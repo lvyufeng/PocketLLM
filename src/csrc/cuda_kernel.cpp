@@ -326,6 +326,11 @@ void fused_o_inverse_rope_inplace_cuda(
     const torch::Tensor& freqs_real,
     const torch::Tensor& freqs_imag);
 
+void fused_minimax_rope_halfsplit_inplace_cuda(
+    torch::Tensor& x,
+    const torch::Tensor& freqs_cos,
+    const torch::Tensor& freqs_sin);
+
 std::vector<std::string> custom_allreduce_ipc_handle_cuda(
     const torch::Tensor& buffer,
     const torch::Tensor& flags);
@@ -1842,6 +1847,26 @@ void fused_o_inverse_rope_inplace(
     fused_o_inverse_rope_inplace_cuda(o, freqs_real, freqs_imag);
 }
 
+void fused_minimax_rope_halfsplit_inplace(
+    torch::Tensor& x,
+    const torch::Tensor& freqs_cos,
+    const torch::Tensor& freqs_sin) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16, "x must be fp16 or bf16");
+    TORCH_CHECK(x.dim() == 4, "x must be [B, S, H, D]");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+    TORCH_CHECK(freqs_cos.is_cuda() && freqs_sin.is_cuda(), "freqs must be CUDA");
+    TORCH_CHECK(freqs_cos.scalar_type() == at::kFloat && freqs_sin.scalar_type() == at::kFloat, "freqs must be fp32");
+    TORCH_CHECK(freqs_cos.is_contiguous() && freqs_sin.is_contiguous(), "freqs must be contiguous");
+    TORCH_CHECK(freqs_cos.dim() == 2 && freqs_sin.dim() == 2, "freqs must be [S, rope_dim/2]");
+    const int S = static_cast<int>(x.size(1));
+    TORCH_CHECK(freqs_cos.size(0) == S && freqs_sin.size(0) == S, "freqs S mismatch");
+    const int rope_dim = static_cast<int>(freqs_cos.size(1)) * 2;
+    const int D = static_cast<int>(x.size(3));
+    TORCH_CHECK(rope_dim > 0 && rope_dim <= D && (rope_dim % 2) == 0, "rope_dim must be even and <= D");
+    fused_minimax_rope_halfsplit_inplace_cuda(x, freqs_cos, freqs_sin);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("custom_allreduce_ipc_handle", &custom_allreduce_ipc_handle, "export custom allreduce CUDA IPC handles");
     m.def("custom_allreduce_open", &custom_allreduce_open, "open custom allreduce CUDA IPC handles");
@@ -1891,4 +1916,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("kv_cache_out") = c10::optional<torch::Tensor>(),
           pybind11::arg("cache_slot") = static_cast<int64_t>(0));
     m.def("fused_o_inverse_rope_inplace", &fused_o_inverse_rope_inplace, "inverse rope on attention output o (CUDA, bf16, in-place)");
+    m.def("fused_minimax_rope_halfsplit_inplace", &fused_minimax_rope_halfsplit_inplace, "MiniMax half-split RoPE (CUDA, fp16/bf16, in-place)");
 }

@@ -43,6 +43,7 @@ setup(
             sources=[
                 str(CSRC / "cuda_kernel.cpp"),
                 str(CSRC / "cuda_kernel_impl.cu"),
+                str(CSRC / "minimax_rope_kernel.cu"),
             ],
             libraries=["cublas"],
             extra_compile_args={

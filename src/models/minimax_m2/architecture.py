@@ -97,6 +97,11 @@ class MiniMaxAttention:
         self.cache_batch = 0
         self.cache_len = 0
 
+        # Pre-compute RoPE freqs for fused kernel (lazy init on first use)
+        self._rope_freqs_cos: torch.Tensor | None = None
+        self._rope_freqs_sin: torch.Tensor | None = None
+        self._fused_rope_enabled = os.environ.get("MINIMAX_M2_FUSED_ROPE", "1") == "1"
+
     def reset_cache(self, batch_size: int, max_seq_len: int) -> None:
         self.cache_batch = int(batch_size)
         self.cache_len = int(max_seq_len)
@@ -117,12 +122,64 @@ class MiniMaxAttention:
             new_len = max(int(needed_len), max(1, self.cache_len) * 2)
             self.reset_cache(batch_size, new_len)
 
+    def _ensure_rope_freqs(self, max_seq_len: int) -> None:
+        """Pre-compute and cache RoPE freqs for fused kernel."""
+        if self._rope_freqs_cos is not None and self._rope_freqs_cos.size(0) >= max_seq_len:
+            return
+
+        rope_dim = int(self.args.rope_dim)
+        if rope_dim <= 0:
+            return
+
+        half = rope_dim // 2
+        positions = torch.arange(max_seq_len, device=self.device, dtype=torch.float32)
+        j = torch.arange(half, device=self.device, dtype=torch.float32)
+        inv = torch.pow(torch.full_like(j, float(self.args.rope_base)), -(2.0 * j) / float(rope_dim))
+        freqs = positions[:, None] * inv[None, :]  # [max_seq_len, half]
+        # Store as fp32 for kernel (kernel expects float32 freqs)
+        self._rope_freqs_cos = torch.cos(freqs).contiguous()
+        self._rope_freqs_sin = torch.sin(freqs).contiguous()
+
     def _apply_rope(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         # fastllm/llama.cpp MiniMax uses half-split RoPE over the first rope_dim:
         # [0:rope_dim/2] rotates with [rope_dim/2:rope_dim], the tail is unchanged.
         rope_dim = int(self.args.rope_dim)
         if rope_dim <= 0:
             return x
+
+        # Try fused kernel path (decode only, seqlen==1)
+        bsz, seqlen = x.size(0), x.size(1)
+        end_pos = start_pos + seqlen
+        use_fused = (
+            self._fused_rope_enabled
+            and seqlen == 1
+            and x.is_cuda
+            and x.is_contiguous()
+            and (x.dtype == torch.float16 or x.dtype == torch.bfloat16)
+        )
+
+        if use_fused:
+            try:
+                from src.kernels.cuda_loader import load_cuda_kernel
+                cuda_ext = load_cuda_kernel()
+                if hasattr(cuda_ext, "fused_minimax_rope_halfsplit_inplace"):
+                    self._ensure_rope_freqs(end_pos)
+                    if self._rope_freqs_cos is not None and self._rope_freqs_sin is not None:
+                        # Narrow to [start_pos:end_pos]
+                        freqs_cos = self._rope_freqs_cos[start_pos:end_pos]
+                        freqs_sin = self._rope_freqs_sin[start_pos:end_pos]
+                        # x is [B, S, H, D], kernel expects contiguous
+                        if not x.is_contiguous():
+                            # Fall back to PyTorch if not contiguous
+                            pass
+                        else:
+                            cuda_ext.fused_minimax_rope_halfsplit_inplace(x, freqs_cos, freqs_sin)
+                            return x
+            except Exception:
+                # Fall back to PyTorch on any error
+                pass
+
+        # Fallback: PyTorch ops
         half = rope_dim // 2
         positions = torch.arange(start_pos, start_pos + x.size(1), device=x.device, dtype=torch.float32)
         j = torch.arange(half, device=x.device, dtype=torch.float32)
