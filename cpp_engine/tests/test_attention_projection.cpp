@@ -189,6 +189,59 @@ void test_cached_attention_kernel() {
     }
 }
 
+void test_prefill_headpair_serial_matches_indexed() {
+    constexpr int tokens = 4;
+    constexpr int heads = 5;
+    constexpr int head_dim = 64;
+    constexpr int topk = 4;
+    constexpr int kv_len = 4;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    std::vector<float> q(static_cast<size_t>(tokens) * heads * head_dim);
+    std::vector<float> kv(static_cast<size_t>(kv_len) * head_dim);
+    std::vector<float> sink(heads);
+    std::vector<int32_t> indices(static_cast<size_t>(tokens) * topk, -1);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = std::sin(static_cast<float>(i) * 0.013f) * 0.25f;
+    for (size_t i = 0; i < kv.size(); ++i) kv[i] = std::cos(static_cast<float>(i) * 0.017f) * 0.2f;
+    for (int h = 0; h < heads; ++h) sink[h] = -0.15f + 0.07f * static_cast<float>(h);
+    for (int t = 0; t < tokens; ++t) {
+        for (int k = 0; k < topk; ++k) indices[static_cast<size_t>(t) * topk + k] = (k <= t) ? k : -1;
+    }
+
+    float* d_q = nullptr;
+    float* d_kv = nullptr;
+    float* d_sink = nullptr;
+    float* d_indexed = nullptr;
+    float* d_serial = nullptr;
+    int32_t* d_indices = nullptr;
+    const size_t out_elems = q.size();
+    check_cuda(cudaMalloc(&d_q, q.size() * sizeof(float)), "cudaMalloc prefill q");
+    check_cuda(cudaMalloc(&d_kv, kv.size() * sizeof(float)), "cudaMalloc prefill kv");
+    check_cuda(cudaMalloc(&d_sink, sink.size() * sizeof(float)), "cudaMalloc prefill sink");
+    check_cuda(cudaMalloc(&d_indices, indices.size() * sizeof(int32_t)), "cudaMalloc prefill indices");
+    check_cuda(cudaMalloc(&d_indexed, out_elems * sizeof(float)), "cudaMalloc prefill indexed");
+    check_cuda(cudaMalloc(&d_serial, out_elems * sizeof(float)), "cudaMalloc prefill serial");
+    check_cuda(cudaMemcpy(d_q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice), "copy prefill q");
+    check_cuda(cudaMemcpy(d_kv, kv.data(), kv.size() * sizeof(float), cudaMemcpyHostToDevice), "copy prefill kv");
+    check_cuda(cudaMemcpy(d_sink, sink.data(), sink.size() * sizeof(float), cudaMemcpyHostToDevice), "copy prefill sink");
+    check_cuda(cudaMemcpy(d_indices, indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy prefill indices");
+    if (!dsv4::prefill_sparse_attention_indexed_cuda(d_q, d_kv, d_sink, d_indices, d_indexed, tokens, heads, kv_len, topk, head_dim, scale)) throw std::runtime_error("prefill indexed attention launch failed");
+    if (!dsv4::prefill_sparse_attention_headpair_serial_cuda(d_q, d_kv, d_sink, d_indices, d_serial, tokens, heads, kv_len, topk, head_dim, scale)) throw std::runtime_error("prefill headpair serial attention launch failed");
+    check_cuda(cudaDeviceSynchronize(), "sync prefill attention compare");
+    std::vector<float> indexed(out_elems);
+    std::vector<float> serial(out_elems);
+    check_cuda(cudaMemcpy(indexed.data(), d_indexed, out_elems * sizeof(float), cudaMemcpyDeviceToHost), "copy indexed attention");
+    check_cuda(cudaMemcpy(serial.data(), d_serial, out_elems * sizeof(float), cudaMemcpyDeviceToHost), "copy serial attention");
+    cudaFree(d_q);
+    cudaFree(d_kv);
+    cudaFree(d_sink);
+    cudaFree(d_indices);
+    cudaFree(d_indexed);
+    cudaFree(d_serial);
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < out_elems; ++i) max_abs = std::max(max_abs, std::fabs(indexed[i] - serial[i]));
+    if (max_abs > 1e-7f) throw std::runtime_error("prefill headpair serial mismatch vs indexed");
+}
+
 void test_single_token_attention_kernel() {
     constexpr int heads = 3;
     constexpr int head_dim = 4;
@@ -245,6 +298,7 @@ int main(int argc, char** argv) {
         test_head_rmsnorm_rope_kernel();
         test_single_token_attention_kernel();
         test_cached_attention_kernel();
+        test_prefill_headpair_serial_matches_indexed();
         Args args = parse_args(argc, argv);
         if (args.ckpt.empty()) throw std::runtime_error("--ckpt is required");
         dsv4::SafeTensorsIndex index(args.ckpt);

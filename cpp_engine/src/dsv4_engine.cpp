@@ -8496,7 +8496,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             prefill_attn_topk > 0 && prefill_attn_index_elems > 0 &&
             (prefill_attn_max_index_topk <= 0 || prefill_attn_topk <= prefill_attn_max_index_topk) &&
             (prefill_attn_max_index_elems <= 0 || prefill_attn_index_elems <= prefill_attn_max_index_elems);
-        const bool use_prefill_headpair_attn = use_prefill_indexed_attn &&
+        const bool use_prefill_headpair_serial_attn = use_prefill_indexed_attn &&
+            env_int_or_default("DSV4_GGUF_PREFILL_HEADPAIR_SERIAL_ATTN", 1) != 0;
+        const bool use_prefill_headpair_attn = use_prefill_indexed_attn && !use_prefill_headpair_serial_attn &&
             env_int_or_default("DSV4_GGUF_PREFILL_HEADPAIR_ATTN", 0) != 0;
         const bool iq1_grouped_w2_q8_enabled = env_int_or_default("DSV4_IQ1_GROUPED_W2_Q8", 1) != 0;
         const bool iq1_grouped_gemm_enabled = env_int_or_default("DSV4_IQ1_GROUPED_GEMM", 1) != 0;
@@ -8690,7 +8692,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 if (!head_rmsnorm_rope_rows_cuda(d_kv_rows, cn, 1, head_dim, rope_dim, cs, ld.rope_theta, false, 0.0f)) throw std::runtime_error("GGUF prefill kv rope rows failed");
                 if (!copy_rows_to_kv_cache_cuda(d_kv_rows, d_kv_cache[L], cn, head_dim, layer_cache_capacity[L], cs)) throw std::runtime_error("GGUF prefill kv cache rows copy failed");
                 if (use_prefill_indexed_attn) {
-                    if (use_prefill_headpair_attn) {
+                    if (use_prefill_headpair_serial_attn) {
+                        if (!prefill_sparse_attention_headpair_serial_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill headpair serial indexed attention rows failed");
+                    } else if (use_prefill_headpair_attn) {
                         if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill headpair indexed attention rows failed");
                     } else {
                         if (!prefill_sparse_attention_indexed_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill indexed attention rows failed");
@@ -8920,6 +8924,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " iq1_route_major=" << (iq1_grouped_route_major_enabled ? 1 : 0)
                       << " indexed_attn=" << (use_prefill_indexed_attn ? 1 : 0)
                       << " headpair_attn=" << (use_prefill_headpair_attn ? 1 : 0)
+                      << " headpair_serial_attn=" << (use_prefill_headpair_serial_attn ? 1 : 0)
                       << " attn_topk=" << prefill_attn_topk
                       << " attn_ms=" << prof_prefill_attn_ms
                       << " gate_ms=" << prof_prefill_gate_ms

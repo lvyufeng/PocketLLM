@@ -1035,6 +1035,129 @@ __global__ void prefill_sparse_attention_headpair_kernel(
     }
 }
 
+__global__ void prefill_sparse_attention_headpair_serial_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ kv,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ topk_idxs,
+    float* __restrict__ out,
+    int seqlen,
+    int heads,
+    int kv_len,
+    int topk,
+    int dim,
+    float softmax_scale) {
+    const int head_pairs = (heads + 1) / 2;
+    const int bsp = blockIdx.x;
+    const int pair = bsp % head_pairs;
+    const int s = (bsp / head_pairs) % seqlen;
+    const int h0 = pair * 2;
+    const int h1 = h0 + 1;
+    const bool has_h1 = h1 < heads;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* scores0 = smem;
+    float* scores1 = scores0 + topk;
+    float* q0_shared = scores1 + topk;
+    float* q1_shared = q0_shared + dim;
+    int32_t* idx_shared = reinterpret_cast<int32_t*>(q1_shared + dim);
+    float* reduce0 = reinterpret_cast<float*>(idx_shared + topk);
+    float* reduce1 = reduce0 + blockDim.x;
+
+    const float* q0_ptr = q + (static_cast<size_t>(s) * heads + h0) * dim;
+    const float* q1_ptr = has_h1 ? q + (static_cast<size_t>(s) * heads + h1) * dim : q0_ptr;
+    const int32_t* idx_base = topk_idxs + static_cast<size_t>(s) * topk;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        q0_shared[d] = q0_ptr[d];
+        if (has_h1) q1_shared[d] = q1_ptr[d];
+    }
+    for (int t = tid; t < topk; t += blockDim.x) idx_shared[t] = idx_base[t];
+    __syncthreads();
+
+    const float sink0 = attn_sink == nullptr ? -INFINITY : attn_sink[h0];
+    const float sink1 = (has_h1 && attn_sink != nullptr) ? attn_sink[h1] : -INFINITY;
+    float local_max0 = sink0;
+    float local_max1 = sink1;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const int idx = idx_shared[t];
+        float score0 = -INFINITY;
+        float score1 = -INFINITY;
+        if (idx >= 0 && idx < kv_len) {
+            const float* kv_ptr = kv + static_cast<size_t>(idx) * dim;
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            for (int d = 0; d < dim; ++d) {
+                const float v = kv_ptr[d];
+                acc0 += q0_shared[d] * v;
+                if (has_h1) acc1 += q1_shared[d] * v;
+            }
+            score0 = acc0 * softmax_scale;
+            if (has_h1) score1 = acc1 * softmax_scale;
+            local_max0 = fmaxf(local_max0, score0);
+            if (has_h1) local_max1 = fmaxf(local_max1, score1);
+        }
+        scores0[t] = score0;
+        if (has_h1) scores1[t] = score1;
+    }
+    reduce0[tid] = local_max0;
+    if (has_h1) reduce1[tid] = local_max1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] = fmaxf(reduce0[tid], reduce0[tid + stride]);
+            if (has_h1) reduce1[tid] = fmaxf(reduce1[tid], reduce1[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float max0 = reduce0[0];
+    const float max1 = has_h1 ? reduce1[0] : -INFINITY;
+
+    float local_denom0 = 0.0f;
+    float local_denom1 = 0.0f;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const float w0 = expf(scores0[t] - max0);
+        scores0[t] = w0;
+        local_denom0 += w0;
+        if (has_h1) {
+            const float w1 = expf(scores1[t] - max1);
+            scores1[t] = w1;
+            local_denom1 += w1;
+        }
+    }
+    reduce0[tid] = local_denom0;
+    if (has_h1) reduce1[tid] = local_denom1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] += reduce0[tid + stride];
+            if (has_h1) reduce1[tid] += reduce1[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float denom0 = reduce0[0] + (attn_sink == nullptr ? 0.0f : expf(sink0 - max0));
+    const float denom1 = has_h1 ? reduce1[0] + (attn_sink == nullptr ? 0.0f : expf(sink1 - max1)) : 1.0f;
+    const float inv0 = 1.0f / denom0;
+    const float inv1 = has_h1 ? 1.0f / denom1 : 0.0f;
+
+    float* out0_ptr = out + (static_cast<size_t>(s) * heads + h0) * dim;
+    float* out1_ptr = has_h1 ? out + (static_cast<size_t>(s) * heads + h1) * dim : out0_ptr;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (int t = 0; t < topk; ++t) {
+            const int idx = idx_shared[t];
+            if (idx >= 0 && idx < kv_len) {
+                const float v = kv[static_cast<size_t>(idx) * dim + d];
+                acc0 += scores0[t] * v;
+                if (has_h1) acc1 += scores1[t] * v;
+            }
+        }
+        out0_ptr[d] = acc0 * inv0;
+        if (has_h1) out1_ptr[d] = acc1 * inv1;
+    }
+}
+
 __global__ void single_token_sparse_attention_kernel(
     const float* q,
     const float* kv,
@@ -1834,6 +1957,29 @@ bool prefill_sparse_attention_headpair_cuda(
     const size_t shared_bytes = (static_cast<size_t>(2) * topk + static_cast<size_t>(2) * head_dim + static_cast<size_t>(topk) * sizeof(int32_t) / sizeof(float) + static_cast<size_t>(2) * threads + 8) * sizeof(float);
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     prefill_sparse_attention_headpair_kernel<<<tokens * head_pairs, threads, shared_bytes, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_topk_indices, d_y, tokens, heads, kv_len, topk, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool prefill_sparse_attention_headpair_serial_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    const int32_t* d_topk_indices,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int topk,
+    int head_dim,
+    float scale,
+    void* stream) {
+    if (d_q == nullptr || d_kv == nullptr || d_attn_sink == nullptr || d_topk_indices == nullptr || d_y == nullptr) return false;
+    if (tokens <= 0 || heads <= 0 || kv_len <= 0 || topk <= 0 || head_dim <= 0) return false;
+    const int head_pairs = (heads + 1) / 2;
+    const int threads = 256;
+    const size_t shared_bytes = (static_cast<size_t>(2) * topk + static_cast<size_t>(2) * head_dim + static_cast<size_t>(topk) * sizeof(int32_t) / sizeof(float) + static_cast<size_t>(2) * threads + 8) * sizeof(float);
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    prefill_sparse_attention_headpair_serial_kernel<<<tokens * head_pairs, threads, shared_bytes, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_topk_indices, d_y, tokens, heads, kv_len, topk, head_dim, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

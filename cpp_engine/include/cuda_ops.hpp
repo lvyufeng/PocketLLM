@@ -759,6 +759,20 @@ bool prefill_sparse_attention_headpair_cuda(
     float scale,
     void* stream = nullptr);
 
+bool prefill_sparse_attention_headpair_serial_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    const int32_t* d_topk_indices,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int topk,
+    int head_dim,
+    float scale,
+    void* stream = nullptr);
+
 bool single_token_sparse_attention_cuda(
     const float* d_q,
     const float* d_kv,
