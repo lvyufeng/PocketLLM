@@ -9,9 +9,16 @@ from src.loader.gguf.reader import GGUF_MAGIC, align_up, tensor_nbytes
 GGUF_VERSION = 3
 GGML_F32 = 0
 GGML_F16 = 1
+GGML_Q8_0 = 8
+GGML_Q2_K = 10
+GGML_Q3_K = 11
 GGML_Q4_K = 12
 GGML_Q5_K = 13
+GGML_Q6_K = 14
 GGML_IQ2_XXS = 16
+GGML_IQ2_XS = 17
+GGML_IQ3_XXS = 18
+GGML_IQ4_XS = 23
 GGML_IQ1_M = 29
 GGML_BF16 = 30
 
@@ -188,5 +195,165 @@ def write_minimax_bundle(
         root / "tiny-minimax-00002-of-00002.gguf",
         metadata={"split.no": 1, "split.count": 2},
         tensors=minimax_tensors(n_layers=n_layers, hidden=hidden, vocab=vocab, experts=experts, inter=inter),
+    )
+    return root
+
+
+def glm_dsa_metadata(
+    *,
+    n_layers: int = 4,
+    leading_dense: int = 1,
+    hidden: int = 12,
+    vocab: int = 32,
+    experts: int = 4,
+    expert_inter: int = 8,
+) -> dict[str, Any]:
+    return {
+        "general.architecture": "glm-dsa",
+        "glm-dsa.block_count": n_layers,
+        "glm-dsa.leading_dense_block_count": leading_dense,
+        "glm-dsa.context_length": 1024,
+        "glm-dsa.embedding_length": hidden,
+        "glm-dsa.vocab_size": vocab,
+        "glm-dsa.attention.head_count": 3,
+        "glm-dsa.attention.head_count_kv": 1,
+        "glm-dsa.attention.key_length": 5,
+        "glm-dsa.attention.value_length": 6,
+        "glm-dsa.attention.key_length_mla": 4,
+        "glm-dsa.attention.value_length_mla": 4,
+        "glm-dsa.attention.q_lora_rank": 6,
+        "glm-dsa.attention.kv_lora_rank": 4,
+        "glm-dsa.attention.indexer.head_count": 2,
+        "glm-dsa.attention.indexer.key_length": 3,
+        "glm-dsa.attention.layer_norm_rms_epsilon": 0.00001,
+        "glm-dsa.rope.dimension_count": 1,
+        "glm-dsa.rope.freq_base": 8000000.0,
+        "glm-dsa.feed_forward_length": 16,
+        "glm-dsa.expert_count": experts,
+        "glm-dsa.expert_used_count": 2,
+        "glm-dsa.expert_feed_forward_length": expert_inter,
+        "glm-dsa.expert_shared_count": 1,
+        "glm-dsa.expert_gating_func": 2,
+        "glm-dsa.nextn_predict_layers": 1,
+    }
+
+
+def glm_dsa_tensors(
+    *,
+    n_layers: int = 4,
+    leading_dense: int = 1,
+    hidden: int = 12,
+    vocab: int = 32,
+    experts: int = 4,
+    expert_inter: int = 8,
+) -> list[tuple[str, tuple[int, ...], int]]:
+    heads = 3
+    key_mla = 4
+    value_len = 6
+    value_mla = 4
+    rope = 1
+    q_lora = 6
+    kv_lora = 4
+    idx_heads = 2
+    idx_key = 3
+    ff = 16
+    k_nope = key_mla - rope
+    tensors: list[tuple[str, tuple[int, ...], int]] = [
+        ("token_embd.weight", (hidden, vocab), GGML_Q5_K),
+        ("output.weight", (hidden, vocab), GGML_Q4_K),
+        ("output_norm.weight", (hidden,), GGML_F32),
+    ]
+    for layer in range(n_layers):
+        prefix = f"blk.{layer}"
+        tensors.extend(
+            [
+                (f"{prefix}.attn_k_b.weight", (k_nope, kv_lora, heads), GGML_Q8_0),
+                (f"{prefix}.attn_kv_a_mqa.weight", (hidden, kv_lora + rope), GGML_Q8_0),
+                (f"{prefix}.attn_kv_a_norm.weight", (kv_lora,), GGML_F32),
+                (f"{prefix}.attn_norm.weight", (hidden,), GGML_F32),
+                (f"{prefix}.attn_output.weight", (heads * value_mla, hidden), GGML_Q5_K),
+                (f"{prefix}.attn_q_a.weight", (hidden, q_lora), GGML_Q5_K),
+                (f"{prefix}.attn_q_a_norm.weight", (q_lora,), GGML_F32),
+                (f"{prefix}.attn_q_b.weight", (q_lora, heads * key_mla), GGML_Q8_0),
+                (f"{prefix}.attn_v_b.weight", (value_len, value_mla, heads), GGML_Q8_0),
+                (f"{prefix}.ffn_norm.weight", (hidden,), GGML_F32),
+                (f"{prefix}.indexer.attn_k.weight", (hidden, idx_key), GGML_Q8_0),
+                (f"{prefix}.indexer.attn_q_b.weight", (q_lora, idx_heads * idx_key), GGML_Q8_0),
+                (f"{prefix}.indexer.k_norm.bias", (idx_key,), GGML_F32),
+                (f"{prefix}.indexer.k_norm.weight", (idx_key,), GGML_F32),
+                (f"{prefix}.indexer.proj.weight", (hidden, idx_heads), GGML_F32),
+            ]
+        )
+        if layer < leading_dense:
+            tensors.extend(
+                [
+                    (f"{prefix}.ffn_down.weight", (ff, hidden), GGML_Q6_K),
+                    (f"{prefix}.ffn_gate.weight", (hidden, ff), GGML_Q5_K),
+                    (f"{prefix}.ffn_up.weight", (hidden, ff), GGML_Q5_K),
+                ]
+            )
+        else:
+            tensors.extend(
+                [
+                    (f"{prefix}.exp_probs_b.bias", (experts,), GGML_F32),
+                    (f"{prefix}.ffn_down_exps.weight", (expert_inter, hidden, experts), GGML_IQ3_XXS),
+                    (f"{prefix}.ffn_down_shexp.weight", (expert_inter, hidden), GGML_Q6_K),
+                    (f"{prefix}.ffn_gate_exps.weight", (hidden, expert_inter, experts), GGML_IQ2_XS),
+                    (f"{prefix}.ffn_gate_inp.weight", (hidden, experts), GGML_F32),
+                    (f"{prefix}.ffn_gate_shexp.weight", (hidden, expert_inter), GGML_Q5_K),
+                    (f"{prefix}.ffn_up_exps.weight", (hidden, expert_inter, experts), GGML_IQ2_XS),
+                    (f"{prefix}.ffn_up_shexp.weight", (hidden, expert_inter), GGML_Q5_K),
+                ]
+            )
+    last = n_layers - 1
+    tensors.extend(
+        [
+            (f"blk.{last}.nextn.eh_proj.weight", (ff, hidden), GGML_Q8_0),
+            (f"blk.{last}.nextn.enorm.weight", (hidden,), GGML_F32),
+            (f"blk.{last}.nextn.hnorm.weight", (hidden,), GGML_F32),
+            (f"blk.{last}.nextn.shared_head_norm.weight", (hidden,), GGML_F32),
+        ]
+    )
+    return tensors
+
+
+def write_glm_dsa_bundle(
+    root: Path,
+    *,
+    n_layers: int = 4,
+    leading_dense: int = 1,
+    hidden: int = 12,
+    vocab: int = 32,
+    experts: int = 4,
+    expert_inter: int = 8,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    write_gguf(
+        root / "tiny-glm-00001-of-00002.gguf",
+        metadata={
+            **glm_dsa_metadata(
+                n_layers=n_layers,
+                leading_dense=leading_dense,
+                hidden=hidden,
+                vocab=vocab,
+                experts=experts,
+                expert_inter=expert_inter,
+            ),
+            "split.no": 0,
+            "split.count": 2,
+        },
+        tensors=[],
+    )
+    write_gguf(
+        root / "tiny-glm-00002-of-00002.gguf",
+        metadata={"split.no": 1, "split.count": 2},
+        tensors=glm_dsa_tensors(
+            n_layers=n_layers,
+            leading_dense=leading_dense,
+            hidden=hidden,
+            vocab=vocab,
+            experts=experts,
+            expert_inter=expert_inter,
+        ),
     )
     return root

@@ -101,6 +101,7 @@ _QUANT_BLOCK_META = {
     "iq1_m": (256, 56),
     "q4_k": (256, 144),
     "q5_k": (256, 176),
+    "q6_k": (256, 210),
 }
 
 
@@ -213,7 +214,7 @@ class GGUFTensorDataReader:
             return self._read_dense_tensor(tensor)
         if tensor.type_name == "q8_0":
             return self._read_q8_0_tensor(tensor)
-        if tensor.type_name in {"q2_k", "iq2_xxs", "iq1_m"} and len(tensor.dimensions) == 2:
+        if tensor.type_name in {"q2_k", "iq2_xxs", "iq1_m", "q4_k", "q5_k", "q6_k"} and len(tensor.dimensions) == 2:
             return self._read_quantized_matrix(tensor, tensor.absolute_offset, int(tensor.dimensions[0]), int(tensor.dimensions[1]), tensor.type_name)
         raise NotImplementedError(f"payload decode for {tensor.name} ({tensor.type_name}) is not supported by read_tensor")
 
@@ -478,9 +479,7 @@ class GGUFTensorDataReader:
         return torch.from_numpy(blocks).to(device="cpu")
 
     def _read_quantized_matrix(self, tensor: GGUFTensorInfo, offset: int, in_dim: int, out_dim: int, type_name: str) -> torch.Tensor:
-        if in_dim % 256 != 0:
-            raise ValueError(f"{tensor.name} in_dim={in_dim} is not divisible by 256")
-        blocks_per_row = in_dim // 256
+        blocks_per_row = math.ceil(in_dim / 256)
         if type_name == "q2_k":
             values = self._read_q2_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq2_xxs":
@@ -491,6 +490,8 @@ class GGUFTensorDataReader:
             values = self._read_q4_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "q5_k":
             values = self._read_q5_k_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "q6_k":
+            values = self._read_q6_k_rows(offset, out_dim, blocks_per_row)
         else:
             raise NotImplementedError(type_name)
         return torch.from_numpy(values.reshape(out_dim, blocks_per_row * 256)[:, :in_dim].copy())
@@ -643,6 +644,52 @@ class GGUFTensorDataReader:
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=q5_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_q6_k_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode Q6_K rows to float32 using llama.cpp/ggml layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 210
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 210)
+        ql = blocks[:, :, 0:128]
+        qh = blocks[:, :, 128:192]
+        scales = blocks[:, :, 192:208].view(np.int8).astype(np.float32)
+        d = _f16_bytes_to_f32(blocks[:, :, 208:210])
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for group in range(16):
+            ql_part = ql[:, :, group * 8:(group + 1) * 8]
+            qh_part = qh[:, :, group * 4:(group + 1) * 4]
+            if group % 2 == 0:
+                low = ql_part & 0x0F
+            else:
+                low = ql_part >> 4
+            high_lo = qh_part & 0x03
+            high_hi = (qh_part >> 2) & 0x03
+            high = np.empty((rows, blocks_per_row, 8), dtype=np.uint8)
+            high[:, :, 0:4] = high_lo
+            high[:, :, 4:8] = high_hi
+            q = (low | (high << 4)).astype(np.int16) - 32
+            out[:, :, group * 16:group * 16 + 8] = d[:, :, None] * scales[:, :, group, None] * q.astype(np.float32)
+            # ql stores 8 bytes per group, i.e. 16 packed low nibbles.
+            if group % 2 == 0:
+                low2 = ql_part >> 4
+            else:
+                low2 = ql_part & 0x0F
+            q2 = (low2 | (high << 4)).astype(np.int16) - 32
+            out[:, :, group * 16 + 8:(group + 1) * 16] = d[:, :, None] * scales[:, :, group, None] * q2.astype(np.float32)
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=q6_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )

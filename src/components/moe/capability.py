@@ -20,10 +20,15 @@ _CAPABILITIES = {
     "i32": QuantCapability("i32", True, True, False, True, "dense scalar tensor payload supported"),
     "q8_0": QuantCapability("q8_0", True, True, True, True, "raw q8_0 binding exists for supported modules"),
     "q2_k": QuantCapability("q2_k", True, True, True, True, "routed expert raw blocks supported in existing DSV4 paths"),
+    "q3_k": QuantCapability("q3_k", True, True, False, False, "GGUF q3_k payload can be inventoried; CUDA runtime support is deferred"),
     "iq2_xxs": QuantCapability("iq2_xxs", True, True, True, True, "routed expert raw blocks supported by MiniMax/DSV4 GGUF CUDA paths"),
+    "iq2_xs": QuantCapability("iq2_xs", True, True, False, False, "GGUF iq2_xs payload can be inventoried; CUDA runtime support is deferred"),
+    "iq3_xxs": QuantCapability("iq3_xxs", True, True, False, False, "GGUF iq3_xxs payload can be inventoried; CUDA runtime support is deferred"),
     "iq1_m": QuantCapability("iq1_m", True, True, True, True, "routed expert raw blocks supported in existing DSV4 paths"),
+    "iq4_xs": QuantCapability("iq4_xs", True, True, False, False, "GGUF iq4_xs payload can be inventoried; CUDA runtime support is deferred"),
     "q4_k": QuantCapability("q4_k", True, True, True, True, "raw q4_k CUDA GEMM and selected-row embedding supported"),
     "q5_k": QuantCapability("q5_k", True, True, True, True, "raw q5_k CUDA GEMM supported"),
+    "q6_k": QuantCapability("q6_k", True, True, False, False, "GGUF q6_k payload can be inventoried; CUDA runtime support is deferred"),
 }
 
 
@@ -36,6 +41,10 @@ def quant_capability(type_name: str) -> QuantCapability:
 
 def capability_status_for_role(role: str, type_name: str, *, architecture: str) -> tuple[str, str]:
     cap = quant_capability(type_name)
+    if architecture == "glm-dsa":
+        if cap.header_supported and cap.payload_reader_supported:
+            return "deferred", f"{cap.notes}; optimized GLM-DSA runtime path is deferred"
+        return "unsupported", cap.notes
     if architecture == "minimax-m2":
         if role in {"routed_w1", "routed_w2", "routed_w3"} and type_name == "iq2_xxs":
             return "supported", "iq2_xxs routed blocks are readable and run through MiniMax TP CUDA grouped MoE"

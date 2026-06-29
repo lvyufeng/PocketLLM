@@ -9,10 +9,12 @@ _SPECS: dict[str, MoEModelSpec] | None = None
 
 def _init_specs() -> dict[str, MoEModelSpec]:
     from src.models.deepseek_v4.spec import DeepSeekV4Spec
+    from src.models.glm_dsa.spec import GLMDSASpec
     from src.models.minimax_m2.spec import MiniMaxM2Spec
 
     return {
         DeepSeekV4Spec.architecture: DeepSeekV4Spec(),
+        GLMDSASpec.architecture: GLMDSASpec(),
         MiniMaxM2Spec.architecture: MiniMaxM2Spec(),
     }
 
