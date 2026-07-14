@@ -390,7 +390,15 @@ int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
     if (type_id == 2) return 56;    // iq1_m
     if (type_id == 3) return 144;   // q4_k
     if (type_id == 4) return 176;   // q5_k
-    TORCH_CHECK(false, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
+    if (type_id == 5) return 74;    // iq2_xs
+    if (type_id == 6) return 98;    // iq3_xxs
+    if (type_id == 8) return 210;   // q6_k
+    TORCH_CHECK(false, "unsupported GGUF quant type_id: ", type_id);
+}
+
+bool gguf_quant_type_supported(int64_t type_id) {
+    return type_id == 0 || type_id == 1 || type_id == 2 || type_id == 3 ||
+           type_id == 4 || type_id == 5 || type_id == 6 || type_id == 8;
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
@@ -404,6 +412,11 @@ void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const cha
         TORCH_CHECK(grid.scalar_type() == torch::kInt8, name, " must be int8");
         TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
         TORCH_CHECK(grid.numel() == 2048 * 8, name, " must contain 2048*8 entries for iq1_m");
+    } else if (type_id == 5 || type_id == 6) {
+        TORCH_CHECK(grid.is_cuda(), name, " must be CUDA for iq2_xs/iq3_xxs");
+        TORCH_CHECK(grid.scalar_type() == torch::kInt8, name, " must be int8");
+        TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
+        TORCH_CHECK(grid.numel() >= (512 * 128 * 8 + 256 * 128 * 8), name, " must contain packed iq2_xs and iq3_xxs signed grids");
     }
 }
 
@@ -542,7 +555,7 @@ torch::Tensor gguf_quant_gemm_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id >= 0 && type_id <= 4, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
+    TORCH_CHECK(gguf_quant_type_supported(type_id), "unsupported GGUF quant type_id: ", type_id);
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
@@ -567,7 +580,7 @@ torch::Tensor gguf_quant_gemm_prefill_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id >= 0 && type_id <= 4, "type_id must be 0 (iq2_xxs), 1 (q2_k), 2 (iq1_m), 3 (q4_k), or 4 (q5_k)");
+    TORCH_CHECK(gguf_quant_type_supported(type_id), "unsupported GGUF quant type_id: ", type_id);
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
     TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
@@ -594,9 +607,14 @@ torch::Tensor gguf_quant_gemm_pair_forward(
     const torch::Tensor& signed_grid) {
     TORCH_CHECK(x.dim() == 2 || x.dim() == 3, "x must have shape [M, K] or [B, S, K]");
     TORCH_CHECK(blocks0.dim() == 3 && blocks1.dim() == 3, "blocks must have shape [N, K_blocks, block_bytes]");
-    TORCH_CHECK(type_id0 >= 0 && type_id0 <= 4, "type_id0 must be 0..4");
-    TORCH_CHECK(type_id1 >= 0 && type_id1 <= 4, "type_id1 must be 0..4");
-    TORCH_CHECK(!(type_id0 == 0 && type_id1 == 2) && !(type_id0 == 2 && type_id1 == 0), "paired GEMM cannot mix iq2_xxs and iq1_m because they require different grids");
+    TORCH_CHECK(gguf_quant_type_supported(type_id0), "unsupported GGUF quant type_id0: ", type_id0);
+    TORCH_CHECK(gguf_quant_type_supported(type_id1), "unsupported GGUF quant type_id1: ", type_id1);
+    const bool uses_iq2_grid = (type_id0 == 0 || type_id1 == 0);
+    const bool uses_iq1_grid = (type_id0 == 2 || type_id1 == 2);
+    const bool uses_iq2_xs_iq3_xxs_grid = (type_id0 == 5 || type_id1 == 5 || type_id0 == 6 || type_id1 == 6);
+    TORCH_CHECK(!(uses_iq2_grid && uses_iq1_grid), "paired GEMM cannot mix iq2_xxs and iq1_m because they require different grids");
+    TORCH_CHECK(!(uses_iq2_grid && uses_iq2_xs_iq3_xxs_grid), "paired GEMM cannot mix iq2_xxs with iq2_xs/iq3_xxs because they require different grids");
+    TORCH_CHECK(!(uses_iq1_grid && uses_iq2_xs_iq3_xxs_grid), "paired GEMM cannot mix iq1_m with iq2_xs/iq3_xxs because they require different grids");
     TORCH_CHECK(row_elems0 > 0 && row_elems1 > 0, "row_elems must be positive");
     TORCH_CHECK(row_elems0 == row_elems1, "paired GGUF GEMM requires matching input dimensions");
     TORCH_CHECK(x.size(-1) == row_elems0, "inner dimension mismatch");
@@ -613,10 +631,12 @@ torch::Tensor gguf_quant_gemm_pair_forward(
         x.scalar_type() == torch::kBFloat16 ||
         x.scalar_type() == torch::kFloat32,
         "x must be float16, bfloat16, or float32");
-    if (type_id0 == 0 || type_id1 == 0) {
+    if (uses_iq2_grid) {
         check_gguf_quant_grid(signed_grid, 0, "signed_grid");
-    } else if (type_id0 == 2 || type_id1 == 2) {
+    } else if (uses_iq1_grid) {
         check_gguf_quant_grid(signed_grid, 2, "signed_grid");
+    } else if (uses_iq2_xs_iq3_xxs_grid) {
+        check_gguf_quant_grid(signed_grid, 5, "signed_grid");
     }
     return gguf_quant_gemm_pair_forward_cuda(
         x,
@@ -675,12 +695,15 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
     TORCH_CHECK(seg_starts.size(0) == w1_blocks.size(0) + 1, "seg_starts/expert count mismatch");
     TORCH_CHECK(w1_blocks.size(0) == w3_blocks.size(0) && w1_blocks.size(0) == w2_blocks.size(0), "expert count mismatch");
     TORCH_CHECK(w1_blocks.size(2) * 256 >= w1_row_elems && w3_blocks.size(2) * 256 >= w3_row_elems && w2_blocks.size(2) * 256 >= w2_row_elems, "blocks do not cover row_elems");
-    TORCH_CHECK(w1_type_id == 0 || w1_type_id == 1 || w1_type_id == 2, "w1_type_id must be 0, 1, or 2");
-    TORCH_CHECK(w3_type_id == 0 || w3_type_id == 1 || w3_type_id == 2, "w3_type_id must be 0, 1, or 2");
-    TORCH_CHECK(w2_type_id == 0 || w2_type_id == 1 || w2_type_id == 2, "w2_type_id must be 0, 1, or 2");
+    TORCH_CHECK(gguf_quant_type_supported(w1_type_id), "unsupported w1 GGUF type: ", w1_type_id);
+    TORCH_CHECK(gguf_quant_type_supported(w3_type_id), "unsupported w3 GGUF type: ", w3_type_id);
+    TORCH_CHECK(gguf_quant_type_supported(w2_type_id), "unsupported w2 GGUF type: ", w2_type_id);
     const bool uses_iq2_grid = (w1_type_id == 0 || w3_type_id == 0 || w2_type_id == 0);
     const bool uses_iq1_grid = (w1_type_id == 2 || w3_type_id == 2 || w2_type_id == 2);
+    const bool uses_iq2_xs_iq3_xxs_grid = (w1_type_id == 5 || w3_type_id == 5 || w2_type_id == 5 || w1_type_id == 6 || w3_type_id == 6 || w2_type_id == 6);
     TORCH_CHECK(!(uses_iq2_grid && uses_iq1_grid), "grouped GGUF kernel cannot mix iq2_xxs and iq1_m because they require different grids");
+    TORCH_CHECK(!(uses_iq2_grid && uses_iq2_xs_iq3_xxs_grid), "grouped GGUF kernel cannot mix iq2_xxs with iq2_xs/iq3_xxs because they require different grids");
+    TORCH_CHECK(!(uses_iq1_grid && uses_iq2_xs_iq3_xxs_grid), "grouped GGUF kernel cannot mix iq1_m with iq2_xs/iq3_xxs because they require different grids");
     TORCH_CHECK(w1_blocks.size(3) == gguf_quant_block_bytes_for_type(w1_type_id), "unexpected w1 GGUF block size");
     TORCH_CHECK(w3_blocks.size(3) == gguf_quant_block_bytes_for_type(w3_type_id), "unexpected w3 GGUF block size");
     TORCH_CHECK(w2_blocks.size(3) == gguf_quant_block_bytes_for_type(w2_type_id), "unexpected w2 GGUF block size");
@@ -706,6 +729,8 @@ torch::Tensor gguf_moe_prefill_grouped_forward(
         check_gguf_quant_grid(signed_grid, 0, "signed_grid");
     } else if (uses_iq1_grid) {
         check_gguf_quant_grid(signed_grid, 2, "signed_grid");
+    } else if (uses_iq2_xs_iq3_xxs_grid) {
+        check_gguf_quant_grid(signed_grid, 5, "signed_grid");
     }
     return gguf_moe_prefill_grouped_forward_cuda(
         x,

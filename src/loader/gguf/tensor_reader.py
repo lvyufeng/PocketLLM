@@ -3,8 +3,10 @@ from __future__ import annotations
 import math
 import mmap
 import os
+import re
 import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Iterable
 
 import numpy as np
@@ -97,11 +99,15 @@ _DENSE_DTYPES = {
 # raw blocks in runtime and use reference dequant only in tests.
 _QUANT_BLOCK_META = {
     "q2_k": (256, 84),
+    "q3_k": (256, 110),
     "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq3_xxs": (256, 98),
     "iq1_m": (256, 56),
     "q4_k": (256, 144),
     "q5_k": (256, 176),
     "q6_k": (256, 210),
+    "iq4_xs": (256, 136),
 }
 
 
@@ -140,6 +146,62 @@ def _get_scale_min_k4(scales: np.ndarray, idx: int) -> tuple[np.ndarray, np.ndar
     )
 
 
+def _extract_ggml_table(table_name: str, *, dtype: str, expected: int) -> np.ndarray:
+    """Parse a vendored llama.cpp IQ lookup table without duplicating constants."""
+    header = Path(__file__).parents[2] / "csrc" / "llama_mmq" / "ggml-common.h"
+    text = header.read_text(encoding="utf-8")
+    match = re.search(
+        rf"GGML_TABLE_BEGIN\([^,]+,\s*{re.escape(table_name)},\s*{expected}\)(.*?)GGML_TABLE_END\(\)",
+        text,
+        flags=re.S,
+    )
+    if match is None:
+        raise RuntimeError(f"failed to locate {table_name} in {header}")
+    values = [int(item, 16) for item in re.findall(r"0x[0-9a-fA-F]+", match.group(1))]
+    if len(values) != int(expected):
+        raise RuntimeError(f"{table_name} expected {expected} entries, got {len(values)}")
+    return np.asarray(values, dtype=np.dtype(dtype))
+
+
+@lru_cache(maxsize=1)
+def _iq2xs_grid() -> np.ndarray:
+    return _extract_ggml_table("iq2xs_grid", dtype="<u8", expected=512)
+
+
+@lru_cache(maxsize=1)
+def _iq3xxs_grid() -> np.ndarray:
+    return _extract_ggml_table("iq3xxs_grid", dtype="<u4", expected=256)
+
+
+@lru_cache(maxsize=1)
+def _iq2xs_signed_grid() -> np.ndarray:
+    base = np.empty((512, 8), dtype=np.int8)
+    for idx, value in enumerate(_iq2xs_grid()):
+        base[idx] = np.frombuffer(int(value).to_bytes(8, "little"), dtype=np.uint8).astype(np.int8)
+    signs = np.empty((128, 8), dtype=np.int8)
+    masks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=np.uint8)
+    for idx in range(128):
+        sign_mask = idx | ((int(idx).bit_count() & 1) << 7)
+        signs[idx] = np.where((sign_mask & masks) != 0, -1, 1).astype(np.int8)
+    return (base[:, None, :].astype(np.int16) * signs[None, :, :].astype(np.int16)).astype(np.int8)
+
+
+@lru_cache(maxsize=1)
+def _iq3xxs_signed_grid() -> np.ndarray:
+    base = np.empty((256, 4), dtype=np.int8)
+    for idx, value in enumerate(_iq3xxs_grid()):
+        base[idx] = np.frombuffer(int(value).to_bytes(4, "little"), dtype=np.uint8).astype(np.int8)
+    signs = np.empty((128, 8), dtype=np.int8)
+    masks = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=np.uint8)
+    for idx in range(128):
+        sign_mask = idx | ((int(idx).bit_count() & 1) << 7)
+        signs[idx] = np.where((sign_mask & masks) != 0, -1, 1).astype(np.int8)
+    expanded = np.empty((256, 128, 8), dtype=np.int8)
+    expanded[:, :, 0:4] = (base[:, None, :].astype(np.int16) * signs[None, :, 0:4].astype(np.int16)).astype(np.int8)
+    expanded[:, :, 4:8] = (base[:, None, :].astype(np.int16) * signs[None, :, 4:8].astype(np.int16)).astype(np.int8)
+    return expanded
+
+
 @lru_cache(maxsize=1)
 def _iq2xxs_signed_grid() -> np.ndarray:
     base = np.empty((256, 8), dtype=np.int8)
@@ -156,6 +218,29 @@ def _iq2xxs_signed_grid() -> np.ndarray:
 @lru_cache(maxsize=1)
 def get_iq2xxs_signed_grid_tensor() -> torch.Tensor:
     return torch.from_numpy(_iq2xxs_signed_grid().copy()).contiguous().to(device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_iq2xs_signed_grid_tensor() -> torch.Tensor:
+    return torch.from_numpy(_iq2xs_signed_grid().copy()).contiguous().to(device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_iq3xxs_signed_grid_tensor() -> torch.Tensor:
+    return torch.from_numpy(_iq3xxs_signed_grid().copy()).contiguous().to(device="cpu")
+
+
+@lru_cache(maxsize=1)
+def get_iq2xs_iq3xxs_signed_grid_tensor() -> torch.Tensor:
+    # GLM MoE uses IQ2_XS for routed w1/w3 and IQ3_XXS for routed w2.  Keep a
+    # single packed tensor for that runtime, but preserve per-format helpers
+    # above so other callers can fetch the exact table they need.
+    return torch.cat(
+        [
+            get_iq2xs_signed_grid_tensor().reshape(-1),
+            get_iq3xxs_signed_grid_tensor().reshape(-1),
+        ]
+    ).contiguous()
 
 
 @lru_cache(maxsize=1)
@@ -214,7 +299,7 @@ class GGUFTensorDataReader:
             return self._read_dense_tensor(tensor)
         if tensor.type_name == "q8_0":
             return self._read_q8_0_tensor(tensor)
-        if tensor.type_name in {"q2_k", "iq2_xxs", "iq1_m", "q4_k", "q5_k", "q6_k"} and len(tensor.dimensions) == 2:
+        if tensor.type_name in _QUANT_BLOCK_META and len(tensor.dimensions) == 2:
             return self._read_quantized_matrix(tensor, tensor.absolute_offset, int(tensor.dimensions[0]), int(tensor.dimensions[1]), tensor.type_name)
         raise NotImplementedError(f"payload decode for {tensor.name} ({tensor.type_name}) is not supported by read_tensor")
 
@@ -482,8 +567,14 @@ class GGUFTensorDataReader:
         blocks_per_row = math.ceil(in_dim / 256)
         if type_name == "q2_k":
             values = self._read_q2_k_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "q3_k":
+            values = self._read_q3_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq2_xxs":
             values = self._read_iq2_xxs_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "iq2_xs":
+            values = self._read_iq2_xs_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "iq3_xxs":
+            values = self._read_iq3_xxs_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq1_m":
             values = self._read_iq1_m_rows(offset, out_dim, blocks_per_row)
         elif type_name == "q4_k":
@@ -492,6 +583,8 @@ class GGUFTensorDataReader:
             values = self._read_q5_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "q6_k":
             values = self._read_q6_k_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "iq4_xs":
+            values = self._read_iq4_xs_rows(offset, out_dim, blocks_per_row)
         else:
             raise NotImplementedError(type_name)
         return torch.from_numpy(values.reshape(out_dim, blocks_per_row * 256)[:, :in_dim].copy())
@@ -562,6 +655,122 @@ class GGUFTensorDataReader:
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=iq2_xxs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_iq2_xs_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode IQ2_XS rows using llama.cpp grid/sign layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 74
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 74)
+        d = _f16_bytes_to_f32(blocks[:, :, 0:2])
+        qs = blocks[:, :, 2:66]
+        scales = blocks[:, :, 66:74]
+        signed_grid = _iq2xs_signed_grid()
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for sub in range(8):
+            chunk = qs[:, :, sub * 8:(sub + 1) * 8]
+            ls0 = (scales[:, :, sub] & 0x0F).astype(np.float32)
+            ls1 = (scales[:, :, sub] >> 4).astype(np.float32)
+            for part in range(4):
+                q = chunk[:, :, part * 2].astype(np.uint16) | (chunk[:, :, part * 2 + 1].astype(np.uint16) << 8)
+                grid_ids = (q & 0x01FF).astype(np.int64)
+                sign_idx = (q >> 9).astype(np.int64)
+                values = signed_grid[grid_ids, sign_idx].astype(np.float32)
+                start = sub * 32 + part * 8
+                scale = (ls0 if part < 2 else ls1) + 0.5
+                out[:, :, start:start + 8] = 0.25 * d[:, :, None] * scale[:, :, None] * values
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=iq2_xs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_iq3_xxs_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode IQ3_XXS rows using llama.cpp grid/sign layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 98
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 98)
+        d = _f16_bytes_to_f32(blocks[:, :, 0:2])
+        qs = blocks[:, :, 2:98]
+        signed_grid = _iq3xxs_signed_grid()
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for sub in range(8):
+            qbytes = qs[:, :, sub * 12:sub * 12 + 8]
+            aux = (
+                qs[:, :, sub * 12 + 8].astype(np.uint32)
+                | (qs[:, :, sub * 12 + 9].astype(np.uint32) << 8)
+                | (qs[:, :, sub * 12 + 10].astype(np.uint32) << 16)
+                | (qs[:, :, sub * 12 + 11].astype(np.uint32) << 24)
+            )
+            ls = (aux >> 28).astype(np.float32)
+            for part in range(8):
+                grid_ids = qbytes[:, :, part].astype(np.int64)
+                sign_idx = ((aux >> (7 * (part // 2))) & 127).astype(np.int64)
+                values = signed_grid[grid_ids, sign_idx, part % 2 * 4:part % 2 * 4 + 4].astype(np.float32)
+                start = sub * 32 + part * 4
+                out[:, :, start:start + 4] = 0.5 * d[:, :, None] * (ls[:, :, None] + 0.5) * values
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=iq3_xxs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_q3_k_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode Q3_K rows to float32 using llama.cpp/ggml layout."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 110
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 110)
+        hmask = blocks[:, :, 0:32]
+        qs = blocks[:, :, 32:96]
+        scales = blocks[:, :, 96:108]
+        d = _f16_bytes_to_f32(blocks[:, :, 108:110])
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for group in range(16):
+            if group < 8:
+                scale = (scales[:, :, group] & 0x0F).astype(np.int16)
+            else:
+                scale = (scales[:, :, group - 8] >> 4).astype(np.int16)
+            scale = (scale - 8).astype(np.float32)
+            qbytes = qs[:, :, group * 4:(group + 1) * 4]
+            qlow = np.empty((rows, blocks_per_row, 16), dtype=np.uint8)
+            qlow[:, :, 0:4] = qbytes & 0x03
+            qlow[:, :, 4:8] = (qbytes >> 2) & 0x03
+            qlow[:, :, 8:12] = (qbytes >> 4) & 0x03
+            qlow[:, :, 12:16] = (qbytes >> 6) & 0x03
+            bits = ((hmask[:, :, group * 2:group * 2 + 2][:, :, :, None] >> np.arange(8, dtype=np.uint8)) & 1).reshape(rows, blocks_per_row, 16)
+            q = qlow.astype(np.int16) - np.where(bits == 0, 4, 0).astype(np.int16)
+            out[:, :, group * 16:(group + 1) * 16] = d[:, :, None] * scale[:, :, None] * q.astype(np.float32)
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=q3_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )
@@ -664,32 +873,73 @@ class GGUFTensorDataReader:
         scales = blocks[:, :, 192:208].view(np.int8).astype(np.float32)
         d = _f16_bytes_to_f32(blocks[:, :, 208:210])
         out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
-        for group in range(16):
-            ql_part = ql[:, :, group * 8:(group + 1) * 8]
-            qh_part = qh[:, :, group * 4:(group + 1) * 4]
-            if group % 2 == 0:
-                low = ql_part & 0x0F
-            else:
-                low = ql_part >> 4
-            high_lo = qh_part & 0x03
-            high_hi = (qh_part >> 2) & 0x03
-            high = np.empty((rows, blocks_per_row, 8), dtype=np.uint8)
-            high[:, :, 0:4] = high_lo
-            high[:, :, 4:8] = high_hi
-            q = (low | (high << 4)).astype(np.int16) - 32
-            out[:, :, group * 16:group * 16 + 8] = d[:, :, None] * scales[:, :, group, None] * q.astype(np.float32)
-            # ql stores 8 bytes per group, i.e. 16 packed low nibbles.
-            if group % 2 == 0:
-                low2 = ql_part >> 4
-            else:
-                low2 = ql_part & 0x0F
-            q2 = (low2 | (high << 4)).astype(np.int16) - 32
-            out[:, :, group * 16 + 8:(group + 1) * 16] = d[:, :, None] * scales[:, :, group, None] * q2.astype(np.float32)
+        d_ = d[:, :, None]
+        # ggml dequantize_row_q6_K layout: two 128-wide halves per super-block.
+        # For l in 0..31 within a half: is = l // 16, and the four sub-lanes use
+        # scales sc[is+0], sc[is+2], sc[is+4], sc[is+6].
+        is_idx = np.concatenate([np.zeros(16, dtype=np.int64), np.ones(16, dtype=np.int64)])
+        for half in range(2):
+            base = half * 128
+            ql_h = ql[:, :, half * 64:(half + 1) * 64]
+            qh_h = qh[:, :, half * 32:(half + 1) * 32]
+            sc_h = scales[:, :, half * 8:(half + 1) * 8]
+            ql_l = ql_h[:, :, 0:32].astype(np.uint8)
+            ql_l32 = ql_h[:, :, 32:64].astype(np.uint8)
+            qh_l = qh_h[:, :, 0:32].astype(np.uint8)
+            q1 = ((ql_l & 0x0F) | (((qh_l >> 0) & 0x03) << 4)).astype(np.int16) - 32
+            q2 = ((ql_l32 & 0x0F) | (((qh_l >> 2) & 0x03) << 4)).astype(np.int16) - 32
+            q3 = ((ql_l >> 4) | (((qh_l >> 4) & 0x03) << 4)).astype(np.int16) - 32
+            q4 = ((ql_l32 >> 4) | (((qh_l >> 6) & 0x03) << 4)).astype(np.int16) - 32
+            sc1 = sc_h[:, :, is_idx + 0]
+            sc2 = sc_h[:, :, is_idx + 2]
+            sc3 = sc_h[:, :, is_idx + 4]
+            sc4 = sc_h[:, :, is_idx + 6]
+            out[:, :, base + 0:base + 32] = d_ * sc1 * q1.astype(np.float32)
+            out[:, :, base + 32:base + 64] = d_ * sc2 * q2.astype(np.float32)
+            out[:, :, base + 64:base + 96] = d_ * sc3 * q3.astype(np.float32)
+            out[:, :, base + 96:base + 128] = d_ * sc4 * q4.astype(np.float32)
         if profile:
             t_done = time.perf_counter()
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=q6_k rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_iq4_xs_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode IQ4_XS rows to float32."""
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        nbytes = rows * blocks_per_row * 136
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 136)
+        d = _f16_bytes_to_f32(blocks[:, :, 0:2])
+        scales_h = blocks[:, :, 2:4].view("<u2")
+        scales_l = blocks[:, :, 4:8]
+        qs = blocks[:, :, 8:136]
+        kvalues = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
+        out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
+        for group in range(8):
+            scale = ((scales_l[:, :, group // 2] >> (4 if group & 1 else 0)) & 0x0F).astype(np.int16)
+            scale |= (((scales_h >> (2 * group)) & 0x03).astype(np.int16) << 4)
+            scale = (scale - 32).astype(np.float32)
+            q = qs[:, :, group * 16:(group + 1) * 16]
+            lo = kvalues[q & 0x0F]
+            hi = kvalues[q >> 4]
+            values = np.empty((rows, blocks_per_row, 32), dtype=np.float32)
+            values[:, :, 0::2] = lo
+            values[:, :, 1::2] = hi
+            out[:, :, group * 32:(group + 1) * 32] = d[:, :, None] * scale[:, :, None] * values
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=iq4_xs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )
