@@ -273,14 +273,18 @@ class GLMDSASpec:
         from src.runtime.generation import GGUFTokenRuntime
         from src.models.glm_dsa.gguf_model import load_glm_dsa_gguf_model
 
-        _ = (world, rank, gpu_memory_gib)
+        _ = gpu_memory_gib
         leading_dense = self.leading_dense_layers(bundle)
         effective_layers = int(leading_dense if n_layers is None else n_layers)
-        if effective_layers > leading_dense:
-            raise NotImplementedError(
-                f"GLM-DSA reference generation currently supports dense-prefix only: "
-                f"n_layers={effective_layers}, leading_dense_layers={leading_dense}"
-            )
+        allow_moe_layers = effective_layers > leading_dense
+        expert_total = int(self.parse_params(bundle).n_routed_experts)
+        if allow_moe_layers:
+            expert_start = (expert_total * int(rank)) // int(world)
+            expert_end = (expert_total * (int(rank) + 1)) // int(world)
+            expert_count = expert_end - expert_start
+        else:
+            expert_start = 0
+            expert_count = 0
 
         t_load = time.perf_counter()
         model, _info = load_glm_dsa_gguf_model(
@@ -288,15 +292,17 @@ class GLMDSASpec:
             device=device,
             dtype=dtype,
             n_layers=effective_layers,
-            allow_moe_layers=False,
+            allow_moe_layers=allow_moe_layers,
+            expert_start=expert_start,
+            expert_count=expert_count,
         )
         load_seconds = time.perf_counter() - t_load
         eos = bundle.metadata.get("tokenizer.ggml.eos_token_id")
         eos_id = int(eos) if isinstance(eos, int) else None
         return GGUFTokenRuntime(
             model=model,
-            expert_start=0,
-            expert_count=0,
+            expert_start=int(expert_start),
+            expert_count=int(expert_count),
             eos_token_id=eos_id,
             load_seconds=float(load_seconds),
         )

@@ -177,6 +177,10 @@ def _gguf_cuda_quant_grid(type_name: str, device: torch.device) -> torch.Tensor:
         from src.loader.gguf.tensor_reader import get_iq2xxs_signed_grid_tensor
 
         return get_iq2xxs_signed_grid_tensor().to(device=device, non_blocking=False).contiguous()
+    if type_name in {"iq2_xs", "iq3_xxs"}:
+        from src.loader.gguf.tensor_reader import get_iq2xs_iq3xxs_signed_grid_tensor
+
+        return get_iq2xs_iq3xxs_signed_grid_tensor().to(device=device, non_blocking=False).contiguous()
     if type_name == "iq1_m":
         from src.loader.gguf.tensor_reader import get_iq1_grid_tensor
 

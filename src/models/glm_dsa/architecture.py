@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from src.components.gguf.tp_logits import distributed_argmax_local_logits, gather_sharded_logits
@@ -269,6 +270,273 @@ class GLMDSADenseMLP:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         hidden = F.silu(self.gate_proj(x).float()) * self.up_proj(x).float()
         return self.down_proj(hidden.to(self.dtype))
+
+
+class GLMDSAMoE:
+    """Reference GLM-DSA routed+shared MoE.
+
+    This is deliberately a correctness bring-up path: selected experts are
+    dequantized on CPU by the GGUF loader, moved to CUDA, and evaluated with
+    PyTorch matmuls.  It enables small-layer full-model smoke tests before the
+    optimized PocketMoE active-expert kernels are wired in.
+    """
+
+    def __init__(
+        self,
+        args: GLMDSAArgs,
+        layer_id: int,
+        gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor | None,
+        shared_gate_proj: ReferenceLinear | None,
+        shared_up_proj: ReferenceLinear | None,
+        shared_down_proj: ReferenceLinear | None,
+        expert_loader,
+        *,
+        device: torch.device,
+        dtype: torch.dtype = torch.float16,
+        expert_start: int = 0,
+        expert_count: int | None = None,
+    ):
+        self.args = args
+        self.layer_id = int(layer_id)
+        self.gate_weight = gate_weight.float().contiguous()
+        self.gate_bias = gate_bias.float().contiguous() if gate_bias is not None else None
+        self.shared_gate_proj = shared_gate_proj
+        self.shared_up_proj = shared_up_proj
+        self.shared_down_proj = shared_down_proj
+        self.expert_loader = expert_loader
+        self.device = device
+        self.dtype = dtype
+        self.expert_start = int(expert_start)
+        available = max(0, int(args.n_routed_experts) - self.expert_start)
+        self.expert_count = available if expert_count is None else int(expert_count)
+        if self.expert_start < 0 or self.expert_count < 0 or self.expert_start + self.expert_count > int(args.n_routed_experts):
+            raise ValueError(
+                f"invalid GLM-DSA local expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
+                f"for expert_count={args.n_routed_experts}"
+            )
+        self._expert_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+    def route(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = x_flat.float() @ self.gate_weight.t()
+        probs = torch.sigmoid(logits)
+        select_scores = probs if self.gate_bias is None else probs + self.gate_bias
+        _, indices = torch.topk(select_scores, k=int(self.args.top_k), dim=-1)
+        weights = torch.gather(probs, dim=-1, index=indices)
+        if self.args.expert_weights_norm:
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
+        weights = weights * float(self.args.expert_weights_scale)
+        return indices.to(torch.long).contiguous(), weights.float().contiguous()
+
+    def _expert_weights(self, expert: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        expert = int(expert)
+        cached = self._expert_cache.get(expert)
+        if cached is not None:
+            return cached
+        w1, w3, w2 = self.expert_loader(expert)
+        cached = (
+            w1.to(device=self.device, dtype=torch.float32, non_blocking=False).contiguous(),
+            w3.to(device=self.device, dtype=torch.float32, non_blocking=False).contiguous(),
+            w2.to(device=self.device, dtype=torch.float32, non_blocking=False).contiguous(),
+        )
+        self._expert_cache[expert] = cached
+        return cached
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        x_flat = x.reshape(-1, original_shape[-1]).contiguous()
+        indices, weights = self.route(x_flat)
+        out = torch.zeros((x_flat.size(0), self.args.dim), device=x.device, dtype=torch.float32)
+        try:
+            local_start = self.expert_start
+            local_end = self.expert_start + self.expert_count
+            for expert in torch.unique(indices).tolist():
+                expert = int(expert)
+                if expert < local_start or expert >= local_end:
+                    continue
+                mask = indices == expert
+                route_pos = mask.nonzero(as_tuple=False)
+                if route_pos.numel() == 0:
+                    continue
+                token_ids = route_pos[:, 0]
+                route_ids = route_pos[:, 1]
+                x_sel = x_flat.index_select(0, token_ids).float()
+                w1, w3, w2 = self._expert_weights(expert)
+                hidden = F.silu(F.linear(x_sel, w1)) * F.linear(x_sel, w3)
+                y = F.linear(hidden, w2) * weights[token_ids, route_ids, None]
+                out.index_add_(0, token_ids, y.float())
+        finally:
+            # Keep this reference path heterogeneous/active-expert: do not retain
+            # dequantized routed experts across layers or decode calls.
+            self._expert_cache.clear()
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(out)
+
+        if self.shared_gate_proj is not None and self.shared_up_proj is not None and self.shared_down_proj is not None:
+            shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
+            out = out + self.shared_down_proj(shared.to(self.dtype)).float()
+        return out.reshape(original_shape).to(self.dtype)
+
+
+class GLMDSARawBlockMoE:
+    """GLM-DSA routed+shared MoE over raw GGUF quantized blocks.
+
+    Routed experts (iq2_xs w1/w3, iq3_xxs w2) are staged per active expert and
+    evaluated with the CUDA grouped MoE kernel; no fp32 weight expansion happens
+    on the hot path.  Shared experts run through raw quantized GGUF linears
+    (q5_k gate/up, q6_k down).  Router math matches ``GLMDSAMoE.route``.
+    """
+
+    def __init__(
+        self,
+        args: GLMDSAArgs,
+        layer_id: int,
+        gate_weight: torch.Tensor,
+        gate_bias: torch.Tensor | None,
+        shared_gate_proj,
+        shared_up_proj,
+        shared_down_proj,
+        *,
+        gguf_path: str,
+        w1_name: str,
+        w3_name: str,
+        w2_name: str,
+        signed_grid: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype = torch.float16,
+        expert_start: int = 0,
+        expert_count: int | None = None,
+        swiglu_limit: float = -1.0,
+    ):
+        self.args = args
+        self.layer_id = int(layer_id)
+        self.gate_weight = gate_weight.float().contiguous()
+        self.gate_bias = gate_bias.float().contiguous() if gate_bias is not None else None
+        self.shared_gate_proj = shared_gate_proj
+        self.shared_up_proj = shared_up_proj
+        self.shared_down_proj = shared_down_proj
+        self.gguf_path = str(gguf_path)
+        self.w1_name = str(w1_name)
+        self.w3_name = str(w3_name)
+        self.w2_name = str(w2_name)
+        self.device = device
+        self.dtype = dtype
+        self.swiglu_limit = float(swiglu_limit)
+        self.expert_start = int(expert_start)
+        available = max(0, int(args.n_routed_experts) - self.expert_start)
+        self.expert_count = available if expert_count is None else int(expert_count)
+        if self.expert_start < 0 or self.expert_count < 0 or self.expert_start + self.expert_count > int(args.n_routed_experts):
+            raise ValueError(
+                f"invalid GLM-DSA local expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
+                f"for expert_count={args.n_routed_experts}"
+            )
+        self._grid = signed_grid.to(device=device, dtype=torch.int8).contiguous()
+        from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
+
+        self._type_ids = GGUF_DENSE_TYPE_IDS
+
+    def route(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = x_flat.float() @ self.gate_weight.t()
+        probs = torch.sigmoid(logits)
+        select_scores = probs if self.gate_bias is None else probs + self.gate_bias
+        _, indices = torch.topk(select_scores, k=int(self.args.top_k), dim=-1)
+        weights = torch.gather(probs, dim=-1, index=indices)
+        if self.args.expert_weights_norm:
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
+        weights = weights * float(self.args.expert_weights_scale)
+        return indices.to(torch.long).contiguous(), weights.float().contiguous()
+
+    def _stage_active_experts(self, reader, local_ids_cpu: list[int]):
+        """Read and stack raw blocks for the active local experts.
+
+        Returns stacked ``[E_active, N, K_blocks, block_bytes]`` tensors for
+        w1/w3/w2 plus their (type_id, in_dim) metadata.
+        """
+        w1_vals, w3_vals, w2_vals = [], [], []
+        for local_id in local_ids_cpu:
+            expert_id = int(local_id) + self.expert_start
+            w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+            w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+            w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+            w1_vals.append((w1_b, w1_tn, w1_in))
+            w3_vals.append((w3_b, w3_tn, w3_in))
+            w2_vals.append((w2_b, w2_tn, w2_in))
+        w1_blocks = torch.stack([v[0] for v in w1_vals], dim=0).to(self.device, non_blocking=True).contiguous()
+        w3_blocks = torch.stack([v[0] for v in w3_vals], dim=0).to(self.device, non_blocking=True).contiguous()
+        w2_blocks = torch.stack([v[0] for v in w2_vals], dim=0).to(self.device, non_blocking=True).contiguous()
+        meta = (
+            (self._type_ids[w1_vals[0][1]], int(w1_vals[0][2])),
+            (self._type_ids[w3_vals[0][1]], int(w3_vals[0][2])),
+            (self._type_ids[w2_vals[0][1]], int(w2_vals[0][2])),
+        )
+        return w1_blocks, w3_blocks, w2_blocks, meta
+
+    def _routed_forward(self, x_flat: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        from src.kernels.cuda_loader import load_cuda_kernel
+        from src.loader.gguf.tensor_reader import get_cached_gguf_tensor_reader
+
+        cuda_mod = load_cuda_kernel()
+        if cuda_mod is None or not hasattr(cuda_mod, "gguf_moe_prefill_grouped_forward"):
+            raise RuntimeError("CUDA grouped MoE kernel is required for GLMDSARawBlockMoE")
+
+        out = torch.zeros((x_flat.size(0), self.args.dim), device=x_flat.device, dtype=torch.float32)
+        grouped = cuda_mod.moe_group_routes(
+            indices.contiguous(),
+            weights.contiguous().to(torch.float32),
+            int(self.expert_start),
+            int(self.expert_count),
+        )
+        if grouped is None:
+            return out
+        local_ids, route_tokens, route_weights, seg_starts = grouped
+        if local_ids.numel() == 0:
+            return out
+        local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+
+        reader = get_cached_gguf_tensor_reader(self.gguf_path)
+        w1_blocks, w3_blocks, w2_blocks, meta = self._stage_active_experts(reader, local_ids_cpu)
+        (w1_type_id, w1_in_dim), (w3_type_id, w3_in_dim), (w2_type_id, w2_in_dim) = meta
+
+        seg_i32 = seg_starts if seg_starts.dtype == torch.int32 else seg_starts.to(torch.int32)
+        compact_starts = torch.cat(
+            [seg_i32[local_ids.to(seg_i32.device)], seg_i32[-1:]], dim=0
+        ).contiguous()
+
+        y = cuda_mod.gguf_moe_prefill_grouped_forward(
+            x_flat.to(torch.float16).contiguous(),
+            route_tokens,
+            route_weights.contiguous(),
+            compact_starts,
+            w1_blocks,
+            w3_blocks,
+            w2_blocks,
+            w1_in_dim,
+            w1_type_id,
+            w3_in_dim,
+            w3_type_id,
+            w2_in_dim,
+            w2_type_id,
+            self._grid,
+            float(self.swiglu_limit),
+        )
+        # The grouped kernel already scatter-adds each route into y[token] and
+        # multiplies route weights internally, so y is the [T, D] routed output.
+        return y.float()
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        x_flat = x.reshape(-1, original_shape[-1]).contiguous()
+        indices, weights = self.route(x_flat)
+        out = self._routed_forward(x_flat, indices, weights)
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(out)
+
+        if self.shared_gate_proj is not None and self.shared_up_proj is not None and self.shared_down_proj is not None:
+            shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
+            out = out + self.shared_down_proj(shared.to(self.dtype)).float()
+        return out.reshape(original_shape).to(self.dtype)
 
 
 class GLMDSAMoEPlaceholder:

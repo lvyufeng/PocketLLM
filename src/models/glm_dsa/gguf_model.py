@@ -13,7 +13,9 @@ from src.models.glm_dsa.architecture import (
     GLMDSAAttention,
     GLMDSABlock,
     GLMDSADenseMLP,
+    GLMDSAMoE,
     GLMDSAMoEPlaceholder,
+    GLMDSARawBlockMoE,
     GLMDSATransformer,
     ReferenceEmbedding,
     ReferenceLinear,
@@ -37,6 +39,9 @@ class GLMDSAGGUFModelLoader:
         dtype: torch.dtype = torch.float16,
         n_layers: int | None = None,
         allow_moe_layers: bool = False,
+        expert_start: int = 0,
+        expert_count: int | None = None,
+        use_raw_block_moe: bool = True,
     ):
         self.bundle = read_gguf_bundle(bundle_or_path) if not isinstance(bundle_or_path, GGUFBundle) else bundle_or_path
         resolved = torch.device(device)
@@ -48,6 +53,15 @@ class GLMDSAGGUFModelLoader:
         self.dtype = dtype
         self.args = GLMDSAArgs.from_bundle(self.bundle, n_layers=n_layers)
         self.allow_moe_layers = bool(allow_moe_layers)
+        self.use_raw_block_moe = bool(use_raw_block_moe)
+        self.expert_start = int(expert_start)
+        available = max(0, int(self.args.n_routed_experts) - self.expert_start)
+        self.expert_count = available if expert_count is None else int(expert_count)
+        if self.expert_start < 0 or self.expert_count < 0 or self.expert_start + self.expert_count > int(self.args.n_routed_experts):
+            raise ValueError(
+                f"invalid GLM-DSA expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
+                f"for expert_count={self.args.n_routed_experts}"
+            )
         self._readers: dict[str, GGUFTensorDataReader] = {}
 
     def close(self) -> None:
@@ -97,6 +111,128 @@ class GLMDSAGGUFModelLoader:
             raise ValueError(f"{name} expected shape {expected_shape}, got {tuple(tensor.shape)}")
         return tensor
 
+    def _read_routed_expert_cpu(self, name: str, expert: int) -> torch.Tensor:
+        tensor = self._tensor_ref(name)
+        return self._reader_for(tensor).read_routed_expert(tensor.name, expert=int(expert)).float().contiguous()
+
+    def _glm_moe_expert_loader(self, prefix: str):
+        def load_expert(expert: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            return (
+                self._read_routed_expert_cpu(f"{prefix}.ffn_gate_exps.weight", expert),
+                self._read_routed_expert_cpu(f"{prefix}.ffn_up_exps.weight", expert),
+                self._read_routed_expert_cpu(f"{prefix}.ffn_down_exps.weight", expert),
+            )
+
+        return load_expert
+
+    def _quant_linear(self, name: str):
+        """Build a raw-block CUDA linear over a 2D quantized GGUF tensor.
+
+        Used for GLM shared experts (q5_k gate/up, q6_k down) so the shared
+        path also avoids fp32 weight expansion.
+        """
+        from src.components.gguf.quantized_ops import QuantizedGGUFLinear
+        from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
+        from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
+
+        tensor = self._tensor_ref(name)
+        blocks, type_name, row_elems = self._reader_for(tensor).read_quantized_matrix_blocks(tensor.name)
+        try:
+            type_id = GGUF_DENSE_TYPE_IDS[type_name]
+        except KeyError as exc:
+            raise NotImplementedError(
+                f"GLM shared expert weight {name} type {type_name!r} is not supported by the raw-block runtime"
+            ) from exc
+        cuda_blocks = blocks.to(device=self.device, non_blocking=False).contiguous()
+        quant = QuantizedGGUFTensor(
+            source_name=name,
+            blocks=cuda_blocks,
+            type_name=type_name,
+            type_id=int(type_id),
+            row_elems=int(row_elems),
+            out_dim=int(cuda_blocks.shape[0]),
+            row_start=0,
+        )
+        return QuantizedGGUFLinear(quant, out_dtype=self.dtype)
+
+    def _glm_routed_type_names(self, prefix: str) -> tuple[str, str, str]:
+        w1 = self._tensor_ref(f"{prefix}.ffn_gate_exps.weight").type_name
+        w3 = self._tensor_ref(f"{prefix}.ffn_up_exps.weight").type_name
+        w2 = self._tensor_ref(f"{prefix}.ffn_down_exps.weight").type_name
+        return w1, w3, w2
+
+    def _routed_grid_for(self, type_names: tuple[str, str, str]) -> torch.Tensor:
+        """Pick the signed grid for the routed dtypes, or an empty tensor.
+
+        GLM routed experts use iq2_xs (w1/w3) + iq3_xxs (w2), which share a
+        single packed codebook.  Non-grid dtypes get an empty grid.
+        """
+        from src.loader.gguf.tensor_reader import get_iq2xs_iq3xxs_signed_grid_tensor
+
+        if any(tn in ("iq2_xs", "iq3_xxs") for tn in type_names):
+            return get_iq2xs_iq3xxs_signed_grid_tensor()
+        return torch.empty(0, dtype=torch.int8)
+
+    def _routed_dtypes_raw_supported(self, type_names: tuple[str, str, str]) -> bool:
+        from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
+
+        return all(tn in GGUF_DENSE_TYPE_IDS for tn in type_names)
+
+    def _routed_blocks_256_aligned(self, prefix: str) -> bool:
+        """Raw-block/CUDA grouped kernels require 256-element block alignment.
+
+        Tiny synthetic test bundles use non-aligned dims (e.g. in_dim=12); those
+        must fall back to the fp32 reference MoE instead of the raw-block path.
+        """
+        for suffix in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"):
+            tensor = self._tensor_ref(f"{prefix}.{suffix}")
+            in_dim = int(tensor.dimensions[0])
+            if in_dim % 256 != 0:
+                return False
+        return True
+
+    def _build_moe_layer(self, prefix: str, layer_id: int):
+        routed_types = self._glm_routed_type_names(prefix)
+        use_raw = (
+            self.use_raw_block_moe
+            and self._routed_dtypes_raw_supported(routed_types)
+            and self._routed_blocks_256_aligned(prefix)
+        )
+        if use_raw:
+            gate = self._tensor_ref(f"{prefix}.ffn_gate_exps.weight")
+            return GLMDSARawBlockMoE(
+                self.args,
+                layer_id,
+                self._read_dense(f"{prefix}.ffn_gate_inp.weight"),
+                self._read_dense(f"{prefix}.exp_probs_b.bias"),
+                self._quant_linear(f"{prefix}.ffn_gate_shexp.weight"),
+                self._quant_linear(f"{prefix}.ffn_up_shexp.weight"),
+                self._quant_linear(f"{prefix}.ffn_down_shexp.weight"),
+                gguf_path=gate.shard_path,
+                w1_name=f"{prefix}.ffn_gate_exps.weight",
+                w3_name=f"{prefix}.ffn_up_exps.weight",
+                w2_name=f"{prefix}.ffn_down_exps.weight",
+                signed_grid=self._routed_grid_for(routed_types),
+                device=self.device,
+                dtype=self.dtype,
+                expert_start=self.expert_start,
+                expert_count=self.expert_count,
+            )
+        return GLMDSAMoE(
+            self.args,
+            layer_id,
+            self._read_dense(f"{prefix}.ffn_gate_inp.weight"),
+            self._read_dense(f"{prefix}.exp_probs_b.bias"),
+            self._linear(f"{prefix}.ffn_gate_shexp.weight"),
+            self._linear(f"{prefix}.ffn_up_shexp.weight"),
+            self._linear(f"{prefix}.ffn_down_shexp.weight"),
+            self._glm_moe_expert_loader(prefix),
+            device=self.device,
+            dtype=self.dtype,
+            expert_start=self.expert_start,
+            expert_count=self.expert_count,
+        )
+
     def load(self) -> GLMDSATransformer:
         if self.args.n_layers > self.args.leading_dense_layers and not self.allow_moe_layers:
             raise NotImplementedError(
@@ -140,7 +276,10 @@ class GLMDSAGGUFModelLoader:
                     dtype=self.dtype,
                 )
             else:
-                mlp = GLMDSAMoEPlaceholder(layer_id)
+                if self.allow_moe_layers:
+                    mlp = self._build_moe_layer(prefix, layer_id)
+                else:
+                    mlp = GLMDSAMoEPlaceholder(layer_id)
             layers.append(
                 GLMDSABlock(
                     self.args,
@@ -175,6 +314,8 @@ def load_glm_dsa_gguf_model(
     dtype: torch.dtype = torch.float16,
     n_layers: int | None = None,
     allow_moe_layers: bool = False,
+    expert_start: int = 0,
+    expert_count: int | None = None,
 ) -> tuple[GLMDSATransformer, dict[str, Any]]:
     start = time.perf_counter()
     loader = GLMDSAGGUFModelLoader(
@@ -183,6 +324,8 @@ def load_glm_dsa_gguf_model(
         dtype=dtype,
         n_layers=n_layers,
         allow_moe_layers=allow_moe_layers,
+        expert_start=expert_start,
+        expert_count=expert_count,
     )
     try:
         model = loader.load()
@@ -200,5 +343,7 @@ def load_glm_dsa_gguf_model(
         "device": str(model.device),
         "dtype": str(dtype),
         "allow_moe_layers": bool(allow_moe_layers),
+        "expert_start": int(loader.expert_start),
+        "expert_count": int(loader.expert_count),
     }
     return model, info

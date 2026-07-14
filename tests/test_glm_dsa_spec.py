@@ -75,7 +75,8 @@ def test_glm_dsa_capability_is_inventory_supported_but_generation_deferred(tmp_p
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GLM-DSA reference runtime smoke")
-def test_glm_dsa_dense_prefix_reference_runtime_forward(tmp_path: Path) -> None:
+@pytest.mark.parametrize("n_layers", [1, 2])
+def test_glm_dsa_reference_runtime_forward(tmp_path: Path, n_layers: int) -> None:
     root = write_glm_dsa_bundle(tmp_path / "bundle", n_layers=4, leading_dense=1)
     bundle = read_gguf_bundle(root)
     spec = GLMDSASpec()
@@ -85,7 +86,7 @@ def test_glm_dsa_dense_prefix_reference_runtime_forward(tmp_path: Path) -> None:
         rank=0,
         device=torch.device("cuda", 0),
         dtype=torch.float16,
-        n_layers=1,
+        n_layers=n_layers,
         gpu_memory_gib=22.0,
     )
 
