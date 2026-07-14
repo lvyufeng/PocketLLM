@@ -25,6 +25,10 @@ class QuantizedGGUFLinear:
     def out_dim(self) -> int:
         return int(self.tensor.out_dim)
 
+    @property
+    def row_start(self) -> int:
+        return int(self.tensor.row_start)
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(-1) != self.in_dim:
             raise ValueError(f"{self.tensor.source_name}: expected input dim {self.in_dim}, got {x.size(-1)}")
