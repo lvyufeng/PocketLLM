@@ -174,6 +174,27 @@ class GLMDSAGGUFModelLoader:
         quant = self._quant_tensor(name)
         return QuantizedGGUFEmbedding(quant, out_dtype=self.dtype)
 
+    def _quant_linear_q8_0(self, name: str):
+        """Build a raw-block CUDA linear over a 2D q8_0 GGUF tensor.
+
+        q8_0 uses its own ``q8_0_gemm_forward`` kernel, not the grid/type-id
+        block-dot path, so it reads raw 34-byte blocks and skips the dense
+        type-id map.
+        """
+        from src.components.gguf.quantized_ops import Q8_0GGUFLinear
+
+        tensor = self._tensor_ref(name)
+        reader = self._reader_for(tensor)
+        blocks = reader.read_q8_0_blocks(tensor.name)
+        row_elems = int(tensor.dimensions[0])
+        cuda_blocks = blocks.to(device=self.device, non_blocking=False).contiguous()
+        return Q8_0GGUFLinear(
+            cuda_blocks,
+            row_elems,
+            source_name=name,
+            out_dtype=self.dtype,
+        )
+
     def _glm_routed_type_names(self, prefix: str) -> tuple[str, str, str]:
         w1 = self._tensor_ref(f"{prefix}.ffn_gate_exps.weight").type_name
         w3 = self._tensor_ref(f"{prefix}.ffn_up_exps.weight").type_name
@@ -272,8 +293,8 @@ class GLMDSAGGUFModelLoader:
                 layer_id,
                 self._quant_linear(f"{prefix}.attn_q_a.weight"),
                 self._read_dense(f"{prefix}.attn_q_a_norm.weight"),
-                self._linear(f"{prefix}.attn_q_b.weight"),
-                self._linear(f"{prefix}.attn_kv_a_mqa.weight"),
+                self._quant_linear_q8_0(f"{prefix}.attn_q_b.weight"),
+                self._quant_linear_q8_0(f"{prefix}.attn_kv_a_mqa.weight"),
                 self._read_dense(f"{prefix}.attn_kv_a_norm.weight"),
                 self._read_q8_0_3d(
                     f"{prefix}.attn_k_b.weight",
