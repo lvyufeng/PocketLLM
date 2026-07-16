@@ -20,6 +20,7 @@ IQ2_XS_ROUTED = "blk.3.ffn_gate_exps.weight"   # type_id 5
 IQ3_XXS_ROUTED = "blk.3.ffn_down_exps.weight"  # type_id 6
 Q6_K_DENSE = "blk.0.ffn_down.weight"           # type_id 8
 Q8_0_ATTN = "blk.0.attn_q_b.weight"            # q8_0 attention projection
+IQ4_XS_ROUTED = "blk.8.ffn_down_exps.weight"   # type_id 7, iq4_xs (4 layers only)
 
 
 def _cuda_gemm_available() -> bool:
@@ -131,3 +132,24 @@ def test_glm_q8_0_gemm_matches_reference() -> None:
     rel_decode = (y1 - expected1).abs().max() / scale1
     assert float(rel_prefill.item()) < 2.0e-2, f"q8_0 prefill rel err {rel_prefill.item()}"
     assert float(rel_decode.item()) < 2.0e-2, f"q8_0 decode rel err {rel_decode.item()}"
+
+
+@pytest.mark.skipif(
+    not REAL_GLM_PATH.exists(),
+    reason="real GLM GGUF not available",
+)
+def test_glm_iq4_xs_reference_decode() -> None:
+    """iq4_xs reference decode must produce finite values (correctness fix for blk.8/75/76/77)."""
+    bundle = read_gguf_bundle(REAL_GLM_PATH)
+    tensor = bundle.tensors_by_name[IQ4_XS_ROUTED]
+    reader = GGUFTensorDataReader(tensor.shard_path)
+    rows = 8
+    try:
+        ref = reader.read_routed_expert(tensor.name, 0, 0, rows).float()
+    finally:
+        reader.close()
+
+    assert ref.shape[0] == rows
+    assert bool(torch.isfinite(ref).all().item()), "iq4_xs reference decode produced NaN/Inf"
+    absmax = ref.abs().max().item()
+    assert absmax > 0.0 and absmax < 1.0, f"iq4_xs decode absmax {absmax} out of expected range"

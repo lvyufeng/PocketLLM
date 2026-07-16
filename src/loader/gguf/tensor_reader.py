@@ -919,7 +919,7 @@ class GGUFTensorDataReader:
             t_read = time.perf_counter()
         blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 136)
         d = _f16_bytes_to_f32(blocks[:, :, 0:2])
-        scales_h = blocks[:, :, 2:4].view("<u2")
+        scales_h = blocks[:, :, 2:4].view("<u2").reshape(rows, blocks_per_row)
         scales_l = blocks[:, :, 4:8]
         qs = blocks[:, :, 8:136]
         kvalues = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
@@ -932,8 +932,10 @@ class GGUFTensorDataReader:
             lo = kvalues[q & 0x0F]
             hi = kvalues[q >> 4]
             values = np.empty((rows, blocks_per_row, 32), dtype=np.float32)
-            values[:, :, 0::2] = lo
-            values[:, :, 1::2] = hi
+            # ggml iq4_xs packs each 16-byte group as 16 low nibbles then 16 high
+            # nibbles (block layout), not interleaved.
+            values[:, :, 0:16] = lo
+            values[:, :, 16:32] = hi
             out[:, :, group * 32:(group + 1) * 32] = d[:, :, None] * scale[:, :, None] * values
         if profile:
             t_done = time.perf_counter()
