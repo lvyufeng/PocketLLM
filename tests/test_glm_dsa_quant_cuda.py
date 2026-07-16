@@ -19,6 +19,7 @@ REAL_GLM_PATH = Path("/mnt/data3/GLM-5.2-GGUF/UD-Q2_K_XL")
 IQ2_XS_ROUTED = "blk.3.ffn_gate_exps.weight"   # type_id 5
 IQ3_XXS_ROUTED = "blk.3.ffn_down_exps.weight"  # type_id 6
 Q6_K_DENSE = "blk.0.ffn_down.weight"           # type_id 8
+Q8_0_ATTN = "blk.0.attn_q_b.weight"            # q8_0 attention projection
 
 
 def _cuda_gemm_available() -> bool:
@@ -85,3 +86,48 @@ def test_glm_quant_gemm_matches_reference(name: str, type_id: int, type_name: st
     rel_prefill = (yp - expected).abs().max() / scale
     assert float(rel_decode.item()) < 2.0e-2, f"{type_name} decode rel err {rel_decode.item()}"
     assert float(rel_prefill.item()) < 2.0e-2, f"{type_name} prefill rel err {rel_prefill.item()}"
+
+
+@pytest.mark.skipif(
+    not (REAL_GLM_PATH.exists() and _cuda_gemm_available()),
+    reason="real GLM GGUF or CUDA extension not available",
+)
+def test_glm_q8_0_gemm_matches_reference() -> None:
+    """q8_0 uses its own kernel (q8_0_gemm_forward), not the grid/type-id path."""
+    from src.kernels.ops import q8_0_weight_dequantize
+
+    bundle = read_gguf_bundle(REAL_GLM_PATH)
+    tensor = bundle.tensors_by_name[Q8_0_ATTN]
+    reader = GGUFTensorDataReader(tensor.shard_path)
+    rows = 16
+    try:
+        blocks = reader.read_q8_0_block_rows(tensor.name, 0, rows)
+        row_elems = int(tensor.dimensions[0])
+        ref = q8_0_weight_dequantize(blocks, row_elems=row_elems).float()
+    finally:
+        reader.close()
+
+    assert blocks.shape == (rows, row_elems // 32, 34)
+    assert ref.shape == (rows, row_elems)
+
+    mod = load_cuda_kernel()
+    blocks_cuda = blocks.cuda()
+    ref_cuda = ref.cuda()
+
+    x = torch.randn((5, row_elems), device="cuda", dtype=torch.float16)
+    expected = x.float() @ ref_cuda.t()
+    y = mod.q8_0_gemm_forward(x, blocks_cuda, row_elems).float()
+
+    x1 = torch.randn((1, row_elems), device="cuda", dtype=torch.float16)
+    expected1 = x1.float() @ ref_cuda.t()
+    y1 = mod.q8_0_gemm_forward(x1, blocks_cuda, row_elems).float()
+
+    assert bool(torch.isfinite(y).all().item())
+    assert bool(torch.isfinite(y1).all().item())
+
+    scale = expected.abs().max().clamp_min(1.0e-3)
+    rel_prefill = (y - expected).abs().max() / scale
+    scale1 = expected1.abs().max().clamp_min(1.0e-3)
+    rel_decode = (y1 - expected1).abs().max() / scale1
+    assert float(rel_prefill.item()) < 2.0e-2, f"q8_0 prefill rel err {rel_prefill.item()}"
+    assert float(rel_decode.item()) < 2.0e-2, f"q8_0 decode rel err {rel_decode.item()}"

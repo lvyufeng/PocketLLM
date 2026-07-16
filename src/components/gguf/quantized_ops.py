@@ -75,6 +75,54 @@ class QuantizedGGUFLinear:
         return y0.to(first.out_dtype), y1.to(second.out_dtype)
 
 
+class Q8_0GGUFLinear:
+    """CUDA linear over raw GGUF q8_0 matrix blocks.
+
+    q8_0 uses a dedicated kernel (``q8_0_gemm_forward``) rather than the
+    grid/type-id block-dot path, so it keeps its own thin wrapper.  Blocks are
+    ``[out_dim, blocks_per_row, 34]`` uint8; ``row_start`` is non-zero only for
+    row-sliced (TP-sharded) weights.
+    """
+
+    def __init__(
+        self,
+        blocks: torch.Tensor,
+        row_elems: int,
+        *,
+        source_name: str = "",
+        out_dtype: torch.dtype = torch.float16,
+        row_start: int = 0,
+    ):
+        if blocks.dim() != 3 or blocks.size(-1) != 34:
+            raise ValueError(f"q8_0 blocks must be [N, K_blocks, 34], got {tuple(blocks.shape)}")
+        self.blocks = blocks.contiguous()
+        self.row_elems = int(row_elems)
+        self.source_name = source_name
+        self.out_dtype = out_dtype
+        self._row_start = int(row_start)
+        self._cuda = load_cuda_kernel()
+        if self._cuda is None or not hasattr(self._cuda, "q8_0_gemm_forward"):
+            raise RuntimeError("q8_0 CUDA extension is required for Q8_0GGUFLinear")
+
+    @property
+    def in_dim(self) -> int:
+        return int(self.row_elems)
+
+    @property
+    def out_dim(self) -> int:
+        return int(self.blocks.size(0))
+
+    @property
+    def row_start(self) -> int:
+        return int(self._row_start)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.in_dim:
+            raise ValueError(f"{self.source_name}: expected input dim {self.in_dim}, got {x.size(-1)}")
+        y = self._cuda.q8_0_gemm_forward(x.contiguous(), self.blocks, int(self.row_elems))
+        return y.to(self.out_dtype)
+
+
 class QuantizedGGUFEmbedding:
     """CUDA selected-row embedding over raw GGUF quantized matrix blocks."""
 
