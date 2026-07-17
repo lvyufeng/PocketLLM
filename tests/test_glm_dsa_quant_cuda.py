@@ -47,6 +47,7 @@ def _empty_grid_cuda() -> torch.Tensor:
     [
         (IQ2_XS_ROUTED, 5, "iq2_xs", True),
         (IQ3_XXS_ROUTED, 6, "iq3_xxs", True),
+        (IQ4_XS_ROUTED, 7, "iq4_xs", True),
         (Q6_K_DENSE, 8, "q6_k", False),
     ],
 )

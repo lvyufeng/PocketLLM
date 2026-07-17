@@ -8,6 +8,7 @@ GGUF_DENSE_TYPE_IDS = {
     "q5_k": 4,
     "iq2_xs": 5,
     "iq3_xxs": 6,
+    "iq4_xs": 7,
     "q6_k": 8,
 }
 
