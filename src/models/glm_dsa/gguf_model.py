@@ -42,6 +42,8 @@ class GLMDSAGGUFModelLoader:
         expert_start: int = 0,
         expert_count: int | None = None,
         use_raw_block_moe: bool = True,
+        world: int = 1,
+        rank: int = 0,
     ):
         self.bundle = read_gguf_bundle(bundle_or_path) if not isinstance(bundle_or_path, GGUFBundle) else bundle_or_path
         resolved = torch.device(device)
@@ -54,6 +56,8 @@ class GLMDSAGGUFModelLoader:
         self.args = GLMDSAArgs.from_bundle(self.bundle, n_layers=n_layers)
         self.allow_moe_layers = bool(allow_moe_layers)
         self.use_raw_block_moe = bool(use_raw_block_moe)
+        self.world = max(1, int(world))
+        self.rank = max(0, int(rank))
         self.expert_start = int(expert_start)
         available = max(0, int(self.args.n_routed_experts) - self.expert_start)
         self.expert_count = available if expert_count is None else int(expert_count)
@@ -174,6 +178,23 @@ class GLMDSAGGUFModelLoader:
         quant = self._quant_tensor(name)
         return QuantizedGGUFEmbedding(quant, out_dtype=self.dtype)
 
+    def _quant_lm_head(self, name: str):
+        """Build a raw-block CUDA lm_head, vocab-row-sharded across TP ranks.
+
+        When ``world > 1`` each rank loads only its ``[row_start, row_start +
+        row_count)`` slice of the vocab rows.  The transformer forward combines
+        the per-rank logit slices via ``distributed_argmax_local_logits`` (decode)
+        or ``gather_sharded_logits`` (return-logits), using ``lm_head.row_start``.
+        Embedding stays replicated.
+        """
+        if self.world <= 1:
+            return self._quant_linear(name)
+        from src.components.gguf.tp_logits import tp_vocab_row_range
+
+        total_rows = int(self._tensor_ref(name).dimensions[1])
+        row_start, row_count = tp_vocab_row_range(total_rows, self.world, self.rank)
+        return self._quant_linear(name, row_start=row_start, row_count=row_count)
+
     def _quant_linear_q8_0(self, name: str):
         """Build a raw-block CUDA linear over a 2D q8_0 GGUF tensor.
 
@@ -281,7 +302,7 @@ class GLMDSAGGUFModelLoader:
             )
 
         embedding = self._quant_embedding("token_embd.weight")
-        lm_head = self._quant_linear("output.weight")
+        lm_head = self._quant_lm_head("output.weight")
         final_norm = self._read_dense("output_norm.weight")
 
         layers: list[GLMDSABlock] = []
@@ -356,6 +377,8 @@ def load_glm_dsa_gguf_model(
     allow_moe_layers: bool = False,
     expert_start: int = 0,
     expert_count: int | None = None,
+    world: int = 1,
+    rank: int = 0,
 ) -> tuple[GLMDSATransformer, dict[str, Any]]:
     start = time.perf_counter()
     loader = GLMDSAGGUFModelLoader(
@@ -366,6 +389,8 @@ def load_glm_dsa_gguf_model(
         allow_moe_layers=allow_moe_layers,
         expert_start=expert_start,
         expert_count=expert_count,
+        world=world,
+        rank=rank,
     )
     try:
         model = loader.load()
@@ -385,5 +410,9 @@ def load_glm_dsa_gguf_model(
         "allow_moe_layers": bool(allow_moe_layers),
         "expert_start": int(loader.expert_start),
         "expert_count": int(loader.expert_count),
+        "world": int(loader.world),
+        "rank": int(loader.rank),
+        "lm_head_out_dim": int(model.lm_head.out_dim),
+        "lm_head_row_start": int(model.lm_head.row_start),
     }
     return model, info

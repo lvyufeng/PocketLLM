@@ -295,6 +295,8 @@ class GLMDSASpec:
             allow_moe_layers=allow_moe_layers,
             expert_start=expert_start,
             expert_count=expert_count,
+            world=int(world),
+            rank=int(rank),
         )
         load_seconds = time.perf_counter() - t_load
         eos = bundle.metadata.get("tokenizer.ggml.eos_token_id")
