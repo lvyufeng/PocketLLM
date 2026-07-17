@@ -153,3 +153,57 @@ def test_glm_iq4_xs_reference_decode() -> None:
     assert bool(torch.isfinite(ref).all().item()), "iq4_xs reference decode produced NaN/Inf"
     absmax = ref.abs().max().item()
     assert absmax > 0.0 and absmax < 1.0, f"iq4_xs decode absmax {absmax} out of expected range"
+
+
+@pytest.mark.skipif(
+    not (REAL_GLM_PATH.exists() and _cuda_gemm_available()),
+    reason="real GLM GGUF or CUDA extension not available",
+)
+def test_glm_lm_head_vocab_sharding() -> None:
+    """lm_head vocab sharding: each rank loads a disjoint vocab row slice that
+    tiles the full vocab, and every rank's local logits match the full lm_head's
+    corresponding slice."""
+    from src.models.glm_dsa.gguf_model import GLMDSAGGUFModelLoader
+
+    bundle = read_gguf_bundle(REAL_GLM_PATH)
+    world = 4
+    total_rows = int(bundle.tensors_by_name["output.weight"].dimensions[1])
+
+    # Full (unsharded) reference lm_head.
+    full_loader = GLMDSAGGUFModelLoader(bundle, world=1, rank=0)
+    try:
+        full_head = full_loader._quant_lm_head("output.weight")
+    finally:
+        full_loader.close()
+    assert full_head.row_start == 0
+    assert full_head.out_dim == total_rows
+
+    dim = int(full_head.in_dim)
+    x = torch.randn((3, dim), device="cuda", dtype=torch.float16)
+    full_logits = full_head(x).float()
+    assert full_logits.shape == (3, total_rows)
+
+    covered = 0
+    prev_end = 0
+    for rank in range(world):
+        loader = GLMDSAGGUFModelLoader(bundle, world=world, rank=rank)
+        try:
+            head = loader._quant_lm_head("output.weight")
+        finally:
+            loader.close()
+        start = head.row_start
+        count = head.out_dim
+        # Slices tile the vocab contiguously with no gaps/overlap.
+        assert start == prev_end, f"rank {rank} start {start} != prev_end {prev_end}"
+        prev_end = start + count
+        covered += count
+
+        local = head(x).float()
+        assert local.shape == (3, count)
+        ref_slice = full_logits[:, start:start + count]
+        scale = ref_slice.abs().max().clamp_min(1.0e-3)
+        rel = (local - ref_slice).abs().max() / scale
+        assert float(rel.item()) < 1.0e-3, f"rank {rank} logit slice rel err {rel.item()}"
+
+    assert prev_end == total_rows
+    assert covered == total_rows
