@@ -25,7 +25,7 @@ _CAPABILITIES = {
     "iq2_xs": QuantCapability("iq2_xs", True, True, False, False, "GGUF iq2_xs payload can be inventoried; CUDA runtime support is deferred"),
     "iq3_xxs": QuantCapability("iq3_xxs", True, True, False, False, "GGUF iq3_xxs payload can be inventoried; CUDA runtime support is deferred"),
     "iq1_m": QuantCapability("iq1_m", True, True, True, True, "routed expert raw blocks supported in existing DSV4 paths"),
-    "iq4_xs": QuantCapability("iq4_xs", True, True, False, False, "GGUF iq4_xs payload can be inventoried; CUDA runtime support is deferred"),
+    "iq4_xs": QuantCapability("iq4_xs", True, True, True, True, "raw iq4_xs CUDA block-dot GEMM supported (type_id 7)"),
     "q4_k": QuantCapability("q4_k", True, True, True, True, "raw q4_k CUDA GEMM and selected-row embedding supported"),
     "q5_k": QuantCapability("q5_k", True, True, True, True, "raw q5_k CUDA GEMM supported"),
     "q6_k": QuantCapability("q6_k", True, True, False, False, "GGUF q6_k payload can be inventoried; CUDA runtime support is deferred"),

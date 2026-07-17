@@ -6131,6 +6131,10 @@ __global__ void gguf_quant_gemm_pair_kernel(
 
 constexpr int kIQ2XSSignedGridEntries = 512 * 128 * 8;
 
+// iq4_xs / iq4_nl non-linear codebook (int8). Matches llama.cpp kvalues_iq4nl.
+__device__ static const int8_t kIQ4NLValues[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
 __device__ __forceinline__ float iq2xs_block_dot_256(
     const float* __restrict__ x_shared,
     const uint8_t* __restrict__ block,
@@ -6244,6 +6248,40 @@ __device__ __forceinline__ float q6k_block_dot_256(
     return local;
 }
 
+__device__ __forceinline__ float iq4xs_block_dot_256(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane) {
+    // block_iq4_xs (136 bytes): d(f16) | scales_h(u16) | scales_l[4] | qs[128].
+    // 8 groups of 32 elems.  Per-group 6-bit scale from scales_l/scales_h - 32.
+    // Each 16-byte group packs 16 low nibbles (elems 0..15) then 16 high
+    // nibbles (elems 16..31); nibble indexes the iq4_nl codebook.
+    const float d = gguf_block_scale_f16(block);
+    const uint16_t scales_h = static_cast<uint16_t>(block[2]) |
+        (static_cast<uint16_t>(block[3]) << 8);
+    const uint8_t* scales_l = block + 4;
+    const uint8_t* qs = block + 8;
+    const int byte_idx = lane & 15;      // 0..15 within the group
+    const int hi_half = lane >> 4;       // 0 => low nibble, 1 => high nibble
+    float local = 0.0f;
+    #pragma unroll
+    for (int group = 0; group < 8; ++group) {
+        const int ls = static_cast<int>(
+            ((scales_l[group >> 1] >> (4 * (group & 1))) & 0x0F) |
+            (((scales_h >> (2 * group)) & 0x03) << 4));
+        const float scale = d * static_cast<float>(ls - 32);
+        const uint8_t q = qs[group * 16 + byte_idx];
+        const int nib = hi_half ? (q >> 4) : (q & 0x0F);
+        const float val = static_cast<float>(kIQ4NLValues[nib]);
+        local += x_shared[group * 32 + lane] * scale * val;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local += __shfl_down_sync(0xffffffff, local, offset);
+    }
+    return local;
+}
+
 __device__ __forceinline__ float gguf_quant_block_dot_256(
     const float* __restrict__ x_shared,
     const uint8_t* __restrict__ block,
@@ -6291,6 +6329,9 @@ __device__ __forceinline__ float gguf_quant_block_dot_256(
         if (lane == 0) acc += blk;
     } else if (type_id == 6) {
         const float blk = iq3xxs_block_dot_256(x_shared, block, signed_grid, lane);
+        if (lane == 0) acc += blk;
+    } else if (type_id == 7) {
+        const float blk = iq4xs_block_dot_256(x_shared, block, lane);
         if (lane == 0) acc += blk;
     } else if (type_id == 8) {
         const float blk = q6k_block_dot_256(x_shared, block, lane);
@@ -6374,7 +6415,7 @@ __device__ __forceinline__ void gguf_quant_block_dot_256_rows4(
         q4k_block_dot_256_rows4(x_shared, block, lane, valid_rows, acc);
     } else if (type_id == 4) {
         q5k_block_dot_256_rows4(x_shared, block, lane, valid_rows, acc);
-    } else if (type_id == 5 || type_id == 6 || type_id == 8) {
+    } else if (type_id == 5 || type_id == 6 || type_id == 7 || type_id == 8) {
         if (valid_rows > 0) {
             float blk = gguf_quant_block_dot_256(x_shared, block, signed_grid, type_id, lane);
             if (lane == 0) acc[0] += blk;

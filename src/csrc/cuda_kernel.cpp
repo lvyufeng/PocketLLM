@@ -392,13 +392,15 @@ int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
     if (type_id == 4) return 176;   // q5_k
     if (type_id == 5) return 74;    // iq2_xs
     if (type_id == 6) return 98;    // iq3_xxs
+    if (type_id == 7) return 136;   // iq4_xs
     if (type_id == 8) return 210;   // q6_k
     TORCH_CHECK(false, "unsupported GGUF quant type_id: ", type_id);
 }
 
 bool gguf_quant_type_supported(int64_t type_id) {
     return type_id == 0 || type_id == 1 || type_id == 2 || type_id == 3 ||
-           type_id == 4 || type_id == 5 || type_id == 6 || type_id == 8;
+           type_id == 4 || type_id == 5 || type_id == 6 || type_id == 7 ||
+           type_id == 8;
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {

@@ -216,6 +216,18 @@ class GLMDSAGGUFModelLoader:
             out_dtype=self.dtype,
         )
 
+    def _quant_linear_auto(self, name: str):
+        """Build a raw-block CUDA linear, dispatching by GGUF dtype.
+
+        ``q8_0`` uses its dedicated ``q8_0_gemm_forward`` kernel; every other
+        supported dtype goes through the grid/type-id block-dot path.  GLM shared
+        experts are mostly q5_k/q6_k, but ``blk.8.ffn_down_shexp`` is q8_0, so the
+        raw-block MoE path must handle both.
+        """
+        if self._tensor_ref(name).type_name == "q8_0":
+            return self._quant_linear_q8_0(name)
+        return self._quant_linear(name)
+
     def _glm_routed_type_names(self, prefix: str) -> tuple[str, str, str]:
         w1 = self._tensor_ref(f"{prefix}.ffn_gate_exps.weight").type_name
         w3 = self._tensor_ref(f"{prefix}.ffn_up_exps.weight").type_name
@@ -266,9 +278,9 @@ class GLMDSAGGUFModelLoader:
                 layer_id,
                 self._read_dense(f"{prefix}.ffn_gate_inp.weight"),
                 self._read_dense(f"{prefix}.exp_probs_b.bias"),
-                self._quant_linear(f"{prefix}.ffn_gate_shexp.weight"),
-                self._quant_linear(f"{prefix}.ffn_up_shexp.weight"),
-                self._quant_linear(f"{prefix}.ffn_down_shexp.weight"),
+                self._quant_linear_auto(f"{prefix}.ffn_gate_shexp.weight"),
+                self._quant_linear_auto(f"{prefix}.ffn_up_shexp.weight"),
+                self._quant_linear_auto(f"{prefix}.ffn_down_shexp.weight"),
                 gguf_path=gate.shard_path,
                 w1_name=f"{prefix}.ffn_gate_exps.weight",
                 w3_name=f"{prefix}.ffn_up_exps.weight",
