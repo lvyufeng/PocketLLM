@@ -25,6 +25,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layers", type=int, default=0, help="debug: limit layer count; 0 means full model")
     parser.add_argument("--gpu-memory-gib", type=float, default=22.0)
     parser.add_argument("--dtype", type=str, choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="read GGUF shards into the OS page cache before load (helps on HDD)",
+    )
     return parser
 
 
@@ -47,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
         dtype=dtype,
         n_layers=None if int(args.layers) <= 0 else int(args.layers),
         gpu_memory_gib=float(args.gpu_memory_gib),
+        prewarm=bool(args.prewarm),
     )
 
 
