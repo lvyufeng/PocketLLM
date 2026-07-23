@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -34,7 +35,11 @@ def setup_dist() -> tuple[int, int, int, torch.device]:
         raise RuntimeError("GGUF raw-block runtime requires CUDA")
     torch.cuda.set_device(local_rank)
     if world > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl")
+        # A long timeout so a slow one-time step on a single rank (e.g. reading
+        # a multi-hundred-GB GGUF into the page cache while the other ranks wait
+        # at the first barrier) does not trip the default 10-minute store
+        # timeout and tear down the NCCL communicator.
+        dist.init_process_group("nccl", timeout=timedelta(hours=2))
     return world, rank, local_rank, torch.device("cuda", local_rank)
 
 
@@ -169,6 +174,7 @@ def run_gguf_generation(
     dtype: torch.dtype = torch.float16,
     n_layers: int | None = None,
     gpu_memory_gib: float = 22.0,
+    prewarm: bool = False,
 ) -> tuple[list[int], dict[str, float]] | None:
     """Dispatch a GGUF checkpoint to its architecture spec and greedily decode.
 
@@ -206,6 +212,26 @@ def run_gguf_generation(
             f"dtype={str(dtype).removeprefix('torch.')}",
             flush=True,
         )
+
+    if prewarm:
+        # The page cache is shared system-wide, so warming on rank 0 benefits
+        # every rank. Other ranks wait at the barrier until warming completes.
+        # A single sequential reader is fastest on a spinning disk. Warming
+        # 236 GB at HDD bandwidth takes many minutes, so setup_dist raises the
+        # process-group timeout to keep the idle ranks from tripping it here.
+        if rank == 0:
+            from src.loader.gguf.prewarm import prewarm_bundle
+
+            t0 = time.perf_counter()
+            elapsed = prewarm_bundle(bundle)
+            total_bytes = sum(os.path.getsize(p) for p in bundle.paths)
+            print(
+                f"gguf_prewarm_done shards={len(elapsed)} "
+                f"total_bytes={total_bytes / 1024**3:.2f}GB "
+                f"elapsed={time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
+        sync()
 
     runtime = spec.build_token_runtime(
         bundle,
