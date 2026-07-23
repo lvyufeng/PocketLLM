@@ -19,7 +19,7 @@ import argparse
 
 import torch
 
-from src.encoding.glm_dsa import decode_glm_dsa_ids, encode_glm_dsa_prompt
+from src.encoding.glm_dsa import decode_glm_dsa_ids, encode_glm_dsa_prompt, glm_dsa_context_info
 from src.runtime.generation import run_gguf_generation
 
 
@@ -31,7 +31,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thinking", action="store_true", help="with --chat, append <think> before generation")
     parser.add_argument("--system-prompt", type=str, default=None, help="optional system prompt (used with --chat)")
     parser.add_argument("--max-new-tokens", type=int, default=32)
-    parser.add_argument("--layers", type=int, default=0, help="debug: limit layer count; 0 means full model")
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=0,
+        help="debug: limit layer count; 0 means the full model (all block_count layers, MoE enabled)",
+    )
     parser.add_argument("--gpu-memory-gib", type=float, default=22.0)
     parser.add_argument("--dtype", type=str, choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--skip-special", action="store_true", help="skip special tokens when decoding output")
@@ -56,13 +61,23 @@ def main(argv: list[str] | None = None) -> None:
         system_prompt=args.system_prompt,
     )
 
+    # GLMDSASpec.build_token_runtime treats n_layers=None as "dense prefix only"
+    # (defaults to leading_dense_block_count=3).  For real generation we always
+    # want the full model, so when --layers is 0 (the default) we read the
+    # actual block count from GGUF metadata and pass it explicitly.
+    if int(args.layers) > 0:
+        n_layers: int | None = int(args.layers)
+    else:
+        info = glm_dsa_context_info(args.gguf_path)
+        n_layers = int(info["n_layers"]) if int(info["n_layers"]) > 0 else None
+
     result = run_gguf_generation(
         args.gguf_path,
         prompt_tokens=prompt_tokens,
         max_new_tokens=int(args.max_new_tokens),
         architecture="glm-dsa",
         dtype=dtype,
-        n_layers=None if int(args.layers) <= 0 else int(args.layers),
+        n_layers=n_layers,
         gpu_memory_gib=float(args.gpu_memory_gib),
         prewarm=bool(args.prewarm),
     )
