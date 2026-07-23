@@ -23,12 +23,12 @@ from src.models.glm_dsa.architecture import (
 
 
 class GLMDSAGGUFModelLoader:
-    """Assemble a first-pass GLM-DSA reference runtime from a GGUF bundle.
+    """Assemble a GLM-DSA GGUF runtime from a GGUF bundle.
 
-    This loader intentionally uses dequantized reference tensors for correctness
-    bring-up. It is only meant for small-layer smoke tests at first; optimized
-    raw-block kernels and PocketMoE active-expert staging should replace the
-    fallback paths once the GLM-DSA math is validated.
+    Routed MoE experts run through the raw-block CUDA grouped kernel
+    (``GLMDSARawBlockMoE``) when the routed dtypes and block layout are eligible;
+    otherwise the loader falls back to the dequantized fp32 reference MoE
+    (``GLMDSAMoE``).  Dense/attention projections use raw quantized GGUF linears.
     """
 
     def __init__(
@@ -309,8 +309,9 @@ class GLMDSAGGUFModelLoader:
     def load(self) -> GLMDSATransformer:
         if self.args.n_layers > self.args.leading_dense_layers and not self.allow_moe_layers:
             raise NotImplementedError(
-                f"GLM-DSA MoE layers are not implemented in the first reference runtime; "
-                f"requested n_layers={self.args.n_layers}, leading_dense_layers={self.args.leading_dense_layers}"
+                f"GLM-DSA MoE layers are implemented but disabled for this load "
+                f"(allow_moe_layers=False); requested n_layers={self.args.n_layers} exceeds "
+                f"leading_dense_layers={self.args.leading_dense_layers}. Enable MoE to load these layers."
             )
 
         embedding = self._quant_embedding("token_embd.weight")
