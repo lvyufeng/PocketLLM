@@ -392,6 +392,7 @@ def load_glm_dsa_gguf_model(
     expert_count: int | None = None,
     world: int = 1,
     rank: int = 0,
+    use_raw_block_moe: bool = True,
 ) -> tuple[GLMDSATransformer, dict[str, Any]]:
     start = time.perf_counter()
     loader = GLMDSAGGUFModelLoader(
@@ -404,6 +405,7 @@ def load_glm_dsa_gguf_model(
         expert_count=expert_count,
         world=world,
         rank=rank,
+        use_raw_block_moe=use_raw_block_moe,
     )
     try:
         model = loader.load()

@@ -287,6 +287,8 @@ class GLMDSASpec:
             expert_count = 0
 
         t_load = time.perf_counter()
+        import os as _os
+        _use_raw = not bool(_os.environ.get("GLM_FORCE_REF_MOE"))
         model, _info = load_glm_dsa_gguf_model(
             bundle,
             device=device,
@@ -297,6 +299,7 @@ class GLMDSASpec:
             expert_count=expert_count,
             world=int(world),
             rank=int(rank),
+            use_raw_block_moe=_use_raw,
         )
         load_seconds = time.perf_counter() - t_load
         eos = bundle.metadata.get("tokenizer.ggml.eos_token_id")
