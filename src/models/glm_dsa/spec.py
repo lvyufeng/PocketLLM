@@ -231,7 +231,7 @@ class GLMDSASpec:
             seen.add(key)
             status, reason = capability_status_for_role(role, tensor.type_name, architecture=self.architecture)
             caps.append(CapabilityItem(f"{role}:{tensor.type_name}", status, reason))
-        caps.append(CapabilityItem("generation", "candidate", "GLM-DSA dense-prefix reference GGUF generation is implemented; MoE layers remain deferred"))
+        caps.append(CapabilityItem("generation", "candidate", "GLM-DSA GGUF generation is implemented for dense-prefix and MoE layers (routed experts run through the CUDA grouped MoE kernel)"))
 
         tensor_bytes = sum(int(t.nbytes or 0) for t in bundle.tensors)
         routed_bytes = sum(int(t.nbytes or 0) for t in bundle.tensors if role_by_name[t.name] in {"routed_w1", "routed_w2", "routed_w3"})
@@ -262,13 +262,13 @@ class GLMDSASpec:
         n_layers: int | None,
         gpu_memory_gib: float,
     ) -> "GGUFTokenRuntime":
-        """Build the first GLM-DSA GGUF token runtime.
+        """Build the GLM-DSA GGUF token runtime.
 
-        The current implementation is a correctness bring-up path: it dequantizes
-        tensors into reference PyTorch modules and only supports the dense-prefix
-        layers.  If ``n_layers`` is omitted, default to ``leading_dense_layers`` so
-        the generic generation CLI can smoke-test GLM attention/dense FFN without
-        accidentally entering the not-yet-implemented 76 MoE layers.
+        Supports the full model: the dense-prefix layers plus the routed+shared
+        MoE layers (routed experts run through the CUDA grouped MoE kernel, with
+        experts sharded across ranks).  If ``n_layers`` is omitted, default to
+        ``leading_dense_layers`` so the generic generation CLI runs only the dense
+        prefix unless more layers are explicitly requested.
         """
         from src.runtime.generation import GGUFTokenRuntime
         from src.models.glm_dsa.gguf_model import load_glm_dsa_gguf_model

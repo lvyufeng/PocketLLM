@@ -57,7 +57,7 @@ def test_glm_dsa_registry_detects_architecture(tmp_path: Path) -> None:
     assert detect_spec(bundle).architecture == "glm-dsa"
 
 
-def test_glm_dsa_capability_is_inventory_supported_but_generation_deferred(tmp_path: Path) -> None:
+def test_glm_dsa_capability_reports_routed_types_supported(tmp_path: Path) -> None:
     root = write_glm_dsa_bundle(tmp_path / "bundle", n_layers=4, leading_dense=1)
     bundle = read_gguf_bundle(root)
     report = GLMDSASpec().capability_report(bundle, gpu_count=4, gpu_memory_gib=22.0)
@@ -68,8 +68,8 @@ def test_glm_dsa_capability_is_inventory_supported_but_generation_deferred(tmp_p
     assert report.tensor_type_counts["iq2_xs"] == 6
     assert report.tensor_type_counts["iq3_xxs"] == 3
     assert report.tensor_type_counts["q6_k"] == 4
-    assert caps["routed_w1:iq2_xs"].status == "deferred"
-    assert caps["routed_w2:iq3_xxs"].status == "deferred"
+    assert caps["routed_w1:iq2_xs"].status == "supported"
+    assert caps["routed_w2:iq3_xxs"].status == "supported"
     assert caps["generation"].status == "candidate"
     assert placements["heterogeneous_routed_experts"].status == "candidate"
 

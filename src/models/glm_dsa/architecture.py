@@ -273,12 +273,12 @@ class GLMDSADenseMLP:
 
 
 class GLMDSAMoE:
-    """Reference GLM-DSA routed+shared MoE.
+    """Reference GLM-DSA routed+shared MoE (fp32 fallback path).
 
-    This is deliberately a correctness bring-up path: selected experts are
-    dequantized on CPU by the GGUF loader, moved to CUDA, and evaluated with
-    PyTorch matmuls.  It enables small-layer full-model smoke tests before the
-    optimized PocketMoE active-expert kernels are wired in.
+    Selected experts are dequantized on CPU by the GGUF loader, moved to CUDA,
+    and evaluated with PyTorch matmuls.  This is the fallback used when the routed
+    dtypes or block layout are not eligible for the raw-block CUDA kernels; the
+    optimized path is ``GLMDSARawBlockMoE``.
     """
 
     def __init__(
@@ -545,8 +545,9 @@ class GLMDSAMoEPlaceholder:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError(
-            f"GLM-DSA MoE runtime is not implemented for layer {self.layer_id}; "
-            "use --n-layers within leading_dense_block_count for the first dense-prefix smoke"
+            f"GLM-DSA MoE layer {self.layer_id} was reached with MoE disabled; "
+            "MoE is implemented but this run opted out (allow_moe_layers=False). "
+            "Request n_layers beyond leading_dense_block_count to enable MoE layers."
         )
 
 
