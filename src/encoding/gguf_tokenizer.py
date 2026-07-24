@@ -4,9 +4,51 @@ import struct
 from pathlib import Path
 from typing import Any, Iterable
 
-from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers
+from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from src.loader.gguf.bundle import resolve_gguf_bundle
+
+# GGUF ``tokenizer.ggml.pre`` values whose reference (llama.cpp) pre-tokenizer
+# is the llama3/CHATGLM4 split regex, NOT plain byte-level. GLM-4/GLM-5.2 use
+# ``glm4``; llama3 shares the identical adapted pattern. Any pre value NOT in
+# this set keeps the historical plain-ByteLevel behavior (e.g. MiniMax-M2),
+# so this table is additive and cannot change existing models' tokenization.
+_LLAMA3_STYLE_PRE = frozenset(
+    {"glm4", "chatglm-bpe", "llama3", "llama-bpe", "llama-v3", "llama3-bpe"}
+)
+
+# The llama.cpp CHATGLM4 / LLAMA3 pre-tokenizer split pattern (two source
+# segments concatenated). Matches contractions (case-insensitive), words,
+# 1-3 digit number groups, punctuation runs, and whitespace/newline runs.
+_LLAMA3_STYLE_SPLIT_REGEX = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+
+def _pre_tokenizer_for(pre: str | None):
+    """Pick the pre-tokenizer for a GGUF ``tokenizer.ggml.pre`` value.
+
+    llama3/glm4-family models need a regex ``Split`` ahead of a
+    ``use_regex=False`` ByteLevel so token boundaries (digits, whitespace,
+    contractions) match the reference tokenization. Every other value keeps
+    the plain ``ByteLevel(add_prefix_space=False)`` used historically, so
+    already-supported models (e.g. MiniMax-M2) are unaffected.
+    """
+
+    if pre and str(pre) in _LLAMA3_STYLE_PRE:
+        return pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(Regex(_LLAMA3_STYLE_SPLIT_REGEX), behavior="isolated", invert=False),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+    return pre_tokenizers.ByteLevel(add_prefix_space=False)
 
 _METADATA_TYPES = {
     0: ("uint8", "<B", 1),
@@ -196,7 +238,7 @@ def build_gguf_bpe_tokenizer(path: str | Path) -> tuple[Tokenizer, dict[str, Any
     unk_id = metadata_int(metadata, "tokenizer.ggml.unknown_token_id", 0)
     unk_token = tokens[unk_id]
     tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=merge_pairs, unk_token=unk_token, fuse_unk=False))
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer.pre_tokenizer = _pre_tokenizer_for(metadata.get("tokenizer.ggml.pre"))
     tokenizer.decoder = decoders.ByteLevel()
 
     special_tokens = [token for token, token_type in zip(tokens, token_types) if int(token_type) != 1]

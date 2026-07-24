@@ -575,9 +575,10 @@ class GLMDSABlock:
         self.attention.reset_cache(batch_size, max_seq_len)
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        x = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
-        x = (x + self.mlp(self.ffn_norm(x))).to(self.dtype)
-        return x
+        x_attn = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
+        mlp_in = self.ffn_norm(x_attn)
+        mlp_out = self.mlp(mlp_in)
+        return (x_attn + mlp_out).to(self.dtype)
 
 
 class GLMDSATransformer:
