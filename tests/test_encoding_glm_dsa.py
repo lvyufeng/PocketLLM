@@ -50,7 +50,10 @@ def test_real_glm_context_info() -> None:
     info = glm_dsa_context_info(REAL_GLM_PATH)
 
     assert info["architecture"] == "glm-dsa"
-    assert info["n_layers"] == 79
+    # block_count is 79 but the trailing block is a NextN/MTP speculative-decode
+    # layer, not part of the main transformer trunk (llama.cpp skips it). The
+    # runnable trunk depth is block_count - nextn_predict_layers = 79 - 1 = 78.
+    assert info["n_layers"] == 78
     assert info["context_length"] == 1048576
     assert info["eos_token_id"] == EOS_ID
     assert info["bos_token_id"] == GMASK_ID
