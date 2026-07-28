@@ -6687,6 +6687,129 @@ __global__ void gguf_moe_w13_iq2_xxs_dp4a_kernel(
     }
 }
 
+// iq2_xs w13 DP4A (block_iq2_xs, 74 bytes): [0:2] d, [2:66] qs (8 sub-blocks x
+// 8 bytes = 8 sub x 4 uint16), [66:74] scales (8 bytes, one per sub-block, low
+// nibble = parts 0-1, high nibble = parts 2-3).  Each uint16 encodes a 9-bit
+// grid id + 7-bit sign id into the shared 512x128x8 signed grid.  Mirrors
+// gguf_moe_w13_iq2_xxs_dp4a_kernel: lane->(sub=lane>>2, part=lane&3), q8_1
+// activation quantized in 32-element groups.
+__global__ void gguf_moe_w13_iq2_xs_dp4a_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int routes,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* x_q_row = x_q + token * dim;
+    const float* x_scale_row = x_scale + token * x_groups;
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 74;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 74;
+
+    __shared__ int x_shared_q[64];
+    __shared__ float x_shared_scale[8];
+
+    float acc1 = 0.0f;
+    float acc3 = 0.0f;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= dim) {
+                v = *reinterpret_cast<const int*>(x_q_row + k_base + byte_off);
+            }
+            x_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            x_shared_scale[tid] = sg_idx < x_groups ? x_scale_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 74;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 74;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+
+            const uint16_t q1 = static_cast<uint16_t>(chunk1[part * 2]) |
+                (static_cast<uint16_t>(chunk1[part * 2 + 1]) << 8);
+            const uint16_t q3 = static_cast<uint16_t>(chunk3[part * 2]) |
+                (static_cast<uint16_t>(chunk3[part * 2 + 1]) << 8);
+            const int grid_id1 = static_cast<int>(q1 & 0x01FFu);
+            const int grid_id3 = static_cast<int>(q3 & 0x01FFu);
+            const int sign_idx1 = static_cast<int>(q1 >> 9);
+            const int sign_idx3 = static_cast<int>(q3 >> 9);
+
+            const uint8_t sc1 = w1_block[66 + sub];
+            const uint8_t sc3 = w3_block[66 + sub];
+            const int ls1 = static_cast<int>(part < 2 ? (sc1 & 0x0F) : (sc1 >> 4));
+            const int ls3 = static_cast<int>(part < 2 ? (sc3 & 0x0F) : (sc3 >> 4));
+            const float s1 = 0.25f * d1 * (static_cast<float>(ls1) + 0.5f);
+            const float s3 = 0.25f * d3 * (static_cast<float>(ls3) + 0.5f);
+
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+
+            const int xq_base = sub * 8 + part * 2;
+            const int x_p0 = x_shared_q[xq_base];
+            const int x_p1 = x_shared_q[xq_base + 1];
+
+            int sumi1 = __dp4a(v1_p0, x_p0, 0);
+            sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+            int sumi3 = __dp4a(v3_p0, x_p0, 0);
+            sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+
+            const float xs = x_shared_scale[sub];
+            float local1 = s1 * xs * static_cast<float>(sumi1);
+            float local3 = s3 * xs * static_cast<float>(sumi3);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                local3 += __shfl_down_sync(0xffffffff, local3, offset);
+            }
+            if (lane == 0) {
+                acc1 += local1;
+                acc3 += local3;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < inter_dim) {
+        gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1;
+        up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3;
+    }
+}
+
 __global__ void gguf_moe_w13_iq2_xxs_dp4a_expert_tile_kernel(
     const int8_t* __restrict__ x_q,
     const float* __restrict__ x_scale,
@@ -7197,6 +7320,107 @@ __global__ void gguf_moe_w2_scatter_iq2_xxs_dp4a_kernel(
             const int v_p1 = *reinterpret_cast<const int*>(vals + 4);
 
             const int hq_base = sub * 8 + part * 2;
+            const int h_p0 = h_shared_q[hq_base];
+            const int h_p1 = h_shared_q[hq_base + 1];
+
+            int sumi = __dp4a(v_p0, h_p0, 0);
+            sumi = __dp4a(v_p1, h_p1, sumi);
+
+            const float hs = h_shared_scale[sub];
+            float local = s * hs * static_cast<float>(sumi);
+
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                local += __shfl_down_sync(0xffffffff, local, offset);
+            }
+            if (lane == 0) acc += local;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < dim) {
+        atomicAdd(y + token * dim + out_col, acc);
+    }
+}
+
+// iq3_xxs w2 scatter DP4A (block_iq3_xxs, 98 bytes): [0:2] d, [2:66] grid
+// indices (8 sub x 8 bytes, one grid_id byte per part), [66:98] aux (8 sub x
+// uint32; low 3x7 bits = sign ids, top nibble = scale).  Structure is 8 sub x
+// 8 part x 4 elem; a lane (sub=lane>>2, pp=lane&3) handles parts 2*pp and
+// 2*pp+1, which share sign_idx = (aux>>(7*pp))&127 and use grid val_offset 0/4.
+// Mirrors gguf_moe_w2_scatter_iq2_xxs_dp4a_kernel; hidden q8_1-quantized in
+// 32-element groups (iq3_xxs sub = 32 elems).
+__global__ void gguf_moe_w2_scatter_iq3_xxs_dp4a_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ route_experts,
+    const uint8_t* __restrict__ w2_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ y,
+    int routes,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    const int route = blockIdx.y;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kGGUFQuantTileN + warp;
+    if (route >= routes || warp >= kGGUFQuantTileN) return;
+
+    const int64_t token = route_tokens[route];
+    const int expert = route_experts[route];
+    const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+    const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 98;
+    const int8_t* iq3_grid = signed_grid + kIQ2XSSignedGridEntries;
+
+    __shared__ int h_shared_q[64];
+    __shared__ float h_shared_scale[8];
+
+    float acc = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        if (tid < 64) {
+            const int byte_off = tid * 4;
+            int v = 0;
+            if (k_base + byte_off + 4 <= inter_dim) {
+                v = *reinterpret_cast<const int*>(hidden_row + k_base + byte_off);
+            }
+            h_shared_q[tid] = v;
+        }
+        if (tid < 8) {
+            const int sg_idx = block_idx * 8 + tid;
+            h_shared_scale[tid] = sg_idx < hidden_groups ? hs_row[sg_idx] : 0.0f;
+        }
+        __syncthreads();
+
+        if (out_col < dim) {
+            const int sub = lane >> 2;
+            const int pp = lane & 3;
+            const uint8_t* w2_block = w2_row + static_cast<int64_t>(block_idx) * 98;
+            const float d = gguf_block_scale_f16(w2_block);
+            const uint8_t* qbytes = w2_block + 2 + sub * 8;
+            const uint8_t* auxb = w2_block + 2 + 64 + sub * 4;
+            const uint32_t aux = static_cast<uint32_t>(auxb[0]) |
+                (static_cast<uint32_t>(auxb[1]) << 8) |
+                (static_cast<uint32_t>(auxb[2]) << 16) |
+                (static_cast<uint32_t>(auxb[3]) << 24);
+
+            const int sign_idx = static_cast<int>((aux >> (7 * pp)) & 127);
+            const float s = 0.5f * d * (static_cast<float>(aux >> 28) + 0.5f);
+
+            const int grid_id0 = qbytes[pp * 2];
+            const int grid_id1 = qbytes[pp * 2 + 1];
+            const int8_t* vals0 = iq3_grid + ((grid_id0 * 128 + sign_idx) * 8 + 0);
+            const int8_t* vals1 = iq3_grid + ((grid_id1 * 128 + sign_idx) * 8 + 4);
+            const int v_p0 = *reinterpret_cast<const int*>(vals0);
+            const int v_p1 = *reinterpret_cast<const int*>(vals1);
+
+            const int hq_base = sub * 8 + pp * 2;
             const int h_p0 = h_shared_q[hq_base];
             const int h_p1 = h_shared_q[hq_base + 1];
 
@@ -7995,7 +8219,42 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
         w1_block_bytes == 66 && w3_block_bytes == 66 &&
         w1_blocks_per_row == w3_blocks_per_row &&
         env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W13_DP4A");
-    if (use_iq2_xxs_w13_dp4a) {
+    const bool use_iq2_xs_w13_dp4a =
+        w1_type_id == 5 && w3_type_id == 5 &&
+        w1_block_bytes == 74 && w3_block_bytes == 74 &&
+        w1_blocks_per_row == w3_blocks_per_row &&
+        env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XS_W13_DP4A");
+    if (use_iq2_xs_w13_dp4a) {
+        const int x_groups = ceil_div(dim, 32);
+        auto x_q = torch::empty({tokens, dim}, x.options().dtype(torch::kInt8));
+        auto x_scale = torch::empty({tokens, x_groups}, x.options().dtype(torch::kFloat32));
+        const dim3 quant_grid(tokens, x_groups);
+        AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "gguf_q8_1_quantize_x_32", [&] {
+            gguf_q8_1_quantize_x_32_kernel<scalar_t><<<quant_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+                x_contig.data_ptr<scalar_t>(),
+                x_q.data_ptr<int8_t>(),
+                x_scale.data_ptr<float>(),
+                tokens,
+                dim);
+        });
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        gguf_moe_w13_iq2_xs_dp4a_kernel<<<w13_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w1_contig.data_ptr<uint8_t>(),
+            w3_contig.data_ptr<uint8_t>(),
+            grid_ptr,
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w1_blocks_per_row,
+            x_groups);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else if (use_iq2_xxs_w13_dp4a) {
         const int x_groups = ceil_div(dim, 32);
         auto x_q = torch::empty({tokens, dim}, x.options().dtype(torch::kInt8));
         auto x_scale = torch::empty({tokens, x_groups}, x.options().dtype(torch::kFloat32));
@@ -8094,11 +8353,56 @@ torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
         w2_type_id == 0 &&
         w2_block_bytes == 66 &&
         env_enabled_explicit("DEEPSEEK_GGUF_IQ2_XXS_W2_DP4A");
+    const bool use_iq3_xxs_w2_dp4a =
+        w2_type_id == 6 &&
+        w2_block_bytes == 98 &&
+        env_enabled_explicit("DEEPSEEK_GGUF_IQ3_XXS_W2_DP4A");
     const bool use_q2k_w2_dp4a =
         w2_type_id == 1 &&
         w2_block_bytes == 84 &&
         env_enabled_explicit("DEEPSEEK_GGUF_Q2K_W2_DP4A");
-    if (use_iq2_xxs_w2_dp4a) {
+    if (use_iq3_xxs_w2_dp4a) {
+        // iq3_xxs w2: hidden quantized in 32-element groups (one per iq3_xxs
+        // sub-block), matching the iq2_xs/iq2_xxs w13 activation quantizer.
+        const int hidden_groups = ceil_div(inter_dim, 32);
+        auto hidden = torch::empty({routes, inter_dim}, x.options().dtype(torch::kFloat32));
+        auto hidden_q = torch::empty({routes, inter_dim}, x.options().dtype(torch::kInt8));
+        auto hidden_scale = torch::empty({routes, hidden_groups}, x.options().dtype(torch::kFloat32));
+        const int hidden_threads = 256;
+        const int hidden_blocks = static_cast<int>((static_cast<int64_t>(routes) * inter_dim + hidden_threads - 1) / hidden_threads);
+        route_swiglu_cast_kernel<float><<<hidden_blocks, hidden_threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            gate.data_ptr<float>(),
+            up.data_ptr<float>(),
+            route_weights_contig.data_ptr<float>(),
+            hidden.data_ptr<float>(),
+            routes,
+            inter_dim,
+            static_cast<float>(swiglu_limit));
+        const dim3 quant_grid(routes, hidden_groups);
+        gguf_q8_1_quantize_x_32_kernel<float><<<quant_grid, 32, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden.data_ptr<float>(),
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            routes,
+            inter_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if (emit_profile) {
+            check_cuda(cudaEventRecord(ev_hidden, at::cuda::getCurrentCUDAStream()), "record gguf prefill profile hidden event");
+        }
+        gguf_moe_w2_scatter_iq3_xxs_dp4a_kernel<<<w2_grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            route_tokens_contig.data_ptr<int64_t>(),
+            route_experts.data_ptr<int32_t>(),
+            w2_contig.data_ptr<uint8_t>(),
+            grid_ptr,
+            y.data_ptr<float>(),
+            routes,
+            dim,
+            inter_dim,
+            w2_blocks_per_row,
+            hidden_groups);
+    } else if (use_iq2_xxs_w2_dp4a) {
         // iq2_xxs w2: hidden quantized in 32-element groups (one per iq2_xxs
         // sub-block), matching the w13 activation quantizer.  Decode reuses the
         // parity-validated grid lookup from gguf_moe_w13_iq2_xxs_dp4a_kernel.

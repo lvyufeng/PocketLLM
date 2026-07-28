@@ -471,6 +471,13 @@ class GLMDSARawBlockMoE:
         # Pinning ~58 GB/rank is non-pageable host memory; opt-in only to avoid
         # over-committing pinned memory across TP ranks.
         self._pin_resident = _os.getenv("GLM_PIN_RESIDENT_EXPERTS", "0") == "1"
+        # GLM routed experts are iq2_xs (w1/w3) + iq3_xxs (w2); enable their
+        # DP4A grouped-MoE kernels by default (numerically parity-checked vs the
+        # fp32 general branch).  The CUDA kernel reads these env gates, so set
+        # them here unless the user explicitly opted out with "0".
+        for _flag in ("DEEPSEEK_GGUF_IQ2_XS_W13_DP4A", "DEEPSEEK_GGUF_IQ3_XXS_W2_DP4A"):
+            if _os.getenv(_flag) is None:
+                _os.environ[_flag] = "1"
 
     def route(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = x_flat.float() @ self.gate_weight.t()
