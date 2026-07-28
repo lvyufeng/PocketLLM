@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import os as _os
+import time as _time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -11,6 +14,69 @@ from src.components.gguf.tp_logits import distributed_argmax_local_logits, gathe
 from src.components.moe.spec import metadata_float, metadata_int
 from src.loader.gguf.bundle import GGUFBundle
 from src.models.glm_dsa.spec import GLMDSASpec
+
+
+# ---------------------------------------------------------------------------
+# Opt-in decode profiler (GLM_PROFILE=1). Accumulates wall time per named
+# section, synchronizing CUDA around each so the numbers are real (not just
+# launch-queue time). Zero overhead when disabled: _prof_section short-circuits
+# before touching the clock or the CUDA device. Print the breakdown via
+# glm_profile_report() (the CLI does this on rank 0 after decode).
+# ---------------------------------------------------------------------------
+_GLM_PROFILE = _os.getenv("GLM_PROFILE", "0") == "1"
+_GLM_PROFILE_TOTALS: dict[str, float] = {}
+_GLM_PROFILE_COUNTS: dict[str, int] = {}
+_GLM_PROFILE_PHASE = "decode"
+
+
+def _glm_profile_set_phase(seqlen: int) -> None:
+    # seqlen==1 is a decode step; anything longer is prefill. Sections are keyed
+    # by phase so the prefill forward's per-layer time does not skew the decode
+    # per-call averages (decode is what we're optimizing).
+    global _GLM_PROFILE_PHASE
+    _GLM_PROFILE_PHASE = "decode" if int(seqlen) == 1 else "prefill"
+
+
+@contextmanager
+def _prof_section(name: str):
+    if not _GLM_PROFILE:
+        yield
+        return
+    key = f"{_GLM_PROFILE_PHASE}.{name}"
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = _time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = _time.perf_counter() - t0
+        _GLM_PROFILE_TOTALS[key] = _GLM_PROFILE_TOTALS.get(key, 0.0) + dt
+        _GLM_PROFILE_COUNTS[key] = _GLM_PROFILE_COUNTS.get(key, 0) + 1
+
+
+def glm_profile_enabled() -> bool:
+    return _GLM_PROFILE
+
+
+def glm_profile_reset() -> None:
+    _GLM_PROFILE_TOTALS.clear()
+    _GLM_PROFILE_COUNTS.clear()
+
+
+def glm_profile_report() -> str:
+    if not _GLM_PROFILE_TOTALS:
+        return "GLM_PROFILE: no sections recorded"
+    lines = ["GLM_PROFILE per-section totals (seconds / calls / ms-per-call):"]
+    total = sum(_GLM_PROFILE_TOTALS.values())
+    for name in sorted(_GLM_PROFILE_TOTALS, key=lambda k: -_GLM_PROFILE_TOTALS[k]):
+        secs = _GLM_PROFILE_TOTALS[name]
+        n = _GLM_PROFILE_COUNTS.get(name, 0)
+        per = 1000.0 * secs / n if n else 0.0
+        pct = 100.0 * secs / total if total else 0.0
+        lines.append(f"  {name:20s} {secs:9.4f}s  {n:6d}x  {per:8.3f}ms  {pct:5.1f}%")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -484,7 +550,23 @@ class GLMDSARawBlockMoE:
         self._resident_w3: torch.Tensor | None = None
         self._resident_w2: torch.Tensor | None = None
         self._resident_meta: tuple | None = None
+        # Reusable pinned host staging buffers (fallback path). The active expert
+        # SET changes every step so we cannot cache contents, but we CAN reuse a
+        # small pinned buffer (<=top_k experts, ~tens of MB) so each step's H2D is
+        # a fast pinned->GPU DMA instead of a pageable copy. Keyed by active count
+        # + block shape; rebuilt only when those change (rare at decode).  This is
+        # NOT the forbidden full-mmap pin: it is a bounded per-layer buffer.
+        self._pin_stage_w1: torch.Tensor | None = None
+        self._pin_stage_w3: torch.Tensor | None = None
+        self._pin_stage_w2: torch.Tensor | None = None
+        self._pin_stage_key: tuple | None = None
         import os as _os
+        # Pinned staging is OFF by default: a profiled e2e showed the per-expert
+        # copy into pinned host memory (stage_read) costs more than the faster
+        # pinned->GPU DMA (stage_h2d) saves — a net staging regression.  The mmap
+        # page-cache read into pinned is no cheaper than into pageable, so there
+        # is no free lunch here.  Kept as an opt-in experiment switch only.
+        self._use_pinned_stage = _os.getenv("GLM_PINNED_STAGE", "0") == "1"
 
         # Resident-cache staging is OFF by default: an e2e measurement showed it
         # does NOT help decode once the page cache is warm (the original per-step
@@ -568,24 +650,57 @@ class GLMDSARawBlockMoE:
             w2_blocks = w2_cpu.to(self.device, non_blocking=True).contiguous()
             return w1_blocks, w3_blocks, w2_blocks, self._resident_meta
 
-        w1_vals, w3_vals, w2_vals = [], [], []
-        for local_id in local_ids_cpu:
-            expert_id = int(local_id) + self.expert_start
-            w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
-            w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
-            w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
-            w1_vals.append((w1_b, w1_tn, w1_in))
-            w3_vals.append((w3_b, w3_tn, w3_in))
-            w2_vals.append((w2_b, w2_tn, w2_in))
-        w1_blocks = torch.stack([v[0] for v in w1_vals], dim=0).to(self.device, non_blocking=True).contiguous()
-        w3_blocks = torch.stack([v[0] for v in w3_vals], dim=0).to(self.device, non_blocking=True).contiguous()
-        w2_blocks = torch.stack([v[0] for v in w2_vals], dim=0).to(self.device, non_blocking=True).contiguous()
+        with _prof_section("stage_read"):
+            w1_vals, w3_vals, w2_vals = [], [], []
+            for local_id in local_ids_cpu:
+                expert_id = int(local_id) + self.expert_start
+                w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+                w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+                w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+                w1_vals.append((w1_b, w1_tn, w1_in))
+                w3_vals.append((w3_b, w3_tn, w3_in))
+                w2_vals.append((w2_b, w2_tn, w2_in))
+            if getattr(self, "_use_pinned_stage", False):
+                w1_host = self._fill_pinned_stage("w1", [v[0] for v in w1_vals])
+                w3_host = self._fill_pinned_stage("w3", [v[0] for v in w3_vals])
+                w2_host = self._fill_pinned_stage("w2", [v[0] for v in w2_vals])
+            else:
+                w1_host = torch.stack([v[0] for v in w1_vals], dim=0)
+                w3_host = torch.stack([v[0] for v in w3_vals], dim=0)
+                w2_host = torch.stack([v[0] for v in w2_vals], dim=0)
+        with _prof_section("stage_h2d"):
+            w1_blocks = w1_host.to(self.device, non_blocking=True).contiguous()
+            w3_blocks = w3_host.to(self.device, non_blocking=True).contiguous()
+            w2_blocks = w2_host.to(self.device, non_blocking=True).contiguous()
         meta = (
             (self._type_ids[w1_vals[0][1]], int(w1_vals[0][2])),
             (self._type_ids[w3_vals[0][1]], int(w3_vals[0][2])),
             (self._type_ids[w2_vals[0][1]], int(w2_vals[0][2])),
         )
         return w1_blocks, w3_blocks, w2_blocks, meta
+
+    def _fill_pinned_stage(self, which: str, blocks: list[torch.Tensor]) -> torch.Tensor:
+        """Copy per-expert raw-block views into a reusable pinned host tensor and
+        return it.  The pinned buffer makes the subsequent H2D a fast DMA; it is
+        reused across steps whenever the active-expert count and block shape match
+        (the common decode case), so we avoid re-pinning every step."""
+        n = len(blocks)
+        b0 = blocks[0]
+        key = (which, n, tuple(b0.shape), b0.dtype)
+        attr = f"_pin_stage_{which}"
+        buf = getattr(self, attr)
+        # w1/w3/w2 shapes are stable per layer; track the active key per buffer.
+        keys = getattr(self, "_pin_stage_keys", None)
+        if keys is None:
+            keys = {}
+            self._pin_stage_keys = keys
+        if buf is None or keys.get(which) != key:
+            buf = torch.empty((n, *b0.shape), dtype=b0.dtype).pin_memory()
+            setattr(self, attr, buf)
+            keys[which] = key
+        for i, b in enumerate(blocks):
+            buf[i].copy_(b)
+        return buf
 
     def _routed_forward(self, x_flat: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         from src.kernels.cuda_loader import load_cuda_kernel
@@ -596,21 +711,24 @@ class GLMDSARawBlockMoE:
             raise RuntimeError("CUDA grouped MoE kernel is required for GLMDSARawBlockMoE")
 
         out = torch.zeros((x_flat.size(0), self.args.dim), device=x_flat.device, dtype=torch.float32)
-        grouped = cuda_mod.moe_group_routes(
-            indices.contiguous(),
-            weights.contiguous().to(torch.float32),
-            int(self.expert_start),
-            int(self.expert_count),
-        )
+        with _prof_section("moe_route_group"):
+            grouped = cuda_mod.moe_group_routes(
+                indices.contiguous(),
+                weights.contiguous().to(torch.float32),
+                int(self.expert_start),
+                int(self.expert_count),
+            )
         if grouped is None:
             return out
         local_ids, route_tokens, route_weights, seg_starts = grouped
         if local_ids.numel() == 0:
             return out
-        local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+        with _prof_section("moe_ids_sync"):
+            local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
 
-        reader = get_cached_gguf_tensor_reader(self.gguf_path)
-        w1_blocks, w3_blocks, w2_blocks, meta = self._stage_active_experts(reader, local_ids_cpu)
+        with _prof_section("moe_stage_experts"):
+            reader = get_cached_gguf_tensor_reader(self.gguf_path)
+            w1_blocks, w3_blocks, w2_blocks, meta = self._stage_active_experts(reader, local_ids_cpu)
         (w1_type_id, w1_in_dim), (w3_type_id, w3_in_dim), (w2_type_id, w2_in_dim) = meta
 
         seg_i32 = seg_starts if seg_starts.dtype == torch.int32 else seg_starts.to(torch.int32)
@@ -618,7 +736,8 @@ class GLMDSARawBlockMoE:
             [seg_i32[local_ids.to(seg_i32.device)], seg_i32[-1:]], dim=0
         ).contiguous()
 
-        y = cuda_mod.gguf_moe_prefill_grouped_forward(
+        with _prof_section("moe_kernel"):
+          y = cuda_mod.gguf_moe_prefill_grouped_forward(
             x_flat.to(torch.float16).contiguous(),
             route_tokens,
             route_weights.contiguous(),
@@ -642,15 +761,18 @@ class GLMDSARawBlockMoE:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         x_flat = x.reshape(-1, original_shape[-1]).contiguous()
-        indices, weights = self.route(x_flat)
+        with _prof_section("moe_route"):
+            indices, weights = self.route(x_flat)
         out = self._routed_forward(x_flat, indices, weights)
 
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(out)
+            with _prof_section("moe_all_reduce"):
+                dist.all_reduce(out)
 
         if self.shared_gate_proj is not None and self.shared_up_proj is not None and self.shared_down_proj is not None:
-            shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
-            out = out + self.shared_down_proj(shared.to(self.dtype)).float()
+            with _prof_section("moe_shared"):
+                shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
+                out = out + self.shared_down_proj(shared.to(self.dtype)).float()
         return out.reshape(original_shape).to(self.dtype)
 
 
@@ -690,10 +812,12 @@ class GLMDSABlock:
         self.attention.reset_cache(batch_size, max_seq_len)
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        x_attn = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
-        mlp_in = self.ffn_norm(x_attn)
-        mlp_out = self.mlp(mlp_in)
-        return (x_attn + mlp_out).to(self.dtype)
+        with _prof_section("attention"):
+            x_attn = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
+        with _prof_section("mlp"):
+            mlp_in = self.ffn_norm(x_attn)
+            mlp_out = self.mlp(mlp_in)
+            return (x_attn + mlp_out).to(self.dtype)
 
 
 class GLMDSATransformer:
@@ -750,6 +874,7 @@ class GLMDSATransformer:
             head = ", ".join(f"{v:12.4f}" for v in last[:3].tolist())
             print(f"GLM_DUMP {name:16s} sum={tf.sum().item():16.6f}  first3=[{head}]", flush=True)
 
+        _glm_profile_set_phase(int(tokens.size(-1)))
         h = self.embedding(tokens).to(self.dtype)
         _d("embd", h)
         for _li, layer in enumerate(self.layers):

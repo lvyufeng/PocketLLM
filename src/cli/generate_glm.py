@@ -89,6 +89,13 @@ def main(argv: list[str] | None = None) -> None:
         text = decode_glm_dsa_ids(args.gguf_path, generated_ids, skip_special=bool(args.skip_special))
         print("prompt_text=" + repr(prompt_text), flush=True)
         print("generated_text=" + repr(text), flush=True)
+        # Opt-in decode profiler (GLM_PROFILE=1): print the per-section wall-time
+        # breakdown gathered during forward so we can see where per-token time
+        # actually goes before optimizing further.
+        from src.models.glm_dsa.architecture import glm_profile_enabled, glm_profile_report
+
+        if glm_profile_enabled():
+            print(glm_profile_report(), flush=True)
 
 
 if __name__ == "__main__":
