@@ -452,6 +452,25 @@ class GLMDSARawBlockMoE:
         from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
 
         self._type_ids = GGUF_DENSE_TYPE_IDS
+        # Resident staging cache: on first forward we read all local experts'
+        # raw blocks once into contiguous (optionally pinned) CPU tensors, so the
+        # decode hot path only does an index + async H2D instead of re-reading
+        # from mmap + torch.stack + a CPU sync every step/layer.  ~0.77 GB/layer.
+        self._resident_w1: torch.Tensor | None = None
+        self._resident_w3: torch.Tensor | None = None
+        self._resident_w2: torch.Tensor | None = None
+        self._resident_meta: tuple | None = None
+        import os as _os
+
+        # Resident-cache staging is OFF by default: an e2e measurement showed it
+        # does NOT help decode once the page cache is warm (the original per-step
+        # mmap read already hits RAM, so torch.stack and index_select cost the
+        # same ~1.8GB host copy), while the one-time 58GB/rank build regresses
+        # prefill.  Kept as an opt-in experiment switch only.
+        self._disable_resident = _os.getenv("GLM_ENABLE_RESIDENT_EXPERTS", "0") != "1"
+        # Pinning ~58 GB/rank is non-pageable host memory; opt-in only to avoid
+        # over-committing pinned memory across TP ranks.
+        self._pin_resident = _os.getenv("GLM_PIN_RESIDENT_EXPERTS", "0") == "1"
 
     def route(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = x_flat.float() @ self.gate_weight.t()
@@ -464,12 +483,60 @@ class GLMDSARawBlockMoE:
         weights = weights * float(self.args.expert_weights_scale)
         return indices.to(torch.long).contiguous(), weights.float().contiguous()
 
-    def _stage_active_experts(self, reader, local_ids_cpu: list[int]):
-        """Read and stack raw blocks for the active local experts.
+    def _build_resident_experts(self, reader) -> None:
+        """Read this rank's ALL local experts' raw blocks once into contiguous
+        CPU tensors of shape ``[expert_count, N, K_blocks, block_bytes]`` for
+        w1/w3/w2.  Done lazily on first forward so the decode hot path can index
+        + async-H2D instead of re-reading mmap + torch.stack + a CPU sync every
+        step.  ~0.77 GB/layer resident on host (system has ample RAM)."""
+        w1_list, w3_list, w2_list = [], [], []
+        w1_tn = w3_tn = w2_tn = None
+        w1_in = w3_in = w2_in = None
+        for local_id in range(self.expert_count):
+            expert_id = local_id + self.expert_start
+            b1, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+            b3, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+            b2, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+            # Clone: read_routed_expert_blocks returns a view over the shared mmap;
+            # we must own the memory to keep it resident and contiguous.
+            w1_list.append(b1.clone())
+            w3_list.append(b3.clone())
+            w2_list.append(b2.clone())
+        w1 = torch.stack(w1_list, dim=0).contiguous()
+        w3 = torch.stack(w3_list, dim=0).contiguous()
+        w2 = torch.stack(w2_list, dim=0).contiguous()
+        if self._pin_resident:
+            w1 = w1.pin_memory()
+            w3 = w3.pin_memory()
+            w2 = w2.pin_memory()
+        self._resident_w1 = w1
+        self._resident_w3 = w3
+        self._resident_w2 = w2
+        self._resident_meta = (
+            (self._type_ids[w1_tn], int(w1_in)),
+            (self._type_ids[w3_tn], int(w3_in)),
+            (self._type_ids[w2_tn], int(w2_in)),
+        )
 
-        Returns stacked ``[E_active, N, K_blocks, block_bytes]`` tensors for
-        w1/w3/w2 plus their (type_id, in_dim) metadata.
-        """
+    def _stage_active_experts(self, reader, local_ids_cpu: list[int]):
+        """Return stacked ``[E_active, N, K_blocks, block_bytes]`` tensors for
+        w1/w3/w2 plus their (type_id, in_dim) metadata, staged on device.
+
+        Fast path: index the resident CPU cache by the active local ids and do a
+        single async H2D per weight.  Fallback (resident disabled): re-read from
+        mmap + torch.stack every call (original behavior)."""
+        if not self._disable_resident:
+            if self._resident_w1 is None:
+                self._build_resident_experts(reader)
+            idx = torch.as_tensor(local_ids_cpu, dtype=torch.long)
+            w1_cpu = self._resident_w1.index_select(0, idx)
+            w3_cpu = self._resident_w3.index_select(0, idx)
+            w2_cpu = self._resident_w2.index_select(0, idx)
+            w1_blocks = w1_cpu.to(self.device, non_blocking=True).contiguous()
+            w3_blocks = w3_cpu.to(self.device, non_blocking=True).contiguous()
+            w2_blocks = w2_cpu.to(self.device, non_blocking=True).contiguous()
+            return w1_blocks, w3_blocks, w2_blocks, self._resident_meta
+
         w1_vals, w3_vals, w2_vals = [], [], []
         for local_id in local_ids_cpu:
             expert_id = int(local_id) + self.expert_start
