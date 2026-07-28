@@ -88,8 +88,32 @@ class RMSNorm:
         self.weight = weight.float().contiguous()
         self.eps = float(eps)
         self.out_dtype = out_dtype
+        import os as _os
+
+        from src.kernels.cuda_loader import load_cuda_kernel
+
+        # OFF by default: a real e2e showed the fused RMSNorm kernel is neutral
+        # for GLM decode (0.66->0.64 tok/s, within noise) because GLM's per-token
+        # time is ~1.5s, so the ~44ms of fp32 norm ops is only ~3% -- unlike
+        # MiniMax (~100ms/token) where it was ~20% and fusing gave +79%.  Keeping
+        # it off preserves bit-identical greedy output vs the DP4A baseline.
+        # Opt in with GLM_FUSED_RMSNORM=1.
+        self._use_fused = _os.getenv("GLM_FUSED_RMSNORM", "0") == "1"
+        self._cuda = load_cuda_kernel() if self._use_fused else None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_fused
+            and self._cuda is not None
+            and hasattr(self._cuda, "fused_rms_norm_forward")
+            and self.out_dtype == torch.float16
+            and x.is_cuda
+            and x.dim() >= 2
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            x_flat = x.reshape(-1, x.size(-1)).contiguous()
+            y_flat = self._cuda.fused_rms_norm_forward(x_flat, self.weight, self.eps)
+            return y_flat.view(x.shape)
         xf = x.float()
         inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return (xf * inv * self.weight).to(self.out_dtype)
