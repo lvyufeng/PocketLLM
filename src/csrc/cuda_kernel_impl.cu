@@ -6178,16 +6178,21 @@ __device__ __forceinline__ float iq3xxs_block_dot_256(
     const int8_t* __restrict__ signed_grid,
     int lane) {
     const float d = gguf_block_scale_f16(block);
-    const uint8_t* qs = block + 2;
+    // IQ3_XXS block layout (block_iq3_xxs, 98 bytes): [0:2] d, [2:66] grid
+    // indices (8 sub-blocks x 8 bytes), [66:98] aux uint32 (8 x 4 bytes).
+    // The grid-index and aux regions are SEPARATE, not 12-byte interleaved.
+    const uint8_t* qs = block + 2;             // 64 bytes of grid indices
+    const uint8_t* aux_bytes = block + 2 + 64; // 32 bytes of scales_and_signs
     const int8_t* iq3_grid = signed_grid + kIQ2XSSignedGridEntries;
     float acc = 0.0f;
     #pragma unroll
     for (int sub = 0; sub < 8; ++sub) {
-        const uint8_t* qbytes = qs + sub * 12;
-        const uint32_t aux = static_cast<uint32_t>(qbytes[8]) |
-            (static_cast<uint32_t>(qbytes[9]) << 8) |
-            (static_cast<uint32_t>(qbytes[10]) << 16) |
-            (static_cast<uint32_t>(qbytes[11]) << 24);
+        const uint8_t* qbytes = qs + sub * 8;
+        const uint8_t* auxb = aux_bytes + sub * 4;
+        const uint32_t aux = static_cast<uint32_t>(auxb[0]) |
+            (static_cast<uint32_t>(auxb[1]) << 8) |
+            (static_cast<uint32_t>(auxb[2]) << 16) |
+            (static_cast<uint32_t>(auxb[3]) << 24);
         const float scale = 0.5f * d * (static_cast<float>(aux >> 28) + 0.5f);
         #pragma unroll
         for (int part = 0; part < 8; ++part) {

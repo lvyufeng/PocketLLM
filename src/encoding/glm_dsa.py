@@ -83,7 +83,12 @@ def decode_glm_dsa_ids(
 def glm_dsa_context_info(gguf_path: str | Path) -> dict[str, Any]:
     metadata = read_gguf_metadata(gguf_path, keep_array_keys=(), keep_all_scalars=True)
     context_length = context_length_from_metadata(metadata, architecture="glm-dsa")
-    n_layers = metadata_int(metadata, "glm-dsa.block_count", 0)
+    # block_count includes the trailing NextN/MTP block(s), which are
+    # speculative-decode layers and not part of the main transformer trunk.
+    # The runnable trunk depth is block_count - nextn_predict_layers.
+    block_count = metadata_int(metadata, "glm-dsa.block_count", 0)
+    nextn_layers = metadata_int(metadata, "glm-dsa.nextn_predict_layers", 0)
+    n_layers = max(0, block_count - nextn_layers)
     n_kv_heads = metadata_int(metadata, "glm-dsa.attention.head_count_kv", 0)
     head_dim = metadata_int(metadata, "glm-dsa.attention.key_length", 0)
     dtype_bytes = 2

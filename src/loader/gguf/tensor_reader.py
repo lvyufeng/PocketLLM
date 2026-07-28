@@ -709,15 +709,22 @@ class GGUFTensorDataReader:
         blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, 98)
         d = _f16_bytes_to_f32(blocks[:, :, 0:2])
         qs = blocks[:, :, 2:98]
+        # IQ3_XXS block layout (block_iq3_xxs, 98 bytes):
+        #   [0:2]   d (fp16)
+        #   [2:66]  grid indices: 8 sub-blocks x 8 bytes  (QK_K/4 = 64 bytes)
+        #   [66:98] scales_and_signs: 8 sub-blocks x 4 bytes aux uint32 (32 bytes)
+        # The grid-index region and the aux region are SEPARATE, not interleaved.
+        grid_idx = qs[:, :, 0:64]                              # [R, B, 64]
+        aux_bytes = qs[:, :, 64:96]                            # [R, B, 32]
         signed_grid = _iq3xxs_signed_grid()
         out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
         for sub in range(8):
-            qbytes = qs[:, :, sub * 12:sub * 12 + 8]
+            qbytes = grid_idx[:, :, sub * 8:sub * 8 + 8]       # [R, B, 8] grid indices
             aux = (
-                qs[:, :, sub * 12 + 8].astype(np.uint32)
-                | (qs[:, :, sub * 12 + 9].astype(np.uint32) << 8)
-                | (qs[:, :, sub * 12 + 10].astype(np.uint32) << 16)
-                | (qs[:, :, sub * 12 + 11].astype(np.uint32) << 24)
+                aux_bytes[:, :, sub * 4 + 0].astype(np.uint32)
+                | (aux_bytes[:, :, sub * 4 + 1].astype(np.uint32) << 8)
+                | (aux_bytes[:, :, sub * 4 + 2].astype(np.uint32) << 16)
+                | (aux_bytes[:, :, sub * 4 + 3].astype(np.uint32) << 24)
             )
             ls = (aux >> 28).astype(np.float32)
             for part in range(8):

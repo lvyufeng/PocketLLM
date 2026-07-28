@@ -46,7 +46,13 @@ class GLMDSAArgs:
         spec = GLMDSASpec()
         params = spec.parse_params(bundle)
         md = bundle.metadata
-        full_layers = int(params.n_layers)
+        # ``params.n_layers`` is the physical block_count (e.g. 79), which
+        # includes the trailing NextN/MTP block(s).  Those are speculative-decode
+        # layers, not part of the main transformer trunk, and must NOT be run in
+        # the forward residual stream (llama.cpp skips them: "unused tensor
+        # blk.<last>").  The trunk depth is block_count - nextn_predict_layers.
+        nextn_layers = metadata_int(md, "glm-dsa.nextn_predict_layers", 0)
+        full_layers = max(0, int(params.n_layers) - int(nextn_layers))
         requested_layers = full_layers if n_layers is None else int(n_layers)
         return cls(
             n_layers=max(0, min(requested_layers, full_layers)),
@@ -178,6 +184,14 @@ class GLMDSAAttention:
             self.reset_cache(batch_size, max(int(needed_len), max(1, self.cache_len) * 2))
 
     def _apply_rope(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """Apply RoPE using interleaved (NEOX/ROPE_TYPE_NEOX) style.
+
+        GLM-5.2 (glm-dsa) uses interleaved rotary embeddings where adjacent
+        pairs (x[0],x[1]), (x[2],x[3]), ... are rotated together. This is
+        ROPE_TYPE_NEOX=2 in llama.cpp, NOT ROPE_TYPE_NORM (split-half).
+        Verified against llama.cpp golden output: token 1 k_pe element 0
+        transforms -2.0848 → -1.0771 via NEOX rotation, NOT split-half.
+        """
         rope_dim = int(self.args.rope_dim)
         if rope_dim < 2:
             return x
@@ -188,13 +202,16 @@ class GLMDSAAttention:
         freqs = positions[:, None] * inv[None, :]
         sin = torch.sin(freqs).to(x.dtype)[None, :, None, :]
         cos = torch.cos(freqs).to(x.dtype)[None, :, None, :]
-        x1 = x[..., :half]
-        x2 = x[..., half:rope_dim]
+        # Interleaved: pair adjacent elements (x[2i], x[2i+1])
+        x1 = x[..., 0::2][..., :half]   # even indices
+        x2 = x[..., 1::2][..., :half]   # odd indices
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
+        # Interleave y1/y2 back: (y1[0], y2[0], y1[1], y2[1], ...)
+        y = torch.stack((y1, y2), dim=-1).flatten(-2)   # [..., rope_dim]
         if rope_dim < x.size(-1):
-            return torch.cat((y1, y2, x[..., rope_dim:]), dim=-1)
-        return torch.cat((y1, y2), dim=-1)
+            return torch.cat((y, x[..., rope_dim:]), dim=-1)
+        return y
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
@@ -620,10 +637,28 @@ class GLMDSATransformer:
             tokens = tokens.to(self.device)
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
+        import os as _os
+
+        _dump = bool(_os.environ.get("GLM_DUMP_LAYERS"))
+
+        def _d(name: str, t: torch.Tensor) -> None:
+            # Per-layer numeric dump for cross-checking against a reference
+            # implementation (e.g. llama.cpp eval-callback). Prints sum + first
+            # 3 values of the last position, matching the reference format.
+            if not _dump:
+                return
+            tf = t.detach().float()
+            last = tf[0, -1] if tf.dim() == 3 else tf.reshape(-1)
+            head = ", ".join(f"{v:12.4f}" for v in last[:3].tolist())
+            print(f"GLM_DUMP {name:16s} sum={tf.sum().item():16.6f}  first3=[{head}]", flush=True)
+
         h = self.embedding(tokens).to(self.dtype)
-        for layer in self.layers:
+        _d("embd", h)
+        for _li, layer in enumerate(self.layers):
             h = layer(h, int(start_pos))
+            _d(f"l_out-{_li}", h)
         h = self.final_norm(h)
+        _d("result_norm", h)
         logits_input = h if keep_all_positions else h[:, -1:, :]
         logits = self.lm_head(logits_input).float()
         if return_next_token:

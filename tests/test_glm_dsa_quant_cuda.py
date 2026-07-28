@@ -157,6 +157,41 @@ def test_glm_iq4_xs_reference_decode() -> None:
 
 
 @pytest.mark.skipif(
+    not REAL_GLM_PATH.exists(),
+    reason="real GLM GGUF not available",
+)
+def test_glm_iq3_xxs_reference_decode_golden() -> None:
+    """IQ3_XXS reference decode must match llama.cpp block layout.
+
+    The ``block_iq3_xxs`` layout stores 64 bytes of grid indices followed by
+    32 bytes of aux (scales_and_signs) as SEPARATE regions, not interleaved
+    12-byte sub-blocks.  Decoding with the interleaved layout mixes grid
+    indices with sign/scale bytes and corrupts the down-projection (verified
+    against the llama.cpp golden l_out-3, which regressed from 1.5% -> 27%
+    relative error when this layout was wrong).  These golden values are
+    captured from the corrected decode of blk.3 expert 0 (down, iq3_xxs).
+    """
+    bundle = read_gguf_bundle(REAL_GLM_PATH)
+    tensor = bundle.tensors_by_name[IQ3_XXS_ROUTED]
+    assert tensor.type_name == "iq3_xxs"
+    reader = GGUFTensorDataReader(tensor.shard_path)
+    try:
+        ref = reader.read_routed_expert(tensor.name, 0, 0, 8).float()
+    finally:
+        reader.close()
+
+    expected_row0 = torch.tensor(
+        [-0.001674, -0.001674, 0.001674, 0.008369, 0.001674, -0.001674, -0.011717, 0.005021],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(ref[0, :8], expected_row0, atol=1.0e-5), (
+        f"IQ3_XXS decode row0 {ref[0, :8].tolist()} != golden {expected_row0.tolist()} "
+        "(check block_iq3_xxs grid/aux layout)"
+    )
+    assert abs(float(ref.sum()) - (-0.535039)) < 1.0e-3, f"IQ3_XXS decode sum {float(ref.sum())} != golden -0.535039"
+
+
+@pytest.mark.skipif(
     not (REAL_GLM_PATH.exists() and _cuda_gemm_available()),
     reason="real GLM GGUF or CUDA extension not available",
 )
