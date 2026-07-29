@@ -553,6 +553,8 @@ class GLMDSARawBlockMoE:
         dtype: torch.dtype = torch.float16,
         expert_start: int = 0,
         expert_count: int | None = None,
+        inter_start: int = 0,
+        inter_count: int | None = None,
         swiglu_limit: float = -1.0,
     ):
         self.args = args
@@ -577,6 +579,33 @@ class GLMDSARawBlockMoE:
                 f"invalid GLM-DSA local expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
                 f"for expert_count={args.n_routed_experts}"
             )
+        # Routed TP: when inter_count is set this rank owns ALL experts
+        # (expert_start=0, expert_count=n_routed_experts) but only the inter
+        # (feed-forward) slice [inter_start, inter_start+inter_count).  w13 is
+        # sliced along its out_dim rows; w2 keeps only the corresponding block
+        # columns of every output row.  The per-layer all_reduce in __call__
+        # then sums the partial-inter contributions across ranks.  When
+        # inter_count is None this is the original EP path (per-rank expert
+        # range, full inter).  Both share the same grouped CUDA kernel; only the
+        # staged tensor shapes differ.
+        self.inter_start = int(inter_start)
+        self.inter_count = None if inter_count is None else int(inter_count)
+        self._tp_routed = self.inter_count is not None
+        if self._tp_routed:
+            moe_inter = int(args.moe_inter_dim)
+            if self.inter_start % 256 != 0 or int(self.inter_count) % 256 != 0:
+                raise ValueError(
+                    f"GLM routed TP inter slice [{self.inter_start}, "
+                    f"{self.inter_start + int(self.inter_count)}) is not 256-block aligned"
+                )
+            if self.inter_start < 0 or self.inter_start + int(self.inter_count) > moe_inter:
+                raise ValueError(
+                    f"GLM routed TP inter slice [{self.inter_start}, "
+                    f"{self.inter_start + int(self.inter_count)}) outside moe_inter_dim={moe_inter}"
+                )
+            # w2 block-column range: iq3_xxs blocks are 256 elems along inter.
+            self._w2_block_start = self.inter_start // 256
+            self._w2_block_end = (self.inter_start + int(self.inter_count)) // 256
         self._grid = signed_grid.to(device=device, dtype=torch.int8).contiguous()
         from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
 
@@ -613,6 +642,12 @@ class GLMDSARawBlockMoE:
         # same ~1.8GB host copy), while the one-time 58GB/rank build regresses
         # prefill.  Kept as an opt-in experiment switch only.
         self._disable_resident = _os.getenv("GLM_ENABLE_RESIDENT_EXPERTS", "0") != "1"
+        # The resident cache stages whole experts (full inter dimension), which
+        # is incompatible with TP inter-slicing.  Force it off under TP so the
+        # fallback per-step slicing path is always used (resident is a default-
+        # off perf experiment that measured no decode win anyway).
+        if self._tp_routed:
+            self._disable_resident = True
         # Pinning ~58 GB/rank is non-pageable host memory; opt-in only to avoid
         # over-committing pinned memory across TP ranks.
         self._pin_resident = _os.getenv("GLM_PIN_RESIDENT_EXPERTS", "0") == "1"
@@ -691,11 +726,32 @@ class GLMDSARawBlockMoE:
 
         with _prof_section("stage_read"):
             w1_vals, w3_vals, w2_vals = [], [], []
+            tp = getattr(self, "_tp_routed", False)
             for local_id in local_ids_cpu:
                 expert_id = int(local_id) + self.expert_start
-                w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
-                w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
-                w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+                if tp:
+                    # w13 out_dim == inter: slice the [inter_start, +inter_count)
+                    # output rows (a contiguous row range the reader supports and
+                    # only reads 1/world of the bytes).  in_dim stays == dim.
+                    w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(
+                        self.w1_name, expert_id,
+                        row_start=self.inter_start, row_count=int(self.inter_count),
+                    )
+                    w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(
+                        self.w3_name, expert_id,
+                        row_start=self.inter_start, row_count=int(self.inter_count),
+                    )
+                    # w2 in_dim == inter: slicing inter means keeping only the
+                    # matching block-columns of every output row.  Read the full
+                    # (page-cache-resident) view, then keep [w2_block_start,
+                    # w2_block_end) block columns.  Effective in_dim = inter_count.
+                    w2_full, w2_tn, _w2_in_full = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+                    w2_b = w2_full[:, self._w2_block_start:self._w2_block_end, :].contiguous()
+                    w2_in = int(self.inter_count)
+                else:
+                    w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+                    w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+                    w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
                 w1_vals.append((w1_b, w1_tn, w1_in))
                 w3_vals.append((w3_b, w3_tn, w3_in))
                 w2_vals.append((w2_b, w2_tn, w2_in))

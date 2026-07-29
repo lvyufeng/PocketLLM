@@ -41,6 +41,8 @@ class GLMDSAGGUFModelLoader:
         allow_moe_layers: bool = False,
         expert_start: int = 0,
         expert_count: int | None = None,
+        inter_start: int = 0,
+        inter_count: int | None = None,
         use_raw_block_moe: bool = True,
         world: int = 1,
         rank: int = 0,
@@ -66,6 +68,9 @@ class GLMDSAGGUFModelLoader:
                 f"invalid GLM-DSA expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
                 f"for expert_count={self.args.n_routed_experts}"
             )
+        # Routed TP inter-dim slice (None => EP / full inter dimension).
+        self.inter_start = int(inter_start)
+        self.inter_count = None if inter_count is None else int(inter_count)
         self._readers: dict[str, GGUFTensorDataReader] = {}
 
     def close(self) -> None:
@@ -290,6 +295,14 @@ class GLMDSAGGUFModelLoader:
                 dtype=self.dtype,
                 expert_start=self.expert_start,
                 expert_count=self.expert_count,
+                inter_start=self.inter_start,
+                inter_count=self.inter_count,
+            )
+        if self.inter_count is not None:
+            raise NotImplementedError(
+                "GLM routed TP (inter-dim slicing) requires the raw-block MoE path; "
+                "the reference GLMDSAMoE fallback does not support it. "
+                "Set GLM_ROUTED_TP=0 (EP) or do not force GLM_FORCE_REF_MOE."
             )
         return GLMDSAMoE(
             self.args,
@@ -390,6 +403,8 @@ def load_glm_dsa_gguf_model(
     allow_moe_layers: bool = False,
     expert_start: int = 0,
     expert_count: int | None = None,
+    inter_start: int = 0,
+    inter_count: int | None = None,
     world: int = 1,
     rank: int = 0,
     use_raw_block_moe: bool = True,
@@ -403,6 +418,8 @@ def load_glm_dsa_gguf_model(
         allow_moe_layers=allow_moe_layers,
         expert_start=expert_start,
         expert_count=expert_count,
+        inter_start=inter_start,
+        inter_count=inter_count,
         world=world,
         rank=rank,
         use_raw_block_moe=use_raw_block_moe,
@@ -425,6 +442,8 @@ def load_glm_dsa_gguf_model(
         "allow_moe_layers": bool(allow_moe_layers),
         "expert_start": int(loader.expert_start),
         "expert_count": int(loader.expert_count),
+        "inter_start": int(loader.inter_start),
+        "inter_count": (None if loader.inter_count is None else int(loader.inter_count)),
         "world": int(loader.world),
         "rank": int(loader.rank),
         "lm_head_out_dim": int(model.lm_head.out_dim),
