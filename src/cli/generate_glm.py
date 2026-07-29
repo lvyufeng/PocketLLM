@@ -84,16 +84,24 @@ def main(argv: list[str] | None = None) -> None:
 
     # run_gguf_generation returns the ids+stats on rank 0 and None elsewhere,
     # so only rank 0 reaches the decode/print below.
+    # Opt-in decode profiler (GLM_PROFILE=1). The per-section wall-time breakdown
+    # is printed on rank 0 (which holds `result`); the EP rank-skew line is per
+    # rank (no collective), so every rank prints its own so we can compare the
+    # local-active-expert means across ranks to size the TP-vs-EP opportunity.
+    from src.models.glm_dsa.architecture import (
+        glm_profile_enabled,
+        glm_profile_report,
+        glm_profile_skew_report,
+    )
+
+    if glm_profile_enabled():
+        print(glm_profile_skew_report(), flush=True)
+
     if result is not None:
         generated_ids, _stats = result
         text = decode_glm_dsa_ids(args.gguf_path, generated_ids, skip_special=bool(args.skip_special))
         print("prompt_text=" + repr(prompt_text), flush=True)
         print("generated_text=" + repr(text), flush=True)
-        # Opt-in decode profiler (GLM_PROFILE=1): print the per-section wall-time
-        # breakdown gathered during forward so we can see where per-token time
-        # actually goes before optimizing further.
-        from src.models.glm_dsa.architecture import glm_profile_enabled, glm_profile_report
-
         if glm_profile_enabled():
             print(glm_profile_report(), flush=True)
 

@@ -60,9 +60,23 @@ def glm_profile_enabled() -> bool:
     return _GLM_PROFILE
 
 
+# Per-(phase) tally of how many local experts each MoE layer activated, so we
+# can quantify TP rank-skew: at decode T=1 the top_k=8 experts scatter across
+# the 4 EP ranks unevenly, and the slowest rank's staging gates the per-layer
+# all_reduce.  Recording the local active count per layer-call lets us report
+# the distribution (and, gathered across ranks, the per-step max-vs-mean skew).
+_GLM_PROFILE_ACTIVE: list[int] = []
+
+
+def _glm_profile_record_active(n_local: int) -> None:
+    if _GLM_PROFILE and _GLM_PROFILE_PHASE == "decode":
+        _GLM_PROFILE_ACTIVE.append(int(n_local))
+
+
 def glm_profile_reset() -> None:
     _GLM_PROFILE_TOTALS.clear()
     _GLM_PROFILE_COUNTS.clear()
+    _GLM_PROFILE_ACTIVE.clear()
 
 
 def glm_profile_report() -> str:
@@ -77,6 +91,31 @@ def glm_profile_report() -> str:
         pct = 100.0 * secs / total if total else 0.0
         lines.append(f"  {name:20s} {secs:9.4f}s  {n:6d}x  {per:8.3f}ms  {pct:5.1f}%")
     return "\n".join(lines)
+
+
+def glm_profile_skew_report() -> str:
+    """Quantify EP rank-skew from THIS rank's samples only (no collective, so it
+    is safe to call after the process group is torn down).  At decode T=1 the
+    top_k=8 experts scatter unevenly across the 4 EP ranks; the slowest
+    (max-active) rank's staging gates that layer's all_reduce.  Each rank prints
+    its own mean/max/min local active count tagged by rank; comparing the four
+    lines gives the cross-rank skew (max-rank-mean / avg-rank-mean)."""
+    local = list(_GLM_PROFILE_ACTIVE)
+    if not local:
+        return "  [skew] no decode activation samples"
+    # RANK from the env is stable even after the process group is destroyed.
+    rank = int(_os.environ.get("RANK", "0"))
+    import statistics
+    mean = statistics.fmean(local)
+    mx = max(local)
+    mn = min(local)
+    # top_k=8 is the global activation budget; on 4 ranks a perfectly balanced
+    # (TP) split would stage 8/world per rank each layer.
+    return (
+        f"  [skew] rank={rank} decode layer-calls={len(local)} "
+        f"local_active mean={mean:.3f} min={mn} max={mx} "
+        f"(TP-balanced would be top_k/world; compare mean across the 4 rank lines)"
+    )
 
 
 @dataclass(frozen=True)
@@ -669,6 +708,10 @@ class GLMDSARawBlockMoE:
                 w3_host = torch.stack([v[0] for v in w3_vals], dim=0)
                 w2_host = torch.stack([v[0] for v in w2_vals], dim=0)
         with _prof_section("stage_h2d"):
+            # Three independent small H2D copies. A merged single-H2D variant was
+            # tried (GLM_MERGED_H2D) and REGRESSED: the host torch.cat memcpy of
+            # ~1.8MB costs more than the 2 launches it saves (stage_h2d 4->12ms),
+            # so decode staging is not launch-overhead bound. Kept as 3 copies.
             w1_blocks = w1_host.to(self.device, non_blocking=True).contiguous()
             w3_blocks = w3_host.to(self.device, non_blocking=True).contiguous()
             w2_blocks = w2_host.to(self.device, non_blocking=True).contiguous()
@@ -722,9 +765,11 @@ class GLMDSARawBlockMoE:
             return out
         local_ids, route_tokens, route_weights, seg_starts = grouped
         if local_ids.numel() == 0:
+            _glm_profile_record_active(0)
             return out
         with _prof_section("moe_ids_sync"):
             local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+        _glm_profile_record_active(len(local_ids_cpu))
 
         with _prof_section("moe_stage_experts"):
             reader = get_cached_gguf_tensor_reader(self.gguf_path)
