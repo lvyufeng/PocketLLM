@@ -274,20 +274,57 @@ class GLMDSASpec:
         from src.models.glm_dsa.gguf_model import load_glm_dsa_gguf_model
 
         _ = gpu_memory_gib
+        import os as _os
         leading_dense = self.leading_dense_layers(bundle)
         effective_layers = int(leading_dense if n_layers is None else n_layers)
         allow_moe_layers = effective_layers > leading_dense
-        expert_total = int(self.parse_params(bundle).n_routed_experts)
-        if allow_moe_layers:
+        params = self.parse_params(bundle)
+        expert_total = int(params.n_routed_experts)
+        moe_inter = int(params.expert_intermediate_size)
+        # Routed-expert sharding mode.  EP (expert-parallel, the default) shards
+        # the expert range across ranks; TP (tensor-parallel, opt-in via
+        # ``GLM_ROUTED_TP=1``) keeps all experts on every rank but slices the
+        # inter (feed-forward) dimension.
+        #
+        # TP was expected to win by removing the per-layer EP rank-skew wait on
+        # the all_reduce, and it DOES eliminate the skew (all_reduce 5.75ms ->
+        # 0.24ms/token, every rank perfectly balanced at 8/8 active).  But the
+        # measured e2e is a NET REGRESSION (decode 0.60 -> 0.54 tok/s): staging
+        # each rank's active experts grows from ~2 (EP) to all 8 (TP), and
+        # warm-cache stage_read is per-expert-call-bound, so it grows 5.46 ->
+        # 12.91ms/token (+7.5ms) and swamps the 5.5ms skew win.  So TP is kept
+        # OFF by default; the code path is retained (numerically validated) as an
+        # opt-in for the case where staging is later made call-count-cheap.
+        # At world==1 there is no skew to remove, so TP never engages.
+        routed_tp = _os.getenv("GLM_ROUTED_TP", "0") == "1" and int(world) > 1
+        if allow_moe_layers and routed_tp:
+            # TP: all experts local (router drops nothing), slice inter per rank.
+            expert_start = 0
+            expert_count = expert_total
+            inter_start = (moe_inter * int(rank)) // int(world)
+            inter_end = (moe_inter * (int(rank) + 1)) // int(world)
+            inter_count: int | None = inter_end - inter_start
+            # iq2_xs/iq3_xxs blocks are 256 elements; the inter slice must land
+            # on whole-block boundaries so the block-internal decode is unchanged.
+            if inter_start % 256 != 0 or int(inter_count) % 256 != 0:
+                raise ValueError(
+                    f"GLM routed TP inter slice [{inter_start}, {inter_end}) for "
+                    f"moe_inter={moe_inter}, world={world} is not 256-block aligned"
+                )
+        elif allow_moe_layers:
+            # EP: contiguous expert range per rank, full inter dimension.
             expert_start = (expert_total * int(rank)) // int(world)
             expert_end = (expert_total * (int(rank) + 1)) // int(world)
             expert_count = expert_end - expert_start
+            inter_start = 0
+            inter_count = None
         else:
             expert_start = 0
             expert_count = 0
+            inter_start = 0
+            inter_count = None
 
         t_load = time.perf_counter()
-        import os as _os
         _use_raw = not bool(_os.environ.get("GLM_FORCE_REF_MOE"))
         model, _info = load_glm_dsa_gguf_model(
             bundle,
@@ -297,6 +334,8 @@ class GLMDSASpec:
             allow_moe_layers=allow_moe_layers,
             expert_start=expert_start,
             expert_count=expert_count,
+            inter_start=int(inter_start),
+            inter_count=inter_count,
             world=int(world),
             rank=int(rank),
             use_raw_block_moe=_use_raw,

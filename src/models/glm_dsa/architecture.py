@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import os as _os
+import time as _time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -11,6 +14,108 @@ from src.components.gguf.tp_logits import distributed_argmax_local_logits, gathe
 from src.components.moe.spec import metadata_float, metadata_int
 from src.loader.gguf.bundle import GGUFBundle
 from src.models.glm_dsa.spec import GLMDSASpec
+
+
+# ---------------------------------------------------------------------------
+# Opt-in decode profiler (GLM_PROFILE=1). Accumulates wall time per named
+# section, synchronizing CUDA around each so the numbers are real (not just
+# launch-queue time). Zero overhead when disabled: _prof_section short-circuits
+# before touching the clock or the CUDA device. Print the breakdown via
+# glm_profile_report() (the CLI does this on rank 0 after decode).
+# ---------------------------------------------------------------------------
+_GLM_PROFILE = _os.getenv("GLM_PROFILE", "0") == "1"
+_GLM_PROFILE_TOTALS: dict[str, float] = {}
+_GLM_PROFILE_COUNTS: dict[str, int] = {}
+_GLM_PROFILE_PHASE = "decode"
+
+
+def _glm_profile_set_phase(seqlen: int) -> None:
+    # seqlen==1 is a decode step; anything longer is prefill. Sections are keyed
+    # by phase so the prefill forward's per-layer time does not skew the decode
+    # per-call averages (decode is what we're optimizing).
+    global _GLM_PROFILE_PHASE
+    _GLM_PROFILE_PHASE = "decode" if int(seqlen) == 1 else "prefill"
+
+
+@contextmanager
+def _prof_section(name: str):
+    if not _GLM_PROFILE:
+        yield
+        return
+    key = f"{_GLM_PROFILE_PHASE}.{name}"
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = _time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dt = _time.perf_counter() - t0
+        _GLM_PROFILE_TOTALS[key] = _GLM_PROFILE_TOTALS.get(key, 0.0) + dt
+        _GLM_PROFILE_COUNTS[key] = _GLM_PROFILE_COUNTS.get(key, 0) + 1
+
+
+def glm_profile_enabled() -> bool:
+    return _GLM_PROFILE
+
+
+# Per-(phase) tally of how many local experts each MoE layer activated, so we
+# can quantify TP rank-skew: at decode T=1 the top_k=8 experts scatter across
+# the 4 EP ranks unevenly, and the slowest rank's staging gates the per-layer
+# all_reduce.  Recording the local active count per layer-call lets us report
+# the distribution (and, gathered across ranks, the per-step max-vs-mean skew).
+_GLM_PROFILE_ACTIVE: list[int] = []
+
+
+def _glm_profile_record_active(n_local: int) -> None:
+    if _GLM_PROFILE and _GLM_PROFILE_PHASE == "decode":
+        _GLM_PROFILE_ACTIVE.append(int(n_local))
+
+
+def glm_profile_reset() -> None:
+    _GLM_PROFILE_TOTALS.clear()
+    _GLM_PROFILE_COUNTS.clear()
+    _GLM_PROFILE_ACTIVE.clear()
+
+
+def glm_profile_report() -> str:
+    if not _GLM_PROFILE_TOTALS:
+        return "GLM_PROFILE: no sections recorded"
+    lines = ["GLM_PROFILE per-section totals (seconds / calls / ms-per-call):"]
+    total = sum(_GLM_PROFILE_TOTALS.values())
+    for name in sorted(_GLM_PROFILE_TOTALS, key=lambda k: -_GLM_PROFILE_TOTALS[k]):
+        secs = _GLM_PROFILE_TOTALS[name]
+        n = _GLM_PROFILE_COUNTS.get(name, 0)
+        per = 1000.0 * secs / n if n else 0.0
+        pct = 100.0 * secs / total if total else 0.0
+        lines.append(f"  {name:20s} {secs:9.4f}s  {n:6d}x  {per:8.3f}ms  {pct:5.1f}%")
+    return "\n".join(lines)
+
+
+def glm_profile_skew_report() -> str:
+    """Quantify EP rank-skew from THIS rank's samples only (no collective, so it
+    is safe to call after the process group is torn down).  At decode T=1 the
+    top_k=8 experts scatter unevenly across the 4 EP ranks; the slowest
+    (max-active) rank's staging gates that layer's all_reduce.  Each rank prints
+    its own mean/max/min local active count tagged by rank; comparing the four
+    lines gives the cross-rank skew (max-rank-mean / avg-rank-mean)."""
+    local = list(_GLM_PROFILE_ACTIVE)
+    if not local:
+        return "  [skew] no decode activation samples"
+    # RANK from the env is stable even after the process group is destroyed.
+    rank = int(_os.environ.get("RANK", "0"))
+    import statistics
+    mean = statistics.fmean(local)
+    mx = max(local)
+    mn = min(local)
+    # top_k=8 is the global activation budget; on 4 ranks a perfectly balanced
+    # (TP) split would stage 8/world per rank each layer.
+    return (
+        f"  [skew] rank={rank} decode layer-calls={len(local)} "
+        f"local_active mean={mean:.3f} min={mn} max={mx} "
+        f"(TP-balanced would be top_k/world; compare mean across the 4 rank lines)"
+    )
 
 
 @dataclass(frozen=True)
@@ -88,8 +193,32 @@ class RMSNorm:
         self.weight = weight.float().contiguous()
         self.eps = float(eps)
         self.out_dtype = out_dtype
+        import os as _os
+
+        from src.kernels.cuda_loader import load_cuda_kernel
+
+        # OFF by default: a real e2e showed the fused RMSNorm kernel is neutral
+        # for GLM decode (0.66->0.64 tok/s, within noise) because GLM's per-token
+        # time is ~1.5s, so the ~44ms of fp32 norm ops is only ~3% -- unlike
+        # MiniMax (~100ms/token) where it was ~20% and fusing gave +79%.  Keeping
+        # it off preserves bit-identical greedy output vs the DP4A baseline.
+        # Opt in with GLM_FUSED_RMSNORM=1.
+        self._use_fused = _os.getenv("GLM_FUSED_RMSNORM", "0") == "1"
+        self._cuda = load_cuda_kernel() if self._use_fused else None
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self._use_fused
+            and self._cuda is not None
+            and hasattr(self._cuda, "fused_rms_norm_forward")
+            and self.out_dtype == torch.float16
+            and x.is_cuda
+            and x.dim() >= 2
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            x_flat = x.reshape(-1, x.size(-1)).contiguous()
+            y_flat = self._cuda.fused_rms_norm_forward(x_flat, self.weight, self.eps)
+            return y_flat.view(x.shape)
         xf = x.float()
         inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return (xf * inv * self.weight).to(self.out_dtype)
@@ -424,6 +553,8 @@ class GLMDSARawBlockMoE:
         dtype: torch.dtype = torch.float16,
         expert_start: int = 0,
         expert_count: int | None = None,
+        inter_start: int = 0,
+        inter_count: int | None = None,
         swiglu_limit: float = -1.0,
     ):
         self.args = args
@@ -448,10 +579,85 @@ class GLMDSARawBlockMoE:
                 f"invalid GLM-DSA local expert range [{self.expert_start}, {self.expert_start + self.expert_count}) "
                 f"for expert_count={args.n_routed_experts}"
             )
+        # Routed TP: when inter_count is set this rank owns ALL experts
+        # (expert_start=0, expert_count=n_routed_experts) but only the inter
+        # (feed-forward) slice [inter_start, inter_start+inter_count).  w13 is
+        # sliced along its out_dim rows; w2 keeps only the corresponding block
+        # columns of every output row.  The per-layer all_reduce in __call__
+        # then sums the partial-inter contributions across ranks.  When
+        # inter_count is None this is the original EP path (per-rank expert
+        # range, full inter).  Both share the same grouped CUDA kernel; only the
+        # staged tensor shapes differ.
+        self.inter_start = int(inter_start)
+        self.inter_count = None if inter_count is None else int(inter_count)
+        self._tp_routed = self.inter_count is not None
+        if self._tp_routed:
+            moe_inter = int(args.moe_inter_dim)
+            if self.inter_start % 256 != 0 or int(self.inter_count) % 256 != 0:
+                raise ValueError(
+                    f"GLM routed TP inter slice [{self.inter_start}, "
+                    f"{self.inter_start + int(self.inter_count)}) is not 256-block aligned"
+                )
+            if self.inter_start < 0 or self.inter_start + int(self.inter_count) > moe_inter:
+                raise ValueError(
+                    f"GLM routed TP inter slice [{self.inter_start}, "
+                    f"{self.inter_start + int(self.inter_count)}) outside moe_inter_dim={moe_inter}"
+                )
+            # w2 block-column range: iq3_xxs blocks are 256 elems along inter.
+            self._w2_block_start = self.inter_start // 256
+            self._w2_block_end = (self.inter_start + int(self.inter_count)) // 256
         self._grid = signed_grid.to(device=device, dtype=torch.int8).contiguous()
         from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
 
         self._type_ids = GGUF_DENSE_TYPE_IDS
+        # Resident staging cache: on first forward we read all local experts'
+        # raw blocks once into contiguous (optionally pinned) CPU tensors, so the
+        # decode hot path only does an index + async H2D instead of re-reading
+        # from mmap + torch.stack + a CPU sync every step/layer.  ~0.77 GB/layer.
+        self._resident_w1: torch.Tensor | None = None
+        self._resident_w3: torch.Tensor | None = None
+        self._resident_w2: torch.Tensor | None = None
+        self._resident_meta: tuple | None = None
+        # Reusable pinned host staging buffers (fallback path). The active expert
+        # SET changes every step so we cannot cache contents, but we CAN reuse a
+        # small pinned buffer (<=top_k experts, ~tens of MB) so each step's H2D is
+        # a fast pinned->GPU DMA instead of a pageable copy. Keyed by active count
+        # + block shape; rebuilt only when those change (rare at decode).  This is
+        # NOT the forbidden full-mmap pin: it is a bounded per-layer buffer.
+        self._pin_stage_w1: torch.Tensor | None = None
+        self._pin_stage_w3: torch.Tensor | None = None
+        self._pin_stage_w2: torch.Tensor | None = None
+        self._pin_stage_key: tuple | None = None
+        import os as _os
+        # Pinned staging is OFF by default: a profiled e2e showed the per-expert
+        # copy into pinned host memory (stage_read) costs more than the faster
+        # pinned->GPU DMA (stage_h2d) saves — a net staging regression.  The mmap
+        # page-cache read into pinned is no cheaper than into pageable, so there
+        # is no free lunch here.  Kept as an opt-in experiment switch only.
+        self._use_pinned_stage = _os.getenv("GLM_PINNED_STAGE", "0") == "1"
+
+        # Resident-cache staging is OFF by default: an e2e measurement showed it
+        # does NOT help decode once the page cache is warm (the original per-step
+        # mmap read already hits RAM, so torch.stack and index_select cost the
+        # same ~1.8GB host copy), while the one-time 58GB/rank build regresses
+        # prefill.  Kept as an opt-in experiment switch only.
+        self._disable_resident = _os.getenv("GLM_ENABLE_RESIDENT_EXPERTS", "0") != "1"
+        # The resident cache stages whole experts (full inter dimension), which
+        # is incompatible with TP inter-slicing.  Force it off under TP so the
+        # fallback per-step slicing path is always used (resident is a default-
+        # off perf experiment that measured no decode win anyway).
+        if self._tp_routed:
+            self._disable_resident = True
+        # Pinning ~58 GB/rank is non-pageable host memory; opt-in only to avoid
+        # over-committing pinned memory across TP ranks.
+        self._pin_resident = _os.getenv("GLM_PIN_RESIDENT_EXPERTS", "0") == "1"
+        # GLM routed experts are iq2_xs (w1/w3) + iq3_xxs (w2); enable their
+        # DP4A grouped-MoE kernels by default (numerically parity-checked vs the
+        # fp32 general branch).  The CUDA kernel reads these env gates, so set
+        # them here unless the user explicitly opted out with "0".
+        for _flag in ("DEEPSEEK_GGUF_IQ2_XS_W13_DP4A", "DEEPSEEK_GGUF_IQ3_XXS_W2_DP4A"):
+            if _os.getenv(_flag) is None:
+                _os.environ[_flag] = "1"
 
     def route(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = x_flat.float() @ self.gate_weight.t()
@@ -464,30 +670,136 @@ class GLMDSARawBlockMoE:
         weights = weights * float(self.args.expert_weights_scale)
         return indices.to(torch.long).contiguous(), weights.float().contiguous()
 
-    def _stage_active_experts(self, reader, local_ids_cpu: list[int]):
-        """Read and stack raw blocks for the active local experts.
+    def _build_resident_experts(self, reader) -> None:
+        """Read this rank's ALL local experts' raw blocks once into contiguous
+        CPU tensors of shape ``[expert_count, N, K_blocks, block_bytes]`` for
+        w1/w3/w2.  Done lazily on first forward so the decode hot path can index
+        + async-H2D instead of re-reading mmap + torch.stack + a CPU sync every
+        step.  ~0.77 GB/layer resident on host (system has ample RAM)."""
+        w1_list, w3_list, w2_list = [], [], []
+        w1_tn = w3_tn = w2_tn = None
+        w1_in = w3_in = w2_in = None
+        for local_id in range(self.expert_count):
+            expert_id = local_id + self.expert_start
+            b1, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+            b3, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+            b2, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+            # Clone: read_routed_expert_blocks returns a view over the shared mmap;
+            # we must own the memory to keep it resident and contiguous.
+            w1_list.append(b1.clone())
+            w3_list.append(b3.clone())
+            w2_list.append(b2.clone())
+        w1 = torch.stack(w1_list, dim=0).contiguous()
+        w3 = torch.stack(w3_list, dim=0).contiguous()
+        w2 = torch.stack(w2_list, dim=0).contiguous()
+        if self._pin_resident:
+            w1 = w1.pin_memory()
+            w3 = w3.pin_memory()
+            w2 = w2.pin_memory()
+        self._resident_w1 = w1
+        self._resident_w3 = w3
+        self._resident_w2 = w2
+        self._resident_meta = (
+            (self._type_ids[w1_tn], int(w1_in)),
+            (self._type_ids[w3_tn], int(w3_in)),
+            (self._type_ids[w2_tn], int(w2_in)),
+        )
 
-        Returns stacked ``[E_active, N, K_blocks, block_bytes]`` tensors for
-        w1/w3/w2 plus their (type_id, in_dim) metadata.
-        """
-        w1_vals, w3_vals, w2_vals = [], [], []
-        for local_id in local_ids_cpu:
-            expert_id = int(local_id) + self.expert_start
-            w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
-            w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
-            w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
-            w1_vals.append((w1_b, w1_tn, w1_in))
-            w3_vals.append((w3_b, w3_tn, w3_in))
-            w2_vals.append((w2_b, w2_tn, w2_in))
-        w1_blocks = torch.stack([v[0] for v in w1_vals], dim=0).to(self.device, non_blocking=True).contiguous()
-        w3_blocks = torch.stack([v[0] for v in w3_vals], dim=0).to(self.device, non_blocking=True).contiguous()
-        w2_blocks = torch.stack([v[0] for v in w2_vals], dim=0).to(self.device, non_blocking=True).contiguous()
+    def _stage_active_experts(self, reader, local_ids_cpu: list[int]):
+        """Return stacked ``[E_active, N, K_blocks, block_bytes]`` tensors for
+        w1/w3/w2 plus their (type_id, in_dim) metadata, staged on device.
+
+        Fast path: index the resident CPU cache by the active local ids and do a
+        single async H2D per weight.  Fallback (resident disabled): re-read from
+        mmap + torch.stack every call (original behavior)."""
+        if not self._disable_resident:
+            if self._resident_w1 is None:
+                self._build_resident_experts(reader)
+            idx = torch.as_tensor(local_ids_cpu, dtype=torch.long)
+            w1_cpu = self._resident_w1.index_select(0, idx)
+            w3_cpu = self._resident_w3.index_select(0, idx)
+            w2_cpu = self._resident_w2.index_select(0, idx)
+            w1_blocks = w1_cpu.to(self.device, non_blocking=True).contiguous()
+            w3_blocks = w3_cpu.to(self.device, non_blocking=True).contiguous()
+            w2_blocks = w2_cpu.to(self.device, non_blocking=True).contiguous()
+            return w1_blocks, w3_blocks, w2_blocks, self._resident_meta
+
+        with _prof_section("stage_read"):
+            w1_vals, w3_vals, w2_vals = [], [], []
+            tp = getattr(self, "_tp_routed", False)
+            for local_id in local_ids_cpu:
+                expert_id = int(local_id) + self.expert_start
+                if tp:
+                    # w13 out_dim == inter: slice the [inter_start, +inter_count)
+                    # output rows (a contiguous row range the reader supports and
+                    # only reads 1/world of the bytes).  in_dim stays == dim.
+                    w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(
+                        self.w1_name, expert_id,
+                        row_start=self.inter_start, row_count=int(self.inter_count),
+                    )
+                    w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(
+                        self.w3_name, expert_id,
+                        row_start=self.inter_start, row_count=int(self.inter_count),
+                    )
+                    # w2 in_dim == inter: slicing inter means keeping only the
+                    # matching block-columns of every output row.  Read the full
+                    # (page-cache-resident) view, then keep [w2_block_start,
+                    # w2_block_end) block columns.  Effective in_dim = inter_count.
+                    w2_full, w2_tn, _w2_in_full = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+                    w2_b = w2_full[:, self._w2_block_start:self._w2_block_end, :].contiguous()
+                    w2_in = int(self.inter_count)
+                else:
+                    w1_b, w1_tn, w1_in = reader.read_routed_expert_blocks(self.w1_name, expert_id)
+                    w3_b, w3_tn, w3_in = reader.read_routed_expert_blocks(self.w3_name, expert_id)
+                    w2_b, w2_tn, w2_in = reader.read_routed_expert_blocks(self.w2_name, expert_id)
+                w1_vals.append((w1_b, w1_tn, w1_in))
+                w3_vals.append((w3_b, w3_tn, w3_in))
+                w2_vals.append((w2_b, w2_tn, w2_in))
+            if getattr(self, "_use_pinned_stage", False):
+                w1_host = self._fill_pinned_stage("w1", [v[0] for v in w1_vals])
+                w3_host = self._fill_pinned_stage("w3", [v[0] for v in w3_vals])
+                w2_host = self._fill_pinned_stage("w2", [v[0] for v in w2_vals])
+            else:
+                w1_host = torch.stack([v[0] for v in w1_vals], dim=0)
+                w3_host = torch.stack([v[0] for v in w3_vals], dim=0)
+                w2_host = torch.stack([v[0] for v in w2_vals], dim=0)
+        with _prof_section("stage_h2d"):
+            # Three independent small H2D copies. A merged single-H2D variant was
+            # tried (GLM_MERGED_H2D) and REGRESSED: the host torch.cat memcpy of
+            # ~1.8MB costs more than the 2 launches it saves (stage_h2d 4->12ms),
+            # so decode staging is not launch-overhead bound. Kept as 3 copies.
+            w1_blocks = w1_host.to(self.device, non_blocking=True).contiguous()
+            w3_blocks = w3_host.to(self.device, non_blocking=True).contiguous()
+            w2_blocks = w2_host.to(self.device, non_blocking=True).contiguous()
         meta = (
             (self._type_ids[w1_vals[0][1]], int(w1_vals[0][2])),
             (self._type_ids[w3_vals[0][1]], int(w3_vals[0][2])),
             (self._type_ids[w2_vals[0][1]], int(w2_vals[0][2])),
         )
         return w1_blocks, w3_blocks, w2_blocks, meta
+
+    def _fill_pinned_stage(self, which: str, blocks: list[torch.Tensor]) -> torch.Tensor:
+        """Copy per-expert raw-block views into a reusable pinned host tensor and
+        return it.  The pinned buffer makes the subsequent H2D a fast DMA; it is
+        reused across steps whenever the active-expert count and block shape match
+        (the common decode case), so we avoid re-pinning every step."""
+        n = len(blocks)
+        b0 = blocks[0]
+        key = (which, n, tuple(b0.shape), b0.dtype)
+        attr = f"_pin_stage_{which}"
+        buf = getattr(self, attr)
+        # w1/w3/w2 shapes are stable per layer; track the active key per buffer.
+        keys = getattr(self, "_pin_stage_keys", None)
+        if keys is None:
+            keys = {}
+            self._pin_stage_keys = keys
+        if buf is None or keys.get(which) != key:
+            buf = torch.empty((n, *b0.shape), dtype=b0.dtype).pin_memory()
+            setattr(self, attr, buf)
+            keys[which] = key
+        for i, b in enumerate(blocks):
+            buf[i].copy_(b)
+        return buf
 
     def _routed_forward(self, x_flat: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
         from src.kernels.cuda_loader import load_cuda_kernel
@@ -498,21 +810,26 @@ class GLMDSARawBlockMoE:
             raise RuntimeError("CUDA grouped MoE kernel is required for GLMDSARawBlockMoE")
 
         out = torch.zeros((x_flat.size(0), self.args.dim), device=x_flat.device, dtype=torch.float32)
-        grouped = cuda_mod.moe_group_routes(
-            indices.contiguous(),
-            weights.contiguous().to(torch.float32),
-            int(self.expert_start),
-            int(self.expert_count),
-        )
+        with _prof_section("moe_route_group"):
+            grouped = cuda_mod.moe_group_routes(
+                indices.contiguous(),
+                weights.contiguous().to(torch.float32),
+                int(self.expert_start),
+                int(self.expert_count),
+            )
         if grouped is None:
             return out
         local_ids, route_tokens, route_weights, seg_starts = grouped
         if local_ids.numel() == 0:
+            _glm_profile_record_active(0)
             return out
-        local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+        with _prof_section("moe_ids_sync"):
+            local_ids_cpu = local_ids.detach().cpu().to(torch.long).tolist()
+        _glm_profile_record_active(len(local_ids_cpu))
 
-        reader = get_cached_gguf_tensor_reader(self.gguf_path)
-        w1_blocks, w3_blocks, w2_blocks, meta = self._stage_active_experts(reader, local_ids_cpu)
+        with _prof_section("moe_stage_experts"):
+            reader = get_cached_gguf_tensor_reader(self.gguf_path)
+            w1_blocks, w3_blocks, w2_blocks, meta = self._stage_active_experts(reader, local_ids_cpu)
         (w1_type_id, w1_in_dim), (w3_type_id, w3_in_dim), (w2_type_id, w2_in_dim) = meta
 
         seg_i32 = seg_starts if seg_starts.dtype == torch.int32 else seg_starts.to(torch.int32)
@@ -520,7 +837,8 @@ class GLMDSARawBlockMoE:
             [seg_i32[local_ids.to(seg_i32.device)], seg_i32[-1:]], dim=0
         ).contiguous()
 
-        y = cuda_mod.gguf_moe_prefill_grouped_forward(
+        with _prof_section("moe_kernel"):
+          y = cuda_mod.gguf_moe_prefill_grouped_forward(
             x_flat.to(torch.float16).contiguous(),
             route_tokens,
             route_weights.contiguous(),
@@ -544,15 +862,18 @@ class GLMDSARawBlockMoE:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         x_flat = x.reshape(-1, original_shape[-1]).contiguous()
-        indices, weights = self.route(x_flat)
+        with _prof_section("moe_route"):
+            indices, weights = self.route(x_flat)
         out = self._routed_forward(x_flat, indices, weights)
 
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            dist.all_reduce(out)
+            with _prof_section("moe_all_reduce"):
+                dist.all_reduce(out)
 
         if self.shared_gate_proj is not None and self.shared_up_proj is not None and self.shared_down_proj is not None:
-            shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
-            out = out + self.shared_down_proj(shared.to(self.dtype)).float()
+            with _prof_section("moe_shared"):
+                shared = F.silu(self.shared_gate_proj(x_flat).float()) * self.shared_up_proj(x_flat).float()
+                out = out + self.shared_down_proj(shared.to(self.dtype)).float()
         return out.reshape(original_shape).to(self.dtype)
 
 
@@ -592,10 +913,12 @@ class GLMDSABlock:
         self.attention.reset_cache(batch_size, max_seq_len)
 
     def __call__(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
-        x_attn = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
-        mlp_in = self.ffn_norm(x_attn)
-        mlp_out = self.mlp(mlp_in)
-        return (x_attn + mlp_out).to(self.dtype)
+        with _prof_section("attention"):
+            x_attn = (x + self.attention(self.attn_norm(x), start_pos)).to(self.dtype)
+        with _prof_section("mlp"):
+            mlp_in = self.ffn_norm(x_attn)
+            mlp_out = self.mlp(mlp_in)
+            return (x_attn + mlp_out).to(self.dtype)
 
 
 class GLMDSATransformer:
@@ -652,6 +975,7 @@ class GLMDSATransformer:
             head = ", ".join(f"{v:12.4f}" for v in last[:3].tolist())
             print(f"GLM_DUMP {name:16s} sum={tf.sum().item():16.6f}  first3=[{head}]", flush=True)
 
+        _glm_profile_set_phase(int(tokens.size(-1)))
         h = self.embedding(tokens).to(self.dtype)
         _d("embd", h)
         for _li, layer in enumerate(self.layers):
