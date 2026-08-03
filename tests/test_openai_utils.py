@@ -1,6 +1,6 @@
 import json
 
-from src.encoding.dsv4 import REASONING_EFFORT_MAX, encode_messages
+from src.encoding.dsv4 import REASONING_EFFORT_PROMPTS, encode_messages
 from src.server.openai import (
     _completion_response,
     _make_payload,
@@ -130,10 +130,27 @@ def test_make_payload_accepts_top_level_reasoning_effort_max():
 
 def test_encode_messages_injects_prefix_only_for_reasoning_effort_max():
     messages = [{"role": "user", "content": "hello"}]
-    max_prompt = encode_messages(messages, thinking_mode="thinking", reasoning_effort="max")
-    high_prompt = encode_messages(messages, thinking_mode="thinking", reasoning_effort="high")
-    assert REASONING_EFFORT_MAX in max_prompt
-    assert REASONING_EFFORT_MAX not in high_prompt
+
+    def prompt(effort):
+        return encode_messages(messages, thinking_mode="thinking", reasoning_effort=effort)
+
+    assert REASONING_EFFORT_PROMPTS["max"] in prompt("max")
+    assert REASONING_EFFORT_PROMPTS["high"] in prompt("high")
+    assert REASONING_EFFORT_PROMPTS["max"] not in prompt("high")
+    # DeepSeek-V4 only defines low/high/max; None and OpenAI's extra levels all
+    # fall back to low, which prepends nothing at all.
+    for effort in (None, "low", "minimal", "medium"):
+        assert REASONING_EFFORT_PROMPTS["high"] not in prompt(effort)
+        assert REASONING_EFFORT_PROMPTS["max"] not in prompt(effort)
+    assert prompt(None) == prompt("low") == prompt("minimal") == prompt("medium")
+
+
+def test_encode_messages_ignores_reasoning_effort_in_chat_mode():
+    messages = [{"role": "user", "content": "hello"}]
+    for effort in (None, "low", "high", "max"):
+        chat_prompt = encode_messages(messages, thinking_mode="chat", reasoning_effort=effort)
+        assert REASONING_EFFORT_PROMPTS["high"] not in chat_prompt
+        assert REASONING_EFFORT_PROMPTS["max"] not in chat_prompt
 
 
 def test_make_payload_accepts_common_openai_params():
