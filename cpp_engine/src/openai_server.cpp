@@ -326,22 +326,31 @@ struct OpenAIServer::Impl {
         generated.reserve(static_cast<size_t>(max_tokens));
         size_t sent_offset = 0;  // bytes of decode_tokens(generated) already sent
 
+        // In thinking mode the prompt ends with <think>, so the completion starts
+        // inside the reasoning block and switches to the answer at the first
+        // </think>. Splitting on the token id rather than the decoded text keeps
+        // each stream's UTF-8 decoding self-contained and cannot be fooled by a
+        // model that writes the literal characters.
+        const int think_end_id = engine.tokenizer().token_id("</think>");
+        bool in_reasoning = (thinking_mode == "thinking");
+
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, max_tokens, sp, thinking_mode, id, created, model, eos_id,
-             generated, sent_offset]
+            [this, enc, max_tokens, sp, id, created, model, eos_id, think_end_id,
+             generated, sent_offset, in_reasoning]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             engine.worker_command_reset();
             engine.reset_session();
 
-            auto send_chunk = [&](const std::string& delta, const char* finish_reason = nullptr) {
+            auto send_chunk = [&](const std::string& delta, const char* field,
+                                  const char* finish_reason = nullptr) {
                 std::ostringstream os;
                 os << "{\"id\":\"" << id << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << model << "\""
                    << ",\"choices\":[{\"index\":0,\"delta\":{";
                 if (!delta.empty()) {
-                    os << "\"content\":\"" << json_escape(delta) << "\"";
+                    os << "\"" << field << "\":\"" << json_escape(delta) << "\"";
                 }
                 os << "}";
                 if (finish_reason != nullptr) {
@@ -369,10 +378,6 @@ struct OpenAIServer::Impl {
             bool hit_eos = (token == eos_id);
             int position = static_cast<int>(enc.token_ids.size());
             int decoded_count = 0;
-            if (!hit_eos) {
-                generated.push_back(token);
-                ++decoded_count;
-            }
 
             auto emit_delta = [&]() {
                 const std::string full = engine.tokenizer().decode_tokens(generated);
@@ -381,19 +386,36 @@ struct OpenAIServer::Impl {
                 auto [complete, leftover] = split_utf8_complete(candidate);
                 if (!complete.empty()) {
                     sent_offset += complete.size();
-                    send_chunk(complete);
+                    send_chunk(complete, in_reasoning ? "reasoning_content" : "content");
                 }
             };
 
-            emit_delta();
+            // Closing the reasoning block restarts the delta window: the marker
+            // itself belongs to neither stream, and dropping the tokens before it
+            // keeps decode_tokens() cheap on long generations.
+            auto accept = [&](int tok) {
+                if (in_reasoning && tok == think_end_id) {
+                    emit_delta();
+                    generated.clear();
+                    sent_offset = 0;
+                    in_reasoning = false;
+                    return;
+                }
+                generated.push_back(tok);
+                emit_delta();
+            };
+
+            if (!hit_eos) {
+                accept(token);
+                ++decoded_count;
+            }
 
             for (int step = 1; step < max_tokens && !hit_eos; ++step) {
                 engine.worker_command_decode(token, position + step - 1);
                 token = engine.decode_step(token, position + step - 1, sp);
                 if (token == eos_id) { hit_eos = true; break; }
-                generated.push_back(token);
+                accept(token);
                 ++decoded_count;
-                emit_delta();
             }
 
             // Flush any remaining tail bytes (e.g. an isolated partial sequence
@@ -404,12 +426,12 @@ struct OpenAIServer::Impl {
                 if (full.size() > sent_offset) {
                     std::string tail = full.substr(sent_offset);
                     sent_offset += tail.size();
-                    send_chunk(tail);
+                    send_chunk(tail, in_reasoning ? "reasoning_content" : "content");
                 }
             }
 
             // Final chunk with finish_reason.
-            send_chunk("", hit_eos ? "stop" : "length");
+            send_chunk("", "content", hit_eos ? "stop" : "length");
             const std::string done = "data: [DONE]\n\n";
             sink.write(done.data(), done.size());
             sink.done();

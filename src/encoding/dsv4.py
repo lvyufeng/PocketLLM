@@ -61,11 +61,30 @@ tool_output_template: str = (
     "<tool_result>{content}</tool_result>"
 )
 
-REASONING_EFFORT_MAX = (
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-)
+# Reasoning effort levels. In thinking mode, the prompt for the selected level is
+# prepended at the very beginning of the conversation. `low` is the default and
+# adds nothing.
+REASONING_EFFORT_PROMPTS: Dict[str, str] = {
+    "low": "",
+    "high": (
+        "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+        "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+        "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
+    ),
+    "max": (
+        "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+        "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+        "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
+    ),
+}
+DEFAULT_REASONING_EFFORT = "low"
+
+# OpenAI clients send effort levels DeepSeek-V4 does not define. Map them onto the
+# nearest official level that is not stronger than what was asked for.
+REASONING_EFFORT_ALIASES: Dict[str, str] = {
+    "minimal": "low",
+    "medium": "low",
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -232,7 +251,8 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         messages: Full list of messages in the conversation.
         thinking_mode: Either "chat" or "thinking".
         drop_thinking: Whether to drop reasoning content from earlier turns.
-        reasoning_effort: Optional reasoning effort level ("minimal", "low", "medium", "high", "max", or None).
+        reasoning_effort: Reasoning effort level. DeepSeek-V4 defines "low",
+            "high", and "max"; None, "minimal", and "medium" map to "low".
 
     Returns:
         Encoded string for this message.
@@ -257,10 +277,14 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     if tool_calls:
         tool_calls = tool_calls_from_openai_format(tool_calls)
 
-    # Reasoning effort prefix (only at index 0 in thinking mode with max effort)
-    assert reasoning_effort in ['max', None, 'minimal', 'low', 'medium', 'high'], f"Invalid reasoning effort: {reasoning_effort}"
-    if index == 0 and thinking_mode == "thinking" and reasoning_effort == 'max':
-        prompt += REASONING_EFFORT_MAX
+    # Reasoning effort prefix (only at index 0 in thinking mode; "low" adds nothing)
+    effort = reasoning_effort or DEFAULT_REASONING_EFFORT
+    effort = REASONING_EFFORT_ALIASES.get(effort, effort)
+    assert effort in REASONING_EFFORT_PROMPTS, \
+        f"Invalid reasoning effort: {reasoning_effort}, expected one of " \
+        f"{list(REASONING_EFFORT_PROMPTS) + list(REASONING_EFFORT_ALIASES)}"
+    if index == 0 and thinking_mode == "thinking":
+        prompt += REASONING_EFFORT_PROMPTS[effort]
 
     if role == "system":
         prompt += system_msg_template.format(content=content or "")
@@ -526,8 +550,10 @@ def encode_messages(
         context: Optional preceding context messages (already encoded prefix).
         drop_thinking: If True, drop reasoning_content from earlier assistant turns
                       (only keep reasoning for messages after the last user message).
+        reasoning_effort: Reasoning effort level. DeepSeek-V4 defines "low",
+            "high", and "max"; None, "minimal", and "medium" map to "low".
+            Only takes effect in thinking mode.
         add_default_bos_token: Whether to prepend BOS token at conversation start.
-        reasoning_effort: Optional reasoning effort level ("minimal", "low", "medium", "high", "max", or None).
 
     Returns:
         The encoded prompt string.

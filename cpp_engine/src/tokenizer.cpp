@@ -191,20 +191,31 @@ Tokenizer::Tokenizer(const std::string& ckpt_dir) {
         }
     }
     if (const JsonValue* added = object_get(root, "added_tokens")) {
+        std::vector<uint8_t> seen;
         for (const JsonValue& item : added->array()) {
             const JsonObject& obj = item.object();
             const JsonValue* id = object_get(obj, "id");
             const JsonValue* content = object_get(obj, "content");
-            if (id != nullptr && content != nullptr) {
-                const uint64_t token_id = json_u64(*id);
-                set_token(id_to_token_, token_id, content->string());
-                token_to_id_[content->string()] = static_cast<int>(token_id);
-                if (token_id >= special_token_ids_.size()) special_token_ids_.resize(static_cast<size_t>(token_id) + 1, 0);
-                if (special_token_ids_[static_cast<size_t>(token_id)] == 0) {
-                    special_token_ids_[static_cast<size_t>(token_id)] = 1;
-                    special_token_id_list_.push_back(static_cast<int>(token_id));
-                }
+            if (id == nullptr || content == nullptr) continue;
+            const uint64_t token_id = json_u64(*id);
+            set_token(id_to_token_, token_id, content->string());
+            token_to_id_[content->string()] = static_cast<int>(token_id);
+
+            // Every added token is atomic for encoding purposes.
+            if (token_id >= seen.size()) seen.resize(static_cast<size_t>(token_id) + 1, 0);
+            if (seen[static_cast<size_t>(token_id)] == 0) {
+                seen[static_cast<size_t>(token_id)] = 1;
+                atomic_token_id_list_.push_back(static_cast<int>(token_id));
             }
+
+            // Only tokens HF itself marks special are stripped from decoded text.
+            // <think>, </think> and ｜DSML｜ carry "special": false precisely
+            // because downstream parsing needs them.
+            const JsonValue* special = object_get(obj, "special");
+            const bool is_special = special != nullptr && special->is_bool() && special->boolean();
+            if (!is_special) continue;
+            if (token_id >= special_token_ids_.size()) special_token_ids_.resize(static_cast<size_t>(token_id) + 1, 0);
+            special_token_ids_[static_cast<size_t>(token_id)] = 1;
         }
     }
 }
@@ -221,7 +232,7 @@ Tokenizer Tokenizer::from_gguf(const GGUFFile& gguf) {
         tok.token_to_id_[tokens[i]] = static_cast<int>(i);
         if (token_types[i] != 1) {
             tok.special_token_ids_[i] = 1;
-            tok.special_token_id_list_.push_back(static_cast<int>(i));
+            tok.atomic_token_id_list_.push_back(static_cast<int>(i));
         }
     }
     int rank = 0;
@@ -245,6 +256,11 @@ std::string Tokenizer::decode_piece(int id) const {
     return s;
 }
 
+int Tokenizer::token_id(const std::string& token) const {
+    const auto it = token_to_id_.find(token);
+    return it == token_to_id_.end() ? -1 : it->second;
+}
+
 bool Tokenizer::is_special_token(int id) const {
     return id >= 0 && static_cast<size_t>(id) < special_token_ids_.size() && special_token_ids_[static_cast<size_t>(id)] != 0;
 }
@@ -254,7 +270,7 @@ std::string Tokenizer::decode_tokens(const std::vector<int>& ids, bool skip_spec
     std::string out;
     for (int id : ids) {
         std::string piece = token(id);
-        if (skip_special_tokens && (is_special_token(id) || (piece.size() >= 2 && piece.front() == '<' && piece.back() == '>'))) continue;
+        if (skip_special_tokens && is_special_token(id)) continue;
         for (size_t i = 0; i < piece.size();) {
             bool matched = false;
             for (const auto& [encoded, byte] : decoder) {
@@ -307,10 +323,10 @@ std::vector<int> Tokenizer::encode_basic(const std::string& text, bool add_bos) 
         }
     };
 
-    auto longest_special_at = [&](size_t pos, int& token_id, size_t& len) -> bool {
+    auto longest_atomic_at = [&](size_t pos, int& token_id, size_t& len) -> bool {
         token_id = -1;
         len = 0;
-        for (int id : special_token_id_list_) {
+        for (int id : atomic_token_id_list_) {
             if (id < 0 || static_cast<size_t>(id) >= id_to_token_.size()) continue;
             const std::string& tok = id_to_token_[static_cast<size_t>(id)];
             if (tok.empty()) continue;
@@ -326,7 +342,7 @@ std::vector<int> Tokenizer::encode_basic(const std::string& text, bool add_bos) 
     for (size_t pos = 0; pos < text.size();) {
         int special_id = -1;
         size_t special_len = 0;
-        if (longest_special_at(pos, special_id, special_len)) {
+        if (longest_atomic_at(pos, special_id, special_len)) {
             if (!segment.empty()) {
                 append_bpe_segment(segment);
                 segment.clear();
