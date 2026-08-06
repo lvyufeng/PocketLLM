@@ -140,6 +140,12 @@ class GPUPrefillMoEBackend:
         self.bucketed_gemm_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_BUCKETED_GEMM", "0").lower() in {"1", "true", "yes"}
         self.fp4_direct_grouped_enabled = os.getenv("DEEPSEEK_GPU_PREFILL_MOE_FP4_DIRECT_GROUPED", "0").lower() in {"1", "true", "yes"}
         self.single_token_group_enabled = os.getenv("DEEPSEEK_GPU_MOE_SINGLE_TOKEN_GROUP", "1").lower() in {"1", "true", "yes"}
+        # Small-batch FP4 path for speculative verify. Without it a k+1 token
+        # verify batch drops out of the single-token FP4 kernel into the prefill
+        # grouped path, which launches over all n_local_experts and restages the
+        # layer as int8; measured at +619ms of MoE for one extra token.
+        self.multi_token_fp4_enabled = os.getenv("DEEPSEEK_GPU_MOE_MULTI_TOKEN_FP4", "0").lower() in {"1", "true", "yes"}
+        self.multi_token_fp4_max_tokens = max(0, int(os.getenv("DEEPSEEK_GPU_MOE_MULTI_TOKEN_FP4_MAX_TOKENS", "8")))
 
     @staticmethod
     def _device_index(device: torch.device) -> int:
@@ -565,6 +571,78 @@ class GPUPrefillMoEBackend:
         the layer-LRU staging in _stage_local_experts."""
         return 0
 
+    def _forward_multi_token_fp4(
+        self,
+        x: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        swiglu_limit: float,
+    ) -> Optional[torch.Tensor]:
+        """Small-batch FP4 MoE over only the experts this batch routes to.
+
+        Returns None when the FP4 arena is unavailable, so the caller falls
+        through to the existing grouped path rather than changing behaviour on
+        int8-only layers.
+
+        The kernel wants routes compacted into (slot -> tokens) form: one slot
+        per distinct local expert, its tokens contiguous. That way the launch
+        scales with the experts the batch touched (~8 for a 6-token verify)
+        instead of with n_local_experts (64).
+        """
+        # The decode-active call site passes indices/weights straight from the
+        # gate without making them contiguous (unlike the prefill call site), so
+        # reshape(-1) is only row-major -- which is what pairs a route with its
+        # token below -- after this.
+        indices = indices.contiguous()
+        weights = weights.contiguous()
+        local_ids = indices.reshape(-1) - self.experts_start_idx
+        mask = (local_ids >= 0) & (local_ids < self.n_local_experts)
+        if not bool(mask.any().item()):
+            return torch.zeros((x.shape[0], self.dim), device=x.device, dtype=torch.float32)
+        tokens, topk = indices.shape
+        pair_tokens = torch.arange(tokens, device=indices.device).repeat_interleave(topk)[mask]
+        pair_experts = local_ids[mask]
+        pair_w = weights.reshape(-1)[mask].to(torch.float32)
+        # stable sort keeps a token's routes in top-k order within a slot, so the
+        # accumulation order matches the single-token kernel's.
+        order = torch.argsort(pair_experts, stable=True)
+        pair_experts = pair_experts[order]
+        pair_tokens = pair_tokens[order].to(torch.int32).contiguous()
+        pair_w = pair_w[order].contiguous()
+        slot_expert, counts = torch.unique_consecutive(pair_experts, return_counts=True)
+        slot_starts = torch.zeros(slot_expert.numel() + 1, dtype=torch.int32, device=x.device)
+        slot_starts[1:] = counts.cumsum(0).to(torch.int32)
+
+        staged_ids = slot_expert.to(torch.long)
+        if self._w1q is None or self._prepared_device != x.device or self._staged_arena_format != "fp4":
+            self._stage_local_experts(x.device, staged_ids)
+        elif len(self._staged_local_experts) < self.n_local_experts:
+            unstaged = [i for i in staged_ids.tolist() if int(i) not in self._staged_local_experts]
+            if unstaged:
+                self._stage_local_experts(
+                    x.device,
+                    torch.tensor(unstaged, device=x.device, dtype=torch.long),
+                )
+        if self._staged_arena_format != "fp4":
+            return None
+        self.wait_for_stage(x.device)
+        self._record_staged_weights_on_current_stream(x.device)
+        self._touch_cache(x.device)
+        return self._cuda_ext.moe_multi_token_fp4_forward(
+            x.contiguous(),
+            slot_expert.to(torch.int32).contiguous(),
+            slot_starts,
+            pair_tokens,
+            pair_w,
+            self._w1q,
+            self._w1s,
+            self._w2q,
+            self._w2s,
+            self._w3q,
+            self._w3s,
+            float(swiglu_limit),
+        )
+
     def forward(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor, swiglu_limit: float) -> torch.Tensor:
         if not x.is_cuda:
             raise RuntimeError("GPU prefill MoE requires CUDA input")
@@ -662,6 +740,15 @@ class GPUPrefillMoEBackend:
                     flush=True,
                 )
             return y
+
+        if (
+            self.multi_token_fp4_enabled
+            and 1 < x.shape[0] <= self.multi_token_fp4_max_tokens
+            and hasattr(self._cuda_ext, "moe_multi_token_fp4_forward")
+        ):
+            y = self._forward_multi_token_fp4(x, indices, weights, swiglu_limit)
+            if y is not None:
+                return y
 
         if hasattr(self._cuda_ext, "moe_group_routes"):
             grouped = self._cuda_ext.moe_group_routes(
