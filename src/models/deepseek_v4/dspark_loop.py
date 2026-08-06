@@ -190,8 +190,12 @@ class DSparkLoop:
                 break
             n_ok += 1
 
-        # Commit the accepted prefix plus the main model's own next token. The
-        # bonus token is what makes the output identical to plain greedy decode.
+        # Commit the accepted prefix plus the main model's own next token. In
+        # exact arithmetic the bonus token makes this equivalent to plain greedy
+        # decode; measured on TP=4 FP4 it is not, because the multi-token verify
+        # forward is not even run-to-run reproducible (docs/dspark.md,
+        # "Output determinism"). That divergence is a property of the batched
+        # attention path, not of this loop or of gating.
         out = torch.cat([self._committed, draft_ids[:, :n_ok]], dim=1)
         self._write_draft_kv(v_hidden[:, :n_ok + 1], self._pos)
         self._pos += n_ok + 1

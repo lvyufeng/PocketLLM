@@ -3,7 +3,12 @@
 DeepSeek-V4-Flash-0731 ships a 3-stage DSpark draft module under `mtp.*`. One
 round drafts `dspark_block_size` (=5) tokens from a single committed token; the
 main model verifies them in one forward and commits the longest matching prefix
-plus one bonus token. Output is identical to plain greedy decoding.
+plus one bonus token.
+
+In exact arithmetic that scheme reproduces plain greedy decoding. On this stack
+it does not, and the cause is upstream of gating -- see
+[Output determinism](#output-determinism) before relying on DSpark output
+matching sequential decode.
 
 All numbers below: TP=4, FP4 active-expert MoE, 4x RTX 2080Ti, routed experts on
 CPU, short prompts (17-22 tokens). Measured 2026-08-05/06.
@@ -141,10 +146,58 @@ FP4 MoE kernel a multi-token verify falls into the prefill grouped MoE path:
 verify goes 850ms -> 3273ms and speculation drops to 0.37x plain decode. That
 kernel is itself default-off.
 
+## Output determinism
+
+Measured on-device (TP=4 FP4, 4x2080Ti, 20 tokens per prompt, three prompts),
+comparing token sequences:
+
+| check | math | code | prose |
+|---|---|---|---|
+| plain vs plain (same input twice) | identical | identical | identical |
+| always-k vs always-k (same input twice) | identical | **diverges at 14** | **diverges at 7** |
+| gated vs always-k | identical | diverges at 14 | identical |
+| always-k vs plain | diverges at 12 | diverges at 5 | identical |
+
+**Sequential decode is reproducible; the multi-token verify forward is not.**
+Running always-k twice on the same prompt with the same weights produced
+different tokens on 2 of 3 prompts. So DSpark output does not match sequential
+decode, and it does not even match itself run to run.
+
+This is upstream of gating. Gating only chooses how many already-drafted tokens
+to submit, and where the verify path is stable (math, prose) gated and always-k
+agree exactly. Where they differ (code, first difference at token 14) always-k
+already differs from itself at the same position, so the divergence cannot be
+attributed to the gate.
+
+Consistent with [`fp4_multi_token_moe_kernel`]: batch-vs-sequential logit drift
+was traced to the batched **attention** path (KV write ordering / indexer), not
+the MoE kernel, and is present with the multi-token kernel off. Speculative
+decoding turns that latent drift into visibly different tokens because the
+accept/reject comparison amplifies it into a discrete decision.
+
+**What this means in practice:** treat DSpark as changing the sampling
+distribution, not as a transparent speedup. It is not safe for workloads
+requiring reproducible output or exact parity with sequential decode. Fixing it
+means fixing multi-token attention determinism, which is out of scope here.
+
+Reproduce with `/tmp/verify_dspark_gate_vs_alwaysk.py` (A/B/C attribution) --
+kept out of the repo because it needs the 167GB checkpoint and 4 GPUs.
+
 ## Tests
 
 - `tests/test_dspark_gate.py` -- decision-rule properties, no GPU needed
 - `tests/test_dspark_gate_replay.py` -- replays `tests/data/dspark_rounds_tp4.json`
   (the 31 measured rounds) and pins the results above
-- On-device A/B lives outside the repo; the replay covers the decision rule but
-  cannot confirm end-to-end token identity.
+- On-device verification: performance gains confirmed (below), token identity
+  disproved (above). The gate's 1.30-1.32x on the hard prompts reproduced live:
+
+| prompt | always-k | gated | |
+|---|---|---|---|
+| math | 3.15 | 4.15 | 1.32x |
+| code | 2.77 | 3.62 | 1.30x |
+| repeat | 4.44 | 4.41 | 0.99x |
+| prose | 3.22 | 3.06 | 0.95x |
+
+The two easy prompts land within noise of always-k rather than exactly equal, as
+the replay predicted -- live accept rates differed from the fixture's, so the
+gate skipped a few rounds it would otherwise have drafted.
