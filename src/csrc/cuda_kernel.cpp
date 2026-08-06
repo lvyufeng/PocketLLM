@@ -141,6 +141,20 @@ torch::Tensor moe_single_token_fp4_forward_cuda(
     int64_t experts_start_idx,
     double swiglu_limit);
 
+torch::Tensor moe_multi_token_fp4_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& slot_expert,
+    const torch::Tensor& slot_starts,
+    const torch::Tensor& slot_tokens,
+    const torch::Tensor& pair_weights,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit);
+
 torch::Tensor moe_single_token_int8_forward_v2_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_to_slot,
@@ -1428,6 +1442,77 @@ torch::Tensor moe_single_token_fp4_forward(
         swiglu_limit);
 }
 
+torch::Tensor moe_multi_token_fp4_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& slot_expert,
+    const torch::Tensor& slot_starts,
+    const torch::Tensor& slot_tokens,
+    const torch::Tensor& pair_weights,
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2, "x must have shape [T, D]");
+    TORCH_CHECK(slot_expert.dim() == 1, "slot_expert must have shape [S]");
+    TORCH_CHECK(slot_starts.dim() == 1, "slot_starts must have shape [S + 1]");
+    TORCH_CHECK(slot_tokens.dim() == 1, "slot_tokens must have shape [P]");
+    TORCH_CHECK(pair_weights.dim() == 1, "pair_weights must have shape [P]");
+    TORCH_CHECK(slot_starts.size(0) == slot_expert.size(0) + 1, "slot_starts must be slot_expert length + 1");
+    TORCH_CHECK(slot_tokens.size(0) == pair_weights.size(0), "slot_tokens/pair_weights length mismatch");
+    TORCH_CHECK(w1q.dim() == 3 && w2q.dim() == 3 && w3q.dim() == 3, "fp4 weights must have shape [E, N, K/2]");
+    TORCH_CHECK(w1s.dim() == 3 && w2s.dim() == 3 && w3s.dim() == 3, "fp4 scales must have shape [E, N, K/32]");
+    TORCH_CHECK(w1q.size(0) == w2q.size(0) && w1q.size(0) == w3q.size(0), "expert count mismatch");
+    TORCH_CHECK(w1q.size(1) == w3q.size(1), "w1/w3 inter_dim mismatch");
+    const int64_t dim = x.size(1);
+    const int64_t inter_dim = w1q.size(1);
+    TORCH_CHECK(dim % 32 == 0, "dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(inter_dim % 32 == 0, "inter_dim must be divisible by 32 for fp4 path");
+    TORCH_CHECK(w1q.size(2) == dim / 2 && w3q.size(2) == dim / 2, "w1/w3 packed K must equal dim/2");
+    TORCH_CHECK(w1s.size(2) == dim / 32 && w3s.size(2) == dim / 32, "w1/w3 scale K must equal dim/32");
+    TORCH_CHECK(w2q.size(1) == dim, "w2 output dim must equal x.dim");
+    TORCH_CHECK(w2q.size(2) == inter_dim / 2, "w2 packed K must equal inter_dim/2");
+    TORCH_CHECK(w2s.size(2) == inter_dim / 32, "w2 scale K must equal inter_dim/32");
+    TORCH_CHECK(w1s.size(1) == w1q.size(1) && w3s.size(1) == w3q.size(1) && w2s.size(1) == w2q.size(1), "scale row count mismatch");
+    TORCH_CHECK(w1s.size(0) == w1q.size(0) && w3s.size(0) == w3q.size(0) && w2s.size(0) == w2q.size(0), "scale expert dim mismatch");
+    TORCH_CHECK(x.is_cuda() && slot_expert.is_cuda() && slot_starts.is_cuda() && slot_tokens.is_cuda() && pair_weights.is_cuda(),
+                "x and route tensors must be CUDA tensors");
+    TORCH_CHECK(w1q.is_cuda() && w1s.is_cuda() && w2q.is_cuda() && w2s.is_cuda() && w3q.is_cuda() && w3s.is_cuda(), "weight tensors must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous() && slot_expert.is_contiguous() && slot_starts.is_contiguous() && slot_tokens.is_contiguous() && pair_weights.is_contiguous(),
+                "x and route tensors must be contiguous");
+    TORCH_CHECK(w1q.is_contiguous() && w1s.is_contiguous() && w2q.is_contiguous() && w2s.is_contiguous() && w3q.is_contiguous() && w3s.is_contiguous(), "weight tensors must be contiguous");
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat16 ||
+        x.scalar_type() == torch::kBFloat16 ||
+        x.scalar_type() == torch::kFloat32,
+        "x must be float16, bfloat16, or float32");
+    TORCH_CHECK(slot_expert.scalar_type() == torch::kInt32, "slot_expert must be int32");
+    TORCH_CHECK(slot_starts.scalar_type() == torch::kInt32, "slot_starts must be int32");
+    TORCH_CHECK(slot_tokens.scalar_type() == torch::kInt32, "slot_tokens must be int32");
+    TORCH_CHECK(pair_weights.scalar_type() == torch::kFloat32, "pair_weights must be float32");
+    check_tensor(w1q, "w1q", torch::kUInt8);
+    check_tensor(w2q, "w2q", torch::kUInt8);
+    check_tensor(w3q, "w3q", torch::kUInt8);
+    check_tensor(w1s, "w1s", torch::kUInt8);
+    check_tensor(w2s, "w2s", torch::kUInt8);
+    check_tensor(w3s, "w3s", torch::kUInt8);
+    return moe_multi_token_fp4_forward_cuda(
+        x,
+        slot_expert,
+        slot_starts,
+        slot_tokens,
+        pair_weights,
+        w1q,
+        w1s,
+        w2q,
+        w2s,
+        w3q,
+        w3s,
+        swiglu_limit);
+}
+
 torch::Tensor moe_single_token_int8_forward_v2(
     const torch::Tensor& x,
     const torch::Tensor& route_to_slot,
@@ -1934,6 +2019,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
+    m.def("moe_multi_token_fp4_forward", &moe_multi_token_fp4_forward, "small-batch top-k MoE FP4 forward, active experts only (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");
     m.def("moe_prefill_fp4_grouped_gemm_forward", &moe_prefill_fp4_grouped_gemm_forward, "prefill MoE grouped-GEMM FP4 forward (CUDA)");

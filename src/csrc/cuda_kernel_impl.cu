@@ -2716,6 +2716,336 @@ torch::Tensor moe_single_token_fp4_forward_cuda(
     return y;
 }
 
+// ---------------------------------------------------------------------------
+// Small-batch (speculative-verify) FP4 MoE.
+//
+// The single-token path above is gated on exactly one token, so a k+1 token
+// verify batch falls into the prefill grouped path, which allocates and
+// launches over ALL n_local_experts (64) even when the batch touches ~8, pads
+// every expert to max_count rows, and uses wmma (measured slower than dp4a for
+// these 2-bit-ish layouts). Measured cost of that fallback: a 2-token decode
+// costs +619ms of MoE over a 1-token decode.
+//
+// Here the unit of work is a (route slot, token) pair drawn from a compacted
+// list of only the experts the batch actually hit. One block handles one
+// (slot, column) tile and walks the tokens routed to that slot, so each
+// weight pack is fetched once and reused across those tokens -- which is the
+// whole point, since these GEMMs are weight-bandwidth bound at small batch.
+//
+// The arithmetic is deliberately identical to the single-token kernels (same
+// dp4a over the same fp4_unpack_4codes_prmt / fp4_block_scale, same per-row
+// int8 activation scaling), so results match the one-token path bit for bit
+// when a batch is fed one token at a time. That matters: the existing
+// FP4_DIRECT_GROUPED kernel is fast at large batch but shifts logits by up to
+// 1.48, which would silently change which draft tokens get accepted.
+// ---------------------------------------------------------------------------
+
+// One block: (slot, column tile). Loops over the slot's tokens.
+__global__ void moe_multi_w1w3_fp4_kernel(
+    const int8_t* __restrict__ x_q,          // [tokens, dim] int8
+    const float* __restrict__ x_scale,       // [tokens]
+    const int32_t* __restrict__ slot_expert, // [slots] local expert id
+    const int32_t* __restrict__ slot_starts, // [slots + 1] into slot_tokens
+    const int32_t* __restrict__ slot_tokens, // [pairs] token row per slot entry
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,            // [pairs, inter_dim]
+    float* __restrict__ up_f32,              // [pairs, inter_dim]
+    int dim,
+    int inter_dim) {
+    const int slot = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int start = slot_starts[slot];
+    const int end = slot_starts[slot + 1];
+    const int n_tok = end - start;
+    if (n_tok <= 0) return;
+    const int local = slot_expert[slot];
+    const int dim_packs = dim / 4;
+    const int blocks_k = dim / 32;
+
+    extern __shared__ int xs_shared[];
+    const uint8_t* w1_row_bytes = w1q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w3_row_bytes = w3q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w1_scale_row = w1s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint8_t* w3_scale_row = w3s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row_bytes);
+    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
+
+    // Tokens are processed kMaxTokens at a time: the accumulators live in
+    // registers, so the tile width is what bounds register pressure. A slot
+    // with more tokens than that just takes another pass over the weights,
+    // which keeps the kernel correct for any batch size instead of silently
+    // dropping rows.
+    constexpr int kMaxTokens = 8;
+    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
+        const int tile = min(kMaxTokens, n_tok - base_t);
+        // Stage this tile's activations once; the K loop below rereads them
+        // for every weight pack.
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * dim_packs; idx += blockDim.x) {
+            const int r = idx / dim_packs;
+            const int pack = idx - r * dim_packs;
+            const int token = slot_tokens[start + base_t + r];
+            xs_shared[idx] = reinterpret_cast<const int*>(
+                x_q + static_cast<int64_t>(token) * dim)[pack];
+        }
+        __syncthreads();
+        if (col >= inter_dim) continue;
+
+        float gate_acc[kMaxTokens];
+        float up_acc[kMaxTokens];
+        #pragma unroll
+        for (int t = 0; t < kMaxTokens; ++t) { gate_acc[t] = 0.0f; up_acc[t] = 0.0f; }
+
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w1_pack = w1_pack_base + kb * 8;
+            const uint16_t* w3_pack = w3_pack_base + kb * 8;
+            int gate_blk[kMaxTokens];
+            int up_blk[kMaxTokens];
+            #pragma unroll
+            for (int t = 0; t < kMaxTokens; ++t) { gate_blk[t] = 0; up_blk[t] = 0; }
+            #pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
+                const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
+                for (int t = 0; t < tile; ++t) {
+                    const int x_p = xs_shared[t * dim_packs + kb * 8 + ip];
+                    gate_blk[t] = __dp4a(x_p, w1_p, gate_blk[t]);
+                    up_blk[t] = __dp4a(x_p, w3_p, up_blk[t]);
+                }
+            }
+            const float w1_s = fp4_block_scale(w1_scale_row[kb]);
+            const float w3_s = fp4_block_scale(w3_scale_row[kb]);
+            for (int t = 0; t < tile; ++t) {
+                gate_acc[t] += static_cast<float>(gate_blk[t]) * w1_s;
+                up_acc[t] += static_cast<float>(up_blk[t]) * w3_s;
+            }
+        }
+        for (int t = 0; t < tile; ++t) {
+            const int pair = start + base_t + t;
+            const float xs = x_scale[slot_tokens[pair]];
+            gate_f32[static_cast<int64_t>(pair) * inter_dim + col] = gate_acc[t] * xs;
+            up_f32[static_cast<int64_t>(pair) * inter_dim + col] = up_acc[t] * xs;
+        }
+    }
+}
+
+// One block per (slot, token) pair, matching the single-token swiglu kernel.
+__global__ void moe_multi_swiglu_quant_fp4_kernel(
+    const float* __restrict__ gate_f32,
+    const float* __restrict__ up_f32,
+    const float* __restrict__ pair_weights, // [pairs] routing weight
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int pairs,
+    int inter_dim,
+    float swiglu_limit) {
+    const int pair = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (pair >= pairs) return;
+    __shared__ float sdata[kQuantThreads];
+    const float route_weight = pair_weights[pair];
+    const int64_t base = static_cast<int64_t>(pair) * inter_dim;
+    float local_max = 0.0f;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[base + col];
+        float up = up_f32[base + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        local_max = fmaxf(local_max, fabsf(silu * up * route_weight));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) hidden_scale[pair] = scale;
+    __syncthreads();
+    const float inv_scale = 1.0f / scale;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[base + col];
+        float up = up_f32[base + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        int q = __float2int_rn(silu * up * route_weight * inv_scale);
+        q = max(-127, min(127, q));
+        hidden_q[base + col] = static_cast<int8_t>(q);
+    }
+}
+
+// Mirrors moe_multi_w1w3: one block per (slot, column tile), looping tokens.
+__global__ void moe_multi_w2_accum_fp4_kernel(
+    const int8_t* __restrict__ hidden_q,     // [pairs, inter_dim]
+    const float* __restrict__ hidden_scale,  // [pairs]
+    const int32_t* __restrict__ slot_expert,
+    const int32_t* __restrict__ slot_starts,
+    const int32_t* __restrict__ slot_tokens,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,                   // [tokens, dim]
+    int dim,
+    int inter_dim) {
+    const int slot = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int start = slot_starts[slot];
+    const int end = slot_starts[slot + 1];
+    const int n_tok = end - start;
+    if (n_tok <= 0) return;
+    const int local = slot_expert[slot];
+    const int packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+
+    extern __shared__ int hs_shared[];
+    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+
+    constexpr int kMaxTokens = 8;
+    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
+        const int tile = min(kMaxTokens, n_tok - base_t);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * packs; idx += blockDim.x) {
+            const int r = idx / packs;
+            const int pack = idx - r * packs;
+            hs_shared[idx] = reinterpret_cast<const int*>(
+                hidden_q + static_cast<int64_t>(start + base_t + r) * inter_dim)[pack];
+        }
+        __syncthreads();
+        if (col >= dim) continue;
+
+        float acc[kMaxTokens];
+        #pragma unroll
+        for (int t = 0; t < kMaxTokens; ++t) acc[t] = 0.0f;
+
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w2_pack = w2_pack_base + kb * 8;
+            int blk[kMaxTokens];
+            #pragma unroll
+            for (int t = 0; t < kMaxTokens; ++t) blk[t] = 0;
+            #pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                for (int t = 0; t < tile; ++t) {
+                    blk[t] = __dp4a(hs_shared[t * packs + kb * 8 + ip], w_p, blk[t]);
+                }
+            }
+            const float w2_s = fp4_block_scale(w2_scale_row[kb]);
+            for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+        }
+        // Different slots can hold the same token (top-k routing), so a token's
+        // partial sums must be combined atomically, exactly as the single-token
+        // kernel accumulates over its routes.
+        for (int t = 0; t < tile; ++t) {
+            const int pair = start + base_t + t;
+            const int token = slot_tokens[pair];
+            atomicAdd(y + static_cast<int64_t>(token) * dim + col, acc[t] * hidden_scale[pair]);
+        }
+    }
+}
+
+torch::Tensor moe_multi_token_fp4_forward_cuda(
+    const torch::Tensor& x,             // [T, dim]
+    const torch::Tensor& slot_expert,   // [S] int32 local expert ids
+    const torch::Tensor& slot_starts,   // [S+1] int32
+    const torch::Tensor& slot_tokens,   // [P] int32 token row per pair
+    const torch::Tensor& pair_weights,  // [P] float32 routing weight
+    const torch::Tensor& w1q,
+    const torch::Tensor& w1s,
+    const torch::Tensor& w2q,
+    const torch::Tensor& w2s,
+    const torch::Tensor& w3q,
+    const torch::Tensor& w3s,
+    double swiglu_limit) {
+    c10::cuda::CUDAGuard device_guard(x.device());
+    const int tokens = static_cast<int>(x.size(0));
+    const int dim = static_cast<int>(x.size(1));
+    const int inter_dim = static_cast<int>(w1q.size(1));
+    const int slots = static_cast<int>(slot_expert.size(0));
+    const int pairs = static_cast<int>(slot_tokens.size(0));
+    auto y = torch::zeros({tokens, dim}, x.options().dtype(torch::kFloat32));
+    if (slots == 0 || pairs == 0) {
+        return y;
+    }
+
+    auto x_contig = x.contiguous();
+    auto x_q = torch::empty({tokens, dim}, x.options().dtype(torch::kInt8));
+    auto x_scale = torch::empty({tokens}, x.options().dtype(torch::kFloat32));
+    auto gate_f32 = torch::empty({pairs, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto up_f32 = torch::empty({pairs, inter_dim}, x.options().dtype(torch::kFloat32));
+    auto hidden_q = torch::empty({pairs, inter_dim}, x.options().dtype(torch::kInt8));
+    auto hidden_scale = torch::empty({pairs}, x.options().dtype(torch::kFloat32));
+
+    // Per-row int8 quantization, same as the single-token path (one row per
+    // block there, `tokens` rows here).
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, x_contig.scalar_type(), "moe_multi_quantize_x_fp4", [&] {
+        quantize_rows_kernel<scalar_t><<<tokens, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+            x_contig.data_ptr<scalar_t>(),
+            x_q.data_ptr<int8_t>(),
+            x_scale.data_ptr<float>(),
+            tokens,
+            1,
+            dim);
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    constexpr int kMultiMaxTokens = 8;
+    const dim3 gemm_block(kGemmThreads);
+    const dim3 w1w3_grid(ceil_div(inter_dim, kGemmThreads), slots);
+    const size_t x_shared_bytes = static_cast<size_t>(kMultiMaxTokens) * (dim / 4) * sizeof(int);
+    moe_multi_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, x_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        x_q.data_ptr<int8_t>(),
+        x_scale.data_ptr<float>(),
+        slot_expert.data_ptr<int32_t>(),
+        slot_starts.data_ptr<int32_t>(),
+        slot_tokens.data_ptr<int32_t>(),
+        w1q.data_ptr<uint8_t>(),
+        w1s.data_ptr<uint8_t>(),
+        w3q.data_ptr<uint8_t>(),
+        w3s.data_ptr<uint8_t>(),
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        dim,
+        inter_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    moe_multi_swiglu_quant_fp4_kernel<<<pairs, kQuantThreads, 0, at::cuda::getCurrentCUDAStream()>>>(
+        gate_f32.data_ptr<float>(),
+        up_f32.data_ptr<float>(),
+        pair_weights.data_ptr<float>(),
+        hidden_q.data_ptr<int8_t>(),
+        hidden_scale.data_ptr<float>(),
+        pairs,
+        inter_dim,
+        static_cast<float>(swiglu_limit));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    const dim3 w2_grid(ceil_div(dim, kGemmThreads), slots);
+    const size_t h_shared_bytes = static_cast<size_t>(kMultiMaxTokens) * (inter_dim / 4) * sizeof(int);
+    moe_multi_w2_accum_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+        hidden_q.data_ptr<int8_t>(),
+        hidden_scale.data_ptr<float>(),
+        slot_expert.data_ptr<int32_t>(),
+        slot_starts.data_ptr<int32_t>(),
+        slot_tokens.data_ptr<int32_t>(),
+        w2q.data_ptr<uint8_t>(),
+        w2s.data_ptr<uint8_t>(),
+        y.data_ptr<float>(),
+        dim,
+        inter_dim);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+}
+
 constexpr int kFp4GroupedCols = 128;
 constexpr int kFp4GroupedRows = 4;
 
