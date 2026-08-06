@@ -532,6 +532,14 @@ class ModelArgs:
     n_hash_layers: int = 0
     n_mtp_layers: int = 1
     n_heads: int = 64
+    # dspark: multi-token draft stages under the mtp.* namespace. All default to
+    # 0/() so a checkpoint without them builds exactly as before; the loader
+    # fills them from the checkpoint's config.json when present.
+    n_dspark_stages: int = 0
+    dspark_block_size: int = 0
+    dspark_target_layer_ids: tuple[int, ...] = ()
+    dspark_markov_rank: int = 0
+    dspark_noise_token_id: int = 0
     # moe
     n_routed_experts: int = 8
     n_shared_experts: int = 1
