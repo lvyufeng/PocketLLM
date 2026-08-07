@@ -117,9 +117,18 @@ gate can decide. Gating avoids verify cost, never the 196ms draft cost. A round
 the gate skips still paid for its draft. Recovered fraction of the always-k ->
 plain gap: prose 44%, math 72%.
 
-Closing it would need a decision made *before* drafting -- e.g. predicting from
-the committed token's own entropy whether drafting is worth attempting. Not
-implemented.
+**Pre-draft gating** addresses this by checking the committed token's entropy
+*before* drafting: if the main model is uncertain about what comes next (high
+entropy in the logit distribution), the draft will be poor and speculation will
+lose even before verify cost. Skipping the round there avoids both draft and
+verify costs. Controlled by `DEEPSEEK_DSPARK_GATE_ENTROPY_THRESHOLD` (default
+3.0): rounds with entropy above this threshold skip drafting entirely and take a
+plain single-token decode step instead. Set to 0 or negative to disable.
+
+The threshold is workload-dependent: easy prompts (repeat, code) rarely hit it
+because the model is confident; hard prompts (math, prose) hit it more often,
+which is exactly when skipping saves the most time. Start with the default 3.0
+and tune based on `entropy_skipped_rounds` in the gate stats.
 
 ## Configuration
 
@@ -129,6 +138,7 @@ should opt in.
 | env var | default | meaning |
 |---|---|---|
 | `DEEPSEEK_DSPARK_GATE` | `0` | enable gating |
+| `DEEPSEEK_DSPARK_GATE_ENTROPY_THRESHOLD` | `3.0` | skip drafting when committed token entropy exceeds this; 0 or negative to disable |
 | `DEEPSEEK_DSPARK_GATE_MARGIN` | `1.15` | truncation must win by this factor |
 | `DEEPSEEK_DSPARK_GATE_MIN_DRAFT` | `0` | never draft fewer than this (0 = no floor) |
 | `DEEPSEEK_DSPARK_GATE_DECAY` | `0.9` | per-round forgetting for workload shifts |

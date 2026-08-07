@@ -120,7 +120,7 @@ class DSparkLoop:
         hidden = None
         if want_hidden and captured:
             hidden = torch.cat([captured[i] for i in self.target_layer_ids], dim=-1)
-        return greedy, hidden
+        return greedy, hidden, logits
 
     @torch.inference_mode()
     def _write_draft_kv(self, main_hidden: torch.Tensor, start_pos: int) -> None:
@@ -151,11 +151,12 @@ class DSparkLoop:
         Returns (first_token, position) where first_token is the main model's
         greedy continuation, exactly as plain decoding would produce.
         """
-        greedy, main_hidden = self._main_forward(tokens, 0, want_hidden=True)
+        greedy, main_hidden, logits = self._main_forward(tokens, 0, want_hidden=True)
         self._write_draft_kv(main_hidden, 0)
         self._pos = tokens.size(1)
         self._committed = greedy[:, -1:]
         self._hidden = main_hidden[:, -1:]
+        self._logits = logits[:, -1:]
         return self._committed, self._pos
 
     @torch.inference_mode()
@@ -165,21 +166,38 @@ class DSparkLoop:
         n_drafted is 0 when the gate chose a plain single-token decode, which is
         the same output path with none of the draft submitted for verification.
         """
-        n = self.gate.choose_draft_len(self.gate_confidence_source())
-        if n == 0:
-            greedy, hidden = self._main_forward(self._committed, self._pos, want_hidden=True)
+        # Pre-draft gating: check if drafting is worth attempting based on the
+        # committed token's uncertainty. If the main model is uncertain about what
+        # comes next, the draft will be poor and speculation will lose to plain
+        # decode even before verify cost.
+        if not self.gate.should_draft(self._logits[:, -1]):
+            greedy, hidden, logits = self._main_forward(self._committed, self._pos, want_hidden=True)
             self._write_draft_kv(hidden, self._pos)
             out = self._committed.clone()
             self._pos += 1
             self._committed = greedy[:, :1]
             self._hidden = hidden[:, :1]
+            self._logits = logits[:, :1]
+            self.gate.note_entropy_skipped_round()
+            self.rounds += 1
+            return out, 0
+
+        n = self.gate.choose_draft_len(self.gate_confidence_source())
+        if n == 0:
+            greedy, hidden, logits = self._main_forward(self._committed, self._pos, want_hidden=True)
+            self._write_draft_kv(hidden, self._pos)
+            out = self._committed.clone()
+            self._pos += 1
+            self._committed = greedy[:, :1]
+            self._hidden = hidden[:, :1]
+            self._logits = logits[:, :1]
             self.gate.note_skipped_round()
             self.rounds += 1
             return out, 0
 
         draft_ids = self._pending_draft[:, :n]
         verify_in = torch.cat([self._committed, draft_ids], dim=1)
-        v_greedy, v_hidden = self._main_forward(verify_in, self._pos, want_hidden=True)
+        v_greedy, v_hidden, v_logits = self._main_forward(verify_in, self._pos, want_hidden=True)
 
         # Longest matching prefix. Position i of the verify output is the main
         # model's prediction for the token after draft position i-1, so draft
@@ -201,6 +219,7 @@ class DSparkLoop:
         self._pos += n_ok + 1
         self._committed = v_greedy[:, n_ok:n_ok + 1]
         self._hidden = v_hidden[:, n_ok:n_ok + 1]
+        self._logits = v_logits[:, n_ok:n_ok + 1]
 
         self.gate.observe(self._pending_conf, n_ok, n)
         self.rounds += 1
