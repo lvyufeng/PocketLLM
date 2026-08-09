@@ -41,6 +41,7 @@ add_library(dsv4_cpp_core STATIC
     src/tensor.cpp
     src/tp_comm.cpp
     src/dsv4_engine.cpp
+    src/dspark_engine.cpp
     src/sampler.cpp
     src/cmd_channel.cpp
     src/python_sidecar.cpp
@@ -108,6 +109,14 @@ set_target_properties(test_safetensors_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_weight_source tests/test_weight_source.cpp)
 target_link_libraries(test_weight_source PRIVATE dsv4_cpp_core)
 set_target_properties(test_weight_source PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_weight_load tests/test_dspark_weight_load.cpp)
+target_link_libraries(test_dspark_weight_load PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_weight_load PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_attention_parity tests/test_dspark_attention_parity.cpp)
+target_link_libraries(test_dspark_attention_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_attention_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_q2_matvec tests/test_q2_matvec.cpp)
 target_link_libraries(test_q2_matvec PRIVATE dsv4_cpp_core)
