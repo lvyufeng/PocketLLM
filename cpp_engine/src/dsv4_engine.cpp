@@ -993,6 +993,7 @@ struct DeviceMoePrefillWorkspace {
 
     void release() {
         cudaFree(fp4.d_x_sorted);
+        cudaFree(fp4.d_partials);
         cudaFree(fp4.d_x_q);
         cudaFree(fp4.d_x_scale);
         cudaFree(fp4.d_x_pad);
@@ -1020,6 +1021,7 @@ struct DeviceMoePrefillWorkspace {
         const size_t padded_dim = static_cast<size_t>(padded_rows_cap) * dim;
         const size_t padded_inter = static_cast<size_t>(padded_rows_cap) * inter_dim;
         check_cuda(cudaMalloc(&fp4.d_x_sorted, routes_dim * sizeof(float)), "cudaMalloc prefill moe x sorted");
+        check_cuda(cudaMalloc(&fp4.d_partials, routes_dim * sizeof(float)), "cudaMalloc prefill moe partials");
         check_cuda(cudaMalloc(&fp4.d_x_q, routes_dim), "cudaMalloc prefill moe x q");
         check_cuda(cudaMalloc(&fp4.d_x_scale, static_cast<size_t>(routes_cap) * sizeof(float)), "cudaMalloc prefill moe x scale");
         check_cuda(cudaMalloc(&fp4.d_x_pad, padded_dim), "cudaMalloc prefill moe x pad");
@@ -2521,6 +2523,11 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_route_indices, routes_cap_chunk * sizeof(int64_t)), "cudaMalloc prefill route indices");
     check_cuda(cudaMalloc(&d_route_weights, routes_cap_chunk * sizeof(float)), "cudaMalloc prefill route weights");
     check_cuda(cudaMalloc(&d_group_route_tokens, routes_cap_chunk * sizeof(int64_t)), "cudaMalloc grouped route tokens");
+    // [chunk_tokens, route_count] slot->route map, used to reduce the MoE w2
+    // output in a fixed order instead of by atomicAdd. Same size as the route
+    // arrays, so it scales linearly with the chunk, not quadratically.
+    int32_t* d_token_slot_routes = nullptr;
+    check_cuda(cudaMalloc(&d_token_slot_routes, routes_cap_chunk * sizeof(int32_t)), "cudaMalloc token slot routes");
     check_cuda(cudaMalloc(&d_group_route_weights, routes_cap_chunk * sizeof(float)), "cudaMalloc grouped route weights");
     check_cuda(cudaMalloc(&d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "cudaMalloc seg starts");
     check_cuda(cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "cudaMalloc route counts");
@@ -2827,7 +2834,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             total_prefill_gate_ms += elapsed_ms(stage_t, Clock::now());
             stage_t = Clock::now();
 
-            if (!moe_group_routes_cuda(d_route_indices, d_route_weights, d_group_route_tokens, d_group_route_weights, d_seg_starts, d_counts, d_offsets, d_total_routes, cn, route_count, expert_start, experts_per_rank)) throw std::runtime_error("prefill group routes launch failed");
+            if (!moe_group_routes_cuda(d_route_indices, d_route_weights, d_group_route_tokens, d_group_route_weights, d_seg_starts, d_counts, d_offsets, d_total_routes, cn, route_count, expert_start, experts_per_rank, d_token_slot_routes)) throw std::runtime_error("prefill group routes launch failed");
             const bool profile_moe_host = profile_forward && env_int_or_default("DSV4_CPP_PROFILE_MOE_HOST", 0) != 0;
             auto moe_host_t0 = Clock::now();
             int32_t total_routes = 0;
@@ -2950,7 +2957,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     check_cuda(cudaStreamWaitEvent(nullptr, prefill_moe_stage_event, 0), "wait prefill moe stage");
                 }
                 auto moe_kernel_t0 = profile_moe_host ? Clock::now() : moe_host_t0;
-                if (!moe_prefill_fp4_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, cn, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit), prefill_moe_workspace.fp4)) throw std::runtime_error("prefill grouped fp4 moe launch failed");
+                if (!moe_prefill_fp4_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, cn, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit), prefill_moe_workspace.fp4, d_token_slot_routes)) throw std::runtime_error("prefill grouped fp4 moe launch failed");
                 if (profile_moe_host) {
                     check_cuda(cudaDeviceSynchronize(), "sync prefill moe kernel host profile");
                     const double moe_kernel_ms = elapsed_ms(moe_kernel_t0, Clock::now());
@@ -3040,7 +3047,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     ctx.last_local_head_start = local_head_start;
 
     cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_attn_out_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
-    cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
+    cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_token_slot_routes); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
     cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_attn_norm_rows); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_q_a_rows); cudaFree(d_q_norm_rows); cudaFree(d_q_rows); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_kv_a_rows); cudaFree(d_kv_norm_rows); cudaFree(d_attn_value); cudaFree(d_attn_value_rows); cudaFree(d_attn_mid); cudaFree(d_attn_mid_rows); cudaFree(d_attn_out); cudaFree(d_prefill_window_indices);
     cudaFree(d_moe_rows); cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden); cudaFree(d_shared_out);
     cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits);

@@ -332,6 +332,9 @@ bool moe_single_token_fp4_cuda_with_workspace(
     MoeSingleTokenFp4Workspace workspace,
     void* stream = nullptr);
 
+// d_token_slot_routes (optional, [tokens, topk]) receives the inverse of
+// d_route_tokens: slot k of token t holds the route id assigned there, or -1
+// when that expert is not local to this rank. Pass nullptr to skip it.
 bool moe_group_routes_cuda(
     const int64_t* d_indices,
     const float* d_weights,
@@ -345,6 +348,7 @@ bool moe_group_routes_cuda(
     int topk,
     int experts_start_idx,
     int n_local_experts,
+    int32_t* d_token_slot_routes = nullptr,
     void* stream = nullptr);
 
 bool moe_prefill_fp4_grouped_cuda(
@@ -381,6 +385,10 @@ struct MoePrefillFp4GroupedWorkspace {
     float* d_hidden_scale = nullptr;
     int32_t* d_tile_experts = nullptr;
     int32_t* d_tile_rows = nullptr;
+    // [routes_cap, dim] scratch for the deterministic reduction. Lives in the
+    // workspace because a per-call cudaMalloc/cudaFree here costs ~19x prefill
+    // throughput -- each pair synchronizes the device inside the layer loop.
+    float* d_partials = nullptr;
     int routes_cap = 0;
     int padded_rows_cap = 0;
     int tile_cap = 0;
@@ -410,6 +418,10 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
     int inter_dim,
     float swiglu_limit,
     MoePrefillFp4GroupedWorkspace workspace,
+    // Optional [tokens, topk] slot->route map from moe_group_routes_cuda. When
+    // present (and topk>=3) the w2 output is reduced in fixed slot order
+    // instead of by atomicAdd, which makes the result reproducible.
+    const int32_t* d_token_slot_routes = nullptr,
     void* stream = nullptr);
 
 bool fp8_e4m3_e8m0_matvec_cuda(
