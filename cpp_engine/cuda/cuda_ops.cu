@@ -767,6 +767,10 @@ __global__ void prefill_causal_attention_chunk_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = start + tid; t <= end; t += blockDim.x) {
@@ -868,6 +872,11 @@ __global__ void prefill_sparse_attention_indexed_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Every thread must have read partial[0] before the denom pass overwrites
+    // partial[tid] below; without this barrier a fast tid=0 clobbers the max
+    // while slower threads are still reading it, which makes the whole kernel
+    // run-to-run nondeterministic.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -1216,6 +1225,10 @@ __global__ void cached_single_token_attention_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < cache_len; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
@@ -1275,6 +1288,10 @@ __global__ void cached_single_token_attention_workspace_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < cache_len; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
@@ -1477,6 +1494,10 @@ __global__ void indexed_cached_single_token_attention_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < index_count; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
