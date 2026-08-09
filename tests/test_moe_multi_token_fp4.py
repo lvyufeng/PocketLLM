@@ -21,6 +21,8 @@ does not tighten it to zero and get a phantom failure.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -94,11 +96,13 @@ def _rel_spread(runs) -> float:
 
 
 def _assert_within_reference_noise(got, want, ref_runs, label: str):
-    """Compare against the reference's own nondeterminism, not a fixed epsilon.
+    """Compare against the reference's own spread, floored at a fixed epsilon.
 
-    atomicAdd makes both kernels order-dependent, and the spread grows with the
-    number of routes summed per token. Demanding better agreement than the
-    reference has with itself would be testing the GPU scheduler.
+    Historically both kernels combined a token's routes with atomicAdd, so the
+    reference disagreed with itself and that spread was the natural bound. The
+    reduction is deterministic now, so the spread term is normally 0 and RTOL
+    carries the bound; the max() is kept so the assertion still adapts if the
+    atomic path is selected via DEEPSEEK_MOE_DETERMINISTIC_REDUCE=0.
     """
     floor = max(_rel_spread(ref_runs), RTOL)
     diff = (got - want).abs()
@@ -334,16 +338,25 @@ def test_agreement_at_production_shapes(tokens):
     ref_runs = [_reference_per_token(x, indices, weights, w, SWIGLU_LIMIT)
                 for _ in range(4)]
     assert got.shape == (tokens, REAL_DIM)
-    # Our own spread counts too: at topk=6 both kernels sum 6 atomicAdd
-    # contributions per output element, and either arm can be the noisier one.
+    # Both kernels are now deterministic (DEEPSEEK_MOE_DETERMINISTIC_REDUCE
+    # defaults on), so run-to-run spread is exactly zero and cannot serve as a
+    # noise floor -- it would collapse the bound onto RTOL and fail a
+    # disagreement that has always been there. Assert reproducibility separately
+    # from magnitude, and bound the magnitude against int8 hidden-state
+    # quantization, which is what actually sets it: the reference requantizes per
+    # token while the kernel requantizes per (slot, token) pair.
     ours = [cuda_kernel.moe_multi_token_fp4_forward(x, *routes, *w, SWIGLU_LIMIT)
             for _ in range(3)]
-    floor = max(_rel_spread(ref_runs), _rel_spread([got] + ours), RTOL)
+    if os.environ.get("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", "1") != "0":
+        assert _rel_spread([got] + ours) == 0.0, (
+            "kernel is not run-to-run reproducible")
+        assert _rel_spread(ref_runs) == 0.0, (
+            "reference is not run-to-run reproducible")
     rel = float(((got - ref_runs[0]).abs()
                  / ref_runs[0].abs().clamp_min(1e-9)).max())
-    assert rel <= floor * 8.0, (
-        f"tokens={tokens} at production shapes: max_rel={rel:.3e} exceeds 8x the "
-        f"measured noise floor ({floor:.3e})")
+    assert rel <= 8e-3, (
+        f"tokens={tokens} at production shapes: max_rel={rel:.3e} exceeds the "
+        f"int8 requantization bound; the batching changed the arithmetic")
 
 
 def test_one_token_per_slot_is_the_single_token_computation():

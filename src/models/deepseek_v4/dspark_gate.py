@@ -36,10 +36,11 @@ per-prompt regression against the current always-draft-k behaviour.
 Pre-draft gating: The confidence score is produced *by* the draft, so gating can
 only avoid the verify cost, never the 196ms draft cost. This is why a skipped
 round still costs draft_ms and the gate cannot fully close the gap to plain
-decode on a hard workload. To close it, the gate also checks the committed
-token's entropy *before* drafting: if the main model is uncertain about what
-comes next, the draft will be poor and speculation will lose even before verify
-cost. Controlled by DEEPSEEK_DSPARK_GATE_ENTROPY_THRESHOLD (default 3.0).
+decode on a hard workload. To close it, the gate checks the committed token's
+logit margin (top1 - top2) *before* drafting: if the main model is uncertain
+about what comes next (small margin), the draft will be poor and speculation
+will lose even before verify cost. Controlled by
+DEEPSEEK_DSPARK_GATE_MARGIN_THRESHOLD (default 0.0 = disabled, set >0 to enable).
 
 See docs/dspark.md for the full measurement tables.
 """
@@ -106,7 +107,7 @@ class DSparkGate:
                  verify_base_ms: float = 300.0, verify_slope_ms: float = 109.0,
                  plain_ms: float = 303.0, margin: float = _MARGIN,
                  min_draft: int = 0, decay: float = _DECAY,
-                 enabled: bool = True, entropy_threshold: float = 3.0):
+                 enabled: bool = True, margin_threshold: float = 0.0):
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}")
         self.block_size = block_size
@@ -118,13 +119,13 @@ class DSparkGate:
         self.min_draft = min_draft
         self.decay = decay
         self.enabled = enabled
-        self.entropy_threshold = entropy_threshold
+        self.margin_threshold = margin_threshold
         # bucket -> [decayed matches, decayed observations]
         self._stats: dict[int, list[float]] = defaultdict(lambda: [0.0, 0.0])
         self.rounds = 0
         self.truncated_rounds = 0
         self.skipped_rounds = 0
-        self.entropy_skipped_rounds = 0
+        self.margin_skipped_rounds = 0
 
     @classmethod
     def from_env(cls, block_size: int) -> "DSparkGate":
@@ -144,7 +145,7 @@ class DSparkGate:
             min_draft=int(_env_float("DEEPSEEK_DSPARK_GATE_MIN_DRAFT", 0)),
             decay=_env_float("DEEPSEEK_DSPARK_GATE_DECAY", _DECAY),
             enabled=_env_flag("DEEPSEEK_DSPARK_GATE"),
-            entropy_threshold=_env_float("DEEPSEEK_DSPARK_GATE_ENTROPY_THRESHOLD", 3.0),
+            margin_threshold=_env_float("DEEPSEEK_DSPARK_GATE_MARGIN_THRESHOLD", 0.0),
         )
 
     def match_prob(self, conf: float) -> float:
@@ -155,18 +156,19 @@ class DSparkGate:
     def should_draft(self, logits: torch.Tensor) -> bool:
         """Whether to attempt drafting based on the committed token's uncertainty.
 
-        If the main model is uncertain (high entropy), the draft will be poor and
-        speculation will lose to plain decode even before verify cost. This check
-        happens before drafting, so skipping here avoids the 196ms draft cost.
+        If the main model is uncertain (small logit margin between top1 and top2),
+        the draft will be poor and speculation will lose to plain decode even
+        before verify cost. This check happens before drafting, so skipping here
+        avoids the 196ms draft cost.
 
         `logits` is the last main-model logits [1, vocab_size] for the committed
-        token, used to compute entropy as a proxy for draft quality.
+        token, used to compute the margin as a proxy for draft quality.
         """
-        if not self.enabled or self.entropy_threshold <= 0:
+        if not self.enabled or self.margin_threshold <= 0:
             return True
-        probs = torch.softmax(logits.float(), dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-        return float(entropy[0]) < self.entropy_threshold
+        top2 = torch.topk(logits[0], k=2, dim=-1).values
+        margin = float(top2[0] - top2[1])
+        return margin >= self.margin_threshold
 
     def choose_draft_len(self, confidence) -> int:
         """How many leading draft tokens to verify. 0 means skip the draft and
@@ -231,11 +233,11 @@ class DSparkGate:
         self.rounds += 1
         self.skipped_rounds += 1
 
-    def note_entropy_skipped_round(self) -> None:
-        """Record that a round was skipped due to high committed-token entropy."""
+    def note_margin_skipped_round(self) -> None:
+        """Record that a round was skipped due to low committed-token margin."""
         self.rounds += 1
         self.skipped_rounds += 1
-        self.entropy_skipped_rounds += 1
+        self.margin_skipped_rounds += 1
 
     def stats(self) -> dict:
         """Diagnostics; the per-bucket rates are what to look at if the gate
@@ -244,7 +246,7 @@ class DSparkGate:
             "rounds": self.rounds,
             "truncated_rounds": self.truncated_rounds,
             "skipped_rounds": self.skipped_rounds,
-            "entropy_skipped_rounds": self.entropy_skipped_rounds,
+            "margin_skipped_rounds": self.margin_skipped_rounds,
             "bucket_rates": {
                 f"[{_BUCKET_EDGES[b]:+.1f},{_BUCKET_EDGES[b + 1]:+.1f})":
                     round(m / n, 3) if n else None

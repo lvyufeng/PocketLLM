@@ -178,7 +178,7 @@ class DSparkLoop:
             self._committed = greedy[:, :1]
             self._hidden = hidden[:, :1]
             self._logits = logits[:, :1]
-            self.gate.note_entropy_skipped_round()
+            self.gate.note_margin_skipped_round()
             self.rounds += 1
             return out, 0
 

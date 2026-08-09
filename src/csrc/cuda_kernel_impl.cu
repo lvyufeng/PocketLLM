@@ -2626,6 +2626,80 @@ __global__ void moe_single_w2_accum_fp4_kernel(
     atomicAdd(y + col, row_acc * hidden_scale[route]);
 }
 
+// Deterministic twin of the kernel above: writes each route's contribution to
+// its own row instead of accumulating them atomically.
+//
+// atomicAdd combines a token's top-k routes in block-completion order, and float
+// addition is not associative, so the same inputs can give different results run
+// to run. Measured on this kernel: topk<=2 is stable (two summands have only one
+// order) but topk>=3 diverged on 60/60 repeats, worst 3.1e-2 absolute (~1e-7
+// relative). n_activated_experts is 6, so the live path is always in the
+// diverging regime. Small enough to rarely flip an argmax, which is why plain
+// decode *looks* reproducible end to end -- but speculative accept/reject turns
+// it into a discrete branch and makes it visible.
+__global__ void moe_single_w2_partial_fp4_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ indices,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ partials,  // [topk, dim]
+    int topk,
+    int experts_start_idx,
+    int n_local_experts,
+    int dim,
+    int inter_dim) {
+    const int route = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (route >= topk) return;
+    const int local = static_cast<int>(indices[route]) - experts_start_idx;
+    // Routes owned by another rank leave their row at the zero it was allocated
+    // with, so the reducer can sum every row unconditionally.
+    if (local < 0 || local >= n_local_experts) return;
+    const int packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+    extern __shared__ int h_shared[];
+    const int* h_i32 = reinterpret_cast<const int*>(hidden_q + route * inter_dim);
+    for (int idx = threadIdx.x; idx < packs; idx += blockDim.x) {
+        h_shared[idx] = h_i32[idx];
+    }
+    __syncthreads();
+    if (col >= dim) return;
+    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+    float row_acc = 0.0f;
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        const uint16_t* w2_pack = w2_pack_base + kb * 8;
+        const int* h_pack = h_shared + kb * 8;
+        int blk = 0;
+        #pragma unroll
+        for (int ip = 0; ip < 8; ++ip) {
+            const uint32_t w_bits = static_cast<uint32_t>(w2_pack[ip]);
+            const int w_p = fp4_unpack_4codes_prmt(w_bits);
+            blk = __dp4a(h_pack[ip], w_p, blk);
+        }
+        row_acc += static_cast<float>(blk) * fp4_block_scale(w2_scale_row[kb]);
+    }
+    partials[static_cast<int64_t>(route) * dim + col] = row_acc * hidden_scale[route];
+}
+
+// Sum the per-route partials in ascending route order. One fixed order for every
+// launch, so the result is bitwise reproducible.
+__global__ void moe_single_reduce_partials_kernel(
+    const float* __restrict__ partials,
+    float* __restrict__ y,
+    int topk,
+    int dim) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    float acc = 0.0f;
+    for (int r = 0; r < topk; ++r) {
+        acc += partials[static_cast<int64_t>(r) * dim + col];
+    }
+    y[col] = acc;
+}
+
 torch::Tensor moe_single_token_fp4_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& indices,
@@ -2700,6 +2774,33 @@ torch::Tensor moe_single_token_fp4_forward_cuda(
 
     const dim3 w2_grid(ceil_div(dim, kGemmThreads), topk);
     const size_t h_shared_bytes = static_cast<size_t>(inter_dim / 4) * sizeof(int);
+    // Deterministic reduction is the default: the atomic version is not run-to-run
+    // reproducible for topk >= 3 (see moe_single_w2_partial_fp4_kernel). The extra
+    // cost is a [topk, dim] fp32 buffer -- 6*4096*4B = 98KB at the live config --
+    // plus one lightweight reduce launch. Set the env var to 0 to compare.
+    if (env_int_default("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", 1) != 0) {
+        auto partials = torch::zeros({topk, dim}, x.options().dtype(torch::kFloat32));
+        moe_single_w2_partial_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            indices_contig.data_ptr<int64_t>(),
+            w2q.data_ptr<uint8_t>(),
+            w2s.data_ptr<uint8_t>(),
+            partials.data_ptr<float>(),
+            topk,
+            static_cast<int>(experts_start_idx),
+            n_local_experts,
+            dim,
+            inter_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        moe_single_reduce_partials_kernel<<<ceil_div(dim, kGemmThreads), gemm_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            partials.data_ptr<float>(),
+            y.data_ptr<float>(),
+            topk,
+            dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return y;
+    }
     moe_single_w2_accum_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
         hidden_q.data_ptr<int8_t>(),
         hidden_scale.data_ptr<float>(),
@@ -2953,6 +3054,99 @@ __global__ void moe_multi_w2_accum_fp4_kernel(
     }
 }
 
+// Deterministic twin: one row per (slot, token) pair, no cross-pair accumulation.
+// See moe_single_w2_partial_fp4_kernel for why the atomic version is not
+// reproducible. Pair rows are indexed by the same `start + base_t + t` the atomic
+// version uses as its token lookup, so the reducer can walk a token's pairs in
+// ascending pair order.
+__global__ void moe_multi_w2_partial_fp4_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int32_t* __restrict__ slot_expert,
+    const int32_t* __restrict__ slot_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ partials,  // [pairs, dim]
+    int dim,
+    int inter_dim) {
+    const int slot = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int start = slot_starts[slot];
+    const int end = slot_starts[slot + 1];
+    const int n_tok = end - start;
+    if (n_tok <= 0) return;
+    const int local = slot_expert[slot];
+    const int packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+
+    extern __shared__ int hs_shared[];
+    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+
+    constexpr int kMaxTokens = 8;
+    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
+        const int tile = min(kMaxTokens, n_tok - base_t);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * packs; idx += blockDim.x) {
+            const int r = idx / packs;
+            const int pack = idx - r * packs;
+            hs_shared[idx] = reinterpret_cast<const int*>(
+                hidden_q + static_cast<int64_t>(start + base_t + r) * inter_dim)[pack];
+        }
+        __syncthreads();
+        if (col >= dim) continue;
+
+        float acc[kMaxTokens];
+        #pragma unroll
+        for (int t = 0; t < kMaxTokens; ++t) acc[t] = 0.0f;
+
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w2_pack = w2_pack_base + kb * 8;
+            int blk[kMaxTokens];
+            #pragma unroll
+            for (int t = 0; t < kMaxTokens; ++t) blk[t] = 0;
+            #pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                for (int t = 0; t < tile; ++t) {
+                    blk[t] = __dp4a(hs_shared[t * packs + kb * 8 + ip], w_p, blk[t]);
+                }
+            }
+            const float w2_s = fp4_block_scale(w2_scale_row[kb]);
+            for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+        }
+        for (int t = 0; t < tile; ++t) {
+            const int pair = start + base_t + t;
+            partials[static_cast<int64_t>(pair) * dim + col] = acc[t] * hidden_scale[pair];
+        }
+    }
+}
+
+// Sum a token's pairs by scanning all pairs in ascending index order. Building a
+// per-token CSR would need slot_tokens on the host, i.e. a D2H sync on the decode
+// critical path; instead each block rescans the whole pair list, which is tiny
+// (tokens * topk, so <= 48 at the speculative-verify sizes this kernel exists for)
+// and stays resident in L2. The order is fixed by the pair index, not by
+// scheduling, so the result is bitwise reproducible.
+__global__ void moe_multi_reduce_partials_kernel(
+    const float* __restrict__ partials,        // [pairs, dim]
+    const int32_t* __restrict__ slot_tokens,   // [pairs]
+    float* __restrict__ y,                     // [tokens, dim]
+    int pairs,
+    int dim) {
+    const int token = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    float acc = 0.0f;
+    for (int p = 0; p < pairs; ++p) {
+        if (slot_tokens[p] == token) {
+            acc += partials[static_cast<int64_t>(p) * dim + col];
+        }
+    }
+    y[static_cast<int64_t>(token) * dim + col] = acc;
+}
+
 torch::Tensor moe_multi_token_fp4_forward_cuda(
     const torch::Tensor& x,             // [T, dim]
     const torch::Tensor& slot_expert,   // [S] int32 local expert ids
@@ -3031,6 +3225,29 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
 
     const dim3 w2_grid(ceil_div(dim, kGemmThreads), slots);
     const size_t h_shared_bytes = static_cast<size_t>(kMultiMaxTokens) * (inter_dim / 4) * sizeof(int);
+    if (env_int_default("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", 1) != 0) {
+        auto partials = torch::zeros({pairs, dim}, x.options().dtype(torch::kFloat32));
+        moe_multi_w2_partial_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
+            hidden_q.data_ptr<int8_t>(),
+            hidden_scale.data_ptr<float>(),
+            slot_expert.data_ptr<int32_t>(),
+            slot_starts.data_ptr<int32_t>(),
+            w2q.data_ptr<uint8_t>(),
+            w2s.data_ptr<uint8_t>(),
+            partials.data_ptr<float>(),
+            dim,
+            inter_dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        const dim3 reduce_grid(ceil_div(dim, kGemmThreads), tokens);
+        moe_multi_reduce_partials_kernel<<<reduce_grid, gemm_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+            partials.data_ptr<float>(),
+            slot_tokens.data_ptr<int32_t>(),
+            y.data_ptr<float>(),
+            pairs,
+            dim);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return y;
+    }
     moe_multi_w2_accum_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
         hidden_q.data_ptr<int8_t>(),
         hidden_scale.data_ptr<float>(),
