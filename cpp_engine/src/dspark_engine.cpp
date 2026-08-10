@@ -285,6 +285,22 @@ struct DSparkEngine::Impl {
         float* d_hidden = nullptr;           // [1, block_size, hc_mult, dim]
         float* d_logits = nullptr;           // [block_size, vocab_size]
 
+        // Stage 2 head buffers
+        float* d_head_x = nullptr;           // [block_size, dim] hc_head output
+        float* d_head_normed = nullptr;      // [block_size, dim]
+        // Confidence input, [block_size, dim + markov_rank]: the hc_head output
+        // followed by that position's markov embedding. Laid out as one buffer
+        // so the markov lookup can write straight into its half instead of
+        // being concatenated afterwards.
+        float* d_conf_in = nullptr;
+        float* d_markov_bias = nullptr;      // [vocab_size] per-position bigram bias
+        float* d_confidence = nullptr;       // [block_size]
+        // [block_size + 1]: the committed token, then each drafted token. Lives
+        // on device so the argmax of position i can feed position i+1's markov
+        // lookup without a round trip to the host.
+        int* d_out_token_ids = nullptr;
+        float* d_argmax_logit = nullptr;     // [1], argmax's discarded value output
+
         // Attention path buffers
         float* d_attn_x = nullptr;           // [block_size, dim]
         float* d_attn_post = nullptr;        // [block_size, hc_mult]
@@ -350,6 +366,16 @@ struct DSparkEngine::Impl {
             cudaMalloc(&d_draft_x, 1 * bsz * hc * dim * sizeof(float));
             cudaMalloc(&d_hidden, 1 * bsz * hc * dim * sizeof(float));
             cudaMalloc(&d_logits, static_cast<size_t>(bsz) * vocab * sizeof(float));
+
+            // Stage 2 head buffers
+            const int mrank = cfg.markov_rank;
+            cudaMalloc(&d_head_x, static_cast<size_t>(bsz) * dim * sizeof(float));
+            cudaMalloc(&d_head_normed, static_cast<size_t>(bsz) * dim * sizeof(float));
+            cudaMalloc(&d_conf_in, static_cast<size_t>(bsz) * (dim + mrank) * sizeof(float));
+            cudaMalloc(&d_markov_bias, static_cast<size_t>(vocab) * sizeof(float));
+            cudaMalloc(&d_confidence, static_cast<size_t>(bsz) * sizeof(float));
+            cudaMalloc(&d_out_token_ids, (static_cast<size_t>(bsz) + 1) * sizeof(int));
+            cudaMalloc(&d_argmax_logit, sizeof(float));
 
             // Attention path buffers
             cudaMalloc(&d_attn_x, bsz * dim * sizeof(float));
@@ -427,6 +453,13 @@ struct DSparkEngine::Impl {
             if (d_draft_x) cudaFree(d_draft_x);
             if (d_hidden) cudaFree(d_hidden);
             if (d_logits) cudaFree(d_logits);
+            if (d_head_x) cudaFree(d_head_x);
+            if (d_head_normed) cudaFree(d_head_normed);
+            if (d_conf_in) cudaFree(d_conf_in);
+            if (d_markov_bias) cudaFree(d_markov_bias);
+            if (d_confidence) cudaFree(d_confidence);
+            if (d_out_token_ids) cudaFree(d_out_token_ids);
+            if (d_argmax_logit) cudaFree(d_argmax_logit);
 
             if (d_attn_x) cudaFree(d_attn_x);
             if (d_attn_post) cudaFree(d_attn_post);
@@ -863,6 +896,17 @@ struct DSparkEngine::Impl {
                          {static_cast<uint64_t>(config.vocab_size), udim}));
         stage0.embed_weight = embed_weight;
 
+        // Output head, also tied to the main model. The reference shards this
+        // by vocab and all-gathers the logits; here every rank keeps the whole
+        // table (1 GB bf16) and computes identical full-vocab logits. That
+        // trades memory for having no collective in the draft's inner loop,
+        // which matters because the loop runs block_size times per round --
+        // and it keeps the draft's token ids identical across ranks by
+        // construction rather than by agreement.
+        head_weight = static_cast<uint16_t*>(
+            upload_whole("head.weight", SafeDType::BF16,
+                         {static_cast<uint64_t>(config.vocab_size), udim}));
+
         weights_loaded = true;
     }
 
@@ -1195,6 +1239,83 @@ struct DSparkEngine::Impl {
             throw std::runtime_error("dspark shared accum failed");
     }
 
+    // Stage 2 output heads: hc_head -> norm -> vocab logits, then one draft
+    // token per position, each biased by the token before it.
+    //
+    //   d_x  [block_size, hc_mult, dim]  the last stage's block output
+    //
+    // Fills buffers.d_logits [block_size, vocab], buffers.d_out_token_ids
+    // [block_size + 1] (input token, then the drafts), and
+    // buffers.d_confidence [block_size].
+    //
+    // The loop is sequential by construction: position i's markov bias is a
+    // lookup on the token argmaxed at position i-1, so the bias cannot be
+    // precomputed. Everything else -- the hc_head, the norm, and the full
+    // [block_size, vocab] logits -- is computed once for the whole block before
+    // the loop starts, which is the only part that touches the 1 GB head.
+    void forward_head(int input_token, const float* d_x) {
+        using namespace dsv4;
+        const int bsz = config.block_size;
+        const int dim = config.dim;
+        const int vocab = config.vocab_size;
+        const int mrank = config.markov_rank;
+        const int conf_dim = dim + mrank;
+
+        if (head_weight == nullptr || stage2_heads.norm_weight == nullptr) {
+            throw std::runtime_error("dspark head weights not loaded");
+        }
+
+        if (!hc_head_float_rows_cuda(d_x, stage2_heads.hc_head_fn, stage2_heads.hc_head_scale,
+                                     stage2_heads.hc_head_base, buffers.d_head_x, bsz, dim))
+            throw std::runtime_error("dspark hc_head failed");
+        if (!rmsnorm_bf16_gamma_rows_cuda(buffers.d_head_x, stage2_heads.norm_weight,
+                                          buffers.d_head_normed, bsz, dim, config.norm_eps))
+            throw std::runtime_error("dspark head norm failed");
+        if (!bf16_matvec_rows_cuda(buffers.d_head_normed, head_weight, buffers.d_logits,
+                                   bsz, vocab, dim))
+            throw std::runtime_error("dspark head logits failed");
+
+        // The confidence head reads concat(hc_head output, markov embedding).
+        // Copy the first half in now; the loop fills each row's second half as
+        // that position's markov embedding is looked up.
+        check_cuda(cudaMemcpy2D(buffers.d_conf_in, conf_dim * sizeof(float),
+                                buffers.d_head_x, dim * sizeof(float),
+                                dim * sizeof(float), bsz, cudaMemcpyDeviceToDevice),
+                   "dspark confidence hidden copy");
+
+        check_cuda(cudaMemcpy(buffers.d_out_token_ids, &input_token, sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "dspark seed output token");
+
+        for (int i = 0; i < bsz; ++i) {
+            // Bigram embedding of the token at position i, written straight
+            // into this row's slot in the confidence input.
+            float* d_embed = buffers.d_conf_in + static_cast<size_t>(i) * conf_dim + dim;
+            if (!bf16_rows_to_float_cuda(stage2_heads.markov_w1_weight,
+                                         buffers.d_out_token_ids + i, d_embed, 1, mrank))
+                throw std::runtime_error("dspark markov embed failed");
+            // markov_w2 is stored [vocab, rank], so this is the projection to
+            // vocab without a transpose.
+            if (!bf16_matvec_cuda(d_embed, stage2_heads.markov_w2_weight,
+                                  buffers.d_markov_bias, vocab, mrank))
+                throw std::runtime_error("dspark markov bias failed");
+
+            float* d_row = buffers.d_logits + static_cast<size_t>(i) * vocab;
+            if (!vector_accum_cuda(buffers.d_markov_bias, d_row, vocab, 1.0f))
+                throw std::runtime_error("dspark markov bias add failed");
+            // Greedy only. The reference also has a temperature path, but the
+            // verify loop compares against the target's greedy choice, so
+            // sampling here would only lower the accept rate.
+            if (!argmax_fp32_cuda(d_row, buffers.d_out_token_ids + i + 1,
+                                  buffers.d_argmax_logit, vocab, 0))
+                throw std::runtime_error("dspark draft argmax failed");
+        }
+
+        if (!bf16_matvec_rows_cuda(buffers.d_conf_in, stage2_heads.confidence_proj_weight,
+                                   buffers.d_confidence, bsz, 1, conf_dim))
+            throw std::runtime_error("dspark confidence head failed");
+    }
+
     void forward_block(float* x, const float* d_main_x, int start_pos,
                        const std::vector<int>& draft_input_ids, int block_id) {
         const int bsz = config.block_size;
@@ -1344,11 +1465,17 @@ struct DSparkEngine::Impl {
             forward_block(x, buffers.d_main_normed, start_pos, draft_input_ids, block_id);
         }
 
-        // Stage 2 heads: markov + confidence (not yet implemented)
+        // Stage 2 heads: hc_head + norm + vocab logits, then the markov-biased
+        // greedy loop that actually emits the draft.
+        forward_head(input_token, x);
 
-        DraftOutput output;
-        output.tokens.resize(config.block_size, 0);
-        output.confidence.resize(config.block_size, 0.0f);
+        DraftOutput output(config.block_size);
+        check_cuda(cudaMemcpy(output.tokens.data(), buffers.d_out_token_ids,
+                              output.tokens.size() * sizeof(int), cudaMemcpyDeviceToHost),
+                   "copy dspark draft tokens");
+        check_cuda(cudaMemcpy(output.confidence.data(), buffers.d_confidence,
+                              output.confidence.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy dspark draft confidence");
         return output;
     }
 };
@@ -1449,6 +1576,38 @@ void DSparkEngine::debug_moe(int stage_id, const float* h_x, int rows, float* h_
     check_cuda(cudaMemcpy(h_out, impl.buffers.d_ffn_out, n * sizeof(float),
                           cudaMemcpyDeviceToHost),
                "debug_moe out");
+}
+
+void DSparkEngine::debug_head(const float* h_x, int input_token, int* h_tokens,
+                              float* h_confidence, float* h_logits) {
+    Impl& impl = *impl_;
+    const int bsz = impl.config.block_size;
+    const int dim = impl.config.dim;
+    const int hc = impl.config.hc_mult;
+
+    // d_draft_x is the same [block_size, hc_mult, dim] scratch the real path
+    // hands to the last stage.
+    check_cuda(cudaMemcpy(impl.buffers.d_draft_x, h_x,
+                          static_cast<size_t>(bsz) * hc * dim * sizeof(float),
+                          cudaMemcpyHostToDevice),
+               "debug_head x");
+    impl.forward_head(input_token, impl.buffers.d_draft_x);
+    check_cuda(cudaDeviceSynchronize(), "debug_head sync");
+
+    check_cuda(cudaMemcpy(h_tokens, impl.buffers.d_out_token_ids,
+                          (static_cast<size_t>(bsz) + 1) * sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "debug_head tokens");
+    check_cuda(cudaMemcpy(h_confidence, impl.buffers.d_confidence,
+                          static_cast<size_t>(bsz) * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "debug_head confidence");
+    if (h_logits != nullptr) {
+        check_cuda(cudaMemcpy(h_logits, impl.buffers.d_logits,
+                              static_cast<size_t>(bsz) * impl.config.vocab_size * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "debug_head logits");
+    }
 }
 
 } // namespace dspark

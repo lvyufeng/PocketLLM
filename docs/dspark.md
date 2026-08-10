@@ -248,16 +248,17 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B2 | Stage 0 (main_proj + main_norm + embed) | done |
 | B3a | DSparkAttention | done |
 | B3b | MoE FFN (routed + shared) | done |
-| B4 | Stage 2 heads (norm, hc_head, markov, confidence) | todo |
+| B4 | Stage 2 heads (norm, hc_head, markov, confidence) | done |
 | B5 | Weight loading | done |
 | B6 | Main-hidden caching during verify | todo |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
-weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`).
+weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
+`tests/test_dspark_head_parity.py`).
 
 Two things are deliberately not done yet: TP>1 needs an all-reduce after the
 attention `wo_b` and after the routed MoE (each rank only sums its own experts'
-routes), and `draft_tokens()` waits on B4/B6.
+routes), and `draft_tokens()` waits on B6.
 
 #### MoE notes
 
@@ -274,3 +275,22 @@ than obvious garbage. Measured on 5 tokens against an fp32 reference, cpp/ref
 while swapping a single expert for the next-ranked one reads 0.476 -- a ~32x
 margin, which is what makes the 0.02 tolerance meaningful rather than merely
 satisfied.
+
+#### Head notes
+
+The output head (`head.weight`, 129280x4096 bf16, ~1 GB) is kept whole on every
+rank rather than vocab-sharded as the reference does. The reference all-gathers
+its logit shards; here the draft's inner loop runs `block_size` times per round,
+so a collective per position would put TP latency on the hot path -- and a
+replicated table makes every rank's drafted ids identical by construction
+rather than by agreement. That is the reason total DSpark weights read 12.4 GB
+at TP=1 rather than the 11.4 GB the MoE alone accounts for.
+
+The head's parity is a different regime from the MoE's: bf16 weights against
+fp32 activations with no int8 anywhere, so cpp/ref `rel_l2` is 1.3e-7. Three
+plausible ways to get it wrong -- no markov bias, all biases computed from the
+input token instead of sequentially, and collapsing the hc dimension by mean
+instead of the head's own gate -- read 8.3e-1, 5.7e-1 and 1.0e0, and each
+changes at least one drafted token. Hence a 1e-5 tolerance plus an exact
+token-id comparison: the smallest observed top1-top2 margin was 0.02, so ids
+matching is a real check, not a foregone one.

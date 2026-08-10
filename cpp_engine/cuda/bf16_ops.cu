@@ -44,6 +44,46 @@ __global__ void bf16_matvec_kernel(const float* x, const uint16_t* w, float* y, 
     if (threadIdx.x == 0) y[row] = scratch[0];
 }
 
+// y[t, r] = sum_c x[t, c] * w[r, c], for a handful of tokens against a large
+// weight matrix (the draft head's vocab). One block per weight row, looping
+// over tokens inside it: the weight is what dominates traffic (129280x4096 bf16
+// is ~1 GB), so it must be read once for the whole block of tokens rather than
+// once per token as repeated matvecs would.
+__global__ void bf16_matvec_rows_kernel(const float* x, const uint16_t* w, float* y,
+                                        int tokens, int rows, int cols) {
+    constexpr int kMaxTokens = 16;
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
+
+    float sums[kMaxTokens];
+    for (int t = 0; t < tokens; ++t) sums[t] = 0.0f;
+
+    const uint16_t* w_row = w + static_cast<size_t>(row) * cols;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        const float wv = bf16_to_float(w_row[c]);
+        for (int t = 0; t < tokens; ++t) {
+            sums[t] += wv * x[static_cast<size_t>(t) * cols + c];
+        }
+    }
+
+    extern __shared__ float scratch[];  // [num_warps * kMaxTokens]
+    for (int t = 0; t < tokens; ++t) {
+        float v = sums[t];
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
+        if (lane == 0) scratch[warp_id * kMaxTokens + t] = v;
+    }
+    __syncthreads();
+    if (tid < tokens) {
+        float total = 0.0f;
+        for (int wi = 0; wi < num_warps; ++wi) total += scratch[wi * kMaxTokens + tid];
+        y[static_cast<size_t>(tid) * rows + row] = total;
+    }
+}
+
 __global__ void bf16_dual_matvec_kernel(const float* x, const uint16_t* w_a, const uint16_t* w_b, float* y_a, float* y_b, int rows, int cols) {
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -302,8 +342,18 @@ bool bf16_matvec_cuda(const float* d_x, const uint16_t* d_w_bf16, float* d_y, in
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool bf16_dual_matvec_cuda(const float* d_x, const uint16_t* d_w_a_bf16, const uint16_t* d_w_b_bf16, float* d_y_a, float* d_y_b, int rows, int cols, void* stream) {
-    if (d_x == nullptr || d_w_a_bf16 == nullptr || d_w_b_bf16 == nullptr || d_y_a == nullptr || d_y_b == nullptr || rows <= 0 || cols <= 0) return false;
+bool bf16_matvec_rows_cuda(const float* d_x, const uint16_t* d_w_bf16, float* d_y, int tokens, int rows, int cols, void* stream) {
+    constexpr int kMaxTokens = 16;
+    if (d_x == nullptr || d_w_bf16 == nullptr || d_y == nullptr) return false;
+    if (tokens <= 0 || tokens > kMaxTokens || rows <= 0 || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr int kThreads = 256;
+    const size_t shmem = static_cast<size_t>(kThreads / 32) * kMaxTokens * sizeof(float);
+    bf16_matvec_rows_kernel<<<rows, kThreads, shmem, cuda_stream>>>(d_x, d_w_bf16, d_y, tokens, rows, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool bf16_dual_matvec_cuda(const float* d_x, const uint16_t* d_w_a_bf16, const uint16_t* d_w_b_bf16, float* d_y_a, float* d_y_b, int rows, int cols, void* stream) {    if (d_x == nullptr || d_w_a_bf16 == nullptr || d_w_b_bf16 == nullptr || d_y_a == nullptr || d_y_b == nullptr || rows <= 0 || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     bf16_dual_matvec_kernel<<<rows, 256, 0, cuda_stream>>>(d_x, d_w_a_bf16, d_w_b_bf16, d_y_a, d_y_b, rows, cols);
     return cudaGetLastError() == cudaSuccess;

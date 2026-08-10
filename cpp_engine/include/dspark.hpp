@@ -97,6 +97,16 @@ public:
     // for one draft block.
     void debug_moe(int stage_id, const float* h_x, int rows, float* h_out);
 
+    // Run the last stage's output heads in isolation.
+    //   h_x          [block_size, hc_mult, dim]  last stage's block output
+    //   input_token                              the committed token
+    //   h_tokens     [block_size + 1]            input token, then the drafts
+    //   h_confidence [block_size]
+    //   h_logits     [block_size, vocab_size]    optional; may be null
+    // h_logits is the markov-biased logits, i.e. what the argmax actually saw.
+    void debug_head(const float* h_x, int input_token, int* h_tokens,
+                    float* h_confidence, float* h_logits);
+
 private:
     struct Impl;
     Impl* impl_;

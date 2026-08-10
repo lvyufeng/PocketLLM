@@ -554,6 +554,19 @@ bool bf16_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+// Batched over a small number of token rows: d_y[t, r] = sum_c d_x[t, c] * w[r, c].
+// d_x is [tokens, cols], d_y is [tokens, rows]. `tokens` must be <= 16 -- the
+// per-thread accumulators are registers, which is what lets the weight row be
+// read once for all tokens instead of once per token.
+bool bf16_matvec_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    float* d_y,
+    int tokens,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 bool bf16_dual_matvec_cuda(
     const float* d_x,
     const uint16_t* d_w_a_bf16,
@@ -999,6 +1012,21 @@ bool hc_post_float_rows_cuda(
     const float* d_post_rows,
     const float* d_comb_rows,
     float* d_y_h4_rows,
+    int rows,
+    int dim,
+    void* stream = nullptr);
+
+// Collapse [rows, 4, dim] -> [rows, dim] with the head's gate. Distinct from
+// hc_pre: only 4 mixes, one shared scale, and no post/comb outputs.
+//   d_fn    [4, 4*dim]
+//   d_scale [1]
+//   d_base  [4]
+bool hc_head_float_rows_cuda(
+    const float* d_h4_rows,
+    const float* d_fn,
+    const float* d_scale,
+    const float* d_base,
+    float* d_y_rows,
     int rows,
     int dim,
     void* stream = nullptr);
