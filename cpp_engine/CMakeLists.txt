@@ -130,6 +130,10 @@ add_executable(test_dspark_moe_parity tests/test_dspark_moe_parity.cpp)
 target_link_libraries(test_dspark_moe_parity PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_moe_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_dspark_draft tests/test_dspark_draft.cpp)
+target_link_libraries(test_dspark_draft PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_draft PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_dspark_hidden_capture tests/test_dspark_hidden_capture.cpp)
 target_link_libraries(test_dspark_hidden_capture PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_hidden_capture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

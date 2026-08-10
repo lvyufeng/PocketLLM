@@ -251,6 +251,7 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B4 | Stage 2 heads (norm, hc_head, markov, confidence) | done |
 | B5 | Weight loading | done |
 | B6 | Main-hidden caching during verify | done |
+| B7 | `draft_tokens()` + TP all-reduces + ring priming | wired, accept rate still 0 |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
 weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
@@ -258,9 +259,61 @@ weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.
 `cpp_engine/tests/test_dspark_hidden_capture.cpp`, which needs no reference
 because it checks the capture against the engine's own decode path.
 
-Two things are deliberately not done yet: TP>1 needs an all-reduce after the
-attention `wo_b` and after the routed MoE (each rank only sums its own experts'
-routes), and `draft_tokens()` is not wired up.
+#### Drafting
+
+`PersistentEngine::load_dspark()` loads the draft module and switches capture on
+for the layers named in the draft's own config, rather than a caller-supplied
+list -- a mismatch there would still produce plausible drafts, just worse ones.
+It is a separate call from the constructor because the weights are ~12.4 GB at
+TP=1.
+
+`draft_tokens(input_token, start_pos, hidden)` takes the hidden explicitly
+instead of reading the engine's last capture: after a verify round the caller
+drafts from the *accepted* position, which is not the last one forwarded. The
+captured row is one concatenated `[n_target * dim]` block, so the bridge uploads
+it once and hands the draft slices of that staging buffer.
+
+TP>1 now does the same two all-reduces the main model does -- after the
+attention `wo_b`, where each rank has only its own heads, and after the routed
+MoE but *before* the shared expert, which every rank computes in full and would
+otherwise be counted `tp_world` times. Both go over bf16, matching the main
+model's reduction. Supplying the NCCL channel is required at TP>1: the
+3-argument `DSparkEngine` constructor throws rather than silently returning a
+partial sum, which would still read as a well-formed draft.
+
+`cpp_engine/tests/test_dspark_draft.cpp` measures accept rate against the main
+model's own verify. Shape and finiteness checks are worthless here -- a draft
+seeded with the wrong hidden still emits fluent token ids -- so the real seed is
+scored against two corruptions on the same committed token, position, and truth:
+a zeroed hidden (the floor for the draft module alone) and a hidden from an
+earlier position (the mistake an off-by-one in the plumbing would actually
+produce). Block alignment is the other trap: verify gets
+`[committed, drafts...]`, since verifying the drafts alone shifts every
+comparison one position and reads as a near-zero accept rate.
+
+**This test currently fails.** At TP=4 the measured accept rate is 0/10 for the
+real seed and equally 0 for both corruptions, so the end-to-end draft path is
+not yet producing usable tokens and the test cannot yet tell a good seed from a
+zeroed one. Two causes have been found and fixed and neither closed it:
+
+- **Ring priming was missing.** `draft()` writes only the position it drafts
+  from, but the reference's `write_main_kv` writes *every* committed position;
+  without it the draft attended to a window that was almost entirely zeros.
+  `PersistentEngine::prime_dspark_kv()` now does this, and prefill's capture
+  keeps the last `window_size` positions rather than one to feed it. This
+  visibly changed the drafts and produced the first partial agreement -- one
+  round had two consecutive draft tokens match the main model at the right
+  positions -- but not at position 0, so the accepted prefix is still 0.
+- **The NCCL id wait was 30s**, which is shorter than the time four ranks take
+  to load a 167 GB checkpoint, so ranks 1-2 died before rank 0 published the id.
+  Now 10 minutes, overridable via `DSV4_CPP_NCCL_ID_WAIT_ATTEMPTS`.
+
+What is *not* yet ruled out: the sub-path parity tests each drive one piece from
+injected inputs at TP=1, so none of them covers the composition (stage 0 ->
+blocks -> head) or TP=4 sharding of the draft. That is where the next
+investigation goes. The plumbing tested above -- capture, slot ordering, verify
+alignment, memory placement -- is verified independently and is not the
+remaining suspect.
 
 #### Main-hidden capture
 

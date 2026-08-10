@@ -2,6 +2,7 @@
 #include "cuda_ops.hpp"
 #include "json_lite.hpp"
 #include "safetensors_reader.hpp"
+#include "tp_comm.hpp"
 #include <stdexcept>
 #include <fstream>
 #include <sstream>
@@ -132,6 +133,42 @@ struct DSparkEngine::Impl {
     int tp_rank;
     int tp_world_size;
     std::string checkpoint_dir;
+    // NCCL channel for the TP all-reduces. Empty means none was supplied, which
+    // is fine at tp_world_size == 1 and fatal above it.
+    int tp_device = 0;
+    std::string nccl_id_path;
+    // bf16 staging for the all-reduce, sized on first use and kept.
+    uint16_t* d_reduce_bf16 = nullptr;
+    int reduce_capacity = 0;
+
+    // All-reduce d_values across ranks, in place. Matches the main model's
+    // reduction: fp32 packed down to bf16 for the wire, which halves the
+    // traffic and is what the main model's activations already round to at
+    // every layer boundary anyway.
+    void tp_all_reduce(float* d_values, int count) {
+        if (tp_world_size <= 1) return;
+        if (nccl_id_path.empty()) {
+            throw std::runtime_error(
+                "DSpark TP>1 needs an NCCL id path; construct with the 5-argument form");
+        }
+#ifdef DSV4_HAVE_NCCL
+        if (count > reduce_capacity) {
+            if (d_reduce_bf16 != nullptr) cudaFree(d_reduce_bf16);
+            d_reduce_bf16 = nullptr;
+            check_cuda(cudaMalloc(&d_reduce_bf16, static_cast<size_t>(count) * sizeof(uint16_t)),
+                       "cudaMalloc dspark reduce scratch");
+            reduce_capacity = count;
+        }
+        if (!dsv4::fp32_to_bf16_cuda(d_values, d_reduce_bf16, count))
+            throw std::runtime_error("dspark reduce pack failed");
+        dsv4::nccl_all_reduce_sum_bf16_inplace(tp_world_size, tp_rank, tp_device,
+                                               nccl_id_path.c_str(), d_reduce_bf16, count);
+        if (!dsv4::bf16_to_fp32_cuda(d_reduce_bf16, d_values, count))
+            throw std::runtime_error("dspark reduce unpack failed");
+#else
+        throw std::runtime_error("DSpark TP>1 requires a NCCL-enabled build");
+#endif
+    }
 
     // Stage 0: main_proj + main_norm
     struct Stage0 {
@@ -508,9 +545,16 @@ struct DSparkEngine::Impl {
         buffers.allocate(config, adims, experts_per_rank);
     }
 
+    Impl(const char* ckpt_dir, int rank, int world_size, int dev, const char* id_path)
+        : Impl(ckpt_dir, rank, world_size) {
+        tp_device = dev;
+        if (id_path != nullptr) nccl_id_path = id_path;
+    }
+
     ~Impl() {
         buffers.free_all();
         free_weights();
+        if (d_reduce_bf16 != nullptr) cudaFree(d_reduce_bf16);
     }
 
     void init_dims() {
@@ -1148,9 +1192,9 @@ struct DSparkEngine::Impl {
                                        block->attn.wo_b_scale, d_out, bsz, dim,
                                        adims.attn_mid))
             throw std::runtime_error("dspark wo_b failed");
-        // NOTE: with tp_world_size > 1 the caller must all-reduce d_out across
-        // ranks before the residual add, exactly as the main model does. That
-        // hook is not wired yet, so TP>1 draft output is incomplete.
+        // Each rank ran its own heads, so d_out is a partial sum until this
+        // reduce -- same place the main model reduces its attention output.
+        tp_all_reduce(d_out, bsz * dim);
     }
 
     // Routed MoE + shared expert for `rows` tokens. d_x is the ffn_norm output
@@ -1216,8 +1260,10 @@ struct DSparkEngine::Impl {
                        "zero dspark moe out");
         }
 
-        // NOTE: TP>1 needs an all-reduce of d_out here, before the shared
-        // expert is added -- each rank only summed its own experts' routes.
+        // Each rank only summed the routes landing on its own experts, so the
+        // reduce goes here -- before the shared expert, which every rank
+        // computes in full and would otherwise be counted tp_world_size times.
+        tp_all_reduce(d_out, rows * dim);
 
         // Shared expert: SwiGLU FFN applied to every token, added on top.
         if (!fp8_e4m3_e8m0_matmul_cuda(d_x, block->ffn.shared_w1_weight,
@@ -1440,6 +1486,98 @@ struct DSparkEngine::Impl {
         }
     }
 
+    // Prime every stage's KV ring from the main model's hiddens for a run of
+    // committed positions. See the header for why this is separate from
+    // draft(): the ring has to hold every committed position, not just the one
+    // being drafted from, and a missing one shows up only as a draft that
+    // matches nothing rather than as an error.
+    void write_main_kv(const float* h_main_hidden, int rows, int start_pos) {
+        using namespace dsv4;
+        if (h_main_hidden == nullptr || rows <= 0) return;
+        if (start_pos < 0) throw std::runtime_error("write_main_kv: negative start_pos");
+
+        const int dim = config.dim;
+        const int win = adims.window_size;
+        const int hd = adims.head_dim;
+        const int rd = adims.rope_dim;
+        const int n_target = static_cast<int>(config.target_layer_ids.size());
+        const size_t stride = static_cast<size_t>(n_target) * dim;
+
+        // Only the last `win` positions can survive the ring, so drop the rest
+        // up front rather than writing slots that will be overwritten.
+        if (rows > win) {
+            h_main_hidden += static_cast<size_t>(rows - win) * stride;
+            start_pos += rows - win;
+            rows = win;
+        }
+
+        // Scratch sized to this call. The per-round buffers are single-row, and
+        // priming happens once per committed block rather than per draft
+        // position, so widening them permanently would cost more than it saves.
+        float* d_concat = nullptr;
+        float* d_proj = nullptr;
+        float* d_normed = nullptr;
+        float* d_kv_a = nullptr;
+        float* d_kv = nullptr;
+        check_cuda(cudaMalloc(&d_concat, static_cast<size_t>(rows) * stride * sizeof(float)),
+                   "cudaMalloc write_main_kv concat");
+        auto cleanup = [&] {
+            if (d_concat) cudaFree(d_concat);
+            if (d_proj) cudaFree(d_proj);
+            if (d_normed) cudaFree(d_normed);
+            if (d_kv_a) cudaFree(d_kv_a);
+            if (d_kv) cudaFree(d_kv);
+        };
+        try {
+            check_cuda(cudaMalloc(&d_proj, static_cast<size_t>(rows) * dim * sizeof(float)),
+                       "cudaMalloc write_main_kv proj");
+            check_cuda(cudaMalloc(&d_normed, static_cast<size_t>(rows) * dim * sizeof(float)),
+                       "cudaMalloc write_main_kv normed");
+            check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(rows) * adims.kv_dim * sizeof(float)),
+                       "cudaMalloc write_main_kv kv_a");
+            check_cuda(cudaMalloc(&d_kv, static_cast<size_t>(rows) * hd * sizeof(float)),
+                       "cudaMalloc write_main_kv kv");
+            check_cuda(cudaMemcpy(d_concat, h_main_hidden,
+                                  static_cast<size_t>(rows) * stride * sizeof(float),
+                                  cudaMemcpyHostToDevice),
+                       "copy write_main_kv hidden");
+
+            // main_proj + main_norm, shared by every stage exactly as in draft().
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_concat, stage0.main_proj_weight,
+                                           stage0.main_proj_scale, d_proj, rows, dim,
+                                           static_cast<int>(stride)))
+                throw std::runtime_error("write_main_kv main_proj failed");
+            if (!rmsnorm_bf16_gamma_rows_cuda(d_proj, stage0.main_norm_weight, d_normed, rows,
+                                              dim, config.norm_eps))
+                throw std::runtime_error("write_main_kv main_norm failed");
+
+            for (int s = 0; s < config.n_stages; ++s) {
+                StageBlock* block = &stages[s];
+                if (!fp8_e4m3_e8m0_matmul_cuda(d_normed, block->attn.wkv_weight,
+                                               block->attn.wkv_scale, d_kv_a, rows,
+                                               adims.kv_dim, dim))
+                    throw std::runtime_error("write_main_kv wkv failed");
+                if (!rmsnorm_bf16_gamma_rows_cuda(d_kv_a, block->attn.kv_norm_weight, d_kv, rows,
+                                                  adims.kv_dim, config.norm_eps))
+                    throw std::runtime_error("write_main_kv kv_norm failed");
+                // rope with no norm, then act_quant over the non-rope prefix --
+                // the same treatment draft() gives the single committed position.
+                if (!head_rmsnorm_rope_rows_cuda(d_kv, rows, 1, hd, rd, start_pos,
+                                                 config.rope_theta, false, 0.0f))
+                    throw std::runtime_error("write_main_kv rope failed");
+                if (!fp8_act_quant_dequant_rows_strided_cuda(d_kv, rows, hd - rd, hd, 64))
+                    throw std::runtime_error("write_main_kv act_quant failed");
+                if (!copy_rows_to_kv_cache_cuda(d_kv, block->attn.kv_cache, rows, hd, win,
+                                                start_pos))
+                    throw std::runtime_error("write_main_kv ring write failed");
+            }
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+        cleanup();
+    }
+
     DraftOutput forward(int input_token, int start_pos,
                        const std::vector<float*>& main_hidden_states) {
         const int bsz = config.block_size;
@@ -1495,6 +1633,18 @@ DSparkEngine::DSparkEngine(const char* checkpoint_dir, int tp_rank, int tp_world
     }
 }
 
+DSparkEngine::DSparkEngine(const char* checkpoint_dir, int tp_rank, int tp_world_size,
+                           int device, const char* nccl_id_path) {
+    impl_ = new Impl(checkpoint_dir, tp_rank, tp_world_size, device, nccl_id_path);
+    try {
+        impl_->load_weights();
+    } catch (...) {
+        delete impl_;
+        impl_ = nullptr;
+        throw;
+    }
+}
+
 DSparkEngine::~DSparkEngine() {
     delete impl_;
 }
@@ -1513,6 +1663,10 @@ DraftOutput DSparkEngine::draft(int input_token, int start_pos,
 
 const Config& DSparkEngine::config() const {
     return impl_->config;
+}
+
+void DSparkEngine::write_main_kv(const float* h_main_hidden, int rows, int start_pos) {
+    impl_->write_main_kv(h_main_hidden, rows, start_pos);
 }
 
 void DSparkEngine::debug_set_kv_cache(int stage_id, const float* h_cache) {

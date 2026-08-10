@@ -58,7 +58,16 @@ public:
     // Initialize DSpark engine from checkpoint directory
     // checkpoint_dir: path to safetensors checkpoint (e.g., /path/to/model/)
     // tp_rank, tp_world_size: tensor parallelism config
+    //
+    // With tp_world_size > 1 the draft needs the same NCCL all-reduces the main
+    // model does -- after the attention output projection and after the routed
+    // MoE, since each rank only holds its own heads and experts. Use the
+    // 5-argument form to supply the channel; the 3-argument form throws at
+    // draft() time when tp_world_size > 1 rather than returning a partial sum
+    // that still looks like a plausible draft.
     DSparkEngine(const char* checkpoint_dir, int tp_rank, int tp_world_size);
+    DSparkEngine(const char* checkpoint_dir, int tp_rank, int tp_world_size,
+                 int device, const char* nccl_id_path);
     ~DSparkEngine();
 
     // Draft block_size tokens from a committed token
@@ -69,6 +78,21 @@ public:
     // Returns: DraftOutput with drafted tokens and confidence scores
     DraftOutput draft(int input_token, int start_pos,
                      const std::vector<float*>& main_hidden_states);
+
+    // Write the main model's KV for positions start_pos .. start_pos+rows-1
+    // into every stage's ring cache, without running attention.
+    //
+    // draft() only writes the single position it drafts from, which is all a
+    // one-token-at-a-time loop needs. A real loop commits several positions per
+    // round and starts from a whole prompt, and every one of those has to land
+    // in the window -- otherwise the draft attends to zeroed slots and its
+    // output, while still fluent, matches nothing the main model does.
+    //
+    // main_hidden is [rows, n_target * dim] on the host: the capture's layout,
+    // rows in position order. Only the last window_size rows can survive the
+    // ring, so passing more is allowed and silently truncated, as the reference
+    // does.
+    void write_main_kv(const float* h_main_hidden, int rows, int start_pos);
 
     const Config& config() const;
 

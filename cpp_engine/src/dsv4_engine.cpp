@@ -2206,6 +2206,11 @@ struct SafeForwardContext {
     std::vector<int> dspark_capture_layers;
     std::vector<float> dspark_hidden;
     int dspark_hidden_positions = 0;
+    // How many trailing positions prefill keeps. The draft's attention ring is
+    // window_size slots, and every committed position has to land in it or the
+    // draft attends to zeros -- so one row is not enough, but nothing beyond
+    // the last window survives the ring either.
+    int dspark_capture_window = 1;
     std::unordered_map<std::string, std::unique_ptr<SafeTensorsShard>> shard_cache;
     std::unordered_map<std::string, DeviceAttentionCache> attention_cache;
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
@@ -2510,14 +2515,22 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     float* d_final_norm = nullptr;
     float* d_logits = nullptr;
 
-    // DSpark target-layer capture. Only the last prompt position is kept: the
-    // drafter is seeded from the token the prefill commits, and holding every
-    // position would cost n_target*dim floats per token -- ~49 KB/token, i.e.
-    // 3 GB at a 64K context -- for hiddens no draft round ever reads.
+    // DSpark target-layer capture. The last `dspark_capture_window` positions
+    // are kept, not just the final one: the draft's attention ring has to be
+    // primed with every committed position or it attends to zeros. Nothing
+    // before the last window survives the ring, so that is also the cap -- at
+    // window_size=128 this is ~6 MB rather than the ~3 GB a 64K prompt would
+    // cost if every position were held.
     float* d_dspark_hidden = nullptr;
     const int dspark_n_target = static_cast<int>(ctx.dspark_capture_layers.size());
     const int dspark_hidden_stride = dspark_n_target * dim;
     const int dspark_capture_slot = dspark_n_target > 0 ? 0 : -1;
+    const int dspark_capture_rows =
+        dspark_capture_slot >= 0
+            ? std::min(token_count, std::max(1, ctx.dspark_capture_window))
+            : 0;
+    // First prompt position that lands in the kept window.
+    const int dspark_capture_first = token_count - dspark_capture_rows;
 
     // Chunked prefill: scratch buffers (everything except the residual stream
     // d_h4_rows, the per-layer KV memory d_kv_norm_rows, and the window-indices
@@ -2594,7 +2607,9 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_final_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc final norm");
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
     if (dspark_capture_slot >= 0) {
-        check_cuda(cudaMalloc(&d_dspark_hidden, static_cast<size_t>(dspark_hidden_stride) * sizeof(float)),
+        check_cuda(cudaMalloc(&d_dspark_hidden,
+                              static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride *
+                                  sizeof(float)),
                    "cudaMalloc prefill dspark hidden");
     }
 
@@ -3031,16 +3046,21 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             sync_prefill_profile("profile sync prefill hc ffn post");
             total_prefill_ffn_post_ms += elapsed_ms(stage_t, Clock::now());
 
-            // DSpark target-layer capture, restricted to the chunk holding the
-            // last prompt position -- the same block output the reference's
-            // forward hook on model.layers[idx] sees, after the bf16 round trip.
-            if (dspark_capture_slot >= 0 && ce == token_count) {
+            // DSpark target-layer capture. The kept window is the last
+            // dspark_capture_rows positions, which may span more than one
+            // chunk, so each chunk contributes whatever part of it overlaps.
+            if (dspark_capture_slot >= 0 && ce > dspark_capture_first) {
                 const auto it = std::find(ctx.dspark_capture_layers.begin(),
                                           ctx.dspark_capture_layers.end(), li);
                 if (it != ctx.dspark_capture_layers.end()) {
                     const int slot = static_cast<int>(it - ctx.dspark_capture_layers.begin());
-                    const float* last_row = h4_chunk + static_cast<size_t>(cn - 1) * 4 * dim;
-                    if (!hc_mean_pool_rows_cuda(last_row, d_dspark_hidden, 1, dim,
+                    const int from = std::max(cs, dspark_capture_first);
+                    const int rows = ce - from;
+                    const float* src = h4_chunk + static_cast<size_t>(from - cs) * 4 * dim;
+                    float* dst = d_dspark_hidden +
+                                 static_cast<size_t>(from - dspark_capture_first) *
+                                     dspark_hidden_stride;
+                    if (!hc_mean_pool_rows_cuda(src, dst, rows, dim,
                                                 dspark_hidden_stride, slot * dim))
                         throw std::runtime_error("prefill dspark hidden capture failed");
                 }
@@ -3086,11 +3106,11 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     ctx.last_local_head_start = local_head_start;
 
     if (dspark_capture_slot >= 0) {
-        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
+        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride);
         check_cuda(cudaMemcpy(ctx.dspark_hidden.data(), d_dspark_hidden,
                               ctx.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
                    "copy prefill dspark hidden");
-        ctx.dspark_hidden_positions = 1;
+        ctx.dspark_hidden_positions = dspark_capture_rows;
     } else {
         ctx.dspark_hidden.clear();
         ctx.dspark_hidden_positions = 0;
@@ -9283,6 +9303,11 @@ struct PersistentEngine::State {
     std::unique_ptr<CmdChannel> cmd;
     // Per-draft-token hiddens from the last verify_step, [draft_len, stride].
     std::vector<float> verify_dspark_hidden;
+    // The draft module, plus the device staging for one round's main hidden.
+    // Both are null until load_dspark().
+    std::unique_ptr<dspark::DSparkEngine> dspark;
+    float* d_dspark_main_hidden = nullptr;
+    int dspark_hidden_stride = 0;
 
     State(const std::string& ckpt_dir, const ForwardSmokeOptions& options, int lc, int mc)
         : ctx(std::make_unique<SafeForwardContext>(ckpt_dir)),
@@ -9293,6 +9318,10 @@ struct PersistentEngine::State {
         if (const char* env = std::getenv("DSV4_CPP_EOS_TOKEN_ID")) {
             try { eos_token_id = std::stoi(env); } catch (...) {}
         }
+    }
+
+    ~State() {
+        if (d_dspark_main_hidden != nullptr) cudaFree(d_dspark_main_hidden);
     }
 };
 
@@ -9453,7 +9482,8 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
     return next_tokens;
 }
 
-void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers) {
+void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers,
+                                                 int prefill_window) {
     auto& s = *state_;
     for (int li : layers) {
         if (li < 0 || li >= s.layer_count) {
@@ -9461,6 +9491,7 @@ void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers)
         }
     }
     s.ctx->dspark_capture_layers = layers;
+    s.ctx->dspark_capture_window = std::max(1, prefill_window);
     s.ctx->dspark_hidden.clear();
     s.ctx->dspark_hidden_positions = 0;
     s.verify_dspark_hidden.clear();
@@ -9474,8 +9505,83 @@ const std::vector<float>& PersistentEngine::last_dspark_hidden() const {
     return state_->ctx->dspark_hidden;
 }
 
+int PersistentEngine::last_dspark_hidden_positions() const {
+    return state_->ctx->dspark_hidden_positions;
+}
+
 const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
     return state_->verify_dspark_hidden;
+}
+
+void PersistentEngine::load_dspark(const std::string& ckpt_dir) {
+    auto& s = *state_;
+    if (s.dspark) return;
+
+    auto engine = std::make_unique<dspark::DSparkEngine>(
+        ckpt_dir.c_str(), s.opts.tp_rank, s.opts.tp_world, s.opts.device,
+        s.opts.nccl_id_path.empty() ? nullptr : s.opts.nccl_id_path.c_str());
+    const dspark::Config& dcfg = engine->config();
+
+    // The draft's own config names the layers it was trained to read, so the
+    // capture is driven from there rather than from a caller-supplied list --
+    // a mismatch here would still produce plausible drafts, just worse ones.
+    const std::vector<int>& targets = dcfg.target_layer_ids;
+    for (int li : targets) {
+        if (li < 0 || li >= s.layer_count) {
+            throw std::runtime_error("load_dspark: target layer " + std::to_string(li) +
+                                     " is outside the " + std::to_string(s.layer_count) +
+                                     " layers this engine runs");
+        }
+    }
+    // Prefill must keep a full ring's worth of positions, not just the last
+    // one: priming the draft's attention needs every committed position, and
+    // nothing older than window_size survives the ring anyway.
+    set_dspark_capture_layers(targets, std::max(1, dcfg.window_size));
+
+    s.dspark_hidden_stride = static_cast<int>(targets.size()) * dcfg.dim;
+    check_cuda(cudaMalloc(&s.d_dspark_main_hidden,
+                          static_cast<size_t>(s.dspark_hidden_stride) * sizeof(float)),
+               "cudaMalloc dspark main hidden staging");
+    s.dspark = std::move(engine);
+}
+
+bool PersistentEngine::dspark_loaded() const { return state_->dspark != nullptr; }
+
+dspark::DraftOutput PersistentEngine::draft_tokens(int input_token, int start_pos,
+                                                   const std::vector<float>& hidden) {
+    auto& s = *state_;
+    if (!s.dspark) throw std::runtime_error("draft_tokens: load_dspark() first");
+    if (static_cast<int>(hidden.size()) != s.dspark_hidden_stride) {
+        throw std::runtime_error("draft_tokens: hidden must be [n_target * dim] = " +
+                                 std::to_string(s.dspark_hidden_stride) + ", got " +
+                                 std::to_string(hidden.size()));
+    }
+
+    check_cuda(cudaMemcpy(s.d_dspark_main_hidden, hidden.data(),
+                          hidden.size() * sizeof(float), cudaMemcpyHostToDevice),
+               "upload dspark main hidden");
+
+    // The capture concatenates the target layers on the last axis; the draft
+    // wants one pointer per layer, so slice the staged row rather than copying
+    // it again.
+    const int dim = s.dspark->config().dim;
+    std::vector<float*> per_layer;
+    per_layer.reserve(s.dspark->config().target_layer_ids.size());
+    for (size_t i = 0; i < s.dspark->config().target_layer_ids.size(); ++i) {
+        per_layer.push_back(s.d_dspark_main_hidden + i * static_cast<size_t>(dim));
+    }
+    return s.dspark->draft(input_token, start_pos, per_layer);
+}
+
+void PersistentEngine::prime_dspark_kv(const std::vector<float>& hidden, int rows,
+                                       int start_pos) {
+    auto& s = *state_;
+    if (!s.dspark) throw std::runtime_error("prime_dspark_kv: load_dspark() first");
+    if (rows <= 0) return;
+    if (hidden.size() < static_cast<size_t>(rows) * s.dspark_hidden_stride) {
+        throw std::runtime_error("prime_dspark_kv: hidden holds fewer than `rows` positions");
+    }
+    s.dspark->write_main_kv(hidden.data(), rows, start_pos);
 }
 
 int PersistentEngine::eos_id() const { return state_->eos_token_id; }

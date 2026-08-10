@@ -5,6 +5,7 @@
 #include <nccl.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <cmath>
@@ -51,7 +52,16 @@ ncclUniqueId load_or_create_id(int rank, const char* path) {
         if (!out) throw std::runtime_error("failed to write NCCL id bytes");
         return id;
     }
-    for (int attempt = 0; attempt < 300; ++attempt) {
+    // Wait for rank 0 to publish the id. The bound is generous because the
+    // ranks reach their first collective only after loading weights, and that
+    // skew is minutes when four processes read a 167 GB checkpoint off the same
+    // disk -- a 30s bound made a slow loader look like a communicator failure.
+    int attempts = 6000;  // 10 minutes at 100ms
+    if (const char* env = std::getenv("DSV4_CPP_NCCL_ID_WAIT_ATTEMPTS")) {
+        const int v = std::atoi(env);
+        if (v > 0) attempts = v;
+    }
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         std::ifstream in(path, std::ios::binary);
         if (in) {
             in.read(reinterpret_cast<char*>(&id), sizeof(id));

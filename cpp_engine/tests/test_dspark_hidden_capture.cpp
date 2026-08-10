@@ -22,6 +22,8 @@
 //     B5  prefill captures the *last* prompt position, checked against a decode
 //         step landing on that same position, with a wrong position reported
 //         alongside as the discrimination margin
+//     B6  a windowed prefill capture returns the right count, in position
+//         order, with the last row still equal to the single-position capture
 //
 //   test_dspark_hidden_capture [ckpt_dir] [layers=3]
 //
@@ -301,6 +303,43 @@ void part_b(const std::string& ckpt_dir, int layer_count) {
     }
     if (!(r_wrong > 10.0 * r_same)) {
         fail("positions are not separable; the position check proves nothing");
+    }
+
+    // --- B6: windowed prefill capture ---
+    // load_dspark() keeps the last window_size positions rather than one,
+    // because priming the draft's attention ring needs every committed
+    // position. The rows must come back in position order and the last one must
+    // still be the one the single-position capture produced -- an off-by-one or
+    // a reversed window would look identical in shape and magnitude.
+    const int window = 4;
+    engine.set_dspark_capture_layers(targets, window);
+    engine.reset_session();
+    (void)engine.prefill(prompt, sp);
+    const std::vector<float> windowed = engine.last_dspark_hidden();
+    const int n_pos = engine.last_dspark_hidden_positions();
+    const size_t stride = static_cast<size_t>(n_target) * dim;
+    const int want_pos = std::min<int>(window, static_cast<int>(prompt.size()));
+    std::cout << "  windowed prefill positions=" << n_pos << " want=" << want_pos
+              << " len=" << windowed.size() << "\n";
+    if (n_pos != want_pos) fail("windowed prefill kept the wrong number of positions");
+    if (windowed.size() != static_cast<size_t>(n_pos) * stride) {
+        fail("windowed prefill length is not positions * n_target * dim");
+    } else {
+        // Last row == the single-position capture of the same prompt.
+        const std::vector<float> last(windowed.end() - stride, windowed.end());
+        const float m = max_abs_diff(last, prefill_hidden);
+        std::cout << "  last windowed row vs single-position capture: max_abs=" << m << "\n";
+        if (m != 0.0f) fail("the last windowed row is not the final prompt position");
+
+        // Rows must be distinct and in order: row i is position
+        // prompt.size() - n_pos + i. Comparing the first row against the last
+        // catches a window written backwards, which a length check cannot.
+        if (n_pos >= 2) {
+            const std::vector<float> first(windowed.begin(), windowed.begin() + stride);
+            const double r = rel_l2(first, last);
+            std::cout << "  first windowed row vs last: rel_l2=" << r << "\n";
+            if (!(r > 1e-3)) fail("windowed rows are not distinct positions");
+        }
     }
 }
 

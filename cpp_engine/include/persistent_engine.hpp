@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dspark.hpp"
 #include "dsv4_engine.hpp"
 #include "tokenizer.hpp"
 
@@ -64,20 +65,53 @@ public:
     // reference's forward hooks on model.layers[idx] record.
     //
     // Off until layers are set; capture costs one pooling kernel per target
-    // layer per forward and a [n_target * dim] D2H copy.
-    void set_dspark_capture_layers(const std::vector<int>& layers);
+    // layer per forward and a [positions * n_target * dim] D2H copy.
+    //
+    // `prefill_window` is how many trailing prompt positions prefill keeps.
+    // Priming the draft's attention ring needs every committed position, so
+    // load_dspark() sets this to the draft's window_size; 1 is right when only
+    // the committed position's hidden is wanted.
+    void set_dspark_capture_layers(const std::vector<int>& layers, int prefill_window = 1);
     const std::vector<int>& dspark_capture_layers() const;
 
-    // Hidden captured by the most recent prefill/decode_step, [n_target * dim].
-    // Empty if capture is off. Prefill captures the last prompt position only,
-    // which is the position the committed token comes from.
+    // Hidden captured by the most recent prefill/decode_step, [positions,
+    // n_target * dim] in position order. Empty if capture is off. A decode step
+    // captures one position; a prefill captures the last window's worth, since
+    // priming the draft's ring needs all of them.
     const std::vector<float>& last_dspark_hidden() const;
+
+    // Number of positions in last_dspark_hidden().
+    int last_dspark_hidden_positions() const;
 
     // Hiddens captured by the most recent verify_step, one row per draft token:
     // [draft_len, n_target * dim]. Row i is the hidden after consuming draft
     // token i, i.e. what seeds a draft continuing from that token. Empty if
     // capture is off.
     const std::vector<float>& last_verify_dspark_hidden() const;
+
+    // Load the DSpark draft module and set capture to its target layers. Must
+    // be called before draft_tokens(); the weights are ~12 GB at TP=1 and
+    // 3.8 GB at TP=4, so this is not done at construction.
+    void load_dspark(const std::string& ckpt_dir);
+    bool dspark_loaded() const;
+
+    // Draft block_size tokens continuing from `input_token` at `start_pos`,
+    // seeded by the hidden the main model produced when it consumed that token.
+    //
+    // `hidden` is one row of [n_target * dim], i.e. last_dspark_hidden() or one
+    // row of last_verify_dspark_hidden(). Pass it explicitly rather than
+    // reading the engine's last capture: after a verify round the caller drafts
+    // from the accepted position, which is not the last one forwarded.
+    dspark::DraftOutput draft_tokens(int input_token, int start_pos,
+                                     const std::vector<float>& hidden);
+
+    // Prime the draft's attention ring with committed positions. Every position
+    // the main model commits has to land in the ring before the next draft, or
+    // the draft attends to zeroed slots -- which yields fluent tokens that
+    // match nothing rather than an error. `hidden` is [rows, n_target * dim] in
+    // position order, e.g. last_dspark_hidden() after a prefill (which keeps
+    // the last window of positions) or the accepted rows of a verify.
+    void prime_dspark_kv(const std::vector<float>& hidden, int rows, int start_pos);
 
     int eos_id() const;
     int max_context() const;
