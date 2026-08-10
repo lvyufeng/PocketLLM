@@ -356,6 +356,24 @@ __global__ void hc_head_float_rows_kernel(
     }
 }
 
+// Mean over the hc dimension: [rows, 4, dim] -> [rows, dim], written into a
+// column slice of a wider destination so the DSpark target layers land
+// concatenated per position (the reference cats them on the last axis).
+//   d_out_rows + row * out_stride + col_offset .. + dim
+__global__ void hc_mean_pool_rows_kernel(const float* h4_rows, float* out_rows,
+                                         int rows, int dim, int out_stride,
+                                         int col_offset) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* h4 = h4_rows + static_cast<size_t>(row) * 4 * dim;
+    float* out = out_rows + static_cast<size_t>(row) * out_stride + col_offset;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < 4; ++h) acc += h4[static_cast<size_t>(h) * dim + d];
+        out[d] = acc * 0.25f;
+    }
+}
+
 __global__ void hc_post_float_rows_kernel(const float* x_rows, const float* residual_rows, const float* post_rows, const float* comb_rows, float* y_rows, int rows, int dim) {
     const int row = blockIdx.x;
     const int h = blockIdx.y;
@@ -1830,6 +1848,22 @@ bool hc_head_float_rows_cuda(
     if (d_h4_rows == nullptr || d_fn == nullptr || d_scale == nullptr || d_base == nullptr || d_y_rows == nullptr || rows <= 0 || dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     hc_head_float_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_h4_rows, d_fn, d_scale, d_base, d_y_rows, rows, dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool hc_mean_pool_rows_cuda(
+    const float* d_h4_rows,
+    float* d_out_rows,
+    int rows,
+    int dim,
+    int out_stride,
+    int col_offset,
+    void* stream) {
+    if (d_h4_rows == nullptr || d_out_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    if (out_stride < col_offset + dim || col_offset < 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_mean_pool_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_h4_rows, d_out_rows, rows, dim,
+                                                           out_stride, col_offset);
     return cudaGetLastError() == cudaSuccess;
 }
 

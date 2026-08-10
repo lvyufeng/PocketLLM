@@ -58,6 +58,27 @@ public:
                                  int start_position,
                                  const SamplingParams& sp);
 
+    // DSpark main-hidden capture. The draft module's main_proj consumes the
+    // main model's block output at a few late layers, mean-pooled over the hc
+    // dimension and concatenated on the last axis -- exactly what the
+    // reference's forward hooks on model.layers[idx] record.
+    //
+    // Off until layers are set; capture costs one pooling kernel per target
+    // layer per forward and a [n_target * dim] D2H copy.
+    void set_dspark_capture_layers(const std::vector<int>& layers);
+    const std::vector<int>& dspark_capture_layers() const;
+
+    // Hidden captured by the most recent prefill/decode_step, [n_target * dim].
+    // Empty if capture is off. Prefill captures the last prompt position only,
+    // which is the position the committed token comes from.
+    const std::vector<float>& last_dspark_hidden() const;
+
+    // Hiddens captured by the most recent verify_step, one row per draft token:
+    // [draft_len, n_target * dim]. Row i is the hidden after consuming draft
+    // token i, i.e. what seeds a draft continuing from that token. Empty if
+    // capture is off.
+    const std::vector<float>& last_verify_dspark_hidden() const;
+
     int eos_id() const;
     int max_context() const;
     int layer_count() const;

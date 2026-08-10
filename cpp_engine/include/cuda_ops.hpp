@@ -1031,6 +1031,19 @@ bool hc_head_float_rows_cuda(
     int dim,
     void* stream = nullptr);
 
+// Mean over the hc dimension: [rows, 4, dim] -> [rows, dim], written at
+// d_out_rows[row * out_stride + col_offset]. The strided destination lets the
+// DSpark target layers be pooled straight into one concatenated
+// [rows, n_target * dim] buffer, matching the reference's cat on the last axis.
+bool hc_mean_pool_rows_cuda(
+    const float* d_h4_rows,
+    float* d_out_rows,
+    int rows,
+    int dim,
+    int out_stride,
+    int col_offset,
+    void* stream = nullptr);
+
 
 bool hc_pre_float_cuda(
     const float* d_h4,

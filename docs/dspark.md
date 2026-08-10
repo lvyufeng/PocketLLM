@@ -250,15 +250,45 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B3b | MoE FFN (routed + shared) | done |
 | B4 | Stage 2 heads (norm, hc_head, markov, confidence) | done |
 | B5 | Weight loading | done |
-| B6 | Main-hidden caching during verify | todo |
+| B6 | Main-hidden caching during verify | done |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
 weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
-`tests/test_dspark_head_parity.py`).
+`tests/test_dspark_head_parity.py`). Main-hidden capture is covered by
+`cpp_engine/tests/test_dspark_hidden_capture.cpp`, which needs no reference
+because it checks the capture against the engine's own decode path.
 
 Two things are deliberately not done yet: TP>1 needs an all-reduce after the
 attention `wo_b` and after the routed MoE (each rank only sums its own experts'
-routes), and `draft_tokens()` waits on B6.
+routes), and `draft_tokens()` is not wired up.
+
+#### Main-hidden capture
+
+`PersistentEngine::set_dspark_capture_layers()` turns on capture of the main
+model's block output at the draft's target layers, mean-pooled over the hc
+dimension and concatenated on the last axis -- exactly what the reference's
+forward hooks on `model.layers[idx]` record. Capturing the raw `[4, dim]`
+instead would be 4x the memory and would not match what `main_proj` was trained
+on. Off by default; the cost when on is one pooling kernel per target layer per
+forward plus an `[n_target * dim]` D2H copy.
+
+`verify_step` keeps one row per draft token rather than only the last, because
+the accepted prefix is not known until after the comparison and the next round
+has to start from wherever it lands. Prefill keeps only the final prompt
+position: holding all of them would be `n_target * dim` floats per token, ~49 KB
+at dim=4096, i.e. 3 GB at a 64K context, for hiddens no draft round reads.
+
+Every way of getting this wrong still yields a finite vector of plausible
+magnitude, so `cpp_engine/tests/test_dspark_hidden_capture.cpp` checks the
+pieces separately. Against the real checkpoint: each slot matches a
+single-layer capture of that layer bitwise (`max_abs=0`), the target layers are
+distinguishable (`rel_l2` 0.56 and 1.23 against the first, so the slot check is
+not vacuous), verify's rows match plain decode at the same positions exactly,
+and prefill's hidden reads 2.8e-6 against the correct position versus 1.79
+against the next one. Enabling capture leaves the token stream unchanged. The
+pooling kernel itself is checked against a CPU mean at exact equality, which
+separates a mean from a sum by a clean 4x, plus a poisoned destination so an
+unwritten or over-wide slot cannot pass.
 
 #### MoE notes
 

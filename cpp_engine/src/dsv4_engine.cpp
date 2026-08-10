@@ -2195,6 +2195,17 @@ struct SafeForwardContext {
     std::vector<float> last_local_logits;
     int last_head_rows = 0;
     int last_local_head_start = 0;
+    // DSpark target-layer hidden states captured by the most recent forward, as
+    // [positions, n_target * dim] with the layers concatenated on the last axis.
+    // Empty unless dspark_capture_layers is non-empty.
+    //
+    // The draft's main_proj consumes the hc dimension mean-pooled away, so this
+    // is what the reference's forward hook records (out.mean(dim=2), then cat
+    // over the target layers). Capturing the raw [4, dim] instead would be four
+    // times the memory and would not match what main_proj was trained on.
+    std::vector<int> dspark_capture_layers;
+    std::vector<float> dspark_hidden;
+    int dspark_hidden_positions = 0;
     std::unordered_map<std::string, std::unique_ptr<SafeTensorsShard>> shard_cache;
     std::unordered_map<std::string, DeviceAttentionCache> attention_cache;
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
@@ -2499,6 +2510,15 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     float* d_final_norm = nullptr;
     float* d_logits = nullptr;
 
+    // DSpark target-layer capture. Only the last prompt position is kept: the
+    // drafter is seeded from the token the prefill commits, and holding every
+    // position would cost n_target*dim floats per token -- ~49 KB/token, i.e.
+    // 3 GB at a 64K context -- for hiddens no draft round ever reads.
+    float* d_dspark_hidden = nullptr;
+    const int dspark_n_target = static_cast<int>(ctx.dspark_capture_layers.size());
+    const int dspark_hidden_stride = dspark_n_target * dim;
+    const int dspark_capture_slot = dspark_n_target > 0 ? 0 : -1;
+
     // Chunked prefill: scratch buffers (everything except the residual stream
     // d_h4_rows, the per-layer KV memory d_kv_norm_rows, and the window-indices
     // table) are sized to one chunk's worth of rows. The layer loop iterates
@@ -2573,6 +2593,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_last_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc last x");
     check_cuda(cudaMalloc(&d_final_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc final norm");
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+    if (dspark_capture_slot >= 0) {
+        check_cuda(cudaMalloc(&d_dspark_hidden, static_cast<size_t>(dspark_hidden_stride) * sizeof(float)),
+                   "cudaMalloc prefill dspark hidden");
+    }
 
     check_cuda(cudaMemcpy(d_token_ids, token_ids.data(), static_cast<size_t>(token_count) * sizeof(int), cudaMemcpyHostToDevice), "copy token ids");
     check_cuda(cudaMemcpy(d_embed_matrix, ctx.embed_shard.tensor_data(*embed), ctx.embed->nbytes, cudaMemcpyHostToDevice), "copy embed matrix");
@@ -3006,6 +3030,21 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             if (!bf16_to_fp32_cuda(d_h4_bf16_rows, h4_chunk, static_cast<int>(cn_dim_sz * 4))) throw std::runtime_error("prefill hc ffn post bf16 restore failed");
             sync_prefill_profile("profile sync prefill hc ffn post");
             total_prefill_ffn_post_ms += elapsed_ms(stage_t, Clock::now());
+
+            // DSpark target-layer capture, restricted to the chunk holding the
+            // last prompt position -- the same block output the reference's
+            // forward hook on model.layers[idx] sees, after the bf16 round trip.
+            if (dspark_capture_slot >= 0 && ce == token_count) {
+                const auto it = std::find(ctx.dspark_capture_layers.begin(),
+                                          ctx.dspark_capture_layers.end(), li);
+                if (it != ctx.dspark_capture_layers.end()) {
+                    const int slot = static_cast<int>(it - ctx.dspark_capture_layers.begin());
+                    const float* last_row = h4_chunk + static_cast<size_t>(cn - 1) * 4 * dim;
+                    if (!hc_mean_pool_rows_cuda(last_row, d_dspark_hidden, 1, dim,
+                                                dspark_hidden_stride, slot * dim))
+                        throw std::runtime_error("prefill dspark hidden capture failed");
+                }
+            }
         }
     }
 
@@ -3046,11 +3085,22 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     ctx.last_head_rows = head_rows;
     ctx.last_local_head_start = local_head_start;
 
+    if (dspark_capture_slot >= 0) {
+        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
+        check_cuda(cudaMemcpy(ctx.dspark_hidden.data(), d_dspark_hidden,
+                              ctx.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy prefill dspark hidden");
+        ctx.dspark_hidden_positions = 1;
+    } else {
+        ctx.dspark_hidden.clear();
+        ctx.dspark_hidden_positions = 0;
+    }
+
     cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_attn_out_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
     cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_token_slot_routes); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
     cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_attn_norm_rows); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_q_a_rows); cudaFree(d_q_norm_rows); cudaFree(d_q_rows); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_kv_a_rows); cudaFree(d_kv_norm_rows); cudaFree(d_attn_value); cudaFree(d_attn_value_rows); cudaFree(d_attn_mid); cudaFree(d_attn_mid_rows); cudaFree(d_attn_out); cudaFree(d_prefill_window_indices);
     cudaFree(d_moe_rows); cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden); cudaFree(d_shared_out);
-    cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits);
+    cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits); cudaFree(d_dspark_hidden);
     if (prefill_moe_copy_stream_enabled) {
         cudaEventDestroy(prefill_moe_stage_event);
         cudaStreamDestroy(prefill_moe_copy_stream);
@@ -3140,6 +3190,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     int64_t* d_route_indices = nullptr;
     float* d_route_weights = nullptr;
     float* d_logits = nullptr;
+    // DSpark target-layer capture buffer, [1, n_target * dim]. Allocated only
+    // when a caller asked for it; dspark_capture_slot < 0 means "off", so the
+    // layer loop's capture branch costs one compare per layer when unused.
+    float* d_dspark_hidden = nullptr;
+    const int dspark_n_target = static_cast<int>(ctx.dspark_capture_layers.size());
+    const int dspark_hidden_stride = dspark_n_target * dim;
+    const int dspark_capture_slot = dspark_n_target > 0 ? 0 : -1;
 
     const auto* embed_data = reinterpret_cast<const uint16_t*>(ctx.embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
     check_cuda(cudaMalloc(&d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc embed");
@@ -3198,6 +3255,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_route_indices, static_cast<size_t>(config.n_activated_experts) * sizeof(int64_t)), "cudaMalloc route indices");
     check_cuda(cudaMalloc(&d_route_weights, static_cast<size_t>(config.n_activated_experts) * sizeof(float)), "cudaMalloc route weights");
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+    if (dspark_capture_slot >= 0) {
+        check_cuda(cudaMalloc(&d_dspark_hidden,
+                              static_cast<size_t>(dspark_hidden_stride) * sizeof(float)),
+                   "cudaMalloc dspark hidden");
+    }
 
     cudaStream_t moe_copy_stream = nullptr;
     cudaEvent_t moe_stage_event = nullptr;
@@ -3662,6 +3724,19 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         if (!hc_post_float_cuda(d_moe, d_h4, d_hc_post, d_hc_comb, d_h4_next, dim)) throw std::runtime_error("hc ffn post launch failed");
         if (!fp32_to_bf16_cuda(d_h4_next, d_h4_bf16, 4 * dim)) throw std::runtime_error("hc ffn post bf16 round failed");
         if (!bf16_to_fp32_cuda(d_h4_bf16, d_h4, 4 * dim)) throw std::runtime_error("hc ffn post bf16 restore failed");
+        // DSpark target-layer capture. This is the block's output, i.e. exactly
+        // what the reference's forward hook on model.layers[idx] sees -- after
+        // the bf16 round trip, since the reference's x is bf16 at this point.
+        if (dspark_capture_slot >= 0) {
+            const auto it = std::find(ctx.dspark_capture_layers.begin(),
+                                      ctx.dspark_capture_layers.end(), li);
+            if (it != ctx.dspark_capture_layers.end()) {
+                const int slot = static_cast<int>(it - ctx.dspark_capture_layers.begin());
+                if (!hc_mean_pool_rows_cuda(d_h4, d_dspark_hidden, 1, dim,
+                                            dspark_hidden_stride, slot * dim))
+                    throw std::runtime_error("dspark hidden capture failed");
+            }
+        }
         post_ms += elapsed_ms(stage_t, Clock::now());
         if (profile_forward) {
             const double layer_ms = elapsed_ms(layer_t0, Clock::now());
@@ -3814,6 +3889,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     ctx.last_local_head_start = local_head_start;
     if (!std::isfinite(checksum) || !std::isfinite(top_logit)) throw std::runtime_error("non-finite smoke logits");
 
+    if (dspark_capture_slot >= 0) {
+        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
+        check_cuda(cudaMemcpy(ctx.dspark_hidden.data(), d_dspark_hidden,
+                              ctx.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy dspark hidden");
+        ctx.dspark_hidden_positions = 1;
+    } else {
+        ctx.dspark_hidden.clear();
+        ctx.dspark_hidden_positions = 0;
+    }
+
     cudaFree(d_embed);
     cudaFree(d_w1);
     cudaFree(d_s1);
@@ -3862,6 +3948,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_route_indices);
     cudaFree(d_route_weights);
     cudaFree(d_logits);
+    cudaFree(d_dspark_hidden);
 
     cudaEventDestroy(moe_stage_event);
     cudaStreamDestroy(moe_copy_stream);
@@ -9194,6 +9281,8 @@ struct PersistentEngine::State {
     std::mt19937 rng{0xDEEDBEEFu};
     uint64_t rng_seed = 0;
     std::unique_ptr<CmdChannel> cmd;
+    // Per-draft-token hiddens from the last verify_step, [draft_len, stride].
+    std::vector<float> verify_dspark_hidden;
 
     State(const std::string& ckpt_dir, const ForwardSmokeOptions& options, int lc, int mc)
         : ctx(std::make_unique<SafeForwardContext>(ckpt_dir)),
@@ -9350,12 +9439,43 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
 
     std::vector<int> next_tokens;
     next_tokens.reserve(draft_tokens.size());
+    s.verify_dspark_hidden.clear();
     for (size_t i = 0; i < draft_tokens.size(); ++i) {
         const int position = start_position + static_cast<int>(i);
         (void)run_safetensors_token_forward_impl(ctx, draft_tokens[i], s.layer_count, position);
         next_tokens.push_back(select_token(ctx, s.opts, sp, s.rng));
+        // Keep every draft position's hidden, not just the last: the accepted
+        // prefix is only known after the comparison below, and the next draft
+        // round has to start from whichever position it ends at.
+        s.verify_dspark_hidden.insert(s.verify_dspark_hidden.end(),
+                                      ctx.dspark_hidden.begin(), ctx.dspark_hidden.end());
     }
     return next_tokens;
+}
+
+void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers) {
+    auto& s = *state_;
+    for (int li : layers) {
+        if (li < 0 || li >= s.layer_count) {
+            throw std::runtime_error("set_dspark_capture_layers: layer index out of range");
+        }
+    }
+    s.ctx->dspark_capture_layers = layers;
+    s.ctx->dspark_hidden.clear();
+    s.ctx->dspark_hidden_positions = 0;
+    s.verify_dspark_hidden.clear();
+}
+
+const std::vector<int>& PersistentEngine::dspark_capture_layers() const {
+    return state_->ctx->dspark_capture_layers;
+}
+
+const std::vector<float>& PersistentEngine::last_dspark_hidden() const {
+    return state_->ctx->dspark_hidden;
+}
+
+const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
+    return state_->verify_dspark_hidden;
 }
 
 int PersistentEngine::eos_id() const { return state_->eos_token_id; }
