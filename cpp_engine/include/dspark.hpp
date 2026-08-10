@@ -71,8 +71,15 @@ public:
     ~DSparkEngine();
 
     // Draft block_size tokens from a committed token
-    // input_token: the committed token at position start_pos
-    // start_pos: position index of the input token
+    // input_token: the committed token, which occupies position start_pos + 1
+    // start_pos: position of the *seed hidden*, i.e. the last position the main
+    //            model consumed. input_token is what it predicted from there, so
+    //            it goes into draft slot 0 and is roped at start_pos + 1. The
+    //            reference passes `self._pos - 1` here for exactly this reason.
+    //            Passing the committed token's own position instead shifts every
+    //            draft position by one and writes a ring slot for a position the
+    //            main model has not consumed -- the draft stays fluent and
+    //            matches nothing.
     // main_hidden_states: hidden states from main model's target layers [n_target][dim]
     //                     (layers 40, 41, 42 for DeepSeek-V4-Flash-0731)
     // Returns: DraftOutput with drafted tokens and confidence scores

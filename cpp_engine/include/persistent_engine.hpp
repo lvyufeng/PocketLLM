@@ -95,8 +95,11 @@ public:
     void load_dspark(const std::string& ckpt_dir);
     bool dspark_loaded() const;
 
-    // Draft block_size tokens continuing from `input_token` at `start_pos`,
-    // seeded by the hidden the main model produced when it consumed that token.
+    // Draft block_size tokens continuing from `input_token`, seeded by the
+    // hidden the main model produced at `start_pos` -- the position it consumed
+    // to predict `input_token`, not `input_token`'s own position. The committed
+    // token occupies start_pos + 1; the draft ropes it there. After a prefill of
+    // `n` tokens that makes start_pos = n - 1.
     //
     // `hidden` is one row of [n_target * dim], i.e. last_dspark_hidden() or one
     // row of last_verify_dspark_hidden(). Pass it explicitly rather than

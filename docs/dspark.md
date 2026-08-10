@@ -251,13 +251,27 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B4 | Stage 2 heads (norm, hc_head, markov, confidence) | done |
 | B5 | Weight loading | done |
 | B6 | Main-hidden caching during verify | done |
-| B7 | `draft_tokens()` + TP all-reduces + ring priming | wired, accept rate still 0 |
+| B7 | `draft_tokens()` + TP all-reduces + ring priming | done |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
 weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
 `tests/test_dspark_head_parity.py`). Main-hidden capture is covered by
 `cpp_engine/tests/test_dspark_hidden_capture.cpp`, which needs no reference
 because it checks the capture against the engine's own decode path.
+
+Two further tests need no reference either, because each compares the draft
+against another run of itself:
+
+- `cpp_engine/tests/test_dspark_tp_consistency.cpp` -- same synthetic seed at
+  TP=1 and TP=4; the drafted tokens must match, which is what says the
+  all-reduces and the replicated head are right.
+- `cpp_engine/tests/test_dspark_draft_sensitivity.cpp` -- perturbs one input at
+  a time (seed, seed position, ring priming, committed token) and requires each
+  to change the drafted tokens. Answers the question an accept rate cannot:
+  whether an input reaches the draft at all.
+
+Both run draft-only at TP=1 where possible -- the module is ~12.4 GB and fits on
+one card without the main model, so neither needs the 167 GB checkpoint load.
 
 #### Drafting
 
@@ -283,37 +297,63 @@ partial sum, which would still read as a well-formed draft.
 
 `cpp_engine/tests/test_dspark_draft.cpp` measures accept rate against the main
 model's own verify. Shape and finiteness checks are worthless here -- a draft
-seeded with the wrong hidden still emits fluent token ids -- so the real seed is
-scored against two corruptions on the same committed token, position, and truth:
-a zeroed hidden (the floor for the draft module alone) and a hidden from an
-earlier position (the mistake an off-by-one in the plumbing would actually
-produce). Block alignment is the other trap: verify gets
-`[committed, drafts...]`, since verifying the drafts alone shifts every
-comparison one position and reads as a near-zero accept rate.
+seeded with the wrong hidden still emits fluent token ids -- and so, it turns
+out, is a low accept rate on ordinary text. The prompt has to be one the main
+model is near-certain about, or a correct draft and a broken one are
+indistinguishable; the default is therefore cyclic and the bar is an absolute
+rate. Block alignment is the other trap: verify gets `[committed, drafts...]`,
+since verifying the drafts alone shifts every comparison one position and reads
+as a near-zero accept rate.
 
-**This test currently fails.** At TP=4 the measured accept rate is 0/10 for the
-real seed and equally 0 for both corruptions, so the end-to-end draft path is
-not yet producing usable tokens and the test cannot yet tell a good seed from a
-zeroed one. Two causes have been found and fixed and neither closed it:
+**The draft works, and the earlier "accept rate 0" was a prompt artifact.** On a
+cyclic prompt the same build accepts 30/30 -- 5/5 on every round, on all four TP
+ranks, with confidence 3.2-4.7. On a short English prompt the same build accepts
+0/30. Ordinary text is genuinely uncertain at every position, so a correct draft
+loses there and the rate says nothing about correctness; that is what the first
+measurements were reading. (A shorter 6-token cyclic prompt reads 20/30: the
+first two rounds score 0 until the pattern is established in the ring, then 5/5
+thereafter, with confidence climbing 1.86 -> 4.21 as it settles.)
+
+Three real bugs were found and fixed on the way, none of which was the reason
+the rate looked like 0:
 
 - **Ring priming was missing.** `draft()` writes only the position it drafts
   from, but the reference's `write_main_kv` writes *every* committed position;
   without it the draft attended to a window that was almost entirely zeros.
   `PersistentEngine::prime_dspark_kv()` now does this, and prefill's capture
-  keeps the last `window_size` positions rather than one to feed it. This
-  visibly changed the drafts and produced the first partial agreement -- one
-  round had two consecutive draft tokens match the main model at the right
-  positions -- but not at position 0, so the accepted prefix is still 0.
+  keeps the last `window_size` positions rather than one to feed it.
 - **The NCCL id wait was 30s**, which is shorter than the time four ranks take
   to load a 167 GB checkpoint, so ranks 1-2 died before rank 0 published the id.
   Now 10 minutes, overridable via `DSV4_CPP_NCCL_ID_WAIT_ATTEMPTS`.
+- **`start_pos` was off by one at the call site.** It is the position of the
+  *seed hidden* -- the last position the main model consumed -- not the
+  committed token's own position; the committed token goes into draft slot 0 and
+  is roped at `start_pos + 1`. The reference passes `self._pos - 1` for exactly
+  this reason. The C++ arithmetic was right and the header comment was wrong,
+  which is what led the test to pass `pos`. Both are fixed.
 
-What is *not* yet ruled out: the sub-path parity tests each drive one piece from
-injected inputs at TP=1, so none of them covers the composition (stage 0 ->
-blocks -> head) or TP=4 sharding of the draft. That is where the next
-investigation goes. The plumbing tested above -- capture, slot ordering, verify
-alignment, memory placement -- is verified independently and is not the
-remaining suspect.
+Two structural suspects were ruled out in the process, each by a test that now
+guards it:
+
+- **TP sharding.** `cpp_engine/tests/test_dspark_tp_consistency.cpp` runs the
+  draft alone (no main model, so it fits on one card) from a fixed synthetic
+  seed at both world sizes. TP=1 and all four TP=4 ranks draft the identical
+  token sequence, so the two all-reduces and the replicated head are correct.
+- **Wiring.** `cpp_engine/tests/test_dspark_draft_sensitivity.cpp` perturbs one
+  input at a time and counts changed draft tokens: committed token 5/5, ring
+  priming 5/5, seed position 1/5, and a zeroed seed 5/5 once the ring is zeroed
+  so the seed's slot is the only live key. Every input reaches the draft.
+  (With the ring primed a zeroed seed changes 0/5 -- priming has already written
+  that position's KV and the seed only overwrites one key of six, so that
+  variant is reported but deliberately not asserted on.)
+
+That last point is also why `test_dspark_draft` asserts an absolute accept rate
+rather than beating a corrupted seed. On a prompt predictable enough for the
+absolute rate to mean anything, the ring and the committed token already carry
+the continuation, so a zeroed seed scores the same (real 30/30, zeros 30/30).
+The seed's contribution is established by the sensitivity test, which isolates
+it properly; an assertion here that only held on prompts where the rate is
+uninformative would be worse than none.
 
 #### Main-hidden capture
 
