@@ -126,6 +126,10 @@ add_executable(test_dspark_attention_parity tests/test_dspark_attention_parity.c
 target_link_libraries(test_dspark_attention_parity PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_attention_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_dspark_moe_parity tests/test_dspark_moe_parity.cpp)
+target_link_libraries(test_dspark_moe_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_moe_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_q2_matvec tests/test_q2_matvec.cpp)
 target_link_libraries(test_q2_matvec PRIVATE dsv4_cpp_core)
 set_target_properties(test_q2_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

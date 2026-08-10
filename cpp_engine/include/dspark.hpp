@@ -90,6 +90,13 @@ public:
     void debug_attention(int stage_id, const float* h_x, const float* h_main_x,
                          int start_pos, float* h_out);
 
+    // Run one stage's MoE FFN in isolation (routed experts + shared expert).
+    //   h_x   [rows, dim]  ffn_norm output
+    //   h_out [rows, dim]  caller-allocated output
+    // rows must not exceed block_size: the engine's routing scratch is sized
+    // for one draft block.
+    void debug_moe(int stage_id, const float* h_x, int rows, float* h_out);
+
 private:
     struct Impl;
     Impl* impl_;

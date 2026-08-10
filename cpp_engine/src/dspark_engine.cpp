@@ -145,6 +145,12 @@ struct DSparkEngine::Impl {
         uint16_t* embed_weight = nullptr;     // [vocab, dim] BF16
     } stage0;
 
+    // Routed-expert sharding, derived from config + tp_world_size. Each rank
+    // owns a contiguous slice [experts_start, experts_start + experts_per_rank);
+    // the grouped MoE kernel indexes experts by their local id within it.
+    int experts_per_rank = 0;
+    int experts_start = 0;
+
     // Per-rank attention dimensions, derived from config + tp_world_size.
     struct AttnDims {
         int dim = 0;
@@ -209,8 +215,29 @@ struct DSparkEngine::Impl {
             uint8_t* shared_w2_weight = nullptr;  // [dim, moe_inter]
             uint8_t* shared_w2_scale = nullptr;
 
-            // Routed experts stay on host and are staged per-token, exactly like
-            // the main model's routed path. Not owned here.
+            // Routed experts. Unlike the main model these stay resident on the
+            // device: a rank owns n_experts/tp_world of them, and at 13.4 MB per
+            // expert that is 10.3 GB at TP=1 but only 2.6 GB at TP=4. Staging
+            // them per draft instead would put a PCIe transfer on the critical
+            // path of every draft round, which is the one thing speculative
+            // decoding cannot afford -- the draft has to be cheap relative to
+            // the verify it is trying to skip.
+            //
+            // Laid out as one contiguous arena per matrix so the grouped MoE
+            // kernel can index expert `local` at a fixed stride, exactly like
+            // the main model's DeviceFp4ActiveArena.
+            uint8_t* routed_w1q = nullptr;
+            uint8_t* routed_w1s = nullptr;
+            uint8_t* routed_w2q = nullptr;
+            uint8_t* routed_w2s = nullptr;
+            uint8_t* routed_w3q = nullptr;
+            uint8_t* routed_w3s = nullptr;
+            size_t routed_w1q_stride = 0;
+            size_t routed_w1s_stride = 0;
+            size_t routed_w2q_stride = 0;
+            size_t routed_w2s_stride = 0;
+            size_t routed_w3q_stride = 0;
+            size_t routed_w3s_stride = 0;
         } ffn;
 
         uint16_t* ffn_norm_weight = nullptr;  // [dim] BF16
@@ -287,7 +314,27 @@ struct DSparkEngine::Impl {
         float* d_ffn_normed = nullptr;       // [block_size, dim]
         float* d_ffn_out = nullptr;          // [block_size, dim]
 
-        void allocate(const Config& cfg, const AttnDims& ad) {
+        // MoE routing + grouped-expert scratch. Sized for block_size tokens, so
+        // every allocation here is small and can live for the engine's lifetime.
+        int64_t* d_route_indices = nullptr;  // [block_size, topk]
+        float* d_route_weights = nullptr;    // [block_size, topk]
+        int64_t* d_group_route_tokens = nullptr;  // [block_size * topk]
+        float* d_group_route_weights = nullptr;   // [block_size * topk]
+        int32_t* d_seg_starts = nullptr;     // [experts_per_rank + 1]
+        int32_t* d_counts = nullptr;         // [experts_per_rank]
+        int32_t* d_offsets = nullptr;        // [experts_per_rank]
+        int32_t* d_total_routes = nullptr;   // [1]
+        int32_t* d_token_slot_routes = nullptr;  // [block_size, topk]
+        // Shared-expert intermediates.
+        float* d_shared_gate = nullptr;      // [block_size, moe_inter]
+        float* d_shared_up = nullptr;        // [block_size, moe_inter]
+        float* d_shared_hidden = nullptr;    // [block_size, moe_inter]
+        float* d_shared_out = nullptr;       // [block_size, dim]
+        // Grouped-MoE workspace, kept across calls: a cudaMalloc/cudaFree pair
+        // per call synchronizes the device and costs far more than the kernel.
+        dsv4::MoePrefillFp4GroupedWorkspace moe_ws;
+
+        void allocate(const Config& cfg, const AttnDims& ad, int experts_per_rank) {
             const int dim = cfg.dim;
             const int bsz = cfg.block_size;
             const int hc = cfg.hc_mult;
@@ -330,6 +377,45 @@ struct DSparkEngine::Impl {
             cudaMalloc(&d_ffn_comb, bsz * hc * hc * sizeof(float));
             cudaMalloc(&d_ffn_normed, bsz * dim * sizeof(float));
             cudaMalloc(&d_ffn_out, bsz * dim * sizeof(float));
+
+            // MoE routing scratch
+            const int topk = cfg.topk;
+            const int moe_inter = cfg.moe_inter;
+            const size_t routes_cap = static_cast<size_t>(bsz) * topk;
+            cudaMalloc(&d_route_indices, routes_cap * sizeof(int64_t));
+            cudaMalloc(&d_route_weights, routes_cap * sizeof(float));
+            cudaMalloc(&d_group_route_tokens, routes_cap * sizeof(int64_t));
+            cudaMalloc(&d_group_route_weights, routes_cap * sizeof(float));
+            cudaMalloc(&d_seg_starts, (static_cast<size_t>(experts_per_rank) + 1) * sizeof(int32_t));
+            cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
+            cudaMalloc(&d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
+            cudaMalloc(&d_total_routes, sizeof(int32_t));
+            cudaMalloc(&d_token_slot_routes, routes_cap * sizeof(int32_t));
+            cudaMalloc(&d_shared_gate, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            cudaMalloc(&d_shared_up, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            cudaMalloc(&d_shared_hidden, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            cudaMalloc(&d_shared_out, bsz * dim * sizeof(float));
+
+            // Grouped-MoE workspace. Every route belongs to one of block_size
+            // tokens, so routes <= block_size * topk and the padded path needs
+            // at most experts_per_rank * block_size rows.
+            moe_ws.dim = dim;
+            moe_ws.inter_dim = moe_inter;
+            moe_ws.routes_cap = static_cast<int>(routes_cap);
+            moe_ws.padded_rows_cap = experts_per_rank * bsz;
+            const size_t rd = routes_cap * dim;
+            const size_t pd = static_cast<size_t>(moe_ws.padded_rows_cap) * dim;
+            const size_t pi = static_cast<size_t>(moe_ws.padded_rows_cap) * moe_inter;
+            cudaMalloc(&moe_ws.d_x_sorted, rd * sizeof(float));
+            cudaMalloc(&moe_ws.d_partials, rd * sizeof(float));
+            cudaMalloc(&moe_ws.d_x_q, rd);
+            cudaMalloc(&moe_ws.d_x_scale, routes_cap * sizeof(float));
+            cudaMalloc(&moe_ws.d_x_pad, pd);
+            cudaMalloc(&moe_ws.d_x_scale_pad, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
+            cudaMalloc(&moe_ws.d_gate, pi * sizeof(float));
+            cudaMalloc(&moe_ws.d_up, pi * sizeof(float));
+            cudaMalloc(&moe_ws.d_hidden_q, pi);
+            cudaMalloc(&moe_ws.d_hidden_scale, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
         }
 
         void free_all() {
@@ -365,6 +451,20 @@ struct DSparkEngine::Impl {
             if (d_ffn_comb) cudaFree(d_ffn_comb);
             if (d_ffn_normed) cudaFree(d_ffn_normed);
             if (d_ffn_out) cudaFree(d_ffn_out);
+
+            for (void* p : {(void*)d_route_indices, (void*)d_route_weights,
+                            (void*)d_group_route_tokens, (void*)d_group_route_weights,
+                            (void*)d_seg_starts, (void*)d_counts, (void*)d_offsets,
+                            (void*)d_total_routes, (void*)d_token_slot_routes,
+                            (void*)d_shared_gate, (void*)d_shared_up,
+                            (void*)d_shared_hidden, (void*)d_shared_out,
+                            (void*)moe_ws.d_x_sorted, (void*)moe_ws.d_partials,
+                            (void*)moe_ws.d_x_q, (void*)moe_ws.d_x_scale,
+                            (void*)moe_ws.d_x_pad, (void*)moe_ws.d_x_scale_pad,
+                            (void*)moe_ws.d_gate, (void*)moe_ws.d_up,
+                            (void*)moe_ws.d_hidden_q, (void*)moe_ws.d_hidden_scale}) {
+                if (p != nullptr) cudaFree(p);
+            }
         }
     } buffers;
 
@@ -372,7 +472,7 @@ struct DSparkEngine::Impl {
         : tp_rank(rank), tp_world_size(world_size), checkpoint_dir(ckpt_dir) {
         config = Config::from_json((std::string(ckpt_dir) + "/config.json").c_str());
         init_dims();
-        buffers.allocate(config, adims);
+        buffers.allocate(config, adims, experts_per_rank);
     }
 
     ~Impl() {
@@ -387,6 +487,11 @@ struct DSparkEngine::Impl {
         if (config.o_groups % tp_world_size != 0) {
             throw std::runtime_error("DSpark: o_groups not divisible by tp_world_size");
         }
+        if (config.n_experts % tp_world_size != 0) {
+            throw std::runtime_error("DSpark: n_routed_experts not divisible by tp_world_size");
+        }
+        experts_per_rank = config.n_experts / tp_world_size;
+        experts_start = tp_rank * experts_per_rank;
         adims.dim = config.dim;
         adims.q_a_dim = config.q_lora_rank;
         adims.heads = config.n_heads / tp_world_size;
@@ -642,6 +747,71 @@ struct DSparkEngine::Impl {
             b.ffn.shared_w2_scale = static_cast<uint8_t*>(
                 upload_whole(p + "ffn.shared_experts.w2.scale", SafeDType::F8_E8M0,
                              {udim / 128, inter / 128}));
+
+            // Routed experts: this rank's slice, uploaded into one arena per
+            // matrix. Experts are FP4 (int8-packed pairs) with e8m0 scales, the
+            // same format the main model's grouped kernel consumes.
+            {
+                const std::string ep = p + "ffn.experts.";
+                auto expert_name = [&](int e, const char* w, const char* suffix) {
+                    return ep + std::to_string(e) + "." + w + "." + suffix;
+                };
+
+                // Size the arena from expert 0; every expert shares a shape, and
+                // `get` below re-checks each one, so a ragged checkpoint fails
+                // loudly rather than writing past a stride.
+                Loaded w1q0 = get(expert_name(experts_start, "w1", "weight"), SafeDType::I8, {inter, udim / 2});
+                Loaded w1s0 = get(expert_name(experts_start, "w1", "scale"), SafeDType::F8_E8M0, {inter, udim / 32});
+                Loaded w2q0 = get(expert_name(experts_start, "w2", "weight"), SafeDType::I8, {udim, inter / 2});
+                Loaded w2s0 = get(expert_name(experts_start, "w2", "scale"), SafeDType::F8_E8M0, {udim, inter / 32});
+                Loaded w3q0 = get(expert_name(experts_start, "w3", "weight"), SafeDType::I8, {inter, udim / 2});
+                Loaded w3s0 = get(expert_name(experts_start, "w3", "scale"), SafeDType::F8_E8M0, {inter, udim / 32});
+
+                b.ffn.routed_w1q_stride = w1q0.info->nbytes;
+                b.ffn.routed_w1s_stride = w1s0.info->nbytes;
+                b.ffn.routed_w2q_stride = w2q0.info->nbytes;
+                b.ffn.routed_w2s_stride = w2s0.info->nbytes;
+                b.ffn.routed_w3q_stride = w3q0.info->nbytes;
+                b.ffn.routed_w3s_stride = w3s0.info->nbytes;
+
+                const size_t n = static_cast<size_t>(experts_per_rank);
+                b.ffn.routed_w1q = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w1q_stride, "dspark routed w1q"));
+                b.ffn.routed_w1s = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w1s_stride, "dspark routed w1s"));
+                b.ffn.routed_w2q = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w2q_stride, "dspark routed w2q"));
+                b.ffn.routed_w2s = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w2s_stride, "dspark routed w2s"));
+                b.ffn.routed_w3q = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w3q_stride, "dspark routed w3q"));
+                b.ffn.routed_w3s = static_cast<uint8_t*>(device_alloc(n * b.ffn.routed_w3s_stride, "dspark routed w3s"));
+
+                for (int local = 0; local < experts_per_rank; ++local) {
+                    const int e = experts_start + local;
+                    struct Upload {
+                        const char* w;
+                        const char* suffix;
+                        SafeDType dtype;
+                        std::vector<uint64_t> shape;
+                        uint8_t* dst;
+                        size_t stride;
+                    };
+                    const Upload uploads[] = {
+                        {"w1", "weight", SafeDType::I8,      {inter, udim / 2},  b.ffn.routed_w1q, b.ffn.routed_w1q_stride},
+                        {"w1", "scale",  SafeDType::F8_E8M0, {inter, udim / 32}, b.ffn.routed_w1s, b.ffn.routed_w1s_stride},
+                        {"w2", "weight", SafeDType::I8,      {udim, inter / 2},  b.ffn.routed_w2q, b.ffn.routed_w2q_stride},
+                        {"w2", "scale",  SafeDType::F8_E8M0, {udim, inter / 32}, b.ffn.routed_w2s, b.ffn.routed_w2s_stride},
+                        {"w3", "weight", SafeDType::I8,      {inter, udim / 2},  b.ffn.routed_w3q, b.ffn.routed_w3q_stride},
+                        {"w3", "scale",  SafeDType::F8_E8M0, {inter, udim / 32}, b.ffn.routed_w3s, b.ffn.routed_w3s_stride},
+                    };
+                    for (const Upload& u : uploads) {
+                        Loaded t = get(expert_name(e, u.w, u.suffix), u.dtype, u.shape);
+                        if (t.info->nbytes != u.stride) {
+                            throw std::runtime_error("DSpark: routed expert size mismatch for " +
+                                                     expert_name(e, u.w, u.suffix));
+                        }
+                        check_cuda(cudaMemcpy(u.dst + static_cast<size_t>(local) * u.stride,
+                                              t.data, u.stride, cudaMemcpyHostToDevice),
+                                   "upload dspark routed expert");
+                    }
+                }
+            }
 
             // Stage 0 extras: main_proj + main_norm
             if (stage == 0) {
@@ -939,6 +1109,92 @@ struct DSparkEngine::Impl {
         // hook is not wired yet, so TP>1 draft output is incomplete.
     }
 
+    // Routed MoE + shared expert for `rows` tokens. d_x is the ffn_norm output
+    // [rows, dim]; d_out receives shared + sum(route_weight * expert(x)).
+    //
+    // Mirrors the main model's prefill MoE: gate -> group routes by expert ->
+    // one grouped FP4 kernel over all routes -> add the shared expert. The
+    // routed weights are already resident (see StageBlock::FFN), so unlike the
+    // main model there is no staging step on the critical path.
+    void forward_moe(StageBlock* block, const float* d_x, float* d_out, int rows) {
+        using namespace dsv4;
+        const int dim = config.dim;
+        const int inter = config.moe_inter;
+        const int topk = config.topk;
+
+        // Gate: scores = sqrt_softplus(W x), select topk by score + bias, then
+        // renormalize the *unbiased* scores over the selection.
+        if (!gate_topk_bf16_rows_cuda(d_x, block->ffn.gate_weight, block->ffn.gate_bias,
+                                      buffers.d_route_indices, buffers.d_route_weights, rows,
+                                      config.n_experts, dim, topk, config.route_scale)) {
+            throw std::runtime_error("dspark gate topk failed");
+        }
+
+        // Bucket the routes this rank owns by expert. Routes whose expert lives
+        // on another rank are dropped here and contributed by that rank's
+        // all-reduce (which TP>1 still needs wiring for -- see forward_attention).
+        if (!moe_group_routes_cuda(buffers.d_route_indices, buffers.d_route_weights,
+                                   buffers.d_group_route_tokens, buffers.d_group_route_weights,
+                                   buffers.d_seg_starts, buffers.d_counts, buffers.d_offsets,
+                                   buffers.d_total_routes, rows, topk, experts_start,
+                                   experts_per_rank, buffers.d_token_slot_routes)) {
+            throw std::runtime_error("dspark group routes failed");
+        }
+
+        int32_t total_routes = 0;
+        check_cuda(cudaMemcpy(&total_routes, buffers.d_total_routes, sizeof(int32_t),
+                              cudaMemcpyDeviceToHost), "copy dspark total routes");
+
+        if (total_routes > 0) {
+            std::vector<int32_t> h_counts(static_cast<size_t>(experts_per_rank));
+            check_cuda(cudaMemcpy(h_counts.data(), buffers.d_counts,
+                                  h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
+                       "copy dspark route counts");
+            int max_count = 0;
+            for (int32_t c : h_counts) max_count = std::max(max_count, static_cast<int>(c));
+
+            // tile_count = 0 selects the padded path. With at most block_size
+            // tokens the compact tiling has nothing to save, and the padded
+            // path needs no host-built tile table.
+            buffers.moe_ws.tile_count = 0;
+            if (!moe_prefill_fp4_grouped_cuda_with_workspace(
+                    d_x, buffers.d_group_route_tokens, buffers.d_group_route_weights,
+                    buffers.d_seg_starts, block->ffn.routed_w1q, block->ffn.routed_w1s,
+                    block->ffn.routed_w2q, block->ffn.routed_w2s, block->ffn.routed_w3q,
+                    block->ffn.routed_w3s, d_out, rows, topk, total_routes,
+                    experts_per_rank, max_count, dim, inter, config.swiglu_limit,
+                    buffers.moe_ws, buffers.d_token_slot_routes)) {
+                throw std::runtime_error("dspark grouped fp4 moe failed");
+            }
+        } else {
+            check_cuda(cudaMemset(d_out, 0,
+                                  static_cast<size_t>(rows) * dim * sizeof(float)),
+                       "zero dspark moe out");
+        }
+
+        // NOTE: TP>1 needs an all-reduce of d_out here, before the shared
+        // expert is added -- each rank only summed its own experts' routes.
+
+        // Shared expert: SwiGLU FFN applied to every token, added on top.
+        if (!fp8_e4m3_e8m0_matmul_cuda(d_x, block->ffn.shared_w1_weight,
+                                       block->ffn.shared_w1_scale, buffers.d_shared_gate, rows,
+                                       inter, dim))
+            throw std::runtime_error("dspark shared w1 failed");
+        if (!fp8_e4m3_e8m0_matmul_cuda(d_x, block->ffn.shared_w3_weight,
+                                       block->ffn.shared_w3_scale, buffers.d_shared_up, rows,
+                                       inter, dim))
+            throw std::runtime_error("dspark shared w3 failed");
+        if (!silu_mul_rows_cuda(buffers.d_shared_gate, buffers.d_shared_up,
+                                buffers.d_shared_hidden, rows, inter))
+            throw std::runtime_error("dspark shared silu failed");
+        if (!fp8_e4m3_e8m0_matmul_cuda(buffers.d_shared_hidden, block->ffn.shared_w2_weight,
+                                       block->ffn.shared_w2_scale, buffers.d_shared_out, rows,
+                                       dim, inter))
+            throw std::runtime_error("dspark shared w2 failed");
+        if (!vector_accum_rows_cuda(buffers.d_shared_out, d_out, rows, dim, 1.0f))
+            throw std::runtime_error("dspark shared accum failed");
+    }
+
     void forward_block(float* x, const float* d_main_x, int start_pos,
                        const std::vector<int>& draft_input_ids, int block_id) {
         const int bsz = config.block_size;
@@ -1041,36 +1297,11 @@ struct DSparkEngine::Impl {
             throw std::runtime_error("ffn_norm failed");
         }
 
-        // 2.3 FFN forward (Q8 expert MoE)
-        // TODO: implement MoE forward
-        //
-        // DSpark FFN is identical to main model Block's MoE:
-        //   - Shared experts: w1, w3 (gate/up), w2 (down)
-        //   - Routed experts: topk selection + expert forward
-        //
-        // Required operations:
-        //   1. Shared experts:
-        //      - w1 @ x -> gate, w3 @ x -> up
-        //      - silu_mul(gate, up) -> hidden
-        //      - w2 @ hidden -> shared_out
-        //   2. Gate scoring:
-        //      - gate_w @ x -> scores
-        //      - topk(scores) -> route_indices, route_weights
-        //   3. Routed experts (for each route in topk):
-        //      - Stage routed expert weights to GPU
-        //      - w1 @ x -> gate, w3 @ x -> up (per expert)
-        //      - silu_mul(gate, up) -> hidden
-        //      - w2 @ hidden -> route_out
-        //   4. Combine: shared_out + sum(route_weights * route_out)
-        //
-        // Implementation strategy:
-        //   - Reuse main model's gguf_layer_forward_shared() + gguf_layer_forward_moe()
-        //   - Handle batch=5 (rows=block_size) instead of batch=1
-        //   - Use same Q8/IQ1/Q2 quantized expert kernels
-        //
-        // For now: copy input to output as placeholder
-        cudaMemcpy(buffers.d_ffn_out, buffers.d_ffn_normed,
-                   rows * dim * sizeof(float), cudaMemcpyDeviceToDevice);
+        // 2.3 FFN forward: shared expert + routed MoE, same structure as a
+        // main-model layer. The reference inherits Block's MoE unchanged, so
+        // this must match it: sqrt-softplus gate scores, topk by score+bias,
+        // weights renormalized from the unbiased scores, times route_scale.
+        forward_moe(block, buffers.d_ffn_normed, buffers.d_ffn_out, rows);
 
         // 2.4 hc_post: merge FFN output back
         success = dsv4::hc_post_float_rows_cuda(
@@ -1196,6 +1427,28 @@ void DSparkEngine::debug_attention(int stage_id, const float* h_x, const float* 
                           static_cast<size_t>(bsz) * dim * sizeof(float),
                           cudaMemcpyDeviceToHost),
                "debug_attention out");
+}
+
+void DSparkEngine::debug_moe(int stage_id, const float* h_x, int rows, float* h_out) {
+    if (stage_id < 0 || stage_id >= impl_->config.n_stages) {
+        throw std::runtime_error("debug_moe: stage_id out of range");
+    }
+    Impl& impl = *impl_;
+    const int dim = impl.config.dim;
+    if (rows <= 0 || rows > impl.config.block_size) {
+        throw std::runtime_error("debug_moe: rows must be in [1, block_size]");
+    }
+    const size_t n = static_cast<size_t>(rows) * dim;
+
+    check_cuda(cudaMemcpy(impl.buffers.d_ffn_normed, h_x, n * sizeof(float),
+                          cudaMemcpyHostToDevice),
+               "debug_moe x");
+    impl.forward_moe(&impl.stages[stage_id], impl.buffers.d_ffn_normed,
+                     impl.buffers.d_ffn_out, rows);
+    check_cuda(cudaDeviceSynchronize(), "debug_moe sync");
+    check_cuda(cudaMemcpy(h_out, impl.buffers.d_ffn_out, n * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "debug_moe out");
 }
 
 } // namespace dspark

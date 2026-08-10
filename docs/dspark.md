@@ -211,3 +211,66 @@ kept out of the repo because it needs the 167GB checkpoint and 4 GPUs.
 The two easy prompts land within noise of always-k rather than exactly equal, as
 the replay predicted -- live accept rates differed from the fixture's, so the
 gate skipped a few rounds it would otherwise have drafted.
+
+---
+
+## cpp_engine port status
+
+### Verify path
+
+`PersistentEngine::verify_step` forwards a draft block and reports, for each
+draft token, what the target model samples after consuming it.
+
+- `cpp_engine/include/persistent_engine.hpp` — interface
+- `cpp_engine/src/dsv4_engine.cpp` — implementation
+- `cpp_engine/tests/test_perfect_draft.cpp` — feeds a plain decode back in as a
+  "perfect" draft, so any mismatch is the verify path's own fault rather than
+  the drafter's. 59/59 checked, 0 mismatches at draft_len 5.
+
+It forwards the draft tokens one at a time rather than as a `[1, n, d]` batch.
+Batching is the whole point of speculative decoding, but the two are not
+numerically equivalent: GEMMs pick tiles and reduction orders by shape, so a
+batched verify disagrees with plain decode by ~4e-3 at the first projection,
+which amplifies to O(1) at the head. Batching it is a separate optimization
+that has to be measured against that drift, not assumed free.
+
+`DSV4_CPP_MOE_DETERMINISTIC_REDUCE=1` (default) removes the MoE atomicAdd
+nondeterminism for topk>=3 via per-route partials and a fixed-order reduction;
+`cpp_engine/tests/test_moe_fp4_determinism.cpp` guards it.
+
+### Draft module (Stage B)
+
+Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cpp`:
+
+| Step | What | State |
+|---|---|---|
+| B1 | Skeleton + config parsing | done |
+| B2 | Stage 0 (main_proj + main_norm + embed) | done |
+| B3a | DSparkAttention | done |
+| B3b | MoE FFN (routed + shared) | done |
+| B4 | Stage 2 heads (norm, hc_head, markov, confidence) | todo |
+| B5 | Weight loading | done |
+| B6 | Main-hidden caching during verify | todo |
+
+Parity tests compare each sub-path against an fp32 reference driven by the same
+weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`).
+
+Two things are deliberately not done yet: TP>1 needs an all-reduce after the
+attention `wo_b` and after the routed MoE (each rank only sums its own experts'
+routes), and `draft_tokens()` waits on B4/B6.
+
+#### MoE notes
+
+The draft's routed experts are held resident on the device rather than staged
+per call: 13.4 MB per expert is 10.3 GB at TP=1 but 2.6 GB at TP=4, and staging
+would put a PCIe transfer on the critical path of every draft round -- the one
+thing speculative decoding cannot afford, since the draft has to stay cheap
+relative to the verify it is trying to skip. Total DSpark weights measure
+11.4 GB at TP=1 and 3.8 GB at TP=4.
+
+Routing is discrete, so a wrong gate produces plausible-looking numbers rather
+than obvious garbage. Measured on 5 tokens against an fp32 reference, cpp/ref
+`rel_l2` is 0.014-0.016 (int8 activation quantization before the expert GEMM),
+while swapping a single expert for the next-ranked one reads 0.476 -- a ~32x
+margin, which is what makes the 0.02 tolerance meaningful rather than merely
+satisfied.
