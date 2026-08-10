@@ -9326,6 +9326,38 @@ int PersistentEngine::decode_step(int last_token, int position, const SamplingPa
     return select_token(ctx, s.opts, sp, s.rng);
 }
 
+// Verify a block of draft tokens: forward each one and report what the target
+// model would have sampled at that position. The caller compares these against
+// the draft to find the accepted prefix.
+//
+// This forwards the draft tokens one at a time rather than as a [1, n, d]
+// batch. A batched forward is the whole point of speculative decoding, but the
+// two are not numerically equivalent here: GEMMs pick tiles and reduction
+// orders by shape, so a batched verify disagrees with plain decode by ~4e-3 at
+// the first projection, which amplifies to O(1) at the head and costs real
+// accept rate (see docs/dspark.md). Sequential keeps verify bit-comparable with
+// decode; batching it is a separate optimization that has to be measured
+// against that drift, not assumed free.
+std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tokens,
+                                               int start_position,
+                                               const SamplingParams& sp) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+    maybe_reseed(sp.seed, s.rng_seed, s.rng);
+
+    if (draft_tokens.empty()) throw std::runtime_error("verify_step: empty draft_tokens");
+
+    std::vector<int> next_tokens;
+    next_tokens.reserve(draft_tokens.size());
+    for (size_t i = 0; i < draft_tokens.size(); ++i) {
+        const int position = start_position + static_cast<int>(i);
+        (void)run_safetensors_token_forward_impl(ctx, draft_tokens[i], s.layer_count, position);
+        next_tokens.push_back(select_token(ctx, s.opts, sp, s.rng));
+    }
+    return next_tokens;
+}
+
 int PersistentEngine::eos_id() const { return state_->eos_token_id; }
 int PersistentEngine::max_context() const { return state_->max_context; }
 int PersistentEngine::layer_count() const { return state_->layer_count; }

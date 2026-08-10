@@ -46,6 +46,18 @@ public:
     // position `position`. Returns the sampled next token (rank 0 valid).
     int decode_step(int last_token, int position, const SamplingParams& sp);
 
+    // Speculative-decode verify: forward `draft_tokens` starting at
+    // `start_position` and return what the target model samples at each one, so
+    // the caller can find the accepted prefix. Only rank 0's values are
+    // meaningful; workers return a rank-local argmax that must be discarded.
+    //
+    // Forwards the drafts one at a time, not as a batch -- see the comment on
+    // the definition for why the batched form is not numerically interchangeable
+    // with plain decode.
+    std::vector<int> verify_step(const std::vector<int>& draft_tokens,
+                                 int start_position,
+                                 const SamplingParams& sp);
+
     int eos_id() const;
     int max_context() const;
     int layer_count() const;

@@ -114,6 +114,10 @@ add_executable(test_dspark_weight_load tests/test_dspark_weight_load.cpp)
 target_link_libraries(test_dspark_weight_load PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_weight_load PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_perfect_draft tests/test_perfect_draft.cpp)
+target_link_libraries(test_perfect_draft PRIVATE dsv4_cpp_core)
+set_target_properties(test_perfect_draft PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_dspark_attention_parity tests/test_dspark_attention_parity.cpp)
 target_link_libraries(test_dspark_attention_parity PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_attention_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
