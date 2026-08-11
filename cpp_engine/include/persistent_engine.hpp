@@ -59,6 +59,15 @@ public:
                                  int start_position,
                                  const SamplingParams& sp);
 
+    // Snapshot the compressor accumulators (layers 2-42) to host memory so a
+    // rejected verify's partial state can be restored. The KV ring self-heals
+    // (position-addressed), but the accumulator is destructive across ratio
+    // boundaries (compressor_shift_overlap_state moves the upper half down and
+    // zeroes the top). Without this, replaying a position that crossed a
+    // boundary reads zeroed slots and diverges.
+    void snapshot_compressor_state();
+    void restore_compressor_state();
+
     // DSpark main-hidden capture. The draft module's main_proj consumes the
     // main model's block output at a few late layers, mean-pooled over the hc
     // dimension and concatenated on the last axis -- exactly what the

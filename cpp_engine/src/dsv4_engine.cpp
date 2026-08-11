@@ -983,6 +983,18 @@ struct DeviceCompressorState {
     int cols = 0;
 };
 
+// Host snapshot for speculative rollback. Compressor state is destructive:
+// compressor_shift_overlap_state moves the upper half down and zeroes the top
+// at ratio boundaries, so replaying a position that crossed one cannot rebuild
+// what was shifted away. The KV ring and pooled compressed slots are position-
+// addressed and self-heal; only the accumulator needs protection.
+struct CompressorSnapshot {
+    std::vector<float> kv;
+    std::vector<float> score;
+    int slots = 0;
+    int cols = 0;
+};
+
 struct DeviceMoeDecodeWorkspace {
     MoeSingleTokenFp4Workspace fp4;
 };
@@ -2105,6 +2117,38 @@ struct SafeForwardContext {
         for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
     }
 
+    void snapshot_compressor_state_to(std::unordered_map<int, CompressorSnapshot>& snap,
+                                      const std::unordered_map<int, DeviceCompressorState>& dev) {
+        for (const auto& [layer_id, s] : dev) {
+            if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) continue;
+            CompressorSnapshot& cs = snap[layer_id];
+            cs.slots = s.slots;
+            cs.cols = s.cols;
+            const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
+            cs.kv.resize(n);
+            cs.score.resize(n);
+            check_cuda(cudaMemcpy(cs.kv.data(), s.kv, n * sizeof(float), cudaMemcpyDeviceToHost),
+                       "snapshot compressor kv");
+            check_cuda(cudaMemcpy(cs.score.data(), s.score, n * sizeof(float), cudaMemcpyDeviceToHost),
+                       "snapshot compressor score");
+        }
+    }
+
+    void restore_compressor_state_from(const std::unordered_map<int, CompressorSnapshot>& snap,
+                                       std::unordered_map<int, DeviceCompressorState>& dev) {
+        for (const auto& [layer_id, cs] : snap) {
+            auto it = dev.find(layer_id);
+            if (it == dev.end()) continue;
+            DeviceCompressorState& s = it->second;
+            if (s.kv == nullptr || s.score == nullptr || s.slots != cs.slots || s.cols != cs.cols) continue;
+            const size_t n = static_cast<size_t>(cs.slots) * static_cast<size_t>(cs.cols);
+            check_cuda(cudaMemcpy(s.kv, cs.kv.data(), n * sizeof(float), cudaMemcpyHostToDevice),
+                       "restore compressor kv");
+            check_cuda(cudaMemcpy(s.score, cs.score.data(), n * sizeof(float), cudaMemcpyHostToDevice),
+                       "restore compressor score");
+        }
+    }
+
     int kv_cache_capacity_for_layer(int layer_id) const {
         const int window = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
         uint64_t ratio = 0;
@@ -2221,6 +2265,8 @@ struct SafeForwardContext {
     std::unordered_map<std::string, DeviceCompressorCache> indexer_compressor_cache;
     std::unordered_map<int, DeviceCompressorState> compressor_device_state;
     std::unordered_map<int, DeviceCompressorState> indexer_compressor_device_state;
+    std::unordered_map<int, CompressorSnapshot> compressor_snapshot;
+    std::unordered_map<int, CompressorSnapshot> indexer_compressor_snapshot;
     std::unordered_map<std::string, DeviceIndexerCache> indexer_cache;
     std::unordered_map<std::string, DeviceFp4ActiveArena> active_arena_cache;
     std::unordered_map<std::string, HostFp4ExpertSlot> host_fp4_slot_cache;
@@ -9589,6 +9635,18 @@ int PersistentEngine::max_context() const { return state_->max_context; }
 int PersistentEngine::layer_count() const { return state_->layer_count; }
 const Tokenizer& PersistentEngine::tokenizer() const { return state_->tokenizer; }
 const ForwardSmokeOptions& PersistentEngine::options() const { return state_->opts; }
+
+void PersistentEngine::snapshot_compressor_state() {
+    auto& ctx = *state_->ctx;
+    ctx.snapshot_compressor_state_to(ctx.compressor_snapshot, ctx.compressor_device_state);
+    ctx.snapshot_compressor_state_to(ctx.indexer_compressor_snapshot, ctx.indexer_compressor_device_state);
+}
+
+void PersistentEngine::restore_compressor_state() {
+    auto& ctx = *state_->ctx;
+    ctx.restore_compressor_state_from(ctx.compressor_snapshot, ctx.compressor_device_state);
+    ctx.restore_compressor_state_from(ctx.indexer_compressor_snapshot, ctx.indexer_compressor_device_state);
+}
 
 // Worker loop / command channel: send 4 int32s [cmd, arg0, arg1, payload_count]
 // followed by an optional int32 payload buffer of payload_count entries. Uses
