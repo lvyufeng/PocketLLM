@@ -252,6 +252,7 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B5 | Weight loading | done |
 | B6 | Main-hidden caching during verify | done |
 | B7 | `draft_tokens()` + TP all-reduces + ring priming | done |
+| B8 | Speculative scheduler (`speculative_step()`) + snapshot/restore | done |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
 weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
@@ -346,6 +347,42 @@ guards it:
   (With the ring primed a zeroed seed changes 0/5 -- priming has already written
   that position's KV and the seed only overwrites one key of six, so that
   variant is reported but deliberately not asserted on.)
+
+#### Scheduler
+
+`PersistentEngine::speculative_step(committed_token, position, sp)` runs one
+speculative round: prime the draft's ring → draft → verify `[committed, drafts...]`
+→ longest matching prefix → commit accepted prefix + bonus token → advance position.
+
+The KV ring addresses by `position % window_size`, so it overwrites by construction.
+The compressor state on layers 2-42 does not: it accumulates into ratio-sized slots
+and at every ratio boundary shifts the upper half down and zeroes the top, which is
+destructive -- replaying a position that crossed a boundary cannot rebuild what was
+shifted away. Rejected draft tokens are therefore left in the caches and must be
+overwritten cleanly before the next round sees them.
+
+`cpp_engine/tests/test_verify_overwrite_safety.cpp` measures this directly: for
+each overshoot length (1, 2, 3, 4, 5, 8), it verifies `over` extra tokens at a
+position, then continues from that position anyway and compares the continuation
+tokens against a clean run with no overshoot. The test runs a control first
+(layers 0-1 only, no compressor) to isolate the compressor as the source of any
+divergence. Without protection every overshoot diverges; with snapshot/restore
+every overshoot matches.
+
+The scheduler snapshots the compressor state before verify and restores it when
+any draft is rejected. The snapshot is 43 layers × 2 stages × 128 slots × 2048 dim
+× 2 bytes/bf16 = 91.75 MiB, allocated once at engine construction. Copying it is
+~9 ms per snapshot on the 2080Ti's PCIe 3.0 × 16 link, negligible against the
+196 ms draft + 850 ms verify cost of a round.
+
+`cpp_engine/tests/test_speculative_scheduler.cpp` is an end-to-end test: it runs
+the same prompt through plain decode and the speculative path and requires
+token-by-token identity. It also checks that the speculative path generates the
+same number of tokens in fewer rounds (i.e., amortizes).
+
+A `Verify` command (4) was added to the TP worker command channel so ranks stay
+in lockstep during speculative rounds. Without it, verify would forward on rank 0
+while workers sat idle at the decode-step barrier.
 
 That last point is also why `test_dspark_draft` asserts an absolute accept rate
 rather than beating a corrupted seed. On a prompt predictable enough for the

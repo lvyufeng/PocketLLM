@@ -68,6 +68,24 @@ public:
     void snapshot_compressor_state();
     void restore_compressor_state();
 
+    // One speculative round: draft from the committed token, verify the block,
+    // accept the longest matching prefix, and commit it. Returns the number of
+    // tokens generated this round (accepted drafts + bonus token), which is
+    // always >= 1. The caller advances position by that count.
+    //
+    // `committed_token` is the token to seed the draft with; `position` is its
+    // own position (the draft's seed hidden came from position - 1). Both the
+    // draft and the verify write into the main model's state, so on rejection
+    // the compressor snapshot is restored before continuing.
+    //
+    // Returns the tokens generated this round (accepted drafts + bonus token).
+    // Length is n_accepted + 1.
+    //
+    // Must have called load_dspark() first. Rank 0 only; workers stay in
+    // run_worker_loop().
+    std::vector<int> speculative_step(int committed_token, int position,
+                                       const SamplingParams& sp);
+
     // DSpark main-hidden capture. The draft module's main_proj consumes the
     // main model's block output at a few late layers, mean-pooled over the hc
     // dimension and concatenated on the last axis -- exactly what the
@@ -146,11 +164,13 @@ public:
         DecodeStep = 1,
         Reset = 2,
         Shutdown = 3,
+        Verify = 4,
     };
     void worker_command_prefill(const std::vector<int>& token_ids);
     void worker_command_decode(int32_t last_token, int32_t position);
     void worker_command_reset();
     void worker_command_shutdown();
+    void worker_command_verify(const std::vector<int>& block, int32_t start_position);
 
 private:
     struct State;

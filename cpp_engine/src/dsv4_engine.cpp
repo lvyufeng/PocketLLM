@@ -9512,6 +9512,9 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
 
     if (draft_tokens.empty()) throw std::runtime_error("verify_step: empty draft_tokens");
 
+    // Coordinate workers: all ranks must verify the same block at the same position
+    worker_command_verify(draft_tokens, start_position);
+
     std::vector<int> next_tokens;
     next_tokens.reserve(draft_tokens.size());
     s.verify_dspark_hidden.clear();
@@ -9526,6 +9529,60 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
                                       ctx.dspark_hidden.begin(), ctx.dspark_hidden.end());
     }
     return next_tokens;
+}
+
+std::vector<int> PersistentEngine::speculative_step(int committed_token, int position,
+                                       const SamplingParams& sp) {
+    auto& s = *state_;
+    if (!dspark_loaded()) {
+        throw std::runtime_error("speculative_step: DSpark not loaded (call load_dspark first)");
+    }
+    if (s.opts.tp_rank != 0) {
+        throw std::runtime_error("speculative_step: rank 0 only (workers stay in run_worker_loop)");
+    }
+
+    // Draft from the committed token, seeded by the hidden at position - 1.
+    const std::vector<float>& captured = last_dspark_hidden();
+    if (captured.empty()) {
+        throw std::runtime_error("speculative_step: no hidden captured (forward the committed token first)");
+    }
+    const size_t stride = captured.size() / static_cast<size_t>(last_dspark_hidden_positions());
+    const std::vector<float> seed_hidden(captured.end() - stride, captured.end());
+
+    const dspark::DraftOutput draft = draft_tokens(committed_token, position - 1, seed_hidden);
+    if (draft.tokens.empty() || draft.tokens[0] != committed_token) {
+        throw std::runtime_error("speculative_step: draft did not start with the committed token");
+    }
+
+    // Verify the block. Snapshot first so rejected state can be restored.
+    snapshot_compressor_state();
+    const std::vector<int> verified = verify_step(draft.tokens, position, sp);
+
+    // Longest matching prefix: verified[i] is the truth for draft.tokens[i+1].
+    int n_accepted = 0;
+    for (size_t i = 0; i + 1 < draft.tokens.size() && i < verified.size(); ++i) {
+        if (draft.tokens[i + 1] != verified[i]) break;
+        ++n_accepted;
+    }
+
+    // On rejection, restore the compressor state so the next round starts clean.
+    if (n_accepted < static_cast<int>(draft.tokens.size()) - 1) {
+        restore_compressor_state();
+    }
+
+    // Commit the accepted prefix + bonus token. The accepted prefix's hiddens
+    // are already in last_verify_dspark_hidden(); prime the draft's ring with them.
+    const std::vector<float>& v_hidden = last_verify_dspark_hidden();
+    if (!v_hidden.empty()) {
+        const int n_rows = n_accepted + 1;  // accepted drafts + committed token
+        prime_dspark_kv(v_hidden, n_rows, position);
+    }
+
+    // Return the generated tokens: accepted drafts + bonus token.
+    // verified[0..n_accepted] are the model's samples after consuming
+    // draft.tokens[0..n_accepted], i.e. the continuation from position.
+    std::vector<int> generated(verified.begin(), verified.begin() + n_accepted + 1);
+    return generated;
 }
 
 void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers,
@@ -9704,6 +9761,20 @@ void PersistentEngine::worker_command_shutdown() {
     s.cmd->send_to_workers(header, kCmdHeaderInts);
 }
 
+void PersistentEngine::worker_command_verify(const std::vector<int>& block, int32_t start_position) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::Verify),
+        start_position,
+        0,
+        static_cast<int32_t>(block.size())
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+    std::vector<int32_t> payload(block.begin(), block.end());
+    s.cmd->send_to_workers(payload.data(), payload.size());
+}
+
 void PersistentEngine::run_worker_loop() {
     auto& s = *state_;
     if (s.opts.tp_world <= 1) return;
@@ -9718,10 +9789,16 @@ void PersistentEngine::run_worker_loop() {
         // Drain any payload first (outside the try). Socket I/O failures are
         // unrecoverable — let them kill the worker.
         std::vector<int> prefill_tokens;
+        std::vector<int> verify_block;
         if (cmd == WorkerCommand::Prefill && header[3] > 0) {
             std::vector<int32_t> payload(static_cast<size_t>(header[3]));
             s.cmd->recv_from_root(payload.data(), payload.size());
             prefill_tokens.assign(payload.begin(), payload.end());
+        }
+        if (cmd == WorkerCommand::Verify && header[3] > 0) {
+            std::vector<int32_t> payload(static_cast<size_t>(header[3]));
+            s.cmd->recv_from_root(payload.data(), payload.size());
+            verify_block.assign(payload.begin(), payload.end());
         }
 
         // Catch per-command compute exceptions (OOM, CUDA errors) so a single
@@ -9735,6 +9812,8 @@ void PersistentEngine::run_worker_loop() {
                 (void)prefill(prefill_tokens, sp);
             } else if (cmd == WorkerCommand::DecodeStep) {
                 (void)decode_step(header[1], header[2], sp);
+            } else if (cmd == WorkerCommand::Verify) {
+                (void)verify_step(verify_block, header[1], sp);
             } else {
                 throw std::runtime_error("PersistentEngine worker received unknown command");
             }

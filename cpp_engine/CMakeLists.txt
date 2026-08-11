@@ -134,6 +134,14 @@ add_executable(test_dspark_draft tests/test_dspark_draft.cpp)
 target_link_libraries(test_dspark_draft PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_draft PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_verify_overwrite_safety tests/test_verify_overwrite_safety.cpp)
+target_link_libraries(test_verify_overwrite_safety PRIVATE dsv4_cpp_core)
+set_target_properties(test_verify_overwrite_safety PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_speculative_scheduler tests/test_speculative_scheduler.cpp)
+target_link_libraries(test_speculative_scheduler PRIVATE dsv4_cpp_core)
+set_target_properties(test_speculative_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_dspark_tp_consistency tests/test_dspark_tp_consistency.cpp)
 target_link_libraries(test_dspark_tp_consistency PRIVATE dsv4_cpp_core)
 set_target_properties(test_dspark_tp_consistency PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
