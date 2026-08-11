@@ -417,3 +417,38 @@ instead of the head's own gate -- read 8.3e-1, 5.7e-1 and 1.0e0, and each
 changes at least one drafted token. Hence a 1e-5 tolerance plus an exact
 token-id comparison: the smallest observed top1-top2 margin was 0.02, so ids
 matching is a real check, not a foregone one.
+
+### Speculative scheduling
+
+A verify round forwards `[committed, d0, d1, ...]` and samples at each position,
+returning the truth for `d0..dn`. The scheduler compares this against the draft
+block, finds the longest matching prefix, and commits `committed` plus that
+prefix (even when the prefix is empty, the committed token advances the
+position by one). The rejected suffix has already been forwarded into the main
+model's KV cache and compressor state. The next round continues from the new
+position, overwriting whatever the verify left.
+
+**The KV ring self-heals**: it addresses by `position % window_size`, so
+forwarding from the new position writes exactly the slots the next verify would
+read. **The compressor accumulator does not.** It sits on layers 2-42, updates
+at offset `position % ratio`, and at every ratio boundary (when
+`(position+1) % ratio == 0`) `compressor_shift_overlap_state_kernel` moves the
+upper half down and zeroes the top. That shift is destructive: replaying a
+position that crossed a boundary cannot rebuild what was shifted away, so a
+rejected verify that crossed one leaves zeroed slots the next decode reads.
+
+`test_verify_overwrite_safety` measures this directly. With a 6-token prompt
+the continuation starts at position 6, mid-ratio for `ratio=4`. Overshoots of
+1–8 all cross the boundary at position 7, and without protection they all
+diverge at token 1 (the boundary crossing). A control at `layer_count=2`
+(excluding every compressed layer) matches exactly, pinning the compressor as
+the cause. The pooled compressed slots are position-addressed (`window +
+position/ratio`) and also self-heal; only the accumulator is destructive.
+
+The fix: `snapshot_compressor_state()` copies both `kv_state` and `score_state`
+to host before verify; `restore_compressor_state()` writes them back after a
+reject. With this, all six overshoot lengths match the clean run exactly. The
+snapshot is ~3.3 MB at TP=4 per compressor (41 layers × 2 compressors/layer × 2
+accumulators × `ratio * state_cols` floats, where the indexer's ratio is always
+4 and state_cols is head-sharded), so ~270 MB round-trip per rejected verify --
+cheap relative to the 13-minute checkpoint load, and only on the reject path.
