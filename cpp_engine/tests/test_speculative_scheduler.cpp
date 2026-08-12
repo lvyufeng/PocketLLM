@@ -1,23 +1,25 @@
 // End-to-end test of the speculative scheduler: does a multi-round speculative
-// loop produce the same tokens as plain decode, with fewer total model calls?
+// loop produce the same tokens as plain decode, while committing only the
+// positions up to the first draft mismatch?
 //
-// The scheduler's job is to call draft() + verify() in a loop and advance the
-// position by (accepted prefix + bonus token) each round, relying on overwrite-
-// in-place for rejected drafts. This test confirms:
+// The scheduler calls draft() and verifies one position at a time. This test
+// confirms:
 //
 //   1. speculative_step() produces correct tokens (exact match vs decode_step)
-//   2. The speculative path makes fewer model forward calls
-//   3. Multi-round works (the hidden capture and ring priming wire together)
+//   2. A high-acceptance prompt generates the same tokens in fewer rounds
+//   3. A rejection-heavy prompt takes the early-exit path without corrupting
+//      compressor state, hidden capture, draft-ring state, or the next round
 //
 // It does NOT measure end-to-end tok/s -- that needs a production serving loop
 // with real request batching and is deferred to a separate benchmark.
 //
-//   test_speculative_scheduler <ckpt_dir> [rounds=8] [layers=43] [tp_world=1] [tp_rank=0] [nccl_id_path]
+//   test_speculative_scheduler <ckpt_dir> [tokens=8] [layers=43] [tp_world=1] [tp_rank=0] [nccl_id_path]
 
 #include "persistent_engine.hpp"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -43,17 +45,104 @@ std::string join(const std::vector<int>& v) {
     return s;
 }
 
+struct TrialResult {
+    std::vector<int> reference;
+    std::vector<int> speculative;
+    int spec_rounds = 0;
+    int total_accepted = 0;
+    bool saw_rejection = false;
+};
+
+TrialResult run_trial(PersistentEngine& engine, const std::string& name,
+                      const std::vector<int>& prompt, int token_count,
+                      int full_draft_len, const SamplingParams& sp,
+                      bool verbose) {
+    TrialResult result;
+
+    // Reference: plain decode from the same prompt. prefill/decode_step do not
+    // fan out to workers on their own -- the caller drives them, as main.cpp does.
+    engine.worker_command_reset();
+    engine.reset_session();
+    engine.worker_command_prefill(prompt);
+    int token = engine.prefill(prompt, sp);
+    int pos = static_cast<int>(prompt.size());
+    for (int i = 0; i < token_count; ++i) {
+        engine.worker_command_decode(token, pos);
+        token = engine.decode_step(token, pos++, sp);
+        result.reference.push_back(token);
+    }
+
+    // Speculative path: speculative_step drives every TP rank itself.
+    engine.worker_command_reset();
+    engine.reset_session();
+    engine.worker_command_prefill(prompt);
+    token = engine.prefill(prompt, sp);
+    pos = static_cast<int>(prompt.size());
+    while (static_cast<int>(result.speculative.size()) < token_count) {
+        const std::vector<int> generated = engine.speculative_step(token, pos, sp);
+        if (generated.empty()) {
+            fail(name + ": speculative_step returned empty vector");
+            break;
+        }
+        ++result.spec_rounds;
+        const int n_generated = static_cast<int>(generated.size());
+        const int remaining = token_count - static_cast<int>(result.speculative.size());
+        const int n_committed = std::min(n_generated, remaining);
+        result.total_accepted += n_committed - 1;
+        result.saw_rejection |= n_generated < full_draft_len;
+
+        result.speculative.insert(result.speculative.end(), generated.begin(),
+                                  generated.begin() + n_committed);
+        pos += n_committed;
+        token = generated[n_committed - 1];
+
+        if (verbose) {
+            std::cout << "  " << name << " round " << result.spec_rounds
+                      << " pos=" << pos << " generated=" << n_generated
+                      << " accepted=" << n_generated - 1 << "\n";
+        }
+    }
+
+    if (verbose) {
+        std::cout << name << " reference  : " << join(result.reference) << "\n"
+                  << name << " speculative: " << join(result.speculative) << "\n"
+                  << name << " rounds=" << result.spec_rounds
+                  << " accepted=" << result.total_accepted
+                  << " avg=" << (result.spec_rounds > 0
+                                      ? static_cast<double>(result.total_accepted) /
+                                            result.spec_rounds
+                                      : 0.0)
+                  << " rejected=" << (result.saw_rejection ? "yes" : "no") << "\n";
+    }
+
+    if (result.speculative.size() != result.reference.size()) {
+        fail(name + ": generated " + std::to_string(result.speculative.size()) +
+             " tokens, expected " + std::to_string(result.reference.size()));
+        return result;
+    }
+
+    const auto mismatch = std::mismatch(result.speculative.begin(), result.speculative.end(),
+                                        result.reference.begin());
+    if (mismatch.first != result.speculative.end()) {
+        const int i = static_cast<int>(mismatch.first - result.speculative.begin());
+        fail(name + ": tokens diverged at position " + std::to_string(i) +
+             " (spec=" + std::to_string(result.speculative[i]) +
+             " ref=" + std::to_string(result.reference[i]) + ")");
+    }
+    return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0]
-                  << " <ckpt_dir> [rounds=8] [layers=43] [tp_world=1] [tp_rank=0]"
+                  << " <ckpt_dir> [tokens=8] [layers=43] [tp_world=1] [tp_rank=0]"
                      " [nccl_id_path]\n";
         return 2;
     }
     const std::string ckpt_dir = argv[1];
-    const int rounds = argc > 2 ? std::atoi(argv[2]) : 8;
+    const int token_count = argc > 2 ? std::atoi(argv[2]) : 8;
     const int layer_count = argc > 3 ? std::atoi(argv[3]) : 43;
 
     ForwardSmokeOptions opts;
@@ -79,92 +168,49 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Rank 0 drives; workers block on the command channel. The draft, verify,
+    // and draft-ring write all fan out from speculative_step().
+    engine.warmup_tp();
+    if (opts.tp_rank != 0) {
+        engine.run_worker_loop();
+        return 0;
+    }
+
     SamplingParams sp;
     sp.greedy = true;
     sp.temperature = 1.0f;
     sp.seed = 12345;
 
-    // A cyclic prompt where the main model is near-certain, so the draft
-    // accepts most of its block. This is the same reasoning as test_dspark_draft.
-    const std::vector<int> prompt = {16, 18, 16, 18, 16, 18, 16, 18, 16, 18, 16, 18};
+    // draft_tokens returns [committed, d0, ..., d4] for block_size=5.
+    const int full_draft_len = 6;
 
-    // Reference: plain decode from the same prompt.
-    engine.reset_session();
-    int token = engine.prefill(prompt, sp);
-    std::vector<int> reference;
-    int pos = static_cast<int>(prompt.size());
-    for (int r = 0; r < rounds; ++r) {
-        token = engine.decode_step(token, pos++, sp);
-        reference.push_back(token);
-    }
-    if (verbose) {
-        std::cout << "reference (plain decode): " << join(reference) << "\n";
-    }
-
-    // Speculative path: same prompt, speculative_step() instead of decode_step().
-    engine.reset_session();
-    token = engine.prefill(prompt, sp);
-    pos = static_cast<int>(prompt.size());
-    std::vector<int> speculative;
-    int total_accepted = 0;
-    int spec_rounds = 0;
-    while (static_cast<int>(speculative.size()) < rounds) {
-        const std::vector<int> generated = engine.speculative_step(token, pos, sp);
-        if (generated.empty()) {
-            fail("speculative_step returned empty vector");
-            break;
-        }
-        ++spec_rounds;
-        const int n_generated = static_cast<int>(generated.size());
-        total_accepted += n_generated - 1;  // -1 for the bonus token
-
-        // Append the generated tokens to the speculative sequence.
-        for (int t : generated) {
-            if (static_cast<int>(speculative.size()) < rounds) {
-                speculative.push_back(t);
-            }
-        }
-
-        // Advance position and update the committed token for the next round.
-        pos += n_generated;
-        token = generated.back();
-
-        if (verbose) {
-            std::cout << "  round " << spec_rounds << " pos=" << pos
-                      << " generated=" << n_generated << " accepted=" << n_generated - 1 << "\n";
-        }
-    }
-
-    if (verbose) {
-        std::cout << "speculative: " << join(speculative) << "\n";
-        std::cout << "\nspec rounds=" << spec_rounds << " accepted=" << total_accepted
-                  << " avg=" << (spec_rounds > 0 ? static_cast<double>(total_accepted) / spec_rounds : 0.0)
-                  << "\n";
-    }
-
-    // Compare token-by-token.
-    int first_diff = -1;
-    for (int i = 0; i < rounds; ++i) {
-        if (speculative[i] != reference[i]) {
-            first_diff = i;
-            break;
-        }
-    }
-    if (first_diff >= 0) {
-        fail("tokens diverged at position " + std::to_string(first_diff) +
-             " (spec=" + std::to_string(speculative[first_diff]) +
-             " ref=" + std::to_string(reference[first_diff]) + ")");
-    }
-    if (spec_rounds >= rounds) {
-        fail("speculative rounds " + std::to_string(spec_rounds) +
-             " >= decode rounds " + std::to_string(rounds) +
+    // Near-certain continuation: exercises full acceptance and amortization.
+    const std::vector<int> cyclic = {
+        16, 18, 16, 18, 16, 18, 16, 18, 16, 18, 16, 18,
+    };
+    const TrialResult accepted = run_trial(engine, "cyclic", cyclic, token_count,
+                                            full_draft_len, sp, verbose);
+    if (accepted.spec_rounds >= token_count) {
+        fail("cyclic: speculative rounds " + std::to_string(accepted.spec_rounds) +
+             " >= decode rounds " + std::to_string(token_count) +
              " (no amortization)");
     }
 
+    // Ordinary English: previously measured 0/30 acceptance. This is the
+    // important correctness branch -- rejection must stop before forwarding the
+    // tail, then the following rounds must still match plain decode exactly.
+    const std::vector<int> english = {0, 17665, 31114, 12, 526, 318, 264, 4017, 30};
+    const TrialResult rejected = run_trial(engine, "english", english, token_count,
+                                            full_draft_len, sp, verbose);
+    if (!rejected.saw_rejection) {
+        fail("english: expected at least one early-exit rejection");
+    }
+
+    engine.worker_command_shutdown();
     if (failures != 0) {
         std::cout << "[FAIL] speculative_scheduler: " << failures << " check(s) failed\n";
         return 1;
     }
-    std::cout << "[PASS] speculative_scheduler (position and amortization verified)\n";
+    std::cout << "[PASS] speculative_scheduler (accept and reject paths verified)\n";
     return 0;
 }

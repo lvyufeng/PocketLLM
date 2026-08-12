@@ -252,7 +252,7 @@ Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cp
 | B5 | Weight loading | done |
 | B6 | Main-hidden caching during verify | done |
 | B7 | `draft_tokens()` + TP all-reduces + ring priming | done |
-| B8 | Speculative scheduler (`speculative_step()`) + snapshot/restore | done |
+| B8 | Speculative scheduler (`speculative_step()`, early-exit verify) | done |
 
 Parity tests compare each sub-path against an fp32 reference driven by the same
 weights (`tests/test_dspark_attention_parity.py`, `tests/test_dspark_moe_parity.py`,
@@ -351,38 +351,55 @@ guards it:
 #### Scheduler
 
 `PersistentEngine::speculative_step(committed_token, position, sp)` runs one
-speculative round: prime the draft's ring → draft → verify `[committed, drafts...]`
-→ longest matching prefix → commit accepted prefix + bonus token → advance position.
+speculative round: draft from the committed token → forward `[committed, drafts...]`
+one position at a time, comparing each sample against the next draft → stop at the
+first mismatch → prime the draft's ring with the committed rows → return the
+accepted prefix plus the bonus token. The caller advances position by that count.
 
-The KV ring addresses by `position % window_size`, so it overwrites by construction.
-The compressor state on layers 2-42 does not: it accumulates into ratio-sized slots
-and at every ratio boundary shifts the upper half down and zeroes the top, which is
-destructive -- replaying a position that crossed a boundary cannot rebuild what was
-shifted away. Rejected draft tokens are therefore left in the caches and must be
-overwritten cleanly before the next round sees them.
+**Verification stops at the first mismatch**, so the only positions ever forwarded
+into the main model's state are the ones the round commits. That is what makes the
+round safe, and it is available only because verify is sequential (see the note on
+batched verify above) -- a batched verify computes the whole block before anything
+can be compared.
 
-`cpp_engine/tests/test_verify_overwrite_safety.cpp` measures this directly: for
-each overshoot length (1, 2, 3, 4, 5, 8), it verifies `over` extra tokens at a
-position, then continues from that position anyway and compares the continuation
-tokens against a clean run with no overshoot. The test runs a control first
-(layers 0-1 only, no compressor) to isolate the compressor as the source of any
-divergence. Without protection every overshoot diverges; with snapshot/restore
-every overshoot matches.
+The alternative -- forward the whole block and roll back on reject -- does not
+work here, for a reason worth recording. The KV ring addresses by
+`position % window_size` and overwrites by construction, but the compressor state
+on layers 2-42 accumulates into ratio-sized slots and at every ratio boundary
+shifts the upper half down and zeroes the top. That shift is destructive: replaying
+a position that crossed a boundary cannot rebuild what was shifted away. A host
+snapshot taken before verify does restore it -- but restoring to the *pre-verify*
+position also discards the accepted prefix's contribution, and nothing re-forwards
+those positions. Rolling back correctly would mean snapshotting per position, at
+which point early exit is strictly cheaper.
 
-The scheduler snapshots the compressor state before verify and restores it when
-any draft is rejected. The snapshot is 43 layers × 2 stages × 128 slots × 2048 dim
-× 2 bytes/bf16 = 91.75 MiB, allocated once at engine construction. Copying it is
-~9 ms per snapshot on the 2080Ti's PCIe 3.0 × 16 link, negligible against the
-196 ms draft + 850 ms verify cost of a round.
+`snapshot_compressor_state()` / `restore_compressor_state()` remain on
+`PersistentEngine` as the primitives that establish the above, and are what
+`cpp_engine/tests/test_verify_overwrite_safety.cpp` exercises: for each overshoot
+length (1, 2, 3, 4, 5, 8) it verifies `over` extra tokens at a position, then
+continues from that position and compares against a clean run. Measured at TP=4,
+43 layers: the clean run gives `455 17132 582 67 4 305 582 2869`; without
+protection all six overshoots diverge at token 1 (the ratio-4 boundary crossing at
+position 7); with snapshot/restore all six match the clean run exactly. A control
+at `layer_count=2` (layers 0-1, `compress_ratio == 0`) matches on both paths,
+pinning the compressor as the cause rather than the ring, the MoE, or TP.
 
 `cpp_engine/tests/test_speculative_scheduler.cpp` is an end-to-end test: it runs
 the same prompt through plain decode and the speculative path and requires
 token-by-token identity. It also checks that the speculative path generates the
 same number of tokens in fewer rounds (i.e., amortizes).
 
-A `Verify` command (4) was added to the TP worker command channel so ranks stay
-in lockstep during speculative rounds. Without it, verify would forward on rank 0
-while workers sat idle at the decode-step barrier.
+`PersistentEngine::prefill()` automatically primes the draft ring from the
+captured trailing prompt window when DSpark is loaded; callers must not write the
+same rows a second time. Under TP, rank 0 then drives workers through three
+scheduler-specific commands. `Draft` makes every rank enter the draft
+attention/MoE all-reduces with its rank-local captured hidden.
+`SpeculativeDecode` forwards one candidate position on every rank; rank 0's
+globally selected token alone decides whether another position is sent.
+`PrimeDraftKV` then writes the accumulated committed hiddens to every rank's draft
+ring in one batched call. This keeps the ranks in lockstep through exactly the
+positions rank 0 commits, without turning the ring update into one allocation-
+heavy call per token.
 
 That last point is also why `test_dspark_draft` asserts an absolute accept rate
 rather than beating a corrupted seed. On a prompt predictable enough for the
@@ -461,9 +478,9 @@ A verify round forwards `[committed, d0, d1, ...]` and samples at each position,
 returning the truth for `d0..dn`. The scheduler compares this against the draft
 block, finds the longest matching prefix, and commits `committed` plus that
 prefix (even when the prefix is empty, the committed token advances the
-position by one). The rejected suffix has already been forwarded into the main
-model's KV cache and compressor state. The next round continues from the new
-position, overwriting whatever the verify left.
+position by one). The question is what happens to the rejected suffix, which a
+naive verify has already forwarded into the main model's KV cache and compressor
+state.
 
 **The KV ring self-heals**: it addresses by `position % window_size`, so
 forwarding from the new position writes exactly the slots the next verify would
@@ -482,10 +499,45 @@ diverge at token 1 (the boundary crossing). A control at `layer_count=2`
 the cause. The pooled compressed slots are position-addressed (`window +
 position/ratio`) and also self-heal; only the accumulator is destructive.
 
-The fix: `snapshot_compressor_state()` copies both `kv_state` and `score_state`
-to host before verify; `restore_compressor_state()` writes them back after a
-reject. With this, all six overshoot lengths match the clean run exactly. The
-snapshot is ~3.3 MB at TP=4 per compressor (41 layers × 2 compressors/layer × 2
-accumulators × `ratio * state_cols` floats, where the indexer's ratio is always
-4 and state_cols is head-sharded), so ~270 MB round-trip per rejected verify --
-cheap relative to the 13-minute checkpoint load, and only on the reject path.
+`snapshot_compressor_state()` copies both `kv_state` and `score_state` to host;
+`restore_compressor_state()` writes them back. With a snapshot taken before the
+overshoot and restored after it, all six overshoot lengths match the clean run
+exactly. Per layer the buffers are `slots * state_cols` **fp32** each, where
+`state_cols = head_dim * 2` and `slots = ratio * 2` when the layer is overlap-
+layout and `head_dim` / `ratio` otherwise -- head-sharded under TP. (The absolute
+size has not been measured; it is small enough that it has never shown up against
+a round's forward cost, but no number should be quoted here until it is.)
+
+The scheduler itself does **not** use this. Restoring to the pre-verify position
+would also discard the accepted prefix's contribution, which nothing re-forwards.
+`speculative_step()` instead stops verifying at the first mismatch, so no
+uncommitted position is ever forwarded -- see [Scheduler](#scheduler).
+
+### Performance status
+
+The current C++ scheduler verifies draft tokens sequentially. This preserves
+plain greedy token identity and allows verification to stop before any rejected
+tail mutates the compressor state, but it does not amortize the target-model
+forward: every accepted draft token still runs one full 43-layer decode and its
+TP collectives.
+
+A TP=4 benchmark on the 0731 FP4 checkpoint measured C++ speculative/plain
+ratios of roughly 0.83-0.90x across cyclic, short-text, and longer-text fixtures.
+Even the cyclic fixture, which accepted the full 5-token draft in each complete
+round, measured about 0.85x. These numbers establish the current limitation:
+the draft cost is added while sequential verification retains almost all of the
+plain-decode work.
+
+This benchmark is intentionally kept separate from PyTorch runtime comparisons.
+The validated PyTorch serving path uses CPU-resident raw FP4 experts with active
+expert staging and normal compressed attention, and measures about 3.44 tok/s on
+the real long-prompt benchmark. Earlier cross-runtime results using a different
+expert placement and disabled compression are not comparable and must not be
+used for parity or speedup claims.
+
+The next performance step is a C++ multi-token verify path. It must be evaluated
+against sequential greedy decode rather than assumed exact: changing the GEMM
+shape changes reduction order, and prior batched verify experiments showed
+numerical drift that can change token selection. Until that path has its own
+correctness policy and real-prompt measurements, the sequential scheduler is a
+correctness implementation, not a speedup claim.

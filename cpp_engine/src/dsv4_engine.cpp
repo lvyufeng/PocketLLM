@@ -9474,6 +9474,11 @@ int PersistentEngine::prefill(const std::vector<int>& token_ids, const SamplingP
     ctx.options = s.opts;
     maybe_reseed(sp.seed, s.rng_seed, s.rng);
     (void)run_safetensors_prompt_prefill_impl(ctx, token_ids, s.layer_count);
+    if (s.dspark && !ctx.dspark_hidden.empty()) {
+        const int rows = ctx.dspark_hidden_positions;
+        prime_dspark_kv(ctx.dspark_hidden, rows,
+                        static_cast<int>(token_ids.size()) - rows);
+    }
     const int token = select_token(ctx, s.opts, sp, s.rng);
     if (env_int_or_default("DSV4_CPP_DECODE_SPARSE_ARENA", 0) > 0) {
         ctx.release_active_arenas_with_suffix(":d");
@@ -9534,6 +9539,7 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
 std::vector<int> PersistentEngine::speculative_step(int committed_token, int position,
                                        const SamplingParams& sp) {
     auto& s = *state_;
+    auto& ctx = *s.ctx;
     if (!dspark_loaded()) {
         throw std::runtime_error("speculative_step: DSpark not loaded (call load_dspark first)");
     }
@@ -9549,39 +9555,60 @@ std::vector<int> PersistentEngine::speculative_step(int committed_token, int pos
     const size_t stride = captured.size() / static_cast<size_t>(last_dspark_hidden_positions());
     const std::vector<float> seed_hidden(captured.end() - stride, captured.end());
 
+    // Every TP rank must enter the draft's attention/MoE all-reduces. Workers
+    // use their rank-local captured hidden and discard the otherwise-identical
+    // DraftOutput; rank 0's output drives acceptance.
+    worker_command_draft(committed_token, position - 1);
     const dspark::DraftOutput draft = draft_tokens(committed_token, position - 1, seed_hidden);
     if (draft.tokens.empty() || draft.tokens[0] != committed_token) {
         throw std::runtime_error("speculative_step: draft did not start with the committed token");
     }
 
-    // Verify the block. Snapshot first so rejected state can be restored.
-    snapshot_compressor_state();
-    const std::vector<int> verified = verify_step(draft.tokens, position, sp);
+    ctx.options = s.opts;
 
-    // Longest matching prefix: verified[i] is the truth for draft.tokens[i+1].
-    int n_accepted = 0;
-    for (size_t i = 0; i + 1 < draft.tokens.size() && i < verified.size(); ++i) {
-        if (draft.tokens[i + 1] != verified[i]) break;
-        ++n_accepted;
+    // Verify with early exit. verify_step() forwards the whole block, which is
+    // wrong for a scheduler in two ways: the rejected tail's positions still hit
+    // the compressor (and restoring the pre-verify snapshot then also discards
+    // the *accepted* prefix's contribution, since nothing re-forwards it), and
+    // last_dspark_hidden() ends up holding the last forwarded position rather
+    // than the accepted one, so the next round drafts from the wrong seed. Both
+    // vanish if we simply stop at the first mismatch: forwarding is sequential
+    // anyway, so every position we touch is a position we commit. No snapshot
+    // is needed on this path.
+    //
+    // Workers are driven one token at a time rather than with a single Verify
+    // command: rank 0 is the only rank whose select_token is meaningful, so the
+    // exit point has to be its decision alone. Per-token commands keep the ranks
+    // in lockstep through exactly the positions rank 0 commits. The extra socket
+    // sends are a few hundred bytes against a full model forward.
+    std::vector<int> generated;
+    generated.reserve(draft.tokens.size());
+    s.verify_dspark_hidden.clear();
+    for (size_t i = 0; i < draft.tokens.size(); ++i) {
+        const int pos_i = position + static_cast<int>(i);
+        worker_command_speculative_decode(draft.tokens[i], pos_i, i == 0);
+        if (i == 0) s.verify_dspark_hidden.clear();
+        const int next = decode_step(draft.tokens[i], pos_i, sp);
+        s.verify_dspark_hidden.insert(s.verify_dspark_hidden.end(),
+                                      ctx.dspark_hidden.begin(), ctx.dspark_hidden.end());
+        generated.push_back(next);
+        // draft.tokens[i + 1] is what the draft guessed the model would say
+        // here. If it guessed wrong, `next` is the bonus token and the round
+        // ends -- forwarding further would write positions we discard.
+        if (i + 1 >= draft.tokens.size() || draft.tokens[i + 1] != next) break;
     }
 
-    // On rejection, restore the compressor state so the next round starts clean.
-    if (n_accepted < static_cast<int>(draft.tokens.size()) - 1) {
-        restore_compressor_state();
+    // Prime the draft's ring on every rank with the committed positions'
+    // hiddens. Row j is the hidden at position + j, and every row we captured
+    // was committed.
+    const int n_rows = static_cast<int>(generated.size());
+    worker_command_prime_draft_kv(n_rows, position);
+    if (!s.verify_dspark_hidden.empty()) {
+        prime_dspark_kv(s.verify_dspark_hidden, n_rows, position);
     }
 
-    // Commit the accepted prefix + bonus token. The accepted prefix's hiddens
-    // are already in last_verify_dspark_hidden(); prime the draft's ring with them.
-    const std::vector<float>& v_hidden = last_verify_dspark_hidden();
-    if (!v_hidden.empty()) {
-        const int n_rows = n_accepted + 1;  // accepted drafts + committed token
-        prime_dspark_kv(v_hidden, n_rows, position);
-    }
-
-    // Return the generated tokens: accepted drafts + bonus token.
-    // verified[0..n_accepted] are the model's samples after consuming
-    // draft.tokens[0..n_accepted], i.e. the continuation from position.
-    std::vector<int> generated(verified.begin(), verified.begin() + n_accepted + 1);
+    // generated[j] is what the model sampled after consuming draft.tokens[j],
+    // i.e. the continuation from `position`. Length is n_accepted + 1.
     return generated;
 }
 
@@ -9717,7 +9744,7 @@ constexpr int kCmdHeaderInts = 4;
 
 void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids) {
     auto& s = *state_;
-    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
         0,
@@ -9733,7 +9760,7 @@ void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids)
 
 void PersistentEngine::worker_command_decode(int32_t last_token, int32_t position) {
     auto& s = *state_;
-    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::DecodeStep),
         last_token,
@@ -9745,7 +9772,7 @@ void PersistentEngine::worker_command_decode(int32_t last_token, int32_t positio
 
 void PersistentEngine::worker_command_reset() {
     auto& s = *state_;
-    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Reset), 0, 0, 0
     };
@@ -9754,7 +9781,7 @@ void PersistentEngine::worker_command_reset() {
 
 void PersistentEngine::worker_command_shutdown() {
     auto& s = *state_;
-    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Shutdown), 0, 0, 0
     };
@@ -9763,7 +9790,7 @@ void PersistentEngine::worker_command_shutdown() {
 
 void PersistentEngine::worker_command_verify(const std::vector<int>& block, int32_t start_position) {
     auto& s = *state_;
-    if (s.opts.tp_world <= 1 || !s.cmd) return;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Verify),
         start_position,
@@ -9773,6 +9800,45 @@ void PersistentEngine::worker_command_verify(const std::vector<int>& block, int3
     s.cmd->send_to_workers(header, kCmdHeaderInts);
     std::vector<int32_t> payload(block.begin(), block.end());
     s.cmd->send_to_workers(payload.data(), payload.size());
+}
+
+void PersistentEngine::worker_command_draft(int32_t input_token, int32_t start_position) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::Draft),
+        input_token,
+        start_position,
+        0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
+void PersistentEngine::worker_command_speculative_decode(int32_t last_token,
+                                                          int32_t position,
+                                                          bool first) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::SpeculativeDecode),
+        last_token,
+        position,
+        first ? 1 : 0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
+void PersistentEngine::worker_command_prime_draft_kv(int32_t rows,
+                                                      int32_t start_position) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::PrimeDraftKV),
+        rows,
+        start_position,
+        0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
 }
 
 void PersistentEngine::run_worker_loop() {
@@ -9814,6 +9880,23 @@ void PersistentEngine::run_worker_loop() {
                 (void)decode_step(header[1], header[2], sp);
             } else if (cmd == WorkerCommand::Verify) {
                 (void)verify_step(verify_block, header[1], sp);
+            } else if (cmd == WorkerCommand::Draft) {
+                const std::vector<float>& captured = last_dspark_hidden();
+                const int positions = last_dspark_hidden_positions();
+                if (captured.empty() || positions <= 0) {
+                    throw std::runtime_error("Draft command has no captured main-model hidden");
+                }
+                const size_t stride = captured.size() / static_cast<size_t>(positions);
+                const std::vector<float> seed_hidden(captured.end() - stride, captured.end());
+                (void)draft_tokens(header[1], header[2], seed_hidden);
+            } else if (cmd == WorkerCommand::SpeculativeDecode) {
+                if (header[3] != 0) s.verify_dspark_hidden.clear();
+                (void)decode_step(header[1], header[2], sp);
+                s.verify_dspark_hidden.insert(s.verify_dspark_hidden.end(),
+                                              s.ctx->dspark_hidden.begin(),
+                                              s.ctx->dspark_hidden.end());
+            } else if (cmd == WorkerCommand::PrimeDraftKV) {
+                prime_dspark_kv(s.verify_dspark_hidden, header[1], header[2]);
             } else {
                 throw std::runtime_error("PersistentEngine worker received unknown command");
             }

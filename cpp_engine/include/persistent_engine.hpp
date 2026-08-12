@@ -69,17 +69,20 @@ public:
     void restore_compressor_state();
 
     // One speculative round: draft from the committed token, verify the block,
-    // accept the longest matching prefix, and commit it. Returns the number of
-    // tokens generated this round (accepted drafts + bonus token), which is
-    // always >= 1. The caller advances position by that count.
+    // accept the longest matching prefix, and commit it.
     //
     // `committed_token` is the token to seed the draft with; `position` is its
-    // own position (the draft's seed hidden came from position - 1). Both the
-    // draft and the verify write into the main model's state, so on rejection
-    // the compressor snapshot is restored before continuing.
+    // own position (the draft's seed hidden came from position - 1).
+    //
+    // Verification stops at the first mismatch, so the only positions forwarded
+    // into the main model's state are the ones this round commits -- no
+    // snapshot/restore is needed. (Forwarding the rejected tail and rolling back
+    // does not work: restoring the pre-verify compressor snapshot would also
+    // discard the accepted prefix's contribution, which nothing re-forwards.)
     //
     // Returns the tokens generated this round (accepted drafts + bonus token).
-    // Length is n_accepted + 1.
+    // Length is n_accepted + 1, always >= 1. The caller advances position by
+    // that count.
     //
     // Must have called load_dspark() first. Rank 0 only; workers stay in
     // run_worker_loop().
@@ -103,8 +106,8 @@ public:
 
     // Hidden captured by the most recent prefill/decode_step, [positions,
     // n_target * dim] in position order. Empty if capture is off. A decode step
-    // captures one position; a prefill captures the last window's worth, since
-    // priming the draft's ring needs all of them.
+    // captures one position; a prefill captures the last window's worth and,
+    // when DSpark is loaded, automatically primes those rows into the draft ring.
     const std::vector<float>& last_dspark_hidden() const;
 
     // Number of positions in last_dspark_hidden().
@@ -135,12 +138,11 @@ public:
     dspark::DraftOutput draft_tokens(int input_token, int start_pos,
                                      const std::vector<float>& hidden);
 
-    // Prime the draft's attention ring with committed positions. Every position
-    // the main model commits has to land in the ring before the next draft, or
-    // the draft attends to zeroed slots -- which yields fluent tokens that
-    // match nothing rather than an error. `hidden` is [rows, n_target * dim] in
-    // position order, e.g. last_dspark_hidden() after a prefill (which keeps
-    // the last window of positions) or the accepted rows of a verify.
+    // Prime the draft's attention ring with committed positions not already
+    // written by prefill/speculative_step. Prefill automatically writes its
+    // captured trailing window when DSpark is loaded, and speculative_step
+    // writes each accepted block on all TP ranks. `hidden` is
+    // [rows, n_target * dim] in position order.
     void prime_dspark_kv(const std::vector<float>& hidden, int rows, int start_pos);
 
     int eos_id() const;
@@ -165,12 +167,19 @@ public:
         Reset = 2,
         Shutdown = 3,
         Verify = 4,
+        Draft = 5,
+        SpeculativeDecode = 6,
+        PrimeDraftKV = 7,
     };
     void worker_command_prefill(const std::vector<int>& token_ids);
     void worker_command_decode(int32_t last_token, int32_t position);
     void worker_command_reset();
     void worker_command_shutdown();
     void worker_command_verify(const std::vector<int>& block, int32_t start_position);
+    void worker_command_draft(int32_t input_token, int32_t start_position);
+    void worker_command_speculative_decode(int32_t last_token, int32_t position,
+                                           bool first);
+    void worker_command_prime_draft_kv(int32_t rows, int32_t start_position);
 
 private:
     struct State;

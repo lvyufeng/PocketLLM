@@ -194,10 +194,8 @@ int main(int argc, char** argv) {
             break;
         }
 
-        // Prime the draft's ring with every captured position before drafting.
-        // The capture keeps the last window's worth, so the first of them sits
-        // at position ctx.size() - n_pos.
-        engine.prime_dspark_kv(captured, n_pos, pos - n_pos);
+        // prefill() primes every captured prompt position into the draft ring
+        // when DSpark is loaded; writing them again would duplicate work.
 
         // Seed the draft from the last captured position -- the one the
         // committed token was predicted *from*, at pos - 1. draft_tokens takes
