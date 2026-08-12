@@ -298,6 +298,82 @@ __global__ void hc_pre_float_rows_kernel(
     }
 }
 
+// Collapse [rows, 4, dim] to [rows, dim] with the head's own gate, which is a
+// different parameterization from hc_pre's: only 4 mixes, one shared scale, and
+// no post/comb outputs. Same warp-per-fn-row layout as hc_pre_float_rows_kernel
+// -- with 4 rows and 8 warps half the block idles, but the dot itself is the
+// cost and splitting it across a warp is what matters.
+__global__ void hc_head_float_rows_kernel(
+    const float* h4_rows,
+    const float* fn,
+    const float* scale,
+    const float* base,
+    float* y_rows,
+    int rows,
+    int dim) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* h4 = h4_rows + static_cast<size_t>(row) * 4 * dim;
+    float* y = y_rows + static_cast<size_t>(row) * dim;
+    constexpr float eps = 1e-6f;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    constexpr int kNumWarps = 8;
+    __shared__ float pre[4];
+    __shared__ float partial[kNumWarps];
+    const int n = 4 * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = h4[i];
+        sum_sq += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, off);
+    if (lane == 0) partial[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        float total_sq = lane < kNumWarps ? partial[lane] : 0.0f;
+        for (int off = kNumWarps / 2; off > 0; off >>= 1) total_sq += __shfl_xor_sync(0xffffffff, total_sq, off);
+        if (lane == 0) partial[0] = total_sq;
+    }
+    __syncthreads();
+    const float rsqrt = rsqrtf(partial[0] / static_cast<float>(n) + eps);
+
+    if (warp_id < 4) {
+        const float* fn_row = fn + static_cast<size_t>(warp_id) * n;
+        float dot = 0.0f;
+        for (int i = lane; i < n; i += 32) dot += fn_row[i] * h4[i];
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+        if (lane == 0) pre[warp_id] = sigmoidf_fast(dot * rsqrt * scale[0] + base[warp_id]) + eps;
+    }
+    __syncthreads();
+
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < 4; ++h) acc += pre[h] * h4[static_cast<size_t>(h) * dim + d];
+        y[d] = acc;
+    }
+}
+
+// Mean over the hc dimension: [rows, 4, dim] -> [rows, dim], written into a
+// column slice of a wider destination so the DSpark target layers land
+// concatenated per position (the reference cats them on the last axis).
+//   d_out_rows + row * out_stride + col_offset .. + dim
+__global__ void hc_mean_pool_rows_kernel(const float* h4_rows, float* out_rows,
+                                         int rows, int dim, int out_stride,
+                                         int col_offset) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* h4 = h4_rows + static_cast<size_t>(row) * 4 * dim;
+    float* out = out_rows + static_cast<size_t>(row) * out_stride + col_offset;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < 4; ++h) acc += h4[static_cast<size_t>(h) * dim + d];
+        out[d] = acc * 0.25f;
+    }
+}
+
 __global__ void hc_post_float_rows_kernel(const float* x_rows, const float* residual_rows, const float* post_rows, const float* comb_rows, float* y_rows, int rows, int dim) {
     const int row = blockIdx.x;
     const int h = blockIdx.y;
@@ -767,6 +843,10 @@ __global__ void prefill_causal_attention_chunk_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = start + tid; t <= end; t += blockDim.x) {
@@ -868,6 +948,11 @@ __global__ void prefill_sparse_attention_indexed_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Every thread must have read partial[0] before the denom pass overwrites
+    // partial[tid] below; without this barrier a fast tid=0 clobbers the max
+    // while slower threads are still reading it, which makes the whole kernel
+    // run-to-run nondeterministic.
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -1216,6 +1301,10 @@ __global__ void cached_single_token_attention_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < cache_len; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
@@ -1275,6 +1364,10 @@ __global__ void cached_single_token_attention_workspace_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < cache_len; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
@@ -1477,6 +1570,10 @@ __global__ void indexed_cached_single_token_attention_kernel(
         __syncthreads();
     }
     const float max_logit = partial[0];
+    // Barrier before the denom pass reuses partial[]: without it a fast
+    // tid=0 overwrites partial[0] while slower threads are still reading
+    // max_logit from it, making the kernel run-to-run nondeterministic.
+    __syncthreads();
     float local_denom = 0.0f;
     for (int t = tid; t < index_count; t += blockDim.x) {
         const float w = expf(weights[t] - max_logit);
@@ -1739,8 +1836,38 @@ bool hc_pre_float_rows_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool hc_post_float_cuda(const float* d_x, const float* d_residual_h4, const float* d_post, const float* d_comb, float* d_y_h4, int dim, void* stream) {
-    if (d_x == nullptr || d_residual_h4 == nullptr || d_post == nullptr || d_comb == nullptr || d_y_h4 == nullptr || dim <= 0) return false;
+bool hc_head_float_rows_cuda(
+    const float* d_h4_rows,
+    const float* d_fn,
+    const float* d_scale,
+    const float* d_base,
+    float* d_y_rows,
+    int rows,
+    int dim,
+    void* stream) {
+    if (d_h4_rows == nullptr || d_fn == nullptr || d_scale == nullptr || d_base == nullptr || d_y_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_head_float_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_h4_rows, d_fn, d_scale, d_base, d_y_rows, rows, dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool hc_mean_pool_rows_cuda(
+    const float* d_h4_rows,
+    float* d_out_rows,
+    int rows,
+    int dim,
+    int out_stride,
+    int col_offset,
+    void* stream) {
+    if (d_h4_rows == nullptr || d_out_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    if (out_stride < col_offset + dim || col_offset < 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_mean_pool_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_h4_rows, d_out_rows, rows, dim,
+                                                           out_stride, col_offset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool hc_post_float_cuda(const float* d_x, const float* d_residual_h4, const float* d_post, const float* d_comb, float* d_y_h4, int dim, void* stream) {    if (d_x == nullptr || d_residual_h4 == nullptr || d_post == nullptr || d_comb == nullptr || d_y_h4 == nullptr || dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     hc_post_float_kernel<<<4, 256, 0, cuda_stream>>>(d_x, d_residual_h4, d_post, d_comb, d_y_h4, dim);
     return cudaGetLastError() == cudaSuccess;

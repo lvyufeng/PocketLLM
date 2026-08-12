@@ -41,6 +41,7 @@ add_library(dsv4_cpp_core STATIC
     src/tensor.cpp
     src/tp_comm.cpp
     src/dsv4_engine.cpp
+    src/dspark_engine.cpp
     src/sampler.cpp
     src/cmd_channel.cpp
     src/python_sidecar.cpp
@@ -108,6 +109,54 @@ set_target_properties(test_safetensors_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_weight_source tests/test_weight_source.cpp)
 target_link_libraries(test_weight_source PRIVATE dsv4_cpp_core)
 set_target_properties(test_weight_source PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_weight_load tests/test_dspark_weight_load.cpp)
+target_link_libraries(test_dspark_weight_load PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_weight_load PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_perfect_draft tests/test_perfect_draft.cpp)
+target_link_libraries(test_perfect_draft PRIVATE dsv4_cpp_core)
+set_target_properties(test_perfect_draft PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_moe_fp4_determinism tests/test_moe_fp4_determinism.cpp)
+target_link_libraries(test_moe_fp4_determinism PRIVATE dsv4_cpp_core)
+set_target_properties(test_moe_fp4_determinism PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_attention_parity tests/test_dspark_attention_parity.cpp)
+target_link_libraries(test_dspark_attention_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_attention_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_moe_parity tests/test_dspark_moe_parity.cpp)
+target_link_libraries(test_dspark_moe_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_moe_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_draft tests/test_dspark_draft.cpp)
+target_link_libraries(test_dspark_draft PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_draft PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_verify_overwrite_safety tests/test_verify_overwrite_safety.cpp)
+target_link_libraries(test_verify_overwrite_safety PRIVATE dsv4_cpp_core)
+set_target_properties(test_verify_overwrite_safety PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_speculative_scheduler tests/test_speculative_scheduler.cpp)
+target_link_libraries(test_speculative_scheduler PRIVATE dsv4_cpp_core)
+set_target_properties(test_speculative_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_tp_consistency tests/test_dspark_tp_consistency.cpp)
+target_link_libraries(test_dspark_tp_consistency PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_tp_consistency PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_draft_sensitivity tests/test_dspark_draft_sensitivity.cpp)
+target_link_libraries(test_dspark_draft_sensitivity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_draft_sensitivity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_hidden_capture tests/test_dspark_hidden_capture.cpp)
+target_link_libraries(test_dspark_hidden_capture PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_hidden_capture PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_dspark_head_parity tests/test_dspark_head_parity.cpp)
+target_link_libraries(test_dspark_head_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_dspark_head_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_q2_matvec tests/test_q2_matvec.cpp)
 target_link_libraries(test_q2_matvec PRIVATE dsv4_cpp_core)

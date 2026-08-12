@@ -332,6 +332,9 @@ bool moe_single_token_fp4_cuda_with_workspace(
     MoeSingleTokenFp4Workspace workspace,
     void* stream = nullptr);
 
+// d_token_slot_routes (optional, [tokens, topk]) receives the inverse of
+// d_route_tokens: slot k of token t holds the route id assigned there, or -1
+// when that expert is not local to this rank. Pass nullptr to skip it.
 bool moe_group_routes_cuda(
     const int64_t* d_indices,
     const float* d_weights,
@@ -345,6 +348,7 @@ bool moe_group_routes_cuda(
     int topk,
     int experts_start_idx,
     int n_local_experts,
+    int32_t* d_token_slot_routes = nullptr,
     void* stream = nullptr);
 
 bool moe_prefill_fp4_grouped_cuda(
@@ -381,6 +385,10 @@ struct MoePrefillFp4GroupedWorkspace {
     float* d_hidden_scale = nullptr;
     int32_t* d_tile_experts = nullptr;
     int32_t* d_tile_rows = nullptr;
+    // [routes_cap, dim] scratch for the deterministic reduction. Lives in the
+    // workspace because a per-call cudaMalloc/cudaFree here costs ~19x prefill
+    // throughput -- each pair synchronizes the device inside the layer loop.
+    float* d_partials = nullptr;
     int routes_cap = 0;
     int padded_rows_cap = 0;
     int tile_cap = 0;
@@ -410,6 +418,10 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
     int inter_dim,
     float swiglu_limit,
     MoePrefillFp4GroupedWorkspace workspace,
+    // Optional [tokens, topk] slot->route map from moe_group_routes_cuda. When
+    // present (and topk>=3) the w2 output is reduced in fixed slot order
+    // instead of by atomicAdd, which makes the result reproducible.
+    const int32_t* d_token_slot_routes = nullptr,
     void* stream = nullptr);
 
 bool fp8_e4m3_e8m0_matvec_cuda(
@@ -538,6 +550,19 @@ bool bf16_matvec_cuda(
     const float* d_x,
     const uint16_t* d_w_bf16,
     float* d_y,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
+// Batched over a small number of token rows: d_y[t, r] = sum_c d_x[t, c] * w[r, c].
+// d_x is [tokens, cols], d_y is [tokens, rows]. `tokens` must be <= 16 -- the
+// per-thread accumulators are registers, which is what lets the weight row be
+// read once for all tokens instead of once per token.
+bool bf16_matvec_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    float* d_y,
+    int tokens,
     int rows,
     int cols,
     void* stream = nullptr);
@@ -989,6 +1014,34 @@ bool hc_post_float_rows_cuda(
     float* d_y_h4_rows,
     int rows,
     int dim,
+    void* stream = nullptr);
+
+// Collapse [rows, 4, dim] -> [rows, dim] with the head's gate. Distinct from
+// hc_pre: only 4 mixes, one shared scale, and no post/comb outputs.
+//   d_fn    [4, 4*dim]
+//   d_scale [1]
+//   d_base  [4]
+bool hc_head_float_rows_cuda(
+    const float* d_h4_rows,
+    const float* d_fn,
+    const float* d_scale,
+    const float* d_base,
+    float* d_y_rows,
+    int rows,
+    int dim,
+    void* stream = nullptr);
+
+// Mean over the hc dimension: [rows, 4, dim] -> [rows, dim], written at
+// d_out_rows[row * out_stride + col_offset]. The strided destination lets the
+// DSpark target layers be pooled straight into one concatenated
+// [rows, n_target * dim] buffer, matching the reference's cat on the last axis.
+bool hc_mean_pool_rows_cuda(
+    const float* d_h4_rows,
+    float* d_out_rows,
+    int rows,
+    int dim,
+    int out_stride,
+    int col_offset,
     void* stream = nullptr);
 
 

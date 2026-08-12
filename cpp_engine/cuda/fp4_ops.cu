@@ -129,12 +129,18 @@ __global__ void moe_route_prefix_kernel(
     total_routes[0] = total;
 }
 
+// `token_slot_routes` is the inverse of route_tokens: for token t and router
+// slot k, it holds the route id that landed there (or -1 when that slot's
+// expert is not local to this rank). The fill order below is atomic and so
+// varies run to run, but (t, k) does not -- which is what lets the deterministic
+// reduction sum a token's contributions in a fixed order. Pass nullptr to skip.
 __global__ void moe_route_fill_kernel(
     const int64_t* __restrict__ indices,
     const float* __restrict__ weights,
     int32_t* __restrict__ offsets,
     int64_t* __restrict__ route_tokens,
     float* __restrict__ route_weights,
+    int32_t* __restrict__ token_slot_routes,
     int tokens,
     int topk,
     int experts_start_idx,
@@ -148,6 +154,7 @@ __global__ void moe_route_fill_kernel(
     const int out = atomicAdd(offsets + local, 1);
     route_tokens[out] = static_cast<int64_t>(idx / topk);
     route_weights[out] = weights[idx];
+    if (token_slot_routes != nullptr) token_slot_routes[idx] = out;
 }
 
 __global__ void gather_routes_float_kernel(
@@ -774,7 +781,8 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_kernel(
     float* __restrict__ y,
     int rows_per_expert,
     int dim,
-    int inter_dim) {
+    int inter_dim,
+    bool write_partials = false) {
     using namespace nvcuda;
     constexpr int TILE = 16;
     const int expert = blockIdx.z;
@@ -848,9 +856,14 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_kernel(
         const int col = col_base + n;
         if (row < count && row < rows_per_expert && col < dim) {
             const int route = seg_starts[expert] + row;
-            const int64_t token = route_tokens[route];
-            atomicAdd(y + static_cast<size_t>(token) * dim + col,
-                      acc[i] * hidden_scale[expert * rows_per_expert + row]);
+            const float val = acc[i] * hidden_scale[expert * rows_per_expert + row];
+            if (write_partials) {
+                // Deterministic path: one row per route, summed in slot order later.
+                y[static_cast<size_t>(route) * dim + col] = val;
+            } else {
+                const int64_t token = route_tokens[route];
+                atomicAdd(y + static_cast<size_t>(token) * dim + col, val);
+            }
         }
     }
 }
@@ -867,7 +880,8 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_compact_kernel(
     float* __restrict__ y,
     int tile_count,
     int dim,
-    int inter_dim) {
+    int inter_dim,
+    bool write_partials = false) {
     using namespace nvcuda;
     constexpr int TILE = 16;
     const int tile_id = blockIdx.y;
@@ -943,8 +957,13 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_compact_kernel(
         if (row < count && col < dim) {
             const int route = seg_starts[expert] + row;
             const int64_t token = route_tokens[route];
-            atomicAdd(y + static_cast<size_t>(token) * dim + col,
-                      acc[i] * hidden_scale[route]);
+            const float val = acc[i] * hidden_scale[route];
+            if (write_partials) {
+                // Deterministic path: one row per route, summed in slot order later.
+                y[static_cast<size_t>(route) * dim + col] = val;
+            } else {
+                atomicAdd(y + static_cast<size_t>(token) * dim + col, val);
+            }
         }
     }
 }
@@ -962,7 +981,8 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel(
     float* __restrict__ y,
     int tile_count,
     int dim,
-    int inter_dim) {
+    int inter_dim,
+    bool write_partials = false) {
     using namespace nvcuda;
     constexpr int TILE = 16;
     const int tile_id = blockIdx.y;
@@ -1047,10 +1067,44 @@ __global__ void moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel(
         if (row < count && col < dim) {
             const int route = seg_starts[expert] + row;
             const int64_t token = route_tokens[route];
-            atomicAdd(y + static_cast<size_t>(token) * dim + col,
-                      acc[i] * hidden_scale[route]);
+            const float val = acc[i] * hidden_scale[route];
+            if (write_partials) {
+                // Deterministic path: one row per route, summed in slot order later.
+                y[static_cast<size_t>(route) * dim + col] = val;
+            } else {
+                atomicAdd(y + static_cast<size_t>(token) * dim + col, val);
+            }
         }
     }
+}
+
+// Deterministic reduction for prefill grouped MoE. The w2 kernels normally
+// atomicAdd each route's contribution straight into y, which makes the sum
+// order depend on block completion order -- float addition is not associative,
+// so topk>=3 diverges run to run. Instead each route writes its own row of
+// `partials` [routes, dim] and this kernel sums a token's routes in router-slot
+// order, which is fixed.
+//
+// partials is [routes, dim] (one row per route, same order as d_x_sorted), not
+// [routes, tokens, dim): the latter is quadratic in tokens and blows past device
+// memory past a few hundred tokens.
+__global__ void moe_prefill_reduce_partials_kernel(
+    const float* __restrict__ partials,           // [routes, dim]
+    float* __restrict__ y,                        // [tokens, dim]
+    const int32_t* __restrict__ token_slot_routes, // [tokens, topk], -1 = not local
+    int topk,
+    int tokens,
+    int dim) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = blockIdx.y;
+    if (token >= tokens || col >= dim) return;
+
+    float sum = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+        const int route = token_slot_routes[static_cast<size_t>(token) * topk + k];
+        if (route >= 0) sum += partials[static_cast<size_t>(route) * dim + col];
+    }
+    y[static_cast<size_t>(token) * dim + col] = sum;
 }
 
 __global__ void moe_prefill_swiglu_quant_fp4_routes_kernel(
@@ -1264,6 +1318,7 @@ bool moe_group_routes_cuda(
     int topk,
     int experts_start_idx,
     int n_local_experts,
+    int32_t* d_token_slot_routes,
     void* stream) {
     if (d_indices == nullptr || d_weights == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_counts == nullptr || d_offsets == nullptr || d_total_routes == nullptr) return false;
     if (tokens <= 0 || topk <= 0 || n_local_experts <= 0) return false;
@@ -1271,9 +1326,15 @@ bool moe_group_routes_cuda(
     const int threads = 256;
     const int blocks = ceil_div_int(tokens * topk, threads);
     cudaMemsetAsync(d_counts, 0, static_cast<size_t>(n_local_experts) * sizeof(int32_t), cuda_stream);
+    if (d_token_slot_routes != nullptr) {
+        // -1 marks "no local route in this slot"; the fill below only writes
+        // the slots whose expert lives on this rank.
+        cudaMemsetAsync(d_token_slot_routes, 0xff,
+                        static_cast<size_t>(tokens) * topk * sizeof(int32_t), cuda_stream);
+    }
     moe_route_count_kernel<<<blocks, threads, 0, cuda_stream>>>(d_indices, d_counts, tokens, topk, experts_start_idx, n_local_experts);
     moe_route_prefix_kernel<<<1, 1, 0, cuda_stream>>>(d_counts, d_seg_starts, d_offsets, d_total_routes, n_local_experts);
-    moe_route_fill_kernel<<<blocks, threads, 0, cuda_stream>>>(d_indices, d_weights, d_offsets, d_route_tokens, d_route_weights, tokens, topk, experts_start_idx, n_local_experts);
+    moe_route_fill_kernel<<<blocks, threads, 0, cuda_stream>>>(d_indices, d_weights, d_offsets, d_route_tokens, d_route_weights, d_token_slot_routes, tokens, topk, experts_start_idx, n_local_experts);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1298,6 +1359,7 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
     int inter_dim,
     float swiglu_limit,
     MoePrefillFp4GroupedWorkspace workspace,
+    const int32_t* d_token_slot_routes,
     void* stream) {
     if (d_x == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
     if (tokens <= 0 || topk <= 0 || routes < 0 || n_local_experts <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
@@ -1336,6 +1398,11 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
             int n = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 4;
             return n > 0 ? n : 4;
         }();
+        static const bool kDeterministicReduce = []() {
+            const char* v = std::getenv("DSV4_CPP_MOE_DETERMINISTIC_REDUCE");
+            if (v == nullptr || v[0] == '\0') return true;  // default enabled
+            return v[0] != '0';
+        }();
         const dim3 fp4_block(32 * kMoeWmmaWarps);
         const dim3 fp4_block_nsplit(32 * kMoeNSplit);
         const size_t x_shared_bytes = 4096;
@@ -1367,21 +1434,42 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
             after_swiglu = std::chrono::steady_clock::now();
         }
         const size_t h_shared_bytes = 4096;
+
+        // Deterministic reduction: each route writes its own row of `partials`
+        // [routes, dim] and a second pass sums each token's routes in router-slot
+        // order. Only worth it for topk>=3 -- a two-term atomic sum has a single
+        // possible order and is already reproducible.
+        const bool deterministic = kDeterministicReduce && topk >= 3 &&
+                                   d_token_slot_routes != nullptr &&
+                                   workspace.d_partials != nullptr &&
+                                   workspace.routes_cap >= routes;
+        float* const w2_out = deterministic ? workspace.d_partials : d_y;
+
         if (kMoeNSplit == 4) {
             const dim3 w2_grid(ceil_div_int(dim, 16 * 4), workspace.tile_count);
             const size_t w2_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W2(4);
             moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel<4><<<w2_grid, fp4_block_nsplit, w2_nsplit_smem, cuda_stream>>>(
-                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s,
+                w2_out, workspace.tile_count, dim, inter_dim, deterministic);
         } else if (kMoeNSplit == 2) {
             const dim3 w2_grid(ceil_div_int(dim, 16 * 2), workspace.tile_count);
             const size_t w2_nsplit_smem = TILE_SHARED_NSPLIT_BYTES_W2(2);
             moe_prefill_fp4_grouped_w2_wmma_compact_nsplit_kernel<2><<<w2_grid, fp4_block_nsplit, w2_nsplit_smem, cuda_stream>>>(
-                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s,
+                w2_out, workspace.tile_count, dim, inter_dim, deterministic);
         } else {
             const dim3 w2_grid(ceil_div_int(dim, 16), workspace.tile_count);
             moe_prefill_fp4_grouped_w2_wmma_compact_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
-                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+                workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s,
+                w2_out, workspace.tile_count, dim, inter_dim, deterministic);
         }
+
+        if (deterministic) {
+            const dim3 reduce_grid(ceil_div_int(dim, 256), tokens);
+            moe_prefill_reduce_partials_kernel<<<reduce_grid, 256, 0, cuda_stream>>>(
+                workspace.d_partials, d_y, d_token_slot_routes, topk, tokens, dim);
+        }
+
         std::chrono::steady_clock::time_point after_w2;
         if (profile) {
             cudaStreamSynchronize(cuda_stream);
@@ -1412,6 +1500,13 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
     quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(workspace.d_x_sorted, workspace.d_x_q, workspace.d_x_scale, routes, dim);
     const int pad_blocks = static_cast<int>((padded_dim + threads - 1) / threads);
     pad_q_rows_kernel<<<pad_blocks, threads, 0, cuda_stream>>>(workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_x_pad, workspace.d_x_scale_pad, n_local_experts, max_count, dim);
+
+    static const bool kDeterministicReduce = []() {
+        const char* v = std::getenv("DSV4_CPP_MOE_DETERMINISTIC_REDUCE");
+        if (v == nullptr || v[0] == '\0') return true;  // default enabled
+        return v[0] != '0';
+    }();
+
     const dim3 fp4_block(128);
     const dim3 w13_grid(ceil_div_int(inter_dim, 16), ceil_div_int(max_count, 16), n_local_experts);
     const size_t x_shared_bytes = 4096;
@@ -1419,10 +1514,26 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
         workspace.d_x_pad, workspace.d_x_scale_pad, d_seg_starts, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, max_count, dim, inter_dim);
     moe_prefill_swiglu_quant_fp4_kernel<<<dim3(n_local_experts, max_count), kQuantThreads, 0, cuda_stream>>>(
         workspace.d_gate, workspace.d_up, d_seg_starts, d_route_weights, workspace.d_hidden_q, workspace.d_hidden_scale, max_count, inter_dim, swiglu_limit);
+
     const dim3 w2_grid(ceil_div_int(dim, 16), ceil_div_int(max_count, 16), n_local_experts);
     const size_t h_shared_bytes = 4096;
+
+    // Same deterministic reduction as the compact path above.
+    const bool deterministic = kDeterministicReduce && topk >= 3 &&
+                               d_token_slot_routes != nullptr &&
+                               workspace.d_partials != nullptr &&
+                               workspace.routes_cap >= routes;
+
     moe_prefill_fp4_grouped_w2_wmma_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
-        workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s, d_y, max_count, dim, inter_dim);
+        workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s,
+        deterministic ? workspace.d_partials : d_y, max_count, dim, inter_dim, deterministic);
+
+    if (deterministic) {
+        const dim3 reduce_grid(ceil_div_int(dim, 256), tokens);
+        moe_prefill_reduce_partials_kernel<<<reduce_grid, 256, 0, cuda_stream>>>(
+            workspace.d_partials, d_y, d_token_slot_routes, topk, tokens, dim);
+    }
+
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1461,6 +1572,7 @@ bool moe_prefill_fp4_grouped_cuda(
     const size_t padded_dim = static_cast<size_t>(workspace.padded_rows_cap) * dim;
     const size_t padded_inter = static_cast<size_t>(workspace.padded_rows_cap) * inter_dim;
     if (cudaMalloc(&workspace.d_x_sorted, routes_dim * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_partials, routes_dim * sizeof(float)) != cudaSuccess) goto fail;
     if (cudaMalloc(&workspace.d_x_q, routes_dim) != cudaSuccess) goto fail;
     if (cudaMalloc(&workspace.d_x_scale, static_cast<size_t>(routes) * sizeof(float)) != cudaSuccess) goto fail;
     if (cudaMalloc(&workspace.d_x_pad, padded_dim) != cudaSuccess) goto fail;
@@ -1474,8 +1586,9 @@ bool moe_prefill_fp4_grouped_cuda(
             d_x, d_route_tokens, d_route_weights, d_seg_starts,
             d_w1q, d_w1s, d_w2q, d_w2s, d_w3q, d_w3s,
             d_y, tokens, topk, routes, n_local_experts, max_count, dim, inter_dim, swiglu_limit,
-            workspace, stream);
+            workspace, /*d_token_slot_routes=*/nullptr, stream);
         cudaFree(workspace.d_x_sorted);
+        cudaFree(workspace.d_partials);
         cudaFree(workspace.d_x_q);
         cudaFree(workspace.d_x_scale);
         cudaFree(workspace.d_x_pad);
@@ -1488,6 +1601,7 @@ bool moe_prefill_fp4_grouped_cuda(
     }
 fail:
     cudaFree(workspace.d_x_sorted);
+    cudaFree(workspace.d_partials);
     cudaFree(workspace.d_x_q);
     cudaFree(workspace.d_x_scale);
     cudaFree(workspace.d_x_pad);

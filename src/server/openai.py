@@ -141,6 +141,9 @@ def _init_runtime(args):
         config_data = json.load(f)
     config_data["routed_experts_device"] = args.routed_experts_device
     config_data["partition_policy"] = args.partition_policy
+    # The 0731 checkpoint's mtp.* tensors belong to DSpark, not the legacy
+    # MTPBlock. Serving does not attach DSpark, so build the main model only.
+    config_data["n_mtp_layers"] = 0
     model_args = ModelArgs(**config_data)
     serving_max_batch_size = max(1, int(os.getenv("DEEPSEEK_SERVING_MAX_RUNNING_REQUESTS", "1")))
     model_args.max_batch_size = serving_max_batch_size
