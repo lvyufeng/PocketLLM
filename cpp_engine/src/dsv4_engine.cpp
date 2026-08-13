@@ -983,11 +983,10 @@ struct DeviceCompressorState {
     int cols = 0;
 };
 
-// Host snapshot for speculative rollback. Compressor state is destructive:
-// compressor_shift_overlap_state moves the upper half down and zeroes the top
-// at ratio boundaries, so replaying a position that crossed one cannot rebuild
-// what was shifted away. The KV ring and pooled compressed slots are position-
-// addressed and self-heal; only the accumulator needs protection.
+// Host snapshot retained for the sequential speculative fallback. Streaming
+// compressor state is destructive across overlap shifts, so rejected sequential
+// work must restore it explicitly. Batched continuation uses DeviceUndoJournal
+// below, which also protects sliding and pooled KV slots.
 struct CompressorSnapshot {
     std::vector<float> kv;
     std::vector<float> score;
@@ -995,8 +994,288 @@ struct CompressorSnapshot {
     int cols = 0;
 };
 
+struct DeviceUndoJournal {
+    struct BackupBlock {
+        void* ptr = nullptr;
+        size_t bytes = 0;
+    };
+    struct Entry {
+        void* destination = nullptr;
+        void* backup = nullptr;
+        size_t bytes = 0;
+        int row = 0;
+    };
+
+    std::vector<BackupBlock> blocks;
+    std::vector<Entry> entries;
+    bool pending = false;
+
+    void release() {
+        for (BackupBlock& block : blocks) cudaFree(block.ptr);
+        blocks.clear();
+        entries.clear();
+        pending = false;
+    }
+
+    void begin() {
+        if (pending) throw std::runtime_error("continuation transaction is already pending");
+        entries.clear();
+        pending = true;
+    }
+
+    void record(void* destination, size_t bytes, int row) {
+        if (!pending) throw std::runtime_error("continuation transaction is not active");
+        if (destination == nullptr || bytes == 0 || row < 0) {
+            throw std::runtime_error("invalid continuation journal entry");
+        }
+        const size_t index = entries.size();
+        if (index == blocks.size()) blocks.push_back(BackupBlock{});
+        BackupBlock& block = blocks[index];
+        if (block.bytes < bytes) {
+            cudaFree(block.ptr);
+            block.ptr = nullptr;
+            block.bytes = 0;
+            check_cuda(cudaMalloc(&block.ptr, bytes), "cudaMalloc continuation undo backup");
+            block.bytes = bytes;
+        }
+        check_cuda(cudaMemcpy(block.ptr, destination, bytes, cudaMemcpyDeviceToDevice),
+                   "snapshot continuation device state");
+        entries.push_back(Entry{destination, block.ptr, bytes, row});
+    }
+
+    void finalize(int committed_rows) {
+        if (!pending) throw std::runtime_error("continuation transaction is not active");
+        if (committed_rows < 0) throw std::runtime_error("negative committed continuation rows");
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->row < committed_rows) continue;
+            check_cuda(cudaMemcpy(it->destination, it->backup, it->bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "restore continuation device state");
+        }
+        check_cuda(cudaDeviceSynchronize(), "sync continuation transaction finalize");
+        entries.clear();
+        pending = false;
+    }
+
+    void abort_noexcept() noexcept {
+        if (!pending) return;
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            if (it->destination != nullptr && it->backup != nullptr && it->bytes != 0) {
+                (void)cudaMemcpy(it->destination, it->backup, it->bytes,
+                                 cudaMemcpyDeviceToDevice);
+            }
+        }
+        (void)cudaDeviceSynchronize();
+        entries.clear();
+        pending = false;
+    }
+};
+
+struct ContinuationTransactionGuard {
+    explicit ContinuationTransactionGuard(DeviceUndoJournal& journal_in)
+        : journal(journal_in) {
+        journal.begin();
+    }
+    ~ContinuationTransactionGuard() { if (armed) journal.abort_noexcept(); }
+    void leave_pending() { armed = false; }
+
+    DeviceUndoJournal& journal;
+    bool armed = true;
+};
+
+struct DeviceDenseModelCache {
+    uint16_t* embed = nullptr;
+    uint16_t* head = nullptr;
+    uint16_t* final_norm = nullptr;
+    float* hc_head_fn = nullptr;
+    float* hc_head_scale = nullptr;
+    float* hc_head_base = nullptr;
+    int vocab_rows = 0;
+    int local_head_rows = 0;
+    int local_head_start = 0;
+    int dim = 0;
+};
+
 struct DeviceMoeDecodeWorkspace {
     MoeSingleTokenFp4Workspace fp4;
+};
+
+struct DeviceMoeBatchWorkspace {
+    MoeMultiTokenFp4Workspace fp4;
+    int32_t* slot_expert = nullptr;
+    int32_t* slot_starts = nullptr;
+    int32_t* slot_tokens = nullptr;
+    float* pair_weights = nullptr;
+    int slots_cap = 0;
+
+    void release() {
+        cudaFree(fp4.d_x_q);
+        cudaFree(fp4.d_x_scale);
+        cudaFree(fp4.d_gate);
+        cudaFree(fp4.d_up);
+        cudaFree(fp4.d_hidden_q);
+        cudaFree(fp4.d_hidden_scale);
+        cudaFree(fp4.d_partials);
+        cudaFree(slot_expert);
+        cudaFree(slot_starts);
+        cudaFree(slot_tokens);
+        cudaFree(pair_weights);
+        *this = DeviceMoeBatchWorkspace{};
+    }
+
+    void ensure(int tokens, int pairs, int slots, int dim, int inter_dim) {
+        if (fp4.d_x_q != nullptr && fp4.tokens_cap >= tokens && fp4.pairs_cap >= pairs &&
+            slots_cap >= slots && fp4.dim == dim && fp4.inter_dim == inter_dim) return;
+        release();
+        fp4.tokens_cap = tokens;
+        fp4.pairs_cap = pairs;
+        fp4.dim = dim;
+        fp4.inter_dim = inter_dim;
+        slots_cap = slots;
+        check_cuda(cudaMalloc(&fp4.d_x_q, static_cast<size_t>(tokens) * dim), "cudaMalloc batch moe x q");
+        check_cuda(cudaMalloc(&fp4.d_x_scale, static_cast<size_t>(tokens) * sizeof(float)), "cudaMalloc batch moe x scale");
+        check_cuda(cudaMalloc(&fp4.d_gate, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "cudaMalloc batch moe gate");
+        check_cuda(cudaMalloc(&fp4.d_up, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "cudaMalloc batch moe up");
+        check_cuda(cudaMalloc(&fp4.d_hidden_q, static_cast<size_t>(pairs) * inter_dim), "cudaMalloc batch moe hidden q");
+        check_cuda(cudaMalloc(&fp4.d_hidden_scale, static_cast<size_t>(pairs) * sizeof(float)), "cudaMalloc batch moe hidden scale");
+        check_cuda(cudaMalloc(&fp4.d_partials, static_cast<size_t>(pairs) * dim * sizeof(float)), "cudaMalloc batch moe partials");
+        check_cuda(cudaMalloc(&slot_expert, static_cast<size_t>(slots) * sizeof(int32_t)), "cudaMalloc batch moe slot experts");
+        check_cuda(cudaMalloc(&slot_starts, static_cast<size_t>(slots + 1) * sizeof(int32_t)), "cudaMalloc batch moe slot starts");
+        check_cuda(cudaMalloc(&slot_tokens, static_cast<size_t>(pairs) * sizeof(int32_t)), "cudaMalloc batch moe slot tokens");
+        check_cuda(cudaMalloc(&pair_weights, static_cast<size_t>(pairs) * sizeof(float)), "cudaMalloc batch moe pair weights");
+    }
+};
+
+struct DeviceContinuationWorkspace {
+    static constexpr int kMaxRows = 8;
+    int rows_cap = 0;
+    int dim = 0;
+    int inter_dim = 0;
+    int q_a_dim = 0;
+    int q_dim = 0;
+    int kv_dim = 0;
+    int attn_mid = 0;
+    int local_head_rows = 0;
+    int max_kv_indices = 0;
+    int route_count = 0;
+    int index_q_dim = 0;
+    int index_head_dim = 0;
+    int* token_ids = nullptr;
+    float* x = nullptr;
+    float* h4 = nullptr;
+    float* h4_next = nullptr;
+    uint16_t* h4_bf16 = nullptr;
+    float* hc_post = nullptr;
+    float* hc_comb = nullptr;
+    float* attn_norm = nullptr;
+    float* q_a = nullptr;
+    float* q_norm = nullptr;
+    float* q = nullptr;
+    float* kv_a = nullptr;
+    float* kv_norm = nullptr;
+    float* attn_value = nullptr;
+    float* attn_mid_rows = nullptr;
+    float* attn_out = nullptr;
+    uint16_t* compressor_input_bf16 = nullptr;
+    float* compressor_input_rounded = nullptr;
+    float* compressor_kv = nullptr;
+    float* compressor_score = nullptr;
+    float* indexer_comp_kv = nullptr;
+    float* indexer_comp_score = nullptr;
+    float* index_q = nullptr;
+    float* index_scores = nullptr;
+    int32_t* kv_row_starts = nullptr;
+    int32_t* kv_indices = nullptr;
+    float* ffn_x = nullptr;
+    float* ffn_norm = nullptr;
+    float* shared_gate = nullptr;
+    float* shared_up = nullptr;
+    float* shared_hidden = nullptr;
+    float* shared_out = nullptr;
+    float* moe = nullptr;
+    int64_t* route_indices = nullptr;
+    float* route_weights = nullptr;
+    float* final_x = nullptr;
+    float* final_norm = nullptr;
+    float* logits = nullptr;
+    float* dspark_hidden = nullptr;
+    int dspark_stride_cap = 0;
+    DeviceMoeBatchWorkspace moe_workspace;
+
+    void release() {
+        cudaFree(token_ids); cudaFree(x); cudaFree(h4); cudaFree(h4_next); cudaFree(h4_bf16);
+        cudaFree(hc_post); cudaFree(hc_comb); cudaFree(attn_norm); cudaFree(q_a); cudaFree(q_norm);
+        cudaFree(q); cudaFree(kv_a); cudaFree(kv_norm); cudaFree(attn_value); cudaFree(attn_mid_rows);
+        cudaFree(attn_out); cudaFree(compressor_input_bf16); cudaFree(compressor_input_rounded);
+        cudaFree(compressor_kv); cudaFree(compressor_score); cudaFree(indexer_comp_kv);
+        cudaFree(indexer_comp_score); cudaFree(index_q); cudaFree(index_scores);
+        cudaFree(kv_row_starts); cudaFree(kv_indices); cudaFree(ffn_x); cudaFree(ffn_norm);
+        cudaFree(shared_gate); cudaFree(shared_up); cudaFree(shared_hidden); cudaFree(shared_out);
+        cudaFree(moe); cudaFree(route_indices); cudaFree(route_weights); cudaFree(final_x);
+        cudaFree(final_norm); cudaFree(logits); cudaFree(dspark_hidden);
+        moe_workspace.release();
+        *this = DeviceContinuationWorkspace{};
+    }
+
+    void ensure(int rows, int dim_in, int inter, const AttentionSmokeDims& a,
+                int local_vocab, int max_indices, int routes, int index_q_cols,
+                int index_head, int dspark_stride) {
+        if (rows <= 0 || rows > kMaxRows) throw std::runtime_error("continuation rows must be in [1, 8]");
+        const bool compatible = x != nullptr && rows_cap >= rows && dim == dim_in &&
+            inter_dim == inter && q_a_dim == a.q_a_dim && q_dim == a.q_dim &&
+            kv_dim == a.kv_dim && attn_mid == a.attn_mid && local_head_rows == local_vocab &&
+            max_kv_indices >= max_indices && route_count == routes && index_q_dim >= index_q_cols &&
+            index_head_dim >= index_head && dspark_stride_cap >= dspark_stride;
+        if (compatible) return;
+        release();
+        rows_cap = rows; dim = dim_in; inter_dim = inter; q_a_dim = a.q_a_dim;
+        q_dim = a.q_dim; kv_dim = a.kv_dim; attn_mid = a.attn_mid;
+        local_head_rows = local_vocab; max_kv_indices = max_indices; route_count = routes;
+        index_q_dim = std::max(1, index_q_cols); index_head_dim = std::max(1, index_head);
+        dspark_stride_cap = dspark_stride;
+        const size_t r = static_cast<size_t>(rows_cap);
+        auto alloc_f = [](float** p, size_t n, const char* what) { check_cuda(cudaMalloc(p, n * sizeof(float)), what); };
+        auto alloc_i = [](int** p, size_t n, const char* what) { check_cuda(cudaMalloc(p, n * sizeof(int)), what); };
+        alloc_i(&token_ids, r, "cudaMalloc continuation token ids");
+        alloc_f(&x, r * dim, "cudaMalloc continuation x");
+        alloc_f(&h4, r * 4 * dim, "cudaMalloc continuation h4");
+        alloc_f(&h4_next, r * 4 * dim, "cudaMalloc continuation h4 next");
+        check_cuda(cudaMalloc(&h4_bf16, r * 4 * dim * sizeof(uint16_t)), "cudaMalloc continuation h4 bf16");
+        alloc_f(&hc_post, r * 4, "cudaMalloc continuation hc post");
+        alloc_f(&hc_comb, r * 16, "cudaMalloc continuation hc comb");
+        alloc_f(&attn_norm, r * dim, "cudaMalloc continuation attn norm");
+        alloc_f(&q_a, r * q_a_dim, "cudaMalloc continuation q a");
+        alloc_f(&q_norm, r * q_a_dim, "cudaMalloc continuation q norm");
+        alloc_f(&q, r * q_dim, "cudaMalloc continuation q");
+        alloc_f(&kv_a, r * kv_dim, "cudaMalloc continuation kv a");
+        alloc_f(&kv_norm, r * kv_dim, "cudaMalloc continuation kv norm");
+        alloc_f(&attn_value, r * q_dim, "cudaMalloc continuation attn value");
+        alloc_f(&attn_mid_rows, r * attn_mid, "cudaMalloc continuation attn mid");
+        alloc_f(&attn_out, r * dim, "cudaMalloc continuation attn out");
+        check_cuda(cudaMalloc(&compressor_input_bf16, r * dim * sizeof(uint16_t)), "cudaMalloc continuation compressor input");
+        alloc_f(&compressor_input_rounded, r * dim, "cudaMalloc continuation compressor rounded");
+        alloc_f(&compressor_kv, r * 1024, "cudaMalloc continuation compressor kv");
+        alloc_f(&compressor_score, r * 1024, "cudaMalloc continuation compressor score");
+        alloc_f(&indexer_comp_kv, r * index_head_dim * 2, "cudaMalloc continuation indexer comp kv");
+        alloc_f(&indexer_comp_score, r * index_head_dim * 2, "cudaMalloc continuation indexer comp score");
+        if (index_q_dim > 0) alloc_f(&index_q, r * index_q_dim, "cudaMalloc continuation index q");
+        alloc_f(&index_scores, static_cast<size_t>(max_indices + index_q_dim), "cudaMalloc continuation index scores");
+        check_cuda(cudaMalloc(&kv_row_starts, (r + 1) * sizeof(int32_t)), "cudaMalloc continuation row starts");
+        check_cuda(cudaMalloc(&kv_indices, r * max_kv_indices * sizeof(int32_t)), "cudaMalloc continuation kv indices");
+        alloc_f(&ffn_x, r * dim, "cudaMalloc continuation ffn x");
+        alloc_f(&ffn_norm, r * dim, "cudaMalloc continuation ffn norm");
+        alloc_f(&shared_gate, r * inter_dim, "cudaMalloc continuation shared gate");
+        alloc_f(&shared_up, r * inter_dim, "cudaMalloc continuation shared up");
+        alloc_f(&shared_hidden, r * inter_dim, "cudaMalloc continuation shared hidden");
+        alloc_f(&shared_out, r * dim, "cudaMalloc continuation shared out");
+        alloc_f(&moe, r * dim, "cudaMalloc continuation moe");
+        check_cuda(cudaMalloc(&route_indices, r * route_count * sizeof(int64_t)), "cudaMalloc continuation route indices");
+        alloc_f(&route_weights, r * route_count, "cudaMalloc continuation route weights");
+        alloc_f(&final_x, r * dim, "cudaMalloc continuation final x");
+        alloc_f(&final_norm, r * dim, "cudaMalloc continuation final norm");
+        alloc_f(&logits, r * local_head_rows, "cudaMalloc continuation logits");
+        if (dspark_stride_cap > 0) alloc_f(&dspark_hidden, r * dspark_stride_cap, "cudaMalloc continuation dspark hidden");
+    }
 };
 
 struct DeviceMoePrefillWorkspace {
@@ -1437,6 +1716,53 @@ struct SafeForwardContext {
             cudaFree(c.wq_b_scale);
             cudaFree(c.weights_proj);
         }
+        for (auto& [_, c] : dense_model_cache) {
+            cudaFree(c.embed);
+            cudaFree(c.head);
+            cudaFree(c.final_norm);
+            cudaFree(c.hc_head_fn);
+            cudaFree(c.hc_head_scale);
+            cudaFree(c.hc_head_base);
+        }
+        continuation_workspace.release();
+        continuation_journal.release();
+    }
+
+    DeviceDenseModelCache& dense_model_device_cache(int tp_world, int tp_rank, int dim) {
+        const std::string key = std::to_string(tp_world) + ":" + std::to_string(tp_rank);
+        auto it = dense_model_cache.find(key);
+        if (it != dense_model_cache.end()) return it->second;
+        const int head_rows = static_cast<int>(head->shape[0]);
+        if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
+        DeviceDenseModelCache c;
+        c.vocab_rows = static_cast<int>(embed->shape[0]);
+        c.local_head_rows = head_rows / tp_world;
+        c.local_head_start = tp_rank * c.local_head_rows;
+        c.dim = dim;
+        check_cuda(cudaMalloc(&c.embed, embed->nbytes), "cudaMalloc cached embedding");
+        check_cuda(cudaMemcpy(c.embed, embed_shard.tensor_data(*embed), embed->nbytes,
+                              cudaMemcpyHostToDevice), "copy cached embedding");
+        check_cuda(cudaMalloc(&c.head, static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t)),
+                   "cudaMalloc cached head");
+        const auto* head_data = reinterpret_cast<const uint16_t*>(head_shard.tensor_data(*head)) +
+            static_cast<size_t>(c.local_head_start) * dim;
+        check_cuda(cudaMemcpy(c.head, head_data,
+                              static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t),
+                              cudaMemcpyHostToDevice), "copy cached head");
+        check_cuda(cudaMalloc(&c.final_norm, final_norm->nbytes), "cudaMalloc cached final norm");
+        check_cuda(cudaMemcpy(c.final_norm, final_norm_shard.tensor_data(*final_norm), final_norm->nbytes,
+                              cudaMemcpyHostToDevice), "copy cached final norm");
+        check_cuda(cudaMalloc(&c.hc_head_fn, hc_head_fn->nbytes), "cudaMalloc cached hc head fn");
+        check_cuda(cudaMalloc(&c.hc_head_scale, hc_head_scale->nbytes), "cudaMalloc cached hc head scale");
+        check_cuda(cudaMalloc(&c.hc_head_base, hc_head_base->nbytes), "cudaMalloc cached hc head base");
+        check_cuda(cudaMemcpy(c.hc_head_fn, hc_head_shard.tensor_data(*hc_head_fn), hc_head_fn->nbytes,
+                              cudaMemcpyHostToDevice), "copy cached hc head fn");
+        check_cuda(cudaMemcpy(c.hc_head_scale, hc_head_shard.tensor_data(*hc_head_scale), hc_head_scale->nbytes,
+                              cudaMemcpyHostToDevice), "copy cached hc head scale");
+        check_cuda(cudaMemcpy(c.hc_head_base, hc_head_shard.tensor_data(*hc_head_base), hc_head_base->nbytes,
+                              cudaMemcpyHostToDevice), "copy cached hc head base");
+        auto inserted = dense_model_cache.emplace(key, c);
+        return inserted.first->second;
     }
 
     SafeTensorsShard& shard_for_tensor(const std::string& tensor) {
@@ -2019,6 +2345,16 @@ struct SafeForwardContext {
         return inserted.first->second;
     }
 
+    DeviceContinuationWorkspace& continuation_device_workspace(
+            int rows, int dim, int inter_dim, const AttentionSmokeDims& dims,
+            int local_vocab, int max_indices, int routes, int index_q_dim,
+            int index_head_dim, int dspark_stride) {
+        continuation_workspace.ensure(rows, dim, inter_dim, dims, local_vocab,
+                                      max_indices, routes, index_q_dim,
+                                      index_head_dim, dspark_stride);
+        return continuation_workspace;
+    }
+
     DeviceMoeDecodeWorkspace& moe_decode_workspace(int topk, int dim, int inter_dim) {
         const std::string key = std::to_string(topk) + ":" + std::to_string(dim) + ":" + std::to_string(inter_dim);
         auto it = moe_decode_workspace_cache.find(key);
@@ -2256,12 +2592,15 @@ struct SafeForwardContext {
     // the last window survives the ring either.
     int dspark_capture_window = 1;
     std::unordered_map<std::string, std::unique_ptr<SafeTensorsShard>> shard_cache;
+    std::unordered_map<std::string, DeviceDenseModelCache> dense_model_cache;
     std::unordered_map<std::string, DeviceAttentionCache> attention_cache;
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
     std::unordered_map<std::string, DeviceFp4ExpertCache> expert_cache;
     std::unordered_map<std::string, DeviceCompressorCache> compressor_cache;
     std::unordered_map<int, DeviceHcCache> hc_cache;
     std::unordered_map<std::string, DeviceMoeDecodeWorkspace> moe_decode_workspace_cache;
+    DeviceContinuationWorkspace continuation_workspace;
+    DeviceUndoJournal continuation_journal;
     std::unordered_map<std::string, DeviceCompressorCache> indexer_compressor_cache;
     std::unordered_map<int, DeviceCompressorState> compressor_device_state;
     std::unordered_map<int, DeviceCompressorState> indexer_compressor_device_state;
@@ -2286,6 +2625,20 @@ struct SafeForwardContext {
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position);
 ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count);
+
+struct ContinuationBatchResult {
+    int rows = 0;
+    int local_head_rows = 0;
+    int local_head_start = 0;
+    std::vector<float> local_logits;
+    std::vector<float> dspark_hidden;
+};
+
+ContinuationBatchResult run_safetensors_continuation_batch_impl(
+    SafeForwardContext& ctx,
+    const std::vector<int>& tokens,
+    int layer_count,
+    int start_position);
 
 Dsv4Engine::Dsv4Engine(const std::string& model_path) : gguf_(model_path), config_(ModelConfig::from_gguf(gguf_)) {}
 
@@ -3177,6 +3530,713 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         cudaStreamDestroy(prefill_shared_stream);
     }
     return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
+}
+
+ContinuationBatchResult run_safetensors_continuation_batch_impl(
+        SafeForwardContext& ctx,
+        const std::vector<int>& tokens,
+        int layer_count,
+        int start_position) {
+    if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
+    if (tokens.empty() || tokens.size() > DeviceContinuationWorkspace::kMaxRows) {
+        throw std::runtime_error("continuation batch must contain 1..8 tokens");
+    }
+    if (start_position < 0) throw std::runtime_error("negative continuation start position");
+    if (layer_count <= 0) layer_count = 1;
+    if (ctx.config.n_layers > 0) layer_count = std::min(layer_count, static_cast<int>(ctx.config.n_layers));
+
+    const int rows = static_cast<int>(tokens.size());
+    const int tp_world = std::max(1, ctx.options.tp_world);
+    const int tp_rank = std::max(0, ctx.options.tp_rank);
+    if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in continuation options");
+    const int dim = static_cast<int>(ctx.embed->shape[1]);
+    Fp4View first_w1 = ctx.fp4_view("layers.0.ffn.experts.0.w1.weight");
+    const int inter = static_cast<int>(first_w1.pair.rows);
+    const int route_count = static_cast<int>(std::min<uint64_t>(
+        ctx.config.n_activated_experts, ctx.config.n_routed_experts));
+    AttentionSmokeDims dims = make_attention_dims(ctx.config, dim, tp_world,
+                                                  start_position + rows - 1);
+    DeviceDenseModelCache& dense = ctx.dense_model_device_cache(tp_world, tp_rank, dim);
+    const int max_compressed = std::max(1, (ctx.kv_cache_tokens + 3) / 4);
+    const int max_keep = static_cast<int>(std::max<uint64_t>(1, ctx.config.index_topk));
+    const int max_indices = dims.window_size + std::max(max_keep, max_compressed);
+    const int index_q_dim = static_cast<int>(ctx.config.index_n_heads * ctx.config.index_head_dim);
+    const int index_head_dim = static_cast<int>(ctx.config.index_head_dim);
+    const int dspark_stride = static_cast<int>(ctx.dspark_capture_layers.size()) * dim;
+    DeviceContinuationWorkspace& w = ctx.continuation_device_workspace(
+        rows, dim, inter, dims, dense.local_head_rows, max_indices, route_count,
+        index_q_dim, index_head_dim, dspark_stride);
+    ContinuationTransactionGuard transaction(ctx.continuation_journal);
+
+    for (int token : tokens) {
+        if (token < 0 || token >= dense.vocab_rows) throw std::runtime_error("token id out of range");
+    }
+
+    // Every continuation mutation is row-tagged in continuation_journal. The
+    // layer loop updates streaming compressor state in position order, while
+    // dense projections and TP reductions remain row-batched.
+
+#ifdef DSV4_HAVE_NCCL
+    BF16AllReduceScratch bf16_reduce_scratch;
+#endif
+    const int experts_per_rank = tp_world > 1
+        ? static_cast<int>(ctx.config.n_routed_experts / tp_world)
+        : static_cast<int>(ctx.config.n_routed_experts);
+    const int expert_start = tp_rank * experts_per_rank;
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
+
+    check_cuda(cudaMemcpy(w.token_ids, tokens.data(), static_cast<size_t>(rows) * sizeof(int),
+                          cudaMemcpyHostToDevice), "copy continuation token ids");
+    if (!bf16_rows_to_float_cuda(dense.embed, w.token_ids, w.x, rows, dim)) {
+        throw std::runtime_error("continuation embedding rows launch failed");
+    }
+    if (!hc_repeat_rows_cuda(w.x, w.h4, rows, dim)) {
+        throw std::runtime_error("continuation hc repeat rows launch failed");
+    }
+
+    for (int li = 0; li < layer_count; ++li) {
+        const std::string prefix = "layers." + std::to_string(li) + ".";
+        DeviceAttentionCache& attn = ctx.attention_device_cache(li, tp_world, tp_rank, dims);
+        DeviceHcCache& hc = ctx.hc_device_cache(li);
+        float* layer_kv = ctx.kv_cache_tokens > 0
+            ? ctx.kv_cache_for_layer(li, dims.head_dim) : nullptr;
+        if (layer_kv == nullptr) {
+            throw std::runtime_error("continuation batch requires a live KV cache");
+        }
+        const uint64_t compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size()
+            ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
+        const float rope_theta = static_cast<float>(
+            compress_ratio == 0 ? ctx.config.rope_theta : ctx.config.compress_rope_theta);
+        if (rope_theta <= 0.0f) throw std::runtime_error("invalid continuation rope theta");
+        const float* inv_freqs = ctx.rope_inv_freqs_for(
+            li, compress_ratio != 0, dims.rope_dim, rope_theta);
+
+        if (!hc_pre_float_rows_cuda(w.h4, hc.attn_fn, hc.attn_scale, hc.attn_base,
+                                    w.x, w.hc_post, w.hc_comb, rows, dim)) {
+            throw std::runtime_error("continuation hc attention pre rows launch failed");
+        }
+        if (!rmsnorm_bf16_gamma_rows_cuda(w.x, attn.attn_norm, w.attn_norm,
+                                          rows, dim, 1e-6f)) {
+            throw std::runtime_error("continuation attention norm rows launch failed");
+        }
+
+        int comp_cols = 0;
+        int comp_ratio = 0;
+        bool comp_overlap = false;
+        int comp_state_cols = 0;
+        int comp_slots = 0;
+        DeviceCompressorCache* comp_cache = nullptr;
+        DeviceCompressorState* comp_state = nullptr;
+        if (compress_ratio > 0 && compress_ratio <= 256 &&
+            ctx.index.shard_for_tensor(prefix + "attn.compressor.wkv.weight") != nullptr) {
+            if (ctx.use_gpu_compressor == 0) {
+                throw std::runtime_error("host compressor path is disabled for continuation batch");
+            }
+            SafeTensorsShard& comp_shard = ctx.shard_for_tensor(prefix + "attn.compressor.wkv.weight");
+            const auto* comp_wkv = require_tensor(comp_shard, prefix + "attn.compressor.wkv.weight");
+            comp_cols = static_cast<int>(comp_wkv->shape[0]);
+            comp_ratio = static_cast<int>(compress_ratio);
+            comp_overlap = comp_cols == dims.head_dim * 2;
+            comp_state_cols = comp_overlap ? dims.head_dim * 2 : dims.head_dim;
+            comp_slots = comp_ratio * (comp_overlap ? 2 : 1);
+            if (comp_cols > 1024) throw std::runtime_error("continuation compressor width exceeds workspace");
+            comp_cache = &ctx.compressor_device_cache(li);
+            comp_state = &ctx.compressor_state_for_layer(
+                li, comp_slots, comp_state_cols);
+            if (!fp32_to_bf16_cuda(w.attn_norm, w.compressor_input_bf16, rows * dim) ||
+                !bf16_to_fp32_cuda(w.compressor_input_bf16, w.compressor_input_rounded,
+                                   rows * dim)) {
+                throw std::runtime_error("continuation compressor input round failed");
+            }
+            if (ctx.use_gpu_compressor == 2) {
+                for (int row = 0; row < rows; ++row) {
+                    const float* input = w.compressor_input_rounded + static_cast<size_t>(row) * dim;
+                    if (!bf16_matvec_cpu_order_cuda(input, comp_cache->wkv,
+                            w.compressor_kv + static_cast<size_t>(row) * comp_cols,
+                            comp_cols, dim) ||
+                        !bf16_matvec_cpu_order_cuda(input, comp_cache->wgate,
+                            w.compressor_score + static_cast<size_t>(row) * comp_cols,
+                            comp_cols, dim)) {
+                        throw std::runtime_error("continuation compressor cpu-order matvec failed");
+                    }
+                }
+            } else if (!bf16_matvec_rows_cuda(w.compressor_input_rounded, comp_cache->wkv,
+                                               w.compressor_kv, rows, comp_cols, dim) ||
+                       !bf16_matvec_rows_cuda(w.compressor_input_rounded, comp_cache->wgate,
+                                               w.compressor_score, rows, comp_cols, dim)) {
+                throw std::runtime_error("continuation compressor matmul failed");
+            }
+        }
+
+        if (!fp8_e4m3_e8m0_matmul_cuda(w.attn_norm, attn.wq_a, attn.wq_a_scale,
+                                       w.q_a, rows, dims.q_a_dim, dim) ||
+            !rmsnorm_bf16_gamma_rows_cuda(w.q_a, attn.q_norm, w.q_norm,
+                                          rows, dims.q_a_dim, 1e-6f) ||
+            !fp8_e4m3_e8m0_matmul_cuda(w.q_norm, attn.wq_b, attn.wq_b_scale,
+                                       w.q, rows, dims.q_dim, dims.q_a_dim) ||
+            !head_rmsnorm_rope_freqs_rows_cuda(w.q, inv_freqs, rows, dims.heads,
+                                               dims.head_dim, dims.rope_dim,
+                                               start_position, false, 1e-6f)) {
+            throw std::runtime_error("continuation Q projection rows launch failed");
+        }
+
+        const bool use_indexer = compress_ratio == 4 &&
+            ctx.index.shard_for_tensor(prefix + "attn.indexer.wq_b.weight") != nullptr;
+        if (use_indexer) {
+            if (ctx.use_gpu_compressor == 0) {
+                throw std::runtime_error("host indexer compressor path is disabled for continuation batch");
+            }
+            SafeTensorsShard& idx_shard = ctx.shard_for_tensor(prefix + "attn.indexer.wq_b.weight");
+            const auto* idx_wkv = require_tensor(idx_shard,
+                prefix + "attn.indexer.compressor.wkv.weight");
+            const int idx_heads = static_cast<int>(ctx.config.index_n_heads);
+            const int idx_head_dim = static_cast<int>(ctx.config.index_head_dim);
+            const int idx_cols = static_cast<int>(idx_wkv->shape[0]);
+            const bool idx_overlap = idx_cols == idx_head_dim * 2;
+            const int idx_state_cols = idx_overlap ? idx_head_dim * 2 : idx_head_dim;
+            const int idx_slots = 4 * (idx_overlap ? 2 : 1);
+            if (idx_cols > idx_head_dim * 2) {
+                throw std::runtime_error("continuation indexer compressor width exceeds workspace");
+            }
+            DeviceCompressorCache& idx_comp = ctx.indexer_compressor_device_cache(li);
+            DeviceCompressorState& idx_state = ctx.indexer_compressor_state_for_layer(
+                li, idx_slots, idx_state_cols);
+            if (ctx.use_gpu_compressor == 2) {
+                for (int row = 0; row < rows; ++row) {
+                    const float* input = w.compressor_input_rounded + static_cast<size_t>(row) * dim;
+                    if (!bf16_matvec_cpu_order_cuda(input, idx_comp.wkv,
+                            w.indexer_comp_kv + static_cast<size_t>(row) * idx_cols,
+                            idx_cols, dim) ||
+                        !bf16_matvec_cpu_order_cuda(input, idx_comp.wgate,
+                            w.indexer_comp_score + static_cast<size_t>(row) * idx_cols,
+                            idx_cols, dim)) {
+                        throw std::runtime_error("continuation indexer compressor cpu-order matvec failed");
+                    }
+                }
+            } else if (!bf16_matvec_rows_cuda(w.compressor_input_rounded, idx_comp.wkv,
+                                               w.indexer_comp_kv, rows, idx_cols, dim) ||
+                       !bf16_matvec_rows_cuda(w.compressor_input_rounded, idx_comp.wgate,
+                                               w.indexer_comp_score, rows, idx_cols, dim)) {
+                throw std::runtime_error("continuation indexer compressor matmul failed");
+            }
+            DeviceIndexerCache& idx = ctx.indexer_device_cache(li);
+            if (!fp8_e4m3_e8m0_matmul_cuda(w.q_norm, idx.wq_b, idx.wq_b_scale,
+                                           w.index_q, rows, idx_heads * idx_head_dim,
+                                           dims.q_a_dim) ||
+                !head_rmsnorm_rope_freqs_rows_cuda(w.index_q, inv_freqs, rows,
+                                                   idx_heads, idx_head_dim,
+                                                   dims.rope_dim, start_position,
+                                                   false, 0.0f) ||
+                !hadamard128_rows_cuda(w.index_q, w.index_q, rows * idx_heads) ||
+                !fp4_fake_quant128_rows_cuda(w.index_q, rows * idx_heads)) {
+                throw std::runtime_error("continuation indexer query rows failed");
+            }
+        }
+
+        if (!fp8_e4m3_e8m0_matmul_cuda(w.attn_norm, attn.wkv, attn.wkv_scale,
+                                       w.kv_a, rows, dims.kv_dim, dim) ||
+            !rmsnorm_bf16_gamma_rows_cuda(w.kv_a, attn.kv_norm, w.kv_norm,
+                                          rows, dims.kv_dim, 1e-6f) ||
+            !head_rmsnorm_rope_freqs_rows_cuda(w.kv_norm, inv_freqs, rows, 1,
+                                               dims.head_dim, dims.rope_dim,
+                                               start_position, false, 0.0f) ||
+            !fp8_act_quant_dequant_rows_strided_cuda(
+                w.kv_norm, rows, dims.head_dim - dims.rope_dim,
+                dims.head_dim, 64)) {
+            throw std::runtime_error("continuation KV projection rows launch failed");
+        }
+
+        std::vector<int32_t> row_starts(static_cast<size_t>(rows) + 1, 0);
+        std::vector<int32_t> indices;
+        std::vector<int> indexer_offsets(static_cast<size_t>(rows), -1);
+        std::vector<int> indexer_counts(static_cast<size_t>(rows), 0);
+        indices.reserve(static_cast<size_t>(rows) * w.max_kv_indices);
+        int max_count = 0;
+        for (int row = 0; row < rows; ++row) {
+            const int position = start_position + row;
+            const int first = std::max(0, position - dims.window_size + 1);
+            const int history_end = std::min(start_position, position + 1);
+            for (int p = first; p < history_end; ++p) {
+                indices.push_back(p % dims.window_size);
+            }
+            for (int p = std::max(first, start_position); p <= position; ++p) {
+                indices.push_back(-2 - (p - start_position));
+            }
+            if (compress_ratio > 0) {
+                const int ready = (position + 1) / static_cast<int>(compress_ratio);
+                const int available = std::min(ready,
+                    std::max(0, ctx.kv_cache_capacity_for_layer(li) - dims.window_size));
+                if (use_indexer && available > 0) {
+                    const int keep = std::min<int>(available,
+                        std::max<uint64_t>(1, ctx.config.index_topk));
+                    indexer_offsets[static_cast<size_t>(row)] = static_cast<int>(indices.size());
+                    indexer_counts[static_cast<size_t>(row)] = keep;
+                    indices.resize(indices.size() + static_cast<size_t>(keep), -1);
+                } else {
+                    for (int c = 0; c < available; ++c) {
+                        indices.push_back(dims.window_size + c);
+                    }
+                }
+            }
+            row_starts[static_cast<size_t>(row) + 1] = static_cast<int32_t>(indices.size());
+            max_count = std::max(max_count,
+                row_starts[static_cast<size_t>(row) + 1] - row_starts[static_cast<size_t>(row)]);
+        }
+        if (static_cast<int>(indices.size()) > rows * w.max_kv_indices) {
+            throw std::runtime_error("continuation KV index workspace is too small");
+        }
+        check_cuda(cudaMemcpy(w.kv_row_starts, row_starts.data(),
+                              row_starts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                   "copy continuation row starts");
+        if (!indices.empty()) {
+            check_cuda(cudaMemcpy(w.kv_indices, indices.data(),
+                                  indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                       "copy continuation KV indices");
+        }
+        if (use_indexer) {
+            const int idx_heads = static_cast<int>(ctx.config.index_n_heads);
+            const int idx_head_dim = static_cast<int>(ctx.config.index_head_dim);
+            DeviceIndexerCache& idx = ctx.indexer_device_cache(li);
+            for (int row = 0; row < rows; ++row) {
+                const int keep = indexer_counts[static_cast<size_t>(row)];
+                if (keep <= 0) continue;
+                const int ready = (start_position + row + 1) / 4;
+                const int available = std::min(ready,
+                    std::max(0, ctx.kv_cache_capacity_for_layer(li) - dims.window_size));
+                if (!indexer_select_topk_cuda(
+                        w.index_q + static_cast<size_t>(row) * idx_heads * idx_head_dim,
+                        ctx.indexer_kv_cache_for_layer(li, idx_head_dim),
+                        idx.weights_proj,
+                        w.x + static_cast<size_t>(row) * dim,
+                        w.index_scores,
+                        reinterpret_cast<int*>(w.kv_indices) +
+                            indexer_offsets[static_cast<size_t>(row)],
+                        available, keep, idx_heads, idx_head_dim, dim,
+                        dims.window_size)) {
+                    throw std::runtime_error("continuation indexer topk failed");
+                }
+            }
+        }
+        if (!indexed_cached_attention_rows_batch_kv_cuda(
+                w.q, layer_kv, w.kv_norm, w.kv_row_starts, w.kv_indices,
+                attn.attn_sink, w.attn_value, rows, dims.heads, dims.head_dim,
+                max_count, attn_scale)) {
+            throw std::runtime_error("continuation indexed attention rows launch failed");
+        }
+        if (!head_rmsnorm_rope_freqs_rows_cuda(
+                w.attn_value, inv_freqs, rows, dims.heads, dims.head_dim,
+                dims.rope_dim, start_position, true, 0.0f)) {
+            throw std::runtime_error("continuation attention inverse rope rows launch failed");
+        }
+        for (int g = 0; g < dims.groups; ++g) {
+            const float* group_x = w.attn_value + static_cast<size_t>(g) * dims.group_dim;
+            const uint8_t* group_w = attn.wo_a +
+                static_cast<size_t>(g) * dims.group_rank * dims.group_dim;
+            const uint8_t* group_s = attn.wo_a_scale +
+                static_cast<size_t>(g) * (dims.group_rank / 128) * (dims.group_dim / 128);
+            float* group_y = w.attn_mid_rows + static_cast<size_t>(g) * dims.group_rank;
+            if (!fp8_e4m3_e8m0_matmul_strided_cuda(
+                    group_x, group_w, group_s, group_y, rows, dims.group_rank,
+                    dims.group_dim, dims.q_dim, dims.attn_mid)) {
+                throw std::runtime_error("continuation WO-A rows launch failed");
+            }
+        }
+        if (!fp8_e4m3_e8m0_matmul_cuda(w.attn_mid_rows, attn.wo_b, attn.wo_b_scale,
+                                       w.attn_out, rows, dim, dims.attn_mid)) {
+            throw std::runtime_error("continuation WO-B rows launch failed");
+        }
+#ifdef DSV4_HAVE_NCCL
+        if (tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) {
+                throw std::runtime_error("TP continuation attention all-reduce requires --nccl-id-path");
+            }
+            all_reduce_sum_fp32_via_bf16_inplace(
+                tp_world, tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(),
+                w.attn_out, rows * dim, bf16_reduce_scratch);
+        }
+#endif
+        if (!hc_post_float_rows_cuda(w.attn_out, w.h4, w.hc_post, w.hc_comb,
+                                     w.h4_next, rows, dim) ||
+            !fp32_to_bf16_cuda(w.h4_next, w.h4_bf16, rows * 4 * dim) ||
+            !bf16_to_fp32_cuda(w.h4_bf16, w.h4, rows * 4 * dim)) {
+            throw std::runtime_error("continuation HC attention post rows launch failed");
+        }
+
+        if (!hc_pre_float_rows_cuda(w.h4, hc.ffn_fn, hc.ffn_scale, hc.ffn_base,
+                                    w.ffn_x, w.hc_post, w.hc_comb, rows, dim) ||
+            !rmsnorm_bf16_gamma_rows_cuda(w.ffn_x, attn.ffn_norm, w.ffn_norm,
+                                          rows, dim, 1e-6f)) {
+            throw std::runtime_error("continuation FFN pre rows launch failed");
+        }
+
+        DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
+        if (!fp8_e4m3_e8m0_matmul_cuda(w.ffn_norm, shared.w1, shared.s1,
+                                       w.shared_gate, rows, inter, dim) ||
+            !fp8_e4m3_e8m0_matmul_cuda(w.ffn_norm, shared.w3, shared.s3,
+                                       w.shared_up, rows, inter, dim) ||
+            !silu_mul_rows_cuda(w.shared_gate, w.shared_up, w.shared_hidden,
+                                rows, inter) ||
+            !fp8_e4m3_e8m0_matmul_cuda(w.shared_hidden, shared.w2, shared.s2,
+                                       w.shared_out, rows, dim, inter)) {
+            throw std::runtime_error("continuation shared expert rows launch failed");
+        }
+
+        DeviceGateCache& gate = ctx.gate_device_cache(li);
+        if (static_cast<uint64_t>(li) < ctx.config.n_hash_layers && gate.tid2eid != nullptr) {
+            // The prefill GPU hash gate is not parity-safe on TP4. Reuse its host
+            // ordering for this tiny continuation block.
+            std::vector<float> norm_host(static_cast<size_t>(rows) * dim);
+            check_cuda(cudaMemcpy(norm_host.data(), w.ffn_norm,
+                                  norm_host.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                       "copy continuation norm for hash gate");
+            SafeTensorsShard& tid_shard = ctx.shard_for_tensor(prefix + "ffn.gate.tid2eid");
+            const auto* tid = require_tensor(tid_shard, prefix + "ffn.gate.tid2eid");
+            const auto* ids = reinterpret_cast<const int64_t*>(tid_shard.tensor_data(*tid));
+            SafeTensorsShard& gw_shard = ctx.shard_for_tensor(prefix + "ffn.gate.weight");
+            const auto* gw_tensor = require_tensor(gw_shard, prefix + "ffn.gate.weight");
+            const auto* gw = reinterpret_cast<const uint16_t*>(gw_shard.tensor_data(*gw_tensor));
+            std::vector<int64_t> route_ids(static_cast<size_t>(rows) * route_count);
+            std::vector<float> route_weights(route_ids.size());
+            for (int row = 0; row < rows; ++row) {
+                float denom = 0.0f;
+                for (int k = 0; k < route_count; ++k) {
+                    const int64_t expert = ids[static_cast<size_t>(tokens[static_cast<size_t>(row)]) *
+                                               ctx.config.n_activated_experts + k];
+                    route_ids[static_cast<size_t>(row) * route_count + k] = expert;
+                    float dot = 0.0f;
+                    for (int d = 0; d < gate.dim; ++d) {
+                        dot += norm_host[static_cast<size_t>(row) * dim + d] *
+                               bf16_to_float(gw[static_cast<size_t>(expert) * gate.dim + d]);
+                    }
+                    const float original = std::sqrt(std::log1pf(std::exp(dot)));
+                    route_weights[static_cast<size_t>(row) * route_count + k] = original;
+                    denom += original;
+                }
+                if (denom == 0.0f) denom = 1.0f;
+                for (int k = 0; k < route_count; ++k) {
+                    route_weights[static_cast<size_t>(row) * route_count + k] =
+                        route_weights[static_cast<size_t>(row) * route_count + k] / denom *
+                        static_cast<float>(ctx.config.route_scale);
+                }
+            }
+            check_cuda(cudaMemcpy(w.route_indices, route_ids.data(),
+                                  route_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice),
+                       "copy continuation hash route ids");
+            check_cuda(cudaMemcpy(w.route_weights, route_weights.data(),
+                                  route_weights.size() * sizeof(float), cudaMemcpyHostToDevice),
+                       "copy continuation hash route weights");
+        } else if (!gate_topk_bf16_rows_cuda(
+                       w.ffn_norm, gate.weight, gate.bias, w.route_indices,
+                       w.route_weights, rows, gate.experts, gate.dim, route_count,
+                       static_cast<float>(ctx.config.route_scale))) {
+            throw std::runtime_error("continuation gate rows launch failed");
+        }
+
+        std::vector<int64_t> route_ids(static_cast<size_t>(rows) * route_count);
+        std::vector<float> route_weights(route_ids.size());
+        check_cuda(cudaMemcpy(route_ids.data(), w.route_indices,
+                              route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost),
+                   "copy continuation route ids");
+        check_cuda(cudaMemcpy(route_weights.data(), w.route_weights,
+                              route_weights.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy continuation route weights");
+        std::vector<int32_t> slot_experts;
+        std::vector<int32_t> slot_starts(1, 0);
+        std::vector<int32_t> slot_tokens;
+        std::vector<float> pair_weights;
+        for (int local = 0; local < experts_per_rank; ++local) {
+            const int global = expert_start + local;
+            bool active = false;
+            for (int row = 0; row < rows; ++row) {
+                for (int k = 0; k < route_count; ++k) {
+                    const size_t ri = static_cast<size_t>(row) * route_count + k;
+                    if (route_ids[ri] != global) continue;
+                    if (!active) {
+                        slot_experts.push_back(local);
+                        active = true;
+                    }
+                    slot_tokens.push_back(row);
+                    pair_weights.push_back(route_weights[ri]);
+                }
+            }
+            if (active) slot_starts.push_back(static_cast<int32_t>(slot_tokens.size()));
+        }
+        check_cuda(cudaMemset(w.moe, 0, static_cast<size_t>(rows) * dim * sizeof(float)),
+                   "zero continuation MoE rows");
+        if (!slot_experts.empty()) {
+            Fp4View sample_w1 = ctx.fp4_view(prefix + "ffn.experts." +
+                                             std::to_string(expert_start) + ".w1.weight");
+            Fp4View sample_w2 = ctx.fp4_view(prefix + "ffn.experts." +
+                                             std::to_string(expert_start) + ".w2.weight");
+            Fp4View sample_w3 = ctx.fp4_view(prefix + "ffn.experts." +
+                                             std::to_string(expert_start) + ".w3.weight");
+            DeviceFp4ExpertCache sample;
+            sample.w1_bytes = sample_w1.w->nbytes; sample.s1_bytes = sample_w1.s->nbytes;
+            sample.w2_bytes = sample_w2.w->nbytes; sample.s2_bytes = sample_w2.s->nbytes;
+            sample.w3_bytes = sample_w3.w->nbytes; sample.s3_bytes = sample_w3.s->nbytes;
+            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(
+                li, tp_world, tp_rank, experts_per_rank, sample);
+            for (int32_t local : slot_experts) {
+                if (!arena.staged_local.insert(local).second) continue;
+                const int global = expert_start + local;
+                Fp4View w1 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(global) + ".w1.weight");
+                Fp4View w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(global) + ".w2.weight");
+                Fp4View w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(global) + ".w3.weight");
+                HostFp4ExpertSlot& host = ctx.host_fp4_slot(li, global, w1, w2, w3);
+                check_cuda(cudaMemcpy(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes,
+                                      host.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "stage continuation w1");
+                check_cuda(cudaMemcpy(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes,
+                                      host.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "stage continuation s1");
+                check_cuda(cudaMemcpy(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes,
+                                      host.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "stage continuation w2");
+                check_cuda(cudaMemcpy(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes,
+                                      host.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "stage continuation s2");
+                check_cuda(cudaMemcpy(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes,
+                                      host.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "stage continuation w3");
+                check_cuda(cudaMemcpy(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes,
+                                      host.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage continuation s3");
+            }
+            DeviceMoeBatchWorkspace& mw = w.moe_workspace;
+            mw.ensure(rows, static_cast<int>(slot_tokens.size()),
+                      static_cast<int>(slot_experts.size()), dim, inter);
+            check_cuda(cudaMemcpy(mw.slot_expert, slot_experts.data(),
+                                  slot_experts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                       "copy continuation slot experts");
+            check_cuda(cudaMemcpy(mw.slot_starts, slot_starts.data(),
+                                  slot_starts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                       "copy continuation slot starts");
+            check_cuda(cudaMemcpy(mw.slot_tokens, slot_tokens.data(),
+                                  slot_tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
+                       "copy continuation slot tokens");
+            check_cuda(cudaMemcpy(mw.pair_weights, pair_weights.data(),
+                                  pair_weights.size() * sizeof(float), cudaMemcpyHostToDevice),
+                       "copy continuation pair weights");
+            if (!moe_multi_token_fp4_cuda_with_workspace(
+                    w.ffn_norm, mw.slot_expert, mw.slot_starts, mw.slot_tokens,
+                    mw.pair_weights, arena.w1, arena.s1, arena.w2, arena.s2,
+                    arena.w3, arena.s3, w.moe, rows,
+                    static_cast<int>(slot_experts.size()),
+                    static_cast<int>(slot_tokens.size()), experts_per_rank, dim, inter,
+                    static_cast<float>(ctx.config.swiglu_limit), mw.fp4)) {
+                throw std::runtime_error("continuation active FP4 MoE launch failed");
+            }
+        }
+#ifdef DSV4_HAVE_NCCL
+        if (tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) {
+                throw std::runtime_error("TP continuation MoE all-reduce requires --nccl-id-path");
+            }
+            all_reduce_sum_fp32_via_bf16_inplace(
+                tp_world, tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(),
+                w.moe, rows * dim, bf16_reduce_scratch);
+        }
+#endif
+        if (!vector_accum_rows_cuda(w.shared_out, w.moe, rows, dim, 1.0f) ||
+            !hc_post_float_rows_cuda(w.moe, w.h4, w.hc_post, w.hc_comb,
+                                     w.h4_next, rows, dim) ||
+            !fp32_to_bf16_cuda(w.h4_next, w.h4_bf16, rows * 4 * dim) ||
+            !bf16_to_fp32_cuda(w.h4_bf16, w.h4, rows * 4 * dim)) {
+            throw std::runtime_error("continuation FFN post rows launch failed");
+        }
+        if (dspark_stride > 0) {
+            const auto it = std::find(ctx.dspark_capture_layers.begin(),
+                                      ctx.dspark_capture_layers.end(), li);
+            if (it != ctx.dspark_capture_layers.end()) {
+                const int slot = static_cast<int>(it - ctx.dspark_capture_layers.begin());
+                if (!hc_mean_pool_rows_cuda(w.h4, w.dspark_hidden, rows, dim,
+                                            dspark_stride, slot * dim)) {
+                    throw std::runtime_error("continuation DSpark hidden capture failed");
+                }
+            }
+        }
+
+        // Compressor mutations are persistent state, but they must not feed any
+        // row in the same verify block. The block's causal KV is carried through
+        // w.kv_norm; publish compressor/indexer state only after attention has
+        // consumed the pre-batch history. This also makes accepted-row hidden and
+        // logits independent of rejected suffix token contents.
+        if (comp_state != nullptr) {
+            for (int row = 0; row < rows; ++row) {
+                const int position = start_position + row;
+                const int offset = position % comp_ratio;
+                const int write_slot = comp_overlap ? comp_ratio + offset : offset;
+                float* kv_slot = comp_state->kv +
+                    static_cast<size_t>(write_slot) * comp_state_cols;
+                float* score_slot = comp_state->score +
+                    static_cast<size_t>(write_slot) * comp_state_cols;
+                ctx.continuation_journal.record(kv_slot,
+                    static_cast<size_t>(comp_state_cols) * sizeof(float), row);
+                ctx.continuation_journal.record(score_slot,
+                    static_cast<size_t>(comp_state_cols) * sizeof(float), row);
+                if (!compressor_update_state_cuda(
+                        w.compressor_kv + static_cast<size_t>(row) * comp_cols,
+                        w.compressor_score + static_cast<size_t>(row) * comp_cols,
+                        comp_cache->ape + static_cast<size_t>(offset) * comp_cols,
+                        comp_state->kv, comp_state->score, offset, write_slot,
+                        comp_state_cols)) {
+                    throw std::runtime_error("continuation compressor state update failed");
+                }
+                if ((position + 1) % comp_ratio != 0) continue;
+                const int compressed_slot = dims.window_size + position / comp_ratio;
+                if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
+                    float* pooled = layer_kv +
+                        static_cast<size_t>(compressed_slot) * dims.head_dim;
+                    ctx.continuation_journal.record(pooled,
+                        static_cast<size_t>(dims.head_dim) * sizeof(float), row);
+                    if (!compressor_pool_cuda(comp_state->kv, comp_state->score,
+                                              pooled, comp_ratio, dims.head_dim,
+                                              comp_state_cols, comp_overlap) ||
+                        !rmsnorm_bf16_gamma_cuda(pooled, comp_cache->norm, pooled,
+                                                dims.head_dim, 1e-6f)) {
+                        throw std::runtime_error("continuation compressed KV pool failed");
+                    }
+                    const float comp_theta = static_cast<float>(
+                        ctx.config.compress_rope_theta == 0 ? 160000 :
+                        ctx.config.compress_rope_theta);
+                    const float* comp_freqs = ctx.rope_inv_freqs_for(
+                        li, true, dims.rope_dim, comp_theta);
+                    if (!head_rmsnorm_rope_freqs_cuda(
+                            pooled, comp_freqs, 1, dims.head_dim, dims.rope_dim,
+                            position + 1 - comp_ratio, false, 0.0f) ||
+                        !fp8_act_quant_dequant_cuda(
+                            pooled, dims.head_dim - dims.rope_dim, 64)) {
+                        throw std::runtime_error("continuation compressed KV finalize failed");
+                    }
+                }
+                if (comp_overlap) {
+                    const size_t state_bytes = static_cast<size_t>(comp_slots) *
+                        comp_state_cols * sizeof(float);
+                    ctx.continuation_journal.record(
+                        comp_state->kv, state_bytes, row);
+                    ctx.continuation_journal.record(
+                        comp_state->score, state_bytes, row);
+                    if (!compressor_shift_overlap_state_cuda(
+                            comp_state->kv, comp_state->score, comp_ratio,
+                            comp_state_cols)) {
+                        throw std::runtime_error("continuation compressor overlap shift failed");
+                    }
+                }
+            }
+        }
+
+        if (use_indexer) {
+            SafeTensorsShard& idx_shard = ctx.shard_for_tensor(
+                prefix + "attn.indexer.wq_b.weight");
+            const auto* idx_wkv = require_tensor(
+                idx_shard, prefix + "attn.indexer.compressor.wkv.weight");
+            const int idx_head_dim = static_cast<int>(ctx.config.index_head_dim);
+            const int idx_cols = static_cast<int>(idx_wkv->shape[0]);
+            const bool idx_overlap = idx_cols == idx_head_dim * 2;
+            const int idx_state_cols = idx_overlap ? idx_head_dim * 2 : idx_head_dim;
+            const int idx_slots = 4 * (idx_overlap ? 2 : 1);
+            DeviceCompressorCache& idx_comp =
+                ctx.indexer_compressor_device_cache(li);
+            DeviceCompressorState& idx_state =
+                ctx.indexer_compressor_state_for_layer(li, idx_slots, idx_state_cols);
+            for (int row = 0; row < rows; ++row) {
+                const int position = start_position + row;
+                const int offset = position % 4;
+                const int write_slot = idx_overlap ? 4 + offset : offset;
+                float* kv_slot = idx_state.kv +
+                    static_cast<size_t>(write_slot) * idx_state_cols;
+                float* score_slot = idx_state.score +
+                    static_cast<size_t>(write_slot) * idx_state_cols;
+                ctx.continuation_journal.record(kv_slot,
+                    static_cast<size_t>(idx_state_cols) * sizeof(float), row);
+                ctx.continuation_journal.record(score_slot,
+                    static_cast<size_t>(idx_state_cols) * sizeof(float), row);
+                if (!compressor_update_state_cuda(
+                        w.indexer_comp_kv + static_cast<size_t>(row) * idx_cols,
+                        w.indexer_comp_score + static_cast<size_t>(row) * idx_cols,
+                        idx_comp.ape + static_cast<size_t>(offset) * idx_cols,
+                        idx_state.kv, idx_state.score, offset, write_slot,
+                        idx_state_cols)) {
+                    throw std::runtime_error("continuation indexer compressor state update failed");
+                }
+                if ((position + 1) % 4 != 0) continue;
+                float* idx_cache =
+                    ctx.indexer_kv_cache_for_layer(li, idx_head_dim);
+                float* idx_slot = idx_cache +
+                    static_cast<size_t>(position / 4) * idx_head_dim;
+                ctx.continuation_journal.record(idx_slot,
+                    static_cast<size_t>(idx_head_dim) * sizeof(float), row);
+                if (!compressor_pool_cuda(idx_state.kv, idx_state.score, idx_slot,
+                                          4, idx_head_dim, idx_state_cols,
+                                          idx_overlap) ||
+                    !rmsnorm_bf16_gamma_cuda(idx_slot, idx_comp.norm, idx_slot,
+                                             idx_head_dim, 1e-6f)) {
+                    throw std::runtime_error("continuation indexer compressed KV pool failed");
+                }
+                const float comp_theta = static_cast<float>(
+                    ctx.config.compress_rope_theta == 0 ? 160000 :
+                    ctx.config.compress_rope_theta);
+                const float* comp_freqs = ctx.rope_inv_freqs_for(
+                    li, true, dims.rope_dim, comp_theta);
+                if (!head_rmsnorm_rope_freqs_cuda(
+                        idx_slot, comp_freqs, 1, idx_head_dim, dims.rope_dim,
+                        position + 1 - 4, false, 0.0f) ||
+                    !hadamard128_rows_cuda(idx_slot, idx_slot, 1) ||
+                    !fp4_fake_quant128_rows_cuda(idx_slot, 1)) {
+                    throw std::runtime_error("continuation indexer compressed KV finalize failed");
+                }
+                if (idx_overlap) {
+                    const size_t state_bytes = static_cast<size_t>(idx_slots) *
+                        idx_state_cols * sizeof(float);
+                    ctx.continuation_journal.record(
+                        idx_state.kv, state_bytes, row);
+                    ctx.continuation_journal.record(
+                        idx_state.score, state_bytes, row);
+                    if (!compressor_shift_overlap_state_cuda(
+                            idx_state.kv, idx_state.score, 4, idx_state_cols)) {
+                        throw std::runtime_error("continuation indexer overlap shift failed");
+                    }
+                }
+            }
+        }
+
+        // Publish the whole input block only after every row has read the old
+        // ring plus batch-local KV. Journal each physical slot immediately before
+        // its row overwrites it, so wraparound within the block is reversible in
+        // exact row order.
+        for (int row = 0; row < rows; ++row) {
+            const int slot = (start_position + row) % dims.window_size;
+            float* destination = layer_kv + static_cast<size_t>(slot) * dims.head_dim;
+            ctx.continuation_journal.record(
+                destination, static_cast<size_t>(dims.head_dim) * sizeof(float), row);
+            check_cuda(cudaMemcpy(destination,
+                                  w.kv_norm + static_cast<size_t>(row) * dims.head_dim,
+                                  static_cast<size_t>(dims.head_dim) * sizeof(float),
+                                  cudaMemcpyDeviceToDevice),
+                       "publish continuation KV row");
+        }
+    }
+
+    if (!hc_head_float_rows_cuda(w.h4, dense.hc_head_fn, dense.hc_head_scale,
+                                 dense.hc_head_base, w.final_x, rows, dim) ||
+        !rmsnorm_bf16_gamma_rows_cuda(w.final_x, dense.final_norm, w.final_norm,
+                                      rows, dim, 1e-6f) ||
+        !bf16_matvec_rows_cuda(w.final_norm, dense.head, w.logits, rows,
+                              dense.local_head_rows, dim)) {
+        throw std::runtime_error("continuation final head rows launch failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync continuation batch forward");
+
+    ContinuationBatchResult result;
+    result.rows = rows;
+    result.local_head_rows = dense.local_head_rows;
+    result.local_head_start = dense.local_head_start;
+    result.local_logits.resize(static_cast<size_t>(rows) * dense.local_head_rows);
+    check_cuda(cudaMemcpy(result.local_logits.data(), w.logits,
+                          result.local_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy continuation logits");
+    if (dspark_stride > 0) {
+        result.dspark_hidden.resize(static_cast<size_t>(rows) * dspark_stride);
+        check_cuda(cudaMemcpy(result.dspark_hidden.data(), w.dspark_hidden,
+                              result.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                   "copy continuation DSpark hidden");
+    }
+    transaction.leave_pending();
+    return result;
 }
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {
@@ -9349,6 +10409,10 @@ struct PersistentEngine::State {
     std::unique_ptr<CmdChannel> cmd;
     // Per-draft-token hiddens from the last verify_step, [draft_len, stride].
     std::vector<float> verify_dspark_hidden;
+    // Full hidden block held while a batched continuation transaction is pending.
+    // FinalizeBatchVerify crops this to the committed prefix.
+    std::vector<float> pending_batch_dspark_hidden;
+    int pending_batch_rows = 0;
     // The draft module, plus the device staging for one round's main hidden.
     // Both are null until load_dspark().
     std::unique_ptr<dspark::DSparkEngine> dspark;
@@ -9398,6 +10462,10 @@ void PersistentEngine::reset_session() {
     // request that ends mid-block leaves a partial accumulation that the next
     // request would resume from. Explicitly restore it to the initial state.
     auto& ctx = *state_->ctx;
+    ctx.continuation_journal.abort_noexcept();
+    state_->pending_batch_dspark_hidden.clear();
+    state_->pending_batch_rows = 0;
+    state_->verify_dspark_hidden.clear();
     ctx.reset_streaming_compressor_states();
     // Sync to drain any in-flight stream work from the previous request.
     cudaDeviceSynchronize();
@@ -9456,6 +10524,81 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
         return best;
     }
     return sample_token_top_p(ctx.last_local_logits.data(), local, sp.temperature, sp.top_p, rng);
+}
+
+std::vector<int> select_continuation_tokens(const ContinuationBatchResult& result,
+                                            const ForwardSmokeOptions& opts,
+                                            const SamplingParams& sp,
+                                            std::mt19937& rng) {
+    if (result.rows <= 0 || result.local_head_rows <= 0 ||
+        result.local_logits.size() !=
+            static_cast<size_t>(result.rows) * result.local_head_rows) {
+        throw std::runtime_error("select_continuation_tokens: invalid logits shape");
+    }
+    const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
+    std::vector<int> tokens(static_cast<size_t>(result.rows));
+
+#ifdef DSV4_HAVE_NCCL
+    if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
+        std::vector<float> gathered;
+        if (opts.tp_rank == 0) {
+            gathered.resize(static_cast<size_t>(opts.tp_world) * result.local_head_rows);
+        }
+        std::vector<float> full_logits;
+        if (opts.tp_rank == 0) {
+            full_logits.resize(static_cast<size_t>(opts.tp_world) * result.local_head_rows);
+        }
+        for (int row = 0; row < result.rows; ++row) {
+            const float* local = result.local_logits.data() +
+                static_cast<size_t>(row) * result.local_head_rows;
+            nccl_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
+                                       opts.nccl_id_path.c_str(), local,
+                                       result.local_head_rows,
+                                       opts.tp_rank == 0 ? gathered.data() : nullptr, 0);
+            int32_t token_buf[1] = {0};
+            if (opts.tp_rank == 0) {
+                // The gather is rank-major, matching contiguous vocabulary shards.
+                full_logits = gathered;
+                const int vocab = static_cast<int>(full_logits.size());
+                if (greedy) {
+                    int best = 0;
+                    float best_v = full_logits[0];
+                    for (int i = 1; i < vocab; ++i) {
+                        if (full_logits[i] > best_v) { best_v = full_logits[i]; best = i; }
+                    }
+                    token_buf[0] = best;
+                } else {
+                    token_buf[0] = sample_token_top_p(
+                        full_logits.data(), vocab, sp.temperature, sp.top_p, rng);
+                }
+            }
+            nccl_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
+                                 opts.nccl_id_path.c_str(), token_buf, 1, 0);
+            tokens[static_cast<size_t>(row)] = token_buf[0];
+        }
+        return tokens;
+    }
+#endif
+
+    for (int row = 0; row < result.rows; ++row) {
+        const float* local = result.local_logits.data() +
+            static_cast<size_t>(row) * result.local_head_rows;
+        if (greedy) {
+            int best = result.local_head_start;
+            float best_v = -INFINITY;
+            for (int i = 0; i < result.local_head_rows; ++i) {
+                if (local[i] > best_v) {
+                    best_v = local[i];
+                    best = result.local_head_start + i;
+                }
+            }
+            tokens[static_cast<size_t>(row)] = best;
+        } else {
+            tokens[static_cast<size_t>(row)] = sample_token_top_p(
+                local, result.local_head_rows, sp.temperature, sp.top_p, rng);
+        }
+    }
+    return tokens;
 }
 
 void maybe_reseed(uint64_t seed, uint64_t& current_seed, std::mt19937& rng) {
@@ -9536,6 +10679,81 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
     return next_tokens;
 }
 
+std::vector<int> PersistentEngine::batch_verify_step(
+    const std::vector<int>& draft_tokens,
+    int start_position,
+    const SamplingParams& sp) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+    maybe_reseed(sp.seed, s.rng_seed, s.rng);
+
+    if (draft_tokens.empty()) {
+        throw std::runtime_error("batch_verify_step: empty draft_tokens");
+    }
+    if (!(sp.greedy || sp.temperature <= 1.0e-5f)) {
+        throw std::runtime_error("batch_verify_step: stochastic sampling is not supported");
+    }
+    if (draft_tokens.size() > 8) {
+        throw std::runtime_error("batch_verify_step: at most 8 continuation rows are supported");
+    }
+
+    worker_command_batch_verify(draft_tokens, start_position);
+    ContinuationBatchResult result;
+    try {
+        result = run_safetensors_continuation_batch_impl(
+            ctx, draft_tokens, s.layer_count, start_position);
+    } catch (...) {
+        // Workers abort their own journal from the command-loop catch. A zero-row
+        // finalize is still sent so a worker that completed before rank 0 failed
+        // does not retain a pending transaction into the next command.
+        worker_command_finalize_batch_verify(0);
+        throw;
+    }
+    std::vector<int> next_tokens;
+    try {
+        next_tokens = select_continuation_tokens(result, s.opts, sp, s.rng);
+        s.pending_batch_dspark_hidden = std::move(result.dspark_hidden);
+        s.pending_batch_rows = result.rows;
+    } catch (...) {
+        ctx.continuation_journal.abort_noexcept();
+        s.pending_batch_dspark_hidden.clear();
+        s.pending_batch_rows = 0;
+        worker_command_finalize_batch_verify(0);
+        throw;
+    }
+
+    // Workers leave the transaction pending until rank 0 sends the accepted
+    // prefix after it has compared the globally selected successors.
+    if (s.opts.tp_rank != 0) return next_tokens;
+
+    int committed_rows = 1;
+    while (committed_rows < result.rows &&
+           next_tokens[static_cast<size_t>(committed_rows - 1)] ==
+               draft_tokens[static_cast<size_t>(committed_rows)]) {
+        ++committed_rows;
+    }
+    worker_command_finalize_batch_verify(committed_rows);
+    try {
+        ctx.continuation_journal.finalize(committed_rows);
+        const size_t stride = s.pending_batch_rows > 0
+            ? s.pending_batch_dspark_hidden.size() /
+                  static_cast<size_t>(s.pending_batch_rows)
+            : 0;
+        s.verify_dspark_hidden.assign(
+            s.pending_batch_dspark_hidden.begin(),
+            s.pending_batch_dspark_hidden.begin() +
+                static_cast<size_t>(committed_rows) * stride);
+        s.pending_batch_dspark_hidden.clear();
+        s.pending_batch_rows = 0;
+    } catch (...) {
+        s.pending_batch_dspark_hidden.clear();
+        s.pending_batch_rows = 0;
+        throw;
+    }
+    return next_tokens;
+}
+
 std::vector<int> PersistentEngine::speculative_step(int committed_token, int position,
                                        const SamplingParams& sp) {
     auto& s = *state_;
@@ -9566,7 +10784,24 @@ std::vector<int> PersistentEngine::speculative_step(int committed_token, int pos
 
     ctx.options = s.opts;
 
-    // Verify with early exit. verify_step() forwards the whole block, which is
+    if (env_int_or_default("DSV4_CPP_BATCHED_VERIFY", 0) != 0) {
+        const std::vector<int> next_tokens = batch_verify_step(draft.tokens, position, sp);
+        int committed_rows = 1;
+        while (committed_rows < static_cast<int>(draft.tokens.size()) &&
+               next_tokens[static_cast<size_t>(committed_rows - 1)] ==
+                   draft.tokens[static_cast<size_t>(committed_rows)]) {
+            ++committed_rows;
+        }
+        std::vector<int> generated(next_tokens.begin(),
+                                   next_tokens.begin() + committed_rows);
+        worker_command_prime_draft_kv(committed_rows, position);
+        if (!s.verify_dspark_hidden.empty()) {
+            prime_dspark_kv(s.verify_dspark_hidden, committed_rows, position);
+        }
+        return generated;
+    }
+
+    // Sequential verify uses early exit. verify_step() forwards the whole block, which is
     // wrong for a scheduler in two ways: the rejected tail's positions still hit
     // the compressor (and restoring the pre-verify snapshot then also discards
     // the *accepted* prefix's contribution, since nothing re-forwards it), and
@@ -9802,6 +11037,33 @@ void PersistentEngine::worker_command_verify(const std::vector<int>& block, int3
     s.cmd->send_to_workers(payload.data(), payload.size());
 }
 
+void PersistentEngine::worker_command_batch_verify(const std::vector<int>& block,
+                                                   int32_t start_position) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::BatchVerify),
+        start_position,
+        0,
+        static_cast<int32_t>(block.size())
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+    std::vector<int32_t> payload(block.begin(), block.end());
+    s.cmd->send_to_workers(payload.data(), payload.size());
+}
+
+void PersistentEngine::worker_command_finalize_batch_verify(int32_t committed_rows) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::FinalizeBatchVerify),
+        committed_rows,
+        0,
+        0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
 void PersistentEngine::worker_command_draft(int32_t input_token, int32_t start_position) {
     auto& s = *state_;
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
@@ -9861,7 +11123,8 @@ void PersistentEngine::run_worker_loop() {
             s.cmd->recv_from_root(payload.data(), payload.size());
             prefill_tokens.assign(payload.begin(), payload.end());
         }
-        if (cmd == WorkerCommand::Verify && header[3] > 0) {
+        if ((cmd == WorkerCommand::Verify || cmd == WorkerCommand::BatchVerify) &&
+            header[3] > 0) {
             std::vector<int32_t> payload(static_cast<size_t>(header[3]));
             s.cmd->recv_from_root(payload.data(), payload.size());
             verify_block.assign(payload.begin(), payload.end());
@@ -9880,6 +11143,24 @@ void PersistentEngine::run_worker_loop() {
                 (void)decode_step(header[1], header[2], sp);
             } else if (cmd == WorkerCommand::Verify) {
                 (void)verify_step(verify_block, header[1], sp);
+            } else if (cmd == WorkerCommand::BatchVerify) {
+                (void)batch_verify_step(verify_block, header[1], sp);
+            } else if (cmd == WorkerCommand::FinalizeBatchVerify) {
+                if (!s.ctx->continuation_journal.pending ||
+                    header[1] < 0 || header[1] > s.pending_batch_rows) {
+                    throw std::runtime_error("invalid FinalizeBatchVerify command");
+                }
+                s.ctx->continuation_journal.finalize(header[1]);
+                const size_t stride = s.pending_batch_rows > 0
+                    ? s.pending_batch_dspark_hidden.size() /
+                          static_cast<size_t>(s.pending_batch_rows)
+                    : 0;
+                s.verify_dspark_hidden.assign(
+                    s.pending_batch_dspark_hidden.begin(),
+                    s.pending_batch_dspark_hidden.begin() +
+                        static_cast<size_t>(header[1]) * stride);
+                s.pending_batch_dspark_hidden.clear();
+                s.pending_batch_rows = 0;
             } else if (cmd == WorkerCommand::Draft) {
                 const std::vector<float>& captured = last_dspark_hidden();
                 const int positions = last_dspark_hidden_positions();
@@ -9901,6 +11182,13 @@ void PersistentEngine::run_worker_loop() {
                 throw std::runtime_error("PersistentEngine worker received unknown command");
             }
         } catch (const std::exception& ex) {
+            if (cmd == WorkerCommand::BatchVerify ||
+                cmd == WorkerCommand::FinalizeBatchVerify) {
+                s.ctx->continuation_journal.abort_noexcept();
+                s.pending_batch_dspark_hidden.clear();
+                s.pending_batch_rows = 0;
+                s.verify_dspark_hidden.clear();
+            }
             std::cerr << "[worker rank " << s.opts.tp_rank << "] caught: " << ex.what() << "\n";
             cudaGetLastError();  // clear sticky CUDA error so next request starts clean
         }

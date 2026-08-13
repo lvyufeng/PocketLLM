@@ -1284,6 +1284,214 @@ __global__ void sum_topk_rows_kernel(
     y[idx] = sum;
 }
 
+// Active-slot small-batch path. One block reuses an expert's weight row across
+// up to eight routed token rows; larger slots are processed in multiple tiles.
+__global__ void moe_multi_w1w3_fp4_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int32_t* __restrict__ slot_expert,
+    const int32_t* __restrict__ slot_starts,
+    const int32_t* __restrict__ slot_tokens,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int dim,
+    int inter_dim) {
+    const int slot = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int start = slot_starts[slot];
+    const int end = slot_starts[slot + 1];
+    const int n_tok = end - start;
+    if (n_tok <= 0) return;
+    const int local = slot_expert[slot];
+    const int dim_packs = dim / 4;
+    const int blocks_k = dim / 32;
+    extern __shared__ int xs_shared[];
+    const uint8_t* w1_row = w1q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w3_row = w3q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
+    const uint8_t* w1_scale = w1s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint8_t* w3_scale = w3s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
+    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row);
+    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row);
+    constexpr int kMaxTokens = 8;
+    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
+        const int tile = min(kMaxTokens, n_tok - base_t);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * dim_packs; idx += blockDim.x) {
+            const int r = idx / dim_packs;
+            const int pack = idx - r * dim_packs;
+            const int token = slot_tokens[start + base_t + r];
+            xs_shared[idx] = reinterpret_cast<const int*>(x_q + static_cast<int64_t>(token) * dim)[pack];
+        }
+        __syncthreads();
+        if (col >= inter_dim) continue;
+        float gate_acc[kMaxTokens];
+        float up_acc[kMaxTokens];
+#pragma unroll
+        for (int t = 0; t < kMaxTokens; ++t) { gate_acc[t] = 0.0f; up_acc[t] = 0.0f; }
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w1_pack = w1_pack_base + kb * 8;
+            const uint16_t* w3_pack = w3_pack_base + kb * 8;
+            int gate_blk[kMaxTokens];
+            int up_blk[kMaxTokens];
+#pragma unroll
+            for (int t = 0; t < kMaxTokens; ++t) { gate_blk[t] = 0; up_blk[t] = 0; }
+#pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
+                const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
+                for (int t = 0; t < tile; ++t) {
+                    const int x_p = xs_shared[t * dim_packs + kb * 8 + ip];
+                    gate_blk[t] = dot_i8x4(x_p, w1_p, gate_blk[t]);
+                    up_blk[t] = dot_i8x4(x_p, w3_p, up_blk[t]);
+                }
+            }
+            const float s1 = fp4_block_scale(w1_scale[kb]);
+            const float s3 = fp4_block_scale(w3_scale[kb]);
+            for (int t = 0; t < tile; ++t) {
+                gate_acc[t] += static_cast<float>(gate_blk[t]) * s1;
+                up_acc[t] += static_cast<float>(up_blk[t]) * s3;
+            }
+        }
+        for (int t = 0; t < tile; ++t) {
+            const int pair = start + base_t + t;
+            const float xs = x_scale[slot_tokens[pair]];
+            gate_f32[static_cast<int64_t>(pair) * inter_dim + col] = gate_acc[t] * xs;
+            up_f32[static_cast<int64_t>(pair) * inter_dim + col] = up_acc[t] * xs;
+        }
+    }
+}
+
+__global__ void moe_multi_swiglu_quant_fp4_kernel(
+    const float* __restrict__ gate_f32,
+    const float* __restrict__ up_f32,
+    const float* __restrict__ pair_weights,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int pairs,
+    int inter_dim,
+    float swiglu_limit) {
+    const int pair = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (pair >= pairs) return;
+    __shared__ float sdata[kQuantThreads];
+    const float route_weight = pair_weights[pair];
+    const int64_t base = static_cast<int64_t>(pair) * inter_dim;
+    float local_max = 0.0f;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[base + col];
+        float up = up_f32[base + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        local_max = fmaxf(local_max, fabsf(silu * up * route_weight));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) hidden_scale[pair] = scale;
+    __syncthreads();
+    const float inv_scale = 1.0f / scale;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        float gate = gate_f32[base + col];
+        float up = up_f32[base + col];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        int q = __float2int_rn(silu * up * route_weight * inv_scale);
+        q = max(-127, min(127, q));
+        hidden_q[base + col] = static_cast<int8_t>(q);
+    }
+}
+
+__global__ void moe_multi_w2_partial_fp4_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int32_t* __restrict__ slot_expert,
+    const int32_t* __restrict__ slot_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ partials,
+    int dim,
+    int inter_dim) {
+    const int slot = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int start = slot_starts[slot];
+    const int end = slot_starts[slot + 1];
+    const int n_tok = end - start;
+    if (n_tok <= 0) return;
+    const int local = slot_expert[slot];
+    const int packs = inter_dim / 4;
+    const int blocks_k = inter_dim / 32;
+    extern __shared__ int hs_shared[];
+    const uint8_t* w2_row = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
+    const uint8_t* w2_scale = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
+    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row);
+    constexpr int kMaxTokens = 8;
+    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
+        const int tile = min(kMaxTokens, n_tok - base_t);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < tile * packs; idx += blockDim.x) {
+            const int r = idx / packs;
+            const int pack = idx - r * packs;
+            hs_shared[idx] = reinterpret_cast<const int*>(hidden_q + static_cast<int64_t>(start + base_t + r) * inter_dim)[pack];
+        }
+        __syncthreads();
+        if (col >= dim) continue;
+        float acc[kMaxTokens];
+#pragma unroll
+        for (int t = 0; t < kMaxTokens; ++t) acc[t] = 0.0f;
+        for (int kb = 0; kb < blocks_k; ++kb) {
+            const uint16_t* w2_pack = w2_pack_base + kb * 8;
+            int blk[kMaxTokens];
+#pragma unroll
+            for (int t = 0; t < kMaxTokens; ++t) blk[t] = 0;
+#pragma unroll
+            for (int ip = 0; ip < 8; ++ip) {
+                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                for (int t = 0; t < tile; ++t) {
+                    blk[t] = dot_i8x4(hs_shared[t * packs + kb * 8 + ip], w_p, blk[t]);
+                }
+            }
+            const float scale = fp4_block_scale(w2_scale[kb]);
+            for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * scale;
+        }
+        for (int t = 0; t < tile; ++t) {
+            const int pair = start + base_t + t;
+            partials[static_cast<int64_t>(pair) * dim + col] = acc[t] * hidden_scale[pair];
+        }
+    }
+}
+
+__global__ void moe_multi_reduce_partials_kernel(
+    const float* __restrict__ partials,
+    const int32_t* __restrict__ slot_tokens,
+    float* __restrict__ y,
+    int pairs,
+    int dim) {
+    const int token = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    float acc = 0.0f;
+    for (int pair = 0; pair < pairs; ++pair) {
+        if (slot_tokens[pair] == token) {
+            acc += partials[static_cast<int64_t>(pair) * dim + col];
+        }
+    }
+    y[static_cast<int64_t>(token) * dim + col] = acc;
+}
+
 }  // namespace
 
 bool fp4_e2m1_e8m0_matvec_cuda(
@@ -1611,6 +1819,72 @@ fail:
     cudaFree(workspace.d_hidden_q);
     cudaFree(workspace.d_hidden_scale);
     return false;
+}
+
+bool moe_multi_token_fp4_cuda_with_workspace(
+    const float* d_x,
+    const int32_t* d_slot_expert,
+    const int32_t* d_slot_starts,
+    const int32_t* d_slot_tokens,
+    const float* d_pair_weights,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int tokens,
+    int slots,
+    int pairs,
+    int n_local_experts,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoeMultiTokenFp4Workspace workspace,
+    void* stream) {
+    if (d_x == nullptr || d_slot_starts == nullptr || d_w1q == nullptr ||
+        d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr ||
+        d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
+    if (tokens <= 0 || slots < 0 || pairs < 0 || n_local_experts <= 0 ||
+        dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 ||
+        (inter_dim % 32) != 0) return false;
+    if (workspace.tokens_cap < tokens || workspace.pairs_cap < pairs ||
+        workspace.dim < dim || workspace.inter_dim < inter_dim ||
+        workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (cudaMemsetAsync(d_y, 0, static_cast<size_t>(tokens) * dim * sizeof(float),
+                        cuda_stream) != cudaSuccess) return false;
+    if (slots == 0 || pairs == 0) return cudaGetLastError() == cudaSuccess;
+    if (d_slot_expert == nullptr || d_slot_tokens == nullptr ||
+        d_pair_weights == nullptr || workspace.d_gate == nullptr ||
+        workspace.d_up == nullptr || workspace.d_hidden_q == nullptr ||
+        workspace.d_hidden_scale == nullptr || workspace.d_partials == nullptr) return false;
+
+    quantize_float_rows_kernel<<<tokens, kQuantThreads, 0, cuda_stream>>>(
+        d_x, workspace.d_x_q, workspace.d_x_scale, tokens, dim);
+    constexpr int kMultiMaxTokens = 8;
+    const dim3 gemm_block(kGemmThreads);
+    const dim3 w1w3_grid(ceil_div_int(inter_dim, kGemmThreads), slots);
+    const size_t x_shared_bytes =
+        static_cast<size_t>(kMultiMaxTokens) * (dim / 4) * sizeof(int);
+    moe_multi_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, x_shared_bytes, cuda_stream>>>(
+        workspace.d_x_q, workspace.d_x_scale, d_slot_expert, d_slot_starts,
+        d_slot_tokens, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate,
+        workspace.d_up, dim, inter_dim);
+    moe_multi_swiglu_quant_fp4_kernel<<<pairs, kQuantThreads, 0, cuda_stream>>>(
+        workspace.d_gate, workspace.d_up, d_pair_weights, workspace.d_hidden_q,
+        workspace.d_hidden_scale, pairs, inter_dim, swiglu_limit);
+    const dim3 w2_grid(ceil_div_int(dim, kGemmThreads), slots);
+    const size_t h_shared_bytes =
+        static_cast<size_t>(kMultiMaxTokens) * (inter_dim / 4) * sizeof(int);
+    moe_multi_w2_partial_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, cuda_stream>>>(
+        workspace.d_hidden_q, workspace.d_hidden_scale, d_slot_expert,
+        d_slot_starts, d_w2q, d_w2s, workspace.d_partials, dim, inter_dim);
+    const dim3 reduce_grid(ceil_div_int(dim, kGemmThreads), tokens);
+    moe_multi_reduce_partials_kernel<<<reduce_grid, gemm_block, 0, cuda_stream>>>(
+        workspace.d_partials, d_slot_tokens, d_y, pairs, dim);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool moe_single_token_fp4_cuda_with_workspace(
