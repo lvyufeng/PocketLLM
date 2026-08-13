@@ -293,6 +293,46 @@ struct MoeSingleTokenFp4Workspace {
     int inter_dim = 0;
 };
 
+// Persistent scratch for the active-slot small-batch FP4 MoE path. Route inputs
+// are compacted by expert: slot_expert[s] names a local expert and
+// [slot_starts[s], slot_starts[s + 1]) contains its (token, weight) pairs.
+struct MoeMultiTokenFp4Workspace {
+    int8_t* d_x_q = nullptr;
+    float* d_x_scale = nullptr;
+    float* d_gate = nullptr;
+    float* d_up = nullptr;
+    int8_t* d_hidden_q = nullptr;
+    float* d_hidden_scale = nullptr;
+    float* d_partials = nullptr;
+    int tokens_cap = 0;
+    int pairs_cap = 0;
+    int dim = 0;
+    int inter_dim = 0;
+};
+
+bool moe_multi_token_fp4_cuda_with_workspace(
+    const float* d_x,
+    const int32_t* d_slot_expert,
+    const int32_t* d_slot_starts,
+    const int32_t* d_slot_tokens,
+    const float* d_pair_weights,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int tokens,
+    int slots,
+    int pairs,
+    int n_local_experts,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoeMultiTokenFp4Workspace workspace,
+    void* stream = nullptr);
+
 bool moe_single_token_fp4_cuda(
     const float* d_x,
     const int64_t* d_indices,
@@ -842,6 +882,43 @@ bool indexed_cached_single_token_attention_cuda(
     int heads,
     int head_dim,
     int index_count,
+    float scale,
+    void* stream = nullptr);
+
+// Continuation attention for a small block of query rows. d_row_starts is a
+// CSR offset array [rows + 1] into d_indices; each row can therefore expose a
+// different causal window and compressed/indexer selection.
+bool indexed_cached_attention_rows_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const int32_t* d_row_starts,
+    const int32_t* d_indices,
+    const float* d_attn_sink,
+    float* d_y,
+    int rows,
+    int heads,
+    int head_dim,
+    int max_index_count,
+    float scale,
+    void* stream = nullptr);
+
+// Variant for continuation blocks whose current rows have not yet been written
+// into the live ring. Non-negative indices address d_kv_cache; indices <= -2
+// address d_batch_kv[-index - 2]. Keeping current rows separate prevents a later
+// row in a wrapping block from overwriting history still visible to an earlier
+// row. -1 remains an invalid/padding index.
+bool indexed_cached_attention_rows_batch_kv_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const float* d_batch_kv,
+    const int32_t* d_row_starts,
+    const int32_t* d_indices,
+    const float* d_attn_sink,
+    float* d_y,
+    int rows,
+    int heads,
+    int head_dim,
+    int max_index_count,
     float scale,
     void* stream = nullptr);
 

@@ -59,12 +59,22 @@ public:
                                  int start_position,
                                  const SamplingParams& sp);
 
+    // Small-batch continuation verify. The target forwards the whole block once,
+    // samples one successor per input row, commits the input rows through the
+    // first mismatch, and rolls back the rejected suffix. The returned vector
+    // still contains every row's successor so callers can inspect divergence.
+    // This path can differ numerically from sequential verify because its GEMM
+    // reduction shapes differ.
+    std::vector<int> batch_verify_step(const std::vector<int>& draft_tokens,
+                                       int start_position,
+                                       const SamplingParams& sp);
+
     // Snapshot the compressor accumulators (layers 2-42) to host memory so a
-    // rejected verify's partial state can be restored. The KV ring self-heals
-    // (position-addressed), but the accumulator is destructive across ratio
-    // boundaries (compressor_shift_overlap_state moves the upper half down and
-    // zeroes the top). Without this, replaying a position that crossed a
-    // boundary reads zeroed slots and diverges.
+    // rejected sequential verify's partial state can be restored. The batched
+    // continuation path instead uses a row-tagged device journal covering the
+    // sliding ring, pooled KV, and both compressor states. Without either form
+    // of rollback, replaying a position that crossed an overlap boundary reads
+    // overwritten or zeroed slots and diverges.
     void snapshot_compressor_state();
     void restore_compressor_state();
 
@@ -74,11 +84,10 @@ public:
     // `committed_token` is the token to seed the draft with; `position` is its
     // own position (the draft's seed hidden came from position - 1).
     //
-    // Verification stops at the first mismatch, so the only positions forwarded
-    // into the main model's state are the ones this round commits -- no
-    // snapshot/restore is needed. (Forwarding the rejected tail and rolling back
-    // does not work: restoring the pre-verify compressor snapshot would also
-    // discard the accepted prefix's contribution, which nothing re-forwards.)
+    // Sequential verification stops at the first mismatch, so it mutates only
+    // committed positions. With DSV4_CPP_BATCHED_VERIFY=1, the whole block is
+    // forwarded once and a row-tagged device undo journal removes the rejected
+    // suffix while preserving the accepted prefix; no accepted row is replayed.
     //
     // Returns the tokens generated this round (accepted drafts + bonus token).
     // Length is n_accepted + 1, always >= 1. The caller advances position by
@@ -170,12 +179,16 @@ public:
         Draft = 5,
         SpeculativeDecode = 6,
         PrimeDraftKV = 7,
+        BatchVerify = 8,
+        FinalizeBatchVerify = 9,
     };
     void worker_command_prefill(const std::vector<int>& token_ids);
     void worker_command_decode(int32_t last_token, int32_t position);
     void worker_command_reset();
     void worker_command_shutdown();
     void worker_command_verify(const std::vector<int>& block, int32_t start_position);
+    void worker_command_batch_verify(const std::vector<int>& block, int32_t start_position);
+    void worker_command_finalize_batch_verify(int32_t committed_rows);
     void worker_command_draft(int32_t input_token, int32_t start_position);
     void worker_command_speculative_decode(int32_t last_token, int32_t position,
                                            bool first);
