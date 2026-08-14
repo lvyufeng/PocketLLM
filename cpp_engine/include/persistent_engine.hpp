@@ -154,6 +154,14 @@ public:
     // [rows, n_target * dim] in position order.
     void prime_dspark_kv(const std::vector<float>& hidden, int rows, int start_pos);
 
+    // Full-vocab top-k of the most recent prefill/decode/verify selection, in
+    // descending logit order. Only populated when DSV4_CPP_TOPK_DIAG > 0, and
+    // only on rank 0 at TP > 1 (the only rank holding the whole vocabulary).
+    // Read-only diagnostic: it reuses the selection's existing gather and does
+    // not add a collective or change the sampled token.
+    const std::vector<int>& last_topk_tokens() const;
+    const std::vector<float>& last_topk_logits() const;
+
     int eos_id() const;
     int max_context() const;
     int layer_count() const;

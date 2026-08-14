@@ -142,6 +142,10 @@ add_executable(test_speculative_scheduler tests/test_speculative_scheduler.cpp)
 target_link_libraries(test_speculative_scheduler PRIVATE dsv4_cpp_core)
 set_target_properties(test_speculative_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(bench_dspark_decode tests/bench_dspark_decode.cpp)
+target_link_libraries(bench_dspark_decode PRIVATE dsv4_cpp_core)
+set_target_properties(bench_dspark_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_batch_verify_transaction tests/test_batch_verify_transaction.cpp)
 target_link_libraries(test_batch_verify_transaction PRIVATE dsv4_cpp_core)
 set_target_properties(test_batch_verify_transaction PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
