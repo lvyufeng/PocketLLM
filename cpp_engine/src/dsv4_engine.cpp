@@ -2575,6 +2575,13 @@ struct SafeForwardContext {
     std::vector<float> last_local_logits;
     int last_head_rows = 0;
     int last_local_head_start = 0;
+    // Full-vocab top-k of the most recent selection, recorded only when
+    // DSV4_CPP_TOPK_DIAG > 0. Diagnostic: it lets a first-token mismatch be
+    // classified as a near-tie against the other runtime's margin instead of
+    // guessing from the argmax alone. Populated on rank 0, which is the only
+    // rank that gathers the whole vocabulary.
+    std::vector<int> last_topk_tokens;
+    std::vector<float> last_topk_logits;
     // DSpark target-layer hidden states captured by the most recent forward, as
     // [positions, n_target * dim] with the layers concatenated on the last axis.
     // Empty unless dspark_capture_layers is non-empty.
@@ -10479,11 +10486,34 @@ namespace {
 //
 // Keeping the protocol uniform lets workers run a fixed sequence that doesn't
 // depend on per-request SamplingParams flags they never see.
+// Record the k largest logits of an already-assembled vocabulary slice.
+// Diagnostic only, gated by DSV4_CPP_TOPK_DIAG; k is small so a partial
+// selection sort is cheaper than sorting the whole vocabulary.
+void record_topk_diag(SafeForwardContext& ctx, const float* values, int count,
+                      int base_token, int k) {
+    ctx.last_topk_tokens.clear();
+    ctx.last_topk_logits.clear();
+    if (k <= 0 || count <= 0) return;
+    k = std::min(k, count);
+    std::vector<int> order(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i) order[static_cast<size_t>(i)] = i;
+    std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                      [&](int a, int b) { return values[a] > values[b]; });
+    ctx.last_topk_tokens.reserve(static_cast<size_t>(k));
+    ctx.last_topk_logits.reserve(static_cast<size_t>(k));
+    for (int i = 0; i < k; ++i) {
+        const int idx = order[static_cast<size_t>(i)];
+        ctx.last_topk_tokens.push_back(base_token + idx);
+        ctx.last_topk_logits.push_back(values[idx]);
+    }
+}
+
 int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
                  const SamplingParams& sp, std::mt19937& rng) {
     const int local = static_cast<int>(ctx.last_local_logits.size());
     if (local <= 0) throw std::runtime_error("select_token: empty local logits");
     const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
+    const int topk_diag = env_int_or_default("DSV4_CPP_TOPK_DIAG", 0);
 
 #ifdef DSV4_HAVE_NCCL
     if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
@@ -10496,6 +10526,9 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
         int32_t token_buf[1] = {0};
         if (opts.tp_rank == 0) {
             const int vocab = static_cast<int>(all.size());
+            // The gather is rank-major and the shards are contiguous vocabulary
+            // ranges, so index i in `all` is token id i.
+            if (topk_diag > 0) record_topk_diag(ctx, all.data(), vocab, 0, topk_diag);
             if (greedy) {
                 int best = 0;
                 float best_v = all[0];
@@ -10512,6 +10545,10 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
         return token_buf[0];
     }
 #endif
+    if (topk_diag > 0) {
+        record_topk_diag(ctx, ctx.last_local_logits.data(), local,
+                         ctx.last_local_head_start, topk_diag);
+    }
     if (greedy) {
         int best = ctx.last_local_head_start;
         float best_v = -INFINITY;
@@ -10524,6 +10561,28 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
         return best;
     }
     return sample_token_top_p(ctx.last_local_logits.data(), local, sp.temperature, sp.top_p, rng);
+}
+
+// Publish the last committed continuation row as "the hidden of the most
+// recently forwarded position", which is what last_dspark_hidden() reports and
+// what the next round's draft seeds from.
+//
+// Only prefill and single-token decode write ctx.dspark_hidden. The batched
+// continuation forward captured its rows into the ContinuationBatchResult and
+// never touched ctx, so with DSV4_CPP_BATCHED_VERIFY=1 every round after the
+// first drafted from a stale seed -- the hidden left behind by the last plain
+// decode. The draft ring was primed correctly, so nothing failed; the drafts
+// were just conditioned on the wrong position and acceptance collapsed.
+void publish_continuation_seed_hidden(SafeForwardContext& ctx,
+                                     const std::vector<float>& committed_hidden,
+                                     int committed_rows) {
+    if (committed_rows <= 0 || committed_hidden.empty()) return;
+    const size_t stride =
+        committed_hidden.size() / static_cast<size_t>(committed_rows);
+    if (stride == 0) return;
+    ctx.dspark_hidden.assign(committed_hidden.end() - stride,
+                             committed_hidden.end());
+    ctx.dspark_hidden_positions = 1;
 }
 
 std::vector<int> select_continuation_tokens(const ContinuationBatchResult& result,
@@ -10746,6 +10805,8 @@ std::vector<int> PersistentEngine::batch_verify_step(
                 static_cast<size_t>(committed_rows) * stride);
         s.pending_batch_dspark_hidden.clear();
         s.pending_batch_rows = 0;
+        publish_continuation_seed_hidden(ctx, s.verify_dspark_hidden,
+                                         committed_rows);
     } catch (...) {
         s.pending_batch_dspark_hidden.clear();
         s.pending_batch_rows = 0;
@@ -10876,6 +10937,14 @@ int PersistentEngine::last_dspark_hidden_positions() const {
 
 const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
     return state_->verify_dspark_hidden;
+}
+
+const std::vector<int>& PersistentEngine::last_topk_tokens() const {
+    return state_->ctx->last_topk_tokens;
+}
+
+const std::vector<float>& PersistentEngine::last_topk_logits() const {
+    return state_->ctx->last_topk_logits;
 }
 
 void PersistentEngine::load_dspark(const std::string& ckpt_dir) {
@@ -11161,6 +11230,12 @@ void PersistentEngine::run_worker_loop() {
                         static_cast<size_t>(header[1]) * stride);
                 s.pending_batch_dspark_hidden.clear();
                 s.pending_batch_rows = 0;
+                // Workers seed their own draft from ctx.dspark_hidden on the
+                // next Draft command, so they must publish the committed row
+                // exactly as rank 0 does or the ranks draft from different
+                // hiddens and the TP collectives carry inconsistent state.
+                publish_continuation_seed_hidden(*s.ctx, s.verify_dspark_hidden,
+                                                 header[1]);
             } else if (cmd == WorkerCommand::Draft) {
                 const std::vector<float>& captured = last_dspark_hidden();
                 const int positions = last_dspark_hidden_positions();

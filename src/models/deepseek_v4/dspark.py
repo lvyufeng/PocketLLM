@@ -43,8 +43,8 @@ def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos:
     one row is expanded rather than built per position."""
     assert start_pos > 0
     matrix = torch.cat([
-        torch.arange(min(window_size, start_pos + 1)),
-        window_size + torch.arange(block_size),
+        torch.arange(min(window_size, start_pos + 1), device="cuda"),
+        window_size + torch.arange(block_size, device="cuda"),
     ])
     return matrix.int().view(1, 1, -1).expand(bsz, block_size, -1).contiguous()
 

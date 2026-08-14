@@ -1521,7 +1521,7 @@ class Attention(nn.Module):
             # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
             act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         t_kv = mark()
-        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).cuda()
         t_window_idx = mark()
         t_compress_idx = t_window_idx
         t_compressor = t_window_idx
@@ -1530,7 +1530,7 @@ class Attention(nn.Module):
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
-                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
+                compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset).cuda()
             t_compress_idx = mark()
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()

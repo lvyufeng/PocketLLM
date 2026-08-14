@@ -41,6 +41,15 @@ std::string join(const std::vector<int>& values) {
     return out;
 }
 
+// Index of the first differing element, or -1 when the two are identical.
+int first_difference(const std::vector<int>& a, const std::vector<int>& b) {
+    const size_t common = std::min(a.size(), b.size());
+    for (size_t i = 0; i < common; ++i) {
+        if (a[i] != b[i]) return static_cast<int>(i);
+    }
+    return a.size() == b.size() ? -1 : static_cast<int>(common);
+}
+
 int accepted_rows(const std::vector<int>& block,
                   const std::vector<int>& next) {
     int committed = 1;
@@ -114,10 +123,13 @@ RunResult run_variant(PersistentEngine& engine,
     return result;
 }
 
-int different_token(int token, int salt) {
-    constexpr int kVocabSize = 163840;
-    int candidate = (token + 1009 + salt * 7919) % kVocabSize;
-    if (candidate == token) candidate = (candidate + 1) % kVocabSize;
+// Pick a token that differs from `token` but stays inside `vocab_size`. The
+// bound must come from the loaded checkpoint: a fixed constant larger than the
+// real vocabulary makes the embedding lookup throw "token id out of range"
+// before any transaction behaviour is exercised.
+int different_token(int token, int salt, int vocab_size) {
+    int candidate = (token + 1009 + salt * 7919) % vocab_size;
+    if (candidate == token) candidate = (candidate + 1) % vocab_size;
     return candidate;
 }
 
@@ -173,42 +185,64 @@ int main(int argc, char** argv) {
 
     const std::vector<int> prompt = make_prompt(prompt_len);
     const int start_position = static_cast<int>(prompt.size());
-
-    // The alternating fixture is the same near-certain continuation used by the
-    // scheduler test. It avoids calibrating the chain with several extra full
-    // model forwards, which would make this already expensive TP test impractical.
-    std::vector<int> accepted_block(static_cast<size_t>(rows), 0);
-    accepted_block[0] = reset_and_prefill(engine, prompt, sp);
-    for (int row = 1; row < rows; ++row) {
-        const int previous = accepted_block[static_cast<size_t>(row - 1)];
-        accepted_block[static_cast<size_t>(row)] = previous == 16 ? 18 : 16;
+    const int vocab_size = static_cast<int>(engine.tokenizer().vocab_size());
+    if (vocab_size < 2) {
+        std::cerr << "tokenizer reported an unusable vocab size: " << vocab_size << "\n";
+        return 2;
     }
 
-    // Confirm the fixture reaches full acceptance before using prefixes of it as
-    // the transaction oracle.
-    (void)reset_and_prefill(engine, prompt, sp);
-    std::vector<int> calibrated_next =
-        engine.batch_verify_step(accepted_block, start_position, sp);
-    int calibrated_rows = accepted_rows(accepted_block, calibrated_next);
-    if (rows > 1 && calibrated_rows != rows) {
-        const int seed = reset_and_prefill(engine, prompt, sp);
-        accepted_block.assign(static_cast<size_t>(rows), 0);
-        accepted_block[0] = seed;
-        const std::vector<int> calibration_next =
-            engine.batch_verify_step(accepted_block, start_position, sp);
-        accepted_block[1] = calibration_next[0];
-        for (int row = 2; row < rows; ++row) {
-            const int previous = accepted_block[static_cast<size_t>(row - 1)];
-            accepted_block[static_cast<size_t>(row)] = previous == 16 ? 18 : 16;
+    // Build the fully-accepted block from the model's own greedy decode chain.
+    // An assumed continuation (the alternating 16/18 fixture) is not reliable:
+    // on this checkpoint the prompt's greedy successor is not part of the
+    // alternation, so only two rows accept and every transaction case below
+    // fails during calibration instead of testing rollback. Deriving the chain
+    // costs rows-1 decode steps, which is small next to the verify forwards.
+    std::vector<int> accepted_block(static_cast<size_t>(rows), 0);
+    {
+        int token = reset_and_prefill(engine, prompt, sp);
+        accepted_block[0] = token;
+        int position = start_position;
+        for (int row = 1; row < rows; ++row) {
+            engine.worker_command_decode(token, position);
+            token = engine.decode_step(token, position, sp);
+            accepted_block[static_cast<size_t>(row)] = token;
+            ++position;
         }
+    }
+
+    const std::vector<int> sequential_chain = accepted_block;
+
+    // Refine the block into one the batched path accepts end to end. This is not
+    // the same as the sequential chain: the batched forward's GEMM shape changes
+    // the reduction order, so a row's successor can differ from what per-token
+    // decode produces. Each pass fixes the first divergent row and re-forwards,
+    // because rows after a wrong row were conditioned on it.
+    //
+    // The two chains are compared and reported below rather than asserted equal.
+    // Rollback correctness (what this test exists to check) is independent of
+    // that drift, and folding them into one assertion hides the rollback signal.
+    std::vector<int> calibrated_next;
+    int calibrated_rows = 0;
+    for (int attempt = 0; attempt < rows; ++attempt) {
         (void)reset_and_prefill(engine, prompt, sp);
-        calibrated_next = engine.batch_verify_step(
-            accepted_block, start_position, sp);
+        calibrated_next = engine.batch_verify_step(accepted_block, start_position, sp);
         calibrated_rows = accepted_rows(accepted_block, calibrated_next);
+        if (calibrated_rows >= rows) break;
+        // accepted_rows stops at the first row whose input != the previous row's
+        // successor, so that row is the one to correct.
+        accepted_block[static_cast<size_t>(calibrated_rows)] =
+            calibrated_next[static_cast<size_t>(calibrated_rows - 1)];
     }
     if (calibrated_rows != rows) {
-        fail("calibrated block accepted " + std::to_string(calibrated_rows) +
-             " rows, expected " + std::to_string(rows));
+        fail("could not calibrate a fully-accepted block in " + std::to_string(rows) +
+             " passes; last block=" + join(accepted_block) +
+             ", batched successors=" + join(calibrated_next));
+    }
+    if (verbose) {
+        const int drift = first_difference(sequential_chain, accepted_block);
+        std::cout << "sequential_chain=" << join(sequential_chain) << "\n"
+                  << "batched_chain=   " << join(accepted_block) << "\n"
+                  << "batched_vs_sequential_first_divergence=" << drift << "\n";
     }
     if (verbose) {
         std::cout << "prompt_len=" << prompt.size() << " calibrated="
@@ -221,13 +255,13 @@ int main(int argc, char** argv) {
         std::vector<int> block_b = accepted_block;
         if (committed < rows) {
             const int expected = accepted_block[static_cast<size_t>(committed)];
-            block_a[static_cast<size_t>(committed)] = different_token(expected, committed);
-            block_b[static_cast<size_t>(committed)] = different_token(expected, committed + rows);
+            block_a[static_cast<size_t>(committed)] = different_token(expected, committed, vocab_size);
+            block_b[static_cast<size_t>(committed)] = different_token(expected, committed + rows, vocab_size);
             for (int row = committed + 1; row < rows; ++row) {
                 block_a[static_cast<size_t>(row)] =
-                    different_token(accepted_block[static_cast<size_t>(row)], row + 17);
+                    different_token(accepted_block[static_cast<size_t>(row)], row + 17, vocab_size);
                 block_b[static_cast<size_t>(row)] =
-                    different_token(accepted_block[static_cast<size_t>(row)], row + 41);
+                    different_token(accepted_block[static_cast<size_t>(row)], row + 41, vocab_size);
             }
         }
 
