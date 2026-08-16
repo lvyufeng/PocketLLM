@@ -11,6 +11,7 @@ enum class DType {
     F32,
     F16,
     BF16,
+    F8_E4M3,
     Q8_0,
     Q2_K,
     IQ2_XXS,

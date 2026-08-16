@@ -9,6 +9,7 @@ std::string dtype_name(DType dtype) {
         case DType::F32: return "f32";
         case DType::F16: return "f16";
         case DType::BF16: return "bf16";
+        case DType::F8_E4M3: return "f8_e4m3";
         case DType::Q8_0: return "q8_0";
         case DType::Q2_K: return "q2_k";
         case DType::IQ2_XXS: return "iq2_xxs";

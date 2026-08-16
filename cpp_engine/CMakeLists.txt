@@ -37,6 +37,9 @@ add_library(dsv4_cpp_core STATIC
     src/safetensors_model.cpp
     src/weight_source.cpp
     src/model_config.cpp
+    src/qwen_config.cpp
+    src/qwen_weights.cpp
+    src/qwen_engine.cpp
     src/tokenizer.cpp
     src/tensor.cpp
     src/tp_comm.cpp
@@ -52,6 +55,8 @@ add_library(dsv4_cpp_core STATIC
     cuda/quant_gemm.cu
     cuda/fp4_ops.cu
     cuda/fp8_ops.cu
+    cuda/qwen_fp8_ops.cu
+    cuda/qwen_attention_ops.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
@@ -285,6 +290,38 @@ set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_nccl_smoke tests/test_nccl_smoke.cpp)
 target_link_libraries(test_nccl_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_config tests/test_qwen_config.cpp)
+target_link_libraries(test_qwen_config PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_config PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
+target_link_libraries(test_qwen_fp8_online PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_fp8_online PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_weights tests/test_qwen_weights.cpp)
+target_link_libraries(test_qwen_weights PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_weights PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_engine tests/test_qwen_engine.cpp)
+target_link_libraries(test_qwen_engine PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_delta_rule tests/test_qwen_delta_rule.cpp)
+target_link_libraries(test_qwen_delta_rule PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_delta_rule PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_gqa_attention tests/test_qwen_gqa_attention.cpp)
+target_link_libraries(test_qwen_gqa_attention PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_gqa_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_conv_tail tests/test_qwen_conv_tail.cpp)
+target_link_libraries(test_qwen_conv_tail PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_conv_tail PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_fp8_kernels tests/bench_qwen_fp8_kernels.cpp)
+target_link_libraries(bench_qwen_fp8_kernels PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_fp8_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
 target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)
