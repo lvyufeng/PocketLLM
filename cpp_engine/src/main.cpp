@@ -3,12 +3,15 @@
 #include "model_config.hpp"
 #include "openai_server.hpp"
 #include "persistent_engine.hpp"
+#include "qwen_config.hpp"
+#include "qwen_engine.hpp"
 #include "python_sidecar.hpp"
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -36,6 +39,7 @@ struct Args {
     std::string nccl_id_path;
     bool generate_token = false;
     bool resident_bench = false;
+    bool qwen_audit = false;
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
@@ -68,6 +72,8 @@ Args parse_args(int argc, char** argv) {
             args.ckpt = argv[++i];
         } else if (arg == "--inspect-tensor" && i + 1 < argc) {
             args.inspect_tensor = argv[++i];
+        } else if (arg == "--qwen-audit") {
+            args.qwen_audit = true;
         } else if (arg == "--dump-config") {
             args.dump_config = true;
         } else if (arg == "--inspect") {
@@ -190,6 +196,9 @@ int main(int argc, char** argv) {
         }
         if (args.serve) {
             if (args.ckpt.empty()) throw std::runtime_error("--serve requires --ckpt");
+            if (dsv4::is_qwen3_5_checkpoint(args.ckpt)) {
+                throw std::runtime_error("Qwen checkpoint is not supported by the DSV4 OpenAI server yet; use --smoke-forward or --generate-token");
+            }
             const int layer_count = args.smoke_layers > 0 ? args.smoke_layers : 43;
             const int max_context = args.max_context > 0 ? args.max_context : 8192;
             dsv4::ForwardSmokeOptions opts;
@@ -221,6 +230,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (!args.ckpt.empty()) {
+            const bool qwen_checkpoint = dsv4::is_qwen3_5_checkpoint(args.ckpt);
             dsv4::SafeTensorsIndex index(args.ckpt);
             std::cout << "dsv4_cpp_engine opened " << args.ckpt << "\n";
             std::cout << "format=safetensors tensors=" << index.tensor_count()
@@ -228,7 +238,28 @@ int main(int argc, char** argv) {
                       << " total_size=" << index.total_size()
                       << " cuda=" << (dsv4::cuda_runtime_available() ? "yes" : "no") << "\n";
             if (args.dump_config) {
-                std::cout << dsv4::ModelConfig::from_hf_config(args.ckpt).to_string();
+                if (qwen_checkpoint) {
+                    const dsv4::QwenConfig qwen_config = dsv4::QwenConfig::from_hf_config(args.ckpt);
+                    std::cout << qwen_config.to_string();
+                } else {
+                    std::cout << dsv4::ModelConfig::from_hf_config(args.ckpt).to_string();
+                }
+            }
+            if (args.qwen_audit) {
+                if (!qwen_checkpoint) throw std::runtime_error("--qwen-audit requires a Qwen checkpoint");
+                const dsv4::QwenConfig qwen_config = dsv4::QwenConfig::from_hf_config(args.ckpt);
+                const dsv4::QwenWeightMap map(index, qwen_config, args.tp_world, args.tp_rank);
+                const double gib = 1024.0 * 1024.0 * 1024.0;
+                std::cout << "qwen_audit tp_world=" << args.tp_world
+                          << " tp_rank=" << args.tp_rank
+                          << " tensors=" << map.tensor_count()
+                          << " weight_bytes=" << map.local_weight_bytes()
+                          << " scale_bytes=" << map.local_scale_bytes()
+                          << " weight_GiB=" << (static_cast<double>(map.local_weight_bytes()) / gib)
+                          << " scale_GiB=" << (static_cast<double>(map.local_scale_bytes()) / gib)
+                          << " total_GiB="
+                          << (static_cast<double>(map.local_weight_bytes() + map.local_scale_bytes()) / gib)
+                          << "\n";
             }
             if (!args.inspect_tensor.empty()) {
                 const std::string* shard_name = index.shard_for_tensor(args.inspect_tensor);
@@ -239,6 +270,95 @@ int main(int argc, char** argv) {
                 print_safe_tensor(*info, *shard_name);
             }
             if (args.smoke_forward) {
+                if (qwen_checkpoint) {
+                    dsv4::Tokenizer tokenizer(args.ckpt);
+                    std::vector<int> prompt_ids = load_token_ids(args);
+                    if (!args.prompt.empty()) prompt_ids = tokenizer.encode_basic(args.prompt, false);
+                    if (prompt_ids.empty()) {
+                        if (args.forward_token < 0) throw std::runtime_error("Qwen smoke requires --prompt, --token-ids, or --generate-token");
+                        prompt_ids.push_back(args.forward_token);
+                    }
+                    dsv4::QwenEngineOptions qwen_opts;
+                    qwen_opts.tp_world = args.tp_world;
+                    qwen_opts.tp_rank = args.tp_rank;
+                    qwen_opts.device = args.device >= 0 ? args.device : args.tp_rank;
+                    qwen_opts.nccl_id_path = args.nccl_id_path;
+                    const int qwen_context = args.max_context > 0
+                        ? args.max_context
+                        : static_cast<int>(prompt_ids.size()) + std::max(1, args.max_new_tokens);
+                    dsv4::QwenEngine qwen(args.ckpt, qwen_opts, args.smoke_layers, qwen_context);
+                    if (args.generate_token) {
+                        using Clock = std::chrono::steady_clock;
+                        const auto t_total0 = Clock::now();
+                        const auto t_prefill0 = Clock::now();
+                        std::vector<dsv4::QwenForwardResult> generated;
+                        generated.reserve(static_cast<size_t>(args.max_new_tokens));
+                        dsv4::QwenForwardResult next = qwen.prefill(prompt_ids);
+                        const auto t_prefill1 = Clock::now();
+                        generated.push_back(next);
+                        const auto t_decode0 = Clock::now();
+                        for (int step = 1; step < args.max_new_tokens; ++step) {
+                            next = qwen.decode_step(next.top_token);
+                            generated.push_back(next);
+                        }
+                        const auto t_decode1 = Clock::now();
+                        for (size_t step = 0; step < generated.size(); ++step) {
+                            std::cout << "generate_step=" << step
+                                      << " token=" << generated[step].top_token
+                                      << " token_text=" << tokenizer.decode_tokens({generated[step].top_token})
+                                      << " top_token=" << generated[step].top_token
+                                      << " top_logit=" << generated[step].top_logit
+                                      << " checksum=" << generated[step].checksum << "\n";
+                        }
+                        size_t free_bytes = 0;
+                        size_t total_bytes = 0;
+                        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                            free_bytes = 0;
+                            total_bytes = 0;
+                        }
+                        std::cout << "qwen_runtime=1 layers=" << generated.front().layers
+                                  << " resident_weight_bytes=" << qwen.resident_weight_bytes()
+                                  << " resident_scale_bytes=" << qwen.resident_scale_bytes()
+                                  << " prompt_tokens=" << prompt_ids.size()
+                                  << " generated_tokens=" << generated.size();
+                        if (args.resident_bench) {
+                            const auto seconds = [](auto begin, auto end) {
+                                return std::chrono::duration<double>(end - begin).count();
+                            };
+                            const double total = seconds(t_total0, t_decode1);
+                            const double prefill = seconds(t_prefill0, t_prefill1);
+                            const double decode = seconds(t_decode0, t_decode1);
+                            const int decode_tokens = generated.size() > 1
+                                ? static_cast<int>(generated.size()) - 1 : 0;
+                            std::cout << " wall=" << total
+                                      << " prefill_seconds=" << prefill
+                                      << " prefill_tokens_per_s="
+                                      << (prefill > 0.0 ? prompt_ids.size() / prefill : 0.0)
+                                      << " decode_seconds=" << decode
+                                      << " decode_tokens_per_s="
+                                      << (decode > 0.0 ? decode_tokens / decode : 0.0)
+                                      << " decode_token_count=" << decode_tokens;
+                        }
+                        if (total_bytes != 0) {
+                            std::cout << " gpu_memory_used_bytes=" << (total_bytes - free_bytes)
+                                      << " gpu_memory_total_bytes=" << total_bytes;
+                        }
+                        std::cout << "\n";
+                    } else {
+                        dsv4::QwenForwardResult result = qwen.prefill(prompt_ids);
+                        std::cout << "smoke_forward=1 qwen_runtime=1 token=" << prompt_ids.back()
+                                  << " layers=" << result.layers
+                                  << " dim=" << result.dim
+                                  << " logits=" << result.logits
+                                  << " top_token=" << result.top_token
+                                  << " top_logit=" << result.top_logit
+                                  << " checksum=" << result.checksum
+                                  << " position=" << result.position
+                                  << " resident_weight_bytes=" << qwen.resident_weight_bytes()
+                                  << " resident_scale_bytes=" << qwen.resident_scale_bytes() << "\n";
+                    }
+                    return 0;
+                }
                 dsv4::Tokenizer tokenizer(args.ckpt);
                 std::vector<int> prompt_ids = load_token_ids(args);
                 if (!prompt_ids.empty()) {

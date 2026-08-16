@@ -15,7 +15,9 @@ bool ends_with(const std::string& s, const std::string& suffix) {
 DType safe_dtype_to_dtype(SafeDType s) {
     switch (s) {
         case SafeDType::BF16: return DType::BF16;
+        case SafeDType::F16: return DType::F16;
         case SafeDType::F32: return DType::F32;
+        case SafeDType::F8_E4M3: return DType::F8_E4M3;
         default: return DType::Unknown;
     }
 }
