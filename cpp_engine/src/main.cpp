@@ -288,6 +288,7 @@ int main(int argc, char** argv) {
                         : static_cast<int>(prompt_ids.size()) + std::max(1, args.max_new_tokens);
                     dsv4::QwenEngine qwen(args.ckpt, qwen_opts, args.smoke_layers, qwen_context);
                     if (args.generate_token) {
+                        qwen.warmup_tp();
                         using Clock = std::chrono::steady_clock;
                         const auto t_total0 = Clock::now();
                         const auto t_prefill0 = Clock::now();

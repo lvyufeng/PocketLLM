@@ -34,6 +34,22 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+// Explicit experimental prefill path used by correctness/performance A/B.
+// It decodes only a block-local K tile and preserves FP32 accumulation.
+bool qwen_fp8_e4m3_fp16scale_matmul_simt_cuda(
+    const float* d_x,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
 // Compatibility/reference path for callers that still keep the scale in BF16
 // bits. Qwen Turing loading should use the FP16-scale APIs above.
 bool qwen_fp8_e4m3_bf16_matvec_cuda(
@@ -127,12 +143,22 @@ bool qwen_gated_delta_step_cuda(float* d_state, const float* d_q, const float* d
                                 float* d_out, int heads, int key_heads, int key_dim,
                                 int value_dim, float q_scale, void* stream = nullptr);
 
-// --- Full attention --------------------------------------------------------
+// Batched causal recurrent pass. Rows are processed strictly in order while
+// the persistent state is updated in place; this is the prefill-only path.
+bool qwen_gated_delta_sequence_cuda(float* d_state, const float* d_q, const float* d_k,
+                                    const float* d_v, const float* d_g, const float* d_beta,
+                                    float* d_out, int rows, int heads, int key_heads,
+                                    int key_dim, int value_dim, float q_scale,
+                                    void* stream = nullptr);
 
-// Partial rotary embedding over the leading `rotary_dim` channels of each head.
 bool qwen_partial_rope_cuda(float* d_q, float* d_k, int position, int rotary_dim,
                             float theta, int q_heads, int kv_heads, int head_dim,
                             void* stream = nullptr);
+
+// Prefill form of the above over `rows` consecutive positions in one launch.
+bool qwen_partial_rope_rows_cuda(float* d_q, float* d_k, int start_position, int rows,
+                                 int rotary_dim, float theta, int q_heads, int kv_heads,
+                                 int head_dim, void* stream = nullptr);
 
 // q_proj stores [q, gate] pairs per head; split them into contiguous matrices.
 bool qwen_split_q_gate_cuda(const float* d_q_proj, float* d_q, float* d_gate,

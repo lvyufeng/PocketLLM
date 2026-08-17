@@ -162,6 +162,13 @@ bool run_case(int batch, int rows, int cols, uint64_t seed, const std::string& l
             fail(label + ": FP16-scale matvec kernel launch failed");
             return true;
         }
+    } else if (batch >= 32) {
+        if (!dsv4::qwen_fp8_e4m3_fp16scale_matmul_simt_cuda(dev.x, dev.weight, dev.scale, dev.y,
+                                                            batch, rows, cols, cols, rows,
+                                                            cols, scale_cols)) {
+            fail(label + ": FP16-scale SIMT matmul kernel launch failed");
+            return true;
+        }
     } else {
         if (!dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_cuda(dev.x, dev.weight, dev.scale, dev.y,
                                                             batch, rows, cols, cols, rows,
@@ -320,6 +327,9 @@ int main() {
         {1, 130, 300, "decode matvec unaligned"},
         {4, 256, 512, "small-batch verify"},
         {9, 128, 256, "prefill multi-row"},
+        {64, 130, 300, "prefill SIMT tiled"},
+        {130, 130, 300, "prefill SIMT wide unaligned"},
+        {256, 256, 512, "prefill SIMT wide aligned"},
     };
     for (const Case& c : cases) {
         if (!run_case(c.batch, c.rows, c.cols, 0x5eed1234u + static_cast<uint64_t>(c.rows), c.label)) {
