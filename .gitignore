@@ -185,6 +185,7 @@ tl_out/
 # Plots
 *.png
 *.pdf
+!docs/reports/*.pdf
 
 # personnal
 work_dirs/

@@ -1,241 +1,130 @@
-# PocketMoE（口袋 MoE）
+# PocketLLM
 
-[English](README.md) | [中文](README_CN.md)
+[English](README.md) | 中文
 
-PocketMoE 是一个面向消费级 GPU 的 **MoE-only 低 bit + 异构推理引擎**，目标是在家用/工作站硬件上做好 300B 以下 MoE 模型的本地化部署。
+PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包含 C++/CUDA 与 PyTorch runtime。它结合模型专用 kernel、低 bit 格式、tensor/expert parallel、CPU/GPU placement，以及面向单请求的可复现实测 benchmark。
 
-“口袋 MoE”的含义是：把原本属于数据中心集群的千亿级 MoE 模型，通过低 bit 压缩、量化 expert kernel 和 CPU/GPU 异构调度，放进用户的“口袋”（消费级显卡）里。
+项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2 和 Qwen3.8-27B-FP8 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
 
-本项目最初来自“在 4×RTX 2080 Ti 上运行 DeepSeek-V4”的工程实践。DeepSeek-V4 仍然是第一个已验证 backend 和性能基线，但仓库现在会按更通用的 MoE 推理引擎方向组织。
+> **项目状态：** 研究和工程软件。下面的数字来自特定 checkpoint、硬件和测试口径，不代表通用性能保证。
 
-## 项目定位
+## PocketLLM 提供什么
 
-PocketMoE 专注于 MoE 模型，以及以下消费级/工作站 GPU：
+- **模型专用推理路径：** 支持 hybrid attention、MLA、GQA、Gated DeltaNet、dense MLP 和 routed MoE 层。
+- **避免不必要的低 bit 展开：** 在支持的热路径中直接消费 FP4、FP8 E4M3、GGUF Q4/Q5/Q8、IQ1/IQ2/IQ3、Q2 等量化 block。
+- **消费级 GPU 并行：** 支持 PCIe 多卡上的 TP4/NCCL；对放不进显存的 checkpoint，支持 CPU/NUMA expert placement。
+- **Prefill/decode 分离：** 大 batch kernel 与单 token latency 路径独立调度、独立优化。
+- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径，以及 Qwen3.8 FP8 Safetensors 文本生成。
+- **检查和验证工具：** GGUF 架构/spec 报告、Safetensors audit、tensor shape 检查、数值 parity 测试和真实 checkpoint benchmark。
 
-- RTX 2080 Ti，包括 22 GiB 魔改卡；
-- RTX 3090；
-- RTX 4090；
-- 类似的 PCIe 消费级多卡机器，没有数据中心级显存容量，也没有 NVLink。
+## 支持模型一览
 
-项目要回答的问题很直接：
+| 模型 | Checkpoint / 格式 | Runtime 状态 | 已验证路径 | 4×RTX 2080 Ti 代表结果 |
+| --- | --- | --- | --- | --- |
+| [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8；GGUF Q2/IQ2/IQ1 | **已验证 generation** | PyTorch 异构、C++/CUDA、GGUF TP4 | C++ FP4：32K–64K prefill 约 401 tok/s；decode 约 3.7 tok/s |
+| [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **已验证 TP4 generation** | Raw-block CUDA、GGUF TP4 | Full-model 256-token prefill 约 104.9–107 tok/s；43-layer decode benchmark 10.32 tok/s |
+| [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **已验证文本生成** | Raw-block CUDA、GGUF TP4 | prefill 约 0.79 tok/s；decode 约 0.66 tok/s |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime** | C++/CUDA TP4、GPU-resident FP8 | 512-token prompt：prefill 416.48 tok/s；decode 35.87 tok/s |
 
-> 怎么在原本放不下这些模型的消费级显卡上运行大 MoE？
+模型页面会把“模型架构规格”和“PocketLLM 当前实际实现能力”分开。`inspect`、`smoke` 和 benchmark 也不自动等于 production serving 保证。
 
-PocketMoE 的答案是两种执行模式。
+## 性能摘要
 
-### 1. 低 bit all-device 模式
+本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/benchmarking.md)。
 
-如果低 bit MoE checkpoint 能放进多卡总显存，就尽量让模型常驻 device：
+### Qwen3.8-27B-FP8 C++ runtime
 
-- dense / attention 权重在 GPU；
-- router / gate 权重在 GPU；
-- routed experts 在 GPU；
-- decode 不走 active-expert H2D；
-- prefill 使用 grouped resident MoE kernel；
-- 热路径直接消费 raw quantized blocks，不把权重展开成 fp32。
+- 64-token prompt：prefill 138.61–138.69 tok/s，decode 36.82 tok/s。
+- 512-token prompt：prefill 416.48 tok/s，decode 35.87 tok/s。
+- 实测每 rank 约使用 8.0–8.6 GiB；本地 FP8 权重和 scale 常驻 GPU。
+- 四个 TP rank 的生成 token 序列一致。当前路径是 text-only，尚未接入 OpenAI server。
 
-这条路线适合 GGUF IQ1/IQ2/Q2/Q3 等能跨多张消费级显卡放下的 MoE checkpoint。
+### DeepSeek-V4 C++ FP4 runtime
 
-### 2. 异构 routed-expert 模式
+- 32K prompt：prefill 约 402 tok/s，约 11.2 GiB/rank。
+- 64K prompt：prefill 约 401 tok/s，约 14.5 GiB/rank。
+- Decode：该 4×RTX 2080 Ti 配置下约 3.7 tok/s。
 
-如果 checkpoint 放不进 device，就把 routed experts 放在 CPU pinned/NUMA 内存中，只搬当前 token 或 prefill chunk 真正激活的 experts：
+### MiniMax-M2.7 与 GLM-5.2 GGUF runtime
 
-- dense/router 计算尽量留在 GPU；
-- routed experts 常驻 CPU 内存；
-- decode 按 top-k active experts staging 到 GPU；
-- prefill 把 expert H2D 和 GPU compute overlap；
-- hot expert cache 和 layer-local prefetch 用于减少重复 PCIe 流量。
+- MiniMax-M2.7 在 Q4/Q5 MMA 和 IQ2 DP4A 路径后，full-model 256-token prefill 约 104.9–107 tok/s；另一个 fused RMSNorm 的 43-layer decode benchmark 达到 10.32 tok/s。
+- GLM-5.2 已通过 raw-block GGUF 路径实现 generation。由于模型规模、expert staging 和逐层同步，其当前 decode floor 明显更低；resident-cache、routed-TP 和 fused-RMSNorm 等实验开关默认不启用。
 
-这条路线适合高 bit MoE checkpoint，或者虽然是低 bit 但在预留 KV cache/workspace 后仍然放不下的模型。
+这些是模型专属结果，不能合并成一个 PocketLLM 总分。
 
-## 非目标
+## 架构概览
 
-PocketMoE 不是通用 dense 模型 serving 框架。
+PocketLLM 包含两类互补执行方式：
 
-Dense layer、attention、tokenizer、OpenAI 兼容服务会被支持，是因为 MoE 模型需要它们；但本项目不打算和 vLLM、SGLang、llama.cpp 在通用 dense LLM runtime 上正面竞争。核心关注点是：
+1. **GPU-resident 与低 bit 执行：** 在总显存预算允许时，让本地权重或 expert block 常驻 GPU。
+2. **异构执行：** 将 routed experts 放在 CPU/NUMA 内存，只把当前 token 或 prefill chunk 激活的量化 block 搬到 GPU。
 
-- routed expert 量化；
-- routed expert 放置策略；
-- active expert dispatch；
-- prefill/decode MoE kernel；
-- PCIe 消费级硬件上的 CPU/GPU 异构调度。
+Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention。设计上的热路径不会将完整量化权重展开成 FP32 副本。
 
-## 当前 backend：DeepSeek-V4 / DSV4
+## 快速开始
 
-第一个已验证 backend 是 4×RTX 2080 Ti 上的 DeepSeek-V4-Flash。这个 backend 包含：
-
-- DeepSeek-V4 MLA、sparse attention、C4 indexer 路径；
-- DeepSeek 风格 hash routing 和 routed experts；
-- Turing GPU 上没有原生 FP4/FP8 Tensor Core 时的 FP4/FP8 风格 checkpoint 处理；
-- GGUF Q2/IQ2/IQ1 routed expert block 路径；
-- CPU/GPU active expert staging；
-- PyTorch runtime 和原生 C++/CUDA engine 两套路径。
-
-仓库里现有脚本和 benchmark 数字，除非特别说明，都是 DeepSeek-V4 backend 的结果。
-
-## 下一个 backend：MiniMax-M2.7
-
-下一个目标是 MiniMax-M2.7 GGUF。已经下载的 `UD-IQ1_M` bundle 是 3 分片 GGUF checkpoint，结构为：
-
-- `general.architecture = minimax-m2`；
-- 62 层；
-- hidden size 3072；
-- context length 196608；
-- 48 个 attention heads，8 个 KV heads；
-- 256 个 routed experts，top-k 8；
-- routed experts 是 `iq2_xxs`；
-- attention projection 是 `q5_k`；
-- embedding/head 是 `q4_k`；
-- router/norm/bias 是 `f32`。
-
-MiniMax-M2.7 支持会从以下能力开始：
-
-- sharded GGUF inspect；
-- architecture/spec 解析；
-- tensor schema validation；
-- quant capability report；
-- all-device 与异构 placement planning。
-
-MiniMax 的完整 generation 暂不启用；需要等 MiniMax GQA runtime、q4_k/q5_k kernel、以及 all-`iq2_xxs` MoE 路径实现后再打开。
-
-## 硬件基线
-
-原始 benchmark 机器为：
-
-- GPU：4× NVIDIA GeForce RTX 2080 Ti，每张 22 GiB，Turing 架构。
-- CPU：双路 Intel Xeon E5-2696 v4 @ 2.20 GHz。
-- CPU 拓扑：88 个逻辑 CPU，2 socket，每 socket 22 core，每 core 2 thread。
-- 系统内存：1 TiB。
-- 运行方式：`torchrun --nproc-per-node 4`，每张 GPU 一个 rank。
-
-重要限制：
-
-- RTX 2080 Ti 没有原生 BF16、FP8、FP4 Tensor Core。
-- 机器没有 NVLink；GPU-GPU 通信需要经过 PCIe/host bridge。
-- PCIe Gen3 x16 带宽使 routed-expert staging 和 overlap 成为核心问题。
-- 单请求 latency 和 decode TPS 是主要优化目标。
-
-## DeepSeek-V4 backend 性能快照
-
-### PyTorch FP4 异构路径
-
-4×RTX 2080 Ti 上的代表性 FP4 结果：
-
-| 场景 | Prompt / prefill tokens | Decode tokens | Prefill | Decode TPS | 说明 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| 已验证最大上下文 | 65,536 | 2 | 257.45s（约 255 tok/s） | n/a | OpenAI 路径，内容校验返回 `OK`。 |
-| 长 prompt decode | 2,148 | 63 | 6.69s（warmup 后约 321 tok/s） | 3.49 tok/s mean | FP4 resident OpenAI 路径，3 次 fresh run：3.464/3.500/3.507 tok/s。 |
-| 短 prompt decode | 29 | 127 | 实测约 1.7-3.2s | 3.16 tok/s mean | 短 prompt prefill timing 在这台机器上噪声较大。 |
-
-### GGUF Q2/IQ2 异构路径
-
-GGUF IQ2_XXS/Q2_K 路径使用 4-GPU TP、grouped GPU prefill、active-expert decode、slot cache、async all-reduce/fused finalize，以及量化 block expert staging。Routed GGUF expert 权重常驻 CPU，并以量化 block 形式 staging 到 GPU，不在热路径中展开成 fp32。
-
-OpenAI 兼容 benchmark，`CASE=all REPEAT=2`，4×RTX 2080 Ti：
-
-| Case | 请求 | Prompt tokens | 服务端 decode tokens | Prefill | Decode TPS | Wall time | 说明 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `short_short` | 1 | 5 | 7 | 3.17s（1.58 tok/s） | 2.94 | 5.64s | 冷 decode cache。 |
-| `short_short` | 2 | 5 | 7 | 2.46s（2.03 tok/s） | 4.83 | 3.98s | warm slot/cache 路径。 |
-| `long_short` | 2 | 2,148 | 7 | 9.94s（216.17 tok/s） | 4.44 | 11.66s | warm prefill staging。 |
-| `long_long` | 2 | 2,148 | 63 | 10.08s（213.05 tok/s） | 3.75 | 27.18s | 较长 decode 仍然更难。 |
-
-当前结论：在这套硬件和 checkpoint 上，prefill 已接近当前架构能达到的最好结果。Decode 仍主要受 active-expert cache miss/H2D copy、TP all-reduce/finalize 和长上下文 attention 成本限制。
-
-### C++ engine
-
-`cpp_engine/` 下的原生 C++/CUDA engine 用于减少 DeepSeek-V4 backend 的 Python/PyTorch per-step overhead。Rank 0 内置 OpenAI 兼容 HTTP 服务，rank 1-3 是 NCCL workers。
-
-同一台 4×RTX 2080 Ti 机器上验证过的 FP4 结果：
-
-| 场景 | Prompt tokens | Prefill | Prefill TPS | Decode TPS | 单卡峰值显存 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 短 prompt | 2,101 | ~7.6s | ~275 tok/s | ~3.7 tok/s | ~7 GiB |
-| 32K 上下文 | 32,768 | ~82s | ~402 tok/s | n/a | ~11.2 GiB |
-| 64K 上下文 | 65,536 | ~164s | ~401 tok/s | ~3.7 tok/s | ~14.5 GiB |
-
-64K prefill 大约比 PyTorch FP4 路径快 1.6×。Decode TPS 接近，因为瓶颈主要是 PCIe expert staging，而不是 Python overhead。
-
-## 构建
-
-Python extension：
+### 构建 Python extensions
 
 ```bash
 python -m pip install -r requirements.txt
 python setup.py build_ext
 ```
 
-C++ engine：
+Python package metadata 现在使用 `pocketllm`；为了兼容性，现有 `src.*` Python import namespace 不变。
+
+### 构建 C++/CUDA engine
 
 ```bash
 cmake -S cpp_engine -B build/cpp_engine -DCMAKE_BUILD_TYPE=Release
 cmake --build build/cpp_engine -j
 ```
 
-当前 C++ binary 仍叫：
+当前 executable 保留兼容名称 `dsv4_cpp_engine`：
 
 ```text
 build/cpp_engine/dsv4_cpp_engine
 ```
 
-等 PocketMoE model-spec 层稳定后会再统一命名。
-
-## 运行现有 DeepSeek-V4 backend
-
-### PyTorch OpenAI 兼容服务
-
-```bash
-CKPT_PATH=/path/to/DeepSeek-V4-Flash-w8a8 \
-bash scripts/run_openai_server.sh
-```
-
-常用覆盖项：
-
-```bash
-CKPT_PATH=/path/to/DeepSeek-V4-Flash-w8a8 \
-HOST=127.0.0.1 \
-PORT=8000 \
-MASTER_PORT=29920 \
-NPROC_PER_NODE=4 \
-bash scripts/run_openai_server.sh
-```
-
-### GGUF Q2/IQ2 路径
-
-```bash
-CKPT_PATH=/path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
-TOKENIZER_PATH=/path/to/DeepSeek-V4-Flash-tokenizer \
-bash scripts/run_gguf_q2_layer_pp.sh
-```
-
-### C++ server
+### 运行 DeepSeek-V4 C++ TP4 serving
 
 ```bash
 CKPT=/path/to/DeepSeek-V4-Flash \
 PORT=8000 \
 MAX_CONTEXT=8192 \
-PYTHON=/path/to/python \
+PYTHON=python \
 bash scripts/run_cpp_serve_tp4.sh
 ```
 
-## Inspect GGUF checkpoint
+该命令让 rank 0 运行 OpenAI 兼容服务，rank 1–3 运行 NCCL worker。
 
-PocketMoE 会为 MoE model onboarding 增加 sharded GGUF inspect 能力。
-
-DeepSeek-V4 legacy inspect：
+### 通过共享 raw-block CLI 运行 GGUF 模型
 
 ```bash
-PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
-  --gguf-path /path/to/deepseek-v4.gguf \
-  --summary \
-  --validate-ds4-q2
+PYTHONPATH=$PWD torchrun --standalone --nproc-per-node=4 \
+  -m src.cli.generate_gguf \
+  --gguf-path /path/to/model.gguf \
+  --seed-file /path/to/prompt_tokens.bin \
+  --max-new-tokens 32 \
+  --prewarm
 ```
 
-MiniMax-M2.7 spec/capability inspect：
+GLM-5.2 文本 prompt：
+
+```bash
+PYTHONPATH=$PWD torchrun --standalone --nproc-per-node=4 \
+  -m src.cli.generate_glm \
+  --gguf-path /path/to/GLM-5.2-GGUF/UD-Q2_K_XL \
+  --prompt "你好" \
+  --chat \
+  --max-new-tokens 32 \
+  --prewarm
+```
+
+### 检查 GGUF checkpoint
 
 ```bash
 PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
-  --gguf-path /mnt/data1/dsv4_inference/gguf_hfd/MiniMax-M2.7-GGUF/UD-IQ1_M \
+  --gguf-path /path/to/model.gguf \
   --architecture auto \
   --spec-summary \
   --validate-spec \
@@ -243,43 +132,67 @@ PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
   --placement-report
 ```
 
-MiniMax generation 还未启用；inspect 路径会把它标记为 deferred。
+### 运行 Qwen3.8-27B-FP8 C++ smoke/benchmark
+
+Qwen 路径支持 text prompt 或 token IDs，并通过 NCCL ID 文件启动 TP4 rank：
+
+```bash
+rm -f /tmp/pocketllm_qwen_nccl.id
+for rank in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$rank \
+  build/cpp_engine/dsv4_cpp_engine \
+    --ckpt /path/to/Qwen3.8-27B-FP8 \
+    --tp-world 4 --tp-rank $rank --device 0 \
+    --nccl-id-path /tmp/pocketllm_qwen_nccl.id \
+    --prompt "请用一段话解释 tensor parallelism。" \
+    --generate-token 123 --max-new-tokens 32 --resident-bench \
+    > /tmp/pocketllm_qwen_rank${rank}.log 2>&1 &
+done
+wait
+```
+
+正常运行时使用相同的 Qwen smoke 参数；rank 0 会输出 `prefill_tokens_per_s`、`decode_tokens_per_s`、resident weight bytes 和 GPU memory。Qwen OpenAI server adapter 尚未实现。
+
+## 文档
+
+- [文档总览](docs/README.md)
+- [模型支持矩阵](docs/models/README.md)
+- [Benchmark 口径](docs/benchmarking.md)
+- [DeepSeek-V4](docs/models/deepseek-v4.md)
+- [MiniMax-M2.7](docs/models/minimax-m2.7.md)
+- [GLM-5.2](docs/models/glm-5.2.md)
+- [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
+- [DSpark speculative decoding](docs/dspark.md)
+- [FlashMemory 1M context](docs/FLASHMEMORY_1M_CONTEXT.md)
+- [MiniMax decode bottleneck 分析](docs/minimax_decode_bottleneck_analysis.md)
+- [历史 2080 Ti 报告](docs/reports/dsv4_2080ti_report.pdf)
 
 ## Roadmap
 
-- [x] 4×RTX 2080 Ti 上的 DeepSeek-V4 backend。
-- [x] DeepSeek-V4 FP4 和 GGUF Q2/IQ2/IQ1 routed expert 路径。
-- [ ] MoE model spec 和 architecture registry。
-- [ ] Sharded GGUF bundle inspect。
-- [ ] MiniMax-M2.7 tensor map validation 和 capability report。
-- [ ] MiniMax dense/attention 权重的 q4_k/q5_k payload/kernel。
-- [ ] MiniMax GQA attention runtime。
-- [ ] all-`iq2_xxs` MiniMax MoE resident path。
-- [ ] 面向未来 MoE 模型的高 bit 异构 routed expert 策略。
+- [x] DeepSeek-V4 FP4/FP8 与 GGUF Q2/IQ2/IQ1 generation 路径。
+- [x] MiniMax-M2.7 与 GLM-5.2 GGUF raw-block generation 路径。
+- [x] Qwen3.8-27B-FP8 C++ TP4 文本 runtime。
+- [ ] 在不破坏现有脚本的前提下，统一 C++ model dispatch 和 binary 命名。
+- [ ] Qwen OpenAI 兼容 serving adapter。
+- [ ] 在实测有收益时接入 CUDA Graph 和 persistent decode dispatch。
+- [ ] 增加更多模型 benchmark fixture 和自动化 regression dashboard。
 
 ## 已知限制
 
-- 当前 generation runtime 仍然是 DeepSeek-V4-specific。
-- MiniMax-M2.7 初期只支持 inspect/spec/validation/capability report。
-- MiniMax 的 q4_k/q5_k 执行 kernel 尚未实现。
-- Dense-only 模型不是本项目目标。
-- 性能对硬件、NUMA、PCIe 拓扑非常敏感。
+- 性能高度依赖 GPU 型号、PCIe 拓扑、NUMA placement、驱动/runtime 版本和 checkpoint 变体。
+- PCIe 系统上的 GGUF expert staging 可能主导 decode；prefill TPS 高不代表 decode TPS 高。
+- DSpark 当前 C++ verify path 是 sequential，不应宣称为加速路径；multi-token verify 有独立的数值漂移策略。
+- Qwen runtime 当前只支持 text checkpoint 路径，视觉输入和 OpenAI 兼容 Qwen serving 尚未接入。
+- 部分实验优化在真实端到端测试出现回归后被保留为 opt-in 或关闭；具体见模型页和历史分析文档。
 
 ## License
 
-This repository's code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+PocketLLM 代码使用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
 
-Permitted uses include personal use, academic research, education, non-commercial benchmarking, and non-commercial deployment.
+个人使用、学术研究、教育、非商业 benchmark 和非商业部署属于允许用途。商业使用需要版权持有者单独书面许可。
 
-Commercial use is not permitted without separate written permission from the copyright holder, including but not limited to:
-
-- selling hosted inference services based on this code;
-- selling packaged deployments or appliances;
-- selling hardware/software bundles using this code;
-- using this code in paid consulting deliverables or commercial products.
-
-Model weights, tokenizer files, and third-party dependencies are governed by their respective licenses. This repository's code license does not grant any additional rights to DeepSeek, MiniMax, or other third-party model assets.
+模型权重、tokenizer、CUDA、PyTorch、GGUF 资源和其他第三方组件分别受其自身许可证约束。PocketLLM 代码许可证不授予任何第三方模型资产的额外权利。
 
 ## 致谢
 
-PocketMoE 基于 PyTorch、CUDA、safetensors、GGUF、transformers、NCCL 等生态。仓库中的 runtime 组织、量化 expert 路径、CPU/GPU 调度和性能脚本，是面向消费级 GPU 的本地 MoE 推理工程实践。
+PocketLLM 基于 CUDA、PyTorch、safetensors、GGUF、Transformers、NCCL 和 llama.cpp 量化研究。仓库中的模型专用 runtime 与 benchmark，是面向消费级硬件可复现本地推理的工程实践。
