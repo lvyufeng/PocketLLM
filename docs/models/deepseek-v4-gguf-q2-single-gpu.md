@@ -1,6 +1,8 @@
-# GGUF Q2 single-GPU 2080 Ti host-memory mode
+# DeepSeek-V4 GGUF Q2 single-GPU 2080 Ti host-memory mode
 
-This note documents the single-GPU path for running the GGUF IQ2_XXS/Q2_K checkpoint on one RTX 2080 Ti with routed experts kept in host memory.
+[Back to the current DeepSeek-V4 guide](deepseek-v4.md)
+
+This historical note documents the single-GPU path for running the DeepSeek-V4 GGUF IQ2_XXS/Q2_K checkpoint on one RTX 2080 Ti with routed experts kept in host memory. Current support status and cross-model navigation live in the model guide; the measurements below retain their original runtime context.
 
 ## How to run
 

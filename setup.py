@@ -20,7 +20,7 @@ class BuildExtensions(BuildExtension):
 
 
 setup(
-    name="dsv4-inference-runtime",
+    name="pocketllm",
     packages=[
         "src",
         "src.cli",
