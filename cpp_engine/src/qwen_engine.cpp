@@ -104,6 +104,12 @@ DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& r
 void allocate(QwenDeviceTensor& tensor, size_t bytes, const std::vector<uint64_t>& shape,
               SafeDType dtype) {
     if (bytes == 0) throw std::runtime_error("Qwen attempted to allocate an empty tensor");
+    if (tensor.data != nullptr && tensor.capacity >= bytes) {
+        tensor.device_dtype = dtype;
+        tensor.shape = shape;
+        tensor.nbytes = bytes;
+        return;
+    }
     if (tensor.data != nullptr) {
         check_cuda(cudaFree(tensor.data), "cudaFree Qwen runtime tensor");
         tensor.data = nullptr;
@@ -112,6 +118,7 @@ void allocate(QwenDeviceTensor& tensor, size_t bytes, const std::vector<uint64_t
     tensor.device_dtype = dtype;
     tensor.shape = shape;
     tensor.nbytes = bytes;
+    tensor.capacity = bytes;
 }
 
 void allocate_float(QwenDeviceTensor& tensor, size_t elements, const std::vector<uint64_t>& shape) {
@@ -121,6 +128,25 @@ void allocate_float(QwenDeviceTensor& tensor, size_t elements, const std::vector
 void zero_tensor(QwenDeviceTensor& tensor) {
     check_cuda(cudaMemset(tensor.data, 0, tensor.nbytes), "cudaMemset Qwen runtime tensor");
 }
+
+// One layer's temporaries are live concurrently, but layers themselves run in
+// strict sequence. Reusing slots across layers removes synchronous allocator
+// calls without changing any operator inputs.
+struct QwenWorkspace {
+    std::vector<QwenDeviceTensor> slots;
+    size_t cursor = 0;
+
+    QwenWorkspace() { slots.reserve(32); }
+
+    void begin() { cursor = 0; }
+
+    QwenDeviceTensor& float_tensor(size_t elements, const std::vector<uint64_t>& shape) {
+        if (cursor == slots.size()) slots.emplace_back();
+        QwenDeviceTensor& tensor = slots[cursor++];
+        allocate_float(tensor, elements, shape);
+        return tensor;
+    }
+};
 
 }  // namespace
 
@@ -143,6 +169,7 @@ struct QwenEngine::Impl {
     QwenDeviceTensor logits;
     QwenDeviceTensor argmax_token;
     QwenDeviceTensor argmax_logit;
+    QwenWorkspace workspace;
 
     // active_layers bounds how many decoder layers are uploaded. A partial-depth
     // smoke run must not stage the full 64-layer checkpoint: at TP1 that is
@@ -303,6 +330,12 @@ struct QwenEngine::Impl {
         require_launch(qwen_add_inplace_cuda(y, x, count), "Qwen residual add");
     }
 
+    void begin_workspace() { workspace.begin(); }
+
+    QwenDeviceTensor& workspace_float(size_t elements, const std::vector<uint64_t>& shape) {
+        return workspace.float_tensor(elements, shape);
+    }
+
     void linear_attention(DeviceLayer& layer, float* hidden, float* output, int rows,
                           int position_offset) {
         const int key_heads = static_cast<int>(config.linear_attention.key_heads / options.tp_world);
@@ -312,19 +345,22 @@ struct QwenEngine::Impl {
         const int packed_dim = 2 * key_dim + value_dim;
         const int kernel = static_cast<int>(config.linear_attention.conv_kernel_dim);
         const int hidden_size = static_cast<int>(config.hidden_size);
-        QwenDeviceTensor packed, conv, q, k, v, a, b, gates, beta, core, z, normalized;
-        allocate_float(packed, static_cast<size_t>(rows) * packed_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(packed_dim)});
-        allocate_float(conv, packed.nbytes / sizeof(float), packed.shape);
-        allocate_float(q, static_cast<size_t>(rows) * key_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(key_dim)});
-        allocate_float(k, q.nbytes / sizeof(float), q.shape);
-        allocate_float(v, static_cast<size_t>(rows) * value_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(value_dim)});
-        allocate_float(a, static_cast<size_t>(rows) * value_heads, {static_cast<uint64_t>(rows), static_cast<uint64_t>(value_heads)});
-        allocate_float(b, a.nbytes / sizeof(float), a.shape);
-        allocate_float(gates, a.nbytes / sizeof(float), a.shape);
-        allocate_float(beta, a.nbytes / sizeof(float), a.shape);
-        allocate_float(core, static_cast<size_t>(rows) * value_dim, v.shape);
-        allocate_float(z, core.nbytes / sizeof(float), core.shape);
-        allocate_float(normalized, core.nbytes / sizeof(float), core.shape);
+        const size_t packed_elements = static_cast<size_t>(rows) * packed_dim;
+        const size_t key_elements = static_cast<size_t>(rows) * key_dim;
+        const size_t value_elements = static_cast<size_t>(rows) * value_dim;
+        const size_t gate_elements = static_cast<size_t>(rows) * value_heads;
+        QwenDeviceTensor& packed = workspace_float(packed_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(packed_dim)});
+        QwenDeviceTensor& conv = workspace_float(packed_elements, packed.shape);
+        QwenDeviceTensor& q = workspace_float(key_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(key_dim)});
+        QwenDeviceTensor& k = workspace_float(key_elements, q.shape);
+        QwenDeviceTensor& v = workspace_float(value_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(value_dim)});
+        QwenDeviceTensor& a = workspace_float(gate_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(value_heads)});
+        QwenDeviceTensor& b = workspace_float(gate_elements, a.shape);
+        QwenDeviceTensor& gates = workspace_float(gate_elements, a.shape);
+        QwenDeviceTensor& beta = workspace_float(gate_elements, a.shape);
+        QwenDeviceTensor& core = workspace_float(value_elements, v.shape);
+        QwenDeviceTensor& z = workspace_float(value_elements, core.shape);
+        QwenDeviceTensor& normalized = workspace_float(value_elements, core.shape);
         projection(layer.linear.qkv, hidden, fp32(packed), rows);
         require_launch(qwen_causal_depthwise_conv_silu_cuda(
                            fp32(packed), fp16(layer.linear.conv), fp32(layer.linear.conv_tail),
@@ -339,7 +375,17 @@ struct QwenEngine::Impl {
                            fp32(gates), fp32(beta), rows, value_heads),
                        "linear gate projection");
         const float q_scale = 1.0f / std::sqrt(static_cast<float>(config.linear_attention.key_head_dim));
-        for (int t = 0; t < rows; ++t) {
+        // Prefill collapses the recurrence into one launch per layer; decode
+        // keeps the single-step kernel so its latency path is unchanged. The
+        // sequence kernel declines shapes it cannot hold, hence the fallback.
+        const bool sequenced =
+            rows > 1 &&
+            qwen_gated_delta_sequence_cuda(
+                fp32(layer.linear.state), fp32(q), fp32(k), fp32(v), fp32(gates), fp32(beta),
+                fp32(core), rows, value_heads, key_heads,
+                static_cast<int>(config.linear_attention.key_head_dim),
+                static_cast<int>(config.linear_attention.value_head_dim), q_scale);
+        for (int t = 0; sequenced ? false : t < rows; ++t) {
             require_launch(qwen_gated_delta_step_cuda(
                                fp32(layer.linear.state), fp32(q) + static_cast<size_t>(t) * key_dim,
                                fp32(k) + static_cast<size_t>(t) * key_dim,
@@ -371,18 +417,21 @@ struct QwenEngine::Impl {
         const int attention_dim = q_heads * head_dim;
         const int q_proj_dim = attention_dim * 2;
         const int kv_dim = total_kv_heads * head_dim;
-        QwenDeviceTensor q_proj, q, gate, k_full, v_full, k, v, q_norm, k_norm, attn, merged;
-        allocate_float(q_proj, static_cast<size_t>(rows) * q_proj_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_proj_dim)});
-        allocate_float(q, static_cast<size_t>(rows) * attention_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(attention_dim)});
-        allocate_float(gate, q.nbytes / sizeof(float), q.shape);
-        allocate_float(k_full, static_cast<size_t>(rows) * kv_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_dim)});
-        allocate_float(v_full, k_full.nbytes / sizeof(float), k_full.shape);
-        allocate_float(k, static_cast<size_t>(rows) * kv_heads * head_dim, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_heads), static_cast<uint64_t>(head_dim)});
-        allocate_float(v, k.nbytes / sizeof(float), k.shape);
-        allocate_float(q_norm, q.nbytes / sizeof(float), q.shape);
-        allocate_float(k_norm, k.nbytes / sizeof(float), k.shape);
-        allocate_float(attn, q.nbytes / sizeof(float), q.shape);
-        allocate_float(merged, q.nbytes / sizeof(float), q.shape);
+        const size_t q_proj_elements = static_cast<size_t>(rows) * q_proj_dim;
+        const size_t attention_elements = static_cast<size_t>(rows) * attention_dim;
+        const size_t kv_full_elements = static_cast<size_t>(rows) * kv_dim;
+        const size_t kv_elements = static_cast<size_t>(rows) * kv_heads * head_dim;
+        QwenDeviceTensor& q_proj = workspace_float(q_proj_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_proj_dim)});
+        QwenDeviceTensor& q = workspace_float(attention_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(attention_dim)});
+        QwenDeviceTensor& gate = workspace_float(attention_elements, q.shape);
+        QwenDeviceTensor& k_full = workspace_float(kv_full_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_dim)});
+        QwenDeviceTensor& v_full = workspace_float(kv_full_elements, k_full.shape);
+        QwenDeviceTensor& k = workspace_float(kv_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_heads), static_cast<uint64_t>(head_dim)});
+        QwenDeviceTensor& v = workspace_float(kv_elements, k.shape);
+        QwenDeviceTensor& q_norm = workspace_float(attention_elements, q.shape);
+        QwenDeviceTensor& k_norm = workspace_float(kv_elements, k.shape);
+        QwenDeviceTensor& attn = workspace_float(attention_elements, q.shape);
+        QwenDeviceTensor& merged = workspace_float(attention_elements, q.shape);
         projection(layer.full.q, hidden, fp32(q_proj), rows);
         require_launch(qwen_split_q_gate_cuda(fp32(q_proj), fp32(q), fp32(gate), rows, q_heads, head_dim), "full Q/gate split");
         projection(layer.full.k, hidden, fp32(k_full), rows);
@@ -394,13 +443,18 @@ struct QwenEngine::Impl {
                                                  head_dim, head_offset), "full V head select");
         norm(layer.full.q_norm, fp32(q), fp32(q_norm), rows * q_heads, head_dim);
         norm(layer.full.k_norm, fp32(k), fp32(k_norm), rows * kv_heads, head_dim);
-        for (int t = 0; t < rows; ++t) {
+        if (rows == 1) {
             require_launch(qwen_partial_rope_cuda(
-                               fp32(q_norm) + static_cast<size_t>(t) * attention_dim,
-                               fp32(k_norm) + static_cast<size_t>(t) * kv_heads * head_dim,
-                               position_offset + t, static_cast<int>(config.partial_rotary_dim()),
+                               fp32(q_norm), fp32(k_norm), position_offset,
+                               static_cast<int>(config.partial_rotary_dim()),
                                static_cast<float>(config.rope_theta), q_heads, kv_heads, head_dim),
                            "partial RoPE");
+        } else {
+            require_launch(qwen_partial_rope_rows_cuda(
+                               fp32(q_norm), fp32(k_norm), position_offset, rows,
+                               static_cast<int>(config.partial_rotary_dim()),
+                               static_cast<float>(config.rope_theta), q_heads, kv_heads, head_dim),
+                           "prefill partial RoPE");
         }
         require_launch(qwen_append_kv_cache_cuda(
                            fp32(k_norm), fp32(v), fp32(layer.full.k_cache), fp32(layer.full.v_cache),
@@ -425,14 +479,16 @@ struct QwenEngine::Impl {
 
     void layer_forward(DeviceLayer& layer, float* hidden, float* work, int rows, int position_offset) {
         const int hidden_size = static_cast<int>(config.hidden_size);
-        QwenDeviceTensor normed, attn, post, gate, up, intermediate, mlp;
-        allocate_float(normed, static_cast<size_t>(rows) * hidden_size, {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
-        allocate_float(attn, normed.nbytes / sizeof(float), normed.shape);
-        allocate_float(post, normed.nbytes / sizeof(float), normed.shape);
-        allocate_float(gate, static_cast<size_t>(rows) * layer.gate.weight.shape[0], {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
-        allocate_float(up, gate.nbytes / sizeof(float), gate.shape);
-        allocate_float(intermediate, gate.nbytes / sizeof(float), gate.shape);
-        allocate_float(mlp, normed.nbytes / sizeof(float), normed.shape);
+        begin_workspace();
+        const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
+        const size_t intermediate_elements = static_cast<size_t>(rows) * layer.gate.weight.shape[0];
+        QwenDeviceTensor& normed = workspace_float(hidden_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
+        QwenDeviceTensor& attn = workspace_float(hidden_elements, normed.shape);
+        QwenDeviceTensor& post = workspace_float(hidden_elements, normed.shape);
+        QwenDeviceTensor& gate = workspace_float(intermediate_elements, {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
+        QwenDeviceTensor& up = workspace_float(intermediate_elements, gate.shape);
+        QwenDeviceTensor& intermediate = workspace_float(intermediate_elements, gate.shape);
+        QwenDeviceTensor& mlp = workspace_float(hidden_elements, normed.shape);
         norm(layer.input_norm, hidden, fp32(normed), rows, hidden_size);
         if (layer.linear.qkv.weight.data != nullptr) {
             linear_attention(layer, fp32(normed), fp32(attn), rows, position_offset);
@@ -465,17 +521,16 @@ struct QwenEngine::Impl {
     QwenForwardResult logits_for(float* hidden, int rows, int last_row, int position_after, int active_layers) {
         const int hidden_size = static_cast<int>(config.hidden_size);
         const int local_vocab = static_cast<int>(lm_head.shape[0]);
-        QwenDeviceTensor normed;
-        allocate_float(normed, static_cast<size_t>(rows) * hidden_size, {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
+        begin_workspace();
+        QwenDeviceTensor& normed = workspace_float(static_cast<size_t>(rows) * hidden_size,
+                                                    {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
         norm(final_norm, hidden, fp32(normed), rows, hidden_size);
-        QwenDeviceTensor selected;
-        allocate_float(selected, hidden_size, {static_cast<uint64_t>(hidden_size)});
+        QwenDeviceTensor& selected = workspace_float(hidden_size, {static_cast<uint64_t>(hidden_size)});
         check_cuda(cudaMemcpy(selected.data, static_cast<uint8_t*>(normed.data) +
                                   static_cast<size_t>(last_row) * hidden_size * sizeof(float),
                               hidden_size * sizeof(float), cudaMemcpyDeviceToDevice),
                    "Qwen final row copy");
-        QwenDeviceTensor local_logits;
-        allocate_float(local_logits, local_vocab, {static_cast<uint64_t>(local_vocab)});
+        QwenDeviceTensor& local_logits = workspace_float(local_vocab, {static_cast<uint64_t>(local_vocab)});
         if (lm_head.device_dtype == SafeDType::F16) {
             require_launch(qwen_fp16_matmul_rows_cuda(
                                fp32(selected), fp16(lm_head), fp32(local_logits), 1, local_vocab,
@@ -580,6 +635,15 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir, const QwenEngineOptions& opt
 QwenEngine::~QwenEngine() {
     delete impl_;
     impl_ = nullptr;
+}
+
+void QwenEngine::warmup_tp() {
+    if (options_.tp_world == 1) return;
+    QwenDeviceTensor scratch;
+    allocate_float(scratch, 1, {1});
+    zero_tensor(scratch);
+    impl_->all_reduce(fp32(scratch), 1);
+    check_cuda(cudaDeviceSynchronize(), "Qwen TP warmup synchronization");
 }
 
 void QwenEngine::reset() {

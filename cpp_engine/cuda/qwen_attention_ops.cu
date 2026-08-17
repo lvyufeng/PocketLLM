@@ -291,6 +291,101 @@ __global__ void gated_delta_step_kernel(float* __restrict__ state,
     out[static_cast<size_t>(head) * value_dim + value] = result * q_scale;
 }
 
+// Prefill-only variant: one block per value head walks the whole sequence and
+// keeps its state column in registers. Per token the arithmetic and its order
+// match gated_delta_step_kernel exactly; the difference is that the 64 KiB
+// per-head state is no longer streamed to global memory twice per token, and
+// 512 tokens cost one launch instead of 512.
+template <int kKeyDim>
+__global__ void gated_delta_sequence_kernel(float* __restrict__ state,
+                                            const float* __restrict__ q,
+                                            const float* __restrict__ k,
+                                            const float* __restrict__ v,
+                                            const float* __restrict__ g,
+                                            const float* __restrict__ beta,
+                                            float* __restrict__ out, int rows,
+                                            int heads, int key_heads, int value_dim,
+                                            float q_scale) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int value = static_cast<int>(threadIdx.x);
+    const int threads = static_cast<int>(blockDim.x);
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    const int key_stride = key_heads * kKeyDim;
+
+    __shared__ float k_shared[kKeyDim];
+    __shared__ float q_shared[kKeyDim];
+    extern __shared__ float reduce[];
+
+    float* state_head = state + static_cast<size_t>(head) * kKeyDim * value_dim;
+    float st[kKeyDim];
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) {
+        st[i] = state_head[static_cast<size_t>(i) * value_dim + value];
+    }
+
+    for (int t = 0; t < rows; ++t) {
+        const float* q_head = q + static_cast<size_t>(t) * key_stride +
+                              static_cast<size_t>(key_head) * kKeyDim;
+        const float* k_head = k + static_cast<size_t>(t) * key_stride +
+                              static_cast<size_t>(key_head) * kKeyDim;
+        float q_partial = 0.0f;
+        float k_partial = 0.0f;
+        for (int i = value; i < kKeyDim; i += threads) {
+            q_partial += q_head[i] * q_head[i];
+            k_partial += k_head[i] * k_head[i];
+        }
+        reduce[value] = q_partial;
+        __syncthreads();
+        for (int stride = threads / 2; stride > 0; stride >>= 1) {
+            if (value < stride) reduce[value] += reduce[value + stride];
+            __syncthreads();
+        }
+        const float q_norm = rsqrtf(reduce[0] + 1.0e-6f);
+        __syncthreads();
+        reduce[value] = k_partial;
+        __syncthreads();
+        for (int stride = threads / 2; stride > 0; stride >>= 1) {
+            if (value < stride) reduce[value] += reduce[value + stride];
+            __syncthreads();
+        }
+        const float k_norm = rsqrtf(reduce[0] + 1.0e-6f);
+        __syncthreads();
+        for (int i = value; i < kKeyDim; i += threads) {
+            k_shared[i] = k_head[i] * k_norm;
+            q_shared[i] = q_head[i] * q_norm;
+        }
+        __syncthreads();
+
+        const float decay = expf(g[static_cast<size_t>(t) * heads + head]);
+        const float b = beta[static_cast<size_t>(t) * heads + head];
+        float kv_mem = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] *= decay;
+            kv_mem += st[i] * k_shared[i];
+        }
+        const float delta = (v[static_cast<size_t>(t) * heads * value_dim +
+                               static_cast<size_t>(head) * value_dim + value] -
+                             kv_mem) *
+                            b;
+        float result = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] += k_shared[i] * delta;
+            result += st[i] * q_shared[i];
+        }
+        out[static_cast<size_t>(t) * heads * value_dim +
+            static_cast<size_t>(head) * value_dim + value] = result * q_scale;
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) {
+        state_head[static_cast<size_t>(i) * value_dim + value] = st[i];
+    }
+}
+
 __device__ __forceinline__ float rope_inv_freq(int index, int rotary_dim, float theta) {
     return powf(theta, -2.0f * static_cast<float>(index) / static_cast<float>(rotary_dim));
 }
@@ -317,6 +412,39 @@ __global__ void partial_rope_kernel(float* __restrict__ q, float* __restrict__ k
         const float b = row[idx + half];
         row[idx] = a * c - b * s;
         row[idx + half] = b * c + a * s;
+    }
+}
+
+// Prefill form: `rows` positions in one launch. Angles and rotations are
+// computed exactly as in partial_rope_kernel, one block per (row, channel pair)
+// group, so per-token results are unchanged.
+__global__ void partial_rope_rows_kernel(float* __restrict__ q, float* __restrict__ k,
+                                         int start_position, int rows, int rotary_dim,
+                                         float theta, int q_heads, int kv_heads,
+                                         int head_dim) {
+    const int half = rotary_dim / 2;
+    const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = static_cast<int>(blockIdx.y);
+    if (idx >= half || row >= rows) return;
+    const float angle =
+        static_cast<float>(start_position + row) * rope_inv_freq(idx, rotary_dim, theta);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    float* q_row = q + static_cast<size_t>(row) * q_heads * head_dim;
+    float* k_row = k + static_cast<size_t>(row) * kv_heads * head_dim;
+    for (int head = 0; head < q_heads; ++head) {
+        float* line = q_row + static_cast<size_t>(head) * head_dim;
+        const float a = line[idx];
+        const float b = line[idx + half];
+        line[idx] = a * c - b * s;
+        line[idx + half] = b * c + a * s;
+    }
+    for (int head = 0; head < kv_heads; ++head) {
+        float* line = k_row + static_cast<size_t>(head) * head_dim;
+        const float a = line[idx];
+        const float b = line[idx + half];
+        line[idx] = a * c - b * s;
+        line[idx + half] = b * c + a * s;
     }
 }
 
@@ -589,6 +717,26 @@ bool qwen_gated_delta_step_cuda(float* d_state, const float* d_q, const float* d
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_gated_delta_sequence_cuda(float* d_state, const float* d_q, const float* d_k,
+                                    const float* d_v, const float* d_g, const float* d_beta,
+                                    float* d_out, int rows, int heads, int key_heads,
+                                    int key_dim, int value_dim, float q_scale,
+                                    void* stream) {
+    if (!d_state || !d_q || !d_k || !d_v || !d_g || !d_beta || !d_out || rows <= 0 ||
+        heads <= 0 || key_heads <= 0 || key_dim <= 0 || value_dim <= 0 ||
+        heads % key_heads != 0 || q_scale <= 0.0f) return false;
+    // The state column lives in registers, so key_dim is a compile-time bound
+    // and the block must be exactly one thread per state column.
+    if (key_dim != 128 || value_dim != 128) return false;
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const int threads = value_dim;
+    const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
+    gated_delta_sequence_kernel<128><<<heads, threads, shmem, s>>>(
+        d_state, d_q, d_k, d_v, d_g, d_beta, d_out, rows, heads, key_heads,
+        value_dim, q_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_partial_rope_cuda(float* d_q, float* d_k, int position, int rotary_dim,
                             float theta, int q_heads, int kv_heads, int head_dim,
                             void* stream) {
@@ -598,6 +746,20 @@ bool qwen_partial_rope_cuda(float* d_q, float* d_k, int position, int rotary_dim
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
     partial_rope_kernel<<<(rotary_dim / 2 + 255) / 256, 256, 0, s>>>(
         d_q, d_k, position, rotary_dim, theta, q_heads, kv_heads, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_partial_rope_rows_cuda(float* d_q, float* d_k, int start_position, int rows,
+                                 int rotary_dim, float theta, int q_heads, int kv_heads,
+                                 int head_dim, void* stream) {
+    if (!d_q || !d_k || start_position < 0 || rows <= 0 || rotary_dim <= 0 ||
+        (rotary_dim & 1) != 0 || rotary_dim > head_dim || theta <= 0.0f || q_heads <= 0 ||
+        kv_heads <= 0 || head_dim <= 0) return false;
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    dim3 grid(static_cast<unsigned>((rotary_dim / 2 + 255) / 256),
+              static_cast<unsigned>(rows), 1);
+    partial_rope_rows_kernel<<<grid, 256, 0, s>>>(d_q, d_k, start_position, rows, rotary_dim,
+                                                  theta, q_heads, kv_heads, head_dim);
     return cudaGetLastError() == cudaSuccess;
 }
 

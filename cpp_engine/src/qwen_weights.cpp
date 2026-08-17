@@ -89,9 +89,11 @@ QwenDeviceTensor::~QwenDeviceTensor() {
 }
 
 QwenDeviceTensor::QwenDeviceTensor(QwenDeviceTensor&& other) noexcept
-    : data(other.data), device_dtype(other.device_dtype), shape(std::move(other.shape)), nbytes(other.nbytes) {
+    : data(other.data), device_dtype(other.device_dtype), shape(std::move(other.shape)),
+      nbytes(other.nbytes), capacity(other.capacity) {
     other.data = nullptr;
     other.nbytes = 0;
+    other.capacity = 0;
     other.device_dtype = SafeDType::Unknown;
 }
 
@@ -102,8 +104,10 @@ QwenDeviceTensor& QwenDeviceTensor::operator=(QwenDeviceTensor&& other) noexcept
     device_dtype = other.device_dtype;
     shape = std::move(other.shape);
     nbytes = other.nbytes;
+    capacity = other.capacity;
     other.data = nullptr;
     other.nbytes = 0;
+    other.capacity = 0;
     other.device_dtype = SafeDType::Unknown;
     return *this;
 }
@@ -222,6 +226,7 @@ QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
     device.device_dtype = host.device_dtype;
     device.shape = host.shape;
     device.nbytes = host.bytes.size();
+    device.capacity = device.nbytes;
     if (device.nbytes == 0 || cudaMalloc(&device.data, device.nbytes) != cudaSuccess) {
         throw std::runtime_error("failed to allocate Qwen device tensor: " + ref.name);
     }
@@ -232,6 +237,7 @@ QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
         cudaFree(device.data);
         device.data = nullptr;
         device.nbytes = 0;
+        device.capacity = 0;
         throw std::runtime_error("failed to upload Qwen device tensor: " + ref.name);
     }
     return device;

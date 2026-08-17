@@ -51,7 +51,10 @@ struct QwenDeviceTensor {
     void* data = nullptr;
     SafeDType device_dtype = SafeDType::Unknown;
     std::vector<uint64_t> shape;
+    // nbytes is the logical extent currently exposed to an operator. capacity
+    // is the allocation size, so workspaces can reuse a larger buffer.
     uint64_t nbytes = 0;
+    uint64_t capacity = 0;
 
     ~QwenDeviceTensor();
     QwenDeviceTensor() = default;

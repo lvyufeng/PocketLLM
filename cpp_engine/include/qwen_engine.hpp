@@ -48,6 +48,7 @@ public:
     uint64_t resident_scale_bytes() const { return resident_scale_bytes_; }
 
     void reset();
+    void warmup_tp();
     QwenForwardResult prefill(const std::vector<int>& token_ids);
     QwenForwardResult decode_step(int token_id);
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,

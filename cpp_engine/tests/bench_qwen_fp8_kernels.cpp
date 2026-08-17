@@ -71,6 +71,15 @@ void run_ref(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
     }
 }
 
+void run_simt(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
+    if (batch == 1) {
+        run_opt(b, batch, rows, cols, scale_cols);
+    } else {
+        dsv4::qwen_fp8_e4m3_fp16scale_matmul_simt_cuda(
+            b.x, b.w, b.s, b.y, batch, rows, cols, cols, rows, cols, scale_cols);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -96,6 +105,9 @@ int main() {
         {"full_q       decode", 1, 1536, 5120},
         {"mlp_gate    prefill", 64, 4352, 5120},
         {"mlp_down    prefill", 64, 5120, 4352},
+        {"mlp_gate    pf-512 ", 512, 4352, 5120},
+        {"mlp_down    pf-512 ", 512, 5120, 4352},
+        {"linear_qkv  pf-512 ", 512, 2560, 5120},
     };
 
     for (const Case& c : cases) {
@@ -126,10 +138,11 @@ int main() {
         const int iters = c.batch == 1 ? 200 : 30;
         const double ref = time_ms(run_ref, b, c.batch, c.rows, c.cols, scale_cols, iters);
         const double opt = time_ms(run_opt, b, c.batch, c.rows, c.cols, scale_cols, iters);
+        const double simt = time_ms(run_simt, b, c.batch, c.rows, c.cols, scale_cols, iters);
         const double bytes = static_cast<double>(c.rows) * c.cols;
-        std::printf("%s batch=%3d rows=%5d cols=%5d  baseline=%7.3f ms  optimized=%7.3f ms  speedup=%5.2fx  eff=%6.1f GB/s\n",
-                    c.label, c.batch, c.rows, c.cols, ref, opt, ref / opt,
-                    bytes / (opt * 1e-3) / 1e9);
+        std::printf("%s batch=%3d rows=%5d cols=%5d  baseline=%7.3f ms  old=%7.3f ms  simt=%7.3f ms  old/simt=%5.2fx  eff=%6.1f GB/s\n",
+                    c.label, c.batch, c.rows, c.cols, ref, opt, simt, opt / simt,
+                    bytes / (simt * 1e-3) / 1e9);
     }
     return 0;
 }
