@@ -411,21 +411,16 @@ struct QwenEngine::Impl {
     void full_attention(DeviceLayer& layer, float* hidden, float* output, int rows,
                         int position_offset) {
         const int q_heads = static_cast<int>(config.full_attention.num_heads / options.tp_world);
-        const int total_kv_heads = static_cast<int>(config.full_attention.num_key_value_heads);
-        const int kv_heads = total_kv_heads / options.tp_world;
+        const int kv_heads = static_cast<int>(config.full_attention.num_key_value_heads / options.tp_world);
         const int head_dim = static_cast<int>(config.full_attention.head_dim);
         const int attention_dim = q_heads * head_dim;
         const int q_proj_dim = attention_dim * 2;
-        const int kv_dim = total_kv_heads * head_dim;
         const size_t q_proj_elements = static_cast<size_t>(rows) * q_proj_dim;
         const size_t attention_elements = static_cast<size_t>(rows) * attention_dim;
-        const size_t kv_full_elements = static_cast<size_t>(rows) * kv_dim;
         const size_t kv_elements = static_cast<size_t>(rows) * kv_heads * head_dim;
         QwenDeviceTensor& q_proj = workspace_float(q_proj_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_proj_dim)});
         QwenDeviceTensor& q = workspace_float(attention_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(attention_dim)});
         QwenDeviceTensor& gate = workspace_float(attention_elements, q.shape);
-        QwenDeviceTensor& k_full = workspace_float(kv_full_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_dim)});
-        QwenDeviceTensor& v_full = workspace_float(kv_full_elements, k_full.shape);
         QwenDeviceTensor& k = workspace_float(kv_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_heads), static_cast<uint64_t>(head_dim)});
         QwenDeviceTensor& v = workspace_float(kv_elements, k.shape);
         QwenDeviceTensor& q_norm = workspace_float(attention_elements, q.shape);
@@ -434,13 +429,8 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& merged = workspace_float(attention_elements, q.shape);
         projection(layer.full.q, hidden, fp32(q_proj), rows);
         require_launch(qwen_split_q_gate_cuda(fp32(q_proj), fp32(q), fp32(gate), rows, q_heads, head_dim), "full Q/gate split");
-        projection(layer.full.k, hidden, fp32(k_full), rows);
-        projection(layer.full.v, hidden, fp32(v_full), rows);
-        const int head_offset = (options.tp_rank * kv_heads);
-        require_launch(qwen_select_kv_heads_cuda(fp32(k_full), fp32(k), rows, total_kv_heads, kv_heads,
-                                                 head_dim, head_offset), "full K head select");
-        require_launch(qwen_select_kv_heads_cuda(fp32(v_full), fp32(v), rows, total_kv_heads, kv_heads,
-                                                 head_dim, head_offset), "full V head select");
+        projection(layer.full.k, hidden, fp32(k), rows);
+        projection(layer.full.v, hidden, fp32(v), rows);
         norm(layer.full.q_norm, fp32(q), fp32(q_norm), rows * q_heads, head_dim);
         norm(layer.full.k_norm, fp32(k), fp32(k_norm), rows * kv_heads, head_dim);
         if (rows == 1) {
@@ -461,9 +451,14 @@ struct QwenEngine::Impl {
                            rows, kv_heads, head_dim, position_offset, max_context),
                        "append full KV cache");
         if (rows == 1) {
+            const int context_len = position_offset + 1;
+            QwenDeviceTensor& scores = workspace_float(
+                static_cast<size_t>(q_heads) * max_context,
+                {static_cast<uint64_t>(q_heads), static_cast<uint64_t>(max_context)});
             require_launch(qwen_gqa_decode_attention_cuda(
                                fp32(q_norm), fp32(layer.full.k_cache), fp32(layer.full.v_cache),
-                               fp32(attn), q_heads, kv_heads, head_dim, position_offset + 1, max_context),
+                               fp32(attn), fp32(scores), q_heads, kv_heads, head_dim,
+                               context_len, max_context),
                            "decode GQA");
         } else {
             require_launch(qwen_gqa_prefill_attention_cuda(
@@ -485,9 +480,19 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& normed = workspace_float(hidden_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
         QwenDeviceTensor& attn = workspace_float(hidden_elements, normed.shape);
         QwenDeviceTensor& post = workspace_float(hidden_elements, normed.shape);
-        QwenDeviceTensor& gate = workspace_float(intermediate_elements, {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
-        QwenDeviceTensor& up = workspace_float(intermediate_elements, gate.shape);
-        QwenDeviceTensor& intermediate = workspace_float(intermediate_elements, gate.shape);
+        const bool fused_swiglu = rows == 1 && layer.gate.fp8 && layer.up.fp8 &&
+                                  layer.gate.weight.shape == layer.up.weight.shape &&
+                                  layer.gate.scale.shape == layer.up.scale.shape;
+        QwenDeviceTensor* gate_ptr = nullptr;
+        QwenDeviceTensor* up_ptr = nullptr;
+        if (!fused_swiglu) {
+            gate_ptr = &workspace_float(intermediate_elements,
+                                        {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
+            up_ptr = &workspace_float(intermediate_elements, gate_ptr->shape);
+        }
+        QwenDeviceTensor& intermediate = workspace_float(
+            intermediate_elements,
+            {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
         QwenDeviceTensor& mlp = workspace_float(hidden_elements, normed.shape);
         norm(layer.input_norm, hidden, fp32(normed), rows, hidden_size);
         if (layer.linear.qkv.weight.data != nullptr) {
@@ -499,11 +504,21 @@ struct QwenEngine::Impl {
                    "Qwen residual copy");
         add(work, fp32(attn), rows * hidden_size);
         norm(layer.post_norm, work, fp32(post), rows, hidden_size);
-        projection(layer.gate, fp32(post), fp32(gate), rows);
-        projection(layer.up, fp32(post), fp32(up), rows);
-        require_launch(qwen_silu_mul_rows_cuda(fp32(gate), fp32(up), fp32(intermediate), rows,
-                                               static_cast<int>(layer.gate.weight.shape[0])),
-                       "Qwen SwiGLU");
+        if (fused_swiglu) {
+            require_launch(qwen_fp8_e4m3_fp16scale_swiglu_matvec_cuda(
+                               fp32(post), fp8(layer.gate.weight), fp16(layer.gate.scale),
+                               fp8(layer.up.weight), fp16(layer.up.scale), fp32(intermediate),
+                               static_cast<int>(layer.gate.weight.shape[0]), hidden_size,
+                               hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
+                           "Qwen fused decode SwiGLU");
+        } else {
+            projection(layer.gate, fp32(post), fp32(*gate_ptr), rows);
+            projection(layer.up, fp32(post), fp32(*up_ptr), rows);
+            require_launch(qwen_silu_mul_rows_cuda(
+                               fp32(*gate_ptr), fp32(*up_ptr), fp32(intermediate), rows,
+                               static_cast<int>(layer.gate.weight.shape[0])),
+                           "Qwen SwiGLU");
+        }
         projection(layer.down, fp32(intermediate), fp32(mlp), rows);
         all_reduce(fp32(mlp), rows * hidden_size);
         add(work, fp32(mlp), rows * hidden_size);

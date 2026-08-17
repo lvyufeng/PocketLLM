@@ -557,18 +557,112 @@ __device__ __forceinline__ void gqa_attention_body(const float* __restrict__ q_r
 }
 
 template <int kThreads>
-__global__ void gqa_decode_attention_kernel(const float* __restrict__ q,
-                                            const float* __restrict__ k_cache,
-                                            const float* __restrict__ v_cache,
-                                            float* __restrict__ out, int q_heads,
-                                            int kv_heads, int head_dim, int context_len,
-                                            int max_context) {
+__global__ void gqa_decode_scores_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ k_cache,
+                                         float* __restrict__ scores, int q_heads,
+                                         int kv_heads, int head_dim, int context_len) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int pos = static_cast<int>(blockIdx.y);
+    if (head >= q_heads || pos >= context_len) return;
+    const int kv_head = head / (q_heads / kv_heads);
+    const float* q_row = q + static_cast<size_t>(head) * head_dim;
+    const float* key = k_cache +
+                       (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim;
+    float partial = 0.0f;
+    for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += kThreads) {
+        partial += q_row[d] * key[d];
+    }
+    extern __shared__ float reduce[];
+    reduce[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scores[static_cast<size_t>(head) * context_len + pos] =
+            reduce[0] * rsqrtf(static_cast<float>(head_dim));
+    }
+}
+
+template <int kThreads>
+__global__ void gqa_decode_softmax_kernel(float* __restrict__ scores,
+                                          int q_heads, int context_len) {
     const int head = static_cast<int>(blockIdx.x);
     if (head >= q_heads) return;
-    const int kv_head = head / (q_heads / kv_heads);
-    gqa_attention_body<kThreads>(q + static_cast<size_t>(head) * head_dim, k_cache, v_cache,
-                                 out + static_cast<size_t>(head) * head_dim, kv_head,
-                                 kv_heads, head_dim, context_len);
+    float* head_scores = scores + static_cast<size_t>(head) * context_len;
+    const int tid = static_cast<int>(threadIdx.x);
+    __shared__ float reduce[kThreads];
+
+    float local_max = -INFINITY;
+    for (int pos = tid; pos < context_len; pos += kThreads) {
+        local_max = fmaxf(local_max, head_scores[pos]);
+    }
+    reduce[tid] = local_max;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+
+    float local_sum = 0.0f;
+    for (int pos = tid; pos < context_len; pos += kThreads) {
+        const float probability = expf(head_scores[pos] - max_score);
+        head_scores[pos] = probability;
+        local_sum += probability;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+    for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float inv_sum = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (int pos = tid; pos < context_len; pos += kThreads) {
+        head_scores[pos] *= inv_sum;
+    }
+}
+
+// Q heads sharing one KV head consume the same V row. Accumulate a small Q-head
+// group together so each V element is loaded once per group instead of per head.
+template <int kThreads, int kHeadsPerGroup>
+__global__ void gqa_decode_grouped_values_kernel(
+    const float* __restrict__ probabilities,
+    const float* __restrict__ v_cache,
+    float* __restrict__ out,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int context_len) {
+    const int q_per_kv = q_heads / kv_heads;
+    const int groups_per_kv = (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    const int kv_head = static_cast<int>(blockIdx.x) / groups_per_kv;
+    const int group = static_cast<int>(blockIdx.x) % groups_per_kv;
+    const int first_head = kv_head * q_per_kv + group * kHeadsPerGroup;
+    const int d = static_cast<int>(blockIdx.y) * kThreads + static_cast<int>(threadIdx.x);
+    if (kv_head >= kv_heads || first_head >= (kv_head + 1) * q_per_kv || d >= head_dim) return;
+
+    float acc[kHeadsPerGroup] = {};
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    for (int pos = 0; pos < context_len; ++pos) {
+        const float value = v_cache[static_cast<size_t>(pos) * kv_stride +
+                                    static_cast<size_t>(kv_head) * head_dim + d];
+#pragma unroll
+        for (int i = 0; i < kHeadsPerGroup; ++i) {
+            const int head = first_head + i;
+            if (head < (kv_head + 1) * q_per_kv) {
+                acc[i] += probabilities[static_cast<size_t>(head) * context_len + pos] * value;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kHeadsPerGroup; ++i) {
+        const int head = first_head + i;
+        if (head < (kv_head + 1) * q_per_kv) {
+            out[static_cast<size_t>(head) * head_dim + d] = acc[i];
+        }
+    }
 }
 
 template <int kThreads>
@@ -803,18 +897,30 @@ bool qwen_append_kv_cache_cuda(const float* d_k_rows, const float* d_v_rows,
 
 bool qwen_gqa_decode_attention_cuda(const float* d_q, const float* d_k_cache,
                                     const float* d_v_cache, float* d_out,
+                                    float* d_score_scratch,
                                     int q_heads, int kv_heads, int head_dim,
                                     int context_len, int max_context,
                                     void* stream) {
-    if (!d_q || !d_k_cache || !d_v_cache || !d_out || q_heads <= 0 || kv_heads <= 0 ||
-        head_dim <= 0 || context_len <= 0 || context_len > max_context || q_heads % kv_heads != 0) return false;
+    if (!d_q || !d_k_cache || !d_v_cache || !d_out || !d_score_scratch ||
+        q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 || context_len <= 0 ||
+        context_len > max_context || q_heads % kv_heads != 0) return false;
     constexpr int kThreads = 128;
     if ((head_dim + kThreads - 1) / kThreads > 8) return false;
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const size_t shmem = (static_cast<size_t>(head_dim) + kThreads) * sizeof(float);
-    gqa_decode_attention_kernel<kThreads><<<q_heads, kThreads, shmem, s>>>(
-        d_q, d_k_cache, d_v_cache, d_out, q_heads, kv_heads, head_dim,
-        context_len, max_context);
+    dim3 score_grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(context_len), 1);
+    gqa_decode_scores_kernel<kThreads><<<score_grid, kThreads, kThreads * sizeof(float), s>>>(
+        d_q, d_k_cache, d_score_scratch, q_heads, kv_heads, head_dim, context_len);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    gqa_decode_softmax_kernel<kThreads><<<q_heads, kThreads, 0, s>>>(
+        d_score_scratch, q_heads, context_len);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    constexpr int kHeadsPerGroup = 3;
+    const int groups_per_kv = ((q_heads / kv_heads) + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    const int dim_blocks = (head_dim + kThreads - 1) / kThreads;
+    dim3 value_grid(static_cast<unsigned>(kv_heads * groups_per_kv),
+                    static_cast<unsigned>(dim_blocks), 1);
+    gqa_decode_grouped_values_kernel<kThreads, kHeadsPerGroup><<<value_grid, kThreads, 0, s>>>(
+        d_score_scratch, d_v_cache, d_out, q_heads, kv_heads, head_dim, context_len);
     return cudaGetLastError() == cudaSuccess;
 }
 

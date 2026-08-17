@@ -1,8 +1,8 @@
 // Qwen Safetensors mapping test with a small synthetic TP4 checkpoint.
 //
 // The fixture preserves the real 128-row FP8 scale block contract while using
-// one linear-attention layer, so it can verify packed QKV/conv segment offsets
-// without requiring a model download.
+// one linear-attention and one full-attention layer, so it can verify packed
+// QKV/conv segments and local full-attention KV heads without a model download.
 
 #include "cuda_ops.hpp"
 #include "qwen_config.hpp"
@@ -67,7 +67,7 @@ std::string config_json() {
     "vocab_size": 512,
     "hidden_size": 128,
     "intermediate_size": 512,
-    "num_hidden_layers": 1,
+    "num_hidden_layers": 2,
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
     "head_dim": 128,
@@ -81,7 +81,7 @@ std::string config_json() {
     "rms_norm_eps": 1e-6,
     "partial_rotary_factor": 0.25,
     "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
-    "layer_types": ["linear_attention"]
+    "layer_types": ["linear_attention", "full_attention"]
   }
 })JSON";
 }
@@ -111,27 +111,48 @@ std::vector<TensorSpec> tensor_specs() {
     add("model.language_model.norm.weight", "BF16", hidden);
     add("lm_head.weight", "BF16", vocab_weight);
 
-    const std::string prefix = "model.language_model.layers.0.";
-    add(prefix + "input_layernorm.weight", "BF16", hidden);
-    add(prefix + "post_attention_layernorm.weight", "BF16", hidden);
-    add(prefix + "linear_attn.in_proj_qkv.weight", "F8_E4M3", qkv);
-    add(prefix + "linear_attn.in_proj_qkv.weight_scale_inv", "BF16", qkv_scale);
-    add(prefix + "linear_attn.in_proj_z.weight", "F8_E4M3", value_proj);
-    add(prefix + "linear_attn.in_proj_z.weight_scale_inv", "BF16", value_proj_scale);
-    add(prefix + "linear_attn.out_proj.weight", "F8_E4M3", out_proj);
-    add(prefix + "linear_attn.out_proj.weight_scale_inv", "BF16", out_proj_scale);
-    add(prefix + "linear_attn.in_proj_a.weight", "BF16", value_heads_weight);
-    add(prefix + "linear_attn.in_proj_b.weight", "BF16", value_heads_weight);
-    add(prefix + "linear_attn.conv1d.weight", "BF16", {1536, 1, 4});
-    add(prefix + "linear_attn.A_log", "BF16", vector4);
-    add(prefix + "linear_attn.dt_bias", "BF16", vector4);
-    add(prefix + "linear_attn.norm.weight", "BF16", {128});
-    add(prefix + "mlp.gate_proj.weight", "F8_E4M3", mlp);
-    add(prefix + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale);
-    add(prefix + "mlp.up_proj.weight", "F8_E4M3", mlp);
-    add(prefix + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale);
-    add(prefix + "mlp.down_proj.weight", "F8_E4M3", down);
-    add(prefix + "mlp.down_proj.weight_scale_inv", "BF16", down_scale);
+    const std::string linear_prefix = "model.language_model.layers.0.";
+    add(linear_prefix + "input_layernorm.weight", "BF16", hidden);
+    add(linear_prefix + "post_attention_layernorm.weight", "BF16", hidden);
+    add(linear_prefix + "linear_attn.in_proj_qkv.weight", "F8_E4M3", qkv);
+    add(linear_prefix + "linear_attn.in_proj_qkv.weight_scale_inv", "BF16", qkv_scale);
+    add(linear_prefix + "linear_attn.in_proj_z.weight", "F8_E4M3", value_proj);
+    add(linear_prefix + "linear_attn.in_proj_z.weight_scale_inv", "BF16", value_proj_scale);
+    add(linear_prefix + "linear_attn.out_proj.weight", "F8_E4M3", out_proj);
+    add(linear_prefix + "linear_attn.out_proj.weight_scale_inv", "BF16", out_proj_scale);
+    add(linear_prefix + "linear_attn.in_proj_a.weight", "BF16", value_heads_weight);
+    add(linear_prefix + "linear_attn.in_proj_b.weight", "BF16", value_heads_weight);
+    add(linear_prefix + "linear_attn.conv1d.weight", "BF16", {1536, 1, 4});
+    add(linear_prefix + "linear_attn.A_log", "BF16", vector4);
+    add(linear_prefix + "linear_attn.dt_bias", "BF16", vector4);
+    add(linear_prefix + "linear_attn.norm.weight", "BF16", {128});
+
+    const std::string full_prefix = "model.language_model.layers.1.";
+    const std::vector<uint64_t> q_proj = {1024, 128};
+    const std::vector<uint64_t> q_proj_scale = {8, 1};
+    add(full_prefix + "input_layernorm.weight", "BF16", hidden);
+    add(full_prefix + "post_attention_layernorm.weight", "BF16", hidden);
+    add(full_prefix + "self_attn.q_proj.weight", "F8_E4M3", q_proj);
+    add(full_prefix + "self_attn.q_proj.weight_scale_inv", "BF16", q_proj_scale);
+    add(full_prefix + "self_attn.k_proj.weight", "F8_E4M3", value_proj);
+    add(full_prefix + "self_attn.k_proj.weight_scale_inv", "BF16", value_proj_scale);
+    add(full_prefix + "self_attn.v_proj.weight", "F8_E4M3", value_proj);
+    add(full_prefix + "self_attn.v_proj.weight_scale_inv", "BF16", value_proj_scale);
+    add(full_prefix + "self_attn.o_proj.weight", "F8_E4M3", out_proj);
+    add(full_prefix + "self_attn.o_proj.weight_scale_inv", "BF16", out_proj_scale);
+    add(full_prefix + "self_attn.q_norm.weight", "BF16", {128});
+    add(full_prefix + "self_attn.k_norm.weight", "BF16", {128});
+
+    auto add_mlp = [&add, &mlp, &mlp_scale, &down, &down_scale](const std::string& prefix) {
+        add(prefix + "mlp.gate_proj.weight", "F8_E4M3", mlp);
+        add(prefix + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale);
+        add(prefix + "mlp.up_proj.weight", "F8_E4M3", mlp);
+        add(prefix + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale);
+        add(prefix + "mlp.down_proj.weight", "F8_E4M3", down);
+        add(prefix + "mlp.down_proj.weight_scale_inv", "BF16", down_scale);
+    };
+    add_mlp(linear_prefix);
+    add_mlp(full_prefix);
     return out;
 }
 
@@ -195,8 +216,9 @@ void require_segment(const dsv4::QwenTensorRef& ref, size_t index,
 
 void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& config, int rank) {
     dsv4::QwenWeightMap map(index, config, 4, rank);
-    require(map.layers().size() == 1, "expected one mapped layer");
+    require(map.layers().size() == 2, "expected two mapped layers");
     const auto& linear = map.layers()[0].linear_attention;
+    const auto& full = map.layers()[1].full_attention;
 
     require(linear.in_proj_a.weight.dtype == dsv4::SafeDType::BF16,
             "in_proj_a must remain BF16 in storage");
@@ -255,6 +277,18 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
     require(linear.out_proj.weight.shard_start == row_start &&
                 linear.out_proj.scale.shard_start == static_cast<uint64_t>(rank),
             "out_proj shard offsets");
+
+    for (const auto* kv : {&full.k_proj, &full.v_proj}) {
+        require(kv->weight.rule == dsv4::QwenShardRule::ColumnParallel,
+                "full KV weight must be column parallel");
+        require(kv->weight.local_shape == std::vector<uint64_t>({128, 128}),
+                "full KV local shape");
+        require(kv->scale.local_shape == std::vector<uint64_t>({1, 1}),
+                "full KV scale local shape");
+        require(kv->weight.shard_start == row_start &&
+                    kv->scale.shard_start == static_cast<uint64_t>(rank),
+                "full KV shard offsets");
+    }
 
     require(map.embed_tokens().local_shape == std::vector<uint64_t>({128, 128}),
             "embedding local shape");

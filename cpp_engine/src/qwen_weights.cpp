@@ -345,10 +345,10 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
                 QwenShardRule::ColumnParallel, 0);
             layer.full_attention.k_proj = require_linear(
                 prefix + "self_attn.k_proj.weight", {kv_dim, config_.hidden_size},
-                QwenShardRule::Replicated, -1);
+                QwenShardRule::ColumnParallel, 0);
             layer.full_attention.v_proj = require_linear(
                 prefix + "self_attn.v_proj.weight", {kv_dim, config_.hidden_size},
-                QwenShardRule::Replicated, -1);
+                QwenShardRule::ColumnParallel, 0);
             layer.full_attention.o_proj = require_linear(
                 prefix + "self_attn.o_proj.weight", {config_.hidden_size, attention_dim},
                 QwenShardRule::RowParallel, 1);

@@ -20,6 +20,21 @@ bool qwen_fp8_e4m3_fp16scale_matvec_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+// Decode-only fused gate/up projection. The two matvecs retain independent FP32
+// accumulation, then write silu(gate) * up without materializing either input.
+bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_cuda(
+    const float* d_x,
+    const uint8_t* d_gate_weight,
+    const uint16_t* d_gate_scale_fp16,
+    const uint8_t* d_up_weight,
+    const uint16_t* d_up_scale_fp16,
+    float* d_y,
+    int rows,
+    int cols,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
 bool qwen_fp8_e4m3_fp16scale_matmul_rows_cuda(
     const float* d_x,
     const uint8_t* d_weight,
@@ -178,9 +193,10 @@ bool qwen_append_kv_cache_cuda(const float* d_k_rows, const float* d_v_rows,
                                int max_context, void* stream = nullptr);
 
 // Single-token GQA attention against the cache. Query head h reads KV head
-// h / (q_heads / kv_heads).
+// h / (q_heads / kv_heads). d_score_scratch holds q_heads * context_len floats.
 bool qwen_gqa_decode_attention_cuda(const float* d_q, const float* d_k_cache,
                                     const float* d_v_cache, float* d_out,
+                                    float* d_score_scratch,
                                     int q_heads, int kv_heads, int head_dim,
                                     int context_len, int max_context,
                                     void* stream = nullptr);
