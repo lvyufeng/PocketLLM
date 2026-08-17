@@ -809,6 +809,92 @@ __global__ void fp8_matvec_multirow_kernel(
     }
 }
 
+// Each warp evaluates the same output rows from the MLP gate and up matrices.
+// This halves x traffic versus two independent matvec launches and avoids both
+// projection outputs, while preserving each dot product's accumulation order.
+template <int kWarpsPerBlock, int kRowsPerWarp>
+__global__ void fp8_swiglu_matvec_kernel(
+    const float* __restrict__ x,
+    const uint8_t* __restrict__ gate_weight,
+    const uint16_t* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const uint16_t* __restrict__ up_scale,
+    float* __restrict__ y,
+    int rows,
+    int cols,
+    int weight_stride,
+    int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += static_cast<int>(blockDim.x)) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row_base = (static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp) * kRowsPerWarp;
+    if (row_base >= rows) return;
+    const int active = min(kRowsPerWarp, rows - row_base);
+
+    const uint8_t* gate_rows[kRowsPerWarp];
+    const uint8_t* up_rows[kRowsPerWarp];
+    const uint16_t* gate_scale_rows[kRowsPerWarp];
+    const uint16_t* up_scale_rows[kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = min(row_base + r, rows - 1);
+        gate_rows[r] = gate_weight + static_cast<size_t>(row) * weight_stride;
+        up_rows[r] = up_weight + static_cast<size_t>(row) * weight_stride;
+        gate_scale_rows[r] = gate_scale + static_cast<size_t>(row / kBlock) * scale_stride;
+        up_scale_rows[r] = up_scale + static_cast<size_t>(row / kBlock) * scale_stride;
+    }
+
+    float gate_sum[kRowsPerWarp] = {};
+    float up_sum[kRowsPerWarp] = {};
+    const int vec_cols = cols & ~3;
+    for (int col = lane * 4; col < vec_cols; col += 128) {
+        const float4 xv = *reinterpret_cast<const float4*>(x + col);
+        const int block_col = col / kBlock;
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            const uchar4 gate_codes = *reinterpret_cast<const uchar4*>(gate_rows[r] + col);
+            const uchar4 up_codes = *reinterpret_cast<const uchar4*>(up_rows[r] + col);
+            const float gate_scale_value = fp16_bits_to_float(gate_scale_rows[r][block_col]);
+            const float up_scale_value = fp16_bits_to_float(up_scale_rows[r][block_col]);
+            gate_sum[r] += (xv.x * lut[gate_codes.x] + xv.y * lut[gate_codes.y] +
+                            xv.z * lut[gate_codes.z] + xv.w * lut[gate_codes.w]) * gate_scale_value;
+            up_sum[r] += (xv.x * lut[up_codes.x] + xv.y * lut[up_codes.y] +
+                          xv.z * lut[up_codes.z] + xv.w * lut[up_codes.w]) * up_scale_value;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float xv = x[col];
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            gate_sum[r] += xv * lut[gate_rows[r][col]] *
+                           fp16_bits_to_float(gate_scale_rows[r][col / kBlock]);
+            up_sum[r] += xv * lut[up_rows[r][col]] *
+                         fp16_bits_to_float(up_scale_rows[r][col / kBlock]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        if (r >= active) break;
+        float gate_value = gate_sum[r];
+        float up_value = up_sum[r];
+        for (int off = 16; off > 0; off >>= 1) {
+            gate_value += __shfl_xor_sync(0xffffffffu, gate_value, off);
+            up_value += __shfl_xor_sync(0xffffffffu, up_value, off);
+        }
+        if (lane == 0) {
+            const float gate_silu = gate_value * (1.0f / (1.0f + expf(-gate_value)));
+            y[row_base + r] = gate_silu * up_value;
+        }
+    }
+}
+
 __global__ void rmsnorm_kernel(const float* __restrict__ x,
                                const float* __restrict__ weight,
                                float* __restrict__ y,
@@ -915,6 +1001,32 @@ bool qwen_fp8_e4m3_fp16scale_matvec_cuda(
     }
     fp8_matvec_kernel<true><<<rows, 256, 256 * sizeof(float), s>>>(
         d_x, d_weight, d_scale_fp16, d_y, rows, cols, weight_stride, scale_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_cuda(
+    const float* d_x,
+    const uint8_t* d_gate_weight,
+    const uint16_t* d_gate_scale_fp16,
+    const uint8_t* d_up_weight,
+    const uint16_t* d_up_scale_fp16,
+    float* d_y,
+    int rows,
+    int cols,
+    int weight_stride,
+    int scale_stride,
+    void* stream) {
+    if (!valid_common(d_x, d_gate_weight, d_gate_scale_fp16, d_y, rows, cols, scale_stride) ||
+        !d_up_weight || !d_up_scale_fp16 || weight_stride < cols || weight_stride % 4 != 0) {
+        return false;
+    }
+    constexpr int kWarps = 8;
+    constexpr int kRowsPerWarp = 1;
+    const int blocks = (rows + kWarps * kRowsPerWarp - 1) / (kWarps * kRowsPerWarp);
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    fp8_swiglu_matvec_kernel<kWarps, kRowsPerWarp><<<blocks, kWarps * 32, 0, s>>>(
+        d_x, d_gate_weight, d_gate_scale_fp16, d_up_weight, d_up_scale_fp16,
+        d_y, rows, cols, weight_stride, scale_stride);
     return cudaGetLastError() == cudaSuccess;
 }
 

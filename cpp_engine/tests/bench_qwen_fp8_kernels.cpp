@@ -20,13 +20,21 @@ constexpr int kBlock = 128;
 struct Buffers {
     float* x = nullptr;
     uint8_t* w = nullptr;
+    uint8_t* w2 = nullptr;
     uint16_t* s = nullptr;
+    uint16_t* s2 = nullptr;
     float* y = nullptr;
+    float* y2 = nullptr;
+    float* y3 = nullptr;
     ~Buffers() {
         cudaFree(x);
         cudaFree(w);
+        cudaFree(w2);
         cudaFree(s);
+        cudaFree(s2);
         cudaFree(y);
+        cudaFree(y2);
+        cudaFree(y3);
     }
 };
 
@@ -80,6 +88,19 @@ void run_simt(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
     }
 }
 
+void run_swiglu_separate(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
+    if (batch != 1) return;
+    dsv4::qwen_fp8_e4m3_fp16scale_matvec_cuda(b.x, b.w, b.s, b.y, rows, cols, cols, scale_cols);
+    dsv4::qwen_fp8_e4m3_fp16scale_matvec_cuda(b.x, b.w2, b.s2, b.y2, rows, cols, cols, scale_cols);
+    dsv4::qwen_silu_mul_rows_cuda(b.y, b.y2, b.y3, 1, rows);
+}
+
+void run_swiglu_fused(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
+    if (batch != 1) return;
+    dsv4::qwen_fp8_e4m3_fp16scale_swiglu_matvec_cuda(
+        b.x, b.w, b.s, b.w2, b.s2, b.y3, rows, cols, cols, scale_cols);
+}
+
 }  // namespace
 
 int main() {
@@ -103,6 +124,7 @@ int main() {
         {"mlp_gate     decode", 1, 4352, 5120},
         {"mlp_down     decode", 1, 5120, 4352},
         {"full_q       decode", 1, 1536, 5120},
+        {"full_kv      decode", 1, 256, 5120},
         {"mlp_gate    prefill", 64, 4352, 5120},
         {"mlp_down    prefill", 64, 5120, 4352},
         {"mlp_gate    pf-512 ", 512, 4352, 5120},
@@ -119,8 +141,12 @@ int main() {
         const size_t w_bytes = static_cast<size_t>(c.rows) * (c.cols + 4);
         if (cudaMalloc(&b.x, static_cast<size_t>(c.batch) * c.cols * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&b.w, w_bytes) != cudaSuccess ||
+            cudaMalloc(&b.w2, w_bytes) != cudaSuccess ||
             cudaMalloc(&b.s, static_cast<size_t>(scale_rows) * scale_cols * sizeof(uint16_t)) != cudaSuccess ||
-            cudaMalloc(&b.y, static_cast<size_t>(c.batch) * c.rows * sizeof(float)) != cudaSuccess) {
+            cudaMalloc(&b.s2, static_cast<size_t>(scale_rows) * scale_cols * sizeof(uint16_t)) != cudaSuccess ||
+            cudaMalloc(&b.y, static_cast<size_t>(c.batch) * c.rows * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.y2, static_cast<size_t>(c.batch) * c.rows * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.y3, static_cast<size_t>(c.batch) * c.rows * sizeof(float)) != cudaSuccess) {
             std::printf("[SKIP] allocation failed for %s\n", c.label);
             return 0;
         }
@@ -133,7 +159,9 @@ int main() {
         std::vector<uint16_t> hs(static_cast<size_t>(scale_rows) * scale_cols, 0x3800);
         cudaMemcpy(b.x, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(b.w, hw.data(), hw.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(b.w2, hw.data(), hw.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(b.s, hs.data(), hs.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(b.s2, hs.data(), hs.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
         const int iters = c.batch == 1 ? 200 : 30;
         const double ref = time_ms(run_ref, b, c.batch, c.rows, c.cols, scale_cols, iters);
@@ -143,6 +171,12 @@ int main() {
         std::printf("%s batch=%3d rows=%5d cols=%5d  baseline=%7.3f ms  old=%7.3f ms  simt=%7.3f ms  old/simt=%5.2fx  eff=%6.1f GB/s\n",
                     c.label, c.batch, c.rows, c.cols, ref, opt, simt, opt / simt,
                     bytes / (simt * 1e-3) / 1e9);
+        if (c.batch == 1 && c.rows == 4352 && c.cols == 5120) {
+            const double separate = time_ms(run_swiglu_separate, b, c.batch, c.rows, c.cols, scale_cols, iters);
+            const double fused = time_ms(run_swiglu_fused, b, c.batch, c.rows, c.cols, scale_cols, iters);
+            std::printf("mlp_swiglu fused                      separate=%7.3f ms  fused=%7.3f ms  speedup=%5.2fx\n",
+                        separate, fused, separate / fused);
+        }
     }
     return 0;
 }

@@ -102,6 +102,30 @@ struct DeviceBuffers {
     }
 };
 
+struct SwiGLUDeviceBuffers {
+    float* x = nullptr;
+    uint8_t* gate_weight = nullptr;
+    uint8_t* up_weight = nullptr;
+    uint16_t* gate_scale = nullptr;
+    uint16_t* up_scale = nullptr;
+    float* gate = nullptr;
+    float* up = nullptr;
+    float* reference = nullptr;
+    float* fused = nullptr;
+
+    ~SwiGLUDeviceBuffers() {
+        cudaFree(x);
+        cudaFree(gate_weight);
+        cudaFree(up_weight);
+        cudaFree(gate_scale);
+        cudaFree(up_scale);
+        cudaFree(gate);
+        cudaFree(up);
+        cudaFree(reference);
+        cudaFree(fused);
+    }
+};
+
 bool run_case(int batch, int rows, int cols, uint64_t seed, const std::string& label) {
     constexpr int kBlock = 128;
     const int scale_rows = (rows + kBlock - 1) / kBlock;
@@ -200,6 +224,76 @@ bool run_case(int batch, int rows, int cols, uint64_t seed, const std::string& l
         fail(label + ": max_rel=" + std::to_string(max_rel) + " max_abs=" + std::to_string(max_abs));
     } else {
         std::cout << "  " << label << " batch=" << batch << " rows=" << rows << " cols=" << cols
+                  << " max_abs=" << max_abs << " max_rel=" << max_rel << "\n";
+    }
+    return true;
+}
+
+bool run_swiglu_case() {
+    constexpr int rows = 4352;
+    constexpr int cols = 5120;
+    constexpr int block = 128;
+    const int scale_cols = cols / block;
+    const int scale_rows = rows / block;
+    std::mt19937_64 rng(0x1234abcd);
+    std::uniform_int_distribution<int> code_dist(0, 255);
+    std::uniform_real_distribution<float> x_dist(-1.0f, 1.0f);
+    SwiGLUDeviceBuffers dev;
+    std::vector<float> x(cols);
+    std::vector<uint8_t> gate_weight(static_cast<size_t>(rows) * cols);
+    std::vector<uint8_t> up_weight(gate_weight.size());
+    std::vector<uint16_t> gate_scale(static_cast<size_t>(scale_rows) * scale_cols, 0x3800);
+    std::vector<uint16_t> up_scale(gate_scale.size(), 0x3a00);
+    for (float& value : x) value = x_dist(rng);
+    for (size_t i = 0; i < gate_weight.size(); ++i) {
+        gate_weight[i] = static_cast<uint8_t>(code_dist(rng));
+        up_weight[i] = static_cast<uint8_t>(code_dist(rng));
+    }
+    if (cudaMalloc(&dev.x, x.size() * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&dev.gate_weight, gate_weight.size()) != cudaSuccess ||
+        cudaMalloc(&dev.up_weight, up_weight.size()) != cudaSuccess ||
+        cudaMalloc(&dev.gate_scale, gate_scale.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&dev.up_scale, up_scale.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&dev.gate, rows * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&dev.up, rows * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&dev.reference, rows * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&dev.fused, rows * sizeof(float)) != cudaSuccess) {
+        return false;
+    }
+    cudaMemcpy(dev.x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev.gate_weight, gate_weight.data(), gate_weight.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev.up_weight, up_weight.data(), up_weight.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev.gate_scale, gate_scale.data(), gate_scale.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev.up_scale, up_scale.data(), up_scale.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matvec_cuda(
+            dev.x, dev.gate_weight, dev.gate_scale, dev.gate, rows, cols, cols, scale_cols) ||
+        !dsv4::qwen_fp8_e4m3_fp16scale_matvec_cuda(
+            dev.x, dev.up_weight, dev.up_scale, dev.up, rows, cols, cols, scale_cols) ||
+        !dsv4::qwen_silu_mul_rows_cuda(dev.gate, dev.up, dev.reference, 1, rows) ||
+        !dsv4::qwen_fp8_e4m3_fp16scale_swiglu_matvec_cuda(
+            dev.x, dev.gate_weight, dev.gate_scale, dev.up_weight, dev.up_scale, dev.fused,
+            rows, cols, cols, scale_cols)) {
+        fail("fused SwiGLU launch failed");
+        return true;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail("fused SwiGLU sync failed");
+        return true;
+    }
+    std::vector<float> reference(rows), fused(rows);
+    cudaMemcpy(reference.data(), dev.reference, reference.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(fused.data(), dev.fused, fused.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+    for (int i = 0; i < rows; ++i) {
+        const double error = std::fabs(static_cast<double>(fused[i]) - reference[i]);
+        max_abs = std::max(max_abs, error);
+        max_rel = std::max(max_rel, error / std::max(1.0, std::fabs(static_cast<double>(reference[i]))));
+    }
+    if (max_rel > 2.0e-4) {
+        fail("fused SwiGLU max_rel=" + std::to_string(max_rel) + " max_abs=" + std::to_string(max_abs));
+    } else {
+        std::cout << "  fused SwiGLU rows=" << rows << " cols=" << cols
                   << " max_abs=" << max_abs << " max_rel=" << max_rel << "\n";
     }
     return true;
@@ -336,6 +430,10 @@ int main() {
             std::cout << "[SKIP] device allocation failed for " << c.label << "\n";
             return 0;
         }
+    }
+    if (!run_swiglu_case()) {
+        std::cout << "[SKIP] device allocation failed for fused SwiGLU\n";
+        return 0;
     }
     if (!run_norm_cases()) {
         std::cout << "[SKIP] device allocation failed for norm cases\n";

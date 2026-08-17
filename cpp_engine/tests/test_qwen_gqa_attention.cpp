@@ -69,11 +69,13 @@ struct Device {
     float* k = nullptr;
     float* v = nullptr;
     float* out = nullptr;
+    float* scores = nullptr;
     ~Device() {
         cudaFree(q);
         cudaFree(k);
         cudaFree(v);
         cudaFree(out);
+        cudaFree(scores);
     }
 };
 
@@ -93,15 +95,17 @@ bool run_decode(int q_heads, int kv_heads, int head_dim, int context_len, int ma
     if (cudaMalloc(&dev.q, q.size() * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&dev.k, k.size() * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&dev.v, v.size() * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&dev.out, q.size() * sizeof(float)) != cudaSuccess) {
+        cudaMalloc(&dev.out, q.size() * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&dev.scores, static_cast<size_t>(q_heads) * context_len * sizeof(float)) != cudaSuccess) {
         return false;
     }
     cudaMemcpy(dev.q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dev.k, k.data(), k.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dev.v, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice);
 
-    if (!dsv4::qwen_gqa_decode_attention_cuda(dev.q, dev.k, dev.v, dev.out, q_heads,
-                                              kv_heads, head_dim, context_len, max_context)) {
+    if (!dsv4::qwen_gqa_decode_attention_cuda(dev.q, dev.k, dev.v, dev.out, dev.scores,
+                                              q_heads, kv_heads, head_dim, context_len,
+                                              max_context)) {
         fail("gqa decode launch failed");
         return true;
     }
