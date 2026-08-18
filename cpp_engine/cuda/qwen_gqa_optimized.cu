@@ -20,6 +20,39 @@ constexpr int kDecodeMaxSplits = 64;
 constexpr int kDecodeTargetPositions = 2048;
 constexpr int kDecodeMinContext = 4096;
 
+// A window of 0 keeps exact full attention. Otherwise every query attends to
+// the leading sink prefix plus the most recent window positions, expressed as
+// two logical ranges over the unmodified KV cache.
+struct SparseRanges {
+    int sink_count;
+    int window_start;
+    int window_count;
+
+    __host__ __device__ int total() const { return sink_count + window_count; }
+
+    __host__ __device__ int position(int logical) const {
+        return logical < sink_count
+            ? logical
+            : window_start + (logical - sink_count);
+    }
+};
+
+__host__ __device__ SparseRanges sparse_ranges(
+    int context_len, int window, int sink) {
+    SparseRanges ranges;
+    if (window <= 0) {
+        ranges.sink_count = 0;
+        ranges.window_start = 0;
+        ranges.window_count = context_len;
+        return ranges;
+    }
+    ranges.sink_count = sink < context_len ? sink : context_len;
+    const int tail = context_len - window;
+    ranges.window_start = tail > ranges.sink_count ? tail : ranges.sink_count;
+    ranges.window_count = context_len - ranges.window_start;
+    return ranges;
+}
+
 __device__ __forceinline__ float half_to_float(uint16_t bits) {
     return __half2float(__ushort_as_half(bits));
 }
@@ -59,8 +92,16 @@ __device__ __forceinline__ void reduce_dot_products(
     __syncthreads();
 }
 
+__host__ __device__ bool attends(
+    int position, int context_limit, int window, int sink) {
+    if (position >= context_limit) return false;
+    if (window <= 0 || position < sink) return true;
+    const int start = context_limit - window;
+    return position >= (start > sink ? start : sink);
+}
+
 // Two adjacent query rows and three Q heads sharing a KV head are processed by
-// one CTA. Each K/V element is loaded once for six exact attention outputs.
+// one CTA. Each K/V element is loaded once for six attention outputs.
 __global__ void gqa_prefill_tiled_f16_kernel(
     const uint16_t* __restrict__ q_rows,
     const uint16_t* __restrict__ k_cache,
@@ -70,7 +111,9 @@ __global__ void gqa_prefill_tiled_f16_kernel(
     int q_heads,
     int kv_heads,
     int head_dim,
-    int position_offset) {
+    int position_offset,
+    int window,
+    int sink) {
     const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv =
         (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
@@ -120,9 +163,17 @@ __global__ void gqa_prefill_tiled_f16_kernel(
 
     const int last_token = min(first_token + kQueryRows - 1, seq_len - 1);
     const int tile_context = position_offset + last_token + 1;
+    // The earliest query in this tile bounds the shared window; positions
+    // between the sink prefix and that bound are attended by no query row.
+    const int tile_window_start = window > 0
+        ? max(sink, position_offset + first_token + 1 - window) : 0;
     const float attention_scale = rsqrtf(static_cast<float>(head_dim));
     const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
     for (int position = 0; position < tile_context; ++position) {
+        if (window > 0 && position >= sink && position < tile_window_start) {
+            position = tile_window_start - 1;
+            continue;
+        }
         const size_t kv_base = static_cast<size_t>(position) * kv_stride +
             static_cast<size_t>(kv_head) * head_dim;
         float key[kValuesPerThread];
@@ -137,7 +188,8 @@ __global__ void gqa_prefill_tiled_f16_kernel(
         float partial[kPrefillCombos] = {};
 #pragma unroll
         for (int combo = 0; combo < kPrefillCombos; ++combo) {
-            if (active[combo] && position < context_limit[combo]) {
+            if (active[combo] &&
+                attends(position, context_limit[combo], window, sink)) {
 #pragma unroll
                 for (int i = 0; i < kValuesPerThread; ++i) {
                     partial[combo] += query[combo][i] * key[i];
@@ -147,7 +199,8 @@ __global__ void gqa_prefill_tiled_f16_kernel(
         reduce_dot_products(partial, warp_sums, scores, attention_scale);
 
         if (tid < kPrefillCombos) {
-            if (active[tid] && position < context_limit[tid]) {
+            if (active[tid] &&
+                attends(position, context_limit[tid], window, sink)) {
                 const float old_max = running_max[tid];
                 const float new_max = fmaxf(old_max, scores[tid]);
                 const float old_scale = old_max == -INFINITY
@@ -206,7 +259,9 @@ __global__ void gqa_decode_split_f16_kernel(
     int head_dim,
     int context_len,
     int splits,
-    int positions_per_split) {
+    int positions_per_split,
+    int window,
+    int sink) {
     const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv =
         (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
@@ -215,8 +270,9 @@ __global__ void gqa_decode_split_f16_kernel(
     const int kv_head = grouped / groups_per_kv;
     const int group = grouped % groups_per_kv;
     const int first_head = kv_head * q_per_kv + group * kHeadsPerGroup;
+    const SparseRanges ranges = sparse_ranges(context_len, window, sink);
     const int start = split * positions_per_split;
-    const int end = min(context_len, start + positions_per_split);
+    const int end = min(ranges.total(), start + positions_per_split);
     if (kv_head >= kv_heads || start >= end) return;
 
     __shared__ float warp_sums[kHeadsPerGroup][kWarps];
@@ -250,7 +306,8 @@ __global__ void gqa_decode_split_f16_kernel(
 
     const float attention_scale = rsqrtf(static_cast<float>(head_dim));
     const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
-    for (int position = start; position < end; ++position) {
+    for (int logical = start; logical < end; ++logical) {
+        const int position = ranges.position(logical);
         const size_t kv_base = static_cast<size_t>(position) * kv_stride +
             static_cast<size_t>(kv_head) * head_dim;
         float key[kValuesPerThread];
@@ -367,9 +424,10 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, int seq_len,
     int q_heads, int kv_heads, int head_dim, int position_offset,
-    int max_context, void* stream) {
+    int max_context, int attention_window, int sink_tokens, void* stream) {
     if (!q || !k_cache || !v_cache || !output || seq_len <= 0 ||
         position_offset < 0 || position_offset + seq_len > max_context ||
+        attention_window < 0 || sink_tokens < 0 ||
         !valid_shape(q_heads, kv_heads, head_dim)) return false;
     const int groups_per_kv =
         (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
@@ -377,7 +435,8 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
                     static_cast<unsigned>((seq_len + kQueryRows - 1) / kQueryRows), 1);
     gqa_prefill_tiled_f16_kernel<<<grid, kThreads, 0,
         static_cast<cudaStream_t>(stream)>>>(q, k_cache, v_cache, output,
-        seq_len, q_heads, kv_heads, head_dim, position_offset);
+        seq_len, q_heads, kv_heads, head_dim, position_offset,
+        attention_window, sink_tokens);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -385,24 +444,27 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
     int q_heads, int kv_heads, int head_dim, int context_len,
-    int max_context, void* stream) {
+    int max_context, int attention_window, int sink_tokens, void* stream) {
     if (!q || !k_cache || !v_cache || !output || !partial_scratch ||
-        context_len < kDecodeMinContext || context_len > max_context ||
+        context_len > max_context ||
+        attention_window < 0 || sink_tokens < 0 ||
+        (attention_window <= 0 && context_len < kDecodeMinContext) ||
         !valid_shape(q_heads, kv_heads, head_dim)) return false;
+    const SparseRanges ranges =
+        sparse_ranges(context_len, attention_window, sink_tokens);
+    const int attended = ranges.total();
     int splits = std::min(kDecodeMaxSplits,
-        (context_len + kDecodeTargetPositions - 1) / kDecodeTargetPositions);
-    const int positions_per_split = (context_len + splits - 1) / splits;
-    const size_t partial_count = static_cast<size_t>(q_heads) * splits *
-        (head_dim + 2);
-    const size_t available_count = static_cast<size_t>(q_heads) * context_len;
-    if (partial_count > available_count) return false;
+        (attended + kDecodeTargetPositions - 1) / kDecodeTargetPositions);
+    splits = std::max(splits, 1);
+    const int positions_per_split = (attended + splits - 1) / splits;
     const int groups_per_kv =
         (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
     const int blocks = kv_heads * groups_per_kv * splits;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     gqa_decode_split_f16_kernel<<<blocks, kThreads, 0, cuda_stream>>>(
         q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim,
-        context_len, splits, positions_per_split);
+        context_len, splits, positions_per_split, attention_window,
+        sink_tokens);
     if (cudaGetLastError() != cudaSuccess) return false;
     gqa_decode_merge_f16_kernel<<<q_heads, kThreads, 0, cuda_stream>>>(
         partial_scratch, output, q_heads, head_dim, splits);

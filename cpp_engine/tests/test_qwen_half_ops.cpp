@@ -158,13 +158,14 @@ bool check_prefill_tiled(int seq_len, int head_dim, int position_offset) {
     for (uint16_t& item : k) item = to_half(dist(rng));
     for (uint16_t& item : v) item = to_half(dist(rng));
 
-    DeviceBuffer dq, dk, dv, dold, dnew;
+    DeviceBuffer dq, dk, dv, dold, dnew, dsparse;
     uint16_t* d_q = dq.allocate<uint16_t>(q.size());
     uint16_t* d_k = dk.allocate<uint16_t>(k.size());
     uint16_t* d_v = dv.allocate<uint16_t>(v.size());
     uint16_t* d_old = dold.allocate<uint16_t>(q.size());
     uint16_t* d_new = dnew.allocate<uint16_t>(q.size());
-    if (!d_q || !d_k || !d_v || !d_old || !d_new) return false;
+    uint16_t* d_sparse = dsparse.allocate<uint16_t>(q.size());
+    if (!d_q || !d_k || !d_v || !d_old || !d_new || !d_sparse) return false;
     if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
@@ -174,24 +175,31 @@ bool check_prefill_tiled(int seq_len, int head_dim, int position_offset) {
         !dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
             d_q, d_k, d_v, d_new, seq_len, q_heads, kv_heads, head_dim,
             position_offset, max_context) ||
+        !dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+            d_q, d_k, d_v, d_sparse, seq_len, q_heads, kv_heads, head_dim,
+            position_offset, max_context, seq_len + position_offset + 8, 0) ||
         cudaDeviceSynchronize() != cudaSuccess) {
         fail("FP16 tiled prefill launch");
         return true;
     }
     std::vector<uint16_t> old_output(q.size());
     std::vector<uint16_t> new_output(q.size());
+    std::vector<uint16_t> sparse_output(q.size());
     if (cudaMemcpy(old_output.data(), d_old, old_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(new_output.data(), d_new, new_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaMemcpy(new_output.data(), d_new, new_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(sparse_output.data(), d_sparse, sparse_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
         fail("FP16 tiled prefill copy");
         return true;
     }
     bool finite = true;
     const double worst = max_half_difference(old_output, new_output, &finite);
-    if (!finite || worst > 4.0e-3) {
+    bool sparse_finite = true;
+    const double sparse_worst = max_half_difference(old_output, sparse_output, &sparse_finite);
+    if (!finite || worst > 4.0e-3 || !sparse_finite || sparse_worst > 4.0e-3) {
         fail("FP16 tiled prefill numerical check");
     } else {
-        std::printf("  FP16 tiled prefill seq=%d dim=%d offset=%d worst=%.3e\n",
-                    seq_len, head_dim, position_offset, worst);
+        std::printf("  FP16 tiled prefill seq=%d dim=%d offset=%d worst=%.3e sparse_exact=%.3e\n",
+                    seq_len, head_dim, position_offset, worst, sparse_worst);
     }
     return true;
 }
@@ -208,17 +216,19 @@ bool check_decode_fused(int context_len, int head_dim) {
     for (uint16_t& item : k) item = to_half(dist(rng));
     for (uint16_t& item : v) item = to_half(dist(rng));
 
-    DeviceBuffer dq, dk, dv, dold, dnew, dscores, dpartial;
+    DeviceBuffer dq, dk, dv, dold, dnew, dscores, dpartial, dsparse;
     uint16_t* d_q = dq.allocate<uint16_t>(q.size());
     uint16_t* d_k = dk.allocate<uint16_t>(k.size());
-    uint16_t* d_v = dv.allocate<uint16_t>(v.size());
+    uint16_t* d_v = dv.allocate<uint16_t>(k.size());
     uint16_t* d_old = dold.allocate<uint16_t>(q.size());
     uint16_t* d_new = dnew.allocate<uint16_t>(q.size());
+    uint16_t* d_sparse = dsparse.allocate<uint16_t>(q.size());
     float* d_scores = dscores.allocate<float>(static_cast<size_t>(q_heads) * context_len);
     const int splits = std::min(64, (context_len + 2048 - 1) / 2048);
     float* d_partial = dpartial.allocate<float>(
         static_cast<size_t>(q_heads) * splits * (head_dim + 2));
-    if (!d_q || !d_k || !d_v || !d_old || !d_new || !d_scores || !d_partial) return false;
+    if (!d_q || !d_k || !d_v || !d_old || !d_new || !d_sparse ||
+        !d_scores || !d_partial) return false;
     if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
@@ -228,26 +238,33 @@ bool check_decode_fused(int context_len, int head_dim) {
         !dsv4::qwen_gqa_decode_attention_f16_fused_cuda(
             d_q, d_k, d_v, d_new, d_partial, q_heads, kv_heads, head_dim,
             context_len, context_len) ||
+        !dsv4::qwen_gqa_decode_attention_f16_fused_cuda(
+            d_q, d_k, d_v, d_sparse, d_partial, q_heads, kv_heads, head_dim,
+            context_len, context_len, context_len + 8, 0) ||
         cudaDeviceSynchronize() != cudaSuccess) {
         fail("FP16 fused decode launch");
         return true;
     }
     std::vector<uint16_t> old_output(q.size());
     std::vector<uint16_t> new_output(q.size());
+    std::vector<uint16_t> sparse_output(q.size());
     if (cudaMemcpy(old_output.data(), d_old, old_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(new_output.data(), d_new, new_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaMemcpy(new_output.data(), d_new, new_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(sparse_output.data(), d_sparse, sparse_output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
         fail("FP16 fused decode copy");
         return true;
     }
     bool finite = true;
     const double worst = max_half_difference(old_output, new_output, &finite);
-    if (!finite || worst > 4.0e-3) {
+    bool sparse_finite = true;
+    const double sparse_worst = max_half_difference(old_output, sparse_output, &sparse_finite);
+    if (!finite || worst > 4.0e-3 || !sparse_finite || sparse_worst > 4.0e-3) {
         std::printf("  FP16 fused decode context=%d dim=%d worst=%.3e finite=%d\n",
                     context_len, head_dim, worst, finite ? 1 : 0);
         fail("FP16 fused decode numerical check");
     } else {
-        std::printf("  FP16 fused decode context=%d dim=%d worst=%.3e\n",
-                    context_len, head_dim, worst);
+        std::printf("  FP16 fused decode context=%d dim=%d worst=%.3e sparse_exact=%.3e\n",
+                    context_len, head_dim, worst, sparse_worst);
     }
     return true;
 }

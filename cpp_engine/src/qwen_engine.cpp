@@ -562,6 +562,8 @@ struct QwenEngine::Impl {
             "FP16 partial RoPE");
 
         const bool fp8_cache = options.kv_cache_dtype == QwenKvCacheDType::Fp8;
+        const int attention_window = options.attention_window;
+        const int sink_tokens = options.attention_sink_tokens;
         if (fp8_cache) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
@@ -578,11 +580,20 @@ struct QwenEngine::Impl {
 
         if (rows == 1) {
             const int context_length = position_offset + 1;
-            const bool optimized_decode = !fp8_cache &&
-                qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") &&
-                context_length >= 4096;
-            const int optimized_splits = std::min(
-                64, (context_length + 2048 - 1) / 2048);
+            const bool optimized_attention =
+                qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
+                attention_window > 0;
+            const bool optimized_decode = !fp8_cache && optimized_attention &&
+                (context_length >= 4096 || attention_window > 0);
+            int attended_positions = context_length;
+            if (attention_window > 0) {
+                const int sink_count = std::min(sink_tokens, context_length);
+                const int window_start = std::max(
+                    context_length - attention_window, sink_count);
+                attended_positions = sink_count + (context_length - window_start);
+            }
+            const int optimized_splits = std::max(1, std::min(
+                64, (attended_positions + 2048 - 1) / 2048));
             const size_t score_elements = optimized_decode
                 ? static_cast<size_t>(q_heads) * optimized_splits *
                       static_cast<size_t>(head_dim + 2)
@@ -608,7 +619,7 @@ struct QwenEngine::Impl {
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
                     layer.full.v_cache.f16_data(), attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
-                    context_length, max_context),
+                    context_length, max_context, attention_window, sink_tokens),
                     "decode optimized FP16-cache GQA");
             } else {
                 require_launch(qwen_gqa_decode_attention_f16_cuda(
@@ -624,11 +635,13 @@ struct QwenEngine::Impl {
                 layer.full.v_scale.f16_data(), attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, kKvScaleBlock, position_offset,
                 max_context), "prefill FP8-cache GQA");
-        } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED")) {
+        } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
+                   attention_window > 0) {
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
                 q_norm.f16_data(), layer.full.k_cache.f16_data(),
                 layer.full.v_cache.f16_data(), attention.f16_data(), rows,
-                q_heads, kv_heads, head_dim, position_offset, max_context),
+                q_heads, kv_heads, head_dim, position_offset, max_context,
+                attention_window, sink_tokens),
                 "prefill optimized FP16-cache GQA");
         } else {
             require_launch(qwen_gqa_prefill_attention_f16_cuda(
@@ -833,6 +846,18 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
     if (options_.device < 0) options_.device = options_.tp_rank;
     if (options_.prefill_chunk_tokens <= 0) {
         throw std::runtime_error("Qwen prefill chunk size must be positive");
+    }
+    if (options_.attention_window < 0 || options_.attention_sink_tokens < 0) {
+        throw std::runtime_error("Qwen attention window and sink must not be negative");
+    }
+    if (options_.attention_window == 0 && options_.attention_sink_tokens != 0) {
+        throw std::runtime_error(
+            "Qwen attention sink requires a nonzero attention window");
+    }
+    if (options_.kv_cache_dtype == QwenKvCacheDType::Fp8 &&
+        options_.attention_window > 0) {
+        throw std::runtime_error(
+            "Qwen sparse attention currently requires an FP16 KV cache");
     }
     if (cudaSetDevice(options_.device) != cudaSuccess) {
         throw std::runtime_error("failed to set Qwen CUDA device");

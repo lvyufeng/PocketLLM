@@ -365,12 +365,14 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
     float* d_partial_scratch, int q_heads, int kv_heads, int head_dim,
-    int context_len, int max_context, void* stream = nullptr);
+    int context_len, int max_context, int attention_window = 0,
+    int sink_tokens = 0, void* stream = nullptr);
 bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
     int seq_len, int q_heads, int kv_heads, int head_dim,
-    int position_offset, int max_context, void* stream = nullptr);
+    int position_offset, int max_context, int attention_window = 0,
+    int sink_tokens = 0, void* stream = nullptr);
 bool qwen_gqa_decode_attention_fp8_cuda(
     const uint16_t* d_q_fp16, const uint8_t* d_k_cache_fp8,
     const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,

@@ -46,6 +46,8 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 - Chunked prefill (default 512 tokens) that retains only recurrent state, convolution tails, and full-attention KV cache between chunks.
 - FP16 KV cache by default, plus explicit opt-in FP8 E4M3 cache with per-token/KV-head FP16 scales over 64-channel blocks.
 - Decode-only fused FP8 gate/up projection plus SwiGLU.
+- Opt-in exact FP16 GQA kernels: tiled prefill and split-context fused decode with compact online-softmax partials. Enable with `DSV4_QWEN_GQA_OPTIMIZED=1`; the default remains the reference full-attention path.
+- Opt-in FP16 sink-plus-sliding-window attention through `--qwen-attention-window N` and optional `--qwen-attention-sink-tokens N`. This changes full-attention semantics and is not part of exact parity or default performance claims; FP8 cache is intentionally rejected for this mode.
 - TP4 NCCL reductions and global greedy top-1 selection.
 
 ## Validated performance
@@ -152,6 +154,10 @@ python scripts/bench_qwen_long_context.py \
 
 The harness persists one log per rank, records rank-local timing and memory fields, checks greedy-token parity across TP ranks, and writes `results.json` after every successful context length. FP16-versus-FP8 cache parity is a separate comparison of the generated sequences from two serial runs.
 
+For the exact optimized FP16 GQA path, set `DSV4_QWEN_GQA_OPTIMIZED=1` around the engine command or benchmark process. It keeps full attention, uses a tiled prefill kernel, and uses compact split-context fused decode partials only from context 4,096 onward. The direct CUDA gate covers causal offsets through 333 tokens, head dimensions 64/256, contexts 4,096/8,192/32,768, and a 262,144-token compact-partial boundary check. The optimized path preserves the default token sequence in the validated TP4 smoke runs.
+
+Sparse experiments require an explicit `--qwen-attention-window N` and may add `--qwen-attention-sink-tokens N`; `N=0` is exact full attention. The sparse kernel attends to the leading sink prefix plus the newest window positions without changing KV-cache storage. This is an experimental semantic change, not an exact full-attention optimization claim. Window values that cover the complete context are directly checked against exact output; long-context quality and throughput are not reported here until measured on clean GPUs.
+
 Audit only the rank-local weight mapping:
 
 ```bash
@@ -169,6 +175,7 @@ build/cpp_engine/dsv4_cpp_engine \
 - The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with the default FP16 KV cache; the separate FP8 boundary validation is reported only when complete.
 - The executable and internal C++ namespace retain DSV4 compatibility names.
 - CUDA Graph, a decode megakernel, and DSpark integration remain future work; none is included in the reported TPS.
+- The exact optimized GQA kernels and sparse attention mode are opt-in. The optimized kernels have direct numerical gates, but clean full-network TP4 A/B timing is still required before making either path the default or updating the long-context TPS table.
 
 ## Evidence and related notes
 
