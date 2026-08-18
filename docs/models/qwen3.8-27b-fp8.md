@@ -74,10 +74,11 @@ The following recent serial runs use the real checkpoint, deterministic natural-
 | FP16 | 131,072 | 33.80 tok/s | 3.58 tok/s | 62.50 MB | 2,048.0 / 0 MB | 9.97 GiB | PASS |
 | FP8 | 131,072 | 26.03 tok/s | 1.25 tok/s | 62.50 MB | 1,024.0 / 32.00 MB | 9.01 GiB | PASS |
 | FP16 | 262,140 | 17.88 tok/s | 1.92 tok/s | 65.50 MB | 4,096.0 / 0 MB | 11.91 GiB | PASS |
+| FP8 | 262,140 | 13.29 tok/s | 0.64 tok/s | 65.50 MB | 2,048.0 / 64.0 MB | 9.97 GiB | PASS |
 
-The 32K, 64K, and 128K FP16/FP8 runs produced identical four-token sequences for each cache-dtype pair. The FP16 262,140-token boundary run generated `[321, 5979, 13914, 13]` with `max_context=262144`, completed without OOM, and preserved TP-rank token parity. FP8 cache is retained as an explicit memory-saving option, not the default: on this RTX 2080 Ti setup, online cache dequantization materially reduces prefill and decode throughput. FP16 KV cache remains the precision/performance baseline.
+The 32K, 64K, and 128K FP16/FP8 runs produced identical four-token sequences for each cache-dtype pair. The FP16 and FP8 262,140-token boundary runs both generated `[321, 5979, 13914, 13]` with `max_context=262144`, completed without OOM, and preserved TP-rank token parity. FP8 cache is retained as an explicit memory-saving option, not the default: on this RTX 2080 Ti setup, online cache dequantization materially reduces prefill and decode throughput. At the 262K boundary it halves KV data from 4,096 MiB to 2,048 MiB and reduces the highest observed rank memory from 11.91 GiB to 9.97 GiB, while prefill falls from 17.88 to 13.29 tok/s and decode from 1.92 to 0.64 tok/s. FP16 KV cache remains the precision/performance baseline.
 
-These measurements establish that chunked prefill removes the previous prompt-length FP32 activation allocation and that a 262,140-token prompt plus four generated positions completes within the 22 GiB/rank budget using the FP16 cache. The FP8 262,140-token boundary run is still being evaluated separately.
+These measurements establish that chunked prefill removes the previous prompt-length FP32 activation allocation and that a 262,140-token prompt plus four generated positions completes within the 22 GiB/rank budget with either FP16 or FP8 KV cache. The FP8 boundary run took approximately 19,729.6 seconds wall time with the complete 64-layer runtime.
 
 ### Decode Context Parallelism feasibility on four GPUs
 
@@ -172,7 +173,7 @@ build/cpp_engine/dsv4_cpp_engine \
 - Text-only: no image/video preprocessing or vision-tower execution.
 - CLI/smoke integration only: Qwen is explicitly rejected by the current DSV4 OpenAI server path.
 - Greedy generation only in the current Qwen engine API.
-- The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with the default FP16 KV cache; the separate FP8 boundary validation is reported only when complete.
+- The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
 - The executable and internal C++ namespace retain DSV4 compatibility names.
 - CUDA Graph, a decode megakernel, and DSpark integration remain future work; none is included in the reported TPS.
 - The exact optimized GQA kernels and sparse attention mode are opt-in. The optimized kernels have direct numerical gates, but clean full-network TP4 A/B timing is still required before making either path the default or updating the long-context TPS table.
