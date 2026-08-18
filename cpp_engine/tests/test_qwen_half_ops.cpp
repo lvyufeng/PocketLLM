@@ -269,6 +269,87 @@ bool check_decode_fused(int context_len, int head_dim) {
     return true;
 }
 
+bool check_decode_window_reference() {
+    constexpr int q_heads = 6;
+    constexpr int kv_heads = 1;
+    constexpr int head_dim = 64;
+    constexpr int context_len = 8192;
+    constexpr int window = 257;
+    constexpr int sink = 3;
+    const int window_start = context_len - window;
+    std::mt19937 rng(18000);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint16_t> q(static_cast<size_t>(q_heads) * head_dim);
+    std::vector<uint16_t> k(static_cast<size_t>(context_len) * head_dim);
+    std::vector<uint16_t> v(k.size());
+    for (uint16_t& item : q) item = to_half(dist(rng));
+    for (uint16_t& item : k) item = to_half(dist(rng));
+    for (uint16_t& item : v) item = to_half(dist(rng));
+
+    const int attended = sink + (context_len - window_start);
+    DeviceBuffer dq, dk, dv, dout, dpartial;
+    uint16_t* d_q = dq.allocate<uint16_t>(q.size());
+    uint16_t* d_k = dk.allocate<uint16_t>(k.size());
+    uint16_t* d_v = dv.allocate<uint16_t>(v.size());
+    uint16_t* d_out = dout.allocate<uint16_t>(q.size());
+    float* d_partial = dpartial.allocate<float>(
+        static_cast<size_t>(q_heads) * (head_dim + 2));
+    if (!d_q || !d_k || !d_v || !d_out || !d_partial) return false;
+    if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        !dsv4::qwen_gqa_decode_attention_f16_fused_cuda(
+            d_q, d_k, d_v, d_out, d_partial, q_heads, kv_heads, head_dim,
+            context_len, context_len, window, sink) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 sparse decode launch");
+        return true;
+    }
+    std::vector<uint16_t> got(q.size());
+    if (cudaMemcpy(got.data(), d_out, got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("FP16 sparse decode copy");
+        return true;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    double worst = 0.0;
+    for (int head = 0; head < q_heads; ++head) {
+        std::vector<double> scores;
+        std::vector<int> positions;
+        for (int pos = 0; pos < context_len; ++pos) {
+            if (pos < sink || pos >= window_start) positions.push_back(pos);
+        }
+        scores.reserve(positions.size());
+        double maximum = -1.0e300;
+        for (int pos : positions) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += static_cast<double>(from_half(q[head * head_dim + d])) *
+                       from_half(k[pos * head_dim + d]);
+            }
+            scores.push_back(dot * scale);
+            maximum = std::max(maximum, scores.back());
+        }
+        double denominator = 0.0;
+        for (double& score : scores) {
+            score = std::exp(score - maximum);
+            denominator += score;
+        }
+        for (int d = 0; d < head_dim; ++d) {
+            double value = 0.0;
+            for (size_t i = 0; i < positions.size(); ++i) {
+                value += scores[i] * from_half(v[positions[i] * head_dim + d]);
+            }
+            const double expected = value / denominator;
+            worst = std::max(worst, std::fabs(
+                static_cast<double>(from_half(got[head * head_dim + d])) - expected));
+        }
+    }
+    if (worst > 4.0e-3) fail("FP16 sparse decode reference check");
+    else std::printf("  FP16 sparse decode context=%d sink=%d window=%d attended=%d worst=%.3e\n",
+                     context_len, sink, window, attended, worst);
+    return true;
+}
+
 bool check_decode_grid_256k() {
     constexpr int q_heads = 6;
     constexpr int kv_heads = 1;
@@ -434,6 +515,7 @@ int main() {
     check_decode_fused(4096, 64);
     check_decode_fused(8192, 256);
     check_decode_fused(32768, 64);
+    check_decode_window_reference();
     check_decode_grid_256k();
     check_fp8_cache();
     if (failures != 0) {
