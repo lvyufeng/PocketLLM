@@ -155,7 +155,17 @@ python scripts/bench_qwen_long_context.py \
 
 The harness persists one log per rank, records rank-local timing and memory fields, checks greedy-token parity across TP ranks, and writes `results.json` after every successful context length. FP16-versus-FP8 cache parity is a separate comparison of the generated sequences from two serial runs.
 
-For the exact optimized FP16 GQA path, set `DSV4_QWEN_GQA_OPTIMIZED=1` around the engine command or benchmark process. It keeps full attention, uses a tiled prefill kernel, and uses compact split-context fused decode partials only from context 4,096 onward. The direct CUDA gate covers causal offsets through 333 tokens, head dimensions 64/256, contexts 4,096/8,192/32,768, and a 262,144-token compact-partial boundary check. The optimized path preserves the default token sequence in the validated TP4 smoke runs.
+For the exact optimized FP16 GQA path, set `DSV4_QWEN_GQA_OPTIMIZED=1` around the engine command or benchmark process. It keeps full attention and uses a tiled prefill kernel. The engine uses compact split-context fused decode partials from context 16,384 onward on SM75; shorter contexts retain the reference score/value decode path because it is faster there. A clean TP4 run with 24 generated tokens measured the following opt-in results, with token parity at every length:
+
+| Prompt | Reference prefill / decode | Optimized prefill / decode |
+| ---: | ---: | ---: |
+| 512 | 295.46 / 31.06 tok/s | 294.84 / 30.98 tok/s |
+| 4,096 | 259.69 / 25.96 tok/s | 282.47 / 25.72 tok/s |
+| 8,192 | 211.02 / 21.19 tok/s | 253.70 / 21.01 tok/s |
+| 16,384 | 154.58 / 15.58 tok/s | 208.24 / 17.57 tok/s |
+| 32,768 | 97.75 / 10.66 tok/s | 159.52 / 17.36 tok/s |
+
+The 4,096 and 8,192 optimized rows use the tiled prefill but reference decode dispatch; the 16,384 row is the fused-decode crossover validation, and the 32,768 row shows the long-context gain. The direct CUDA gate covers causal offsets through 333 tokens, head dimensions 64/256, contexts 4,096/8,192/32,768, and a 262,144-token compact-partial boundary check. The optimized path preserves the default token sequence in the clean TP4 runs.
 
 Sparse experiments require an explicit `--qwen-attention-window N` and may add `--qwen-attention-sink-tokens N`; `N=0` is exact full attention. The sparse kernel attends to the leading sink prefix plus the newest window positions without changing KV-cache storage. This is an experimental semantic change, not an exact full-attention optimization claim. Window values that cover the complete context are directly checked against exact output; long-context quality and throughput are not reported here until measured on clean GPUs.
 

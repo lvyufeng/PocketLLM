@@ -583,8 +583,12 @@ struct QwenEngine::Impl {
             const bool optimized_attention =
                 qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
                 attention_window > 0;
+            // The compact split/merge decode path crosses over the reference
+            // score/value kernels only at long contexts on SM75.
+            constexpr int kOptimizedDecodeMinContext = 16384;
             const bool optimized_decode = !fp8_cache && optimized_attention &&
-                (context_length >= 4096 || attention_window > 0);
+                (context_length >= kOptimizedDecodeMinContext ||
+                 attention_window > 0);
             int attended_positions = context_length;
             if (attention_window > 0) {
                 const int sink_count = std::min(sink_tokens, context_length);
