@@ -145,7 +145,7 @@ for rank in 0 1 2 3; do
     --tp-world 4 --tp-rank $rank --device 0 \
     --nccl-id-path /tmp/pocketllm_qwen_nccl.id \
     --prompt "Explain tensor parallelism in one paragraph." \
-    --generate-token 123 --max-new-tokens 32 --resident-bench \
+    --generate-token 123 --max-new-tokens 32 --smoke-layers 0 --resident-bench \
     > /tmp/pocketllm_qwen_rank${rank}.log 2>&1 &
 done
 wait

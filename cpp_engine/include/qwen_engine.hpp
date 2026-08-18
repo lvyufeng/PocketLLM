@@ -9,10 +9,20 @@
 
 namespace dsv4 {
 
+enum class QwenKvCacheDType {
+    Fp16,
+    Fp8,
+};
+
+const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype);
+QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value);
+
 struct QwenEngineOptions {
     int tp_world = 1;
     int tp_rank = 0;
     int device = 0;
+    int prefill_chunk_tokens = 512;
+    QwenKvCacheDType kv_cache_dtype = QwenKvCacheDType::Fp16;
     std::string nccl_id_path;
 };
 
@@ -46,6 +56,9 @@ public:
     int position() const { return position_; }
     uint64_t resident_weight_bytes() const { return resident_weight_bytes_; }
     uint64_t resident_scale_bytes() const { return resident_scale_bytes_; }
+    uint64_t activation_workspace_peak_bytes() const;
+    uint64_t kv_cache_bytes() const;
+    uint64_t kv_cache_scale_bytes() const;
 
     void reset();
     void warmup_tp();

@@ -1,7 +1,7 @@
-// Minimal Qwen engine lifecycle test with a one-layer linear-attention fixture.
+// Minimal Qwen engine lifecycle test with linear-attention and full-GQA layers.
 // All weights are zero, so the greedy result is deterministic while the test
 // still exercises FP8 online projection, FP16 materialization, conv tail,
-// recurrent state, residual/MLP wiring, and the decode cache continuation.
+// recurrent state, residual/MLP wiring, and FP16/FP8 cache continuation.
 
 #include "cuda_ops.hpp"
 #include "qwen_config.hpp"
@@ -64,7 +64,7 @@ std::string config_json() {
     "vocab_size": 64,
     "hidden_size": 128,
     "intermediate_size": 128,
-    "num_hidden_layers": 1,
+    "num_hidden_layers": 2,
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
     "head_dim": 128,
@@ -78,7 +78,7 @@ std::string config_json() {
     "rms_norm_eps": 1e-6,
     "partial_rotary_factor": 0.25,
     "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
-    "layer_types": ["linear_attention"]
+    "layer_types": ["linear_attention", "full_attention"]
   }
 })JSON";
 }
@@ -96,32 +96,56 @@ std::vector<TensorSpec> specs() {
     const std::vector<uint64_t> vector4 = {4};
     const std::vector<uint64_t> mlp = {128, 128};
     const std::vector<uint64_t> mlp_scale = {1, 1};
-    const std::string p = "model.language_model.layers.0.";
-    return {
+    const std::vector<uint64_t> q_proj = {1024, 128};
+    const std::vector<uint64_t> q_proj_scale = {8, 1};
+    const std::string linear = "model.language_model.layers.0.";
+    const std::string full = "model.language_model.layers.1.";
+    std::vector<TensorSpec> out = {
         {"model.language_model.embed_tokens.weight", "BF16", vocab},
         {"model.language_model.norm.weight", "BF16", hidden},
         {"lm_head.weight", "BF16", vocab},
-        {p + "input_layernorm.weight", "BF16", hidden},
-        {p + "post_attention_layernorm.weight", "BF16", hidden},
-        {p + "linear_attn.in_proj_qkv.weight", "F8_E4M3", qkv},
-        {p + "linear_attn.in_proj_qkv.weight_scale_inv", "BF16", qkv_scale},
-        {p + "linear_attn.in_proj_z.weight", "F8_E4M3", value_proj},
-        {p + "linear_attn.in_proj_z.weight_scale_inv", "BF16", value_scale},
-        {p + "linear_attn.out_proj.weight", "F8_E4M3", out_proj},
-        {p + "linear_attn.out_proj.weight_scale_inv", "BF16", out_scale},
-        {p + "linear_attn.in_proj_a.weight", "BF16", heads},
-        {p + "linear_attn.in_proj_b.weight", "BF16", heads},
-        {p + "linear_attn.conv1d.weight", "BF16", {1536, 1, 4}},
-        {p + "linear_attn.A_log", "BF16", vector4},
-        {p + "linear_attn.dt_bias", "BF16", vector4},
-        {p + "linear_attn.norm.weight", "BF16", {128}},
-        {p + "mlp.gate_proj.weight", "F8_E4M3", mlp},
-        {p + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale},
-        {p + "mlp.up_proj.weight", "F8_E4M3", mlp},
-        {p + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale},
-        {p + "mlp.down_proj.weight", "F8_E4M3", mlp},
-        {p + "mlp.down_proj.weight_scale_inv", "BF16", mlp_scale},
+        {linear + "input_layernorm.weight", "BF16", hidden},
+        {linear + "post_attention_layernorm.weight", "BF16", hidden},
+        {linear + "linear_attn.in_proj_qkv.weight", "F8_E4M3", qkv},
+        {linear + "linear_attn.in_proj_qkv.weight_scale_inv", "BF16", qkv_scale},
+        {linear + "linear_attn.in_proj_z.weight", "F8_E4M3", value_proj},
+        {linear + "linear_attn.in_proj_z.weight_scale_inv", "BF16", value_scale},
+        {linear + "linear_attn.out_proj.weight", "F8_E4M3", out_proj},
+        {linear + "linear_attn.out_proj.weight_scale_inv", "BF16", out_scale},
+        {linear + "linear_attn.in_proj_a.weight", "BF16", heads},
+        {linear + "linear_attn.in_proj_b.weight", "BF16", heads},
+        {linear + "linear_attn.conv1d.weight", "BF16", {1536, 1, 4}},
+        {linear + "linear_attn.A_log", "BF16", vector4},
+        {linear + "linear_attn.dt_bias", "BF16", vector4},
+        {linear + "linear_attn.norm.weight", "BF16", hidden},
+        {linear + "mlp.gate_proj.weight", "F8_E4M3", mlp},
+        {linear + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale},
+        {linear + "mlp.up_proj.weight", "F8_E4M3", mlp},
+        {linear + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale},
+        {linear + "mlp.down_proj.weight", "F8_E4M3", mlp},
+        {linear + "mlp.down_proj.weight_scale_inv", "BF16", mlp_scale},
     };
+    out.insert(out.end(), {
+        {full + "input_layernorm.weight", "BF16", hidden},
+        {full + "post_attention_layernorm.weight", "BF16", hidden},
+        {full + "self_attn.q_proj.weight", "F8_E4M3", q_proj},
+        {full + "self_attn.q_proj.weight_scale_inv", "BF16", q_proj_scale},
+        {full + "self_attn.k_proj.weight", "F8_E4M3", value_proj},
+        {full + "self_attn.k_proj.weight_scale_inv", "BF16", value_scale},
+        {full + "self_attn.v_proj.weight", "F8_E4M3", value_proj},
+        {full + "self_attn.v_proj.weight_scale_inv", "BF16", value_scale},
+        {full + "self_attn.o_proj.weight", "F8_E4M3", out_proj},
+        {full + "self_attn.o_proj.weight_scale_inv", "BF16", out_scale},
+        {full + "self_attn.q_norm.weight", "BF16", hidden},
+        {full + "self_attn.k_norm.weight", "BF16", hidden},
+        {full + "mlp.gate_proj.weight", "F8_E4M3", mlp},
+        {full + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale},
+        {full + "mlp.up_proj.weight", "F8_E4M3", mlp},
+        {full + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale},
+        {full + "mlp.down_proj.weight", "F8_E4M3", mlp},
+        {full + "mlp.down_proj.weight_scale_inv", "BF16", mlp_scale},
+    });
+    return out;
 }
 
 bool write_fixture(const std::string& dir) {
@@ -171,6 +195,56 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void exercise_cache_lifecycle(const std::string& dir,
+                              dsv4::QwenKvCacheDType cache_dtype) {
+    dsv4::QwenEngineOptions options;
+    options.tp_world = 1;
+    options.tp_rank = 0;
+    options.device = 0;
+    options.prefill_chunk_tokens = 2;
+    options.kv_cache_dtype = cache_dtype;
+    dsv4::QwenEngine engine(dir, options, 2, 8);
+    require(engine.resident_weight_bytes() > 0, "resident Qwen weights missing");
+    require(engine.resident_scale_bytes() > 0, "resident Qwen scales missing");
+
+    const uint64_t fp16_cache_bytes = 2ULL * 8 * 4 * 128 * sizeof(uint16_t);
+    const uint64_t fp8_cache_bytes = 2ULL * 8 * 4 * 128;
+    const uint64_t fp8_scale_bytes =
+        2ULL * 8 * 4 * (128 / 64) * sizeof(uint16_t);
+    if (cache_dtype == dsv4::QwenKvCacheDType::Fp16) {
+        require(engine.kv_cache_bytes() == fp16_cache_bytes,
+                "FP16 KV cache accounting");
+        require(engine.kv_cache_scale_bytes() == 0,
+                "FP16 KV cache must not allocate scales");
+    } else {
+        require(engine.kv_cache_bytes() == fp8_cache_bytes,
+                "FP8 KV cache accounting");
+        require(engine.kv_cache_scale_bytes() == fp8_scale_bytes,
+                "FP8 KV scale accounting");
+    }
+
+    const dsv4::QwenForwardResult prefill = engine.prefill({1, 2, 3});
+    require(prefill.layers == 2 && prefill.dim == 128, "prefill metadata");
+    require(prefill.position == 3, "chunked prefill position");
+    require(prefill.top_token == 0, "zero fixture prefill greedy token");
+    require(engine.activation_workspace_peak_bytes() > 0, "activation accounting");
+
+    const dsv4::QwenForwardResult decoded = engine.decode_step(4);
+    require(decoded.position == 4, "decode position");
+    require(decoded.top_token == 0, "zero fixture decode greedy token");
+
+    engine.reset();
+    require(engine.position() == 0, "reset position");
+    const dsv4::QwenForwardResult second = engine.prefill({4, 5});
+    require(second.position == 2 && second.top_token == 0,
+            "reset and second chunked prefill");
+    std::cout << "  cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(cache_dtype)
+              << " kv_cache_bytes=" << engine.kv_cache_bytes()
+              << " kv_cache_scale_bytes=" << engine.kv_cache_scale_bytes()
+              << " activation_workspace_peak_bytes="
+              << engine.activation_workspace_peak_bytes() << "\n";
+}
+
 }  // namespace
 
 int main() {
@@ -181,30 +255,9 @@ int main() {
     try {
         const std::string dir = fixture_dir();
         require(write_fixture(dir), "could not create Qwen engine fixture");
-        dsv4::QwenEngineOptions options;
-        options.tp_world = 1;
-        options.tp_rank = 0;
-        options.device = 0;
-        dsv4::QwenEngine engine(dir, options, 1, 8);
-        require(engine.resident_weight_bytes() > 0, "resident Qwen weights missing");
-        require(engine.resident_scale_bytes() > 0, "resident Qwen scales missing");
-
-        const dsv4::QwenForwardResult prefill = engine.prefill({1, 2});
-        require(prefill.layers == 1 && prefill.dim == 128, "prefill metadata");
-        require(prefill.position == 2, "prefill position");
-        require(prefill.top_token == 0, "zero fixture prefill greedy token");
-
-        const dsv4::QwenForwardResult decoded = engine.decode_step(3);
-        require(decoded.position == 3, "decode position");
-        require(decoded.top_token == 0, "zero fixture decode greedy token");
-
-        engine.reset();
-        require(engine.position() == 0, "reset position");
-        const dsv4::QwenForwardResult second = engine.prefill({4});
-        require(second.position == 1 && second.top_token == 0, "reset and second prefill");
-        std::cout << "[PASS] test_qwen_engine layers=" << second.layers
-                  << " resident_weight_bytes=" << engine.resident_weight_bytes()
-                  << " resident_scale_bytes=" << engine.resident_scale_bytes() << "\n";
+        exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp16);
+        exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp8);
+        std::cout << "[PASS] test_qwen_engine layers=2\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cout << "[FAIL] test_qwen_engine " << ex.what() << "\n";

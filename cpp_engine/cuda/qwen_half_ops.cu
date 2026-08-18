@@ -1,0 +1,1155 @@
+#include "qwen_cuda_ops.hpp"
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstdint>
+
+namespace dsv4 {
+namespace {
+
+constexpr int kFp8WeightBlock = 128;
+constexpr int kThreads = 256;
+
+__device__ __forceinline__ float half_to_float(uint16_t bits) {
+    return __half2float(__ushort_as_half(bits));
+}
+
+__device__ __forceinline__ uint16_t float_to_half(float value) {
+    return __half_as_ushort(__float2half_rn(value));
+}
+
+__device__ __forceinline__ float sigmoid(float value) {
+    return 1.0f / (1.0f + expf(-value));
+}
+
+__device__ __forceinline__ float silu(float value) {
+    return value * sigmoid(value);
+}
+
+__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t code) {
+    const uint32_t sign = static_cast<uint32_t>(code & 0x80u) << 24;
+    const uint32_t exponent = (code >> 3) & 0xfu;
+    const uint32_t mantissa = code & 0x7u;
+    uint32_t bits;
+    if (exponent != 0) {
+        bits = sign | ((exponent + 120u) << 23) | (mantissa << 20);
+    } else if (mantissa >= 4) {
+        bits = sign | (120u << 23) | ((mantissa - 4u) << 21);
+    } else if (mantissa >= 2) {
+        bits = sign | (119u << 23) | ((mantissa - 2u) << 22);
+    } else {
+        bits = sign | (mantissa == 0 ? 0u : (118u << 23));
+    }
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ uint8_t float_to_fp8_e4m3(float value) {
+    const bool negative = signbit(value);
+    float magnitude = fminf(fabsf(value), 448.0f);
+    uint8_t code = 0;
+    if (magnitude >= 0.0009765625f) {
+        if (magnitude < 0.015625f) {
+            int mantissa = __float2int_rn(magnitude * 512.0f);
+            mantissa = max(1, mantissa);
+            code = static_cast<uint8_t>(min(8, mantissa));
+        } else {
+            int exponent = static_cast<int>(floorf(log2f(magnitude)));
+            exponent = max(-6, min(8, exponent));
+            const float base = exp2f(static_cast<float>(exponent));
+            int mantissa = __float2int_rn((magnitude / base - 1.0f) * 8.0f);
+            if (mantissa == 8) {
+                mantissa = 0;
+                ++exponent;
+            }
+            int biased = exponent + 7;
+            if (biased >= 15 && mantissa > 6) mantissa = 6;
+            biased = min(15, biased);
+            code = static_cast<uint8_t>((biased << 3) | mantissa);
+        }
+    }
+    return static_cast<uint8_t>(code | (negative ? 0x80u : 0u));
+}
+
+__device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    return scratch[0];
+}
+
+// One warp owns one output row. This is the decode path; all products and the
+// warp reduction remain FP32 while the activation vector and result are FP16.
+template <int kWarps>
+__global__ void fp8_matvec_f16_kernel(
+    const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
+    const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
+    int rows, int cols, int weight_stride, int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+    if (row >= rows) return;
+    const uint8_t* w = weight + static_cast<size_t>(row) * weight_stride;
+    const uint16_t* s = scale + static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    float sum = 0.0f;
+    for (int col = lane; col < cols; col += 32) {
+        sum += half_to_float(x[col]) * lut[w[col]] * half_to_float(s[col / kFp8WeightBlock]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) y[row] = float_to_half(sum);
+}
+
+template <int kWarps, int kRowsPerWarp>
+__global__ void fp8_swiglu_matvec_f16_kernel(
+    const uint16_t* __restrict__ x,
+    const uint8_t* __restrict__ gate_weight,
+    const uint16_t* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const uint16_t* __restrict__ up_scale,
+    uint16_t* __restrict__ y, int rows, int cols, int weight_stride,
+    int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row_base = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
+    if (row_base >= rows) return;
+    const int active = min(kRowsPerWarp, rows - row_base);
+    float gate_sum[kRowsPerWarp] = {};
+    float up_sum[kRowsPerWarp] = {};
+    for (int col = lane; col < cols; col += 32) {
+        const float xv = half_to_float(x[col]);
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            const int row = row_base + r;
+            const size_t wi = static_cast<size_t>(row) * weight_stride + col;
+            const size_t si = static_cast<size_t>(row / kFp8WeightBlock) * scale_stride +
+                              col / kFp8WeightBlock;
+            gate_sum[r] += xv * lut[gate_weight[wi]] * half_to_float(gate_scale[si]);
+            up_sum[r] += xv * lut[up_weight[wi]] * half_to_float(up_scale[si]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        if (r >= active) break;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_sum[r] += __shfl_xor_sync(0xffffffffu, gate_sum[r], offset);
+            up_sum[r] += __shfl_xor_sync(0xffffffffu, up_sum[r], offset);
+        }
+        if (lane == 0) y[row_base + r] = float_to_half(silu(gate_sum[r]) * up_sum[r]);
+    }
+}
+
+// A 64-token by 64-output tile reuses each online-decoded weight across all
+// tokens in the tile. Shared storage is FP32 so arithmetic association and
+// accumulation are independent of activation storage precision.
+template <int kK>
+__global__ void fp8_matmul_f16_tiled_kernel(
+    const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
+    const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, int scale_stride) {
+    constexpr int kM = 64;
+    constexpr int kN = 64;
+    __shared__ float xs[kM][kK + 1];
+    __shared__ float ws[kN][kK + 1];
+    __shared__ float lut[256];
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int i = tid; i < 256; i += blockDim.x) lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    __syncthreads();
+    const int batch_base = static_cast<int>(blockIdx.y) * kM;
+    const int row_base = static_cast<int>(blockIdx.x) * kN;
+    const int tm = tid >> 4;
+    const int tn = tid & 15;
+    float acc[4][4] = {};
+    for (int col_base = 0; col_base < cols; col_base += kK) {
+        for (int index = tid; index < kM * kK; index += blockDim.x) {
+            const int m = index / kK;
+            const int k = index % kK;
+            const int gb = batch_base + m;
+            const int gc = col_base + k;
+            xs[m][k] = gb < batch && gc < cols
+                ? half_to_float(x[static_cast<size_t>(gb) * x_stride + gc]) : 0.0f;
+        }
+        for (int index = tid; index < kN * kK; index += blockDim.x) {
+            const int n = index / kK;
+            const int k = index % kK;
+            const int gr = row_base + n;
+            const int gc = col_base + k;
+            float value = 0.0f;
+            if (gr < rows && gc < cols) {
+                value = lut[weight[static_cast<size_t>(gr) * weight_stride + gc]] *
+                        half_to_float(scale[static_cast<size_t>(gr / kFp8WeightBlock) *
+                                                  scale_stride + gc / kFp8WeightBlock]);
+            }
+            ws[n][k] = value;
+        }
+        __syncthreads();
+        float tile[4][4] = {};
+#pragma unroll
+        for (int k = 0; k < kK; ++k) {
+            float a[4];
+            float b[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                a[i] = xs[tm + i * 16][k];
+                b[i] = ws[tn + i * 16][k];
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) tile[i][j] += a[i] * b[j];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] += tile[i][j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int gb = batch_base + tm + i * 16;
+        if (gb >= batch) continue;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int gr = row_base + tn + j * 16;
+            if (gr < rows) y[static_cast<size_t>(gb) * y_stride + gr] = float_to_half(acc[i][j]);
+        }
+    }
+}
+
+template <bool kFloatOutput>
+__global__ void fp16_matmul_f16_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ weight,
+    void* __restrict__ output, int batch, int rows, int cols,
+    int x_stride, int y_stride, int weight_stride) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int sample = static_cast<int>(blockIdx.y);
+    if (row >= rows || sample >= batch) return;
+    const uint16_t* xr = x + static_cast<size_t>(sample) * x_stride;
+    const uint16_t* wr = weight + static_cast<size_t>(row) * weight_stride;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        sum += half_to_float(xr[col]) * half_to_float(wr[col]);
+    }
+    extern __shared__ float scratch[];
+    const float total = block_reduce_sum(sum, scratch);
+    if (threadIdx.x == 0) {
+        const size_t index = static_cast<size_t>(sample) * y_stride + row;
+        if constexpr (kFloatOutput) static_cast<float*>(output)[index] = total;
+        else static_cast<uint16_t*>(output)[index] = float_to_half(total);
+    }
+}
+
+__global__ void embedding_f16_kernel(const uint16_t* table, const int* tokens,
+                                     uint16_t* output, int count, int cols,
+                                     int row_start, int row_count) {
+    const int token_index = static_cast<int>(blockIdx.x);
+    if (token_index >= count) return;
+    const int token = tokens[token_index];
+    uint16_t* dst = output + static_cast<size_t>(token_index) * cols;
+    if (token < row_start || token >= row_start + row_count) {
+        for (int col = threadIdx.x; col < cols; col += blockDim.x) dst[col] = 0;
+        return;
+    }
+    const uint16_t* src = table + static_cast<size_t>(token - row_start) * cols;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) dst[col] = src[col];
+}
+
+__global__ void rmsnorm_f16_kernel(const uint16_t* x, const uint16_t* gamma,
+                                   uint16_t* y, int rows, int cols, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const uint16_t* src = x + static_cast<size_t>(row) * cols;
+    uint16_t* dst = y + static_cast<size_t>(row) * cols;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = half_to_float(src[col]);
+        sum += value * value;
+    }
+    extern __shared__ float scratch[];
+    const float inv = rsqrtf(block_reduce_sum(sum, scratch) / static_cast<float>(cols) + eps);
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        dst[col] = float_to_half(half_to_float(src[col]) * inv * (1.0f + half_to_float(gamma[col])));
+    }
+}
+
+__global__ void gated_rmsnorm_f16_kernel(
+    const uint16_t* x, const uint16_t* gamma, const uint16_t* gate,
+    uint16_t* y, int rows, int cols, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const uint16_t* src = x + static_cast<size_t>(row) * cols;
+    const uint16_t* gr = gate + static_cast<size_t>(row) * cols;
+    uint16_t* dst = y + static_cast<size_t>(row) * cols;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = half_to_float(src[col]);
+        sum += value * value;
+    }
+    extern __shared__ float scratch[];
+    const float inv = rsqrtf(block_reduce_sum(sum, scratch) / static_cast<float>(cols) + eps);
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        const float value = half_to_float(src[col]) * inv * half_to_float(gamma[col]);
+        dst[col] = float_to_half(value * silu(half_to_float(gr[col])));
+    }
+}
+
+__global__ void split_packed_qkv_f16_kernel(
+    const uint16_t* packed, uint16_t* q, uint16_t* k, uint16_t* v,
+    int rows, int key_dim, int value_dim) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int packed_dim = 2 * key_dim + value_dim;
+    const int total = rows * packed_dim;
+    if (index >= total) return;
+    const int row = index / packed_dim;
+    const int col = index % packed_dim;
+    if (col < key_dim) q[static_cast<size_t>(row) * key_dim + col] = packed[index];
+    else if (col < 2 * key_dim) k[static_cast<size_t>(row) * key_dim + col - key_dim] = packed[index];
+    else v[static_cast<size_t>(row) * value_dim + col - 2 * key_dim] = packed[index];
+}
+
+__global__ void conv_silu_f16_kernel(
+    const uint16_t* x, const uint16_t* weight, uint16_t* tail,
+    uint16_t* y, int seq_len, int channels, int kernel, bool update_tail) {
+    const int channel = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    const uint16_t* w = weight + static_cast<size_t>(channel) * kernel;
+    for (int t = 0; t < seq_len; ++t) {
+        float value = 0.0f;
+        for (int j = 0; j < kernel; ++j) {
+            const int source_t = t - (kernel - 1) + j;
+            float input = 0.0f;
+            if (source_t >= 0) input = half_to_float(x[static_cast<size_t>(source_t) * channels + channel]);
+            else if (tail != nullptr) input = half_to_float(tail[static_cast<size_t>(source_t + kernel - 1) * channels + channel]);
+            value += input * half_to_float(w[j]);
+        }
+        y[static_cast<size_t>(t) * channels + channel] = float_to_half(silu(value));
+    }
+    if (update_tail && tail != nullptr && kernel > 1) {
+        constexpr int kMaxTail = 8;
+        const int tail_len = kernel - 1;
+        uint16_t next[kMaxTail];
+        for (int j = 0; j < tail_len; ++j) {
+            const int source_t = seq_len - tail_len + j;
+            next[j] = source_t >= 0
+                ? x[static_cast<size_t>(source_t) * channels + channel]
+                : tail[static_cast<size_t>(source_t + tail_len) * channels + channel];
+        }
+        for (int j = 0; j < tail_len; ++j) tail[static_cast<size_t>(j) * channels + channel] = next[j];
+    }
+}
+
+__global__ void linear_gates_f16_kernel(
+    const uint16_t* a, const uint16_t* b, const uint16_t* a_log,
+    const uint16_t* dt_bias, uint16_t* g, uint16_t* beta,
+    int rows, int heads) {
+    const int head = static_cast<int>(blockIdx.x);
+    if (head >= heads) return;
+    const float al = half_to_float(a_log[head]);
+    const float dt = half_to_float(dt_bias[head]);
+    for (int row = threadIdx.x; row < rows; row += blockDim.x) {
+        const size_t index = static_cast<size_t>(row) * heads + head;
+        const float av = half_to_float(a[index]);
+        const float bv = half_to_float(b[index]);
+        g[index] = float_to_half(-expf(al) * log1pf(expf(av + dt)));
+        beta[index] = float_to_half(sigmoid(bv));
+    }
+}
+
+__global__ void gated_delta_step_f16_kernel(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int value = static_cast<int>(threadIdx.x);
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    extern __shared__ float smem[];
+    float* k_shared = smem;
+    float* q_shared = smem + key_dim;
+    float* reduce = smem + 2 * key_dim;
+    const int tid = static_cast<int>(threadIdx.x);
+    float q_partial = 0.0f;
+    float k_partial = 0.0f;
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        const float qv = half_to_float(q[static_cast<size_t>(key_head) * key_dim + i]);
+        const float kv = half_to_float(k[static_cast<size_t>(key_head) * key_dim + i]);
+        q_partial += qv * qv;
+        k_partial += kv * kv;
+    }
+    reduce[tid] = q_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float q_inv = rsqrtf(reduce[0] + 1.0e-6f);
+    __syncthreads();
+    reduce[tid] = k_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float k_inv = rsqrtf(reduce[0] + 1.0e-6f);
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        q_shared[i] = half_to_float(q[static_cast<size_t>(key_head) * key_dim + i]) * q_inv;
+        k_shared[i] = half_to_float(k[static_cast<size_t>(key_head) * key_dim + i]) * k_inv;
+    }
+    __syncthreads();
+    if (head >= heads || value >= value_dim) return;
+    float* sh = state + static_cast<size_t>(head) * key_dim * value_dim;
+    const float decay = expf(half_to_float(g[head]));
+    const float b = half_to_float(beta[head]);
+    float kv_mem = 0.0f;
+    for (int i = 0; i < key_dim; ++i) {
+        const size_t index = static_cast<size_t>(i) * value_dim + value;
+        const float cell = sh[index] * decay;
+        sh[index] = cell;
+        kv_mem += cell * k_shared[i];
+    }
+    const float delta = (half_to_float(v[static_cast<size_t>(head) * value_dim + value]) - kv_mem) * b;
+    float result = 0.0f;
+    for (int i = 0; i < key_dim; ++i) {
+        const size_t index = static_cast<size_t>(i) * value_dim + value;
+        const float cell = sh[index] + k_shared[i] * delta;
+        sh[index] = cell;
+        result += cell * q_shared[i];
+    }
+    output[static_cast<size_t>(head) * value_dim + value] = float_to_half(result * q_scale);
+}
+
+template <int kKeyDim>
+__global__ void gated_delta_sequence_f16_kernel(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads,
+    int value_dim, float q_scale) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int value = static_cast<int>(threadIdx.x);
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    const int key_stride = key_heads * kKeyDim;
+    __shared__ float q_shared[kKeyDim];
+    __shared__ float k_shared[kKeyDim];
+    extern __shared__ float reduce[];
+    float* sh = state + static_cast<size_t>(head) * kKeyDim * value_dim;
+    float st[kKeyDim];
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) st[i] = sh[static_cast<size_t>(i) * value_dim + value];
+    for (int token = 0; token < rows; ++token) {
+        const uint16_t* qr = q + static_cast<size_t>(token) * key_stride + static_cast<size_t>(key_head) * kKeyDim;
+        const uint16_t* kr = k + static_cast<size_t>(token) * key_stride + static_cast<size_t>(key_head) * kKeyDim;
+        float q_partial = 0.0f;
+        float k_partial = 0.0f;
+        for (int i = value; i < kKeyDim; i += blockDim.x) {
+            const float qv = half_to_float(qr[i]);
+            const float kv = half_to_float(kr[i]);
+            q_partial += qv * qv;
+            k_partial += kv * kv;
+        }
+        reduce[value] = q_partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (value < stride) reduce[value] += reduce[value + stride];
+            __syncthreads();
+        }
+        const float q_inv = rsqrtf(reduce[0] + 1.0e-6f);
+        __syncthreads();
+        reduce[value] = k_partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (value < stride) reduce[value] += reduce[value + stride];
+            __syncthreads();
+        }
+        const float k_inv = rsqrtf(reduce[0] + 1.0e-6f);
+        for (int i = value; i < kKeyDim; i += blockDim.x) {
+            q_shared[i] = half_to_float(qr[i]) * q_inv;
+            k_shared[i] = half_to_float(kr[i]) * k_inv;
+        }
+        __syncthreads();
+        const size_t gate_index = static_cast<size_t>(token) * heads + head;
+        const float decay = expf(half_to_float(g[gate_index]));
+        const float b = half_to_float(beta[gate_index]);
+        float kv_mem = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] *= decay;
+            kv_mem += st[i] * k_shared[i];
+        }
+        const size_t value_index = static_cast<size_t>(token) * heads * value_dim +
+                                   static_cast<size_t>(head) * value_dim + value;
+        const float delta = (half_to_float(v[value_index]) - kv_mem) * b;
+        float result = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] += k_shared[i] * delta;
+            result += st[i] * q_shared[i];
+        }
+        output[value_index] = float_to_half(result * q_scale);
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) sh[static_cast<size_t>(i) * value_dim + value] = st[i];
+}
+
+__device__ __forceinline__ float rope_inv_freq(int index, int rotary_dim, float theta) {
+    return powf(theta, -2.0f * static_cast<float>(index) / static_cast<float>(rotary_dim));
+}
+
+__global__ void partial_rope_f16_kernel(
+    uint16_t* q, uint16_t* k, int start_position, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim) {
+    const int half = rotary_dim / 2;
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = static_cast<int>(blockIdx.y);
+    if (index >= half || row >= rows) return;
+    const float angle = static_cast<float>(start_position + row) * rope_inv_freq(index, rotary_dim, theta);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    uint16_t* qr = q + static_cast<size_t>(row) * q_heads * head_dim;
+    uint16_t* kr = k + static_cast<size_t>(row) * kv_heads * head_dim;
+    for (int head = 0; head < q_heads; ++head) {
+        uint16_t* line = qr + static_cast<size_t>(head) * head_dim;
+        const float a = half_to_float(line[index]);
+        const float b = half_to_float(line[index + half]);
+        line[index] = float_to_half(a * c - b * s);
+        line[index + half] = float_to_half(b * c + a * s);
+    }
+    for (int head = 0; head < kv_heads; ++head) {
+        uint16_t* line = kr + static_cast<size_t>(head) * head_dim;
+        const float a = half_to_float(line[index]);
+        const float b = half_to_float(line[index + half]);
+        line[index] = float_to_half(a * c - b * s);
+        line[index + half] = float_to_half(b * c + a * s);
+    }
+}
+
+__global__ void split_q_gate_f16_kernel(
+    const uint16_t* source, uint16_t* q, uint16_t* gate,
+    int rows, int q_heads, int head_dim) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = rows * q_heads * head_dim;
+    if (index >= total) return;
+    const int d = index % head_dim;
+    const int head = (index / head_dim) % q_heads;
+    const int row = index / (q_heads * head_dim);
+    const size_t base = (static_cast<size_t>(row) * q_heads + head) * head_dim * 2;
+    q[index] = source[base + d];
+    gate[index] = source[base + head_dim + d];
+}
+
+__global__ void sigmoid_mul_f16_kernel(const uint16_t* x, const uint16_t* gate,
+                                       uint16_t* y, int count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) y[index] = float_to_half(half_to_float(x[index]) * sigmoid(half_to_float(gate[index])));
+}
+
+__global__ void add_f16_kernel(uint16_t* y, const uint16_t* x, int count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) y[index] = float_to_half(half_to_float(y[index]) + half_to_float(x[index]));
+}
+
+__global__ void silu_mul_f16_kernel(const uint16_t* gate, const uint16_t* up,
+                                    uint16_t* y, int count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) y[index] = float_to_half(silu(half_to_float(gate[index])) * half_to_float(up[index]));
+}
+
+__global__ void append_kv_f16_kernel(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, int total,
+    int kv_heads, int head_dim, int start_pos, int max_context) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total) return;
+    const int token = index / (kv_heads * head_dim);
+    const int within = index % (kv_heads * head_dim);
+    const int destination_token = start_pos + token;
+    if (destination_token >= max_context) return;
+    const size_t destination = static_cast<size_t>(destination_token) * kv_heads * head_dim + within;
+    k_cache[destination] = k_rows[index];
+    v_cache[destination] = v_rows[index];
+}
+
+__global__ void append_kv_fp8_kernel(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint8_t* k_cache, uint8_t* v_cache,
+    uint16_t* k_scale, uint16_t* v_scale,
+    int seq_len, int kv_heads, int head_dim, int scale_block,
+    int start_pos, int max_context) {
+    const int block_index = static_cast<int>(blockIdx.x);
+    const int blocks_per_head = head_dim / scale_block;
+    const int token = block_index / (kv_heads * blocks_per_head);
+    const int within = block_index % (kv_heads * blocks_per_head);
+    const int head = within / blocks_per_head;
+    const int channel_block = within % blocks_per_head;
+    if (token >= seq_len || start_pos + token >= max_context) return;
+    const int source_base = (token * kv_heads + head) * head_dim + channel_block * scale_block;
+    float k_max = 0.0f;
+    float v_max = 0.0f;
+    for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
+        k_max = fmaxf(k_max, fabsf(half_to_float(k_rows[source_base + d])));
+        v_max = fmaxf(v_max, fabsf(half_to_float(v_rows[source_base + d])));
+    }
+    __shared__ float reduce_k[128];
+    __shared__ float reduce_v[128];
+    reduce_k[threadIdx.x] = k_max;
+    reduce_v[threadIdx.x] = v_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce_k[threadIdx.x] = fmaxf(reduce_k[threadIdx.x], reduce_k[threadIdx.x + stride]);
+            reduce_v[threadIdx.x] = fmaxf(reduce_v[threadIdx.x], reduce_v[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float ks = reduce_k[0] > 0.0f ? reduce_k[0] / 448.0f : 1.0f;
+    const float vs = reduce_v[0] > 0.0f ? reduce_v[0] / 448.0f : 1.0f;
+    const int destination_token = start_pos + token;
+    const size_t scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) * blocks_per_head + channel_block;
+    if (threadIdx.x == 0) {
+        k_scale[scale_index] = float_to_half(ks);
+        v_scale[scale_index] = float_to_half(vs);
+    }
+    const size_t destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) * head_dim + channel_block * scale_block;
+    for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
+        k_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(k_rows[source_base + d]) / ks);
+        v_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(v_rows[source_base + d]) / vs);
+    }
+}
+
+template <bool kFp8Cache>
+__device__ __forceinline__ float cache_value(
+    const void* cache, const uint16_t* scale, size_t value_index,
+    size_t scale_index) {
+    if constexpr (kFp8Cache) {
+        return fp8_e4m3_to_float(static_cast<const uint8_t*>(cache)[value_index]) *
+               half_to_float(scale[scale_index]);
+    }
+    return half_to_float(static_cast<const uint16_t*>(cache)[value_index]);
+}
+
+template <bool kFp8Cache, int kThreadsPerBlock>
+__global__ void gqa_scores_f16_kernel(
+    const uint16_t* q, const void* k_cache, const uint16_t* k_scale,
+    float* scores, int q_heads, int kv_heads, int head_dim,
+    int scale_block, int context_len) {
+    const uint64_t work = static_cast<uint64_t>(blockIdx.x);
+    const int head = static_cast<int>(work / static_cast<uint64_t>(context_len));
+    const int position = static_cast<int>(work % static_cast<uint64_t>(context_len));
+    if (head >= q_heads) return;
+    const int kv_head = head / (q_heads / kv_heads);
+    const uint16_t* qr = q + static_cast<size_t>(head) * head_dim;
+    const int blocks_per_head = head_dim / scale_block;
+    float partial = 0.0f;
+    for (int d = threadIdx.x; d < head_dim; d += kThreadsPerBlock) {
+        const size_t value_index = (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim + d;
+        const size_t scale_index = (static_cast<size_t>(position) * kv_heads + kv_head) * blocks_per_head + d / scale_block;
+        partial += half_to_float(qr[d]) * cache_value<kFp8Cache>(k_cache, k_scale, value_index, scale_index);
+    }
+    extern __shared__ float reduce[];
+    reduce[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = kThreadsPerBlock / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scores[static_cast<size_t>(head) * context_len + position] =
+            reduce[0] * rsqrtf(static_cast<float>(head_dim));
+    }
+}
+
+template <int kThreadsPerBlock>
+__global__ void softmax_scores_kernel(float* scores, int q_heads, int context_len) {
+    const int head = static_cast<int>(blockIdx.x);
+    if (head >= q_heads) return;
+    float* line = scores + static_cast<size_t>(head) * context_len;
+    __shared__ float reduce[kThreadsPerBlock];
+    float local_max = -INFINITY;
+    for (int pos = threadIdx.x; pos < context_len; pos += kThreadsPerBlock) local_max = fmaxf(local_max, line[pos]);
+    reduce[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = kThreadsPerBlock / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float maximum = reduce[0];
+    float sum = 0.0f;
+    for (int pos = threadIdx.x; pos < context_len; pos += kThreadsPerBlock) {
+        line[pos] = expf(line[pos] - maximum);
+        sum += line[pos];
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = kThreadsPerBlock / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (int pos = threadIdx.x; pos < context_len; pos += kThreadsPerBlock) line[pos] *= inverse;
+}
+
+template <bool kFp8Cache, int kThreadsPerBlock, int kHeadsPerGroup>
+__global__ void gqa_values_f16_kernel(
+    const float* probabilities, const void* v_cache, const uint16_t* v_scale,
+    uint16_t* output, int q_heads, int kv_heads, int head_dim,
+    int scale_block, int context_len) {
+    const int q_per_kv = q_heads / kv_heads;
+    const int groups_per_kv = (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    const int kv_head = static_cast<int>(blockIdx.x) / groups_per_kv;
+    const int group = static_cast<int>(blockIdx.x) % groups_per_kv;
+    const int first_head = kv_head * q_per_kv + group * kHeadsPerGroup;
+    const int d = static_cast<int>(blockIdx.y) * kThreadsPerBlock + threadIdx.x;
+    if (kv_head >= kv_heads || first_head >= (kv_head + 1) * q_per_kv || d >= head_dim) return;
+    const int blocks_per_head = head_dim / scale_block;
+    float acc[kHeadsPerGroup] = {};
+    for (int pos = 0; pos < context_len; ++pos) {
+        const size_t value_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim + d;
+        const size_t scale_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * blocks_per_head + d / scale_block;
+        const float value = cache_value<kFp8Cache>(v_cache, v_scale, value_index, scale_index);
+#pragma unroll
+        for (int i = 0; i < kHeadsPerGroup; ++i) {
+            const int head = first_head + i;
+            if (head < (kv_head + 1) * q_per_kv) acc[i] += probabilities[static_cast<size_t>(head) * context_len + pos] * value;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < kHeadsPerGroup; ++i) {
+        const int head = first_head + i;
+        if (head < (kv_head + 1) * q_per_kv) output[static_cast<size_t>(head) * head_dim + d] = float_to_half(acc[i]);
+    }
+}
+
+template <bool kFp8Cache, int kThreadsPerBlock>
+__global__ void gqa_prefill_f16_kernel(
+    const uint16_t* q_rows, const void* k_cache, const void* v_cache,
+    const uint16_t* k_scale, const uint16_t* v_scale,
+    uint16_t* output, int seq_len, int q_heads, int kv_heads,
+    int head_dim, int scale_block, int position_offset) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    if (head >= q_heads || token >= seq_len) return;
+    const int kv_head = head / (q_heads / kv_heads);
+    const int context_len = position_offset + token + 1;
+    const size_t query_offset = (static_cast<size_t>(token) * q_heads + head) * head_dim;
+    const uint16_t* query = q_rows + query_offset;
+    extern __shared__ float smem[];
+    float* q_shared = smem;
+    float* reduce = smem + head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += kThreadsPerBlock) q_shared[d] = half_to_float(query[d]);
+    __syncthreads();
+    constexpr int kMaxSlice = 8;
+    float acc[kMaxSlice] = {};
+    const int slice = (head_dim + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    const int blocks_per_head = head_dim / scale_block;
+    for (int pos = 0; pos < context_len; ++pos) {
+        float partial = 0.0f;
+        for (int d = threadIdx.x; d < head_dim; d += kThreadsPerBlock) {
+            const size_t value_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim + d;
+            const size_t scale_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * blocks_per_head + d / scale_block;
+            partial += q_shared[d] * cache_value<kFp8Cache>(k_cache, k_scale, value_index, scale_index);
+        }
+        reduce[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = kThreadsPerBlock / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float score = reduce[0] * rsqrtf(static_cast<float>(head_dim));
+        __syncthreads();
+        const float new_max = fmaxf(running_max, score);
+        const float rescale = running_max == -INFINITY ? 0.0f : expf(running_max - new_max);
+        const float probability = expf(score - new_max);
+        running_sum = running_sum * rescale + probability;
+        running_max = new_max;
+        for (int i = 0, d = threadIdx.x; i < slice && d < head_dim; ++i, d += kThreadsPerBlock) {
+            const size_t value_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim + d;
+            const size_t scale_index = (static_cast<size_t>(pos) * kv_heads + kv_head) * blocks_per_head + d / scale_block;
+            acc[i] = acc[i] * rescale + probability * cache_value<kFp8Cache>(v_cache, v_scale, value_index, scale_index);
+        }
+    }
+    const float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    for (int i = 0, d = threadIdx.x; i < slice && d < head_dim; ++i, d += kThreadsPerBlock) {
+        output[query_offset + d] = float_to_half(acc[i] * inverse);
+    }
+}
+
+bool valid_attention(int q_heads, int kv_heads, int head_dim,
+                     int context_len, int max_context, int scale_block) {
+    return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 &&
+           head_dim > 0 && context_len > 0 && context_len <= max_context &&
+           scale_block > 0 && head_dim % scale_block == 0;
+}
+
+template <bool kFp8Cache>
+bool launch_decode_attention(
+    const uint16_t* q, const void* k_cache, const void* v_cache,
+    const uint16_t* k_scale, const uint16_t* v_scale,
+    uint16_t* output, float* scores, int q_heads, int kv_heads,
+    int head_dim, int scale_block, int context_len, int max_context,
+    cudaStream_t stream) {
+    if (!q || !k_cache || !v_cache || !output || !scores ||
+        !valid_attention(q_heads, kv_heads, head_dim, context_len, max_context, scale_block)) return false;
+    if constexpr (kFp8Cache) {
+        if (!k_scale || !v_scale) return false;
+    }
+    constexpr int kAttentionThreads = 128;
+    const uint64_t score_blocks = static_cast<uint64_t>(q_heads) * context_len;
+    if (score_blocks > static_cast<uint64_t>(UINT32_MAX)) return false;
+    dim3 score_grid(static_cast<unsigned>(score_blocks), 1, 1);
+    gqa_scores_f16_kernel<kFp8Cache, kAttentionThreads><<<score_grid, kAttentionThreads,
+        kAttentionThreads * sizeof(float), stream>>>(q, k_cache, k_scale, scores,
+        q_heads, kv_heads, head_dim, scale_block, context_len);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    softmax_scores_kernel<kAttentionThreads><<<q_heads, kAttentionThreads, 0, stream>>>(scores, q_heads, context_len);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    constexpr int kHeadsPerGroup = 3;
+    const int groups_per_kv = ((q_heads / kv_heads) + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    dim3 value_grid(static_cast<unsigned>(kv_heads * groups_per_kv),
+                    static_cast<unsigned>((head_dim + kAttentionThreads - 1) / kAttentionThreads), 1);
+    gqa_values_f16_kernel<kFp8Cache, kAttentionThreads, kHeadsPerGroup>
+        <<<value_grid, kAttentionThreads, 0, stream>>>(scores, v_cache, v_scale,
+        output, q_heads, kv_heads, head_dim, scale_block, context_len);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <bool kFp8Cache>
+bool launch_prefill_attention(
+    const uint16_t* q, const void* k_cache, const void* v_cache,
+    const uint16_t* k_scale, const uint16_t* v_scale,
+    uint16_t* output, int seq_len, int q_heads, int kv_heads,
+    int head_dim, int scale_block, int position_offset, int max_context,
+    cudaStream_t stream) {
+    if (!q || !k_cache || !v_cache || !output || seq_len <= 0 || position_offset < 0 ||
+        position_offset + seq_len > max_context ||
+        !valid_attention(q_heads, kv_heads, head_dim, position_offset + seq_len,
+                         max_context, scale_block)) return false;
+    if constexpr (kFp8Cache) {
+        if (!k_scale || !v_scale) return false;
+    }
+    constexpr int kAttentionThreads = 128;
+    if ((head_dim + kAttentionThreads - 1) / kAttentionThreads > 8) return false;
+    dim3 grid(static_cast<unsigned>(q_heads), static_cast<unsigned>(seq_len), 1);
+    const size_t shared = (static_cast<size_t>(head_dim) + kAttentionThreads) * sizeof(float);
+    gqa_prefill_f16_kernel<kFp8Cache, kAttentionThreads><<<grid, kAttentionThreads, shared, stream>>>(
+        q, k_cache, v_cache, k_scale, v_scale, output, seq_len, q_heads, kv_heads,
+        head_dim, scale_block, position_offset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+    const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
+    uint16_t* y, int rows, int cols, int weight_stride, int scale_stride,
+    void* stream) {
+    if (!x || !weight || !scale || !y || rows <= 0 || cols <= 0 ||
+        weight_stride < cols || scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
+    constexpr int kWarps = 8;
+    fp8_matvec_f16_kernel<kWarps><<<(rows + kWarps - 1) / kWarps,
+        kWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(x, weight, scale, y,
+        rows, cols, weight_stride, scale_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
+    const uint16_t* x, const uint8_t* gate_weight,
+    const uint16_t* gate_scale, const uint8_t* up_weight,
+    const uint16_t* up_scale, uint16_t* y, int rows, int cols,
+    int weight_stride, int scale_stride, void* stream) {
+    if (!x || !gate_weight || !gate_scale || !up_weight || !up_scale || !y ||
+        rows <= 0 || cols <= 0 || weight_stride < cols ||
+        scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
+    constexpr int kWarps = 8;
+    constexpr int kRowsPerWarp = 1;
+    fp8_swiglu_matvec_f16_kernel<kWarps, kRowsPerWarp>
+        <<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0,
+           static_cast<cudaStream_t>(stream)>>>(x, gate_weight, gate_scale,
+           up_weight, up_scale, y, rows, cols, weight_stride, scale_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+    const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
+    uint16_t* y, int batch, int rows, int cols, int x_stride,
+    int y_stride, int weight_stride, int scale_stride, void* stream) {
+    if (!x || !weight || !scale || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols ||
+        scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
+    dim3 grid(static_cast<unsigned>((rows + 63) / 64),
+              static_cast<unsigned>((batch + 63) / 64), 1);
+    fp8_matmul_f16_tiled_kernel<32><<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+        weight_stride, scale_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp16_matmul_rows_f16_cuda(
+    const uint16_t* x, const uint16_t* weight, uint16_t* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, void* stream) {
+    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols) return false;
+    dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(batch), 1);
+    fp16_matmul_f16_kernel<false><<<grid, kThreads, kThreads * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(x, weight, y, batch, rows, cols,
+        x_stride, y_stride, weight_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp16_matmul_rows_f16_f32_cuda(
+    const uint16_t* x, const uint16_t* weight, float* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, void* stream) {
+    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols) return false;
+    dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(batch), 1);
+    fp16_matmul_f16_kernel<true><<<grid, kThreads, kThreads * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(x, weight, y, batch, rows, cols,
+        x_stride, y_stride, weight_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_embedding_fp16_gather_f16_cuda(
+    const uint16_t* table, const int* tokens, uint16_t* output,
+    int count, int cols, int row_start, int row_count, void* stream) {
+    if (!table || !tokens || !output || count <= 0 || cols <= 0 ||
+        row_start < 0 || row_count <= 0) return false;
+    embedding_f16_kernel<<<count, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        table, tokens, output, count, cols, row_start, row_count);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
+    const uint16_t* x, const uint16_t* gamma, uint16_t* y,
+    int rows, int cols, float eps, void* stream) {
+    if (!x || !gamma || !y || rows <= 0 || cols <= 0 || eps < 0.0f) return false;
+    rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(x, gamma, y, rows, cols, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
+    const uint16_t* x, const uint16_t* gamma, const uint16_t* gate,
+    uint16_t* y, int rows, int cols, float eps, void* stream) {
+    if (!x || !gamma || !gate || !y || rows <= 0 || cols <= 0 || eps < 0.0f) return false;
+    gated_rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(x, gamma, gate, y, rows, cols, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_split_packed_qkv_f16_cuda(
+    const uint16_t* packed, uint16_t* q, uint16_t* k, uint16_t* v,
+    int rows, int key_dim, int value_dim, void* stream) {
+    if (!packed || !q || !k || !v || rows <= 0 || key_dim <= 0 || value_dim <= 0) return false;
+    const int total = rows * (2 * key_dim + value_dim);
+    split_packed_qkv_f16_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(packed, q, k, v, rows, key_dim, value_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_causal_depthwise_conv_silu_f16_cuda(
+    const uint16_t* x, const uint16_t* weight, uint16_t* tail,
+    uint16_t* y, int seq_len, int channels, int kernel,
+    bool update_tail, void* stream) {
+    if (!x || !weight || !y || seq_len <= 0 || channels <= 0 || kernel <= 0 || kernel - 1 > 8) return false;
+    conv_silu_f16_kernel<<<(channels + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(x, weight, tail, y, seq_len,
+        channels, kernel, update_tail);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_linear_attn_gates_f16_cuda(
+    const uint16_t* a, const uint16_t* b, const uint16_t* a_log,
+    const uint16_t* dt_bias, uint16_t* g, uint16_t* beta,
+    int rows, int heads, void* stream) {
+    if (!a || !b || !a_log || !dt_bias || !g || !beta || rows <= 0 || heads <= 0) return false;
+    linear_gates_f16_kernel<<<heads, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        a, b, a_log, dt_bias, g, beta, rows, heads);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_delta_step_f16_cuda(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale, void* stream) {
+    if (!state || !q || !k || !v || !g || !beta || !output || heads <= 0 ||
+        key_heads <= 0 || heads % key_heads != 0 || key_dim <= 0 || value_dim <= 0 || q_scale <= 0.0f) return false;
+    int threads = 32;
+    while (threads < value_dim) threads <<= 1;
+    if (threads > 1024) return false;
+    const size_t shared = (2u * static_cast<size_t>(key_dim) + threads) * sizeof(float);
+    gated_delta_step_f16_kernel<<<heads, threads, shared, static_cast<cudaStream_t>(stream)>>>(
+        state, q, k, v, g, beta, output, heads, key_heads, key_dim, value_dim, q_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_delta_sequence_f16_cuda(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale, void* stream) {
+    if (!state || !q || !k || !v || !g || !beta || !output || rows <= 0 ||
+        heads <= 0 || key_heads <= 0 || heads % key_heads != 0 || key_dim != 128 ||
+        value_dim != 128 || q_scale <= 0.0f) return false;
+    gated_delta_sequence_f16_kernel<128><<<heads, value_dim,
+        static_cast<size_t>(value_dim) * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
+        state, q, k, v, g, beta, output, rows, heads, key_heads, value_dim, q_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_partial_rope_f16_cuda(
+    uint16_t* q, uint16_t* k, int position, int rotary_dim,
+    float theta, int q_heads, int kv_heads, int head_dim, void* stream) {
+    return qwen_partial_rope_rows_f16_cuda(q, k, position, 1, rotary_dim,
+        theta, q_heads, kv_heads, head_dim, stream);
+}
+
+bool qwen_partial_rope_rows_f16_cuda(
+    uint16_t* q, uint16_t* k, int start_position, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads,
+    int head_dim, void* stream) {
+    if (!q || !k || start_position < 0 || rows <= 0 || rotary_dim <= 0 ||
+        (rotary_dim & 1) != 0 || rotary_dim > head_dim || theta <= 0.0f ||
+        q_heads <= 0 || kv_heads <= 0 || head_dim <= 0) return false;
+    dim3 grid(static_cast<unsigned>((rotary_dim / 2 + kThreads - 1) / kThreads),
+              static_cast<unsigned>(rows), 1);
+    partial_rope_f16_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        q, k, start_position, rows, rotary_dim, theta, q_heads, kv_heads, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_split_q_gate_f16_cuda(
+    const uint16_t* source, uint16_t* q, uint16_t* gate,
+    int rows, int q_heads, int head_dim, void* stream) {
+    if (!source || !q || !gate || rows <= 0 || q_heads <= 0 || head_dim <= 0) return false;
+    const int total = rows * q_heads * head_dim;
+    split_q_gate_f16_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(source, q, gate, rows, q_heads, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_sigmoid_mul_f16_cuda(
+    const uint16_t* x, const uint16_t* gate, uint16_t* y,
+    int count, void* stream) {
+    if (!x || !gate || !y || count <= 0) return false;
+    sigmoid_mul_f16_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(x, gate, y, count);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_add_inplace_f16_cuda(
+    uint16_t* y, const uint16_t* x, int count, void* stream) {
+    if (!x || !y || count <= 0) return false;
+    add_f16_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(y, x, count);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_silu_mul_rows_f16_cuda(
+    const uint16_t* gate, const uint16_t* up, uint16_t* y,
+    int rows, int cols, void* stream) {
+    if (!gate || !up || !y || rows <= 0 || cols <= 0) return false;
+    const int count = rows * cols;
+    silu_mul_f16_kernel<<<(count + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(gate, up, y, count);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_f16_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, int seq_len,
+    int kv_heads, int head_dim, int start_pos, int max_context,
+    void* stream) {
+    if (!k_rows || !v_rows || !k_cache || !v_cache || seq_len <= 0 ||
+        kv_heads <= 0 || head_dim <= 0 || start_pos < 0 || max_context <= 0 ||
+        start_pos + seq_len > max_context) return false;
+    const int total = seq_len * kv_heads * head_dim;
+    append_kv_f16_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(k_rows, v_rows, k_cache, v_cache,
+        total, kv_heads, head_dim, start_pos, max_context);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_fp8_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint8_t* k_cache, uint8_t* v_cache, uint16_t* k_scale,
+    uint16_t* v_scale, int seq_len, int kv_heads, int head_dim,
+    int scale_block, int start_pos, int max_context, void* stream) {
+    if (!k_rows || !v_rows || !k_cache || !v_cache || !k_scale || !v_scale ||
+        seq_len <= 0 || kv_heads <= 0 || head_dim <= 0 || scale_block <= 0 ||
+        scale_block > 128 || head_dim % scale_block != 0 || start_pos < 0 ||
+        max_context <= 0 || start_pos + seq_len > max_context) return false;
+    const int blocks = seq_len * kv_heads * (head_dim / scale_block);
+    append_kv_fp8_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, seq_len,
+        kv_heads, head_dim, scale_block, start_pos, max_context);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gqa_decode_attention_f16_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, float* scores,
+    int q_heads, int kv_heads, int head_dim, int context_len,
+    int max_context, void* stream) {
+    return launch_decode_attention<false>(q, k_cache, v_cache, nullptr,
+        nullptr, output, scores, q_heads, kv_heads, head_dim, head_dim,
+        context_len, max_context, static_cast<cudaStream_t>(stream));
+}
+
+bool qwen_gqa_prefill_attention_f16_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, int seq_len,
+    int q_heads, int kv_heads, int head_dim, int position_offset,
+    int max_context, void* stream) {
+    return launch_prefill_attention<false>(q, k_cache, v_cache, nullptr,
+        nullptr, output, seq_len, q_heads, kv_heads, head_dim, head_dim,
+        position_offset, max_context, static_cast<cudaStream_t>(stream));
+}
+
+bool qwen_gqa_decode_attention_fp8_cuda(
+    const uint16_t* q, const uint8_t* k_cache,
+    const uint8_t* v_cache, const uint16_t* k_scale,
+    const uint16_t* v_scale, uint16_t* output, float* scores,
+    int q_heads, int kv_heads, int head_dim, int scale_block,
+    int context_len, int max_context, void* stream) {
+    return launch_decode_attention<true>(q, k_cache, v_cache, k_scale,
+        v_scale, output, scores, q_heads, kv_heads, head_dim, scale_block,
+        context_len, max_context, static_cast<cudaStream_t>(stream));
+}
+
+bool qwen_gqa_prefill_attention_fp8_cuda(
+    const uint16_t* q, const uint8_t* k_cache,
+    const uint8_t* v_cache, const uint16_t* k_scale,
+    const uint16_t* v_scale, uint16_t* output, int seq_len,
+    int q_heads, int kv_heads, int head_dim, int scale_block,
+    int position_offset, int max_context, void* stream) {
+    return launch_prefill_attention<true>(q, k_cache, v_cache, k_scale,
+        v_scale, output, seq_len, q_heads, kv_heads, head_dim, scale_block,
+        position_offset, max_context, static_cast<cudaStream_t>(stream));
+}
+
+}  // namespace dsv4

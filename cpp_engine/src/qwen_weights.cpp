@@ -112,6 +112,36 @@ QwenDeviceTensor& QwenDeviceTensor::operator=(QwenDeviceTensor&& other) noexcept
     return *this;
 }
 
+float* QwenDeviceTensor::f32_data() {
+    if (device_dtype != SafeDType::F32) throw std::runtime_error("Qwen tensor is not F32");
+    return static_cast<float*>(data);
+}
+
+const float* QwenDeviceTensor::f32_data() const {
+    if (device_dtype != SafeDType::F32) throw std::runtime_error("Qwen tensor is not F32");
+    return static_cast<const float*>(data);
+}
+
+uint16_t* QwenDeviceTensor::f16_data() {
+    if (device_dtype != SafeDType::F16) throw std::runtime_error("Qwen tensor is not F16");
+    return static_cast<uint16_t*>(data);
+}
+
+const uint16_t* QwenDeviceTensor::f16_data() const {
+    if (device_dtype != SafeDType::F16) throw std::runtime_error("Qwen tensor is not F16");
+    return static_cast<const uint16_t*>(data);
+}
+
+uint8_t* QwenDeviceTensor::fp8_data() {
+    if (device_dtype != SafeDType::F8_E4M3) throw std::runtime_error("Qwen tensor is not FP8 E4M3");
+    return static_cast<uint8_t*>(data);
+}
+
+const uint8_t* QwenDeviceTensor::fp8_data() const {
+    if (device_dtype != SafeDType::F8_E4M3) throw std::runtime_error("Qwen tensor is not FP8 E4M3");
+    return static_cast<const uint8_t*>(data);
+}
+
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
     if (!ref.found) throw std::runtime_error("cannot materialize an absent Qwen tensor: " + ref.name);
