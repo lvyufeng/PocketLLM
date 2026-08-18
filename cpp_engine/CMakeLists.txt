@@ -58,6 +58,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_fp8_ops.cu
     cuda/qwen_attention_ops.cu
     cuda/qwen_half_ops.cu
+    cuda/qwen_gqa_optimized.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu

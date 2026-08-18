@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 
@@ -25,6 +27,16 @@ void check_cuda(cudaError_t status, const char* what) {
 
 void require_launch(bool ok, const char* what) {
     if (!ok) throw std::runtime_error(std::string("Qwen CUDA launch failed: ") + what);
+}
+
+bool qwen_env_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0 &&
+           std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "OFF") != 0;
 }
 
 struct DeviceLinear {
@@ -566,10 +578,23 @@ struct QwenEngine::Impl {
 
         if (rows == 1) {
             const int context_length = position_offset + 1;
+            const bool optimized_decode = !fp8_cache &&
+                qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") &&
+                context_length >= 4096;
+            const int optimized_splits = std::min(
+                64, (context_length + 2048 - 1) / 2048);
+            const size_t score_elements = optimized_decode
+                ? static_cast<size_t>(q_heads) * optimized_splits *
+                      static_cast<size_t>(head_dim + 2)
+                : static_cast<size_t>(q_heads) * context_length;
             QwenDeviceTensor& scores = workspace_float(
-                static_cast<size_t>(q_heads) * context_length,
-                {static_cast<uint64_t>(q_heads),
-                 static_cast<uint64_t>(context_length)});
+                score_elements,
+                optimized_decode
+                    ? std::vector<uint64_t>{static_cast<uint64_t>(q_heads),
+                                            static_cast<uint64_t>(optimized_splits),
+                                            static_cast<uint64_t>(head_dim + 2)}
+                    : std::vector<uint64_t>{static_cast<uint64_t>(q_heads),
+                                             static_cast<uint64_t>(context_length)});
             if (fp8_cache) {
                 require_launch(qwen_gqa_decode_attention_fp8_cuda(
                     q_norm.f16_data(), layer.full.k_cache.fp8_data(),
@@ -578,6 +603,13 @@ struct QwenEngine::Impl {
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     kKvScaleBlock, context_length, max_context),
                     "decode FP8-cache GQA");
+            } else if (optimized_decode) {
+                require_launch(qwen_gqa_decode_attention_f16_fused_cuda(
+                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    scores.f32_data(), q_heads, kv_heads, head_dim,
+                    context_length, max_context),
+                    "decode optimized FP16-cache GQA");
             } else {
                 require_launch(qwen_gqa_decode_attention_f16_cuda(
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
@@ -592,6 +624,12 @@ struct QwenEngine::Impl {
                 layer.full.v_scale.f16_data(), attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, kKvScaleBlock, position_offset,
                 max_context), "prefill FP8-cache GQA");
+        } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED")) {
+            require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
+                q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                layer.full.v_cache.f16_data(), attention.f16_data(), rows,
+                q_heads, kv_heads, head_dim, position_offset, max_context),
+                "prefill optimized FP16-cache GQA");
         } else {
             require_launch(qwen_gqa_prefill_attention_f16_cuda(
                 q_norm.f16_data(), layer.full.k_cache.f16_data(),

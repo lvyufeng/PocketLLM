@@ -359,6 +359,18 @@ bool qwen_gqa_prefill_attention_f16_cuda(
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
     int seq_len, int q_heads, int kv_heads, int head_dim,
     int position_offset, int max_context, void* stream = nullptr);
+// Exact optimized paths. Decode reuses the existing score scratch for compact
+// split partials; prefill shares each K/V load across GQA heads and query rows.
+bool qwen_gqa_decode_attention_f16_fused_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_partial_scratch, int q_heads, int kv_heads, int head_dim,
+    int context_len, int max_context, void* stream = nullptr);
+bool qwen_gqa_prefill_attention_f16_tiled_cuda(
+    const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
+    int seq_len, int q_heads, int kv_heads, int head_dim,
+    int position_offset, int max_context, void* stream = nullptr);
 bool qwen_gqa_decode_attention_fp8_cuda(
     const uint16_t* d_q_fp16, const uint8_t* d_k_cache_fp8,
     const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,
