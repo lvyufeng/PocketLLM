@@ -47,6 +47,8 @@ struct Args {
     int max_context = 0;
     int prefill_chunk_tokens = 512;
     std::string kv_cache_dtype = "fp16";
+    int qwen_attention_window = 0;
+    int qwen_attention_sink_tokens = 0;
     bool serve = false;
     int port = 8000;
     std::string host = "0.0.0.0";
@@ -127,6 +129,10 @@ Args parse_args(int argc, char** argv) {
             args.prefill_chunk_tokens = std::stoi(argv[++i]);
         } else if (arg == "--kv-cache-dtype" && i + 1 < argc) {
             args.kv_cache_dtype = argv[++i];
+        } else if (arg == "--qwen-attention-window" && i + 1 < argc) {
+            args.qwen_attention_window = std::stoi(argv[++i]);
+        } else if (arg == "--qwen-attention-sink-tokens" && i + 1 < argc) {
+            args.qwen_attention_sink_tokens = std::stoi(argv[++i]);
         } else if (arg == "--serve") {
             args.serve = true;
         } else if (arg == "--port" && i + 1 < argc) {
@@ -150,6 +156,16 @@ Args parse_args(int argc, char** argv) {
     if (args.prefill_chunk_tokens <= 0) throw std::runtime_error("--prefill-chunk-tokens must be positive");
     if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8") {
         throw std::runtime_error("--kv-cache-dtype must be fp16 or fp8");
+    }
+    if (args.qwen_attention_window < 0) {
+        throw std::runtime_error("--qwen-attention-window must not be negative");
+    }
+    if (args.qwen_attention_sink_tokens < 0) {
+        throw std::runtime_error("--qwen-attention-sink-tokens must not be negative");
+    }
+    if (args.qwen_attention_window == 0 && args.qwen_attention_sink_tokens != 0) {
+        throw std::runtime_error(
+            "--qwen-attention-sink-tokens requires --qwen-attention-window");
     }
     if (args.model.empty() && args.ckpt.empty()) {
         throw std::runtime_error("--model or --ckpt is required");
@@ -294,6 +310,8 @@ int main(int argc, char** argv) {
                     qwen_opts.device = args.device >= 0 ? args.device : args.tp_rank;
                     qwen_opts.prefill_chunk_tokens = args.prefill_chunk_tokens;
                     qwen_opts.kv_cache_dtype = dsv4::parse_qwen_kv_cache_dtype(args.kv_cache_dtype);
+                    qwen_opts.attention_window = args.qwen_attention_window;
+                    qwen_opts.attention_sink_tokens = args.qwen_attention_sink_tokens;
                     qwen_opts.nccl_id_path = args.nccl_id_path;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
@@ -307,6 +325,8 @@ int main(int argc, char** argv) {
                     std::cout << "qwen_startup=1 layers=" << (args.smoke_layers > 0 ? args.smoke_layers : 64)
                               << " prefill_chunk_tokens=" << qwen_opts.prefill_chunk_tokens
                               << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen_opts.kv_cache_dtype)
+                              << " attention_window=" << qwen_opts.attention_window
+                              << " attention_sink_tokens=" << qwen_opts.attention_sink_tokens
                               << " prompt_tokens=" << prompt_ids.size()
                               << " max_context=" << qwen_context << "\n";
                     if (args.generate_token) {
@@ -347,6 +367,8 @@ int main(int argc, char** argv) {
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
                                   << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
                                   << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
+                                  << " attention_window=" << qwen.options().attention_window
+                                  << " attention_sink_tokens=" << qwen.options().attention_sink_tokens
                                   << " max_context=" << qwen.max_context()
                                   << " prompt_tokens=" << prompt_ids.size()
                                   << " generated_tokens=" << generated.size();
@@ -390,6 +412,8 @@ int main(int argc, char** argv) {
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
                                   << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
                                   << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
+                                  << " attention_window=" << qwen.options().attention_window
+                                  << " attention_sink_tokens=" << qwen.options().attention_sink_tokens
                                   << " max_context=" << qwen.max_context() << "\n";
                     }
                     return 0;

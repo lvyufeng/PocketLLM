@@ -23,6 +23,10 @@ struct QwenEngineOptions {
     int device = 0;
     int prefill_chunk_tokens = 512;
     QwenKvCacheDType kv_cache_dtype = QwenKvCacheDType::Fp16;
+    // 0 preserves exact full attention. Nonzero values enable the explicit
+    // sink-plus-sliding-window attention path in the optimized FP16 kernels.
+    int attention_window = 0;
+    int attention_sink_tokens = 0;
     std::string nccl_id_path;
 };
 
