@@ -57,6 +57,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/fp8_ops.cu
     cuda/qwen_fp8_ops.cu
     cuda/qwen_attention_ops.cu
+    cuda/qwen_half_ops.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
@@ -314,6 +315,10 @@ set_target_properties(test_qwen_delta_rule PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_qwen_gqa_attention tests/test_qwen_gqa_attention.cpp)
 target_link_libraries(test_qwen_gqa_attention PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_gqa_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_half_ops tests/test_qwen_half_ops.cpp)
+target_link_libraries(test_qwen_half_ops PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_half_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_conv_tail tests/test_qwen_conv_tail.cpp)
 target_link_libraries(test_qwen_conv_tail PRIVATE dsv4_cpp_core)

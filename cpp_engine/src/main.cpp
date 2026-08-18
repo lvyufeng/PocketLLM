@@ -45,6 +45,8 @@ struct Args {
     bool smoke_forward = false;
     bool use_persistent = false;
     int max_context = 0;
+    int prefill_chunk_tokens = 512;
+    std::string kv_cache_dtype = "fp16";
     bool serve = false;
     int port = 8000;
     std::string host = "0.0.0.0";
@@ -121,6 +123,10 @@ Args parse_args(int argc, char** argv) {
             args.use_persistent = true;
         } else if (arg == "--max-context" && i + 1 < argc) {
             args.max_context = std::stoi(argv[++i]);
+        } else if (arg == "--prefill-chunk-tokens" && i + 1 < argc) {
+            args.prefill_chunk_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--kv-cache-dtype" && i + 1 < argc) {
+            args.kv_cache_dtype = argv[++i];
         } else if (arg == "--serve") {
             args.serve = true;
         } else if (arg == "--port" && i + 1 < argc) {
@@ -141,6 +147,10 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.tp_world <= 0) throw std::runtime_error("--tp-world must be positive");
     if (args.tp_rank < 0 || args.tp_rank >= args.tp_world) throw std::runtime_error("--tp-rank must be in [0, tp_world)");
+    if (args.prefill_chunk_tokens <= 0) throw std::runtime_error("--prefill-chunk-tokens must be positive");
+    if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8") {
+        throw std::runtime_error("--kv-cache-dtype must be fp16 or fp8");
+    }
     if (args.model.empty() && args.ckpt.empty()) {
         throw std::runtime_error("--model or --ckpt is required");
     }
@@ -282,11 +292,23 @@ int main(int argc, char** argv) {
                     qwen_opts.tp_world = args.tp_world;
                     qwen_opts.tp_rank = args.tp_rank;
                     qwen_opts.device = args.device >= 0 ? args.device : args.tp_rank;
+                    qwen_opts.prefill_chunk_tokens = args.prefill_chunk_tokens;
+                    qwen_opts.kv_cache_dtype = dsv4::parse_qwen_kv_cache_dtype(args.kv_cache_dtype);
                     qwen_opts.nccl_id_path = args.nccl_id_path;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
                         : static_cast<int>(prompt_ids.size()) + std::max(1, args.max_new_tokens);
+                    if (static_cast<uint64_t>(prompt_ids.size()) +
+                            static_cast<uint64_t>(std::max(1, args.max_new_tokens)) >
+                        static_cast<uint64_t>(qwen_context)) {
+                        throw std::runtime_error("Qwen prompt plus generation exceeds --max-context");
+                    }
                     dsv4::QwenEngine qwen(args.ckpt, qwen_opts, args.smoke_layers, qwen_context);
+                    std::cout << "qwen_startup=1 layers=" << (args.smoke_layers > 0 ? args.smoke_layers : 64)
+                              << " prefill_chunk_tokens=" << qwen_opts.prefill_chunk_tokens
+                              << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen_opts.kv_cache_dtype)
+                              << " prompt_tokens=" << prompt_ids.size()
+                              << " max_context=" << qwen_context << "\n";
                     if (args.generate_token) {
                         qwen.warmup_tp();
                         using Clock = std::chrono::steady_clock;
@@ -320,6 +342,12 @@ int main(int argc, char** argv) {
                         std::cout << "qwen_runtime=1 layers=" << generated.front().layers
                                   << " resident_weight_bytes=" << qwen.resident_weight_bytes()
                                   << " resident_scale_bytes=" << qwen.resident_scale_bytes()
+                                  << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
+                                  << " kv_cache_bytes=" << qwen.kv_cache_bytes()
+                                  << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
+                                  << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
+                                  << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
+                                  << " max_context=" << qwen.max_context()
                                   << " prompt_tokens=" << prompt_ids.size()
                                   << " generated_tokens=" << generated.size();
                         if (args.resident_bench) {
@@ -356,7 +384,13 @@ int main(int argc, char** argv) {
                                   << " checksum=" << result.checksum
                                   << " position=" << result.position
                                   << " resident_weight_bytes=" << qwen.resident_weight_bytes()
-                                  << " resident_scale_bytes=" << qwen.resident_scale_bytes() << "\n";
+                                  << " resident_scale_bytes=" << qwen.resident_scale_bytes()
+                                  << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
+                                  << " kv_cache_bytes=" << qwen.kv_cache_bytes()
+                                  << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
+                                  << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
+                                  << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
+                                  << " max_context=" << qwen.max_context() << "\n";
                     }
                     return 0;
                 }

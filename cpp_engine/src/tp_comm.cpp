@@ -118,6 +118,12 @@ void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const ch
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm, nullptr), "ncclAllReduce inplace");
 }
 
+void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count) {
+    if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL fp16 all-reduce args");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclHalf, ncclSum, comm, nullptr), "ncclAllReduce fp16 inplace");
+}
+
 void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bf16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);

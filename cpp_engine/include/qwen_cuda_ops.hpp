@@ -49,6 +49,47 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+// FP16 activation-storage variants. Dot products and normalization statistics
+// still accumulate in FP32; only global activation traffic and workspace storage
+// use IEEE FP16.
+bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    uint16_t* d_y_fp16,
+    int rows,
+    int cols,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
+bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_gate_weight,
+    const uint16_t* d_gate_scale_fp16,
+    const uint8_t* d_up_weight,
+    const uint16_t* d_up_scale_fp16,
+    uint16_t* d_y_fp16,
+    int rows,
+    int cols,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
+bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    uint16_t* d_y_fp16,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
 // Explicit experimental prefill path used by correctness/performance A/B.
 // It decodes only a block-local K tile and preserves FP32 accumulation.
 bool qwen_fp8_e4m3_fp16scale_matmul_simt_cuda(
@@ -217,5 +258,119 @@ bool qwen_add_inplace_cuda(float* d_y, const float* d_x, int count,
                            void* stream = nullptr);
 bool qwen_silu_mul_rows_cuda(const float* d_gate, const float* d_up, float* d_y,
                              int rows, int cols, void* stream = nullptr);
+
+// --- FP16 activation-storage runtime ----------------------------------------
+
+bool qwen_fp16_matmul_rows_f16_cuda(const uint16_t* d_x_fp16,
+                                    const uint16_t* d_w_fp16,
+                                    uint16_t* d_y_fp16, int batch, int rows,
+                                    int cols, int x_stride, int y_stride,
+                                    int weight_stride, void* stream = nullptr);
+bool qwen_fp16_matmul_rows_f16_f32_cuda(const uint16_t* d_x_fp16,
+                                        const uint16_t* d_w_fp16,
+                                        float* d_y, int batch, int rows,
+                                        int cols, int x_stride, int y_stride,
+                                        int weight_stride, void* stream = nullptr);
+bool qwen_embedding_fp16_gather_f16_cuda(const uint16_t* d_table_fp16,
+                                         const int* d_tokens,
+                                         uint16_t* d_out_fp16, int count,
+                                         int cols, int row_start, int row_count,
+                                         void* stream = nullptr);
+bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(const uint16_t* d_x_fp16,
+                                           const uint16_t* d_gamma_fp16,
+                                           uint16_t* d_y_fp16, int rows,
+                                           int cols, float eps,
+                                           void* stream = nullptr);
+bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_gamma_fp16,
+    const uint16_t* d_gate_fp16, uint16_t* d_y_fp16, int rows, int cols,
+    float eps, void* stream = nullptr);
+bool qwen_split_packed_qkv_f16_cuda(const uint16_t* d_packed_fp16,
+                                    uint16_t* d_q_fp16, uint16_t* d_k_fp16,
+                                    uint16_t* d_v_fp16, int rows,
+                                    int key_dim, int value_dim,
+                                    void* stream = nullptr);
+bool qwen_causal_depthwise_conv_silu_f16_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
+    uint16_t* d_tail_fp16, uint16_t* d_y_fp16, int seq_len, int channels,
+    int kernel, bool update_tail, void* stream = nullptr);
+bool qwen_linear_attn_gates_f16_cuda(
+    const uint16_t* d_a_fp16, const uint16_t* d_b_fp16,
+    const uint16_t* d_a_log_fp16, const uint16_t* d_dt_bias_fp16,
+    uint16_t* d_g_fp16, uint16_t* d_beta_fp16, int rows, int heads,
+    void* stream = nullptr);
+bool qwen_gated_delta_step_f16_cuda(
+    float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int heads,
+    int key_heads, int key_dim, int value_dim, float q_scale,
+    void* stream = nullptr);
+bool qwen_gated_delta_sequence_f16_cuda(
+    float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int rows,
+    int heads, int key_heads, int key_dim, int value_dim, float q_scale,
+    void* stream = nullptr);
+bool qwen_partial_rope_f16_cuda(uint16_t* d_q_fp16, uint16_t* d_k_fp16,
+                                int position, int rotary_dim, float theta,
+                                int q_heads, int kv_heads, int head_dim,
+                                void* stream = nullptr);
+bool qwen_partial_rope_rows_f16_cuda(
+    uint16_t* d_q_fp16, uint16_t* d_k_fp16, int start_position, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim,
+    void* stream = nullptr);
+bool qwen_split_q_gate_f16_cuda(const uint16_t* d_q_proj_fp16,
+                                uint16_t* d_q_fp16,
+                                uint16_t* d_gate_fp16, int rows,
+                                int q_heads, int head_dim,
+                                void* stream = nullptr);
+bool qwen_sigmoid_mul_f16_cuda(const uint16_t* d_x_fp16,
+                               const uint16_t* d_gate_fp16,
+                               uint16_t* d_y_fp16, int count,
+                               void* stream = nullptr);
+bool qwen_add_inplace_f16_cuda(uint16_t* d_y_fp16,
+                               const uint16_t* d_x_fp16, int count,
+                               void* stream = nullptr);
+bool qwen_silu_mul_rows_f16_cuda(const uint16_t* d_gate_fp16,
+                                 const uint16_t* d_up_fp16,
+                                 uint16_t* d_y_fp16, int rows, int cols,
+                                 void* stream = nullptr);
+
+// FP16 cache is the precision baseline. FP8 cache stores E4M3 codes plus one
+// IEEE FP16 scale for each token/head/64-channel block.
+bool qwen_append_kv_cache_f16_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len,
+    int kv_heads, int head_dim, int start_pos, int max_context,
+    void* stream = nullptr);
+bool qwen_append_kv_cache_fp8_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_k_cache_fp8, uint8_t* d_v_cache_fp8,
+    uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16, int seq_len,
+    int kv_heads, int head_dim, int scale_block, int start_pos,
+    int max_context, void* stream = nullptr);
+bool qwen_gqa_decode_attention_f16_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_score_scratch, int q_heads, int kv_heads, int head_dim,
+    int context_len, int max_context, void* stream = nullptr);
+bool qwen_gqa_prefill_attention_f16_cuda(
+    const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
+    int seq_len, int q_heads, int kv_heads, int head_dim,
+    int position_offset, int max_context, void* stream = nullptr);
+bool qwen_gqa_decode_attention_fp8_cuda(
+    const uint16_t* d_q_fp16, const uint8_t* d_k_cache_fp8,
+    const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,
+    const uint16_t* d_v_scale_fp16, uint16_t* d_out_fp16,
+    float* d_score_scratch, int q_heads, int kv_heads, int head_dim,
+    int scale_block, int context_len, int max_context,
+    void* stream = nullptr);
+bool qwen_gqa_prefill_attention_fp8_cuda(
+    const uint16_t* d_q_rows_fp16, const uint8_t* d_k_cache_fp8,
+    const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,
+    const uint16_t* d_v_scale_fp16, uint16_t* d_out_rows_fp16,
+    int seq_len, int q_heads, int kv_heads, int head_dim, int scale_block,
+    int position_offset, int max_context, void* stream = nullptr);
 
 }  // namespace dsv4

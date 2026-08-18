@@ -62,6 +62,13 @@ struct QwenDeviceTensor {
     QwenDeviceTensor& operator=(const QwenDeviceTensor&) = delete;
     QwenDeviceTensor(QwenDeviceTensor&& other) noexcept;
     QwenDeviceTensor& operator=(QwenDeviceTensor&& other) noexcept;
+
+    float* f32_data();
+    const float* f32_data() const;
+    uint16_t* f16_data();
+    const uint16_t* f16_data() const;
+    uint8_t* fp8_data();
+    const uint8_t* fp8_data() const;
 };
 
 struct QwenLinearRef {
