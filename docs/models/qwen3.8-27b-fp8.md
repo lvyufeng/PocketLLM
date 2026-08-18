@@ -74,6 +74,7 @@ The same executable was then run serially over longer prompts with four generate
 | 4,096 | 386.16 tok/s | 29.82 tok/s | 61.00 MiB | 64.1 MiB | 8.02 GiB | PASS |
 | 8,192 | 293.60 tok/s | 24.58 tok/s | 61.00 MiB | 128.1 MiB | 8.09 GiB | PASS |
 | 32,768 | 113.92 tok/s | 11.05 tok/s | 61.00 MiB | 512.1 MiB | 8.47 GiB | PASS |
+| 65,536 | 65.21 tok/s | 6.60 tok/s | 61.00 MiB | 1,024.1 MiB | 8.97 GiB | PASS |
 
 The direct FP16-activation FP8 projection gate covers aligned and padded strides, masked rows, tail K tiles, vectorized-versus-scalar decode dispatch, and the wide prefill tile. It reports decode max absolute error `1.459e-2` against the FP32 host reference, with vectorized-versus-scalar output difference `0`; the 4-row experimental path differs by at most `3.906e-3`. The focused FP8 online operator suite and full TP4 rank parity checks also pass.
 
