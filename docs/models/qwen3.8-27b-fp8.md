@@ -61,6 +61,22 @@ Hardware: 4×RTX 2080 Ti 22 GiB, TP4, single request, real Qwen3.8-27B-FP8 check
 
 Additional repeat runs on the 512-token fixture measured approximately 411.8–416.4 tok/s prefill and 35.66–35.85 tok/s decode.
 
+### Current memory-safe FP16-activation kernels
+
+The current reference runtime now uses FP16-input, FP32-accumulation FP8 projection kernels without expanding prompt activations or weights. The prefill path uses a 128-token x 64-output N64 tile when alignment and batch size permit; decode uses vectorized single-row FP8 matvec, while the original scalar kernel remains the fallback. Two-row and four-row decode variants remain explicit experiments because their register pressure reduced end-to-end decode throughput. These kernels preserve the default exact full-attention semantics and FP16 KV cache.
+
+A clean serial TP4 run on the same real checkpoint and 512-token fixture measured `453.08 tok/s` prefill and `36.95 tok/s` decode with 24 generated tokens. A prior repeat measured `456.78 / 37.12 tok/s`; both runs produced identical rank-local greedy sequences and `rank_token_parity=PASS`. The resident weight and scale bytes remained `7,367,270,656` and `742,400` per rank, and peak GPU memory was `8,497,528,832` bytes on the highest rank.
+
+The same executable was then run serially over longer prompts with four generated tokens, complete 64-layer execution, 512-token chunks, and FP16 KV cache:
+
+| Prompt | Prefill | Decode | Activation workspace | KV data | Highest rank memory | Rank parity |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 4,096 | 386.16 tok/s | 29.82 tok/s | 61.00 MiB | 64.1 MiB | 8.02 GiB | PASS |
+| 8,192 | 293.60 tok/s | 24.58 tok/s | 61.00 MiB | 128.1 MiB | 8.09 GiB | PASS |
+| 32,768 | 113.92 tok/s | 11.05 tok/s | 61.00 MiB | 512.1 MiB | 8.47 GiB | PASS |
+
+The direct FP16-activation FP8 projection gate covers aligned and padded strides, masked rows, tail K tiles, vectorized-versus-scalar decode dispatch, and the wide prefill tile. It reports decode max absolute error `1.459e-2` against the FP32 host reference, with vectorized-versus-scalar output difference `0`; the 4-row experimental path differs by at most `3.906e-3`. The focused FP8 online operator suite and full TP4 rank parity checks also pass.
+
 ### Long-context TP4 baseline
 
 The following recent serial runs use the real checkpoint, deterministic natural-language tokenizer IDs, four generated tokens, complete 64-layer execution, 512-token prefill chunks, and greedy-token parity across all four ranks. Decode TPS excludes the first generated token, which is produced by prefill. The activation workspace is the peak capacity of the reusable chunk workspace, not a prompt-length buffer.

@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace dsv4 {
 namespace {
@@ -108,6 +110,73 @@ __global__ void fp8_matvec_f16_kernel(
         sum += __shfl_xor_sync(0xffffffffu, sum, offset);
     }
     if (lane == 0) y[row] = float_to_half(sum);
+}
+
+// Same decode arithmetic as fp8_matvec_f16_kernel, but each warp owns
+// kRowsPerWarp output rows and reads every FP16 activation element once for
+// all of them. Column order and per-row accumulation order are unchanged, so
+// only the number of activation loads differs.
+template <int kWarps, int kRowsPerWarp>
+__global__ void fp8_matvec_f16_multirow_kernel(
+    const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
+    const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
+    int rows, int cols, int weight_stride, int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row_base = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
+    if (row_base >= rows) return;
+    const int active = min(kRowsPerWarp, rows - row_base);
+
+    const uint8_t* weight_rows[kRowsPerWarp];
+    const uint16_t* scale_rows[kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = min(row_base + r, rows - 1);
+        weight_rows[r] = weight + static_cast<size_t>(row) * weight_stride;
+        scale_rows[r] = scale + static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    }
+
+    float sums[kRowsPerWarp] = {};
+    const int vec_cols = cols & ~3;
+    for (int col = lane * 4; col < vec_cols; col += 128) {
+        const uint2 packed = *reinterpret_cast<const uint2*>(x + col);
+        const float x0 = half_to_float(static_cast<uint16_t>(packed.x));
+        const float x1 = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+        const float x2 = half_to_float(static_cast<uint16_t>(packed.y));
+        const float x3 = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+        const int block_col = col / kFp8WeightBlock;
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            const uchar4 codes = *reinterpret_cast<const uchar4*>(weight_rows[r] + col);
+            const float s = half_to_float(scale_rows[r][block_col]);
+            sums[r] += (x0 * lut[codes.x] + x1 * lut[codes.y] +
+                        x2 * lut[codes.z] + x3 * lut[codes.w]) * s;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float xv = half_to_float(x[col]);
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            sums[r] += xv * lut[weight_rows[r][col]] *
+                       half_to_float(scale_rows[r][col / kFp8WeightBlock]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        if (r >= active) break;
+        float sum = sums[r];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) y[row_base + r] = float_to_half(sum);
+    }
 }
 
 template <int kWarps, int kRowsPerWarp>
@@ -231,6 +300,135 @@ __global__ void fp8_matmul_f16_tiled_kernel(
         for (int j = 0; j < 4; ++j) {
             const int gr = row_base + tn + j * 16;
             if (gr < rows) y[static_cast<size_t>(gb) * y_stride + gr] = float_to_half(acc[i][j]);
+        }
+    }
+}
+
+// Lower-register FP16-activation variant of the wide N64 prefill tile. The
+// layout matches the validated FP32 kernel: 128 input tokens by 64 output
+// rows, with FP8 weights decoded once per K tile and reused across tokens.
+__global__ void fp8_matmul_f16_wide_n64_kernel(
+    const uint16_t* __restrict__ x,
+    const uint8_t* __restrict__ weight,
+    const uint16_t* __restrict__ scale,
+    uint16_t* __restrict__ y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, int scale_stride) {
+    constexpr int kM = 128;
+    constexpr int kN = 64;
+    constexpr int kK = 16;
+    constexpr int kThreads = 256;
+    __shared__ float as[kK][kM];
+    __shared__ float bs[kK][kN];
+    __shared__ float lut[256];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int i = tid; i < 256; i += kThreads) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+
+    const int batch_base = static_cast<int>(blockIdx.y) * kM;
+    const int row_base = static_cast<int>(blockIdx.x) * kN;
+    const int tx = tid & 15;
+    const int ty = tid >> 4;
+    const int m0 = ty * 4;
+    const int m1 = 64 + ty * 4;
+    const int n0 = tx * 4;
+    const int load_lane = (tid & 3) * 4;
+    const int load_line = tid >> 2;
+    float acc[8][4] = {};
+
+    for (int col_base = 0; col_base < cols; col_base += kK) {
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+            const int local_batch = load_line + it * 64;
+            const int global_batch = batch_base + local_batch;
+            const int global_col = col_base + load_lane;
+            float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (global_batch < batch) {
+                const uint16_t* src = x + static_cast<size_t>(global_batch) * x_stride;
+                if (global_col + 3 < cols) {
+                    const uint2 packed = *reinterpret_cast<const uint2*>(src + global_col);
+                    values[0] = half_to_float(static_cast<uint16_t>(packed.x));
+                    values[1] = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+                    values[2] = half_to_float(static_cast<uint16_t>(packed.y));
+                    values[3] = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+                } else {
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        if (global_col + t < cols) values[t] = half_to_float(src[global_col + t]);
+                    }
+                }
+            }
+            as[load_lane + 0][local_batch] = values[0];
+            as[load_lane + 1][local_batch] = values[1];
+            as[load_lane + 2][local_batch] = values[2];
+            as[load_lane + 3][local_batch] = values[3];
+        }
+#pragma unroll
+        for (int it = 0; it < 1; ++it) {
+            const int local_row = load_line;
+            const int global_row = row_base + local_row;
+            const int global_col = col_base + load_lane;
+            float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (global_row < rows && global_col < cols) {
+                const uint8_t* src = weight + static_cast<size_t>(global_row) * weight_stride;
+                const float s = half_to_float(
+                    scale[static_cast<size_t>(global_row / kFp8WeightBlock) * scale_stride +
+                          global_col / kFp8WeightBlock]);
+                if (global_col + 3 < cols) {
+                    const uchar4 codes = *reinterpret_cast<const uchar4*>(src + global_col);
+                    values[0] = lut[codes.x] * s;
+                    values[1] = lut[codes.y] * s;
+                    values[2] = lut[codes.z] * s;
+                    values[3] = lut[codes.w] * s;
+                } else {
+#pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        if (global_col + t < cols) values[t] = lut[src[global_col + t]] * s;
+                    }
+                }
+            }
+            bs[load_lane + 0][local_row] = values[0];
+            bs[load_lane + 1][local_row] = values[1];
+            bs[load_lane + 2][local_row] = values[2];
+            bs[load_lane + 3][local_row] = values[3];
+        }
+        __syncthreads();
+
+        float tile[8][4] = {};
+#pragma unroll
+        for (int k = 0; k < kK; ++k) {
+            float a[8];
+            float b[4];
+            *reinterpret_cast<float4*>(&a[0]) = *reinterpret_cast<const float4*>(&as[k][m0]);
+            *reinterpret_cast<float4*>(&a[4]) = *reinterpret_cast<const float4*>(&as[k][m1]);
+            *reinterpret_cast<float4*>(&b[0]) = *reinterpret_cast<const float4*>(&bs[k][n0]);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) tile[i][j] += a[i] * b[j];
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) acc[i][j] += tile[i][j];
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int local_batch = i < 4 ? m0 + i : m1 + (i - 4);
+        const int global_batch = batch_base + local_batch;
+        if (global_batch >= batch) continue;
+        uint16_t* dst = y + static_cast<size_t>(global_batch) * y_stride;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int global_row = row_base + n0 + j;
+            if (global_row < rows) dst[global_row] = float_to_half(acc[i][j]);
         }
     }
 }
@@ -868,9 +1066,37 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
     if (!x || !weight || !scale || !y || rows <= 0 || cols <= 0 ||
         weight_stride < cols || scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
     constexpr int kWarps = 8;
-    fp8_matvec_f16_kernel<kWarps><<<(rows + kWarps - 1) / kWarps,
-        kWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(x, weight, scale, y,
-        rows, cols, weight_stride, scale_stride);
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const char* multirow = std::getenv("QWEN_FP8_F16_MULTIROW");
+    const char* rows_env = std::getenv("QWEN_FP8_F16_MULTIROW_ROWS");
+    const char* vectorized = std::getenv("QWEN_FP8_F16_VECTORIZE");
+    const bool multirow_disabled =
+        multirow != nullptr && std::strcmp(multirow, "0") == 0;
+    const bool use_multirow = multirow != nullptr && !multirow_disabled;
+    const bool use_vectorized =
+        !multirow_disabled &&
+        (vectorized == nullptr || std::strcmp(vectorized, "0") != 0);
+    const int requested_rows = rows_env != nullptr ? std::atoi(rows_env) : 0;
+    constexpr int kMinBlocks = 136;
+    auto blocks_for = [&](int rows_per_warp) {
+        return (rows + kWarps * rows_per_warp - 1) / (kWarps * rows_per_warp);
+    };
+    if (use_multirow && weight_stride % 4 == 0 && requested_rows == 4 &&
+        blocks_for(4) >= kMinBlocks) {
+        fp8_matvec_f16_multirow_kernel<kWarps, 4><<<blocks_for(4), kWarps * 32, 0, s>>>(
+            x, weight, scale, y, rows, cols, weight_stride, scale_stride);
+    } else if (use_multirow && weight_stride % 4 == 0 && requested_rows == 2 &&
+               blocks_for(2) >= kMinBlocks) {
+        fp8_matvec_f16_multirow_kernel<kWarps, 2><<<blocks_for(2), kWarps * 32, 0, s>>>(
+            x, weight, scale, y, rows, cols, weight_stride, scale_stride);
+    } else if (use_vectorized && weight_stride % 4 == 0) {
+        fp8_matvec_f16_multirow_kernel<kWarps, 1><<<blocks_for(1), kWarps * 32, 0, s>>>(
+            x, weight, scale, y, rows, cols, weight_stride, scale_stride);
+    } else {
+        fp8_matvec_f16_kernel<kWarps><<<(rows + kWarps - 1) / kWarps,
+            kWarps * 32, 0, s>>>(x, weight, scale, y, rows, cols,
+            weight_stride, scale_stride);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -883,11 +1109,32 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
         rows <= 0 || cols <= 0 || weight_stride < cols ||
         scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
     constexpr int kWarps = 8;
-    constexpr int kRowsPerWarp = 1;
-    fp8_swiglu_matvec_f16_kernel<kWarps, kRowsPerWarp>
-        <<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0,
-           static_cast<cudaStream_t>(stream)>>>(x, gate_weight, gate_scale,
-           up_weight, up_scale, y, rows, cols, weight_stride, scale_stride);
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const char* multirow = std::getenv("QWEN_FP8_F16_MULTIROW");
+    const char* rows_env = std::getenv("QWEN_FP8_F16_MULTIROW_ROWS");
+    const bool use_multirow = multirow != nullptr && std::strcmp(multirow, "0") != 0;
+    const int requested_rows = rows_env != nullptr ? std::atoi(rows_env) : 0;
+    constexpr int kMinBlocks = 136;
+    auto blocks_for = [&](int rows_per_warp) {
+        return (rows + kWarps * rows_per_warp - 1) / (kWarps * rows_per_warp);
+    };
+    if (use_multirow && weight_stride % 4 == 0 && requested_rows == 4 &&
+        blocks_for(4) >= kMinBlocks) {
+        fp8_swiglu_matvec_f16_kernel<kWarps, 4><<<blocks_for(4), kWarps * 32, 0, s>>>(
+            x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+            weight_stride, scale_stride);
+    } else if (use_multirow && weight_stride % 4 == 0 && requested_rows == 2 &&
+               blocks_for(2) >= kMinBlocks) {
+        fp8_swiglu_matvec_f16_kernel<kWarps, 2><<<blocks_for(2), kWarps * 32, 0, s>>>(
+            x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+            weight_stride, scale_stride);
+    } else {
+        // The fused gate/up kernel has no aligned vectorized variant yet; keep
+        // its one-row path independent of the weight stride alignment.
+        fp8_swiglu_matvec_f16_kernel<kWarps, 1><<<blocks_for(1), kWarps * 32, 0, s>>>(
+            x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+            weight_stride, scale_stride);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -898,11 +1145,22 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     if (!x || !weight || !scale || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
         x_stride < cols || y_stride < rows || weight_stride < cols ||
         scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
-    dim3 grid(static_cast<unsigned>((rows + 63) / 64),
-              static_cast<unsigned>((batch + 63) / 64), 1);
-    fp8_matmul_f16_tiled_kernel<32><<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-        weight_stride, scale_stride);
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const char* wide = std::getenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
+    const bool use_wide = wide == nullptr || std::strcmp(wide, "0") != 0;
+    if (use_wide && batch >= 96 && x_stride % 4 == 0 && weight_stride % 4 == 0) {
+        dim3 grid(static_cast<unsigned>((rows + 63) / 64),
+                  static_cast<unsigned>((batch + 127) / 128), 1);
+        fp8_matmul_f16_wide_n64_kernel<<<grid, 256, 0, s>>>(
+            x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride);
+    } else {
+        dim3 grid(static_cast<unsigned>((rows + 63) / 64),
+                  static_cast<unsigned>((batch + 63) / 64), 1);
+        fp8_matmul_f16_tiled_kernel<32><<<grid, 256, 0, s>>>(
+            x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 

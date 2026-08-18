@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -398,6 +399,197 @@ bool check_decode_grid_256k() {
     return true;
 }
 
+bool check_fp8_f16_projection() {
+    std::mt19937 rng(24000);
+    std::uniform_real_distribution<float> x_dist(-0.75f, 0.75f);
+    std::uniform_real_distribution<float> scale_dist(0.005f, 0.02f);
+    auto random_code = [&]() {
+        // Keep the direct gate finite and away from the E4M3 NaN encodings.
+        return static_cast<uint8_t>(32 + (rng() % 192));
+    };
+    auto max_error = [](const std::vector<uint16_t>& got,
+                        const std::vector<float>& expected, int stride,
+                        int rows, int batch) {
+        double worst = 0.0;
+        for (int b = 0; b < batch; ++b) {
+            for (int r = 0; r < rows; ++r) {
+                worst = std::max(worst, std::fabs(
+                    static_cast<double>(from_half(got[static_cast<size_t>(b) * stride + r])) -
+                    expected[static_cast<size_t>(b) * rows + r]));
+            }
+        }
+        return worst;
+    };
+
+    // Decode shape crosses the multi-row occupancy threshold (4352 rows ->
+    // 136 blocks at four rows per warp) and uses a non-power-of-two block count.
+    constexpr int decode_rows = 4352;
+    constexpr int decode_cols = 512;
+    constexpr int decode_weight_stride = 512;
+    constexpr int decode_scale_stride = 4;
+    std::vector<uint16_t> decode_x(decode_cols);
+    std::vector<uint8_t> decode_weight(static_cast<size_t>(decode_rows) * decode_weight_stride);
+    std::vector<uint16_t> decode_scale(static_cast<size_t>(decode_rows / 128) * decode_scale_stride);
+    for (uint16_t& value : decode_x) value = to_half(x_dist(rng));
+    for (uint8_t& value : decode_weight) value = random_code();
+    for (uint16_t& value : decode_scale) value = to_half(scale_dist(rng));
+    std::vector<float> decode_expected(decode_rows);
+    for (int r = 0; r < decode_rows; ++r) {
+        float sum = 0.0f;
+        for (int c = 0; c < decode_cols; ++c) {
+            sum += from_half(decode_x[c]) * from_fp8_e4m3(decode_weight[
+                static_cast<size_t>(r) * decode_weight_stride + c]) *
+                   from_half(decode_scale[static_cast<size_t>(r / 128) * decode_scale_stride + c / 128]);
+        }
+        decode_expected[r] = sum;
+    }
+    DeviceBuffer d_decode_x, d_decode_weight, d_decode_scale, d_decode_multi,
+        d_decode_vector, d_decode_fallback;
+    uint16_t* dx = d_decode_x.allocate<uint16_t>(decode_x.size());
+    uint8_t* dw = d_decode_weight.allocate<uint8_t>(decode_weight.size());
+    uint16_t* ds = d_decode_scale.allocate<uint16_t>(decode_scale.size());
+    uint16_t* dy_multi = d_decode_multi.allocate<uint16_t>(decode_rows);
+    uint16_t* dy_vector = d_decode_vector.allocate<uint16_t>(decode_rows);
+    uint16_t* dy_fallback = d_decode_fallback.allocate<uint16_t>(decode_rows);
+    if (!dx || !dw || !ds || !dy_multi || !dy_vector || !dy_fallback ||
+        cudaMemcpy(dx, decode_x.data(), decode_x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(dw, decode_weight.data(), decode_weight.size() * sizeof(uint8_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ds, decode_scale.data(), decode_scale.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail("FP16 FP8 decode gate allocation/copy");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_MULTIROW", "1", 1);
+    setenv("QWEN_FP8_F16_MULTIROW_ROWS", "4", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+            dx, dw, ds, dy_multi, decode_rows, decode_cols,
+            decode_weight_stride, decode_scale_stride) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 multi-row decode launch");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_MULTIROW", "0", 1);
+    unsetenv("QWEN_FP8_F16_MULTIROW_ROWS");
+    setenv("QWEN_FP8_F16_VECTORIZE", "1", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+            dx, dw, ds, dy_vector, decode_rows, decode_cols,
+            decode_weight_stride, decode_scale_stride) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 vectorized decode launch");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_MULTIROW", "0", 1);
+    setenv("QWEN_FP8_F16_VECTORIZE", "0", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+            dx, dw, ds, dy_fallback, decode_rows, decode_cols,
+            decode_weight_stride, decode_scale_stride) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 scalar decode launch");
+        return false;
+    }
+    std::vector<uint16_t> decode_multi(decode_rows), decode_vector(decode_rows),
+        decode_fallback(decode_rows);
+    cudaMemcpy(decode_multi.data(), dy_multi, decode_multi.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(decode_vector.data(), dy_vector, decode_vector.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(decode_fallback.data(), dy_fallback, decode_fallback.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    double decode_vector_dispatch_error = 0.0;
+    double decode_multi_dispatch_error = 0.0;
+    for (int r = 0; r < decode_rows; ++r) {
+        decode_vector_dispatch_error = std::max(decode_vector_dispatch_error,
+            std::fabs(static_cast<double>(from_half(decode_vector[r])) - from_half(decode_fallback[r])));
+        decode_multi_dispatch_error = std::max(decode_multi_dispatch_error,
+            std::fabs(static_cast<double>(from_half(decode_multi[r])) - from_half(decode_fallback[r])));
+    }
+    const double decode_error = max_error(decode_vector, decode_expected, 1, decode_rows, 1);
+    const double decode_multi_error = max_error(decode_multi, decode_expected, 1, decode_rows, 1);
+    if (decode_error > 2.0e-2 || decode_multi_error > 2.0e-2 ||
+        decode_vector_dispatch_error > 2.0e-2 || decode_multi_dispatch_error > 2.0e-2) {
+        fail("FP16 FP8 decode dispatch numerical check");
+    } else {
+        std::printf("  FP16 FP8 decode rows=%d cols=%d vector=%.3e multi=%.3e "
+                    "vector_vs_scalar=%.3e multi_vs_scalar=%.3e\n",
+                    decode_rows, decode_cols, decode_error, decode_multi_error,
+                    decode_vector_dispatch_error, decode_multi_dispatch_error);
+    }
+
+    // Prefill shape triggers the 128-token x 64-row N64 tile and has padded
+    // strides so both aligned vector loads and output indexing are exercised.
+    constexpr int batch = 128;
+    constexpr int rows = 130;
+    constexpr int cols = 300;
+    constexpr int x_stride = 304;
+    constexpr int y_stride = 136;
+    constexpr int weight_stride = 304;
+    constexpr int scale_stride = 3;
+    std::vector<uint16_t> prefill_x(static_cast<size_t>(batch) * x_stride);
+    std::vector<uint8_t> prefill_weight(static_cast<size_t>(rows) * weight_stride);
+    std::vector<uint16_t> prefill_scale(static_cast<size_t>((rows + 127) / 128) * scale_stride);
+    for (uint16_t& value : prefill_x) value = to_half(x_dist(rng));
+    for (uint8_t& value : prefill_weight) value = random_code();
+    for (uint16_t& value : prefill_scale) value = to_half(scale_dist(rng));
+    std::vector<float> prefill_expected(static_cast<size_t>(batch) * rows);
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            float sum = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                sum += from_half(prefill_x[static_cast<size_t>(b) * x_stride + c]) *
+                       from_fp8_e4m3(prefill_weight[static_cast<size_t>(r) * weight_stride + c]) *
+                       from_half(prefill_scale[static_cast<size_t>(r / 128) * scale_stride + c / 128]);
+            }
+            prefill_expected[static_cast<size_t>(b) * rows + r] = sum;
+        }
+    }
+    DeviceBuffer d_prefill_x, d_prefill_weight, d_prefill_scale, d_prefill_wide, d_prefill_fallback;
+    uint16_t* px = d_prefill_x.allocate<uint16_t>(prefill_x.size());
+    uint8_t* pw = d_prefill_weight.allocate<uint8_t>(prefill_weight.size());
+    uint16_t* ps = d_prefill_scale.allocate<uint16_t>(prefill_scale.size());
+    uint16_t* py_wide = d_prefill_wide.allocate<uint16_t>(static_cast<size_t>(batch) * y_stride);
+    uint16_t* py_fallback = d_prefill_fallback.allocate<uint16_t>(static_cast<size_t>(batch) * y_stride);
+    if (!px || !pw || !ps || !py_wide || !py_fallback ||
+        cudaMemcpy(px, prefill_x.data(), prefill_x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pw, prefill_weight.data(), prefill_weight.size() * sizeof(uint8_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ps, prefill_scale.data(), prefill_scale.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail("FP16 FP8 wide prefill allocation/copy");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_PREFILL_WIDE_N64", "1", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+            px, pw, ps, py_wide, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride) || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 wide prefill launch");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_PREFILL_WIDE_N64", "0", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+            px, pw, ps, py_fallback, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride) || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 fallback prefill launch");
+        return false;
+    }
+    std::vector<uint16_t> prefill_wide(static_cast<size_t>(batch) * y_stride);
+    std::vector<uint16_t> prefill_fallback(prefill_wide.size());
+    cudaMemcpy(prefill_wide.data(), py_wide, prefill_wide.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(prefill_fallback.data(), py_fallback, prefill_fallback.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    double prefill_dispatch_error = 0.0;
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            prefill_dispatch_error = std::max(prefill_dispatch_error,
+                std::fabs(static_cast<double>(from_half(prefill_wide[static_cast<size_t>(b) * y_stride + r])) -
+                          from_half(prefill_fallback[static_cast<size_t>(b) * y_stride + r])));
+        }
+    }
+    const double prefill_error = max_error(prefill_wide, prefill_expected, y_stride, rows, batch);
+    unsetenv("QWEN_FP8_F16_MULTIROW");
+    unsetenv("QWEN_FP8_F16_MULTIROW_ROWS");
+    unsetenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
+    if (prefill_error > 3.0e-2 || prefill_dispatch_error > 3.0e-2) {
+        fail("FP16 FP8 wide prefill numerical check");
+    } else {
+        std::printf("  FP16 FP8 prefill batch=%d rows=%d cols=%d error=%.3e dispatch=%.3e\n",
+                    batch, rows, cols, prefill_error, prefill_dispatch_error);
+    }
+    return true;
+}
+
 bool check_fp8_cache() {
     constexpr int q_heads = 6;
     constexpr int kv_heads = 1;
@@ -517,6 +709,7 @@ int main() {
     check_decode_fused(32768, 64);
     check_decode_window_reference();
     check_decode_grid_256k();
+    check_fp8_f16_projection();
     check_fp8_cache();
     if (failures != 0) {
         std::printf("test_qwen_half_ops failures=%d\n", failures);
