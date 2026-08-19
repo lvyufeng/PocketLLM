@@ -9,6 +9,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -176,8 +178,36 @@ bool write_fixture(const std::string& dir) {
     const uint64_t header_len = header_text.size();
     shard.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
     shard.write(header_text.data(), static_cast<std::streamsize>(header_text.size()));
-    std::vector<uint8_t> zeros(static_cast<size_t>(offset), 0);
-    shard.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+    std::vector<uint8_t> data(static_cast<size_t>(offset), 0);
+    uint64_t data_offset = 0;
+    for (const TensorSpec& tensor : tensors) {
+        const uint64_t bytes = numel(tensor.shape) * dtype_size(tensor.dtype);
+        if (tensor.dtype == "F8_E4M3") {
+            // E4M3 1.0, with a nonzero scale, exercises online FP8 paths.
+            std::fill(data.begin() + static_cast<ptrdiff_t>(data_offset),
+                      data.begin() + static_cast<ptrdiff_t>(data_offset + bytes),
+                      static_cast<uint8_t>(0x38));
+        } else {
+            // BF16 1.0. Make embedding rows token-dependent so a branch at a
+            // changed token actually changes the recurrent state.
+            const bool embedding = tensor.name.find("embed_tokens.weight") !=
+                std::string::npos;
+            const uint64_t elements = bytes / 2;
+            for (uint64_t element = 0; element < elements; ++element) {
+                uint16_t bits = 0x3f80;
+                if (embedding && !tensor.shape.empty()) {
+                    const uint64_t row = element / tensor.shape.back();
+                    bits = static_cast<uint16_t>(0x3f80u + (row & 0x1fu));
+                }
+                const uint64_t at = data_offset + element * 2;
+                data[static_cast<size_t>(at)] = static_cast<uint8_t>(bits & 0xffu);
+                data[static_cast<size_t>(at + 1)] = static_cast<uint8_t>(bits >> 8);
+            }
+        }
+        data_offset += bytes;
+    }
+    shard.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
     if (!shard) return false;
 
     std::ofstream index(dir + "/model.safetensors.index.json", std::ios::binary | std::ios::trunc);
@@ -193,6 +223,69 @@ bool write_fixture(const std::string& dir) {
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void exercise_prefix_cache(const std::string& dir,
+                           dsv4::QwenKvCacheDType cache_dtype) {
+    dsv4::QwenEngineOptions options;
+    options.tp_world = 1;
+    options.tp_rank = 0;
+    options.device = 0;
+    options.prefill_chunk_tokens = 2;
+    options.kv_cache_dtype = cache_dtype;
+    options.state_snapshot_interval_tokens = 2;
+    options.max_state_snapshots = 8;
+    dsv4::QwenEngine engine(dir, options, 2, 8);
+
+    const dsv4::QwenForwardResult baseline = engine.prefill({1, 2, 3});
+    const dsv4::QwenPrefixCacheStats first = engine.prefix_cache_stats();
+    require(first.reused_tokens == 0 && first.computed_tokens == 3,
+            "initial prefix cache accounting");
+
+    (void)engine.prefill({1, 2, 3, 4, 5});
+    const dsv4::QwenPrefixCacheStats appended = engine.prefix_cache_stats();
+    require(appended.resume_source == "live" && appended.reused_tokens == 3 &&
+                appended.computed_tokens == 2,
+            "appended prompt must reuse live recurrent state");
+
+    const dsv4::QwenForwardResult shortened_result = engine.prefill({1, 2, 3});
+    const dsv4::QwenPrefixCacheStats shortened = engine.prefix_cache_stats();
+    require(shortened.resume_source == "snapshot" &&
+                shortened.reused_tokens == 3 && shortened.computed_tokens == 0,
+            "shorter prompt must reuse request-boundary snapshot");
+    require(shortened_result.top_token == baseline.top_token &&
+                shortened_result.top_logit == baseline.top_logit &&
+                shortened_result.checksum == baseline.checksum,
+            "snapshot result must match cold prefill");
+
+    const dsv4::QwenForwardResult branched_result = engine.prefill({1, 2, 9});
+    const dsv4::QwenPrefixCacheStats branched = engine.prefix_cache_stats();
+    require(branched.resume_source == "snapshot" && branched.reused_tokens == 2 &&
+                branched.computed_tokens == 1,
+            "branched prompt must resume from interior snapshot");
+
+    dsv4::QwenEngine cold_engine(dir, options, 2, 8);
+    const dsv4::QwenForwardResult cold_branch = cold_engine.prefill({1, 2, 9});
+    require(branched_result.top_token == cold_branch.top_token &&
+                branched_result.top_logit == cold_branch.top_logit &&
+                branched_result.checksum == cold_branch.checksum,
+            "snapshot branch must match cold prefill");
+
+    dsv4::QwenEngineOptions no_cache_options = options;
+    no_cache_options.prefix_cache = false;
+    dsv4::QwenEngine no_cache_engine(dir, no_cache_options, 2, 8);
+    (void)no_cache_engine.prefill({1, 2, 3});
+    const dsv4::QwenPrefixCacheStats no_cache = no_cache_engine.prefix_cache_stats();
+    require(no_cache.reused_tokens == 0 && no_cache.computed_tokens == 3 &&
+                no_cache.snapshots == 0 && no_cache.snapshot_bytes == 0,
+            "disabled prefix cache must not retain snapshots");
+
+    engine.reset();
+    (void)engine.prefill({1, 2, 3});
+    const dsv4::QwenPrefixCacheStats reset = engine.prefix_cache_stats();
+    require(reset.reused_tokens == 0 && reset.computed_tokens == 3 &&
+                reset.resume_source == "empty",
+            "reset must invalidate prefix cache");
 }
 
 void exercise_cache_lifecycle(const std::string& dir,
@@ -257,6 +350,8 @@ int main() {
         require(write_fixture(dir), "could not create Qwen engine fixture");
         exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp16);
+        exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp8);
         std::cout << "[PASS] test_qwen_engine layers=2\n";
         return 0;
     } catch (const std::exception& ex) {

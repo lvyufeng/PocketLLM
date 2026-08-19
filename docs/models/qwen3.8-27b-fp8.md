@@ -44,6 +44,7 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 - 16-layer GQA prefill and KV-cache decode with local K/V heads.
 - FP16 activation storage with FP32 local accumulation/state where required; no prompt-length FP32 activation expansion.
 - Chunked prefill (default 512 tokens) that retains only recurrent state, convolution tails, and full-attention KV cache between chunks.
+- Exact single-request prefix reuse: the position-indexed GQA KV cache and the DeltaNet recurrent state are retained across sequential `prefill()` calls. Appended prompts execute only their uncached suffix; diverging or compressed prompts restore a device-resident recurrent snapshot at the longest safe common prefix.
 - FP16 KV cache by default, plus explicit opt-in FP8 E4M3 cache with per-token/KV-head FP16 scales over 64-channel blocks.
 - Decode-only fused FP8 gate/up projection plus SwiGLU.
 - Opt-in exact FP16 GQA kernels: tiled prefill and split-context fused decode with compact online-softmax partials. Enable with `DSV4_QWEN_GQA_OPTIMIZED=1`; the default remains the reference full-attention path.
@@ -78,6 +79,36 @@ The same executable was then run serially over longer prompts with four generate
 | 131,072 | 35.19 tok/s | 3.65 tok/s | 62.50 MiB | 2,048.1 MiB | 9.97 GiB | PASS |
 
 The direct FP16-activation FP8 projection gate covers aligned and padded strides, masked rows, tail K tiles, vectorized-versus-scalar decode dispatch, and the wide prefill tile. It reports decode max absolute error `1.459e-2` against the FP32 host reference, with vectorized-versus-scalar output difference `0`; the 4-row experimental path differs by at most `3.906e-3`. The focused FP8 online operator suite and full TP4 rank parity checks also pass.
+
+### Exact prefix reuse
+
+`QwenEngineOptions::prefix_cache` is enabled by default for a long-lived engine. The full-attention KV cache is already indexed by absolute position, while the 48 DeltaNet layers carry a small recurrent state (`state` plus convolution tail). The engine retains both across sequential prefill requests and reports `prefix_reused_tokens`, `prefix_computed_tokens`, `prefix_matched_tokens`, and `prefix_resume_source` in the persistent stdin result.
+
+The runtime stores device-resident recurrent snapshots at dense 256-token boundaries through the first 4K, then at the configured 4K interval through the 262K limit. This keeps a compressed or diverging request exact while limiting recomputation to the suffix after the selected snapshot. The default 82 snapshots use about 3.0 GiB per rank on the full 48-layer model; this is additional KV/state working memory and is included in the reported GPU memory. `--qwen-no-prefix-cache`, `--qwen-snapshot-interval N`, and `--qwen-max-snapshots N` provide explicit A/B controls.
+
+A long-lived TP4 stdin worker can be started with `--qwen-persistent-stdin --max-context N`; rank 0 reads lines of the form `<max_new_tokens> token0 token1 ...`, and rank 1..3 receive the same requests over the Qwen command socket. This mode is intended for single-concurrency clients and preserves the cache between lines. Each request returns exact greedy tokens and prefix accounting. The ordinary one-shot CLI creates a fresh engine, so it cannot reuse a cache across processes and therefore keeps snapshots disabled; the reported one-shot long-context TPS and memory are unaffected by this feature. `--qwen-no-prefix-cache` fully disables snapshots, prompt history, and cached results even in persistent mode.
+
+A real TP4 continuous-request test on the Qwen3.8-27B-FP8 checkpoint produced:
+
+| Request | Prompt | Reused | Computed | Resume | Request prefill TPS |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 1 | 512 | 0 | 512 | empty | 409.9 |
+| 2 | 1,028 | 515 | 513 | live | 642.8 |
+| 3 | 1,544 | 1,031 | 513 | live | 908.9 |
+| 4 | 768 (256 common prefix + compressed suffix) | 256 | 512 | snapshot | 627.5 |
+
+The cache-on and cold A/B runs generated identical tokens on all four TP ranks. In the cold run, requests 2/3/4 computed 1,028/1,544/768 tokens respectively, and every cold request reported `prefix_snapshots=0` with `prefix_snapshot_bytes=0`. Prefix reuse is exact: it does not claim that newly compressed content is cached; only the unchanged token prefix is reused.
+
+The same harness was then run from a 32,768-token cold prompt with 512-token appends and a 4,096-token compression boundary:
+
+| Request | Prompt | Reused | Computed | Resume | Request prefill TPS | Snapshot bytes/rank |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 1 | 32,768 | 0 | 32,768 | empty | 113.7 | 885,178,368 |
+| 2 | 33,284 | 32,771 | 513 | live | 4,083.9 | 923,664,384 |
+| 3 | 33,800 | 33,287 | 513 | live | 4,105.8 | 962,150,400 |
+| 4 | 4,608 (4,096 common prefix + compressed suffix) | 4,096 | 512 | snapshot | 2,361.3 | 654,262,272 |
+
+Request 1 matches the cold 32K prefill baseline. The two appends each execute only the 513 uncached tokens, and the compressed request recomputes only its 512-token suffix after restoring the 4,096-token snapshot. Snapshot memory shrinks when a shorter prompt invalidates later rollback points.
 
 ### Long-context TP4 baseline
 

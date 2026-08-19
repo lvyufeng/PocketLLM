@@ -27,6 +27,18 @@ struct QwenEngineOptions {
     // sink-plus-sliding-window attention path in the optimized FP16 kernels.
     int attention_window = 0;
     int attention_sink_tokens = 0;
+    // Exact prefix reuse across sequential requests. The full-attention KV
+    // cache is already position-indexed, so only the recurrent DeltaNet state
+    // has to be carried forward or rolled back.
+    bool prefix_cache = true;
+    // Recurrent-state snapshots let a diverging prompt roll back to an interior
+    // position instead of recomputing from zero. 0 disables snapshots; live
+    // continuation of an appended prompt still applies.
+    int state_snapshot_interval_tokens = 4096;
+    // 82 covers dense 256-token checkpoints through 4K, every 4K boundary
+    // through the 262,144-token limit, and a few request-boundary snapshots.
+    // This uses about 3.0 GiB/rank for 48-layer Qwen3.8 recurrent snapshots.
+    int max_state_snapshots = 82;
     std::string nccl_id_path;
 };
 
@@ -39,6 +51,24 @@ struct QwenForwardResult {
     float top_logit = 0.0f;
     float checksum = 0.0f;
     int position = 0;
+};
+
+// Accounting for one prefill call under exact prefix reuse.
+struct QwenPrefixCacheStats {
+    // Tokens whose KV cache and recurrent state were reused unchanged.
+    int reused_tokens = 0;
+    // Tokens actually pushed through the network by the last prefill.
+    int computed_tokens = 0;
+    // Total prompt length of the last prefill.
+    int prompt_tokens = 0;
+    // Recurrent state source: "empty", "live", or "snapshot".
+    std::string resume_source = "empty";
+    // Longest common prefix with the previous prompt, before snapshot rounding.
+    int matched_tokens = 0;
+    int snapshots = 0;
+    uint64_t snapshot_bytes = 0;
+    int hits = 0;
+    int misses = 0;
 };
 
 // Independent Qwen3.5 hybrid dense runtime. Checkpoint BF16 tensors are
@@ -64,7 +94,13 @@ public:
     uint64_t kv_cache_bytes() const;
     uint64_t kv_cache_scale_bytes() const;
 
+    const QwenPrefixCacheStats& prefix_cache_stats() const {
+        return prefix_stats_;
+    }
+
     void reset();
+    // Drops every cached prefix so the next prefill recomputes from zero.
+    void clear_prefix_cache();
     void warmup_tp();
     QwenForwardResult prefill(const std::vector<int>& token_ids);
     QwenForwardResult decode_step(int token_id);
@@ -84,6 +120,9 @@ private:
     int position_ = 0;
     uint64_t resident_weight_bytes_ = 0;
     uint64_t resident_scale_bytes_ = 0;
+    QwenPrefixCacheStats prefix_stats_;
+    QwenForwardResult cached_result_;
+    bool has_cached_result_ = false;
     Impl* impl_ = nullptr;
 };
 

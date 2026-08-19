@@ -142,6 +142,26 @@ void zero_tensor(QwenDeviceTensor& tensor) {
     }
 }
 
+// One rollback point for the recurrent half of the network. The 16 full
+// attention layers need nothing here because their KV cache is indexed by
+// absolute position and is never invalidated by a longer prompt.
+struct QwenRecurrentSnapshot {
+    int position = 0;
+    // Device-resident contiguous copies avoid a PCIe round trip and thousands
+    // of small allocations. The tensors are local to one TP rank.
+    QwenDeviceTensor state;
+    QwenDeviceTensor conv_tail;
+    bool periodic = false;
+    // A request-boundary snapshot can answer an exact shorter-prefix prefill
+    // without re-running its final token.
+    QwenForwardResult result;
+    bool has_result = false;
+
+    uint64_t bytes() const {
+        return state.capacity + conv_tail.capacity;
+    }
+};
+
 struct QwenWorkspace {
     std::vector<QwenDeviceTensor> slots;
     size_t cursor = 0;
@@ -211,6 +231,13 @@ struct QwenEngine::Impl {
     uint64_t uploaded_scale_bytes = 0;
     uint64_t cache_data_bytes = 0;
     uint64_t cache_scale_bytes = 0;
+    // Prompt whose KV cache and recurrent state are currently materialized.
+    std::vector<int> cached_prompt;
+    // Ordered by ascending position. Index 0 is always the implicit empty
+    // state, which is not stored.
+    std::vector<QwenRecurrentSnapshot> snapshots;
+    int prefix_hits = 0;
+    int prefix_misses = 0;
 
     Impl(SafeTensorsIndex& index_, QwenConfig& config_,
          const QwenWeightMap& map, const QwenEngineOptions& options_,
@@ -359,6 +386,210 @@ struct QwenEngine::Impl {
             }
             layers.push_back(std::move(destination));
         }
+    }
+
+    bool has_recurrent_state() const {
+        for (const DeviceLayer& layer : layers) {
+            if (layer.linear.state.data != nullptr) return true;
+        }
+        return false;
+    }
+
+    void zero_recurrent_state() {
+        for (DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            zero_tensor(layer.linear.state);
+            zero_tensor(layer.linear.conv_tail);
+        }
+    }
+
+    // Copies the recurrent half of the network to device-resident snapshots.
+    // Only the 48 DeltaNet layers carry order-dependent state; full attention
+    // is skipped because its KV cache is addressed by absolute position.
+    QwenRecurrentSnapshot capture_recurrent_state(
+        int position, const QwenForwardResult* result = nullptr,
+        bool periodic = false) {
+        QwenRecurrentSnapshot snapshot;
+        snapshot.position = position;
+        snapshot.periodic = periodic;
+        if (result != nullptr) {
+            snapshot.result = *result;
+            snapshot.has_result = true;
+        }
+        size_t state_bytes = 0;
+        size_t tail_bytes = 0;
+        for (const DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            state_bytes += layer.linear.state.nbytes;
+            tail_bytes += layer.linear.conv_tail.nbytes;
+        }
+        if (state_bytes != 0) {
+            allocate(snapshot.state, state_bytes, {state_bytes / sizeof(float)},
+                     SafeDType::F32);
+        }
+        if (tail_bytes != 0) {
+            allocate(snapshot.conv_tail, tail_bytes,
+                     {tail_bytes / sizeof(uint16_t)}, SafeDType::F16);
+        }
+        size_t state_offset = 0;
+        size_t tail_offset = 0;
+        for (const DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            check_cuda(cudaMemcpy(
+                           static_cast<uint8_t*>(snapshot.state.data) + state_offset,
+                           layer.linear.state.data, layer.linear.state.nbytes,
+                           cudaMemcpyDeviceToDevice),
+                       "Qwen recurrent state snapshot copy");
+            state_offset += layer.linear.state.nbytes;
+            if (layer.linear.conv_tail.nbytes != 0) {
+                check_cuda(cudaMemcpy(
+                               static_cast<uint8_t*>(snapshot.conv_tail.data) + tail_offset,
+                               layer.linear.conv_tail.data,
+                               layer.linear.conv_tail.nbytes,
+                               cudaMemcpyDeviceToDevice),
+                           "Qwen convolution tail snapshot copy");
+                tail_offset += layer.linear.conv_tail.nbytes;
+            }
+        }
+        return snapshot;
+    }
+
+    void restore_recurrent_state(const QwenRecurrentSnapshot& snapshot) {
+        size_t expected_state_bytes = 0;
+        size_t expected_tail_bytes = 0;
+        for (const DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            expected_state_bytes += layer.linear.state.nbytes;
+            expected_tail_bytes += layer.linear.conv_tail.nbytes;
+        }
+        if (snapshot.state.nbytes != expected_state_bytes ||
+            snapshot.conv_tail.nbytes != expected_tail_bytes) {
+            throw std::runtime_error("Qwen recurrent snapshot extent mismatch");
+        }
+        size_t state_offset = 0;
+        size_t tail_offset = 0;
+        for (DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            check_cuda(cudaMemcpy(
+                           layer.linear.state.data,
+                           static_cast<const uint8_t*>(snapshot.state.data) + state_offset,
+                           layer.linear.state.nbytes, cudaMemcpyDeviceToDevice),
+                       "Qwen recurrent state snapshot restore");
+            state_offset += layer.linear.state.nbytes;
+            if (layer.linear.conv_tail.nbytes != 0) {
+                check_cuda(cudaMemcpy(
+                               layer.linear.conv_tail.data,
+                               static_cast<const uint8_t*>(snapshot.conv_tail.data) + tail_offset,
+                               layer.linear.conv_tail.nbytes,
+                               cudaMemcpyDeviceToDevice),
+                           "Qwen convolution tail snapshot restore");
+                tail_offset += layer.linear.conv_tail.nbytes;
+            }
+        }
+    }
+
+    // Keeps snapshots ordered and bounded. The newest position wins because a
+    // monotonically growing prompt resumes from the deepest available point.
+    void record_snapshot(int position, const QwenForwardResult* result = nullptr,
+                         bool periodic = false) {
+        if (!options.prefix_cache ||
+            options.state_snapshot_interval_tokens <= 0 ||
+            options.max_state_snapshots <= 0 || position <= 0) {
+            return;
+        }
+        if (!has_recurrent_state()) return;
+        for (QwenRecurrentSnapshot& entry : snapshots) {
+            if (entry.position != position) continue;
+            entry.periodic = entry.periodic || periodic;
+            if (result != nullptr && !entry.has_result) {
+                entry.result = *result;
+                entry.has_result = true;
+            }
+            return;
+        }
+        snapshots.push_back(capture_recurrent_state(position, result, periodic));
+        std::sort(snapshots.begin(), snapshots.end(),
+                  [](const QwenRecurrentSnapshot& a,
+                     const QwenRecurrentSnapshot& b) {
+                      return a.position < b.position;
+                  });
+        // Preserve periodic coverage. Request-boundary snapshots improve exact
+        // repeats but are expendable; evict their oldest entries first.
+        while (static_cast<int>(snapshots.size()) > options.max_state_snapshots) {
+            auto evict = std::find_if(
+                snapshots.begin(), snapshots.end(),
+                [](const QwenRecurrentSnapshot& entry) {
+                    return !entry.periodic;
+                });
+            if (evict == snapshots.end()) evict = snapshots.begin();
+            snapshots.erase(evict);
+        }
+    }
+
+    // Deepest snapshot at or before limit, or nullptr for the empty state.
+    const QwenRecurrentSnapshot* snapshot_at_or_before(int limit) const {
+        const QwenRecurrentSnapshot* best = nullptr;
+        for (const QwenRecurrentSnapshot& entry : snapshots) {
+            if (entry.position <= limit &&
+                (best == nullptr || entry.position > best->position)) {
+                best = &entry;
+            }
+        }
+        return best;
+    }
+
+    // A prompt result needs the hidden/logits for its final token. If the
+    // chosen state is already after that token, use an earlier snapshot so the
+    // final token is executed again rather than returning stale logits.
+    const QwenRecurrentSnapshot* snapshot_strictly_before(int limit) const {
+        const QwenRecurrentSnapshot* best = nullptr;
+        for (const QwenRecurrentSnapshot& entry : snapshots) {
+            if (entry.position < limit &&
+                (best == nullptr || entry.position > best->position)) {
+                best = &entry;
+            }
+        }
+        return best;
+    }
+
+    uint64_t snapshot_bytes() const {
+        uint64_t total = 0;
+        for (const QwenRecurrentSnapshot& entry : snapshots) {
+            total += entry.bytes();
+        }
+        return total;
+    }
+
+    int early_snapshot_interval() const {
+        if (options.state_snapshot_interval_tokens <= 0) return 0;
+        return std::min(256, options.state_snapshot_interval_tokens);
+    }
+
+    bool is_periodic_snapshot_position(int position) const {
+        const int interval = options.state_snapshot_interval_tokens;
+        if (interval <= 0 || position <= 0) return false;
+        if (position % interval == 0) return true;
+        const int early_interval = early_snapshot_interval();
+        return position <= 4096 && position % early_interval == 0;
+    }
+
+    int next_periodic_snapshot_after(int position) const {
+        const int interval = options.state_snapshot_interval_tokens;
+        if (interval <= 0) return 0;
+        const int next_regular = ((position / interval) + 1) * interval;
+        if (position >= 4096) return next_regular;
+        const int early_interval = early_snapshot_interval();
+        const int next_early = ((position / early_interval) + 1) * early_interval;
+        return std::min(next_regular, next_early);
+    }
+
+    void drop_snapshots_after(int position) {
+        snapshots.erase(
+            std::remove_if(snapshots.begin(), snapshots.end(),
+                           [position](const QwenRecurrentSnapshot& entry) {
+                               return entry.position > position;
+                           }),
+            snapshots.end());
     }
 
     void all_reduce_half(uint16_t* values, int count) {
@@ -912,15 +1143,21 @@ void QwenEngine::warmup_tp() {
 }
 
 void QwenEngine::reset() {
+    clear_prefix_cache();
+}
+
+void QwenEngine::clear_prefix_cache() {
     position_ = 0;
-    for (DeviceLayer& layer : impl_->layers) {
-        if (layer.linear.state.data != nullptr) {
-            zero_tensor(layer.linear.state);
-            zero_tensor(layer.linear.conv_tail);
-        }
-        // KV storage is overwritten before it is read. Avoid clearing several
-        // GiB on every request; position_ bounds all attention reads.
-    }
+    has_cached_result_ = false;
+    cached_result_ = QwenForwardResult{};
+    prefix_stats_ = QwenPrefixCacheStats{};
+    impl_->cached_prompt.clear();
+    impl_->snapshots.clear();
+    impl_->prefix_hits = 0;
+    impl_->prefix_misses = 0;
+    impl_->zero_recurrent_state();
+    // KV storage is overwritten before it is read. Avoid clearing several GiB
+    // on every request; position_ bounds all attention reads.
 }
 
 QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
@@ -930,20 +1167,139 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
     if (token_ids.size() > static_cast<size_t>(max_context_)) {
         throw std::runtime_error("Qwen context length exceeded");
     }
-    reset();
-    QwenForwardResult result;
-    const int chunk_size = options_.prefill_chunk_tokens;
-    for (size_t offset = 0; offset < token_ids.size();
-         offset += static_cast<size_t>(chunk_size)) {
-        const size_t end = std::min(token_ids.size(),
-                                    offset + static_cast<size_t>(chunk_size));
-        std::vector<int> chunk(token_ids.begin() + static_cast<ptrdiff_t>(offset),
-                               token_ids.begin() + static_cast<ptrdiff_t>(end));
-        const bool last = end == token_ids.size();
-        result = impl_->run_chunk(chunk, static_cast<int>(offset),
-                                  active_layers_, last);
+
+    prefix_stats_ = QwenPrefixCacheStats{};
+    prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
+
+    const bool can_reuse = options_.prefix_cache &&
+        !impl_->cached_prompt.empty() && position_ ==
+            static_cast<int>(impl_->cached_prompt.size());
+    size_t common = 0;
+    if (can_reuse) {
+        const size_t limit = std::min(token_ids.size(), impl_->cached_prompt.size());
+        while (common < limit && token_ids[common] == impl_->cached_prompt[common]) {
+            ++common;
+        }
     }
-    position_ = static_cast<int>(token_ids.size());
+    prefix_stats_.matched_tokens = static_cast<int>(common);
+
+    // Exact repeat: the cached final logits are already the requested result.
+    if (can_reuse && common == token_ids.size() &&
+        token_ids.size() == impl_->cached_prompt.size() && has_cached_result_) {
+        ++impl_->prefix_hits;
+        prefix_stats_.hits = impl_->prefix_hits;
+        prefix_stats_.misses = impl_->prefix_misses;
+        prefix_stats_.reused_tokens = static_cast<int>(token_ids.size());
+        prefix_stats_.resume_source = "live";
+        prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+        prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
+        return cached_result_;
+    }
+
+    int start_position = 0;
+    const QwenRecurrentSnapshot* resume_snapshot = nullptr;
+    if (can_reuse && common == impl_->cached_prompt.size() &&
+        common <= token_ids.size()) {
+        // The current recurrent state is exactly the state after the common
+        // prefix. This is the hot path for monotonically growing prompts.
+        start_position = static_cast<int>(common);
+        prefix_stats_.resume_source = "live";
+        ++impl_->prefix_hits;
+    } else if (options_.prefix_cache && common > 0) {
+        // For a branch or a shorter prompt, restore the deepest safe snapshot.
+        // A request-boundary snapshot also carries the final-token result, so
+        // an exact shorter-prefix request can finish without recomputation.
+        resume_snapshot = impl_->snapshot_at_or_before(
+            static_cast<int>(common));
+        if (resume_snapshot != nullptr &&
+            resume_snapshot->position == static_cast<int>(common) &&
+            resume_snapshot->has_result && token_ids.size() == common) {
+            impl_->restore_recurrent_state(*resume_snapshot);
+            position_ = static_cast<int>(common);
+            impl_->cached_prompt = token_ids;
+            cached_result_ = resume_snapshot->result;
+            has_cached_result_ = true;
+            impl_->drop_snapshots_after(position_);
+            prefix_stats_.resume_source = "snapshot";
+            prefix_stats_.reused_tokens = static_cast<int>(common);
+            prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+            prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
+            ++impl_->prefix_hits;
+            prefix_stats_.hits = impl_->prefix_hits;
+            prefix_stats_.misses = impl_->prefix_misses;
+            return cached_result_;
+        }
+        if (resume_snapshot != nullptr &&
+            resume_snapshot->position == static_cast<int>(token_ids.size())) {
+            resume_snapshot = impl_->snapshot_strictly_before(
+                static_cast<int>(token_ids.size()));
+        }
+        if (resume_snapshot != nullptr) {
+            impl_->restore_recurrent_state(*resume_snapshot);
+            start_position = resume_snapshot->position;
+            prefix_stats_.resume_source = "snapshot";
+            ++impl_->prefix_hits;
+        } else {
+            impl_->zero_recurrent_state();
+            prefix_stats_.resume_source = "empty";
+            ++impl_->prefix_misses;
+        }
+        impl_->drop_snapshots_after(start_position);
+    } else {
+        impl_->zero_recurrent_state();
+        prefix_stats_.resume_source = "empty";
+        if (can_reuse) ++impl_->prefix_misses;
+        impl_->drop_snapshots_after(0);
+    }
+
+    const int target_position = static_cast<int>(token_ids.size());
+    QwenForwardResult result;
+    const int chunk_size = std::max(1, options_.prefill_chunk_tokens);
+    for (int offset = start_position; offset < target_position;) {
+        int end = std::min(target_position, offset + chunk_size);
+        // Split at exact snapshot boundaries even when a request begins at an
+        // arbitrary position. Otherwise a 512-token append starting at 100 can
+        // step over 4096 forever and never create the rollback point.
+        if (options_.state_snapshot_interval_tokens > 0) {
+            const int next_snapshot = impl_->next_periodic_snapshot_after(offset);
+            if (next_snapshot > offset && next_snapshot < end) {
+                end = next_snapshot;
+            }
+        }
+        std::vector<int> chunk(
+            token_ids.begin() + static_cast<ptrdiff_t>(offset),
+            token_ids.begin() + static_cast<ptrdiff_t>(end));
+        result = impl_->run_chunk(chunk, offset, active_layers_,
+                                  end == target_position);
+        const bool periodic_snapshot =
+            impl_->is_periodic_snapshot_position(end);
+        if (periodic_snapshot || end == target_position) {
+            impl_->record_snapshot(end, end == target_position ? &result : nullptr,
+                                   periodic_snapshot);
+        }
+        offset = end;
+    }
+
+    // A same-length prompt resumed from an interior snapshot always computes
+    // at least one token; the only zero-work case returned above was exact hit.
+    if (start_position == target_position) {
+        throw std::runtime_error("Qwen prefix cache failed to produce logits");
+    }
+    position_ = target_position;
+    if (options_.prefix_cache) {
+        impl_->cached_prompt = token_ids;
+        cached_result_ = result;
+        has_cached_result_ = true;
+    } else {
+        impl_->cached_prompt.clear();
+        has_cached_result_ = false;
+    }
+    prefix_stats_.reused_tokens = start_position;
+    prefix_stats_.computed_tokens = target_position - start_position;
+    prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+    prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
+    prefix_stats_.hits = impl_->prefix_hits;
+    prefix_stats_.misses = impl_->prefix_misses;
     return result;
 }
 
@@ -954,6 +1310,14 @@ QwenForwardResult QwenEngine::decode_step(int token_id) {
     QwenForwardResult result = impl_->run_chunk(
         {token_id}, position_, active_layers_, true);
     ++position_;
+    if (options_.prefix_cache) {
+        impl_->cached_prompt.push_back(token_id);
+        cached_result_ = result;
+        has_cached_result_ = true;
+        if (impl_->is_periodic_snapshot_position(position_)) {
+            impl_->record_snapshot(position_, &result, true);
+        }
+    }
     return result;
 }
 
