@@ -153,6 +153,19 @@ wait
 
 For a normal run, use the same command-line options as the Qwen smoke entrypoint and let rank 0 report `prefill_tokens_per_s`, `decode_tokens_per_s`, resident weight bytes, and GPU memory. The Qwen OpenAI server adapter is not implemented yet.
 
+For a single-concurrency client whose next request extends or compresses the previous one, keep one TP4 process group alive with the persistent token-ID worker. Rank 0 reads `<max_new_tokens> token0 token1 ...` lines and reports exact prefix accounting; the worker reuses live state for appends and device snapshots for branches:
+
+```bash
+python scripts/bench_qwen_prefix_cache.py \\
+  --ckpt /path/to/Qwen3.8-27B-FP8 \\
+  --token-ids-file /path/to/prompt_ids.csv \\
+  --max-context 32768 \\
+  --max-new-tokens 4 \\
+  --compression-prefix-tokens 4096
+```
+
+The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for all requests. Use `--disable-prefix-cache` for a cold parity A/B. One-shot Qwen commands disable prefix snapshots because their engine lifetime covers only one request; `--qwen-persistent-stdin` enables the cache, while `--qwen-no-prefix-cache` explicitly disables it.
+
 ## Documentation
 
 - [Documentation index](docs/README.md)

@@ -153,6 +153,19 @@ wait
 
 正常运行时使用相同的 Qwen smoke 参数；rank 0 会输出 `prefill_tokens_per_s`、`decode_tokens_per_s`、resident weight bytes 和 GPU memory。Qwen OpenAI server adapter 尚未实现。
 
+对于单并发客户端，如果后续请求会追加或压缩上一次请求，使用长期存活的 TP4 token-ID worker。rank 0 读取 `<max_new_tokens> token0 token1 ...`，并输出 exact prefix 统计；追加请求复用 live state，分叉请求从 GPU snapshot 恢复：
+
+```bash
+python scripts/bench_qwen_prefix_cache.py \\
+  --ckpt /path/to/Qwen3.8-27B-FP8 \\
+  --token-ids-file /path/to/prompt_ids.csv \\
+  --max-context 32768 \\
+  --max-new-tokens 4 \\
+  --compression-prefix-tokens 4096
+```
+
+benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保持 engine。使用 `--disable-prefix-cache` 做 cold parity A/B。一次性 Qwen 命令只处理单个请求，因此默认不创建 prefix snapshot；`--qwen-persistent-stdin` 开启缓存，`--qwen-no-prefix-cache` 可显式关闭。
+
 ## 文档
 
 - [文档总览](docs/README.md)
