@@ -39,6 +39,14 @@ struct QwenEngineOptions {
     // through the 262,144-token limit, and a few request-boundary snapshots.
     // This uses about 3.0 GiB/rank for 48-layer Qwen3.8 recurrent snapshots.
     int max_state_snapshots = 82;
+    // Native Qwen MTP is opt-in until real TP4 parity/performance validation
+    // proves that speculative verification is a win on the target GPU.
+    bool mtp = false;
+    int mtp_speculative_tokens = 1;
+    // When enabled, start with one draft token, double K after full acceptance,
+    // and back off after rejection. This protects low-acceptance prompts while
+    // quickly reaching the configured maximum on predictable continuations.
+    bool mtp_adaptive = false;
     std::string nccl_id_path;
 };
 
@@ -48,12 +56,37 @@ struct QwenForwardResult {
     int dim = 0;
     int logits = 0;
     int top_token = 0;
+    // Filled by native MTP speculative steps; plain forwards leave these zero.
+    int correct_drafts = 0;
+    int bonus_token = 0;
+    std::vector<int> accept_tokens;
+    std::vector<float> accept_logits;
+    std::vector<float> accept_checksums;
     float top_logit = 0.0f;
     float checksum = 0.0f;
     int position = 0;
 };
 
-// Accounting for one prefill call under exact prefix reuse.
+// Accounting for one native-MTP generate call.
+struct QwenMtpStats {
+    uint64_t verify_count = 0;
+    uint64_t proposed_drafts = 0;
+    uint64_t correct_drafts = 0;
+    uint64_t rollback_count = 0;
+    uint64_t replay_tokens = 0;
+    double prefill_seconds = 0.0;
+    double draft_seconds = 0.0;
+    double verify_seconds = 0.0;
+    double replay_seconds = 0.0;
+
+    double accept_rate() const {
+        return proposed_drafts == 0
+            ? 0.0
+            : static_cast<double>(correct_drafts) /
+                  static_cast<double>(proposed_drafts);
+    }
+};
+
 struct QwenPrefixCacheStats {
     // Tokens whose KV cache and recurrent state were reused unchanged.
     int reused_tokens = 0;
@@ -97,6 +130,7 @@ public:
     const QwenPrefixCacheStats& prefix_cache_stats() const {
         return prefix_stats_;
     }
+    const QwenMtpStats& mtp_stats() const { return mtp_stats_; }
 
     void reset();
     // Drops every cached prefix so the next prefill recomputes from zero.
@@ -121,6 +155,7 @@ private:
     uint64_t resident_weight_bytes_ = 0;
     uint64_t resident_scale_bytes_ = 0;
     QwenPrefixCacheStats prefix_stats_;
+    QwenMtpStats mtp_stats_;
     QwenForwardResult cached_result_;
     bool has_cached_result_ = false;
     Impl* impl_ = nullptr;

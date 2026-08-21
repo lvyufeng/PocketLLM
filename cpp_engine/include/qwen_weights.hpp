@@ -112,6 +112,15 @@ struct QwenLayerWeights {
     QwenMlpWeights mlp;
 };
 
+struct QwenMtpWeights {
+    QwenTensorRef pre_fc_norm_embedding;
+    QwenTensorRef pre_fc_norm_hidden;
+    QwenLinearRef fc;
+    QwenLayerWeights layer;
+    QwenTensorRef norm;
+    bool found = false;
+};
+
 class QwenWeightMap {
 public:
     QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& config,
@@ -121,6 +130,7 @@ public:
     const QwenTensorRef& final_norm() const { return final_norm_; }
     const QwenTensorRef& lm_head() const { return lm_head_; }
     const std::vector<QwenLayerWeights>& layers() const { return layers_; }
+    const QwenMtpWeights& mtp() const { return mtp_; }
     const QwenConfig& config() const { return config_; }
     int tp_world() const { return tp_world_; }
     int tp_rank() const { return tp_rank_; }
@@ -150,6 +160,7 @@ private:
     QwenTensorRef final_norm_;
     QwenTensorRef lm_head_;
     std::vector<QwenLayerWeights> layers_;
+    QwenMtpWeights mtp_;
     uint64_t local_weight_bytes_ = 0;
     uint64_t local_scale_bytes_ = 0;
     size_t tensor_count_ = 0;

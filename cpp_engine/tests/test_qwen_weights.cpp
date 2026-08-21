@@ -68,6 +68,8 @@ std::string config_json() {
     "hidden_size": 128,
     "intermediate_size": 512,
     "num_hidden_layers": 2,
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false,
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
     "head_dim": 128,
@@ -153,6 +155,25 @@ std::vector<TensorSpec> tensor_specs() {
     };
     add_mlp(linear_prefix);
     add_mlp(full_prefix);
+
+    add("mtp.pre_fc_norm_embedding.weight", "BF16", hidden);
+    add("mtp.pre_fc_norm_hidden.weight", "BF16", hidden);
+    add("mtp.norm.weight", "BF16", hidden);
+    add("mtp.fc.weight", "BF16", {128, 256});
+    const std::string mtp_prefix = "mtp.layers.0.";
+    add(mtp_prefix + "input_layernorm.weight", "BF16", hidden);
+    add(mtp_prefix + "post_attention_layernorm.weight", "BF16", hidden);
+    add(mtp_prefix + "self_attn.q_proj.weight", "F8_E4M3", q_proj);
+    add(mtp_prefix + "self_attn.q_proj.weight_scale_inv", "BF16", q_proj_scale);
+    add(mtp_prefix + "self_attn.k_proj.weight", "F8_E4M3", value_proj);
+    add(mtp_prefix + "self_attn.k_proj.weight_scale_inv", "BF16", value_proj_scale);
+    add(mtp_prefix + "self_attn.v_proj.weight", "F8_E4M3", value_proj);
+    add(mtp_prefix + "self_attn.v_proj.weight_scale_inv", "BF16", value_proj_scale);
+    add(mtp_prefix + "self_attn.o_proj.weight", "F8_E4M3", out_proj);
+    add(mtp_prefix + "self_attn.o_proj.weight_scale_inv", "BF16", out_proj_scale);
+    add(mtp_prefix + "self_attn.q_norm.weight", "BF16", {128});
+    add(mtp_prefix + "self_attn.k_norm.weight", "BF16", {128});
+    add_mlp(mtp_prefix);
     return out;
 }
 
@@ -298,6 +319,32 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
             "head local shape");
     require(map.lm_head().device_dtype == dsv4::SafeDType::F16,
             "head must upload as FP16");
+
+    const dsv4::QwenMtpWeights& mtp = map.mtp();
+    require(mtp.found, "native MTP tensors must be mapped");
+    require(mtp.fc.weight.dtype == dsv4::SafeDType::BF16 &&
+                mtp.fc.weight.device_dtype == dsv4::SafeDType::F16 &&
+                !mtp.fc.has_scale,
+            "MTP fusion projection must stay dense FP16 on Turing");
+    require(mtp.fc.weight.rule == dsv4::QwenShardRule::Replicated &&
+                mtp.fc.weight.local_shape == std::vector<uint64_t>({128, 256}),
+            "MTP fusion projection must be replicated");
+    require(mtp.pre_fc_norm_embedding.device_dtype == dsv4::SafeDType::F16 &&
+                mtp.pre_fc_norm_hidden.device_dtype == dsv4::SafeDType::F16 &&
+                mtp.norm.device_dtype == dsv4::SafeDType::F16,
+            "MTP norms must materialize as FP16");
+    const auto& mtp_full = mtp.layer.full_attention;
+    require(mtp_full.q_proj.weight.local_shape ==
+                std::vector<uint64_t>({256, 128}),
+            "MTP Q projection local shape");
+    require(mtp_full.k_proj.weight.local_shape ==
+                std::vector<uint64_t>({128, 128}) &&
+                mtp_full.v_proj.weight.local_shape ==
+                    std::vector<uint64_t>({128, 128}),
+            "MTP KV projection local shapes");
+    require(mtp_full.o_proj.weight.local_shape ==
+                std::vector<uint64_t>({128, 128}),
+            "MTP output projection local shape");
 
     const dsv4::QwenHostTensor qkv_host =
         dsv4::qwen_materialize_host_tensor(index, linear.in_proj_qkv.weight);

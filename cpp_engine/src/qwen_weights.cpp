@@ -400,17 +400,84 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
             QwenShardRule::RowParallel, 1);
         layers_.push_back(std::move(layer));
     }
+
+    if (config_.mtp_num_hidden_layers != 0) {
+        if (config_.mtp_num_hidden_layers != 1) {
+            throw std::runtime_error(
+                "Qwen native MTP currently supports exactly one MTP layer");
+        }
+        if (config_.mtp_use_dedicated_embeddings) {
+            throw std::runtime_error(
+                "Qwen native MTP dedicated embeddings are not supported");
+        }
+        mtp_.found = true;
+        mtp_.pre_fc_norm_embedding = require_tensor(
+            "mtp.pre_fc_norm_embedding.weight", SafeDType::BF16,
+            {config_.hidden_size});
+        mtp_.pre_fc_norm_hidden = require_tensor(
+            "mtp.pre_fc_norm_hidden.weight", SafeDType::BF16,
+            {config_.hidden_size});
+        mtp_.norm = require_tensor(
+            "mtp.norm.weight", SafeDType::BF16, {config_.hidden_size});
+        mtp_.fc = require_linear(
+            "mtp.fc.weight", {config_.hidden_size, 2 * config_.hidden_size},
+            QwenShardRule::Replicated, -1, SafeDType::BF16);
+
+        const std::string prefix = "mtp.layers.0.";
+        mtp_.layer.input_layernorm = require_tensor(
+            prefix + "input_layernorm.weight", SafeDType::BF16,
+            {config_.hidden_size});
+        mtp_.layer.post_attention_layernorm = require_tensor(
+            prefix + "post_attention_layernorm.weight", SafeDType::BF16,
+            {config_.hidden_size});
+        const auto& full = config_.full_attention;
+        const uint64_t attention_dim = full.num_heads * full.head_dim;
+        const uint64_t q_dim = attention_dim * 2;
+        const uint64_t kv_dim = full.num_key_value_heads * full.head_dim;
+        mtp_.layer.full_attention.q_proj = require_linear(
+            prefix + "self_attn.q_proj.weight", {q_dim, config_.hidden_size},
+            QwenShardRule::ColumnParallel, 0);
+        mtp_.layer.full_attention.k_proj = require_linear(
+            prefix + "self_attn.k_proj.weight", {kv_dim, config_.hidden_size},
+            QwenShardRule::ColumnParallel, 0);
+        mtp_.layer.full_attention.v_proj = require_linear(
+            prefix + "self_attn.v_proj.weight", {kv_dim, config_.hidden_size},
+            QwenShardRule::ColumnParallel, 0);
+        mtp_.layer.full_attention.o_proj = require_linear(
+            prefix + "self_attn.o_proj.weight", {config_.hidden_size, attention_dim},
+            QwenShardRule::RowParallel, 1);
+        mtp_.layer.full_attention.q_norm = require_tensor(
+            prefix + "self_attn.q_norm.weight", SafeDType::BF16,
+            {full.head_dim});
+        mtp_.layer.full_attention.k_norm = require_tensor(
+            prefix + "self_attn.k_norm.weight", SafeDType::BF16,
+            {full.head_dim});
+        const std::string mlp_prefix = prefix + "mlp.";
+        mtp_.layer.mlp.gate_proj = require_linear(
+            mlp_prefix + "gate_proj.weight",
+            {config_.mlp.intermediate_size, config_.hidden_size},
+            QwenShardRule::ColumnParallel, 0);
+        mtp_.layer.mlp.up_proj = require_linear(
+            mlp_prefix + "up_proj.weight",
+            {config_.mlp.intermediate_size, config_.hidden_size},
+            QwenShardRule::ColumnParallel, 0);
+        mtp_.layer.mlp.down_proj = require_linear(
+            mlp_prefix + "down_proj.weight",
+            {config_.hidden_size, config_.mlp.intermediate_size},
+            QwenShardRule::RowParallel, 1);
+    }
+
     auto count_ref = [this](const QwenTensorRef& ref, bool scale) { record(ref, scale); };
+    const auto count_linear = [&count_ref](const QwenLinearRef& linear) {
+        if (linear.weight.found) count_ref(linear.weight, false);
+        if (linear.has_scale) count_ref(linear.scale, true);
+    };
     count_ref(embed_tokens_, false);
     count_ref(final_norm_, false);
     count_ref(lm_head_, false);
     for (const auto& layer : layers_) {
         count_ref(layer.input_layernorm, false);
         count_ref(layer.post_attention_layernorm, false);
-        const auto count_linear = [&count_ref](const QwenLinearRef& linear) {
-            if (linear.weight.found) count_ref(linear.weight, false);
-            if (linear.has_scale) count_ref(linear.scale, true);
-        };
         if (layer.linear_attention.in_proj_qkv.weight.found) {
             count_linear(layer.linear_attention.in_proj_qkv);
             count_linear(layer.linear_attention.in_proj_z);
@@ -429,6 +496,24 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
             count_ref(layer.full_attention.q_norm, false);
             count_ref(layer.full_attention.k_norm, false);
         }
+        count_linear(layer.mlp.gate_proj);
+        count_linear(layer.mlp.up_proj);
+        count_linear(layer.mlp.down_proj);
+    }
+    if (mtp_.found) {
+        count_ref(mtp_.pre_fc_norm_embedding, false);
+        count_ref(mtp_.pre_fc_norm_hidden, false);
+        count_linear(mtp_.fc);
+        count_ref(mtp_.norm, false);
+        const QwenLayerWeights& layer = mtp_.layer;
+        count_ref(layer.input_layernorm, false);
+        count_ref(layer.post_attention_layernorm, false);
+        count_linear(layer.full_attention.q_proj);
+        count_linear(layer.full_attention.k_proj);
+        count_linear(layer.full_attention.v_proj);
+        count_linear(layer.full_attention.o_proj);
+        count_ref(layer.full_attention.q_norm, false);
+        count_ref(layer.full_attention.k_norm, false);
         count_linear(layer.mlp.gate_proj);
         count_linear(layer.mlp.up_proj);
         count_linear(layer.mlp.down_proj);

@@ -68,6 +68,13 @@ bool required_bool(const JsonObject& obj, const std::string& key) {
     return value->boolean();
 }
 
+bool optional_bool(const JsonObject& obj, const std::string& key, bool fallback) {
+    const JsonValue* value = object_get(obj, key);
+    if (value == nullptr || value->is_null()) return fallback;
+    if (!value->is_bool()) throw std::runtime_error("Qwen config boolean has wrong type: " + key);
+    return value->boolean();
+}
+
 std::string optional_string(const JsonObject& obj, const std::string& key, const std::string& fallback) {
     const JsonValue* value = object_get(obj, key);
     if (value == nullptr || value->is_null()) return fallback;
@@ -100,6 +107,9 @@ QwenConfig QwenConfig::from_hf_config(const std::string& ckpt_dir) {
     cfg.hidden_size = required_u64(text, "hidden_size");
     cfg.num_hidden_layers = required_u64(text, "num_hidden_layers");
     cfg.max_position_embeddings = required_u64(text, "max_position_embeddings");
+    cfg.mtp_num_hidden_layers = optional_u64(text, "mtp_num_hidden_layers", 0);
+    cfg.mtp_use_dedicated_embeddings = optional_bool(
+        text, "mtp_use_dedicated_embeddings", false);
     cfg.rms_norm_eps = optional_f64(text, "rms_norm_eps", 1.0e-6);
     cfg.partial_rotary_factor = optional_f64(text, "partial_rotary_factor", 1.0);
     cfg.fp8_block_size = 128;
@@ -216,6 +226,8 @@ std::string QwenConfig::to_string() const {
         << "hidden_size=" << hidden_size << '\n'
         << "num_hidden_layers=" << num_hidden_layers << '\n'
         << "max_position_embeddings=" << max_position_embeddings << '\n'
+        << "mtp_num_hidden_layers=" << mtp_num_hidden_layers << '\n'
+        << "mtp_use_dedicated_embeddings=" << (mtp_use_dedicated_embeddings ? 1 : 0) << '\n'
         << "rms_norm_eps=" << rms_norm_eps << '\n'
         << "rope_theta=" << rope_theta << '\n'
         << "partial_rotary_factor=" << partial_rotary_factor << '\n'

@@ -725,6 +725,17 @@ bool argmax_fp32_cuda(
     int token_offset,
     void* stream = nullptr);
 
+// Row-wise greedy top-1 over a contiguous [rows, count] logits matrix.
+// Each output token includes token_offset and ties prefer the lower token id.
+bool argmax_fp32_rows_cuda(
+    const float* d_logits,
+    int* d_tokens,
+    float* d_logits_out,
+    int rows,
+    int count,
+    int token_offset,
+    void* stream = nullptr);
+
 bool vector_add_cuda(
     const float* d_a,
     const float* d_b,

@@ -80,7 +80,9 @@ std::string config_json() {
     "rms_norm_eps": 1e-6,
     "partial_rotary_factor": 0.25,
     "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
-    "layer_types": ["linear_attention", "full_attention"]
+    "layer_types": ["linear_attention", "full_attention"],
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false
   }
 })JSON";
 }
@@ -146,6 +148,32 @@ std::vector<TensorSpec> specs() {
         {full + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale},
         {full + "mlp.down_proj.weight", "F8_E4M3", mlp},
         {full + "mlp.down_proj.weight_scale_inv", "BF16", mlp_scale},
+    });
+    const std::string mtp = "mtp.";
+    const std::string mtp_layer = "mtp.layers.0.";
+    out.insert(out.end(), {
+        {mtp + "pre_fc_norm_embedding.weight", "BF16", hidden},
+        {mtp + "pre_fc_norm_hidden.weight", "BF16", hidden},
+        {mtp + "norm.weight", "BF16", hidden},
+        {mtp + "fc.weight", "BF16", {128, 256}},
+        {mtp_layer + "input_layernorm.weight", "BF16", hidden},
+        {mtp_layer + "post_attention_layernorm.weight", "BF16", hidden},
+        {mtp_layer + "self_attn.q_proj.weight", "F8_E4M3", q_proj},
+        {mtp_layer + "self_attn.q_proj.weight_scale_inv", "BF16", q_proj_scale},
+        {mtp_layer + "self_attn.k_proj.weight", "F8_E4M3", value_proj},
+        {mtp_layer + "self_attn.k_proj.weight_scale_inv", "BF16", value_scale},
+        {mtp_layer + "self_attn.v_proj.weight", "F8_E4M3", value_proj},
+        {mtp_layer + "self_attn.v_proj.weight_scale_inv", "BF16", value_scale},
+        {mtp_layer + "self_attn.o_proj.weight", "F8_E4M3", out_proj},
+        {mtp_layer + "self_attn.o_proj.weight_scale_inv", "BF16", out_scale},
+        {mtp_layer + "self_attn.q_norm.weight", "BF16", hidden},
+        {mtp_layer + "self_attn.k_norm.weight", "BF16", hidden},
+        {mtp_layer + "mlp.gate_proj.weight", "F8_E4M3", mlp},
+        {mtp_layer + "mlp.gate_proj.weight_scale_inv", "BF16", mlp_scale},
+        {mtp_layer + "mlp.up_proj.weight", "F8_E4M3", mlp},
+        {mtp_layer + "mlp.up_proj.weight_scale_inv", "BF16", mlp_scale},
+        {mtp_layer + "mlp.down_proj.weight", "F8_E4M3", mlp},
+        {mtp_layer + "mlp.down_proj.weight_scale_inv", "BF16", mlp_scale},
     });
     return out;
 }
@@ -225,6 +253,54 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void require_same_generation(
+    const std::vector<dsv4::QwenForwardResult>& actual,
+    const std::vector<dsv4::QwenForwardResult>& expected,
+    const std::string& label) {
+    require(actual.size() == expected.size(), label + " output count");
+    for (size_t index = 0; index < actual.size(); ++index) {
+        require(actual[index].top_token == expected[index].top_token,
+                label + " greedy token parity at " + std::to_string(index) +
+                    ": got " + std::to_string(actual[index].top_token) +
+                    ", expected " + std::to_string(expected[index].top_token));
+    }
+}
+
+void require_same_mtp_decisions(const dsv4::QwenMtpStats& actual,
+                                const dsv4::QwenMtpStats& expected,
+                                const std::string& label) {
+    require(actual.verify_count == expected.verify_count &&
+                actual.proposed_drafts == expected.proposed_drafts &&
+                actual.correct_drafts == expected.correct_drafts &&
+                actual.rollback_count == expected.rollback_count &&
+                actual.replay_tokens == expected.replay_tokens,
+            label + " MTP decision parity");
+}
+
+std::vector<dsv4::QwenForwardResult> require_cached_mtp_matches_cold(
+    const std::string& dir, dsv4::QwenEngine& cached,
+    const dsv4::QwenEngineOptions& cached_options,
+    const std::vector<int>& prompt, int max_new_tokens,
+    const std::string& resume_source, int reused_tokens, int computed_tokens,
+    const std::string& label) {
+    const auto actual = cached.generate(prompt, max_new_tokens);
+    const dsv4::QwenMtpStats actual_stats = cached.mtp_stats();
+    const dsv4::QwenPrefixCacheStats prefix = cached.prefix_cache_stats();
+    require(prefix.resume_source == resume_source &&
+                prefix.reused_tokens == reused_tokens &&
+                prefix.computed_tokens == computed_tokens,
+            label + " prefix accounting");
+
+    dsv4::QwenEngineOptions cold_options = cached_options;
+    cold_options.prefix_cache = false;
+    dsv4::QwenEngine cold(dir, cold_options, 2, 32);
+    const auto expected = cold.generate(prompt, max_new_tokens);
+    require_same_generation(actual, expected, label);
+    require_same_mtp_decisions(actual_stats, cold.mtp_stats(), label);
+    require(cached.position() == cold.position(), label + " committed position");
+    return actual;
+}
+
 void exercise_prefix_cache(const std::string& dir,
                            dsv4::QwenKvCacheDType cache_dtype) {
     dsv4::QwenEngineOptions options;
@@ -286,6 +362,108 @@ void exercise_prefix_cache(const std::string& dir,
     require(reset.reused_tokens == 0 && reset.computed_tokens == 3 &&
                 reset.resume_source == "empty",
             "reset must invalidate prefix cache");
+}
+
+void exercise_mtp(const std::string& dir,
+                  dsv4::QwenKvCacheDType cache_dtype) {
+    dsv4::QwenEngineOptions plain_options;
+    plain_options.tp_world = 1;
+    plain_options.tp_rank = 0;
+    plain_options.device = 0;
+    plain_options.prefill_chunk_tokens = 2;
+    plain_options.kv_cache_dtype = cache_dtype;
+    plain_options.prefix_cache = false;
+
+    dsv4::QwenEngineOptions mtp_options = plain_options;
+    mtp_options.mtp = true;
+    mtp_options.mtp_speculative_tokens = 4;
+    dsv4::QwenEngine plain(dir, plain_options, 2, 16);
+    dsv4::QwenEngine mtp(dir, mtp_options, 2, 16);
+    const auto plain_outputs = plain.generate({1, 2, 3}, 8);
+    const auto mtp_outputs = mtp.generate({1, 2, 3}, 8);
+    require_same_generation(mtp_outputs, plain_outputs, "MTP");
+    dsv4::QwenEngineOptions adaptive_options = mtp_options;
+    adaptive_options.mtp_adaptive = true;
+    dsv4::QwenEngine adaptive(dir, adaptive_options, 2, 16);
+    const auto adaptive_outputs = adaptive.generate({1, 2, 3}, 8);
+    require_same_generation(adaptive_outputs, plain_outputs, "adaptive MTP");
+
+    require(mtp.mtp_stats().verify_count > 0 &&
+                mtp.mtp_stats().proposed_drafts > 0 &&
+                mtp.mtp_stats().prefill_seconds > 0.0,
+            "MTP runtime statistics");
+    require(mtp.position() <= mtp.max_context(), "MTP committed position");
+
+    bool partial_depth_rejected = false;
+    try {
+        dsv4::QwenEngine invalid(dir, mtp_options, 1, 16);
+    } catch (const std::runtime_error&) {
+        partial_depth_rejected = true;
+    }
+    require(partial_depth_rejected, "MTP must reject a partial target model");
+}
+
+void exercise_mtp_prefix_cache(const std::string& dir,
+                               dsv4::QwenKvCacheDType cache_dtype) {
+    dsv4::QwenEngineOptions options;
+    options.tp_world = 1;
+    options.tp_rank = 0;
+    options.device = 0;
+    options.prefill_chunk_tokens = 2;
+    options.kv_cache_dtype = cache_dtype;
+    options.mtp = true;
+    options.mtp_speculative_tokens = 2;
+    options.state_snapshot_interval_tokens = 2;
+    options.max_state_snapshots = 16;
+
+    dsv4::QwenEngine cached(dir, options, 2, 32);
+    const std::vector<int> base = {1, 2, 3};
+    const auto base_outputs = cached.generate(base, 4);
+    const dsv4::QwenPrefixCacheStats initial = cached.prefix_cache_stats();
+    require(initial.resume_source == "empty" && initial.reused_tokens == 0 &&
+                initial.computed_tokens == 3,
+            "MTP initial chunk-boundary prompt prefix accounting");
+
+    // A generated request leaves committed output tokens in cached_prompt. An
+    // exact repeat of the original prompt therefore restores its request-boundary
+    // snapshot rather than reusing the later live generation state.
+    const auto repeated = cached.generate(base, 4);
+    const dsv4::QwenPrefixCacheStats repeated_prefix = cached.prefix_cache_stats();
+    require(repeated_prefix.resume_source == "snapshot" &&
+                repeated_prefix.reused_tokens == 3 &&
+                repeated_prefix.computed_tokens == 0,
+            "MTP exact repeat prefix accounting");
+    require_same_generation(repeated, base_outputs, "MTP exact repeat");
+
+    std::vector<int> committed_after_repeat = base;
+    committed_after_repeat.reserve(base.size() + repeated.size() - 1);
+    for (size_t index = 0; index + 1 < repeated.size(); ++index) {
+        committed_after_repeat.push_back(repeated[index].top_token);
+    }
+    std::vector<int> appended = committed_after_repeat;
+    appended.push_back(repeated.back().top_token);
+    require_cached_mtp_matches_cold(
+        dir, cached, options, appended, 4, "live",
+        static_cast<int>(committed_after_repeat.size()), 1,
+        "MTP live continuation");
+    require_cached_mtp_matches_cold(
+        dir, cached, options, base, 4, "snapshot", 3, 0,
+        "MTP shorter request-boundary snapshot");
+    require_cached_mtp_matches_cold(
+        dir, cached, options, {1, 2, 9, 10}, 4, "snapshot", 2, 2,
+        "MTP interior branch");
+
+    // Compression is a branch whose replacement suffix starts at an interior
+    // snapshot. It specifically checks that predictor row S-1 is rebound from
+    // the old token x[S] to the compressed request's new token.
+    require_cached_mtp_matches_cold(
+        dir, cached, options, {1, 2, 11}, 4, "snapshot", 2, 1,
+        "MTP compressed suffix");
+
+    cached.reset();
+    require_cached_mtp_matches_cold(
+        dir, cached, options, {7, 8, 9, 10, 11}, 4, "empty", 0, 5,
+        "MTP reset after prefix reuse");
 }
 
 void exercise_cache_lifecycle(const std::string& dir,
@@ -352,7 +530,11 @@ int main() {
         exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp8);
         exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp8);
-        std::cout << "[PASS] test_qwen_engine layers=2\n";
+        exercise_mtp(dir, dsv4::QwenKvCacheDType::Fp16);
+        exercise_mtp(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_mtp_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp16);
+        exercise_mtp_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp8);
+        std::cout << "[PASS] test_qwen_engine layers=2 mtp=1\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cout << "[FAIL] test_qwen_engine " << ex.what() << "\n";

@@ -30,6 +30,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=0)
     parser.add_argument("--prefill-chunk-tokens", type=int, default=512)
     parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8"), default="fp16")
+    parser.add_argument(
+        "--qwen-mtp-tokens", type=int, default=0,
+        help="enable native Qwen MTP with this many speculative draft tokens",
+    )
+    parser.add_argument(
+        "--qwen-mtp-adaptive", action="store_true",
+        help="start at K=1 and adapt up to --qwen-mtp-tokens",
+    )
     parser.add_argument("--nccl-id-path", default=".tmp/qwen_prefix_cache/nccl.id")
     parser.add_argument("--log-dir", default=".tmp/qwen_prefix_cache/logs")
     parser.add_argument("--suffix-tokens", type=int, default=512)
@@ -98,6 +106,10 @@ def main() -> int:
         raise SystemExit("--devices count must match --tp-world")
     if args.max_new_tokens <= 0 or args.suffix_tokens <= 0:
         raise SystemExit("max-new-tokens and suffix-tokens must be positive")
+    if args.qwen_mtp_tokens < 0:
+        raise SystemExit("--qwen-mtp-tokens must be non-negative")
+    if args.qwen_mtp_tokens > 0 and args.layers != 0:
+        raise SystemExit("native MTP validation requires --layers 0")
 
     id_path = Path(args.nccl_id_path).resolve()
     id_path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +142,10 @@ def main() -> int:
             ])
             if args.disable_prefix_cache:
                 commands[-1].append("--qwen-no-prefix-cache")
+            if args.qwen_mtp_tokens > 0:
+                commands[-1] += ["--qwen-mtp-tokens", str(args.qwen_mtp_tokens)]
+                if args.qwen_mtp_adaptive:
+                    commands[-1].append("--qwen-mtp-adaptive")
         for rank in range(1, args.tp_world):
             log_path = log_dir / f"rank{rank}.log"
             log = log_path.open("wb")
@@ -167,7 +183,9 @@ def main() -> int:
             result = wait_result(root)
             print(
                 f"request={request_index} prompt_tokens={result.get('prompt_tokens')} "
-                f"request_tps={result.get('prefill_tokens_per_s')} "
+                f"wall={result.get('wall')} "
+                f"prefill_tps={result.get('prefill_tokens_per_s')} "
+                f"decode_tps={result.get('decode_tokens_per_s')} "
                 f"computed_tps={result.get('prefill_computed_tokens_per_s')} "
                 f"reused={result.get('prefix_reused_tokens')} "
                 f"computed={result.get('prefix_computed_tokens')} "
@@ -175,6 +193,7 @@ def main() -> int:
                 f"source={result.get('prefix_resume_source')} "
                 f"snapshots={result.get('prefix_snapshots')} "
                 f"snapshot_bytes={result.get('prefix_snapshot_bytes')} "
+                f"mtp_accept_rate={result.get('mtp_accept_rate')} "
                 f"tokens={result.get('tokens')}"
             )
             generated = result.get("tokens")

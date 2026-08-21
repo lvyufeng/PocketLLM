@@ -179,6 +179,155 @@ __global__ void fp8_matvec_f16_multirow_kernel(
     }
 }
 
+// Small speculative batches are weight-bandwidth bound. One warp owns one
+// output channel and evaluates all token rows while each FP8 weight code is in
+// registers, so a K+1 verify block reads every projection weight only once.
+template <int kWarps, int kBatchCapacity>
+__global__ void fp8_matmul_f16_small_batch_kernel(
+    const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
+    const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+    if (row >= rows) return;
+    const uint8_t* w = weight + static_cast<size_t>(row) * weight_stride;
+    const uint16_t* s = scale + static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    float sums[kBatchCapacity] = {};
+    const int vec_cols = cols & ~3;
+    for (int col = lane * 4; col < vec_cols; col += 128) {
+        const uchar4 codes = *reinterpret_cast<const uchar4*>(w + col);
+        const float weight_scale = half_to_float(s[col / kFp8WeightBlock]);
+        const float w0 = lut[codes.x] * weight_scale;
+        const float w1 = lut[codes.y] * weight_scale;
+        const float w2 = lut[codes.z] * weight_scale;
+        const float w3 = lut[codes.w] * weight_scale;
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            const uint2 packed = *reinterpret_cast<const uint2*>(
+                x + static_cast<size_t>(sample) * x_stride + col);
+            sums[sample] +=
+                half_to_float(static_cast<uint16_t>(packed.x)) * w0 +
+                half_to_float(static_cast<uint16_t>(packed.x >> 16)) * w1 +
+                half_to_float(static_cast<uint16_t>(packed.y)) * w2 +
+                half_to_float(static_cast<uint16_t>(packed.y >> 16)) * w3;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float weight_value = lut[w[col]] *
+            half_to_float(s[col / kFp8WeightBlock]);
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            sums[sample] += half_to_float(
+                x[static_cast<size_t>(sample) * x_stride + col]) * weight_value;
+        }
+    }
+#pragma unroll
+    for (int sample = 0; sample < kBatchCapacity; ++sample) {
+        if (sample >= batch) break;
+        float sum = sums[sample];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            y[static_cast<size_t>(sample) * y_stride + row] = float_to_half(sum);
+        }
+    }
+}
+
+template <int kWarps, int kBatchCapacity>
+__global__ void fp8_swiglu_small_batch_f16_kernel(
+    const uint16_t* __restrict__ x,
+    const uint8_t* __restrict__ gate_weight,
+    const uint16_t* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const uint16_t* __restrict__ up_scale,
+    uint16_t* __restrict__ y, int batch, int rows, int cols,
+    int x_stride, int y_stride, int weight_stride, int scale_stride) {
+    __shared__ float lut[256];
+    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
+        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
+    }
+    __syncthreads();
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+    if (row >= rows) return;
+    const uint8_t* gate_row = gate_weight +
+        static_cast<size_t>(row) * weight_stride;
+    const uint8_t* up_row = up_weight +
+        static_cast<size_t>(row) * weight_stride;
+    const uint16_t* gate_scale_row = gate_scale +
+        static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    const uint16_t* up_scale_row = up_scale +
+        static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    float gate_sums[kBatchCapacity] = {};
+    float up_sums[kBatchCapacity] = {};
+    const int vec_cols = cols & ~3;
+    for (int col = lane * 4; col < vec_cols; col += 128) {
+        const uchar4 gate_codes = *reinterpret_cast<const uchar4*>(gate_row + col);
+        const uchar4 up_codes = *reinterpret_cast<const uchar4*>(up_row + col);
+        const float gate_s = half_to_float(gate_scale_row[col / kFp8WeightBlock]);
+        const float up_s = half_to_float(up_scale_row[col / kFp8WeightBlock]);
+        const float gw0 = lut[gate_codes.x] * gate_s;
+        const float gw1 = lut[gate_codes.y] * gate_s;
+        const float gw2 = lut[gate_codes.z] * gate_s;
+        const float gw3 = lut[gate_codes.w] * gate_s;
+        const float uw0 = lut[up_codes.x] * up_s;
+        const float uw1 = lut[up_codes.y] * up_s;
+        const float uw2 = lut[up_codes.z] * up_s;
+        const float uw3 = lut[up_codes.w] * up_s;
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            const uint2 packed = *reinterpret_cast<const uint2*>(
+                x + static_cast<size_t>(sample) * x_stride + col);
+            const float x0 = half_to_float(static_cast<uint16_t>(packed.x));
+            const float x1 = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+            const float x2 = half_to_float(static_cast<uint16_t>(packed.y));
+            const float x3 = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+            gate_sums[sample] += x0 * gw0 + x1 * gw1 + x2 * gw2 + x3 * gw3;
+            up_sums[sample] += x0 * uw0 + x1 * uw1 + x2 * uw2 + x3 * uw3;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float gate_value = lut[gate_row[col]] *
+            half_to_float(gate_scale_row[col / kFp8WeightBlock]);
+        const float up_value = lut[up_row[col]] *
+            half_to_float(up_scale_row[col / kFp8WeightBlock]);
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            const float xv = half_to_float(
+                x[static_cast<size_t>(sample) * x_stride + col]);
+            gate_sums[sample] += xv * gate_value;
+            up_sums[sample] += xv * up_value;
+        }
+    }
+#pragma unroll
+    for (int sample = 0; sample < kBatchCapacity; ++sample) {
+        if (sample >= batch) break;
+        float gate_sum = gate_sums[sample];
+        float up_sum = up_sums[sample];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_sum += __shfl_xor_sync(0xffffffffu, gate_sum, offset);
+            up_sum += __shfl_xor_sync(0xffffffffu, up_sum, offset);
+        }
+        if (lane == 0) {
+            y[static_cast<size_t>(sample) * y_stride + row] =
+                float_to_half(silu(gate_sum) * up_sum);
+        }
+    }
+}
+
 template <int kWarps, int kRowsPerWarp>
 __global__ void fp8_swiglu_matvec_f16_kernel(
     const uint16_t* __restrict__ x,
@@ -433,6 +582,63 @@ __global__ void fp8_matmul_f16_wide_n64_kernel(
     }
 }
 
+template <bool kFloatOutput, int kWarps, int kBatchCapacity>
+__global__ void fp16_matmul_f16_small_batch_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ weight,
+    void* __restrict__ output, int batch, int rows, int cols,
+    int x_stride, int y_stride, int weight_stride) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+    if (row >= rows) return;
+    const uint16_t* wr = weight + static_cast<size_t>(row) * weight_stride;
+    float sums[kBatchCapacity] = {};
+    const int vec_cols = cols & ~3;
+    for (int col = lane * 4; col < vec_cols; col += 128) {
+        const uint2 packed_w = *reinterpret_cast<const uint2*>(wr + col);
+        const float w0 = half_to_float(static_cast<uint16_t>(packed_w.x));
+        const float w1 = half_to_float(static_cast<uint16_t>(packed_w.x >> 16));
+        const float w2 = half_to_float(static_cast<uint16_t>(packed_w.y));
+        const float w3 = half_to_float(static_cast<uint16_t>(packed_w.y >> 16));
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            const uint2 packed_x = *reinterpret_cast<const uint2*>(
+                x + static_cast<size_t>(sample) * x_stride + col);
+            sums[sample] +=
+                half_to_float(static_cast<uint16_t>(packed_x.x)) * w0 +
+                half_to_float(static_cast<uint16_t>(packed_x.x >> 16)) * w1 +
+                half_to_float(static_cast<uint16_t>(packed_x.y)) * w2 +
+                half_to_float(static_cast<uint16_t>(packed_x.y >> 16)) * w3;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float weight_value = half_to_float(wr[col]);
+#pragma unroll
+        for (int sample = 0; sample < kBatchCapacity; ++sample) {
+            if (sample >= batch) break;
+            sums[sample] += half_to_float(
+                x[static_cast<size_t>(sample) * x_stride + col]) * weight_value;
+        }
+    }
+#pragma unroll
+    for (int sample = 0; sample < kBatchCapacity; ++sample) {
+        if (sample >= batch) break;
+        float sum = sums[sample];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            const size_t index = static_cast<size_t>(sample) * y_stride + row;
+            if constexpr (kFloatOutput) {
+                static_cast<float*>(output)[index] = sum;
+            } else {
+                static_cast<uint16_t*>(output)[index] = float_to_half(sum);
+            }
+        }
+    }
+}
+
 template <bool kFloatOutput>
 __global__ void fp16_matmul_f16_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ weight,
@@ -469,6 +675,19 @@ __global__ void embedding_f16_kernel(const uint16_t* table, const int* tokens,
     }
     const uint16_t* src = table + static_cast<size_t>(token - row_start) * cols;
     for (int col = threadIdx.x; col < cols; col += blockDim.x) dst[col] = src[col];
+}
+
+__global__ void concat_rows_f16_kernel(const uint16_t* left, const uint16_t* right,
+                                       uint16_t* output, int rows, int cols) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const uint16_t* left_row = left + static_cast<size_t>(row) * cols;
+    const uint16_t* right_row = right + static_cast<size_t>(row) * cols;
+    uint16_t* output_row = output + static_cast<size_t>(row) * 2 * cols;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        output_row[col] = left_row[col];
+        output_row[cols + col] = right_row[col];
+    }
 }
 
 __global__ void rmsnorm_f16_kernel(const uint16_t* x, const uint16_t* gamma,
@@ -1138,6 +1357,51 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
+    const uint16_t* x, const uint8_t* gate_weight,
+    const uint16_t* gate_scale, const uint8_t* up_weight,
+    const uint16_t* up_scale, uint16_t* y, int batch, int rows, int cols,
+    int x_stride, int y_stride, int weight_stride, int scale_stride,
+    void* stream) {
+    if (!x || !gate_weight || !gate_scale || !up_weight || !up_scale || !y ||
+        batch <= 1 || batch > 8 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols ||
+        x_stride % 4 != 0 || weight_stride % 4 != 0 ||
+        scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) {
+        return false;
+    }
+    constexpr int kWarps = 8;
+    const int blocks = (rows + kWarps - 1) / kWarps;
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    if (batch <= 2) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 2>
+            <<<blocks, kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 3) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 3>
+            <<<blocks, kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 4) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 4>
+            <<<blocks, kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 5) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 5>
+            <<<blocks, kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 8>
+            <<<blocks, kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
     uint16_t* y, int batch, int rows, int cols, int x_stride,
@@ -1146,20 +1410,92 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
         x_stride < cols || y_stride < rows || weight_stride < cols ||
         scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) return false;
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const char* wide = std::getenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
-    const bool use_wide = wide == nullptr || std::strcmp(wide, "0") != 0;
-    if (use_wide && batch >= 96 && x_stride % 4 == 0 && weight_stride % 4 == 0) {
-        dim3 grid(static_cast<unsigned>((rows + 63) / 64),
-                  static_cast<unsigned>((batch + 127) / 128), 1);
-        fp8_matmul_f16_wide_n64_kernel<<<grid, 256, 0, s>>>(
-            x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-            weight_stride, scale_stride);
+    const char* small_batch_env = std::getenv("QWEN_FP8_F16_SMALL_BATCH");
+    const bool use_small_batch = small_batch_env == nullptr ||
+        std::strcmp(small_batch_env, "0") != 0;
+    constexpr int kSmallBatchWarps = 8;
+    if (use_small_batch && batch <= 8 && x_stride % 4 == 0 &&
+        weight_stride % 4 == 0) {
+        const int blocks = (rows + kSmallBatchWarps - 1) / kSmallBatchWarps;
+        if (batch <= 2) {
+            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 2>
+                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
+                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                    weight_stride, scale_stride);
+        } else if (batch == 3) {
+            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 3>
+                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
+                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                    weight_stride, scale_stride);
+        } else if (batch == 4) {
+            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 4>
+                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
+                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                    weight_stride, scale_stride);
+        } else if (batch == 5) {
+            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 5>
+                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
+                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                    weight_stride, scale_stride);
+        } else {
+            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 8>
+                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
+                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                    weight_stride, scale_stride);
+        }
     } else {
-        dim3 grid(static_cast<unsigned>((rows + 63) / 64),
-                  static_cast<unsigned>((batch + 63) / 64), 1);
-        fp8_matmul_f16_tiled_kernel<32><<<grid, 256, 0, s>>>(
-            x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-            weight_stride, scale_stride);
+        const char* wide = std::getenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
+        const bool use_wide = wide == nullptr || std::strcmp(wide, "0") != 0;
+        if (use_wide && batch >= 96 && x_stride % 4 == 0 &&
+            weight_stride % 4 == 0) {
+            dim3 grid(static_cast<unsigned>((rows + 63) / 64),
+                      static_cast<unsigned>((batch + 127) / 128), 1);
+            fp8_matmul_f16_wide_n64_kernel<<<grid, 256, 0, s>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+        } else {
+            dim3 grid(static_cast<unsigned>((rows + 63) / 64),
+                      static_cast<unsigned>((batch + 63) / 64), 1);
+            fp8_matmul_f16_tiled_kernel<32><<<grid, 256, 0, s>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+        }
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <bool kFloatOutput>
+bool launch_fp16_matmul_rows_f16(
+    const uint16_t* x, const uint16_t* weight, void* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, bool allow_small_batch, void* stream) {
+    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols) return false;
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const char* small_batch_env = std::getenv("QWEN_FP16_SMALL_BATCH");
+    const bool use_small_batch = small_batch_env == nullptr ||
+        std::strcmp(small_batch_env, "0") != 0;
+    constexpr int kWarps = 8;
+    if (allow_small_batch && use_small_batch && batch > 1 && batch <= 8 &&
+        x_stride % 4 == 0 &&
+        weight_stride % 4 == 0) {
+        const int blocks = (rows + kWarps - 1) / kWarps;
+#define LAUNCH_FP16_SMALL(CAPACITY) \
+        fp16_matmul_f16_small_batch_kernel<kFloatOutput, kWarps, CAPACITY> \
+            <<<blocks, kWarps * 32, 0, s>>>( \
+                x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride)
+        if (batch <= 2) { LAUNCH_FP16_SMALL(2); }
+        else if (batch == 3) { LAUNCH_FP16_SMALL(3); }
+        else if (batch == 4) { LAUNCH_FP16_SMALL(4); }
+        else if (batch == 5) { LAUNCH_FP16_SMALL(5); }
+        else { LAUNCH_FP16_SMALL(8); }
+#undef LAUNCH_FP16_SMALL
+    } else {
+        dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(batch), 1);
+        fp16_matmul_f16_kernel<kFloatOutput>
+            <<<grid, kThreads, kThreads * sizeof(float), s>>>(
+                x, weight, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride);
     }
     return cudaGetLastError() == cudaSuccess;
 }
@@ -1168,26 +1504,21 @@ bool qwen_fp16_matmul_rows_f16_cuda(
     const uint16_t* x, const uint16_t* weight, uint16_t* y,
     int batch, int rows, int cols, int x_stride, int y_stride,
     int weight_stride, void* stream) {
-    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
-        x_stride < cols || y_stride < rows || weight_stride < cols) return false;
-    dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(batch), 1);
-    fp16_matmul_f16_kernel<false><<<grid, kThreads, kThreads * sizeof(float),
-        static_cast<cudaStream_t>(stream)>>>(x, weight, y, batch, rows, cols,
-        x_stride, y_stride, weight_stride);
-    return cudaGetLastError() == cudaSuccess;
+    return launch_fp16_matmul_rows_f16<false>(
+        x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
+        true, stream);
 }
 
 bool qwen_fp16_matmul_rows_f16_f32_cuda(
     const uint16_t* x, const uint16_t* weight, float* y,
     int batch, int rows, int cols, int x_stride, int y_stride,
     int weight_stride, void* stream) {
-    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
-        x_stride < cols || y_stride < rows || weight_stride < cols) return false;
-    dim3 grid(static_cast<unsigned>(rows), static_cast<unsigned>(batch), 1);
-    fp16_matmul_f16_kernel<true><<<grid, kThreads, kThreads * sizeof(float),
-        static_cast<cudaStream_t>(stream)>>>(x, weight, y, batch, rows, cols,
-        x_stride, y_stride, weight_stride);
-    return cudaGetLastError() == cudaSuccess;
+    // Keep FP32 logits on the established reduction order. Greedy argmax can be
+    // sensitive to near ties even when the small-batch dot product is numerically
+    // close; FP16 activation outputs may still use the weight-reuse kernel.
+    return launch_fp16_matmul_rows_f16<true>(
+        x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
+        false, stream);
 }
 
 bool qwen_embedding_fp16_gather_f16_cuda(
@@ -1197,6 +1528,15 @@ bool qwen_embedding_fp16_gather_f16_cuda(
         row_start < 0 || row_count <= 0) return false;
     embedding_f16_kernel<<<count, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         table, tokens, output, count, cols, row_start, row_count);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_concat_rows_f16_cuda(const uint16_t* left, const uint16_t* right,
+                               uint16_t* output, int rows, int cols,
+                               void* stream) {
+    if (!left || !right || !output || rows <= 0 || cols <= 0) return false;
+    concat_rows_f16_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        left, right, output, rows, cols);
     return cudaGetLastError() == cudaSuccess;
 }
 
