@@ -153,6 +153,8 @@ wait
 
 For a normal run, use the same command-line options as the Qwen smoke entrypoint and let rank 0 report `prefill_tokens_per_s`, `decode_tokens_per_s`, resident weight bytes, and GPU memory. The Qwen OpenAI server adapter is not implemented yet.
 
+External Qwen DSpark is available as an opt-in with `--qwen-dspark /path/to/Qwen3.8-27B-DSpark`; it cannot be combined with native MTP. The real five-layer drafter proposes seven tokens and verifies eight target rows at once. It remains default-off because measured gains are acceptance-dependent. See the [Qwen model page](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) for real 512/8K/32K results and the prefix/cold-parity command.
+
 For a single-concurrency client whose next request extends or compresses the previous one, keep one TP4 process group alive with the persistent token-ID worker. Rank 0 reads `<max_new_tokens> token0 token1 ...` lines and reports exact prefix accounting; the worker reuses live state for appends and device snapshots for branches:
 
 ```bash
@@ -194,7 +196,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 - Performance is highly sensitive to GPU model, PCIe topology, NUMA placement, driver/runtime versions, and checkpoint variant.
 - GGUF expert staging can dominate decode on PCIe-only systems; a high prefill number does not imply high decode TPS.
-- DSpark's current C++ verify path is sequential and should not be presented as a speedup claim; multi-token verification has a separate numerical-drift policy.
+- DeepSeek-V4 DSpark's current C++ verify path is sequential and should not be presented as a speedup claim. Qwen DSpark is a separate external drafter with one eight-row target verification and model-specific parity/performance data.
 - The Qwen runtime currently supports the text checkpoint path only. Vision inputs and OpenAI-compatible Qwen serving are not wired in.
 - Some experimental optimizations are intentionally opt-in or disabled after real end-to-end regressions. See the model pages and historical notes for details.
 

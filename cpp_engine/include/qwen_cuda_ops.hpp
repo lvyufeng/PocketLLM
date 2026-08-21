@@ -5,6 +5,53 @@
 
 namespace dsv4 {
 
+// Qwen DSpark uses standard Qwen3 RMSNorm affine weights (gamma directly),
+// unlike the Qwen3.5 target runtime's (1 + weight) convention.
+bool qwen_dspark_rmsnorm_f16_cuda(const uint16_t* d_x_fp16,
+                                  const uint16_t* d_gamma_fp16,
+                                  uint16_t* d_y_fp16, int rows, int cols,
+                                  float eps, void* stream = nullptr);
+
+// Apply full NeoX-style YaRN RoPE in-place to [rows, heads, head_dim]. The
+// inverse-frequency table has head_dim/2 FP32 elements; attention_factor scales
+// both cos and sin exactly like Transformers Qwen3RotaryEmbedding.
+bool qwen_dspark_yarn_rope_f16_cuda(uint16_t* d_x_fp16,
+                                    const float* d_inv_freqs, int rows,
+                                    int heads, int head_dim,
+                                    int start_position,
+                                    float attention_factor,
+                                    void* stream = nullptr);
+
+// Non-causal dual-source block attention used by the fixed-width DSpark
+// proposal: every query sees committed context [0, context_len) and all block
+// K/V rows [0, block_rows).
+bool qwen_dspark_dual_source_gqa_f16_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_context_k_fp16,
+    const uint16_t* d_context_v_fp16, const uint16_t* d_block_k_fp16,
+    const uint16_t* d_block_v_fp16, uint16_t* d_output_fp16,
+    int block_rows, int q_heads, int kv_heads, int head_dim,
+    int context_len, int max_context, void* stream = nullptr);
+
+// In-place local-vocab Markov correction for one proposal row.
+bool qwen_dspark_add_markov_bias_f32_cuda(
+    float* d_logits, const uint16_t* d_markov_embedding_fp16,
+    const uint16_t* d_markov_w2_fp16, int local_vocab, int markov_rank,
+    void* stream = nullptr);
+
+// Gather rows from a replicated FP16 table; unlike target TP embedding gather,
+// every token must be locally present.
+bool qwen_dspark_embedding_gather_f16_cuda(
+    const uint16_t* d_table_fp16, const int* d_tokens,
+    uint16_t* d_output_fp16, int count, int cols, int table_rows,
+    void* stream = nullptr);
+
+bool qwen_dspark_confidence_f16_cuda(
+    const uint16_t* d_hidden_fp16,
+    const uint16_t* d_markov_embeddings_fp16,
+    const uint16_t* d_weight_fp16, const uint16_t* d_bias_fp16,
+    float* d_confidence, int rows, int hidden_size, int markov_rank,
+    void* stream = nullptr);
+
 // Qwen FP8 weights use E4M3 codes and 128x128 block scales. On Turing,
 // checkpoint BF16 scales are converted to IEEE FP16 before device upload.
 // These kernels decode each code at the point of use; no expanded copy of the
@@ -276,6 +323,13 @@ bool qwen_silu_mul_rows_cuda(const float* d_gate, const float* d_up, float* d_y,
                              int rows, int cols, void* stream = nullptr);
 
 // --- FP16 activation-storage runtime ----------------------------------------
+
+// cuBLAS-backed FP16 matrix product for large DSpark batches. Weight storage is
+// row-major [output_rows, columns]; output is row-major [batch, output_rows].
+bool qwen_dspark_fp16_gemm_rows_f16_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
+    uint16_t* d_y_fp16, int batch, int output_rows, int columns,
+    void* stream = nullptr);
 
 bool qwen_fp16_matmul_rows_f16_cuda(const uint16_t* d_x_fp16,
                                     const uint16_t* d_w_fp16,
