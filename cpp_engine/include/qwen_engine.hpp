@@ -47,6 +47,10 @@ struct QwenEngineOptions {
     // and back off after rejection. This protects low-acceptance prompts while
     // quickly reaching the configured maximum on predictable continuations.
     bool mtp_adaptive = false;
+    // External Qwen DSpark drafter. Empty keeps the feature disabled. DSpark and
+    // native MTP are mutually exclusive because both own the speculative target
+    // transaction and hidden-state side channel.
+    std::string dspark_checkpoint;
     std::string nccl_id_path;
 };
 
@@ -67,23 +71,43 @@ struct QwenForwardResult {
     int position = 0;
 };
 
-// Accounting for one native-MTP generate call.
+// Accounting for one native-MTP or external-DSpark generate call.
 struct QwenMtpStats {
     uint64_t verify_count = 0;
     uint64_t proposed_drafts = 0;
     uint64_t correct_drafts = 0;
     uint64_t rollback_count = 0;
     uint64_t replay_tokens = 0;
+    uint64_t confidence_count = 0;
+    double confidence_sum = 0.0;
+    float confidence_min = 0.0f;
+    float confidence_max = 0.0f;
     double prefill_seconds = 0.0;
     double draft_seconds = 0.0;
     double verify_seconds = 0.0;
     double replay_seconds = 0.0;
 
+    // Mean committed tokens per speculative verification, including the target
+    // bonus token. This matches DSpark's published spec_accept_length metric.
+    double accept_length() const {
+        return verify_count == 0
+            ? 0.0
+            : static_cast<double>(correct_drafts + verify_count) /
+                  static_cast<double>(verify_count);
+    }
+
+    // Draft-token match ratio only. This excludes the target bonus and must not
+    // be compared directly with bonus-inclusive spec_accept_length results.
     double accept_rate() const {
         return proposed_drafts == 0
             ? 0.0
             : static_cast<double>(correct_drafts) /
                   static_cast<double>(proposed_drafts);
+    }
+
+    double mean_confidence() const {
+        return confidence_count == 0
+            ? 0.0 : confidence_sum / static_cast<double>(confidence_count);
     }
 };
 

@@ -39,6 +39,7 @@ add_library(dsv4_cpp_core STATIC
     src/model_config.cpp
     src/qwen_config.cpp
     src/qwen_weights.cpp
+    src/qwen_dspark.cpp
     src/qwen_engine.cpp
     src/tokenizer.cpp
     src/tensor.cpp
@@ -59,6 +60,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_attention_ops.cu
     cuda/qwen_half_ops.cu
     cuda/qwen_gqa_optimized.cu
+    cuda/qwen_dspark_ops.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
@@ -296,6 +298,14 @@ set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 add_executable(test_qwen_config tests/test_qwen_config.cpp)
 target_link_libraries(test_qwen_config PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_config PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_dspark tests/test_qwen_dspark.cpp)
+target_link_libraries(test_qwen_dspark PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_dspark PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_dspark_ops tests/test_qwen_dspark_ops.cpp)
+target_link_libraries(test_qwen_dspark_ops PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_dspark_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE dsv4_cpp_core)

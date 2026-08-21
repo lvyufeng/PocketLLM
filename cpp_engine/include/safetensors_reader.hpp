@@ -45,6 +45,12 @@ struct SafeFp4TensorPair {
 class SafeTensorsIndex {
 public:
     explicit SafeTensorsIndex(const std::string& ckpt_dir);
+    // Build an index for a checkpoint exported as one unsharded file. This is
+    // deliberately explicit so existing sharded-checkpoint error behavior stays
+    // unchanged for callers that require model.safetensors.index.json.
+    static SafeTensorsIndex from_single_file(const std::string& ckpt_dir,
+                                             const std::string& filename =
+                                                 "model.safetensors");
 
     const std::string& ckpt_dir() const { return ckpt_dir_; }
     uint64_t total_size() const { return total_size_; }
@@ -58,6 +64,8 @@ public:
     std::vector<std::string> grep_tensors(const std::string& needle, size_t limit = 50) const;
 
 private:
+    SafeTensorsIndex() = default;
+
     std::string ckpt_dir_;
     uint64_t total_size_ = 0;
     std::map<std::string, std::string> weight_map_;

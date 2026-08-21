@@ -2,6 +2,7 @@
 
 #include "cuda_ops.hpp"
 #include "qwen_cuda_ops.hpp"
+#include "qwen_dspark.hpp"
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
@@ -244,6 +245,12 @@ struct QwenEngine::Impl {
     QwenDeviceTensor final_norm;
     QwenDeviceTensor lm_head;
     bool mtp_enabled = false;
+    bool dspark_enabled = false;
+    std::unique_ptr<QwenDSparkConfig> dspark_config;
+    std::unique_ptr<SafeTensorsIndex> dspark_index;
+    std::unique_ptr<QwenDSparkWeightMap> dspark_weights;
+    std::unique_ptr<QwenDSparkRuntime> dspark;
+    QwenDeviceTensor dspark_target_taps;
     DeviceLinear mtp_fc;
     QwenDeviceTensor mtp_pre_fc_norm_embedding;
     QwenDeviceTensor mtp_pre_fc_norm_hidden;
@@ -433,6 +440,38 @@ struct QwenEngine::Impl {
             layers.push_back(std::move(destination));
         }
 
+        if (options.mtp && !options.dspark_checkpoint.empty()) {
+            throw std::runtime_error(
+                "Qwen native MTP and external DSpark are mutually exclusive");
+        }
+        if (!options.dspark_checkpoint.empty()) {
+            if (active_layers > 0 &&
+                active_layers != static_cast<int>(config.num_hidden_layers)) {
+                throw std::runtime_error(
+                    "Qwen DSpark requires the complete target layer stack");
+            }
+            dspark_config = std::make_unique<QwenDSparkConfig>(
+                QwenDSparkConfig::from_directory(options.dspark_checkpoint));
+            dspark_config->validate_for_target(
+                config.hidden_size, config.vocab_size, config.num_hidden_layers);
+            dspark_index = std::make_unique<SafeTensorsIndex>(
+                SafeTensorsIndex::from_single_file(options.dspark_checkpoint));
+            dspark_weights = std::make_unique<QwenDSparkWeightMap>(
+                *dspark_index, *dspark_config, options.tp_world, options.tp_rank);
+            // The target embedding is vocab-sharded. QwenDSparkRuntime gathers
+            // local rows then performs the same TP all-reduce as target prefill.
+            dspark = std::make_unique<QwenDSparkRuntime>(
+                options.dspark_checkpoint, *dspark_config, *dspark_weights,
+                embed, lm_head,
+                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
+                    options.tp_world,
+                options.tp_world, options.tp_rank, options.device,
+                options.nccl_id_path, max_context);
+            dspark_enabled = true;
+            uploaded_weight_bytes += dspark->resident_weight_bytes();
+            cache_data_bytes += dspark->context_cache_bytes();
+        }
+
         if (options.mtp) {
             if (!map.mtp().found) {
                 throw std::runtime_error(
@@ -530,6 +569,7 @@ struct QwenEngine::Impl {
             zero_tensor(layer.linear.state);
             zero_tensor(layer.linear.conv_tail);
         }
+        if (dspark_enabled) dspark->reset();
         has_target_last_hidden = false;
         mtp_seed_ready = false;
         mtp_position = 0;
@@ -543,24 +583,47 @@ struct QwenEngine::Impl {
     // Only the 48 DeltaNet layers carry order-dependent state; full attention
     // is skipped because its KV cache is addressed by absolute position.
     void prepare_transaction_state() {
-        if (transaction_states.size() == layers.size()) return;
-        transaction_states.clear();
-        transaction_conv_tails.clear();
-        transaction_states.resize(layers.size());
-        transaction_conv_tails.resize(layers.size());
-        for (size_t index = 0; index < layers.size(); ++index) {
-            const DeviceLayer& layer = layers[index];
-            if (layer.linear.state.data == nullptr) continue;
-            allocate_float(transaction_states[index],
-                           layer.linear.state.nbytes / sizeof(float),
-                           layer.linear.state.shape);
-            allocate_half(transaction_conv_tails[index],
-                          layer.linear.conv_tail.nbytes / sizeof(uint16_t),
-                          layer.linear.conv_tail.shape);
+        if (transaction_states.size() != layers.size()) {
+            transaction_states.clear();
+            transaction_conv_tails.clear();
+            transaction_states.resize(layers.size());
+            transaction_conv_tails.resize(layers.size());
+            for (size_t index = 0; index < layers.size(); ++index) {
+                const DeviceLayer& layer = layers[index];
+                if (layer.linear.state.data == nullptr) continue;
+                allocate_float(transaction_states[index],
+                               layer.linear.state.nbytes / sizeof(float),
+                               layer.linear.state.shape);
+                allocate_half(transaction_conv_tails[index],
+                              layer.linear.conv_tail.nbytes / sizeof(uint16_t),
+                              layer.linear.conv_tail.shape);
+            }
         }
         if (mtp_enabled) {
             allocate_half(transaction_target_hidden, config.hidden_size,
                           {config.hidden_size});
+        }
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const DeviceLayer& layer = layers[index];
+            if (layer.linear.state.data == nullptr) continue;
+            check_cuda(cudaMemcpy(transaction_states[index].data,
+                                  layer.linear.state.data,
+                                  layer.linear.state.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction state copy");
+            check_cuda(cudaMemcpy(transaction_conv_tails[index].data,
+                                  layer.linear.conv_tail.data,
+                                  layer.linear.conv_tail.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction convolution copy");
+        }
+        if (mtp_enabled) {
+            check_cuda(cudaMemcpy(transaction_target_hidden.data,
+                                  target_last_hidden.data,
+                                  static_cast<size_t>(config.hidden_size) *
+                                      sizeof(uint16_t),
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction hidden copy");
         }
     }
 
@@ -582,15 +645,18 @@ struct QwenEngine::Impl {
                                   cudaMemcpyDeviceToDevice),
                        "Qwen transaction convolution restore");
         }
-        check_cuda(cudaMemcpy(target_last_hidden.data,
-                              transaction_target_hidden.data,
-                              static_cast<size_t>(config.hidden_size) *
-                                  sizeof(uint16_t),
-                              cudaMemcpyDeviceToDevice),
-                   "Qwen transaction hidden restore");
-        has_target_last_hidden = true;
-        mtp_seed_ready = false;
-        mtp_position = position;
+        if (mtp_enabled) {
+            check_cuda(cudaMemcpy(target_last_hidden.data,
+                                  transaction_target_hidden.data,
+                                  static_cast<size_t>(config.hidden_size) *
+                                      sizeof(uint16_t),
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction hidden restore");
+            has_target_last_hidden = true;
+            mtp_seed_ready = false;
+            mtp_position = position;
+        }
+        if (dspark_enabled) dspark->crop_context(position);
     }
 
     QwenRecurrentSnapshot capture_recurrent_state(
@@ -689,6 +755,16 @@ struct QwenEngine::Impl {
             mtp_seed_ready = false;
             mtp_position = 0;
         }
+        if (dspark_enabled) {
+            // DSpark K/V is position-indexed like target GQA. Cropping only moves
+            // the logical committed boundary; replay overwrites the suffix.
+            if (snapshot.position <= dspark->committed_position()) {
+                dspark->crop_context(snapshot.position);
+            } else {
+                throw std::runtime_error(
+                    "Qwen DSpark snapshot exceeds committed context");
+            }
+        }
         size_t state_offset = 0;
         size_t tail_offset = 0;
         for (DeviceLayer& layer : layers) {
@@ -720,7 +796,7 @@ struct QwenEngine::Impl {
             options.max_state_snapshots <= 0 || position <= 0) {
             return;
         }
-        if (!has_recurrent_state() && !mtp_enabled) return;
+        if (!has_recurrent_state() && !mtp_enabled && !dspark_enabled) return;
         for (QwenRecurrentSnapshot& entry : snapshots) {
             if (entry.position != position) continue;
             entry.periodic = entry.periodic || periodic;
@@ -1476,6 +1552,97 @@ struct QwenEngine::Impl {
         return drafts;
     }
 
+    QwenForwardResult dspark_speculative_step(int input_token,
+                                              QwenMtpStats* stats) {
+        if (!dspark_enabled) {
+            throw std::runtime_error("Qwen DSpark speculative step is disabled");
+        }
+        const int committed_position = dspark->committed_position();
+        prepare_transaction_state();
+        const auto draft_started = std::chrono::steady_clock::now();
+        const QwenDSparkProposal proposal = dspark->propose(input_token);
+        if (stats != nullptr) {
+            stats->draft_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - draft_started).count();
+            stats->proposed_drafts += proposal.tokens.size();
+            for (float confidence : proposal.confidences) {
+                if (!std::isfinite(confidence)) {
+                    throw std::runtime_error(
+                        "Qwen DSpark confidence is not finite");
+                }
+                if (stats->confidence_count == 0) {
+                    stats->confidence_min = confidence;
+                    stats->confidence_max = confidence;
+                } else {
+                    stats->confidence_min = std::min(
+                        stats->confidence_min, confidence);
+                    stats->confidence_max = std::max(
+                        stats->confidence_max, confidence);
+                }
+                stats->confidence_sum += confidence;
+                ++stats->confidence_count;
+            }
+        }
+        std::vector<int> verify_inputs;
+        verify_inputs.reserve(proposal.tokens.size() + 1);
+        verify_inputs.push_back(input_token);
+        verify_inputs.insert(verify_inputs.end(), proposal.tokens.begin(),
+                             proposal.tokens.end());
+        QwenVerifyBatch verify;
+        const auto verify_started = std::chrono::steady_clock::now();
+        (void)run_chunk(verify_inputs, committed_position,
+                        static_cast<int>(layers.size()), false, &verify);
+        if (stats != nullptr) {
+            stats->verify_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - verify_started).count();
+            ++stats->verify_count;
+        }
+        int correct = 0;
+        while (correct < static_cast<int>(proposal.tokens.size()) &&
+               verify.top_tokens[static_cast<size_t>(correct)] ==
+                   proposal.tokens[static_cast<size_t>(correct)]) {
+            ++correct;
+        }
+        if (stats != nullptr) stats->correct_drafts += correct;
+        const size_t bonus_row = static_cast<size_t>(correct);
+        const int bonus = verify.top_tokens[bonus_row];
+        const float bonus_logit = verify.top_logits[bonus_row];
+        const float bonus_checksum = verify.local_logits[bonus_row];
+        if (correct != static_cast<int>(proposal.tokens.size())) {
+            if (stats != nullptr) {
+                ++stats->rollback_count;
+                stats->replay_tokens += static_cast<uint64_t>(correct + 1);
+            }
+            const auto replay_started = std::chrono::steady_clock::now();
+            restore_transaction_state(committed_position);
+            std::vector<int> replay(verify_inputs.begin(),
+                                    verify_inputs.begin() + correct + 1);
+            (void)run_chunk(replay, committed_position,
+                            static_cast<int>(layers.size()), false);
+            if (stats != nullptr) {
+                stats->replay_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - replay_started).count();
+            }
+        }
+        QwenForwardResult result;
+        result.top_token = bonus;
+        result.bonus_token = bonus;
+        result.correct_drafts = correct;
+        result.accept_tokens.assign(proposal.tokens.begin(),
+                                    proposal.tokens.begin() + correct);
+        result.accept_logits.assign(verify.top_logits.begin(),
+                                    verify.top_logits.begin() + correct);
+        result.accept_checksums.assign(verify.local_logits.begin(),
+                                       verify.local_logits.begin() + correct);
+        result.layers = static_cast<int>(layers.size());
+        result.dim = static_cast<int>(config.hidden_size);
+        result.logits = static_cast<int>(config.vocab_size);
+        result.top_logit = bonus_logit;
+        result.checksum = bonus_checksum;
+        result.position = dspark->committed_position();
+        return result;
+    }
+
     QwenForwardResult speculative_step(int input_token, int draft_count,
                                        QwenMtpStats* stats) {
         if (!mtp_enabled || draft_count <= 0) {
@@ -1484,26 +1651,6 @@ struct QwenEngine::Impl {
         }
         const int committed_position = mtp_position;
         prepare_transaction_state();
-        check_cuda(cudaMemcpy(transaction_target_hidden.data,
-                              target_last_hidden.data,
-                              static_cast<size_t>(config.hidden_size) *
-                                  sizeof(uint16_t),
-                              cudaMemcpyDeviceToDevice),
-                   "Qwen transaction hidden copy");
-        for (size_t index = 0; index < layers.size(); ++index) {
-            const DeviceLayer& layer = layers[index];
-            if (layer.linear.state.data == nullptr) continue;
-            check_cuda(cudaMemcpy(transaction_states[index].data,
-                                  layer.linear.state.data,
-                                  layer.linear.state.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction state copy");
-            check_cuda(cudaMemcpy(transaction_conv_tails[index].data,
-                                  layer.linear.conv_tail.data,
-                                  layer.linear.conv_tail.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction convolution copy");
-        }
         const std::vector<int> drafts = draft_tokens(draft_count, input_token, stats);
         std::vector<int> verify_inputs;
         verify_inputs.reserve(drafts.size() + 1);
@@ -1616,10 +1763,53 @@ struct QwenEngine::Impl {
         all_reduce_half(hidden_a.f16_data(), rows * hidden_size);
         uint16_t* hidden = hidden_a.f16_data();
         uint16_t* output = hidden_b.f16_data();
+        const int dspark_tap_count = dspark_enabled
+            ? static_cast<int>(dspark_config->target_layer_ids.size()) : 0;
+        if (dspark_enabled) {
+            allocate_half(
+                dspark_target_taps,
+                static_cast<size_t>(rows) * hidden_size * dspark_tap_count,
+                {static_cast<uint64_t>(rows),
+                 static_cast<uint64_t>(hidden_size * dspark_tap_count)});
+        }
+        int dspark_tap_index = 0;
         for (int layer_index = 0; layer_index < active_layers; ++layer_index) {
             layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
                           output, rows, position_offset);
             std::swap(hidden, output);
+            if (dspark_enabled && dspark_tap_index < dspark_tap_count &&
+                layer_index == dspark_config->target_layer_ids[
+                    static_cast<size_t>(dspark_tap_index)]) {
+                // Store [row, tap, hidden] as the row-major concat expected by
+                // fc.weight [hidden, tap_count * hidden].
+                for (int row = 0; row < rows; ++row) {
+                    uint16_t* destination = dspark_target_taps.f16_data() +
+                        (static_cast<size_t>(row) * dspark_tap_count +
+                         dspark_tap_index) * hidden_size;
+                    check_cuda(cudaMemcpy(
+                        destination,
+                        hidden + static_cast<size_t>(row) * hidden_size,
+                        static_cast<size_t>(hidden_size) * sizeof(uint16_t),
+                        cudaMemcpyDeviceToDevice),
+                        "Qwen DSpark target tap copy");
+                }
+                ++dspark_tap_index;
+            }
+        }
+        if (dspark_enabled) {
+            if (dspark_tap_index != dspark_tap_count) {
+                throw std::runtime_error("Qwen DSpark target taps were not captured");
+            }
+            if (dspark->committed_position() != position_offset) {
+                if (position_offset <= dspark->committed_position()) {
+                    dspark->crop_context(position_offset);
+                } else {
+                    throw std::runtime_error(
+                        "Qwen DSpark target context has a position gap");
+                }
+            }
+            dspark->append_target_taps(dspark_target_taps.f16_data(), rows,
+                                       position_offset);
         }
         if (mtp_enabled) {
             allocate_half(target_hidden_rows, hidden_elements, hidden_shape);
@@ -1682,7 +1872,9 @@ struct QwenEngine::Impl {
                mtp_normalized_embedding.capacity +
                mtp_normalized_hidden.capacity + mtp_concat.capacity +
                mtp_fused.capacity + mtp_next_hidden.capacity +
-               mtp_normalized_output.capacity + workspace.capacity_bytes();
+               mtp_normalized_output.capacity + dspark_target_taps.capacity +
+               workspace.capacity_bytes() +
+               (dspark != nullptr ? dspark->activation_workspace_bytes() : 0);
     }
 };
 
@@ -1693,11 +1885,15 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
       config_(QwenConfig::from_hf_config(ckpt_dir)), index_(ckpt_dir),
       weights_(index_, config_, options.tp_world, options.tp_rank) {
     if (options_.device < 0) options_.device = options_.tp_rank;
-    if (options_.mtp && layer_count > 0 &&
+    if (options_.mtp && !options_.dspark_checkpoint.empty()) {
+        throw std::runtime_error(
+            "Qwen native MTP and external DSpark are mutually exclusive");
+    }
+    if ((options_.mtp || !options_.dspark_checkpoint.empty()) && layer_count > 0 &&
         layer_count != static_cast<int>(config_.num_hidden_layers)) {
         throw std::runtime_error(
-            "Qwen MTP requires the complete target model; partial --smoke-layers "
-            "would verify drafts against a different model");
+            "Qwen speculative decoding requires the complete target model; partial "
+            "--smoke-layers would verify drafts against a different model");
     }
     if (options_.prefill_chunk_tokens <= 0) {
         throw std::runtime_error("Qwen prefill chunk size must be positive");
@@ -1790,7 +1986,6 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
 
     prefix_stats_ = QwenPrefixCacheStats{};
     prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
-
     const bool can_reuse = options_.prefix_cache &&
         !impl_->cached_prompt.empty() && position_ ==
             static_cast<int>(impl_->cached_prompt.size());
@@ -1988,7 +2183,7 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         std::chrono::steady_clock::now() - prefill_started).count();
     std::vector<QwenForwardResult> results;
     results.reserve(static_cast<size_t>(max_new_tokens));
-    if (!options_.mtp) {
+    if (!options_.mtp && options_.dspark_checkpoint.empty()) {
         for (int index = 0; index < max_new_tokens; ++index) {
             results.push_back(next);
             if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
@@ -2002,8 +2197,11 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     // until the next transaction.
     results.push_back(next);
     int current_token = next.top_token;
-    const int max_draft_tokens = std::max(1, options_.mtp_speculative_tokens);
-    int adaptive_draft_tokens = options_.mtp_adaptive ? 1 : max_draft_tokens;
+    const bool use_dspark = !options_.dspark_checkpoint.empty();
+    const int max_draft_tokens = use_dspark
+        ? 7 : std::max(1, options_.mtp_speculative_tokens);
+    int adaptive_draft_tokens = use_dspark
+        ? 7 : (options_.mtp_adaptive ? 1 : max_draft_tokens);
     int full_accept_streak = 0;
     while (static_cast<int>(results.size()) < max_new_tokens) {
         const int remaining = max_new_tokens - static_cast<int>(results.size());
@@ -2012,10 +2210,23 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             results.push_back(next);
             break;
         }
+        if (use_dspark && remaining < 8) {
+            // The published checkpoint is trained for a fixed seven-row block;
+            // use exact plain decode for a short output tail rather than changing
+            // its attention semantics or returning unnecessary tokens.
+            while (static_cast<int>(results.size()) < max_new_tokens) {
+                next = decode_step(current_token);
+                results.push_back(next);
+                current_token = next.top_token;
+            }
+            break;
+        }
         const int proposed = std::min(adaptive_draft_tokens, remaining - 1);
-        next = impl_->speculative_step(current_token, proposed, &mtp_stats_);
+        next = use_dspark
+            ? impl_->dspark_speculative_step(current_token, &mtp_stats_)
+            : impl_->speculative_step(current_token, proposed, &mtp_stats_);
         const int correct = next.correct_drafts;
-        if (options_.mtp_adaptive) {
+        if (!use_dspark && options_.mtp_adaptive) {
             if (correct == proposed) {
                 ++full_accept_streak;
                 if (full_accept_streak >= 1 &&

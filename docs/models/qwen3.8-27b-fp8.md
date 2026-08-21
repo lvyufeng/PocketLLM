@@ -51,6 +51,7 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 - Opt-in FP16 sink-plus-sliding-window attention through `--qwen-attention-window N` and optional `--qwen-attention-sink-tokens N`. This changes full-attention semantics and is not part of exact parity or default performance claims; FP8 cache is intentionally rejected for this mode.
 - TP4 NCCL reductions and global greedy top-1 selection.
 - Opt-in native one-layer MTP loading and greedy speculative generation through `--qwen-mtp-tokens K`. The MTP layer reuses the target embedding/LM head, recursively proposes drafts, and verifies `[current_token, draft_1, ..., draft_K]` in one multi-row target forward. Partial rejection restores DeltaNet state/convolution tails and replays only the committed input prefix. MTP remains disabled by default.
+- Opt-in external Qwen DSpark loading through `--qwen-dspark PATH`. The real five-layer BF16 drafter is replicated on every TP rank, consumes target post-layer taps `4,16,28,40,52`, proposes the checkpoint's fixed seven-token block, and verifies `[anchor,draft_1,...,draft_7]` in one eight-row target forward. Its position-indexed context K/V follows the target prefix cache across append, shorter-prefix, branch, and compressed-context restores.
 
 ## Validated performance
 
@@ -142,6 +143,61 @@ python scripts/bench_qwen_mtp.py \
   --mtp-tokens 4 --adaptive \
   --max-new-tokens 64 --layers 0 \
   --tokenizer-python /path/to/deepseek/bin/python
+```
+
+### External DSpark speculative decoding
+
+The external checkpoint `RadixArk/Qwen3.8-27B-DSpark` (`epoch_2_step_4166`) is supported as an explicit opt-in:
+
+```bash
+--qwen-dspark /path/to/Qwen3.8-27B-DSpark
+```
+
+The directory must contain its `config.json` and single `model.safetensors`. The implementation validates all 62 expected BF16 tensors, materializes them as FP16 on SM75, and adds `2,623,214,594` resident weight bytes per rank. The five-layer draft backbone is replicated rather than tensor-parallel; only target embedding/head operations and the vocabulary-sharded Markov `w2` use TP collectives. Native MTP and external DSpark are mutually exclusive, and DSpark requires all 64 target layers.
+
+The checkpoint fixes `block_size=7`, so each transaction proposes seven drafts and target-verifies eight rows: `[anchor,draft_1,...,draft_7]`. The target post-layer taps are `4,16,28,40,52`. Partial rejection restores DeltaNet recurrent state and convolution tails, crops logical target/DSpark K/V to the committed position, then replays only `[anchor,accepted drafts]`. A remaining output tail shorter than eight tokens uses ordinary exact decode rather than changing the checkpoint's block semantics.
+
+The confidence head is evaluated for every draft and reported as `dspark_confidence_count/mean/min/max`, but it does not currently change the static width-8 schedule: neither the checkpoint nor its published static deployment supplies a validated confidence threshold. Speculative accounting retains the existing `mtp_*` field names for CLI compatibility (`mtp_accept_rate`, proposed/correct drafts, rollback/replay, and stage seconds).
+
+Real TP4, full-model, FP16-target-KV A/B results below use the same tokenizer-real deterministic language fixture, 64 generated tokens, plain then DSpark serial execution, and exact DSpark-versus-plain plus all-rank token checks. The table's `draft match rate` is `correct_drafts / proposed_drafts` and excludes the target bonus token; it is not the model-card `spec_accept_length`, whose numerator includes one bonus token per verification step.
+
+| Prompt | Draft match rate | Plain TPS | DSpark TPS | Decode speedup | Plain wall | DSpark wall | Wall speedup | Highest DSpark rank memory | Parity |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 512 | 94.64% | 37.20 | 60.02 | **1.614x** | 2.944 s | 2.385 s | **1.235x** | 11.19 GB | PASS |
+| 8,192 | 96.43% | 24.80 | 43.79 | **1.766x** | 31.505 s | 31.551 s | 0.999x | 11.61 GB | PASS |
+| 32,768 | 96.43% | 11.31 | 21.70 | **1.919x** | 295.812 s | 295.773 s | 1.000x | 12.52 GB | PASS |
+
+Long-context one-shot wall time is prefill-bound. DSpark's target-feature projector and five layers of context K/V projection make prefill slightly slower even though decode gets progressively faster. This is why the intended deployment remains a long-lived, single-request prefix-reusing engine rather than repeatedly paying cold prefill.
+
+Acceptance is workload-sensitive. The earlier 17% figure came from a deliberately bare 16-token prompt, not the DSpark model-card benchmark protocol: it omitted the Qwen chat template, used greedy decoding, and counted only draft matches. Re-running the same wording with the real chat template still produced a difficult greedy case (15.34% draft match without thinking, 23.81% with thinking), so it is a valid stress case but not evidence that the published DSpark acceptance is 17%. The model card instead reports `spec_accept_length` including the bonus token, with a request-weighted mean of 3.39 accepted tokens per verification step over 1,164 sampled requests (macro-average 3.35) at temperature 0.6, top-k 20, top-p 0.95, thinking enabled, and 2,048 generated tokens. Our native path is currently greedy and should not be compared to those stochastic benchmark numbers as if they were the same metric. DSpark remains default-off pending benchmark-protocol-matched measurements.
+
+For reference, the bare greedy stress prompt measured 31 correct drafts out of 182 proposals (`31/182 = 17.03%`), 17.42 tok/s DSpark decode, and exact plain-token parity. The chat-template, thinking-enabled rerun measured 35/147 (`23.81%`).
+
+Reproduce the protocol-sensitive chat-template fixture with `AutoTokenizer.apply_chat_template(..., add_generation_prompt=True, enable_thinking=True)` before passing token IDs to the C++ runtime; do not use the raw user sentence as the benchmark prompt.
+
+DSpark therefore remains default-off; enable it only after measuring representative traffic with the intended chat template, sampling policy, and generation length.
+
+Reproduce the short/long serial A/B with:
+
+```bash
+/path/to/deepseek/bin/python scripts/bench_qwen_dspark.py \
+  --ckpt /path/to/Qwen3.8-27B-FP8 \
+  --dspark /path/to/Qwen3.8-27B-DSpark \
+  --tp-world 4 --devices 0,1,2,3 \
+  --lengths 512,8192,32768 \
+  --max-new-tokens 64
+```
+
+The focused prefix/cold-parity suite covers exact repeat, monotonic append, shorter prefix, interior branch, and compressed context under both target KV dtypes. With the default early 256-token snapshot spacing, a shorter/branched prompt may reuse the deepest safe 256-token boundary and recompute the remainder rather than claiming the entire matched prefix:
+
+```bash
+for dtype in fp16 fp8; do
+  /path/to/deepseek/bin/python scripts/bench_qwen_dspark_prefix_cache.py \
+    --ckpt /path/to/Qwen3.8-27B-FP8 \
+    --dspark /path/to/Qwen3.8-27B-DSpark \
+    --kv-cache-dtype "$dtype" \
+    --max-context 1024 --max-new-tokens 16
+done
 ```
 
 ### Exact prefix reuse
@@ -309,8 +365,9 @@ build/cpp_engine/dsv4_cpp_engine \
 - Greedy generation only in the current Qwen engine API.
 - The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
 - The executable and internal C++ namespace retain DSV4 compatibility names.
-- CUDA Graph, a decode megakernel, and DSpark integration remain future work; none is included in the reported TPS.
+- CUDA Graph and a decode megakernel remain future work; neither is included in the reported TPS.
 - Native MTP is opt-in. Parity-safe high-acceptance cases accelerate decode by 1.67x at 4K, 2.47x at 8K, and 3.21x at 32K; 65–71% acceptance gives only 1.18–1.37x on 512-token varied prompts. Persistent exact-prefix workloads are the intended use case; `--qwen-mtp-adaptive` starts at K=1 and limits but does not eliminate low-acceptance overhead.
+- External Qwen DSpark is opt-in and always uses its fixed seven-draft/eight-row transaction. It accelerates high-draft-match decode by 1.61–1.92x in measured 512/8K/32K cases, while a bare greedy stress prompt achieved only 31/182 draft matches and regressed to about 17.4 tok/s. This draft-match ratio excludes bonus tokens and is not comparable to the model card's bonus-inclusive `spec_accept_length=3.39` sampled-workload mean. Confidence is telemetry only; no unvalidated threshold is used to gate transactions.
 - Split exact-GQA verification is experimental and enabled only with `QWEN_GQA_VERIFY_SPLIT=1`; direct numerical checks pass, but near-tie greedy output can drift. General long-prefill/decode optimized GQA and sparse attention remain separate opt-in paths; sparse attention changes model semantics.
 
 ## Evidence and related notes
@@ -328,5 +385,12 @@ build/cpp_engine/dsv4_cpp_engine \
 - `cpp_engine/tests/test_qwen_half_ops.cpp`
 - `cpp_engine/tests/test_qwen_weights.cpp`
 - `cpp_engine/tests/test_qwen_engine.cpp`
+- `cpp_engine/include/qwen_dspark.hpp`
+- `cpp_engine/src/qwen_dspark.cpp`
+- `cpp_engine/cuda/qwen_dspark_ops.cu`
+- `cpp_engine/tests/test_qwen_dspark.cpp`
+- `cpp_engine/tests/test_qwen_dspark_ops.cpp`
 - `scripts/bench_qwen_mtp.py`
+- `scripts/bench_qwen_dspark.py`
+- `scripts/bench_qwen_dspark_prefix_cache.py`
 - [Benchmark reporting rules](../benchmarking.md)

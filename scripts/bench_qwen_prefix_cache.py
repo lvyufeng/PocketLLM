@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
         "--qwen-mtp-adaptive", action="store_true",
         help="start at K=1 and adapt up to --qwen-mtp-tokens",
     )
+    parser.add_argument(
+        "--qwen-dspark",
+        help="enable external Qwen DSpark from this checkpoint directory",
+    )
     parser.add_argument("--nccl-id-path", default=".tmp/qwen_prefix_cache/nccl.id")
     parser.add_argument("--log-dir", default=".tmp/qwen_prefix_cache/logs")
     parser.add_argument("--suffix-tokens", type=int, default=512)
@@ -81,6 +85,18 @@ def parse_result(line: str) -> dict[str, Any] | None:
     return result
 
 
+def parse_worker_tokens(path: Path) -> list[list[int]]:
+    results: list[list[int]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("qwen_persistent_worker_result=1 "):
+            continue
+        match = re.search(r"\btokens=([^\s]*)", line)
+        if match is None:
+            raise RuntimeError(f"worker result is missing tokens: {path}")
+        results.append([int(item) for item in match.group(1).split(",") if item])
+    return results
+
+
 def wait_result(root: subprocess.Popen[str]) -> dict[str, Any]:
     while True:
         line = root.stdout.readline() if root.stdout is not None else ""
@@ -110,6 +126,15 @@ def main() -> int:
         raise SystemExit("--qwen-mtp-tokens must be non-negative")
     if args.qwen_mtp_tokens > 0 and args.layers != 0:
         raise SystemExit("native MTP validation requires --layers 0")
+    if args.qwen_dspark and args.qwen_mtp_tokens > 0:
+        raise SystemExit("--qwen-dspark and native MTP are mutually exclusive")
+    dspark = Path(args.qwen_dspark).resolve() if args.qwen_dspark else None
+    if dspark is not None and (
+        args.layers != 0
+        or not (dspark / "config.json").is_file()
+        or not (dspark / "model.safetensors").is_file()
+    ):
+        raise SystemExit("DSpark requires --layers 0 and a complete checkpoint")
 
     id_path = Path(args.nccl_id_path).resolve()
     id_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +171,8 @@ def main() -> int:
                 commands[-1] += ["--qwen-mtp-tokens", str(args.qwen_mtp_tokens)]
                 if args.qwen_mtp_adaptive:
                     commands[-1].append("--qwen-mtp-adaptive")
+            if dspark is not None:
+                commands[-1] += ["--qwen-dspark", str(dspark)]
         for rank in range(1, args.tp_world):
             log_path = log_dir / f"rank{rank}.log"
             log = log_path.open("wb")
@@ -162,6 +189,7 @@ def main() -> int:
         # First request uses the base fixture. Later requests include the
         # previous assistant output and a deterministic new suffix.
         prompt = list(base)
+        root_tokens: list[list[int]] = []
         requests = 3
         if args.compression_prefix_tokens > 0:
             requests += 1
@@ -199,6 +227,7 @@ def main() -> int:
             generated = result.get("tokens")
             if not isinstance(generated, list) or not generated:
                 raise RuntimeError(f"invalid generated token list: {result}")
+            root_tokens.append([int(token) for token in generated])
             # The engine has already executed all but the final generated token
             # into its recurrent/KV state. Including the complete assistant
             # output therefore exercises live reuse for the next request and
@@ -215,6 +244,14 @@ def main() -> int:
                 f"persistent processes failed root={root.returncode} "
                 f"workers={[worker.returncode for worker in workers]}"
             )
+        if dspark is not None:
+            for rank in range(1, args.tp_world):
+                worker_tokens = parse_worker_tokens(log_dir / f"rank{rank}.log")
+                if worker_tokens != root_tokens:
+                    raise RuntimeError(
+                        f"DSpark TP-rank token parity failed for rank {rank}"
+                    )
+            print("dspark_rank_token_parity=PASS")
         print(f"elapsed_wall_seconds={time.monotonic() - started:.3f}")
         return 0
     finally:

@@ -49,6 +49,22 @@ SafeTensorsIndex::SafeTensorsIndex(const std::string& ckpt_dir) : ckpt_dir_(ckpt
     }
 }
 
+SafeTensorsIndex SafeTensorsIndex::from_single_file(
+    const std::string& ckpt_dir, const std::string& filename) {
+    if (filename.empty()) {
+        throw std::runtime_error("safetensors filename must not be empty");
+    }
+    SafeTensorsIndex index;
+    index.ckpt_dir_ = ckpt_dir;
+    SafeTensorsShard shard(ckpt_dir + "/" + filename);
+    index.total_size_ = shard.file_size();
+    index.shards_.insert(filename);
+    for (const auto& [name, _info] : shard.tensors()) {
+        index.weight_map_[name] = filename;
+    }
+    return index;
+}
+
 const std::string* SafeTensorsIndex::shard_for_tensor(const std::string& tensor) const {
     auto it = weight_map_.find(tensor);
     return it == weight_map_.end() ? nullptr : &it->second;
