@@ -46,6 +46,10 @@ struct QwenConfig {
     uint64_t hidden_size = 0;
     uint64_t num_hidden_layers = 0;
     uint64_t max_position_embeddings = 0;
+    // Native Qwen next-token predictor layers. Zero means the checkpoint has
+    // no native MTP branch and the plain runtime remains the only path.
+    uint64_t mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
     double rms_norm_eps = 1.0e-6;
     double rope_theta = 10000000.0;
     double partial_rotary_factor = 1.0;

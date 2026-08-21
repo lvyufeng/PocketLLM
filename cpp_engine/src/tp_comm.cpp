@@ -76,6 +76,33 @@ struct CachedComm {
     ncclComm_t comm = nullptr;
 };
 
+struct Top1RowsWorkspace {
+    int* d_tokens = nullptr;
+    float* d_logits = nullptr;
+    size_t capacity = 0;
+};
+
+Top1RowsWorkspace& top1_rows_workspace(int device, size_t count) {
+    static std::unordered_map<int, Top1RowsWorkspace> workspaces;
+    Top1RowsWorkspace& workspace = workspaces[device];
+    if (workspace.capacity >= count) return workspace;
+    check_cuda(cudaSetDevice(device), "cudaSetDevice top1 workspace");
+    if (workspace.d_tokens != nullptr) {
+        check_cuda(cudaFree(workspace.d_tokens), "cudaFree gathered top tokens");
+        workspace.d_tokens = nullptr;
+    }
+    if (workspace.d_logits != nullptr) {
+        check_cuda(cudaFree(workspace.d_logits), "cudaFree gathered top logits");
+        workspace.d_logits = nullptr;
+    }
+    check_cuda(cudaMalloc(&workspace.d_tokens, count * sizeof(int)),
+               "cudaMalloc gathered batched top tokens");
+    check_cuda(cudaMalloc(&workspace.d_logits, count * sizeof(float)),
+               "cudaMalloc gathered batched top logits");
+    workspace.capacity = count;
+    return workspace;
+}
+
 ncclComm_t cached_comm(int world, int rank, int device, const char* id_path) {
     static std::unordered_map<std::string, CachedComm> comms;
     const std::string key = std::to_string(world) + ":" + std::to_string(rank) + ":" + std::to_string(device) + ":" + id_path;
@@ -110,6 +137,52 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
     cudaFree(d_value);
     cudaFree(d_sum);
     ncclCommDestroy(comm);
+}
+
+void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
+                           const int* d_local_tokens,
+                           const float* d_local_logits, int rows,
+                           int* global_tokens, float* global_logits) {
+    if (world <= 0 || rank < 0 || rank >= world || rows <= 0 ||
+        d_local_tokens == nullptr || d_local_logits == nullptr ||
+        global_tokens == nullptr || global_logits == nullptr) {
+        throw std::runtime_error("invalid NCCL batched top args");
+    }
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const size_t gathered_count = static_cast<size_t>(world) * rows;
+    Top1RowsWorkspace& workspace = top1_rows_workspace(device, gathered_count);
+    check_nccl(ncclGroupStart(), "ncclGroupStart batched top");
+    check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, rows, ncclInt32,
+                             comm, nullptr),
+               "ncclAllGather batched top tokens");
+    check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, rows, ncclFloat,
+                             comm, nullptr),
+               "ncclAllGather batched top logits");
+    check_nccl(ncclGroupEnd(), "ncclGroupEnd batched top");
+    std::vector<int> all_tokens(gathered_count);
+    std::vector<float> all_logits(gathered_count);
+    check_cuda(cudaMemcpy(all_tokens.data(), workspace.d_tokens,
+                          gathered_count * sizeof(int), cudaMemcpyDeviceToHost),
+               "copy gathered batched top tokens");
+    check_cuda(cudaMemcpy(all_logits.data(), workspace.d_logits,
+                          gathered_count * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy gathered batched top logits");
+    for (int row = 0; row < rows; ++row) {
+        float best_logit = -INFINITY;
+        int best_token = 0;
+        for (int r = 0; r < world; ++r) {
+            const size_t at = static_cast<size_t>(r) * rows + row;
+            const float logit = all_logits[at];
+            const int token = all_tokens[at];
+            if (logit > best_logit ||
+                (logit == best_logit && token < best_token)) {
+                best_logit = logit;
+                best_token = token;
+            }
+        }
+        global_tokens[row] = best_token;
+        global_logits[row] = best_logit;
+    }
 }
 
 void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count) {

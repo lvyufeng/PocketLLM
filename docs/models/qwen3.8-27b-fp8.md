@@ -50,6 +50,7 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 - Opt-in exact FP16 GQA kernels: tiled prefill and split-context fused decode with compact online-softmax partials. Enable with `DSV4_QWEN_GQA_OPTIMIZED=1`; the default remains the reference full-attention path.
 - Opt-in FP16 sink-plus-sliding-window attention through `--qwen-attention-window N` and optional `--qwen-attention-sink-tokens N`. This changes full-attention semantics and is not part of exact parity or default performance claims; FP8 cache is intentionally rejected for this mode.
 - TP4 NCCL reductions and global greedy top-1 selection.
+- Opt-in native one-layer MTP loading and greedy speculative generation through `--qwen-mtp-tokens K`. The MTP layer reuses the target embedding/LM head, recursively proposes drafts, and verifies `[current_token, draft_1, ..., draft_K]` in one multi-row target forward. Partial rejection restores DeltaNet state/convolution tails and replays only the committed input prefix. MTP remains disabled by default.
 
 ## Validated performance
 
@@ -80,6 +81,69 @@ The same executable was then run serially over longer prompts with four generate
 
 The direct FP16-activation FP8 projection gate covers aligned and padded strides, masked rows, tail K tiles, vectorized-versus-scalar decode dispatch, and the wide prefill tile. It reports decode max absolute error `1.459e-2` against the FP32 host reference, with vectorized-versus-scalar output difference `0`; the 4-row experimental path differs by at most `3.906e-3`. The focused FP8 online operator suite and full TP4 rank parity checks also pass.
 
+### Native MTP speculative decoding
+
+The checkpoint declares `mtp_num_hidden_layers=1` and ships the predictor in `mtp.safetensors`. PocketLLM maps this full-attention layer under TP4, uses the required `[normalized_embedding, normalized_hidden]` fusion order, consumes the target's final-normalized hidden state, and uses the MTP layer's normalized output as the recursive hidden. Target verification computes all candidate-row logits together and performs one batched TP global top-1 collective.
+
+Enable it explicitly with:
+
+```bash
+--qwen-mtp-tokens 4
+```
+
+`--qwen-mtp` is equivalent to enabling the default `K=1`. MTP requires all 64 target layers; combining it with a nonzero partial `--smoke-layers` value is rejected. It is also context-safe: the prompt plus requested output count must fit in `max_context`; each speculative block is capped by the remaining output count, so its temporary verify suffix stays within that bound. The runtime reports `mtp_accept_rate`, proposed/correct draft counts, rollback/replay counts, and separate prefill/draft/verify/replay seconds.
+
+This MTP implementation follows the standard Qwen3.5 shifted-hidden predictor path used by vLLM: prompt target rows are paired with their next-token inputs to prime an independent absolute-position MTP KV cache, after which the predictor advances recursively. SGLang's newer `frozen_kv_mtp` worker is a separate Gemma-oriented optimization that requires a model-specific mapping from assistant layers to target KV-owner layers; Qwen3.5 does not expose such a mapping, so target and MTP KV are not aliased.
+
+The optimized target verifier reuses each FP8 weight row across all 2–8 candidate rows, fuses small-batch gate/up/SwiGLU, reuses transaction buffers, and batches exact GQA while retaining the reference score/softmax/value reduction order. An even faster split online-softmax verifier is available through `QWEN_GQA_VERIFY_SPLIT=1`, but stays experimental: its small numerical drift can change greedy output at near-tie logits even though direct attention error is below `8e-6`.
+
+Real TP4, full 64-layer, 64-token generation results below cover several tokenizer-real 512-token prompts. Every TP rank agreed and each MTP sequence matched its serial plain run. The final adaptive policy starts at `K=1`, doubles K after full acceptance, and backs off after rejection:
+
+| Prompt | Acceptance | Plain TPS | Adaptive K<=4 TPS | Decode speedup | Wall speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Repeated natural language | 100.0% | 37.19 | 79.39 | **2.135x** | **1.331x** |
+| Config/model text | 94.0% | 36.75 | 69.61 | **1.894x** | **1.273x** |
+| Source code | 70.0% | 36.91 | 50.66 | 1.372x | 1.106x |
+| README prose | 70.9% | 36.83 | 48.10 | 1.306x | 1.079x |
+| Model documentation | 64.8% | 36.93 | 43.53 | 1.179x | 1.026x |
+
+The optimized path therefore clears 1.5x only when draft acceptance is high (94% or better in the measured cases); it cannot honestly guarantee 1.5x for arbitrary prompts. Starting adaptive mode at K=1 protects mixed prompts better than starting at K=4, but 65–71% acceptance still yields only 1.18–1.37x decode speedup. A target top1-top2 logit-margin gate was also tested and rejected: thresholds 0.5 and 1.0 reduced performance on the difficult prompts, so no margin-gating code or CLI option is retained. The one-shot wall result includes independent-MTP prompt priming; persistent single-concurrency requests with exact prefix reuse remain the intended workload.
+
+The parity-safe exact-GQA verifier now uses a warp-tiled value pass: one warp owns one candidate row, three query heads, and 32 value channels while preserving each output element's left-to-right FP32 accumulation order. Fresh 100%-acceptance measurements show the long-context gain increasing as plain decode becomes attention-bound:
+
+| Prompt | Plain TPS | MTP K=4 TPS | Decode speedup | One-shot wall speedup | Parity |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 4,096 | 30.10 | 50.17 | **1.667x** | not reported | PASS |
+| 8,192 | 24.78 | 61.29 | **2.474x** | 0.961x | PASS |
+| 32,768 | 11.30 | 36.26 | **3.208x** | 0.929x | PASS |
+
+The 8K/32K one-shot wall numbers remain below 1x because each separately launched MTP process primes an additional full-prompt predictor KV cache; this is not repeated for an exact-prefix hit in the long-lived workload. An opt-in split-GQA experiment measured 2.38–4.57x at 512/4K/8K/32K, but it is not included in the parity-safe claim because a separate near-tie prompt exposed sequence drift.
+
+Reproduce serial plain/K=1/K=2/K=4 A/B cases with real tokenizer IDs and automatic TP-rank/plain parity checks:
+
+```bash
+python scripts/bench_qwen_mtp.py \
+  --ckpt /path/to/Qwen3.8-27B-FP8 \
+  --tp-world 4 --devices 0,1,2,3 \
+  --lengths 512,32768 \
+  --mtp-tokens 1,2,4 \
+  --max-new-tokens 32 \
+  --layers 0 \
+  --tokenizer-python /path/to/deepseek/bin/python
+```
+
+For the recommended adaptive policy, pass one maximum K and `--adaptive`:
+
+```bash
+python scripts/bench_qwen_mtp.py \
+  --ckpt /path/to/Qwen3.8-27B-FP8 \
+  --tp-world 4 --devices 0,1,2,3 \
+  --lengths 512,8192,32768 \
+  --mtp-tokens 4 --adaptive \
+  --max-new-tokens 64 --layers 0 \
+  --tokenizer-python /path/to/deepseek/bin/python
+```
+
 ### Exact prefix reuse
 
 `QwenEngineOptions::prefix_cache` is enabled by default for a long-lived engine. The full-attention KV cache is already indexed by absolute position, while the 48 DeltaNet layers carry a small recurrent state (`state` plus convolution tail). The engine retains both across sequential prefill requests and reports `prefix_reused_tokens`, `prefix_computed_tokens`, `prefix_matched_tokens`, and `prefix_resume_source` in the persistent stdin result.
@@ -98,6 +162,17 @@ A real TP4 continuous-request test on the Qwen3.8-27B-FP8 checkpoint produced:
 | 4 | 768 (256 common prefix + compressed suffix) | 256 | 512 | snapshot | 627.5 |
 
 The cache-on and cold A/B runs generated identical tokens on all four TP ranks. In the cold run, requests 2/3/4 computed 1,028/1,544/768 tokens respectively, and every cold request reported `prefix_snapshots=0` with `prefix_snapshot_bytes=0`. Prefix reuse is exact: it does not claim that newly compressed content is cached; only the unchanged token prefix is reused.
+
+Native MTP was also exercised through this same long-lived protocol with adaptive `K<=4`, 64 generated tokens, two appends, and an interior compression branch. A separate serial plain run used the identical four requests. All generated sequences matched, every request had TP-rank parity, and both modes reported identical prefix accounting:
+
+| Request | Prompt | Reused | Computed | Resume | MTP acceptance | Plain decode TPS | MTP decode TPS | Decode speedup | Plain wall | MTP wall | Wall speedup |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 0 | 512 | empty | 100.0% | 37.13 | 79.67 | **2.146x** | 2.959 s | 2.219 s | **1.334x** |
+| 2 | 1,088 | 575 | 513 | live | 77.8% | 35.75 | 50.42 | 1.410x | 3.426 s | 3.120 s | 1.098x |
+| 3 | 1,664 | 1,151 | 513 | live | 70.2% | 34.55 | 48.65 | 1.408x | 3.484 s | 3.169 s | 1.099x |
+| 4 | 768 (256 common prefix + compressed suffix) | 256 | 512 | snapshot | 63.2% | 36.30 | 42.45 | 1.169x | 2.955 s | 2.897 s | 1.020x |
+
+This validates the intended single-concurrency cache behavior and shows a wall win on all four requests, but it also confirms that the 1.5x requirement remains acceptance-dependent: only the 100%-acceptance request clears 1.5x decode and wall throughput. Appends reuse the target recurrent/KV state and the MTP shifted boundary; compression restores a target-hidden snapshot and rewrites the MTP boundary before priming the new suffix. The persistent harness reports wall, prefill, and decode timing separately; prefill includes MTP predictor priming when enabled.
 
 The same harness was then run from a 32,768-token cold prompt with 512-token appends and a 4,096-token compression boundary:
 
@@ -235,7 +310,8 @@ build/cpp_engine/dsv4_cpp_engine \
 - The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
 - The executable and internal C++ namespace retain DSV4 compatibility names.
 - CUDA Graph, a decode megakernel, and DSpark integration remain future work; none is included in the reported TPS.
-- The exact optimized GQA kernels and sparse attention mode are opt-in. The optimized kernels have direct numerical gates, but clean full-network TP4 A/B timing is still required before making either path the default or updating the long-context TPS table.
+- Native MTP is opt-in. Parity-safe high-acceptance cases accelerate decode by 1.67x at 4K, 2.47x at 8K, and 3.21x at 32K; 65–71% acceptance gives only 1.18–1.37x on 512-token varied prompts. Persistent exact-prefix workloads are the intended use case; `--qwen-mtp-adaptive` starts at K=1 and limits but does not eliminate low-acceptance overhead.
+- Split exact-GQA verification is experimental and enabled only with `QWEN_GQA_VERIFY_SPLIT=1`; direct numerical checks pass, but near-tie greedy output can drift. General long-prefill/decode optimized GQA and sparse attention remain separate opt-in paths; sparse attention changes model semantics.
 
 ## Evidence and related notes
 
@@ -251,4 +327,6 @@ build/cpp_engine/dsv4_cpp_engine \
 - `cpp_engine/tests/test_qwen_gqa_attention.cpp`
 - `cpp_engine/tests/test_qwen_half_ops.cpp`
 - `cpp_engine/tests/test_qwen_weights.cpp`
+- `cpp_engine/tests/test_qwen_engine.cpp`
+- `scripts/bench_qwen_mtp.py`
 - [Benchmark reporting rules](../benchmarking.md)

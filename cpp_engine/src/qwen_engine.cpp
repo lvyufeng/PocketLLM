@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
@@ -37,6 +38,17 @@ bool qwen_env_enabled(const char* name) {
            std::strcmp(value, "FALSE") != 0 &&
            std::strcmp(value, "off") != 0 &&
            std::strcmp(value, "OFF") != 0;
+}
+
+int qwen_env_int(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return fallback;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0 || parsed > 1'000'000) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
 }
 
 struct DeviceLinear {
@@ -151,6 +163,7 @@ struct QwenRecurrentSnapshot {
     // of small allocations. The tensors are local to one TP rank.
     QwenDeviceTensor state;
     QwenDeviceTensor conv_tail;
+    QwenDeviceTensor target_hidden;
     bool periodic = false;
     // A request-boundary snapshot can answer an exact shorter-prefix prefill
     // without re-running its final token.
@@ -158,8 +171,15 @@ struct QwenRecurrentSnapshot {
     bool has_result = false;
 
     uint64_t bytes() const {
-        return state.capacity + conv_tail.capacity;
+        return state.capacity + conv_tail.capacity + target_hidden.capacity;
     }
+};
+
+struct QwenVerifyBatch {
+    std::vector<int> top_tokens;
+    std::vector<float> top_logits;
+    std::vector<float> local_logits;
+    int position_after = 0;
 };
 
 struct QwenWorkspace {
@@ -217,9 +237,35 @@ struct QwenEngine::Impl {
     QwenEngineOptions options;
     int max_context = 0;
     std::vector<DeviceLayer> layers;
+    std::vector<QwenDeviceTensor> transaction_states;
+    std::vector<QwenDeviceTensor> transaction_conv_tails;
+    QwenDeviceTensor transaction_target_hidden;
     QwenDeviceTensor embed;
     QwenDeviceTensor final_norm;
     QwenDeviceTensor lm_head;
+    bool mtp_enabled = false;
+    DeviceLinear mtp_fc;
+    QwenDeviceTensor mtp_pre_fc_norm_embedding;
+    QwenDeviceTensor mtp_pre_fc_norm_hidden;
+    QwenDeviceTensor mtp_norm;
+    DeviceLayer mtp_layer;
+    QwenDeviceTensor target_hidden_rows;
+    QwenDeviceTensor target_last_hidden;
+    QwenDeviceTensor mtp_seed_hidden;
+    QwenDeviceTensor mtp_embedding;
+    QwenDeviceTensor mtp_normalized_embedding;
+    QwenDeviceTensor mtp_normalized_hidden;
+    QwenDeviceTensor mtp_concat;
+    QwenDeviceTensor mtp_fused;
+    QwenDeviceTensor mtp_next_hidden;
+    QwenDeviceTensor mtp_normalized_output;
+    int mtp_position = 0;
+    int mtp_seed_input_token = 0;
+    int mtp_next_token = 0;
+    float mtp_next_logit = 0.0f;
+    float mtp_next_checksum = 0.0f;
+    bool has_target_last_hidden = false;
+    bool mtp_seed_ready = false;
     std::vector<int> local_tokens;
     QwenDeviceTensor d_tokens;
     QwenDeviceTensor hidden_a;
@@ -386,6 +432,89 @@ struct QwenEngine::Impl {
             }
             layers.push_back(std::move(destination));
         }
+
+        if (options.mtp) {
+            if (!map.mtp().found) {
+                throw std::runtime_error(
+                    "Qwen MTP requested but checkpoint has no native MTP weights");
+            }
+            if (config.mtp_num_hidden_layers != 1) {
+                throw std::runtime_error(
+                    "Qwen runtime currently supports exactly one native MTP layer");
+            }
+            mtp_enabled = true;
+            const QwenMtpWeights& source = map.mtp();
+            mtp_pre_fc_norm_embedding = upload(index, source.pre_fc_norm_embedding);
+            mtp_pre_fc_norm_hidden = upload(index, source.pre_fc_norm_hidden);
+            mtp_norm = upload(index, source.norm);
+            mtp_fc = upload_linear(index, source.fc);
+            const QwenLayerWeights& mtp_source = source.layer;
+            mtp_layer.input_norm = upload(index, mtp_source.input_layernorm);
+            mtp_layer.post_norm = upload(index, mtp_source.post_attention_layernorm);
+            mtp_layer.gate = upload_linear(index, mtp_source.mlp.gate_proj);
+            mtp_layer.up = upload_linear(index, mtp_source.mlp.up_proj);
+            mtp_layer.down = upload_linear(index, mtp_source.mlp.down_proj);
+            mtp_layer.full.q = upload_linear(index, mtp_source.full_attention.q_proj);
+            mtp_layer.full.k = upload_linear(index, mtp_source.full_attention.k_proj);
+            mtp_layer.full.v = upload_linear(index, mtp_source.full_attention.v_proj);
+            mtp_layer.full.out = upload_linear(index, mtp_source.full_attention.o_proj);
+            mtp_layer.full.q_norm = upload(index, mtp_source.full_attention.q_norm);
+            mtp_layer.full.k_norm = upload(index, mtp_source.full_attention.k_norm);
+            uploaded_weight_bytes += source.pre_fc_norm_embedding.device_nbytes +
+                source.pre_fc_norm_hidden.device_nbytes + source.norm.device_nbytes +
+                mtp_source.input_layernorm.device_nbytes +
+                mtp_source.post_attention_layernorm.device_nbytes +
+                mtp_source.full_attention.q_norm.device_nbytes +
+                mtp_source.full_attention.k_norm.device_nbytes;
+            const auto count_mtp_linear = [this](const QwenLinearRef& linear) {
+                uploaded_weight_bytes += linear.weight.device_nbytes;
+                if (linear.has_scale) {
+                    uploaded_scale_bytes += linear.scale.device_nbytes;
+                }
+            };
+            count_mtp_linear(source.fc);
+            for (const QwenLinearRef* linear : {
+                     &mtp_source.full_attention.q_proj,
+                     &mtp_source.full_attention.k_proj,
+                     &mtp_source.full_attention.v_proj,
+                     &mtp_source.full_attention.o_proj,
+                     &mtp_source.mlp.gate_proj,
+                     &mtp_source.mlp.up_proj,
+                     &mtp_source.mlp.down_proj}) {
+                count_mtp_linear(*linear);
+            }
+            const size_t mtp_cache_elements = static_cast<size_t>(max_context) *
+                local_kv_heads * head_dim;
+            const std::vector<uint64_t> mtp_cache_shape = {
+                static_cast<uint64_t>(max_context),
+                static_cast<uint64_t>(local_kv_heads),
+                static_cast<uint64_t>(head_dim)};
+            if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
+                allocate_half(mtp_layer.full.k_cache, mtp_cache_elements,
+                              mtp_cache_shape);
+                allocate_half(mtp_layer.full.v_cache, mtp_cache_elements,
+                              mtp_cache_shape);
+                cache_data_bytes += mtp_layer.full.k_cache.nbytes +
+                                    mtp_layer.full.v_cache.nbytes;
+            } else {
+                allocate_elements(mtp_layer.full.k_cache, mtp_cache_elements,
+                                  mtp_cache_shape, SafeDType::F8_E4M3);
+                allocate_elements(mtp_layer.full.v_cache, mtp_cache_elements,
+                                  mtp_cache_shape, SafeDType::F8_E4M3);
+                const size_t scale_elements = static_cast<size_t>(max_context) *
+                    local_kv_heads * (head_dim / kKvScaleBlock);
+                const std::vector<uint64_t> scale_shape = {
+                    static_cast<uint64_t>(max_context),
+                    static_cast<uint64_t>(local_kv_heads),
+                    static_cast<uint64_t>(head_dim / kKvScaleBlock)};
+                allocate_half(mtp_layer.full.k_scale, scale_elements, scale_shape);
+                allocate_half(mtp_layer.full.v_scale, scale_elements, scale_shape);
+                cache_data_bytes += mtp_layer.full.k_cache.nbytes +
+                                    mtp_layer.full.v_cache.nbytes;
+                cache_scale_bytes += mtp_layer.full.k_scale.nbytes +
+                                     mtp_layer.full.v_scale.nbytes;
+            }
+        }
     }
 
     bool has_recurrent_state() const {
@@ -401,11 +530,69 @@ struct QwenEngine::Impl {
             zero_tensor(layer.linear.state);
             zero_tensor(layer.linear.conv_tail);
         }
+        has_target_last_hidden = false;
+        mtp_seed_ready = false;
+        mtp_position = 0;
+        mtp_seed_input_token = 0;
+        mtp_next_token = 0;
+        mtp_next_logit = 0.0f;
+        mtp_next_checksum = 0.0f;
     }
 
     // Copies the recurrent half of the network to device-resident snapshots.
     // Only the 48 DeltaNet layers carry order-dependent state; full attention
     // is skipped because its KV cache is addressed by absolute position.
+    void prepare_transaction_state() {
+        if (transaction_states.size() == layers.size()) return;
+        transaction_states.clear();
+        transaction_conv_tails.clear();
+        transaction_states.resize(layers.size());
+        transaction_conv_tails.resize(layers.size());
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const DeviceLayer& layer = layers[index];
+            if (layer.linear.state.data == nullptr) continue;
+            allocate_float(transaction_states[index],
+                           layer.linear.state.nbytes / sizeof(float),
+                           layer.linear.state.shape);
+            allocate_half(transaction_conv_tails[index],
+                          layer.linear.conv_tail.nbytes / sizeof(uint16_t),
+                          layer.linear.conv_tail.shape);
+        }
+        if (mtp_enabled) {
+            allocate_half(transaction_target_hidden, config.hidden_size,
+                          {config.hidden_size});
+        }
+    }
+
+    void restore_transaction_state(int position) {
+        if (transaction_states.size() != layers.size()) {
+            throw std::runtime_error("Qwen transaction state is unavailable");
+        }
+        for (size_t index = 0; index < layers.size(); ++index) {
+            DeviceLayer& layer = layers[index];
+            if (layer.linear.state.data == nullptr) continue;
+            check_cuda(cudaMemcpy(layer.linear.state.data,
+                                  transaction_states[index].data,
+                                  layer.linear.state.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction state restore");
+            check_cuda(cudaMemcpy(layer.linear.conv_tail.data,
+                                  transaction_conv_tails[index].data,
+                                  layer.linear.conv_tail.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction convolution restore");
+        }
+        check_cuda(cudaMemcpy(target_last_hidden.data,
+                              transaction_target_hidden.data,
+                              static_cast<size_t>(config.hidden_size) *
+                                  sizeof(uint16_t),
+                              cudaMemcpyDeviceToDevice),
+                   "Qwen transaction hidden restore");
+        has_target_last_hidden = true;
+        mtp_seed_ready = false;
+        mtp_position = position;
+    }
+
     QwenRecurrentSnapshot capture_recurrent_state(
         int position, const QwenForwardResult* result = nullptr,
         bool periodic = false) {
@@ -431,6 +618,20 @@ struct QwenEngine::Impl {
             allocate(snapshot.conv_tail, tail_bytes,
                      {tail_bytes / sizeof(uint16_t)}, SafeDType::F16);
         }
+        if (mtp_enabled && position > 0) {
+            if (!has_target_last_hidden || target_last_hidden.data == nullptr) {
+                throw std::runtime_error(
+                    "Qwen MTP snapshot requires the committed target hidden");
+            }
+            const size_t hidden_elements = static_cast<size_t>(config.hidden_size);
+            allocate_half(snapshot.target_hidden, hidden_elements,
+                          {config.hidden_size});
+            check_cuda(cudaMemcpy(snapshot.target_hidden.data,
+                                  target_last_hidden.data,
+                                  hidden_elements * sizeof(uint16_t),
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen target hidden snapshot copy");
+        }
         size_t state_offset = 0;
         size_t tail_offset = 0;
         for (const DeviceLayer& layer : layers) {
@@ -454,7 +655,8 @@ struct QwenEngine::Impl {
         return snapshot;
     }
 
-    void restore_recurrent_state(const QwenRecurrentSnapshot& snapshot) {
+    void restore_recurrent_state(const QwenRecurrentSnapshot& snapshot,
+                                 bool restore_target_hidden = true) {
         size_t expected_state_bytes = 0;
         size_t expected_tail_bytes = 0;
         for (const DeviceLayer& layer : layers) {
@@ -465,6 +667,27 @@ struct QwenEngine::Impl {
         if (snapshot.state.nbytes != expected_state_bytes ||
             snapshot.conv_tail.nbytes != expected_tail_bytes) {
             throw std::runtime_error("Qwen recurrent snapshot extent mismatch");
+        }
+        if (restore_target_hidden && mtp_enabled && snapshot.position > 0) {
+            const size_t hidden_bytes = static_cast<size_t>(config.hidden_size) *
+                sizeof(uint16_t);
+            if (snapshot.target_hidden.nbytes != hidden_bytes) {
+                throw std::runtime_error(
+                    "Qwen MTP snapshot target hidden extent mismatch");
+            }
+            allocate_half(target_last_hidden, config.hidden_size,
+                          {config.hidden_size});
+            check_cuda(cudaMemcpy(target_last_hidden.data,
+                                  snapshot.target_hidden.data, hidden_bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen target hidden snapshot restore");
+            has_target_last_hidden = true;
+            mtp_seed_ready = false;
+            mtp_position = snapshot.position;
+        } else if (snapshot.position == 0) {
+            has_target_last_hidden = false;
+            mtp_seed_ready = false;
+            mtp_position = 0;
         }
         size_t state_offset = 0;
         size_t tail_offset = 0;
@@ -497,7 +720,7 @@ struct QwenEngine::Impl {
             options.max_state_snapshots <= 0 || position <= 0) {
             return;
         }
-        if (!has_recurrent_state()) return;
+        if (!has_recurrent_state() && !mtp_enabled) return;
         for (QwenRecurrentSnapshot& entry : snapshots) {
             if (entry.position != position) continue;
             entry.periodic = entry.periodic || periodic;
@@ -870,6 +1093,44 @@ struct QwenEngine::Impl {
                 layer.full.v_scale.f16_data(), attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, kKvScaleBlock, position_offset,
                 max_context), "prefill FP8-cache GQA");
+        } else if (rows <= 8 && attention_window == 0) {
+            const int context_length = position_offset + rows;
+            if (qwen_env_enabled("QWEN_GQA_VERIFY_SPLIT")) {
+                const int verify_target_positions =
+                    qwen_env_int("QWEN_GQA_VERIFY_TILE", 64);
+                const int verify_splits = std::max(1, std::min(
+                    64, (context_length + verify_target_positions - 1) /
+                            verify_target_positions));
+                const size_t partial_elements =
+                    static_cast<size_t>(rows) * q_heads * verify_splits *
+                    static_cast<size_t>(head_dim + 2);
+                QwenDeviceTensor& partials = workspace_float(
+                    partial_elements,
+                    {static_cast<uint64_t>(rows),
+                     static_cast<uint64_t>(q_heads),
+                     static_cast<uint64_t>(verify_splits),
+                     static_cast<uint64_t>(head_dim + 2)});
+                require_launch(qwen_gqa_verify_attention_f16_cuda(
+                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    partials.f32_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context, verify_splits),
+                    "verify split FP16-cache GQA");
+            } else {
+                const size_t score_elements =
+                    static_cast<size_t>(rows) * q_heads * context_length;
+                QwenDeviceTensor& scores = workspace_float(
+                    score_elements,
+                    {static_cast<uint64_t>(rows),
+                     static_cast<uint64_t>(q_heads),
+                     static_cast<uint64_t>(context_length)});
+                require_launch(qwen_gqa_verify_attention_f16_exact_cuda(
+                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    scores.f32_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context),
+                    "verify exact FP16-cache GQA");
+            }
         } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
                    attention_window > 0) {
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
@@ -904,12 +1165,15 @@ struct QwenEngine::Impl {
                               static_cast<uint64_t>(hidden_size)});
         QwenDeviceTensor& attention = workspace_half(hidden_elements, normalized.shape);
         QwenDeviceTensor& post = workspace_half(hidden_elements, normalized.shape);
-        const bool fused_swiglu = rows == 1 && layer.gate.fp8 && layer.up.fp8 &&
+        const bool compatible_swiglu = layer.gate.fp8 && layer.up.fp8 &&
             layer.gate.weight.shape == layer.up.weight.shape &&
             layer.gate.scale.shape == layer.up.scale.shape;
+        const bool fused_decode_swiglu = rows == 1 && compatible_swiglu;
+        const bool fused_small_batch_swiglu = rows > 1 && rows <= 8 &&
+            compatible_swiglu && hidden_size % 4 == 0;
         QwenDeviceTensor* gate = nullptr;
         QwenDeviceTensor* up = nullptr;
-        if (!fused_swiglu) {
+        if (!fused_decode_swiglu && !fused_small_batch_swiglu) {
             gate = &workspace_half(intermediate_elements,
                 {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
             up = &workspace_half(intermediate_elements, gate->shape);
@@ -932,7 +1196,7 @@ struct QwenEngine::Impl {
             "Qwen FP16 residual copy");
         add(output, attention.f16_data(), rows * hidden_size);
         norm(layer.post_norm, output, post.f16_data(), rows, hidden_size);
-        if (fused_swiglu) {
+        if (fused_decode_swiglu) {
             require_launch(qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
                 post.f16_data(), layer.gate.weight.fp8_data(),
                 layer.gate.scale.f16_data(), layer.up.weight.fp8_data(),
@@ -940,6 +1204,16 @@ struct QwenEngine::Impl {
                 static_cast<int>(layer.gate.weight.shape[0]), hidden_size,
                 hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
                 "FP16 fused decode SwiGLU");
+        } else if (fused_small_batch_swiglu) {
+            require_launch(
+                qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
+                    post.f16_data(), layer.gate.weight.fp8_data(),
+                    layer.gate.scale.f16_data(), layer.up.weight.fp8_data(),
+                    layer.up.scale.f16_data(), intermediate.f16_data(), rows,
+                    static_cast<int>(layer.gate.weight.shape[0]), hidden_size,
+                    hidden_size, static_cast<int>(layer.gate.weight.shape[0]),
+                    hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
+                "FP16 fused small-batch SwiGLU");
         } else {
             projection(layer.gate, post.f16_data(), gate->f16_data(), rows);
             projection(layer.up, post.f16_data(), up->f16_data(), rows);
@@ -952,63 +1226,355 @@ struct QwenEngine::Impl {
         add(output, mlp.f16_data(), rows * hidden_size);
     }
 
-    QwenForwardResult logits_for(const uint16_t* hidden, int last_row,
-                                 int position_after, int active_layers) {
+    QwenVerifyBatch top_tokens_for(const uint16_t* hidden, int rows,
+                                   const QwenDeviceTensor* output_norm,
+                                   int position_after) {
+        if (rows <= 0) {
+            throw std::runtime_error("Qwen logits require at least one row");
+        }
         const int hidden_size = static_cast<int>(config.hidden_size);
         const int local_vocab = static_cast<int>(lm_head.shape[0]);
         begin_workspace();
         QwenDeviceTensor& normalized = workspace_half(
-            hidden_size, {static_cast<uint64_t>(hidden_size)});
-        norm(final_norm, hidden + static_cast<size_t>(last_row) * hidden_size,
-             normalized.f16_data(), 1, hidden_size);
+            static_cast<size_t>(rows) * hidden_size,
+            {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)});
+        if (output_norm != nullptr) {
+            norm(*output_norm, hidden, normalized.f16_data(), rows, hidden_size);
+        } else {
+            check_cuda(cudaMemcpy(normalized.data, hidden,
+                                  static_cast<size_t>(rows) * hidden_size *
+                                      sizeof(uint16_t),
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen normalized hidden copy");
+        }
         QwenDeviceTensor& local_logits = workspace_float(
-            local_vocab, {static_cast<uint64_t>(local_vocab)});
+            static_cast<size_t>(rows) * local_vocab,
+            {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
         require_launch(qwen_fp16_matmul_rows_f16_f32_cuda(
             normalized.f16_data(), lm_head.f16_data(), local_logits.f32_data(),
-            1, local_vocab, hidden_size, hidden_size, local_vocab, hidden_size),
-            "Qwen final FP32 logits");
-        allocate(argmax_token, sizeof(int), {1}, SafeDType::I64);
-        allocate_float(argmax_logit, 1, {1});
+            rows, local_vocab, hidden_size, hidden_size, local_vocab,
+            hidden_size), "Qwen batched FP32 logits");
+        allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
+                 {static_cast<uint64_t>(rows)}, SafeDType::I64);
+        allocate_float(argmax_logit, static_cast<size_t>(rows),
+                       {static_cast<uint64_t>(rows)});
         const int vocab_start = static_cast<int>(weights_vocab_start());
-        require_launch(argmax_fp32_cuda(
+        require_launch(argmax_fp32_rows_cuda(
             local_logits.f32_data(), static_cast<int*>(argmax_token.data),
-            argmax_logit.f32_data(), local_vocab, vocab_start),
-            "Qwen local argmax");
-        check_cuda(cudaDeviceSynchronize(), "Qwen logits synchronization");
-        int local_token = 0;
-        float local_logit = 0.0f;
-        check_cuda(cudaMemcpy(&local_token, argmax_token.data, sizeof(local_token),
-                              cudaMemcpyDeviceToHost),
-                   "Qwen argmax token copy");
-        check_cuda(cudaMemcpy(&local_logit, argmax_logit.data, sizeof(local_logit),
-                              cudaMemcpyDeviceToHost),
-                   "Qwen argmax logit copy");
-        int top_token = local_token;
-        float top_logit = local_logit;
+            argmax_logit.f32_data(), rows, local_vocab, vocab_start),
+            "Qwen batched local argmax");
+
+        QwenVerifyBatch result;
+        result.top_tokens.resize(static_cast<size_t>(rows));
+        result.top_logits.resize(static_cast<size_t>(rows));
+        result.local_logits.resize(static_cast<size_t>(rows));
+        result.position_after = position_after;
 #ifdef DSV4_HAVE_NCCL
         if (options.tp_world > 1) {
             if (options.nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen TP requires --nccl-id-path");
             }
-            const TpTopResult global = nccl_global_top1(
+            nccl_global_top1_rows(
                 options.tp_world, options.tp_rank, options.device,
-                options.nccl_id_path.c_str(), local_token, local_logit);
-            top_token = global.token;
-            top_logit = global.logit;
-        }
-#else
-        if (options.tp_world > 1) {
-            throw std::runtime_error("Qwen TP requires an NCCL-enabled build");
-        }
+                options.nccl_id_path.c_str(),
+                static_cast<const int*>(argmax_token.data),
+                argmax_logit.f32_data(), rows, result.top_tokens.data(),
+                result.top_logits.data());
+            check_cuda(cudaMemcpy(result.local_logits.data(), argmax_logit.data,
+                                  static_cast<size_t>(rows) * sizeof(float),
+                                  cudaMemcpyDeviceToHost),
+                       "Qwen batched local logit copy");
+        } else
 #endif
+        {
+#ifndef DSV4_HAVE_NCCL
+            if (options.tp_world > 1) {
+                throw std::runtime_error(
+                    "Qwen TP requires an NCCL-enabled build");
+            }
+#endif
+            check_cuda(cudaMemcpy(result.top_tokens.data(), argmax_token.data,
+                                  static_cast<size_t>(rows) * sizeof(int),
+                                  cudaMemcpyDeviceToHost),
+                       "Qwen batched argmax token copy");
+            check_cuda(cudaMemcpy(result.top_logits.data(), argmax_logit.data,
+                                  static_cast<size_t>(rows) * sizeof(float),
+                                  cudaMemcpyDeviceToHost),
+                       "Qwen batched argmax logit copy");
+            result.local_logits = result.top_logits;
+        }
+        return result;
+    }
+
+    QwenForwardResult logits_for(const uint16_t* hidden, int last_row,
+                                 int position_after, int active_layers) {
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        QwenVerifyBatch batch = top_tokens_for(
+            hidden + static_cast<size_t>(last_row) * hidden_size, 1,
+            &final_norm, position_after);
         QwenForwardResult result;
         result.layers = active_layers;
         result.dim = hidden_size;
         result.logits = static_cast<int>(config.vocab_size);
-        result.top_token = top_token;
-        result.top_logit = top_logit;
-        result.checksum = local_logit;
+        result.top_token = batch.top_tokens[0];
+        result.top_logit = batch.top_logits[0];
+        result.checksum = batch.local_logits[0];
         result.position = position_after;
+        return result;
+    }
+
+    QwenVerifyBatch target_logits_for(const uint16_t* hidden, int rows,
+                                      int position_after) {
+        return top_tokens_for(hidden, rows, &final_norm, position_after);
+    }
+
+    QwenForwardResult mtp_logits_for(const uint16_t* normalized_hidden,
+                                     int position_after) {
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        QwenVerifyBatch batch = top_tokens_for(normalized_hidden, 1, nullptr,
+                                               position_after);
+        QwenForwardResult result;
+        result.layers = 1;
+        result.dim = hidden_size;
+        result.logits = static_cast<int>(config.vocab_size);
+        result.top_token = batch.top_tokens[0];
+        result.top_logit = batch.top_logits[0];
+        result.checksum = batch.local_logits[0];
+        result.position = position_after;
+        return result;
+    }
+
+    QwenForwardResult mtp_forward_rows(const std::vector<int>& tokens,
+                                       const uint16_t* hidden, int position) {
+        if (!mtp_enabled) {
+            throw std::runtime_error("Qwen MTP rows requested while disabled");
+        }
+        const int rows = static_cast<int>(tokens.size());
+        if (hidden == nullptr || rows <= 0 || position < 0 ||
+            position + rows > max_context) {
+            throw std::runtime_error("invalid Qwen MTP row extent");
+        }
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
+        const std::vector<uint64_t> hidden_shape = {
+            static_cast<uint64_t>(rows), config.hidden_size};
+        allocate(d_tokens, tokens.size() * sizeof(int),
+                 {static_cast<uint64_t>(rows)}, SafeDType::I64);
+        check_cuda(cudaMemcpy(d_tokens.data, tokens.data(),
+                              tokens.size() * sizeof(int), cudaMemcpyHostToDevice),
+                   "Qwen MTP token upload");
+        allocate_half(mtp_embedding, hidden_elements, hidden_shape);
+        require_launch(qwen_embedding_fp16_gather_f16_cuda(
+            embed.f16_data(), static_cast<int*>(d_tokens.data),
+            mtp_embedding.f16_data(), rows, hidden_size,
+            static_cast<int>(weights_vocab_start()),
+            static_cast<int>(embed.shape[0])), "Qwen MTP embedding lookup");
+        all_reduce_half(mtp_embedding.f16_data(), rows * hidden_size);
+
+        allocate_half(mtp_normalized_embedding, hidden_elements, hidden_shape);
+        allocate_half(mtp_normalized_hidden, hidden_elements, hidden_shape);
+        norm(mtp_pre_fc_norm_embedding, mtp_embedding.f16_data(),
+             mtp_normalized_embedding.f16_data(), rows, hidden_size);
+        norm(mtp_pre_fc_norm_hidden, hidden,
+             mtp_normalized_hidden.f16_data(), rows, hidden_size);
+        allocate_half(mtp_concat, hidden_elements * 2,
+                      {static_cast<uint64_t>(rows),
+                       static_cast<uint64_t>(2 * hidden_size)});
+        require_launch(qwen_concat_rows_f16_cuda(
+            mtp_normalized_embedding.f16_data(),
+            mtp_normalized_hidden.f16_data(), mtp_concat.f16_data(), rows,
+            hidden_size), "Qwen MTP fusion concat");
+        allocate_half(mtp_fused, hidden_elements, hidden_shape);
+        projection(mtp_fc, mtp_concat.f16_data(), mtp_fused.f16_data(), rows);
+        allocate_half(mtp_next_hidden, hidden_elements, hidden_shape);
+        layer_forward(mtp_layer, mtp_fused.f16_data(),
+                      mtp_next_hidden.f16_data(), rows, position);
+        allocate_half(mtp_normalized_output, hidden_elements, hidden_shape);
+        norm(mtp_norm, mtp_next_hidden.f16_data(),
+             mtp_normalized_output.f16_data(), rows, hidden_size);
+        const uint16_t* last_hidden = mtp_normalized_output.f16_data() +
+            static_cast<size_t>(rows - 1) * hidden_size;
+        QwenForwardResult result = mtp_logits_for(last_hidden, position + rows);
+        allocate_half(mtp_seed_hidden, hidden_size, {config.hidden_size});
+        // Recursive Qwen3.5 MTP consumes the prior predictor's returned hidden,
+        // and that return is after mtp.norm in both vLLM and SGLang.
+        check_cuda(cudaMemcpy(mtp_seed_hidden.data, last_hidden,
+                              static_cast<size_t>(hidden_size) *
+                                  sizeof(uint16_t),
+                              cudaMemcpyDeviceToDevice),
+                   "Qwen MTP seed hidden copy");
+        mtp_position = position + rows;
+        mtp_seed_input_token = tokens.back();
+        mtp_next_token = result.top_token;
+        mtp_next_logit = result.top_logit;
+        mtp_next_checksum = result.checksum;
+        mtp_seed_ready = true;
+        return result;
+    }
+
+    QwenForwardResult mtp_forward_row(int token, const uint16_t* hidden,
+                                      int position) {
+        return mtp_forward_rows({token}, hidden, position);
+    }
+
+    QwenForwardResult prime_target_mtp(const std::vector<int>& shifted_tokens,
+                                       int position) {
+        const int rows = static_cast<int>(shifted_tokens.size());
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        if (rows <= 0 || target_hidden_rows.data == nullptr ||
+            target_hidden_rows.nbytes < static_cast<uint64_t>(rows) * hidden_size *
+                sizeof(uint16_t)) {
+            throw std::runtime_error(
+                "Qwen MTP target prime requires matching target hidden rows");
+        }
+        return mtp_forward_rows(shifted_tokens, target_hidden_rows.f16_data(),
+                                position);
+    }
+
+    QwenForwardResult seed_mtp(int input_token) {
+        if (!has_target_last_hidden) {
+            throw std::runtime_error(
+                "Qwen MTP seed requires a committed target hidden");
+        }
+        return mtp_forward_row(input_token, target_last_hidden.f16_data(),
+                               mtp_position - 1);
+    }
+
+    void rewrite_mtp_boundary(int input_token, int position) {
+        if (!has_target_last_hidden || position < 0 || position >= max_context) {
+            throw std::runtime_error(
+                "Qwen MTP boundary rewrite requires a committed target hidden");
+        }
+        (void)mtp_forward_row(input_token, target_last_hidden.f16_data(), position);
+    }
+
+    std::vector<int> draft_tokens(int count, int input_token,
+                                  QwenMtpStats* stats) {
+        if (count <= 0) return {};
+        const auto started = std::chrono::steady_clock::now();
+        QwenForwardResult next;
+        if (mtp_seed_ready && mtp_seed_input_token == input_token) {
+            next.top_token = mtp_next_token;
+            next.top_logit = mtp_next_logit;
+            next.checksum = mtp_next_checksum;
+        } else {
+            next = seed_mtp(input_token);
+        }
+        std::vector<int> drafts;
+        drafts.reserve(static_cast<size_t>(count));
+        drafts.push_back(next.top_token);
+        while (static_cast<int>(drafts.size()) < count) {
+            next = mtp_forward_row(
+                drafts.back(), mtp_seed_hidden.f16_data(), mtp_position);
+            drafts.push_back(next.top_token);
+        }
+        if (stats != nullptr) {
+            stats->draft_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+            stats->proposed_drafts += static_cast<uint64_t>(drafts.size());
+        }
+        return drafts;
+    }
+
+    QwenForwardResult speculative_step(int input_token, int draft_count,
+                                       QwenMtpStats* stats) {
+        if (!mtp_enabled || draft_count <= 0) {
+            return run_chunk({input_token}, mtp_position,
+                             static_cast<int>(layers.size()), true);
+        }
+        const int committed_position = mtp_position;
+        prepare_transaction_state();
+        check_cuda(cudaMemcpy(transaction_target_hidden.data,
+                              target_last_hidden.data,
+                              static_cast<size_t>(config.hidden_size) *
+                                  sizeof(uint16_t),
+                              cudaMemcpyDeviceToDevice),
+                   "Qwen transaction hidden copy");
+        for (size_t index = 0; index < layers.size(); ++index) {
+            const DeviceLayer& layer = layers[index];
+            if (layer.linear.state.data == nullptr) continue;
+            check_cuda(cudaMemcpy(transaction_states[index].data,
+                                  layer.linear.state.data,
+                                  layer.linear.state.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction state copy");
+            check_cuda(cudaMemcpy(transaction_conv_tails[index].data,
+                                  layer.linear.conv_tail.data,
+                                  layer.linear.conv_tail.nbytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "Qwen transaction convolution copy");
+        }
+        const std::vector<int> drafts = draft_tokens(draft_count, input_token, stats);
+        std::vector<int> verify_inputs;
+        verify_inputs.reserve(drafts.size() + 1);
+        verify_inputs.push_back(input_token);
+        verify_inputs.insert(verify_inputs.end(), drafts.begin(), drafts.end());
+        QwenVerifyBatch verify;
+        const auto verify_started = std::chrono::steady_clock::now();
+        (void)run_chunk(verify_inputs, committed_position,
+                        static_cast<int>(layers.size()), false, &verify);
+        if (stats != nullptr) {
+            stats->verify_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - verify_started).count();
+        }
+        int correct = 0;
+        while (correct < draft_count &&
+               verify.top_tokens[static_cast<size_t>(correct)] ==
+                   drafts[static_cast<size_t>(correct)]) {
+            ++correct;
+        }
+        if (stats != nullptr) {
+            ++stats->verify_count;
+            stats->correct_drafts += static_cast<uint64_t>(correct);
+        }
+        const size_t bonus_row = static_cast<size_t>(correct);
+        const int bonus = verify.top_tokens[bonus_row];
+        const float bonus_logit = verify.top_logits[bonus_row];
+        const float bonus_checksum = verify.local_logits[bonus_row];
+        const bool full_accept = correct == draft_count;
+        if (!full_accept) {
+            if (stats != nullptr) {
+                ++stats->rollback_count;
+                stats->replay_tokens += static_cast<uint64_t>(correct + 1);
+            }
+            const auto replay_started = std::chrono::steady_clock::now();
+            restore_transaction_state(committed_position);
+            std::vector<int> replay(verify_inputs.begin(),
+                                    verify_inputs.begin() + correct + 1);
+            (void)run_chunk(replay, committed_position,
+                            static_cast<int>(layers.size()), false);
+            if (stats != nullptr) {
+                stats->replay_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - replay_started).count();
+            }
+        }
+        // Rebind the last committed MTP row to the target bonus. On full accept
+        // this fills the one row beyond the recursively proposed drafts; on
+        // rejection it overwrites the stale speculative suffix after replay.
+        const auto seed_started = std::chrono::steady_clock::now();
+        rewrite_mtp_boundary(bonus, committed_position + correct);
+        if (stats != nullptr) {
+            stats->draft_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - seed_started).count();
+        }
+        // The target state now ends after the accepted input sequence. The
+        // bonus is the next input and must not be consumed by target yet. The
+        // MTP boundary row is already primed with that bonus for the next round.
+        QwenForwardResult result;
+        result.top_token = bonus;
+        result.bonus_token = bonus;
+        result.correct_drafts = correct;
+        result.accept_tokens.assign(drafts.begin(), drafts.begin() + correct);
+        result.accept_logits.assign(verify.top_logits.begin(),
+                                    verify.top_logits.begin() + correct);
+        result.accept_checksums.assign(verify.local_logits.begin(),
+                                       verify.local_logits.begin() + correct);
+        result.layers = static_cast<int>(layers.size());
+        result.dim = static_cast<int>(config.hidden_size);
+        result.logits = static_cast<int>(config.vocab_size);
+        result.top_logit = bonus_logit;
+        result.checksum = bonus_checksum;
+        result.position = mtp_position;
         return result;
     }
 
@@ -1019,7 +1585,9 @@ struct QwenEngine::Impl {
 
     QwenForwardResult run_chunk(const std::vector<int>& token_ids,
                                 int position_offset, int active_layers,
-                                bool compute_logits) {
+                                bool compute_logits,
+                                QwenVerifyBatch* verify_batch = nullptr,
+                                const std::vector<int>* mtp_shifted_tokens = nullptr) {
         if (token_ids.empty()) {
             throw std::runtime_error("Qwen forward requires at least one token");
         }
@@ -1053,9 +1621,50 @@ struct QwenEngine::Impl {
                           output, rows, position_offset);
             std::swap(hidden, output);
         }
+        if (mtp_enabled) {
+            allocate_half(target_hidden_rows, hidden_elements, hidden_shape);
+            // Qwen3.5 MTP consumes the target model's returned hidden states,
+            // which are after the target final RMSNorm (matching vLLM/SGLang).
+            norm(final_norm, hidden, target_hidden_rows.f16_data(), rows,
+                 hidden_size);
+            allocate_half(target_last_hidden, hidden_size,
+                          {config.hidden_size});
+            check_cuda(cudaMemcpy(
+                           target_last_hidden.data,
+                           target_hidden_rows.f16_data() +
+                               static_cast<size_t>(rows - 1) * hidden_size,
+                           static_cast<size_t>(hidden_size) * sizeof(uint16_t),
+                           cudaMemcpyDeviceToDevice),
+                       "Qwen target last hidden copy");
+            has_target_last_hidden = true;
+            mtp_seed_ready = false;
+            mtp_position = position_offset + rows;
+            if (mtp_shifted_tokens != nullptr) {
+                if (mtp_shifted_tokens->size() != token_ids.size()) {
+                    throw std::runtime_error(
+                        "Qwen MTP shifted-token extent does not match target rows");
+                }
+                (void)prime_target_mtp(*mtp_shifted_tokens, position_offset);
+            }
+        }
+        if (verify_batch != nullptr) {
+            *verify_batch = target_logits_for(
+                hidden, rows, position_offset + rows);
+        }
         if (compute_logits) {
-            return logits_for(hidden, rows - 1, position_offset + rows,
-                              active_layers);
+            if (verify_batch != nullptr) {
+                QwenForwardResult result;
+                result.layers = active_layers;
+                result.dim = hidden_size;
+                result.logits = static_cast<int>(config.vocab_size);
+                result.top_token = verify_batch->top_tokens.back();
+                result.top_logit = verify_batch->top_logits.back();
+                result.checksum = verify_batch->local_logits.back();
+                result.position = position_offset + rows;
+                return result;
+            }
+            return logits_for(
+                hidden, rows - 1, position_offset + rows, active_layers);
         }
         QwenForwardResult result;
         result.layers = active_layers;
@@ -1068,7 +1677,12 @@ struct QwenEngine::Impl {
     uint64_t activation_capacity_bytes() const {
         return hidden_a.capacity + hidden_b.capacity + d_tokens.capacity +
                argmax_token.capacity + argmax_logit.capacity +
-               workspace.capacity_bytes();
+               target_hidden_rows.capacity + target_last_hidden.capacity +
+               mtp_seed_hidden.capacity + mtp_embedding.capacity +
+               mtp_normalized_embedding.capacity +
+               mtp_normalized_hidden.capacity + mtp_concat.capacity +
+               mtp_fused.capacity + mtp_next_hidden.capacity +
+               mtp_normalized_output.capacity + workspace.capacity_bytes();
     }
 };
 
@@ -1079,6 +1693,12 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
       config_(QwenConfig::from_hf_config(ckpt_dir)), index_(ckpt_dir),
       weights_(index_, config_, options.tp_world, options.tp_rank) {
     if (options_.device < 0) options_.device = options_.tp_rank;
+    if (options_.mtp && layer_count > 0 &&
+        layer_count != static_cast<int>(config_.num_hidden_layers)) {
+        throw std::runtime_error(
+            "Qwen MTP requires the complete target model; partial --smoke-layers "
+            "would verify drafts against a different model");
+    }
     if (options_.prefill_chunk_tokens <= 0) {
         throw std::runtime_error("Qwen prefill chunk size must be positive");
     }
@@ -1253,6 +1873,15 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
     }
 
     const int target_position = static_cast<int>(token_ids.size());
+    if (options_.mtp && start_position > 0 && start_position < target_position) {
+        // The cached MTP row at S-1 was paired with the prior request's token
+        // x[S]. An append may reuse that token, while a branch or compression
+        // may replace it. Rebind the shifted-token boundary before priming the
+        // new suffix so every predictor row observes target h[S-1] + new x[S].
+        impl_->rewrite_mtp_boundary(
+            token_ids[static_cast<size_t>(start_position)],
+            start_position - 1);
+    }
     QwenForwardResult result;
     const int chunk_size = std::max(1, options_.prefill_chunk_tokens);
     for (int offset = start_position; offset < target_position;) {
@@ -1269,8 +1898,29 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
         std::vector<int> chunk(
             token_ids.begin() + static_cast<ptrdiff_t>(offset),
             token_ids.begin() + static_cast<ptrdiff_t>(end));
-        result = impl_->run_chunk(chunk, offset, active_layers_,
-                                  end == target_position);
+        if (options_.mtp) {
+            std::vector<int> shifted;
+            shifted.reserve(chunk.size());
+            for (int position = offset; position < end; ++position) {
+                shifted.push_back(
+                    position + 1 < target_position
+                        ? token_ids[static_cast<size_t>(position + 1)]
+                        : -1);
+            }
+            if (shifted.back() < 0) {
+                // The last shifted input is the target token predicted by this
+                // final prompt row, so obtain its logits before priming MTP.
+                result = impl_->run_chunk(chunk, offset, active_layers_, true);
+                shifted.back() = result.top_token;
+                (void)impl_->prime_target_mtp(shifted, offset);
+            } else {
+                result = impl_->run_chunk(chunk, offset, active_layers_, false,
+                                          nullptr, &shifted);
+            }
+        } else {
+            result = impl_->run_chunk(chunk, offset, active_layers_,
+                                      end == target_position);
+        }
         const bool periodic_snapshot =
             impl_->is_periodic_snapshot_position(end);
         if (periodic_snapshot || end == target_position) {
@@ -1324,12 +1974,86 @@ QwenForwardResult QwenEngine::decode_step(int token_id) {
 std::vector<QwenForwardResult> QwenEngine::generate(
     const std::vector<int>& prompt_ids, int max_new_tokens) {
     if (max_new_tokens <= 0) return {};
+    if (prompt_ids.empty()) {
+        throw std::runtime_error("Qwen generation requires a non-empty prompt");
+    }
+    if (prompt_ids.size() + static_cast<size_t>(max_new_tokens) >
+        static_cast<size_t>(max_context_)) {
+        throw std::runtime_error("Qwen prompt plus generation exceeds context");
+    }
+    mtp_stats_ = QwenMtpStats{};
+    const auto prefill_started = std::chrono::steady_clock::now();
     QwenForwardResult next = prefill(prompt_ids);
+    mtp_stats_.prefill_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prefill_started).count();
     std::vector<QwenForwardResult> results;
     results.reserve(static_cast<size_t>(max_new_tokens));
-    for (int index = 0; index < max_new_tokens; ++index) {
-        results.push_back(next);
-        if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
+    if (!options_.mtp) {
+        for (int index = 0; index < max_new_tokens; ++index) {
+            results.push_back(next);
+            if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
+        }
+        return results;
+    }
+
+    // `prefill()` predicts the first output token without consuming it, just as
+    // the plain path does. A speculative transaction consumes that token and
+    // any correct drafts, then returns a bonus token which remains unconsumed
+    // until the next transaction.
+    results.push_back(next);
+    int current_token = next.top_token;
+    const int max_draft_tokens = std::max(1, options_.mtp_speculative_tokens);
+    int adaptive_draft_tokens = options_.mtp_adaptive ? 1 : max_draft_tokens;
+    int full_accept_streak = 0;
+    while (static_cast<int>(results.size()) < max_new_tokens) {
+        const int remaining = max_new_tokens - static_cast<int>(results.size());
+        if (remaining == 1) {
+            next = decode_step(current_token);
+            results.push_back(next);
+            break;
+        }
+        const int proposed = std::min(adaptive_draft_tokens, remaining - 1);
+        next = impl_->speculative_step(current_token, proposed, &mtp_stats_);
+        const int correct = next.correct_drafts;
+        if (options_.mtp_adaptive) {
+            if (correct == proposed) {
+                ++full_accept_streak;
+                if (full_accept_streak >= 1 &&
+                    adaptive_draft_tokens < max_draft_tokens) {
+                    adaptive_draft_tokens = std::min(
+                        max_draft_tokens, adaptive_draft_tokens * 2);
+                    full_accept_streak = 0;
+                }
+            } else {
+                adaptive_draft_tokens = std::max(
+                    1, std::min(adaptive_draft_tokens / 2, correct + 1));
+                full_accept_streak = 0;
+            }
+        }
+        const int consumed = 1 + correct;
+        position_ += consumed;
+        if (options_.prefix_cache) {
+            impl_->cached_prompt.push_back(current_token);
+            impl_->cached_prompt.insert(impl_->cached_prompt.end(),
+                                        next.accept_tokens.begin(),
+                                        next.accept_tokens.end());
+            cached_result_ = next;
+            has_cached_result_ = true;
+        }
+
+        for (size_t index = 0; index < next.accept_tokens.size(); ++index) {
+            if (static_cast<int>(results.size()) == max_new_tokens) break;
+            QwenForwardResult token_result = next;
+            token_result.top_token = next.accept_tokens[index];
+            token_result.top_logit = next.accept_logits[index];
+            token_result.checksum = next.accept_checksums[index];
+            token_result.position = position_ - correct + static_cast<int>(index);
+            results.push_back(std::move(token_result));
+        }
+        if (static_cast<int>(results.size()) < max_new_tokens) {
+            results.push_back(next);
+        }
+        current_token = next.bonus_token;
     }
     return results;
 }

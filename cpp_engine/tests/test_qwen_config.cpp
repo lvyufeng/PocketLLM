@@ -54,6 +54,8 @@ std::string qwen38_config_json() {
         << "    \"hidden_size\": 5120,\n"
         << "    \"intermediate_size\": 17408,\n"
         << "    \"num_hidden_layers\": 64,\n"
+        << "    \"mtp_num_hidden_layers\": 1,\n"
+        << "    \"mtp_use_dedicated_embeddings\": false,\n"
         << "    \"num_attention_heads\": 24,\n"
         << "    \"num_key_value_heads\": 4,\n"
         << "    \"head_dim\": 256,\n"
@@ -113,6 +115,9 @@ int main() {
     check_eq(cfg.hidden_size, 5120u, "hidden_size");
     check_eq(cfg.vocab_size, 248320u, "vocab_size");
     check_eq(cfg.num_hidden_layers, 64u, "num_hidden_layers");
+    check_eq(cfg.mtp_num_hidden_layers, 1u, "mtp_num_hidden_layers");
+    check(!cfg.mtp_use_dedicated_embeddings,
+          "MTP shares the main embedding table");
     check_eq(cfg.mlp.intermediate_size, 17408u, "dense MLP intermediate_size");
     check_eq(cfg.max_position_embeddings, 262144u, "max_position_embeddings");
     check_eq(cfg.full_attention.num_heads, 24u, "num_attention_heads");

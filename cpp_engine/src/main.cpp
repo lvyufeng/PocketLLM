@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -55,6 +56,9 @@ struct Args {
     bool qwen_prefix_cache = true;
     int qwen_snapshot_interval = 4096;
     int qwen_max_snapshots = 82;
+    bool qwen_mtp = false;
+    int qwen_mtp_tokens = 1;
+    bool qwen_mtp_adaptive = false;
     bool serve = false;
     int port = 8000;
     std::string host = "0.0.0.0";
@@ -148,6 +152,14 @@ Args parse_args(int argc, char** argv) {
             args.qwen_snapshot_interval = std::stoi(argv[++i]);
         } else if (arg == "--qwen-max-snapshots" && i + 1 < argc) {
             args.qwen_max_snapshots = std::stoi(argv[++i]);
+        } else if (arg == "--qwen-mtp") {
+            args.qwen_mtp = true;
+        } else if (arg == "--qwen-mtp-tokens" && i + 1 < argc) {
+            args.qwen_mtp = true;
+            args.qwen_mtp_tokens = std::stoi(argv[++i]);
+        } else if (arg == "--qwen-mtp-adaptive") {
+            args.qwen_mtp = true;
+            args.qwen_mtp_adaptive = true;
         } else if (arg == "--serve") {
             args.serve = true;
         } else if (arg == "--port" && i + 1 < argc) {
@@ -171,6 +183,9 @@ Args parse_args(int argc, char** argv) {
     if (args.prefill_chunk_tokens <= 0) throw std::runtime_error("--prefill-chunk-tokens must be positive");
     if (args.qwen_snapshot_interval < 0 || args.qwen_max_snapshots < 0) {
         throw std::runtime_error("Qwen snapshot settings must not be negative");
+    }
+    if (args.qwen_mtp_tokens <= 0) {
+        throw std::runtime_error("--qwen-mtp-tokens must be positive");
     }
     if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8") {
         throw std::runtime_error("--kv-cache-dtype must be fp16 or fp8");
@@ -221,6 +236,7 @@ enum class QwenPersistentCommand : int32_t {
     Decode = 1,
     Reset = 2,
     Shutdown = 3,
+    Generate = 4,
 };
 
 void qwen_send_command(dsv4::CmdChannel& channel, QwenPersistentCommand command,
@@ -258,6 +274,8 @@ void run_qwen_persistent_worker(dsv4::QwenEngine& qwen,
             (void)qwen.prefill(payload);
         } else if (command == QwenPersistentCommand::Decode) {
             (void)qwen.decode_step(header[1]);
+        } else if (command == QwenPersistentCommand::Generate) {
+            (void)qwen.generate(payload, header[1]);
         } else {
             throw std::runtime_error("unknown Qwen persistent worker command");
         }
@@ -393,6 +411,9 @@ int main(int argc, char** argv) {
                         args.qwen_persistent_stdin;
                     qwen_opts.state_snapshot_interval_tokens = args.qwen_snapshot_interval;
                     qwen_opts.max_state_snapshots = args.qwen_max_snapshots;
+                    qwen_opts.mtp = args.qwen_mtp;
+                    qwen_opts.mtp_speculative_tokens = args.qwen_mtp_tokens;
+                    qwen_opts.mtp_adaptive = args.qwen_mtp_adaptive;
                     qwen_opts.nccl_id_path = args.nccl_id_path;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
@@ -411,6 +432,9 @@ int main(int argc, char** argv) {
                               << " attention_window=" << qwen_opts.attention_window
                               << " attention_sink_tokens=" << qwen_opts.attention_sink_tokens
                               << " prefix_cache=" << (qwen_opts.prefix_cache ? 1 : 0)
+                              << " mtp=" << (qwen_opts.mtp ? 1 : 0)
+                              << " mtp_tokens=" << qwen_opts.mtp_speculative_tokens
+                              << " mtp_adaptive=" << (qwen_opts.mtp_adaptive ? 1 : 0)
                               << " snapshot_interval=" << qwen_opts.state_snapshot_interval_tokens
                               << " max_snapshots=" << qwen_opts.max_state_snapshots
                               << " prompt_tokens=" << prompt_ids.size()
@@ -461,24 +485,44 @@ int main(int argc, char** argv) {
                                     throw std::runtime_error(
                                         "persistent Qwen prompt is empty or exceeds max_context");
                                 }
-                                qwen_send_command(*channel, QwenPersistentCommand::Prefill,
-                                                  0, 0, &ids);
                                 const auto t0 = std::chrono::steady_clock::now();
-                                dsv4::QwenForwardResult next = qwen.prefill(ids);
-                                const auto t1 = std::chrono::steady_clock::now();
+                                double plain_prefill_seconds = 0.0;
                                 std::vector<int> generated;
                                 generated.reserve(static_cast<size_t>(max_new_tokens));
-                                generated.push_back(next.top_token);
-                                for (int step = 1; step < max_new_tokens; ++step) {
-                                    qwen_send_command(*channel, QwenPersistentCommand::Decode,
-                                                      next.top_token,
-                                                      static_cast<int>(ids.size()) + step - 1);
-                                    next = qwen.decode_step(next.top_token);
+                                if (qwen.options().mtp) {
+                                    qwen_send_command(*channel, QwenPersistentCommand::Generate,
+                                                      max_new_tokens, 0, &ids);
+                                    const std::vector<dsv4::QwenForwardResult> outputs =
+                                        qwen.generate(ids, max_new_tokens);
+                                    for (const dsv4::QwenForwardResult& output : outputs) {
+                                        generated.push_back(output.top_token);
+                                    }
+                                } else {
+                                    qwen_send_command(*channel, QwenPersistentCommand::Prefill,
+                                                      0, 0, &ids);
+                                    const auto prefill_started =
+                                        std::chrono::steady_clock::now();
+                                    dsv4::QwenForwardResult next = qwen.prefill(ids);
+                                    plain_prefill_seconds = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() - prefill_started).count();
                                     generated.push_back(next.top_token);
+                                    for (int step = 1; step < max_new_tokens; ++step) {
+                                        qwen_send_command(*channel, QwenPersistentCommand::Decode,
+                                                          next.top_token,
+                                                          static_cast<int>(ids.size()) + step - 1);
+                                        next = qwen.decode_step(next.top_token);
+                                        generated.push_back(next.top_token);
+                                    }
                                 }
+                                const auto t1 = std::chrono::steady_clock::now();
                                 const auto stats = qwen.prefix_cache_stats();
-                                const double prefill_seconds =
+                                const double wall_seconds =
                                     std::chrono::duration<double>(t1 - t0).count();
+                                const double prefill_seconds = qwen.options().mtp
+                                    ? qwen.mtp_stats().prefill_seconds
+                                    : plain_prefill_seconds;
+                                const double decode_seconds = std::max(
+                                    0.0, wall_seconds - prefill_seconds);
                                 std::cout << "qwen_persistent_result=1 prompt_tokens="
                                           << ids.size() << " generated_tokens="
                                           << generated.size() << " tokens=";
@@ -486,7 +530,13 @@ int main(int argc, char** argv) {
                                     if (i) std::cout << ',';
                                     std::cout << generated[i];
                                 }
-                                std::cout << " prefill_seconds=" << prefill_seconds
+                                std::cout << " wall=" << wall_seconds
+                                          << " prefill_seconds=" << prefill_seconds
+                                          << " decode_seconds=" << decode_seconds
+                                          << " decode_tokens_per_s="
+                                          << (decode_seconds > 0.0 && generated.size() > 1
+                                                  ? (generated.size() - 1) / decode_seconds
+                                                  : 0.0)
                                           << " prefill_tokens_per_s="
                                           << (prefill_seconds > 0.0 ? ids.size() / prefill_seconds : 0.0)
                                           << " prefill_computed_tokens_per_s="
@@ -498,7 +548,20 @@ int main(int argc, char** argv) {
                                           << " prefix_matched_tokens=" << stats.matched_tokens
                                           << " prefix_resume_source=" << stats.resume_source
                                           << " prefix_snapshots=" << stats.snapshots
-                                          << " prefix_snapshot_bytes=" << stats.snapshot_bytes << "\n";
+                                          << " prefix_snapshot_bytes=" << stats.snapshot_bytes
+                                          << " mtp=" << (qwen.options().mtp ? 1 : 0)
+                                          << " mtp_tokens=" << qwen.options().mtp_speculative_tokens
+                                          << " mtp_adaptive=" << (qwen.options().mtp_adaptive ? 1 : 0)
+                                          << " mtp_accept_rate=" << qwen.mtp_stats().accept_rate()
+                                          << " mtp_verify_count=" << qwen.mtp_stats().verify_count
+                                          << " mtp_proposed_drafts=" << qwen.mtp_stats().proposed_drafts
+                                          << " mtp_correct_drafts=" << qwen.mtp_stats().correct_drafts
+                                          << " mtp_rollback_count=" << qwen.mtp_stats().rollback_count
+                                          << " mtp_replay_tokens=" << qwen.mtp_stats().replay_tokens
+                                          << " mtp_prefill_seconds=" << qwen.mtp_stats().prefill_seconds
+                                          << " mtp_draft_seconds=" << qwen.mtp_stats().draft_seconds
+                                          << " mtp_verify_seconds=" << qwen.mtp_stats().verify_seconds
+                                          << " mtp_replay_seconds=" << qwen.mtp_stats().replay_seconds << "\n";
                                 std::cout.flush();
                             }
                         } catch (...) {
@@ -515,15 +578,25 @@ int main(int argc, char** argv) {
                         const auto t_prefill0 = Clock::now();
                         std::vector<dsv4::QwenForwardResult> generated;
                         generated.reserve(static_cast<size_t>(args.max_new_tokens));
-                        dsv4::QwenForwardResult next = qwen.prefill(prompt_ids);
-                        const dsv4::QwenPrefixCacheStats prefix_stats =
-                            qwen.prefix_cache_stats();
-                        const auto t_prefill1 = Clock::now();
-                        generated.push_back(next);
-                        const auto t_decode0 = Clock::now();
-                        for (int step = 1; step < args.max_new_tokens; ++step) {
-                            next = qwen.decode_step(next.top_token);
+                        dsv4::QwenPrefixCacheStats prefix_stats;
+                        Clock::time_point t_prefill1;
+                        Clock::time_point t_decode0;
+                        if (qwen.options().mtp) {
+                            generated = qwen.generate(prompt_ids, args.max_new_tokens);
+                            prefix_stats = qwen.prefix_cache_stats();
+                            t_prefill1 = t_prefill0 + std::chrono::duration_cast<Clock::duration>(
+                                std::chrono::duration<double>(qwen.mtp_stats().prefill_seconds));
+                            t_decode0 = t_prefill1;
+                        } else {
+                            dsv4::QwenForwardResult next = qwen.prefill(prompt_ids);
+                            prefix_stats = qwen.prefix_cache_stats();
+                            t_prefill1 = Clock::now();
+                            t_decode0 = t_prefill1;
                             generated.push_back(next);
+                            for (int step = 1; step < args.max_new_tokens; ++step) {
+                                next = qwen.decode_step(next.top_token);
+                                generated.push_back(next);
+                            }
                         }
                         const auto t_decode1 = Clock::now();
                         for (size_t step = 0; step < generated.size(); ++step) {
@@ -565,7 +638,20 @@ int main(int argc, char** argv) {
                                   << " prefix_snapshots=" << prefix_stats.snapshots
                                   << " prefix_snapshot_bytes=" << prefix_stats.snapshot_bytes
                                   << " prefix_hits=" << prefix_stats.hits
-                                  << " prefix_misses=" << prefix_stats.misses;
+                                  << " prefix_misses=" << prefix_stats.misses
+                                  << " mtp=" << (qwen.options().mtp ? 1 : 0)
+                                  << " mtp_tokens=" << qwen.options().mtp_speculative_tokens
+                                  << " mtp_adaptive=" << (qwen.options().mtp_adaptive ? 1 : 0)
+                                  << " mtp_accept_rate=" << qwen.mtp_stats().accept_rate()
+                                  << " mtp_verify_count=" << qwen.mtp_stats().verify_count
+                                  << " mtp_proposed_drafts=" << qwen.mtp_stats().proposed_drafts
+                                  << " mtp_correct_drafts=" << qwen.mtp_stats().correct_drafts
+                                  << " mtp_rollback_count=" << qwen.mtp_stats().rollback_count
+                                  << " mtp_replay_tokens=" << qwen.mtp_stats().replay_tokens
+                                  << " mtp_prefill_seconds=" << qwen.mtp_stats().prefill_seconds
+                                  << " mtp_draft_seconds=" << qwen.mtp_stats().draft_seconds
+                                  << " mtp_verify_seconds=" << qwen.mtp_stats().verify_seconds
+                                  << " mtp_replay_seconds=" << qwen.mtp_stats().replay_seconds;
                         if (args.resident_bench) {
                             const auto seconds = [](auto begin, auto end) {
                                 return std::chrono::duration<double>(end - begin).count();

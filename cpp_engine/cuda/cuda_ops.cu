@@ -4,6 +4,7 @@
 #include <sm_61_intrinsics.h>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 
 namespace dsv4 {
@@ -74,6 +75,51 @@ __global__ void argmax_fp32_kernel(
     if (tid == 0) {
         *out_token = token_offset + s_idx[0];
         *out_logit = s_val[0];
+    }
+}
+
+__global__ void argmax_fp32_rows_kernel(
+    const float* __restrict__ logits,
+    int* __restrict__ out_tokens,
+    float* __restrict__ out_logits,
+    int rows,
+    int count,
+    int token_offset) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const int tid = threadIdx.x;
+    const int threads = blockDim.x;
+    extern __shared__ char smem_raw[];
+    float* s_val = reinterpret_cast<float*>(smem_raw);
+    int* s_idx = reinterpret_cast<int*>(s_val + threads);
+    float best = -INFINITY;
+    int best_idx = 0;
+    const float* row_logits = logits + static_cast<size_t>(row) * count;
+    for (int i = tid; i < count; i += threads) {
+        const float value = row_logits[i];
+        if (value > best || (value == best && i < best_idx)) {
+            best = value;
+            best_idx = i;
+        }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_idx;
+    __syncthreads();
+    for (int stride = threads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float other_value = s_val[tid + stride];
+            const int other_idx = s_idx[tid + stride];
+            if (other_value > s_val[tid] ||
+                (other_value == s_val[tid] && other_idx < s_idx[tid])) {
+                s_val[tid] = other_value;
+                s_idx[tid] = other_idx;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_tokens[row] = token_offset + s_idx[0];
+        out_logits[row] = s_val[0];
     }
 }
 
@@ -2078,6 +2124,24 @@ bool argmax_fp32_cuda(
     const size_t shared_bytes = threads * (sizeof(float) + sizeof(int));
     argmax_fp32_kernel<<<1, threads, shared_bytes, cuda_stream>>>(
         d_logits, d_token, d_logit, count, token_offset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool argmax_fp32_rows_cuda(
+    const float* d_logits,
+    int* d_tokens,
+    float* d_logits_out,
+    int rows,
+    int count,
+    int token_offset,
+    void* stream) {
+    if (d_logits == nullptr || d_tokens == nullptr || d_logits_out == nullptr ||
+        rows <= 0 || count <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    constexpr int threads = 256;
+    const size_t shared_bytes = threads * (sizeof(float) + sizeof(int));
+    argmax_fp32_rows_kernel<<<rows, threads, shared_bytes, cuda_stream>>>(
+        d_logits, d_tokens, d_logits_out, rows, count, token_offset);
     return cudaGetLastError() == cudaSuccess;
 }
 

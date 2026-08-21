@@ -76,6 +76,22 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+bool qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_gate_weight,
+    const uint16_t* d_gate_scale_fp16,
+    const uint8_t* d_up_weight,
+    const uint16_t* d_up_scale_fp16,
+    uint16_t* d_y_fp16,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
+    int scale_stride,
+    void* stream = nullptr);
+
 bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     const uint16_t* d_x_fp16,
     const uint8_t* d_weight,
@@ -276,6 +292,9 @@ bool qwen_embedding_fp16_gather_f16_cuda(const uint16_t* d_table_fp16,
                                          uint16_t* d_out_fp16, int count,
                                          int cols, int row_start, int row_count,
                                          void* stream = nullptr);
+bool qwen_concat_rows_f16_cuda(const uint16_t* d_left, const uint16_t* d_right,
+                               uint16_t* d_out, int rows, int cols,
+                               void* stream = nullptr);
 bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(const uint16_t* d_x_fp16,
                                            const uint16_t* d_gamma_fp16,
                                            uint16_t* d_y_fp16, int rows,
@@ -373,6 +392,25 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     int seq_len, int q_heads, int kv_heads, int head_dim,
     int position_offset, int max_context, int attention_window = 0,
     int sink_tokens = 0, void* stream = nullptr);
+// Batched verifier preserving the reference decode reduction order. Each K row
+// is shared across all candidate rows and the Q heads belonging to one KV head;
+// scratch contains rows * q_heads * (position_offset + rows) FP32 scores.
+bool qwen_gqa_verify_attention_f16_exact_cuda(
+    const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
+    float* d_score_scratch, int rows, int q_heads, int kv_heads,
+    int head_dim, int position_offset, int max_context,
+    void* stream = nullptr);
+// Experimental exact-full-attention path for speculative target verification.
+// Context splits run in parallel while every K/V load serves every verify row
+// in the CTA. Its online-softmax order may change near-tie downstream logits.
+// Scratch contains rows * q_heads * splits * (head_dim + 2) FP32 elements.
+bool qwen_gqa_verify_attention_f16_cuda(
+    const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
+    float* d_partial_scratch, int rows, int q_heads, int kv_heads,
+    int head_dim, int position_offset, int max_context, int splits,
+    void* stream = nullptr);
 bool qwen_gqa_decode_attention_fp8_cuda(
     const uint16_t* d_q_fp16, const uint8_t* d_k_cache_fp8,
     const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,
