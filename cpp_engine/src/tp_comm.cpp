@@ -1,9 +1,12 @@
 #include "tp_comm.hpp"
 
 #ifdef DSV4_HAVE_NCCL
+#include "qwen_cuda_ops.hpp"
+
 #include <cuda_runtime.h>
 #include <nccl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -82,6 +85,33 @@ struct Top1RowsWorkspace {
     size_t capacity = 0;
 };
 
+struct TopKRowsWorkspace {
+    int* d_tokens = nullptr;
+    float* d_logits = nullptr;
+    size_t capacity = 0;
+};
+
+TopKRowsWorkspace& topk_rows_workspace(int device, size_t count) {
+    static std::unordered_map<int, TopKRowsWorkspace> workspaces;
+    TopKRowsWorkspace& workspace = workspaces[device];
+    if (workspace.capacity >= count) return workspace;
+    check_cuda(cudaSetDevice(device), "cudaSetDevice top-k merge workspace");
+    if (workspace.d_tokens != nullptr) {
+        check_cuda(cudaFree(workspace.d_tokens), "cudaFree gathered top-k tokens");
+        workspace.d_tokens = nullptr;
+    }
+    if (workspace.d_logits != nullptr) {
+        check_cuda(cudaFree(workspace.d_logits), "cudaFree gathered top-k logits");
+        workspace.d_logits = nullptr;
+    }
+    check_cuda(cudaMalloc(&workspace.d_tokens, count * sizeof(int)),
+               "cudaMalloc gathered top-k tokens");
+    check_cuda(cudaMalloc(&workspace.d_logits, count * sizeof(float)),
+               "cudaMalloc gathered top-k logits");
+    workspace.capacity = count;
+    return workspace;
+}
+
 Top1RowsWorkspace& top1_rows_workspace(int device, size_t count) {
     static std::unordered_map<int, Top1RowsWorkspace> workspaces;
     Top1RowsWorkspace& workspace = workspaces[device];
@@ -137,6 +167,90 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
     cudaFree(d_value);
     cudaFree(d_sum);
     ncclCommDestroy(comm);
+}
+
+void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
+                           const int* d_local_tokens,
+                           const float* d_local_logits, int rows, int top_k,
+                           int* global_tokens, float* global_logits) {
+    if (world <= 0 || rank < 0 || rank >= world || rows <= 0 || top_k <= 0 ||
+        d_local_tokens == nullptr || d_local_logits == nullptr ||
+        global_tokens == nullptr || global_logits == nullptr) {
+        throw std::runtime_error("invalid NCCL batched top-k args");
+    }
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const size_t local_count = static_cast<size_t>(rows) * top_k;
+    const size_t gathered_count = static_cast<size_t>(world) * local_count;
+    Top1RowsWorkspace& workspace = top1_rows_workspace(device, gathered_count);
+    check_nccl(ncclGroupStart(), "ncclGroupStart batched top-k");
+    check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, local_count,
+                             ncclInt32, comm, nullptr),
+               "ncclAllGather batched top-k tokens");
+    check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, local_count,
+                             ncclFloat, comm, nullptr),
+               "ncclAllGather batched top-k logits");
+    check_nccl(ncclGroupEnd(), "ncclGroupEnd batched top-k");
+    std::vector<int> all_tokens(gathered_count);
+    std::vector<float> all_logits(gathered_count);
+    check_cuda(cudaMemcpy(all_tokens.data(), workspace.d_tokens,
+                          gathered_count * sizeof(int), cudaMemcpyDeviceToHost),
+               "copy gathered batched top-k tokens");
+    check_cuda(cudaMemcpy(all_logits.data(), workspace.d_logits,
+                          gathered_count * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy gathered batched top-k logits");
+    for (int row = 0; row < rows; ++row) {
+        std::vector<std::pair<float, int>> candidates;
+        candidates.reserve(static_cast<size_t>(world) * top_k);
+        for (int r = 0; r < world; ++r) {
+            for (int k = 0; k < top_k; ++k) {
+                const size_t at = static_cast<size_t>(r) * local_count +
+                                  static_cast<size_t>(row) * top_k + k;
+                candidates.emplace_back(all_logits[at], all_tokens[at]);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& left, const auto& right) {
+                      if (left.first != right.first) return left.first > right.first;
+                      return left.second < right.second;
+                  });
+        for (int k = 0; k < top_k; ++k) {
+            global_tokens[static_cast<size_t>(row) * top_k + k] =
+                candidates[static_cast<size_t>(k)].second;
+            global_logits[static_cast<size_t>(row) * top_k + k] =
+                candidates[static_cast<size_t>(k)].first;
+        }
+    }
+}
+
+void nccl_global_topk_rows_device(int world, int rank, int device,
+                                  const char* id_path,
+                                  const int* d_local_tokens,
+                                  const float* d_local_logits, int rows,
+                                  int top_k, int* d_global_tokens,
+                                  float* d_global_logits) {
+    if (world <= 0 || rank < 0 || rank >= world || rows <= 0 || top_k <= 0 ||
+        d_local_tokens == nullptr || d_local_logits == nullptr ||
+        d_global_tokens == nullptr || d_global_logits == nullptr) {
+        throw std::runtime_error("invalid NCCL device top-k args");
+    }
+    check_cuda(cudaSetDevice(device), "cudaSetDevice device top-k");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const size_t local_count = static_cast<size_t>(rows) * top_k;
+    const size_t gathered_count = static_cast<size_t>(world) * local_count;
+    TopKRowsWorkspace& workspace = topk_rows_workspace(device, gathered_count);
+    check_nccl(ncclGroupStart(), "ncclGroupStart device top-k");
+    check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, local_count,
+                             ncclInt32, comm, nullptr),
+               "ncclAllGather device top-k tokens");
+    check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, local_count,
+                             ncclFloat, comm, nullptr),
+               "ncclAllGather device top-k logits");
+    check_nccl(ncclGroupEnd(), "ncclGroupEnd device top-k");
+    if (!qwen_dflash2_merge_topk_f32_cuda(
+            workspace.d_tokens, workspace.d_logits, d_global_tokens,
+            d_global_logits, world, rows, top_k)) {
+        throw std::runtime_error("Qwen DFlash2 device top-k merge launch failed");
+    }
 }
 
 void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,

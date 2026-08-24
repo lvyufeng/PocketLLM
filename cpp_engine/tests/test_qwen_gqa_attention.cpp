@@ -7,10 +7,12 @@
 #include "cuda_ops.hpp"
 #include "qwen_cuda_ops.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -23,6 +25,14 @@ int failures = 0;
 void fail(const std::string& what) {
     std::printf("[FAIL] %s\n", what.c_str());
     ++failures;
+}
+
+uint16_t to_half(float value) {
+    return __half_as_ushort(__float2half(value));
+}
+
+float from_half(uint16_t bits) {
+    return __half2float(__ushort_as_half(bits));
 }
 
 // Reference: explicit max, exp, normalize over the causal window.
@@ -131,6 +141,166 @@ bool run_decode(int q_heads, int kv_heads, int head_dim, int context_len, int ma
     return true;
 }
 
+// Prefill: compare the tiled kernel (K/V loads shared across GQA heads and query
+// rows) against both the reference streaming kernel and the CPU softmax. The
+// tiled path is what long-context prefill dispatches to, so it needs its own
+// numerical gate rather than inheriting the decode kernel's.
+bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
+                       int position_offset, int max_context) {
+    std::mt19937 rng(13579);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    const int context_len = position_offset + rows;
+    const size_t q_elements = static_cast<size_t>(rows) * q_heads * head_dim;
+    const size_t kv_elements =
+        static_cast<size_t>(max_context) * kv_heads * head_dim;
+    std::vector<uint16_t> q(q_elements);
+    std::vector<uint16_t> k(kv_elements, 0);
+    std::vector<uint16_t> v(kv_elements, 0);
+    std::vector<float> q_ref(q_elements);
+    std::vector<float> k_ref(kv_elements, 0.0f);
+    std::vector<float> v_ref(kv_elements, 0.0f);
+    for (size_t i = 0; i < q_elements; ++i) {
+        q_ref[i] = dist(rng);
+        q[i] = to_half(q_ref[i]);
+        // Round-trip so the reference sees exactly the FP16 values the kernel does.
+        q_ref[i] = from_half(q[i]);
+    }
+    for (size_t i = 0;
+         i < static_cast<size_t>(context_len) * kv_heads * head_dim; ++i) {
+        k[i] = to_half(dist(rng));
+        v[i] = to_half(dist(rng));
+        k_ref[i] = from_half(k[i]);
+        v_ref[i] = from_half(v[i]);
+    }
+
+    uint16_t* d_q = nullptr;
+    uint16_t* d_k = nullptr;
+    uint16_t* d_v = nullptr;
+    uint16_t* d_tiled = nullptr;
+    uint16_t* d_plain = nullptr;
+    auto release = [&]() {
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_tiled); cudaFree(d_plain);
+    };
+    if (cudaMalloc(&d_q, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_k, k.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_v, v.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_tiled, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_plain, q.size() * sizeof(uint16_t)) != cudaSuccess) {
+        release();
+        return false;
+    }
+    cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+    setenv("DSV4_QWEN_GQA_POS_TILE", "1", 1);
+    const bool tiled_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+        d_q, d_k, d_v, d_tiled, rows, q_heads, kv_heads, head_dim,
+        position_offset, max_context, 0, 0);
+    // The position-batched kernel only amortises barriers; it must reproduce the
+    // per-position kernel bit for bit, so this is an equality check rather than a
+    // tolerance check.
+    uint16_t* d_seq = nullptr;
+    bool seq_ok = cudaMalloc(&d_seq, q.size() * sizeof(uint16_t)) == cudaSuccess;
+    setenv("DSV4_QWEN_GQA_POS_TILE", "0", 1);
+    seq_ok = seq_ok && dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+        d_q, d_k, d_v, d_seq, rows, q_heads, kv_heads, head_dim,
+        position_offset, max_context, 0, 0);
+    // The warp-per-combo kernel reassociates the dot-product reduction, so it is
+    // checked against the CPU softmax reference on tolerance rather than for bit
+    // equality with the per-position kernel.
+    uint16_t* d_warp = nullptr;
+    bool warp_ok = cudaMalloc(&d_warp, q.size() * sizeof(uint16_t)) == cudaSuccess;
+    setenv("DSV4_QWEN_GQA_POS_TILE", "1", 1);
+    setenv("DSV4_QWEN_GQA_WARP_COMBO", "1", 1);
+    warp_ok = warp_ok && dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+        d_q, d_k, d_v, d_warp, rows, q_heads, kv_heads, head_dim,
+        position_offset, max_context, 0, 0);
+    unsetenv("DSV4_QWEN_GQA_WARP_COMBO");
+    unsetenv("DSV4_QWEN_GQA_POS_TILE");
+    const bool plain_ok = dsv4::qwen_gqa_prefill_attention_f16_cuda(
+        d_q, d_k, d_v, d_plain, rows, q_heads, kv_heads, head_dim,
+        position_offset, max_context);
+    if (!tiled_ok || !plain_ok || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa prefill tiled launch failed");
+        release();
+        return true;
+    }
+    std::vector<uint16_t> got_warp(q_elements);
+    if (!warp_ok || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa prefill warp-combo launch failed");
+        cudaFree(d_warp);
+        cudaFree(d_seq);
+        release();
+        return true;
+    }
+    cudaMemcpy(got_warp.data(), d_warp, got_warp.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_warp);
+    std::vector<uint16_t> got_tiled(q_elements);
+    std::vector<uint16_t> got_plain(q_elements);
+    std::vector<uint16_t> got_seq(q_elements);
+    if (!seq_ok || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa prefill position-batched fallback launch failed");
+        cudaFree(d_seq);
+        release();
+        return true;
+    }
+    cudaMemcpy(got_seq.data(), d_seq, got_seq.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_seq);
+    cudaMemcpy(got_tiled.data(), d_tiled, got_tiled.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_plain.data(), d_plain, got_plain.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    release();
+
+    size_t pos_tile_mismatches = 0;
+    for (size_t i = 0; i < got_tiled.size(); ++i) {
+        if (got_tiled[i] != got_seq[i]) ++pos_tile_mismatches;
+    }
+    if (pos_tile_mismatches != 0) {
+        fail("gqa prefill position-batched kernel differs from per-position "
+             "kernel in " + std::to_string(pos_tile_mismatches) + " elements");
+    }
+    double worst_ref = 0.0;
+    double worst_cross = 0.0;
+    double worst_warp = 0.0;
+    for (int row = 0; row < rows; ++row) {
+        std::vector<float> row_q(static_cast<size_t>(q_heads) * head_dim);
+        for (size_t i = 0; i < row_q.size(); ++i) {
+            row_q[i] = q_ref[static_cast<size_t>(row) * q_heads * head_dim + i];
+        }
+        std::vector<float> want(row_q.size());
+        attention_reference(row_q, k_ref, v_ref, want, q_heads, kv_heads,
+                            head_dim, position_offset + row + 1);
+        for (size_t i = 0; i < want.size(); ++i) {
+            const size_t flat = static_cast<size_t>(row) * q_heads * head_dim + i;
+            const double tiled = from_half(got_tiled[flat]);
+            const double plain = from_half(got_plain[flat]);
+            worst_ref = std::max(worst_ref, std::fabs(tiled - want[i]));
+            worst_cross = std::max(worst_cross, std::fabs(tiled - plain));
+            worst_warp = std::max(worst_warp,
+                std::fabs(static_cast<double>(from_half(got_warp[flat])) -
+                          want[i]));
+        }
+    }
+    // FP16 accumulation over thousands of keys; 2e-3 matches the engine's other
+    // FP16 attention gates.
+    if (worst_ref > 2.0e-3 || worst_cross > 2.0e-3 || worst_warp > 2.0e-3) {
+        fail("gqa prefill tiled rows=" + std::to_string(rows) + " ctx=" +
+             std::to_string(context_len) + " ref=" + std::to_string(worst_ref) +
+             " cross=" + std::to_string(worst_cross) +
+             " warp=" + std::to_string(worst_warp));
+    } else {
+        std::printf("  gqa prefill tiled rows=%3d ctx=%5d ref=%.3e cross=%.3e "
+                    "warp=%.3e\n",
+                    rows, context_len, worst_ref, worst_cross, worst_warp);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -142,6 +312,26 @@ int main() {
     const int contexts[] = {1, 7, 128, 333};
     for (int ctx : contexts) {
         if (!run_decode(24, 4, 256, ctx, 512)) {
+            std::printf("[SKIP] device allocation failed\n");
+            return 0;
+        }
+    }
+    // Long-context prefill shape: 16 q over 4 kv heads at head_dim 128 is the
+    // TP4 shard of Qwen3.8 full attention. Includes a chunk landing deep into a
+    // populated cache, which is where the tiled kernel is actually dispatched.
+    const int prefill_offsets[] = {0, 512, 4096};
+    for (int offset : prefill_offsets) {
+        if (!run_prefill_tiled(64, 16, 4, 128, offset, 8192)) {
+            std::printf("[SKIP] device allocation failed\n");
+            return 0;
+        }
+    }
+    // The position-batched kernel picks its head grouping from q_heads/kv_heads,
+    // so exercise each branch: 4 (the TP4 shard above), 2, 1, and an odd ratio
+    // that falls back to the original group of three.
+    const int grouping_shapes[][2] = {{12, 6}, {8, 8}, {24, 8}};
+    for (const auto& shape : grouping_shapes) {
+        if (!run_prefill_tiled(64, shape[0], shape[1], 128, 512, 8192)) {
             std::printf("[SKIP] device allocation failed\n");
             return 0;
         }

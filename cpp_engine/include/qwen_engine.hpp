@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qwen_config.hpp"
+#include "qwen_dflash2.hpp"
 #include "qwen_weights.hpp"
 
 #include <cstdint>
@@ -51,6 +52,9 @@ struct QwenEngineOptions {
     // native MTP are mutually exclusive because both own the speculative target
     // transaction and hidden-state side channel.
     std::string dspark_checkpoint;
+    // External Qwen DFlash2 block-diffusion drafter. This remains opt-in and
+    // is mutually exclusive with native MTP and DSpark.
+    std::string dflash2_checkpoint;
     std::string nccl_id_path;
 };
 
@@ -86,7 +90,6 @@ struct QwenMtpStats {
     double draft_seconds = 0.0;
     double verify_seconds = 0.0;
     double replay_seconds = 0.0;
-
     // Mean committed tokens per speculative verification, including the target
     // bonus token. This matches DSpark's published spec_accept_length metric.
     double accept_length() const {
@@ -155,6 +158,16 @@ public:
         return prefix_stats_;
     }
     const QwenMtpStats& mtp_stats() const { return mtp_stats_; }
+
+    void set_dflash2_debug_callback(QwenDFlash2DebugCallback callback);
+    // Runs target prefill with the normal native kernels while exporting the
+    // captured [row, tap, hidden] DFlash2 feature matrix through the callback.
+    // This path does not load the drafter and is therefore usable in TP=1 within
+    // one 22 GiB card.
+    QwenForwardResult debug_prefill_dflash2(
+        const std::vector<int>& token_ids,
+        const std::vector<int>& target_layer_ids,
+        QwenDFlash2DebugCallback callback);
 
     void reset();
     // Drops every cached prefix so the next prefill recomputes from zero.

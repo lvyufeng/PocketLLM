@@ -18,6 +18,18 @@ void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows,
                            int* global_tokens, float* global_logits);
+void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
+                           const int* d_local_tokens,
+                           const float* d_local_logits, int rows, int top_k,
+                           int* global_tokens, float* global_logits);
+// All-gather and merge batched top-k candidates without synchronizing to the
+// host. The output buffers remain device-resident for the next CUDA stage.
+void nccl_global_topk_rows_device(int world, int rank, int device,
+                                  const char* id_path,
+                                  const int* d_local_tokens,
+                                  const float* d_local_logits, int rows,
+                                  int top_k, int* d_global_tokens,
+                                  float* d_global_logits);
 void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count);
 void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count);
 void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count);

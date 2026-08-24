@@ -40,6 +40,7 @@ add_library(dsv4_cpp_core STATIC
     src/qwen_config.cpp
     src/qwen_weights.cpp
     src/qwen_dspark.cpp
+    src/qwen_dflash2.cpp
     src/qwen_engine.cpp
     src/tokenizer.cpp
     src/tensor.cpp
@@ -61,6 +62,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_half_ops.cu
     cuda/qwen_gqa_optimized.cu
     cuda/qwen_dspark_ops.cu
+    cuda/qwen_dflash2_ops.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
@@ -303,9 +305,21 @@ add_executable(test_qwen_dspark tests/test_qwen_dspark.cpp)
 target_link_libraries(test_qwen_dspark PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_dspark PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_dflash2 tests/test_qwen_dflash2.cpp)
+target_link_libraries(test_qwen_dflash2 PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_dflash2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_dflash2_parity tests/test_qwen_dflash2_parity.cpp)
+target_link_libraries(test_qwen_dflash2_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_dflash2_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_qwen_dspark_ops tests/test_qwen_dspark_ops.cpp)
 target_link_libraries(test_qwen_dspark_ops PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_dspark_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_dflash2_ops tests/test_qwen_dflash2_ops.cpp)
+target_link_libraries(test_qwen_dflash2_ops PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_dflash2_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE dsv4_cpp_core)
@@ -339,6 +353,26 @@ add_executable(bench_qwen_fp8_kernels tests/bench_qwen_fp8_kernels.cpp)
 target_link_libraries(bench_qwen_fp8_kernels PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_fp8_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(bench_qwen_verify_batch tests/bench_qwen_verify_batch.cpp)
+target_link_libraries(bench_qwen_verify_batch PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_verify_batch PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
+target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
 target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)
 set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_fp8_batch_crossover tests/bench_qwen_fp8_batch_crossover.cpp)
+target_link_libraries(bench_qwen_fp8_batch_crossover PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_fp8_batch_crossover PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_gqa_prefill tests/bench_qwen_gqa_prefill.cpp)
+target_link_libraries(bench_qwen_gqa_prefill PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_gqa_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_dflash2_topk tests/bench_qwen_dflash2_topk.cpp)
+target_link_libraries(bench_qwen_dflash2_topk PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_dflash2_topk PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

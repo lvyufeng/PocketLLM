@@ -146,9 +146,9 @@ double max_half_difference(const std::vector<uint16_t>& lhs,
     return worst;
 }
 
-bool check_prefill_tiled(int seq_len, int head_dim, int position_offset) {
-    constexpr int q_heads = 6;
-    constexpr int kv_heads = 1;
+bool check_prefill_tiled(int seq_len, int head_dim, int position_offset,
+                         int q_heads = 6, int kv_heads = 1) {
+
     const int max_context = position_offset + seq_len + 3;
     std::mt19937 rng(9000 + seq_len * 17 + head_dim + position_offset);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -657,6 +657,124 @@ bool check_fp8_f16_projection() {
                     small_dispatch_error);
     }
 
+    // The shared-activation small-batch kernel keeps the per-lane column order of
+    // the register-only kernel, so speculative verification must stay bit exact.
+    // A near-tie greedy argmax would otherwise diverge from plain decode.
+    {
+        struct SharedCase {
+            int batch;
+            int rows;
+            int cols;
+        };
+        // 5120/4352/1536 are the real Qwen3.8 TP4 shard widths; 300 and 2052
+        // exercise a partial final tile and a non-128-multiple vector width.
+        const SharedCase cases[] = {
+            {2, 130, 5120}, {3, 96, 4352}, {4, 72, 1536},
+            {5, 130, 300},  {8, 136, 2052}, {8, 40, 5120},
+        };
+        bool shared_ok = true;
+        double worst = 0.0;
+        // Both shared-activation variants are checked against the register-only
+        // kernel. The packed-conversion variant fuses two strided steps per
+        // iteration but keeps each lane's columns and their addition order, so it
+        // must also be bit exact.
+        const char* const shared_variants[] = {"0", "1"};
+        for (const char* fshared : shared_variants)
+        for (const SharedCase& item : cases) {
+            const int x_stride = item.cols;
+            const int y_stride = item.rows;
+            const int weight_stride = item.cols;
+            const int scale_stride = (item.cols + 127) / 128;
+            std::vector<uint16_t> host_x(
+                static_cast<size_t>(item.batch) * x_stride);
+            std::vector<uint8_t> host_weight(
+                static_cast<size_t>(item.rows) * weight_stride);
+            std::vector<uint16_t> host_scale(
+                static_cast<size_t>((item.rows + 127) / 128) * scale_stride);
+            for (uint16_t& value : host_x) value = to_half(x_dist(rng));
+            for (uint8_t& value : host_weight) value = random_code();
+            for (uint16_t& value : host_scale) value = to_half(scale_dist(rng));
+            DeviceBuffer dx, dw, ds, d_shared, d_plain;
+            uint16_t* px = dx.allocate<uint16_t>(host_x.size());
+            uint8_t* pw = dw.allocate<uint8_t>(host_weight.size());
+            uint16_t* ps = ds.allocate<uint16_t>(host_scale.size());
+            const size_t out_elements =
+                static_cast<size_t>(item.batch) * y_stride;
+            uint16_t* py_shared = d_shared.allocate<uint16_t>(out_elements);
+            uint16_t* py_plain = d_plain.allocate<uint16_t>(out_elements);
+            if (!px || !pw || !ps || !py_shared || !py_plain ||
+                cudaMemcpy(px, host_x.data(),
+                           host_x.size() * sizeof(uint16_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(pw, host_weight.data(), host_weight.size(),
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(ps, host_scale.data(),
+                           host_scale.size() * sizeof(uint16_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                fail("FP16 FP8 shared small-batch allocation/copy");
+                shared_ok = false;
+                break;
+            }
+            setenv("QWEN_FP8_F16_SMALL_BATCH", "1", 1);
+            setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "1", 1);
+            setenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED", fshared, 1);
+            const bool shared_launched =
+                dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+                    px, pw, ps, py_shared, item.batch, item.rows, item.cols,
+                    x_stride, y_stride, weight_stride, scale_stride) &&
+                cudaDeviceSynchronize() == cudaSuccess;
+            setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "0", 1);
+            setenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED", "0", 1);
+            const bool plain_launched =
+                dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+                    px, pw, ps, py_plain, item.batch, item.rows, item.cols,
+                    x_stride, y_stride, weight_stride, scale_stride) &&
+                cudaDeviceSynchronize() == cudaSuccess;
+            unsetenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED");
+            unsetenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
+            unsetenv("QWEN_FP8_F16_SMALL_BATCH");
+            if (!shared_launched || !plain_launched) {
+                fail("FP16 FP8 shared small-batch launch");
+                shared_ok = false;
+                break;
+            }
+            std::vector<uint16_t> got(out_elements);
+            std::vector<uint16_t> want(out_elements);
+            cudaMemcpy(got.data(), py_shared, out_elements * sizeof(uint16_t),
+                       cudaMemcpyDeviceToHost);
+            cudaMemcpy(want.data(), py_plain, out_elements * sizeof(uint16_t),
+                       cudaMemcpyDeviceToHost);
+            int mismatches = 0;
+            for (int sample = 0; sample < item.batch; ++sample) {
+                for (int row = 0; row < item.rows; ++row) {
+                    const size_t at =
+                        static_cast<size_t>(sample) * y_stride + row;
+                    if (got[at] != want[at]) {
+                        ++mismatches;
+                        worst = std::max(worst,
+                            std::fabs(static_cast<double>(from_half(got[at])) -
+                                      from_half(want[at])));
+                    }
+                }
+            }
+            if (mismatches != 0) {
+                std::printf("  FP16 FP8 shared small-batch mismatch batch=%d "
+                            "rows=%d cols=%d fshared=%s count=%d worst=%.3e\n",
+                            item.batch, item.rows, item.cols, fshared,
+                            mismatches, worst);
+                fail("FP16 FP8 shared small-batch bit exactness");
+                shared_ok = false;
+                break;
+            }
+        }
+        if (shared_ok) {
+            std::printf("  FP16 FP8 shared small-batch bit exact over %zu "
+                        "shard shapes x %zu variants\n",
+                        sizeof(cases) / sizeof(cases[0]),
+                        sizeof(shared_variants) / sizeof(shared_variants[0]));
+        }
+    }
+
     // Prefill shape triggers the 128-token x 64-row N64 tile and has padded
     // strides so both aligned vector loads and output indexing are exercised.
     constexpr int batch = 128;
@@ -724,14 +842,134 @@ bool check_fp8_f16_projection() {
         }
     }
     const double prefill_error = max_error(prefill_wide, prefill_expected, y_stride, rows, batch);
+    // cuBLAS prefill path. It dequantises the weight block to FP16 scratch and
+    // runs a tensor-core GEMM, so it accumulates in a different order than the
+    // hand-written tiles. The check is against the same FP32 CPU reference the
+    // other variants use, at the same tolerance, rather than bit equality.
+    DeviceBuffer d_prefill_cublas;
+    uint16_t* py_cublas =
+        d_prefill_cublas.allocate<uint16_t>(static_cast<size_t>(batch) * y_stride);
+    double prefill_cublas_error = 0.0;
+    if (!py_cublas) {
+        fail("FP16 FP8 cuBLAS prefill allocation");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_PREFILL_CUBLAS", "1", 1);
+    if (!dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+            px, pw, ps, py_cublas, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride) || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 FP8 cuBLAS prefill launch");
+        return false;
+    }
+    unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+    std::vector<uint16_t> prefill_cublas(prefill_wide.size());
+    cudaMemcpy(prefill_cublas.data(), py_cublas,
+               prefill_cublas.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    prefill_cublas_error =
+        max_error(prefill_cublas, prefill_expected, y_stride, rows, batch);
+    // Only the first `rows` entries of each `y_stride` row are written; the
+    // stride padding stays untouched, so scanning it would read uninitialised
+    // device memory rather than kernel output.
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            const float value = from_half(
+                prefill_cublas[static_cast<size_t>(b) * y_stride + r]);
+            if (!std::isfinite(static_cast<double>(value))) {
+                fail("FP16 FP8 cuBLAS prefill produced a non-finite value");
+                return false;
+            }
+        }
+    }
     unsetenv("QWEN_FP8_F16_MULTIROW");
     unsetenv("QWEN_FP8_F16_MULTIROW_ROWS");
     unsetenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
-    if (prefill_error > 3.0e-2 || prefill_dispatch_error > 3.0e-2) {
+    if (prefill_error > 3.0e-2 || prefill_dispatch_error > 3.0e-2 ||
+        prefill_cublas_error > 3.0e-2) {
         fail("FP16 FP8 wide prefill numerical check");
     } else {
-        std::printf("  FP16 FP8 prefill batch=%d rows=%d cols=%d error=%.3e dispatch=%.3e\n",
-                    batch, rows, cols, prefill_error, prefill_dispatch_error);
+        std::printf("  FP16 FP8 prefill batch=%d rows=%d cols=%d error=%.3e "
+                    "dispatch=%.3e cublas=%.3e\n",
+                    batch, rows, cols, prefill_error, prefill_dispatch_error,
+                    prefill_cublas_error);
+    }
+    return true;
+}
+
+bool check_fp8_prefill_tail(int cols) {
+    constexpr int batch = 128;
+    constexpr int rows = 128;
+    constexpr int x_stride = 320;
+    constexpr int y_stride = 136;
+    constexpr int weight_stride = 320;
+    const int scale_stride = (cols + 127) / 128;
+    std::mt19937 rng(7000 + cols);
+    std::uniform_real_distribution<float> x_dist(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> scale_dist(0.005f, 0.02f);
+    auto random_code = [&]() {
+        // Avoid the E4M3 NaN encodings so the scalar reference and device
+        // conversion both stay finite.
+        return static_cast<uint8_t>(32 + (rng() % 192));
+    };
+    std::vector<uint16_t> x(static_cast<size_t>(batch) * x_stride);
+    std::vector<uint8_t> weight(static_cast<size_t>(rows) * weight_stride);
+    std::vector<uint16_t> scale(static_cast<size_t>((rows + 127) / 128) * scale_stride);
+    for (uint16_t& value : x) value = to_half(x_dist(rng));
+    for (uint8_t& value : weight) value = random_code();
+    for (uint16_t& value : scale) value = to_half(scale_dist(rng));
+    std::vector<float> expected(static_cast<size_t>(batch) * rows);
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            float sum = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                sum += from_half(x[static_cast<size_t>(b) * x_stride + c]) *
+                    from_fp8_e4m3(weight[static_cast<size_t>(r) * weight_stride + c]) *
+                    from_half(scale[static_cast<size_t>(r / 128) * scale_stride + c / 128]);
+            }
+            expected[static_cast<size_t>(b) * rows + r] = sum;
+        }
+    }
+    DeviceBuffer dx, dw, ds, dy;
+    uint16_t* px = dx.allocate<uint16_t>(x.size());
+    uint8_t* pw = dw.allocate<uint8_t>(weight.size());
+    uint16_t* ps = ds.allocate<uint16_t>(scale.size());
+    uint16_t* py = dy.allocate<uint16_t>(static_cast<size_t>(batch) * y_stride);
+    if (!px || !pw || !ps || !py ||
+        cudaMemcpy(px, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pw, weight.data(), weight.size(), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ps, scale.data(), scale.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail("FP8 prefill tail allocation/copy");
+        return false;
+    }
+    setenv("QWEN_FP8_F16_SMALL_BATCH", "0", 1);
+    unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+    setenv("QWEN_FP8_F16_PREFILL_WIDE_N64", "1", 1);
+    const bool launched = dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+        px, pw, ps, py, batch, rows, cols, x_stride, y_stride,
+        weight_stride, scale_stride) && cudaDeviceSynchronize() == cudaSuccess;
+    unsetenv("QWEN_FP8_F16_SMALL_BATCH");
+    unsetenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
+    if (!launched) {
+        fail("FP8 prefill tail launch");
+        return false;
+    }
+    unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+    std::vector<uint16_t> output(static_cast<size_t>(batch) * y_stride);
+    if (cudaMemcpy(output.data(), py, output.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("FP8 prefill tail copy");
+        return false;
+    }
+    double error = 0.0;
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            error = std::max(error, std::fabs(
+                static_cast<double>(from_half(output[static_cast<size_t>(b) * y_stride + r])) -
+                expected[static_cast<size_t>(b) * rows + r]));
+        }
+    }
+    if (error > 3.0e-2) {
+        fail("FP8 prefill tail numerical check");
+    } else {
+        std::printf("  FP16 FP8 prefill tail cols=%d error=%.3e\n", cols, error);
     }
     return true;
 }
@@ -781,6 +1019,222 @@ bool check_batched_argmax() {
         std::printf("  batched argmax rows=%d count=%d tie=lower-token\n",
                     rows, count);
     }
+    return true;
+}
+
+bool check_strided_row_copy(int rows) {
+    constexpr int source_stride = 7;
+    constexpr int destination_stride = 19;
+    constexpr int columns = 5;
+    constexpr int destination_offset = 3;
+    std::vector<uint16_t> source(static_cast<size_t>(rows) * source_stride);
+    std::vector<uint16_t> destination(static_cast<size_t>(rows) * destination_stride,
+                                      to_half(-7.0f));
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < source_stride; ++column) {
+            source[static_cast<size_t>(row) * source_stride + column] =
+                to_half(static_cast<float>(row * 100 + column));
+        }
+    }
+    DeviceBuffer dsource, ddestination;
+    uint16_t* d_source = dsource.allocate<uint16_t>(source.size());
+    uint16_t* d_destination = ddestination.allocate<uint16_t>(destination.size());
+    if (!d_source || !d_destination) return false;
+    if (cudaMemcpy(d_source, source.data(), source.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_destination, destination.data(),
+                   destination.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !dsv4::qwen_copy_rows_strided_f16_cuda(
+            d_source, source_stride, d_destination + destination_offset,
+            destination_stride, rows, columns) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        cudaMemcpy(destination.data(), d_destination,
+                   destination.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("FP16 strided row copy launch");
+        return true;
+    }
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < destination_stride; ++column) {
+            const bool copied = column >= destination_offset &&
+                column < destination_offset + columns;
+            const uint16_t expected = copied
+                ? source[static_cast<size_t>(row) * source_stride +
+                         column - destination_offset]
+                : to_half(-7.0f);
+            if (destination[static_cast<size_t>(row) * destination_stride + column] !=
+                expected) {
+                fail("FP16 strided row copy numerical check");
+                return true;
+            }
+        }
+    }
+    std::printf("  FP16 strided row copy rows=%d\n", rows);
+    return true;
+}
+
+// The FP8 fused gate/up SwiGLU kernel runs on every speculative verify batch.
+// Its shared-activation variant must stay bit exact against the register-only
+// kernel or greedy near ties would diverge from plain decode.
+bool check_fp8_fused_swiglu_shared() {
+    struct Case {
+        int batch;
+        int rows;
+        int cols;
+    };
+    // 5120 is the real Qwen3.8 MLP input width; 300 and 2052 cover a partial
+    // final tile and a non-128-multiple vectorized width.
+    const Case cases[] = {
+        {2, 130, 5120}, {3, 96, 5120}, {4, 72, 2052},
+        {5, 130, 300},  {8, 136, 5120}, {8, 40, 2052},
+    };
+    std::mt19937 rng(9182);
+    std::uniform_real_distribution<float> x_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> scale_dist(0.01f, 0.05f);
+    auto random_code = [&rng]() {
+        return static_cast<uint8_t>(32 + (rng() % 192));
+    };
+    for (const Case& item : cases) {
+        const int x_stride = item.cols;
+        const int y_stride = item.rows;
+        const int weight_stride = item.cols;
+        const int scale_stride = (item.cols + 127) / 128;
+        std::vector<uint16_t> host_x(static_cast<size_t>(item.batch) * x_stride);
+        std::vector<uint8_t> host_gate(
+            static_cast<size_t>(item.rows) * weight_stride);
+        std::vector<uint8_t> host_up(host_gate.size());
+        std::vector<uint16_t> host_gate_scale(
+            static_cast<size_t>((item.rows + 127) / 128) * scale_stride);
+        std::vector<uint16_t> host_up_scale(host_gate_scale.size());
+        for (uint16_t& value : host_x) value = to_half(x_dist(rng));
+        for (uint8_t& value : host_gate) value = random_code();
+        for (uint8_t& value : host_up) value = random_code();
+        for (uint16_t& value : host_gate_scale) value = to_half(scale_dist(rng));
+        for (uint16_t& value : host_up_scale) value = to_half(scale_dist(rng));
+        DeviceBuffer dx, dg, du, dgs, dus, d_shared, d_plain;
+        uint16_t* px = dx.allocate<uint16_t>(host_x.size());
+        uint8_t* pg = dg.allocate<uint8_t>(host_gate.size());
+        uint8_t* pu = du.allocate<uint8_t>(host_up.size());
+        uint16_t* pgs = dgs.allocate<uint16_t>(host_gate_scale.size());
+        uint16_t* pus = dus.allocate<uint16_t>(host_up_scale.size());
+        const size_t out_elements = static_cast<size_t>(item.batch) * y_stride;
+        uint16_t* py_shared = d_shared.allocate<uint16_t>(out_elements);
+        uint16_t* py_plain = d_plain.allocate<uint16_t>(out_elements);
+        if (!px || !pg || !pu || !pgs || !pus || !py_shared || !py_plain ||
+            cudaMemcpy(px, host_x.data(), host_x.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pg, host_gate.data(), host_gate.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pu, host_up.data(), host_up.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pgs, host_gate_scale.data(),
+                       host_gate_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pus, host_up_scale.data(),
+                       host_up_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            fail("FP8 fused SwiGLU shared allocation/copy");
+            return true;
+        }
+        setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "1", 1);
+        const bool shared_ok =
+            dsv4::qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
+                px, pg, pgs, pu, pus, py_shared, item.batch, item.rows,
+                item.cols, x_stride, y_stride, weight_stride, scale_stride) &&
+            cudaDeviceSynchronize() == cudaSuccess;
+        setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "0", 1);
+        const bool plain_ok =
+            dsv4::qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
+                px, pg, pgs, pu, pus, py_plain, item.batch, item.rows,
+                item.cols, x_stride, y_stride, weight_stride, scale_stride) &&
+            cudaDeviceSynchronize() == cudaSuccess;
+        unsetenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
+        if (!shared_ok || !plain_ok) {
+            fail("FP8 fused SwiGLU shared launch");
+            return true;
+        }
+        std::vector<uint16_t> got(out_elements);
+        std::vector<uint16_t> want(out_elements);
+        cudaMemcpy(got.data(), py_shared, out_elements * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(want.data(), py_plain, out_elements * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        for (int sample = 0; sample < item.batch; ++sample) {
+            for (int row = 0; row < item.rows; ++row) {
+                const size_t at = static_cast<size_t>(sample) * y_stride + row;
+                if (got[at] != want[at]) {
+                    std::printf("  FP8 fused SwiGLU shared mismatch batch=%d "
+                                "rows=%d cols=%d at sample=%d row=%d "
+                                "%.6e vs %.6e\n",
+                                item.batch, item.rows, item.cols, sample, row,
+                                static_cast<double>(from_half(got[at])),
+                                static_cast<double>(from_half(want[at])));
+                    fail("FP8 fused SwiGLU shared bit exactness");
+                    return true;
+                }
+            }
+        }
+    }
+    std::printf("  FP8 fused SwiGLU shared bit exact over %zu shard shapes\n",
+                sizeof(cases) / sizeof(cases[0]));
+    return true;
+}
+
+bool check_fused_swiglu() {
+    constexpr int batch = 8;
+    constexpr int rows = 17;
+    constexpr int cols = 12;
+    std::mt19937 rng(731);
+    std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
+    std::vector<uint16_t> input(static_cast<size_t>(batch) * cols);
+    std::vector<uint16_t> gate(static_cast<size_t>(rows) * cols);
+    std::vector<uint16_t> up(static_cast<size_t>(rows) * cols);
+    for (uint16_t& value : input) value = to_half(dist(rng));
+    for (uint16_t& value : gate) value = to_half(dist(rng));
+    for (uint16_t& value : up) value = to_half(dist(rng));
+    DeviceBuffer dinput, dgate, dup, doutput;
+    uint16_t* d_input = dinput.allocate<uint16_t>(input.size());
+    uint16_t* d_gate = dgate.allocate<uint16_t>(gate.size());
+    uint16_t* d_up = dup.allocate<uint16_t>(up.size());
+    uint16_t* d_output = doutput.allocate<uint16_t>(static_cast<size_t>(batch) * rows);
+    if (!d_input || !d_gate || !d_up || !d_output) return false;
+    if (cudaMemcpy(d_input, input.data(), input.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_gate, gate.data(), gate.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_up, up.data(), up.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !dsv4::qwen_fp16_swiglu_matmul_rows_f16_cuda(
+            d_input, d_gate, d_up, d_output, batch, rows, cols, cols, rows,
+            cols) || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 fused SwiGLU launch");
+        return true;
+    }
+    std::vector<uint16_t> output(static_cast<size_t>(batch) * rows);
+    if (cudaMemcpy(output.data(), d_output, output.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("FP16 fused SwiGLU copy");
+        return true;
+    }
+    double worst = 0.0;
+    for (int sample = 0; sample < batch; ++sample) {
+        for (int row = 0; row < rows; ++row) {
+            float gate_sum = 0.0f;
+            float up_sum = 0.0f;
+            for (int column = 0; column < cols; ++column) {
+                const float x = from_half(input[static_cast<size_t>(sample) * cols + column]);
+                gate_sum += x * from_half(gate[static_cast<size_t>(row) * cols + column]);
+                up_sum += x * from_half(up[static_cast<size_t>(row) * cols + column]);
+            }
+            const float expected = gate_sum / (1.0f + std::exp(-gate_sum)) * up_sum;
+            worst = std::max(worst, std::fabs(static_cast<double>(
+                from_half(output[static_cast<size_t>(sample) * rows + row])) - expected));
+        }
+    }
+    if (worst > 2.0e-3) fail("FP16 fused SwiGLU numerical check");
+    else std::printf("  FP16 fused SwiGLU batch=%d rows=%d worst=%.3e\n",
+                     batch, rows, worst);
     return true;
 }
 
@@ -898,6 +1352,11 @@ int main() {
     check_prefill_tiled(17, 256, 5);
     check_prefill_tiled(128, 64, 7);
     check_prefill_tiled(333, 256, 11);
+    check_prefill_tiled(17, 128, 5, 8, 2);
+    check_prefill_tiled(33, 256, 7, 32, 8);
+    check_fp8_prefill_tail(301);
+    check_fp8_prefill_tail(302);
+    check_fp8_prefill_tail(303);
     check_verify_split(2, 64, 0);
     check_verify_split(3, 256, 37);
     check_verify_split(5, 64, 4093);
@@ -909,6 +1368,10 @@ int main() {
     check_decode_grid_256k();
     check_fp8_f16_projection();
     check_batched_argmax();
+    check_strided_row_copy(1);
+    check_strided_row_copy(8);
+    check_fused_swiglu();
+    check_fp8_fused_swiglu_shared();
     check_fp8_cache();
     if (failures != 0) {
         std::printf("test_qwen_half_ops failures=%d\n", failures);
