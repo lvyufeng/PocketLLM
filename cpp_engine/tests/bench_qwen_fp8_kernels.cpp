@@ -5,6 +5,7 @@
 #include "cuda_ops.hpp"
 #include "qwen_cuda_ops.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -19,6 +20,7 @@ constexpr int kBlock = 128;
 
 struct Buffers {
     float* x = nullptr;
+    uint16_t* x_half = nullptr;
     uint8_t* w = nullptr;
     uint8_t* w2 = nullptr;
     uint16_t* s = nullptr;
@@ -28,6 +30,7 @@ struct Buffers {
     float* y3 = nullptr;
     ~Buffers() {
         cudaFree(x);
+        cudaFree(x_half);
         cudaFree(w);
         cudaFree(w2);
         cudaFree(s);
@@ -88,6 +91,24 @@ void run_simt(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
     }
 }
 
+void run_half_prefill_online(const Buffers& b, int batch, int rows, int cols,
+                             int scale_cols) {
+    if (batch == 1) return;
+    unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+    dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+        b.x_half, b.w, b.s, reinterpret_cast<uint16_t*>(b.y), batch, rows,
+        cols, cols, rows, cols, scale_cols);
+}
+
+void run_half_prefill_cublas(const Buffers& b, int batch, int rows, int cols,
+                             int scale_cols) {
+    if (batch == 1) return;
+    setenv("QWEN_FP8_F16_PREFILL_CUBLAS", "1", 1);
+    dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+        b.x_half, b.w, b.s, reinterpret_cast<uint16_t*>(b.y), batch, rows,
+        cols, cols, rows, cols, scale_cols);
+}
+
 void run_swiglu_separate(const Buffers& b, int batch, int rows, int cols, int scale_cols) {
     if (batch != 1) return;
     dsv4::qwen_fp8_e4m3_fp16scale_matvec_cuda(b.x, b.w, b.s, b.y, rows, cols, cols, scale_cols);
@@ -127,6 +148,9 @@ int main() {
         {"full_kv      decode", 1, 256, 5120},
         {"mlp_gate    prefill", 64, 4352, 5120},
         {"mlp_down    prefill", 64, 5120, 4352},
+        {"mlp_gate    verify", 8, 4352, 5120},
+        {"mlp_down    verify", 8, 5120, 4352},
+        {"linear_qkv  verify", 8, 2560, 5120},
         {"mlp_gate    pf-512 ", 512, 4352, 5120},
         {"mlp_down    pf-512 ", 512, 5120, 4352},
         {"linear_qkv  pf-512 ", 512, 2560, 5120},
@@ -140,6 +164,7 @@ int main() {
         // stays in bounds.
         const size_t w_bytes = static_cast<size_t>(c.rows) * (c.cols + 4);
         if (cudaMalloc(&b.x, static_cast<size_t>(c.batch) * c.cols * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&b.x_half, static_cast<size_t>(c.batch) * c.cols * sizeof(uint16_t)) != cudaSuccess ||
             cudaMalloc(&b.w, w_bytes) != cudaSuccess ||
             cudaMalloc(&b.w2, w_bytes) != cudaSuccess ||
             cudaMalloc(&b.s, static_cast<size_t>(scale_rows) * scale_cols * sizeof(uint16_t)) != cudaSuccess ||
@@ -157,7 +182,13 @@ int main() {
         std::vector<uint8_t> hw(w_bytes);
         for (uint8_t& v : hw) v = static_cast<uint8_t>(0x38 + (rng() & 7));
         std::vector<uint16_t> hs(static_cast<size_t>(scale_rows) * scale_cols, 0x3800);
+        std::vector<uint16_t> hx_half(hx.size());
+        for (size_t i = 0; i < hx.size(); ++i) {
+            hx_half[i] = __half_as_ushort(__float2half(hx[i]));
+        }
         cudaMemcpy(b.x, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(b.x_half, hx_half.data(), hx_half.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice);
         cudaMemcpy(b.w, hw.data(), hw.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(b.w2, hw.data(), hw.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(b.s, hs.data(), hs.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
@@ -171,6 +202,17 @@ int main() {
         std::printf("%s batch=%3d rows=%5d cols=%5d  baseline=%7.3f ms  old=%7.3f ms  simt=%7.3f ms  old/simt=%5.2fx  eff=%6.1f GB/s\n",
                     c.label, c.batch, c.rows, c.cols, ref, opt, simt, opt / simt,
                     bytes / (simt * 1e-3) / 1e9);
+        if (c.batch > 1) {
+            const double online = time_ms(
+                run_half_prefill_online, b, c.batch, c.rows, c.cols,
+                scale_cols, iters);
+            const double cublas = time_ms(
+                run_half_prefill_cublas, b, c.batch, c.rows, c.cols,
+                scale_cols, iters);
+            unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+            std::printf("  fp16-output online=%7.3f ms cublas=%7.3f ms speedup=%5.2fx\n",
+                        online, cublas, online / cublas);
+        }
         if (c.batch == 1 && c.rows == 4352 && c.cols == 5120) {
             const double separate = time_ms(run_swiglu_separate, b, c.batch, c.rows, c.cols, scale_cols, iters);
             const double fused = time_ms(run_swiglu_fused, b, c.batch, c.rows, c.cols, scale_cols, iters);

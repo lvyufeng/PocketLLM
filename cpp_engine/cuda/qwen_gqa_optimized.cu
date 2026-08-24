@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace dsv4 {
 namespace {
@@ -62,6 +64,16 @@ __device__ __forceinline__ uint16_t float_to_half(float value) {
     return __half_as_ushort(__float2half_rn(value));
 }
 
+// Butterfly reduction: every lane ends with the full warp total, so a warp that
+// owns one dot product needs no lane-0 broadcast afterwards.
+__device__ __forceinline__ float warp_sum_all(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -100,6 +112,349 @@ __host__ __device__ bool attends(
     const int start = context_limit - window;
     return position >= (start > sink ? start : sink);
 }
+
+// Batched-position variant of the tiled prefill kernel below. The per-position
+// kernel spends four block-wide __syncthreads() on every history element, so an
+// 8192-token prefill pays roughly half a million barriers per layer and becomes
+// synchronisation bound rather than bandwidth bound. This scores kPosTile
+// positions per barrier round: the dot products for the whole sub-tile are
+// reduced together, then the online-softmax update walks the sub-tile in
+// position order exactly as before. The running max/sum recurrence and the
+// accumulator update order are therefore identical to the per-position kernel,
+// so the result is bit-identical.
+constexpr int kPosTile = 8;
+
+template <int kHPG, int kVPT, int kQR>
+__global__ void gqa_prefill_tiled_batched_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset,
+    int window,
+    int sink) {
+    constexpr int kCombosT = kHPG * kQR;
+    const int q_per_kv = q_heads / kv_heads;
+    const int groups_per_kv =
+        (q_per_kv + kHPG - 1) / kHPG;
+    const int kv_head = static_cast<int>(blockIdx.x) / groups_per_kv;
+    const int group = static_cast<int>(blockIdx.x) % groups_per_kv;
+    const int first_head = kv_head * q_per_kv + group * kHPG;
+    const int first_token = static_cast<int>(blockIdx.y) * kQR;
+    if (kv_head >= kv_heads || first_token >= seq_len) return;
+
+    __shared__ float warp_sums[kPosTile][kCombosT][kWarps];
+    __shared__ float scores[kPosTile][kCombosT];
+    __shared__ float rescale[kPosTile][kCombosT];
+    __shared__ float probability[kPosTile][kCombosT];
+    __shared__ float running_max[kCombosT];
+    __shared__ float running_sum[kCombosT];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    float query[kCombosT][kVPT];
+    float accumulator[kCombosT][kVPT];
+    bool active[kCombosT];
+    int context_limit[kCombosT];
+
+#pragma unroll
+    for (int combo = 0; combo < kCombosT; ++combo) {
+        const int query_row = combo / kHPG;
+        const int head_in_group = combo % kHPG;
+        const int token = first_token + query_row;
+        const int head = first_head + head_in_group;
+        active[combo] = token < seq_len &&
+            head < (kv_head + 1) * q_per_kv && head < q_heads;
+        context_limit[combo] = position_offset + token + 1;
+#pragma unroll
+        for (int i = 0; i < kVPT; ++i) {
+            const int d = tid + i * kThreads;
+            query[combo][i] = active[combo] && d < head_dim
+                ? half_to_float(q_rows[
+                      (static_cast<size_t>(token) * q_heads + head) * head_dim + d])
+                : 0.0f;
+            accumulator[combo][i] = 0.0f;
+        }
+        if (tid == combo) {
+            running_max[combo] = -INFINITY;
+            running_sum[combo] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    const int last_token = min(first_token + kQR - 1, seq_len - 1);
+    const int tile_context = position_offset + last_token + 1;
+    const int tile_window_start = window > 0
+        ? max(sink, position_offset + first_token + 1 - window) : 0;
+    const float attention_scale = rsqrtf(static_cast<float>(head_dim));
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+
+    for (int base = 0; base < tile_context; base += kPosTile) {
+        // Skip whole sub-tiles that no query row in this CTA attends. The
+        // per-position kernel jumps the same gap one element at a time.
+        if (window > 0) {
+            const int last = min(base + kPosTile, tile_context) - 1;
+            if (last >= sink && last < tile_window_start) continue;
+        }
+        const int count = min(kPosTile, tile_context - base);
+        float value[kPosTile][kVPT];
+#pragma unroll
+        for (int slot = 0; slot < kPosTile; ++slot) {
+            if (slot >= count) break;
+            const int position = base + slot;
+            const bool skipped = window > 0 && position >= sink &&
+                position < tile_window_start;
+            const size_t kv_base = static_cast<size_t>(position) * kv_stride +
+                static_cast<size_t>(kv_head) * head_dim;
+            float key[kVPT];
+#pragma unroll
+            for (int i = 0; i < kVPT; ++i) {
+                const int d = tid + i * kThreads;
+                const bool load = !skipped && d < head_dim;
+                key[i] = load ? half_to_float(k_cache[kv_base + d]) : 0.0f;
+                value[slot][i] = load ? half_to_float(v_cache[kv_base + d]) : 0.0f;
+            }
+#pragma unroll
+            for (int combo = 0; combo < kCombosT; ++combo) {
+                float partial = 0.0f;
+                if (!skipped && active[combo] &&
+                    attends(position, context_limit[combo], window, sink)) {
+#pragma unroll
+                    for (int i = 0; i < kVPT; ++i) {
+                        partial += query[combo][i] * key[i];
+                    }
+                }
+                const float sum = warp_sum(partial);
+                if (lane == 0) warp_sums[slot][combo][warp] = sum;
+            }
+        }
+        __syncthreads();
+        // One thread per (slot, combo) folds the warp partials, then the online
+        // softmax recurrence is replayed in position order by thread `combo`.
+        if (tid < kCombosT) {
+            const int combo = tid;
+            for (int slot = 0; slot < count; ++slot) {
+                float sum = 0.0f;
+#pragma unroll
+                for (int w = 0; w < kWarps; ++w) sum += warp_sums[slot][combo][w];
+                scores[slot][combo] = sum * attention_scale;
+            }
+            for (int slot = 0; slot < count; ++slot) {
+                const int position = base + slot;
+                const bool skipped = window > 0 && position >= sink &&
+                    position < tile_window_start;
+                if (!skipped && active[combo] &&
+                    attends(position, context_limit[combo], window, sink)) {
+                    const float old_max = running_max[combo];
+                    const float new_max = fmaxf(old_max, scores[slot][combo]);
+                    const float old_scale = old_max == -INFINITY
+                        ? 0.0f : expf(old_max - new_max);
+                    const float weight = expf(scores[slot][combo] - new_max);
+                    running_max[combo] = new_max;
+                    running_sum[combo] = running_sum[combo] * old_scale + weight;
+                    rescale[slot][combo] = old_scale;
+                    probability[slot][combo] = weight;
+                } else {
+                    rescale[slot][combo] = 1.0f;
+                    probability[slot][combo] = 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+        // Replay the accumulator update in the same position order.
+        for (int slot = 0; slot < count; ++slot) {
+#pragma unroll
+            for (int combo = 0; combo < kCombosT; ++combo) {
+#pragma unroll
+                for (int i = 0; i < kVPT; ++i) {
+                    accumulator[combo][i] =
+                        accumulator[combo][i] * rescale[slot][combo] +
+                        probability[slot][combo] * value[slot][i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int combo = 0; combo < kCombosT; ++combo) {
+        if (!active[combo]) continue;
+        const int query_row = combo / kHPG;
+        const int head_in_group = combo % kHPG;
+        const int token = first_token + query_row;
+        const int head = first_head + head_in_group;
+        const float inverse = running_sum[combo] > 0.0f
+            ? 1.0f / running_sum[combo] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < kVPT; ++i) {
+            const int d = tid + i * kThreads;
+            if (d < head_dim) {
+                output[(static_cast<size_t>(token) * q_heads + head) * head_dim + d] =
+                    float_to_half(accumulator[combo][i] * inverse);
+            }
+        }
+    }
+}
+
+// Warp-per-combo variant. The kernels above spread each dot product across all
+// 128 threads, so with head_dim 128 every thread contributes a single FMA and
+// then pays a five-shuffle reduction plus block barriers: measured 27.6 GB/s and
+// 441 GFLOP/s on SM75, roughly 3% of both roofs, so the cost is reduction
+// instructions rather than data. Here each warp owns a slice of the (query row,
+// head) combos and each lane holds kDPL contiguous head dimensions, so a dot
+// product is one warp butterfly with no block barrier and the online-softmax
+// state stays in registers. K/V for the position tile is staged once in shared
+// memory so the four warps do not re-read it. The reduction tree changes, so
+// results differ from the per-position kernel in the last FP32 bits.
+template <int kHPG, int kQR, int kDPL>
+__global__ void gqa_prefill_warp_combo_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset,
+    int window,
+    int sink) {
+    constexpr int kCombosT = kHPG * kQR;
+    constexpr int kCPW = (kCombosT + kWarps - 1) / kWarps;
+    constexpr int kDim = kDPL * 32;
+    const int q_per_kv = q_heads / kv_heads;
+    const int groups_per_kv = (q_per_kv + kHPG - 1) / kHPG;
+    const int kv_head = static_cast<int>(blockIdx.x) / groups_per_kv;
+    const int group = static_cast<int>(blockIdx.x) % groups_per_kv;
+    const int first_head = kv_head * q_per_kv + group * kHPG;
+    const int first_token = static_cast<int>(blockIdx.y) * kQR;
+    if (kv_head >= kv_heads || first_token >= seq_len) return;
+
+    __shared__ uint16_t ks[kPosTile][kDim];
+    __shared__ uint16_t vs[kPosTile][kDim];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int lane_base = lane * kDPL;
+
+    float query[kCPW][kDPL];
+    float accumulator[kCPW][kDPL];
+    float running_max[kCPW];
+    float running_sum[kCPW];
+    bool active[kCPW];
+    int context_limit[kCPW];
+
+#pragma unroll
+    for (int c = 0; c < kCPW; ++c) {
+        const int combo = warp * kCPW + c;
+        const int query_row = combo / kHPG;
+        const int head_in_group = combo % kHPG;
+        const int token = first_token + query_row;
+        const int head = first_head + head_in_group;
+        active[c] = combo < kCombosT && token < seq_len &&
+            head < (kv_head + 1) * q_per_kv && head < q_heads;
+        context_limit[c] = position_offset + token + 1;
+        running_max[c] = -INFINITY;
+        running_sum[c] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) {
+            query[c][i] = active[c]
+                ? half_to_float(q_rows[
+                      (static_cast<size_t>(token) * q_heads + head) * head_dim +
+                      lane_base + i])
+                : 0.0f;
+            accumulator[c][i] = 0.0f;
+        }
+    }
+
+    const int last_token = min(first_token + kQR - 1, seq_len - 1);
+    const int tile_context = position_offset + last_token + 1;
+    const int tile_window_start = window > 0
+        ? max(sink, position_offset + first_token + 1 - window) : 0;
+    const float attention_scale = rsqrtf(static_cast<float>(head_dim));
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+
+    for (int base = 0; base < tile_context; base += kPosTile) {
+        if (window > 0) {
+            const int last = min(base + kPosTile, tile_context) - 1;
+            if (last >= sink && last < tile_window_start) continue;
+        }
+        const int count = min(kPosTile, tile_context - base);
+        __syncthreads();
+        for (int idx = tid; idx < count * kDim; idx += kThreads) {
+            const int slot = idx / kDim;
+            const int d = idx - slot * kDim;
+            const size_t at = static_cast<size_t>(base + slot) * kv_stride +
+                static_cast<size_t>(kv_head) * head_dim + d;
+            ks[slot][d] = k_cache[at];
+            vs[slot][d] = v_cache[at];
+        }
+        __syncthreads();
+        for (int slot = 0; slot < count; ++slot) {
+            const int position = base + slot;
+            const bool skipped = window > 0 && position >= sink &&
+                position < tile_window_start;
+            if (skipped) continue;
+            float key[kDPL];
+            float value[kDPL];
+#pragma unroll
+            for (int i = 0; i < kDPL; ++i) {
+                key[i] = half_to_float(ks[slot][lane_base + i]);
+                value[i] = half_to_float(vs[slot][lane_base + i]);
+            }
+#pragma unroll
+            for (int c = 0; c < kCPW; ++c) {
+                const bool contributes = active[c] &&
+                    attends(position, context_limit[c], window, sink);
+                float partial = 0.0f;
+                if (contributes) {
+#pragma unroll
+                    for (int i = 0; i < kDPL; ++i) {
+                        partial += query[c][i] * key[i];
+                    }
+                }
+                // Butterfly reduction leaves the full sum in every lane, so no
+                // broadcast is needed before the softmax update.
+                const float score = warp_sum_all(partial) * attention_scale;
+                if (!contributes) continue;
+                const float old_max = running_max[c];
+                const float new_max = fmaxf(old_max, score);
+                const float old_scale = old_max == -INFINITY
+                    ? 0.0f : expf(old_max - new_max);
+                const float weight = expf(score - new_max);
+                running_max[c] = new_max;
+                running_sum[c] = running_sum[c] * old_scale + weight;
+#pragma unroll
+                for (int i = 0; i < kDPL; ++i) {
+                    accumulator[c][i] =
+                        accumulator[c][i] * old_scale + weight * value[i];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < kCPW; ++c) {
+        if (!active[c]) continue;
+        const int combo = warp * kCPW + c;
+        const int token = first_token + combo / kHPG;
+        const int head = first_head + combo % kHPG;
+        const float inverse = running_sum[c] > 0.0f
+            ? 1.0f / running_sum[c] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) {
+            output[(static_cast<size_t>(token) * q_heads + head) * head_dim +
+                   lane_base + i] = float_to_half(accumulator[c][i] * inverse);
+        }
+    }
+}
+
 
 // Two adjacent query rows and three Q heads sharing a KV head are processed by
 // one CTA. Each K/V element is loaded once for six attention outputs.
@@ -774,6 +1129,123 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
         (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
     const dim3 grid(static_cast<unsigned>(kv_heads * groups_per_kv),
                     static_cast<unsigned>((seq_len + kQueryRows - 1) / kQueryRows), 1);
+    // The batched-position kernel amortises the per-history-element barriers
+    // over kPosTile positions while preserving the online-softmax order, so it
+    // is bit-identical. Set DSV4_QWEN_GQA_POS_TILE=0 to fall back.
+    const char* pos_tile = std::getenv("DSV4_QWEN_GQA_POS_TILE");
+    const bool use_pos_tile = pos_tile == nullptr ||
+        std::strcmp(pos_tile, "0") != 0;
+    if (use_pos_tile) {
+        // Choose the head grouping that divides q_per_kv exactly. With the fixed
+        // group of three and the real q_per_kv of four, the second group carried a
+        // single head yet still streamed the whole KV history for its KV head, so
+        // each history element was read twice per layer. A group of four covers
+        // all four heads in one CTA and halves that traffic. Shapes that do not
+        // divide evenly keep the original grouping.
+        const int q_per_kv = q_heads / kv_heads;
+        int hpg = kHeadsPerGroup;
+        // Wider groups cut history traffic but cost registers per CTA. Measured at
+        // the real TP4 shape (6 q heads over 1 kv head, head_dim 256, 4096 rows),
+        // groups of six spill and lose: 67.7/215.4 ms against 54.9/186.8 for two.
+        if (q_per_kv % 4 == 0) hpg = 4;
+        else if (q_per_kv % 2 == 0) hpg = 2;
+        else if (q_per_kv == 1) hpg = 1;
+        if (const char* hpg_env = std::getenv("DSV4_QWEN_GQA_HEADS_PER_GROUP")) {
+            const int requested = std::atoi(hpg_env);
+            if (requested >= 1 && requested <= 6 && q_per_kv % requested == 0) {
+                hpg = requested;
+            }
+        }
+        const int batched_groups = (q_per_kv + hpg - 1) / hpg;
+        // Every CTA streams the whole KV history for its KV head, so the number of
+        // query-row tiles is a direct multiplier on history traffic. At 8192 with
+        // two rows per CTA the 16 GQA layers re-read 544 GiB per rank and run at
+        // ~118 GB/s of the ~600 GB/s the card can sustain. Widening the tile
+        // divides that traffic; the accumulator lives in registers, so the width
+        // is capped to keep occupancy.
+        int qr = 2;
+        const char* qr_env = std::getenv("DSV4_QWEN_GQA_QUERY_ROWS");
+        if (qr_env != nullptr) {
+            const int requested = std::atoi(qr_env);
+            if (requested == 2 || requested == 4 || requested == 8) qr = requested;
+        } else if (hpg <= 2) {
+            // Measured on the real 8192 TP4 prefill: full_attention 4.96 s at two
+            // rows, 4.51 s at four, 6.60 s at eight. Past four rows the register
+            // accumulator spills and the traffic saving is more than undone. At
+            // head_dim 256 the accumulator is twice as wide, so four rows only pay
+            // off for the narrow groups: 53.7/178.5 ms against 54.9/186.8 at two
+            // rows for hpg=2, while hpg=3 regresses to 69.7/214.3.
+            qr = 4;
+        }
+        const dim3 batched_grid(
+            static_cast<unsigned>(kv_heads * batched_groups),
+            static_cast<unsigned>((seq_len + qr - 1) / qr), 1);
+        // Warp-per-combo variant. Opt-in: it reassociates the dot-product
+        // reduction, so the last FP32 bits differ from the per-position kernel and
+        // a near-tie greedy argmax could flip. Requires head_dim to split evenly
+        // across a warp and the combo count to cover the warps.
+        const char* warp_combo = std::getenv("DSV4_QWEN_GQA_WARP_COMBO");
+        if (warp_combo != nullptr && std::strcmp(warp_combo, "0") != 0 &&
+            (head_dim == 128 || head_dim == 256) && attention_window <= 0) {
+            const int combos = hpg * qr;
+            const int dpl = head_dim / 32;
+            if (combos % kWarps == 0) {
+#define DSV4_LAUNCH_WARP_COMBO_D(HPG, QR, DPL) \
+                gqa_prefill_warp_combo_f16_kernel<HPG, QR, DPL> \
+                    <<<batched_grid, kThreads, 0, \
+                       static_cast<cudaStream_t>(stream)>>>( \
+                        q, k_cache, v_cache, output, seq_len, q_heads, kv_heads, \
+                        head_dim, position_offset, attention_window, sink_tokens)
+#define DSV4_LAUNCH_WARP_COMBO(HPG, QR) \
+                do { \
+                    if (dpl == 8) { DSV4_LAUNCH_WARP_COMBO_D(HPG, QR, 8); } \
+                    else { DSV4_LAUNCH_WARP_COMBO_D(HPG, QR, 4); } \
+                } while (0)
+                bool launched = true;
+                if (hpg == 4 && qr == 4) { DSV4_LAUNCH_WARP_COMBO(4, 4); }
+                else if (hpg == 4 && qr == 2) { DSV4_LAUNCH_WARP_COMBO(4, 2); }
+                else if (hpg == 4 && qr == 8) { DSV4_LAUNCH_WARP_COMBO(4, 8); }
+                else if (hpg == 2 && qr == 2) { DSV4_LAUNCH_WARP_COMBO(2, 2); }
+                else if (hpg == 2 && qr == 4) { DSV4_LAUNCH_WARP_COMBO(2, 4); }
+                else if (hpg == 2 && qr == 8) { DSV4_LAUNCH_WARP_COMBO(2, 8); }
+                else if (hpg == 1 && qr == 4) { DSV4_LAUNCH_WARP_COMBO(1, 4); }
+                else if (hpg == 1 && qr == 8) { DSV4_LAUNCH_WARP_COMBO(1, 8); }
+                else { launched = false; }
+#undef DSV4_LAUNCH_WARP_COMBO
+#undef DSV4_LAUNCH_WARP_COMBO_D
+                if (launched) return cudaGetLastError() == cudaSuccess;
+            }
+        }
+        // kValuesPerThread is sized for the largest supported head_dim. The real
+        // GQA head_dim is 128, which leaves half of every register array and half
+        // of each inner loop doing nothing, so specialise on the exact count.
+        const int vpt = (head_dim + kThreads - 1) / kThreads;
+#define DSV4_LAUNCH_POS_TILE(HPG, VPT, QR) \
+        gqa_prefill_tiled_batched_f16_kernel<HPG, VPT, QR> \
+            <<<batched_grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>( \
+                q, k_cache, v_cache, output, seq_len, q_heads, kv_heads, \
+                head_dim, position_offset, attention_window, sink_tokens)
+#define DSV4_LAUNCH_POS_TILE_QR(HPG, VPT) \
+        do { \
+            if (qr == 8) { DSV4_LAUNCH_POS_TILE(HPG, VPT, 8); } \
+            else if (qr == 4) { DSV4_LAUNCH_POS_TILE(HPG, VPT, 4); } \
+            else { DSV4_LAUNCH_POS_TILE(HPG, VPT, 2); } \
+        } while (0)
+#define DSV4_LAUNCH_POS_TILE_HPG(HPG) \
+        do { \
+            if (vpt == 1) { DSV4_LAUNCH_POS_TILE_QR(HPG, 1); } \
+            else { DSV4_LAUNCH_POS_TILE_QR(HPG, kValuesPerThread); } \
+        } while (0)
+        if (hpg == 6) { DSV4_LAUNCH_POS_TILE_HPG(6); }
+        else if (hpg == 4) { DSV4_LAUNCH_POS_TILE_HPG(4); }
+        else if (hpg == 2) { DSV4_LAUNCH_POS_TILE_HPG(2); }
+        else if (hpg == 1) { DSV4_LAUNCH_POS_TILE_HPG(1); }
+        else { DSV4_LAUNCH_POS_TILE_HPG(3); }
+#undef DSV4_LAUNCH_POS_TILE_HPG
+#undef DSV4_LAUNCH_POS_TILE_QR
+#undef DSV4_LAUNCH_POS_TILE
+        return cudaGetLastError() == cudaSuccess;
+    }
     gqa_prefill_tiled_f16_kernel<<<grid, kThreads, 0,
         static_cast<cudaStream_t>(stream)>>>(q, k_cache, v_cache, output,
         seq_len, q_heads, kv_heads, head_dim, position_offset,

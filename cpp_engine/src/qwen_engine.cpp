@@ -3,6 +3,7 @@
 #include "cuda_ops.hpp"
 #include "qwen_cuda_ops.hpp"
 #include "qwen_dspark.hpp"
+#include "qwen_dflash2.hpp"
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
@@ -13,7 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <iostream>
+#include <map>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace dsv4 {
@@ -246,7 +251,25 @@ struct QwenEngine::Impl {
     QwenDeviceTensor lm_head;
     bool mtp_enabled = false;
     bool dspark_enabled = false;
+    bool dflash2_enabled = false;
+    // Caps the verified draft block width. 0 verifies the full seven-draft
+    // proposal, which is the upstream behaviour and stays the default.
+    int dflash2_draft_width = qwen_env_int("DSV4_DFLASH2_DRAFT_WIDTH", 0);
+    // A fixed cap cannot serve both high- and low-acceptance workloads, so the
+    // width is also allowed to track measured acceptance. The controller keeps an
+    // exponentially weighted accepted-draft count and verifies one row past it,
+    // which is the cheapest width that can still grow when acceptance recovers.
+    bool dflash2_adaptive_width = qwen_env_enabled("DSV4_DFLASH2_ADAPTIVE_WIDTH");
+    double dflash2_accept_ewma = 0.0;
+    uint64_t dflash2_width_samples = 0;
     std::unique_ptr<QwenDSparkConfig> dspark_config;
+    std::unique_ptr<QwenDFlash2Config> dflash2_config;
+    std::unique_ptr<SafeTensorsIndex> dflash2_index;
+    std::unique_ptr<QwenDFlash2WeightMap> dflash2_weights;
+    std::unique_ptr<QwenDFlash2Runtime> dflash2;
+    QwenDeviceTensor dflash2_target_taps;
+    std::vector<int> dflash2_debug_target_layer_ids;
+    QwenDFlash2DebugCallback dflash2_target_debug_callback;
     std::unique_ptr<SafeTensorsIndex> dspark_index;
     std::unique_ptr<QwenDSparkWeightMap> dspark_weights;
     std::unique_ptr<QwenDSparkRuntime> dspark;
@@ -440,10 +463,6 @@ struct QwenEngine::Impl {
             layers.push_back(std::move(destination));
         }
 
-        if (options.mtp && !options.dspark_checkpoint.empty()) {
-            throw std::runtime_error(
-                "Qwen native MTP and external DSpark are mutually exclusive");
-        }
         if (!options.dspark_checkpoint.empty()) {
             if (active_layers > 0 &&
                 active_layers != static_cast<int>(config.num_hidden_layers)) {
@@ -470,6 +489,31 @@ struct QwenEngine::Impl {
             dspark_enabled = true;
             uploaded_weight_bytes += dspark->resident_weight_bytes();
             cache_data_bytes += dspark->context_cache_bytes();
+        }
+        if (!options.dflash2_checkpoint.empty()) {
+            if (active_layers > 0 &&
+                active_layers != static_cast<int>(config.num_hidden_layers)) {
+                throw std::runtime_error(
+                    "Qwen DFlash2 requires the complete target layer stack");
+            }
+            dflash2_config = std::make_unique<QwenDFlash2Config>(
+                QwenDFlash2Config::from_directory(options.dflash2_checkpoint));
+            dflash2_config->validate_for_target(
+                config.hidden_size, config.vocab_size, config.num_hidden_layers);
+            dflash2_index = std::make_unique<SafeTensorsIndex>(
+                SafeTensorsIndex::from_single_file(options.dflash2_checkpoint));
+            dflash2_weights = std::make_unique<QwenDFlash2WeightMap>(
+                *dflash2_index, *dflash2_config, options.tp_world, options.tp_rank);
+            dflash2 = std::make_unique<QwenDFlash2Runtime>(
+                options.dflash2_checkpoint, *dflash2_config, *dflash2_weights,
+                embed, lm_head,
+                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
+                    options.tp_world,
+                options.tp_world, options.tp_rank, options.device,
+                options.nccl_id_path, max_context);
+            dflash2_enabled = true;
+            uploaded_weight_bytes += dflash2->resident_weight_bytes();
+            cache_data_bytes += dflash2->context_cache_bytes();
         }
 
         if (options.mtp) {
@@ -570,6 +614,7 @@ struct QwenEngine::Impl {
             zero_tensor(layer.linear.conv_tail);
         }
         if (dspark_enabled) dspark->reset();
+        if (dflash2_enabled) dflash2->reset();
         has_target_last_hidden = false;
         mtp_seed_ready = false;
         mtp_position = 0;
@@ -583,6 +628,7 @@ struct QwenEngine::Impl {
     // Only the 48 DeltaNet layers carry order-dependent state; full attention
     // is skipped because its KV cache is addressed by absolute position.
     void prepare_transaction_state() {
+        PhaseScope scope(this, "transaction_snapshot");
         if (transaction_states.size() != layers.size()) {
             transaction_states.clear();
             transaction_conv_tails.clear();
@@ -628,6 +674,7 @@ struct QwenEngine::Impl {
     }
 
     void restore_transaction_state(int position) {
+        PhaseScope scope(this, "transaction_restore");
         if (transaction_states.size() != layers.size()) {
             throw std::runtime_error("Qwen transaction state is unavailable");
         }
@@ -657,6 +704,7 @@ struct QwenEngine::Impl {
             mtp_position = position;
         }
         if (dspark_enabled) dspark->crop_context(position);
+        if (dflash2_enabled) dflash2->crop_context(position);
     }
 
     QwenRecurrentSnapshot capture_recurrent_state(
@@ -763,6 +811,14 @@ struct QwenEngine::Impl {
             } else {
                 throw std::runtime_error(
                     "Qwen DSpark snapshot exceeds committed context");
+            }
+        }
+        if (dflash2_enabled) {
+            if (snapshot.position <= dflash2->committed_position()) {
+                dflash2->crop_context(snapshot.position);
+            } else {
+                throw std::runtime_error(
+                    "Qwen DFlash2 snapshot exceeds committed context");
             }
         }
         size_t state_offset = 0;
@@ -891,15 +947,66 @@ struct QwenEngine::Impl {
             snapshots.end());
     }
 
+    // Opt-in prefill phase attribution. Each scope synchronises the device, so it
+    // is only ever enabled for profiling runs; the default path adds no sync.
+    bool phase_profile = qwen_env_enabled("QWEN_PHASE_PROFILE");
+    std::map<std::string, double> phase_seconds;
+    std::map<std::string, uint64_t> phase_calls;
+
+    class PhaseScope {
+    public:
+        PhaseScope(Impl* owner, const char* name) : owner_(owner), name_(name) {
+            if (owner_->phase_profile) {
+                cudaDeviceSynchronize();
+                started_ = std::chrono::steady_clock::now();
+            }
+        }
+        ~PhaseScope() {
+            if (owner_->phase_profile) {
+                cudaDeviceSynchronize();
+                owner_->phase_seconds[name_] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started_).count();
+                ++owner_->phase_calls[name_];
+            }
+        }
+        PhaseScope(const PhaseScope&) = delete;
+        PhaseScope& operator=(const PhaseScope&) = delete;
+
+    private:
+        Impl* owner_;
+        std::string name_;
+        std::chrono::steady_clock::time_point started_;
+    };
+
+    void report_phase_profile(const char* tag) const {
+        if (!phase_profile) return;
+        double total = 0.0;
+        for (const auto& entry : phase_seconds) total += entry.second;
+        for (const auto& entry : phase_seconds) {
+            std::cout << "qwen_phase tag=" << tag << " rank=" << options.tp_rank
+                      << " phase=" << entry.first
+                      << " seconds=" << entry.second
+                      << " calls=" << phase_calls.at(entry.first)
+                      << " share=" << (total > 0.0 ? entry.second / total : 0.0)
+                      << "\n";
+        }
+        std::cout << "qwen_phase tag=" << tag << " rank=" << options.tp_rank
+                  << " phase=TOTAL seconds=" << total << "\n";
+        std::cout.flush();
+    }
+
     void all_reduce_half(uint16_t* values, int count) {
         if (options.tp_world == 1) return;
 #ifdef DSV4_HAVE_NCCL
         if (options.nccl_id_path.empty()) {
             throw std::runtime_error("Qwen TP requires --nccl-id-path");
         }
-        nccl_all_reduce_sum_f16_inplace(
-            options.tp_world, options.tp_rank, options.device,
-            options.nccl_id_path.c_str(), values, count);
+        {
+            PhaseScope scope(this, "tp_all_reduce");
+            nccl_all_reduce_sum_f16_inplace(
+                options.tp_world, options.tp_rank, options.device,
+                options.nccl_id_path.c_str(), values, count);
+        }
 #else
         (void)values;
         (void)count;
@@ -909,6 +1016,7 @@ struct QwenEngine::Impl {
 
     void projection(const DeviceLinear& linear, const uint16_t* input,
                     uint16_t* output, int rows) {
+        PhaseScope scope(this, rows == 1 ? "projection_decode" : "projection_rows");
         const int output_rows = static_cast<int>(linear.weight.shape[0]);
         const int columns = static_cast<int>(linear.weight.shape[1]);
         if (linear.fp8) {
@@ -1011,10 +1119,12 @@ struct QwenEngine::Impl {
             rows, value_heads), "FP16 linear attention gates");
         const float q_scale = 1.0f / std::sqrt(
             static_cast<float>(config.linear_attention.key_head_dim));
+        std::optional<PhaseScope> delta_scope;
+        delta_scope.emplace(this, "gated_delta");
         const bool sequenced = rows > 1 && qwen_gated_delta_sequence_f16_cuda(
             layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
-            v.f16_data(), gates.f16_data(), beta.f16_data(), core.f16_data(),
-            rows, value_heads, key_heads,
+            v.f16_data(), gates.f16_data(), beta.f16_data(),
+            core.f16_data(), rows, value_heads, key_heads,
             static_cast<int>(config.linear_attention.key_head_dim),
             static_cast<int>(config.linear_attention.value_head_dim), q_scale);
         for (int token = 0; !sequenced && token < rows; ++token) {
@@ -1031,6 +1141,7 @@ struct QwenEngine::Impl {
                 static_cast<int>(config.linear_attention.value_head_dim), q_scale),
                 "FP16 linear recurrent state");
         }
+        delta_scope.reset();
         projection(layer.linear.z, hidden, z.f16_data(), rows);
         require_launch(qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
             core.f16_data(), layer.linear.norm.f16_data(), z.f16_data(),
@@ -1045,6 +1156,7 @@ struct QwenEngine::Impl {
 
     void full_attention(DeviceLayer& layer, const uint16_t* hidden,
                         uint16_t* output, int rows, int position_offset) {
+        PhaseScope scope(this, "full_attention");
         const int q_heads = static_cast<int>(
             config.full_attention.num_heads / options.tp_world);
         const int kv_heads = static_cast<int>(
@@ -1326,10 +1438,18 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& local_logits = workspace_float(
             static_cast<size_t>(rows) * local_vocab,
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
-        require_launch(qwen_fp16_matmul_rows_f16_f32_cuda(
-            normalized.f16_data(), lm_head.f16_data(), local_logits.f32_data(),
-            rows, local_vocab, hidden_size, hidden_size, local_vocab,
-            hidden_size), "Qwen batched FP32 logits");
+        const bool cublas_logits = rows > 1 &&
+            qwen_env_enabled("QWEN_FP16_LOGITS_CUBLAS");
+        require_launch(cublas_logits
+            ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+                  normalized.f16_data(), lm_head.f16_data(),
+                  local_logits.f32_data(), rows, local_vocab, hidden_size,
+                  hidden_size, local_vocab, hidden_size)
+            : qwen_fp16_matmul_rows_f16_f32_cuda(
+                  normalized.f16_data(), lm_head.f16_data(),
+                  local_logits.f32_data(), rows, local_vocab, hidden_size,
+                  hidden_size, local_vocab, hidden_size),
+            "Qwen batched FP32 logits");
         allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
         allocate_float(argmax_logit, static_cast<size_t>(rows),
@@ -1552,6 +1672,115 @@ struct QwenEngine::Impl {
         return drafts;
     }
 
+    QwenForwardResult dflash2_speculative_step(int input_token,
+                                               QwenMtpStats* stats) {
+        if (!dflash2_enabled) {
+            throw std::runtime_error("Qwen DFlash2 speculative step is disabled");
+        }
+        const int committed_position = dflash2->committed_position();
+        prepare_transaction_state();
+        const auto draft_started = std::chrono::steady_clock::now();
+        const QwenDFlash2Proposal proposal = dflash2->propose(input_token);
+        // The 48 gated-delta layers recur sequentially across verify rows, so a
+        // verify block costs close to linearly in its width. When acceptance runs
+        // well below the full seven drafts the tail rows are paid for and then
+        // discarded, so allow the block to be capped. 0 keeps the full proposal.
+        std::vector<int> draft_tokens_used = proposal.tokens;
+        int width_limit = dflash2_draft_width;
+        if (dflash2_adaptive_width) {
+            // Verify one row past the accepted-count average, floored at two so a
+            // recovering prompt can always re-earn width, and never above the
+            // explicit cap when both are set.
+            const int adaptive =
+                dflash2_width_samples == 0
+                    ? static_cast<int>(proposal.tokens.size())
+                    : std::max(2, static_cast<int>(dflash2_accept_ewma + 1.5));
+            width_limit = width_limit > 0 ? std::min(width_limit, adaptive) : adaptive;
+        }
+        if (width_limit > 0 &&
+            static_cast<int>(draft_tokens_used.size()) > width_limit) {
+            draft_tokens_used.resize(static_cast<size_t>(width_limit));
+        }
+        if (stats != nullptr) {
+            stats->draft_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - draft_started).count();
+            stats->proposed_drafts += draft_tokens_used.size();
+        }
+        std::vector<int> verify_inputs;
+        verify_inputs.reserve(draft_tokens_used.size() + 1);
+        verify_inputs.push_back(input_token);
+        verify_inputs.insert(verify_inputs.end(), draft_tokens_used.begin(),
+                             draft_tokens_used.end());
+        QwenVerifyBatch verify;
+        const auto verify_started = std::chrono::steady_clock::now();
+        (void)run_chunk(verify_inputs, committed_position,
+                        static_cast<int>(layers.size()), false, &verify);
+        if (stats != nullptr) {
+            stats->verify_seconds += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - verify_started).count();
+            ++stats->verify_count;
+        }
+        int correct = 0;
+        while (correct < static_cast<int>(draft_tokens_used.size()) &&
+               verify.top_tokens[static_cast<size_t>(correct)] ==
+                   draft_tokens_used[static_cast<size_t>(correct)]) {
+            ++correct;
+        }
+        if (stats != nullptr) stats->correct_drafts += static_cast<uint64_t>(correct);
+        if (dflash2_adaptive_width) {
+            // A block that accepted every row it verified is censored: the true
+            // acceptance may be higher, so credit it one extra row to let the
+            // width grow back. Otherwise `correct` is the exact observation.
+            const double observed =
+                correct == static_cast<int>(draft_tokens_used.size())
+                    ? static_cast<double>(correct) + 1.0
+                    : static_cast<double>(correct);
+            constexpr double kAlpha = 0.25;
+            dflash2_accept_ewma = dflash2_width_samples == 0
+                                      ? observed
+                                      : dflash2_accept_ewma +
+                                            kAlpha * (observed - dflash2_accept_ewma);
+            ++dflash2_width_samples;
+        }
+        const size_t bonus_row = static_cast<size_t>(correct);
+        const int bonus = verify.top_tokens[bonus_row];
+        const float bonus_logit = verify.top_logits[bonus_row];
+        const float bonus_checksum = verify.local_logits[bonus_row];
+        if (correct != static_cast<int>(draft_tokens_used.size())) {
+            if (stats != nullptr) {
+                ++stats->rollback_count;
+                stats->replay_tokens += static_cast<uint64_t>(correct + 1);
+            }
+            const auto replay_started = std::chrono::steady_clock::now();
+            restore_transaction_state(committed_position);
+            std::vector<int> replay(verify_inputs.begin(),
+                                    verify_inputs.begin() + correct + 1);
+            (void)run_chunk(replay, committed_position,
+                            static_cast<int>(layers.size()), false);
+            if (stats != nullptr) {
+                stats->replay_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - replay_started).count();
+            }
+        }
+        QwenForwardResult result;
+        result.top_token = bonus;
+        result.bonus_token = bonus;
+        result.correct_drafts = correct;
+        result.accept_tokens.assign(draft_tokens_used.begin(),
+                                    draft_tokens_used.begin() + correct);
+        result.accept_logits.assign(verify.top_logits.begin(),
+                                    verify.top_logits.begin() + correct);
+        result.accept_checksums.assign(verify.local_logits.begin(),
+                                      verify.local_logits.begin() + correct);
+        result.layers = static_cast<int>(layers.size());
+        result.dim = static_cast<int>(config.hidden_size);
+        result.logits = static_cast<int>(config.vocab_size);
+        result.top_logit = bonus_logit;
+        result.checksum = bonus_checksum;
+        result.position = dflash2->committed_position();
+        return result;
+    }
+
     QwenForwardResult dspark_speculative_step(int input_token,
                                               QwenMtpStats* stats) {
         if (!dspark_enabled) {
@@ -1765,6 +1994,12 @@ struct QwenEngine::Impl {
         uint16_t* output = hidden_b.f16_data();
         const int dspark_tap_count = dspark_enabled
             ? static_cast<int>(dspark_config->target_layer_ids.size()) : 0;
+        const std::vector<int>* dflash2_tap_layers = dflash2_enabled
+            ? &dflash2_config->target_layer_ids
+            : (!dflash2_debug_target_layer_ids.empty()
+                   ? &dflash2_debug_target_layer_ids : nullptr);
+        const int dflash2_tap_count = dflash2_tap_layers != nullptr
+            ? static_cast<int>(dflash2_tap_layers->size()) : 0;
         if (dspark_enabled) {
             allocate_half(
                 dspark_target_taps,
@@ -1772,7 +2007,15 @@ struct QwenEngine::Impl {
                 {static_cast<uint64_t>(rows),
                  static_cast<uint64_t>(hidden_size * dspark_tap_count)});
         }
+        if (dflash2_tap_count != 0) {
+            allocate_half(
+                dflash2_target_taps,
+                static_cast<size_t>(rows) * hidden_size * dflash2_tap_count,
+                {static_cast<uint64_t>(rows),
+                 static_cast<uint64_t>(hidden_size * dflash2_tap_count)});
+        }
         int dspark_tap_index = 0;
+        int dflash2_tap_index = 0;
         for (int layer_index = 0; layer_index < active_layers; ++layer_index) {
             layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
                           output, rows, position_offset);
@@ -1781,19 +2024,27 @@ struct QwenEngine::Impl {
                 layer_index == dspark_config->target_layer_ids[
                     static_cast<size_t>(dspark_tap_index)]) {
                 // Store [row, tap, hidden] as the row-major concat expected by
-                // fc.weight [hidden, tap_count * hidden].
-                for (int row = 0; row < rows; ++row) {
-                    uint16_t* destination = dspark_target_taps.f16_data() +
-                        (static_cast<size_t>(row) * dspark_tap_count +
-                         dspark_tap_index) * hidden_size;
-                    check_cuda(cudaMemcpy(
-                        destination,
-                        hidden + static_cast<size_t>(row) * hidden_size,
-                        static_cast<size_t>(hidden_size) * sizeof(uint16_t),
-                        cudaMemcpyDeviceToDevice),
-                        "Qwen DSpark target tap copy");
-                }
+                // fc.weight [hidden, tap_count * hidden]. One pitched copy keeps
+                // the exact layout without issuing one CUDA copy per target row.
+                require_launch(qwen_copy_rows_strided_f16_cuda(
+                    hidden, hidden_size,
+                    dspark_target_taps.f16_data() +
+                        static_cast<size_t>(dspark_tap_index) * hidden_size,
+                    dspark_tap_count * hidden_size, rows, hidden_size),
+                    "Qwen DSpark target tap copy");
                 ++dspark_tap_index;
+            }
+            if (dflash2_tap_layers != nullptr &&
+                dflash2_tap_index < dflash2_tap_count &&
+                layer_index == (*dflash2_tap_layers)[
+                    static_cast<size_t>(dflash2_tap_index)]) {
+                require_launch(qwen_copy_rows_strided_f16_cuda(
+                    hidden, hidden_size,
+                    dflash2_target_taps.f16_data() +
+                        static_cast<size_t>(dflash2_tap_index) * hidden_size,
+                    dflash2_tap_count * hidden_size, rows, hidden_size),
+                    "Qwen DFlash2 target tap copy");
+                ++dflash2_tap_index;
             }
         }
         if (dspark_enabled) {
@@ -1810,6 +2061,33 @@ struct QwenEngine::Impl {
             }
             dspark->append_target_taps(dspark_target_taps.f16_data(), rows,
                                        position_offset);
+        }
+        if (dflash2_tap_layers != nullptr) {
+            if (dflash2_tap_index != dflash2_tap_count) {
+                throw std::runtime_error("Qwen DFlash2 target taps were not captured");
+            }
+            if (dflash2_enabled) {
+                if (dflash2->committed_position() != position_offset) {
+                    if (position_offset <= dflash2->committed_position()) {
+                        dflash2->crop_context(position_offset);
+                    } else {
+                        throw std::runtime_error(
+                            "Qwen DFlash2 target context has a position gap");
+                    }
+                }
+                dflash2->append_target_taps(dflash2_target_taps.f16_data(), rows,
+                                            position_offset);
+            } else if (dflash2_target_debug_callback) {
+                QwenDFlash2DebugTensor tensor;
+                tensor.name = "target_taps";
+                tensor.dtype = QwenDFlash2DebugDType::F16;
+                tensor.shape = dflash2_target_taps.shape;
+                tensor.bytes.resize(static_cast<size_t>(dflash2_target_taps.nbytes));
+                check_cuda(cudaMemcpy(tensor.bytes.data(), dflash2_target_taps.data,
+                                      tensor.bytes.size(), cudaMemcpyDeviceToHost),
+                           "Qwen DFlash2 target tap debug copy");
+                dflash2_target_debug_callback(tensor);
+            }
         }
         if (mtp_enabled) {
             allocate_half(target_hidden_rows, hidden_elements, hidden_shape);
@@ -1873,8 +2151,9 @@ struct QwenEngine::Impl {
                mtp_normalized_hidden.capacity + mtp_concat.capacity +
                mtp_fused.capacity + mtp_next_hidden.capacity +
                mtp_normalized_output.capacity + dspark_target_taps.capacity +
-               workspace.capacity_bytes() +
-               (dspark != nullptr ? dspark->activation_workspace_bytes() : 0);
+               dflash2_target_taps.capacity + workspace.capacity_bytes() +
+               (dspark != nullptr ? dspark->activation_workspace_bytes() : 0) +
+               (dflash2 != nullptr ? dflash2->activation_workspace_bytes() : 0);
     }
 };
 
@@ -1885,11 +2164,18 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
       config_(QwenConfig::from_hf_config(ckpt_dir)), index_(ckpt_dir),
       weights_(index_, config_, options.tp_world, options.tp_rank) {
     if (options_.device < 0) options_.device = options_.tp_rank;
-    if (options_.mtp && !options_.dspark_checkpoint.empty()) {
+    const int external_drafter_count =
+        (!options_.dspark_checkpoint.empty() ? 1 : 0) +
+        (!options_.dflash2_checkpoint.empty() ? 1 : 0);
+    if (options_.mtp && external_drafter_count != 0) {
         throw std::runtime_error(
-            "Qwen native MTP and external DSpark are mutually exclusive");
+            "Qwen native MTP cannot be combined with an external drafter");
     }
-    if ((options_.mtp || !options_.dspark_checkpoint.empty()) && layer_count > 0 &&
+    if (external_drafter_count > 1) {
+        throw std::runtime_error(
+            "Qwen DSpark and DFlash2 are mutually exclusive");
+    }
+    if ((options_.mtp || external_drafter_count != 0) && layer_count > 0 &&
         layer_count != static_cast<int>(config_.num_hidden_layers)) {
         throw std::runtime_error(
             "Qwen speculative decoding requires the complete target model; partial "
@@ -1949,6 +2235,43 @@ uint64_t QwenEngine::kv_cache_scale_bytes() const {
     return impl_->cache_scale_bytes;
 }
 
+void QwenEngine::set_dflash2_debug_callback(
+    QwenDFlash2DebugCallback callback) {
+    if (!impl_->dflash2_enabled || impl_->dflash2 == nullptr) {
+        throw std::runtime_error("Qwen DFlash2 debug callback requires --qwen-dflash2");
+    }
+    impl_->dflash2->set_debug_callback(std::move(callback));
+}
+
+QwenForwardResult QwenEngine::debug_prefill_dflash2(
+    const std::vector<int>& token_ids,
+    const std::vector<int>& target_layer_ids,
+    QwenDFlash2DebugCallback callback) {
+    if (!callback || target_layer_ids.empty()) {
+        throw std::runtime_error("Qwen DFlash2 debug prefill requires target taps");
+    }
+    int previous = -1;
+    for (int layer : target_layer_ids) {
+        if (layer <= previous || layer < 0 || layer >= active_layers_) {
+            throw std::runtime_error("invalid Qwen DFlash2 debug target layer IDs");
+        }
+        previous = layer;
+    }
+    clear_prefix_cache();
+    impl_->dflash2_debug_target_layer_ids = target_layer_ids;
+    impl_->dflash2_target_debug_callback = std::move(callback);
+    try {
+        QwenForwardResult result = prefill(token_ids);
+        impl_->dflash2_debug_target_layer_ids.clear();
+        impl_->dflash2_target_debug_callback = {};
+        return result;
+    } catch (...) {
+        impl_->dflash2_debug_target_layer_ids.clear();
+        impl_->dflash2_target_debug_callback = {};
+        throw;
+    }
+}
+
 void QwenEngine::warmup_tp() {
     if (options_.tp_world == 1) return;
     QwenDeviceTensor scratch;
@@ -1986,6 +2309,8 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
 
     prefix_stats_ = QwenPrefixCacheStats{};
     prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
+    impl_->phase_seconds.clear();
+    impl_->phase_calls.clear();
     const bool can_reuse = options_.prefix_cache &&
         !impl_->cached_prompt.empty() && position_ ==
             static_cast<int>(impl_->cached_prompt.size());
@@ -2090,10 +2415,17 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
                 end = next_snapshot;
             }
         }
+        const bool periodic_snapshot =
+            impl_->is_periodic_snapshot_position(end);
+        // Periodic snapshots may later serve an exact shorter-prefix request.
+        // Keep the final-row logits with those snapshots so restoring one does
+        // not have to recompute the whole prefix just to recover its result.
+        const bool snapshot_result = end == target_position || periodic_snapshot;
         std::vector<int> chunk(
             token_ids.begin() + static_cast<ptrdiff_t>(offset),
             token_ids.begin() + static_cast<ptrdiff_t>(end));
         if (options_.mtp) {
+
             std::vector<int> shifted;
             shifted.reserve(chunk.size());
             for (int position = offset; position < end; ++position) {
@@ -2109,19 +2441,17 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
                 shifted.back() = result.top_token;
                 (void)impl_->prime_target_mtp(shifted, offset);
             } else {
-                result = impl_->run_chunk(chunk, offset, active_layers_, false,
-                                          nullptr, &shifted);
+                result = impl_->run_chunk(chunk, offset, active_layers_,
+                                          snapshot_result, nullptr, &shifted);
             }
         } else {
             result = impl_->run_chunk(chunk, offset, active_layers_,
-                                      end == target_position);
+                                      snapshot_result);
         }
-        const bool periodic_snapshot =
-            impl_->is_periodic_snapshot_position(end);
         if (periodic_snapshot || end == target_position) {
-            impl_->record_snapshot(end, end == target_position ? &result : nullptr,
-                                   periodic_snapshot);
+            impl_->record_snapshot(end, &result, periodic_snapshot);
         }
+
         offset = end;
     }
 
@@ -2145,6 +2475,7 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
     prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
     prefix_stats_.hits = impl_->prefix_hits;
     prefix_stats_.misses = impl_->prefix_misses;
+    impl_->report_phase_profile("prefill");
     return result;
 }
 
@@ -2181,13 +2512,19 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     QwenForwardResult next = prefill(prompt_ids);
     mtp_stats_.prefill_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prefill_started).count();
+    // Prefill already reported; reset so the decode/verify phases are attributed
+    // on their own rather than buried under the prompt pass.
+    impl_->phase_seconds.clear();
+    impl_->phase_calls.clear();
     std::vector<QwenForwardResult> results;
     results.reserve(static_cast<size_t>(max_new_tokens));
-    if (!options_.mtp && options_.dspark_checkpoint.empty()) {
+    if (!options_.mtp && options_.dspark_checkpoint.empty() &&
+        options_.dflash2_checkpoint.empty()) {
         for (int index = 0; index < max_new_tokens; ++index) {
             results.push_back(next);
             if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
         }
+        impl_->report_phase_profile("decode");
         return results;
     }
 
@@ -2198,9 +2535,11 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     results.push_back(next);
     int current_token = next.top_token;
     const bool use_dspark = !options_.dspark_checkpoint.empty();
-    const int max_draft_tokens = use_dspark
+    const bool use_dflash2 = !options_.dflash2_checkpoint.empty();
+    const bool use_external_drafter = use_dspark || use_dflash2;
+    const int max_draft_tokens = use_external_drafter
         ? 7 : std::max(1, options_.mtp_speculative_tokens);
-    int adaptive_draft_tokens = use_dspark
+    int adaptive_draft_tokens = use_external_drafter
         ? 7 : (options_.mtp_adaptive ? 1 : max_draft_tokens);
     int full_accept_streak = 0;
     while (static_cast<int>(results.size()) < max_new_tokens) {
@@ -2210,7 +2549,7 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             results.push_back(next);
             break;
         }
-        if (use_dspark && remaining < 8) {
+        if (use_external_drafter && remaining < 8) {
             // The published checkpoint is trained for a fixed seven-row block;
             // use exact plain decode for a short output tail rather than changing
             // its attention semantics or returning unnecessary tokens.
@@ -2222,11 +2561,15 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             break;
         }
         const int proposed = std::min(adaptive_draft_tokens, remaining - 1);
-        next = use_dspark
-            ? impl_->dspark_speculative_step(current_token, &mtp_stats_)
-            : impl_->speculative_step(current_token, proposed, &mtp_stats_);
+        if (use_dspark) {
+            next = impl_->dspark_speculative_step(current_token, &mtp_stats_);
+        } else if (use_dflash2) {
+            next = impl_->dflash2_speculative_step(current_token, &mtp_stats_);
+        } else {
+            next = impl_->speculative_step(current_token, proposed, &mtp_stats_);
+        }
         const int correct = next.correct_drafts;
-        if (!use_dspark && options_.mtp_adaptive) {
+        if (!use_external_drafter && options_.mtp_adaptive) {
             if (correct == proposed) {
                 ++full_accept_streak;
                 if (full_accept_streak >= 1 &&
@@ -2266,6 +2609,7 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         }
         current_token = next.bonus_token;
     }
+    impl_->report_phase_profile("spec_decode");
     return results;
 }
 

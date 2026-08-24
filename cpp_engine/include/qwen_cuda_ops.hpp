@@ -52,6 +52,107 @@ bool qwen_dspark_confidence_f16_cuda(
     float* d_confidence, int rows, int hidden_size, int markov_rank,
     void* stream = nullptr);
 
+// DFlash2 draft primitives. Convolution and attention preserve the
+// reference's block-local zero padding and non-causal block visibility.
+bool qwen_dflash2_f16_to_f32_cuda(
+    const uint16_t* d_input_fp16, float* d_output_f32, int count,
+    void* stream = nullptr);
+bool qwen_dflash2_rmsnorm_f32_f16_cuda(
+    const float* d_input_f32, const uint16_t* d_gamma_fp16,
+    uint16_t* d_output_fp16, int rows, int columns, float eps,
+    void* stream = nullptr);
+bool qwen_dflash2_add_f32_cuda(
+    float* d_output_f32, const float* d_input_f32, int count,
+    void* stream = nullptr);
+bool qwen_dflash2_grouped_dynamic_conv_f16_cuda(
+    const uint16_t* d_hidden_fp16, const uint16_t* d_dynamic_fp16,
+    const uint16_t* d_base_fp16, uint16_t* d_output_fp16, int rows,
+    int hidden_size, int groups, int group_size, int kernel_size,
+    void* stream = nullptr);
+bool qwen_dflash2_grouped_dynamic_conv_strided_f16_cuda(
+    const uint16_t* d_hidden_fp16, const uint16_t* d_dynamic_fp16,
+    const uint16_t* d_base_fp16, uint16_t* d_output_fp16, int rows,
+    int hidden_size, int groups, int group_size, int kernel_size,
+    int dynamic_row_stride, int dynamic_offset, void* stream = nullptr);
+bool qwen_dflash2_grouped_dynamic_conv_strided_f32_cuda(
+    const float* d_hidden_f32, const uint16_t* d_dynamic_fp16,
+    const uint16_t* d_base_fp16, float* d_output_f32, int rows,
+    int hidden_size, int groups, int group_size, int kernel_size,
+    int dynamic_row_stride, int dynamic_offset, void* stream = nullptr);
+bool qwen_dflash2_rmsnorm_heads_f16_cuda(
+    const uint16_t* d_input_fp16, const uint16_t* d_gamma_fp16,
+    uint16_t* d_output_fp16, int rows, int heads, int head_dim,
+    float eps, void* stream = nullptr);
+bool qwen_dflash2_rope_rows_f16_cuda(
+    uint16_t* d_q_fp16, uint16_t* d_k_fp16, int rows, int q_heads,
+    int kv_heads, int head_dim, int start_position, float theta,
+    void* stream = nullptr);
+bool qwen_dflash2_rope_k_rows_f16_cuda(
+    uint16_t* d_k_fp16, int rows, int kv_heads, int head_dim,
+    int start_position, float theta, void* stream = nullptr);
+bool qwen_dflash2_attention_f16_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_context_k_fp16,
+    const uint16_t* d_context_v_fp16, const uint16_t* d_block_k_fp16,
+    const uint16_t* d_block_v_fp16, uint16_t* d_output_fp16, int block_rows,
+    int q_heads, int kv_heads, int head_dim, int context_len, int max_context,
+    int sliding_window, void* stream = nullptr);
+bool qwen_dflash2_attention_grouped_f16_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_context_k_fp16,
+    const uint16_t* d_context_v_fp16, const uint16_t* d_block_k_fp16,
+    const uint16_t* d_block_v_fp16, uint16_t* d_output_fp16, int block_rows,
+    int q_heads, int kv_heads, int head_dim, int context_len, int max_context,
+    int sliding_window, void* stream = nullptr);
+bool qwen_dflash2_local_topk_f32_cuda(
+    const float* d_logits, int* d_tokens, float* d_values, int rows,
+    int vocab, int vocab_start, int top_k, void* stream = nullptr);
+// Split variant. The single-block-per-row kernel launches only `rows` blocks, so
+// on a 68-SM device the seven DFlash2 rows leave the GPU ~90% idle while each
+// thread carries a spilling top_k register array. This partitions each row's
+// vocabulary across `splits` blocks, then merges the partial lists with the same
+// descending-logit / ascending-token comparator, so the result is bit-identical.
+// `d_partial_tokens` and `d_partial_values` must hold rows * splits * top_k.
+bool qwen_dflash2_local_topk_split_f32_cuda(
+    const float* d_logits, int* d_partial_tokens, float* d_partial_values,
+    int* d_tokens, float* d_values, int rows, int vocab, int vocab_start,
+    int top_k, int splits, void* stream = nullptr);
+// Merge the world-major NCCL all-gathered local top-k rows on device. The
+// comparator is identical to local_topk: descending logit, ascending token.
+bool qwen_dflash2_merge_topk_f32_cuda(
+    const int* d_gathered_tokens, const float* d_gathered_logits,
+    int* d_tokens, float* d_values, int world, int rows, int top_k,
+    void* stream = nullptr);
+bool qwen_dflash2_selector_path_f16_cuda(
+    const uint16_t* d_hidden_fp16, const int* d_candidates,
+    const float* d_unary, const uint16_t* d_predecessor,
+    const uint16_t* d_successor, const uint16_t* d_projection, int* d_output,
+    int rows, int vocab, int hidden_size, int rank, int top_k,
+    int anchor_token, void* stream = nullptr);
+bool qwen_dflash2_selector_path_projected_f16_cuda(
+    const float* d_projected, const int* d_candidates,
+    const float* d_unary, const uint16_t* d_predecessor,
+    const uint16_t* d_successor, int* d_output, int rows, int vocab,
+    int rank, int top_k, int anchor_token, void* stream = nullptr);
+// Exact-MAP selector. The projected selector score is a first-order chain over
+// positions -- unary(position, token) plus a pairwise term that depends only on
+// (previous token, token) -- so the greedy left-to-right argmax can sacrifice a
+// whole suffix for a small gain at one position. This runs Viterbi over the same
+// scores and returns the highest-scoring complete path. The score function, its
+// FP32 accumulation order and the descending-score / ascending-token tie-break
+// are identical to the greedy kernel, so with top_k=1 the two agree exactly.
+// Draft content is a heuristic the target re-verifies, so a different path can
+// only change acceptance, never emitted tokens.
+bool qwen_dflash2_selector_path_viterbi_f16_cuda(
+    const float* d_projected, const int* d_candidates,
+    const float* d_unary, const uint16_t* d_predecessor,
+    const uint16_t* d_successor, int* d_output, int rows, int vocab,
+    int rank, int top_k, int anchor_token, void* stream = nullptr);
+bool qwen_dflash2_selector_project_f16_cuda(
+    const uint16_t* d_hidden_fp16, const uint16_t* d_projection_fp16,
+    float* d_output, int rows, int hidden_size, int rank,
+    void* stream = nullptr);
+
+
+
 // Qwen FP8 weights use E4M3 codes and 128x128 block scales. On Turing,
 // checkpoint BF16 scales are converted to IEEE FP16 before device upload.
 // These kernels decode each code at the point of use; no expanded copy of the
@@ -151,6 +252,20 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     int y_stride,
     int weight_stride,
     int scale_stride,
+    void* stream = nullptr);
+
+// FP16 input/weight tensor-op GEMM with FP32 output. This is kept separate from
+// the exact reduction-order reference path and enabled only by runtime A/B gates.
+bool qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+    const uint16_t* d_x_fp16,
+    const uint16_t* d_weight_fp16,
+    float* d_y_fp32,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
     void* stream = nullptr);
 
 // Explicit experimental prefill path used by correctness/performance A/B.
@@ -330,7 +445,6 @@ bool qwen_dspark_fp16_gemm_rows_f16_cuda(
     const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
     uint16_t* d_y_fp16, int batch, int output_rows, int columns,
     void* stream = nullptr);
-
 bool qwen_fp16_matmul_rows_f16_cuda(const uint16_t* d_x_fp16,
                                     const uint16_t* d_w_fp16,
                                     uint16_t* d_y_fp16, int batch, int rows,
@@ -341,6 +455,14 @@ bool qwen_fp16_matmul_rows_f16_f32_cuda(const uint16_t* d_x_fp16,
                                         float* d_y, int batch, int rows,
                                         int cols, int x_stride, int y_stride,
                                         int weight_stride, void* stream = nullptr);
+// Fused FP16 gate/up projections and SiLU multiplication for small batches.
+// The output is [batch, rows] with the supplied row strides.
+bool qwen_fp16_swiglu_matmul_rows_f16_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_gate_fp16,
+    const uint16_t* d_up_fp16, uint16_t* d_y_fp16, int batch, int rows,
+    int cols, int x_stride, int y_stride, int weight_stride,
+    void* stream = nullptr);
+
 bool qwen_embedding_fp16_gather_f16_cuda(const uint16_t* d_table_fp16,
                                          const int* d_tokens,
                                          uint16_t* d_out_fp16, int count,
@@ -349,6 +471,12 @@ bool qwen_embedding_fp16_gather_f16_cuda(const uint16_t* d_table_fp16,
 bool qwen_concat_rows_f16_cuda(const uint16_t* d_left, const uint16_t* d_right,
                                uint16_t* d_out, int rows, int cols,
                                void* stream = nullptr);
+// Copies a contiguous column range from every source row into a strided
+// destination. Pitches and width are expressed in FP16 elements.
+bool qwen_copy_rows_strided_f16_cuda(
+    const uint16_t* d_source_fp16, int source_row_stride,
+    uint16_t* d_destination_fp16, int destination_row_stride,
+    int rows, int columns, void* stream = nullptr);
 bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(const uint16_t* d_x_fp16,
                                            const uint16_t* d_gamma_fp16,
                                            uint16_t* d_y_fp16, int rows,

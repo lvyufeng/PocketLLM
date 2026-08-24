@@ -200,6 +200,67 @@ for dtype in fp16 fp8; do
 done
 ```
 
+### External DFlash2 speculative decoding
+
+The external draft checkpoint is supported as an explicit opt-in:
+
+```bash
+--qwen-dflash2 /path/to/Qwen3.8-27B-DFlash2
+```
+
+The directory must contain its `config.json` and single `model.safetensors`. The runtime validates all 81 expected tensors and adds `1,450,191,360` sharded plus `3,848,808,960` replicated device bytes per rank. `--qwen-dspark` and `--qwen-dflash2` are mutually exclusive, and neither can be combined with native MTP.
+
+The checkpoint fixes `block_size=8` with `target_layer_ids = [5,19,33,47,61]`, a five-layer sliding-attention backbone (`sliding_window=2048`), `selector_rank=256`, and `selector_top_k=16`. Each transaction drafts up to seven tokens and verifies eight target rows. Partial rejection restores DeltaNet recurrent state and convolution tails, crops logical K/V to the committed position, and replays only the accepted prefix.
+
+Unlike DSpark, DFlash2's residual and MLP `down` outputs exceed the FP16 range: a pure FP16 residual overflows in the first layer and produces NaN. The working SM75 mixed precision keeps the residual, `down` output, and finish convolution in FP32 while `gate`/`up`/SwiGLU stay in cuBLAS FP16, converting back to FP16 after each layer norm for attention and dynamic projection. All DFlash2 RMSNorms are standard direct-gamma, not the target's `(1 + gamma)`.
+
+Real TP4, full-model, FP16-target-KV A/B results with serial plain-then-DFlash2 execution and exact cross-mode plus all-rank token checks:
+
+| Fixture | Plain wall | DFlash2 wall | Wall speedup | Decode speedup | Accept length | Parity |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Synthetic 512, 512 new | 14.510 s | 5.228 s | **2.776x** | **3.017x** | 8 / 8 | PASS |
+| Synthetic 4,096, 512 new | 21.019 s | 9.307 s | 2.259x | 3.104x | 8 / 8 | PASS |
+| Synthetic 8,192, 512 new | 30.539 s | 15.677 s | 1.951x | 3.400x | 8 / 8 | PASS |
+| GSM8K, 8 prompts, 256 new | 57.595 s | 43.356 s | **1.328x** | 1.300x | 2.87 – 4.40 | PASS 8/8 |
+
+Decode-phase speedup lands inside upstream's published 2.67–3.43x band on all three synthetic lengths. Upstream defines speedup as a per-token decoding latency ratio, so a full-request wall ratio is not the same metric: prefill is shared identically by both modes and caps the 8,192 case at 1.95x regardless of drafter quality.
+
+GSM8K acceptance is far lower (0.55–0.71 per-draft rate) and per-prompt wall speedup tracks it directly, from 1.13x to 1.57x. Verify cost is roughly linear in block width because the 48 gated-delta layers recur sequentially over rows, so a full-width block pays for and discards the rejected tail. `DSV4_DFLASH2_ADAPTIVE_WIDTH=1` tracks an EWMA of accepted count and verifies `ewma + 1.5` rows with a floor of two, which keeps the fully-accepted synthetic cases at width 8 while lifting the low-acceptance GSM8K case. A fixed width cannot serve both: at width 7 GSM8K regresses to 0.86x, and at width 2 the synthetic gains are discarded.
+
+Four flags are opt-in and all four were enabled for the results above:
+
+| Flag | Effect |
+| --- | --- |
+| `DSV4_DFLASH2_CUBLAS_FP32=1` | Routes the target LM head through cuBLAS FP32; the head is 55% of draft cost and this makes it ~10x faster |
+| `DSV4_DFLASH2_ADAPTIVE_WIDTH=1` | EWMA-driven verify width, as above |
+| `DSV4_DFLASH2_SPLIT_TOPK=1` | Partitions each row's local top-16 shard and merges with the identical comparator |
+| `DSV4_QWEN_GQA_OPTIMIZED=1` | Selects the tiled GQA prefill kernel; long prefill is 64% full-attention, not FP8 GEMM |
+
+`DSV4_DFLASH2_VITERBI_SELECTOR=1` computes an exact MAP over the selector chain instead of greedy argmax. It scores higher but accepts worse (3.02 to 2.95 accept length, 0.555 to 0.279 rate), so draft search is not an acceptance lever.
+
+Reproduce the synthetic serial A/B with:
+
+```bash
+DSV4_DFLASH2_CUBLAS_FP32=1 DSV4_DFLASH2_ADAPTIVE_WIDTH=1 \
+DSV4_DFLASH2_SPLIT_TOPK=1 DSV4_QWEN_GQA_OPTIMIZED=1 \
+/path/to/deepseek/bin/python scripts/bench_qwen_dflash2.py \
+  --ckpt /path/to/Qwen3.8-27B-FP8 \
+  --dflash2 /path/to/Qwen3.8-27B-DFlash2 \
+  --lengths 512,4096,8192 \
+  --max-new-tokens 512 --prefill-chunk-tokens 4096 --snapshot-interval 0
+```
+
+And the dataset-shaped single-request workload, which matches upstream's aggregate-completion protocol rather than a fixed-token microbenchmark:
+
+```bash
+DSV4_DFLASH2_CUBLAS_FP32=1 DSV4_DFLASH2_ADAPTIVE_WIDTH=1 \
+DSV4_DFLASH2_SPLIT_TOPK=1 DSV4_QWEN_GQA_OPTIMIZED=1 \
+/path/to/deepseek/bin/python scripts/bench_qwen_dflash2_upstream.py \
+  --ckpt /path/to/Qwen3.8-27B-FP8 \
+  --dflash2 /path/to/Qwen3.8-27B-DFlash2 \
+  --dataset gsm8k --num-prompts 8 --max-new-tokens 256
+```
+
 ### Exact prefix reuse
 
 `QwenEngineOptions::prefix_cache` is enabled by default for a long-lived engine. The full-attention KV cache is already indexed by absolute position, while the 48 DeltaNet layers carry a small recurrent state (`state` plus convolution tail). The engine retains both across sequential prefill requests and reports `prefix_reused_tokens`, `prefix_computed_tokens`, `prefix_matched_tokens`, and `prefix_resume_source` in the persistent stdin result.

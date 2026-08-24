@@ -60,6 +60,7 @@ struct Args {
     int qwen_mtp_tokens = 1;
     bool qwen_mtp_adaptive = false;
     std::string qwen_dspark_checkpoint;
+    std::string qwen_dflash2_checkpoint;
     bool serve = false;
     int port = 8000;
     std::string host = "0.0.0.0";
@@ -163,6 +164,8 @@ Args parse_args(int argc, char** argv) {
             args.qwen_mtp_adaptive = true;
         } else if (arg == "--qwen-dspark" && i + 1 < argc) {
             args.qwen_dspark_checkpoint = argv[++i];
+        } else if (arg == "--qwen-dflash2" && i + 1 < argc) {
+            args.qwen_dflash2_checkpoint = argv[++i];
         } else if (arg == "--serve") {
             args.serve = true;
         } else if (arg == "--port" && i + 1 < argc) {
@@ -190,9 +193,16 @@ Args parse_args(int argc, char** argv) {
     if (args.qwen_mtp_tokens <= 0) {
         throw std::runtime_error("--qwen-mtp-tokens must be positive");
     }
-    if (args.qwen_mtp && !args.qwen_dspark_checkpoint.empty()) {
+    const int external_drafter_count =
+        (!args.qwen_dspark_checkpoint.empty() ? 1 : 0) +
+        (!args.qwen_dflash2_checkpoint.empty() ? 1 : 0);
+    if (args.qwen_mtp && external_drafter_count != 0) {
         throw std::runtime_error(
-            "--qwen-dspark cannot be combined with native Qwen MTP");
+            "external Qwen drafters cannot be combined with native Qwen MTP");
+    }
+    if (external_drafter_count > 1) {
+        throw std::runtime_error(
+            "--qwen-dspark and --qwen-dflash2 are mutually exclusive");
     }
     if (!args.qwen_dspark_checkpoint.empty() &&
         (!is_dir(args.qwen_dspark_checkpoint) ||
@@ -200,6 +210,13 @@ Args parse_args(int argc, char** argv) {
          !path_exists(args.qwen_dspark_checkpoint + "/model.safetensors"))) {
         throw std::runtime_error(
             "--qwen-dspark must name a complete DSpark checkpoint directory");
+    }
+    if (!args.qwen_dflash2_checkpoint.empty() &&
+        (!is_dir(args.qwen_dflash2_checkpoint) ||
+         !path_exists(args.qwen_dflash2_checkpoint + "/config.json") ||
+         !path_exists(args.qwen_dflash2_checkpoint + "/model.safetensors"))) {
+        throw std::runtime_error(
+            "--qwen-dflash2 must name a complete DFlash2 checkpoint directory");
     }
     if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8") {
         throw std::runtime_error("--kv-cache-dtype must be fp16 or fp8");
@@ -438,6 +455,7 @@ int main(int argc, char** argv) {
                     qwen_opts.mtp_speculative_tokens = args.qwen_mtp_tokens;
                     qwen_opts.mtp_adaptive = args.qwen_mtp_adaptive;
                     qwen_opts.dspark_checkpoint = args.qwen_dspark_checkpoint;
+                    qwen_opts.dflash2_checkpoint = args.qwen_dflash2_checkpoint;
                     qwen_opts.nccl_id_path = args.nccl_id_path;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
@@ -460,8 +478,11 @@ int main(int argc, char** argv) {
                               << " mtp_tokens=" << qwen_opts.mtp_speculative_tokens
                               << " mtp_adaptive=" << (qwen_opts.mtp_adaptive ? 1 : 0)
                               << " dspark=" << (!qwen_opts.dspark_checkpoint.empty() ? 1 : 0)
+                              << " dflash2=" << (!qwen_opts.dflash2_checkpoint.empty() ? 1 : 0)
                               << " dspark_checkpoint=" << (qwen_opts.dspark_checkpoint.empty()
                                   ? "-" : qwen_opts.dspark_checkpoint)
+                              << " dflash2_checkpoint=" << (qwen_opts.dflash2_checkpoint.empty()
+                                  ? "-" : qwen_opts.dflash2_checkpoint)
                               << " snapshot_interval=" << qwen_opts.state_snapshot_interval_tokens
                               << " max_snapshots=" << qwen_opts.max_state_snapshots
                               << " prompt_tokens=" << prompt_ids.size()
@@ -517,7 +538,8 @@ int main(int argc, char** argv) {
                                 std::vector<int> generated;
                                 generated.reserve(static_cast<size_t>(max_new_tokens));
                                 if (qwen.options().mtp ||
-                                    !qwen.options().dspark_checkpoint.empty()) {
+                                    !qwen.options().dspark_checkpoint.empty() ||
+                                    !qwen.options().dflash2_checkpoint.empty()) {
                                     qwen_send_command(*channel, QwenPersistentCommand::Generate,
                                                       max_new_tokens, 0, &ids);
                                     const std::vector<dsv4::QwenForwardResult> outputs =
@@ -547,7 +569,8 @@ int main(int argc, char** argv) {
                                 const double wall_seconds =
                                     std::chrono::duration<double>(t1 - t0).count();
                                 const bool speculative = qwen.options().mtp ||
-                                    !qwen.options().dspark_checkpoint.empty();
+                                    !qwen.options().dspark_checkpoint.empty() ||
+                                    !qwen.options().dflash2_checkpoint.empty();
                                 const double prefill_seconds = speculative
                                     ? qwen.mtp_stats().prefill_seconds
                                     : plain_prefill_seconds;
@@ -581,6 +604,7 @@ int main(int argc, char** argv) {
                                           << " prefix_snapshot_bytes=" << stats.snapshot_bytes
                                           << " mtp=" << (qwen.options().mtp ? 1 : 0)
                                           << " dspark=" << (!qwen.options().dspark_checkpoint.empty() ? 1 : 0)
+                                          << " dflash2=" << (!qwen.options().dflash2_checkpoint.empty() ? 1 : 0)
                                           << " mtp_tokens=" << qwen.options().mtp_speculative_tokens
                                           << " mtp_adaptive=" << (qwen.options().mtp_adaptive ? 1 : 0)
                                           << " mtp_accept_rate=" << qwen.mtp_stats().accept_rate()
@@ -618,7 +642,8 @@ int main(int argc, char** argv) {
                         Clock::time_point t_prefill1;
                         Clock::time_point t_decode0;
                         if (qwen.options().mtp ||
-                            !qwen.options().dspark_checkpoint.empty()) {
+                            !qwen.options().dspark_checkpoint.empty() ||
+                            !qwen.options().dflash2_checkpoint.empty()) {
                             generated = qwen.generate(prompt_ids, args.max_new_tokens);
                             prefix_stats = qwen.prefix_cache_stats();
                             t_prefill1 = t_prefill0 + std::chrono::duration_cast<Clock::duration>(
@@ -678,6 +703,7 @@ int main(int argc, char** argv) {
                                   << " prefix_misses=" << prefix_stats.misses
                                   << " mtp=" << (qwen.options().mtp ? 1 : 0)
                                   << " dspark=" << (!qwen.options().dspark_checkpoint.empty() ? 1 : 0)
+                                  << " dflash2=" << (!qwen.options().dflash2_checkpoint.empty() ? 1 : 0)
                                   << " mtp_tokens=" << qwen.options().mtp_speculative_tokens
                                   << " mtp_adaptive=" << (qwen.options().mtp_adaptive ? 1 : 0)
                                   << " mtp_accept_rate=" << qwen.mtp_stats().accept_rate()
