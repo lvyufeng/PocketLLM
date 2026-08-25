@@ -58,6 +58,11 @@ struct Args {
     int qwen_max_snapshots = 82;
     bool qwen_mtp = false;
     int qwen_mtp_tokens = 1;
+    // Greedy by default so existing results stay reproducible.
+    float qwen_temperature = 0.0f;
+    float qwen_top_p = 1.0f;
+    int qwen_top_k = 20;
+    unsigned long long qwen_seed = 0;
     bool qwen_mtp_adaptive = false;
     std::string qwen_dspark_checkpoint;
     std::string qwen_dflash2_checkpoint;
@@ -162,6 +167,14 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--qwen-mtp-adaptive") {
             args.qwen_mtp = true;
             args.qwen_mtp_adaptive = true;
+        } else if (arg == "--qwen-temperature" && i + 1 < argc) {
+            args.qwen_temperature = std::stof(argv[++i]);
+        } else if (arg == "--qwen-top-p" && i + 1 < argc) {
+            args.qwen_top_p = std::stof(argv[++i]);
+        } else if (arg == "--qwen-top-k" && i + 1 < argc) {
+            args.qwen_top_k = std::stoi(argv[++i]);
+        } else if (arg == "--qwen-seed" && i + 1 < argc) {
+            args.qwen_seed = std::stoull(argv[++i]);
         } else if (arg == "--qwen-dspark" && i + 1 < argc) {
             args.qwen_dspark_checkpoint = argv[++i];
         } else if (arg == "--qwen-dflash2" && i + 1 < argc) {
@@ -457,6 +470,10 @@ int main(int argc, char** argv) {
                     qwen_opts.dspark_checkpoint = args.qwen_dspark_checkpoint;
                     qwen_opts.dflash2_checkpoint = args.qwen_dflash2_checkpoint;
                     qwen_opts.nccl_id_path = args.nccl_id_path;
+                    qwen_opts.temperature = args.qwen_temperature;
+                    qwen_opts.top_p = args.qwen_top_p;
+                    qwen_opts.top_k = args.qwen_top_k;
+                    qwen_opts.sampling_seed = args.qwen_seed;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
                         : static_cast<int>(prompt_ids.size()) + std::max(1, args.max_new_tokens);

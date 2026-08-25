@@ -4,6 +4,7 @@
 #include "qwen_cuda_ops.hpp"
 #include "qwen_dspark.hpp"
 #include "qwen_dflash2.hpp"
+#include "qwen_sampler.hpp"
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -302,6 +304,19 @@ struct QwenEngine::Impl {
     QwenDeviceTensor hidden_b;
     QwenDeviceTensor argmax_token;
     QwenDeviceTensor argmax_logit;
+    // Sampling scratch. Allocated lazily on the first sampled step so greedy
+    // runs pay nothing.
+    QwenDeviceTensor sample_cand_token;
+    QwenDeviceTensor sample_cand_logit;
+    QwenDeviceTensor sample_merged_token;
+    QwenDeviceTensor sample_merged_logit;
+    QwenDeviceTensor sample_uniforms;
+    QwenDeviceTensor sample_rng_states;
+    // Host RNG. Seeding this identically on every rank and broadcasting the
+    // drawn uniforms is what makes a TP group agree on the sampled token.
+    std::mt19937_64 sampling_rng;
+    bool sampling_rng_ready = false;
+    std::vector<float> host_uniform_scratch;
     QwenWorkspace workspace;
     uint64_t uploaded_weight_bytes = 0;
     uint64_t uploaded_scale_bytes = 0;
@@ -1414,6 +1429,126 @@ struct QwenEngine::Impl {
         add(output, mlp.f16_data(), rows * hidden_size);
     }
 
+    bool sampling_enabled() const { return options.temperature > 1.0e-5f; }
+
+    // Draw one uniform per row on the host. Every rank seeds the same generator
+    // and consumes it in the same order, so the rows match across the TP group
+    // without an extra broadcast.
+    const float* host_uniforms_for(int rows) {
+        if (!sampling_rng_ready) {
+            sampling_rng.seed(options.sampling_seed);
+            sampling_rng_ready = true;
+        }
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        host_uniform_scratch.resize(static_cast<size_t>(rows));
+        for (int i = 0; i < rows; ++i) host_uniform_scratch[i] = dist(sampling_rng);
+        return host_uniform_scratch.data();
+    }
+
+    // Device top-k -> temperature -> top-p sampling over a batch of logit rows.
+    // Under TP the vocabulary is sharded, so each rank emits its local top-k as
+    // global ids, NCCL merges the candidates, and the draw happens over the
+    // merged set with a uniform every rank already agrees on.
+    QwenVerifyBatch sample_tokens_for(QwenDeviceTensor& local_logits, int rows,
+                                      int local_vocab, int vocab_start,
+                                      int position_after) {
+        int top_k = options.top_k;
+        const int max_top_k = qwen_sampler_max_top_k();
+        if (top_k <= 0 || top_k > max_top_k) top_k = max_top_k;
+        if (top_k > local_vocab) top_k = local_vocab;
+
+        allocate(sample_rng_states,
+                 static_cast<size_t>(rows) * sizeof(curandState),
+                 {static_cast<uint64_t>(rows)}, SafeDType::I8);
+        allocate_float(sample_uniforms, static_cast<size_t>(rows),
+                       {static_cast<uint64_t>(rows)});
+        allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
+                 {static_cast<uint64_t>(rows)}, SafeDType::I64);
+        allocate_float(argmax_logit, static_cast<size_t>(rows),
+                       {static_cast<uint64_t>(rows)});
+
+        const float* uniforms = host_uniforms_for(rows);
+        check_cuda(cudaMemcpy(sample_uniforms.data, uniforms,
+                              static_cast<size_t>(rows) * sizeof(float),
+                              cudaMemcpyHostToDevice),
+                   "Qwen sampling uniform upload");
+
+        QwenVerifyBatch result;
+        result.top_tokens.resize(static_cast<size_t>(rows));
+        result.top_logits.resize(static_cast<size_t>(rows));
+        result.local_logits.resize(static_cast<size_t>(rows));
+        result.position_after = position_after;
+
+#ifdef DSV4_HAVE_NCCL
+        if (options.tp_world > 1) {
+            if (options.nccl_id_path.empty()) {
+                throw std::runtime_error("Qwen TP requires --nccl-id-path");
+            }
+            const size_t cand = static_cast<size_t>(rows) * top_k;
+            const size_t gathered = cand * static_cast<size_t>(options.tp_world);
+            allocate(sample_cand_token, cand * sizeof(int),
+                     {static_cast<uint64_t>(cand)}, SafeDType::I64);
+            allocate_float(sample_cand_logit, cand, {static_cast<uint64_t>(cand)});
+            allocate(sample_merged_token, gathered * sizeof(int),
+                     {static_cast<uint64_t>(gathered)}, SafeDType::I64);
+            allocate_float(sample_merged_logit, gathered,
+                           {static_cast<uint64_t>(gathered)});
+
+            require_launch(qwen_local_topk_candidates_cuda(
+                local_logits.f32_data(),
+                static_cast<int*>(sample_cand_token.data),
+                sample_cand_logit.f32_data(), rows, local_vocab, vocab_start,
+                top_k, nullptr),
+                "Qwen sampling local top-k");
+
+            nccl_global_topk_rows_device(
+                options.tp_world, options.tp_rank, options.device,
+                options.nccl_id_path.c_str(),
+                static_cast<const int*>(sample_cand_token.data),
+                sample_cand_logit.f32_data(), rows, top_k,
+                static_cast<int*>(sample_merged_token.data),
+                sample_merged_logit.f32_data());
+
+            require_launch(qwen_sample_from_candidates_cuda(
+                static_cast<const int*>(sample_merged_token.data),
+                sample_merged_logit.f32_data(),
+                static_cast<int*>(argmax_token.data), argmax_logit.f32_data(),
+                rows, top_k * options.tp_world, options.temperature,
+                options.top_p, top_k,
+                static_cast<curandState*>(sample_rng_states.data),
+                sample_uniforms.f32_data(), nullptr),
+                "Qwen sampling from merged candidates");
+        } else
+#endif
+        {
+#ifndef DSV4_HAVE_NCCL
+            if (options.tp_world > 1) {
+                throw std::runtime_error(
+                    "Qwen TP requires an NCCL-enabled build");
+            }
+#endif
+            require_launch(qwen_sample_top_k_top_p_rows_cuda(
+                local_logits.f32_data(),
+                static_cast<int*>(argmax_token.data), argmax_logit.f32_data(),
+                rows, local_vocab, vocab_start, options.temperature,
+                options.top_p, top_k,
+                static_cast<curandState*>(sample_rng_states.data),
+                sample_uniforms.f32_data(), nullptr),
+                "Qwen sampling single shard");
+        }
+
+        check_cuda(cudaMemcpy(result.top_tokens.data(), argmax_token.data,
+                              static_cast<size_t>(rows) * sizeof(int),
+                              cudaMemcpyDeviceToHost),
+                   "Qwen sampled token copy");
+        check_cuda(cudaMemcpy(result.top_logits.data(), argmax_logit.data,
+                              static_cast<size_t>(rows) * sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "Qwen sampled logit copy");
+        result.local_logits = result.top_logits;
+        return result;
+    }
+
     QwenVerifyBatch top_tokens_for(const uint16_t* hidden, int rows,
                                    const QwenDeviceTensor* output_norm,
                                    int position_after) {
@@ -1455,6 +1590,15 @@ struct QwenEngine::Impl {
         allocate_float(argmax_logit, static_cast<size_t>(rows),
                        {static_cast<uint64_t>(rows)});
         const int vocab_start = static_cast<int>(weights_vocab_start());
+
+        // Sampled path. Kept ahead of the argmax launch so a sampled run does
+        // not pay for a top-1 reduction it discards; greedy falls through to
+        // the original code unchanged.
+        if (sampling_enabled()) {
+            return sample_tokens_for(local_logits, rows, local_vocab,
+                                     vocab_start, position_after);
+        }
+
         require_launch(argmax_fp32_rows_cuda(
             local_logits.f32_data(), static_cast<int*>(argmax_token.data),
             argmax_logit.f32_data(), rows, local_vocab, vocab_start),
