@@ -56,6 +56,14 @@ struct QwenEngineOptions {
     // is mutually exclusive with native MTP and DSpark.
     std::string dflash2_checkpoint;
     std::string nccl_id_path;
+    // Stochastic sampling. temperature <= 1e-5 keeps the exact greedy argmax
+    // path, so existing greedy results stay reproducible by default. Sampling
+    // draws its uniforms on the host and shares them across TP ranks, which is
+    // what keeps every rank committing the same token.
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 20;
+    unsigned long long sampling_seed = 0;
 };
 
 struct QwenForwardResult {

@@ -63,6 +63,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_gqa_optimized.cu
     cuda/qwen_dspark_ops.cu
     cuda/qwen_dflash2_ops.cu
+    cuda/qwen_sampler.cu
     cuda/q2_ops.cu
     cuda/iq1_ops.cu
     cuda/rmsnorm_rope.cu
@@ -74,7 +75,7 @@ target_include_directories(dsv4_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
-target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas)
+target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas CUDA::curand)
 if(DSV4_HAVE_NCCL)
     target_include_directories(dsv4_cpp_core PUBLIC ${NCCL_INCLUDE_DIR})
     target_link_libraries(dsv4_cpp_core PUBLIC ${NCCL_LIBRARY})
@@ -320,6 +321,10 @@ set_target_properties(test_qwen_dspark_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_qwen_dflash2_ops tests/test_qwen_dflash2_ops.cpp)
 target_link_libraries(test_qwen_dflash2_ops PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_dflash2_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_sampler tests/test_qwen_sampler.cpp)
+target_link_libraries(test_qwen_sampler PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_sampler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE dsv4_cpp_core)
