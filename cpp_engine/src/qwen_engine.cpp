@@ -1484,15 +1484,18 @@ struct QwenEngine::Impl {
             if (options.nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen TP requires --nccl-id-path");
             }
+            // nccl_global_topk_rows_device reduces the gathered candidates back
+            // down to top_k per row, so the merged buffers are rows * top_k --
+            // not rows * top_k * tp_world. The gathered staging lives inside
+            // tp_comm's own workspace.
             const size_t cand = static_cast<size_t>(rows) * top_k;
-            const size_t gathered = cand * static_cast<size_t>(options.tp_world);
             allocate(sample_cand_token, cand * sizeof(int),
                      {static_cast<uint64_t>(cand)}, SafeDType::I64);
             allocate_float(sample_cand_logit, cand, {static_cast<uint64_t>(cand)});
-            allocate(sample_merged_token, gathered * sizeof(int),
-                     {static_cast<uint64_t>(gathered)}, SafeDType::I64);
-            allocate_float(sample_merged_logit, gathered,
-                           {static_cast<uint64_t>(gathered)});
+            allocate(sample_merged_token, cand * sizeof(int),
+                     {static_cast<uint64_t>(cand)}, SafeDType::I64);
+            allocate_float(sample_merged_logit, cand,
+                           {static_cast<uint64_t>(cand)});
 
             require_launch(qwen_local_topk_candidates_cuda(
                 local_logits.f32_data(),
@@ -1513,7 +1516,7 @@ struct QwenEngine::Impl {
                 static_cast<const int*>(sample_merged_token.data),
                 sample_merged_logit.f32_data(),
                 static_cast<int*>(argmax_token.data), argmax_logit.f32_data(),
-                rows, top_k * options.tp_world, options.temperature,
+                rows, top_k, options.temperature,
                 options.top_p, top_k,
                 static_cast<curandState*>(sample_rng_states.data),
                 sample_uniforms.f32_data(), nullptr),
