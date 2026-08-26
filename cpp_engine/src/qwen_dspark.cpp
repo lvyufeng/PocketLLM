@@ -550,6 +550,16 @@ struct QwenDSparkRuntime::Impl {
                    "upload Qwen DSpark YaRN frequencies");
     }
 
+    // The draft LM head is a batch=block_size by vocab by hidden GEMM. The
+    // generic FP32 kernel launches a rows x batch grid, so it re-reads the
+    // whole vocab-sized weight matrix once per draft row and lands about an
+    // order of magnitude off the memory-bound floor. cuBLAS reuses the weights
+    // across rows instead. Set DSV4_DSPARK_LM_HEAD_CUBLAS=0 to fall back.
+    static bool lm_head_cublas_enabled() {
+        const char* value = std::getenv("DSV4_DSPARK_LM_HEAD_CUBLAS");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }
+
     void all_reduce_half(uint16_t* values, int count) {
         if (tp_world == 1) return;
 #ifdef DSV4_HAVE_NCCL
@@ -776,9 +786,16 @@ struct QwenDSparkRuntime::Impl {
         allocate_float(logits, static_cast<size_t>(rows) * local_vocab,
                        {static_cast<uint64_t>(rows),
                         static_cast<uint64_t>(local_vocab)});
-        require_launch(qwen_fp16_matmul_rows_f16_f32_cuda(
-            normalized.f16_data(), target_lm_head.f16_data(), logits.f32_data(),
-            rows, local_vocab, hidden, hidden, local_vocab, hidden),
+        static const bool lm_head_cublas = lm_head_cublas_enabled();
+        require_launch(lm_head_cublas && rows > 1
+            ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+                  normalized.f16_data(), target_lm_head.f16_data(),
+                  logits.f32_data(), rows, local_vocab, hidden, hidden,
+                  local_vocab, hidden)
+            : qwen_fp16_matmul_rows_f16_f32_cuda(
+                  normalized.f16_data(), target_lm_head.f16_data(),
+                  logits.f32_data(), rows, local_vocab, hidden, hidden,
+                  local_vocab, hidden),
             "draft base logits");
         allocate_half(markov_embeddings,
                       static_cast<size_t>(rows) * config.markov_rank,

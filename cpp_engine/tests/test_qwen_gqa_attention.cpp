@@ -301,6 +301,103 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     return true;
 }
 
+bool run_verify_crossover(int context_len) {
+    constexpr int rows = 8;
+    constexpr int q_heads = 6;
+    constexpr int kv_heads = 1;
+    constexpr int head_dim = 256;
+    constexpr int splits = 64;
+    const int position_offset = context_len - rows;
+    const size_t q_elements = static_cast<size_t>(rows) * q_heads * head_dim;
+    const size_t kv_elements = static_cast<size_t>(context_len) * kv_heads * head_dim;
+    const size_t score_elements = static_cast<size_t>(rows) * q_heads * context_len;
+    const size_t partial_elements = static_cast<size_t>(rows) * q_heads * splits *
+        static_cast<size_t>(head_dim + 2);
+    std::mt19937 rng(97531 + context_len);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+    std::vector<uint16_t> q(q_elements), k(kv_elements), v(kv_elements);
+    for (uint16_t& value : q) value = to_half(dist(rng));
+    for (uint16_t& value : k) value = to_half(dist(rng));
+    for (uint16_t& value : v) value = to_half(dist(rng));
+
+    uint16_t* d_q = nullptr;
+    uint16_t* d_k = nullptr;
+    uint16_t* d_v = nullptr;
+    uint16_t* d_exact = nullptr;
+    uint16_t* d_split = nullptr;
+    uint16_t* d_cublas = nullptr;
+    float* d_scores = nullptr;
+    float* d_partials = nullptr;
+    auto release = [&]() {
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_exact); cudaFree(d_split); cudaFree(d_cublas);
+        cudaFree(d_scores); cudaFree(d_partials);
+    };
+    if (cudaMalloc(&d_q, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_k, k.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_v, v.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_exact, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_split, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_cublas, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_scores, score_elements * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d_partials, partial_elements * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+    }
+    if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !dsv4::qwen_gqa_verify_attention_f16_exact_cuda(
+            d_q, d_k, d_v, d_exact, d_scores, rows, q_heads, kv_heads,
+            head_dim, position_offset, context_len) ||
+        !dsv4::qwen_gqa_verify_attention_f16_cuda(
+            d_q, d_k, d_v, d_split, d_partials, rows, q_heads, kv_heads,
+            head_dim, position_offset, context_len, splits) ||
+        !dsv4::qwen_gqa_verify_attention_f16_cublas_qk_cuda(
+            d_q, d_k, d_v, d_cublas, d_scores, rows, q_heads, kv_heads,
+            head_dim, position_offset, context_len) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa verify crossover launch ctx=" + std::to_string(context_len));
+        release();
+        return true;
+    }
+    std::vector<uint16_t> exact(q_elements), split(q_elements), cublas(q_elements);
+    if (cudaMemcpy(exact.data(), d_exact, exact.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(split.data(), d_split, split.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(cublas.data(), d_cublas, cublas.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("gqa verify crossover copy ctx=" + std::to_string(context_len));
+        release();
+        return true;
+    }
+    release();
+    double split_worst = 0.0;
+    double cublas_worst = 0.0;
+    for (size_t index = 0; index < exact.size(); ++index) {
+        const double reference = from_half(exact[index]);
+        split_worst = std::max(split_worst, std::fabs(
+            reference - from_half(split[index])));
+        cublas_worst = std::max(cublas_worst, std::fabs(
+            reference - from_half(cublas[index])));
+    }
+    if (split_worst > 2.0e-3 || cublas_worst > 2.0e-3) {
+        fail("gqa verify crossover ctx=" + std::to_string(context_len) +
+             " split=" + std::to_string(split_worst) +
+             " cublas=" + std::to_string(cublas_worst));
+    } else {
+        const char* production_default = context_len <= 1024 ? "exact" : "split";
+        std::printf("  gqa verify crossover ctx=%5d default=%s "
+                    "exact_vs_split=%.3e exact_vs_cublas=%.3e\n",
+                    context_len, production_default, split_worst, cublas_worst);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -332,6 +429,16 @@ int main() {
     const int grouping_shapes[][2] = {{12, 6}, {8, 8}, {24, 8}};
     for (const auto& shape : grouping_shapes) {
         if (!run_prefill_tiled(64, shape[0], shape[1], 128, 512, 8192)) {
+            std::printf("[SKIP] device allocation failed\n");
+            return 0;
+        }
+    }
+    // Production currently uses exact through 1K context and split-K above it;
+    // cuBLAS-QK is opt-in while its real-model crossover is validated. Cover
+    // both sides of the current boundary and representative mid/long contexts.
+    const int verify_contexts[] = {1024, 1025, 4096, 8192};
+    for (int context : verify_contexts) {
+        if (!run_verify_crossover(context)) {
             std::printf("[SKIP] device allocation failed\n");
             return 0;
         }

@@ -8,10 +8,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
@@ -85,6 +86,11 @@ struct Top1RowsWorkspace {
     size_t capacity = 0;
 };
 
+struct PackedTop1RowsWorkspace {
+    uint64_t* d_keys = nullptr;
+    size_t capacity = 0;
+};
+
 struct TopKRowsWorkspace {
     int* d_tokens = nullptr;
     float* d_logits = nullptr;
@@ -133,6 +139,44 @@ Top1RowsWorkspace& top1_rows_workspace(int device, size_t count) {
     return workspace;
 }
 
+PackedTop1RowsWorkspace& packed_top1_rows_workspace(int device, size_t count) {
+    static std::unordered_map<int, PackedTop1RowsWorkspace> workspaces;
+    PackedTop1RowsWorkspace& workspace = workspaces[device];
+    if (workspace.capacity >= count) return workspace;
+    check_cuda(cudaSetDevice(device), "cudaSetDevice packed top1 workspace");
+    if (workspace.d_keys != nullptr) {
+        check_cuda(cudaFree(workspace.d_keys), "cudaFree packed top1 keys");
+        workspace.d_keys = nullptr;
+    }
+    check_cuda(cudaMalloc(&workspace.d_keys, count * sizeof(uint64_t)),
+               "cudaMalloc packed top1 keys");
+    workspace.capacity = count;
+    return workspace;
+}
+
+void nccl_all_reduce_max_u64(ncclComm_t comm, uint64_t* d_values, int count,
+                             cudaStream_t stream) {
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclUint64, ncclMax,
+                             comm, stream), "ncclAllReduce packed top1");
+}
+
+void unpack_packed_top1(uint64_t* d_keys, int* d_tokens, float* d_logits,
+                        int rows, cudaStream_t stream) {
+    if (!qwen_dflash2_unpack_top1_key_f32_cuda(
+            d_keys, d_tokens, d_logits, rows, stream)) {
+        throw std::runtime_error("Qwen packed top-1 unpack launch failed");
+    }
+}
+
+void pack_top1(const int* d_tokens, const float* d_logits, uint64_t* d_keys,
+               int rows, cudaStream_t stream) {
+    if (!qwen_dflash2_pack_top1_key_f32_cuda(
+            d_tokens, d_logits, d_keys, rows, stream)) {
+        throw std::runtime_error("Qwen packed top-1 pack launch failed");
+    }
+}
+
+
 ncclComm_t cached_comm(int world, int rank, int device, const char* id_path) {
     static std::unordered_map<std::string, CachedComm> comms;
     const std::string key = std::to_string(world) + ":" + std::to_string(rank) + ":" + std::to_string(device) + ":" + id_path;
@@ -172,7 +216,8 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
 void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows, int top_k,
-                           int* global_tokens, float* global_logits) {
+                           int* global_tokens, float* global_logits,
+                           void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || rows <= 0 || top_k <= 0 ||
         d_local_tokens == nullptr || d_local_logits == nullptr ||
         global_tokens == nullptr || global_logits == nullptr) {
@@ -181,23 +226,30 @@ void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     const size_t local_count = static_cast<size_t>(rows) * top_k;
     const size_t gathered_count = static_cast<size_t>(world) * local_count;
-    Top1RowsWorkspace& workspace = top1_rows_workspace(device, gathered_count);
+    TopKRowsWorkspace& workspace = topk_rows_workspace(device, gathered_count);
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     check_nccl(ncclGroupStart(), "ncclGroupStart batched top-k");
     check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, local_count,
-                             ncclInt32, comm, nullptr),
+                             ncclInt32, comm, cuda_stream),
                "ncclAllGather batched top-k tokens");
     check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, local_count,
-                             ncclFloat, comm, nullptr),
+                             ncclFloat, comm, cuda_stream),
                "ncclAllGather batched top-k logits");
     check_nccl(ncclGroupEnd(), "ncclGroupEnd batched top-k");
+    check_cuda(cudaStreamSynchronize(cuda_stream),
+               "sync gathered batched top-k");
     std::vector<int> all_tokens(gathered_count);
     std::vector<float> all_logits(gathered_count);
-    check_cuda(cudaMemcpy(all_tokens.data(), workspace.d_tokens,
-                          gathered_count * sizeof(int), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(all_tokens.data(), workspace.d_tokens,
+                               gathered_count * sizeof(int),
+                               cudaMemcpyDeviceToHost, cuda_stream),
                "copy gathered batched top-k tokens");
-    check_cuda(cudaMemcpy(all_logits.data(), workspace.d_logits,
-                          gathered_count * sizeof(float), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(all_logits.data(), workspace.d_logits,
+                               gathered_count * sizeof(float),
+                               cudaMemcpyDeviceToHost, cuda_stream),
                "copy gathered batched top-k logits");
+    check_cuda(cudaStreamSynchronize(cuda_stream),
+               "sync copied batched top-k");
     for (int row = 0; row < rows; ++row) {
         std::vector<std::pair<float, int>> candidates;
         candidates.reserve(static_cast<size_t>(world) * top_k);
@@ -227,7 +279,7 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
                                   const int* d_local_tokens,
                                   const float* d_local_logits, int rows,
                                   int top_k, int* d_global_tokens,
-                                  float* d_global_logits) {
+                                  float* d_global_logits, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || rows <= 0 || top_k <= 0 ||
         d_local_tokens == nullptr || d_local_logits == nullptr ||
         d_global_tokens == nullptr || d_global_logits == nullptr) {
@@ -235,59 +287,123 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
     }
     check_cuda(cudaSetDevice(device), "cudaSetDevice device top-k");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     const size_t local_count = static_cast<size_t>(rows) * top_k;
     const size_t gathered_count = static_cast<size_t>(world) * local_count;
     TopKRowsWorkspace& workspace = topk_rows_workspace(device, gathered_count);
     check_nccl(ncclGroupStart(), "ncclGroupStart device top-k");
     check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, local_count,
-                             ncclInt32, comm, nullptr),
+                             ncclInt32, comm, cuda_stream),
                "ncclAllGather device top-k tokens");
     check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, local_count,
-                             ncclFloat, comm, nullptr),
+                             ncclFloat, comm, cuda_stream),
                "ncclAllGather device top-k logits");
     check_nccl(ncclGroupEnd(), "ncclGroupEnd device top-k");
     if (!qwen_dflash2_merge_topk_f32_cuda(
             workspace.d_tokens, workspace.d_logits, d_global_tokens,
-            d_global_logits, world, rows, top_k)) {
+            d_global_logits, world, rows, top_k, cuda_stream)) {
         throw std::runtime_error("Qwen DFlash2 device top-k merge launch failed");
     }
+}
+
+void nccl_global_top1_rows_device(int world, int rank, int device,
+                                  const char* id_path,
+                                  const int* d_local_tokens,
+                                  const float* d_local_logits, int rows,
+                                  int* d_global_tokens,
+                                  float* d_global_logits, void* stream) {
+    if (world <= 0 || rank < 0 || rank >= world || rows <= 0 ||
+        d_local_tokens == nullptr || d_local_logits == nullptr ||
+        d_global_tokens == nullptr || d_global_logits == nullptr) {
+        throw std::runtime_error("invalid NCCL device top args");
+    }
+    check_cuda(cudaSetDevice(device), "cudaSetDevice device top");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const size_t gathered_count = static_cast<size_t>(world) * rows;
+    Top1RowsWorkspace& workspace = top1_rows_workspace(device, gathered_count);
+    check_nccl(ncclGroupStart(), "ncclGroupStart device top");
+    check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, rows,
+                             ncclInt32, comm, cuda_stream),
+               "ncclAllGather device top tokens");
+    check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, rows,
+                             ncclFloat, comm, cuda_stream),
+               "ncclAllGather device top logits");
+    check_nccl(ncclGroupEnd(), "ncclGroupEnd device top");
+    if (!qwen_dflash2_merge_topk_f32_cuda(
+            workspace.d_tokens, workspace.d_logits, d_global_tokens,
+            d_global_logits, world, rows, 1, cuda_stream)) {
+        throw std::runtime_error("Qwen device top-1 merge launch failed");
+    }
+}
+
+void nccl_global_top1_rows_packed_device(
+    int world, int rank, int device, const char* id_path,
+    const int* d_local_tokens, const float* d_local_logits, int rows,
+    int* d_global_tokens, float* d_global_logits, void* stream) {
+    if (world <= 0 || rank < 0 || rank >= world || rows <= 0 ||
+        d_local_tokens == nullptr || d_local_logits == nullptr ||
+        d_global_tokens == nullptr || d_global_logits == nullptr) {
+        throw std::runtime_error("invalid NCCL packed device top args");
+    }
+    check_cuda(cudaSetDevice(device), "cudaSetDevice packed device top");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    PackedTop1RowsWorkspace& workspace =
+        packed_top1_rows_workspace(device, static_cast<size_t>(rows));
+    pack_top1(d_local_tokens, d_local_logits, workspace.d_keys, rows,
+              cuda_stream);
+    nccl_all_reduce_max_u64(comm, workspace.d_keys, rows, cuda_stream);
+    unpack_packed_top1(workspace.d_keys, d_global_tokens, d_global_logits,
+                       rows, cuda_stream);
 }
 
 void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows,
-                           int* global_tokens, float* global_logits) {
+                           int* global_tokens, float* global_logits,
+                           void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || rows <= 0 ||
         d_local_tokens == nullptr || d_local_logits == nullptr ||
         global_tokens == nullptr || global_logits == nullptr) {
         throw std::runtime_error("invalid NCCL batched top args");
     }
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     const size_t gathered_count = static_cast<size_t>(world) * rows;
     Top1RowsWorkspace& workspace = top1_rows_workspace(device, gathered_count);
     check_nccl(ncclGroupStart(), "ncclGroupStart batched top");
     check_nccl(ncclAllGather(d_local_tokens, workspace.d_tokens, rows, ncclInt32,
-                             comm, nullptr),
+                             comm, cuda_stream),
                "ncclAllGather batched top tokens");
     check_nccl(ncclAllGather(d_local_logits, workspace.d_logits, rows, ncclFloat,
-                             comm, nullptr),
+                             comm, cuda_stream),
                "ncclAllGather batched top logits");
     check_nccl(ncclGroupEnd(), "ncclGroupEnd batched top");
+    check_cuda(cudaStreamSynchronize(cuda_stream), "sync gathered batched top");
     std::vector<int> all_tokens(gathered_count);
     std::vector<float> all_logits(gathered_count);
-    check_cuda(cudaMemcpy(all_tokens.data(), workspace.d_tokens,
-                          gathered_count * sizeof(int), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(all_tokens.data(), workspace.d_tokens,
+                               gathered_count * sizeof(int),
+                               cudaMemcpyDeviceToHost, cuda_stream),
                "copy gathered batched top tokens");
-    check_cuda(cudaMemcpy(all_logits.data(), workspace.d_logits,
-                          gathered_count * sizeof(float), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(all_logits.data(), workspace.d_logits,
+                               gathered_count * sizeof(float),
+                               cudaMemcpyDeviceToHost, cuda_stream),
                "copy gathered batched top logits");
+    check_cuda(cudaStreamSynchronize(cuda_stream), "sync copied batched top");
+
+    // The device-resident sibling below uses the same gathered layout and
+    // comparator. Keep this synchronous API's CPU merge for compatibility.
+    if (rows <= 0) return;
     for (int row = 0; row < rows; ++row) {
         float best_logit = -INFINITY;
-        int best_token = 0;
+        int best_token = INT_MAX;
         for (int r = 0; r < world; ++r) {
             const size_t at = static_cast<size_t>(r) * rows + row;
             const float logit = all_logits[at];
             const int token = all_tokens[at];
+            if (std::isnan(logit)) continue;
             if (logit > best_logit ||
                 (logit == best_logit && token < best_token)) {
                 best_logit = logit;
@@ -299,22 +415,25 @@ void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
     }
 }
 
-void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count) {
+void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
-    check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm, nullptr), "ncclAllReduce inplace");
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm,
+                             static_cast<cudaStream_t>(stream)), "ncclAllReduce inplace");
 }
 
-void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count) {
+void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL fp16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
-    check_nccl(ncclAllReduce(d_values, d_values, count, ncclHalf, ncclSum, comm, nullptr), "ncclAllReduce fp16 inplace");
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclHalf, ncclSum, comm,
+                             static_cast<cudaStream_t>(stream)), "ncclAllReduce fp16 inplace");
 }
 
-void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count) {
+void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bf16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
-    check_nccl(ncclAllReduce(d_values, d_values, count, ncclBfloat16, ncclSum, comm, nullptr), "ncclAllReduce bf16 inplace");
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclBfloat16, ncclSum, comm,
+                             static_cast<cudaStream_t>(stream)), "ncclAllReduce bf16 inplace");
 }
 
 void nccl_broadcast_int32(int world, int rank, int device, const char* id_path, int32_t* buf, int count, int root) {

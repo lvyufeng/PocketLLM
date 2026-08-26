@@ -121,6 +121,15 @@ bool qwen_dflash2_merge_topk_f32_cuda(
     const int* d_gathered_tokens, const float* d_gathered_logits,
     int* d_tokens, float* d_values, int world, int rows, int top_k,
     void* stream = nullptr);
+// Pack/unpack one deterministic global top-1 candidate per row. The packed key
+// is suitable for NCCL uint64 Max: larger logit wins, equal logit picks the
+// smaller token id, and NaN loses to every finite or -inf candidate.
+bool qwen_dflash2_pack_top1_key_f32_cuda(
+    const int* d_tokens, const float* d_values, uint64_t* d_keys, int rows,
+    void* stream = nullptr);
+bool qwen_dflash2_unpack_top1_key_f32_cuda(
+    const uint64_t* d_keys, int* d_tokens, float* d_values, int rows,
+    void* stream = nullptr);
 bool qwen_dflash2_selector_path_f16_cuda(
     const uint16_t* d_hidden_fp16, const int* d_candidates,
     const float* d_unary, const uint16_t* d_predecessor,
@@ -253,6 +262,21 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     int weight_stride,
     int scale_stride,
     void* stream = nullptr);
+
+// Materialize a dense FP16 matrix from the checkpoint's raw FP8 codes and block
+// scales. This is intended for long-lived verify caches; decode and prefill keep
+// using the raw quantized storage paths.
+bool qwen_fp8_e4m3_fp16scale_dequantize_f16_cuda(
+    const uint8_t* d_weight, const uint16_t* d_scale_fp16,
+    uint16_t* d_output_fp16, int rows, int cols, int weight_stride,
+    int scale_stride, void* stream = nullptr);
+
+// FP16 input/weight tensor-op GEMM with FP16 output. Weight storage is row-major
+// [output_rows, columns], matching the target projection layout.
+bool qwen_fp16_matmul_rows_f16_cublas_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
+    uint16_t* d_y_fp16, int batch, int rows, int cols, int x_stride,
+    int y_stride, int weight_stride, void* stream = nullptr);
 
 // FP16 input/weight tensor-op GEMM with FP32 output. This is kept separate from
 // the exact reduction-order reference path and enabled only by runtime A/B gates.
@@ -477,11 +501,43 @@ bool qwen_copy_rows_strided_f16_cuda(
     const uint16_t* d_source_fp16, int source_row_stride,
     uint16_t* d_destination_fp16, int destination_row_stride,
     int rows, int columns, void* stream = nullptr);
+
+// Device-resident scatter/gather for independently allocated byte regions. The
+// host builds a descriptor table once; every block copies one fixed-size chunk
+// of a region to or from its offset in a contiguous transaction buffer.
+struct QwenCopyRegion {
+    uint64_t device_address = 0;
+    uint64_t packed_offset = 0;
+    uint64_t bytes = 0;
+    uint64_t first_block = 0;
+};
+
+constexpr uint64_t kQwenCopyRegionBlockBytes = 64 * 1024;
+constexpr uint64_t qwen_copy_region_blocks(uint64_t bytes) {
+    return (bytes + kQwenCopyRegionBlockBytes - 1) /
+           kQwenCopyRegionBlockBytes;
+}
+
+bool qwen_gather_copy_regions_cuda(
+    const QwenCopyRegion* d_regions, int region_count, uint8_t* d_packed,
+    uint64_t total_blocks, void* stream = nullptr);
+bool qwen_scatter_copy_regions_cuda(
+    const QwenCopyRegion* d_regions, int region_count, const uint8_t* d_packed,
+    uint64_t total_blocks, void* stream = nullptr);
+
 bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(const uint16_t* d_x_fp16,
                                            const uint16_t* d_gamma_fp16,
                                            uint16_t* d_y_fp16, int rows,
                                            int cols, float eps,
                                            void* stream = nullptr);
+// Fuses the attention residual boundary with post-attention RMSNorm. The sum is
+// rounded to FP16 before it contributes to the RMS statistic, exactly matching
+// copy(hidden) -> FP16 add(attention) -> RMSNorm(residual).
+bool qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+    const uint16_t* d_hidden_fp16, const uint16_t* d_delta_fp16,
+    const uint16_t* d_gamma_fp16, uint16_t* d_residual_fp16,
+    uint16_t* d_normalized_fp16, int rows, int cols, float eps,
+    void* stream = nullptr);
 bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
     const uint16_t* d_x_fp16, const uint16_t* d_gamma_fp16,
     const uint16_t* d_gate_fp16, uint16_t* d_y_fp16, int rows, int cols,
@@ -491,6 +547,12 @@ bool qwen_split_packed_qkv_f16_cuda(const uint16_t* d_packed_fp16,
                                     uint16_t* d_v_fp16, int rows,
                                     int key_dim, int value_dim,
                                     void* stream = nullptr);
+// Splits a [rows, 2*width] row-major tensor into two [rows, width] tensors.
+// Used to unpack a fused projection whose weight was row-concatenated.
+bool qwen_split_rows_pair_f16_cuda(const uint16_t* d_packed_fp16,
+                                   uint16_t* d_first_fp16,
+                                   uint16_t* d_second_fp16, int rows,
+                                   int width, void* stream = nullptr);
 bool qwen_causal_depthwise_conv_silu_f16_cuda(
     const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
     uint16_t* d_tail_fp16, uint16_t* d_y_fp16, int seq_len, int channels,
@@ -512,6 +574,27 @@ bool qwen_gated_delta_sequence_f16_cuda(
     const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int rows,
     int heads, int key_heads, int key_dim, int value_dim, float q_scale,
     void* stream = nullptr);
+// Same recurrence with Q/K already L2-normalized as FP32. Separating the
+// normalization lets one key head serve all repeated value heads.
+bool qwen_gated_delta_sequence_normalized_f16_cuda(
+    float* d_state, const float* d_q_normalized, const float* d_k_normalized,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int rows,
+    int heads, int key_heads, int key_dim, int value_dim, float q_scale,
+    void* stream = nullptr);
+// Optional verify path that keeps the recurrent state in shared memory instead
+// of a 128-element per-thread register vector. Set
+// QWEN_GATED_DELTA_SHARED_STATE=1 to compare it with the fallback.
+bool qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+    float* d_state, const float* d_q_normalized, const float* d_k_normalized,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int rows,
+    int heads, int key_heads, int key_dim, int value_dim, float q_scale,
+    void* stream = nullptr);
+bool qwen_normalize_gated_delta_qk_f16_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
+    float* d_q_normalized, float* d_k_normalized, int rows, int key_heads,
+    int key_dim, void* stream = nullptr);
 bool qwen_partial_rope_f16_cuda(uint16_t* d_q_fp16, uint16_t* d_k_fp16,
                                 int position, int rotary_dim, float theta,
                                 int q_heads, int kv_heads, int head_dim,
@@ -587,6 +670,16 @@ bool qwen_gqa_verify_attention_f16_exact_cuda(
 // Context splits run in parallel while every K/V load serves every verify row
 // in the CTA. Its online-softmax order may change near-tie downstream logits.
 // Scratch contains rows * q_heads * splits * (head_dim + 2) FP32 elements.
+// Tensor-core QK + FP32 masked softmax + deterministic SIMT PV. Optimized for
+// TP shards with one KV head, where all local Q heads share a contiguous K/V
+// matrix and QK becomes one large GEMM.
+bool qwen_gqa_verify_attention_f16_cublas_qk_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_output_fp16,
+    float* d_score_scratch, int rows, int q_heads, int kv_heads,
+    int head_dim, int position_offset, int max_context,
+    void* stream = nullptr);
+
 bool qwen_gqa_verify_attention_f16_cuda(
     const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,

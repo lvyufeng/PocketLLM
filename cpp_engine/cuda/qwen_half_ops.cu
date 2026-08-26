@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 namespace dsv4 {
 namespace {
@@ -245,17 +246,11 @@ __global__ void fp8_matmul_f16_small_batch_kernel(
     }
 }
 
-// Same math again, but the staged activation tile holds floats rather than fp16
-// codes. The fp16 variants re-run half_to_float inside the weight loop, so each
-// of the kWarps warps converts the same activation element again for every weight
-// quad it processes. At batch 8 that is 32 conversions per 4 weight bytes, and
-// SM75 issues conversions at a quarter of its FMA rate, which is what makes an
-// otherwise weight-bandwidth-bound projection lose half its throughput between
-// batch 1 and batch 8. Converting once during the cooperative load leaves the
-// inner loop pure FMA. fp16 -> fp32 is exact and the per-lane column order is
-// unchanged, so results are bit-identical to both fp16 variants.
+// Shared-activation verify kernel. Pairing two 128-column lane strides reduces
+// loop and shared-load instructions while preserving each lane's accumulation
+// order, so the result stays bit-identical to plain decode.
 template <int kWarps, int kBatchCapacity, int kTile>
-__global__ void fp8_matmul_f16_small_batch_fshared_kernel(
+__global__ void fp8_matmul_f16_small_batch_paired_shared_kernel(
     const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
     const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
     int batch, int rows, int cols, int x_stride, int y_stride,
@@ -280,25 +275,32 @@ __global__ void fp8_matmul_f16_small_batch_fshared_kernel(
         const int tile_cols = min(kTile, vec_cols - tile);
         const int vec_count = tile_cols >> 2;
         __syncthreads();
-#pragma unroll
-        for (int sample = 0; sample < kBatchCapacity; ++sample) {
-            if (sample >= batch) break;
-            const uint2* source = reinterpret_cast<const uint2*>(
-                x + static_cast<size_t>(sample) * x_stride + tile);
-            uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
-            for (int i = static_cast<int>(threadIdx.x); i < vec_count;
-                 i += threads) {
+        if constexpr (kWarps >= 16) {
+            const int load_count = batch * vec_count;
+            for (int index = static_cast<int>(threadIdx.x); index < load_count;
+                 index += threads) {
+                const int sample = index / vec_count;
+                const int i = index - sample * vec_count;
+                const uint2* source = reinterpret_cast<const uint2*>(
+                    x + static_cast<size_t>(sample) * x_stride + tile);
+                uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
                 target[i] = source[i];
+            }
+        } else {
+#pragma unroll
+            for (int sample = 0; sample < kBatchCapacity; ++sample) {
+                if (sample >= batch) break;
+                const uint2* source = reinterpret_cast<const uint2*>(
+                    x + static_cast<size_t>(sample) * x_stride + tile);
+                uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
+                for (int i = static_cast<int>(threadIdx.x); i < vec_count;
+                     i += threads) {
+                    target[i] = source[i];
+                }
             }
         }
         __syncthreads();
         if (!active) continue;
-        // Two strided steps fused into one iteration. The batch-8 verify shape is
-        // neither DRAM bound (121 of ~600 GB/s) nor FMA bound (1.94 of 13.4
-        // TFLOP/s), so the cost is loop and shared-load instruction count. Each
-        // lane keeps exactly the columns it owned before and accumulates them in
-        // the same order, so the result stays bit identical to the register-only
-        // kernel that plain decode uses; only the loop overhead is halved.
         const int pair_limit = tile_cols - 128;
         int local = lane * 4;
         for (; local < pair_limit; local += 256) {
@@ -306,7 +308,8 @@ __global__ void fp8_matmul_f16_small_batch_fshared_kernel(
             const uchar4 c0 = *reinterpret_cast<const uchar4*>(w + col);
             const uchar4 c1 = *reinterpret_cast<const uchar4*>(w + col + 128);
             const float scale0 = half_to_float(s[col / kFp8WeightBlock]);
-            const float scale1 = half_to_float(s[(col + 128) / kFp8WeightBlock]);
+            const float scale1 = half_to_float(
+                s[(col + 128) / kFp8WeightBlock]);
             const float a0 = lut[c0.x] * scale0;
             const float a1 = lut[c0.y] * scale0;
             const float a2 = lut[c0.z] * scale0;
@@ -335,11 +338,11 @@ __global__ void fp8_matmul_f16_small_batch_fshared_kernel(
                 sums[sample] = acc;
             }
         }
-        // Odd trailing step when the tile does not hold a whole pair.
         for (; local < tile_cols; local += 128) {
             const int col = tile + local;
             const uchar4 codes = *reinterpret_cast<const uchar4*>(w + col);
-            const float weight_scale = half_to_float(s[col / kFp8WeightBlock]);
+            const float weight_scale = half_to_float(
+                s[col / kFp8WeightBlock]);
             const float w0 = lut[codes.x] * weight_scale;
             const float w1 = lut[codes.y] * weight_scale;
             const float w2 = lut[codes.z] * weight_scale;
@@ -354,96 +357,6 @@ __global__ void fp8_matmul_f16_small_batch_fshared_kernel(
                 const float2 hi = __half22float2(
                     *reinterpret_cast<const __half2*>(&packed.y));
                 sums[sample] += lo.x * w0 + lo.y * w1 + hi.x * w2 + hi.y * w3;
-            }
-        }
-    }
-    if (!active) return;
-    for (int col = vec_cols + lane; col < cols; col += 32) {
-        const float weight_value = lut[w[col]] *
-            half_to_float(s[col / kFp8WeightBlock]);
-#pragma unroll
-        for (int sample = 0; sample < kBatchCapacity; ++sample) {
-            if (sample >= batch) break;
-            sums[sample] += half_to_float(
-                x[static_cast<size_t>(sample) * x_stride + col]) * weight_value;
-        }
-    }
-#pragma unroll
-    for (int sample = 0; sample < kBatchCapacity; ++sample) {
-        if (sample >= batch) break;
-        float sum = sums[sample];
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
-        }
-        if (lane == 0) {
-            y[static_cast<size_t>(sample) * y_stride + row] = float_to_half(sum);
-        }
-    }
-}
-
-// Same math as fp8_matmul_f16_small_batch_kernel with the activation tile staged
-// in shared memory. Every warp in a block reads the same activation rows, so the
-// non-staged kernel issues the activation traffic kWarps times and becomes L2
-// bound instead of weight bound once batch > 1. Column tiles are multiples of the
-// 128-element per-lane stride, so each lane still accumulates its columns in the
-// original order and the result is bit-identical.
-template <int kWarps, int kBatchCapacity, int kTile>
-__global__ void fp8_matmul_f16_small_batch_shared_kernel(
-    const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
-    const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
-    int batch, int rows, int cols, int x_stride, int y_stride,
-    int weight_stride, int scale_stride) {
-    __shared__ float lut[256];
-    __shared__ uint16_t xs[kBatchCapacity * kTile];
-    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
-        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
-    }
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
-    const bool active = row < rows;
-    const uint8_t* w = weight + static_cast<size_t>(active ? row : 0) *
-        weight_stride;
-    const uint16_t* s = scale +
-        static_cast<size_t>((active ? row : 0) / kFp8WeightBlock) * scale_stride;
-    float sums[kBatchCapacity] = {};
-    const int vec_cols = cols & ~3;
-    const int threads = static_cast<int>(blockDim.x);
-    for (int tile = 0; tile < vec_cols; tile += kTile) {
-        const int tile_cols = min(kTile, vec_cols - tile);
-        const int vec_count = tile_cols >> 2;
-        __syncthreads();
-#pragma unroll
-        for (int sample = 0; sample < kBatchCapacity; ++sample) {
-            if (sample >= batch) break;
-            const uint2* source = reinterpret_cast<const uint2*>(
-                x + static_cast<size_t>(sample) * x_stride + tile);
-            uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
-            for (int i = static_cast<int>(threadIdx.x); i < vec_count;
-                 i += threads) {
-                target[i] = source[i];
-            }
-        }
-        __syncthreads();
-        if (!active) continue;
-        for (int local = lane * 4; local < tile_cols; local += 128) {
-            const int col = tile + local;
-            const uchar4 codes = *reinterpret_cast<const uchar4*>(w + col);
-            const float weight_scale = half_to_float(s[col / kFp8WeightBlock]);
-            const float w0 = lut[codes.x] * weight_scale;
-            const float w1 = lut[codes.y] * weight_scale;
-            const float w2 = lut[codes.z] * weight_scale;
-            const float w3 = lut[codes.w] * weight_scale;
-#pragma unroll
-            for (int sample = 0; sample < kBatchCapacity; ++sample) {
-                if (sample >= batch) break;
-                const uint2 packed = *reinterpret_cast<const uint2*>(
-                    xs + sample * kTile + local);
-                sums[sample] +=
-                    half_to_float(static_cast<uint16_t>(packed.x)) * w0 +
-                    half_to_float(static_cast<uint16_t>(packed.x >> 16)) * w1 +
-                    half_to_float(static_cast<uint16_t>(packed.y)) * w2 +
-                    half_to_float(static_cast<uint16_t>(packed.y >> 16)) * w3;
             }
         }
     }
@@ -511,20 +424,96 @@ __global__ void fp8_swiglu_small_batch_shared_f16_kernel(
         const int tile_cols = min(kTile, vec_cols - tile);
         const int vec_count = tile_cols >> 2;
         __syncthreads();
-#pragma unroll
-        for (int sample = 0; sample < kBatchCapacity; ++sample) {
-            if (sample >= batch) break;
-            const uint2* source = reinterpret_cast<const uint2*>(
-                x + static_cast<size_t>(sample) * x_stride + tile);
-            uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
-            for (int i = static_cast<int>(threadIdx.x); i < vec_count;
-                 i += threads) {
+        if constexpr (kWarps >= 16) {
+            const int load_count = batch * vec_count;
+            for (int index = static_cast<int>(threadIdx.x); index < load_count;
+                 index += threads) {
+                const int sample = index / vec_count;
+                const int i = index - sample * vec_count;
+                const uint2* source = reinterpret_cast<const uint2*>(
+                    x + static_cast<size_t>(sample) * x_stride + tile);
+                uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
                 target[i] = source[i];
+            }
+        } else {
+#pragma unroll
+            for (int sample = 0; sample < kBatchCapacity; ++sample) {
+                if (sample >= batch) break;
+                const uint2* source = reinterpret_cast<const uint2*>(
+                    x + static_cast<size_t>(sample) * x_stride + tile);
+                uint2* target = reinterpret_cast<uint2*>(xs + sample * kTile);
+                for (int i = static_cast<int>(threadIdx.x); i < vec_count;
+                     i += threads) {
+                    target[i] = source[i];
+                }
             }
         }
         __syncthreads();
         if (!active) continue;
-        for (int local = lane * 4; local < tile_cols; local += 128) {
+        const int pair_limit = tile_cols - 128;
+        int local = lane * 4;
+        for (; local < pair_limit; local += 256) {
+            const int col = tile + local;
+            const uchar4 gate0 =
+                *reinterpret_cast<const uchar4*>(gate_row + col);
+            const uchar4 gate1 =
+                *reinterpret_cast<const uchar4*>(gate_row + col + 128);
+            const uchar4 up0 = *reinterpret_cast<const uchar4*>(up_row + col);
+            const uchar4 up1 =
+                *reinterpret_cast<const uchar4*>(up_row + col + 128);
+            const float gate_s0 =
+                half_to_float(gate_scale_row[col / kFp8WeightBlock]);
+            const float gate_s1 = half_to_float(
+                gate_scale_row[(col + 128) / kFp8WeightBlock]);
+            const float up_s0 =
+                half_to_float(up_scale_row[col / kFp8WeightBlock]);
+            const float up_s1 =
+                half_to_float(up_scale_row[(col + 128) / kFp8WeightBlock]);
+            const float gw00 = lut[gate0.x] * gate_s0;
+            const float gw01 = lut[gate0.y] * gate_s0;
+            const float gw02 = lut[gate0.z] * gate_s0;
+            const float gw03 = lut[gate0.w] * gate_s0;
+            const float gw10 = lut[gate1.x] * gate_s1;
+            const float gw11 = lut[gate1.y] * gate_s1;
+            const float gw12 = lut[gate1.z] * gate_s1;
+            const float gw13 = lut[gate1.w] * gate_s1;
+            const float uw00 = lut[up0.x] * up_s0;
+            const float uw01 = lut[up0.y] * up_s0;
+            const float uw02 = lut[up0.z] * up_s0;
+            const float uw03 = lut[up0.w] * up_s0;
+            const float uw10 = lut[up1.x] * up_s1;
+            const float uw11 = lut[up1.y] * up_s1;
+            const float uw12 = lut[up1.z] * up_s1;
+            const float uw13 = lut[up1.w] * up_s1;
+#pragma unroll
+            for (int sample = 0; sample < kBatchCapacity; ++sample) {
+                if (sample >= batch) break;
+                const uint16_t* base = xs + sample * kTile + local;
+                const uint2 p0 = *reinterpret_cast<const uint2*>(base);
+                const uint2 p1 = *reinterpret_cast<const uint2*>(base + 128);
+                const float2 lo0 = __half22float2(
+                    *reinterpret_cast<const __half2*>(&p0.x));
+                const float2 hi0 = __half22float2(
+                    *reinterpret_cast<const __half2*>(&p0.y));
+                const float2 lo1 = __half22float2(
+                    *reinterpret_cast<const __half2*>(&p1.x));
+                const float2 hi1 = __half22float2(
+                    *reinterpret_cast<const __half2*>(&p1.y));
+                float gate_acc = gate_sums[sample];
+                float up_acc = up_sums[sample];
+                gate_acc += lo0.x * gw00 + lo0.y * gw01 +
+                    hi0.x * gw02 + hi0.y * gw03;
+                up_acc += lo0.x * uw00 + lo0.y * uw01 +
+                    hi0.x * uw02 + hi0.y * uw03;
+                gate_acc += lo1.x * gw10 + lo1.y * gw11 +
+                    hi1.x * gw12 + hi1.y * gw13;
+                up_acc += lo1.x * uw10 + lo1.y * uw11 +
+                    hi1.x * uw12 + hi1.y * uw13;
+                gate_sums[sample] = gate_acc;
+                up_sums[sample] = up_acc;
+            }
+        }
+        for (; local < tile_cols; local += 128) {
             const int col = tile + local;
             const uchar4 gate_codes =
                 *reinterpret_cast<const uchar4*>(gate_row + col);
@@ -547,14 +536,14 @@ __global__ void fp8_swiglu_small_batch_shared_f16_kernel(
                 if (sample >= batch) break;
                 const uint2 packed = *reinterpret_cast<const uint2*>(
                     xs + sample * kTile + local);
-                const float x0 = half_to_float(static_cast<uint16_t>(packed.x));
-                const float x1 =
-                    half_to_float(static_cast<uint16_t>(packed.x >> 16));
-                const float x2 = half_to_float(static_cast<uint16_t>(packed.y));
-                const float x3 =
-                    half_to_float(static_cast<uint16_t>(packed.y >> 16));
-                gate_sums[sample] += x0 * gw0 + x1 * gw1 + x2 * gw2 + x3 * gw3;
-                up_sums[sample] += x0 * uw0 + x1 * uw1 + x2 * uw2 + x3 * uw3;
+                const float2 lo = __half22float2(
+                    *reinterpret_cast<const __half2*>(&packed.x));
+                const float2 hi = __half22float2(
+                    *reinterpret_cast<const __half2*>(&packed.y));
+                gate_sums[sample] +=
+                    lo.x * gw0 + lo.y * gw1 + hi.x * gw2 + hi.y * gw3;
+                up_sums[sample] +=
+                    lo.x * uw0 + lo.y * uw1 + hi.x * uw2 + hi.y * uw3;
             }
         }
     }
@@ -1048,33 +1037,34 @@ bool ensure_fp8_f16_cublas_workspace(
     return true;
 }
 
-bool fp8_matmul_f16_cublas(
-    const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
-    uint16_t* y, int batch, int rows, int cols, int x_stride,
-    int y_stride, int weight_stride, int scale_stride, cudaStream_t stream) {
-    Fp8F16CublasWorkspace& workspace = fp8_f16_cublas_workspace();
+bool dequantize_fp8_weight_f16(
+    const uint8_t* weight, const uint16_t* scale, uint16_t* output,
+    int rows, int cols, int weight_stride, int scale_stride,
+    cudaStream_t stream) {
     const size_t weight_elements = static_cast<size_t>(rows) * cols;
-    if (!ensure_fp8_f16_cublas_workspace(workspace, weight_elements)) return false;
     constexpr int kThreads = 256;
     const size_t block_count = (weight_elements + kThreads - 1) / kThreads;
     const int blocks = static_cast<int>(block_count > 65535 ? 65535 : block_count);
     fp8_weight_fp16scale_to_half_kernel<<<blocks, kThreads, 0, stream>>>(
-        weight, scale, workspace.weight, rows, cols, weight_stride,
-        scale_stride);
+        weight, scale, output, rows, cols, weight_stride, scale_stride);
     if (cudaGetLastError() != cudaSuccess) return false;
     const int tail = cols & 3;
-    if (tail != 0) {
-        const size_t tail_elements = static_cast<size_t>(rows) * tail;
-        const size_t tail_block_count =
-            (tail_elements + kThreads - 1) / kThreads;
-        const int tail_blocks = static_cast<int>(std::min<size_t>(
-            tail_block_count, 65535));
-        fp8_weight_fp16scale_to_half_tail_kernel<<<
-            tail_blocks, kThreads, 0, stream>>>(
-                weight, scale, workspace.weight, rows, cols,
-                weight_stride, scale_stride);
-        if (cudaGetLastError() != cudaSuccess) return false;
-    }
+    if (tail == 0) return true;
+    const size_t tail_elements = static_cast<size_t>(rows) * tail;
+    const size_t tail_block_count = (tail_elements + kThreads - 1) / kThreads;
+    const int tail_blocks = static_cast<int>(std::min<size_t>(
+        tail_block_count, 65535));
+    fp8_weight_fp16scale_to_half_tail_kernel<<<tail_blocks, kThreads, 0, stream>>>(
+        weight, scale, output, rows, cols, weight_stride, scale_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool fp16_matmul_f16_cublas(
+    const uint16_t* x, const uint16_t* weight, uint16_t* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, cudaStream_t stream) {
+    Fp8F16CublasWorkspace& workspace = fp8_f16_cublas_workspace();
+    if (!ensure_fp8_f16_cublas_workspace(workspace, 0, false)) return false;
     if (cublasSetStream(workspace.handle, stream) != CUBLAS_STATUS_SUCCESS) {
         return false;
     }
@@ -1083,14 +1073,29 @@ bool fp8_matmul_f16_cublas(
     const cublasGemmAlgo_t algo =
         (rows % 8 == 0 && batch % 8 == 0 && cols % 8 == 0)
             ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
-    const cublasStatus_t gemm_status = cublasGemmEx(
+    return cublasGemmEx(
         workspace.handle, CUBLAS_OP_T, CUBLAS_OP_N,
         rows, batch, cols, &alpha,
-        workspace.weight, CUDA_R_16F, cols,
+        weight, CUDA_R_16F, weight_stride,
         x, CUDA_R_16F, x_stride,
         &beta, y, CUDA_R_16F, y_stride,
-        CUBLAS_COMPUTE_32F, algo);
-    return gemm_status == CUBLAS_STATUS_SUCCESS;
+        CUBLAS_COMPUTE_32F, algo) == CUBLAS_STATUS_SUCCESS;
+}
+
+bool fp8_matmul_f16_cublas(
+    const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
+    uint16_t* y, int batch, int rows, int cols, int x_stride,
+    int y_stride, int weight_stride, int scale_stride, cudaStream_t stream) {
+    Fp8F16CublasWorkspace& workspace = fp8_f16_cublas_workspace();
+    const size_t weight_elements = static_cast<size_t>(rows) * cols;
+    if (!ensure_fp8_f16_cublas_workspace(workspace, weight_elements)) return false;
+    if (!dequantize_fp8_weight_f16(weight, scale, workspace.weight, rows, cols,
+                                   weight_stride, scale_stride, stream)) {
+        return false;
+    }
+    return fp16_matmul_f16_cublas(
+        x, workspace.weight, y, batch, rows, cols, x_stride, y_stride, cols,
+        stream);
 }
 
 template <bool kFloatOutput, int kWarps, int kBatchCapacity>
@@ -1286,6 +1291,34 @@ __global__ void rmsnorm_f16_kernel(const uint16_t* x, const uint16_t* gamma,
     }
 }
 
+__global__ void residual_add_rmsnorm_f16_kernel(
+    const uint16_t* hidden, const uint16_t* delta, const uint16_t* gamma,
+    uint16_t* residual, uint16_t* normalized, int rows, int cols, float eps) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+    const uint16_t* hidden_row = hidden + row_offset;
+    const uint16_t* delta_row = delta + row_offset;
+    uint16_t* residual_row = residual + row_offset;
+    uint16_t* normalized_row = normalized + row_offset;
+    float sum = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        const uint16_t value = float_to_half(
+            half_to_float(hidden_row[col]) + half_to_float(delta_row[col]));
+        residual_row[col] = value;
+        const float rounded = half_to_float(value);
+        sum += rounded * rounded;
+    }
+    extern __shared__ float scratch[];
+    const float inv = rsqrtf(
+        block_reduce_sum(sum, scratch) / static_cast<float>(cols) + eps);
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        normalized_row[col] = float_to_half(
+            half_to_float(residual_row[col]) * inv *
+            (1.0f + half_to_float(gamma[col])));
+    }
+}
+
 __global__ void gated_rmsnorm_f16_kernel(
     const uint16_t* x, const uint16_t* gamma, const uint16_t* gate,
     uint16_t* y, int rows, int cols, float eps) {
@@ -1432,6 +1465,163 @@ __global__ void gated_delta_step_f16_kernel(
         result += cell * q_shared[i];
     }
     output[static_cast<size_t>(head) * value_dim + value] = float_to_half(result * q_scale);
+}
+
+__global__ void normalize_gated_delta_qk_f16_kernel(
+    const uint16_t* q, const uint16_t* k, float* q_normalized,
+    float* k_normalized, int rows, int key_heads, int key_dim) {
+    const int key_head = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    const int tid = static_cast<int>(threadIdx.x);
+    const size_t offset =
+        (static_cast<size_t>(token) * key_heads + key_head) * key_dim;
+    float q_partial = 0.0f;
+    float k_partial = 0.0f;
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        const float qv = half_to_float(q[offset + i]);
+        const float kv = half_to_float(k[offset + i]);
+        q_partial += qv * qv;
+        k_partial += kv * kv;
+    }
+    __shared__ float q_reduce[128];
+    __shared__ float k_reduce[128];
+    q_reduce[tid] = q_partial;
+    k_reduce[tid] = k_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            q_reduce[tid] += q_reduce[tid + stride];
+            k_reduce[tid] += k_reduce[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float q_inv = rsqrtf(q_reduce[0] + 1.0e-6f);
+    const float k_inv = rsqrtf(k_reduce[0] + 1.0e-6f);
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        q_normalized[offset + i] = half_to_float(q[offset + i]) * q_inv;
+        k_normalized[offset + i] = half_to_float(k[offset + i]) * k_inv;
+    }
+}
+
+template <int kKeyDim>
+__global__ void gated_delta_sequence_normalized_f16_kernel(
+    float* state, const float* q_normalized, const float* k_normalized,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads,
+    int value_dim, float q_scale) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int value = static_cast<int>(threadIdx.x);
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    const int key_stride = key_heads * kKeyDim;
+    float* sh = state + static_cast<size_t>(head) * kKeyDim * value_dim;
+    float st[kKeyDim];
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) {
+        st[i] = sh[static_cast<size_t>(i) * value_dim + value];
+    }
+    for (int token = 0; token < rows; ++token) {
+        const float* qr = q_normalized +
+            static_cast<size_t>(token) * key_stride +
+            static_cast<size_t>(key_head) * kKeyDim;
+        const float* kr = k_normalized +
+            static_cast<size_t>(token) * key_stride +
+            static_cast<size_t>(key_head) * kKeyDim;
+        const size_t gate_index = static_cast<size_t>(token) * heads + head;
+        const float decay = expf(half_to_float(g[gate_index]));
+        const float b = half_to_float(beta[gate_index]);
+        float kv_mem = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] *= decay;
+            kv_mem += st[i] * kr[i];
+        }
+        const size_t value_index = static_cast<size_t>(token) * heads * value_dim +
+                                   static_cast<size_t>(head) * value_dim + value;
+        const float delta = (half_to_float(v[value_index]) - kv_mem) * b;
+        float result = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kKeyDim; ++i) {
+            st[i] += kr[i] * delta;
+            result += st[i] * qr[i];
+        }
+        output[value_index] = float_to_half(result * q_scale);
+    }
+#pragma unroll
+    for (int i = 0; i < kKeyDim; ++i) {
+        sh[static_cast<size_t>(i) * value_dim + value] = st[i];
+    }
+}
+
+template <int kKeyDim, int kValueTile, int kChunk>
+__global__ void gated_delta_sequence_normalized_shared_f16_kernel(
+    float* state, const float* q_normalized, const float* k_normalized,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads,
+    int value_dim, float q_scale) {
+    const int tile = static_cast<int>(blockIdx.x) %
+                     ((value_dim + kValueTile - 1) / kValueTile);
+    const int head = static_cast<int>(blockIdx.x) /
+                     ((value_dim + kValueTile - 1) / kValueTile);
+    const int value = tile * kValueTile + static_cast<int>(threadIdx.x);
+    if (head >= heads || value >= value_dim) return;
+
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    const int key_stride = key_heads * kKeyDim;
+    const int lane = static_cast<int>(threadIdx.x);
+    extern __shared__ float state_tile[];
+    float* sh = state + static_cast<size_t>(head) * kKeyDim * value_dim;
+
+    // Keep the recurrent state in shared memory and use a compile-time key
+    // chunk only to control loop unrolling. This preserves the original scalar
+    // FP32 order without keeping the full state vector in registers.
+    for (int i = 0; i < kKeyDim; ++i) {
+        state_tile[i * kValueTile + lane] =
+            sh[static_cast<size_t>(i) * value_dim + value];
+    }
+    for (int token = 0; token < rows; ++token) {
+        const float* qr = q_normalized +
+            static_cast<size_t>(token) * key_stride +
+            static_cast<size_t>(key_head) * kKeyDim;
+        const float* kr = k_normalized +
+            static_cast<size_t>(token) * key_stride +
+            static_cast<size_t>(key_head) * kKeyDim;
+        const size_t gate_index = static_cast<size_t>(token) * heads + head;
+        const float decay = expf(half_to_float(g[gate_index]));
+        const float b = half_to_float(beta[gate_index]);
+        float kv_mem = 0.0f;
+        for (int base = 0; base < kKeyDim; base += kChunk) {
+#pragma unroll
+            for (int j = 0; j < kChunk; ++j) {
+                const int i = base + j;
+                const int index = i * kValueTile + lane;
+                const float cell = state_tile[index] * decay;
+                state_tile[index] = cell;
+                kv_mem += cell * kr[i];
+            }
+        }
+        const size_t value_index = static_cast<size_t>(token) * heads * value_dim +
+                                   static_cast<size_t>(head) * value_dim + value;
+        const float delta = (half_to_float(v[value_index]) - kv_mem) * b;
+        float result = 0.0f;
+        for (int base = 0; base < kKeyDim; base += kChunk) {
+#pragma unroll
+            for (int j = 0; j < kChunk; ++j) {
+                const int i = base + j;
+                const int index = i * kValueTile + lane;
+                const float cell = state_tile[index] + kr[i] * delta;
+                state_tile[index] = cell;
+                result += cell * qr[i];
+            }
+        }
+        output[value_index] = float_to_half(result * q_scale);
+    }
+
+    for (int i = 0; i < kKeyDim; ++i) {
+        sh[static_cast<size_t>(i) * value_dim + value] =
+            state_tile[i * kValueTile + lane];
+    }
 }
 
 template <int kKeyDim>
@@ -1855,6 +2045,113 @@ bool launch_prefill_attention(
     return cudaGetLastError() == cudaSuccess;
 }
 
+template <int kWarps>
+bool launch_fp8_swiglu_small_batch_f16(
+    const uint16_t* x, const uint8_t* gate_weight,
+    const uint16_t* gate_scale, const uint8_t* up_weight,
+    const uint16_t* up_scale, uint16_t* y, int batch, int rows, int cols,
+    int x_stride, int y_stride, int weight_stride, int scale_stride,
+    bool use_shared, int tile, cudaStream_t stream) {
+    const int blocks = (rows + kWarps - 1) / kWarps;
+#define LAUNCH_FP8_SWIGLU_TILED(CAPACITY, TILE) \
+    fp8_swiglu_small_batch_shared_f16_kernel<kWarps, CAPACITY, TILE> \
+        <<<blocks, kWarps * 32, 0, stream>>>( \
+            x, gate_weight, gate_scale, up_weight, up_scale, y, batch, rows, \
+            cols, x_stride, y_stride, weight_stride, scale_stride)
+#define LAUNCH_FP8_SWIGLU_CAP(TILE) \
+    do { \
+        if (batch <= 2) { LAUNCH_FP8_SWIGLU_TILED(2, TILE); } \
+        else if (batch == 3) { LAUNCH_FP8_SWIGLU_TILED(3, TILE); } \
+        else if (batch == 4) { LAUNCH_FP8_SWIGLU_TILED(4, TILE); } \
+        else if (batch == 5) { LAUNCH_FP8_SWIGLU_TILED(5, TILE); } \
+        else { LAUNCH_FP8_SWIGLU_TILED(8, TILE); } \
+    } while (0)
+    if (use_shared) {
+        if (tile == 512) { LAUNCH_FP8_SWIGLU_CAP(512); }
+        else if (tile == 2048) { LAUNCH_FP8_SWIGLU_CAP(2048); }
+        else { LAUNCH_FP8_SWIGLU_CAP(1024); }
+    } else if (batch <= 2) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 2>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 3) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 3>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 4) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 4>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else if (batch == 5) {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 5>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    } else {
+        fp8_swiglu_small_batch_f16_kernel<kWarps, 8>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
+                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    }
+#undef LAUNCH_FP8_SWIGLU_CAP
+#undef LAUNCH_FP8_SWIGLU_TILED
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <int kWarps>
+bool launch_fp8_matmul_f16_small_batch(
+    const uint16_t* x, const uint8_t* weight, const uint16_t* scale,
+    uint16_t* y, int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, int scale_stride, bool use_shared,
+    cudaStream_t stream) {
+    const int blocks = (rows + kWarps - 1) / kWarps;
+    if (use_shared && batch > 1) {
+#define LAUNCH_FP8_SMALL_PAIRED(CAPACITY) \
+        fp8_matmul_f16_small_batch_paired_shared_kernel< \
+            kWarps, CAPACITY, 1024> \
+            <<<blocks, kWarps * 32, 0, stream>>>( \
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride, \
+                weight_stride, scale_stride)
+        if (batch == 2) { LAUNCH_FP8_SMALL_PAIRED(2); }
+        else if (batch == 3) { LAUNCH_FP8_SMALL_PAIRED(3); }
+        else if (batch == 4) { LAUNCH_FP8_SMALL_PAIRED(4); }
+        else if (batch == 5) { LAUNCH_FP8_SMALL_PAIRED(5); }
+        else { LAUNCH_FP8_SMALL_PAIRED(8); }
+#undef LAUNCH_FP8_SMALL_PAIRED
+        return cudaGetLastError() == cudaSuccess;
+    }
+    if (batch <= 2) {
+        fp8_matmul_f16_small_batch_kernel<kWarps, 2>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+    } else if (batch == 3) {
+        fp8_matmul_f16_small_batch_kernel<kWarps, 3>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+    } else if (batch == 4) {
+        fp8_matmul_f16_small_batch_kernel<kWarps, 4>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+    } else if (batch == 5) {
+        fp8_matmul_f16_small_batch_kernel<kWarps, 5>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+    } else {
+        fp8_matmul_f16_small_batch_kernel<kWarps, 8>
+            <<<blocks, kWarps * 32, 0, stream>>>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride);
+    }
+    return cudaGetLastError() == cudaSuccess;
+}
+
 }  // namespace
 
 bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
@@ -1910,7 +2207,8 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
     const char* multirow = std::getenv("QWEN_FP8_F16_MULTIROW");
     const char* rows_env = std::getenv("QWEN_FP8_F16_MULTIROW_ROWS");
-    const bool use_multirow = multirow != nullptr && std::strcmp(multirow, "0") != 0;
+    const bool use_multirow =
+        multirow != nullptr && std::strcmp(multirow, "0") != 0;
     const int requested_rows = rows_env != nullptr ? std::atoi(rows_env) : 0;
     constexpr int kMinBlocks = 136;
     auto blocks_for = [&](int rows_per_warp) {
@@ -1949,54 +2247,55 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
         scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) {
         return false;
     }
-    constexpr int kWarps = 8;
-    const int blocks = (rows + kWarps - 1) / kWarps;
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
-    // See fp8_matmul_f16_small_batch_shared_kernel: staging the shared activation
-    // tile removes the per-warp activation re-read without changing the result.
     const char* shared_env = std::getenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
-    if (shared_env == nullptr || std::strcmp(shared_env, "0") != 0) {
-        constexpr int kTile = 1024;
-#define LAUNCH_FP8_SWIGLU_SHARED(CAPACITY) \
-        fp8_swiglu_small_batch_shared_f16_kernel<kWarps, CAPACITY, kTile> \
-            <<<blocks, kWarps * 32, 0, s>>>( \
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch, \
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride)
-        if (batch <= 2) { LAUNCH_FP8_SWIGLU_SHARED(2); }
-        else if (batch == 3) { LAUNCH_FP8_SWIGLU_SHARED(3); }
-        else if (batch == 4) { LAUNCH_FP8_SWIGLU_SHARED(4); }
-        else if (batch == 5) { LAUNCH_FP8_SWIGLU_SHARED(5); }
-        else { LAUNCH_FP8_SWIGLU_SHARED(8); }
-#undef LAUNCH_FP8_SWIGLU_SHARED
-        return cudaGetLastError() == cudaSuccess;
+    const bool use_shared =
+        shared_env == nullptr || std::strcmp(shared_env, "0") != 0;
+    int tile = 1024;
+    if (const char* tile_env = std::getenv("QWEN_FP8_SWIGLU_TILE")) {
+        const int parsed = std::atoi(tile_env);
+        if (parsed == 512 || parsed == 1024 || parsed == 2048) tile = parsed;
     }
-    if (batch <= 2) {
-        fp8_swiglu_small_batch_f16_kernel<kWarps, 2>
-            <<<blocks, kWarps * 32, 0, s>>>(
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
-    } else if (batch == 3) {
-        fp8_swiglu_small_batch_f16_kernel<kWarps, 3>
-            <<<blocks, kWarps * 32, 0, s>>>(
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
-    } else if (batch == 4) {
-        fp8_swiglu_small_batch_f16_kernel<kWarps, 4>
-            <<<blocks, kWarps * 32, 0, s>>>(
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
-    } else if (batch == 5) {
-        fp8_swiglu_small_batch_f16_kernel<kWarps, 5>
-            <<<blocks, kWarps * 32, 0, s>>>(
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
-    } else {
-        fp8_swiglu_small_batch_f16_kernel<kWarps, 8>
-            <<<blocks, kWarps * 32, 0, s>>>(
-                x, gate_weight, gate_scale, up_weight, up_scale, y, batch,
-                rows, cols, x_stride, y_stride, weight_stride, scale_stride);
+    int warps = batch >= 3 ? 16 : 8;
+    if (const char* warps_env = std::getenv("QWEN_FP8_SWIGLU_WARPS")) {
+        const int parsed = std::atoi(warps_env);
+        if (parsed == 8 || parsed == 16) warps = parsed;
     }
-    return cudaGetLastError() == cudaSuccess;
+    if (warps == 16) {
+        return launch_fp8_swiglu_small_batch_f16<16>(
+            x, gate_weight, gate_scale, up_weight, up_scale, y, batch, rows,
+            cols, x_stride, y_stride, weight_stride, scale_stride, use_shared,
+            tile, s);
+    }
+    return launch_fp8_swiglu_small_batch_f16<8>(
+        x, gate_weight, gate_scale, up_weight, up_scale, y, batch, rows, cols,
+        x_stride, y_stride, weight_stride, scale_stride, use_shared, tile, s);
+}
+
+bool qwen_fp8_e4m3_fp16scale_dequantize_f16_cuda(
+    const uint8_t* weight, const uint16_t* scale, uint16_t* output,
+    int rows, int cols, int weight_stride, int scale_stride, void* stream) {
+    if (!weight || !scale || !output || rows <= 0 || cols <= 0 ||
+        weight_stride < cols ||
+        scale_stride < (cols + kFp8WeightBlock - 1) / kFp8WeightBlock) {
+        return false;
+    }
+    return dequantize_fp8_weight_f16(
+        weight, scale, output, rows, cols, weight_stride, scale_stride,
+        static_cast<cudaStream_t>(stream));
+}
+
+bool qwen_fp16_matmul_rows_f16_cublas_cuda(
+    const uint16_t* x, const uint16_t* weight, uint16_t* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, void* stream) {
+    if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
+        x_stride < cols || y_stride < rows || weight_stride < cols) {
+        return false;
+    }
+    return fp16_matmul_f16_cublas(
+        x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
+        static_cast<cudaStream_t>(stream));
 }
 
 bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
@@ -2019,105 +2318,28 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
     // full.q_gate 1.97 -> 0.52, linear.out 0.97 -> 0.26 (3.8x-5.0x). Set
     // QWEN_FP8_F16_PREFILL_CUBLAS=0 to fall back to the previous kernels.
     const char* cublas_env = std::getenv("QWEN_FP8_F16_PREFILL_CUBLAS");
-    const bool use_cublas = cublas_env == nullptr ||
-        std::strcmp(cublas_env, "0") != 0;
-    constexpr int kSmallBatchWarps = 8;
+    const bool use_cublas =
+        cublas_env == nullptr || std::strcmp(cublas_env, "0") != 0;
     if (use_small_batch && batch <= 8 && x_stride % 4 == 0 &&
         weight_stride % 4 == 0) {
-        const int blocks = (rows + kSmallBatchWarps - 1) / kSmallBatchWarps;
-        // Speculative verify batches re-read the same activation rows from every
-        // warp in the block. Staging that tile in shared memory keeps the kernel
-        // weight-bound; the per-lane column order is unchanged so results match
-        // the non-staged kernel bit for bit.
-        const char* shared_env = std::getenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
-        const bool use_shared = shared_env == nullptr ||
-            std::strcmp(shared_env, "0") != 0;
-        constexpr int kSmallBatchTile = 1024;
-        // Packed-conversion variant. Bit-identical to the fp16-staged kernel; the
-        // activation conversions issue as packed pairs.
-        int fshared_tile = 1024;
-        if (const char* tile_env = std::getenv("QWEN_FP8_F16_SMALL_BATCH_TILE")) {
-            const int parsed = std::atoi(tile_env);
-            if (parsed == 256 || parsed == 512 || parsed == 2048) {
-                fshared_tile = parsed;
-            }
+        const char* shared_env =
+            std::getenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
+        const bool use_shared =
+            shared_env == nullptr || std::strcmp(shared_env, "0") != 0;
+        int warps = batch >= 3 ? 16 : 8;
+        if (const char* warps_env =
+                std::getenv("QWEN_FP8_F16_SMALL_BATCH_WARPS")) {
+            const int parsed = std::atoi(warps_env);
+            if (parsed == 8 || parsed == 16) warps = parsed;
         }
-        // Default. Fusing two strided steps per iteration halves the loop overhead
-        // of the batch-8 speculative-verify shape, which is limited by instruction
-        // issue rather than by DRAM or FMA throughput. Measured on SM75 at the real
-        // TP4 shard shapes, batch 8: mlp.gate 0.1838 -> 0.1539 ms, mlp.down 0.1564
-        // -> 0.1307, linear.qkv 0.0908 -> 0.0739, full.q_gate 0.0943 -> 0.0858,
-        // linear.out 0.0592 -> 0.0517. Each lane keeps its own columns and their
-        // addition order, so it is bit identical to the register-only kernel plain
-        // decode uses; test_qwen_half_ops gates that. Set
-        // QWEN_FP8_F16_SMALL_BATCH_FSHARED=0 to fall back.
-        const char* fshared_env = std::getenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED");
-        const bool use_fshared = fshared_env == nullptr ||
-            std::strcmp(fshared_env, "0") != 0;
-        if (use_fshared && use_shared && batch > 1) {
-#define LAUNCH_FP8_SMALL_FSHARED_T(CAPACITY, TILE) \
-            fp8_matmul_f16_small_batch_fshared_kernel< \
-                kSmallBatchWarps, CAPACITY, TILE> \
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>( \
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride, \
-                    weight_stride, scale_stride)
-#define LAUNCH_FP8_SMALL_FSHARED(CAPACITY) \
-            do { \
-                if (fshared_tile == 256) { LAUNCH_FP8_SMALL_FSHARED_T(CAPACITY, 256); } \
-                else if (fshared_tile == 512) { LAUNCH_FP8_SMALL_FSHARED_T(CAPACITY, 512); } \
-                else if (fshared_tile == 2048) { LAUNCH_FP8_SMALL_FSHARED_T(CAPACITY, 2048); } \
-                else { LAUNCH_FP8_SMALL_FSHARED_T(CAPACITY, 1024); } \
-            } while (0)
-            if (batch == 2) { LAUNCH_FP8_SMALL_FSHARED(2); }
-            else if (batch == 3) { LAUNCH_FP8_SMALL_FSHARED(3); }
-            else if (batch == 4) { LAUNCH_FP8_SMALL_FSHARED(4); }
-            else if (batch == 5) { LAUNCH_FP8_SMALL_FSHARED(5); }
-            else { LAUNCH_FP8_SMALL_FSHARED(8); }
-#undef LAUNCH_FP8_SMALL_FSHARED
-#undef LAUNCH_FP8_SMALL_FSHARED_T
-            return cudaGetLastError() == cudaSuccess;
+        if (warps == 16) {
+            return launch_fp8_matmul_f16_small_batch<16>(
+                x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+                weight_stride, scale_stride, use_shared, s);
         }
-        if (use_shared && batch > 1) {
-#define LAUNCH_FP8_SMALL_SHARED(CAPACITY) \
-            fp8_matmul_f16_small_batch_shared_kernel< \
-                kSmallBatchWarps, CAPACITY, kSmallBatchTile> \
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>( \
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride, \
-                    weight_stride, scale_stride)
-            if (batch == 2) { LAUNCH_FP8_SMALL_SHARED(2); }
-            else if (batch == 3) { LAUNCH_FP8_SMALL_SHARED(3); }
-            else if (batch == 4) { LAUNCH_FP8_SMALL_SHARED(4); }
-            else if (batch == 5) { LAUNCH_FP8_SMALL_SHARED(5); }
-            else { LAUNCH_FP8_SMALL_SHARED(8); }
-#undef LAUNCH_FP8_SMALL_SHARED
-            return cudaGetLastError() == cudaSuccess;
-        }
-        if (batch <= 2) {
-            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 2>
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-                    weight_stride, scale_stride);
-        } else if (batch == 3) {
-            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 3>
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-                    weight_stride, scale_stride);
-        } else if (batch == 4) {
-            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 4>
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-                    weight_stride, scale_stride);
-        } else if (batch == 5) {
-            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 5>
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-                    weight_stride, scale_stride);
-        } else {
-            fp8_matmul_f16_small_batch_kernel<kSmallBatchWarps, 8>
-                <<<blocks, kSmallBatchWarps * 32, 0, s>>>(
-                    x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
-                    weight_stride, scale_stride);
-        }
+        return launch_fp8_matmul_f16_small_batch<8>(
+            x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
+            weight_stride, scale_stride, use_shared, s);
     } else {
         // cuBLAS needs the dequantised weight to be a dense `rows x cols` matrix
         // with leading dimension `cols`. The expansion kernels write that layout
@@ -2129,8 +2351,10 @@ bool qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
                 x, weight, scale, y, batch, rows, cols, x_stride, y_stride,
                 weight_stride, scale_stride, s);
         }
-        const char* wide = std::getenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
-        const bool use_wide = wide == nullptr || std::strcmp(wide, "0") != 0;
+        const char* wide_env =
+            std::getenv("QWEN_FP8_F16_PREFILL_WIDE_N64");
+        const bool use_wide =
+            wide_env == nullptr || std::strcmp(wide_env, "0") != 0;
         if (use_wide && batch >= 96 && x_stride % 4 == 0 &&
             weight_stride % 4 == 0) {
             dim3 grid(static_cast<unsigned>((rows + 63) / 64),
@@ -2309,12 +2533,103 @@ bool qwen_copy_rows_strided_f16_cuda(
     return status == cudaSuccess;
 }
 
+namespace {
+
+template <bool kGather>
+__global__ void copy_regions_kernel(
+    const QwenCopyRegion* __restrict__ regions, int region_count,
+    uint8_t* __restrict__ packed) {
+    const uint64_t global_block = static_cast<uint64_t>(blockIdx.x);
+    int lo = 0;
+    int hi = region_count;
+    while (lo + 1 < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (regions[mid].first_block <= global_block) lo = mid;
+        else hi = mid;
+    }
+    const QwenCopyRegion region = regions[lo];
+    const uint64_t local_block = global_block - region.first_block;
+    const uint64_t local_offset = local_block * kQwenCopyRegionBlockBytes;
+    if (local_offset >= region.bytes) return;
+    const uint64_t remaining = region.bytes - local_offset;
+    const uint64_t bytes = remaining < kQwenCopyRegionBlockBytes
+        ? remaining : kQwenCopyRegionBlockBytes;
+    uint8_t* region_data = reinterpret_cast<uint8_t*>(region.device_address) +
+        local_offset;
+    uint8_t* packed_data = packed + region.packed_offset + local_offset;
+    const uint8_t* source = kGather ? region_data : packed_data;
+    uint8_t* destination = kGather ? packed_data : region_data;
+
+    const uintptr_t alignment = reinterpret_cast<uintptr_t>(source) |
+        reinterpret_cast<uintptr_t>(destination);
+    if ((alignment & 0xfu) == 0 && (bytes & 0xfu) == 0) {
+        const uint4* source4 = reinterpret_cast<const uint4*>(source);
+        uint4* destination4 = reinterpret_cast<uint4*>(destination);
+        for (uint64_t index = threadIdx.x; index < bytes / sizeof(uint4);
+             index += blockDim.x) {
+            destination4[index] = source4[index];
+        }
+    } else {
+        for (uint64_t index = threadIdx.x; index < bytes;
+             index += blockDim.x) {
+            destination[index] = source[index];
+        }
+    }
+}
+
+template <bool kGather>
+bool launch_copy_regions(
+    const QwenCopyRegion* regions, int region_count, uint8_t* packed,
+    uint64_t total_blocks, void* stream) {
+    if (!regions || !packed || region_count <= 0 || total_blocks == 0 ||
+        total_blocks > static_cast<uint64_t>(UINT32_MAX)) {
+        return false;
+    }
+    copy_regions_kernel<kGather><<<
+        static_cast<unsigned>(total_blocks), kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(regions, region_count, packed);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool qwen_gather_copy_regions_cuda(
+    const QwenCopyRegion* regions, int region_count, uint8_t* packed,
+    uint64_t total_blocks, void* stream) {
+    return launch_copy_regions<true>(
+        regions, region_count, packed, total_blocks, stream);
+}
+
+bool qwen_scatter_copy_regions_cuda(
+    const QwenCopyRegion* regions, int region_count, const uint8_t* packed,
+    uint64_t total_blocks, void* stream) {
+    return launch_copy_regions<false>(
+        regions, region_count, const_cast<uint8_t*>(packed), total_blocks,
+        stream);
+}
+
 bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
     const uint16_t* x, const uint16_t* gamma, uint16_t* y,
     int rows, int cols, float eps, void* stream) {
     if (!x || !gamma || !y || rows <= 0 || cols <= 0 || eps < 0.0f) return false;
     rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
         static_cast<cudaStream_t>(stream)>>>(x, gamma, y, rows, cols, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+    const uint16_t* hidden, const uint16_t* delta, const uint16_t* gamma,
+    uint16_t* residual, uint16_t* normalized, int rows, int cols, float eps,
+    void* stream) {
+    if (!hidden || !delta || !gamma || !residual || !normalized || rows <= 0 ||
+        cols <= 0 || eps < 0.0f || residual == hidden || residual == delta ||
+        normalized == hidden || normalized == delta || normalized == residual) {
+        return false;
+    }
+    residual_add_rmsnorm_f16_kernel<<<
+        rows, kThreads, kThreads * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(
+        hidden, delta, gamma, residual, normalized, rows, cols, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2334,6 +2649,29 @@ bool qwen_split_packed_qkv_f16_cuda(
     const int total = rows * (2 * key_dim + value_dim);
     split_packed_qkv_f16_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
         static_cast<cudaStream_t>(stream)>>>(packed, q, k, v, rows, key_dim, value_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+__global__ void split_rows_pair_f16_kernel(const uint16_t* __restrict__ packed,
+                                           uint16_t* __restrict__ first,
+                                           uint16_t* __restrict__ second,
+                                           int rows, int width) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= rows * width) return;
+    const int row = index / width;
+    const int column = index - row * width;
+    const int packed_row = row * 2 * width;
+    first[index] = packed[packed_row + column];
+    second[index] = packed[packed_row + width + column];
+}
+
+bool qwen_split_rows_pair_f16_cuda(const uint16_t* packed, uint16_t* first,
+                                   uint16_t* second, int rows, int width,
+                                   void* stream) {
+    if (!packed || !first || !second || rows <= 0 || width <= 0) return false;
+    const int total = rows * width;
+    split_rows_pair_f16_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(packed, first, second, rows, width);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2383,10 +2721,112 @@ bool qwen_gated_delta_sequence_f16_cuda(
         heads <= 0 || key_heads <= 0 || heads % key_heads != 0 || key_dim != 128 ||
         value_dim != 128 || q_scale <= 0.0f) return false;
     gated_delta_sequence_f16_kernel<128><<<heads, value_dim,
-        static_cast<size_t>(value_dim) * sizeof(float), static_cast<cudaStream_t>(stream)>>>(
-        state, q, k, v, g, beta, output, rows, heads, key_heads,
-        value_dim, q_scale);
+        static_cast<size_t>(value_dim) * sizeof(float),
+        static_cast<cudaStream_t>(stream)>>>(
+            state, q, k, v, g, beta, output, rows, heads, key_heads,
+            value_dim, q_scale);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_normalize_gated_delta_qk_f16_cuda(
+    const uint16_t* q, const uint16_t* k, float* q_normalized,
+    float* k_normalized, int rows, int key_heads, int key_dim, void* stream) {
+    if (!q || !k || !q_normalized || !k_normalized || rows <= 0 ||
+        key_heads <= 0 || key_dim != 128) {
+        return false;
+    }
+    dim3 grid(static_cast<unsigned>(key_heads),
+              static_cast<unsigned>(rows), 1);
+    normalize_gated_delta_qk_f16_kernel<<<
+        grid, key_dim, 0, static_cast<cudaStream_t>(stream)>>>(
+            q, k, q_normalized, k_normalized, rows, key_heads, key_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_delta_sequence_normalized_f16_cuda(
+    float* state, const float* q_normalized, const float* k_normalized,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale, void* stream) {
+    if (!state || !q_normalized || !k_normalized || !v || !g || !beta ||
+        !output || rows <= 0 || heads <= 0 || key_heads <= 0 ||
+        heads % key_heads != 0 || key_dim != 128 || value_dim != 128 ||
+        q_scale <= 0.0f) {
+        return false;
+    }
+    gated_delta_sequence_normalized_f16_kernel<128><<<
+        heads, value_dim, 0, static_cast<cudaStream_t>(stream)>>>(
+            state, q_normalized, k_normalized, v, g, beta, output, rows,
+            heads, key_heads, value_dim, q_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+    float* state, const float* q_normalized, const float* k_normalized,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, int rows, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale, void* stream) {
+    if (!state || !q_normalized || !k_normalized || !v || !g || !beta ||
+        !output || rows <= 0 || heads <= 0 || key_heads <= 0 ||
+        heads % key_heads != 0 || key_dim != 128 || value_dim != 128 ||
+        q_scale <= 0.0f) {
+        return false;
+    }
+    // 32 lanes keeps one warp per block with a 16 KiB state tile. 16 halves the
+    // tile but doubles the block count, 64 needs 32 KiB and drops to one block
+    // per SM pair; the sweep below picks between them at build-probe time.
+    auto launch = [&](auto tile_tag, auto chunk_tag) -> bool {
+        constexpr int kValueTile = decltype(tile_tag)::value;
+        constexpr int kChunk = decltype(chunk_tag)::value;
+        const int tiles = (value_dim + kValueTile - 1) / kValueTile;
+        const size_t shared_bytes = static_cast<size_t>(key_dim) * kValueTile *
+                                    sizeof(float);
+        if (shared_bytes > 48u * 1024u) {
+            const cudaError_t attribute = cudaFuncSetAttribute(
+                gated_delta_sequence_normalized_shared_f16_kernel<
+                    128, kValueTile, kChunk>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(shared_bytes));
+            if (attribute != cudaSuccess) return false;
+        }
+        gated_delta_sequence_normalized_shared_f16_kernel<
+            128, kValueTile, kChunk><<<
+                heads * tiles, kValueTile, shared_bytes,
+                static_cast<cudaStream_t>(stream)>>>(
+            state, q_normalized, k_normalized, v, g, beta, output, rows,
+            heads, key_heads, value_dim, q_scale);
+        return cudaGetLastError() == cudaSuccess;
+    };
+    auto launch_chunk = [&](auto tile_tag, int chunk) -> bool {
+        if (chunk == 4) {
+            return launch(tile_tag, std::integral_constant<int, 4>{});
+        }
+        if (chunk == 16) {
+            return launch(tile_tag, std::integral_constant<int, 16>{});
+        }
+        if (chunk == 32) {
+            return launch(tile_tag, std::integral_constant<int, 32>{});
+        }
+        return launch(tile_tag, std::integral_constant<int, 8>{});
+    };
+    static const int tile_choice = [] {
+        const char* raw = std::getenv("QWEN_GATED_DELTA_VALUE_TILE");
+        const int parsed = raw != nullptr ? std::atoi(raw) : 32;
+        return (parsed == 16 || parsed == 32 || parsed == 64) ? parsed : 32;
+    }();
+    static const int chunk_choice = [] {
+        const char* raw = std::getenv("QWEN_GATED_DELTA_CHUNK");
+        const int parsed = raw != nullptr ? std::atoi(raw) : 8;
+        return (parsed == 4 || parsed == 8 || parsed == 16 || parsed == 32)
+            ? parsed : 8;
+    }();
+    if (tile_choice == 16) {
+        return launch_chunk(std::integral_constant<int, 16>{}, chunk_choice);
+    }
+    if (tile_choice == 64) {
+        return launch_chunk(std::integral_constant<int, 64>{}, chunk_choice);
+    }
+    return launch_chunk(std::integral_constant<int, 32>{}, chunk_choice);
 }
 
 bool qwen_partial_rope_f16_cuda(

@@ -1,5 +1,6 @@
 #include "qwen_cuda_ops.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -19,6 +20,11 @@ constexpr int kMaxHeadDim = 256;
 constexpr int kValuesPerThread = kMaxHeadDim / kThreads;
 constexpr int kPrefillCombos = kHeadsPerGroup * kQueryRows;
 constexpr int kDecodeMaxSplits = 64;
+// Verify attention splits far more finely than decode: it has only a handful of
+// query rows to fill the device with, so a 32-position tile at 8192 context wants
+// 256 splits where the decode ceiling would force 128. Sizes the merge kernel's
+// shared weight array, so 256 costs 1 KiB of shared memory per merge block.
+constexpr int kVerifyMaxSplits = 256;
 constexpr int kDecodeTargetPositions = 2048;
 constexpr int kDecodeMinContext = 4096;
 constexpr int kVerifyMaxRows = 8;
@@ -735,7 +741,7 @@ __global__ void gqa_decode_split_f16_kernel(
 // is loaded once for up to rows * 3 outputs. Splitting the history restores
 // enough parallelism for the 4-32K context regime where a single CTA per group
 // leaves SM75 mostly idle.
-template <int kRows>
+template <int kRows, int kHPG>
 __global__ void gqa_verify_split_f16_kernel(
     const uint16_t* __restrict__ q_rows,
     const uint16_t* __restrict__ k_cache,
@@ -748,15 +754,15 @@ __global__ void gqa_verify_split_f16_kernel(
     int position_offset,
     int splits,
     int positions_per_split) {
-    constexpr int kCombos = kRows * kHeadsPerGroup;
+    constexpr int kCombos = kRows * kHPG;
     const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv =
-        (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
+        (q_per_kv + kHPG - 1) / kHPG;
     const int grouped = static_cast<int>(blockIdx.x) / splits;
     const int split = static_cast<int>(blockIdx.x) % splits;
     const int kv_head = grouped / groups_per_kv;
     const int group = grouped % groups_per_kv;
-    const int first_head = kv_head * q_per_kv + group * kHeadsPerGroup;
+    const int first_head = kv_head * q_per_kv + group * kHPG;
     const int split_start = split * positions_per_split;
     const int split_end = min(
         position_offset + rows, split_start + positions_per_split);
@@ -776,8 +782,8 @@ __global__ void gqa_verify_split_f16_kernel(
     int context_limit[kCombos];
 #pragma unroll
     for (int combo = 0; combo < kCombos; ++combo) {
-        const int row = combo / kHeadsPerGroup;
-        const int head_in_group = combo % kHeadsPerGroup;
+        const int row = combo / kHPG;
+        const int head_in_group = combo % kHPG;
         const int head = first_head + head_in_group;
         active[combo] = row < rows &&
             head < (kv_head + 1) * q_per_kv && head < q_heads;
@@ -854,8 +860,8 @@ __global__ void gqa_verify_split_f16_kernel(
 #pragma unroll
     for (int combo = 0; combo < kCombos; ++combo) {
         if (!active[combo]) continue;
-        const int row = combo / kHeadsPerGroup;
-        const int head_in_group = combo % kHeadsPerGroup;
+        const int row = combo / kHPG;
+        const int head_in_group = combo % kHPG;
         const int head = first_head + head_in_group;
         float* destination = partial_output +
             ((static_cast<size_t>(row) * q_heads + head) * splits + split) *
@@ -882,7 +888,7 @@ __global__ void gqa_verify_merge_f16_kernel(
     const int row = static_cast<int>(blockIdx.y);
     const int head = static_cast<int>(blockIdx.x);
     if (row >= rows || head >= q_heads) return;
-    __shared__ float weights[kDecodeMaxSplits];
+    __shared__ float weights[kVerifyMaxSplits];
     if (threadIdx.x == 0) {
         const int stride = head_dim + 2;
         const size_t base =
@@ -980,17 +986,20 @@ __global__ void gqa_verify_scores_exact_f16_kernel(
 }
 
 __global__ void gqa_verify_softmax_exact_f16_kernel(
-    float* __restrict__ scores, int rows, int q_heads, int context_len) {
+    float* __restrict__ scores, int rows, int q_heads, int context_len,
+    int position_offset) {
     const int row = static_cast<int>(blockIdx.y);
     const int head = static_cast<int>(blockIdx.x);
     if (row >= rows || head >= q_heads) return;
     float* line = scores +
         (static_cast<size_t>(row) * q_heads + head) * context_len;
+    const int context_limit = position_offset + row + 1;
     __shared__ float reduce[kThreads];
     float local_max = -INFINITY;
     for (int position = static_cast<int>(threadIdx.x); position < context_len;
          position += kThreads) {
-        local_max = fmaxf(local_max, line[position]);
+        const float value = position < context_limit ? line[position] : -INFINITY;
+        local_max = fmaxf(local_max, value);
     }
     reduce[threadIdx.x] = local_max;
     __syncthreads();
@@ -1005,7 +1014,8 @@ __global__ void gqa_verify_softmax_exact_f16_kernel(
     float sum = 0.0f;
     for (int position = static_cast<int>(threadIdx.x); position < context_len;
          position += kThreads) {
-        line[position] = expf(line[position] - maximum);
+        line[position] = position < context_limit
+            ? expf(line[position] - maximum) : 0.0f;
         sum += line[position];
     }
     reduce[threadIdx.x] = sum;
@@ -1112,6 +1122,33 @@ __global__ void gqa_decode_merge_f16_kernel(
 bool valid_shape(int q_heads, int kv_heads, int head_dim) {
     return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 &&
         head_dim > 0 && head_dim <= kMaxHeadDim;
+}
+
+struct GqaCublasWorkspace {
+    int device = -1;
+    cublasHandle_t handle = nullptr;
+    ~GqaCublasWorkspace() {
+        if (handle != nullptr) cublasDestroy(handle);
+    }
+};
+
+GqaCublasWorkspace& gqa_cublas_workspace() {
+    static GqaCublasWorkspace workspace;
+    return workspace;
+}
+
+bool ensure_gqa_cublas_workspace(GqaCublasWorkspace& workspace) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    if (workspace.handle != nullptr && workspace.device == device) return true;
+    if (workspace.handle != nullptr) {
+        cublasDestroy(workspace.handle);
+        workspace.handle = nullptr;
+    }
+    if (cublasCreate(&workspace.handle) != CUBLAS_STATUS_SUCCESS) return false;
+    (void)cublasSetMathMode(workspace.handle, CUBLAS_TENSOR_OP_MATH);
+    workspace.device = device;
+    return true;
 }
 
 }  // namespace
@@ -1253,6 +1290,60 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_gqa_verify_attention_f16_cublas_qk_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, float* score_scratch,
+    int rows, int q_heads, int kv_heads, int head_dim,
+    int position_offset, int max_context, void* stream) {
+    if (!q || !k_cache || !v_cache || !output || !score_scratch ||
+        rows < 2 || rows > kVerifyMaxRows || kv_heads != 1 ||
+        position_offset < 0 || position_offset + rows > max_context ||
+        !valid_shape(q_heads, kv_heads, head_dim)) return false;
+    const int context_len = position_offset + rows;
+    GqaCublasWorkspace& workspace = gqa_cublas_workspace();
+    if (!ensure_gqa_cublas_workspace(workspace)) return false;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    if (cublasSetStream(workspace.handle, cuda_stream) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+
+    // Row-major Q [M,K] times row-major K_cache^T [K,N]. cuBLAS is column
+    // major, so compute C^T [N,M] = K_cache [N,K] * Q^T [K,M]. C's row-major
+    // storage is exactly C^T's column-major storage.
+    const int m = rows * q_heads;
+    const int n = context_len;
+    const int k = head_dim;
+    const float alpha = rsqrtf(static_cast<float>(head_dim));
+    const float beta = 0.0f;
+    if (cublasGemmEx(
+            workspace.handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            n, m, k, &alpha,
+            k_cache, CUDA_R_16F, k,
+            q, CUDA_R_16F, k,
+            &beta, score_scratch, CUDA_R_32F, n,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
+        CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const dim3 softmax_grid(static_cast<unsigned>(q_heads),
+                            static_cast<unsigned>(rows), 1);
+    gqa_verify_softmax_exact_f16_kernel<<<
+        softmax_grid, kThreads, 0, cuda_stream>>>(
+        score_scratch, rows, q_heads, context_len, position_offset);
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    const int groups_per_kv =
+        (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    const dim3 value_grid(static_cast<unsigned>(kv_heads * groups_per_kv),
+                          static_cast<unsigned>(rows),
+                          static_cast<unsigned>((head_dim + 31) / 32));
+    gqa_verify_values_exact_f16_kernel<<<value_grid, 32, 0, cuda_stream>>>(
+        score_scratch, v_cache, output, rows, q_heads, kv_heads, head_dim,
+        context_len);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_gqa_verify_attention_f16_exact_cuda(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, float* score_scratch,
@@ -1289,7 +1380,7 @@ bool qwen_gqa_verify_attention_f16_exact_cuda(
     const dim3 softmax_grid(static_cast<unsigned>(q_heads),
                             static_cast<unsigned>(rows), 1);
     gqa_verify_softmax_exact_f16_kernel<<<softmax_grid, kThreads, 0, cuda_stream>>>(
-        score_scratch, rows, q_heads, context_len);
+        score_scratch, rows, q_heads, context_len, position_offset);
     if (cudaGetLastError() != cudaSuccess) return false;
     const dim3 value_grid(static_cast<unsigned>(kv_heads * groups_per_kv),
                           static_cast<unsigned>(rows),
@@ -1308,18 +1399,20 @@ bool qwen_gqa_verify_attention_f16_cuda(
     if (!q || !k_cache || !v_cache || !output || !partial_scratch ||
         rows < 2 || rows > kVerifyMaxRows || position_offset < 0 ||
         position_offset + rows > max_context || splits <= 0 ||
-        splits > kDecodeMaxSplits ||
+        splits > kVerifyMaxSplits ||
         !valid_shape(q_heads, kv_heads, head_dim)) return false;
     const int context_len = position_offset + rows;
     const int positions_per_split = (context_len + splits - 1) / splits;
+    const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv =
-        (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
+        (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
     const int blocks = kv_heads * groups_per_kv * splits;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 #define DSV4_LAUNCH_VERIFY(ROWS) \
-    gqa_verify_split_f16_kernel<ROWS><<<blocks, kThreads, 0, cuda_stream>>>( \
-        q, k_cache, v_cache, partial_scratch, rows, q_heads, kv_heads, \
-        head_dim, position_offset, splits, positions_per_split)
+    gqa_verify_split_f16_kernel<ROWS, kHeadsPerGroup> \
+        <<<blocks, kThreads, 0, cuda_stream>>>( \
+            q, k_cache, v_cache, partial_scratch, rows, q_heads, kv_heads, \
+            head_dim, position_offset, splits, positions_per_split)
     switch (rows) {
         case 2: DSV4_LAUNCH_VERIFY(2); break;
         case 3: DSV4_LAUNCH_VERIFY(3); break;

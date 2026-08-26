@@ -8,6 +8,7 @@
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -48,6 +49,13 @@ bool qwen_env_enabled(const char* name) {
            std::strcmp(value, "OFF") != 0;
 }
 
+// Opt-out switch for defaults that are on unless explicitly disabled.
+bool qwen_env_enabled_default(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return true;
+    return qwen_env_enabled(name);
+}
+
 int qwen_env_int(const char* name, int fallback) {
     const char* value = std::getenv(name);
     if (value == nullptr || *value == '\0') return fallback;
@@ -62,6 +70,9 @@ int qwen_env_int(const char* name, int fallback) {
 struct DeviceLinear {
     QwenDeviceTensor weight;
     QwenDeviceTensor scale;
+    // Optional dense FP16 expansion used only by batched target verification.
+    // The raw FP8 matrix remains canonical and serves decode/prefill.
+    QwenDeviceTensor verify_weight;
     bool fp8 = false;
 };
 
@@ -71,6 +82,8 @@ struct DeviceLinearAttention {
     DeviceLinear out;
     DeviceLinear a;
     DeviceLinear b;
+    // Row-concat of a and b; empty when the two cannot be fused.
+    DeviceLinear ab;
     QwenDeviceTensor conv;
     QwenDeviceTensor a_log;
     QwenDeviceTensor dt_bias;
@@ -83,6 +96,9 @@ struct DeviceFullAttention {
     DeviceLinear q;
     DeviceLinear k;
     DeviceLinear v;
+    // Row-concat of K and V for batched verify/prefill. Decode keeps the
+    // individual projections so its established one-row path is unchanged.
+    DeviceLinear kv;
     DeviceLinear out;
     QwenDeviceTensor q_norm;
     QwenDeviceTensor k_norm;
@@ -112,6 +128,61 @@ DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& r
     output.fp8 = ref.weight.device_dtype == SafeDType::F8_E4M3;
     if (ref.has_scale) output.scale = upload(index, ref.scale);
     return output;
+}
+
+void allocate(QwenDeviceTensor& tensor, size_t bytes,
+              const std::vector<uint64_t>& shape, SafeDType dtype);
+
+// Concatenates two linear weights along output rows so one GEMM can produce both
+// results. FP8 scales are row-concatenated in lockstep. Only the input width and
+// dtypes must match; output row counts may differ (Q/K/V fusion relies on this).
+DeviceLinear fuse_linear_rows(const DeviceLinear& first,
+                              const DeviceLinear& second) {
+    DeviceLinear fused;
+    if (first.weight.data == nullptr || second.weight.data == nullptr) return fused;
+    if (first.weight.shape.size() != 2 || second.weight.shape.size() != 2) return fused;
+    if (first.weight.shape[1] != second.weight.shape[1] ||
+        first.weight.device_dtype != second.weight.device_dtype ||
+        first.fp8 != second.fp8) {
+        return fused;
+    }
+    if (first.fp8 &&
+        (first.scale.data == nullptr || second.scale.data == nullptr ||
+         first.scale.shape.size() != 2 || second.scale.shape.size() != 2 ||
+         first.scale.shape[1] != second.scale.shape[1] ||
+         first.scale.device_dtype != second.scale.device_dtype)) {
+        return fused;
+    }
+
+    const uint64_t first_rows = first.weight.shape[0];
+    const uint64_t second_rows = second.weight.shape[0];
+    const uint64_t columns = first.weight.shape[1];
+    allocate(fused.weight, first.weight.nbytes + second.weight.nbytes,
+             {first_rows + second_rows, columns}, first.weight.device_dtype);
+    check_cuda(cudaMemcpy(fused.weight.data, first.weight.data,
+                          first.weight.nbytes, cudaMemcpyDeviceToDevice),
+               "Qwen fused projection first weight copy");
+    check_cuda(cudaMemcpy(static_cast<uint8_t*>(fused.weight.data) +
+                              first.weight.nbytes,
+                          second.weight.data, second.weight.nbytes,
+                          cudaMemcpyDeviceToDevice),
+               "Qwen fused projection second weight copy");
+    fused.fp8 = first.fp8;
+    if (first.fp8) {
+        const uint64_t scale_columns = first.scale.shape[1];
+        allocate(fused.scale, first.scale.nbytes + second.scale.nbytes,
+                 {first.scale.shape[0] + second.scale.shape[0], scale_columns},
+                 first.scale.device_dtype);
+        check_cuda(cudaMemcpy(fused.scale.data, first.scale.data,
+                              first.scale.nbytes, cudaMemcpyDeviceToDevice),
+                   "Qwen fused projection first scale copy");
+        check_cuda(cudaMemcpy(static_cast<uint8_t*>(fused.scale.data) +
+                                  first.scale.nbytes,
+                              second.scale.data, second.scale.nbytes,
+                              cudaMemcpyDeviceToDevice),
+                   "Qwen fused projection second scale copy");
+    }
+    return fused;
 }
 
 void allocate(QwenDeviceTensor& tensor, size_t bytes,
@@ -245,9 +316,10 @@ struct QwenEngine::Impl {
     QwenEngineOptions options;
     int max_context = 0;
     std::vector<DeviceLayer> layers;
-    std::vector<QwenDeviceTensor> transaction_states;
-    std::vector<QwenDeviceTensor> transaction_conv_tails;
-    QwenDeviceTensor transaction_target_hidden;
+    QwenDeviceTensor transaction_packed;
+    QwenDeviceTensor transaction_regions;
+    std::vector<QwenCopyRegion> host_transaction_regions;
+    uint64_t transaction_total_blocks = 0;
     QwenDeviceTensor embed;
     QwenDeviceTensor final_norm;
     QwenDeviceTensor lm_head;
@@ -318,8 +390,18 @@ struct QwenEngine::Impl {
     bool sampling_rng_ready = false;
     std::vector<float> host_uniform_scratch;
     QwenWorkspace workspace;
+    // Optional NCCL stream candidate. Every collective is bracketed by events
+    // on the default compute stream, so enabling this cannot expose a partially
+    // reduced tensor to the next layer. It is opt-in because the dependency
+    // chain may leave no useful work to overlap on the target verify topology.
+    const bool use_nccl_comm_stream = qwen_env_enabled("QWEN_NCCL_COMM_STREAM");
+    cudaStream_t nccl_comm_stream = nullptr;
+    cudaEvent_t nccl_comm_ready = nullptr;
+    cudaEvent_t nccl_comm_done = nullptr;
+    bool nccl_comm_stream_initialized = false;
     uint64_t uploaded_weight_bytes = 0;
     uint64_t uploaded_scale_bytes = 0;
+    uint64_t verify_weight_bytes = 0;
     uint64_t cache_data_bytes = 0;
     uint64_t cache_scale_bytes = 0;
     // Prompt whose KV cache and recurrent state are currently materialized.
@@ -329,6 +411,49 @@ struct QwenEngine::Impl {
     std::vector<QwenRecurrentSnapshot> snapshots;
     int prefix_hits = 0;
     int prefix_misses = 0;
+
+    void ensure_nccl_comm_stream() {
+        if (!use_nccl_comm_stream || nccl_comm_stream_initialized) return;
+        check_cuda(cudaStreamCreateWithFlags(&nccl_comm_stream,
+                                             cudaStreamNonBlocking),
+                   "Qwen NCCL communication stream");
+        check_cuda(cudaEventCreateWithFlags(&nccl_comm_ready,
+                                            cudaEventDisableTiming),
+                   "Qwen NCCL ready event");
+        check_cuda(cudaEventCreateWithFlags(&nccl_comm_done,
+                                            cudaEventDisableTiming),
+                   "Qwen NCCL done event");
+        nccl_comm_stream_initialized = true;
+    }
+
+    // The compute kernels all use the legacy default stream. Bracket a
+    // communication-stream collective with events so the collective sees the
+    // complete producer work and the next compute kernel sees its result.
+    void begin_nccl_collective() {
+        ensure_nccl_comm_stream();
+        check_cuda(cudaEventRecord(nccl_comm_ready, nullptr),
+                   "Qwen record NCCL ready event");
+        check_cuda(cudaStreamWaitEvent(nccl_comm_stream, nccl_comm_ready, 0),
+                   "Qwen NCCL stream wait");
+    }
+
+    void end_nccl_collective() {
+        check_cuda(cudaEventRecord(nccl_comm_done, nccl_comm_stream),
+                   "Qwen record NCCL done event");
+        check_cuda(cudaStreamWaitEvent(nullptr, nccl_comm_done, 0),
+                   "Qwen compute stream wait");
+    }
+
+    ~Impl() {
+        if (nccl_comm_stream != nullptr) {
+            // The default stream wait above normally makes this unnecessary;
+            // keep destruction safe if construction or a caller failed midway.
+            cudaStreamSynchronize(nccl_comm_stream);
+        }
+        if (nccl_comm_done != nullptr) cudaEventDestroy(nccl_comm_done);
+        if (nccl_comm_ready != nullptr) cudaEventDestroy(nccl_comm_ready);
+        if (nccl_comm_stream != nullptr) cudaStreamDestroy(nccl_comm_stream);
+    }
 
     Impl(SafeTensorsIndex& index_, QwenConfig& config_,
          const QwenWeightMap& map, const QwenEngineOptions& options_,
@@ -358,6 +483,11 @@ struct QwenEngine::Impl {
         const int local_kv_heads =
             static_cast<int>(config.full_attention.num_key_value_heads / world);
         const int head_dim = static_cast<int>(config.full_attention.head_dim);
+        const bool speculative_target = options.mtp ||
+            !options.dspark_checkpoint.empty() ||
+            !options.dflash2_checkpoint.empty();
+        const bool fuse_kv_projection = speculative_target &&
+            qwen_env_enabled("QWEN_FUSE_KV_PROJECTION");
 
         for (size_t layer_index = 0; layer_index < layer_limit; ++layer_index) {
             const QwenLayerWeights& source = map.layers()[layer_index];
@@ -414,6 +544,13 @@ struct QwenEngine::Impl {
                     upload_linear(index, source.linear_attention.in_proj_a);
                 destination.linear.b =
                     upload_linear(index, source.linear_attention.in_proj_b);
+                // in_proj_a and in_proj_b are both BF16 [num_v_heads, hidden]
+                // and read the same activation, so a row-concat lets one GEMM
+                // replace two. Each alone is far too small to fill the device
+                // (12 rows per rank), and together they cost ~6.9 ms/step of
+                // verify. Rows [0, n) are a; rows [n, 2n) are b.
+                destination.linear.ab = fuse_linear_rows(
+                    destination.linear.a, destination.linear.b);
                 destination.linear.conv =
                     upload(index, source.linear_attention.conv1d);
                 destination.linear.a_log =
@@ -442,6 +579,10 @@ struct QwenEngine::Impl {
                 destination.full.q = upload_linear(index, source.full_attention.q_proj);
                 destination.full.k = upload_linear(index, source.full_attention.k_proj);
                 destination.full.v = upload_linear(index, source.full_attention.v_proj);
+                if (fuse_kv_projection) {
+                    destination.full.kv = fuse_linear_rows(
+                        destination.full.k, destination.full.v);
+                }
                 destination.full.out = upload_linear(index, source.full_attention.o_proj);
                 destination.full.q_norm = upload(index, source.full_attention.q_norm);
                 destination.full.k_norm = upload(index, source.full_attention.k_norm);
@@ -476,6 +617,56 @@ struct QwenEngine::Impl {
                 }
             }
             layers.push_back(std::move(destination));
+        }
+
+        // On SM75 the verify batch is too narrow to amortize online FP8 decode.
+        // A dense FP16 cache lets cuBLAS reuse tensor-core tiles across all rows,
+        // but expanding the whole model would consume ~17 GiB/rank. Keep only the
+        // most frequently executed target projections: qkv/z/out/down on the 48
+        // linear-attention layers and q/k/v/down on the 16 full-attention layers.
+        // Gate/up stay raw FP8 because their fused kernel is close to the two-GEMM
+        // resident alternative while costing another ~5.3 GiB; full-attention out
+        // saves only ~0.15 ms/verify for another 240 MiB and stays raw FP8. Set
+        // QWEN_VERIFY_RESIDENT_FP16=0 to keep the former all-FP8 verify path.
+        // Plain decoding never consumes these matrices, so do not spend the fixed
+        // cache unless this engine actually owns a speculative target.
+        const bool verify_resident_weights = speculative_target &&
+            qwen_env_enabled_default("QWEN_VERIFY_RESIDENT_FP16");
+        if (verify_resident_weights) {
+            auto materialize_verify_weight = [this](DeviceLinear& linear) {
+                if (!linear.fp8 || linear.weight.data == nullptr ||
+                    linear.weight.shape.size() != 2 ||
+                    linear.scale.data == nullptr || linear.scale.shape.size() != 2) {
+                    return;
+                }
+                const int rows = static_cast<int>(linear.weight.shape[0]);
+                const int cols = static_cast<int>(linear.weight.shape[1]);
+                const size_t elements = static_cast<size_t>(rows) * cols;
+                allocate_half(linear.verify_weight, elements,
+                              {linear.weight.shape[0], linear.weight.shape[1]});
+                require_launch(qwen_fp8_e4m3_fp16scale_dequantize_f16_cuda(
+                    linear.weight.fp8_data(), linear.scale.f16_data(),
+                    linear.verify_weight.f16_data(), rows, cols, cols,
+                    static_cast<int>(linear.scale.shape[1])),
+                    "Qwen resident verify weight expansion");
+                verify_weight_bytes += linear.verify_weight.nbytes;
+            };
+            for (DeviceLayer& layer : layers) {
+                materialize_verify_weight(layer.down);
+                if (layer.linear.qkv.weight.data != nullptr) {
+                    materialize_verify_weight(layer.linear.qkv);
+                    materialize_verify_weight(layer.linear.z);
+                    materialize_verify_weight(layer.linear.out);
+                } else {
+                    materialize_verify_weight(layer.full.q);
+                    if (layer.full.kv.weight.data != nullptr) {
+                        materialize_verify_weight(layer.full.kv);
+                    } else {
+                        materialize_verify_weight(layer.full.k);
+                        materialize_verify_weight(layer.full.v);
+                    }
+                }
+            }
         }
 
         if (!options.dspark_checkpoint.empty()) {
@@ -639,81 +830,94 @@ struct QwenEngine::Impl {
         mtp_next_checksum = 0.0f;
     }
 
+    void append_transaction_region(void* data, uint64_t bytes,
+                                   uint64_t& packed_offset) {
+        if (data == nullptr || bytes == 0) return;
+        if (packed_offset > UINT64_MAX - bytes) {
+            throw std::runtime_error("Qwen transaction byte extent overflow");
+        }
+        QwenCopyRegion region;
+        region.device_address = reinterpret_cast<uint64_t>(data);
+        region.packed_offset = packed_offset;
+        region.bytes = bytes;
+        region.first_block = transaction_total_blocks;
+        host_transaction_regions.push_back(region);
+        const uint64_t blocks = qwen_copy_region_blocks(bytes);
+        if (transaction_total_blocks > UINT64_MAX - blocks) {
+            throw std::runtime_error("Qwen transaction block extent overflow");
+        }
+        transaction_total_blocks += blocks;
+        packed_offset += bytes;
+    }
+
+    void initialize_packed_transaction_state() {
+        if (!host_transaction_regions.empty()) return;
+        uint64_t packed_bytes = 0;
+        transaction_total_blocks = 0;
+        host_transaction_regions.reserve(layers.size() * 2 +
+                                         (mtp_enabled ? 1 : 0));
+        for (DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr) continue;
+            append_transaction_region(layer.linear.state.data,
+                                      layer.linear.state.nbytes, packed_bytes);
+            append_transaction_region(layer.linear.conv_tail.data,
+                                      layer.linear.conv_tail.nbytes,
+                                      packed_bytes);
+        }
+        if (mtp_enabled) {
+            if (!has_target_last_hidden || target_last_hidden.data == nullptr) {
+                throw std::runtime_error(
+                    "Qwen MTP transaction requires the committed target hidden");
+            }
+            append_transaction_region(
+                target_last_hidden.data,
+                static_cast<uint64_t>(config.hidden_size) * sizeof(uint16_t),
+                packed_bytes);
+        }
+        if (host_transaction_regions.empty() || packed_bytes == 0 ||
+            transaction_total_blocks == 0) {
+            throw std::runtime_error("Qwen transaction has no recurrent state");
+        }
+        allocate(transaction_packed, packed_bytes, {packed_bytes}, SafeDType::I8);
+        const uint64_t descriptor_bytes =
+            host_transaction_regions.size() * sizeof(QwenCopyRegion);
+        allocate(transaction_regions, descriptor_bytes,
+                 {static_cast<uint64_t>(host_transaction_regions.size())},
+                 SafeDType::I8);
+        check_cuda(cudaMemcpy(transaction_regions.data,
+                              host_transaction_regions.data(), descriptor_bytes,
+                              cudaMemcpyHostToDevice),
+                   "Qwen transaction descriptor upload");
+    }
+
     // Copies the recurrent half of the network to device-resident snapshots.
     // Only the 48 DeltaNet layers carry order-dependent state; full attention
     // is skipped because its KV cache is addressed by absolute position.
     void prepare_transaction_state() {
         PhaseScope scope(this, "transaction_snapshot");
-        if (transaction_states.size() != layers.size()) {
-            transaction_states.clear();
-            transaction_conv_tails.clear();
-            transaction_states.resize(layers.size());
-            transaction_conv_tails.resize(layers.size());
-            for (size_t index = 0; index < layers.size(); ++index) {
-                const DeviceLayer& layer = layers[index];
-                if (layer.linear.state.data == nullptr) continue;
-                allocate_float(transaction_states[index],
-                               layer.linear.state.nbytes / sizeof(float),
-                               layer.linear.state.shape);
-                allocate_half(transaction_conv_tails[index],
-                              layer.linear.conv_tail.nbytes / sizeof(uint16_t),
-                              layer.linear.conv_tail.shape);
-            }
-        }
-        if (mtp_enabled) {
-            allocate_half(transaction_target_hidden, config.hidden_size,
-                          {config.hidden_size});
-        }
-        for (size_t index = 0; index < layers.size(); ++index) {
-            const DeviceLayer& layer = layers[index];
-            if (layer.linear.state.data == nullptr) continue;
-            check_cuda(cudaMemcpy(transaction_states[index].data,
-                                  layer.linear.state.data,
-                                  layer.linear.state.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction state copy");
-            check_cuda(cudaMemcpy(transaction_conv_tails[index].data,
-                                  layer.linear.conv_tail.data,
-                                  layer.linear.conv_tail.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction convolution copy");
-        }
-        if (mtp_enabled) {
-            check_cuda(cudaMemcpy(transaction_target_hidden.data,
-                                  target_last_hidden.data,
-                                  static_cast<size_t>(config.hidden_size) *
-                                      sizeof(uint16_t),
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction hidden copy");
-        }
+        initialize_packed_transaction_state();
+        require_launch(qwen_gather_copy_regions_cuda(
+            static_cast<const QwenCopyRegion*>(transaction_regions.data),
+            static_cast<int>(host_transaction_regions.size()),
+            static_cast<uint8_t*>(transaction_packed.data),
+            transaction_total_blocks),
+            "Qwen packed transaction snapshot");
     }
 
     void restore_transaction_state(int position) {
         PhaseScope scope(this, "transaction_restore");
-        if (transaction_states.size() != layers.size()) {
+        if (host_transaction_regions.empty() ||
+            transaction_regions.data == nullptr ||
+            transaction_packed.data == nullptr) {
             throw std::runtime_error("Qwen transaction state is unavailable");
         }
-        for (size_t index = 0; index < layers.size(); ++index) {
-            DeviceLayer& layer = layers[index];
-            if (layer.linear.state.data == nullptr) continue;
-            check_cuda(cudaMemcpy(layer.linear.state.data,
-                                  transaction_states[index].data,
-                                  layer.linear.state.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction state restore");
-            check_cuda(cudaMemcpy(layer.linear.conv_tail.data,
-                                  transaction_conv_tails[index].data,
-                                  layer.linear.conv_tail.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction convolution restore");
-        }
+        require_launch(qwen_scatter_copy_regions_cuda(
+            static_cast<const QwenCopyRegion*>(transaction_regions.data),
+            static_cast<int>(host_transaction_regions.size()),
+            static_cast<const uint8_t*>(transaction_packed.data),
+            transaction_total_blocks),
+            "Qwen packed transaction restore");
         if (mtp_enabled) {
-            check_cuda(cudaMemcpy(target_last_hidden.data,
-                                  transaction_target_hidden.data,
-                                  static_cast<size_t>(config.hidden_size) *
-                                      sizeof(uint16_t),
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen transaction hidden restore");
             has_target_last_hidden = true;
             mtp_seed_ready = false;
             mtp_position = position;
@@ -970,7 +1174,7 @@ struct QwenEngine::Impl {
 
     class PhaseScope {
     public:
-        PhaseScope(Impl* owner, const char* name) : owner_(owner), name_(name) {
+        PhaseScope(Impl* owner, std::string name) : owner_(owner), name_(std::move(name)) {
             if (owner_->phase_profile) {
                 cudaDeviceSynchronize();
                 started_ = std::chrono::steady_clock::now();
@@ -993,6 +1197,14 @@ struct QwenEngine::Impl {
         std::chrono::steady_clock::time_point started_;
     };
 
+    class NvtxScope {
+    public:
+        explicit NvtxScope(const char* name) { nvtxRangePushA(name); }
+        ~NvtxScope() { nvtxRangePop(); }
+        NvtxScope(const NvtxScope&) = delete;
+        NvtxScope& operator=(const NvtxScope&) = delete;
+    };
+
     void report_phase_profile(const char* tag) const {
         if (!phase_profile) return;
         double total = 0.0;
@@ -1010,7 +1222,8 @@ struct QwenEngine::Impl {
         std::cout.flush();
     }
 
-    void all_reduce_half(uint16_t* values, int count) {
+    void all_reduce_half(uint16_t* values, int count, const char* site = "other") {
+        PhaseScope scope(this, std::string("ar.") + site);
         if (options.tp_world == 1) return;
 #ifdef DSV4_HAVE_NCCL
         if (options.nccl_id_path.empty()) {
@@ -1018,9 +1231,18 @@ struct QwenEngine::Impl {
         }
         {
             PhaseScope scope(this, "tp_all_reduce");
-            nccl_all_reduce_sum_f16_inplace(
-                options.tp_world, options.tp_rank, options.device,
-                options.nccl_id_path.c_str(), values, count);
+            if (use_nccl_comm_stream) {
+                begin_nccl_collective();
+                nccl_all_reduce_sum_f16_inplace(
+                    options.tp_world, options.tp_rank, options.device,
+                    options.nccl_id_path.c_str(), values, count,
+                    nccl_comm_stream);
+                end_nccl_collective();
+            } else {
+                nccl_all_reduce_sum_f16_inplace(
+                    options.tp_world, options.tp_rank, options.device,
+                    options.nccl_id_path.c_str(), values, count);
+            }
         }
 #else
         (void)values;
@@ -1030,8 +1252,8 @@ struct QwenEngine::Impl {
     }
 
     void projection(const DeviceLinear& linear, const uint16_t* input,
-                    uint16_t* output, int rows) {
-        PhaseScope scope(this, rows == 1 ? "projection_decode" : "projection_rows");
+                    uint16_t* output, int rows, const char* site = "other") {
+        PhaseScope scope(this, std::string(rows == 1 ? "pd." : "pr.") + site);
         const int output_rows = static_cast<int>(linear.weight.shape[0]);
         const int columns = static_cast<int>(linear.weight.shape[1]);
         if (linear.fp8) {
@@ -1041,6 +1263,11 @@ struct QwenEngine::Impl {
                     output, output_rows, columns, columns,
                     static_cast<int>(linear.scale.shape[1])),
                     "FP8 FP16-activation decode projection");
+            } else if (rows <= 8 && linear.verify_weight.data != nullptr) {
+                require_launch(qwen_fp16_matmul_rows_f16_cublas_cuda(
+                    input, linear.verify_weight.f16_data(), output, rows,
+                    output_rows, columns, columns, output_rows, columns),
+                    "resident FP16 verify projection");
             } else {
                 require_launch(qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
                     input, linear.weight.fp8_data(), linear.scale.f16_data(),
@@ -1049,21 +1276,37 @@ struct QwenEngine::Impl {
                     "FP8 FP16-activation projection");
             }
         } else {
-            require_launch(qwen_fp16_matmul_rows_f16_cuda(
-                input, linear.weight.f16_data(), output, rows, output_rows,
-                columns, columns, output_rows, columns),
-                "FP16 activation/weight projection");
+            // The fused DeltaNet a/b matrix is only 24 rows per TP4 rank. At
+            // verify width 8, tensor cores are ~5x faster than the generic
+            // warp-per-output-row reduction. Decode keeps its established
+            // reduction order, and wider prefill remains on the existing path.
+            const bool verify_cublas = rows >= 4 && rows <= 8 &&
+                output_rows <= 32 && columns % 8 == 0 &&
+                qwen_env_enabled_default("QWEN_VERIFY_SMALL_FP16_CUBLAS");
+            if (verify_cublas) {
+                require_launch(qwen_fp16_matmul_rows_f16_cublas_cuda(
+                    input, linear.weight.f16_data(), output, rows, output_rows,
+                    columns, columns, output_rows, columns),
+                    "small FP16 verify cuBLAS projection");
+            } else {
+                require_launch(qwen_fp16_matmul_rows_f16_cuda(
+                    input, linear.weight.f16_data(), output, rows, output_rows,
+                    columns, columns, output_rows, columns),
+                    "FP16 activation/weight projection");
+            }
         }
     }
 
     void norm(const QwenDeviceTensor& gamma, const uint16_t* input,
               uint16_t* output, int rows, int columns) {
+        PhaseScope scope(this, "norm");
         require_launch(qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
             input, gamma.f16_data(), output, rows, columns,
             static_cast<float>(config.rms_norm_eps)), "Qwen FP16 RMSNorm");
     }
 
     void add(uint16_t* output, const uint16_t* input, int count) {
+        PhaseScope scope(this, "add");
         require_launch(qwen_add_inplace_f16_cuda(output, input, count),
                        "Qwen FP16 residual add");
     }
@@ -1118,7 +1361,7 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& z = workspace_half(value_elements, v.shape);
         QwenDeviceTensor& normalized = workspace_half(value_elements, v.shape);
 
-        projection(layer.linear.qkv, hidden, packed.f16_data(), rows);
+        projection(layer.linear.qkv, hidden, packed.f16_data(), rows, "lin.qkv");
         require_launch(qwen_causal_depthwise_conv_silu_f16_cuda(
             packed.f16_data(), layer.linear.conv.f16_data(),
             layer.linear.conv_tail.f16_data(), convolved.f16_data(), rows,
@@ -1126,8 +1369,23 @@ struct QwenEngine::Impl {
         require_launch(qwen_split_packed_qkv_f16_cuda(
             convolved.f16_data(), q.f16_data(), k.f16_data(), v.f16_data(),
             rows, key_dim, value_dim), "FP16 linear QKV split");
-        projection(layer.linear.a, hidden, a.f16_data(), rows);
-        projection(layer.linear.b, hidden, b.f16_data(), rows);
+        if (layer.linear.ab.weight.data != nullptr &&
+            qwen_env_enabled_default("QWEN_FUSE_AB_PROJECTION")) {
+            // One GEMM over the row-concatenated [2*gate, hidden] weight. The
+            // output is [rows, 2*gate] interleaved per row, so a and b are
+            // strided slices of it rather than contiguous halves.
+            QwenDeviceTensor& ab = workspace_half(
+                gate_elements * 2,
+                {static_cast<uint64_t>(rows),
+                 static_cast<uint64_t>(value_heads * 2)});
+            projection(layer.linear.ab, hidden, ab.f16_data(), rows, "lin.ab");
+            require_launch(qwen_split_rows_pair_f16_cuda(
+                ab.f16_data(), a.f16_data(), b.f16_data(), rows, value_heads),
+                "FP16 fused a/b split");
+        } else {
+            projection(layer.linear.a, hidden, a.f16_data(), rows, "lin.a");
+            projection(layer.linear.b, hidden, b.f16_data(), rows, "lin.b");
+        }
         require_launch(qwen_linear_attn_gates_f16_cuda(
             a.f16_data(), b.f16_data(), layer.linear.a_log.f16_data(),
             layer.linear.dt_bias.f16_data(), gates.f16_data(), beta.f16_data(),
@@ -1136,12 +1394,43 @@ struct QwenEngine::Impl {
             static_cast<float>(config.linear_attention.key_head_dim));
         std::optional<PhaseScope> delta_scope;
         delta_scope.emplace(this, "gated_delta");
-        const bool sequenced = rows > 1 && qwen_gated_delta_sequence_f16_cuda(
-            layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
-            v.f16_data(), gates.f16_data(), beta.f16_data(),
-            core.f16_data(), rows, value_heads, key_heads,
-            static_cast<int>(config.linear_attention.key_head_dim),
-            static_cast<int>(config.linear_attention.value_head_dim), q_scale);
+        bool sequenced = false;
+        if (rows >= 5 && key_heads < value_heads &&
+            qwen_env_enabled_default("QWEN_GATED_DELTA_PRENORMALIZE")) {
+            QwenDeviceTensor& q_normalized = workspace_float(
+                key_elements, {static_cast<uint64_t>(rows),
+                               static_cast<uint64_t>(key_dim)});
+            QwenDeviceTensor& k_normalized = workspace_float(
+                key_elements, q_normalized.shape);
+            sequenced = qwen_normalize_gated_delta_qk_f16_cuda(
+                q.f16_data(), k.f16_data(), q_normalized.f32_data(),
+                k_normalized.f32_data(), rows, key_heads,
+                static_cast<int>(config.linear_attention.key_head_dim)) &&
+                (qwen_env_enabled("QWEN_GATED_DELTA_SHARED_STATE")
+                 ? qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+                        layer.linear.state.f32_data(), q_normalized.f32_data(),
+                        k_normalized.f32_data(), v.f16_data(), gates.f16_data(),
+                        beta.f16_data(), core.f16_data(), rows, value_heads,
+                        key_heads,
+                        static_cast<int>(config.linear_attention.key_head_dim),
+                        static_cast<int>(config.linear_attention.value_head_dim),
+                        q_scale)
+                    : qwen_gated_delta_sequence_normalized_f16_cuda(
+                        layer.linear.state.f32_data(), q_normalized.f32_data(),
+                        k_normalized.f32_data(), v.f16_data(), gates.f16_data(),
+                        beta.f16_data(), core.f16_data(), rows, value_heads,
+                        key_heads,
+                        static_cast<int>(config.linear_attention.key_head_dim),
+                        static_cast<int>(config.linear_attention.value_head_dim),
+                        q_scale));
+        } else if (rows > 1) {
+            sequenced = qwen_gated_delta_sequence_f16_cuda(
+                layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
+                v.f16_data(), gates.f16_data(), beta.f16_data(),
+                core.f16_data(), rows, value_heads, key_heads,
+                static_cast<int>(config.linear_attention.key_head_dim),
+                static_cast<int>(config.linear_attention.value_head_dim), q_scale);
+        }
         for (int token = 0; !sequenced && token < rows; ++token) {
             require_launch(qwen_gated_delta_step_f16_cuda(
                 layer.linear.state.f32_data(),
@@ -1157,15 +1446,15 @@ struct QwenEngine::Impl {
                 "FP16 linear recurrent state");
         }
         delta_scope.reset();
-        projection(layer.linear.z, hidden, z.f16_data(), rows);
+        projection(layer.linear.z, hidden, z.f16_data(), rows, "lin.z");
         require_launch(qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
             core.f16_data(), layer.linear.norm.f16_data(), z.f16_data(),
             normalized.f16_data(), rows * value_heads,
             static_cast<int>(config.linear_attention.value_head_dim),
             static_cast<float>(config.rms_norm_eps)),
             "FP16 linear gated RMSNorm");
-        projection(layer.linear.out, normalized.f16_data(), output, rows);
-        all_reduce_half(output, rows * hidden_size);
+        projection(layer.linear.out, normalized.f16_data(), output, rows, "lin.out");
+        all_reduce_half(output, rows * hidden_size, "lin.out");
         (void)position_offset;
     }
 
@@ -1197,17 +1486,37 @@ struct QwenEngine::Impl {
                           static_cast<uint64_t>(kv_heads),
                           static_cast<uint64_t>(head_dim)});
         QwenDeviceTensor& v = workspace_half(kv_elements, k.shape);
+        QwenDeviceTensor* kv_projection = nullptr;
+        // Keep the candidate isolated to the fixed-width target verify batch;
+        // prefill and one-row decode retain their established K/V projections.
+        const bool fused_kv = rows > 1 && rows <= 8 &&
+            layer.full.kv.weight.data != nullptr;
+        if (fused_kv) {
+            kv_projection = &workspace_half(
+                static_cast<size_t>(rows) * 2 * kv_heads * head_dim,
+                {static_cast<uint64_t>(rows),
+                 static_cast<uint64_t>(2 * kv_heads * head_dim)});
+        }
         QwenDeviceTensor& q_norm = workspace_half(attention_elements, q.shape);
         QwenDeviceTensor& k_norm = workspace_half(kv_elements, k.shape);
         QwenDeviceTensor& attention = workspace_half(attention_elements, q.shape);
         QwenDeviceTensor& merged = workspace_half(attention_elements, q.shape);
 
-        projection(layer.full.q, hidden, q_projection.f16_data(), rows);
+        { PhaseScope sub(this, "full.q_proj"); projection(layer.full.q, hidden, q_projection.f16_data(), rows, "full.q"); }
+        if (fused_kv) {
+            { PhaseScope sub(this, "full.kv_proj"); projection(
+                layer.full.kv, hidden, kv_projection->f16_data(), rows,
+                "full.kv"); }
+            require_launch(qwen_split_rows_pair_f16_cuda(
+                kv_projection->f16_data(), k.f16_data(), v.f16_data(), rows,
+                kv_heads * head_dim), "FP16 fused full K/V split");
+        } else {
+            { PhaseScope sub(this, "full.k_proj"); projection(layer.full.k, hidden, k.f16_data(), rows, "full.k"); }
+            { PhaseScope sub(this, "full.v_proj"); projection(layer.full.v, hidden, v.f16_data(), rows, "full.v"); }
+        }
         require_launch(qwen_split_q_gate_f16_cuda(
             q_projection.f16_data(), q.f16_data(), gate.f16_data(), rows,
             q_heads, head_dim), "FP16 full Q/gate split");
-        projection(layer.full.k, hidden, k.f16_data(), rows);
-        projection(layer.full.v, hidden, v.f16_data(), rows);
         norm(layer.full.q_norm, q.f16_data(), q_norm.f16_data(),
              rows * q_heads, head_dim);
         norm(layer.full.k_norm, k.f16_data(), k_norm.f16_data(),
@@ -1298,12 +1607,39 @@ struct QwenEngine::Impl {
                 max_context), "prefill FP8-cache GQA");
         } else if (rows <= 8 && attention_window == 0) {
             const int context_length = position_offset + rows;
-            if (qwen_env_enabled("QWEN_GQA_VERIFY_SPLIT")) {
-                const int verify_target_positions =
-                    qwen_env_int("QWEN_GQA_VERIFY_TILE", 64);
-                const int verify_splits = std::max(1, std::min(
-                    64, (context_length + verify_target_positions - 1) /
-                            verify_target_positions));
+            // Tensor-core QK experiment for the real TP4 shape (one KV head per
+            // rank). Keeps the existing FP32 softmax/PV order; opt-in until real
+            // parity and latency are validated.
+            if (qwen_env_enabled("QWEN_GQA_VERIFY_CUBLAS_QK") &&
+                kv_heads == 1) {
+                const size_t score_elements =
+                    static_cast<size_t>(rows) * q_heads * context_length;
+                QwenDeviceTensor& scores = workspace_float(
+                    score_elements,
+                    {static_cast<uint64_t>(rows),
+                     static_cast<uint64_t>(q_heads),
+                     static_cast<uint64_t>(context_length)});
+                PhaseScope sub(this, "full.attn_kernel");
+                require_launch(qwen_gqa_verify_attention_f16_cublas_qk_cuda(
+                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    scores.f32_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context),
+                    "verify cuBLAS-QK FP16-cache GQA");
+            // The exact three-kernel path avoids split partials below 1K context;
+            // the split-K path crosses over above that and remains faster at long
+            // context. QWEN_GQA_VERIFY_SPLIT explicitly overrides the crossover.
+            } else if ((std::getenv("QWEN_GQA_VERIFY_SPLIT") != nullptr
+                            ? qwen_env_enabled("QWEN_GQA_VERIFY_SPLIT")
+                            : context_length > 1024)) {
+                // 32 splits stay slightly faster end-to-end at short context;
+                // 64 cross over at 1K and remain best through 32K.
+                const int default_splits = context_length >= 1024 ? 64 : 32;
+                int target_splits = qwen_env_int(
+                    "QWEN_GQA_VERIFY_SPLITS", default_splits);
+                if (target_splits <= 0) target_splits = default_splits;
+                const int verify_splits = std::max(
+                    1, std::min(target_splits, context_length));
                 const size_t partial_elements =
                     static_cast<size_t>(rows) * q_heads * verify_splits *
                     static_cast<size_t>(head_dim + 2);
@@ -1313,6 +1649,7 @@ struct QwenEngine::Impl {
                      static_cast<uint64_t>(q_heads),
                      static_cast<uint64_t>(verify_splits),
                      static_cast<uint64_t>(head_dim + 2)});
+                PhaseScope sub(this, "full.attn_kernel");
                 require_launch(qwen_gqa_verify_attention_f16_cuda(
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
                     layer.full.v_cache.f16_data(), attention.f16_data(),
@@ -1327,12 +1664,12 @@ struct QwenEngine::Impl {
                     {static_cast<uint64_t>(rows),
                      static_cast<uint64_t>(q_heads),
                      static_cast<uint64_t>(context_length)});
-                require_launch(qwen_gqa_verify_attention_f16_exact_cuda(
+                { PhaseScope sub(this, "full.attn_kernel"); require_launch(qwen_gqa_verify_attention_f16_exact_cuda(
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
                     layer.full.v_cache.f16_data(), attention.f16_data(),
                     scores.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context),
-                    "verify exact FP16-cache GQA");
+                    "verify exact FP16-cache GQA"); }
             }
         } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
                    attention_window > 0) {
@@ -1352,8 +1689,8 @@ struct QwenEngine::Impl {
         require_launch(qwen_sigmoid_mul_f16_cuda(
             attention.f16_data(), gate.f16_data(), merged.f16_data(),
             rows * attention_dim), "FP16 full attention output gate");
-        projection(layer.full.out, merged.f16_data(), output, rows);
-        all_reduce_half(output, rows * static_cast<int>(config.hidden_size));
+        { PhaseScope sub(this, "full.out_proj"); projection(layer.full.out, merged.f16_data(), output, rows, "full.out"); }
+        all_reduce_half(output, rows * static_cast<int>(config.hidden_size), "full.out");
     }
 
     void layer_forward(DeviceLayer& layer, const uint16_t* hidden,
@@ -1394,12 +1731,26 @@ struct QwenEngine::Impl {
             full_attention(layer, normalized.f16_data(), attention.f16_data(),
                            rows, position_offset);
         }
-        check_cuda(cudaMemcpy(output, hidden,
-            hidden_elements * sizeof(uint16_t), cudaMemcpyDeviceToDevice),
-            "Qwen FP16 residual copy");
-        add(output, attention.f16_data(), rows * hidden_size);
-        norm(layer.post_norm, output, post.f16_data(), rows, hidden_size);
+        if (qwen_env_enabled("QWEN_FUSE_ATTN_RESID_NORM")) {
+            PhaseScope scope(this, "attn_resid_norm");
+            require_launch(
+                qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+                    hidden, attention.f16_data(), layer.post_norm.f16_data(),
+                    output, post.f16_data(), rows, hidden_size,
+                    static_cast<float>(config.rms_norm_eps)),
+                "Qwen fused attention residual RMSNorm");
+        } else {
+            {
+                PhaseScope scope(this, "resid_copy");
+                check_cuda(cudaMemcpy(output, hidden,
+                    hidden_elements * sizeof(uint16_t), cudaMemcpyDeviceToDevice),
+                    "Qwen FP16 residual copy");
+            }
+            add(output, attention.f16_data(), rows * hidden_size);
+            norm(layer.post_norm, output, post.f16_data(), rows, hidden_size);
+        }
         if (fused_decode_swiglu) {
+            PhaseScope scope(this, "swiglu.d");
             require_launch(qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
                 post.f16_data(), layer.gate.weight.fp8_data(),
                 layer.gate.scale.f16_data(), layer.up.weight.fp8_data(),
@@ -1408,6 +1759,7 @@ struct QwenEngine::Impl {
                 hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
                 "FP16 fused decode SwiGLU");
         } else if (fused_small_batch_swiglu) {
+            PhaseScope scope(this, "swiglu.r");
             require_launch(
                 qwen_fp8_e4m3_fp16scale_swiglu_small_batch_f16_cuda(
                     post.f16_data(), layer.gate.weight.fp8_data(),
@@ -1418,14 +1770,14 @@ struct QwenEngine::Impl {
                     hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
                 "FP16 fused small-batch SwiGLU");
         } else {
-            projection(layer.gate, post.f16_data(), gate->f16_data(), rows);
-            projection(layer.up, post.f16_data(), up->f16_data(), rows);
+            projection(layer.gate, post.f16_data(), gate->f16_data(), rows, "mlp.gate");
+            projection(layer.up, post.f16_data(), up->f16_data(), rows, "mlp.up");
             require_launch(qwen_silu_mul_rows_f16_cuda(
                 gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
                 static_cast<int>(layer.gate.weight.shape[0])), "FP16 SwiGLU");
         }
-        projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows);
-        all_reduce_half(mlp.f16_data(), rows * hidden_size);
+        projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows, "mlp.down");
+        all_reduce_half(mlp.f16_data(), rows * hidden_size, "mlp");
         add(output, mlp.f16_data(), rows * hidden_size);
     }
 
@@ -1576,18 +1928,24 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& local_logits = workspace_float(
             static_cast<size_t>(rows) * local_vocab,
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
+        // The hand-rolled matvec wins at rows==1, but cuBLAS is far better once
+        // the LM head GEMM is batched: verify measured 57.6 vs 70.2 ms/step at
+        // 8192 context. Set QWEN_FP16_LOGITS_CUBLAS=0 to force the custom kernel.
         const bool cublas_logits = rows > 1 &&
-            qwen_env_enabled("QWEN_FP16_LOGITS_CUBLAS");
-        require_launch(cublas_logits
-            ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
-                  normalized.f16_data(), lm_head.f16_data(),
-                  local_logits.f32_data(), rows, local_vocab, hidden_size,
-                  hidden_size, local_vocab, hidden_size)
-            : qwen_fp16_matmul_rows_f16_f32_cuda(
-                  normalized.f16_data(), lm_head.f16_data(),
-                  local_logits.f32_data(), rows, local_vocab, hidden_size,
-                  hidden_size, local_vocab, hidden_size),
-            "Qwen batched FP32 logits");
+            qwen_env_enabled_default("QWEN_FP16_LOGITS_CUBLAS");
+        {
+            PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
+            require_launch(cublas_logits
+                ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+                      normalized.f16_data(), lm_head.f16_data(),
+                      local_logits.f32_data(), rows, local_vocab, hidden_size,
+                      hidden_size, local_vocab, hidden_size)
+                : qwen_fp16_matmul_rows_f16_f32_cuda(
+                      normalized.f16_data(), lm_head.f16_data(),
+                      local_logits.f32_data(), rows, local_vocab, hidden_size,
+                      hidden_size, local_vocab, hidden_size),
+                "Qwen batched FP32 logits");
+        }
         allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
         allocate_float(argmax_logit, static_cast<size_t>(rows),
@@ -1602,10 +1960,13 @@ struct QwenEngine::Impl {
                                      vocab_start, position_after);
         }
 
-        require_launch(argmax_fp32_rows_cuda(
-            local_logits.f32_data(), static_cast<int*>(argmax_token.data),
-            argmax_logit.f32_data(), rows, local_vocab, vocab_start),
-            "Qwen batched local argmax");
+        {
+            PhaseScope scope(this, "argmax");
+            require_launch(argmax_fp32_rows_cuda(
+                local_logits.f32_data(), static_cast<int*>(argmax_token.data),
+                argmax_logit.f32_data(), rows, local_vocab, vocab_start),
+                "Qwen batched local argmax");
+        }
 
         QwenVerifyBatch result;
         result.top_tokens.resize(static_cast<size_t>(rows));
@@ -1617,12 +1978,60 @@ struct QwenEngine::Impl {
             if (options.nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen TP requires --nccl-id-path");
             }
-            nccl_global_top1_rows(
-                options.tp_world, options.tp_rank, options.device,
-                options.nccl_id_path.c_str(),
-                static_cast<const int*>(argmax_token.data),
-                argmax_logit.f32_data(), rows, result.top_tokens.data(),
-                result.top_logits.data());
+            const bool device_top1 = qwen_env_enabled("QWEN_VERIFY_DEVICE_TOP1");
+            const bool packed_device_top1 = device_top1 &&
+                qwen_env_enabled("QWEN_VERIFY_DEVICE_TOP1_PACKED");
+            {
+                PhaseScope scope(this, device_top1
+                    ? (packed_device_top1 ? "top1_packed_merge"
+                                          : "top1_device_merge")
+                    : "top1_allreduce");
+                if (device_top1) {
+                    // Keep local argmax values intact for `local_logits`; the
+                    // merged result has separate workspace buffers because the
+                    // verifier reports both local and global TP logits.
+                    QwenDeviceTensor& global_token = workspace.tensor(
+                        static_cast<size_t>(rows),
+                        {static_cast<uint64_t>(rows)}, SafeDType::I64);
+                    QwenDeviceTensor& global_logit = workspace_float(
+                        static_cast<size_t>(rows),
+                        {static_cast<uint64_t>(rows)});
+                    if (packed_device_top1) {
+                        nccl_global_top1_rows_packed_device(
+                            options.tp_world, options.tp_rank, options.device,
+                            options.nccl_id_path.c_str(),
+                            static_cast<const int*>(argmax_token.data),
+                            argmax_logit.f32_data(), rows,
+                            static_cast<int*>(global_token.data),
+                            global_logit.f32_data());
+                    } else {
+                        nccl_global_top1_rows_device(
+                            options.tp_world, options.tp_rank, options.device,
+                            options.nccl_id_path.c_str(),
+                            static_cast<const int*>(argmax_token.data),
+                            argmax_logit.f32_data(), rows,
+                            static_cast<int*>(global_token.data),
+                            global_logit.f32_data());
+                    }
+                    check_cuda(cudaMemcpy(result.top_tokens.data(),
+                                          global_token.data,
+                                          static_cast<size_t>(rows) * sizeof(int),
+                                          cudaMemcpyDeviceToHost),
+                               "Qwen device top-1 token copy");
+                    check_cuda(cudaMemcpy(result.top_logits.data(),
+                                          global_logit.data,
+                                          static_cast<size_t>(rows) * sizeof(float),
+                                          cudaMemcpyDeviceToHost),
+                               "Qwen device top-1 logit copy");
+                } else {
+                    nccl_global_top1_rows(
+                        options.tp_world, options.tp_rank, options.device,
+                        options.nccl_id_path.c_str(),
+                        static_cast<const int*>(argmax_token.data),
+                        argmax_logit.f32_data(), rows, result.top_tokens.data(),
+                        result.top_logits.data());
+                }
+            }
             check_cuda(cudaMemcpy(result.local_logits.data(), argmax_logit.data,
                                   static_cast<size_t>(rows) * sizeof(float),
                                   cudaMemcpyDeviceToHost),
@@ -1712,7 +2121,7 @@ struct QwenEngine::Impl {
             mtp_embedding.f16_data(), rows, hidden_size,
             static_cast<int>(weights_vocab_start()),
             static_cast<int>(embed.shape[0])), "Qwen MTP embedding lookup");
-        all_reduce_half(mtp_embedding.f16_data(), rows * hidden_size);
+        all_reduce_half(mtp_embedding.f16_data(), rows * hidden_size, "mtp.emb");
 
         allocate_half(mtp_normalized_embedding, hidden_elements, hidden_shape);
         allocate_half(mtp_normalized_hidden, hidden_elements, hidden_shape);
@@ -1728,7 +2137,7 @@ struct QwenEngine::Impl {
             mtp_normalized_hidden.f16_data(), mtp_concat.f16_data(), rows,
             hidden_size), "Qwen MTP fusion concat");
         allocate_half(mtp_fused, hidden_elements, hidden_shape);
-        projection(mtp_fc, mtp_concat.f16_data(), mtp_fused.f16_data(), rows);
+        projection(mtp_fc, mtp_concat.f16_data(), mtp_fused.f16_data(), rows, "mtp.fc");
         allocate_half(mtp_next_hidden, hidden_elements, hidden_shape);
         layer_forward(mtp_layer, mtp_fused.f16_data(),
                       mtp_next_hidden.f16_data(), rows, position);
@@ -1936,7 +2345,11 @@ struct QwenEngine::Impl {
         const int committed_position = dspark->committed_position();
         prepare_transaction_state();
         const auto draft_started = std::chrono::steady_clock::now();
-        const QwenDSparkProposal proposal = dspark->propose(input_token);
+        QwenDSparkProposal proposal;
+        {
+            NvtxScope scope("qwen.dspark.draft");
+            proposal = dspark->propose(input_token);
+        }
         if (stats != nullptr) {
             stats->draft_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - draft_started).count();
@@ -1966,8 +2379,11 @@ struct QwenEngine::Impl {
                              proposal.tokens.end());
         QwenVerifyBatch verify;
         const auto verify_started = std::chrono::steady_clock::now();
-        (void)run_chunk(verify_inputs, committed_position,
-                        static_cast<int>(layers.size()), false, &verify);
+        {
+            NvtxScope scope("qwen.target.verify");
+            (void)run_chunk(verify_inputs, committed_position,
+                            static_cast<int>(layers.size()), false, &verify);
+        }
         if (stats != nullptr) {
             stats->verify_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - verify_started).count();
@@ -2136,7 +2552,7 @@ struct QwenEngine::Impl {
             hidden_a.f16_data(), rows, hidden_size,
             static_cast<int>(weights_vocab_start()),
             static_cast<int>(embed.shape[0])), "Qwen FP16 embedding lookup");
-        all_reduce_half(hidden_a.f16_data(), rows * hidden_size);
+        all_reduce_half(hidden_a.f16_data(), rows * hidden_size, "hidden_a");
         uint16_t* hidden = hidden_a.f16_data();
         uint16_t* output = hidden_b.f16_data();
         const int dspark_tap_count = dspark_enabled
@@ -2164,8 +2580,11 @@ struct QwenEngine::Impl {
         int dspark_tap_index = 0;
         int dflash2_tap_index = 0;
         for (int layer_index = 0; layer_index < active_layers; ++layer_index) {
-            layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
-                          output, rows, position_offset);
+            {
+                PhaseScope scope(this, rows == 1 ? "STACK.d" : "STACK.r");
+                layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
+                              output, rows, position_offset);
+            }
             std::swap(hidden, output);
             if (dspark_enabled && dspark_tap_index < dspark_tap_count &&
                 layer_index == dspark_config->target_layer_ids[
@@ -2370,6 +2789,10 @@ QwenEngine::~QwenEngine() {
     impl_ = nullptr;
 }
 
+uint64_t QwenEngine::verify_weight_bytes() const {
+    return impl_->verify_weight_bytes;
+}
+
 uint64_t QwenEngine::activation_workspace_peak_bytes() const {
     return impl_->activation_capacity_bytes();
 }
@@ -2424,7 +2847,7 @@ void QwenEngine::warmup_tp() {
     QwenDeviceTensor scratch;
     allocate_half(scratch, 1, {1});
     zero_tensor(scratch);
-    impl_->all_reduce_half(scratch.f16_data(), 1);
+    impl_->all_reduce_half(scratch.f16_data(), 1, "scratch");
     check_cuda(cudaDeviceSynchronize(), "Qwen TP warmup synchronization");
 }
 
