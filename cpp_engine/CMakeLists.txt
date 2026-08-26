@@ -76,6 +76,13 @@ target_include_directories(dsv4_cpp_core PUBLIC
 )
 
 target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas CUDA::curand)
+if(TARGET CUDA::nvtx3)
+    target_link_libraries(dsv4_cpp_core PUBLIC CUDA::nvtx3)
+elseif(TARGET CUDA::nvToolsExt)
+    target_link_libraries(dsv4_cpp_core PUBLIC CUDA::nvToolsExt)
+else()
+    message(FATAL_ERROR "NVTX is required but was not found in the CUDA toolkit")
+endif()
 if(DSV4_HAVE_NCCL)
     target_include_directories(dsv4_cpp_core PUBLIC ${NCCL_INCLUDE_DIR})
     target_link_libraries(dsv4_cpp_core PUBLIC ${NCCL_LIBRARY})
@@ -358,9 +365,21 @@ add_executable(bench_qwen_fp8_kernels tests/bench_qwen_fp8_kernels.cpp)
 target_link_libraries(bench_qwen_fp8_kernels PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_fp8_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(bench_qwen_draft_lm_head tests/bench_qwen_draft_lm_head.cpp)
+target_link_libraries(bench_qwen_draft_lm_head PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_draft_lm_head PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(bench_qwen_verify_batch tests/bench_qwen_verify_batch.cpp)
 target_link_libraries(bench_qwen_verify_batch PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_verify_batch PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_delta_f16 tests/bench_qwen_delta_f16.cpp)
+target_link_libraries(bench_qwen_delta_f16 PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_delta_f16 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_transaction_copy tests/bench_qwen_transaction_copy.cpp)
+target_link_libraries(bench_qwen_transaction_copy PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_transaction_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
 target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
@@ -377,6 +396,10 @@ set_target_properties(bench_qwen_fp8_batch_crossover PROPERTIES RUNTIME_OUTPUT_D
 add_executable(bench_qwen_gqa_prefill tests/bench_qwen_gqa_prefill.cpp)
 target_link_libraries(bench_qwen_gqa_prefill PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_gqa_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_gqa_verify tests/bench_qwen_gqa_verify.cpp)
+target_link_libraries(bench_qwen_gqa_verify PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_gqa_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_dflash2_topk tests/bench_qwen_dflash2_topk.cpp)
 target_link_libraries(bench_qwen_dflash2_topk PRIVATE dsv4_cpp_core)

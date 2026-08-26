@@ -146,6 +146,95 @@ double max_half_difference(const std::vector<uint16_t>& lhs,
     return worst;
 }
 
+bool check_residual_add_rmsnorm_fused() {
+    constexpr int cols = 5120;
+    constexpr float eps = 1.0e-6f;
+    const int row_cases[] = {2, 3, 5, 8};
+    std::mt19937 rng(26391);
+    std::uniform_real_distribution<float> hidden_dist(-2.0f, 2.0f);
+    std::uniform_real_distribution<float> delta_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> gamma_dist(-0.2f, 0.2f);
+    for (int rows : row_cases) {
+        const size_t elements = static_cast<size_t>(rows) * cols;
+        std::vector<uint16_t> hidden(elements);
+        std::vector<uint16_t> delta(elements);
+        std::vector<uint16_t> gamma(cols);
+        for (uint16_t& value : hidden) value = to_half(hidden_dist(rng));
+        for (uint16_t& value : delta) value = to_half(delta_dist(rng));
+        for (uint16_t& value : gamma) value = to_half(gamma_dist(rng));
+
+        DeviceBuffer dhidden, ddelta, dgamma, dref_residual, dref_normalized,
+            dfused_residual, dfused_normalized;
+        uint16_t* d_hidden = dhidden.allocate<uint16_t>(elements);
+        uint16_t* d_delta = ddelta.allocate<uint16_t>(elements);
+        uint16_t* d_gamma = dgamma.allocate<uint16_t>(gamma.size());
+        uint16_t* d_ref_residual = dref_residual.allocate<uint16_t>(elements);
+        uint16_t* d_ref_normalized = dref_normalized.allocate<uint16_t>(elements);
+        uint16_t* d_fused_residual = dfused_residual.allocate<uint16_t>(elements);
+        uint16_t* d_fused_normalized = dfused_normalized.allocate<uint16_t>(elements);
+        if (!d_hidden || !d_delta || !d_gamma || !d_ref_residual ||
+            !d_ref_normalized || !d_fused_residual || !d_fused_normalized ||
+            cudaMemcpy(d_hidden, hidden.data(), elements * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_delta, delta.data(), elements * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_gamma, gamma.data(), gamma.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(d_ref_residual, d_hidden, elements * sizeof(uint16_t),
+                       cudaMemcpyDeviceToDevice) != cudaSuccess ||
+            !dsv4::qwen_add_inplace_f16_cuda(
+                d_ref_residual, d_delta, static_cast<int>(elements)) ||
+            !dsv4::qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
+                d_ref_residual, d_gamma, d_ref_normalized, rows, cols, eps) ||
+            !dsv4::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+                d_hidden, d_delta, d_gamma, d_fused_residual,
+                d_fused_normalized, rows, cols, eps) ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            fail("FP16 fused residual RMSNorm launch");
+            return true;
+        }
+
+        std::vector<uint16_t> ref_residual(elements);
+        std::vector<uint16_t> ref_normalized(elements);
+        std::vector<uint16_t> fused_residual(elements);
+        std::vector<uint16_t> fused_normalized(elements);
+        if (cudaMemcpy(ref_residual.data(), d_ref_residual,
+                       elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) !=
+                cudaSuccess ||
+            cudaMemcpy(ref_normalized.data(), d_ref_normalized,
+                       elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) !=
+                cudaSuccess ||
+            cudaMemcpy(fused_residual.data(), d_fused_residual,
+                       elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) !=
+                cudaSuccess ||
+            cudaMemcpy(fused_normalized.data(), d_fused_normalized,
+                       elements * sizeof(uint16_t), cudaMemcpyDeviceToHost) !=
+                cudaSuccess) {
+            fail("FP16 fused residual RMSNorm copy");
+            return true;
+        }
+        int residual_mismatches = 0;
+        int normalized_mismatches = 0;
+        for (size_t index = 0; index < elements; ++index) {
+            residual_mismatches +=
+                ref_residual[index] != fused_residual[index] ? 1 : 0;
+            normalized_mismatches +=
+                ref_normalized[index] != fused_normalized[index] ? 1 : 0;
+        }
+        if (residual_mismatches != 0 || normalized_mismatches != 0) {
+            std::printf("  FP16 fused residual RMSNorm rows=%d cols=%d "
+                        "residual_mismatch=%d normalized_mismatch=%d\n",
+                        rows, cols, residual_mismatches,
+                        normalized_mismatches);
+            fail("FP16 fused residual RMSNorm bit exactness");
+            return true;
+        }
+    }
+    std::printf("  FP16 fused residual RMSNorm bit exact rows=2,3,5,8 "
+                "cols=%d\n", cols);
+    return true;
+}
+
 bool check_prefill_tiled(int seq_len, int head_dim, int position_offset,
                          int q_heads = 6, int kv_heads = 1) {
 
@@ -674,12 +763,9 @@ bool check_fp8_f16_projection() {
         };
         bool shared_ok = true;
         double worst = 0.0;
-        // Both shared-activation variants are checked against the register-only
-        // kernel. The packed-conversion variant fuses two strided steps per
-        // iteration but keeps each lane's columns and their addition order, so it
-        // must also be bit exact.
-        const char* const shared_variants[] = {"0", "1"};
-        for (const char* fshared : shared_variants)
+        // The paired shared kernel fuses two strided steps while keeping each
+        // lane's columns and addition order, so it must match the register-only
+        // path bit for bit.
         for (const SharedCase& item : cases) {
             const int x_stride = item.cols;
             const int y_stride = item.rows;
@@ -717,20 +803,17 @@ bool check_fp8_f16_projection() {
             }
             setenv("QWEN_FP8_F16_SMALL_BATCH", "1", 1);
             setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "1", 1);
-            setenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED", fshared, 1);
             const bool shared_launched =
                 dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
                     px, pw, ps, py_shared, item.batch, item.rows, item.cols,
                     x_stride, y_stride, weight_stride, scale_stride) &&
                 cudaDeviceSynchronize() == cudaSuccess;
             setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "0", 1);
-            setenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED", "0", 1);
             const bool plain_launched =
                 dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
                     px, pw, ps, py_plain, item.batch, item.rows, item.cols,
                     x_stride, y_stride, weight_stride, scale_stride) &&
                 cudaDeviceSynchronize() == cudaSuccess;
-            unsetenv("QWEN_FP8_F16_SMALL_BATCH_FSHARED");
             unsetenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
             unsetenv("QWEN_FP8_F16_SMALL_BATCH");
             if (!shared_launched || !plain_launched) {
@@ -759,9 +842,8 @@ bool check_fp8_f16_projection() {
             }
             if (mismatches != 0) {
                 std::printf("  FP16 FP8 shared small-batch mismatch batch=%d "
-                            "rows=%d cols=%d fshared=%s count=%d worst=%.3e\n",
-                            item.batch, item.rows, item.cols, fshared,
-                            mismatches, worst);
+                            "rows=%d cols=%d count=%d worst=%.3e\n",
+                            item.batch, item.rows, item.cols, mismatches, worst);
                 fail("FP16 FP8 shared small-batch bit exactness");
                 shared_ok = false;
                 break;
@@ -769,9 +851,8 @@ bool check_fp8_f16_projection() {
         }
         if (shared_ok) {
             std::printf("  FP16 FP8 shared small-batch bit exact over %zu "
-                        "shard shapes x %zu variants\n",
-                        sizeof(cases) / sizeof(cases[0]),
-                        sizeof(shared_variants) / sizeof(shared_variants[0]));
+                        "shard shapes\n",
+                        sizeof(cases) / sizeof(cases[0]));
         }
     }
 
@@ -891,6 +972,154 @@ bool check_fp8_f16_projection() {
                     "dispatch=%.3e cublas=%.3e\n",
                     batch, rows, cols, prefill_error, prefill_dispatch_error,
                     prefill_cublas_error);
+    }
+    return true;
+}
+
+bool check_resident_fp16_projection() {
+    constexpr int batch = 8;
+    constexpr int rows = 136;
+    constexpr int cols = 512;
+    constexpr int x_stride = 520;
+    constexpr int y_stride = 144;
+    constexpr int weight_stride = 520;
+    constexpr int scale_stride = 5;
+    const uint8_t finite_codes[] = {
+        0x01, 0x03, 0x08, 0x18, 0x20, 0x28, 0x30, 0x38,
+        0x40, 0x48, 0x81, 0x83, 0x88, 0x98, 0xa0, 0xa8,
+        0xb0, 0xb8, 0xc0, 0xc8,
+    };
+    std::mt19937 rng(52081);
+    std::uniform_real_distribution<float> x_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> scale_dist(0.005f, 0.02f);
+    std::vector<uint16_t> x(static_cast<size_t>(batch) * x_stride);
+    std::vector<uint8_t> weight(static_cast<size_t>(rows) * weight_stride);
+    std::vector<uint16_t> scale(
+        static_cast<size_t>((rows + 127) / 128) * scale_stride);
+    for (uint16_t& value : x) value = to_half(x_dist(rng));
+    for (uint8_t& value : weight) {
+        value = finite_codes[rng() % (sizeof(finite_codes) / sizeof(finite_codes[0]))];
+    }
+    for (uint16_t& value : scale) value = to_half(scale_dist(rng));
+
+    std::vector<uint16_t> expected_weight(static_cast<size_t>(rows) * cols);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            expected_weight[static_cast<size_t>(row) * cols + col] = to_half(
+                from_fp8_e4m3(weight[static_cast<size_t>(row) * weight_stride + col]) *
+                from_half(scale[static_cast<size_t>(row / 128) * scale_stride +
+                                      col / 128]));
+        }
+    }
+
+    DeviceBuffer dx, dw, ds, d_resident_weight, d_online, d_resident;
+    uint16_t* d_x = dx.allocate<uint16_t>(x.size());
+    uint8_t* d_weight = dw.allocate<uint8_t>(weight.size());
+    uint16_t* d_scale = ds.allocate<uint16_t>(scale.size());
+    uint16_t* d_dense = d_resident_weight.allocate<uint16_t>(
+        expected_weight.size());
+    uint16_t* d_online_y = d_online.allocate<uint16_t>(
+        static_cast<size_t>(batch) * y_stride);
+    uint16_t* d_resident_y = d_resident.allocate<uint16_t>(
+        static_cast<size_t>(batch) * y_stride);
+    if (!d_x || !d_weight || !d_scale || !d_dense || !d_online_y ||
+        !d_resident_y ||
+        cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_weight, weight.data(), weight.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_scale, scale.data(), scale.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail("resident FP16 projection allocation/copy");
+        return false;
+    }
+
+    setenv("QWEN_FP8_F16_SMALL_BATCH", "1", 1);
+    setenv("QWEN_FP8_F16_SMALL_BATCH_SHARED", "1", 1);
+    const bool launched =
+        dsv4::qwen_fp8_e4m3_fp16scale_dequantize_f16_cuda(
+            d_weight, d_scale, d_dense, rows, cols, weight_stride,
+            scale_stride) &&
+        dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(
+            d_x, d_weight, d_scale, d_online_y, batch, rows, cols, x_stride,
+            y_stride, weight_stride, scale_stride) &&
+        dsv4::qwen_fp16_matmul_rows_f16_cublas_cuda(
+            d_x, d_dense, d_resident_y, batch, rows, cols, x_stride, y_stride,
+            cols) &&
+        cudaDeviceSynchronize() == cudaSuccess;
+    unsetenv("QWEN_FP8_F16_SMALL_BATCH_SHARED");
+    unsetenv("QWEN_FP8_F16_SMALL_BATCH");
+    if (!launched) {
+        fail("resident FP16 projection launch");
+        return false;
+    }
+
+    std::vector<uint16_t> dense(expected_weight.size());
+    std::vector<uint16_t> online(static_cast<size_t>(batch) * y_stride);
+    std::vector<uint16_t> resident(online.size());
+    if (cudaMemcpy(dense.data(), d_dense, dense.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(online.data(), d_online_y, online.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(resident.data(), d_resident_y,
+                   resident.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("resident FP16 projection copy");
+        return false;
+    }
+    if (dense != expected_weight) {
+        fail("resident FP16 weight expansion layout");
+        return true;
+    }
+
+    double direct_abs = 0.0;
+    double direct_rel = 0.0;
+    double online_reference = 0.0;
+    double resident_reference = 0.0;
+    for (int sample = 0; sample < batch; ++sample) {
+        for (int row = 0; row < rows; ++row) {
+            float raw_sum = 0.0f;
+            float rounded_sum = 0.0f;
+            for (int col = 0; col < cols; ++col) {
+                const float activation = from_half(
+                    x[static_cast<size_t>(sample) * x_stride + col]);
+                const float block_scale = from_half(
+                    scale[static_cast<size_t>(row / 128) * scale_stride +
+                          col / 128]);
+                raw_sum += activation *
+                    from_fp8_e4m3(weight[static_cast<size_t>(row) *
+                                               weight_stride + col]) *
+                    block_scale;
+                rounded_sum += activation * from_half(
+                    expected_weight[static_cast<size_t>(row) * cols + col]);
+            }
+            const size_t at = static_cast<size_t>(sample) * y_stride + row;
+            const double online_value = from_half(online[at]);
+            const double resident_value = from_half(resident[at]);
+            const double difference = std::fabs(online_value - resident_value);
+            direct_abs = std::max(direct_abs, difference);
+            const double magnitude = std::max(
+                std::fabs(online_value), std::fabs(resident_value));
+            if (magnitude >= 0.25) {
+                direct_rel = std::max(direct_rel, difference / magnitude);
+            }
+            online_reference = std::max(
+                online_reference,
+                std::fabs(online_value - static_cast<double>(raw_sum)));
+            resident_reference = std::max(
+                resident_reference,
+                std::fabs(resident_value - static_cast<double>(rounded_sum)));
+        }
+    }
+    if (direct_abs > 3.0e-2 || online_reference > 3.0e-2 ||
+        resident_reference > 3.0e-2) {
+        fail("resident FP16 projection numerical check");
+    } else {
+        std::printf("  resident FP16 projection batch=%d rows=%d cols=%d "
+                    "online_vs_resident_abs=%.3e rel=%.3e "
+                    "online_ref=%.3e resident_ref=%.3e\n",
+                    batch, rows, cols, direct_abs, direct_rel,
+                    online_reference, resident_reference);
     }
     return true;
 }
@@ -1019,6 +1248,126 @@ bool check_batched_argmax() {
         std::printf("  batched argmax rows=%d count=%d tie=lower-token\n",
                     rows, count);
     }
+    return true;
+}
+
+bool check_region_copy() {
+    constexpr uint8_t kGuard = 0xa7;
+    std::vector<size_t> sizes;
+    sizes.reserve(97);
+    for (int index = 0; index < 48; ++index) {
+        sizes.push_back(index == 17 ? 786432 + 13 : 786432);
+        sizes.push_back(index == 9 ? 15360 + 7 : 15360);
+    }
+    sizes.push_back(10240 + 5);
+
+    std::vector<DeviceBuffer> buffers(sizes.size());
+    std::vector<uint8_t*> device_regions(sizes.size());
+    std::vector<std::vector<uint8_t>> expected(sizes.size());
+    std::vector<dsv4::QwenCopyRegion> descriptors;
+    descriptors.reserve(sizes.size());
+    uint64_t packed_bytes = 0;
+    uint64_t total_blocks = 0;
+    for (size_t region = 0; region < sizes.size(); ++region) {
+        const size_t bytes = sizes[region];
+        device_regions[region] = buffers[region].allocate<uint8_t>(bytes + 32);
+        if (device_regions[region] == nullptr) return false;
+        expected[region].resize(bytes);
+        for (size_t index = 0; index < bytes; ++index) {
+            expected[region][index] = static_cast<uint8_t>(
+                (region * 131 + index * 17 + (index >> 8)) & 0xffu);
+        }
+        std::vector<uint8_t> initial(bytes + 32, kGuard);
+        std::copy(expected[region].begin(), expected[region].end(),
+                  initial.begin() + 16);
+        if (cudaMemcpy(device_regions[region], initial.data(), initial.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            fail("region copy source upload");
+            return true;
+        }
+        device_regions[region] += 16;
+        dsv4::QwenCopyRegion descriptor;
+        descriptor.device_address = reinterpret_cast<uint64_t>(
+            device_regions[region]);
+        descriptor.packed_offset = packed_bytes;
+        descriptor.bytes = bytes;
+        descriptor.first_block = total_blocks;
+        descriptors.push_back(descriptor);
+        packed_bytes += bytes;
+        total_blocks += dsv4::qwen_copy_region_blocks(bytes);
+    }
+
+    DeviceBuffer ddescriptors, dpacked;
+    auto* d_regions = ddescriptors.allocate<dsv4::QwenCopyRegion>(
+        descriptors.size());
+    uint8_t* d_packed = dpacked.allocate<uint8_t>(packed_bytes + 32);
+    if (!d_regions || !d_packed ||
+        cudaMemcpy(d_regions, descriptors.data(),
+                   descriptors.size() * sizeof(descriptors[0]),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset(d_packed, kGuard, packed_bytes + 32) != cudaSuccess ||
+        !dsv4::qwen_gather_copy_regions_cuda(
+            d_regions, static_cast<int>(descriptors.size()), d_packed + 16,
+            total_blocks) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("region gather launch");
+        return true;
+    }
+
+    std::vector<uint8_t> packed(packed_bytes + 32);
+    if (cudaMemcpy(packed.data(), d_packed, packed.size(),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("region gather copy");
+        return true;
+    }
+    for (size_t index = 0; index < 16; ++index) {
+        if (packed[index] != kGuard || packed[16 + packed_bytes + index] != kGuard) {
+            fail("region gather guard check");
+            return true;
+        }
+    }
+    for (size_t region = 0; region < descriptors.size(); ++region) {
+        const uint8_t* got = packed.data() + 16 +
+            descriptors[region].packed_offset;
+        if (!std::equal(expected[region].begin(), expected[region].end(), got)) {
+            fail("region gather numerical check");
+            return true;
+        }
+    }
+
+    for (size_t region = 0; region < descriptors.size(); ++region) {
+        if (cudaMemset(device_regions[region], 0, sizes[region]) != cudaSuccess) {
+            fail("region scatter reset");
+            return true;
+        }
+    }
+    if (!dsv4::qwen_scatter_copy_regions_cuda(
+            d_regions, static_cast<int>(descriptors.size()), d_packed + 16,
+            total_blocks) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("region scatter launch");
+        return true;
+    }
+    for (size_t region = 0; region < descriptors.size(); ++region) {
+        std::vector<uint8_t> got(sizes[region] + 32);
+        if (cudaMemcpy(got.data(), device_regions[region] - 16, got.size(),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            fail("region scatter copy");
+            return true;
+        }
+        if (!std::all_of(got.begin(), got.begin() + 16,
+                         [](uint8_t value) { return value == kGuard; }) ||
+            !std::all_of(got.end() - 16, got.end(),
+                         [](uint8_t value) { return value == kGuard; }) ||
+            !std::equal(expected[region].begin(), expected[region].end(),
+                        got.begin() + 16)) {
+            fail("region scatter numerical check");
+            return true;
+        }
+    }
+    std::printf("  region gather/scatter regions=%zu bytes=%llu bit exact\n",
+                descriptors.size(),
+                static_cast<unsigned long long>(packed_bytes));
     return true;
 }
 
@@ -1238,6 +1587,158 @@ bool check_fused_swiglu() {
     return true;
 }
 
+bool check_gated_delta_prenormalized(int rows = 8, int heads = 12,
+                                     int key_heads = 4, int passes = 1,
+                                     float scale = 0.2f) {
+    constexpr int dim = 128;
+    const size_t state_elements = static_cast<size_t>(heads) * dim * dim;
+    const size_t key_elements = static_cast<size_t>(rows) * key_heads * dim;
+    const size_t value_elements = static_cast<size_t>(rows) * heads * dim;
+    const size_t gate_elements = static_cast<size_t>(rows) * heads;
+    std::mt19937 rng(17001 + rows * 31 + heads * 7 + key_heads);
+    std::uniform_real_distribution<float> dist(-scale, scale);
+    std::vector<float> state(state_elements);
+    for (float& value : state) value = dist(rng);
+    std::vector<uint16_t> q(key_elements), k(key_elements), v(value_elements);
+    std::vector<uint16_t> g(gate_elements), beta(gate_elements);
+    for (uint16_t& value : q) value = to_half(dist(rng));
+    for (uint16_t& value : k) value = to_half(dist(rng));
+    for (uint16_t& value : v) value = to_half(dist(rng));
+    for (uint16_t& value : g) value = to_half(dist(rng) - 0.3f);
+    for (uint16_t& value : beta) value = to_half(dist(rng) + 0.5f);
+
+    float* d_state_reference = nullptr;
+    float* d_state_normalized = nullptr;
+    float* d_state_shared = nullptr;
+    uint16_t* d_shared = nullptr;
+    uint16_t* d_q = nullptr;
+    uint16_t* d_k = nullptr;
+    uint16_t* d_v = nullptr;
+    uint16_t* d_g = nullptr;
+    uint16_t* d_beta = nullptr;
+    uint16_t* d_reference = nullptr;
+    uint16_t* d_normalized = nullptr;
+    float* d_q_normalized = nullptr;
+    float* d_k_normalized = nullptr;
+    auto malloc_copy = [](void** device, const void* host, size_t bytes) {
+        return cudaMalloc(device, bytes) == cudaSuccess &&
+               cudaMemcpy(*device, host, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (!malloc_copy(reinterpret_cast<void**>(&d_state_reference), state.data(),
+                     state.size() * sizeof(float)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_state_normalized), state.data(),
+                     state.size() * sizeof(float)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_state_shared), state.data(),
+                     state.size() * sizeof(float)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_q), q.data(),
+                     q.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_k), k.data(),
+                     k.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_v), v.data(),
+                     v.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_g), g.data(),
+                     g.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_beta), beta.data(),
+                     beta.size() * sizeof(uint16_t)) ||
+        cudaMalloc(&d_reference, value_elements * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_normalized, value_elements * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_shared, value_elements * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_q_normalized, key_elements * sizeof(float)) != cudaSuccess ||
+        cudaMalloc(&d_k_normalized, key_elements * sizeof(float)) != cudaSuccess) {
+        fail("gated delta prenormalized allocation");
+        return false;
+    }
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    // Repeated passes reuse the evolving state, which is what a multi-round
+    // speculative verify does. A kernel that mishandles the state load/store
+    // shows up on the second pass even if the first one looks right.
+    for (int pass = 0; pass < passes; ++pass) {
+        if (!dsv4::qwen_gated_delta_sequence_f16_cuda(
+                d_state_reference, d_q, d_k, d_v, d_g, d_beta, d_reference,
+                rows, heads, key_heads, dim, dim, q_scale) ||
+            !dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+                d_q, d_k, d_q_normalized, d_k_normalized, rows, key_heads, dim) ||
+            !dsv4::qwen_gated_delta_sequence_normalized_f16_cuda(
+                d_state_normalized, d_q_normalized, d_k_normalized, d_v, d_g,
+                d_beta, d_normalized, rows, heads, key_heads, dim, dim, q_scale) ||
+            !dsv4::qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+                d_state_shared, d_q_normalized, d_k_normalized, d_v, d_g,
+                d_beta, d_shared, rows, heads, key_heads, dim, dim, q_scale) ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            fail("gated delta prenormalized launch");
+            return false;
+        }
+    }
+    std::vector<uint16_t> reference(value_elements), normalized(value_elements);
+    std::vector<uint16_t> shared(value_elements);
+    std::vector<float> reference_state(state_elements), normalized_state(state_elements);
+    std::vector<float> shared_state(state_elements);
+    cudaMemcpy(reference.data(), d_reference,
+               reference.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(normalized.data(), d_normalized,
+               normalized.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(shared.data(), d_shared,
+               shared.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(reference_state.data(), d_state_reference,
+               reference_state.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(normalized_state.data(), d_state_normalized,
+               normalized_state.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(shared_state.data(), d_state_shared,
+               shared_state.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    double output_worst = 0.0;
+    double shared_output_worst = 0.0;
+    bool finite = true;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double base = from_half(reference[i]);
+        const double candidate = from_half(shared[i]);
+        if (!std::isfinite(candidate)) finite = false;
+        output_worst = std::max(
+            output_worst, std::fabs(base - from_half(normalized[i])));
+        shared_output_worst = std::max(shared_output_worst,
+                                       std::fabs(base - candidate));
+    }
+    double state_worst = 0.0;
+    double shared_state_worst = 0.0;
+    for (size_t i = 0; i < reference_state.size(); ++i) {
+        if (!std::isfinite(shared_state[i])) finite = false;
+        state_worst = std::max(
+            state_worst,
+            std::fabs(static_cast<double>(reference_state[i]) -
+                      normalized_state[i]));
+        shared_state_worst = std::max(
+            shared_state_worst,
+            std::fabs(static_cast<double>(reference_state[i]) -
+                      shared_state[i]));
+    }
+    if (output_worst != 0.0 || state_worst != 0.0) {
+        fail("gated delta prenormalized bit exact");
+    } else if (!finite) {
+        fail("gated delta shared-state finite");
+    } else if (shared_output_worst != 0.0 || shared_state_worst != 0.0) {
+        fail("gated delta shared-state bit exact");
+    } else {
+        std::printf("  gated delta prenormalized rows=%d heads=%d key_heads=%d "
+                    "passes=%d output=%.3e state=%.3e shared_output=%.3e "
+                    "shared_state=%.3e\n",
+                    rows, heads, key_heads, passes, output_worst, state_worst,
+                    shared_output_worst, shared_state_worst);
+    }
+    cudaFree(d_state_reference);
+    cudaFree(d_state_normalized);
+    cudaFree(d_state_shared);
+    cudaFree(d_shared);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_g);
+    cudaFree(d_beta);
+    cudaFree(d_reference);
+    cudaFree(d_normalized);
+    cudaFree(d_q_normalized);
+    cudaFree(d_k_normalized);
+    return true;
+}
+
 bool check_fp8_cache() {
     constexpr int q_heads = 6;
     constexpr int kv_heads = 1;
@@ -1346,6 +1847,7 @@ int main() {
     check_fp16_cache(1);
     check_fp16_cache(17);
     check_fp16_cache(333);
+    check_residual_add_rmsnorm_fused();
     check_prefill_tiled(1, 64, 0);
     check_prefill_tiled(2, 256, 0);
     check_prefill_tiled(7, 64, 3);
@@ -1367,11 +1869,23 @@ int main() {
     check_decode_window_reference();
     check_decode_grid_256k();
     check_fp8_f16_projection();
+    check_resident_fp16_projection();
     check_batched_argmax();
+    check_region_copy();
     check_strided_row_copy(1);
     check_strided_row_copy(8);
     check_fused_swiglu();
     check_fp8_fused_swiglu_shared();
+    check_gated_delta_prenormalized();
+    check_gated_delta_prenormalized(2);
+    check_gated_delta_prenormalized(3);
+    check_gated_delta_prenormalized(5);
+    check_gated_delta_prenormalized(7);
+    check_gated_delta_prenormalized(8, 12, 2);
+    check_gated_delta_prenormalized(8, 12, 12);
+    check_gated_delta_prenormalized(8, 4, 1);
+    check_gated_delta_prenormalized(8, 12, 4, 3);
+    check_gated_delta_prenormalized(8, 12, 4, 3, 2.0f);
     check_fp8_cache();
     if (failures != 0) {
         std::printf("test_qwen_half_ops failures=%d\n", failures);

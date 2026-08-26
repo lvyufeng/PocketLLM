@@ -158,6 +158,7 @@ public:
     int position() const { return position_; }
     uint64_t resident_weight_bytes() const { return resident_weight_bytes_; }
     uint64_t resident_scale_bytes() const { return resident_scale_bytes_; }
+    uint64_t verify_weight_bytes() const;
     uint64_t activation_workspace_peak_bytes() const;
     uint64_t kv_cache_bytes() const;
     uint64_t kv_cache_scale_bytes() const;

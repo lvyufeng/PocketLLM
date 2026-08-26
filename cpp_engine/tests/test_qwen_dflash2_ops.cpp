@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <random>
@@ -356,6 +357,186 @@ void test_selector_viterbi_beats_greedy() {
     cudaFree(d_predecessor); cudaFree(d_successor);
 }
 
+void test_device_global_top1_merge() {
+    // This is the exact world-major layout produced by the NCCL all-gather
+    // wrapper: [rank][row]. Keep the test independent of NCCL so it also checks
+    // the merge kernel on a single GPU, including stream ordering.
+    const int world = 4;
+    const int rows = 5;
+    const int top_k = 1;
+    const int invalid_token = std::numeric_limits<int>::max();
+    const float negative_infinity = -std::numeric_limits<float>::infinity();
+    const std::vector<int> gathered_tokens = {
+        40, 700, 2, 99, 3,
+        41, 100, 1, 98, 4,
+        42, 50, 7, 97, 5,
+        43, 200, 8, 96, 6,
+    };
+    const std::vector<float> gathered_logits = {
+        1.0f, 5.0f, NAN, 4.0f, -1.0f,
+        3.0f, 5.0f, NAN, 4.0f, -1.0f,
+        2.0f, 4.9f, NAN, 4.0f, -1.0f,
+        NAN, 5.0f, NAN, NAN, -2.0f,
+    };
+    const std::vector<int> expected_tokens = {41, 100, invalid_token, 97, 3};
+    const std::vector<float> expected_logits = {3.0f, 5.0f, negative_infinity,
+                                                4.0f, -1.0f};
+
+    int* d_gathered_tokens = upload(gathered_tokens);
+    float* d_gathered_logits = upload(gathered_logits);
+    int* d_output_tokens = nullptr;
+    float* d_output_logits = nullptr;
+    check_cuda(cudaMalloc(&d_output_tokens, rows * sizeof(int)),
+               "global top-1 output tokens");
+    check_cuda(cudaMalloc(&d_output_logits, rows * sizeof(float)),
+               "global top-1 output logits");
+    cudaStream_t stream = nullptr;
+    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+               "global top-1 stream");
+    require(dsv4::qwen_dflash2_merge_topk_f32_cuda(
+                d_gathered_tokens, d_gathered_logits, d_output_tokens,
+                d_output_logits, world, rows, top_k, stream),
+            "device global top-1 merge launch failed");
+    std::vector<int> output_tokens(rows);
+    std::vector<float> output_logits(rows);
+    check_cuda(cudaMemcpyAsync(output_tokens.data(), d_output_tokens,
+                               rows * sizeof(int), cudaMemcpyDeviceToHost,
+                               stream),
+               "copy global top-1 tokens");
+    check_cuda(cudaMemcpyAsync(output_logits.data(), d_output_logits,
+                               rows * sizeof(float), cudaMemcpyDeviceToHost,
+                               stream),
+               "copy global top-1 logits");
+    check_cuda(cudaStreamSynchronize(stream), "sync global top-1 merge");
+    for (int row = 0; row < rows; ++row) {
+        require(output_tokens[static_cast<size_t>(row)] == expected_tokens[row],
+                "device global top-1 token mismatch row=" + std::to_string(row));
+        const float actual = output_logits[static_cast<size_t>(row)];
+        const float expected = expected_logits[row];
+        if (std::isinf(expected)) {
+            require(std::isinf(actual) && actual < 0.0f,
+                    "device global top-1 empty logit mismatch row=" +
+                        std::to_string(row));
+        } else {
+            require(actual == expected,
+                    "device global top-1 logit mismatch row=" +
+                        std::to_string(row));
+        }
+    }
+    check_cuda(cudaStreamDestroy(stream), "destroy global top-1 stream");
+    cudaFree(d_gathered_tokens);
+    cudaFree(d_gathered_logits);
+    cudaFree(d_output_tokens);
+    cudaFree(d_output_logits);
+}
+
+void test_packed_top1_key() {
+    // Simulate the NCCL uint64 Max reduction on one GPU. Each rank packs one
+    // local candidate per row; the host-side max below is exactly the ordering
+    // used by ncclMax for the production packed path.
+    const int world = 4;
+    const int rows = 8;
+    const int invalid_token = std::numeric_limits<int>::max();
+    const float negative_infinity = -std::numeric_limits<float>::infinity();
+    const std::vector<std::vector<int>> tokens = {
+        {40, 700, 2, 99, 3, 8, 10, 20},
+        {41, 100, 1, 98, 4, 7, 11, 21},
+        {42, 50, 7, 97, 5, 6, 12, 22},
+        {43, 200, 8, 96, 6, 5, 13, 23},
+    };
+    const std::vector<std::vector<float>> logits = {
+        {1.0f, 5.0f, NAN, 4.0f, -1.0f, -0.0f, negative_infinity, NAN},
+        {3.0f, 5.0f, NAN, 4.0f, -1.0f, +0.0f, negative_infinity, NAN},
+        {2.0f, 4.9f, NAN, 4.0f, -1.0f, -0.0f, negative_infinity, NAN},
+        {NAN, 5.0f, NAN, NAN, -2.0f, +0.0f, negative_infinity, NAN},
+    };
+    const std::vector<int> expected_tokens = {
+        41, 100, invalid_token, 97, 3, 5, 10, invalid_token};
+    const std::vector<float> expected_logits = {
+        3.0f, 5.0f, negative_infinity, 4.0f, -1.0f, 0.0f,
+        negative_infinity, negative_infinity};
+
+    std::vector<int*> d_tokens(world, nullptr);
+    std::vector<float*> d_logits(world, nullptr);
+    std::vector<uint64_t*> d_keys(world, nullptr);
+    std::vector<std::vector<uint64_t>> packed(
+        world, std::vector<uint64_t>(rows));
+    for (int rank = 0; rank < world; ++rank) {
+        d_tokens[rank] = upload(tokens[rank]);
+        d_logits[rank] = upload(logits[rank]);
+        check_cuda(cudaMalloc(&d_keys[rank], rows * sizeof(uint64_t)),
+                   "packed top-1 keys");
+    }
+
+    cudaStream_t stream = nullptr;
+    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+               "packed top-1 stream");
+    for (int rank = 0; rank < world; ++rank) {
+        require(dsv4::qwen_dflash2_pack_top1_key_f32_cuda(
+                    d_tokens[rank], d_logits[rank], d_keys[rank], rows, stream),
+                "packed top-1 pack launch failed");
+        check_cuda(cudaMemcpyAsync(packed[rank].data(), d_keys[rank],
+                                   rows * sizeof(uint64_t),
+                                   cudaMemcpyDeviceToHost, stream),
+                   "copy packed top-1 keys");
+    }
+    check_cuda(cudaStreamSynchronize(stream), "sync packed top-1 pack");
+
+    std::vector<uint64_t> reduced(rows, 0ull);
+    for (int row = 0; row < rows; ++row) {
+        for (int rank = 0; rank < world; ++rank) {
+            reduced[row] = std::max(reduced[row], packed[rank][row]);
+        }
+    }
+    uint64_t* d_reduced = upload(reduced);
+    int* d_output_tokens = nullptr;
+    float* d_output_logits = nullptr;
+    check_cuda(cudaMalloc(&d_output_tokens, rows * sizeof(int)),
+               "packed top-1 output tokens");
+    check_cuda(cudaMalloc(&d_output_logits, rows * sizeof(float)),
+               "packed top-1 output logits");
+    require(dsv4::qwen_dflash2_unpack_top1_key_f32_cuda(
+                d_reduced, d_output_tokens, d_output_logits, rows, stream),
+            "packed top-1 unpack launch failed");
+    std::vector<int> output_tokens(rows);
+    std::vector<float> output_logits(rows);
+    check_cuda(cudaMemcpyAsync(output_tokens.data(), d_output_tokens,
+                               rows * sizeof(int), cudaMemcpyDeviceToHost,
+                               stream),
+               "copy unpacked top-1 tokens");
+    check_cuda(cudaMemcpyAsync(output_logits.data(), d_output_logits,
+                               rows * sizeof(float), cudaMemcpyDeviceToHost,
+                               stream),
+               "copy unpacked top-1 logits");
+    check_cuda(cudaStreamSynchronize(stream), "sync packed top-1 unpack");
+
+    for (int row = 0; row < rows; ++row) {
+        require(output_tokens[row] == expected_tokens[row],
+                "packed top-1 token mismatch row=" + std::to_string(row));
+        if (std::isinf(expected_logits[row])) {
+            require(std::isinf(output_logits[row]) && output_logits[row] < 0.0f,
+                    "packed top-1 -inf mismatch row=" + std::to_string(row));
+        } else {
+            require(output_logits[row] == expected_logits[row],
+                    "packed top-1 logit mismatch row=" + std::to_string(row));
+        }
+    }
+    // Signed zero is canonicalized before packing so it has the same ordering
+    // as the host comparator and decodes to the canonical +0 representation.
+    require(!std::signbit(output_logits[5]),
+            "packed top-1 failed to canonicalize signed zero");
+
+    check_cuda(cudaStreamDestroy(stream), "destroy packed top-1 stream");
+    for (int rank = 0; rank < world; ++rank) {
+        cudaFree(d_tokens[rank]);
+        cudaFree(d_logits[rank]);
+        cudaFree(d_keys[rank]);
+    }
+    cudaFree(d_reduced);
+    cudaFree(d_output_tokens);
+    cudaFree(d_output_logits);
+}
+
 void test_selector_path() {
     const int rows = 3;
     const int vocab = 8;
@@ -535,6 +716,8 @@ int main() {
         test_strided_dynamic_conv();
         test_local_topk();
         test_local_topk_split_matches_reference();
+        test_device_global_top1_merge();
+        test_packed_top1_key();
         test_selector_viterbi_beats_greedy();
         test_selector_path();
         test_grouped_attention();

@@ -17,11 +17,29 @@ TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_pat
 void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows,
-                           int* global_tokens, float* global_logits);
+                           int* global_tokens, float* global_logits,
+                           void* stream = nullptr);
+// Device-resident top-1 merge. The all-gather and deterministic comparator run
+// on `stream`; no host synchronization or device-to-host copy is performed.
+void nccl_global_top1_rows_device(int world, int rank, int device,
+                                  const char* id_path,
+                                  const int* d_local_tokens,
+                                  const float* d_local_logits, int rows,
+                                  int* d_global_tokens,
+                                  float* d_global_logits,
+                                  void* stream = nullptr);
+// Device-resident top-1 using one packed uint64 NCCL Max per row instead of
+// all-gathering both arrays. The packed order is deterministic and matches the
+// host/device comparator: larger logit wins, ties pick the smaller token id.
+void nccl_global_top1_rows_packed_device(
+    int world, int rank, int device, const char* id_path,
+    const int* d_local_tokens, const float* d_local_logits, int rows,
+    int* d_global_tokens, float* d_global_logits, void* stream = nullptr);
 void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows, int top_k,
-                           int* global_tokens, float* global_logits);
+                           int* global_tokens, float* global_logits,
+                           void* stream = nullptr);
 // All-gather and merge batched top-k candidates without synchronizing to the
 // host. The output buffers remain device-resident for the next CUDA stage.
 void nccl_global_topk_rows_device(int world, int rank, int device,
@@ -29,10 +47,11 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
                                   const int* d_local_tokens,
                                   const float* d_local_logits, int rows,
                                   int top_k, int* d_global_tokens,
-                                  float* d_global_logits);
-void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count);
-void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count);
-void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count);
+                                  float* d_global_logits,
+                                  void* stream = nullptr);
+void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count, void* stream = nullptr);
+void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream = nullptr);
+void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream = nullptr);
 // Broadcast a small int32 buffer from rank `root` to all ranks. Synchronous.
 void nccl_broadcast_int32(int world, int rank, int device, const char* id_path, int32_t* buf, int count, int root);
 // Gather equal-sized float32 chunks from every rank to `root`. `h_local` is read on

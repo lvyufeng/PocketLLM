@@ -697,6 +697,7 @@ int main(int argc, char** argv) {
                         std::cout << "qwen_runtime=1 layers=" << generated.front().layers
                                   << " resident_weight_bytes=" << qwen.resident_weight_bytes()
                                   << " resident_scale_bytes=" << qwen.resident_scale_bytes()
+                                  << " verify_weight_bytes=" << qwen.verify_weight_bytes()
                                   << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
                                   << " kv_cache_bytes=" << qwen.kv_cache_bytes()
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
@@ -773,6 +774,7 @@ int main(int argc, char** argv) {
                                   << " position=" << result.position
                                   << " resident_weight_bytes=" << qwen.resident_weight_bytes()
                                   << " resident_scale_bytes=" << qwen.resident_scale_bytes()
+                                  << " verify_weight_bytes=" << qwen.verify_weight_bytes()
                                   << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
                                   << " kv_cache_bytes=" << qwen.kv_cache_bytes()
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()

@@ -394,6 +394,60 @@ __global__ void local_topk_f32_kernel(
     }
 }
 
+__device__ __forceinline__ uint32_t ordered_float_bits(float value) {
+    // Canonicalize signed zero because the host comparator treats -0 and +0 as
+    // equal and then breaks the tie by token id.
+    if (value == 0.0f) value = 0.0f;
+    const uint32_t bits = __float_as_uint(value);
+    return (bits & 0x80000000u) != 0u
+        ? ~bits
+        : (bits ^ 0x80000000u);
+}
+
+__device__ __forceinline__ float unordered_float_bits(uint32_t ordered) {
+    const uint32_t bits = (ordered & 0x80000000u) != 0u
+        ? (ordered ^ 0x80000000u)
+        : ~ordered;
+    return __uint_as_float(bits);
+}
+
+// Encode the same total order as better_candidate() into one unsigned integer.
+// The high word is monotonic in the FP32 logit; the low word is inverted token
+// id so ncclMax selects the smaller token when logits compare equal. NaNs are
+// represented by zero and therefore lose to every valid logit, including -inf.
+__global__ void pack_top1_key_f32_kernel(
+    const int* __restrict__ tokens, const float* __restrict__ values,
+    uint64_t* __restrict__ keys, int rows) {
+    const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const float value = values[row];
+    if (isnan(value)) {
+        keys[row] = 0ull;
+        return;
+    }
+    const uint32_t ordered = ordered_float_bits(value);
+    const uint32_t inverted_token =
+        0xffffffffu - static_cast<uint32_t>(tokens[row]);
+    keys[row] = (static_cast<uint64_t>(ordered) << 32) |
+                static_cast<uint64_t>(inverted_token);
+}
+
+__global__ void unpack_top1_key_f32_kernel(
+    const uint64_t* __restrict__ keys, int* __restrict__ tokens,
+    float* __restrict__ values, int rows) {
+    const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const uint64_t key = keys[row];
+    if (key == 0ull) {
+        tokens[row] = INT_MAX;
+        values[row] = -INFINITY;
+        return;
+    }
+    tokens[row] = static_cast<int>(0xffffffffu -
+                                   static_cast<uint32_t>(key));
+    values[row] = unordered_float_bits(static_cast<uint32_t>(key >> 32));
+}
+
 __global__ void merge_topk_f32_kernel(
     const int* __restrict__ gathered_tokens,
     const float* __restrict__ gathered_values,
@@ -1054,6 +1108,23 @@ bool qwen_dflash2_merge_topk_f32_cuda(
     }
     merge_topk_f32_kernel<<<rows, 1, 0, static_cast<cudaStream_t>(stream)>>>(
         gathered_tokens, gathered_values, tokens, values, world, rows, top_k);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_dflash2_pack_top1_key_f32_cuda(
+    const int* tokens, const float* values, uint64_t* keys, int rows,
+    void* stream) {
+    if (!tokens || !values || !keys || rows <= 0) return false;
+    pack_top1_key_f32_kernel<<<(rows + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(tokens, values, keys, rows);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_dflash2_unpack_top1_key_f32_cuda(
+    const uint64_t* keys, int* tokens, float* values, int rows, void* stream) {
+    if (!keys || !tokens || !values || rows <= 0) return false;
+    unpack_top1_key_f32_kernel<<<(rows + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(keys, tokens, values, rows);
     return cudaGetLastError() == cudaSuccess;
 }
 
