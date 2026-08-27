@@ -46,8 +46,10 @@ def parse_args() -> argparse.Namespace:
         help="comma-separated prompt lengths",
     )
     parser.add_argument("--max-new-tokens", type=int, default=16)
-    parser.add_argument("--prefill-chunk-tokens", type=int, default=512)
-    parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8"), default="fp16")
+    # Matches QwenEngineOptions::prefill_chunk_tokens. Keep these in step, or the
+    # benchmark measures a chunk size production does not use.
+    parser.add_argument("--prefill-chunk-tokens", type=int, default=4096)
+    parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8", "turboquant_k8v4"), default="fp16")
     parser.add_argument("--tp-world", type=int, default=4)
     parser.add_argument(
         "--devices",
@@ -238,9 +240,13 @@ def environment_metadata() -> dict[str, str]:
         "DSV4_QWEN_GQA_OPTIMIZED",
         "DSV4_QWEN_GQA_LONG_TILE",
         "DSV4_QWEN_GQA_FLASH_TILE",
+        "DSV4_QWEN_GQA_MMA_TILE",
+        "QWEN_NCCL_COMM_STREAM",
+        "QWEN_COMM_OVERLAP_SLICES",
         "DSV4_QWEN_GQA_QUERY_ROWS",
         "QWEN_FP8_F16_PREFILL_CUBLAS",
         "QWEN_FUSE_ATTN_RESID_NORM",
+        "QWEN_GATED_DELTA_FLASHQLA_SM75",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
 

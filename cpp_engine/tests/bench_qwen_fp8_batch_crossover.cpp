@@ -23,8 +23,7 @@ const Shape kShapes[] = {
 };
 double run(bool cublas, const uint16_t* x, const uint8_t* w, const uint16_t* s,
            uint16_t* y, int batch, int rows, int cols, int sc, int iters) {
-    if (cublas) setenv("QWEN_FP8_F16_PREFILL_CUBLAS", "1", 1);
-    else unsetenv("QWEN_FP8_F16_PREFILL_CUBLAS");
+    setenv("QWEN_FP8_F16_PREFILL_CUBLAS", cublas ? "1" : "0", 1);
     setenv("QWEN_FP8_F16_SMALL_BATCH", cublas ? "0" : "1", 1);
     auto go = [&]() {
         return dsv4::qwen_fp8_e4m3_fp16scale_matmul_rows_f16_cuda(

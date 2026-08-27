@@ -761,6 +761,284 @@ __global__ void gqa_prefill_hpg6_f16_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core exact prefill.
+//
+// The scalar paths above are not bandwidth bound. Measured at the real TP4 shape
+// (6 q heads over 1 kv head, head_dim 256, rows=4096 offset=32768) hpg6 takes
+// 770 ms for 876 GFLOP, i.e. 1.14 TFLOP/s or roughly 8.5% of the FP32 CUDA-core
+// peak, while the DRAM side only moves ~47 GB/s of a 616 GB/s card. The limit is
+// scalar issue: every (row, position) pair costs five warp shuffles plus an expf.
+// Tile-shape tuning cannot move that ceiling, so this path puts both GEMMs on the
+// tensor cores instead.
+//
+// SM75 has no m16n8k16, so the primitive is m16n8k8 with FP32 accumulate. The
+// dot products are reassociated relative to the scalar kernels, so this is exact
+// in the sense that matters here (full causal history, no window, no sink) but
+// not bit-identical to hpg6; it carries its own numerical and token-parity gates.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+#define DSV4_QWEN_MMA_AVAILABLE 1
+#endif
+
+__device__ __forceinline__ void mma_m16n8k8_f16_f32(
+    float (&d)[4], const uint32_t (&a)[2], uint32_t b) {
+#ifdef DSV4_QWEN_MMA_AVAILABLE
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(b));
+#else
+    (void)d;
+    (void)a;
+    (void)b;
+#endif
+}
+
+// One CTA owns 32 query rows of one Q head as two 16-row MMA blocks. The eight
+// warps are indexed as (row block, slice): for Q*K each slice takes eight KV
+// positions, for P*V each slice takes 64 of the 256 head dims. Both products are
+// therefore full-width tensor-core work and the only scalar phase left is the
+// 32x32 softmax. Two row blocks per CTA is what makes the ~43 KiB of K/V staging
+// worth its occupancy cost: the tile is loaded once for twice the output.
+constexpr int kMmaQRows = 32;
+constexpr int kMmaRowBlocks = kMmaQRows / 16;
+constexpr int kMmaKvTile = 32;
+constexpr int kMmaDim = 256;
+constexpr int kMmaSlices = 4;
+constexpr int kMmaWarps = kMmaRowBlocks * kMmaSlices;
+constexpr int kMmaSteps = kMmaDim / 8;
+// Shared row strides are chosen for bank behaviour, and both must stay even so
+// the 4-byte fragment loads remain aligned.
+//
+// ks stride 264 halves = 132 words: a Q*K fragment load varies over gid and tig,
+// giving banks (132*gid + tig) % 32 = (4*gid + tig) % 32, which is 32 distinct
+// banks. Conflict free.
+//
+// vt stride 34 halves = 17 words: the natural padding of 40 would make the
+// transpose store stride 8*40/2 = 160 words, a multiple of 32, so all 32 lanes of
+// a store would hit one bank. 34 cuts that to 8*34/2 = 136 ≡ 8 (mod 32), i.e. 4
+// banks, and makes the fragment loads (17*gid + tig) % 32 nearly conflict free.
+constexpr int kMmaKsStride = kMmaDim + 8;
+constexpr int kMmaVtStride = kMmaKvTile + 2;
+
+__global__ __launch_bounds__(kMmaWarps * 32) void gqa_prefill_mma_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset) {
+    __shared__ __align__(16) uint16_t ks[kMmaKvTile][kMmaKsStride];
+    __shared__ __align__(16) uint16_t vt[kMmaDim][kMmaVtStride];
+    __shared__ float sc[kMmaQRows][kMmaKvTile];
+    __shared__ __align__(16) uint16_t ph[kMmaQRows][kMmaVtStride];
+    __shared__ float row_m[kMmaQRows];
+    __shared__ float row_l[kMmaQRows];
+    __shared__ float row_alpha[kMmaQRows];
+
+    const int head = static_cast<int>(blockIdx.x);
+    const int qbase = static_cast<int>(blockIdx.y) * kMmaQRows;
+    if (head >= q_heads || qbase >= seq_len || head_dim != kMmaDim ||
+        q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0) {
+        return;
+    }
+    const int kv_head = head / (q_heads / kv_heads);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int block_row = (warp / kMmaSlices) * 16;
+    const int slice = warp % kMmaSlices;
+    const int lane = tid & 31;
+    // m16n8k8 operand mapping: the eight lanes of a group share a matrix row and
+    // the four lanes within a group cover two adjacent columns each.
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    // Rows of the 16x8 A/D fragment owned by this lane, in CTA-local terms.
+    const int lrow0 = block_row + gid;
+    const int lrow1 = block_row + gid + 8;
+
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
+    }
+    if (tid < kMmaQRows) {
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+    }
+
+    // Q is reused by every KV tile, so it stays resident in registers.
+    uint32_t qfrag[kMmaSteps][2];
+#pragma unroll
+    for (int k = 0; k < kMmaSteps; ++k) {
+        const int col = k * 8 + tig * 2;
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int row = qbase + (part == 0 ? lrow0 : lrow1);
+            uint32_t value = 0;
+            if (row < seq_len) {
+                value = *reinterpret_cast<const uint32_t*>(
+                    q_rows + (static_cast<size_t>(row) * q_heads + head) *
+                        head_dim + col);
+            }
+            qfrag[k][part] = value;
+        }
+    }
+
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    const int q_last = position_offset + min(qbase + kMmaQRows - 1, seq_len - 1);
+    const int tile_context = q_last + 1;
+    const float attention_scale = rsqrtf(static_cast<float>(head_dim));
+    __syncthreads();
+
+    for (int base = 0; base < tile_context; base += kMmaKvTile) {
+        const int count = min(kMmaKvTile, tile_context - base);
+        for (int idx = tid; idx < kMmaKvTile * kMmaSteps;
+             idx += kMmaWarps * 32) {
+            const int slot = idx / kMmaSteps;
+            const int chunk = idx - slot * kMmaSteps;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u);
+            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+            if (slot < count) {
+                const size_t at = static_cast<size_t>(base + slot) * kv_stride +
+                    static_cast<size_t>(kv_head) * head_dim + chunk * 8;
+                kv = *reinterpret_cast<const uint4*>(k_cache + at);
+                vv = *reinterpret_cast<const uint4*>(v_cache + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[slot][chunk * 8]) = kv;
+            // V is transposed on the way in so the P*V B operand, which wants
+            // eight consecutive positions for one dim, is a 4-byte shared load.
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(&vv);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) vt[chunk * 8 + i][slot] = src[i];
+        }
+        __syncthreads();
+
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int k = 0; k < kMmaSteps; ++k) {
+            const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                &ks[slice * 8 + gid][k * 8 + tig * 2]);
+            mma_m16n8k8_f16_f32(s, qfrag[k], b);
+        }
+        {
+            const int col = slice * 8 + tig * 2;
+            sc[lrow0][col] = s[0];
+            sc[lrow0][col + 1] = s[1];
+            sc[lrow1][col] = s[2];
+            sc[lrow1][col + 1] = s[3];
+        }
+        __syncthreads();
+
+        // Online softmax over the 16x32 tile. Eight threads share a row, so the
+        // row reductions are three shuffles inside a warp.
+        {
+            const int row = tid >> 3;
+            const int col0 = (tid & 7) * 4;
+            const int token = qbase + row;
+            const int limit = token < seq_len ? position_offset + token : -1;
+            const float m_old = row_m[row];
+            const float l_old = row_l[row];
+            float sv[4];
+            float local_max = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = col0 + i;
+                float value = -INFINITY;
+                if (col < count && base + col <= limit) {
+                    value = sc[row][col] * attention_scale;
+                }
+                sv[i] = value;
+                local_max = fmaxf(local_max, value);
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                local_max = fmaxf(local_max,
+                                  __shfl_xor_sync(0xffffffffu, local_max, off));
+            }
+            const float m_new = fmaxf(m_old, local_max);
+            float local_sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                // The numerator is rounded to half for the tensor-core operand,
+                // so the denominator sums the rounded values to keep the two
+                // consistent.
+                uint16_t bits = 0;
+                if (m_new != -INFINITY && sv[i] != -INFINITY) {
+                    bits = float_to_half(expf(sv[i] - m_new));
+                    local_sum += half_to_float(bits);
+                }
+                ph[row][col0 + i] = bits;
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+            }
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                const float alpha =
+                    m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+                row_alpha[row] = alpha;
+                row_m[row] = m_new;
+                row_l[row] = l_old * alpha + local_sum;
+            }
+        }
+        __syncthreads();
+
+        {
+            const float alpha0 = row_alpha[lrow0];
+            const float alpha1 = row_alpha[lrow1];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc[j][0] *= alpha0;
+                acc[j][1] *= alpha0;
+                acc[j][2] *= alpha1;
+                acc[j][3] *= alpha1;
+            }
+#pragma unroll
+            for (int kt = 0; kt < kMmaKvTile / 8; ++kt) {
+                uint32_t a[2];
+                a[0] = *reinterpret_cast<const uint32_t*>(
+                    &ph[lrow0][kt * 8 + tig * 2]);
+                a[1] = *reinterpret_cast<const uint32_t*>(
+                    &ph[lrow1][kt * 8 + tig * 2]);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                        &vt[slice * 64 + j * 8 + gid][kt * 8 + tig * 2]);
+                    mma_m16n8k8_f16_f32(acc[j], a, b);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv0 = row_l[lrow0] > 0.0f ? 1.0f / row_l[lrow0] : 0.0f;
+    const float inv1 = row_l[lrow1] > 0.0f ? 1.0f / row_l[lrow1] : 0.0f;
+    const int row0 = qbase + lrow0;
+    const int row1 = qbase + lrow1;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int dim = slice * 64 + j * 8 + tig * 2;
+        if (row0 < seq_len) {
+            uint16_t* out = output +
+                (static_cast<size_t>(row0) * q_heads + head) * head_dim + dim;
+            out[0] = float_to_half(acc[j][0] * inv0);
+            out[1] = float_to_half(acc[j][1] * inv0);
+        }
+        if (row1 < seq_len) {
+            uint16_t* out = output +
+                (static_cast<size_t>(row1) * q_heads + head) * head_dim + dim;
+            out[0] = float_to_half(acc[j][2] * inv1);
+            out[1] = float_to_half(acc[j][3] * inv1);
+        }
+    }
+}
+
 // Two adjacent query rows and three Q heads sharing a KV head are processed by
 // one CTA. Each K/V element is loaded once for six attention outputs.
 __global__ void gqa_prefill_tiled_f16_kernel(
@@ -1501,6 +1779,7 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
         // is capped to keep occupancy.
         int qr = 2;
         const char* qr_env = std::getenv("DSV4_QWEN_GQA_QUERY_ROWS");
+        const bool query_rows_explicit = qr_env != nullptr;
         if (qr_env != nullptr) {
             const int requested = std::atoi(qr_env);
             if (requested == 2 || requested == 4 || requested == 8) qr = requested;
@@ -1529,6 +1808,40 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
         const bool tp4_long_shape = attention_window <= 0 && q_heads == 6 &&
             kv_heads == 1 && head_dim == 256 && seq_len >= 128 &&
             total_context >= 2048;
+        // Tensor-core exact path, and the production default for the shapes it
+        // supports. The scalar kernels are scalar-issue bound at roughly 8.5% of
+        // the FP32 CUDA-core peak, so moving both GEMMs onto the tensor cores is
+        // the only lever that moves exact long-context prefill. Measured on the
+        // real 64-layer TP4 checkpoint, strictly serial, one binary:
+        //
+        //   context   scalar default   mma      prefill
+        //     8192     824.3 tok/s   1125.7    1.37x
+        //    32768     442.7 tok/s   1058.9    2.39x
+        //    65536     258.0 tok/s    887.6    3.44x
+        //
+        // decode is unchanged (25.15/19.90/19.25 against 25.12/20.78/19.54) and
+        // the generated tokens are identical at all three lengths. It reassociates
+        // both dot products and rounds the softmax numerator to half for the MMA
+        // operand, so `=0` selects the scalar path for A/B and for any future
+        // divergence hunt.
+        const char* mma_tile = std::getenv("DSV4_QWEN_GQA_MMA_TILE");
+        const bool mma_enabled =
+            mma_tile == nullptr || std::strcmp(mma_tile, "0") != 0;
+        // Windowed and sink attention stay on the scalar kernels: this kernel
+        // masks by causal limit only, so an approximate window would silently
+        // become exact rather than fail.
+        if (mma_enabled && attention_window <= 0 && sink_tokens == 0 &&
+            head_dim == kMmaDim && seq_len >= kMmaQRows) {
+            const dim3 mma_grid(
+                static_cast<unsigned>(q_heads),
+                static_cast<unsigned>((seq_len + kMmaQRows - 1) / kMmaQRows), 1);
+            gqa_prefill_mma_f16_kernel<<<
+                mma_grid, kMmaWarps * 32, 0,
+                static_cast<cudaStream_t>(stream)>>>(
+                q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                head_dim, position_offset);
+            return cudaGetLastError() == cudaSuccess;
+        }
         // Two-phase flash tile: one warp reduction per 32 positions instead of
         // one per position. It remains opt-in because it is not faster than the
         // hpg6 path on the measured TP4 long-context cases.
@@ -1553,23 +1866,33 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
             return cudaGetLastError() == cudaSuccess;
         }
         if (long_tile_enabled && tp4_long_shape) {
-            const int long_qr = qr == 8 ? 4 : qr;
-            const dim3 long_grid(
-                static_cast<unsigned>(kv_heads),
-                static_cast<unsigned>((seq_len + long_qr - 1) / long_qr), 1);
-            if (long_qr == 2) {
-                gqa_prefill_hpg6_f16_kernel<8, 2><<<
-                    long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
-                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
-                    head_dim, position_offset, attention_window, sink_tokens);
+            // The hpg6 kernel has a six-warp register footprint. On SM75, its
+            // four-row specialization is the production default; a caller that
+            // explicitly requests two rows is allowed for controlled A/B tests.
+            // Do not silently reinterpret an explicit eight-row request as four:
+            // the generic batched path is the honest fallback for that shape.
+            if (query_rows_explicit && qr == 8) {
+                // Fall through to the generic position-tiled dispatch below.
             } else {
-                gqa_prefill_hpg6_f16_kernel<8, 4><<<
-                    long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
-                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
-                    head_dim, position_offset, attention_window, sink_tokens);
+                const int long_qr = qr == 8 ? 4 : qr;
+                const dim3 long_grid(
+                    static_cast<unsigned>(kv_heads),
+                    static_cast<unsigned>((seq_len + long_qr - 1) / long_qr), 1);
+                if (long_qr == 2) {
+                    gqa_prefill_hpg6_f16_kernel<8, 2><<<
+                        long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                        q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                        head_dim, position_offset, attention_window, sink_tokens);
+                } else {
+                    gqa_prefill_hpg6_f16_kernel<8, 4><<<
+                        long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                        q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                        head_dim, position_offset, attention_window, sink_tokens);
+                }
+                return cudaGetLastError() == cudaSuccess;
             }
-            return cudaGetLastError() == cudaSuccess;
         }
+
         // Warp-per-combo variant. Opt-in: it reassociates the dot-product
         // reduction, so the last FP32 bits differ from the per-position kernel and
         // a near-tie greedy argmax could flip. Requires head_dim to split evenly

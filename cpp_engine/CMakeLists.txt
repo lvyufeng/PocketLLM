@@ -61,6 +61,8 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_attention_ops.cu
     cuda/qwen_half_ops.cu
     cuda/qwen_gqa_optimized.cu
+    cuda/qwen_gdn_flashqla.cu
+    cuda/qwen_turboquant_ops.cu
     cuda/qwen_dspark_ops.cu
     cuda/qwen_dflash2_ops.cu
     cuda/qwen_sampler.cu
@@ -377,6 +379,14 @@ add_executable(bench_qwen_delta_f16 tests/bench_qwen_delta_f16.cpp)
 target_link_libraries(bench_qwen_delta_f16 PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_delta_f16 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_gdn_flashqla tests/test_qwen_gdn_flashqla.cpp)
+target_link_libraries(test_qwen_gdn_flashqla PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_gdn_flashqla PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_turboquant_k8v4 tests/test_qwen_turboquant_k8v4.cpp)
+target_link_libraries(test_qwen_turboquant_k8v4 PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_turboquant_k8v4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(bench_qwen_transaction_copy tests/bench_qwen_transaction_copy.cpp)
 target_link_libraries(bench_qwen_transaction_copy PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_transaction_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
@@ -392,6 +402,10 @@ set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(bench_qwen_fp8_batch_crossover tests/bench_qwen_fp8_batch_crossover.cpp)
 target_link_libraries(bench_qwen_fp8_batch_crossover PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_fp8_batch_crossover PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_fp8_dequant_overhead tests/bench_qwen_fp8_dequant_overhead.cpp)
+target_link_libraries(bench_qwen_fp8_dequant_overhead PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_fp8_dequant_overhead PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_gqa_prefill tests/bench_qwen_gqa_prefill.cpp)
 target_link_libraries(bench_qwen_gqa_prefill PRIVATE dsv4_cpp_core)

@@ -120,6 +120,17 @@ int main(int argc, char** argv) {
                    rows, kHeads, kKeyHeads, kDim, kDim,
                    1.0f / 11.3137085f);
     };
+    // FlashQLA SM75 subgroup-sharded kernel: WIDTH=16 lanes hold COLS=4 state
+    // columns each, so the [D, D] state is spread over 8 warps instead of one
+    // thread per value dimension. Same serial recurrence, different sharding.
+    auto flashqla = [&]() {
+        return dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+                   q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
+               dsv4::qwen_gated_delta_flashqla_sm75_f16_cuda(
+                   state, q_normalized, k_normalized, v, g, beta, output,
+                   rows, kHeads, kKeyHeads, kDim, kDim,
+                   1.0f / 11.3137085f);
+    };
     auto steps = [&]() {
         for (int row = 0; row < rows; ++row) {
             if (!dsv4::qwen_gated_delta_step_f16_cuda(
@@ -140,13 +151,17 @@ int main(int argc, char** argv) {
     check(cudaMemset(state, 0, state_elements * sizeof(float)), "reset state");
     const double shared_ms = time_launch(shared_state_variant, iters);
     check(cudaMemset(state, 0, state_elements * sizeof(float)), "reset state");
+    const double flashqla_ms = time_launch(flashqla, iters);
+    check(cudaMemset(state, 0, state_elements * sizeof(float)), "reset state");
     const double step_ms = time_launch(steps, iters);
     std::printf("qwen_gated_delta_f16 rows=%d heads=%d key_heads=%d dim=%d "
                 "sequence=%.6f ms normalized=%.6f ms shared=%.6f ms "
-                "steps=%.6f ms normalized_speedup=%.3f shared_speedup=%.3f "
+                "flashqla=%.6f ms steps=%.6f ms normalized_speedup=%.3f "
+                "shared_speedup=%.3f flashqla_speedup=%.3f "
                 "sequence_speedup=%.3f\n",
                 rows, kHeads, kKeyHeads, kDim, seq_ms, normalized_ms, shared_ms,
-                step_ms, seq_ms / normalized_ms, normalized_ms / shared_ms,
+                flashqla_ms, step_ms, seq_ms / normalized_ms,
+                normalized_ms / shared_ms, normalized_ms / flashqla_ms,
                 step_ms / seq_ms);
     cudaFree(state);
     cudaFree(q);
