@@ -146,7 +146,8 @@ bool run_decode(int q_heads, int kv_heads, int head_dim, int context_len, int ma
 // tiled path is what long-context prefill dispatches to, so it needs its own
 // numerical gate rather than inheriting the decode kernel's.
 bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
-                       int position_offset, int max_context) {
+                       int position_offset, int max_context,
+                       bool exercise_long_tiles = false) {
     std::mt19937 rng(13579);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     const int context_len = position_offset + rows;
@@ -178,22 +179,31 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     uint16_t* d_v = nullptr;
     uint16_t* d_tiled = nullptr;
     uint16_t* d_plain = nullptr;
+    uint16_t* d_long_qr2 = nullptr;
     uint16_t* d_long = nullptr;
     uint16_t* d_flash = nullptr;
-    const bool long_shape = rows >= 128 && q_heads == 6 && kv_heads == 1 &&
-        head_dim == 256;
+    uint16_t* d_mma = nullptr;
+    const bool long_shape = exercise_long_tiles && rows >= 128 &&
+        q_heads == 6 && kv_heads == 1 && head_dim == 256 &&
+        context_len >= 2048;
     auto release = [&]() {
         cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
-        cudaFree(d_tiled); cudaFree(d_plain); cudaFree(d_long);
-        cudaFree(d_flash);
+        cudaFree(d_tiled); cudaFree(d_plain); cudaFree(d_long_qr2);
+        cudaFree(d_long); cudaFree(d_flash); cudaFree(d_mma);
     };
     if (cudaMalloc(&d_q, q.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_k, k.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_v, v.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_tiled, q.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_plain, q.size() * sizeof(uint16_t)) != cudaSuccess ||
-        (long_shape && cudaMalloc(&d_long, q.size() * sizeof(uint16_t)) != cudaSuccess) ||
-        (long_shape && cudaMalloc(&d_flash, q.size() * sizeof(uint16_t)) != cudaSuccess)) {
+        (long_shape && cudaMalloc(&d_long_qr2, q.size() * sizeof(uint16_t)) !=
+            cudaSuccess) ||
+        (long_shape && cudaMalloc(&d_long, q.size() * sizeof(uint16_t)) !=
+            cudaSuccess) ||
+        (long_shape && cudaMalloc(&d_flash, q.size() * sizeof(uint16_t)) !=
+            cudaSuccess) ||
+        (long_shape && cudaMalloc(&d_mma, q.size() * sizeof(uint16_t)) !=
+            cudaSuccess)) {
         release();
         return false;
     }
@@ -202,22 +212,46 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
 
     setenv("DSV4_QWEN_GQA_POS_TILE", "1", 1);
+    // An unset LONG_TILE selects hpg6 and an unset MMA_TILE selects the
+    // tensor-core kernel in production. Make this reference launch explicitly
+    // generic on both so the candidate checks below cannot compare a kernel with
+    // itself through inherited or default environment state.
+    setenv("DSV4_QWEN_GQA_LONG_TILE", "0", 1);
+    setenv("DSV4_QWEN_GQA_MMA_TILE", "0", 1);
+    unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
+    unsetenv("DSV4_QWEN_GQA_QUERY_ROWS");
     const bool tiled_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
         d_q, d_k, d_v, d_tiled, rows, q_heads, kv_heads, head_dim,
         position_offset, max_context, 0, 0);
+    bool long_qr2_ok = true;
     bool long_ok = true;
     bool flash_ok = true;
+    bool mma_ok = true;
     if (long_shape) {
         setenv("DSV4_QWEN_GQA_LONG_TILE", "1", 1);
+        setenv("DSV4_QWEN_GQA_QUERY_ROWS", "2", 1);
+        long_qr2_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+            d_q, d_k, d_v, d_long_qr2, rows, q_heads, kv_heads, head_dim,
+            position_offset, max_context, 0, 0);
+        setenv("DSV4_QWEN_GQA_QUERY_ROWS", "4", 1);
         long_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
             d_q, d_k, d_v, d_long, rows, q_heads, kv_heads, head_dim,
             position_offset, max_context, 0, 0);
-        unsetenv("DSV4_QWEN_GQA_LONG_TILE");
         setenv("DSV4_QWEN_GQA_FLASH_TILE", "1", 1);
         flash_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
             d_q, d_k, d_v, d_flash, rows, q_heads, kv_heads, head_dim,
             position_offset, max_context, 0, 0);
         unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
+        unsetenv("DSV4_QWEN_GQA_QUERY_ROWS");
+        // Tensor-core path. It reassociates both dot products and rounds the
+        // softmax numerator to half for the MMA operand, so it is checked against
+        // the CPU reference on its own tolerance, never for equality with hpg6.
+        setenv("DSV4_QWEN_GQA_MMA_TILE", "1", 1);
+        mma_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+            d_q, d_k, d_v, d_mma, rows, q_heads, kv_heads, head_dim,
+            position_offset, max_context, 0, 0);
+        setenv("DSV4_QWEN_GQA_MMA_TILE", "0", 1);
+        setenv("DSV4_QWEN_GQA_LONG_TILE", "0", 1);
     }
     // The position-batched kernel only amortises barriers; it must reproduce the
     // per-position kernel bit for bit, so this is an equality check rather than a
@@ -243,8 +277,8 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     const bool plain_ok = dsv4::qwen_gqa_prefill_attention_f16_cuda(
         d_q, d_k, d_v, d_plain, rows, q_heads, kv_heads, head_dim,
         position_offset, max_context);
-    if (!tiled_ok || !plain_ok || !long_ok || !flash_ok ||
-        cudaDeviceSynchronize() != cudaSuccess) {
+    if (!tiled_ok || !plain_ok || !long_qr2_ok || !long_ok || !flash_ok ||
+        !mma_ok || cudaDeviceSynchronize() != cudaSuccess) {
         fail("gqa prefill tiled launch failed");
         release();
         return true;
@@ -263,11 +297,15 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     std::vector<uint16_t> got_tiled(q_elements);
     std::vector<uint16_t> got_plain(q_elements);
     std::vector<uint16_t> got_seq(q_elements);
+    std::vector<uint16_t> got_long_qr2;
     std::vector<uint16_t> got_long;
     std::vector<uint16_t> got_flash;
+    std::vector<uint16_t> got_mma;
     if (long_shape) {
+        got_long_qr2.resize(q_elements);
         got_long.resize(q_elements);
         got_flash.resize(q_elements);
+        got_mma.resize(q_elements);
     }
     if (!seq_ok || cudaDeviceSynchronize() != cudaSuccess) {
         fail("gqa prefill position-batched fallback launch failed");
@@ -283,10 +321,15 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     cudaMemcpy(got_plain.data(), d_plain, got_plain.size() * sizeof(uint16_t),
                cudaMemcpyDeviceToHost);
     if (long_shape) {
+        cudaMemcpy(got_long_qr2.data(), d_long_qr2,
+                   got_long_qr2.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
         cudaMemcpy(got_long.data(), d_long, got_long.size() * sizeof(uint16_t),
                    cudaMemcpyDeviceToHost);
         cudaMemcpy(got_flash.data(), d_flash,
                    got_flash.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(got_mma.data(), d_mma,
+                   got_mma.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
     }
     release();
 
@@ -301,12 +344,20 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     double worst_ref = 0.0;
     double worst_cross = 0.0;
     double worst_warp = 0.0;
+    double worst_long_qr2 = 0.0;
     double worst_long = 0.0;
     double worst_flash = 0.0;
+    double worst_mma = 0.0;
+    bool long_qr2_finite = true;
     bool long_finite = true;
     bool flash_finite = true;
+    bool mma_finite = true;
+    size_t long_qr2_mismatches = 0;
     size_t long_mismatches = 0;
     size_t flash_mismatches = 0;
+    size_t mma_mismatches = 0;
+    size_t long_qr2_vs_qr4_mismatches = 0;
+    double worst_long_qr2_vs_qr4 = 0.0;
     for (int row = 0; row < rows; ++row) {
         std::vector<float> row_q(static_cast<size_t>(q_heads) * head_dim);
         for (size_t i = 0; i < row_q.size(); ++i) {
@@ -325,16 +376,30 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
                 std::fabs(static_cast<double>(from_half(got_warp[flat])) -
                           want[i]));
             if (long_shape) {
+                const double long_qr2_value = from_half(got_long_qr2[flat]);
+                long_qr2_finite = long_qr2_finite && std::isfinite(long_qr2_value);
+                worst_long_qr2 = std::max(worst_long_qr2,
+                    std::fabs(long_qr2_value - want[i]));
+                if (got_long_qr2[flat] != got_plain[flat]) ++long_qr2_mismatches;
                 const double long_value = from_half(got_long[flat]);
                 long_finite = long_finite && std::isfinite(long_value);
                 worst_long = std::max(worst_long,
                     std::fabs(long_value - want[i]));
                 if (got_long[flat] != got_plain[flat]) ++long_mismatches;
+                if (got_long_qr2[flat] != got_long[flat]) {
+                    ++long_qr2_vs_qr4_mismatches;
+                }
+                worst_long_qr2_vs_qr4 = std::max(worst_long_qr2_vs_qr4,
+                    std::fabs(long_qr2_value - long_value));
                 const double flash_value = from_half(got_flash[flat]);
                 flash_finite = flash_finite && std::isfinite(flash_value);
                 worst_flash = std::max(worst_flash,
                     std::fabs(flash_value - want[i]));
                 if (got_flash[flat] != got_plain[flat]) ++flash_mismatches;
+                const double mma_value = from_half(got_mma[flat]);
+                mma_finite = mma_finite && std::isfinite(mma_value);
+                worst_mma = std::max(worst_mma, std::fabs(mma_value - want[i]));
+                if (got_mma[flat] != got_plain[flat]) ++mma_mismatches;
             }
         }
     }
@@ -342,18 +407,42 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     // softmax denominator differently from the per-position kernel, so they are
     // gated on distance from the CPU reference. The FP16 bit mismatch count
     // against the per-position kernel is reported, not asserted.
-    if (long_shape && (!long_finite || !flash_finite ||
-                       worst_long > 2.0e-3 || worst_flash > 2.0e-3)) {
+    // The tensor-core path rounds the softmax numerator to half for the MMA
+    // operand, one extra rounding step the scalar paths do not have, so it gets a
+    // slightly wider band. Anything past 8e-3 means a real indexing or online
+    // rescale bug, not accumulated FP16 noise.
+    if (long_shape && (!long_qr2_finite || !long_finite || !flash_finite ||
+                       !mma_finite || worst_long_qr2 > 2.0e-3 ||
+                       worst_long > 2.0e-3 || worst_flash > 2.0e-3 ||
+                       worst_mma > 8.0e-3)) {
         fail("gqa prefill long-tile rows=" + std::to_string(rows) +
-             " ctx=" + std::to_string(context_len) + " long_ref=" +
+             " ctx=" + std::to_string(context_len) + " qr2_ref=" +
+             std::to_string(worst_long_qr2) + " qr4_ref=" +
              std::to_string(worst_long) + " flash_ref=" +
-             std::to_string(worst_flash));
+             std::to_string(worst_flash) + " mma_ref=" +
+             std::to_string(worst_mma));
     } else if (long_shape) {
-        std::printf("  gqa prefill long-tile rows=%3d ctx=%5d ref=%.3e "
-                    "cross_mismatches=%zu flash_ref=%.3e "
-                    "flash_mismatches=%zu\n", rows, context_len, worst_long,
-                    long_mismatches, worst_flash, flash_mismatches);
+        std::printf("  gqa prefill long-tile rows=%3d ctx=%5d qr2_ref=%.3e "
+                    "qr2_mismatches=%zu qr4_ref=%.3e qr4_mismatches=%zu "
+                    "qr2_vs_qr4=%.3e/%zu flash_ref=%.3e "
+                    "flash_mismatches=%zu mma_ref=%.3e mma_mismatches=%zu\n",
+                    rows, context_len,
+                    worst_long_qr2, long_qr2_mismatches, worst_long,
+                    long_mismatches, worst_long_qr2_vs_qr4,
+                    long_qr2_vs_qr4_mismatches, worst_flash, flash_mismatches,
+                    worst_mma, mma_mismatches);
     }
+    unsetenv("DSV4_QWEN_GQA_LONG_TILE");
+    unsetenv("DSV4_QWEN_GQA_QUERY_ROWS");
+    unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
+    unsetenv("DSV4_QWEN_GQA_MMA_TILE");
+    unsetenv("DSV4_QWEN_GQA_POS_TILE");
+    (void)long_qr2_mismatches;
+    (void)long_mismatches;
+    (void)flash_mismatches;
+    (void)mma_mismatches;
+    (void)long_qr2_vs_qr4_mismatches;
+    (void)worst_long_qr2_vs_qr4;
     // FP16 accumulation over thousands of keys; 2e-3 matches the engine's other
     // FP16 attention gates.
     if (worst_ref > 2.0e-3 || worst_cross > 2.0e-3 || worst_warp > 2.0e-3) {
@@ -501,10 +590,19 @@ int main() {
             return 0;
         }
     }
-    // The production TP4 Qwen shard has six Q heads over one KV head. Exercise
-    // the long-tile candidate with a nonzero cache offset and compare every
-    // output element against the exact reference path.
-    if (!run_prefill_tiled(128, 6, 1, 256, 384, 8192)) {
+    // The production TP4 Qwen shard has six Q heads over one KV head. Use a
+    // nonzero offset that makes total_context >= 2048 so this actually crosses
+    // the production hpg6/flash dispatch gate, then compare every output element
+    // against the exact generic and CPU reference paths.
+    if (!run_prefill_tiled(128, 6, 1, 256, 1920, 2048, true)) {
+        std::printf("[SKIP] device allocation failed\n");
+        return 0;
+    }
+    // The tensor-core path owns 32 query rows and a 32-position KV tile per CTA.
+    // Row 150 leaves a 22-row final block and context 2198 leaves a 22-position
+    // final KV tile, so this covers both partial-tile masks at once. A kernel that
+    // mishandles either would still pass the aligned case above.
+    if (!run_prefill_tiled(150, 6, 1, 256, 2048, 2198, true)) {
         std::printf("[SKIP] device allocation failed\n");
         return 0;
     }

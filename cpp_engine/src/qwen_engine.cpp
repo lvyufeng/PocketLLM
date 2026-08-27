@@ -106,6 +106,9 @@ struct DeviceFullAttention {
     QwenDeviceTensor v_cache;
     QwenDeviceTensor k_scale;
     QwenDeviceTensor v_scale;
+    // TurboQuant K8V4 combined cache: 196-byte slots with FP8 E5M2 key + 4-bit
+    // value + FP16 metadata. Only allocated when kv_cache_dtype is TurboQuantK8V4.
+    QwenDeviceTensor turboquant_cache;
 };
 
 struct DeviceLayer {
@@ -300,6 +303,7 @@ const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype) {
     switch (dtype) {
         case QwenKvCacheDType::Fp16: return "fp16";
         case QwenKvCacheDType::Fp8: return "fp8";
+        case QwenKvCacheDType::TurboQuantK8V4: return "turboquant_k8v4";
     }
     return "unknown";
 }
@@ -307,7 +311,8 @@ const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype) {
 QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value) {
     if (value == "fp16") return QwenKvCacheDType::Fp16;
     if (value == "fp8") return QwenKvCacheDType::Fp8;
-    throw std::runtime_error("Qwen KV cache dtype must be fp16 or fp8");
+    if (value == "turboquant_k8v4") return QwenKvCacheDType::TurboQuantK8V4;
+    throw std::runtime_error("Qwen KV cache dtype must be fp16, fp8, or turboquant_k8v4");
 }
 
 struct QwenEngine::Impl {
@@ -399,6 +404,12 @@ struct QwenEngine::Impl {
     cudaEvent_t nccl_comm_ready = nullptr;
     cudaEvent_t nccl_comm_done = nullptr;
     bool nccl_comm_stream_initialized = false;
+    // The overlapped path has two collectives in flight across a slice boundary,
+    // so it cannot share the single ready/done pair above: recording ready for
+    // slice i+1 could overwrite it before slice i's waiter has resolved. These are
+    // allocated per slice index and reused across layers.
+    std::vector<cudaEvent_t> comm_slice_ready;
+    std::vector<cudaEvent_t> comm_slice_done;
     uint64_t uploaded_weight_bytes = 0;
     uint64_t uploaded_scale_bytes = 0;
     uint64_t verify_weight_bytes = 0;
@@ -426,6 +437,21 @@ struct QwenEngine::Impl {
         nccl_comm_stream_initialized = true;
     }
 
+    // Grow the per-slice event pool to hold at least `slices` entries.
+    void ensure_comm_slice_events(int slices) {
+        while (static_cast<int>(comm_slice_ready.size()) <
+               static_cast<size_t>(slices)) {
+            cudaEvent_t ready = nullptr;
+            cudaEvent_t done = nullptr;
+            check_cuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming),
+                       "Qwen comm slice ready event");
+            check_cuda(cudaEventCreateWithFlags(&done, cudaEventDisableTiming),
+                       "Qwen comm slice done event");
+            comm_slice_ready.push_back(ready);
+            comm_slice_done.push_back(done);
+        }
+    }
+
     // The compute kernels all use the legacy default stream. Bracket a
     // communication-stream collective with events so the collective sees the
     // complete producer work and the next compute kernel sees its result.
@@ -449,6 +475,12 @@ struct QwenEngine::Impl {
             // The default stream wait above normally makes this unnecessary;
             // keep destruction safe if construction or a caller failed midway.
             cudaStreamSynchronize(nccl_comm_stream);
+        }
+        for (cudaEvent_t event : comm_slice_ready) {
+            if (event != nullptr) cudaEventDestroy(event);
+        }
+        for (cudaEvent_t event : comm_slice_done) {
+            if (event != nullptr) cudaEventDestroy(event);
         }
         if (nccl_comm_done != nullptr) cudaEventDestroy(nccl_comm_done);
         if (nccl_comm_ready != nullptr) cudaEventDestroy(nccl_comm_ready);
@@ -597,7 +629,7 @@ struct QwenEngine::Impl {
                     allocate_half(destination.full.v_cache, cache_elements, cache_shape);
                     cache_data_bytes += destination.full.k_cache.nbytes +
                                         destination.full.v_cache.nbytes;
-                } else {
+                } else if (options.kv_cache_dtype == QwenKvCacheDType::Fp8) {
                     allocate_elements(destination.full.k_cache, cache_elements,
                                       cache_shape, SafeDType::F8_E4M3);
                     allocate_elements(destination.full.v_cache, cache_elements,
@@ -614,6 +646,20 @@ struct QwenEngine::Impl {
                                         destination.full.v_cache.nbytes;
                     cache_scale_bytes += destination.full.k_scale.nbytes +
                                          destination.full.v_scale.nbytes;
+                } else {
+                    // TurboQuantK8V4: one combined slot per token/head, sized
+                    // from head_dim (196 bytes at 128, 388 at 256).
+                    const int slot_bytes =
+                        qwen_turboquant_k8v4_slot_bytes(head_dim);
+                    const size_t slot_elements = static_cast<size_t>(max_context) *
+                        local_kv_heads * slot_bytes;
+                    const std::vector<uint64_t> slot_shape = {
+                        static_cast<uint64_t>(max_context),
+                        static_cast<uint64_t>(local_kv_heads),
+                        static_cast<uint64_t>(slot_bytes)};
+                    allocate_elements(destination.full.turboquant_cache, slot_elements,
+                                      slot_shape, SafeDType::I8);
+                    cache_data_bytes += destination.full.turboquant_cache.nbytes;
                 }
             }
             layers.push_back(std::move(destination));
@@ -785,7 +831,7 @@ struct QwenEngine::Impl {
                               mtp_cache_shape);
                 cache_data_bytes += mtp_layer.full.k_cache.nbytes +
                                     mtp_layer.full.v_cache.nbytes;
-            } else {
+            } else if (options.kv_cache_dtype == QwenKvCacheDType::Fp8) {
                 allocate_elements(mtp_layer.full.k_cache, mtp_cache_elements,
                                   mtp_cache_shape, SafeDType::F8_E4M3);
                 allocate_elements(mtp_layer.full.v_cache, mtp_cache_elements,
@@ -802,6 +848,19 @@ struct QwenEngine::Impl {
                                     mtp_layer.full.v_cache.nbytes;
                 cache_scale_bytes += mtp_layer.full.k_scale.nbytes +
                                      mtp_layer.full.v_scale.nbytes;
+            } else {
+                // TurboQuantK8V4: one combined slot per token/head, sized
+                // from head_dim (196 bytes at 128, 388 at 256).
+                const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+                const size_t slot_elements = static_cast<size_t>(max_context) *
+                    local_kv_heads * slot_bytes;
+                const std::vector<uint64_t> slot_shape = {
+                    static_cast<uint64_t>(max_context),
+                    static_cast<uint64_t>(local_kv_heads),
+                    static_cast<uint64_t>(slot_bytes)};
+                allocate_elements(mtp_layer.full.turboquant_cache, slot_elements,
+                                  slot_shape, SafeDType::I8);
+                cache_data_bytes += mtp_layer.full.turboquant_cache.nbytes;
             }
         }
     }
@@ -1222,6 +1281,119 @@ struct QwenEngine::Impl {
         std::cout.flush();
     }
 
+    // Number of row slices used by the overlapped projection+all-reduce path.
+    // 0 or 1 disables slicing entirely and keeps the serial behaviour.
+    //
+    // Opt-in, and deliberately not defaulted on. Measured serially on the real
+    // 64-layer TP4 checkpoint with QWEN_NCCL_COMM_STREAM=1 and both the mlp.down
+    // and lin.out sites overlapped, against the same binary's serial default:
+    //
+    //   context   serial    slices=4   prefill   decode
+    //     8192    1221.9     1218.3    1.00x     25.24 -> 24.92
+    //    32768    1228.3     1272.6    1.04x     20.85 -> 20.79
+    //    65536    1065.3     1098.6    1.03x     19.52 -> 19.34
+    //
+    // Only 3-4% at long context, nothing at 8K, and decode is consistently a
+    // little worse because the comm stream competes for SMs with kernels that had
+    // the device to themselves. The collective is bytes-bound at ~26 GB/s of ring
+    // bandwidth, so most of it simply cannot hide behind one layer's GEMMs.
+    // Enable with QWEN_COMM_OVERLAP_SLICES=4 for long-context prefill-heavy work.
+    int comm_overlap_slices() const {
+        static const int slices =
+            qwen_env_int("QWEN_COMM_OVERLAP_SLICES", 0);
+        return slices;
+    }
+
+    // Pipelined projection and all-reduce.
+    //
+    // The collective is bytes-bound, not launch-bound: raising the prefill chunk
+    // from 512 to 4096 cut the call count 3.1x (9288 -> 2967) but the time only
+    // 6% (7.72 -> 7.24 s), and ar.mlp moves 41.9 MB in 2.43 ms, about 26 GB/s of
+    // ring bandwidth. So it cannot be made faster, only hidden.
+    //
+    // This splits the output rows into slices. After slice i's GEMM is issued,
+    // its all-reduce goes on the communication stream while slice i+1's GEMM runs
+    // on the compute stream. Only the final slice's collective is exposed. Each
+    // slice is an independent contiguous row range, and NCCL reduces each element
+    // over the same four ranks in the same order regardless of slicing, so the
+    // reduction itself is unchanged.
+    //
+    // The projection is a different matter: slicing changes the GEMM's batch
+    // dimension, and cuBLAS may pick a different algorithm for a different batch,
+    // so the projection output is not guaranteed bit-identical. Slices are
+    // therefore kept at or above the batch>=96 cuBLAS dispatch gate, and the real
+    // token-parity gate is what decides whether this ships.
+    //
+    // Requires the row-major [rows, hidden] layout: a row slice must be a
+    // contiguous byte range in both the projection output and the reduced buffer.
+    bool projection_all_reduce_overlapped(
+            const DeviceLinear& linear, const uint16_t* input, uint16_t* output,
+            int rows, int hidden, const char* proj_site, const char* ar_site) {
+        const int slices = comm_overlap_slices();
+        if (options.tp_world == 1 || slices <= 1 || rows < slices * 2) {
+            return false;
+        }
+#ifndef DSV4_HAVE_NCCL
+        return false;
+#else
+        if (!use_nccl_comm_stream || options.nccl_id_path.empty()) return false;
+        // Rows per slice, rounded up so the tail slice is the short one. Below the
+        // cuBLAS batch>=96 gate the projection would fall back to the handwritten
+        // tile kernel, which is 3-5x slower and would cost far more than the
+        // collective being hidden, so refuse to slice that finely.
+        const int per = (rows + slices - 1) / slices;
+        if (per < 96) return false;
+        ensure_nccl_comm_stream();
+        const int slice_count = (rows + per - 1) / per;
+        ensure_comm_slice_events(slice_count);
+        int index = 0;
+        bool pending = false;
+        int pending_index = 0;
+        for (int start = 0; start < rows; start += per, ++index) {
+            const int count = std::min(per, rows - start);
+            const size_t offset = static_cast<size_t>(start) * hidden;
+            projection(linear, input + static_cast<size_t>(start) * linear_columns(linear),
+                       output + offset, count, proj_site);
+            // Wait for the previous slice's collective only now, so it had the
+            // whole of this slice's GEMM to run underneath.
+            if (pending) {
+                check_cuda(cudaStreamWaitEvent(
+                    nullptr, comm_slice_done[pending_index], 0),
+                    "Qwen overlapped all-reduce wait");
+                pending = false;
+            }
+            // Deliberately no PhaseScope around the collective. PhaseScope calls
+            // cudaDeviceSynchronize() on entry and exit, which would drain the
+            // comm stream and serialize exactly the pipeline being built, so a
+            // profiled run would report a slowdown caused by the profiler. The
+            // enclosing per-layer scopes still attribute the exposed cost.
+            check_cuda(cudaEventRecord(comm_slice_ready[index], nullptr),
+                       "Qwen overlapped ready event");
+            check_cuda(cudaStreamWaitEvent(
+                nccl_comm_stream, comm_slice_ready[index], 0),
+                "Qwen overlapped comm wait");
+            nccl_all_reduce_sum_f16_inplace(
+                options.tp_world, options.tp_rank, options.device,
+                options.nccl_id_path.c_str(), output + offset,
+                count * hidden, nccl_comm_stream);
+            check_cuda(cudaEventRecord(comm_slice_done[index], nccl_comm_stream),
+                       "Qwen overlapped done event");
+            pending = true;
+            pending_index = index;
+        }
+        if (pending) {
+            check_cuda(cudaStreamWaitEvent(
+                nullptr, comm_slice_done[pending_index], 0),
+                "Qwen overlapped final all-reduce wait");
+        }
+        return true;
+#endif
+    }
+
+    static int linear_columns(const DeviceLinear& linear) {
+        return static_cast<int>(linear.weight.shape[1]);
+    }
+
     void all_reduce_half(uint16_t* values, int count, const char* site = "other") {
         PhaseScope scope(this, std::string("ar.") + site);
         if (options.tp_world == 1) return;
@@ -1360,6 +1532,16 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& core = workspace_half(value_elements, v.shape);
         QwenDeviceTensor& z = workspace_half(value_elements, v.shape);
         QwenDeviceTensor& normalized = workspace_half(value_elements, v.shape);
+        QwenDeviceTensor* q_normalized = nullptr;
+        QwenDeviceTensor* k_normalized = nullptr;
+        const bool flashqla = rows >= 8 &&
+            qwen_env_enabled_default("QWEN_GATED_DELTA_FLASHQLA_SM75");
+        if (flashqla) {
+            q_normalized = &workspace_float(
+                key_elements,
+                {static_cast<uint64_t>(rows), static_cast<uint64_t>(key_dim)});
+            k_normalized = &workspace_float(key_elements, q_normalized->shape);
+        }
 
         projection(layer.linear.qkv, hidden, packed.f16_data(), rows, "lin.qkv");
         require_launch(qwen_causal_depthwise_conv_silu_f16_cuda(
@@ -1395,7 +1577,26 @@ struct QwenEngine::Impl {
         std::optional<PhaseScope> delta_scope;
         delta_scope.emplace(this, "gated_delta");
         bool sequenced = false;
-        if (rows >= 5 && key_heads < value_heads &&
+        if (flashqla) {
+            // FlashQLA SM75 subgroup-sharded kernel. Still a serial recurrence,
+            // but sharding the [128, 128] state over 16-lane subgroups replaces
+            // the baseline's 128-element per-thread register vector: 1.85x on the
+            // primitive and +5-7% real TP4 prefill at token-exact parity.
+            // Consume the established FP32 normalized Q/K tensors so the norm
+            // reduction order remains identical to the reference path.
+            sequenced = qwen_normalize_gated_delta_qk_f16_cuda(
+                q.f16_data(), k.f16_data(), q_normalized->f32_data(),
+                k_normalized->f32_data(), rows, key_heads,
+                static_cast<int>(config.linear_attention.key_head_dim)) &&
+                qwen_gated_delta_flashqla_sm75_f16_cuda(
+                    layer.linear.state.f32_data(), q_normalized->f32_data(),
+                    k_normalized->f32_data(), v.f16_data(), gates.f16_data(),
+                    beta.f16_data(), core.f16_data(), rows, value_heads,
+                    key_heads,
+                    static_cast<int>(config.linear_attention.key_head_dim),
+                    static_cast<int>(config.linear_attention.value_head_dim),
+                    q_scale);
+        } else if (rows >= 5 && key_heads < value_heads &&
             qwen_env_enabled_default("QWEN_GATED_DELTA_PRENORMALIZE")) {
             QwenDeviceTensor& q_normalized = workspace_float(
                 key_elements, {static_cast<uint64_t>(rows),
@@ -1453,8 +1654,15 @@ struct QwenEngine::Impl {
             static_cast<int>(config.linear_attention.value_head_dim),
             static_cast<float>(config.rms_norm_eps)),
             "FP16 linear gated RMSNorm");
-        projection(layer.linear.out, normalized.f16_data(), output, rows, "lin.out");
-        all_reduce_half(output, rows * hidden_size, "lin.out");
+        // ar.lin.out is the second-largest collective (2.69 s at 32K) and runs on
+        // the 48 DeltaNet layers, so it is the other worthwhile overlap site.
+        if (!projection_all_reduce_overlapped(
+                layer.linear.out, normalized.f16_data(), output, rows,
+                hidden_size, "lin.out", "lin.out")) {
+            projection(layer.linear.out, normalized.f16_data(), output, rows,
+                       "lin.out");
+            all_reduce_half(output, rows * hidden_size, "lin.out");
+        }
         (void)position_offset;
     }
 
@@ -1527,16 +1735,21 @@ struct QwenEngine::Impl {
             static_cast<float>(config.rope_theta), q_heads, kv_heads, head_dim),
             "FP16 partial RoPE");
 
-        const bool fp8_cache = options.kv_cache_dtype == QwenKvCacheDType::Fp8;
+        const QwenKvCacheDType cache_dtype = options.kv_cache_dtype;
         const int attention_window = options.attention_window;
         const int sink_tokens = options.attention_sink_tokens;
-        if (fp8_cache) {
+        if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
                 layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
                 layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
                 kKvScaleBlock, position_offset, max_context),
                 "append FP8 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            require_launch(qwen_append_kv_cache_turboquant_k8v4_cuda(
+                k_norm.f16_data(), v.f16_data(), layer.full.turboquant_cache.byte_data(),
+                rows, kv_heads, head_dim, position_offset, max_context),
+                "append TurboQuant K8V4 full KV cache");
         } else {
             require_launch(qwen_append_kv_cache_f16_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
@@ -1552,7 +1765,8 @@ struct QwenEngine::Impl {
             // The compact split/merge decode path crosses over the reference
             // score/value kernels only at long contexts on SM75.
             constexpr int kOptimizedDecodeMinContext = 16384;
-            const bool optimized_decode = !fp8_cache && optimized_attention &&
+            const bool optimized_decode = cache_dtype == QwenKvCacheDType::Fp16 &&
+                optimized_attention &&
                 (context_length >= kOptimizedDecodeMinContext ||
                  attention_window > 0);
             int attended_positions = context_length;
@@ -1576,7 +1790,7 @@ struct QwenEngine::Impl {
                                             static_cast<uint64_t>(head_dim + 2)}
                     : std::vector<uint64_t>{static_cast<uint64_t>(q_heads),
                                              static_cast<uint64_t>(context_length)});
-            if (fp8_cache) {
+            if (cache_dtype == QwenKvCacheDType::Fp8) {
                 require_launch(qwen_gqa_decode_attention_fp8_cuda(
                     q_norm.f16_data(), layer.full.k_cache.fp8_data(),
                     layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
@@ -1584,6 +1798,12 @@ struct QwenEngine::Impl {
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     kKvScaleBlock, context_length, max_context),
                     "decode FP8-cache GQA");
+            } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+                require_launch(qwen_gqa_decode_attention_turboquant_k8v4_cuda(
+                    q_norm.f16_data(), layer.full.turboquant_cache.byte_data(),
+                    attention.f16_data(), scores.f32_data(), q_heads, kv_heads,
+                    head_dim, context_length, max_context, attention_window,
+                    sink_tokens), "decode TurboQuant K8V4 GQA");
             } else if (optimized_decode) {
                 require_launch(qwen_gqa_decode_attention_f16_fused_cuda(
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
@@ -1598,14 +1818,20 @@ struct QwenEngine::Impl {
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context), "decode FP16-cache GQA");
             }
-        } else if (fp8_cache) {
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_gqa_prefill_attention_fp8_cuda(
                 q_norm.f16_data(), layer.full.k_cache.fp8_data(),
                 layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
                 layer.full.v_scale.f16_data(), attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, kKvScaleBlock, position_offset,
                 max_context), "prefill FP8-cache GQA");
-        } else if (rows <= 8 && attention_window == 0) {
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            require_launch(qwen_gqa_prefill_attention_turboquant_k8v4_cuda(
+                q_norm.f16_data(), layer.full.turboquant_cache.byte_data(),
+                attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                position_offset, max_context, attention_window, sink_tokens),
+                "prefill TurboQuant K8V4 GQA");
+        } else if (cache_dtype == QwenKvCacheDType::Fp16 && rows <= 8 && attention_window == 0) {
             const int context_length = position_offset + rows;
             // Tensor-core QK experiment for the real TP4 shape (one KV head per
             // rank). Keeps the existing FP32 softmax/PV order; opt-in until real
@@ -1779,8 +2005,16 @@ struct QwenEngine::Impl {
                 gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
                 static_cast<int>(layer.gate.weight.shape[0])), "FP16 SwiGLU");
         }
-        projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows, "mlp.down");
-        all_reduce_half(mlp.f16_data(), rows * hidden_size, "mlp");
+        // ar.mlp is the largest single collective (3.58 s of the 7.24 s
+        // tp_all_reduce leaf at 32K), and down is a large GEMM, so this is the
+        // best overlap candidate in the layer.
+        if (!projection_all_reduce_overlapped(
+                layer.down, intermediate.f16_data(), mlp.f16_data(), rows,
+                hidden_size, "mlp.down", "mlp")) {
+            projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows,
+                       "mlp.down");
+            all_reduce_half(mlp.f16_data(), rows * hidden_size, "mlp");
+        }
         add(output, mlp.f16_data(), rows * hidden_size);
     }
 

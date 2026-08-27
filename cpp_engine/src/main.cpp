@@ -49,7 +49,10 @@ struct Args {
     bool qwen_persistent_stdin = false;
     bool use_persistent = false;
     int max_context = 0;
-    int prefill_chunk_tokens = 512;
+    // 0 means "leave the engine's own default alone" rather than duplicating the
+    // constant here, so raising QwenEngineOptions::prefill_chunk_tokens does not
+    // need a matching edit in the argument parser.
+    int prefill_chunk_tokens = 0;
     std::string kv_cache_dtype = "fp16";
     int qwen_attention_window = 0;
     int qwen_attention_sink_tokens = 0;
@@ -147,6 +150,11 @@ Args parse_args(int argc, char** argv) {
             args.max_context = std::stoi(argv[++i]);
         } else if (arg == "--prefill-chunk-tokens" && i + 1 < argc) {
             args.prefill_chunk_tokens = std::stoi(argv[++i]);
+            // An explicit value must still be positive. The 0 sentinel means
+            // "unspecified", so it is only valid when the flag is absent.
+            if (args.prefill_chunk_tokens <= 0) {
+                throw std::runtime_error("--prefill-chunk-tokens must be positive");
+            }
         } else if (arg == "--kv-cache-dtype" && i + 1 < argc) {
             args.kv_cache_dtype = argv[++i];
         } else if (arg == "--qwen-attention-window" && i + 1 < argc) {
@@ -199,7 +207,7 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.tp_world <= 0) throw std::runtime_error("--tp-world must be positive");
     if (args.tp_rank < 0 || args.tp_rank >= args.tp_world) throw std::runtime_error("--tp-rank must be in [0, tp_world)");
-    if (args.prefill_chunk_tokens <= 0) throw std::runtime_error("--prefill-chunk-tokens must be positive");
+    if (args.prefill_chunk_tokens < 0) throw std::runtime_error("--prefill-chunk-tokens must be positive");
     if (args.qwen_snapshot_interval < 0 || args.qwen_max_snapshots < 0) {
         throw std::runtime_error("Qwen snapshot settings must not be negative");
     }
@@ -231,8 +239,9 @@ Args parse_args(int argc, char** argv) {
         throw std::runtime_error(
             "--qwen-dflash2 must name a complete DFlash2 checkpoint directory");
     }
-    if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8") {
-        throw std::runtime_error("--kv-cache-dtype must be fp16 or fp8");
+    if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8" &&
+        args.kv_cache_dtype != "turboquant_k8v4") {
+        throw std::runtime_error("--kv-cache-dtype must be fp16, fp8, or turboquant_k8v4");
     }
     if (args.qwen_attention_window < 0) {
         throw std::runtime_error("--qwen-attention-window must not be negative");
@@ -452,7 +461,9 @@ int main(int argc, char** argv) {
                     qwen_opts.tp_world = args.tp_world;
                     qwen_opts.tp_rank = args.tp_rank;
                     qwen_opts.device = args.device >= 0 ? args.device : args.tp_rank;
-                    qwen_opts.prefill_chunk_tokens = args.prefill_chunk_tokens;
+                    if (args.prefill_chunk_tokens > 0) {
+                        qwen_opts.prefill_chunk_tokens = args.prefill_chunk_tokens;
+                    }
                     qwen_opts.kv_cache_dtype = dsv4::parse_qwen_kv_cache_dtype(args.kv_cache_dtype);
                     qwen_opts.attention_window = args.qwen_attention_window;
                     qwen_opts.attention_sink_tokens = args.qwen_attention_sink_tokens;

@@ -29,12 +29,13 @@ constexpr int kHeadDim = 256;
 // Flash remains explicitly enabled for this mode. Long is the validated
 // default dispatch, and setting it to 0 selects the fallback for baseline.
 // Clear both variables for every case so one mode cannot leak into another.
-enum class Mode { Base, Long, Flash };
+enum class Mode { Base, Long, Flash, Mma };
 
 const char* mode_name(Mode mode) {
     switch (mode) {
         case Mode::Long: return "long";
         case Mode::Flash: return "flash";
+        case Mode::Mma: return "mma";
         default: return "base";
     }
 }
@@ -50,10 +51,15 @@ double time_case(int rows, int position_offset, int max_context, int iters,
     // Compare candidates against the current tiled production path, regardless
     // of inherited shell state.
     setenv("DSV4_QWEN_GQA_OPTIMIZED", "1", 1);
-    unsetenv("DSV4_QWEN_GQA_LONG_TILE");
+    // The production default enables hpg6 when the variable is unset. Make the
+    // baseline explicit so this benchmark cannot compare hpg6 against itself.
+    setenv("DSV4_QWEN_GQA_LONG_TILE", mode == Mode::Base ? "0" : "1", 1);
     unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
-    if (mode == Mode::Long) setenv("DSV4_QWEN_GQA_LONG_TILE", "1", 1);
+    unsetenv("DSV4_QWEN_GQA_MMA_TILE");
     if (mode == Mode::Flash) setenv("DSV4_QWEN_GQA_FLASH_TILE", "1", 1);
+    // The MMA dispatch is checked before flash and long, so this one variable
+    // selects it regardless of the others.
+    if (mode == Mode::Mma) setenv("DSV4_QWEN_GQA_MMA_TILE", "1", 1);
     std::vector<uint16_t> host_q(q_elements);
     std::vector<uint16_t> host_kv(kv_elements, 0);
     for (uint16_t& value : host_q) {
@@ -135,7 +141,7 @@ int main() {
         {2048,     0}, {2048,  4096},
         {4096,     0}, {4096,  4096}, {4096, 16384}, {4096, 32768}, {4096, 61440},
     };
-    const Mode modes[] = {Mode::Base, Mode::Long, Mode::Flash};
+    const Mode modes[] = {Mode::Base, Mode::Long, Mode::Flash, Mode::Mma};
     for (Mode mode : modes) {
         for (const Case& item : cases) {
             const int max_context = item.offset + item.rows;

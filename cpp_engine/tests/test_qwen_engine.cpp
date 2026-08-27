@@ -482,16 +482,22 @@ void exercise_cache_lifecycle(const std::string& dir,
     const uint64_t fp8_cache_bytes = 2ULL * 8 * 4 * 128;
     const uint64_t fp8_scale_bytes =
         2ULL * 8 * 4 * (128 / 64) * sizeof(uint16_t);
+    const uint64_t tq_cache_bytes = 8ULL * 4 * 196;
     if (cache_dtype == dsv4::QwenKvCacheDType::Fp16) {
         require(engine.kv_cache_bytes() == fp16_cache_bytes,
                 "FP16 KV cache accounting");
         require(engine.kv_cache_scale_bytes() == 0,
                 "FP16 KV cache must not allocate scales");
-    } else {
+    } else if (cache_dtype == dsv4::QwenKvCacheDType::Fp8) {
         require(engine.kv_cache_bytes() == fp8_cache_bytes,
                 "FP8 KV cache accounting");
         require(engine.kv_cache_scale_bytes() == fp8_scale_bytes,
                 "FP8 KV scale accounting");
+    } else {
+        require(engine.kv_cache_bytes() == tq_cache_bytes,
+                "TurboQuant K8V4 cache accounting");
+        require(engine.kv_cache_scale_bytes() == 0,
+                "TurboQuant K8V4 metadata is embedded in slots");
     }
 
     const dsv4::QwenForwardResult prefill = engine.prefill({1, 2, 3});
@@ -528,12 +534,16 @@ int main() {
         require(write_fixture(dir), "could not create Qwen engine fixture");
         exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_cache_lifecycle(dir, dsv4::QwenKvCacheDType::TurboQuantK8V4);
         exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_prefix_cache(dir, dsv4::QwenKvCacheDType::TurboQuantK8V4);
         exercise_mtp(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_mtp(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_mtp(dir, dsv4::QwenKvCacheDType::TurboQuantK8V4);
         exercise_mtp_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp16);
         exercise_mtp_prefix_cache(dir, dsv4::QwenKvCacheDType::Fp8);
+        exercise_mtp_prefix_cache(dir, dsv4::QwenKvCacheDType::TurboQuantK8V4);
         std::cout << "[PASS] test_qwen_engine layers=2 mtp=1\n";
         return 0;
     } catch (const std::exception& ex) {

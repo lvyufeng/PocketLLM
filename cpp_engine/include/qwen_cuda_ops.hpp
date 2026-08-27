@@ -595,6 +595,12 @@ bool qwen_normalize_gated_delta_qk_f16_cuda(
     const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
     float* d_q_normalized, float* d_k_normalized, int rows, int key_heads,
     int key_dim, void* stream = nullptr);
+bool qwen_gated_delta_flashqla_sm75_f16_cuda(
+    float* d_state, const float* d_q_normalized,
+    const float* d_k_normalized, const uint16_t* d_v,
+    const uint16_t* d_g, const uint16_t* d_beta, uint16_t* d_out,
+    int rows, int heads, int key_heads, int key_dim, int value_dim,
+    float q_scale, void* stream = nullptr);
 bool qwen_partial_rope_f16_cuda(uint16_t* d_q_fp16, uint16_t* d_k_fp16,
                                 int position, int rotary_dim, float theta,
                                 int q_heads, int kv_heads, int head_dim,
@@ -699,5 +705,32 @@ bool qwen_gqa_prefill_attention_fp8_cuda(
     const uint16_t* d_v_scale_fp16, uint16_t* d_out_rows_fp16,
     int seq_len, int q_heads, int kv_heads, int head_dim, int scale_block,
     int position_offset, int max_context, void* stream = nullptr);
+
+// TurboQuant K8V4 KV-cache: one combined slot per token and KV head holding an
+// FP8 E5M2 key (one byte per channel), a 4-bit uniformly quantized value (two
+// channels per byte), and the value's FP16 scale and minimum. The slot size
+// follows head_dim, so it is 196 bytes at head_dim=128 and 388 at head_dim=256.
+constexpr int kTurboQuantK8V4MetadataBytes = 4;
+
+constexpr int qwen_turboquant_k8v4_slot_bytes(int head_dim) {
+    return head_dim + head_dim / 2 + kTurboQuantK8V4MetadataBytes;
+}
+
+bool qwen_append_kv_cache_turboquant_k8v4_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_combined_cache, int seq_len, int kv_heads, int head_dim,
+    int start_pos, int max_context, void* stream = nullptr);
+
+bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
+    const uint16_t* d_q_fp16, const uint8_t* d_combined_cache,
+    uint16_t* d_out_fp16, float* d_score_scratch, int q_heads, int kv_heads,
+    int head_dim, int context_len, int max_context, int attention_window,
+    int attention_sink_tokens, void* stream = nullptr);
+
+bool qwen_gqa_prefill_attention_turboquant_k8v4_cuda(
+    const uint16_t* d_q_rows_fp16, const uint8_t* d_combined_cache,
+    uint16_t* d_out_rows_fp16, int seq_len, int q_heads, int kv_heads,
+    int head_dim, int position_offset, int max_context, int attention_window,
+    int attention_sink_tokens, void* stream = nullptr);
 
 }  // namespace dsv4

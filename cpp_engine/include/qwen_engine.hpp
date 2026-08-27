@@ -13,6 +13,11 @@ namespace dsv4 {
 enum class QwenKvCacheDType {
     Fp16,
     Fp8,
+    // TurboQuant K8V4: one combined byte slot per token and KV head holding an
+    // FP8 E5M2 key, a 4-bit uniformly quantized value, and the value's FP16
+    // scale and minimum. This is a lossy cache and stays opt-in; the FP16 and
+    // separate-array FP8 paths remain the exact defaults.
+    TurboQuantK8V4,
 };
 
 const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype);
@@ -22,7 +27,20 @@ struct QwenEngineOptions {
     int tp_world = 1;
     int tp_rank = 0;
     int device = 0;
-    int prefill_chunk_tokens = 512;
+    // The FP8 projections dequantize the weight into an FP16 scratch buffer once
+    // per call, a fixed cost that amortises over the chunk: measured per-call
+    // dequant overhead on the real projection shapes is 29-34% at 512 rows but
+    // only 9-12% at 2048. Raising the chunk from 512 recovers that on the real
+    // 64-layer TP4 checkpoint at a cost of 0.42 GiB/rank, well inside the 22 GB
+    // budget, with generated tokens unchanged:
+    //
+    //   context   chunk 512   chunk 4096   prefill
+    //     8192     1125.7      1229.9      1.09x
+    //    32768     1059.1      1244.3      1.17x
+    //    65536      886.8      1077.7      1.21x
+    //
+    // The DSV4 engine already defaults to 4096 for the same reason.
+    int prefill_chunk_tokens = 4096;
     QwenKvCacheDType kv_cache_dtype = QwenKvCacheDType::Fp16;
     // 0 preserves exact full attention. Nonzero values enable the explicit
     // sink-plus-sliding-window attention path in the optimized FP16 kernels.
