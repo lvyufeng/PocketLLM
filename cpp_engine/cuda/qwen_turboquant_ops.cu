@@ -186,6 +186,49 @@ __global__ void gqa_decode_attention_turboquant_k8v4_score_kernel(
     }
 }
 
+// One block per (position, kv head); each thread expands one channel. Writes
+// dense K/V with the FP16 cache's [max_context, kv_heads, head_dim] layout so
+// the existing tensor-core prefill kernel can consume it unchanged.
+__global__ void dequant_kv_turboquant_k8v4_kernel(
+    const uint8_t* __restrict__ d_combined_cache,
+    uint16_t* __restrict__ d_k_dense_fp16,
+    uint16_t* __restrict__ d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int max_context) {
+
+    const int pos = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int dim = threadIdx.x;
+    if (pos >= context_len || kv_head >= kv_heads || dim >= head_dim) return;
+
+    const int value_bytes = head_dim / 2;
+    const int slot_bytes = slot_bytes_for(head_dim);
+    const uint8_t* slot = d_combined_cache +
+        (static_cast<size_t>(pos) * kv_heads + kv_head) * slot_bytes;
+
+    uint16_t scale_bits, min_bits;
+    std::memcpy(&scale_bits, slot + head_dim + value_bytes, 2);
+    std::memcpy(&min_bits, slot + head_dim + value_bytes + 2, 2);
+    __half scale_h, min_h;
+    std::memcpy(&scale_h, &scale_bits, 2);
+    std::memcpy(&min_h, &min_bits, 2);
+
+    const __half k_h = __nv_cvt_fp8_to_halfraw(slot[dim], __NV_E5M2);
+
+    const uint8_t packed = slot[head_dim + (dim >> 1)];
+    const uint8_t nibble = (dim & 1) ? (packed >> 4) : (packed & 0x0F);
+    const float v = dequantize_value_nibble(nibble, __half2float(scale_h),
+                                            __half2float(min_h));
+    const __half v_h = __float2half(v);
+
+    const size_t out_offset =
+        (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim + dim;
+    uint16_t k_bits, v_bits;
+    std::memcpy(&k_bits, &k_h, 2);
+    std::memcpy(&v_bits, &v_h, 2);
+    d_k_dense_fp16[out_offset] = k_bits;
+    d_v_dense_fp16[out_offset] = v_bits;
+}
+
 // One block per query head. Masked-out positions already hold -inf, so they
 // contribute nothing and stay zero after normalization.
 __global__ void softmax_rows_f32_kernel(float* __restrict__ d_scores,
@@ -500,6 +543,28 @@ bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
             kv_heads, head_dim, context_len, max_context, attention_window,
             attention_sink_tokens);
     }
+
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_turboquant_k8v4_dequant_kv_cuda(
+    const uint8_t* d_combined_cache, uint16_t* d_k_dense_fp16,
+    uint16_t* d_v_dense_fp16, int context_len, int kv_heads, int head_dim,
+    int max_context, void* stream) {
+
+    if (context_len <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > kMaxHeadDim || (head_dim % 2) != 0 || max_context <= 0 ||
+        context_len > max_context) {
+        return false;
+    }
+    if (!d_combined_cache || !d_k_dense_fp16 || !d_v_dense_fp16) return false;
+
+    dim3 grid(context_len, kv_heads);
+    dim3 block(head_dim);
+    dequant_kv_turboquant_k8v4_kernel<<<grid, block, 0,
+                                       static_cast<cudaStream_t>(stream)>>>(
+        d_combined_cache, d_k_dense_fp16, d_v_dense_fp16, context_len, kv_heads,
+        head_dim, max_context);
 
     return cudaGetLastError() == cudaSuccess;
 }

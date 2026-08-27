@@ -304,6 +304,7 @@ const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype) {
         case QwenKvCacheDType::Fp16: return "fp16";
         case QwenKvCacheDType::Fp8: return "fp8";
         case QwenKvCacheDType::TurboQuantK8V4: return "turboquant_k8v4";
+        case QwenKvCacheDType::Int8PerTokenHead: return "int8_per_token_head";
     }
     return "unknown";
 }
@@ -312,7 +313,8 @@ QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value) {
     if (value == "fp16") return QwenKvCacheDType::Fp16;
     if (value == "fp8") return QwenKvCacheDType::Fp8;
     if (value == "turboquant_k8v4") return QwenKvCacheDType::TurboQuantK8V4;
-    throw std::runtime_error("Qwen KV cache dtype must be fp16, fp8, or turboquant_k8v4");
+    if (value == "int8_per_token_head") return QwenKvCacheDType::Int8PerTokenHead;
+    throw std::runtime_error("Qwen KV cache dtype must be fp16, fp8, turboquant_k8v4, or int8_per_token_head");
 }
 
 struct QwenEngine::Impl {
@@ -646,7 +648,7 @@ struct QwenEngine::Impl {
                                         destination.full.v_cache.nbytes;
                     cache_scale_bytes += destination.full.k_scale.nbytes +
                                          destination.full.v_scale.nbytes;
-                } else {
+                } else if (options.kv_cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
                     // TurboQuantK8V4: one combined slot per token/head, sized
                     // from head_dim (196 bytes at 128, 388 at 256).
                     const int slot_bytes =
@@ -660,6 +662,28 @@ struct QwenEngine::Impl {
                     allocate_elements(destination.full.turboquant_cache, slot_elements,
                                       slot_shape, SafeDType::I8);
                     cache_data_bytes += destination.full.turboquant_cache.nbytes;
+                } else if (options.kv_cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+                    // INT8 per-token-head: separate INT8 K/V arrays + per-token per-head scales
+                    allocate_elements(destination.full.k_cache, cache_elements,
+                                      cache_shape, SafeDType::I8);
+                    allocate_elements(destination.full.v_cache, cache_elements,
+                                      cache_shape, SafeDType::I8);
+                    const size_t scale_elements = static_cast<size_t>(max_context) * local_kv_heads;
+                    const std::vector<uint64_t> scale_shape = {
+                        static_cast<uint64_t>(max_context),
+                        static_cast<uint64_t>(local_kv_heads)};
+                    allocate_half(destination.full.k_scale, scale_elements, scale_shape);
+                    allocate_half(destination.full.v_scale, scale_elements, scale_shape);
+                    cache_data_bytes += destination.full.k_cache.nbytes +
+                                        destination.full.v_cache.nbytes;
+                    cache_scale_bytes += destination.full.k_scale.nbytes +
+                                         destination.full.v_scale.nbytes;
+                } else {
+                    // FP16: default exact path
+                    allocate_half(destination.full.k_cache, cache_elements, cache_shape);
+                    allocate_half(destination.full.v_cache, cache_elements, cache_shape);
+                    cache_data_bytes += destination.full.k_cache.nbytes +
+                                        destination.full.v_cache.nbytes;
                 }
             }
             layers.push_back(std::move(destination));
@@ -1750,6 +1774,13 @@ struct QwenEngine::Impl {
                 k_norm.f16_data(), v.f16_data(), layer.full.turboquant_cache.byte_data(),
                 rows, kv_heads, head_dim, position_offset, max_context),
                 "append TurboQuant K8V4 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+            require_launch(qwen_append_kv_cache_int8_per_token_head_cuda(
+                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.int8_data(),
+                layer.full.v_cache.int8_data(), layer.full.k_scale.f16_data(),
+                layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
+                position_offset, max_context),
+                "append INT8 per-token-head full KV cache");
         } else {
             require_launch(qwen_append_kv_cache_f16_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
@@ -1804,6 +1835,14 @@ struct QwenEngine::Impl {
                     attention.f16_data(), scores.f32_data(), q_heads, kv_heads,
                     head_dim, context_length, max_context, attention_window,
                     sink_tokens), "decode TurboQuant K8V4 GQA");
+            } else if (cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+                require_launch(qwen_gqa_decode_attention_int8_per_token_head_cuda(
+                    q_norm.f16_data(), layer.full.k_cache.int8_data(),
+                    layer.full.v_cache.int8_data(), layer.full.k_scale.f16_data(),
+                    layer.full.v_scale.f16_data(), attention.f16_data(),
+                    scores.f32_data(), q_heads, kv_heads, head_dim,
+                    context_length, max_context, attention_window, sink_tokens),
+                    "decode INT8 per-token-head GQA");
             } else if (optimized_decode) {
                 require_launch(qwen_gqa_decode_attention_f16_fused_cuda(
                     q_norm.f16_data(), layer.full.k_cache.f16_data(),
@@ -1819,18 +1858,108 @@ struct QwenEngine::Impl {
                     context_length, max_context), "decode FP16-cache GQA");
             }
         } else if (cache_dtype == QwenKvCacheDType::Fp8) {
-            require_launch(qwen_gqa_prefill_attention_fp8_cuda(
-                q_norm.f16_data(), layer.full.k_cache.fp8_data(),
-                layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
-                layer.full.v_scale.f16_data(), attention.f16_data(), rows,
-                q_heads, kv_heads, head_dim, kKvScaleBlock, position_offset,
-                max_context), "prefill FP8-cache GQA");
+            const int context_length = position_offset + rows;
+            // Dequantize the [0, context_length) range once into dense FP16
+            // buffers, then call the tensor-core prefill kernel. O(ctx) dequant
+            // + tensor core beats O(rows*ctx) inline dequant by the same factor
+            // as TurboQuant (6-13×).
+            QwenDeviceTensor& k_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            QwenDeviceTensor& v_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            require_launch(qwen_fp8_dequant_kv_cache_cuda(
+                layer.full.k_cache.fp8_data(), layer.full.v_cache.fp8_data(),
+                layer.full.k_scale.f16_data(), layer.full.v_scale.f16_data(),
+                k_dense.f16_data(), v_dense.f16_data(), context_length,
+                kv_heads, head_dim, kKvScaleBlock, max_context),
+                "dequant FP8 cache to dense FP16");
+            if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
+                attention_window > 0) {
+                require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context, attention_window, sink_tokens),
+                    "prefill FP8 via tensor-core tiled");
+            } else {
+                require_launch(qwen_gqa_prefill_attention_f16_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context),
+                    "prefill FP8 via tensor-core exact");
+            }
+        } else if (cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+            const int context_length = position_offset + rows;
+            // INT8 per-token-head uses the same dequant-once architecture as FP8
+            QwenDeviceTensor& k_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            QwenDeviceTensor& v_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            require_launch(qwen_int8_dequant_kv_cache_cuda(
+                layer.full.k_cache.int8_data(), layer.full.v_cache.int8_data(),
+                layer.full.k_scale.f16_data(), layer.full.v_scale.f16_data(),
+                k_dense.f16_data(), v_dense.f16_data(), context_length,
+                kv_heads, head_dim, max_context),
+                "dequant INT8 cache to dense FP16");
+            if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
+                attention_window > 0) {
+                require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context, attention_window, sink_tokens),
+                    "prefill INT8 via tensor-core tiled");
+            } else {
+                require_launch(qwen_gqa_prefill_attention_f16_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context),
+                    "prefill INT8 via tensor-core exact");
+            }
         } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
-            require_launch(qwen_gqa_prefill_attention_turboquant_k8v4_cuda(
-                q_norm.f16_data(), layer.full.turboquant_cache.byte_data(),
-                attention.f16_data(), rows, q_heads, kv_heads, head_dim,
-                position_offset, max_context, attention_window, sink_tokens),
-                "prefill TurboQuant K8V4 GQA");
+            const int context_length = position_offset + rows;
+            // Dequantize the [0, context_length) range once into dense FP16
+            // buffers laid out like the FP16 cache, then call the tensor-core
+            // prefill kernel on them. O(ctx) dequant + tensor core beats
+            // O(rows*ctx) inline dequant by 6-13× and keeps prefill fast.
+            QwenDeviceTensor& k_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            QwenDeviceTensor& v_dense = workspace_half(
+                static_cast<size_t>(context_length) * kv_heads * head_dim,
+                {static_cast<uint64_t>(context_length),
+                 static_cast<uint64_t>(kv_heads),
+                 static_cast<uint64_t>(head_dim)});
+            require_launch(qwen_turboquant_k8v4_dequant_kv_cuda(
+                layer.full.turboquant_cache.byte_data(), k_dense.f16_data(),
+                v_dense.f16_data(), context_length, kv_heads, head_dim,
+                max_context), "dequant TurboQuant cache to dense FP16");
+            if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
+                attention_window > 0) {
+                require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context, attention_window, sink_tokens),
+                    "prefill TurboQuant via tensor-core tiled");
+            } else {
+                require_launch(qwen_gqa_prefill_attention_f16_cuda(
+                    q_norm.f16_data(), k_dense.f16_data(), v_dense.f16_data(),
+                    attention.f16_data(), rows, q_heads, kv_heads, head_dim,
+                    position_offset, max_context),
+                    "prefill TurboQuant via tensor-core exact");
+            }
         } else if (cache_dtype == QwenKvCacheDType::Fp16 && rows <= 8 && attention_window == 0) {
             const int context_length = position_offset + rows;
             // Tensor-core QK experiment for the real TP4 shape (one KV head per

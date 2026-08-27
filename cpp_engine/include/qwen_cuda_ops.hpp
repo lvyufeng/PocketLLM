@@ -706,6 +706,39 @@ bool qwen_gqa_prefill_attention_fp8_cuda(
     int seq_len, int q_heads, int kv_heads, int head_dim, int scale_block,
     int position_offset, int max_context, void* stream = nullptr);
 
+// Bulk dequantize FP8 KV cache to dense FP16. Used to amortize dequant cost
+// before calling tensor-core prefill kernels on quantized KV history.
+bool qwen_fp8_dequant_kv_cache_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block,
+    int max_context, void* stream = nullptr);
+
+// INT8 per-token-head KV cache: INT8 K/V arrays with per-token per-head FP16
+// scales. Dynamic quantization per token and KV head, proved faster than FP16
+// in vLLM-2080Ti benchmarks (+16% decode at 65K).
+bool qwen_append_kv_cache_int8_per_token_head_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    int8_t* d_k_cache_int8, int8_t* d_v_cache_int8,
+    uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16,
+    int seq_len, int kv_heads, int head_dim, int start_pos, int max_context,
+    void* stream = nullptr);
+
+bool qwen_int8_dequant_kv_cache_cuda(
+    const int8_t* d_k_cache_int8, const int8_t* d_v_cache_int8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int max_context,
+    void* stream = nullptr);
+
+bool qwen_gqa_decode_attention_int8_per_token_head_cuda(
+    const uint16_t* d_q_fp16, const int8_t* d_k_cache_int8,
+    const int8_t* d_v_cache_int8, const uint16_t* d_k_scale_fp16,
+    const uint16_t* d_v_scale_fp16, uint16_t* d_out_fp16, float* d_score_scratch,
+    int q_heads, int kv_heads, int head_dim, int context_len, int max_context,
+    int attention_window, int attention_sink_tokens, void* stream = nullptr);
+
 // TurboQuant K8V4 KV-cache: one combined slot per token and KV head holding an
 // FP8 E5M2 key (one byte per channel), a 4-bit uniformly quantized value (two
 // channels per byte), and the value's FP16 scale and minimum. The slot size
@@ -732,5 +765,16 @@ bool qwen_gqa_prefill_attention_turboquant_k8v4_cuda(
     uint16_t* d_out_rows_fp16, int seq_len, int q_heads, int kv_heads,
     int head_dim, int position_offset, int max_context, int attention_window,
     int attention_sink_tokens, void* stream = nullptr);
+
+// Expand [0, context_len) of the combined cache into dense FP16 K/V laid out
+// exactly like the FP16 cache ([max_context, kv_heads, head_dim], so the same
+// max_context stride). Dequantizing the whole range once and handing the result
+// to the tensor-core prefill kernel costs O(context) instead of the
+// O(rows * context) of dequantizing inside the attention loop, which is what
+// makes a quantized cache competitive on prefill.
+bool qwen_turboquant_k8v4_dequant_kv_cuda(
+    const uint8_t* d_combined_cache, uint16_t* d_k_dense_fp16,
+    uint16_t* d_v_dense_fp16, int context_len, int kv_heads, int head_dim,
+    int max_context, void* stream = nullptr);
 
 }  // namespace dsv4

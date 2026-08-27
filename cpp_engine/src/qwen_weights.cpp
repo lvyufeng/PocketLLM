@@ -152,6 +152,16 @@ const uint8_t* QwenDeviceTensor::byte_data() const {
     return static_cast<const uint8_t*>(data);
 }
 
+int8_t* QwenDeviceTensor::int8_data() {
+    if (device_dtype != SafeDType::I8) throw std::runtime_error("Qwen tensor is not INT8");
+    return static_cast<int8_t*>(data);
+}
+
+const int8_t* QwenDeviceTensor::int8_data() const {
+    if (device_dtype != SafeDType::I8) throw std::runtime_error("Qwen tensor is not INT8");
+    return static_cast<const int8_t*>(data);
+}
+
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
     if (!ref.found) throw std::runtime_error("cannot materialize an absent Qwen tensor: " + ref.name);

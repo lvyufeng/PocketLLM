@@ -69,6 +69,8 @@ struct QwenDeviceTensor {
     const uint16_t* f16_data() const;
     uint8_t* fp8_data();
     const uint8_t* fp8_data() const;
+    int8_t* int8_data();
+    const int8_t* int8_data() const;
     // Raw byte storage for packed caches whose slot mixes several element types,
     // so they cannot claim a single arithmetic dtype. Accepts I8 only.
     uint8_t* byte_data();

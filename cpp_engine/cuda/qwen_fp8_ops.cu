@@ -1192,4 +1192,74 @@ bool qwen_l2_norm_f32_cuda(const float* d_x, float* d_y, int rows, int cols,
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Bulk dequantize FP8 KV cache into dense FP16 buffers. Each block handles one
+// (position, kv_head) pair, and threads within the block dequantize head_dim
+// channels. The scale tensor uses block quantization (scale_block channels per
+// scale), so each thread reads one FP8 code, looks up the corresponding scale,
+// multiplies, and writes FP16. This amortizes dequant cost before calling
+// tensor-core prefill kernels on quantized KV history (O(context) dequant once,
+// not O(rows×context) dequant per query row).
+template <bool kFp16Scale>
+__global__ void dequant_fp8_kv_cache_kernel(
+    const uint8_t* __restrict__ d_k_cache_fp8,
+    const uint8_t* __restrict__ d_v_cache_fp8,
+    const uint16_t* __restrict__ d_k_scale,
+    const uint16_t* __restrict__ d_v_scale,
+    uint16_t* __restrict__ d_k_dense_fp16,
+    uint16_t* __restrict__ d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block, int max_context) {
+    // One block per (position, kv_head). position = blockIdx.x, kv_head = blockIdx.y
+    const int position = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    if (position >= context_len || kv_head >= kv_heads) return;
+
+    // FP8 cache layout: [max_context, kv_heads, head_dim]
+    const size_t cache_offset = (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+    // Scale layout: [max_context, kv_heads, head_dim / scale_block]
+    const int scales_per_head = head_dim / scale_block;
+    const size_t scale_offset = (static_cast<size_t>(position) * kv_heads + kv_head) * scales_per_head;
+    // Dense FP16 output layout: [max_context, kv_heads, head_dim] (matching FP16 cache)
+    const size_t dense_offset = (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+
+    // Each thread dequantizes one channel
+    for (int ch = threadIdx.x; ch < head_dim; ch += blockDim.x) {
+        const int scale_idx = ch / scale_block;
+
+        // Dequantize K
+        const uint8_t k_code = d_k_cache_fp8[cache_offset + ch];
+        const float k_scale = scale_bits_to_float<kFp16Scale>(d_k_scale[scale_offset + scale_idx]);
+        const float k_val = fp8_e4m3_to_float(k_code) * k_scale;
+        d_k_dense_fp16[dense_offset + ch] = __float2half_rn(k_val);
+
+        // Dequantize V
+        const uint8_t v_code = d_v_cache_fp8[cache_offset + ch];
+        const float v_scale = scale_bits_to_float<kFp16Scale>(d_v_scale[scale_offset + scale_idx]);
+        const float v_val = fp8_e4m3_to_float(v_code) * v_scale;
+        d_v_dense_fp16[dense_offset + ch] = __float2half_rn(v_val);
+    }
+}
+
+bool qwen_fp8_dequant_kv_cache_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block,
+    int max_context, void* stream) {
+    if (!d_k_cache_fp8 || !d_v_cache_fp8 || !d_k_scale_fp16 || !d_v_scale_fp16 ||
+        !d_k_dense_fp16 || !d_v_dense_fp16 || context_len <= 0 || kv_heads <= 0 ||
+        head_dim <= 0 || scale_block <= 0 || head_dim % scale_block != 0 ||
+        max_context <= 0 || context_len > max_context) {
+        return false;
+    }
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const dim3 grid(context_len, kv_heads);
+    const int block = 256;
+    dequant_fp8_kv_cache_kernel<true><<<grid, block, 0, s>>>(
+        d_k_cache_fp8, d_v_cache_fp8, d_k_scale_fp16, d_v_scale_fp16,
+        d_k_dense_fp16, d_v_dense_fp16, context_len, kv_heads, head_dim,
+        scale_block, max_context);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+
 }  // namespace dsv4
