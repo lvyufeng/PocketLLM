@@ -1547,7 +1547,7 @@ struct QwenEngine::Impl {
         if (rows == 1) {
             const int context_length = position_offset + 1;
             const bool optimized_attention =
-                qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
+                qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
                 attention_window > 0;
             // The compact split/merge decode path crosses over the reference
             // score/value kernels only at long contexts on SM75.
@@ -1671,7 +1671,10 @@ struct QwenEngine::Impl {
                     position_offset, max_context),
                     "verify exact FP16-cache GQA"); }
             }
-        } else if (qwen_env_enabled("DSV4_QWEN_GQA_OPTIMIZED") ||
+        // The tiled kernel shares each K/V element across a head group and a
+        // pair of query rows, so it is the default for multi-row prefill. The
+        // wider TP4 candidate is selected separately through LONG_TILE.
+        } else if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
                    attention_window > 0) {
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
                 q_norm.f16_data(), layer.full.k_cache.f16_data(),
