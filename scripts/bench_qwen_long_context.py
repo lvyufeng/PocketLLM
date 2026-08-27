@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     # Matches QwenEngineOptions::prefill_chunk_tokens. Keep these in step, or the
     # benchmark measures a chunk size production does not use.
     parser.add_argument("--prefill-chunk-tokens", type=int, default=4096)
-    parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8", "turboquant_k8v4"), default="fp16")
+    parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8", "turboquant_k8v4", "int8_per_token_head"), default="fp16")
     parser.add_argument("--tp-world", type=int, default=4)
     parser.add_argument(
         "--devices",

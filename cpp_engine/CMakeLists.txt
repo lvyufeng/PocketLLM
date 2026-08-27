@@ -63,6 +63,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_gqa_optimized.cu
     cuda/qwen_gdn_flashqla.cu
     cuda/qwen_turboquant_ops.cu
+    cuda/qwen_int8_per_token_head_ops.cu
     cuda/qwen_dspark_ops.cu
     cuda/qwen_dflash2_ops.cu
     cuda/qwen_sampler.cu

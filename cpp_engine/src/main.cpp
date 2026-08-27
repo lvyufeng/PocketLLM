@@ -240,8 +240,9 @@ Args parse_args(int argc, char** argv) {
             "--qwen-dflash2 must name a complete DFlash2 checkpoint directory");
     }
     if (args.kv_cache_dtype != "fp16" && args.kv_cache_dtype != "fp8" &&
-        args.kv_cache_dtype != "turboquant_k8v4") {
-        throw std::runtime_error("--kv-cache-dtype must be fp16, fp8, or turboquant_k8v4");
+        args.kv_cache_dtype != "turboquant_k8v4" &&
+        args.kv_cache_dtype != "int8_per_token_head") {
+        throw std::runtime_error("--kv-cache-dtype must be fp16, fp8, turboquant_k8v4, or int8_per_token_head");
     }
     if (args.qwen_attention_window < 0) {
         throw std::runtime_error("--qwen-attention-window must not be negative");

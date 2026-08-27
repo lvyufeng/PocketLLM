@@ -18,6 +18,10 @@ enum class QwenKvCacheDType {
     // scale and minimum. This is a lossy cache and stays opt-in; the FP16 and
     // separate-array FP8 paths remain the exact defaults.
     TurboQuantK8V4,
+    // INT8 per-token-head: INT8 K/V arrays with per-token per-head FP16 scales.
+    // Dynamic quantization per token and KV head. Proved faster than FP16 in
+    // vLLM-2080Ti benchmarks (+16% decode at 65K context).
+    Int8PerTokenHead,
 };
 
 const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype);
