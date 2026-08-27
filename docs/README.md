@@ -22,6 +22,7 @@ This directory contains model-specific support notes, reproducible benchmark def
 - [DSpark speculative decoding](dspark.md)
 - [FlashMemory 1M context](FLASHMEMORY_1M_CONTEXT.md)
 - [MiniMax decode bottleneck analysis](minimax_decode_bottleneck_analysis.md)
+- [Qwen quantized KV cache at 65K (TG512)](qwen_kv_cache_65k_tg512.md)
 - [Phase 2 validation results](PHASE2_VALIDATION_RESULTS.md)
 
 ## Historical reports
