@@ -10,6 +10,7 @@ tokenizer IDs, not synthetic random tensors.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -133,13 +134,46 @@ def parse_runtime_line(line: str) -> dict[str, Any] | None:
     return result
 
 
-def parse_log(path: Path) -> tuple[dict[str, Any], list[int]]:
+def binary_metadata(binary: Path) -> dict[str, Any]:
+    stat = binary.stat()
+    digest = hashlib.sha256()
+    with binary.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "binary_inode": stat.st_ino,
+        "binary_size": stat.st_size,
+        "binary_mtime_ns": stat.st_mtime_ns,
+        "binary_sha256": digest.hexdigest(),
+    }
+
+
+def parse_log(path: Path) -> tuple[dict[str, Any], list[int], list[dict[str, Any]]]:
+    phases: list[dict[str, Any]] = []
+    phase_pattern = re.compile(
+        r"qwen_phase tag=(\S+) rank=(\d+) phase=(\S+) "
+        r"seconds=([^\s]+)(?: calls=(\d+) share=([^\s]+))?"
+    )
     runtime: dict[str, Any] | None = None
     tokens: list[int] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         parsed = parse_runtime_line(line)
         if parsed is not None:
             runtime = parsed
+        phase_match = phase_pattern.match(line)
+        if phase_match:
+            tag, rank, phase, seconds, calls, share = phase_match.groups()
+            entry: dict[str, Any] = {
+                "tag": tag,
+                "rank": int(rank),
+                "phase": phase,
+                "seconds": float(seconds),
+            }
+            if calls is not None:
+                entry["calls"] = int(calls)
+            if share is not None:
+                entry["share"] = float(share)
+            phases.append(entry)
         match = re.match(r"generate_step=(\d+) token=(-?\d+)", line)
         if match:
             tokens.append(int(match.group(2)))
@@ -147,7 +181,81 @@ def parse_log(path: Path) -> tuple[dict[str, Any], list[int]]:
         raise RuntimeError(f"rank log has no qwen_runtime line: {path}")
     if not tokens:
         raise RuntimeError(f"rank log has no generated tokens: {path}")
-    return runtime, tokens
+    return runtime, tokens, phases
+
+
+def phase_leaf_summary(phases: list[dict[str, Any]]) -> dict[str, float]:
+    """Return primitive phase times, excluding nested aliases and containers."""
+    # `projection()` and `all_reduce_half()` each have an outer scope, while
+    # full_attention adds site-specific scopes around the same calls. Keep the
+    # primitive projection/collective scopes once instead of summing aliases.
+    primitive_prefixes = ("pr.", "pd.")
+    primitive_names = {
+        "full.attn_kernel",
+        "tp_all_reduce",
+        "gated_delta",
+        "norm",
+        "add",
+        "resid_copy",
+        "attn_resid_norm",
+        "swiglu.d",
+        "swiglu.r",
+        "lmhead.d",
+        "lmhead.r",
+        "argmax",
+        "top1_allreduce",
+    }
+    summary: dict[str, float] = {}
+    for item in phases:
+        name = str(item["phase"])
+        if not (name.startswith(primitive_prefixes) or name in primitive_names):
+            continue
+        summary[name] = summary.get(name, 0.0) + float(item["seconds"])
+    return summary
+
+
+def phase_share_summary(
+    phases: list[dict[str, Any]], total_seconds: float
+) -> dict[str, float]:
+    """Convert primitive phase totals to shares of the runtime prefill time."""
+    if total_seconds <= 0.0:
+        return {}
+    return {
+        name: seconds / total_seconds
+        for name, seconds in phase_leaf_summary(phases).items()
+    }
+
+
+def phase_summary(phases: list[dict[str, Any]]) -> dict[str, float]:
+    return phase_leaf_summary(phases)
+
+
+
+def environment_metadata() -> dict[str, str]:
+    names = (
+        "CUDA_VISIBLE_DEVICES",
+        "QWEN_PHASE_PROFILE",
+        "DSV4_QWEN_GQA_OPTIMIZED",
+        "DSV4_QWEN_GQA_LONG_TILE",
+        "DSV4_QWEN_GQA_FLASH_TILE",
+        "DSV4_QWEN_GQA_QUERY_ROWS",
+        "QWEN_FP8_F16_PREFILL_CUBLAS",
+        "QWEN_FUSE_ATTN_RESID_NORM",
+    )
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
+def git_revision() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
 
 
 def run_case(
@@ -245,6 +353,7 @@ def run_case(
     parsed = [parse_log(case_dir / f"rank{rank}.log") for rank in range(tp_world)]
     rank_runtime = [item[0] for item in parsed]
     rank_tokens = [item[1] for item in parsed]
+    rank_phases = [item[2] for item in parsed]
     if any(rank_tokens[0] != other for other in rank_tokens[1:]):
         raise RuntimeError(f"token parity failure at prompt length {length}")
     runtime = rank_runtime[0]
@@ -261,7 +370,50 @@ def run_case(
         "rank_token_parity": True,
         "rank_wall_seconds": [item.get("wall") for item in rank_runtime],
         "rank_gpu_memory_used_bytes": [item.get("gpu_memory_used_bytes") for item in rank_runtime],
+        "rank_phase_summary": [phase_summary(items) for items in rank_phases],
+        "phase_leaf_summary": phase_leaf_summary(rank_phases[0]),
+        "phase_leaf_share_summary": phase_share_summary(
+            rank_phases[0], float(runtime.get("prefill_seconds", 0.0))
+        ),
+        "phase_total_seconds": next(
+            (float(item["seconds"]) for item in rank_phases[0]
+             if item["phase"] == "TOTAL"),
+            None,
+        ),
+        "environment": environment_metadata(),
+        "git_revision": git_revision(),
+        "binary_metadata": binary_metadata(binary),
         "log_dir": str(case_dir),
+    }
+    result["runtime"]["actual_prompt_tokens"] = int(
+        result["runtime"].get("prompt_tokens", length)
+    )
+    result["runtime"]["prefill_seconds_reported"] = result["runtime"].get(
+        "prefill_seconds"
+    )
+    result["runtime"]["decode_seconds_reported"] = result["runtime"].get(
+        "decode_seconds"
+    )
+    result["runtime"]["full_request_wall_seconds"] = result["runtime"].get("wall")
+    result["runtime"]["phase_profile_present"] = bool(rank_phases[0])
+    result["runtime"]["phase_profile_warning"] = (
+        "QWEN_PHASE_PROFILE synchronizes around every scope; use only for attribution"
+        if rank_phases[0]
+        else None
+    )
+    result["runtime"]["cold_start_excluded"] = False
+    result["runtime"]["failure_excluded"] = False
+    result["runtime"]["note"] = (
+        "phase_leaf_summary excludes full_attention and STACK.r containers; "
+        "phase instrumentation synchronizes CUDA and is diagnostic only"
+    )
+    result["environment"] = {
+        **result["environment"],
+        "benchmark_cuda_visible_devices": ",".join(str(device) for device in devices),
+        "benchmark_binary": str(binary),
+        "benchmark_checkpoint": str(ckpt),
+        "benchmark_prefill_chunk_tokens": str(prefill_chunk_tokens),
+        "benchmark_kv_cache_dtype": kv_cache_dtype,
     }
     print(
         f"length={length} layers={runtime.get('layers')} "
@@ -315,6 +467,11 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "prefill_chunk_tokens": args.prefill_chunk_tokens,
         "kv_cache_dtype": args.kv_cache_dtype,
+        "git_revision": git_revision(),
+        "binary_metadata": binary_metadata(binary),
+        "environment": environment_metadata(),
+        "serial_cases": True,
+        "phase_profile_diagnostic_only": "QWEN_PHASE_PROFILE" in os.environ,
         "results": results,
     }
     result_path = work_dir / "results.json"

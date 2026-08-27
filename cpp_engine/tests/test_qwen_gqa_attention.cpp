@@ -178,15 +178,22 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     uint16_t* d_v = nullptr;
     uint16_t* d_tiled = nullptr;
     uint16_t* d_plain = nullptr;
+    uint16_t* d_long = nullptr;
+    uint16_t* d_flash = nullptr;
+    const bool long_shape = rows >= 128 && q_heads == 6 && kv_heads == 1 &&
+        head_dim == 256;
     auto release = [&]() {
         cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
-        cudaFree(d_tiled); cudaFree(d_plain);
+        cudaFree(d_tiled); cudaFree(d_plain); cudaFree(d_long);
+        cudaFree(d_flash);
     };
     if (cudaMalloc(&d_q, q.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_k, k.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_v, v.size() * sizeof(uint16_t)) != cudaSuccess ||
         cudaMalloc(&d_tiled, q.size() * sizeof(uint16_t)) != cudaSuccess ||
-        cudaMalloc(&d_plain, q.size() * sizeof(uint16_t)) != cudaSuccess) {
+        cudaMalloc(&d_plain, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        (long_shape && cudaMalloc(&d_long, q.size() * sizeof(uint16_t)) != cudaSuccess) ||
+        (long_shape && cudaMalloc(&d_flash, q.size() * sizeof(uint16_t)) != cudaSuccess)) {
         release();
         return false;
     }
@@ -198,6 +205,20 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     const bool tiled_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
         d_q, d_k, d_v, d_tiled, rows, q_heads, kv_heads, head_dim,
         position_offset, max_context, 0, 0);
+    bool long_ok = true;
+    bool flash_ok = true;
+    if (long_shape) {
+        setenv("DSV4_QWEN_GQA_LONG_TILE", "1", 1);
+        long_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+            d_q, d_k, d_v, d_long, rows, q_heads, kv_heads, head_dim,
+            position_offset, max_context, 0, 0);
+        unsetenv("DSV4_QWEN_GQA_LONG_TILE");
+        setenv("DSV4_QWEN_GQA_FLASH_TILE", "1", 1);
+        flash_ok = dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
+            d_q, d_k, d_v, d_flash, rows, q_heads, kv_heads, head_dim,
+            position_offset, max_context, 0, 0);
+        unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
+    }
     // The position-batched kernel only amortises barriers; it must reproduce the
     // per-position kernel bit for bit, so this is an equality check rather than a
     // tolerance check.
@@ -222,7 +243,8 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     const bool plain_ok = dsv4::qwen_gqa_prefill_attention_f16_cuda(
         d_q, d_k, d_v, d_plain, rows, q_heads, kv_heads, head_dim,
         position_offset, max_context);
-    if (!tiled_ok || !plain_ok || cudaDeviceSynchronize() != cudaSuccess) {
+    if (!tiled_ok || !plain_ok || !long_ok || !flash_ok ||
+        cudaDeviceSynchronize() != cudaSuccess) {
         fail("gqa prefill tiled launch failed");
         release();
         return true;
@@ -241,6 +263,12 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     std::vector<uint16_t> got_tiled(q_elements);
     std::vector<uint16_t> got_plain(q_elements);
     std::vector<uint16_t> got_seq(q_elements);
+    std::vector<uint16_t> got_long;
+    std::vector<uint16_t> got_flash;
+    if (long_shape) {
+        got_long.resize(q_elements);
+        got_flash.resize(q_elements);
+    }
     if (!seq_ok || cudaDeviceSynchronize() != cudaSuccess) {
         fail("gqa prefill position-batched fallback launch failed");
         cudaFree(d_seq);
@@ -254,6 +282,12 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
                cudaMemcpyDeviceToHost);
     cudaMemcpy(got_plain.data(), d_plain, got_plain.size() * sizeof(uint16_t),
                cudaMemcpyDeviceToHost);
+    if (long_shape) {
+        cudaMemcpy(got_long.data(), d_long, got_long.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(got_flash.data(), d_flash,
+                   got_flash.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    }
     release();
 
     size_t pos_tile_mismatches = 0;
@@ -267,6 +301,12 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     double worst_ref = 0.0;
     double worst_cross = 0.0;
     double worst_warp = 0.0;
+    double worst_long = 0.0;
+    double worst_flash = 0.0;
+    bool long_finite = true;
+    bool flash_finite = true;
+    size_t long_mismatches = 0;
+    size_t flash_mismatches = 0;
     for (int row = 0; row < rows; ++row) {
         std::vector<float> row_q(static_cast<size_t>(q_heads) * head_dim);
         for (size_t i = 0; i < row_q.size(); ++i) {
@@ -284,7 +324,35 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
             worst_warp = std::max(worst_warp,
                 std::fabs(static_cast<double>(from_half(got_warp[flat])) -
                           want[i]));
+            if (long_shape) {
+                const double long_value = from_half(got_long[flat]);
+                long_finite = long_finite && std::isfinite(long_value);
+                worst_long = std::max(worst_long,
+                    std::fabs(long_value - want[i]));
+                if (got_long[flat] != got_plain[flat]) ++long_mismatches;
+                const double flash_value = from_half(got_flash[flat]);
+                flash_finite = flash_finite && std::isfinite(flash_value);
+                worst_flash = std::max(worst_flash,
+                    std::fabs(flash_value - want[i]));
+                if (got_flash[flat] != got_plain[flat]) ++flash_mismatches;
+            }
         }
+    }
+    // The long-tile and flash-tile candidates reassociate the dot product and the
+    // softmax denominator differently from the per-position kernel, so they are
+    // gated on distance from the CPU reference. The FP16 bit mismatch count
+    // against the per-position kernel is reported, not asserted.
+    if (long_shape && (!long_finite || !flash_finite ||
+                       worst_long > 2.0e-3 || worst_flash > 2.0e-3)) {
+        fail("gqa prefill long-tile rows=" + std::to_string(rows) +
+             " ctx=" + std::to_string(context_len) + " long_ref=" +
+             std::to_string(worst_long) + " flash_ref=" +
+             std::to_string(worst_flash));
+    } else if (long_shape) {
+        std::printf("  gqa prefill long-tile rows=%3d ctx=%5d ref=%.3e "
+                    "cross_mismatches=%zu flash_ref=%.3e "
+                    "flash_mismatches=%zu\n", rows, context_len, worst_long,
+                    long_mismatches, worst_flash, flash_mismatches);
     }
     // FP16 accumulation over thousands of keys; 2e-3 matches the engine's other
     // FP16 attention gates.
@@ -432,6 +500,13 @@ int main() {
             std::printf("[SKIP] device allocation failed\n");
             return 0;
         }
+    }
+    // The production TP4 Qwen shard has six Q heads over one KV head. Exercise
+    // the long-tile candidate with a nonzero cache offset and compare every
+    // output element against the exact reference path.
+    if (!run_prefill_tiled(128, 6, 1, 256, 384, 8192)) {
+        std::printf("[SKIP] device allocation failed\n");
+        return 0;
     }
     // Production currently uses exact through 1K context and split-K above it;
     // cuBLAS-QK is opt-in while its real-model crossover is validated. Cover

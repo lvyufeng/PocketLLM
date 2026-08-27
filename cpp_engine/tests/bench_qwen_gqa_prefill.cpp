@@ -26,13 +26,34 @@ constexpr int kQHeads = 6;
 constexpr int kKvHeads = 1;
 constexpr int kHeadDim = 256;
 
-double time_case(int rows, int position_offset, int max_context, int iters) {
+// Flash remains explicitly enabled for this mode. Long is the validated
+// default dispatch, and setting it to 0 selects the fallback for baseline.
+// Clear both variables for every case so one mode cannot leak into another.
+enum class Mode { Base, Long, Flash };
+
+const char* mode_name(Mode mode) {
+    switch (mode) {
+        case Mode::Long: return "long";
+        case Mode::Flash: return "flash";
+        default: return "base";
+    }
+}
+
+double time_case(int rows, int position_offset, int max_context, int iters,
+                 Mode mode) {
     std::mt19937 rng(97531);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     const int context_len = position_offset + rows;
     const size_t q_elements = static_cast<size_t>(rows) * kQHeads * kHeadDim;
     const size_t kv_elements =
         static_cast<size_t>(max_context) * kKvHeads * kHeadDim;
+    // Compare candidates against the current tiled production path, regardless
+    // of inherited shell state.
+    setenv("DSV4_QWEN_GQA_OPTIMIZED", "1", 1);
+    unsetenv("DSV4_QWEN_GQA_LONG_TILE");
+    unsetenv("DSV4_QWEN_GQA_FLASH_TILE");
+    if (mode == Mode::Long) setenv("DSV4_QWEN_GQA_LONG_TILE", "1", 1);
+    if (mode == Mode::Flash) setenv("DSV4_QWEN_GQA_FLASH_TILE", "1", 1);
     std::vector<uint16_t> host_q(q_elements);
     std::vector<uint16_t> host_kv(kv_elements, 0);
     for (uint16_t& value : host_q) {
@@ -105,20 +126,35 @@ int main() {
         int offset;
     };
     // The real 8192 run prefills in two 4096-token chunks, so these are the two
-    // shapes full_attention is actually dispatched with, 16 times each.
+    // shapes full_attention is actually dispatched with, 16 times each. The
+    // shapes full_attention is dispatched with there. The 32K/64K rows cover the
+    // deep-history offsets that dominate long-context prefill.
     const Case cases[] = {
-        {4096, 0}, {4096, 4096},
+        { 512,     0}, { 512,  4096},
+        {1024,     0}, {1024,  4096},
+        {2048,     0}, {2048,  4096},
+        {4096,     0}, {4096,  4096}, {4096, 16384}, {4096, 32768}, {4096, 61440},
     };
-    for (const Case& item : cases) {
-        const double ms = time_case(item.rows, item.offset, 8192, 10);
-        if (ms < 0.0) return 0;
-        // Every CTA reads the whole history for its KV head; report the K+V bytes
-        // a single pass over the causal window would need as a traffic floor.
-        const double window = item.offset + item.rows / 2.0;
-        const double bytes = window * kKvHeads * kHeadDim * 2.0 * 2.0;
-        std::printf("rows=%4d offset=%4d %8.4f ms  min-traffic=%6.1f GB/s\n",
-                    item.rows, item.offset, ms,
-                    bytes / (ms * 1.0e-3) / 1.0e9);
+    const Mode modes[] = {Mode::Base, Mode::Long, Mode::Flash};
+    for (Mode mode : modes) {
+        for (const Case& item : cases) {
+            const int max_context = item.offset + item.rows;
+            const double ms = time_case(item.rows, item.offset, max_context, 5,
+                                        mode);
+            if (ms < 0.0) return 0;
+            // Every CTA reads the whole history for its KV head; report the K+V
+            // bytes a single pass over the causal window would need as a floor.
+            // Logical traffic for this CTA's causal K/V scan, not achieved
+            // DRAM bandwidth; the latter includes cache behavior and rereads.
+            const double positions =
+                static_cast<double>(item.offset) * item.rows +
+                static_cast<double>(item.rows) * (item.rows + 1) / 2.0;
+            const double bytes = positions * kKvHeads * kHeadDim * 2.0 * 2.0;
+            std::printf("mode=%-5s rows=%4d offset=%5d %9.4f ms  "
+                        "logical=%8.3f GB/s\n",
+                        mode_name(mode), item.rows, item.offset, ms,
+                        bytes / (ms * 1.0e-3) / 1.0e9);
+        }
     }
     return 0;
 }

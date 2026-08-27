@@ -462,6 +462,305 @@ __global__ void gqa_prefill_warp_combo_f16_kernel(
 }
 
 
+// Two-phase flash tile for long FP16-cache prefill. The established kernels
+// spend a five-shuffle warp reduction on every single key position; this one
+// reduces once per 32-position tile instead:
+//   phase A: lane p scores position base+p over the whole head_dim, so the dot
+//            product needs no cross-lane reduction at all, and only the tile
+//            max/denominator are reduced.
+//   phase B: lane owns head_dim/32 output dimensions and walks the 32 stored
+//            weights, so the value accumulation is also shuffle-free.
+// K and V share one padded staging buffer: phase A only reads K and phase B
+// only reads V. The +2 row padding makes the phase A access pattern (all lanes
+// on distinct positions, same dimension) bank-conflict free.
+template <int kDPL, int kQR>
+__global__ void gqa_prefill_flash_tile_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset) {
+    constexpr int kWarpCount = 6;
+    constexpr int kDim = kDPL * 32;
+    constexpr int kTile = 32;
+    constexpr int kPad = kDim + 2;
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int first_token = static_cast<int>(blockIdx.y) * kQR;
+    if (kv_head >= kv_heads || first_token >= seq_len ||
+        q_heads != kWarpCount || kv_heads != 1 || head_dim != kDim) {
+        return;
+    }
+
+    __shared__ uint16_t stage[kTile][kPad];
+    __shared__ uint16_t qs[kWarpCount][kQR][kDim];
+    __shared__ float ws[kWarpCount][kQR][kTile];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    for (int index = tid; index < kWarpCount * kQR * kDim;
+         index += kWarpCount * 32) {
+        const int head = index / (kQR * kDim);
+        const int rest = index - head * kQR * kDim;
+        const int row = rest / kDim;
+        const int d = rest - row * kDim;
+        const int token = first_token + row;
+        qs[head][row][d] = token < seq_len
+            ? q_rows[(static_cast<size_t>(token) * q_heads + head) * kDim + d]
+            : 0;
+    }
+    // Every warp reads the query tile owned by every other warp during phase A.
+    // Without this barrier, the first K tile can observe a partially filled qs.
+    __syncthreads();
+
+    float accumulator[kQR][kDPL];
+    float running_max[kQR];
+    float running_sum[kQR];
+#pragma unroll
+    for (int row = 0; row < kQR; ++row) {
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) accumulator[row][i] = 0.0f;
+        running_max[row] = -INFINITY;
+        running_sum[row] = 0.0f;
+    }
+
+    const int last_token = min(first_token + kQR - 1, seq_len - 1);
+    const int tile_context = position_offset + last_token + 1;
+    const float attention_scale = rsqrtf(static_cast<float>(kDim));
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * kDim;
+
+    for (int base = 0; base < tile_context; base += kTile) {
+        const int count = min(kTile, tile_context - base);
+        __syncthreads();
+        for (int index = tid; index < count * kDim; index += kWarpCount * 32) {
+            const int slot = index / kDim;
+            const int d = index - slot * kDim;
+            stage[slot][d] = k_cache[static_cast<size_t>(base + slot) *
+                kv_stride + static_cast<size_t>(kv_head) * kDim + d];
+        }
+        __syncthreads();
+
+        const int position = base + lane;
+        float score[kQR];
+#pragma unroll
+        for (int row = 0; row < kQR; ++row) {
+            const int token = first_token + row;
+            const bool active = lane < count && token < seq_len &&
+                position < position_offset + token + 1;
+            float partial = 0.0f;
+            if (active) {
+                for (int d = 0; d < kDim; ++d) {
+                    partial += half_to_float(qs[warp][row][d]) *
+                        half_to_float(stage[lane][d]);
+                }
+            }
+            score[row] = active ? partial * attention_scale : -INFINITY;
+        }
+
+        float old_scale[kQR];
+#pragma unroll
+        for (int row = 0; row < kQR; ++row) {
+            float tile_max = score[row];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                tile_max = fmaxf(tile_max,
+                    __shfl_xor_sync(0xffffffffu, tile_max, offset));
+            }
+            const float new_max = fmaxf(running_max[row], tile_max);
+            const float weight = new_max == -INFINITY || score[row] == -INFINITY
+                ? 0.0f : expf(score[row] - new_max);
+            ws[warp][row][lane] = weight;
+            const float tile_sum = warp_sum_all(weight);
+            old_scale[row] = running_max[row] == -INFINITY
+                ? 0.0f : expf(running_max[row] - new_max);
+            running_sum[row] = running_sum[row] * old_scale[row] + tile_sum;
+            running_max[row] = new_max;
+        }
+
+        __syncthreads();
+        for (int index = tid; index < count * kDim; index += kWarpCount * 32) {
+            const int slot = index / kDim;
+            const int d = index - slot * kDim;
+            stage[slot][d] = v_cache[static_cast<size_t>(base + slot) *
+                kv_stride + static_cast<size_t>(kv_head) * kDim + d];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int row = 0; row < kQR; ++row) {
+#pragma unroll
+            for (int i = 0; i < kDPL; ++i) {
+                accumulator[row][i] *= old_scale[row];
+            }
+            for (int slot = 0; slot < count; ++slot) {
+                const float weight = ws[warp][row][slot];
+                if (weight == 0.0f) continue;
+#pragma unroll
+                for (int i = 0; i < kDPL; ++i) {
+                    accumulator[row][i] += weight *
+                        half_to_float(stage[slot][lane * kDPL + i]);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int row = 0; row < kQR; ++row) {
+        const int token = first_token + row;
+        if (token >= seq_len) continue;
+        const float inverse = running_sum[row] > 0.0f
+            ? 1.0f / running_sum[row] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) {
+            const int d = lane * kDPL + i;
+            output[(static_cast<size_t>(token) * q_heads + warp) * kDim + d] =
+                float_to_half(accumulator[row][i] * inverse);
+        }
+    }
+}
+
+// Long-prefill path for the common Qwen TP4 shape: one six-warp CTA owns all
+// six query heads of a KV head and two adjacent query rows. Compared with the
+// generic hpg=2 path this loads each K/V tile once instead of three times, while
+// keeping one warp's dot product and online-softmax state independent. Dispatch
+// enables it by default for the validated exact shape; `=0` remains an escape
+// hatch for A/B and fallback debugging.
+template <int kDPL, int kQR>
+__global__ void gqa_prefill_hpg6_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset,
+    int window,
+    int sink) {
+    constexpr int kWarpCount = 6;
+    constexpr int kDim = kDPL * 32;
+    const int kv_head = static_cast<int>(blockIdx.x);
+    const int first_token = static_cast<int>(blockIdx.y) * kQR;
+    const int q_per_kv = q_heads / kv_heads;
+    if (kv_head >= kv_heads || first_token >= seq_len ||
+        q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
+        q_per_kv != kWarpCount || head_dim != kDim) {
+        return;
+    }
+    __shared__ uint16_t ks[kPosTile][kDim];
+    __shared__ uint16_t vs[kPosTile][kDim];
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (warp >= kWarpCount) return;
+
+    float query[kQR][kDPL];
+    float accumulator[kQR][kDPL];
+    float running_max[kQR];
+    float running_sum[kQR];
+#pragma unroll
+    for (int row = 0; row < kQR; ++row) {
+        const int token = first_token + row;
+        const bool active = token < seq_len;
+        const size_t query_base =
+            (static_cast<size_t>(token) * q_heads + warp) * head_dim;
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) {
+            const int d = lane * kDPL + i;
+            query[row][i] = active && d < head_dim
+                ? half_to_float(q_rows[query_base + d]) : 0.0f;
+            accumulator[row][i] = 0.0f;
+        }
+        running_max[row] = -INFINITY;
+        running_sum[row] = 0.0f;
+    }
+
+    const int last_token = min(first_token + kQR - 1, seq_len - 1);
+    const int tile_context = position_offset + last_token + 1;
+    const int tile_window_start = window > 0
+        ? max(sink, position_offset + first_token + 1 - window) : 0;
+    const float attention_scale = rsqrtf(static_cast<float>(head_dim));
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+
+    for (int base = 0; base < tile_context; base += kPosTile) {
+        if (window > 0) {
+            const int last = min(base + kPosTile, tile_context) - 1;
+            if (last >= sink && last < tile_window_start) continue;
+        }
+        const int count = min(kPosTile, tile_context - base);
+        for (int index = tid; index < count * kDim; index += kWarpCount * 32) {
+            const int slot = index / kDim;
+            const int d = index - slot * kDim;
+            const size_t at = static_cast<size_t>(base + slot) * kv_stride +
+                static_cast<size_t>(kv_head) * head_dim + d;
+            ks[slot][d] = d < head_dim ? k_cache[at] : 0;
+            vs[slot][d] = d < head_dim ? v_cache[at] : 0;
+        }
+        __syncthreads();
+
+        for (int slot = 0; slot < count; ++slot) {
+            const int position = base + slot;
+            if (window > 0 && position >= sink && position < tile_window_start) {
+                continue;
+            }
+            float key[kDPL];
+            float value[kDPL];
+#pragma unroll
+            for (int i = 0; i < kDPL; ++i) {
+                key[i] = half_to_float(ks[slot][lane * kDPL + i]);
+                value[i] = half_to_float(vs[slot][lane * kDPL + i]);
+            }
+#pragma unroll
+            for (int row = 0; row < kQR; ++row) {
+                const int token = first_token + row;
+                if (token >= seq_len || position >= position_offset + token + 1) {
+                    continue;
+                }
+                float partial = 0.0f;
+#pragma unroll
+                for (int i = 0; i < kDPL; ++i) {
+                    partial += query[row][i] * key[i];
+                }
+                const float score = warp_sum_all(partial) * attention_scale;
+                const float old_max = running_max[row];
+                const float new_max = fmaxf(old_max, score);
+                const float old_scale = old_max == -INFINITY
+                    ? 0.0f : expf(old_max - new_max);
+                const float weight = expf(score - new_max);
+                running_max[row] = new_max;
+                running_sum[row] = running_sum[row] * old_scale + weight;
+#pragma unroll
+                for (int i = 0; i < kDPL; ++i) {
+                    accumulator[row][i] = accumulator[row][i] * old_scale +
+                        weight * value[i];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int row = 0; row < kQR; ++row) {
+        const int token = first_token + row;
+        if (token >= seq_len) continue;
+        const float inverse = running_sum[row] > 0.0f
+            ? 1.0f / running_sum[row] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < kDPL; ++i) {
+            const int d = lane * kDPL + i;
+            if (d < head_dim) {
+                output[(static_cast<size_t>(token) * q_heads + warp) * head_dim + d] =
+                    float_to_half(accumulator[row][i] * inverse);
+            }
+        }
+    }
+}
+
 // Two adjacent query rows and three Q heads sharing a KV head are processed by
 // one CTA. Each K/V element is loaded once for six attention outputs.
 __global__ void gqa_prefill_tiled_f16_kernel(
@@ -1217,6 +1516,60 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
         const dim3 batched_grid(
             static_cast<unsigned>(kv_heads * batched_groups),
             static_cast<unsigned>((seq_len + qr - 1) / qr), 1);
+        // One warp per Q head avoids re-reading the single TP4 KV head for each
+        // hpg=2 group. It uses a different dot-product reassociation, so the
+        // numerical and real-model token-parity gates are kept separate below.
+        const int total_context = position_offset + seq_len;
+        const char* long_tile = std::getenv("DSV4_QWEN_GQA_LONG_TILE");
+        // The TP4 Q=6/KV=1 path is the measured production candidate for exact
+        // long-context prefill. Keep an explicit `=0` escape hatch for A/B and
+        // fallback debugging; an unset variable selects the faster path.
+        const bool long_tile_enabled =
+            long_tile == nullptr || std::strcmp(long_tile, "0") != 0;
+        const bool tp4_long_shape = attention_window <= 0 && q_heads == 6 &&
+            kv_heads == 1 && head_dim == 256 && seq_len >= 128 &&
+            total_context >= 2048;
+        // Two-phase flash tile: one warp reduction per 32 positions instead of
+        // one per position. It remains opt-in because it is not faster than the
+        // hpg6 path on the measured TP4 long-context cases.
+        const char* flash_tile = std::getenv("DSV4_QWEN_GQA_FLASH_TILE");
+        if (flash_tile != nullptr && std::strcmp(flash_tile, "0") != 0 &&
+            tp4_long_shape) {
+            const int flash_qr = qr >= 4 ? 4 : 2;
+            const dim3 flash_grid(
+                static_cast<unsigned>(kv_heads),
+                static_cast<unsigned>((seq_len + flash_qr - 1) / flash_qr), 1);
+            if (flash_qr == 2) {
+                gqa_prefill_flash_tile_f16_kernel<8, 2><<<
+                    flash_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                    head_dim, position_offset);
+            } else {
+                gqa_prefill_flash_tile_f16_kernel<8, 4><<<
+                    flash_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                    head_dim, position_offset);
+            }
+            return cudaGetLastError() == cudaSuccess;
+        }
+        if (long_tile_enabled && tp4_long_shape) {
+            const int long_qr = qr == 8 ? 4 : qr;
+            const dim3 long_grid(
+                static_cast<unsigned>(kv_heads),
+                static_cast<unsigned>((seq_len + long_qr - 1) / long_qr), 1);
+            if (long_qr == 2) {
+                gqa_prefill_hpg6_f16_kernel<8, 2><<<
+                    long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                    head_dim, position_offset, attention_window, sink_tokens);
+            } else {
+                gqa_prefill_hpg6_f16_kernel<8, 4><<<
+                    long_grid, 6 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                    head_dim, position_offset, attention_window, sink_tokens);
+            }
+            return cudaGetLastError() == cudaSuccess;
+        }
         // Warp-per-combo variant. Opt-in: it reassociates the dot-product
         // reduction, so the last FP32 bits differ from the per-position kernel and
         // a near-tie greedy argmax could flip. Requires head_dim to split evenly
