@@ -2348,8 +2348,17 @@ struct QwenEngine::Impl {
         require_launch(qwen_sigmoid_mul_f16_cuda(
             attention.f16_data(), gate.f16_data(), merged.f16_data(),
             rows * attention_dim), "FP16 full attention output gate");
-        { PhaseScope sub(this, "full.out_proj"); projection(layer.full.out, merged.f16_data(), output, rows, "full.out"); }
-        all_reduce_half(output, rows * static_cast<int>(config.hidden_size), "full.out");
+        // Row-parallel output projection: each slice's rows are complete once its
+        // GEMM lands, so the collective for slice i can run under slice i+1's GEMM.
+        // This site was left serial when mlp.down and lin.out were pipelined, and
+        // at 65K it was the single largest exposed collective in the profile
+        // (ar.full.out 2.12 s against tp_all_reduce's 3.16 s total).
+        if (!projection_all_reduce_overlapped(
+                layer.full.out, merged.f16_data(), output, rows,
+                static_cast<int>(config.hidden_size), "full.out", "full.out")) {
+            { PhaseScope sub(this, "full.out_proj"); projection(layer.full.out, merged.f16_data(), output, rows, "full.out"); }
+            all_reduce_half(output, rows * static_cast<int>(config.hidden_size), "full.out");
+        }
     }
 
     void layer_forward(DeviceLayer& layer, const uint16_t* hidden,

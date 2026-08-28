@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 
 namespace dsv4 {
 
@@ -81,24 +82,41 @@ __global__ void gdn_flashqla_kernel(
         }
     }
 
-    // Serial recurrence over tokens.
-    for (int t = 0; t < tokens; ++t) {
-        // Broadcast gate and beta to all threads.
-        float gate_value = 0.0f;
-        float beta_value = 0.0f;
-        // Each y-row is an independent warp processing a different state-column
-        // group, so lane 0 of every warp must load the per-head gate and beta.
-        if (threadIdx.x == 0) {
-            gate_value = expf(__half2float(gate[static_cast<size_t>(t) * v_heads + hv]));
-            beta_value = __half2float(beta[static_cast<size_t>(t) * v_heads + hv]);
-        }
-        gate_value = warp_broadcast_lane0(gate_value, 32);
-        beta_value = warp_broadcast_lane0(beta_value, 32);
+    // Software-pipelined operand loads.
+    //
+    // Nothing a token reads depends on the previous token's state, so every load
+    // can be issued one iteration early and its latency overlapped with the
+    // recurrence arithmetic. That matters here because the recurrence is serial in
+    // tokens and the per-token critical path was dominated by memory latency
+    // rather than math: `gate`/`beta` were fetched at the top of the body, and
+    // `v[col]` was fetched by lane 0 *after* the K-state reduction, putting a full
+    // dependent global load in the middle of the chain. Holding token t+1's
+    // operands in registers while token t computes leaves only the shuffle
+    // reductions on the path. The arithmetic, its order, and the reduction widths
+    // are untouched, so results stay bit-identical.
+    float q_next[rows_per_lane];
+    float k_next[rows_per_lane];
+    float v_next[COLS];
+    float gate_next = 0.0f;
+    float beta_next = 0.0f;
 
-        // Load pre-normalized Q and K for this position. Q and K share the key
-        // head hq under GQA; the key row stride is q_heads * D.
-        float k_reg[rows_per_lane];
-        float q_reg[rows_per_lane];
+    // `gate`/`beta` are per-head scalars broadcast across the warp. Each y-row is
+    // an independent warp working a different state-column group, so lane 0 of
+    // every warp loads them; expf is applied at the load site exactly as before.
+    auto load_scalars = [&](int t, float* gate_out, float* beta_out) {
+        float g_value = 0.0f;
+        float b_value = 0.0f;
+        if (threadIdx.x == 0) {
+            g_value = expf(__half2float(gate[static_cast<size_t>(t) * v_heads + hv]));
+            b_value = __half2float(beta[static_cast<size_t>(t) * v_heads + hv]);
+        }
+        *gate_out = g_value;
+        *beta_out = b_value;
+    };
+
+    // Pre-normalized Q and K. Q and K share the key head hq under GQA, so the
+    // key row stride is q_heads * D.
+    auto load_qk = [&](int t, float* q_out, float* k_out) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; ++r) {
             const int row = r * WIDTH + lane;
@@ -112,9 +130,59 @@ __global__ void gdn_flashqla_kernel(
                 q_value = q_normalized[qk_index];
                 k_value = k_normalized[qk_index];
             }
-            q_reg[r] = q_value;
-            k_reg[r] = k_value;
+            q_out[r] = q_value;
+            k_out[r] = k_value;
         }
+    };
+
+    // Only lane 0 consumes v, matching the original delta computation.
+    auto load_v = [&](int t, float* v_out) {
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            float value = 0.0f;
+            if (lane == 0) {
+                const int col = col_base + c;
+                if (col < D) {
+                    const size_t v_index =
+                        static_cast<size_t>(t) * v_heads * D +
+                        static_cast<size_t>(hv) * D +
+                        static_cast<size_t>(col);
+                    value = __half2float(v[v_index]);
+                }
+            }
+            v_out[c] = value;
+        }
+    };
+
+    load_scalars(0, &gate_next, &beta_next);
+    load_qk(0, q_next, k_next);
+    load_v(0, v_next);
+
+    // Serial recurrence over tokens.
+    for (int t = 0; t < tokens; ++t) {
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+        float v_reg[COLS];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            q_reg[r] = q_next[r];
+            k_reg[r] = k_next[r];
+        }
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) v_reg[c] = v_next[c];
+        float gate_value = gate_next;
+        float beta_value = beta_next;
+
+        // Issue the next token's loads before consuming this one's, so their
+        // latency hides behind the reductions below.
+        if (t + 1 < tokens) {
+            load_scalars(t + 1, &gate_next, &beta_next);
+            load_qk(t + 1, q_next, k_next);
+            load_v(t + 1, v_next);
+        }
+
+        gate_value = warp_broadcast_lane0(gate_value, 32);
+        beta_value = warp_broadcast_lane0(beta_value, 32);
 
         // Compute K · state for each column: sum over rows (subgroup reduction).
         float kv_partial[COLS];
@@ -128,8 +196,8 @@ __global__ void gdn_flashqla_kernel(
             kv_partial[c] = warp_reduce_sum(sum, WIDTH);
         }
 
-        // Compute delta = (v - gate * K·state) * beta for each column.
-        // Lane 0 loads v[col], broadcasts delta.
+        // Compute delta = (v - gate * K·state) * beta for each column. v is already
+        // in registers from the prefetch, so lane 0 only does arithmetic here.
         float delta[COLS];
 #pragma unroll
         for (int c = 0; c < COLS; ++c) {
@@ -137,11 +205,7 @@ __global__ void gdn_flashqla_kernel(
             if (lane == 0) {
                 const int col = col_base + c;
                 if (col < D) {
-                    const size_t v_index =
-                        static_cast<size_t>(t) * v_heads * D +
-                        static_cast<size_t>(hv) * D +
-                        static_cast<size_t>(col);
-                    delta_value = (__half2float(v[v_index]) - gate_value * kv_partial[c]) *
+                    delta_value = (v_reg[c] - gate_value * kv_partial[c]) *
                                   beta_value;
                 }
             }
@@ -224,7 +288,20 @@ bool qwen_gated_delta_flashqla_sm75_f16_cuda(
     constexpr int COLS = 4;
     constexpr int WIDTH = 16;
     constexpr int subgroups_per_warp = 32 / WIDTH;  // 2
-    constexpr int column_groups_per_block = 8;
+
+    // Column groups per CTA. Every subgroup is fully independent -- it owns COLS
+    // columns of the [D, D] state and never communicates -- so this only decides
+    // how the fixed 32 groups per head are packed into CTAs, never the arithmetic.
+    // Packing 8 groups per CTA leaves grid=(heads,1,2): on the real TP4 shape that
+    // is 16 CTAs for 68 SMs, so three quarters of the device is idle through a
+    // recurrence that is already serial in tokens. Fewer groups per CTA trades
+    // redundant Q/K re-reads (each group reads all D rows of the same q/k row) for
+    // SM coverage; the default is swept in bench_qwen_delta_f16.
+    static const int column_groups_per_block = [] {
+        const char* raw = std::getenv("QWEN_GDN_FLASHQLA_GROUPS_PER_CTA");
+        const int value = raw == nullptr ? 1 : std::atoi(raw);
+        return value >= 1 && value <= 8 ? value : 1;
+    }();
 
     const int groups = D / COLS;  // 32
     const int z = (groups + column_groups_per_block * subgroups_per_warp - 1) /

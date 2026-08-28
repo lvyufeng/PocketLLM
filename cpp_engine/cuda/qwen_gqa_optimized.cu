@@ -2081,12 +2081,15 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
             const dim3 mma_grid(
                 static_cast<unsigned>(q_heads),
                 static_cast<unsigned>((seq_len + kMmaQRows - 1) / kMmaQRows), 1);
-            // The occupancy variant aliases the K and V staging buffers, which
-            // are live in disjoint phases, cutting shared memory 40960 -> 24064 B
-            // so two CTAs fit per SM instead of one. The cost is one extra
-            // __syncthreads() and a second pass over the KV tile addresses per
-            // iteration; the benefit is 1.15x on the kernel and +1.4% end-to-end
-            // at bitwise parity. Set DSV4_QWEN_GQA_MMA_OCC=0 to disable.
+            // The non-aliased kernel is the production default. After widening
+            // the query tile to 64 rows, both variants are limited to one CTA/SM:
+            // 512 threads already consume the full 1024-thread SM75 block budget,
+            // so aliasing K/V staging no longer buys occupancy. It still pays an
+            // extra barrier and a second address/load pass per KV tile. Serial
+            // same-binary real TP4 65K A/B measured 1400.67/1396.26 tok/s for the
+            // non-aliased path against 1368.73/1352.86 for aliasing, with rank
+            // parity PASS. Set DSV4_QWEN_GQA_MMA_OCC=1 to restore the alias path
+            // for controlled A/B.
             // Pairing two Q heads of one KV head into a CTA was tried and
             // rejected: it halves the KV traffic on paper, but two sets of Q
             // fragments and P*V accumulators need ~192 registers per thread, so
@@ -2095,7 +2098,7 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
             // output. Sharing a tile across heads needs the accumulators moved to
             // shared memory first.
             const char* mma_occ = std::getenv("DSV4_QWEN_GQA_MMA_OCC");
-            if (mma_occ == nullptr || std::strcmp(mma_occ, "0") != 0) {
+            if (mma_occ != nullptr && std::strcmp(mma_occ, "0") != 0) {
                 gqa_prefill_mma_occ_f16_kernel<<<
                     mma_grid, kMmaWarps * 32, 0,
                     static_cast<cudaStream_t>(stream)>>>(
