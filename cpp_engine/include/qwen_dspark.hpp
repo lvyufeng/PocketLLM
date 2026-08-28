@@ -1,5 +1,6 @@
 #pragma once
 
+#include "qwen_target_head.hpp"
 #include "qwen_weights.hpp"
 #include "safetensors_reader.hpp"
 
@@ -81,8 +82,7 @@ public:
                       const QwenDSparkConfig& config,
                       const QwenDSparkWeightMap& weights,
                       const QwenDeviceTensor& target_embedding,
-                      const QwenDeviceTensor& target_lm_head,
-                      uint64_t target_vocab_start,
+                      QwenTargetHeadAdapter target_head,
                       int tp_world, int tp_rank, int device,
                       std::string nccl_id_path, int max_context);
     ~QwenDSparkRuntime();

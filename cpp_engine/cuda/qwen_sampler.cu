@@ -179,6 +179,42 @@ __global__ void local_topk_candidates_kernel(
 
 // Stage 2 of the TP path: sample from candidates already merged across ranks.
 // `cand_tokens` holds global ids, so no vocab_start offset applies here.
+__global__ void merge_topk_candidates_kernel(
+    const int* __restrict__ gathered_tokens,
+    const float* __restrict__ gathered_logits,
+    int* __restrict__ out_tokens,
+    float* __restrict__ out_logits,
+    int world,
+    int rows,
+    int top_k) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows || threadIdx.x != 0) return;
+
+    Candidate list[kMaxTopK];
+    int len = 0;
+    const size_t local_count = static_cast<size_t>(rows) * top_k;
+    for (int rank = 0; rank < world; ++rank) {
+        const size_t row_base = static_cast<size_t>(rank) * local_count +
+                                static_cast<size_t>(row) * top_k;
+        for (int candidate = 0; candidate < top_k; ++candidate) {
+            const int token = gathered_tokens[row_base + candidate];
+            const float logit = gathered_logits[row_base + candidate];
+            if (token < 0 || isnan(logit)) continue;
+            insert_sorted(list, len, top_k, Candidate{logit, token});
+        }
+    }
+    for (int candidate = 0; candidate < top_k; ++candidate) {
+        const size_t output = static_cast<size_t>(row) * top_k + candidate;
+        if (candidate < len) {
+            out_tokens[output] = list[candidate].index;
+            out_logits[output] = list[candidate].logit;
+        } else {
+            out_tokens[output] = -1;
+            out_logits[output] = -INFINITY;
+        }
+    }
+}
+
 __global__ void sample_from_candidates_kernel(
     const int* __restrict__ cand_tokens, const float* __restrict__ cand_logits,
     int* __restrict__ out_tokens, float* __restrict__ out_logits, int rows,
@@ -299,6 +335,23 @@ bool qwen_local_topk_candidates_cuda(
     }
     local_topk_candidates_kernel<<<rows, kBlockThreads, 0, stream>>>(
         logits, out_tokens, out_logits, rows, vocab, vocab_start, top_k);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_merge_topk_candidates_cuda(
+    const int* gathered_tokens, const float* gathered_logits,
+    int* out_tokens, float* out_logits, int world, int rows, int top_k,
+    cudaStream_t stream) {
+    if (gathered_tokens == nullptr || gathered_logits == nullptr ||
+        out_tokens == nullptr || out_logits == nullptr) {
+        return false;
+    }
+    if (world <= 0 || rows <= 0 || top_k <= 0 || top_k > kMaxTopK) {
+        return false;
+    }
+    merge_topk_candidates_kernel<<<rows, 1, 0, stream>>>(
+        gathered_tokens, gathered_logits, out_tokens, out_logits, world, rows,
+        top_k);
     return cudaGetLastError() == cudaSuccess;
 }
 

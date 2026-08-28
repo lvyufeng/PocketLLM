@@ -278,6 +278,126 @@ bool qwen_fp16_matmul_rows_f16_cublas_cuda(
     uint16_t* d_y_fp16, int batch, int rows, int cols, int x_stride,
     int y_stride, int weight_stride, void* stream = nullptr);
 
+// Per-output-channel FP8 used by compressed-tensors Qwen checkpoints. Scale
+// lookup is scale[row], unlike the legacy 128x128 block-scale APIs above.
+bool qwen_fp8_e4m3_channel_matvec_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    uint16_t* d_y_fp16,
+    int rows,
+    int cols,
+    int weight_stride,
+    void* stream = nullptr);
+
+bool qwen_fp8_e4m3_channel_matmul_rows_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    uint16_t* d_y_fp16,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
+    void* stream = nullptr);
+
+bool qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_weight,
+    const uint16_t* d_scale_fp16,
+    float* d_y_fp32,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    int weight_stride,
+    void* stream = nullptr);
+
+// Qwen compressed-tensors NVFP4. `d_blocks` is a row-major array of 36-byte
+// block64 records produced by qwen_materialize_nvfp4_host_linear(). The global
+// factor is reciprocal(checkpoint weight_global_scale); input_global_scale is
+// calibration metadata and is deliberately not applied by the SM75 fallback.
+bool qwen_nvfp4_group16_matvec_f16_cuda(
+    const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+    uint16_t* d_y_fp16, int rows, int cols, int blocks_per_row,
+    float weight_global_factor, void* stream = nullptr);
+
+bool qwen_nvfp4_group16_matmul_rows_f16_cuda(
+    const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+    uint16_t* d_y_fp16, int batch, int rows, int cols,
+    int x_stride, int y_stride, int blocks_per_row,
+    float weight_global_factor, void* stream = nullptr);
+
+bool qwen_nvfp4_group16_matmul_rows_f16_f32_cuda(
+    const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+    float* d_y_fp32, int batch, int rows, int cols,
+    int x_stride, int y_stride, int blocks_per_row,
+    float weight_global_factor, void* stream = nullptr);
+
+// SM75 decode/small-batch fallback. Activations are dynamically quantized to
+// one symmetric Q8 scale per logical group of 32 values, then packed E2M1 codes
+// are consumed by DP4A. `d_q8` holds batch*cols bytes and `d_q8_scale` holds
+// batch*(cols/32) FP32 scales; callers may reuse the buffers across linears.
+bool qwen_nvfp4_quantize_q8_group32_f16_cuda(
+    const uint16_t* d_x_fp16, int8_t* d_q8, float* d_q8_scale,
+    int batch, int cols, int x_stride, void* stream = nullptr);
+
+bool qwen_nvfp4_group16_matmul_q8_f16_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_blocks, uint16_t* d_y_fp16,
+    int batch, int rows, int cols, int q8_stride, int y_stride,
+    int blocks_per_row, float weight_global_factor,
+    void* stream = nullptr);
+
+bool qwen_nvfp4_group16_matmul_q8_f32_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_blocks, float* d_y_fp32,
+    int batch, int rows, int cols, int q8_stride, int y_stride,
+    int blocks_per_row, float weight_global_factor,
+    void* stream = nullptr);
+
+// SM75 INT8 tensor-core prefill. Every K=16 MMA is rescaled independently so
+// the checkpoint's per-output-row group-16 E4M3 scales remain exact relative to
+// the shared Q8 activation representation.
+bool qwen_nvfp4_group16_matmul_q8_wmma_f16_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_blocks, uint16_t* d_y_fp16,
+    int batch, int rows, int cols, int q8_stride, int y_stride,
+    int blocks_per_row, float weight_global_factor,
+    void* stream = nullptr);
+
+bool qwen_nvfp4_group16_matmul_q8_wmma_f32_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_blocks, float* d_y_fp32,
+    int batch, int rows, int cols, int q8_stride, int y_stride,
+    int blocks_per_row, float weight_global_factor,
+    void* stream = nullptr);
+
+// Wide prefill path for real prompt batches. A 128x64 block reuses each packed
+// weight tile across 128 activation rows and consumes each K=16 subgroup with
+// PRMT-unpacked INT8 DP4A. It keeps Qwen's group-16 scale boundaries exact while
+// avoiding the per-K16 WMMA store/barrier sequence of the narrow fallback.
+bool qwen_nvfp4_group16_matmul_q8_wide_n64_f16_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_blocks, uint16_t* d_y_fp16,
+    int batch, int rows, int cols, int q8_stride, int y_stride,
+    int blocks_per_row, float weight_global_factor,
+    void* stream = nullptr);
+
+// Paired MLP prefill path. Gate and up share the same Q8 activation buffer and
+// are computed in one WMMA launch before SiLU multiplication, avoiding a second
+// dynamic quantization pass and the two materialized projection tensors.
+bool qwen_nvfp4_group16_swiglu_q8_wmma_f16_cuda(
+    const int8_t* d_q8, const float* d_q8_scale,
+    const uint8_t* d_gate_blocks, float gate_weight_global_factor,
+    const uint8_t* d_up_blocks, float up_weight_global_factor,
+    uint16_t* d_y_fp16, int batch, int rows, int cols,
+    int q8_stride, int y_stride, int blocks_per_row,
+    void* stream = nullptr);
+
 // FP16 input/weight tensor-op GEMM with FP32 output. This is kept separate from
 // the exact reduction-order reference path and enabled only by runtime A/B gates.
 bool qwen_fp16_matmul_rows_f16_f32_cublas_cuda(

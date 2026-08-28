@@ -480,8 +480,7 @@ struct QwenDFlash2Runtime::Impl {
     const QwenDFlash2WeightMap& weight_map;
     SafeTensorsIndex index;
     const QwenDeviceTensor& target_embedding;
-    const QwenDeviceTensor& target_lm_head;
-    uint64_t target_vocab_start = 0;
+    QwenTargetHeadAdapter target_head;
     int tp_world = 1;
     int tp_rank = 0;
     int device = 0;
@@ -572,24 +571,26 @@ struct QwenDFlash2Runtime::Impl {
 
     Impl(const std::string& checkpoint_dir_, const QwenDFlash2Config& config_,
          const QwenDFlash2WeightMap& weights_, const QwenDeviceTensor& embedding,
-         const QwenDeviceTensor& lm_head, uint64_t vocab_start, int world,
-         int rank, int device_, std::string id_path, int max_context_)
+         QwenTargetHeadAdapter target_head_, int world, int rank, int device_,
+         std::string id_path, int max_context_)
         : checkpoint_dir(checkpoint_dir_), config(config_), weight_map(weights_),
           index(SafeTensorsIndex::from_single_file(checkpoint_dir_)),
-          target_embedding(embedding), target_lm_head(lm_head),
-          target_vocab_start(vocab_start), tp_world(world), tp_rank(rank),
-          device(device_), nccl_id_path(std::move(id_path)), max_context(max_context_),
+          target_embedding(embedding), target_head(target_head_),
+          tp_world(world), tp_rank(rank), device(device_),
+          nccl_id_path(std::move(id_path)), max_context(max_context_),
           profiler(device_, rank) {
-        if (device < 0 || max_context <= 0 || target_embedding.device_dtype != SafeDType::F16 ||
-            target_lm_head.device_dtype != SafeDType::F16 || target_embedding.shape.size() != 2 ||
-            target_lm_head.shape.size() != 2 || target_embedding.shape[1] != static_cast<uint64_t>(config.hidden_size) ||
-            target_lm_head.shape[1] != static_cast<uint64_t>(config.hidden_size)) {
+        if (device < 0 || max_context <= 0 ||
+            target_embedding.device_dtype != SafeDType::F16 ||
+            target_embedding.shape.size() != 2 ||
+            target_embedding.shape[1] != static_cast<uint64_t>(config.hidden_size) ||
+            !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DFlash2 runtime target tensors");
         }
         check_cuda(cudaSetDevice(device), "select Qwen DFlash2 CUDA device");
         grouped_attention = env_enabled("DSV4_DFLASH2_GROUPED_ATTN");
         fused_swiglu = env_enabled("DSV4_DFLASH2_FUSED_SWIGLU");
         cublas_fp32 = env_enabled("DSV4_DFLASH2_CUBLAS_FP32");
+        target_head.cublas_fp32 = cublas_fp32;
         small_batch_gemm = env_enabled("DSV4_DFLASH2_SMALL_BATCH_GEMM");
         // The single-block top-k launches one block per draft row, leaving a
         // 68-SM device almost idle. The split path partitions each row's shard
@@ -673,6 +674,31 @@ struct QwenDFlash2Runtime::Impl {
                               cudaMemcpyDeviceToHost),
                    "download Qwen DFlash2 debug tensor");
         debug_callback(tensor);
+    }
+
+    void dump_sharded(const std::string& name, const void* data,
+                      QwenDFlash2DebugDType dtype, size_t item_size,
+                      const std::vector<uint64_t>& shape) const {
+        dump(name + ".tp_rank_" + std::to_string(tp_rank), data, dtype,
+             item_size, shape);
+    }
+
+    void dump_half_sharded(const std::string& name, const uint16_t* data,
+                           const std::vector<uint64_t>& shape) const {
+        dump_sharded(name, data, QwenDFlash2DebugDType::F16,
+                     sizeof(uint16_t), shape);
+    }
+
+    void dump_float_sharded(const std::string& name, const float* data,
+                            const std::vector<uint64_t>& shape) const {
+        dump_sharded(name, data, QwenDFlash2DebugDType::F32, sizeof(float),
+                     shape);
+    }
+
+    void dump_i32_sharded(const std::string& name, const int* data,
+                          const std::vector<uint64_t>& shape) const {
+        dump_sharded(name, data, QwenDFlash2DebugDType::I32, sizeof(int),
+                     shape);
     }
 
     void dump_half(const std::string& name, const uint16_t* data,
@@ -784,13 +810,13 @@ struct QwenDFlash2Runtime::Impl {
             DeviceLayer& layer = layers[layer_index];
             const std::string prefix = "layer." + std::to_string(layer_index) + ".context.";
             projection(layer.k, normalized.f16_data(), k.f16_data(), rows, kv_dim, config.hidden_size);
-            dump_half(prefix + "k_projection", k.f16_data(), k.shape);
+            dump_half_sharded(prefix + "k_projection", k.f16_data(), k.shape);
             projection(layer.v, normalized.f16_data(), v.f16_data(), rows, kv_dim, config.hidden_size);
-            dump_half(prefix + "v", v.f16_data(), v.shape);
+            dump_half_sharded(prefix + "v", v.f16_data(), v.shape);
             require_launch(qwen_dflash2_rmsnorm_heads_f16_cuda(k.f16_data(), layer.k_norm.f16_data(), knorm.f16_data(), rows, local_kv_heads, config.head_dim, config.rms_norm_eps), "DFlash2 context K norm");
-            dump_half(prefix + "k_norm", knorm.f16_data(), knorm.shape);
+            dump_half_sharded(prefix + "k_norm", knorm.f16_data(), knorm.shape);
             require_launch(qwen_dflash2_rope_k_rows_f16_cuda(knorm.f16_data(), rows, local_kv_heads, config.head_dim, position_offset, static_cast<float>(config.rope_theta)), "DFlash2 context K RoPE");
-            dump_half(prefix + "k_rope", knorm.f16_data(), knorm.shape);
+            dump_half_sharded(prefix + "k_rope", knorm.f16_data(), knorm.shape);
             check_cuda(cudaMemcpy(layer.context_k.f16_data() + static_cast<size_t>(position_offset) * kv_dim, knorm.f16_data(), k.nbytes, cudaMemcpyDeviceToDevice), "append DFlash2 context K");
             check_cuda(cudaMemcpy(layer.context_v.f16_data() + static_cast<size_t>(position_offset) * kv_dim, v.f16_data(), v.nbytes, cudaMemcpyDeviceToDevice), "append DFlash2 context V");
         }
@@ -808,7 +834,7 @@ struct QwenDFlash2Runtime::Impl {
         const int hidden = config.hidden_size;
         const int q_dim = local_q_dim;
         const int kv_dim = local_kv_dim;
-        const int local_vocab = static_cast<int>(target_lm_head.shape.at(0));
+        const int local_vocab = target_head.local_vocab;
         allocate_int(tokens, rows, {static_cast<uint64_t>(rows)});
         check_cuda(cudaMemcpy(tokens.data, host_tokens.data(), host_tokens.size() * sizeof(int), cudaMemcpyHostToDevice), "upload DFlash2 tokens");
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden;
@@ -824,7 +850,7 @@ struct QwenDFlash2Runtime::Impl {
                       {static_cast<uint64_t>(rows),
                        static_cast<uint64_t>(dynamic_row_stride)});
         profiler.begin("embedding");
-        require_launch(qwen_embedding_fp16_gather_f16_cuda(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
+        require_launch(qwen_embedding_fp16_gather_f16_cuda(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_head.vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
         all_reduce_half(hidden_a.f16_data(), static_cast<int>(hidden_elements));
         profiler.end();
         profiler.begin("initial_residual");
@@ -874,30 +900,30 @@ struct QwenDFlash2Runtime::Impl {
                           {static_cast<uint64_t>(rows), static_cast<uint64_t>(kv_dim)});
             allocate_half(v, k.nbytes / sizeof(uint16_t), k.shape);
             projection(layer.q, conv_hidden.f16_data(), q.f16_data(), rows, q_dim, hidden);
-            dump_half(prefix + "attention.q_projection", q.f16_data(), q.shape);
+            dump_half_sharded(prefix + "attention.q_projection", q.f16_data(), q.shape);
             projection(layer.k, conv_hidden.f16_data(), k.f16_data(), rows, kv_dim, hidden);
-            dump_half(prefix + "attention.k_projection", k.f16_data(), k.shape);
+            dump_half_sharded(prefix + "attention.k_projection", k.f16_data(), k.shape);
             projection(layer.v, conv_hidden.f16_data(), v.f16_data(), rows, kv_dim, hidden);
             profiler.end();
-            dump_half(prefix + "attention.v", v.f16_data(), v.shape);
+            dump_half_sharded(prefix + "attention.v", v.f16_data(), v.shape);
             profiler.begin(prefix + "qk_norm_rope");
             require_launch(qwen_dflash2_rmsnorm_heads_f16_cuda(
                 q.f16_data(), layer.q_norm.f16_data(), q.f16_data(), rows,
                 local_q_heads, config.head_dim, config.rms_norm_eps),
                 "DFlash2 Q norm");
-            dump_half(prefix + "attention.q_norm", q.f16_data(), q.shape);
+            dump_half_sharded(prefix + "attention.q_norm", q.f16_data(), q.shape);
             require_launch(qwen_dflash2_rmsnorm_heads_f16_cuda(
                 k.f16_data(), layer.k_norm.f16_data(), k.f16_data(), rows,
                 local_kv_heads, config.head_dim, config.rms_norm_eps),
                 "DFlash2 K norm");
-            dump_half(prefix + "attention.k_norm", k.f16_data(), k.shape);
+            dump_half_sharded(prefix + "attention.k_norm", k.f16_data(), k.shape);
             require_launch(qwen_dflash2_rope_rows_f16_cuda(
                 q.f16_data(), k.f16_data(), rows, local_q_heads,
                 local_kv_heads, config.head_dim, committed,
                 static_cast<float>(config.rope_theta)), "DFlash2 noise RoPE");
             profiler.end();
-            dump_half(prefix + "attention.q_rope", q.f16_data(), q.shape);
-            dump_half(prefix + "attention.k_rope", k.f16_data(), k.shape);
+            dump_half_sharded(prefix + "attention.q_rope", q.f16_data(), q.shape);
+            dump_half_sharded(prefix + "attention.k_rope", k.f16_data(), k.shape);
             profiler.begin(prefix + "attention");
             allocate_half(attention, static_cast<size_t>(rows) * q_dim, q.shape);
             const bool grouped = use_grouped_attention();
@@ -917,7 +943,7 @@ struct QwenDFlash2Runtime::Impl {
             require_launch(attention_ok, grouped
                 ? "DFlash2 grouped attention" : "DFlash2 attention");
             profiler.end();
-            dump_half(prefix + "attention.output", attention.f16_data(), attention.shape);
+            dump_half_sharded(prefix + "attention.output", attention.f16_data(), attention.shape);
             profiler.begin(prefix + "o_projection_finish_residual");
             allocate_half(hidden_b, hidden_elements, hidden_a.shape);
             projection(layer.out, attention.f16_data(), hidden_b.f16_data(),
@@ -992,15 +1018,15 @@ struct QwenDFlash2Runtime::Impl {
             } else {
                 projection(layer.gate, conv_hidden.f16_data(), gate.f16_data(),
                            rows, local_intermediate, hidden);
-                dump_half(prefix + "mlp.gate", gate.f16_data(), gate.shape);
+                dump_half_sharded(prefix + "mlp.gate", gate.f16_data(), gate.shape);
                 projection(layer.up, conv_hidden.f16_data(), up.f16_data(),
                            rows, local_intermediate, hidden);
-                dump_half(prefix + "mlp.up", up.f16_data(), up.shape);
+                dump_half_sharded(prefix + "mlp.up", up.f16_data(), up.shape);
                 require_launch(qwen_silu_mul_rows_f16_cuda(
                     gate.f16_data(), up.f16_data(), intermediate.f16_data(), rows,
                     local_intermediate), "DFlash2 SwiGLU");
             }
-            dump_half(prefix + "mlp.swiglu", intermediate.f16_data(), intermediate.shape);
+            dump_half_sharded(prefix + "mlp.swiglu", intermediate.f16_data(), intermediate.shape);
             profiler.end();
             profiler.begin(prefix + "mlp_down_finish_residual");
             require_launch(cublas_fp32
@@ -1055,18 +1081,11 @@ struct QwenDFlash2Runtime::Impl {
                         static_cast<uint64_t>(local_vocab)});
         allocate_int(path, draft_rows, {static_cast<uint64_t>(draft_rows)});
         profiler.begin("lm_head");
-        require_launch(cublas_fp32
-            ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
-                  normalized.f16_data() + hidden, target_lm_head.f16_data(),
-                  logits.f32_data(), draft_rows, local_vocab, hidden, hidden,
-                  local_vocab, hidden)
-            : qwen_fp16_matmul_rows_f16_f32_cuda(
-                  normalized.f16_data() + hidden, target_lm_head.f16_data(),
-                  logits.f32_data(), draft_rows, local_vocab, hidden, hidden,
-                  local_vocab, hidden),
+        require_launch(target_head.project_f16_to_f32(
+            normalized.f16_data() + hidden, logits.f32_data(), draft_rows),
             "DFlash2 local logits");
         profiler.end();
-        dump_float("logits.local", logits.f32_data(), logits.shape);
+        dump_float_sharded("logits.local", logits.f32_data(), logits.shape);
         profiler.begin("local_topk");
         if (split_local_topk) {
             // Measured on SM75 at the real 7x62080 shard: 8 splits is the
@@ -1091,19 +1110,21 @@ struct QwenDFlash2Runtime::Impl {
                 local_topk_partial_values.f32_data(),
                 static_cast<int*>(local_candidates.data),
                 local_unary.f32_data(), draft_rows, local_vocab,
-                static_cast<int>(target_vocab_start), config.selector_top_k,
+                static_cast<int>(target_head.vocab_start), config.selector_top_k,
                 splits), "DFlash2 split local top-k");
         } else {
             require_launch(qwen_dflash2_local_topk_f32_cuda(
                 logits.f32_data(), static_cast<int*>(local_candidates.data),
                 local_unary.f32_data(), draft_rows, local_vocab,
-                static_cast<int>(target_vocab_start), config.selector_top_k),
+                static_cast<int>(target_head.vocab_start), config.selector_top_k),
                 "DFlash2 local top-k");
         }
         profiler.end();
-        dump_i32("topk.local.tokens", static_cast<const int*>(local_candidates.data),
-                 local_candidates.shape);
-        dump_float("topk.local.logits", local_unary.f32_data(), local_unary.shape);
+        dump_i32_sharded(
+            "topk.local.tokens", static_cast<const int*>(local_candidates.data),
+            local_candidates.shape);
+        dump_float_sharded("topk.local.logits", local_unary.f32_data(),
+                           local_unary.shape);
         profiler.begin("tp_global_topk");
 #ifdef DSV4_HAVE_NCCL
         if (tp_world > 1) {
@@ -1240,17 +1261,15 @@ struct QwenDFlash2Runtime::Impl {
     }
 };
 
-QwenDFlash2Runtime::QwenDFlash2Runtime(const std::string& checkpoint_dir,
-                                       const QwenDFlash2Config& config,
-                                       const QwenDFlash2WeightMap& weights,
-                                       const QwenDeviceTensor& target_embedding,
-                                       const QwenDeviceTensor& target_lm_head,
-                                       uint64_t target_vocab_start, int tp_world,
-                                       int tp_rank, int device,
-                                       std::string nccl_id_path, int max_context)
-    : impl_(std::make_unique<Impl>(checkpoint_dir, config, weights, target_embedding,
-                                   target_lm_head, target_vocab_start, tp_world,
-                                   tp_rank, device, std::move(nccl_id_path), max_context)) {}
+QwenDFlash2Runtime::QwenDFlash2Runtime(
+    const std::string& checkpoint_dir, const QwenDFlash2Config& config,
+    const QwenDFlash2WeightMap& weights,
+    const QwenDeviceTensor& target_embedding,
+    QwenTargetHeadAdapter target_head, int tp_world, int tp_rank, int device,
+    std::string nccl_id_path, int max_context)
+    : impl_(std::make_unique<Impl>(
+          checkpoint_dir, config, weights, target_embedding, target_head,
+          tp_world, tp_rank, device, std::move(nccl_id_path), max_context)) {}
 
 QwenDFlash2Runtime::~QwenDFlash2Runtime() = default;
 void QwenDFlash2Runtime::reset() {

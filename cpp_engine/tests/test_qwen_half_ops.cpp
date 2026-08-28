@@ -1203,6 +1203,121 @@ bool check_fp8_prefill_tail(int cols) {
     return true;
 }
 
+bool check_fp8_channel_projection() {
+    constexpr int batch = 37;
+    constexpr int rows = 41;
+    constexpr int cols = 67;
+    constexpr int x_stride = 72;
+    constexpr int y_stride = 48;
+    constexpr int weight_stride = 72;
+    std::mt19937 rng(34001);
+    std::uniform_real_distribution<float> x_dist(-0.25f, 0.25f);
+    std::uniform_real_distribution<float> scale_dist(0.002f, 0.01f);
+    std::vector<uint16_t> x(static_cast<size_t>(batch) * x_stride);
+    std::vector<uint8_t> weight(static_cast<size_t>(rows) * weight_stride);
+    std::vector<uint16_t> scale(rows);
+    for (uint16_t& value : x) value = to_half(x_dist(rng));
+    for (uint8_t& value : weight) {
+        value = static_cast<uint8_t>(32 + (rng() % 192));
+    }
+    for (uint16_t& value : scale) value = to_half(scale_dist(rng));
+    std::vector<float> expected(static_cast<size_t>(batch) * rows);
+    for (int sample = 0; sample < batch; ++sample) {
+        for (int row = 0; row < rows; ++row) {
+            float sum = 0.0f;
+            for (int col = 0; col < cols; ++col) {
+                sum += from_half(x[static_cast<size_t>(sample) * x_stride + col]) *
+                    from_fp8_e4m3(weight[static_cast<size_t>(row) *
+                                             weight_stride + col]);
+            }
+            expected[static_cast<size_t>(sample) * rows + row] =
+                sum * from_half(scale[row]);
+        }
+    }
+    DeviceBuffer dx, dw, ds, dy_half, dy_float;
+    uint16_t* px = dx.allocate<uint16_t>(x.size());
+    uint8_t* pw = dw.allocate<uint8_t>(weight.size());
+    uint16_t* ps = ds.allocate<uint16_t>(scale.size());
+    uint16_t* py_half = dy_half.allocate<uint16_t>(
+        static_cast<size_t>(batch) * y_stride);
+    float* py_float = dy_float.allocate<float>(
+        static_cast<size_t>(batch) * y_stride);
+    if (!px || !pw || !ps || !py_half || !py_float ||
+        cudaMemcpy(px, x.data(), x.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pw, weight.data(), weight.size(),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(ps, scale.data(), scale.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        !dsv4::qwen_fp8_e4m3_channel_matmul_rows_f16_cuda(
+            px, pw, ps, py_half, batch, rows, cols, x_stride, y_stride,
+            weight_stride) ||
+        !dsv4::qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(
+            px, pw, ps, py_float, batch, rows, cols, x_stride, y_stride,
+            weight_stride) || cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP8 channel projection launch");
+        return true;
+    }
+    std::vector<uint16_t> got_half(static_cast<size_t>(batch) * y_stride);
+    std::vector<float> got_float(static_cast<size_t>(batch) * y_stride);
+    cudaMemcpy(got_half.data(), py_half,
+               got_half.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(got_float.data(), py_float,
+               got_float.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    double half_error = 0.0;
+    double float_error = 0.0;
+    int worst_half_sample = 0;
+    int worst_half_row = 0;
+    int worst_float_sample = 0;
+    int worst_float_row = 0;
+    for (int sample = 0; sample < batch; ++sample) {
+        for (int row = 0; row < rows; ++row) {
+            const size_t output_at = static_cast<size_t>(sample) * y_stride + row;
+            const float reference =
+                expected[static_cast<size_t>(sample) * rows + row];
+            const double current_half = std::fabs(
+                static_cast<double>(from_half(got_half[output_at])) - reference);
+            const double current_float = std::fabs(
+                static_cast<double>(got_float[output_at]) - reference);
+            if (current_half > half_error) {
+                half_error = current_half;
+                worst_half_sample = sample;
+                worst_half_row = row;
+            }
+            if (current_float > float_error) {
+                float_error = current_float;
+                worst_float_sample = sample;
+                worst_float_row = row;
+            }
+        }
+    }
+    if (half_error > 3.0e-2 || float_error > 2.0e-4) {
+        const size_t half_at = static_cast<size_t>(worst_half_sample) * y_stride +
+            worst_half_row;
+        const size_t float_at = static_cast<size_t>(worst_float_sample) * y_stride +
+            worst_float_row;
+        std::printf("    worst_half sample=%d row=%d got=%.6e expected=%.6e\n",
+                    worst_half_sample, worst_half_row,
+                    static_cast<double>(from_half(got_half[half_at])),
+                    static_cast<double>(expected[
+                        static_cast<size_t>(worst_half_sample) * rows +
+                        worst_half_row]));
+        std::printf("    worst_float sample=%d row=%d got=%.6e expected=%.6e\n",
+                    worst_float_sample, worst_float_row,
+                    static_cast<double>(got_float[float_at]),
+                    static_cast<double>(expected[
+                        static_cast<size_t>(worst_float_sample) * rows +
+                        worst_float_row]));
+        std::printf("  FP8 channel mismatch batch=%d rows=%d cols=%d half=%.3e float=%.3e\n",
+                    batch, rows, cols, half_error, float_error);
+        fail("FP8 channel projection numerical check");
+    } else {
+        std::printf("  FP8 channel batch=%d rows=%d cols=%d half=%.3e float=%.3e\n",
+                    batch, rows, cols, half_error, float_error);
+    }
+    return true;
+}
+
 bool check_batched_argmax() {
     constexpr int rows = 5;
     constexpr int count = 263;
@@ -1870,6 +1985,7 @@ int main() {
     check_decode_grid_256k();
     check_fp8_f16_projection();
     check_resident_fp16_projection();
+    check_fp8_channel_projection();
     check_batched_argmax();
     check_region_copy();
     check_strided_row_copy(1);

@@ -17,6 +17,7 @@ enum class SafeDType {
     F32,
     I64,
     I8,
+    U8,
     F8_E4M3,
     F8_E8M0,
     Unknown,

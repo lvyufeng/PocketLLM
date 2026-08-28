@@ -454,4 +454,5 @@ build/cpp_engine/dsv4_cpp_engine \
 - `scripts/bench_qwen_mtp.py`
 - `scripts/bench_qwen_dspark.py`
 - `scripts/bench_qwen_dspark_prefix_cache.py`
+- [Qwen3.8-27B-NVFP4](qwen3.8-27b-nvfp4.md) for the mixed NVFP4/FP8 checkpoint on the same text runtime
 - [Benchmark reporting rules](../benchmarking.md)

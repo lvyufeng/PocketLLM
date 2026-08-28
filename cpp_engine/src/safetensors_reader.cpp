@@ -188,6 +188,7 @@ std::string safe_dtype_name(SafeDType dtype) {
         case SafeDType::F32: return "F32";
         case SafeDType::I64: return "I64";
         case SafeDType::I8: return "I8";
+        case SafeDType::U8: return "U8";
         case SafeDType::F8_E4M3: return "F8_E4M3";
         case SafeDType::F8_E8M0: return "F8_E8M0";
         case SafeDType::Unknown: return "Unknown";
@@ -201,6 +202,7 @@ SafeDType safe_dtype_from_string(const std::string& dtype) {
     if (dtype == "F32") return SafeDType::F32;
     if (dtype == "I64") return SafeDType::I64;
     if (dtype == "I8") return SafeDType::I8;
+    if (dtype == "U8") return SafeDType::U8;
     if (dtype == "F8_E4M3") return SafeDType::F8_E4M3;
     if (dtype == "F8_E8M0") return SafeDType::F8_E8M0;
     return SafeDType::Unknown;
@@ -213,6 +215,7 @@ uint64_t safe_dtype_size(SafeDType dtype) {
         case SafeDType::F32: return 4;
         case SafeDType::I64: return 8;
         case SafeDType::I8: return 1;
+        case SafeDType::U8: return 1;
         case SafeDType::F8_E4M3: return 1;
         case SafeDType::F8_E8M0: return 1;
         case SafeDType::Unknown: return 0;
