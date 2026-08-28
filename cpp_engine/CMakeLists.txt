@@ -396,6 +396,10 @@ add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
 target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(bench_qwen_prefill_allreduce tests/bench_qwen_prefill_allreduce.cpp)
+target_link_libraries(bench_qwen_prefill_allreduce PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_prefill_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
 target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)
 set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
