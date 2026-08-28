@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -92,6 +93,7 @@ def load_model(
     *,
     dtype: torch.dtype = torch.bfloat16,
     expert_cache_capacity: int = 0,
+    profiler=None,
 ) -> tuple[Qwen4ExpModel, Qwen4ExpConfig]:
     config = Qwen4ExpConfig.from_pretrained(model_dir)
     checkpoint = Qwen4ExpCheckpoint(model_dir, store=MmapSafetensors(model_dir))
@@ -104,6 +106,7 @@ def load_model(
         world_size=ctx.world_size,
         all_reduce=make_all_reduce(ctx),
         expert_cache_capacity=expert_cache_capacity,
+        profiler=profiler,
     )
     return model, config
 
@@ -128,13 +131,17 @@ def generate(
     prompt_len = input_ids.shape[1]
     cache = model.make_cache(batch_size=input_ids.shape[0], max_seq_len=prompt_len + max_new_tokens + 1)
 
+    profiler = model.profiler
+    prof_scope = profiler.scope if profiler else lambda _name: nullcontext()
+
     t0 = time.perf_counter()
     logits = None
     past = 0
-    while past < prompt_len:
-        piece = input_ids[:, past : past + chunk_size]
-        logits = model.forward(piece, cache=cache, past_len=past)
-        past += piece.shape[1]
+    with prof_scope("prefill"):
+        while past < prompt_len:
+            piece = input_ids[:, past : past + chunk_size]
+            logits = model.forward(piece, cache=cache, past_len=past)
+            past += piece.shape[1]
     if ctx.device.type == "cuda":
         torch.cuda.synchronize()
     prefill_s = time.perf_counter() - t0
@@ -143,16 +150,17 @@ def generate(
     produced: list[int] = []
     t1 = time.perf_counter()
     next_id = logits.argmax(-1, keepdim=True)
-    for _ in range(max_new_tokens):
-        token = int(next_id.item())
-        produced.append(token)
-        if on_token is not None and ctx.rank == 0:
-            on_token(token)
-        if token in eos_token_ids:
-            break
-        step = model.forward(next_id.to(ctx.device), cache=cache, past_len=past)
-        past += 1
-        next_id = gather_logits(step[:, -1], ctx).argmax(-1, keepdim=True)
+    with prof_scope("decode"):
+        for _ in range(max_new_tokens):
+            token = int(next_id.item())
+            produced.append(token)
+            if on_token is not None and ctx.rank == 0:
+                on_token(token)
+            if token in eos_token_ids:
+                break
+            step = model.forward(next_id.to(ctx.device), cache=cache, past_len=past)
+            past += 1
+            next_id = gather_logits(step[:, -1], ctx).argmax(-1, keepdim=True)
     if ctx.device.type == "cuda":
         torch.cuda.synchronize()
     decode_s = time.perf_counter() - t1
@@ -199,19 +207,31 @@ def run_tp4(
     dtype: torch.dtype = torch.bfloat16,
     expert_cache_capacity: int = 0,
     raw_prompt: bool = False,
+    enable_profile: bool = False,
 ) -> dict:
+    from src.models.qwen4_exp.profiler import Profiler
+
     ctx = init_distributed()
+    profiler = Profiler(enabled=enable_profile, device=ctx.device) if enable_profile else None
+
     if ctx.rank == 0:
         print(f"[rank{ctx.rank}] loading {model_dir} world_size={ctx.world_size}", flush=True)
 
     t0 = time.perf_counter()
     model, config = load_model(
-        model_dir, ctx, dtype=dtype, expert_cache_capacity=expert_cache_capacity
+        model_dir, ctx, dtype=dtype, expert_cache_capacity=expert_cache_capacity, profiler=profiler
     )
     load_s = time.perf_counter() - t0
     if ctx.rank == 0:
         mem = torch.cuda.memory_allocated(ctx.device) / 2**30 if ctx.device.type == "cuda" else 0.0
         print(f"[rank{ctx.rank}] loaded in {load_s:.1f}s, {mem:.2f} GiB on device", flush=True)
+
+    # All layers share one MoE backend instance; reach it through layer 0.
+    moe_backend = getattr(model.layers[0], "moe", None)
+    moe_backend = getattr(moe_backend, "inner", moe_backend)  # unwrap ShardedMoE
+    moe_phase_profile = enable_profile and os.environ.get("DSV4_QWEN4_MOE_PHASE_PROFILE") == "1"
+    if moe_phase_profile and hasattr(moe_backend, "phase_stats"):
+        moe_backend.phase_stats = {}
 
     tokenizer = _load_tokenizer(model_dir)
     text = prompt if raw_prompt else _apply_chat_template(model_dir, prompt)
@@ -233,6 +253,24 @@ def run_tp4(
         print(f"[rank0] output: {result['text']!r}", flush=True)
         print(f"[rank0] stats: {json.dumps(stats, indent=2)}", flush=True)
 
+        if moe_phase_profile and getattr(moe_backend, "phase_stats", None):
+            ps = moe_backend.phase_stats
+            staged = moe_backend.stage_calls
+            hits = moe_backend.cache_hits
+            gib = moe_backend.stage_bytes / 2**30
+            print(
+                "\n[rank0] moe phases: "
+                f"stage {ps.get('stage_s', 0.0):.3f}s  "
+                f"compute {ps.get('compute_s', 0.0):.3f}s  "
+                f"expert-calls {ps.get('experts', 0)} over {ps.get('calls', 0)} moe calls\n"
+                f"[rank0] staging: {staged} misses / {hits} hits "
+                f"({100.0 * hits / max(1, staged + hits):.1f}% hit), {gib:.2f} GiB H2D",
+                flush=True,
+            )
+
+        if profiler and profiler.enabled:
+            print("\n" + profiler.report())
+
     if ctx.initialized:
         import torch.distributed as dist
 
@@ -245,6 +283,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen4-Exp TP heterogeneous inference")
     parser.add_argument("--model", required=True, help="checkpoint directory")
     parser.add_argument("--prompt", default="Hello, who are you?")
+    parser.add_argument("--prompt-file", help="read the prompt from a file instead of --prompt")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -255,16 +294,23 @@ def main() -> None:
         help="number of staged experts to keep on device (0 = restage every step)",
     )
     parser.add_argument("--raw-prompt", action="store_true", help="skip the chat template")
+    parser.add_argument("--profile", action="store_true", help="enable hierarchical profiler")
     args = parser.parse_args()
+
+    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            prompt = f.read()
 
     run_tp4(
         args.model,
-        args.prompt,
+        prompt,
         max_new_tokens=args.max_new_tokens,
         chunk_size=args.chunk_size,
         dtype=getattr(torch, args.dtype),
         expert_cache_capacity=args.expert_cache,
         raw_prompt=args.raw_prompt,
+        enable_profile=args.profile,
     )
 
 

@@ -8,6 +8,7 @@ module code serves the single-GPU reference path and the TP4 heterogeneous path
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -30,6 +31,12 @@ from src.models.qwen4_exp.layers import (
     inject_into_streams,
 )
 from src.models.qwen4_exp.moe import MoEBackend
+
+
+@contextmanager
+def _noop_context():
+    """No-op context manager when profiler is disabled."""
+    yield
 
 
 @dataclass
@@ -219,32 +226,58 @@ class Qwen4ExpDecoderLayer:
         past_len: int,
         token_history: torch.Tensor | None,
         use_cache: bool,
+        profiler=None,
     ) -> torch.Tensor:
-        if self.ple is not None:
-            assert token_history is not None, "PLE layers need the token id history"
-            hidden_states = hidden_states + self.ple(
-                hidden_states, token_history, hidden_states.shape[1], use_cache=use_cache
-            )
+        prof_scope = profiler.scope if profiler else lambda x: _noop_context()
 
-        mixed, hyper_input, inject = self.attn_hc(hidden_states)
-        if self.is_linear:
-            attn_out = self.attn(mixed, cache)
-        else:
-            attn_out = self.attn(mixed, cos, sin, cache, past_len=past_len)
-        if self.all_reduce is not None:
-            attn_out = self.all_reduce(attn_out)
-        hidden_states = inject_into_streams(attn_out, hyper_input, inject)
+        with prof_scope(f"layer_{self.layer_idx}"):
+            if self.ple is not None:
+                assert token_history is not None, "PLE layers need the token id history"
+                with prof_scope("ple"):
+                    ple_out = self.ple(
+                        hidden_states, token_history, hidden_states.shape[1], use_cache=use_cache
+                    )
+                hidden_states = hidden_states + ple_out
 
-        mixed, hyper_input, inject = self.mlp_hc(hidden_states)
-        flat = mixed.reshape(-1, mixed.shape[-1])
-        weights, indices = self.router(flat)
-        routed = self.moe(self.layer_idx, flat, indices, weights)
-        shared = self.shared_expert(flat)
-        shared = torch.sigmoid(F.linear(flat, self.shared_expert_gate)) * shared
-        mlp_out = (routed + shared).reshape(mixed.shape)
-        if self.all_reduce is not None:
-            mlp_out = self.all_reduce(mlp_out)
-        return inject_into_streams(mlp_out, hyper_input, inject)
+            with prof_scope("attn_hc"):
+                mixed, hyper_input, inject = self.attn_hc(hidden_states)
+
+            with prof_scope("attention"):
+                if self.is_linear:
+                    attn_out = self.attn(mixed, cache)
+                else:
+                    attn_out = self.attn(mixed, cos, sin, cache, past_len=past_len)
+
+            if self.all_reduce is not None:
+                with prof_scope("attn_reduce"):
+                    attn_out = self.all_reduce(attn_out)
+
+            with prof_scope("attn_inject"):
+                hidden_states = inject_into_streams(attn_out, hyper_input, inject)
+
+            with prof_scope("mlp_hc"):
+                mixed, hyper_input, inject = self.mlp_hc(hidden_states)
+
+            flat = mixed.reshape(-1, mixed.shape[-1])
+
+            with prof_scope("router"):
+                weights, indices = self.router(flat)
+
+            with prof_scope("moe"):
+                routed = self.moe(self.layer_idx, flat, indices, weights)
+
+            with prof_scope("shared_expert"):
+                shared = self.shared_expert(flat)
+                shared = torch.sigmoid(F.linear(flat, self.shared_expert_gate)) * shared
+
+            mlp_out = (routed + shared).reshape(mixed.shape)
+
+            if self.all_reduce is not None:
+                with prof_scope("mlp_reduce"):
+                    mlp_out = self.all_reduce(mlp_out)
+
+            with prof_scope("mlp_inject"):
+                return inject_into_streams(mlp_out, hyper_input, inject)
 
 
 @dataclass
@@ -281,6 +314,7 @@ class Qwen4ExpModel:
         final_mixer: GatedResidual,
         device: torch.device,
         dtype: torch.dtype,
+        profiler=None,
     ) -> None:
         self.config = config
         self.layers = layers
@@ -289,6 +323,7 @@ class Qwen4ExpModel:
         self.final_mixer = final_mixer
         self.device = device
         self.dtype = dtype
+        self.profiler = profiler
         self.rope = MRoPE(config, device)
         self._cos: torch.Tensor | None = None
         self._sin: torch.Tensor | None = None
@@ -323,27 +358,33 @@ class Qwen4ExpModel:
         cache: Qwen4ExpCache | None = None,
         past_len: int = 0,
     ) -> torch.Tensor:
+        prof_scope = self.profiler.scope if self.profiler else lambda x: _noop_context()
+
         batch_size, seq_len = input_ids.shape
         total_len = past_len + seq_len
-        cos, sin = self._rope_cache(total_len, batch_size)
+
+        with prof_scope("rope_cache"):
+            cos, sin = self._rope_cache(total_len, batch_size)
 
         token_history = None
         if any(layer.ple is not None for layer in self.layers):
-            # Token ids and the n-gram hash live on the CPU (the PLE table is
-            # host-resident), so keep the history there too.
-            ids_cpu = input_ids.to("cpu", dtype=torch.long)
-            if cache is not None and cache.ple_token_history is not None:
-                token_history = torch.cat([cache.ple_token_history, ids_cpu], dim=1)
-            else:
-                pad = torch.full(
-                    (batch_size, self.config.ngram_size - 1),
-                    self.config.primary_eos_token_id,
-                    dtype=torch.long,
-                )
-                token_history = torch.cat([pad, ids_cpu], dim=1)
+            with prof_scope("token_history"):
+                # Token ids and the n-gram hash live on the CPU (the PLE table is
+                # host-resident), so keep the history there too.
+                ids_cpu = input_ids.to("cpu", dtype=torch.long)
+                if cache is not None and cache.ple_token_history is not None:
+                    token_history = torch.cat([cache.ple_token_history, ids_cpu], dim=1)
+                else:
+                    pad = torch.full(
+                        (batch_size, self.config.ngram_size - 1),
+                        self.config.primary_eos_token_id,
+                        dtype=torch.long,
+                    )
+                    token_history = torch.cat([pad, ids_cpu], dim=1)
 
-        hidden = self.embed_tokens(input_ids).to(self.dtype)
-        hidden = hidden.repeat(1, 1, self.config.hc_count)
+        with prof_scope("embed"):
+            hidden = self.embed_tokens(input_ids).to(self.dtype)
+            hidden = hidden.repeat(1, 1, self.config.hc_count)
 
         for idx, layer in enumerate(self.layers):
             hidden = layer(
@@ -354,6 +395,7 @@ class Qwen4ExpModel:
                 past_len=past_len,
                 token_history=token_history,
                 use_cache=cache is not None,
+                profiler=self.profiler,
             )
 
         if cache is not None:
@@ -361,5 +403,8 @@ class Qwen4ExpModel:
             if token_history is not None:
                 cache.ple_token_history = token_history[:, -(self.config.ngram_size - 1) :].clone()
 
-        hidden = self.final_mixer(hidden)
-        return F.linear(hidden, self.lm_head)
+        with prof_scope("final_mixer"):
+            hidden = self.final_mixer(hidden)
+
+        with prof_scope("lm_head"):
+            return F.linear(hidden, self.lm_head)
