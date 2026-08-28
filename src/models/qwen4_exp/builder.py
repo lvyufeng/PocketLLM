@@ -146,6 +146,7 @@ def build_from_state_dict(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
     prefix: str = LM,
+    profiler=None,
 ) -> Qwen4ExpModel:
     """Single-device model with every expert resident. Small models / tests only."""
     device = torch.device(device)
@@ -195,6 +196,7 @@ def build_from_state_dict(
         final_mixer=_final_mixer(getter, config, prefix=prefix),
         device=device,
         dtype=dtype,
+        profiler=profiler,
     )
 
 
@@ -217,6 +219,7 @@ def build_heterogeneous(
     all_reduce=None,
     expert_cache_capacity: int = 0,
     prefix: str = LM,
+    profiler=None,
 ) -> Qwen4ExpModel:
     """TP-sharded dense weights on GPU, routed experts + PLE table in host RAM.
 
@@ -422,4 +425,5 @@ def build_heterogeneous(
         final_mixer=_final_mixer(dense, config, prefix=prefix),
         device=device,
         dtype=dtype,
+        profiler=profiler,
     )

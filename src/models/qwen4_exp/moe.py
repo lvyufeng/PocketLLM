@@ -37,12 +37,16 @@ def _dispatch_experts(
     weights: torch.Tensor,
     num_experts: int,
     expert_weights,
+    stats: dict | None = None,
 ) -> torch.Tensor:
     """Group tokens by expert, run each expert once, scatter-add the results.
 
     `expert_weights(expert_id)` returns `(gate_up, down)` on the compute device.
     Experts are visited in ascending id so the accumulation order is fixed and
     the result is run-to-run reproducible.
+
+    When `stats` is given, per-phase wall time is accumulated into it.  The
+    timing path synchronizes and is meant for profiling runs only.
     """
     out = torch.zeros_like(hidden_states)
     flat_experts = indices.reshape(-1)
@@ -50,6 +54,28 @@ def _dispatch_experts(
     sorted_experts = flat_experts[order]
     unique, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
     top_k = indices.shape[1]
+
+    if stats is None:
+        offset = 0
+        unique_list = unique.tolist()
+        counts_list = counts.tolist()
+        for expert_id, count in zip(unique_list, counts_list):
+            slot = order[offset : offset + count]
+            offset += count
+            if expert_id >= num_experts:
+                continue
+            token_idx = slot // top_k
+            k_idx = slot % top_k
+            gate_up, down = expert_weights(int(expert_id))
+            contrib = swiglu_expert(hidden_states[token_idx], gate_up, down)
+            contrib = contrib * weights[token_idx, k_idx].unsqueeze(-1).to(contrib.dtype)
+            out.index_add_(0, token_idx, contrib.to(out.dtype))
+        return out
+
+    import time
+
+    dev = hidden_states.device
+    sync = torch.cuda.synchronize if dev.type == "cuda" else lambda *a: None
 
     offset = 0
     unique_list = unique.tolist()
@@ -61,10 +87,22 @@ def _dispatch_experts(
             continue
         token_idx = slot // top_k
         k_idx = slot % top_k
+
+        sync(dev)
+        t0 = time.perf_counter()
         gate_up, down = expert_weights(int(expert_id))
+        sync(dev)
+        t1 = time.perf_counter()
         contrib = swiglu_expert(hidden_states[token_idx], gate_up, down)
         contrib = contrib * weights[token_idx, k_idx].unsqueeze(-1).to(contrib.dtype)
         out.index_add_(0, token_idx, contrib.to(out.dtype))
+        sync(dev)
+        t2 = time.perf_counter()
+
+        stats["stage_s"] = stats.get("stage_s", 0.0) + (t1 - t0)
+        stats["compute_s"] = stats.get("compute_s", 0.0) + (t2 - t1)
+        stats["experts"] = stats.get("experts", 0) + 1
+    stats["calls"] = stats.get("calls", 0) + 1
     return out
 
 
@@ -121,11 +159,15 @@ class HostExpertMoE:
         self._order: list[tuple[int, int]] = []
         self.stage_bytes = 0
         self.stage_calls = 0
+        self.cache_hits = 0
+        # Set to a dict to collect per-phase timings (profiling only).
+        self.phase_stats: dict | None = None
 
     def _fetch(self, layer_idx: int, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         key = (layer_idx, expert_id)
         hit = self._cache.get(key)
         if hit is not None:
+            self.cache_hits += 1
             return hit
         gate_up_cpu, down_cpu = self.reader.expert_rows(layer_idx, expert_id)
         gate_up = gate_up_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
@@ -153,6 +195,7 @@ class HostExpertMoE:
             weights,
             self.num_experts,
             lambda e: self._fetch(layer_idx, e),
+            stats=self.phase_stats,
         )
 
 
