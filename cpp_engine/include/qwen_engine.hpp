@@ -144,6 +144,18 @@ struct QwenMtpStats {
     }
 };
 
+struct QwenRuntimeTelemetry {
+    QwenLinearKindCounts checkpoint_linear_kinds;
+    QwenLinearKindCounts active_linear_kinds;
+    std::string nvfp4_decode_path = "unused";
+    std::string nvfp4_prefill_path = "unused";
+    std::string fp8_channel_decode_path = "unused";
+    std::string fp8_channel_prefill_path = "unused";
+    std::string target_head_path = "unknown";
+    uint64_t host_global_metadata_bytes = 0;
+    uint64_t nvfp4_q8_workspace_peak_bytes = 0;
+};
+
 struct QwenPrefixCacheStats {
     // Tokens whose KV cache and recurrent state were reused unchanged.
     int reused_tokens = 0;
@@ -184,6 +196,7 @@ public:
     uint64_t activation_workspace_peak_bytes() const;
     uint64_t kv_cache_bytes() const;
     uint64_t kv_cache_scale_bytes() const;
+    QwenRuntimeTelemetry runtime_telemetry() const;
 
     const QwenPrefixCacheStats& prefix_cache_stats() const {
         return prefix_stats_;

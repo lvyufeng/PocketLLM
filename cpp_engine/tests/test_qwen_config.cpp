@@ -122,6 +122,9 @@ int main() {
     check_eq(cfg.max_position_embeddings, 262144u, "max_position_embeddings");
     check_eq(cfg.full_attention.num_heads, 24u, "num_attention_heads");
     check_eq(cfg.full_attention.num_key_value_heads, 4u, "num_key_value_heads");
+    check(cfg.full_attention.num_heads % 2 == 0 &&
+              cfg.full_attention.num_key_value_heads % 2 == 0,
+          "real attention heads are TP2-compatible");
     check_eq(cfg.full_attention.head_dim, 256u, "head_dim");
     check(cfg.full_attention.output_gate, "attn_output_gate is true");
     check_eq(cfg.full_attention.attention_dim(), 6144u, "attention_dim = 24*256");
@@ -143,6 +146,31 @@ int main() {
     check_eq(cfg.layer_type_name(0), std::string("linear_attention"), "layer 0 is linear attention");
     check_eq(cfg.layer_type_name(3), std::string("full_attention"), "layer 3 is full attention");
     check_eq(cfg.layer_type_name(63), std::string("full_attention"), "last layer is full attention");
+
+    // Parsing is topology-agnostic. A valid Qwen config whose KV-head count is
+    // not divisible by four must still parse; the runtime validates the actual
+    // requested TP world later.
+    std::string tp2_only = qwen38_config_json();
+    const std::string kv_heads = "\"num_key_value_heads\": 4";
+    const size_t kv_at = tp2_only.find(kv_heads);
+    check(kv_at != std::string::npos, "fixture contains num_key_value_heads");
+    if (kv_at != std::string::npos) {
+        tp2_only.replace(kv_at, kv_heads.size(), "\"num_key_value_heads\": 2");
+        const std::string tp2_dir = dir + "_tp2_only";
+        const std::string tp2_mkdir = "mkdir -p '" + tp2_dir + "'";
+        if (std::system(tp2_mkdir.c_str()) == 0 &&
+            write_file(tp2_dir + "/config.json", tp2_only)) {
+            bool parsed = true;
+            try {
+                const dsv4::QwenConfig tp2_cfg =
+                    dsv4::QwenConfig::from_hf_config(tp2_dir);
+                parsed = tp2_cfg.full_attention.num_key_value_heads == 2;
+            } catch (const std::exception&) {
+                parsed = false;
+            }
+            check(parsed, "config parser does not impose TP4 divisibility");
+        }
+    }
 
     // A dense text config must not be mistaken for MoE: dropping
     // intermediate_size has to fail loudly rather than default to zero.

@@ -357,6 +357,7 @@ void print_safe_tensor(const dsv4::SafeTensorInfo& info, const std::string& shar
 }  // namespace
 
 int main(int argc, char** argv) {
+    const auto process_started = std::chrono::steady_clock::now();
     try {
         Args args = parse_args(argc, argv);
         if (args.device >= 0) {
@@ -423,6 +424,7 @@ int main(int argc, char** argv) {
                 if (!qwen_checkpoint) throw std::runtime_error("--qwen-audit requires a Qwen checkpoint");
                 const dsv4::QwenConfig qwen_config = dsv4::QwenConfig::from_hf_config(args.ckpt);
                 const dsv4::QwenWeightMap map(index, qwen_config, args.tp_world, args.tp_rank);
+                const dsv4::QwenLinearKindCounts kinds = map.checkpoint_linear_kind_counts();
                 const double gib = 1024.0 * 1024.0 * 1024.0;
                 std::cout << "qwen_audit tp_world=" << args.tp_world
                           << " tp_rank=" << args.tp_rank
@@ -433,6 +435,12 @@ int main(int argc, char** argv) {
                           << " scale_GiB=" << (static_cast<double>(map.local_scale_bytes()) / gib)
                           << " total_GiB="
                           << (static_cast<double>(map.local_weight_bytes() + map.local_scale_bytes()) / gib)
+                          << " host_global_metadata_bytes="
+                          << map.host_global_metadata_bytes()
+                          << " checkpoint_dense_f16_linears=" << kinds.dense_f16
+                          << " checkpoint_fp8_block128_linears=" << kinds.fp8_block128
+                          << " checkpoint_fp8_channel_linears=" << kinds.fp8_channel
+                          << " checkpoint_nvfp4_group16_linears=" << kinds.nvfp4_group16
                           << "\n";
             }
             if (!args.inspect_tensor.empty()) {
@@ -495,7 +503,13 @@ int main(int argc, char** argv) {
                         static_cast<uint64_t>(qwen_context)) {
                         throw std::runtime_error("Qwen prompt plus generation exceeds --max-context");
                     }
+                    const auto model_load_started =
+                        std::chrono::steady_clock::now();
                     dsv4::QwenEngine qwen(args.ckpt, qwen_opts, args.smoke_layers, qwen_context);
+                    const double model_load_seconds = std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - model_load_started).count();
+                    dsv4::QwenRuntimeTelemetry qwen_telemetry =
+                        qwen.runtime_telemetry();
                     std::cout << "qwen_startup=1 layers=" << (args.smoke_layers > 0 ? args.smoke_layers : 64)
                               << " persistent_stdin=" << (args.qwen_persistent_stdin ? 1 : 0)
                               << " prefill_chunk_tokens=" << qwen_opts.prefill_chunk_tokens
@@ -515,7 +529,42 @@ int main(int argc, char** argv) {
                               << " snapshot_interval=" << qwen_opts.state_snapshot_interval_tokens
                               << " max_snapshots=" << qwen_opts.max_state_snapshots
                               << " prompt_tokens=" << prompt_ids.size()
-                              << " max_context=" << qwen_context << "\n";
+                              << " max_context=" << qwen_context
+                              << " model_load_seconds=" << model_load_seconds
+                              << " process_elapsed_seconds="
+                              << std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() -
+                                     process_started).count()
+                              << " host_global_metadata_bytes="
+                              << qwen_telemetry.host_global_metadata_bytes
+                              << " checkpoint_dense_f16_linears="
+                              << qwen_telemetry.checkpoint_linear_kinds.dense_f16
+                              << " checkpoint_fp8_block128_linears="
+                              << qwen_telemetry.checkpoint_linear_kinds.fp8_block128
+                              << " checkpoint_fp8_channel_linears="
+                              << qwen_telemetry.checkpoint_linear_kinds.fp8_channel
+                              << " checkpoint_nvfp4_group16_linears="
+                              << qwen_telemetry.checkpoint_linear_kinds.nvfp4_group16
+                              << " active_dense_f16_linears="
+                              << qwen_telemetry.active_linear_kinds.dense_f16
+                              << " active_fp8_block128_linears="
+                              << qwen_telemetry.active_linear_kinds.fp8_block128
+                              << " active_fp8_channel_linears="
+                              << qwen_telemetry.active_linear_kinds.fp8_channel
+                              << " active_nvfp4_group16_linears="
+                              << qwen_telemetry.active_linear_kinds.nvfp4_group16
+                              << " nvfp4_q8_workspace_peak_bytes="
+                              << qwen_telemetry.nvfp4_q8_workspace_peak_bytes
+                              << " nvfp4_decode_path="
+                              << qwen_telemetry.nvfp4_decode_path
+                              << " nvfp4_prefill_path="
+                              << qwen_telemetry.nvfp4_prefill_path
+                              << " fp8_channel_decode_path="
+                              << qwen_telemetry.fp8_channel_decode_path
+                              << " fp8_channel_prefill_path="
+                              << qwen_telemetry.fp8_channel_prefill_path
+                              << " target_head_path="
+                              << qwen_telemetry.target_head_path << "\n";
                     if (args.qwen_persistent_stdin) {
                         if (args.tp_world > 1 && args.nccl_id_path.empty()) {
                             throw std::runtime_error(
@@ -700,6 +749,7 @@ int main(int argc, char** argv) {
                                       << " top_logit=" << generated[step].top_logit
                                       << " checksum=" << generated[step].checksum << "\n";
                         }
+                        qwen_telemetry = qwen.runtime_telemetry();
                         size_t free_bytes = 0;
                         size_t total_bytes = 0;
                         if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
@@ -713,6 +763,41 @@ int main(int argc, char** argv) {
                                   << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
                                   << " kv_cache_bytes=" << qwen.kv_cache_bytes()
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
+                                  << " model_load_seconds=" << model_load_seconds
+                                  << " process_elapsed_seconds="
+                                  << std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now() -
+                                         process_started).count()
+                                  << " host_global_metadata_bytes="
+                                  << qwen_telemetry.host_global_metadata_bytes
+                                  << " checkpoint_dense_f16_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.dense_f16
+                                  << " checkpoint_fp8_block128_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.fp8_block128
+                                  << " checkpoint_fp8_channel_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.fp8_channel
+                                  << " checkpoint_nvfp4_group16_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.nvfp4_group16
+                                  << " active_dense_f16_linears="
+                                  << qwen_telemetry.active_linear_kinds.dense_f16
+                                  << " active_fp8_block128_linears="
+                                  << qwen_telemetry.active_linear_kinds.fp8_block128
+                                  << " active_fp8_channel_linears="
+                                  << qwen_telemetry.active_linear_kinds.fp8_channel
+                                  << " active_nvfp4_group16_linears="
+                                  << qwen_telemetry.active_linear_kinds.nvfp4_group16
+                                  << " nvfp4_q8_workspace_peak_bytes="
+                                  << qwen_telemetry.nvfp4_q8_workspace_peak_bytes
+                                  << " nvfp4_decode_path="
+                                  << qwen_telemetry.nvfp4_decode_path
+                                  << " nvfp4_prefill_path="
+                                  << qwen_telemetry.nvfp4_prefill_path
+                                  << " fp8_channel_decode_path="
+                                  << qwen_telemetry.fp8_channel_decode_path
+                                  << " fp8_channel_prefill_path="
+                                  << qwen_telemetry.fp8_channel_prefill_path
+                                  << " target_head_path="
+                                  << qwen_telemetry.target_head_path
                                   << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
                                   << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
                                   << " attention_window=" << qwen.options().attention_window
@@ -773,9 +858,14 @@ int main(int argc, char** argv) {
                             std::cout << " gpu_memory_used_bytes=" << (total_bytes - free_bytes)
                                       << " gpu_memory_total_bytes=" << total_bytes;
                         }
-                        std::cout << "\n";
+                        std::cout << " process_elapsed_final_seconds="
+                                  << std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now() -
+                                         process_started).count()
+                                  << "\n";
                     } else {
                         dsv4::QwenForwardResult result = qwen.prefill(prompt_ids);
+                        qwen_telemetry = qwen.runtime_telemetry();
                         std::cout << "smoke_forward=1 qwen_runtime=1 token=" << prompt_ids.back()
                                   << " layers=" << result.layers
                                   << " dim=" << result.dim
@@ -790,6 +880,41 @@ int main(int argc, char** argv) {
                                   << " activation_workspace_peak_bytes=" << qwen.activation_workspace_peak_bytes()
                                   << " kv_cache_bytes=" << qwen.kv_cache_bytes()
                                   << " kv_cache_scale_bytes=" << qwen.kv_cache_scale_bytes()
+                                  << " model_load_seconds=" << model_load_seconds
+                                  << " process_elapsed_seconds="
+                                  << std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now() -
+                                         process_started).count()
+                                  << " host_global_metadata_bytes="
+                                  << qwen_telemetry.host_global_metadata_bytes
+                                  << " checkpoint_dense_f16_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.dense_f16
+                                  << " checkpoint_fp8_block128_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.fp8_block128
+                                  << " checkpoint_fp8_channel_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.fp8_channel
+                                  << " checkpoint_nvfp4_group16_linears="
+                                  << qwen_telemetry.checkpoint_linear_kinds.nvfp4_group16
+                                  << " active_dense_f16_linears="
+                                  << qwen_telemetry.active_linear_kinds.dense_f16
+                                  << " active_fp8_block128_linears="
+                                  << qwen_telemetry.active_linear_kinds.fp8_block128
+                                  << " active_fp8_channel_linears="
+                                  << qwen_telemetry.active_linear_kinds.fp8_channel
+                                  << " active_nvfp4_group16_linears="
+                                  << qwen_telemetry.active_linear_kinds.nvfp4_group16
+                                  << " nvfp4_q8_workspace_peak_bytes="
+                                  << qwen_telemetry.nvfp4_q8_workspace_peak_bytes
+                                  << " nvfp4_decode_path="
+                                  << qwen_telemetry.nvfp4_decode_path
+                                  << " nvfp4_prefill_path="
+                                  << qwen_telemetry.nvfp4_prefill_path
+                                  << " fp8_channel_decode_path="
+                                  << qwen_telemetry.fp8_channel_decode_path
+                                  << " fp8_channel_prefill_path="
+                                  << qwen_telemetry.fp8_channel_prefill_path
+                                  << " target_head_path="
+                                  << qwen_telemetry.target_head_path
                                   << " prefill_chunk_tokens=" << qwen.options().prefill_chunk_tokens
                                   << " kv_cache_dtype=" << dsv4::qwen_kv_cache_dtype_name(qwen.options().kv_cache_dtype)
                                   << " attention_window=" << qwen.options().attention_window
@@ -797,7 +922,12 @@ int main(int argc, char** argv) {
                                   << " prefix_cache=" << (qwen.options().prefix_cache ? 1 : 0)
                                   << " snapshot_interval=" << qwen.options().state_snapshot_interval_tokens
                                   << " max_snapshots=" << qwen.options().max_state_snapshots
-                                  << " max_context=" << qwen.max_context() << "\n";
+                                  << " max_context=" << qwen.max_context()
+                                  << " process_elapsed_final_seconds="
+                                  << std::chrono::duration<double>(
+                                         std::chrono::steady_clock::now() -
+                                         process_started).count()
+                                  << "\n";
                     }
                     return 0;
                 }

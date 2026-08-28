@@ -15,6 +15,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 set(NCCL_ROOT "" CACHE PATH "Optional NCCL root directory")
+option(DSV4_REQUIRE_NCCL "Fail configuration when NCCL is unavailable" OFF)
 set(DSV4_HAVE_NCCL OFF)
 if(NCCL_ROOT)
     find_path(NCCL_INCLUDE_DIR nccl.h PATHS "${NCCL_ROOT}/include" NO_DEFAULT_PATH)
@@ -27,6 +28,9 @@ if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
     set(DSV4_HAVE_NCCL ON)
     message(STATUS "NCCL found: ${NCCL_LIBRARY}")
 else()
+    if(DSV4_REQUIRE_NCCL)
+        message(FATAL_ERROR "NCCL is required but was not found; set NCCL_ROOT")
+    endif()
     message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
 endif()
 
@@ -39,6 +43,7 @@ add_library(dsv4_cpp_core STATIC
     src/model_config.cpp
     src/qwen_config.cpp
     src/qwen_weights.cpp
+    src/qwen_target_head.cpp
     src/qwen_dspark.cpp
     src/qwen_dflash2.cpp
     src/qwen_engine.cpp
@@ -60,6 +65,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/qwen_fp8_ops.cu
     cuda/qwen_attention_ops.cu
     cuda/qwen_half_ops.cu
+    cuda/qwen_nvfp4_ops.cu
     cuda/qwen_gqa_optimized.cu
     cuda/qwen_gdn_flashqla.cu
     cuda/qwen_turboquant_ops.cu
@@ -360,6 +366,14 @@ add_executable(test_qwen_half_ops tests/test_qwen_half_ops.cpp)
 target_link_libraries(test_qwen_half_ops PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_half_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_nvfp4 tests/test_qwen_nvfp4.cpp)
+target_link_libraries(test_qwen_nvfp4 PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_nvfp4 tests/bench_qwen_nvfp4.cpp)
+target_link_libraries(bench_qwen_nvfp4 PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_qwen_conv_tail tests/test_qwen_conv_tail.cpp)
 target_link_libraries(test_qwen_conv_tail PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_conv_tail PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
@@ -392,9 +406,11 @@ add_executable(bench_qwen_transaction_copy tests/bench_qwen_transaction_copy.cpp
 target_link_libraries(bench_qwen_transaction_copy PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_transaction_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
-add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
-target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
-set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+if(DSV4_HAVE_NCCL)
+    add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
+    target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
+    set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
 
 add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
 target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)

@@ -1,7 +1,7 @@
 #include "tp_comm.hpp"
 
 #ifdef DSV4_HAVE_NCCL
-#include "qwen_cuda_ops.hpp"
+#include "qwen_sampler.hpp"
 
 #include <cuda_runtime.h>
 #include <nccl.h>
@@ -299,10 +299,10 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
                              ncclFloat, comm, cuda_stream),
                "ncclAllGather device top-k logits");
     check_nccl(ncclGroupEnd(), "ncclGroupEnd device top-k");
-    if (!qwen_dflash2_merge_topk_f32_cuda(
+    if (!qwen_merge_topk_candidates_cuda(
             workspace.d_tokens, workspace.d_logits, d_global_tokens,
             d_global_logits, world, rows, top_k, cuda_stream)) {
-        throw std::runtime_error("Qwen DFlash2 device top-k merge launch failed");
+        throw std::runtime_error("Qwen sampling device top-k merge launch failed");
     }
 }
 

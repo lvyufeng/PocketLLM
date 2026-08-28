@@ -175,9 +175,6 @@ QwenConfig QwenConfig::from_hf_config(const std::string& ckpt_dir) {
     if (cfg.full_attention.num_heads % cfg.full_attention.num_key_value_heads != 0) {
         throw std::runtime_error("Qwen attention heads must be divisible by key/value heads");
     }
-    if (cfg.full_attention.num_heads % 4 != 0 || cfg.full_attention.num_key_value_heads % 4 != 0) {
-        throw std::runtime_error("Qwen TP4 requires attention heads and KV heads divisible by four");
-    }
     if (cfg.partial_rotary_dim() == 0 || cfg.partial_rotary_dim() > cfg.full_attention.head_dim ||
         (cfg.partial_rotary_dim() % 2) != 0) {
         throw std::runtime_error("Qwen partial rotary dimension must be a positive even head dimension");

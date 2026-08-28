@@ -5,6 +5,7 @@
 #include "qwen_dspark.hpp"
 #include "qwen_dflash2.hpp"
 #include "qwen_sampler.hpp"
+#include "qwen_target_head.hpp"
 #include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
@@ -67,13 +68,26 @@ int qwen_env_int(const char* name, int fallback) {
     return static_cast<int>(parsed);
 }
 
+// The wide 128x64 tile only pays off once the batch fills its row span; below
+// that the WMMA path stays cheaper. Enabled by default above the row threshold.
+bool qwen_nvfp4_wide_n64_enabled(int rows) {
+    return rows >= qwen_env_int("DSV4_QWEN_NVFP4_WIDE_N64_MIN_ROWS", 128) &&
+           qwen_env_enabled_default("DSV4_QWEN_NVFP4_WIDE_N64");
+}
+
 struct DeviceLinear {
+    QwenLinearKind kind = QwenLinearKind::DenseF16;
+    std::vector<uint64_t> logical_shape;
     QwenDeviceTensor weight;
     QwenDeviceTensor scale;
     // Optional dense FP16 expansion used only by batched target verification.
     // The raw FP8 matrix remains canonical and serves decode/prefill.
     QwenDeviceTensor verify_weight;
     bool fp8 = false;
+    // NVFP4 tensor-level scaling. The factor is reciprocal(weight_global_scale);
+    // input_global_scale is calibration metadata the SM75 path does not apply.
+    float weight_global_factor = 1.0f;
+    float input_global_scale = 1.0f;
 };
 
 struct DeviceLinearAttention {
@@ -127,9 +141,16 @@ QwenDeviceTensor upload(const SafeTensorsIndex& index, const QwenTensorRef& ref)
 
 DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& ref) {
     DeviceLinear output;
-    output.weight = upload(index, ref.weight);
-    output.fp8 = ref.weight.device_dtype == SafeDType::F8_E4M3;
-    if (ref.has_scale) output.scale = upload(index, ref.scale);
+    output.kind = ref.kind;
+    output.logical_shape = ref.logical_local_shape;
+    if (ref.kind == QwenLinearKind::NvFp4Group16) {
+        output.weight = qwen_upload_nvfp4_linear_cuda(
+            index, ref, &output.weight_global_factor,
+            &output.input_global_scale);
+    } else {
+        output.weight = upload(index, ref.weight);
+        if (ref.has_scale) output.scale = upload(index, ref.scale);
+    }
     return output;
 }
 
@@ -329,7 +350,7 @@ struct QwenEngine::Impl {
     uint64_t transaction_total_blocks = 0;
     QwenDeviceTensor embed;
     QwenDeviceTensor final_norm;
-    QwenDeviceTensor lm_head;
+    DeviceLinear lm_head;
     bool mtp_enabled = false;
     bool dspark_enabled = false;
     bool dflash2_enabled = false;
@@ -412,11 +433,16 @@ struct QwenEngine::Impl {
     // allocated per slice index and reused across layers.
     std::vector<cudaEvent_t> comm_slice_ready;
     std::vector<cudaEvent_t> comm_slice_done;
+    // Reusable per-token INT8 activation buffers for the NVFP4 integer kernels.
+    QwenDeviceTensor nvfp4_q8;
+    QwenDeviceTensor nvfp4_q8_scale;
+    QwenLinearKindCounts active_linear_kinds;
     uint64_t uploaded_weight_bytes = 0;
     uint64_t uploaded_scale_bytes = 0;
     uint64_t verify_weight_bytes = 0;
     uint64_t cache_data_bytes = 0;
     uint64_t cache_scale_bytes = 0;
+    QwenRuntimeTelemetry telemetry;
     // Prompt whose KV cache and recurrent state are currently materialized.
     std::vector<int> cached_prompt;
     // Ordered by ascending position. Index 0 is always the implicit empty
@@ -494,12 +520,72 @@ struct QwenEngine::Impl {
          int max_context_, int active_layers)
         : index(index_), config(config_), options(options_),
           max_context(max_context_) {
+        telemetry.checkpoint_linear_kinds =
+            map.checkpoint_linear_kind_counts();
+        telemetry.host_global_metadata_bytes = map.host_global_metadata_bytes();
+        if (telemetry.checkpoint_linear_kinds.nvfp4_group16 != 0) {
+            const char* requested = std::getenv("DSV4_QWEN_NVFP4");
+            const bool reference = requested != nullptr &&
+                std::strcmp(requested, "reference") == 0;
+            const bool dp4a = requested != nullptr &&
+                std::strcmp(requested, "dp4a") == 0;
+            const bool wmma = requested != nullptr &&
+                std::strcmp(requested, "wmma") == 0;
+            const bool automatic = requested == nullptr || *requested == '\0' ||
+                std::strcmp(requested, "auto") == 0;
+            if (!reference && !dp4a && !wmma && !automatic) {
+                throw std::runtime_error(
+                    "DSV4_QWEN_NVFP4 must be auto, dp4a, wmma, or reference");
+            }
+            telemetry.nvfp4_decode_path = reference
+                ? "packed_reference" : wmma ? "q8_group32_wmma" :
+                    "q8_group32_dp4a";
+            if (reference) {
+                telemetry.nvfp4_prefill_path = "packed_reference";
+            } else if (dp4a) {
+                telemetry.nvfp4_prefill_path = "q8_group32_dp4a";
+            } else {
+                const char* fused =
+                    std::getenv("DSV4_QWEN_NVFP4_FUSED_SWIGLU");
+                const char* shared =
+                    std::getenv("DSV4_QWEN_NVFP4_SHARED_Q8_SWIGLU");
+                // Report the path the configured chunk size will actually
+                // take, since the wide tile only engages above a row count.
+                const bool wide = qwen_nvfp4_wide_n64_enabled(
+                    std::max(1, options_.prefill_chunk_tokens));
+                telemetry.nvfp4_prefill_path =
+                    fused != nullptr && std::strcmp(fused, "1") == 0
+                        ? "q8_group32_wmma_fused_gate_up_swiglu_experimental"
+                        : wide
+                              ? "q8_group32_wide_n64_shared_gate_up_q8"
+                        : shared == nullptr || std::strcmp(shared, "0") != 0
+                              ? "q8_group32_wmma_shared_gate_up_q8"
+                              : "q8_group32_wmma";
+            }
+        }
+        if (telemetry.checkpoint_linear_kinds.fp8_channel != 0) {
+            telemetry.fp8_channel_decode_path = "online_matvec";
+            const char* wide = std::getenv("QWEN_FP8_CHANNEL_PREFILL_WIDE_N64");
+            telemetry.fp8_channel_prefill_path =
+                wide == nullptr || std::strcmp(wide, "0") != 0
+                    ? "wide_n64_online" : "tiled_online";
+        }
+        telemetry.target_head_path =
+            map.lm_head().kind == QwenLinearKind::DenseF16
+                ? "dense_f16"
+                : map.lm_head().kind == QwenLinearKind::Fp8Channel
+                      ? "fp8_channel_online"
+                      : qwen_linear_kind_name(map.lm_head().kind);
         embed = upload(index, map.embed_tokens());
         final_norm = upload(index, map.final_norm());
-        lm_head = upload(index, map.lm_head());
+        lm_head = upload_linear(index, map.lm_head());
+        count_active_linear(map.lm_head().kind);
         uploaded_weight_bytes += map.embed_tokens().device_nbytes +
-                                 map.final_norm().device_nbytes +
-                                 map.lm_head().device_nbytes;
+                                 map.final_norm().device_nbytes;
+        uploaded_weight_bytes += map.lm_head().weight.device_nbytes;
+        if (map.lm_head().has_scale) {
+            uploaded_scale_bytes += map.lm_head().scale.device_nbytes;
+        }
         const size_t layer_limit = active_layers > 0
             ? std::min(static_cast<size_t>(active_layers), map.layers().size())
             : map.layers().size();
@@ -558,6 +644,30 @@ struct QwenEngine::Impl {
                      &source.full_attention.o_proj}) {
                 if (ref->has_scale) {
                     uploaded_scale_bytes += ref->scale.device_nbytes;
+                }
+            }
+
+            for (const QwenLinearRef* ref : {
+                     &source.mlp.gate_proj, &source.mlp.up_proj,
+                     &source.mlp.down_proj}) {
+                count_active_linear(ref->kind);
+            }
+            if (source.linear_attention.in_proj_qkv.weight.found) {
+                for (const QwenLinearRef* ref : {
+                         &source.linear_attention.in_proj_qkv,
+                         &source.linear_attention.in_proj_z,
+                         &source.linear_attention.out_proj,
+                         &source.linear_attention.in_proj_a,
+                         &source.linear_attention.in_proj_b}) {
+                    count_active_linear(ref->kind);
+                }
+            } else {
+                for (const QwenLinearRef* ref : {
+                         &source.full_attention.q_proj,
+                         &source.full_attention.k_proj,
+                         &source.full_attention.v_proj,
+                         &source.full_attention.o_proj}) {
+                    count_active_linear(ref->kind);
                 }
             }
 
@@ -755,13 +865,17 @@ struct QwenEngine::Impl {
                 *dspark_index, *dspark_config, options.tp_world, options.tp_rank);
             // The target embedding is vocab-sharded. QwenDSparkRuntime gathers
             // local rows then performs the same TP all-reduce as target prefill.
+            const QwenTargetHeadAdapter target_head{
+                lm_head.kind, &lm_head.weight,
+                lm_head.scale.data != nullptr ? &lm_head.scale : nullptr,
+                static_cast<int>(lm_head.logical_shape.at(0)),
+                static_cast<int>(lm_head.logical_shape.at(1)),
+                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
+                    options.tp_world};
             dspark = std::make_unique<QwenDSparkRuntime>(
                 options.dspark_checkpoint, *dspark_config, *dspark_weights,
-                embed, lm_head,
-                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
-                    options.tp_world,
-                options.tp_world, options.tp_rank, options.device,
-                options.nccl_id_path, max_context);
+                embed, target_head, options.tp_world, options.tp_rank,
+                options.device, options.nccl_id_path, max_context);
             dspark_enabled = true;
             uploaded_weight_bytes += dspark->resident_weight_bytes();
             cache_data_bytes += dspark->context_cache_bytes();
@@ -780,13 +894,17 @@ struct QwenEngine::Impl {
                 SafeTensorsIndex::from_single_file(options.dflash2_checkpoint));
             dflash2_weights = std::make_unique<QwenDFlash2WeightMap>(
                 *dflash2_index, *dflash2_config, options.tp_world, options.tp_rank);
+            const QwenTargetHeadAdapter target_head{
+                lm_head.kind, &lm_head.weight,
+                lm_head.scale.data != nullptr ? &lm_head.scale : nullptr,
+                static_cast<int>(lm_head.logical_shape.at(0)),
+                static_cast<int>(lm_head.logical_shape.at(1)),
+                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
+                    options.tp_world};
             dflash2 = std::make_unique<QwenDFlash2Runtime>(
                 options.dflash2_checkpoint, *dflash2_config, *dflash2_weights,
-                embed, lm_head,
-                static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
-                    options.tp_world,
-                options.tp_world, options.tp_rank, options.device,
-                options.nccl_id_path, max_context);
+                embed, target_head, options.tp_world, options.tp_rank,
+                options.device, options.nccl_id_path, max_context);
             dflash2_enabled = true;
             uploaded_weight_bytes += dflash2->resident_weight_bytes();
             cache_data_bytes += dflash2->context_cache_bytes();
@@ -832,6 +950,7 @@ struct QwenEngine::Impl {
                 }
             };
             count_mtp_linear(source.fc);
+            count_active_linear(source.fc.kind);
             for (const QwenLinearRef* linear : {
                      &mtp_source.full_attention.q_proj,
                      &mtp_source.full_attention.k_proj,
@@ -841,6 +960,7 @@ struct QwenEngine::Impl {
                      &mtp_source.mlp.up_proj,
                      &mtp_source.mlp.down_proj}) {
                 count_mtp_linear(*linear);
+                count_active_linear(linear->kind);
             }
             const size_t mtp_cache_elements = static_cast<size_t>(max_context) *
                 local_kv_heads * head_dim;
@@ -1447,12 +1567,130 @@ struct QwenEngine::Impl {
 #endif
     }
 
+    void count_active_linear(QwenLinearKind kind) {
+        switch (kind) {
+            case QwenLinearKind::DenseF16:
+                ++active_linear_kinds.dense_f16;
+                break;
+            case QwenLinearKind::Fp8Block128:
+                ++active_linear_kinds.fp8_block128;
+                break;
+            case QwenLinearKind::Fp8Channel:
+                ++active_linear_kinds.fp8_channel;
+                break;
+            case QwenLinearKind::NvFp4Group16:
+                ++active_linear_kinds.nvfp4_group16;
+                break;
+        }
+        telemetry.active_linear_kinds = active_linear_kinds;
+    }
+
+    void allocate_nvfp4_q8(int rows, int columns) {
+        allocate(nvfp4_q8, static_cast<size_t>(rows) * columns,
+                 {static_cast<uint64_t>(rows),
+                  static_cast<uint64_t>(columns)}, SafeDType::I8);
+        allocate_float(nvfp4_q8_scale,
+                       static_cast<size_t>(rows) * (columns / 32),
+                       {static_cast<uint64_t>(rows),
+                        static_cast<uint64_t>(columns / 32)});
+        telemetry.nvfp4_q8_workspace_peak_bytes = std::max(
+            telemetry.nvfp4_q8_workspace_peak_bytes,
+            nvfp4_q8.capacity + nvfp4_q8_scale.capacity);
+    }
+
+    bool nvfp4_integer_projection(const DeviceLinear& linear,
+                                  const uint16_t* input, uint16_t* output,
+                                  int rows, bool wmma) {
+        const int output_rows = static_cast<int>(linear.logical_shape[0]);
+        const int columns = static_cast<int>(linear.logical_shape[1]);
+        allocate_nvfp4_q8(rows, columns);
+        if (!qwen_nvfp4_quantize_q8_group32_f16_cuda(
+                input, static_cast<int8_t*>(nvfp4_q8.data),
+                nvfp4_q8_scale.f32_data(), rows, columns, columns)) {
+            return false;
+        }
+        if (wmma && qwen_nvfp4_wide_n64_enabled(rows)) {
+            return qwen_nvfp4_group16_matmul_q8_wide_n64_f16_cuda(
+                static_cast<const int8_t*>(nvfp4_q8.data),
+                nvfp4_q8_scale.f32_data(), linear.weight.u8_data(), output,
+                rows, output_rows, columns, columns, output_rows,
+                columns / 64, linear.weight_global_factor);
+        }
+        return wmma
+            ? qwen_nvfp4_group16_matmul_q8_wmma_f16_cuda(
+                  static_cast<const int8_t*>(nvfp4_q8.data),
+                  nvfp4_q8_scale.f32_data(), linear.weight.u8_data(), output,
+                  rows, output_rows, columns, columns, output_rows,
+                  columns / 64, linear.weight_global_factor)
+            : qwen_nvfp4_group16_matmul_q8_f16_cuda(
+                  static_cast<const int8_t*>(nvfp4_q8.data),
+                  nvfp4_q8_scale.f32_data(), linear.weight.u8_data(), output,
+                  rows, output_rows, columns, columns, output_rows,
+                  columns / 64, linear.weight_global_factor);
+    }
+
+    bool nvfp4_shared_q8_swiglu_projection(
+        const DeviceLinear& gate, const DeviceLinear& up,
+        const uint16_t* input, uint16_t* gate_output,
+        uint16_t* up_output, int rows) {
+        const int output_rows = static_cast<int>(gate.logical_shape[0]);
+        const int columns = static_cast<int>(gate.logical_shape[1]);
+        allocate_nvfp4_q8(rows, columns);
+        if (!qwen_nvfp4_quantize_q8_group32_f16_cuda(
+                input, static_cast<int8_t*>(nvfp4_q8.data),
+                nvfp4_q8_scale.f32_data(), rows, columns, columns)) {
+            return false;
+        }
+        const int8_t* q8 = static_cast<const int8_t*>(nvfp4_q8.data);
+        const float* q8_scale = nvfp4_q8_scale.f32_data();
+        if (qwen_nvfp4_wide_n64_enabled(rows)) {
+            return qwen_nvfp4_group16_matmul_q8_wide_n64_f16_cuda(
+                       q8, q8_scale, gate.weight.u8_data(), gate_output,
+                       rows, output_rows, columns, columns, output_rows,
+                       columns / 64, gate.weight_global_factor) &&
+                   qwen_nvfp4_group16_matmul_q8_wide_n64_f16_cuda(
+                       q8, q8_scale, up.weight.u8_data(), up_output,
+                       rows, output_rows, columns, columns, output_rows,
+                       columns / 64, up.weight_global_factor);
+        }
+        return qwen_nvfp4_group16_matmul_q8_wmma_f16_cuda(
+                   q8, q8_scale, gate.weight.u8_data(), gate_output,
+                   rows, output_rows, columns, columns, output_rows,
+                   columns / 64, gate.weight_global_factor) &&
+               qwen_nvfp4_group16_matmul_q8_wmma_f16_cuda(
+                   q8, q8_scale, up.weight.u8_data(), up_output,
+                   rows, output_rows, columns, columns, output_rows,
+                   columns / 64, up.weight_global_factor);
+    }
+
+    bool nvfp4_fused_swiglu_projection(
+        const DeviceLinear& gate, const DeviceLinear& up,
+        const uint16_t* input, uint16_t* output, int rows) {
+        const int output_rows = static_cast<int>(gate.logical_shape[0]);
+        const int columns = static_cast<int>(gate.logical_shape[1]);
+        allocate_nvfp4_q8(rows, columns);
+        if (!qwen_nvfp4_quantize_q8_group32_f16_cuda(
+                input, static_cast<int8_t*>(nvfp4_q8.data),
+                nvfp4_q8_scale.f32_data(), rows, columns, columns)) {
+            return false;
+        }
+        return qwen_nvfp4_group16_swiglu_q8_wmma_f16_cuda(
+            static_cast<const int8_t*>(nvfp4_q8.data),
+            nvfp4_q8_scale.f32_data(), gate.weight.u8_data(),
+            gate.weight_global_factor, up.weight.u8_data(),
+            up.weight_global_factor, output, rows, output_rows, columns,
+            columns, output_rows, columns / 64);
+    }
+
     void projection(const DeviceLinear& linear, const uint16_t* input,
                     uint16_t* output, int rows, const char* site = "other") {
         PhaseScope scope(this, std::string(rows == 1 ? "pd." : "pr.") + site);
-        const int output_rows = static_cast<int>(linear.weight.shape[0]);
-        const int columns = static_cast<int>(linear.weight.shape[1]);
-        if (linear.fp8) {
+        if (linear.logical_shape.size() != 2) {
+            throw std::runtime_error("Qwen linear has invalid logical shape");
+        }
+        const int output_rows = static_cast<int>(linear.logical_shape[0]);
+        const int columns = static_cast<int>(linear.logical_shape[1]);
+        if (linear.kind == QwenLinearKind::Fp8Block128) {
             if (rows == 1) {
                 require_launch(qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
                     input, linear.weight.fp8_data(), linear.scale.f16_data(),
@@ -1471,7 +1709,52 @@ struct QwenEngine::Impl {
                     columns, static_cast<int>(linear.scale.shape[1])),
                     "FP8 FP16-activation projection");
             }
-        } else {
+        } else if (linear.kind == QwenLinearKind::Fp8Channel) {
+            require_launch(rows == 1
+                ? qwen_fp8_e4m3_channel_matvec_f16_cuda(
+                      input, linear.weight.fp8_data(), linear.scale.f16_data(),
+                      output, output_rows, columns, columns)
+                : qwen_fp8_e4m3_channel_matmul_rows_f16_cuda(
+                      input, linear.weight.fp8_data(), linear.scale.f16_data(),
+                      output, rows, output_rows, columns, columns, output_rows,
+                      columns),
+                "channel FP8 FP16-activation projection");
+        } else if (linear.kind == QwenLinearKind::NvFp4Group16) {
+            const char* requested = std::getenv("DSV4_QWEN_NVFP4");
+            const bool reference = requested != nullptr &&
+                std::strcmp(requested, "reference") == 0;
+            const bool explicit_dp4a = requested != nullptr &&
+                std::strcmp(requested, "dp4a") == 0;
+            const bool explicit_wmma = requested != nullptr &&
+                std::strcmp(requested, "wmma") == 0;
+            const bool automatic = requested == nullptr || *requested == '\0' ||
+                std::strcmp(requested, "auto") == 0;
+            if (!reference && !explicit_dp4a && !explicit_wmma && !automatic) {
+                throw std::runtime_error(
+                    "DSV4_QWEN_NVFP4 must be auto, dp4a, wmma, or reference");
+            }
+            const int blocks_per_row = columns / 64;
+            if (!reference) {
+                const bool use_wmma = explicit_wmma || (automatic && rows >= 8);
+                const bool use_wide =
+                    use_wmma && qwen_nvfp4_wide_n64_enabled(rows);
+                require_launch(nvfp4_integer_projection(
+                    linear, input, output, rows, use_wmma),
+                    use_wide ? "NVFP4 group-16 Q8 wide-N64 projection" :
+                    use_wmma ? "NVFP4 group-16 Q8 WMMA projection" :
+                               "NVFP4 group-16 Q8 DP4A projection");
+            } else {
+                require_launch(rows == 1
+                    ? qwen_nvfp4_group16_matvec_f16_cuda(
+                          input, linear.weight.u8_data(), output, output_rows,
+                          columns, blocks_per_row, linear.weight_global_factor)
+                    : qwen_nvfp4_group16_matmul_rows_f16_cuda(
+                          input, linear.weight.u8_data(), output, rows,
+                          output_rows, columns, columns, output_rows,
+                          blocks_per_row, linear.weight_global_factor),
+                    "NVFP4 group-16 reference projection");
+            }
+        } else if (linear.kind == QwenLinearKind::DenseF16) {
             // The fused DeltaNet a/b matrix is only 24 rows per TP4 rank. At
             // verify width 8, tensor cores are ~5x faster than the generic
             // warp-per-output-row reduction. Decode keeps its established
@@ -1490,6 +1773,10 @@ struct QwenEngine::Impl {
                     columns, columns, output_rows, columns),
                     "FP16 activation/weight projection");
             }
+        } else {
+            throw std::runtime_error(
+                std::string("Qwen linear CUDA path is not implemented for ") +
+                qwen_linear_kind_name(linear.kind));
         }
     }
 
@@ -2057,28 +2344,51 @@ struct QwenEngine::Impl {
         begin_workspace();
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
         const size_t intermediate_elements = static_cast<size_t>(rows) *
-            layer.gate.weight.shape[0];
+            layer.gate.logical_shape[0];
         QwenDeviceTensor& normalized = workspace_half(
             hidden_elements, {static_cast<uint64_t>(rows),
                               static_cast<uint64_t>(hidden_size)});
         QwenDeviceTensor& attention = workspace_half(hidden_elements, normalized.shape);
         QwenDeviceTensor& post = workspace_half(hidden_elements, normalized.shape);
-        const bool compatible_swiglu = layer.gate.fp8 && layer.up.fp8 &&
-            layer.gate.weight.shape == layer.up.weight.shape &&
+        const bool compatible_fp8_swiglu =
+            layer.gate.kind == QwenLinearKind::Fp8Block128 &&
+            layer.up.kind == QwenLinearKind::Fp8Block128 &&
+            layer.gate.logical_shape == layer.up.logical_shape &&
             layer.gate.scale.shape == layer.up.scale.shape;
-        const bool fused_decode_swiglu = rows == 1 && compatible_swiglu;
+        const bool fused_decode_swiglu = rows == 1 && compatible_fp8_swiglu;
         const bool fused_small_batch_swiglu = rows > 1 && rows <= 8 &&
-            compatible_swiglu && hidden_size % 4 == 0;
+            compatible_fp8_swiglu && hidden_size % 4 == 0;
+        const char* nvfp4_mode = std::getenv("DSV4_QWEN_NVFP4");
+        const bool nvfp4_wmma = nvfp4_mode == nullptr || *nvfp4_mode == '\0' ||
+            std::strcmp(nvfp4_mode, "auto") == 0 ||
+            std::strcmp(nvfp4_mode, "wmma") == 0;
+        const char* fused_nvfp4 =
+            std::getenv("DSV4_QWEN_NVFP4_FUSED_SWIGLU");
+        const bool fused_nvfp4_swiglu = rows >= 8 && nvfp4_wmma &&
+            fused_nvfp4 != nullptr && std::strcmp(fused_nvfp4, "1") == 0 &&
+            layer.gate.kind == QwenLinearKind::NvFp4Group16 &&
+            layer.up.kind == QwenLinearKind::NvFp4Group16 &&
+            layer.gate.logical_shape == layer.up.logical_shape;
+        const char* shared_nvfp4 =
+            std::getenv("DSV4_QWEN_NVFP4_SHARED_Q8_SWIGLU");
+        const bool shared_nvfp4_enabled = shared_nvfp4 == nullptr ||
+            std::strcmp(shared_nvfp4, "0") != 0;
+        const bool shared_nvfp4_swiglu = rows >= 8 && nvfp4_wmma &&
+            shared_nvfp4_enabled && !fused_nvfp4_swiglu &&
+            layer.gate.kind == QwenLinearKind::NvFp4Group16 &&
+            layer.up.kind == QwenLinearKind::NvFp4Group16 &&
+            layer.gate.logical_shape == layer.up.logical_shape;
         QwenDeviceTensor* gate = nullptr;
         QwenDeviceTensor* up = nullptr;
-        if (!fused_decode_swiglu && !fused_small_batch_swiglu) {
+        if (!fused_decode_swiglu && !fused_small_batch_swiglu &&
+            !fused_nvfp4_swiglu) {
             gate = &workspace_half(intermediate_elements,
-                {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
+                {static_cast<uint64_t>(rows), layer.gate.logical_shape[0]});
             up = &workspace_half(intermediate_elements, gate->shape);
         }
         QwenDeviceTensor& intermediate = workspace_half(
             intermediate_elements,
-            {static_cast<uint64_t>(rows), layer.gate.weight.shape[0]});
+            {static_cast<uint64_t>(rows), layer.gate.logical_shape[0]});
         QwenDeviceTensor& mlp = workspace_half(hidden_elements, normalized.shape);
 
         norm(layer.input_norm, hidden, normalized.f16_data(), rows, hidden_size);
@@ -2113,7 +2423,7 @@ struct QwenEngine::Impl {
                 post.f16_data(), layer.gate.weight.fp8_data(),
                 layer.gate.scale.f16_data(), layer.up.weight.fp8_data(),
                 layer.up.scale.f16_data(), intermediate.f16_data(),
-                static_cast<int>(layer.gate.weight.shape[0]), hidden_size,
+                static_cast<int>(layer.gate.logical_shape[0]), hidden_size,
                 hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
                 "FP16 fused decode SwiGLU");
         } else if (fused_small_batch_swiglu) {
@@ -2123,16 +2433,30 @@ struct QwenEngine::Impl {
                     post.f16_data(), layer.gate.weight.fp8_data(),
                     layer.gate.scale.f16_data(), layer.up.weight.fp8_data(),
                     layer.up.scale.f16_data(), intermediate.f16_data(), rows,
-                    static_cast<int>(layer.gate.weight.shape[0]), hidden_size,
-                    hidden_size, static_cast<int>(layer.gate.weight.shape[0]),
+                    static_cast<int>(layer.gate.logical_shape[0]), hidden_size,
+                    hidden_size, static_cast<int>(layer.gate.logical_shape[0]),
                     hidden_size, static_cast<int>(layer.gate.scale.shape[1])),
                 "FP16 fused small-batch SwiGLU");
+        } else if (fused_nvfp4_swiglu) {
+            PhaseScope scope(this, "projection_rows_nvfp4");
+            require_launch(nvfp4_fused_swiglu_projection(
+                layer.gate, layer.up, post.f16_data(),
+                intermediate.f16_data(), rows),
+                "NVFP4 fused Q8 WMMA SwiGLU projection");
         } else {
-            projection(layer.gate, post.f16_data(), gate->f16_data(), rows, "mlp.gate");
-            projection(layer.up, post.f16_data(), up->f16_data(), rows, "mlp.up");
+            if (shared_nvfp4_swiglu) {
+                PhaseScope scope(this, "projection_rows_nvfp4");
+                require_launch(nvfp4_shared_q8_swiglu_projection(
+                    layer.gate, layer.up, post.f16_data(), gate->f16_data(),
+                    up->f16_data(), rows),
+                    "NVFP4 shared-Q8 WMMA gate/up projection");
+            } else {
+                projection(layer.gate, post.f16_data(), gate->f16_data(), rows, "mlp.gate");
+                projection(layer.up, post.f16_data(), up->f16_data(), rows, "mlp.up");
+            }
             require_launch(qwen_silu_mul_rows_f16_cuda(
                 gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
-                static_cast<int>(layer.gate.weight.shape[0])), "FP16 SwiGLU");
+                static_cast<int>(layer.gate.logical_shape[0])), "FP16 SwiGLU");
         }
         // ar.mlp is the largest single collective (3.58 s of the 7.24 s
         // tp_all_reduce leaf at 32K), and down is a large GEMM, so this is the
@@ -2277,7 +2601,10 @@ struct QwenEngine::Impl {
             throw std::runtime_error("Qwen logits require at least one row");
         }
         const int hidden_size = static_cast<int>(config.hidden_size);
-        const int local_vocab = static_cast<int>(lm_head.shape[0]);
+        if (lm_head.logical_shape.size() != 2) {
+            throw std::runtime_error("Qwen target head has invalid logical shape");
+        }
+        const int local_vocab = static_cast<int>(lm_head.logical_shape[0]);
         begin_workspace();
         QwenDeviceTensor& normalized = workspace_half(
             static_cast<size_t>(rows) * hidden_size,
@@ -2294,24 +2621,34 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& local_logits = workspace_float(
             static_cast<size_t>(rows) * local_vocab,
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
-        // The hand-rolled matvec wins at rows==1, but cuBLAS is far better once
-        // the LM head GEMM is batched: verify measured 57.6 vs 70.2 ms/step at
-        // 8192 context. Set QWEN_FP16_LOGITS_CUBLAS=0 to force the custom kernel.
-        const bool cublas_logits = rows > 1 &&
-            qwen_env_enabled_default("QWEN_FP16_LOGITS_CUBLAS");
-        {
+<<<<<<< HEAD
+        bool logits_ok = false;
+        if (lm_head.kind == QwenLinearKind::DenseF16) {
+            const bool cublas_logits = rows > 1 &&
+                qwen_env_enabled_default("QWEN_FP16_LOGITS_CUBLAS");
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
-            require_launch(cublas_logits
+            logits_ok = cublas_logits
                 ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
-                      normalized.f16_data(), lm_head.f16_data(),
+                      normalized.f16_data(), lm_head.weight.f16_data(),
                       local_logits.f32_data(), rows, local_vocab, hidden_size,
                       hidden_size, local_vocab, hidden_size)
                 : qwen_fp16_matmul_rows_f16_f32_cuda(
-                      normalized.f16_data(), lm_head.f16_data(),
+                      normalized.f16_data(), lm_head.weight.f16_data(),
                       local_logits.f32_data(), rows, local_vocab, hidden_size,
-                      hidden_size, local_vocab, hidden_size),
-                "Qwen batched FP32 logits");
+                      hidden_size, local_vocab, hidden_size);
+        } else if (lm_head.kind == QwenLinearKind::Fp8Channel) {
+            PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
+            logits_ok = qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(
+                normalized.f16_data(), lm_head.weight.fp8_data(),
+                lm_head.scale.f16_data(), local_logits.f32_data(), rows,
+                local_vocab, hidden_size, hidden_size, local_vocab,
+                hidden_size);
+        } else {
+            throw std::runtime_error(
+                std::string("Qwen target-head CUDA path is not implemented for ") +
+                qwen_linear_kind_name(lm_head.kind));
         }
+        require_launch(logits_ok, "Qwen batched FP32 logits");
         allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
         allocate_float(argmax_logit, static_cast<size_t>(rows),
@@ -3084,6 +3421,7 @@ struct QwenEngine::Impl {
                mtp_fused.capacity + mtp_next_hidden.capacity +
                mtp_normalized_output.capacity + dspark_target_taps.capacity +
                dflash2_target_taps.capacity + workspace.capacity_bytes() +
+               nvfp4_q8.capacity + nvfp4_q8_scale.capacity +
                (dspark != nullptr ? dspark->activation_workspace_bytes() : 0) +
                (dflash2 != nullptr ? dflash2->activation_workspace_bytes() : 0);
     }
@@ -3169,6 +3507,10 @@ uint64_t QwenEngine::kv_cache_bytes() const {
 
 uint64_t QwenEngine::kv_cache_scale_bytes() const {
     return impl_->cache_scale_bytes;
+}
+
+QwenRuntimeTelemetry QwenEngine::runtime_telemetry() const {
+    return impl_->telemetry;
 }
 
 void QwenEngine::set_dflash2_debug_callback(
