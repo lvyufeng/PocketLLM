@@ -1,0 +1,272 @@
+"""TP4 heterogeneous runtime for Qwen4-Exp.
+
+Launch layout: one process per GPU, NCCL for the per-layer all-reduce.  Dense
+weights are sharded (see `builder.build_heterogeneous`); routed experts and the
+95 GiB PLE table stay in host RAM and are read through the shared page cache, so
+the four ranks pay for one copy between them.
+
+Memory per rank (BF16, 4 ranks):
+  dense sharded weights   ~2.6 GiB   (attn/linear-attn projections, HC mixers)
+  lm_head shard            0.30 GiB
+  KV + conv/recurrent      grows with context
+  staged experts        top_k * 6.6 MiB per layer, freed each step
+
+Entry point: `python -m src.models.qwen4_exp.runtime --model DIR --prompt ...`
+under torchrun, or `run_tp4()` from another module.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+from dataclasses import dataclass
+
+import torch
+
+from src.models.qwen4_exp.builder import build_heterogeneous
+from src.models.qwen4_exp.config import Qwen4ExpConfig
+from src.models.qwen4_exp.model import Qwen4ExpModel
+from src.models.qwen4_exp.weights import MmapSafetensors, Qwen4ExpCheckpoint
+
+
+@dataclass
+class TPContext:
+    rank: int
+    world_size: int
+    device: torch.device
+    initialized: bool
+
+
+def init_distributed() -> TPContext:
+    """Join the torchrun-provided process group, or fall back to single-rank."""
+    import torch.distributed as dist
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+
+    if world_size > 1:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(local_rank)
+        return TPContext(rank, world_size, torch.device(f"cuda:{local_rank}"), True)
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return TPContext(rank, world_size, device, False)
+
+
+def make_all_reduce(ctx: TPContext):
+    """Sum a row-parallel block output across ranks. None when world_size == 1."""
+    if ctx.world_size == 1:
+        return None
+    import torch.distributed as dist
+
+    def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+        # The tensor is a fresh block output, so an in-place reduce is safe and
+        # avoids an extra allocation per layer.
+        tensor = tensor.contiguous()
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
+
+    return all_reduce
+
+
+def gather_logits(logits: torch.Tensor, ctx: TPContext) -> torch.Tensor:
+    """Concatenate the vocab-sharded lm_head outputs into full logits."""
+    if ctx.world_size == 1:
+        return logits
+    import torch.distributed as dist
+
+    parts = [torch.empty_like(logits) for _ in range(ctx.world_size)]
+    dist.all_gather(parts, logits.contiguous())
+    return torch.cat(parts, dim=-1)
+
+
+def load_model(
+    model_dir: str,
+    ctx: TPContext,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    expert_cache_capacity: int = 0,
+) -> tuple[Qwen4ExpModel, Qwen4ExpConfig]:
+    config = Qwen4ExpConfig.from_pretrained(model_dir)
+    checkpoint = Qwen4ExpCheckpoint(model_dir, store=MmapSafetensors(model_dir))
+    model = build_heterogeneous(
+        config.text_config,
+        checkpoint,
+        device=ctx.device,
+        dtype=dtype,
+        rank=ctx.rank,
+        world_size=ctx.world_size,
+        all_reduce=make_all_reduce(ctx),
+        expert_cache_capacity=expert_cache_capacity,
+    )
+    return model, config
+
+
+def generate(
+    model: Qwen4ExpModel,
+    ctx: TPContext,
+    input_ids: torch.Tensor,
+    *,
+    max_new_tokens: int = 32,
+    chunk_size: int = 512,
+    eos_token_ids: tuple[int, ...] = (),
+    on_token=None,
+) -> tuple[list[int], dict[str, float]]:
+    """Greedy decode with chunked prefill.
+
+    Chunking keeps the QSA attention matrix bounded: a 64K single-shot prefill
+    would need a 64K x 64K mask per layer, which does not fit.  The GatedDeltaNet
+    and QSA caches carry state across chunks (validated by
+    `test_chunked_prefill_matches_single_shot`).
+    """
+    prompt_len = input_ids.shape[1]
+    cache = model.make_cache(batch_size=input_ids.shape[0], max_seq_len=prompt_len + max_new_tokens + 1)
+
+    t0 = time.perf_counter()
+    logits = None
+    past = 0
+    while past < prompt_len:
+        piece = input_ids[:, past : past + chunk_size]
+        logits = model.forward(piece, cache=cache, past_len=past)
+        past += piece.shape[1]
+    if ctx.device.type == "cuda":
+        torch.cuda.synchronize()
+    prefill_s = time.perf_counter() - t0
+
+    logits = gather_logits(logits[:, -1], ctx)
+    produced: list[int] = []
+    t1 = time.perf_counter()
+    next_id = logits.argmax(-1, keepdim=True)
+    for _ in range(max_new_tokens):
+        token = int(next_id.item())
+        produced.append(token)
+        if on_token is not None and ctx.rank == 0:
+            on_token(token)
+        if token in eos_token_ids:
+            break
+        step = model.forward(next_id.to(ctx.device), cache=cache, past_len=past)
+        past += 1
+        next_id = gather_logits(step[:, -1], ctx).argmax(-1, keepdim=True)
+    if ctx.device.type == "cuda":
+        torch.cuda.synchronize()
+    decode_s = time.perf_counter() - t1
+
+    stats = {
+        "prompt_tokens": float(prompt_len),
+        "generated_tokens": float(len(produced)),
+        "prefill_s": prefill_s,
+        "decode_s": decode_s,
+        "prefill_tps": prompt_len / prefill_s if prefill_s > 0 else 0.0,
+        "decode_tps": len(produced) / decode_s if decode_s > 0 else 0.0,
+    }
+    return produced, stats
+
+
+def _load_tokenizer(model_dir: str):
+    from tokenizers import Tokenizer
+
+    return Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+
+
+def _apply_chat_template(model_dir: str, prompt: str) -> str:
+    """Wrap a prompt in the checkpoint's chat template if jinja2 is available."""
+    template_path = os.path.join(model_dir, "chat_template.jinja")
+    if not os.path.exists(template_path):
+        return prompt
+    try:
+        from jinja2 import Template
+    except ImportError:
+        return prompt
+    with open(template_path) as f:
+        template = Template(f.read())
+    return template.render(
+        messages=[{"role": "user", "content": prompt}], add_generation_prompt=True
+    )
+
+
+def run_tp4(
+    model_dir: str,
+    prompt: str,
+    *,
+    max_new_tokens: int = 32,
+    chunk_size: int = 512,
+    dtype: torch.dtype = torch.bfloat16,
+    expert_cache_capacity: int = 0,
+    raw_prompt: bool = False,
+) -> dict:
+    ctx = init_distributed()
+    if ctx.rank == 0:
+        print(f"[rank{ctx.rank}] loading {model_dir} world_size={ctx.world_size}", flush=True)
+
+    t0 = time.perf_counter()
+    model, config = load_model(
+        model_dir, ctx, dtype=dtype, expert_cache_capacity=expert_cache_capacity
+    )
+    load_s = time.perf_counter() - t0
+    if ctx.rank == 0:
+        mem = torch.cuda.memory_allocated(ctx.device) / 2**30 if ctx.device.type == "cuda" else 0.0
+        print(f"[rank{ctx.rank}] loaded in {load_s:.1f}s, {mem:.2f} GiB on device", flush=True)
+
+    tokenizer = _load_tokenizer(model_dir)
+    text = prompt if raw_prompt else _apply_chat_template(model_dir, prompt)
+    input_ids = torch.tensor([tokenizer.encode(text).ids], dtype=torch.long)
+
+    eos = tuple(config.text_config.eos_token_id)
+    produced, stats = generate(
+        model,
+        ctx,
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        chunk_size=chunk_size,
+        eos_token_ids=eos,
+    )
+    stats["load_s"] = load_s
+
+    result = {"tokens": produced, "text": tokenizer.decode(produced), "stats": stats}
+    if ctx.rank == 0:
+        print(f"[rank0] output: {result['text']!r}", flush=True)
+        print(f"[rank0] stats: {json.dumps(stats, indent=2)}", flush=True)
+
+    if ctx.initialized:
+        import torch.distributed as dist
+
+        dist.barrier()
+        dist.destroy_process_group()
+    return result
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Qwen4-Exp TP heterogeneous inference")
+    parser.add_argument("--model", required=True, help="checkpoint directory")
+    parser.add_argument("--prompt", default="Hello, who are you?")
+    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--chunk-size", type=int, default=512)
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument(
+        "--expert-cache",
+        type=int,
+        default=0,
+        help="number of staged experts to keep on device (0 = restage every step)",
+    )
+    parser.add_argument("--raw-prompt", action="store_true", help="skip the chat template")
+    args = parser.parse_args()
+
+    run_tp4(
+        args.model,
+        args.prompt,
+        max_new_tokens=args.max_new_tokens,
+        chunk_size=args.chunk_size,
+        dtype=getattr(torch, args.dtype),
+        expert_cache_capacity=args.expert_cache,
+        raw_prompt=args.raw_prompt,
+    )
+
+
+if __name__ == "__main__":
+    main()
