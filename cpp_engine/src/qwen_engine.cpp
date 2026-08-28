@@ -397,11 +397,13 @@ struct QwenEngine::Impl {
     bool sampling_rng_ready = false;
     std::vector<float> host_uniform_scratch;
     QwenWorkspace workspace;
-    // Optional NCCL stream candidate. Every collective is bracketed by events
-    // on the default compute stream, so enabling this cannot expose a partially
-    // reduced tensor to the next layer. It is opt-in because the dependency
-    // chain may leave no useful work to overlap on the target verify topology.
-    const bool use_nccl_comm_stream = qwen_env_enabled("QWEN_NCCL_COMM_STREAM");
+    // Separate NCCL stream. Every collective is bracketed by events on the
+    // default compute stream, so enabling this cannot expose a partially reduced
+    // tensor to the next layer. It is on by default because the sliced
+    // projection+all-reduce pipeline below needs it to hide any of the
+    // collective; `=0` restores the single-stream behaviour.
+    const bool use_nccl_comm_stream =
+        qwen_env_enabled_default("QWEN_NCCL_COMM_STREAM");
     cudaStream_t nccl_comm_stream = nullptr;
     cudaEvent_t nccl_comm_ready = nullptr;
     cudaEvent_t nccl_comm_done = nullptr;
@@ -1308,23 +1310,22 @@ struct QwenEngine::Impl {
     // Number of row slices used by the overlapped projection+all-reduce path.
     // 0 or 1 disables slicing entirely and keeps the serial behaviour.
     //
-    // Opt-in, and deliberately not defaulted on. Measured serially on the real
-    // 64-layer TP4 checkpoint with QWEN_NCCL_COMM_STREAM=1 and both the mlp.down
-    // and lin.out sites overlapped, against the same binary's serial default:
+    // Four slices is the default. Measured serially on the real 64-layer TP4
+    // checkpoint with QWEN_NCCL_COMM_STREAM=1 and both the mlp.down and lin.out
+    // sites overlapped, against the same binary's serial path:
     //
-    //   context   serial    slices=4   prefill   decode
-    //     8192    1221.9     1218.3    1.00x     25.24 -> 24.92
-    //    32768    1228.3     1272.6    1.04x     20.85 -> 20.79
-    //    65536    1065.3     1098.6    1.03x     19.52 -> 19.34
+    //   context   serial    slices=4   slices=8   prefill
+    //    65536    1275.7     1325.8     1304.1     1.04x
     //
-    // Only 3-4% at long context, nothing at 8K, and decode is consistently a
-    // little worse because the comm stream competes for SMs with kernels that had
-    // the device to themselves. The collective is bytes-bound at ~26 GB/s of ring
-    // bandwidth, so most of it simply cannot hide behind one layer's GEMMs.
-    // Enable with QWEN_COMM_OVERLAP_SLICES=4 for long-context prefill-heavy work.
+    // Eight slices is worse than four: the per-slice GEMM gets short enough that
+    // the collective no longer has a full slice of compute to hide under. The
+    // gain used to be 3% when attention dominated; with the 64-row attention tile
+    // the collective is 28.6% of prefill, so hiding part of it is worth more.
+    // The collective is bytes-bound at ~8.8 GB/s of ring bandwidth per rank, so
+    // it cannot be made faster, only hidden. Set 0 or 1 to disable.
     int comm_overlap_slices() const {
         static const int slices =
-            qwen_env_int("QWEN_COMM_OVERLAP_SLICES", 0);
+            qwen_env_int("QWEN_COMM_OVERLAP_SLICES", 4);
         return slices;
     }
 
@@ -2097,7 +2098,11 @@ struct QwenEngine::Impl {
             full_attention(layer, normalized.f16_data(), attention.f16_data(),
                            rows, position_offset);
         }
-        if (qwen_env_enabled("QWEN_FUSE_ATTN_RESID_NORM")) {
+        // One fused pass replaces the residual copy, the add, and the norm. It is
+        // the default: measured on the real 65K TP4 prefill it saves 1.51 s
+        // (55.80 -> 54.28 s) with identical generated tokens. `=0` restores the
+        // three separate passes for A/B.
+        if (qwen_env_enabled_default("QWEN_FUSE_ATTN_RESID_NORM")) {
             PhaseScope scope(this, "attn_resid_norm");
             require_launch(
                 qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(

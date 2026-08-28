@@ -799,9 +799,10 @@ __device__ __forceinline__ void mma_m16n8k8_f16_f32(
 // warps are indexed as (row block, slice): for Q*K each slice takes eight KV
 // positions, for P*V each slice takes 64 of the 256 head dims. Both products are
 // therefore full-width tensor-core work and the only scalar phase left is the
-// 32x32 softmax. Two row blocks per CTA is what makes the ~43 KiB of K/V staging
-// worth its occupancy cost: the tile is loaded once for twice the output.
-constexpr int kMmaQRows = 32;
+// 32x32 softmax. Four row blocks per CTA cuts long-context KV traffic in half.
+// A 512-thread CTA is intentionally limited to one resident block so the
+// accumulator registers are not forced to spill by a two-block launch bound.
+constexpr int kMmaQRows = 64;
 constexpr int kMmaRowBlocks = kMmaQRows / 16;
 constexpr int kMmaKvTile = 32;
 constexpr int kMmaDim = 256;
@@ -1039,10 +1040,13 @@ __global__ __launch_bounds__(kMmaWarps * 32) void gqa_prefill_mma_f16_kernel(
     }
 }
 
-// The second launch_bounds argument asks for two resident blocks, which caps the
-// register budget at 128 per thread. Shared memory is already under half an SM's
-// 64 KB after the aliasing above, so registers are the only other gate.
-__global__ __launch_bounds__(kMmaWarps * 32, 2) void gqa_prefill_mma_occ_f16_kernel(
+// At 64 query rows the CTA is 512 threads, and asking for two resident blocks
+// would cap registers at 64 per thread and spill the accumulators: measured at
+// the real TP4 shape that costs 3.2x on the deep-history cases (268.4 ms against
+// 83.6 at offset 61440). One resident block per SM is therefore requested
+// explicitly, and the wider row tile pays for the lost occupancy by halving how
+// often the KV history is re-streamed.
+__global__ __launch_bounds__(kMmaWarps * 32, 1) void gqa_prefill_mma_occ_f16_kernel(
     const uint16_t* __restrict__ q_rows,
     const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache,
@@ -1054,8 +1058,8 @@ __global__ __launch_bounds__(kMmaWarps * 32, 2) void gqa_prefill_mma_occ_f16_ker
     int position_offset) {
     // ks and vt are live in disjoint phases: Q*K reads ks and is fenced by a
     // __syncthreads() before the softmax, and P*V reads vt only after that. So
-    // they share one buffer, which is what brings shared memory from 40960 B to
-    // 24064 B and lets two CTAs be resident per SM instead of one.
+    // they share one buffer, which keeps the K/V staging at 17408 B instead of
+    // 40960 B and leaves room for the wider row tile's sc/ph arrays.
     constexpr int kStageHalves =
         kMmaKvTile * kMmaKsStride > kMmaDim * kMmaVtStride
             ? kMmaKvTile * kMmaKsStride
@@ -2083,6 +2087,13 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
             // __syncthreads() and a second pass over the KV tile addresses per
             // iteration; the benefit is 1.15x on the kernel and +1.4% end-to-end
             // at bitwise parity. Set DSV4_QWEN_GQA_MMA_OCC=0 to disable.
+            // Pairing two Q heads of one KV head into a CTA was tried and
+            // rejected: it halves the KV traffic on paper, but two sets of Q
+            // fragments and P*V accumulators need ~192 registers per thread, so
+            // ptxas spills 400 bytes and the kernel runs 3x slower (249.0 ms
+            // against 83.6 at 4096 rows, offset 61440) despite bit-identical
+            // output. Sharing a tile across heads needs the accumulators moved to
+            // shared memory first.
             const char* mma_occ = std::getenv("DSV4_QWEN_GQA_MMA_OCC");
             if (mma_occ == nullptr || std::strcmp(mma_occ, "0") != 0) {
                 gqa_prefill_mma_occ_f16_kernel<<<
