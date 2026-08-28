@@ -170,6 +170,17 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
         first.fp8 != second.fp8) {
         return fused;
     }
+    // The two operands must dispatch to the same kernel family, and both must
+    // carry a logical shape: `projection` reads kind and logical_shape, not the
+    // storage shape, so a fused linear that leaves them defaulted would either
+    // pick the wrong kernel or throw. NVFP4 is never fused because its packed
+    // rows and per-tensor factors do not concatenate.
+    if (first.kind != second.kind ||
+        first.kind == QwenLinearKind::NvFp4Group16 ||
+        first.logical_shape.size() != 2 || second.logical_shape.size() != 2 ||
+        first.logical_shape[1] != second.logical_shape[1]) {
+        return fused;
+    }
     if (first.fp8 &&
         (first.scale.data == nullptr || second.scale.data == nullptr ||
          first.scale.shape.size() != 2 || second.scale.shape.size() != 2 ||
@@ -178,6 +189,9 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
         return fused;
     }
 
+    fused.kind = first.kind;
+    fused.logical_shape = {first.logical_shape[0] + second.logical_shape[0],
+                           first.logical_shape[1]};
     const uint64_t first_rows = first.weight.shape[0];
     const uint64_t second_rows = second.weight.shape[0];
     const uint64_t columns = first.weight.shape[1];

@@ -615,13 +615,13 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "prefill_chunk_tokens": args.prefill_chunk_tokens,
         "kv_cache_dtype": args.kv_cache_dtype,
-<<<<<<< HEAD
         "git_revision": git_revision(),
         "binary_metadata": binary_metadata(binary),
+        # Both the ambient CUDA/NCCL environment and the explicit --env overrides
+        # are recorded. They answer different questions: the first says what the
+        # machine was, the second says what the run asked for.
         "environment": environment_metadata(),
-        "serial_cases": True,
-        "phase_profile_diagnostic_only": "QWEN_PHASE_PROFILE" in os.environ,
-=======
+        "env_overrides": env_overrides,
         "qwen_sampling": {
             "temperature": args.qwen_temperature,
             "top_p": args.qwen_top_p,
@@ -629,8 +629,8 @@ def main() -> int:
             "seed": args.qwen_seed,
         },
         "repetitions": args.repetitions,
-        "environment": env_overrides,
->>>>>>> 456f45c (Add Qwen3.8-27B-NVFP4 TP2 runtime with wide INT8 prefill tile)
+        "serial_cases": True,
+        "phase_profile_diagnostic_only": "QWEN_PHASE_PROFILE" in os.environ,
         "results": results,
     }
     result_path = work_dir / "results.json"
