@@ -799,9 +799,10 @@ __device__ __forceinline__ void mma_m16n8k8_f16_f32(
 // warps are indexed as (row block, slice): for Q*K each slice takes eight KV
 // positions, for P*V each slice takes 64 of the 256 head dims. Both products are
 // therefore full-width tensor-core work and the only scalar phase left is the
-// 32x32 softmax. Two row blocks per CTA is what makes the ~43 KiB of K/V staging
-// worth its occupancy cost: the tile is loaded once for twice the output.
-constexpr int kMmaQRows = 32;
+// 32x32 softmax. Four row blocks per CTA cuts long-context KV traffic in half.
+// A 512-thread CTA is intentionally limited to one resident block so the
+// accumulator registers are not forced to spill by a two-block launch bound.
+constexpr int kMmaQRows = 64;
 constexpr int kMmaRowBlocks = kMmaQRows / 16;
 constexpr int kMmaKvTile = 32;
 constexpr int kMmaDim = 256;
@@ -931,6 +932,251 @@ __global__ __launch_bounds__(kMmaWarps * 32) void gqa_prefill_mma_f16_kernel(
             sc[lrow0][col + 1] = s[1];
             sc[lrow1][col] = s[2];
             sc[lrow1][col + 1] = s[3];
+        }
+        __syncthreads();
+
+        // Online softmax over the 16x32 tile. Eight threads share a row, so the
+        // row reductions are three shuffles inside a warp.
+        {
+            const int row = tid >> 3;
+            const int col0 = (tid & 7) * 4;
+            const int token = qbase + row;
+            const int limit = token < seq_len ? position_offset + token : -1;
+            const float m_old = row_m[row];
+            const float l_old = row_l[row];
+            float sv[4];
+            float local_max = -INFINITY;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = col0 + i;
+                float value = -INFINITY;
+                if (col < count && base + col <= limit) {
+                    value = sc[row][col] * attention_scale;
+                }
+                sv[i] = value;
+                local_max = fmaxf(local_max, value);
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                local_max = fmaxf(local_max,
+                                  __shfl_xor_sync(0xffffffffu, local_max, off));
+            }
+            const float m_new = fmaxf(m_old, local_max);
+            float local_sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                // The numerator is rounded to half for the tensor-core operand,
+                // so the denominator sums the rounded values to keep the two
+                // consistent.
+                uint16_t bits = 0;
+                if (m_new != -INFINITY && sv[i] != -INFINITY) {
+                    bits = float_to_half(expf(sv[i] - m_new));
+                    local_sum += half_to_float(bits);
+                }
+                ph[row][col0 + i] = bits;
+            }
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                local_sum += __shfl_xor_sync(0xffffffffu, local_sum, off);
+            }
+            __syncwarp();
+            if ((tid & 7) == 0) {
+                const float alpha =
+                    m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+                row_alpha[row] = alpha;
+                row_m[row] = m_new;
+                row_l[row] = l_old * alpha + local_sum;
+            }
+        }
+        __syncthreads();
+
+        {
+            const float alpha0 = row_alpha[lrow0];
+            const float alpha1 = row_alpha[lrow1];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                acc[j][0] *= alpha0;
+                acc[j][1] *= alpha0;
+                acc[j][2] *= alpha1;
+                acc[j][3] *= alpha1;
+            }
+#pragma unroll
+            for (int kt = 0; kt < kMmaKvTile / 8; ++kt) {
+                uint32_t a[2];
+                a[0] = *reinterpret_cast<const uint32_t*>(
+                    &ph[lrow0][kt * 8 + tig * 2]);
+                a[1] = *reinterpret_cast<const uint32_t*>(
+                    &ph[lrow1][kt * 8 + tig * 2]);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                        &vt[slice * 64 + j * 8 + gid][kt * 8 + tig * 2]);
+                    mma_m16n8k8_f16_f32(acc[j], a, b);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    const float inv0 = row_l[lrow0] > 0.0f ? 1.0f / row_l[lrow0] : 0.0f;
+    const float inv1 = row_l[lrow1] > 0.0f ? 1.0f / row_l[lrow1] : 0.0f;
+    const int row0 = qbase + lrow0;
+    const int row1 = qbase + lrow1;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int dim = slice * 64 + j * 8 + tig * 2;
+        if (row0 < seq_len) {
+            uint16_t* out = output +
+                (static_cast<size_t>(row0) * q_heads + head) * head_dim + dim;
+            out[0] = float_to_half(acc[j][0] * inv0);
+            out[1] = float_to_half(acc[j][1] * inv0);
+        }
+        if (row1 < seq_len) {
+            uint16_t* out = output +
+                (static_cast<size_t>(row1) * q_heads + head) * head_dim + dim;
+            out[0] = float_to_half(acc[j][2] * inv1);
+            out[1] = float_to_half(acc[j][3] * inv1);
+        }
+    }
+}
+
+// At 64 query rows the CTA is 512 threads, and asking for two resident blocks
+// would cap registers at 64 per thread and spill the accumulators: measured at
+// the real TP4 shape that costs 3.2x on the deep-history cases (268.4 ms against
+// 83.6 at offset 61440). One resident block per SM is therefore requested
+// explicitly, and the wider row tile pays for the lost occupancy by halving how
+// often the KV history is re-streamed.
+__global__ __launch_bounds__(kMmaWarps * 32, 1) void gqa_prefill_mma_occ_f16_kernel(
+    const uint16_t* __restrict__ q_rows,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ output,
+    int seq_len,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int position_offset) {
+    // ks and vt are live in disjoint phases: Q*K reads ks and is fenced by a
+    // __syncthreads() before the softmax, and P*V reads vt only after that. So
+    // they share one buffer, which keeps the K/V staging at 17408 B instead of
+    // 40960 B and leaves room for the wider row tile's sc/ph arrays.
+    constexpr int kStageHalves =
+        kMmaKvTile * kMmaKsStride > kMmaDim * kMmaVtStride
+            ? kMmaKvTile * kMmaKsStride
+            : kMmaDim * kMmaVtStride;
+    __shared__ __align__(16) uint16_t kv_stage[kStageHalves];
+    uint16_t (*ks)[kMmaKsStride] =
+        reinterpret_cast<uint16_t (*)[kMmaKsStride]>(kv_stage);
+    uint16_t (*vt)[kMmaVtStride] =
+        reinterpret_cast<uint16_t (*)[kMmaVtStride]>(kv_stage);
+    __shared__ float sc[kMmaQRows][kMmaKvTile];
+    __shared__ __align__(16) uint16_t ph[kMmaQRows][kMmaVtStride];
+    __shared__ float row_m[kMmaQRows];
+    __shared__ float row_l[kMmaQRows];
+    __shared__ float row_alpha[kMmaQRows];
+
+    const int head = static_cast<int>(blockIdx.x);
+    const int qbase = static_cast<int>(blockIdx.y) * kMmaQRows;
+    if (head >= q_heads || qbase >= seq_len || head_dim != kMmaDim ||
+        q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0) {
+        return;
+    }
+    const int kv_head = head / (q_heads / kv_heads);
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int block_row = (warp / kMmaSlices) * 16;
+    const int slice = warp % kMmaSlices;
+    const int lane = tid & 31;
+    // m16n8k8 operand mapping: the eight lanes of a group share a matrix row and
+    // the four lanes within a group cover two adjacent columns each.
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    // Rows of the 16x8 A/D fragment owned by this lane, in CTA-local terms.
+    const int lrow0 = block_row + gid;
+    const int lrow1 = block_row + gid + 8;
+
+    float acc[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
+    }
+    if (tid < kMmaQRows) {
+        row_m[tid] = -INFINITY;
+        row_l[tid] = 0.0f;
+    }
+
+    // Q is reused by every KV tile, so it stays resident in registers.
+    uint32_t qfrag[kMmaSteps][2];
+#pragma unroll
+    for (int k = 0; k < kMmaSteps; ++k) {
+        const int col = k * 8 + tig * 2;
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            const int row = qbase + (part == 0 ? lrow0 : lrow1);
+            uint32_t value = 0;
+            if (row < seq_len) {
+                value = *reinterpret_cast<const uint32_t*>(
+                    q_rows + (static_cast<size_t>(row) * q_heads + head) *
+                        head_dim + col);
+            }
+            qfrag[k][part] = value;
+        }
+    }
+
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    const int q_last = position_offset + min(qbase + kMmaQRows - 1, seq_len - 1);
+    const int tile_context = q_last + 1;
+    const float attention_scale = rsqrtf(static_cast<float>(head_dim));
+    __syncthreads();
+
+    for (int base = 0; base < tile_context; base += kMmaKvTile) {
+        const int count = min(kMmaKvTile, tile_context - base);
+        for (int idx = tid; idx < kMmaKvTile * kMmaSteps;
+             idx += kMmaWarps * 32) {
+            const int slot = idx / kMmaSteps;
+            const int chunk = idx - slot * kMmaSteps;
+            uint4 kv = make_uint4(0u, 0u, 0u, 0u);
+            if (slot < count) {
+                const size_t at = static_cast<size_t>(base + slot) * kv_stride +
+                    static_cast<size_t>(kv_head) * head_dim + chunk * 8;
+                kv = *reinterpret_cast<const uint4*>(k_cache + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[slot][chunk * 8]) = kv;
+        }
+        __syncthreads();
+
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int k = 0; k < kMmaSteps; ++k) {
+            const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                &ks[slice * 8 + gid][k * 8 + tig * 2]);
+            mma_m16n8k8_f16_f32(s, qfrag[k], b);
+        }
+        {
+            const int col = slice * 8 + tig * 2;
+            sc[lrow0][col] = s[0];
+            sc[lrow0][col + 1] = s[1];
+            sc[lrow1][col] = s[2];
+            sc[lrow1][col + 1] = s[3];
+        }
+        // Scores are in sc[][] now, so ks is dead and V can reuse its memory.
+        // V is transposed on the way in so the P*V B operand, which wants eight
+        // consecutive positions for one dim, is a 4-byte shared load.
+        __syncthreads();
+        for (int idx = tid; idx < kMmaKvTile * kMmaSteps;
+             idx += kMmaWarps * 32) {
+            const int slot = idx / kMmaSteps;
+            const int chunk = idx - slot * kMmaSteps;
+            uint4 vv = make_uint4(0u, 0u, 0u, 0u);
+            if (slot < count) {
+                const size_t at = static_cast<size_t>(base + slot) * kv_stride +
+                    static_cast<size_t>(kv_head) * head_dim + chunk * 8;
+                vv = *reinterpret_cast<const uint4*>(v_cache + at);
+            }
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(&vv);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) vt[chunk * 8 + i][slot] = src[i];
         }
         __syncthreads();
 
@@ -1835,6 +2081,28 @@ bool qwen_gqa_prefill_attention_f16_tiled_cuda(
             const dim3 mma_grid(
                 static_cast<unsigned>(q_heads),
                 static_cast<unsigned>((seq_len + kMmaQRows - 1) / kMmaQRows), 1);
+            // The occupancy variant aliases the K and V staging buffers, which
+            // are live in disjoint phases, cutting shared memory 40960 -> 24064 B
+            // so two CTAs fit per SM instead of one. The cost is one extra
+            // __syncthreads() and a second pass over the KV tile addresses per
+            // iteration; the benefit is 1.15x on the kernel and +1.4% end-to-end
+            // at bitwise parity. Set DSV4_QWEN_GQA_MMA_OCC=0 to disable.
+            // Pairing two Q heads of one KV head into a CTA was tried and
+            // rejected: it halves the KV traffic on paper, but two sets of Q
+            // fragments and P*V accumulators need ~192 registers per thread, so
+            // ptxas spills 400 bytes and the kernel runs 3x slower (249.0 ms
+            // against 83.6 at 4096 rows, offset 61440) despite bit-identical
+            // output. Sharing a tile across heads needs the accumulators moved to
+            // shared memory first.
+            const char* mma_occ = std::getenv("DSV4_QWEN_GQA_MMA_OCC");
+            if (mma_occ == nullptr || std::strcmp(mma_occ, "0") != 0) {
+                gqa_prefill_mma_occ_f16_kernel<<<
+                    mma_grid, kMmaWarps * 32, 0,
+                    static_cast<cudaStream_t>(stream)>>>(
+                    q, k_cache, v_cache, output, seq_len, q_heads, kv_heads,
+                    head_dim, position_offset);
+                return cudaGetLastError() == cudaSuccess;
+            }
             gqa_prefill_mma_f16_kernel<<<
                 mma_grid, kMmaWarps * 32, 0,
                 static_cast<cudaStream_t>(stream)>>>(

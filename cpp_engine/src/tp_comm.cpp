@@ -1,6 +1,11 @@
 #include "tp_comm.hpp"
 
 #ifdef DSV4_HAVE_NCCL
+// Both are required: qwen_sampler.hpp for the sampler uniforms and
+// qwen_cuda_ops.hpp for the DFlash2 top-k pack/merge kernels used by the
+// global-top1 collective below. The latter is only visible in NCCL builds,
+// which is why dropping it still compiled with NCCL off.
+#include "qwen_cuda_ops.hpp"
 #include "qwen_sampler.hpp"
 
 #include <cuda_runtime.h>
