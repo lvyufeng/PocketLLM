@@ -392,6 +392,10 @@ add_executable(bench_qwen_transaction_copy tests/bench_qwen_transaction_copy.cpp
 target_link_libraries(bench_qwen_transaction_copy PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_transaction_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_gqa_mma_occ tests/test_qwen_gqa_mma_occ.cpp)
+target_link_libraries(test_qwen_gqa_mma_occ PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_gqa_mma_occ PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
 target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
