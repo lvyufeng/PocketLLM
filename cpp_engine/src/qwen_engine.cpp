@@ -1753,15 +1753,20 @@ struct QwenEngine::Impl {
              rows * q_heads, head_dim);
         norm(layer.full.k_norm, k.f16_data(), k_norm.f16_data(),
              rows * kv_heads, head_dim);
-        require_launch(qwen_partial_rope_rows_f16_cuda(
-            q_norm.f16_data(), k_norm.f16_data(), position_offset, rows,
-            static_cast<int>(config.partial_rotary_dim()),
-            static_cast<float>(config.rope_theta), q_heads, kv_heads, head_dim),
-            "FP16 partial RoPE");
+        {
+            PhaseScope sub(this, "full.rope");
+            require_launch(qwen_partial_rope_rows_f16_cuda(
+                q_norm.f16_data(), k_norm.f16_data(), position_offset, rows,
+                static_cast<int>(config.partial_rotary_dim()),
+                static_cast<float>(config.rope_theta), q_heads, kv_heads, head_dim),
+                "FP16 partial RoPE");
+        }
 
         const QwenKvCacheDType cache_dtype = options.kv_cache_dtype;
         const int attention_window = options.attention_window;
         const int sink_tokens = options.attention_sink_tokens;
+        {
+        PhaseScope append_scope(this, "full.kv_append");
         if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
@@ -1786,6 +1791,7 @@ struct QwenEngine::Impl {
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
                 layer.full.v_cache.f16_data(), rows, kv_heads, head_dim,
                 position_offset, max_context), "append FP16 full KV cache");
+        }
         }
 
         if (rows == 1) {
@@ -2031,6 +2037,7 @@ struct QwenEngine::Impl {
         // wider TP4 candidate is selected separately through LONG_TILE.
         } else if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
                    attention_window > 0) {
+            PhaseScope sub(this, "full.attn_kernel");
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
                 q_norm.f16_data(), layer.full.k_cache.f16_data(),
                 layer.full.v_cache.f16_data(), attention.f16_data(), rows,
@@ -2038,6 +2045,7 @@ struct QwenEngine::Impl {
                 attention_window, sink_tokens),
                 "prefill optimized FP16-cache GQA");
         } else {
+            PhaseScope sub(this, "full.attn_kernel");
             require_launch(qwen_gqa_prefill_attention_f16_cuda(
                 q_norm.f16_data(), layer.full.k_cache.f16_data(),
                 layer.full.v_cache.f16_data(), attention.f16_data(), rows,
@@ -2130,6 +2138,7 @@ struct QwenEngine::Impl {
         } else {
             projection(layer.gate, post.f16_data(), gate->f16_data(), rows, "mlp.gate");
             projection(layer.up, post.f16_data(), up->f16_data(), rows, "mlp.up");
+            PhaseScope sub(this, "swiglu.act");
             require_launch(qwen_silu_mul_rows_f16_cuda(
                 gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
                 static_cast<int>(layer.gate.weight.shape[0])), "FP16 SwiGLU");
