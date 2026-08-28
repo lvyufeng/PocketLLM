@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -36,8 +37,9 @@ uint64_t numel(const std::vector<uint64_t>& shape) {
 }
 
 uint64_t dtype_size(const std::string& dtype) {
-    if (dtype == "F8_E4M3") return 1;
+    if (dtype == "F8_E4M3" || dtype == "U8") return 1;
     if (dtype == "BF16") return 2;
+    if (dtype == "F32") return 4;
     throw std::runtime_error("unsupported fixture dtype: " + dtype);
 }
 
@@ -184,12 +186,13 @@ bool write_file(const std::string& path, const std::string& contents) {
     return static_cast<bool>(out);
 }
 
-bool write_fixture(const std::string& dir) {
+bool write_specs_fixture(const std::string& dir,
+                         const std::vector<TensorSpec>& specs,
+                         bool sentinel) {
     const std::string mkdir_cmd = "mkdir -p '" + dir + "'";
     if (std::system(mkdir_cmd.c_str()) != 0) return false;
     if (!write_file(dir + "/config.json", config_json())) return false;
 
-    const std::vector<TensorSpec> specs = tensor_specs();
     std::ostringstream header;
     header << '{';
     uint64_t offset = 0;
@@ -204,13 +207,31 @@ bool write_fixture(const std::string& dir) {
     }
     header << '}';
 
-    std::ofstream shard(dir + "/model.safetensors", std::ios::binary | std::ios::trunc);
+    std::ofstream shard(dir + "/model.safetensors",
+                        std::ios::binary | std::ios::trunc);
     if (!shard) return false;
     const uint64_t header_len = header.str().size();
     shard.write(reinterpret_cast<const char*>(&header_len), sizeof(header_len));
     shard.write(header.str().data(), static_cast<std::streamsize>(header.str().size()));
-    std::vector<uint8_t> zeros(static_cast<size_t>(offset), 0);
-    shard.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
+    for (size_t tensor = 0; tensor < specs.size(); ++tensor) {
+        const TensorSpec& spec = specs[tensor];
+        const size_t bytes = static_cast<size_t>(
+            numel(spec.shape) * dtype_size(spec.dtype));
+        std::vector<uint8_t> payload(bytes, 0);
+        if (sentinel) {
+            for (size_t i = 0; i < bytes; ++i) {
+                payload[i] = static_cast<uint8_t>(
+                    (tensor * 29 + i + i / 251) & 0xffu);
+            }
+            if (spec.dtype == "F32" && bytes == sizeof(float)) {
+                const float value = spec.name.find("weight_global") !=
+                        std::string::npos ? 4.0f : 2.0f;
+                std::memcpy(payload.data(), &value, sizeof(value));
+            }
+        }
+        shard.write(reinterpret_cast<const char*>(payload.data()),
+                    static_cast<std::streamsize>(payload.size()));
+    }
     if (!shard) return false;
 
     std::ostringstream index;
@@ -222,6 +243,50 @@ bool write_fixture(const std::string& dir) {
     }
     index << "}}";
     return write_file(dir + "/model.safetensors.index.json", index.str());
+}
+
+bool write_fixture(const std::string& dir) {
+    return write_specs_fixture(dir, tensor_specs(), false);
+}
+
+std::string mixed_fixture_dir() {
+    const char* base = std::getenv("CLAUDE_JOB_DIR");
+    const std::string root = base != nullptr
+        ? std::string(base) + "/tmp" : std::string("/tmp");
+    return root + "/qwen_weights_mixed_tp2_fixture";
+}
+
+std::vector<TensorSpec> mixed_tensor_specs() {
+    std::vector<TensorSpec> specs = tensor_specs();
+    auto erase = [&specs](const std::string& name) {
+        specs.erase(std::remove_if(
+            specs.begin(), specs.end(),
+            [&](const TensorSpec& spec) { return spec.name == name; }),
+            specs.end());
+    };
+    erase("lm_head.weight");
+    specs.push_back({"lm_head.weight", "F8_E4M3", {512, 128}});
+    specs.push_back({"lm_head.weight_scale", "BF16", {512, 1}});
+    for (int layer = 0; layer < 2; ++layer) {
+        const std::string prefix = "model.language_model.layers." +
+            std::to_string(layer) + ".mlp.";
+        for (const std::string projection : {
+                 "gate_proj", "up_proj", "down_proj"}) {
+            const std::string base = prefix + projection;
+            erase(base + ".weight");
+            erase(base + ".weight_scale_inv");
+            const std::vector<uint64_t> logical = projection == "down_proj"
+                ? std::vector<uint64_t>{128, 512}
+                : std::vector<uint64_t>{512, 128};
+            specs.push_back({base + ".weight_packed", "U8",
+                             {logical[0], logical[1] / 2}});
+            specs.push_back({base + ".weight_scale", "F8_E4M3",
+                             {logical[0], logical[1] / 16}});
+            specs.push_back({base + ".weight_global_scale", "F32", {1}});
+            specs.push_back({base + ".input_global_scale", "F32", {1}});
+        }
+    }
+    return specs;
 }
 
 void require(bool condition, const std::string& message) {
@@ -251,6 +316,8 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
             "in_proj_b must remain BF16 in storage");
     require(linear.in_proj_b.weight.device_dtype == dsv4::SafeDType::F16,
             "in_proj_b must upload as FP16 on Turing");
+    require(linear.in_proj_qkv.kind == dsv4::QwenLinearKind::Fp8Block128,
+            "legacy QKV must use block-128 FP8");
     require(linear.in_proj_qkv.weight.dtype == dsv4::SafeDType::F8_E4M3 &&
                 linear.in_proj_qkv.weight.device_dtype == dsv4::SafeDType::F8_E4M3,
             "QKV FP8 must remain compressed on device");
@@ -315,9 +382,14 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
             "embedding local shape");
     require(map.embed_tokens().device_dtype == dsv4::SafeDType::F16,
             "embedding must upload as FP16");
-    require(map.lm_head().local_shape == std::vector<uint64_t>({128, 128}),
+    require(map.lm_head().kind == dsv4::QwenLinearKind::DenseF16,
+            "head linear kind");
+    require(map.lm_head().logical_local_shape ==
+                std::vector<uint64_t>({128, 128}) &&
+                map.lm_head().weight.local_shape ==
+                    std::vector<uint64_t>({128, 128}),
             "head local shape");
-    require(map.lm_head().device_dtype == dsv4::SafeDType::F16,
+    require(map.lm_head().weight.device_dtype == dsv4::SafeDType::F16,
             "head must upload as FP16");
 
     const dsv4::QwenMtpWeights& mtp = map.mtp();
@@ -385,6 +457,89 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
             "weight byte accounting");
 }
 
+void check_mixed_tp2() {
+    const std::string dir = mixed_fixture_dir();
+    require(write_specs_fixture(dir, mixed_tensor_specs(), true),
+            "could not create mixed TP2 fixture");
+    const dsv4::QwenConfig config = dsv4::QwenConfig::from_hf_config(dir);
+    dsv4::SafeTensorsIndex index(dir);
+    dsv4::QwenWeightMap rank0(index, config, 2, 0);
+    dsv4::QwenWeightMap rank1(index, config, 2, 1);
+    for (const dsv4::QwenWeightMap* map : {&rank0, &rank1}) {
+        require(map->lm_head().kind == dsv4::QwenLinearKind::Fp8Channel,
+                "mixed head kind");
+        require(map->lm_head().logical_local_shape ==
+                    std::vector<uint64_t>({256, 128}) &&
+                map->lm_head().scale.local_shape ==
+                    std::vector<uint64_t>({256, 1}),
+                "mixed head local shape");
+        require(map->mtp().fc.kind == dsv4::QwenLinearKind::DenseF16,
+                "mixed MTP remains dense");
+        const auto kinds = map->checkpoint_linear_kind_counts();
+        require(kinds.dense_f16 == 3 && kinds.fp8_block128 == 14 &&
+                    kinds.fp8_channel == 1 && kinds.nvfp4_group16 == 6,
+                "mixed checkpoint linear kind counts dense=" +
+                    std::to_string(kinds.dense_f16) + " block=" +
+                    std::to_string(kinds.fp8_block128) + " channel=" +
+                    std::to_string(kinds.fp8_channel) + " nvfp4=" +
+                    std::to_string(kinds.nvfp4_group16));
+        const auto& mlp = map->layers()[0].mlp;
+        require(mlp.gate_proj.kind == dsv4::QwenLinearKind::NvFp4Group16 &&
+                    mlp.up_proj.kind == dsv4::QwenLinearKind::NvFp4Group16 &&
+                    mlp.down_proj.kind == dsv4::QwenLinearKind::NvFp4Group16,
+                "mixed MLP NVFP4 kinds");
+        require(mlp.gate_proj.logical_local_shape ==
+                    std::vector<uint64_t>({256, 128}) &&
+                mlp.gate_proj.weight.local_shape ==
+                    std::vector<uint64_t>({256, 64}) &&
+                mlp.gate_proj.scale.local_shape ==
+                    std::vector<uint64_t>({256, 8}),
+                "NVFP4 column shard shapes");
+        require(mlp.down_proj.logical_local_shape ==
+                    std::vector<uint64_t>({128, 256}) &&
+                mlp.down_proj.weight.local_shape ==
+                    std::vector<uint64_t>({128, 128}) &&
+                mlp.down_proj.scale.local_shape ==
+                    std::vector<uint64_t>({128, 16}),
+                "NVFP4 row shard shapes");
+    }
+    require(rank0.layers()[0].mlp.down_proj.weight.shard_start == 0 &&
+                rank1.layers()[0].mlp.down_proj.weight.shard_start == 128 &&
+                rank1.layers()[0].mlp.down_proj.scale.shard_start == 16,
+            "NVFP4 logical K shard offsets");
+    const auto host0 = dsv4::qwen_materialize_nvfp4_host_linear(
+        index, rank0.layers()[0].mlp.gate_proj);
+    const auto host1 = dsv4::qwen_materialize_nvfp4_host_linear(
+        index, rank1.layers()[0].mlp.gate_proj);
+    require(host0.logical_shape == std::vector<uint64_t>({256, 128}) &&
+                host0.blocks.size() == 512 &&
+                host0.weight_global_factor == 0.25f &&
+                host0.input_global_scale == 2.0f,
+            "NVFP4 host interleave metadata");
+    require(host0.blocks.front().qs[1] != host1.blocks.front().qs[1],
+            "NVFP4 nonzero rank sentinel");
+    const auto packed0 = dsv4::qwen_materialize_host_tensor(
+        index, rank0.layers()[0].mlp.gate_proj.weight);
+    const auto scales0 = dsv4::qwen_materialize_host_tensor(
+        index, rank0.layers()[0].mlp.gate_proj.scale);
+    const uint64_t interleaved_bytes = host0.blocks.size() *
+        sizeof(dsv4::QwenNvfp4Block64);
+    require(packed0.bytes.size() == 256u * 128u / 2u &&
+                scales0.bytes.size() == 256u * 128u / 16u &&
+                interleaved_bytes == packed0.bytes.size() + scales0.bytes.size(),
+            "NVFP4 resident weight/scale accounting");
+    require(rank0.host_global_metadata_bytes() == 12u * sizeof(float),
+            "NVFP4 host-only global metadata accounting");
+    require(std::equal(std::begin(host0.blocks.front().qs),
+                       std::end(host0.blocks.front().qs),
+                       packed0.bytes.begin()),
+            "NVFP4 block packed bytes");
+    require(std::equal(std::begin(host0.blocks.front().d),
+                       std::end(host0.blocks.front().d),
+                       scales0.bytes.begin()),
+            "NVFP4 block scale bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -397,7 +552,9 @@ int main() {
         const dsv4::QwenConfig config = dsv4::QwenConfig::from_hf_config(dir);
         dsv4::SafeTensorsIndex index(dir);
         for (int rank = 0; rank < 4; ++rank) check_rank(index, config, rank);
-        std::cout << "[PASS] test_qwen_weights tp=4 layers=" << config.num_hidden_layers << "\n";
+        check_mixed_tp2();
+        std::cout << "[PASS] test_qwen_weights tp=4 legacy tp=2 mixed layers="
+                  << config.num_hidden_layers << "\n";
         return 0;
     } catch (const std::exception& ex) {
         std::cout << "[FAIL] test_qwen_weights " << ex.what() << "\n";

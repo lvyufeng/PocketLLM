@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +37,26 @@ void shard_range(uint64_t total, int world, int rank, uint64_t* start, uint64_t*
     }
     *size = total / static_cast<uint64_t>(world);
     *start = *size * static_cast<uint64_t>(rank);
+}
+
+void validate_model_tp(const QwenConfig& config, int world) {
+    auto require_divisible = [world](uint64_t value, const char* name) {
+        if (value == 0 || value % static_cast<uint64_t>(world) != 0) {
+            throw std::runtime_error(
+                std::string("Qwen ") + name + " is not divisible by TP world " +
+                std::to_string(world));
+        }
+    };
+    require_divisible(config.vocab_size, "vocabulary size");
+    require_divisible(config.mlp.intermediate_size, "MLP intermediate size");
+    require_divisible(config.full_attention.num_heads,
+                      "full-attention query heads");
+    require_divisible(config.full_attention.num_key_value_heads,
+                      "full-attention KV heads");
+    require_divisible(config.linear_attention.key_heads,
+                      "linear-attention key heads");
+    require_divisible(config.linear_attention.value_heads,
+                      "linear-attention value heads");
 }
 
 }  // namespace
@@ -162,6 +183,16 @@ const int8_t* QwenDeviceTensor::int8_data() const {
     return static_cast<const int8_t*>(data);
 }
 
+uint8_t* QwenDeviceTensor::u8_data() {
+    if (device_dtype != SafeDType::U8) throw std::runtime_error("Qwen tensor is not U8");
+    return static_cast<uint8_t*>(data);
+}
+
+const uint8_t* QwenDeviceTensor::u8_data() const {
+    if (device_dtype != SafeDType::U8) throw std::runtime_error("Qwen tensor is not U8");
+    return static_cast<const uint8_t*>(data);
+}
+
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
     if (!ref.found) throw std::runtime_error("cannot materialize an absent Qwen tensor: " + ref.name);
@@ -268,6 +299,72 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
     throw std::runtime_error("unsupported Qwen materialization rank/dimension: " + ref.name);
 }
 
+QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
+    const SafeTensorsIndex& index, const QwenLinearRef& ref) {
+    if (ref.kind != QwenLinearKind::NvFp4Group16 || !ref.has_scale ||
+        !ref.has_weight_global_scale || !ref.has_input_global_scale ||
+        ref.logical_local_shape.size() != 2) {
+        throw std::runtime_error("invalid Qwen NVFP4 linear descriptor");
+    }
+    const uint64_t rows = ref.logical_local_shape[0];
+    const uint64_t cols = ref.logical_local_shape[1];
+    if (rows == 0 || cols == 0 || cols % 64 != 0) {
+        throw std::runtime_error(
+            "Qwen NVFP4 logical local shape is not block64 aligned");
+    }
+    const QwenHostTensor packed = qwen_materialize_host_tensor(index, ref.weight);
+    const QwenHostTensor scales = qwen_materialize_host_tensor(index, ref.scale);
+    const QwenHostTensor weight_global =
+        qwen_materialize_host_tensor(index, ref.weight_global_scale);
+    const QwenHostTensor input_global =
+        qwen_materialize_host_tensor(index, ref.input_global_scale);
+    const uint64_t expected_packed = rows * cols / 2;
+    const uint64_t expected_scales = rows * cols / 16;
+    if (packed.device_dtype != SafeDType::U8 ||
+        scales.device_dtype != SafeDType::F8_E4M3 ||
+        packed.bytes.size() != expected_packed ||
+        scales.bytes.size() != expected_scales ||
+        weight_global.device_dtype != SafeDType::F32 ||
+        input_global.device_dtype != SafeDType::F32 ||
+        weight_global.bytes.size() != sizeof(float) ||
+        input_global.bytes.size() != sizeof(float)) {
+        throw std::runtime_error("Qwen NVFP4 materialized metadata mismatch");
+    }
+
+    float checkpoint_weight_global = 0.0f;
+    float checkpoint_input_global = 0.0f;
+    std::memcpy(&checkpoint_weight_global, weight_global.bytes.data(),
+                sizeof(float));
+    std::memcpy(&checkpoint_input_global, input_global.bytes.data(),
+                sizeof(float));
+    if (!std::isfinite(checkpoint_weight_global) ||
+        checkpoint_weight_global == 0.0f ||
+        !std::isfinite(checkpoint_input_global) ||
+        checkpoint_input_global == 0.0f) {
+        throw std::runtime_error("Qwen NVFP4 global scale is non-finite or zero");
+    }
+
+    QwenNvfp4HostLinear output;
+    output.logical_shape = ref.logical_local_shape;
+    output.weight_global_factor = 1.0f / checkpoint_weight_global;
+    output.input_global_scale = checkpoint_input_global;
+    const uint64_t blocks_per_row = cols / 64;
+    output.blocks.resize(static_cast<size_t>(rows * blocks_per_row));
+    for (uint64_t row = 0; row < rows; ++row) {
+        const uint8_t* packed_row = packed.bytes.data() + row * cols / 2;
+        const uint8_t* scale_row = scales.bytes.data() + row * cols / 16;
+        for (uint64_t block = 0; block < blocks_per_row; ++block) {
+            QwenNvfp4Block64& destination =
+                output.blocks[static_cast<size_t>(row * blocks_per_row + block)];
+            std::memcpy(destination.d, scale_row + block * 4,
+                        sizeof(destination.d));
+            std::memcpy(destination.qs, packed_row + block * 32,
+                        sizeof(destination.qs));
+        }
+    }
+    return output;
+}
+
 QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
                                          const QwenTensorRef& ref,
                                          void* stream) {
@@ -290,6 +387,38 @@ QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
         device.capacity = 0;
         throw std::runtime_error("failed to upload Qwen device tensor: " + ref.name);
     }
+    return device;
+}
+
+QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
+    const SafeTensorsIndex& index, const QwenLinearRef& ref,
+    float* weight_global_factor, float* input_global_scale, void* stream) {
+    if (weight_global_factor == nullptr || input_global_scale == nullptr) {
+        throw std::invalid_argument("null Qwen NVFP4 global metadata output");
+    }
+    QwenNvfp4HostLinear host = qwen_materialize_nvfp4_host_linear(index, ref);
+    QwenDeviceTensor device;
+    device.device_dtype = SafeDType::U8;
+    device.shape = host.logical_shape;
+    device.shape.push_back(sizeof(QwenNvfp4Block64));
+    device.nbytes = host.blocks.size() * sizeof(QwenNvfp4Block64);
+    device.capacity = device.nbytes;
+    if (device.nbytes == 0 || cudaMalloc(&device.data, device.nbytes) != cudaSuccess) {
+        throw std::runtime_error("failed to allocate Qwen NVFP4 device linear");
+    }
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const cudaError_t status = cudaMemcpyAsync(
+        device.data, host.blocks.data(), device.nbytes, cudaMemcpyHostToDevice,
+        cuda_stream);
+    if (status != cudaSuccess) {
+        cudaFree(device.data);
+        device.data = nullptr;
+        device.nbytes = 0;
+        device.capacity = 0;
+        throw std::runtime_error("failed to upload Qwen NVFP4 device linear");
+    }
+    *weight_global_factor = host.weight_global_factor;
+    *input_global_scale = host.input_global_scale;
     return device;
 }
 
@@ -331,19 +460,30 @@ const char* qwen_shard_rule_name(QwenShardRule rule) {
     return "unknown";
 }
 
+const char* qwen_linear_kind_name(QwenLinearKind kind) {
+    switch (kind) {
+        case QwenLinearKind::DenseF16: return "dense_f16";
+        case QwenLinearKind::Fp8Block128: return "fp8_block128";
+        case QwenLinearKind::Fp8Channel: return "fp8_channel";
+        case QwenLinearKind::NvFp4Group16: return "nvfp4_group16";
+    }
+    return "unknown";
+}
+
 QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& config,
                              int tp_world, int tp_rank)
     : index_(index), config_(config), tp_world_(tp_world), tp_rank_(tp_rank) {
     require_tp(tp_world_, tp_rank_);
+    validate_model_tp(config_, tp_world_);
     embed_tokens_ = require_tensor(
         "model.language_model.embed_tokens.weight", SafeDType::BF16,
         {config_.vocab_size, config_.hidden_size}, QwenShardRule::ParallelEmbedding, 0);
     final_norm_ = require_tensor(
         "model.language_model.norm.weight", SafeDType::BF16,
         {config_.hidden_size}, QwenShardRule::Replicated, -1);
-    lm_head_ = require_tensor(
-        "lm_head.weight", SafeDType::BF16,
-        {config_.vocab_size, config_.hidden_size}, QwenShardRule::ParallelHead, 0);
+    lm_head_ = require_linear(
+        "lm_head.weight", {config_.vocab_size, config_.hidden_size},
+        QwenShardRule::ParallelHead, 0);
 
     layers_.reserve(config_.num_hidden_layers);
     for (uint64_t layer_id = 0; layer_id < config_.num_hidden_layers; ++layer_id) {
@@ -369,10 +509,10 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
                 QwenShardRule::RowParallel, 1);
             layer.linear_attention.in_proj_a = require_linear(
                 prefix + "linear_attn.in_proj_a.weight", {linear.value_heads, config_.hidden_size},
-                QwenShardRule::ColumnParallel, 0, SafeDType::BF16);
+                QwenShardRule::ColumnParallel, 0);
             layer.linear_attention.in_proj_b = require_linear(
                 prefix + "linear_attn.in_proj_b.weight", {linear.value_heads, config_.hidden_size},
-                QwenShardRule::ColumnParallel, 0, SafeDType::BF16);
+                QwenShardRule::ColumnParallel, 0);
             layer.linear_attention.conv1d = require_tensor(
                 prefix + "linear_attn.conv1d.weight", SafeDType::BF16,
                 {2 * key_dim + value_dim, 1, linear.conv_kernel_dim},
@@ -441,7 +581,7 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
             "mtp.norm.weight", SafeDType::BF16, {config_.hidden_size});
         mtp_.fc = require_linear(
             "mtp.fc.weight", {config_.hidden_size, 2 * config_.hidden_size},
-            QwenShardRule::Replicated, -1, SafeDType::BF16);
+            QwenShardRule::Replicated, -1);
 
         const std::string prefix = "mtp.layers.0.";
         mtp_.layer.input_layernorm = require_tensor(
@@ -487,14 +627,15 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
             QwenShardRule::RowParallel, 1);
     }
 
-    auto count_ref = [this](const QwenTensorRef& ref, bool scale) { record(ref, scale); };
-    const auto count_linear = [&count_ref](const QwenLinearRef& linear) {
-        if (linear.weight.found) count_ref(linear.weight, false);
-        if (linear.has_scale) count_ref(linear.scale, true);
+    auto count_ref = [this](const QwenTensorRef& ref, bool scale) {
+        record(ref, scale);
+    };
+    const auto count_linear = [this](const QwenLinearRef& linear) {
+        record_linear(linear);
     };
     count_ref(embed_tokens_, false);
     count_ref(final_norm_, false);
-    count_ref(lm_head_, false);
+    count_linear(lm_head_);
     for (const auto& layer : layers_) {
         count_ref(layer.input_layernorm, false);
         count_ref(layer.post_attention_layernorm, false);
@@ -602,51 +743,261 @@ QwenTensorRef QwenWeightMap::require_tensor(const std::string& name, SafeDType d
 
 QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
                                             const std::vector<uint64_t>& shape,
-                                            QwenShardRule rule, int shard_dim,
-                                            SafeDType weight_dtype) const {
-    QwenLinearRef result;
-    result.weight = require_tensor(name, weight_dtype, shape, rule, shard_dim);
-    if (weight_dtype != SafeDType::F8_E4M3) return result;
+                                            QwenShardRule rule,
+                                            int shard_dim) const {
+    const std::string weight_suffix = ".weight";
+    const bool conventional_name =
+        name.size() >= weight_suffix.size() &&
+        name.compare(name.size() - weight_suffix.size(), weight_suffix.size(),
+                     weight_suffix) == 0;
+    const std::string base = conventional_name
+        ? name.substr(0, name.size() - weight_suffix.size()) : name;
+    const std::string packed_name = base + ".weight_packed";
+    const std::string block_scale_name = base + ".weight_scale_inv";
+    const std::string channel_scale_name = base + ".weight_scale";
+    const std::string weight_global_name = base + ".weight_global_scale";
+    const std::string input_global_name = base + ".input_global_scale";
 
-    const std::string suffix = ".weight";
-    const std::string scale_name =
-        name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0
-            ? name.substr(0, name.size() - suffix.size()) + ".weight_scale_inv"
-            : name + ".weight_scale_inv";
-    const std::string* shard_name = index_.shard_for_tensor(scale_name);
-    if (shard_name == nullptr) throw std::runtime_error("Qwen FP8 scale not in checkpoint index: " + scale_name);
-    SafeTensorsShard shard(index_.shard_path(*shard_name));
-    const SafeTensorInfo* scale_info = shard.find_tensor(scale_name);
-    if (scale_info == nullptr) throw std::runtime_error("Qwen FP8 scale missing from shard header: " + scale_name);
-    if (scale_info->dtype != SafeDType::BF16) throw std::runtime_error("Qwen FP8 scale must be BF16: " + scale_name);
-    const std::vector<uint64_t> full_scale_shape = {ceil_div(shape[0], config_.fp8_block_size),
-                                                    ceil_div(shape[1], config_.fp8_block_size)};
-    if (scale_info->shape != full_scale_shape) {
-        throw std::runtime_error("unexpected Qwen FP8 scale shape for " + scale_name +
-                                 " expected=" + shape_string(full_scale_shape) +
-                                 " actual=" + shape_string(scale_info->shape));
+    QwenLinearRef result;
+    result.logical_full_shape = shape;
+    result.rule = rule;
+    result.shard_dim = shard_dim;
+    result.logical_local_shape = shape;
+    if (rule != QwenShardRule::Replicated) {
+        if (rule == QwenShardRule::PackedQkvColumnParallel) {
+            const uint64_t key_dim = config_.linear_attention.key_heads *
+                                     config_.linear_attention.key_head_dim;
+            const uint64_t value_dim = config_.linear_attention.value_heads *
+                                       config_.linear_attention.value_head_dim;
+            const uint64_t segments[] = {key_dim, key_dim, value_dim};
+            uint64_t local_rows = 0;
+            for (uint64_t segment : segments) {
+                uint64_t start = 0;
+                uint64_t size = 0;
+                shard_range(segment, tp_world_, tp_rank_, &start, &size);
+                local_rows += size;
+            }
+            result.logical_local_shape[0] = local_rows;
+        } else {
+            uint64_t start = 0;
+            uint64_t size = 0;
+            shard_range(shape.at(static_cast<size_t>(shard_dim)), tp_world_,
+                        tp_rank_, &start, &size);
+            result.logical_local_shape[static_cast<size_t>(shard_dim)] = size;
+        }
+    }
+    const uint64_t local_n = result.logical_local_shape.at(0);
+    const uint64_t local_k = result.logical_local_shape.at(1);
+    if ((rule == QwenShardRule::ColumnParallel ||
+         rule == QwenShardRule::ParallelHead) &&
+        result.logical_local_shape[1] != shape[1]) {
+        throw std::runtime_error(
+            "Qwen column-parallel linear changed logical K: " + base);
+    }
+    if (rule == QwenShardRule::RowParallel &&
+        result.logical_local_shape[0] != shape[0]) {
+        throw std::runtime_error(
+            "Qwen row-parallel linear changed logical N: " + base);
+    }
+    (void)local_n;
+    (void)local_k;
+
+    const std::string* packed_shard = index_.shard_for_tensor(packed_name);
+    const std::string* weight_shard = index_.shard_for_tensor(name);
+    if (packed_shard != nullptr) {
+        if (weight_shard != nullptr) {
+            throw std::runtime_error(
+                "ambiguous Qwen linear has both packed and dense weights: " + base);
+        }
+        if (shape.size() != 2 || shape[1] % 64 != 0) {
+            throw std::runtime_error(
+                "Qwen NVFP4 logical K must be divisible by 64: " + base);
+        }
+        result.kind = QwenLinearKind::NvFp4Group16;
+        const std::vector<uint64_t> packed_shape = {shape[0], shape[1] / 2};
+        result.weight = require_tensor(packed_name, SafeDType::U8, packed_shape,
+                                       rule, shard_dim);
+        if (result.weight.local_shape[1] % 32 != 0) {
+            throw std::runtime_error(
+                "Qwen NVFP4 local packed K is not block64 aligned: " + base);
+        }
+
+        const std::string* scale_shard = index_.shard_for_tensor(channel_scale_name);
+        if (scale_shard == nullptr) {
+            throw std::runtime_error(
+                "Qwen NVFP4 local scale not in checkpoint index: " +
+                channel_scale_name);
+        }
+        SafeTensorsShard scale_file(index_.shard_path(*scale_shard));
+        const SafeTensorInfo* scale_info =
+            scale_file.find_tensor(channel_scale_name);
+        const std::vector<uint64_t> scale_shape = {shape[0], shape[1] / 16};
+        if (scale_info == nullptr || scale_info->dtype != SafeDType::F8_E4M3 ||
+            scale_info->shape != scale_shape) {
+            throw std::runtime_error(
+                "unexpected Qwen NVFP4 scale metadata for " +
+                channel_scale_name);
+        }
+        if (rule == QwenShardRule::PackedQkvColumnParallel) {
+            throw std::runtime_error(
+                "Qwen NVFP4 packed QKV projections are not supported: " + base);
+        }
+        if (rule == QwenShardRule::RowParallel) {
+            uint64_t logical_start = 0;
+            uint64_t logical_size = 0;
+            shard_range(shape[1], tp_world_, tp_rank_, &logical_start,
+                        &logical_size);
+            if (logical_start % 64 != 0 || logical_size % 64 != 0) {
+                throw std::runtime_error(
+                    "Qwen row-parallel NVFP4 shard is not block64 aligned: " +
+                    base);
+            }
+            result.weight.shard_start = logical_start / 2;
+            result.weight.shard_size = logical_size / 2;
+            result.weight.local_shape[1] = logical_size / 2;
+            result.weight.nbytes = safe_tensor_numel(result.weight.local_shape);
+            result.weight.device_nbytes = result.weight.nbytes;
+            result.scale = make_ref(
+                channel_scale_name, *scale_shard, *scale_info, rule, 1,
+                logical_start / 16, logical_size / 16,
+                {shape[0], logical_size / 16});
+        } else if (rule == QwenShardRule::Replicated) {
+            result.scale = make_ref(channel_scale_name, *scale_shard, *scale_info,
+                                    rule, -1, 0, 0, scale_shape);
+        } else {
+            result.scale = require_tensor(
+                channel_scale_name, SafeDType::F8_E4M3, scale_shape, rule, 0);
+        }
+        result.has_scale = true;
+        result.weight_global_scale = require_tensor(
+            weight_global_name, SafeDType::F32, {1},
+            QwenShardRule::Replicated, -1);
+        result.input_global_scale = require_tensor(
+            input_global_name, SafeDType::F32, {1},
+            QwenShardRule::Replicated, -1);
+        result.has_weight_global_scale = true;
+        result.has_input_global_scale = true;
+        return result;
+    }
+
+    if (weight_shard == nullptr) {
+        throw std::runtime_error("Qwen linear not in checkpoint index: " + name);
+    }
+    SafeTensorsShard weight_file(index_.shard_path(*weight_shard));
+    const SafeTensorInfo* weight_info = weight_file.find_tensor(name);
+    if (weight_info == nullptr) {
+        throw std::runtime_error("Qwen linear missing from shard header: " + name);
+    }
+    if (weight_info->dtype == SafeDType::BF16 ||
+        weight_info->dtype == SafeDType::F16) {
+        result.kind = QwenLinearKind::DenseF16;
+        result.weight = require_tensor(name, weight_info->dtype, shape, rule,
+                                       shard_dim);
+        if (index_.shard_for_tensor(block_scale_name) != nullptr ||
+            index_.shard_for_tensor(channel_scale_name) != nullptr) {
+            throw std::runtime_error(
+                "dense Qwen linear unexpectedly has quantization scale: " + name);
+        }
+        return result;
+    }
+    if (weight_info->dtype != SafeDType::F8_E4M3) {
+        throw std::runtime_error("unsupported Qwen linear dtype for " + name +
+                                 ": " + safe_dtype_name(weight_info->dtype));
+    }
+    result.weight = require_tensor(name, SafeDType::F8_E4M3, shape, rule,
+                                   shard_dim);
+
+    const std::string* block_shard = index_.shard_for_tensor(block_scale_name);
+    const std::string* channel_shard = index_.shard_for_tensor(channel_scale_name);
+    if ((block_shard != nullptr) == (channel_shard != nullptr)) {
+        throw std::runtime_error(
+            "Qwen FP8 linear must have exactly one recognized scale: " + name);
+    }
+
+    if (channel_shard != nullptr) {
+        result.kind = QwenLinearKind::Fp8Channel;
+        SafeTensorsShard scale_file(index_.shard_path(*channel_shard));
+        const SafeTensorInfo* scale_info = scale_file.find_tensor(channel_scale_name);
+        const std::vector<uint64_t> full_scale_shape = {shape[0], 1};
+        if (scale_info == nullptr || scale_info->dtype != SafeDType::BF16 ||
+            scale_info->shape != full_scale_shape) {
+            throw std::runtime_error(
+                "unexpected Qwen FP8 channel scale metadata for " +
+                channel_scale_name);
+        }
+        if (rule == QwenShardRule::PackedQkvColumnParallel) {
+            const uint64_t key_dim = config_.linear_attention.key_heads *
+                                     config_.linear_attention.key_head_dim;
+            const uint64_t value_dim = config_.linear_attention.value_heads *
+                                       config_.linear_attention.value_head_dim;
+            const uint64_t segments[] = {key_dim, key_dim, value_dim};
+            uint64_t source_offset = 0;
+            uint64_t local_rows = 0;
+            std::vector<std::pair<uint64_t, uint64_t>> segments_out;
+            for (uint64_t segment : segments) {
+                uint64_t start = 0;
+                uint64_t size = 0;
+                shard_range(segment, tp_world_, tp_rank_, &start, &size);
+                segments_out.emplace_back(source_offset + start, size);
+                source_offset += segment;
+                local_rows += size;
+            }
+            result.scale = make_ref(
+                channel_scale_name, *channel_shard, *scale_info, rule, 0,
+                0, local_rows, {local_rows, 1});
+            result.scale.segments = std::move(segments_out);
+        } else if (rule == QwenShardRule::RowParallel ||
+                   rule == QwenShardRule::Replicated) {
+            result.scale = make_ref(channel_scale_name, *channel_shard,
+                                    *scale_info, QwenShardRule::Replicated, -1,
+                                    0, 0, full_scale_shape);
+        } else {
+            uint64_t start = 0;
+            uint64_t size = 0;
+            shard_range(shape[0], tp_world_, tp_rank_, &start, &size);
+            result.scale = make_ref(channel_scale_name, *channel_shard,
+                                    *scale_info, rule, 0, start, size,
+                                    {size, 1});
+        }
+        result.has_scale = true;
+        return result;
+    }
+
+    result.kind = QwenLinearKind::Fp8Block128;
+    SafeTensorsShard scale_file(index_.shard_path(*block_shard));
+    const SafeTensorInfo* scale_info = scale_file.find_tensor(block_scale_name);
+    const std::vector<uint64_t> full_scale_shape = {
+        ceil_div(shape[0], config_.fp8_block_size),
+        ceil_div(shape[1], config_.fp8_block_size)};
+    if (scale_info == nullptr || scale_info->dtype != SafeDType::BF16 ||
+        scale_info->shape != full_scale_shape) {
+        throw std::runtime_error(
+            "unexpected Qwen FP8 block scale metadata for " + block_scale_name);
     }
 
     std::vector<uint64_t> local_scale_shape = full_scale_shape;
     uint64_t scale_start = 0;
     uint64_t scale_size = 0;
-    QwenTensorRef scale_ref;
     if (rule == QwenShardRule::Replicated) {
-        // No dimension is sharded, so every rank consumes the complete scale.
-        scale_ref = make_ref(scale_name, *shard_name, *scale_info, rule, shard_dim,
-                             0, 0, local_scale_shape);
+        result.scale = make_ref(block_scale_name, *block_shard, *scale_info,
+                                rule, shard_dim, 0, 0, local_scale_shape);
     } else if (rule == QwenShardRule::RowParallel) {
         shard_range(shape[1], tp_world_, tp_rank_, &scale_start, &scale_size);
-        if (scale_start % config_.fp8_block_size != 0 || scale_size % config_.fp8_block_size != 0) {
-            throw std::runtime_error("Qwen row-parallel FP8 shard is not scale-block aligned: " + name);
+        if (scale_start % config_.fp8_block_size != 0 ||
+            scale_size % config_.fp8_block_size != 0) {
+            throw std::runtime_error(
+                "Qwen row-parallel FP8 shard is not scale-block aligned: " + name);
         }
         local_scale_shape[1] = scale_size / config_.fp8_block_size;
-        scale_ref = make_ref(scale_name, *shard_name, *scale_info, rule, shard_dim,
-                             scale_start / config_.fp8_block_size,
-                             scale_size / config_.fp8_block_size, local_scale_shape);
+        result.scale = make_ref(
+            block_scale_name, *block_shard, *scale_info, rule, shard_dim,
+            scale_start / config_.fp8_block_size,
+            scale_size / config_.fp8_block_size, local_scale_shape);
     } else if (rule == QwenShardRule::PackedQkvColumnParallel) {
-        const uint64_t key_dim = config_.linear_attention.key_heads * config_.linear_attention.key_head_dim;
-        const uint64_t value_dim = config_.linear_attention.value_heads * config_.linear_attention.value_head_dim;
+        const uint64_t key_dim = config_.linear_attention.key_heads *
+                                 config_.linear_attention.key_head_dim;
+        const uint64_t value_dim = config_.linear_attention.value_heads *
+                                   config_.linear_attention.value_head_dim;
         const uint64_t segments[] = {key_dim, key_dim, value_dim};
         uint64_t source_offset = 0;
         uint64_t local_rows = 0;
@@ -654,31 +1005,39 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
         for (uint64_t segment : segments) {
             uint64_t segment_start = 0;
             uint64_t segment_size = 0;
-            shard_range(segment, tp_world_, tp_rank_, &segment_start, &segment_size);
-            if (segment_start % config_.fp8_block_size != 0 || segment_size % config_.fp8_block_size != 0) {
-                throw std::runtime_error("Qwen packed QKV shard is not scale-block aligned: " + name);
+            shard_range(segment, tp_world_, tp_rank_, &segment_start,
+                        &segment_size);
+            if (segment_start % config_.fp8_block_size != 0 ||
+                segment_size % config_.fp8_block_size != 0) {
+                throw std::runtime_error(
+                    "Qwen packed QKV shard is not scale-block aligned: " + name);
             }
-            scale_segments.emplace_back(source_offset / config_.fp8_block_size +
-                                            segment_start / config_.fp8_block_size,
-                                        segment_size / config_.fp8_block_size);
+            scale_segments.emplace_back(
+                source_offset / config_.fp8_block_size +
+                    segment_start / config_.fp8_block_size,
+                segment_size / config_.fp8_block_size);
             source_offset += segment;
             local_rows += segment_size / config_.fp8_block_size;
         }
         local_scale_shape[0] = local_rows;
-        scale_ref = make_ref(scale_name, *shard_name, *scale_info, rule, shard_dim,
-                             0, local_rows, local_scale_shape);
-        scale_ref.segments = std::move(scale_segments);
+        result.scale = make_ref(block_scale_name, *block_shard, *scale_info,
+                                rule, shard_dim, 0, local_rows,
+                                local_scale_shape);
+        result.scale.segments = std::move(scale_segments);
     } else {
         shard_range(shape[0], tp_world_, tp_rank_, &scale_start, &scale_size);
-        if (scale_start % config_.fp8_block_size != 0 || scale_size % config_.fp8_block_size != 0) {
-            throw std::runtime_error("Qwen column-parallel FP8 shard is not scale-block aligned: " + name);
+        if (scale_start % config_.fp8_block_size != 0 ||
+            scale_size % config_.fp8_block_size != 0) {
+            throw std::runtime_error(
+                "Qwen column-parallel FP8 shard is not scale-block aligned: " +
+                name);
         }
         local_scale_shape[0] = scale_size / config_.fp8_block_size;
-        scale_ref = make_ref(scale_name, *shard_name, *scale_info, rule, shard_dim,
-                             scale_start / config_.fp8_block_size,
-                             scale_size / config_.fp8_block_size, local_scale_shape);
+        result.scale = make_ref(
+            block_scale_name, *block_shard, *scale_info, rule, shard_dim,
+            scale_start / config_.fp8_block_size,
+            scale_size / config_.fp8_block_size, local_scale_shape);
     }
-    result.scale = std::move(scale_ref);
     result.has_scale = true;
     return result;
 }
@@ -687,6 +1046,33 @@ void QwenWeightMap::record(const QwenTensorRef& ref, bool scale) {
     ++tensor_count_;
     if (scale) local_scale_bytes_ += ref.nbytes;
     else local_weight_bytes_ += ref.nbytes;
+}
+
+void QwenWeightMap::record_linear(const QwenLinearRef& ref) {
+    if (ref.weight.found) record(ref.weight, false);
+    if (ref.has_scale) record(ref.scale, true);
+    if (ref.has_weight_global_scale) {
+        ++tensor_count_;
+        host_global_metadata_bytes_ += ref.weight_global_scale.nbytes;
+    }
+    if (ref.has_input_global_scale) {
+        ++tensor_count_;
+        host_global_metadata_bytes_ += ref.input_global_scale.nbytes;
+    }
+    switch (ref.kind) {
+        case QwenLinearKind::DenseF16:
+            ++checkpoint_linear_kind_counts_.dense_f16;
+            break;
+        case QwenLinearKind::Fp8Block128:
+            ++checkpoint_linear_kind_counts_.fp8_block128;
+            break;
+        case QwenLinearKind::Fp8Channel:
+            ++checkpoint_linear_kind_counts_.fp8_channel;
+            break;
+        case QwenLinearKind::NvFp4Group16:
+            ++checkpoint_linear_kind_counts_.nvfp4_group16;
+            break;
+    }
 }
 
 }  // namespace dsv4

@@ -55,6 +55,20 @@ bool qwen_local_topk_candidates_cuda(
     int top_k,
     cudaStream_t stream);
 
+// Merge NCCL all-gathered local top-k lists into one exact top-k list per row.
+// Input layout is world-major [world, rows, top_k], matching ncclAllGather;
+// output layout is row-major [rows, top_k]. Ordering is descending logit with
+// ascending global token id as the deterministic tie-break.
+bool qwen_merge_topk_candidates_cuda(
+    const int* gathered_tokens,
+    const float* gathered_logits,
+    int* out_tokens,
+    float* out_logits,
+    int world,
+    int rows,
+    int top_k,
+    cudaStream_t stream);
+
 // TP stage 2: sample from candidates already merged across ranks. `cand_tokens`
 // are global ids, so no vocab_start offset is applied. Pass the same `uniforms`
 // on every rank to make all ranks commit the same token.

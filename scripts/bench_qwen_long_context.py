@@ -50,7 +50,29 @@ def parse_args() -> argparse.Namespace:
     # benchmark measures a chunk size production does not use.
     parser.add_argument("--prefill-chunk-tokens", type=int, default=4096)
     parser.add_argument("--kv-cache-dtype", choices=("fp16", "fp8", "turboquant_k8v4", "int8_per_token_head"), default="fp16")
+    parser.add_argument("--qwen-temperature", type=float, default=0.0)
+    parser.add_argument("--qwen-top-p", type=float, default=1.0)
+    parser.add_argument("--qwen-top-k", type=int, default=0)
+    parser.add_argument("--qwen-seed", type=int, default=0)
     parser.add_argument("--tp-world", type=int, default=4)
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="serial fresh-process repetitions per prompt length",
+    )
+    parser.add_argument(
+        "--topology-label",
+        default="",
+        help="human-readable topology label stored in the result artifact",
+    )
+    parser.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="environment override passed to every rank and recorded verbatim",
+    )
     parser.add_argument(
         "--devices",
         default="",
@@ -73,6 +95,59 @@ def parse_args() -> argparse.Namespace:
         help="Python interpreter used to create tokenizer fixtures",
     )
     return parser.parse_args()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def parse_env_overrides(values: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in values:
+        name, separator, value = item.partition("=")
+        if not separator or not name:
+            raise SystemExit(f"invalid --env value, expected NAME=VALUE: {item}")
+        overrides[name] = value
+    return overrides
+
+
+def checkpoint_manifest(ckpt: Path) -> dict[str, Any]:
+    revision = None
+    metadata_dir = ckpt / ".cache" / "huggingface" / "download"
+    files: dict[str, Any] = {}
+    for name in (
+        "config.json",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "model.safetensors",
+        "model_mtp.safetensors",
+    ):
+        path = ckpt / name
+        if not path.is_file():
+            continue
+        entry: dict[str, Any] = {"size": path.stat().st_size}
+        if path.stat().st_size < 64 * 1024 * 1024:
+            entry["sha256"] = sha256_file(path)
+        metadata = metadata_dir / f"{name}.metadata"
+        if metadata.is_file():
+            lines = metadata.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            if lines:
+                revision = revision or lines[0]
+            if len(lines) >= 2:
+                hub_oid = lines[1]
+                entry["hub_sha256" if len(hub_oid) == 64 else "hub_etag"] = hub_oid
+        files[name] = entry
+    return {"path": str(ckpt), "revision": revision, "files": files}
 
 
 def make_token_fixture(
@@ -269,6 +344,7 @@ def run_case(
     ckpt: Path,
     work_dir: Path,
     length: int,
+    repetition: int,
     max_new_tokens: int,
     layers: int,
     tp_world: int,
@@ -276,10 +352,15 @@ def run_case(
     tokenizer_python: str,
     prefill_chunk_tokens: int,
     kv_cache_dtype: str,
+    qwen_temperature: float,
+    qwen_top_p: float,
+    qwen_top_k: int,
+    qwen_seed: int,
+    env_overrides: dict[str, str],
 ) -> dict[str, Any]:
     token_path = work_dir / f"tokens_{length}.txt"
     tokens = make_token_fixture(ckpt, token_path, length, tokenizer_python)
-    case_dir = work_dir / f"run_{length}"
+    case_dir = work_dir / f"run_{length}_rep{repetition}"
     case_dir.mkdir(parents=True, exist_ok=True)
     id_path = case_dir / "nccl.id"
     if id_path.exists():
@@ -317,11 +398,20 @@ def run_case(
                 str(prefill_chunk_tokens),
                 "--kv-cache-dtype",
                 kv_cache_dtype,
+                "--qwen-temperature",
+                str(qwen_temperature),
+                "--qwen-top-p",
+                str(qwen_top_p),
+                "--qwen-top-k",
+                str(qwen_top_k),
+                "--qwen-seed",
+                str(qwen_seed),
                 "--smoke-layers",
                 str(layers),
                 "--resident-bench",
             ]
             env = os.environ.copy()
+            env.update(env_overrides)
             env["CUDA_VISIBLE_DEVICES"] = str(devices[rank])
             processes.append((rank, subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)))
             log.close()
@@ -366,8 +456,30 @@ def run_case(
     if runtime.get("layers") != 64 and layers == 0:
         raise RuntimeError(f"complete-model run did not load 64 layers: {runtime}")
     elapsed = time.monotonic() - started
+    token_bytes = token_path.read_bytes()
+    command_template = [
+        str(binary),
+        "--ckpt", str(ckpt),
+        "--tp-world", str(tp_world),
+        "--tp-rank", "<rank>",
+        "--device", "0",
+        "--nccl-id-path", str(id_path),
+        "--token-ids-file", str(token_path),
+        "--generate-token", "123",
+        "--max-new-tokens", str(max_new_tokens),
+        "--max-context", str(length + max_new_tokens),
+        "--prefill-chunk-tokens", str(prefill_chunk_tokens),
+        "--kv-cache-dtype", kv_cache_dtype,
+        "--qwen-temperature", str(qwen_temperature),
+        "--qwen-top-p", str(qwen_top_p),
+        "--qwen-top-k", str(qwen_top_k),
+        "--qwen-seed", str(qwen_seed),
+        "--smoke-layers", str(layers),
+        "--resident-bench",
+    ]
     result = {
         "prompt_tokens": length,
+        "repetition": repetition,
         "generated_tokens": len(rank_tokens[0]),
         "tokens": rank_tokens[0],
         "elapsed_wall_seconds": elapsed,
@@ -375,7 +487,18 @@ def run_case(
         "rank_runtime": rank_runtime,
         "rank_token_parity": True,
         "rank_wall_seconds": [item.get("wall") for item in rank_runtime],
-        "rank_gpu_memory_used_bytes": [item.get("gpu_memory_used_bytes") for item in rank_runtime],
+        "rank_model_load_seconds": [
+            item.get("model_load_seconds") for item in rank_runtime
+        ],
+        "rank_process_elapsed_seconds": [
+            item.get("process_elapsed_final_seconds") for item in rank_runtime
+        ],
+        "rank_gpu_memory_used_bytes": [
+            item.get("gpu_memory_used_bytes") for item in rank_runtime
+        ],
+        "rank_gpu_memory_total_bytes": [
+            item.get("gpu_memory_total_bytes") for item in rank_runtime
+        ],
         "rank_phase_summary": [phase_summary(items) for items in rank_phases],
         "phase_leaf_summary": phase_leaf_summary(rank_phases[0]),
         "phase_leaf_share_summary": phase_share_summary(
@@ -386,6 +509,9 @@ def run_case(
              if item["phase"] == "TOTAL"),
             None,
         ),
+        "token_fixture": str(token_path),
+        "token_fixture_sha256": sha256_bytes(token_bytes),
+        "command_template": command_template,
         "environment": environment_metadata(),
         "git_revision": git_revision(),
         "binary_metadata": binary_metadata(binary),
@@ -444,6 +570,14 @@ def main() -> int:
         raise SystemExit("--max-new-tokens must be at least 2 to measure decode")
     if args.prefill_chunk_tokens <= 0:
         raise SystemExit("--prefill-chunk-tokens must be positive")
+    if args.qwen_temperature < 0.0:
+        raise SystemExit("--qwen-temperature must be non-negative")
+    if not 0.0 < args.qwen_top_p <= 1.0:
+        raise SystemExit("--qwen-top-p must be in (0, 1]")
+    if args.qwen_top_k < 0:
+        raise SystemExit("--qwen-top-k must be non-negative")
+    if args.qwen_seed < 0:
+        raise SystemExit("--qwen-seed must be non-negative")
     lengths = [int(item) for item in args.lengths.split(",") if item.strip()]
     if not lengths or any(length <= 0 for length in lengths):
         raise SystemExit("--lengths must contain positive integers")
@@ -451,6 +585,9 @@ def main() -> int:
         raise SystemExit("--layers must be non-negative")
     if args.tp_world <= 0:
         raise SystemExit("--tp-world must be positive")
+    if args.repetitions <= 0:
+        raise SystemExit("--repetitions must be positive")
+    env_overrides = parse_env_overrides(args.env)
     devices = (
         [int(item) for item in args.devices.split(",") if item.strip()]
         if args.devices
@@ -465,39 +602,94 @@ def main() -> int:
     results = []
     output = {
         "mode": "qwen_tp_long_context_baseline",
-        "checkpoint": str(ckpt),
-        "binary": str(binary),
+        "checkpoint": checkpoint_manifest(ckpt),
+        "binary": {
+            "path": str(binary),
+            "size": binary.stat().st_size,
+            "sha256": sha256_file(binary),
+        },
         "tp_world": args.tp_world,
         "devices": devices,
+        "topology_label": args.topology_label,
         "layers": args.layers,
         "max_new_tokens": args.max_new_tokens,
         "prefill_chunk_tokens": args.prefill_chunk_tokens,
         "kv_cache_dtype": args.kv_cache_dtype,
+<<<<<<< HEAD
         "git_revision": git_revision(),
         "binary_metadata": binary_metadata(binary),
         "environment": environment_metadata(),
         "serial_cases": True,
         "phase_profile_diagnostic_only": "QWEN_PHASE_PROFILE" in os.environ,
+=======
+        "qwen_sampling": {
+            "temperature": args.qwen_temperature,
+            "top_p": args.qwen_top_p,
+            "top_k": args.qwen_top_k,
+            "seed": args.qwen_seed,
+        },
+        "repetitions": args.repetitions,
+        "environment": env_overrides,
+>>>>>>> 456f45c (Add Qwen3.8-27B-NVFP4 TP2 runtime with wide INT8 prefill tile)
         "results": results,
     }
     result_path = work_dir / "results.json"
     for length in lengths:
-        results.append(
-            run_case(
-                binary,
-                ckpt,
-                work_dir,
-                length,
-                args.max_new_tokens,
-                args.layers,
-                args.tp_world,
-                devices,
-                args.tokenizer_python,
-                args.prefill_chunk_tokens,
-                args.kv_cache_dtype,
+        for repetition in range(args.repetitions):
+            results.append(
+                run_case(
+                    binary,
+                    ckpt,
+                    work_dir,
+                    length,
+                    repetition,
+                    args.max_new_tokens,
+                    args.layers,
+                    args.tp_world,
+                    devices,
+                    args.tokenizer_python,
+                    args.prefill_chunk_tokens,
+                    args.kv_cache_dtype,
+                    args.qwen_temperature,
+                    args.qwen_top_p,
+                    args.qwen_top_k,
+                    args.qwen_seed,
+                    env_overrides,
+                )
             )
+            result_path.write_text(
+                json.dumps(output, indent=2) + "\n", encoding="utf-8"
+            )
+    medians: dict[str, Any] = {}
+    for length in lengths:
+        cases = [item for item in results if item["prompt_tokens"] == length]
+        fields = (
+            "wall",
+            "prefill_seconds",
+            "prefill_tokens_per_s",
+            "decode_seconds",
+            "decode_tokens_per_s",
+            "model_load_seconds",
+            "process_elapsed_final_seconds",
+            "gpu_memory_used_bytes",
         )
-        result_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+        summary: dict[str, Any] = {}
+        for field in fields:
+            values = sorted(
+                float(case["runtime"][field])
+                for case in cases
+                if field in case["runtime"]
+            )
+            if values:
+                middle = len(values) // 2
+                summary[field] = (
+                    values[middle]
+                    if len(values) % 2
+                    else (values[middle - 1] + values[middle]) / 2.0
+                )
+        medians[str(length)] = summary
+    output["medians"] = medians
+    result_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
     print(f"results={result_path}")
     return 0
 

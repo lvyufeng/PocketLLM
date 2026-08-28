@@ -424,8 +424,7 @@ struct QwenDSparkRuntime::Impl {
     const QwenDSparkWeightMap& weight_map;
     SafeTensorsIndex index;
     const QwenDeviceTensor& target_embedding;
-    const QwenDeviceTensor& target_lm_head;
-    uint64_t target_vocab_start = 0;
+    QwenTargetHeadAdapter target_head;
     int tp_world = 1;
     int tp_rank = 0;
     int device = 0;
@@ -468,23 +467,19 @@ struct QwenDSparkRuntime::Impl {
     Impl(const std::string& checkpoint_dir_, const QwenDSparkConfig& config_,
          const QwenDSparkWeightMap& weights_,
          const QwenDeviceTensor& target_embedding_,
-         const QwenDeviceTensor& target_lm_head_,
-         uint64_t target_vocab_start_, int tp_world_, int tp_rank_, int device_,
-         std::string nccl_id_path_, int max_context_)
+         QwenTargetHeadAdapter target_head_, int tp_world_, int tp_rank_,
+         int device_, std::string nccl_id_path_, int max_context_)
         : checkpoint_dir(checkpoint_dir_), config(config_), weight_map(weights_),
           index(SafeTensorsIndex::from_single_file(checkpoint_dir_)),
-          target_embedding(target_embedding_), target_lm_head(target_lm_head_),
-          target_vocab_start(target_vocab_start_), tp_world(tp_world_),
-          tp_rank(tp_rank_), device(device_),
+          target_embedding(target_embedding_), target_head(target_head_),
+          tp_world(tp_world_), tp_rank(tp_rank_), device(device_),
           nccl_id_path(std::move(nccl_id_path_)), max_context(max_context_) {
         if (tp_world <= 0 || tp_rank < 0 || tp_rank >= tp_world ||
             device < 0 || max_context <= 0 ||
             target_embedding.device_dtype != SafeDType::F16 ||
-            target_lm_head.device_dtype != SafeDType::F16 ||
             target_embedding.shape.size() != 2 ||
-            target_lm_head.shape.size() != 2 ||
             target_embedding.shape[1] != static_cast<uint64_t>(config.hidden_size) ||
-            target_lm_head.shape[1] != static_cast<uint64_t>(config.hidden_size)) {
+            !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DSpark runtime target tensors");
         }
         check_cuda(cudaSetDevice(device), "select Qwen DSpark CUDA device");
@@ -655,7 +650,7 @@ struct QwenDSparkRuntime::Impl {
         require_launch(argmax_fp32_rows_cuda(
             local_logits, static_cast<int*>(local_argmax_tokens.data),
             local_argmax_logits.f32_data(), 1, local_vocab,
-            static_cast<int>(target_vocab_start)), "local Markov argmax");
+            static_cast<int>(target_head.vocab_start)), "local Markov argmax");
         int token = 0;
         float value = 0.0f;
 #ifdef DSV4_HAVE_NCCL
@@ -705,7 +700,7 @@ struct QwenDSparkRuntime::Impl {
         const int q_dim = q_heads * config.head_dim;
         const int kv_dim = kv_heads * config.head_dim;
         const int intermediate_size = config.intermediate_size;
-        const int local_vocab = static_cast<int>(target_lm_head.shape.at(0));
+        const int local_vocab = target_head.local_vocab;
         std::vector<int> host_tokens(static_cast<size_t>(rows),
                                      config.mask_token_id);
         host_tokens[0] = anchor_token;
@@ -722,7 +717,7 @@ struct QwenDSparkRuntime::Impl {
         require_launch(qwen_embedding_fp16_gather_f16_cuda(
             target_embedding.f16_data(), static_cast<const int*>(tokens.data),
             hidden_a.f16_data(), rows, hidden,
-            static_cast<int>(target_vocab_start),
+            static_cast<int>(target_head.vocab_start),
             static_cast<int>(target_embedding.shape.at(0))),
             "target embedding gather");
         all_reduce_half(hidden_a.f16_data(), static_cast<int>(hidden_elements));
@@ -786,16 +781,14 @@ struct QwenDSparkRuntime::Impl {
         allocate_float(logits, static_cast<size_t>(rows) * local_vocab,
                        {static_cast<uint64_t>(rows),
                         static_cast<uint64_t>(local_vocab)});
+        // The dense FP16 head reuses its weights across draft rows only through
+        // cuBLAS, so keep that gate while routing through the adapter that also
+        // handles an FP8 per-channel checkpoint head.
         static const bool lm_head_cublas = lm_head_cublas_enabled();
-        require_launch(lm_head_cublas && rows > 1
-            ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
-                  normalized.f16_data(), target_lm_head.f16_data(),
-                  logits.f32_data(), rows, local_vocab, hidden, hidden,
-                  local_vocab, hidden)
-            : qwen_fp16_matmul_rows_f16_f32_cuda(
-                  normalized.f16_data(), target_lm_head.f16_data(),
-                  logits.f32_data(), rows, local_vocab, hidden, hidden,
-                  local_vocab, hidden),
+        QwenTargetHeadAdapter draft_head = target_head;
+        draft_head.cublas_fp32 = lm_head_cublas && rows > 1;
+        require_launch(draft_head.project_f16_to_f32(
+            normalized.f16_data(), logits.f32_data(), rows),
             "draft base logits");
         allocate_half(markov_embeddings,
                       static_cast<size_t>(rows) * config.markov_rank,
@@ -850,13 +843,11 @@ QwenDSparkRuntime::QwenDSparkRuntime(
     const std::string& checkpoint_dir, const QwenDSparkConfig& config,
     const QwenDSparkWeightMap& weights,
     const QwenDeviceTensor& target_embedding,
-    const QwenDeviceTensor& target_lm_head, uint64_t target_vocab_start,
-    int tp_world, int tp_rank, int device, std::string nccl_id_path,
-    int max_context)
+    QwenTargetHeadAdapter target_head, int tp_world, int tp_rank, int device,
+    std::string nccl_id_path, int max_context)
     : impl_(std::make_unique<Impl>(
-          checkpoint_dir, config, weights, target_embedding, target_lm_head,
-          target_vocab_start, tp_world, tp_rank, device,
-          std::move(nccl_id_path), max_context)) {}
+          checkpoint_dir, config, weights, target_embedding, target_head,
+          tp_world, tp_rank, device, std::move(nccl_id_path), max_context)) {}
 
 QwenDSparkRuntime::~QwenDSparkRuntime() = default;
 

@@ -135,16 +135,28 @@ int main(int argc, char** argv) {
             target_index, target_config, tp_world, tp_rank);
         dsv4::QwenDeviceTensor embedding = dsv4::qwen_upload_tensor_cuda(
             target_index, target_weights.embed_tokens());
+        const dsv4::QwenLinearRef& head_ref = target_weights.lm_head();
         dsv4::QwenDeviceTensor lm_head = dsv4::qwen_upload_tensor_cuda(
-            target_index, target_weights.lm_head());
+            target_index, head_ref.weight);
+        dsv4::QwenDeviceTensor lm_head_scale;
+        if (head_ref.has_scale) {
+            lm_head_scale = dsv4::qwen_upload_tensor_cuda(
+                target_index, head_ref.scale);
+        }
+        const dsv4::QwenTargetHeadAdapter target_head{
+            head_ref.kind, &lm_head,
+            head_ref.has_scale ? &lm_head_scale : nullptr,
+            static_cast<int>(head_ref.logical_local_shape.at(0)),
+            static_cast<int>(head_ref.logical_local_shape.at(1)),
+            static_cast<uint64_t>(tp_rank) * target_config.vocab_size /
+                tp_world};
         const dsv4::SafeTensorsIndex draft_index =
             dsv4::SafeTensorsIndex::from_single_file(draft_checkpoint);
         const dsv4::QwenDFlash2WeightMap draft_weights(
             draft_index, draft_config, tp_world, tp_rank);
         dsv4::QwenDFlash2Runtime draft(
-            draft_checkpoint, draft_config, draft_weights, embedding, lm_head,
-            static_cast<uint64_t>(tp_rank) * target_config.vocab_size / tp_world,
-            tp_world, tp_rank, device, nccl_path,
+            draft_checkpoint, draft_config, draft_weights, embedding,
+            target_head, tp_world, tp_rank, device, nccl_path,
             context_rows + draft_config.block_size + 1);
 
         dsv4_test::DFlash2TensorFile output;

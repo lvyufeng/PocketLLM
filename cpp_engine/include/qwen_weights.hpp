@@ -21,6 +21,13 @@ enum class QwenShardRule {
     PackedConvChannelParallel,
 };
 
+enum class QwenLinearKind {
+    DenseF16,
+    Fp8Block128,
+    Fp8Channel,
+    NvFp4Group16,
+};
+
 struct QwenTensorRef {
     std::string name;
     std::string shard_name;
@@ -45,6 +52,29 @@ struct QwenHostTensor {
     SafeDType device_dtype = SafeDType::Unknown;
     std::vector<uint64_t> shape;
     std::vector<uint8_t> bytes;
+};
+
+// Lossless device record for 64 logical compressed-tensors NVFP4 weights.
+// Four E4M3 group-16 scales precede the original low-nibble-first E2M1 codes.
+struct QwenNvfp4Block64 {
+    uint8_t d[4];
+    uint8_t qs[32];
+};
+static_assert(sizeof(QwenNvfp4Block64) == 36,
+              "Qwen NVFP4 block64 layout changed");
+
+struct QwenNvfp4HostLinear {
+    std::vector<uint64_t> logical_shape;
+    std::vector<QwenNvfp4Block64> blocks;
+    float weight_global_factor = 0.0f;
+    float input_global_scale = 0.0f;
+};
+
+struct QwenLinearKindCounts {
+    uint64_t dense_f16 = 0;
+    uint64_t fp8_block128 = 0;
+    uint64_t fp8_channel = 0;
+    uint64_t nvfp4_group16 = 0;
 };
 
 struct QwenDeviceTensor {
@@ -75,12 +105,24 @@ struct QwenDeviceTensor {
     // so they cannot claim a single arithmetic dtype. Accepts I8 only.
     uint8_t* byte_data();
     const uint8_t* byte_data() const;
+    // Packed NVFP4 block records, which are U8-typed rather than I8.
+    uint8_t* u8_data();
+    const uint8_t* u8_data() const;
 };
 
 struct QwenLinearRef {
+    QwenLinearKind kind = QwenLinearKind::DenseF16;
+    std::vector<uint64_t> logical_full_shape;
+    std::vector<uint64_t> logical_local_shape;
+    QwenShardRule rule = QwenShardRule::Replicated;
+    int shard_dim = -1;
     QwenTensorRef weight;
     QwenTensorRef scale;
+    QwenTensorRef weight_global_scale;
+    QwenTensorRef input_global_scale;
     bool has_scale = false;
+    bool has_weight_global_scale = false;
+    bool has_input_global_scale = false;
 };
 
 struct QwenLinearAttentionWeights {
@@ -134,7 +176,7 @@ public:
 
     const QwenTensorRef& embed_tokens() const { return embed_tokens_; }
     const QwenTensorRef& final_norm() const { return final_norm_; }
-    const QwenTensorRef& lm_head() const { return lm_head_; }
+    const QwenLinearRef& lm_head() const { return lm_head_; }
     const std::vector<QwenLayerWeights>& layers() const { return layers_; }
     const QwenMtpWeights& mtp() const { return mtp_; }
     const QwenConfig& config() const { return config_; }
@@ -143,6 +185,14 @@ public:
 
     uint64_t local_weight_bytes() const { return local_weight_bytes_; }
     uint64_t local_scale_bytes() const { return local_scale_bytes_; }
+    uint64_t host_global_metadata_bytes() const {
+        return host_global_metadata_bytes_;
+    }
+    // Counts every linear descriptor present in the checkpoint map, including
+    // optional MTP weights whether or not the runtime enables MTP residency.
+    const QwenLinearKindCounts& checkpoint_linear_kind_counts() const {
+        return checkpoint_linear_kind_counts_;
+    }
     size_t tensor_count() const { return tensor_count_; }
 
 private:
@@ -154,9 +204,9 @@ private:
     QwenLinearRef require_linear(const std::string& name,
                                  const std::vector<uint64_t>& shape,
                                  QwenShardRule rule,
-                                 int shard_dim,
-                                 SafeDType weight_dtype = SafeDType::F8_E4M3) const;
+                                 int shard_dim) const;
     void record(const QwenTensorRef& ref, bool scale);
+    void record_linear(const QwenLinearRef& ref);
 
     const SafeTensorsIndex& index_;
     QwenConfig config_;
@@ -164,15 +214,18 @@ private:
     int tp_rank_ = 0;
     QwenTensorRef embed_tokens_;
     QwenTensorRef final_norm_;
-    QwenTensorRef lm_head_;
+    QwenLinearRef lm_head_;
     std::vector<QwenLayerWeights> layers_;
     QwenMtpWeights mtp_;
     uint64_t local_weight_bytes_ = 0;
     uint64_t local_scale_bytes_ = 0;
+    uint64_t host_global_metadata_bytes_ = 0;
+    QwenLinearKindCounts checkpoint_linear_kind_counts_;
     size_t tensor_count_ = 0;
 };
 
 const char* qwen_shard_rule_name(QwenShardRule rule);
+const char* qwen_linear_kind_name(QwenLinearKind kind);
 
 // Qwen checkpoint tensors retain their source dtype for validation. On Turing,
 // BF16 tensors must be materialized as IEEE FP16 before device upload.
@@ -185,8 +238,14 @@ void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count)
 // slices are copied without expanding FP8 weights.
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref);
+QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
+    const SafeTensorsIndex& index, const QwenLinearRef& ref);
 QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
+QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
+    const SafeTensorsIndex& index, const QwenLinearRef& ref,
+    float* weight_global_factor, float* input_global_scale,
+    void* stream = nullptr);
 
 }  // namespace dsv4

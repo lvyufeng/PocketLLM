@@ -154,6 +154,105 @@ std::vector<float> random_logits(int rows, int vocab, unsigned seed) {
     return out;
 }
 
+void test_topk40_world_major_merge() {
+    constexpr int world = 4;
+    constexpr int rows = 3;
+    constexpr int top_k = 40;
+    const size_t local_count = static_cast<size_t>(rows) * top_k;
+    std::vector<int> gathered_tokens(static_cast<size_t>(world) * local_count);
+    std::vector<float> gathered_logits(gathered_tokens.size());
+
+    for (int rank = 0; rank < world; ++rank) {
+        for (int row = 0; row < rows; ++row) {
+            for (int candidate = 0; candidate < top_k; ++candidate) {
+                const size_t at = static_cast<size_t>(rank) * local_count +
+                                  static_cast<size_t>(row) * top_k + candidate;
+                gathered_tokens[at] = rank * 10000 + row * 1000 + candidate;
+                gathered_logits[at] =
+                    static_cast<float>((candidate * 17 + rank * 11 + row * 5) % 53);
+            }
+        }
+    }
+
+    // Force equal logits across ranks and distant list positions so the lower
+    // global token must win independently of world-major scan order.
+    gathered_logits[0 * local_count + 0 * top_k + 39] = 100.0f;
+    gathered_tokens[0 * local_count + 0 * top_k + 39] = 400;
+    gathered_logits[3 * local_count + 0 * top_k + 0] = 100.0f;
+    gathered_tokens[3 * local_count + 0 * top_k + 0] = 17;
+    gathered_logits[1 * local_count + 1 * top_k + 7] = NAN;
+    gathered_tokens[2 * local_count + 2 * top_k + 4] = -1;
+
+    std::vector<int> expected_tokens(static_cast<size_t>(rows) * top_k);
+    std::vector<float> expected_logits(static_cast<size_t>(rows) * top_k);
+    for (int row = 0; row < rows; ++row) {
+        std::vector<std::pair<float, int>> candidates;
+        for (int rank = 0; rank < world; ++rank) {
+            const size_t row_base = static_cast<size_t>(rank) * local_count +
+                                    static_cast<size_t>(row) * top_k;
+            for (int candidate = 0; candidate < top_k; ++candidate) {
+                const size_t at = row_base + candidate;
+                if (gathered_tokens[at] < 0 || std::isnan(gathered_logits[at])) continue;
+                candidates.emplace_back(gathered_logits[at], gathered_tokens[at]);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left,
+                                                           const auto& right) {
+            if (left.first != right.first) return left.first > right.first;
+            return left.second < right.second;
+        });
+        for (int candidate = 0; candidate < top_k; ++candidate) {
+            const size_t out = static_cast<size_t>(row) * top_k + candidate;
+            expected_logits[out] = candidates[static_cast<size_t>(candidate)].first;
+            expected_tokens[out] = candidates[static_cast<size_t>(candidate)].second;
+        }
+    }
+
+    int* d_gathered_tokens = nullptr;
+    float* d_gathered_logits = nullptr;
+    int* d_tokens = nullptr;
+    float* d_logits = nullptr;
+    check(cudaMalloc(&d_gathered_tokens,
+                     gathered_tokens.size() * sizeof(int)),
+          "merge malloc gathered tokens");
+    check(cudaMalloc(&d_gathered_logits,
+                     gathered_logits.size() * sizeof(float)),
+          "merge malloc gathered logits");
+    check(cudaMalloc(&d_tokens, expected_tokens.size() * sizeof(int)),
+          "merge malloc output tokens");
+    check(cudaMalloc(&d_logits, expected_logits.size() * sizeof(float)),
+          "merge malloc output logits");
+    check(cudaMemcpy(d_gathered_tokens, gathered_tokens.data(),
+                     gathered_tokens.size() * sizeof(int), cudaMemcpyHostToDevice),
+          "merge copy gathered tokens");
+    check(cudaMemcpy(d_gathered_logits, gathered_logits.data(),
+                     gathered_logits.size() * sizeof(float), cudaMemcpyHostToDevice),
+          "merge copy gathered logits");
+    check(dsv4::qwen_merge_topk_candidates_cuda(
+              d_gathered_tokens, d_gathered_logits, d_tokens, d_logits, world,
+              rows, top_k, nullptr),
+          "merge top-k=40 launch");
+    check(cudaDeviceSynchronize(), "merge top-k=40 sync");
+
+    std::vector<int> actual_tokens(expected_tokens.size());
+    std::vector<float> actual_logits(expected_logits.size());
+    check(cudaMemcpy(actual_tokens.data(), d_tokens,
+                     actual_tokens.size() * sizeof(int), cudaMemcpyDeviceToHost),
+          "merge copy output tokens");
+    check(cudaMemcpy(actual_logits.data(), d_logits,
+                     actual_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "merge copy output logits");
+    expect(actual_tokens == expected_tokens,
+           "top-k=40 merge preserves world-major rows and tie-breaks");
+    expect(actual_logits == expected_logits,
+           "top-k=40 merge preserves descending logits");
+
+    cudaFree(d_gathered_tokens);
+    cudaFree(d_gathered_logits);
+    cudaFree(d_tokens);
+    cudaFree(d_logits);
+}
+
 }  // namespace
 
 int main() {
@@ -166,6 +265,8 @@ int main() {
     // Realistic shard width for TP4 over a 248,320-token vocabulary.
     const int vocab = 62080;
     const int rows = 8;
+
+    test_topk40_world_major_merge();
 
     // 1. Temperature 0 must reproduce argmax exactly.
     {
