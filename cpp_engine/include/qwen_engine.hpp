@@ -44,7 +44,18 @@ struct QwenEngineOptions {
     //    65536      886.8      1077.7      1.21x
     //
     // The DSV4 engine already defaults to 4096 for the same reason.
-    int prefill_chunk_tokens = 4096;
+    //
+    // 8192 became reachable only once the snapshot grid stopped splitting the
+    // chunk (see `snapshot_interval_tokens`). Re-measured on the real 64-layer
+    // TP4 model with that fix, identical generated tokens, FP16 cache:
+    //
+    //   context   chunk 4096   chunk 8192   chunk 16384
+    //     8192      1798.7       1811.1        -
+    //    65536      1457.0       1481.8       1490.2
+    //
+    // 16384 is within noise of 8192 at 65K but costs another 1.06 GB of
+    // activation workspace per rank, so 8192 is the default.
+    int prefill_chunk_tokens = 8192;
     QwenKvCacheDType kv_cache_dtype = QwenKvCacheDType::Fp16;
     // 0 preserves exact full attention. Nonzero values enable the explicit
     // sink-plus-sliding-window attention path in the optimized FP16 kernels.
