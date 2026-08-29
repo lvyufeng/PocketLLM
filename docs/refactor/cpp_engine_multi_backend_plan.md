@@ -114,6 +114,10 @@ Each phase ends in a buildable, testable state.
 
 ### Phase 1 — Extract device_runtime, CUDA-only
 
+Scope is now measured: the 7 engine sources still needing a vendor SDK are `dsv4_engine.cpp`,
+`qwen_engine.cpp`, `dspark_engine.cpp`, `qwen_dflash2.cpp`, `qwen_dspark.cpp`, `qwen_weights.cpp`
+and `main.cpp`. Completing this phase means `check_layering` can be extended to cover `engine/`.
+
 - Define `backends/api/device_runtime.hpp`.
 - Implement it in `backends/cuda/runtime/`, initially as thin inline wrappers so the CUDA path stays
   identical in codegen.
@@ -125,13 +129,18 @@ Each phase ends in a buildable, testable state.
 - Safety net: CUDA build must stay green throughout; the compiler catches missed sites once vendor
   headers are removed from `engine/`.
 
-### Phase 2 — Move directories
+### Phase 2 — Move directories (DONE)
 
-- `git mv` into the Option B layout. Pure path changes, no content edits, so the diff stays
-  reviewable and bisectable.
-- Add the CI check that `core/` and `engine/` contain no vendor includes.
-- Rework CMake into `POCKET_BACKEND=cuda|ascend`, with `cuda` as default so existing build commands
-  and the 87 test targets keep working unchanged.
+- Moved into the Option B layout with `git mv`. All 43 moves are `R100`, i.e. byte-identical
+  renames, so no CUDA kernel content changed.
+- Added the `check_layering` target asserting that `include/` and `core/` pull in no vendor SDK
+  header. `engine/` is deliberately not yet covered, since it still calls vendor APIs directly.
+- Reworked CMake into `POCKET_BACKEND=cuda|ascend` with `cuda` as the default, keeping the
+  `dsv4_cpp_core` archive, the `dsv4_cpp_engine` binary name and all 87 test targets unchanged.
+
+Verified locally without a CUDA toolchain: all 13 `core/` sources plus `third_party/httplib.cpp`
+compile to objects, while the 7 `engine/` sources fail on `cuda_runtime.h` exactly as expected.
+That is empirical confirmation the core boundary holds and a precise scope for Phase 1.
 
 ### Phase 3 — Ascend runtime skeleton
 

@@ -184,10 +184,10 @@ Measure on idle GPUs. Contention from unrelated jobs was repeatedly visible in t
 
 ## Evidence and related notes
 
-- `cpp_engine/cuda/qwen_nvfp4_ops.cu`
+- `cpp_engine/backends/cuda/kernels/qwen_nvfp4_ops.cu`
 - `cpp_engine/include/qwen_cuda_ops.hpp`
-- `cpp_engine/src/qwen_engine.cpp`
-- `cpp_engine/src/qwen_weights.cpp`
+- `cpp_engine/engine/qwen_engine.cpp`
+- `cpp_engine/engine/qwen_weights.cpp`
 - `cpp_engine/tests/test_qwen_nvfp4.cpp`
 - `cpp_engine/tests/bench_qwen_nvfp4.cpp`
 - `scripts/bench_qwen_long_context.py`

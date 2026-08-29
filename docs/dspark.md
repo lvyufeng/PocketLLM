@@ -222,7 +222,7 @@ gate skipped a few rounds it would otherwise have drafted.
 draft token, what the target model samples after consuming it.
 
 - `cpp_engine/include/persistent_engine.hpp` — interface
-- `cpp_engine/src/dsv4_engine.cpp` — implementation
+- `cpp_engine/engine/dsv4_engine.cpp` — implementation
 - `cpp_engine/tests/test_perfect_draft.cpp` — feeds a plain decode back in as a
   "perfect" draft, so any mismatch is the verify path's own fault rather than
   the drafter's. 59/59 checked, 0 mismatches at draft_len 5.
@@ -258,7 +258,7 @@ which is why the hidden comparison is reported rather than asserted exact.
 
 ### Draft module (Stage B)
 
-Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/src/dspark_engine.cpp`:
+Porting `src/models/deepseek_v4/dspark.py` into `cpp_engine/engine/dspark_engine.cpp`:
 
 | Step | What | State |
 |---|---|---|

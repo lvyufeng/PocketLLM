@@ -75,7 +75,7 @@ The FP16 and TQK8V4 decode ratios are plausible as TP4 communication overhead pl
 differences. The INT8 ratio is not: on vLLM, INT8 decode is *faster* than FP16 (33.7 vs
 29.1), while ours is 1/19th of our own FP16. The sign is reversed, which points at the
 implementation rather than at hardware or model differences. The suspect is Phase 3 of
-`cpp_engine/cuda/qwen_int8_per_token_head_ops.cu`, which walks all 65536 positions serially
+`cpp_engine/backends/cuda/kernels/qwen_int8_per_token_head_ops.cu`, which walks all 65536 positions serially
 per output channel, dequantizing one value at a time. Wiring in the already-validated
 Triton kernel (`src/kernels/int8_per_token_head_triton.py`) is the open follow-up; whether
 it reaches vLLM's 33.7 tok/s is untested.

@@ -363,8 +363,8 @@ struct GgufKvSwapLayerState {
 ## 引用与相关文档
 
 - **FlashMemory 论文**：DeepSeek-V4 Technical Report（Memory Indexer 章节）
-- **实现细节**：`cpp_engine/cuda/flashmemory_ops.cu`（scorer kernels）
-- **KV_SWAP 实现**：`cpp_engine/src/dsv4_engine.cpp` line 4010-4170
+- **实现细节**：`cpp_engine/backends/cuda/kernels/flashmemory_ops.cu`（scorer kernels）
+- **KV_SWAP 实现**：`cpp_engine/engine/dsv4_engine.cpp` line 4010-4170
 - **Phase-1 验证**：FlashMemory runtime scoring 接入（`cheeky-hugging-eich.md` Phase-1）
 - **Phase-2 验证**：KV_SWAP 组合验证（本文档）
 

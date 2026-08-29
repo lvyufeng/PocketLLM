@@ -1,105 +1,175 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(dsv4_cpp_engine LANGUAGES CXX CUDA)
+# Backend selection happens at configure time. Each build produces a binary for
+# exactly one accelerator vendor, so no vendor dispatch remains in the hot path
+# and an unused vendor SDK is never a build dependency.
+set(POCKET_BACKEND "cuda" CACHE STRING "Device backend: cuda or ascend")
+set_property(CACHE POCKET_BACKEND PROPERTY STRINGS cuda ascend)
+
+if(POCKET_BACKEND STREQUAL "cuda")
+    project(dsv4_cpp_engine LANGUAGES CXX CUDA)
+elseif(POCKET_BACKEND STREQUAL "ascend")
+    # The Ascend backend has no kernels yet, so CXX alone is enough to configure.
+    project(dsv4_cpp_engine LANGUAGES CXX)
+else()
+    message(FATAL_ERROR "Unsupported POCKET_BACKEND '${POCKET_BACKEND}' (expected cuda or ascend)")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_EXTENSIONS OFF)
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 75)
-endif()
 
-find_package(CUDAToolkit REQUIRED)
+# Sources that touch no vendor SDK. Keeping this list free of vendor headers is
+# what lets a second backend reuse the loaders, tokenizer and HTTP server
+# unchanged; see check_layering below, which enforces it.
+set(POCKET_CORE_SOURCES
+    core/json_lite.cpp
+    core/gguf_reader.cpp
+    core/safetensors_reader.cpp
+    core/safetensors_model.cpp
+    core/weight_source.cpp
+    core/model_config.cpp
+    core/qwen_config.cpp
+    core/tokenizer.cpp
+    core/tensor.cpp
+    core/sampler.cpp
+    core/cmd_channel.cpp
+    core/python_sidecar.cpp
+    core/openai_server.cpp
+    third_party/httplib.cpp
+)
 
-set(NCCL_ROOT "" CACHE PATH "Optional NCCL root directory")
-option(DSV4_REQUIRE_NCCL "Fail configuration when NCCL is unavailable" OFF)
-set(DSV4_HAVE_NCCL OFF)
-if(NCCL_ROOT)
-    find_path(NCCL_INCLUDE_DIR nccl.h PATHS "${NCCL_ROOT}/include" NO_DEFAULT_PATH)
-    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2 PATHS "${NCCL_ROOT}/lib" NO_DEFAULT_PATH)
-else()
-    find_path(NCCL_INCLUDE_DIR nccl.h)
-    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2)
-endif()
-if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
-    set(DSV4_HAVE_NCCL ON)
-    message(STATUS "NCCL found: ${NCCL_LIBRARY}")
-else()
-    if(DSV4_REQUIRE_NCCL)
-        message(FATAL_ERROR "NCCL is required but was not found; set NCCL_ROOT")
+# One engine implementation shared by every backend. These still call vendor
+# runtime APIs directly; extracting that into backends/api is the next phase and
+# is intentionally not part of this change.
+set(POCKET_ENGINE_SOURCES
+    engine/qwen_weights.cpp
+    engine/qwen_target_head.cpp
+    engine/qwen_dspark.cpp
+    engine/qwen_dflash2.cpp
+    engine/qwen_engine.cpp
+    engine/dsv4_engine.cpp
+    engine/dspark_engine.cpp
+)
+
+set(POCKET_BACKEND_SOURCES)
+set(POCKET_BACKEND_LIBS)
+set(POCKET_BACKEND_INCLUDES)
+set(POCKET_BACKEND_DEFINES)
+
+if(POCKET_BACKEND STREQUAL "cuda")
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_EXTENSIONS OFF)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        # sm_75. The kernels under backends/cuda/kernels are hand-tuned for
+        # Turing's lack of native BF16/FP8 units; do not raise this default
+        # without re-tuning them.
+        set(CMAKE_CUDA_ARCHITECTURES 75)
     endif()
-    message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
+
+    find_package(CUDAToolkit REQUIRED)
+
+    set(NCCL_ROOT "" CACHE PATH "Optional NCCL root directory")
+    option(DSV4_REQUIRE_NCCL "Fail configuration when NCCL is unavailable" OFF)
+    set(DSV4_HAVE_NCCL OFF)
+    if(NCCL_ROOT)
+        find_path(NCCL_INCLUDE_DIR nccl.h PATHS "${NCCL_ROOT}/include" NO_DEFAULT_PATH)
+        find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2 PATHS "${NCCL_ROOT}/lib" NO_DEFAULT_PATH)
+    else()
+        find_path(NCCL_INCLUDE_DIR nccl.h)
+        find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2)
+    endif()
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        set(DSV4_HAVE_NCCL ON)
+        message(STATUS "NCCL found: ${NCCL_LIBRARY}")
+    else()
+        if(DSV4_REQUIRE_NCCL)
+            message(FATAL_ERROR "NCCL is required but was not found; set NCCL_ROOT")
+        endif()
+        message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
+    endif()
+
+    list(APPEND POCKET_BACKEND_SOURCES
+        backends/cuda/collective/tp_comm.cpp
+        backends/cuda/kernels/cuda_ops.cu
+        backends/cuda/kernels/bf16_ops.cu
+        backends/cuda/kernels/quant_gemm.cu
+        backends/cuda/kernels/fp4_ops.cu
+        backends/cuda/kernels/fp8_ops.cu
+        backends/cuda/kernels/qwen_fp8_ops.cu
+        backends/cuda/kernels/qwen_attention_ops.cu
+        backends/cuda/kernels/qwen_half_ops.cu
+        backends/cuda/kernels/qwen_nvfp4_ops.cu
+        backends/cuda/kernels/qwen_gqa_optimized.cu
+        backends/cuda/kernels/qwen_gdn_flashqla.cu
+        backends/cuda/kernels/qwen_turboquant_ops.cu
+        backends/cuda/kernels/qwen_int8_per_token_head_ops.cu
+        backends/cuda/kernels/qwen_dspark_ops.cu
+        backends/cuda/kernels/qwen_dflash2_ops.cu
+        backends/cuda/kernels/qwen_sampler.cu
+        backends/cuda/kernels/q2_ops.cu
+        backends/cuda/kernels/iq1_ops.cu
+        backends/cuda/kernels/rmsnorm_rope.cu
+        backends/cuda/kernels/flashmemory_ops.cu
+    )
+    list(APPEND POCKET_BACKEND_LIBS CUDA::cudart CUDA::cublas CUDA::curand)
+    if(TARGET CUDA::nvtx3)
+        list(APPEND POCKET_BACKEND_LIBS CUDA::nvtx3)
+    elseif(TARGET CUDA::nvToolsExt)
+        list(APPEND POCKET_BACKEND_LIBS CUDA::nvToolsExt)
+    else()
+        message(FATAL_ERROR "NVTX is required but was not found in the CUDA toolkit")
+    endif()
+    if(DSV4_HAVE_NCCL)
+        list(APPEND POCKET_BACKEND_INCLUDES ${NCCL_INCLUDE_DIR})
+        list(APPEND POCKET_BACKEND_LIBS ${NCCL_LIBRARY})
+        list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_NCCL=1)
+    endif()
+else()
+    # Ascend: ACL runtime, AscendC kernels and HCCL collectives land under
+    # backends/ascend. Until they exist this configuration is expected to fail at
+    # link time; it is wired up so the layering can be checked, not shipped.
+    set(DSV4_HAVE_NCCL OFF)
+    message(WARNING
+        "POCKET_BACKEND=ascend has no kernel or runtime implementation yet; "
+        "configure succeeds but the engine will not link.")
 endif()
 
 add_library(dsv4_cpp_core STATIC
-    src/json_lite.cpp
-    src/gguf_reader.cpp
-    src/safetensors_reader.cpp
-    src/safetensors_model.cpp
-    src/weight_source.cpp
-    src/model_config.cpp
-    src/qwen_config.cpp
-    src/qwen_weights.cpp
-    src/qwen_target_head.cpp
-    src/qwen_dspark.cpp
-    src/qwen_dflash2.cpp
-    src/qwen_engine.cpp
-    src/tokenizer.cpp
-    src/tensor.cpp
-    src/tp_comm.cpp
-    src/dsv4_engine.cpp
-    src/dspark_engine.cpp
-    src/sampler.cpp
-    src/cmd_channel.cpp
-    src/python_sidecar.cpp
-    src/openai_server.cpp
-    third_party/httplib.cpp
-    cuda/cuda_ops.cu
-    cuda/bf16_ops.cu
-    cuda/quant_gemm.cu
-    cuda/fp4_ops.cu
-    cuda/fp8_ops.cu
-    cuda/qwen_fp8_ops.cu
-    cuda/qwen_attention_ops.cu
-    cuda/qwen_half_ops.cu
-    cuda/qwen_nvfp4_ops.cu
-    cuda/qwen_gqa_optimized.cu
-    cuda/qwen_gdn_flashqla.cu
-    cuda/qwen_turboquant_ops.cu
-    cuda/qwen_int8_per_token_head_ops.cu
-    cuda/qwen_dspark_ops.cu
-    cuda/qwen_dflash2_ops.cu
-    cuda/qwen_sampler.cu
-    cuda/q2_ops.cu
-    cuda/iq1_ops.cu
-    cuda/rmsnorm_rope.cu
-    cuda/flashmemory_ops.cu
+    ${POCKET_CORE_SOURCES}
+    ${POCKET_ENGINE_SOURCES}
+    ${POCKET_BACKEND_SOURCES}
 )
 
 target_include_directories(dsv4_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
-
-target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas CUDA::curand)
-if(TARGET CUDA::nvtx3)
-    target_link_libraries(dsv4_cpp_core PUBLIC CUDA::nvtx3)
-elseif(TARGET CUDA::nvToolsExt)
-    target_link_libraries(dsv4_cpp_core PUBLIC CUDA::nvToolsExt)
-else()
-    message(FATAL_ERROR "NVTX is required but was not found in the CUDA toolkit")
+if(POCKET_BACKEND_INCLUDES)
+    target_include_directories(dsv4_cpp_core PUBLIC ${POCKET_BACKEND_INCLUDES})
 endif()
-if(DSV4_HAVE_NCCL)
-    target_include_directories(dsv4_cpp_core PUBLIC ${NCCL_INCLUDE_DIR})
-    target_link_libraries(dsv4_cpp_core PUBLIC ${NCCL_LIBRARY})
-    target_compile_definitions(dsv4_cpp_core PUBLIC DSV4_HAVE_NCCL=1)
+if(POCKET_BACKEND_LIBS)
+    target_link_libraries(dsv4_cpp_core PUBLIC ${POCKET_BACKEND_LIBS})
 endif()
-set_target_properties(dsv4_cpp_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+if(POCKET_BACKEND_DEFINES)
+    target_compile_definitions(dsv4_cpp_core PUBLIC ${POCKET_BACKEND_DEFINES})
+endif()
+if(POCKET_BACKEND STREQUAL "cuda")
+    set_target_properties(dsv4_cpp_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
 
-add_executable(dsv4_cpp_engine src/main.cpp)
+# Fail the build if a vendor SDK leaks into the shared layers. This is the
+# structural guarantee behind "one engine, swappable backends": without it the
+# boundary is a convention that erodes silently.
+add_custom_target(check_layering
+    COMMAND ${CMAKE_COMMAND}
+        -DPOCKET_ENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckLayering.cmake
+    COMMENT "Checking that core/ and include/ pull in no vendor SDK headers"
+)
+
+add_executable(dsv4_cpp_engine engine/main.cpp)
 target_link_libraries(dsv4_cpp_engine PRIVATE dsv4_cpp_core)
 
 add_executable(inspect_gguf tools/inspect_gguf.cpp)

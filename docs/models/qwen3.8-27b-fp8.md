@@ -434,12 +434,12 @@ build/cpp_engine/dsv4_cpp_engine \
 ## Evidence and related notes
 
 - `cpp_engine/include/qwen_config.hpp`
-- `cpp_engine/src/qwen_config.cpp`
-- `cpp_engine/src/qwen_weights.cpp`
-- `cpp_engine/src/qwen_engine.cpp`
-- `cpp_engine/cuda/qwen_fp8_ops.cu`
-- `cpp_engine/cuda/qwen_half_ops.cu`
-- `cpp_engine/cuda/qwen_attention_ops.cu`
+- `cpp_engine/core/qwen_config.cpp`
+- `cpp_engine/engine/qwen_weights.cpp`
+- `cpp_engine/engine/qwen_engine.cpp`
+- `cpp_engine/backends/cuda/kernels/qwen_fp8_ops.cu`
+- `cpp_engine/backends/cuda/kernels/qwen_half_ops.cu`
+- `cpp_engine/backends/cuda/kernels/qwen_attention_ops.cu`
 - `cpp_engine/tests/test_qwen_config.cpp`
 - `cpp_engine/tests/test_qwen_fp8_online.cpp`
 - `cpp_engine/tests/test_qwen_gqa_attention.cpp`
@@ -447,8 +447,8 @@ build/cpp_engine/dsv4_cpp_engine \
 - `cpp_engine/tests/test_qwen_weights.cpp`
 - `cpp_engine/tests/test_qwen_engine.cpp`
 - `cpp_engine/include/qwen_dspark.hpp`
-- `cpp_engine/src/qwen_dspark.cpp`
-- `cpp_engine/cuda/qwen_dspark_ops.cu`
+- `cpp_engine/engine/qwen_dspark.cpp`
+- `cpp_engine/backends/cuda/kernels/qwen_dspark_ops.cu`
 - `cpp_engine/tests/test_qwen_dspark.cpp`
 - `cpp_engine/tests/test_qwen_dspark_ops.cpp`
 - `scripts/bench_qwen_mtp.py`

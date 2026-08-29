@@ -85,6 +85,37 @@ The current executable keeps the compatibility name `dsv4_cpp_engine`:
 build/cpp_engine/dsv4_cpp_engine
 ```
 
+The backend is selected at configure time via `POCKET_BACKEND`, which defaults
+to `cuda`, so the command above is unchanged from before:
+
+```bash
+cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
+```
+
+`POCKET_BACKEND=ascend` reserves the layout for Ascend NPUs. It configures but
+does not yet link, because the ACL runtime, AscendC kernels and HCCL collectives
+under `cpp_engine/backends/ascend/` are not implemented.
+
+The source tree is layered so that a second backend can reuse everything that is
+not vendor-specific:
+
+```text
+cpp_engine/
+  core/              device-agnostic: loaders, tokenizer, HTTP server
+  engine/            one engine implementation, shared by all backends
+  backends/
+    api/             vendor-neutral contracts (to be populated)
+    cuda/            kernels/ runtime/ collective/
+    ascend/          kernels/ runtime/ collective/
+```
+
+`core/` and the public headers under `include/` must not include a vendor SDK.
+This is enforced, not merely documented:
+
+```bash
+cmake --build build/cpp_engine --target check_layering
+```
+
 ### Run DeepSeek-V4 C++ TP4 serving
 
 ```bash
