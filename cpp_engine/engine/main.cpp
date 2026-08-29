@@ -43,6 +43,7 @@ struct Args {
     bool generate_token = false;
     bool resident_bench = false;
     bool qwen_audit = false;
+    bool qwen_audit_strict = false;
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
@@ -81,6 +82,16 @@ bool path_exists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0;
 }
 
+// True when every requested action only reads checkpoint metadata on the host.
+// Those modes must not bind an accelerator: auditing a 52 GiB checkpoint has to
+// work on a machine with no vendor runtime, and with --tp-world 4 on a host that
+// does not have four visible devices.
+bool is_host_only_mode(const Args& args) {
+    return !args.serve && !args.smoke_forward && !args.generate_token &&
+           !args.resident_bench && !args.use_persistent &&
+           !args.qwen_persistent_stdin;
+}
+
 bool is_dir(const std::string& path) {
     struct stat st;
     return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
@@ -98,6 +109,9 @@ Args parse_args(int argc, char** argv) {
             args.inspect_tensor = argv[++i];
         } else if (arg == "--qwen-audit") {
             args.qwen_audit = true;
+        } else if (arg == "--qwen-audit-strict") {
+            args.qwen_audit = true;
+            args.qwen_audit_strict = true;
         } else if (arg == "--dump-config") {
             args.dump_config = true;
         } else if (arg == "--inspect") {
@@ -360,10 +374,13 @@ int main(int argc, char** argv) {
     const auto process_started = std::chrono::steady_clock::now();
     try {
         Args args = parse_args(argc, argv);
-        if (args.device >= 0) {
-            if (cudaSetDevice(args.device) != cudaSuccess) throw std::runtime_error("failed to set CUDA device");
-        } else if (args.tp_world > 1) {
-            if (cudaSetDevice(args.tp_rank) != cudaSuccess) throw std::runtime_error("failed to set CUDA device for tp rank");
+        const bool host_only = is_host_only_mode(args);
+        if (!host_only) {
+            if (args.device >= 0) {
+                if (cudaSetDevice(args.device) != cudaSuccess) throw std::runtime_error("failed to set CUDA device");
+            } else if (args.tp_world > 1) {
+                if (cudaSetDevice(args.tp_rank) != cudaSuccess) throw std::runtime_error("failed to set CUDA device for tp rank");
+            }
         }
         if (args.tp_world > 1) {
             std::cout << "tp_world=" << args.tp_world << " tp_rank=" << args.tp_rank
@@ -425,6 +442,7 @@ int main(int argc, char** argv) {
                 const dsv4::QwenConfig qwen_config = dsv4::QwenConfig::from_hf_config(args.ckpt);
                 const dsv4::QwenWeightMap map(index, qwen_config, args.tp_world, args.tp_rank);
                 const dsv4::QwenLinearKindCounts kinds = map.checkpoint_linear_kind_counts();
+                const dsv4::QwenCoverage cover = map.coverage();
                 const double gib = 1024.0 * 1024.0 * 1024.0;
                 std::cout << "qwen_audit tp_world=" << args.tp_world
                           << " tp_rank=" << args.tp_rank
@@ -442,6 +460,48 @@ int main(int argc, char** argv) {
                           << " checkpoint_fp8_channel_linears=" << kinds.fp8_channel
                           << " checkpoint_nvfp4_group16_linears=" << kinds.nvfp4_group16
                           << "\n";
+                // Coverage is what tells an official multimodal checkpoint apart
+                // from an unrecognized one: the text runtime must claim every
+                // index entry that is not a vision tensor.
+                std::cout << "qwen_coverage index_tensors=" << cover.index_tensors
+                          << " mapped=" << cover.mapped_tensors
+                          << " visual_ignored=" << cover.visual_tensors
+                          << " unexpected=" << cover.unexpected_tensors
+                          << " checkpoint_text_bytes=" << cover.checkpoint_text_bytes
+                          << " checkpoint_text_GiB="
+                          << (static_cast<double>(cover.checkpoint_text_bytes) / gib)
+                          << " sharded_GiB="
+                          << (static_cast<double>(cover.sharded_local_bytes) / gib)
+                          << " replicated_GiB="
+                          << (static_cast<double>(cover.replicated_local_bytes) / gib)
+                          << "\n";
+                for (const std::string& name : cover.unexpected_examples) {
+                    std::cout << "qwen_coverage_unexpected " << name << "\n";
+                }
+                const dsv4::QwenTensorRef& embed = map.embed_tokens();
+                const dsv4::QwenLinearRef& head = map.lm_head();
+                const dsv4::QwenMlpWeights& mlp = map.layers().front().mlp;
+                std::cout << "qwen_tp_local storage_dtype="
+                          << dsv4::safe_dtype_name(embed.dtype)
+                          << " device_dtype=" << dsv4::safe_dtype_name(embed.device_dtype)
+                          << " embed_rows=" << embed.local_shape.at(0)
+                          << " head_rows=" << head.logical_local_shape.at(0)
+                          << " mlp_intermediate_rows="
+                          << mlp.gate_proj.logical_local_shape.at(0)
+                          << " down_proj_k=" << mlp.down_proj.logical_local_shape.at(1)
+                          << " linear_attention_layers="
+                          << qwen_config.linear_attention_layers()
+                          << " full_attention_layers="
+                          << qwen_config.full_attention_layers()
+                          << " mtp=" << (map.mtp().found ? 1 : 0)
+                          << "\n";
+                if (args.qwen_audit_strict) {
+                    // Throws unless the whole index is accounted for, so a CI run
+                    // fails on an unknown checkpoint variant instead of silently
+                    // loading a partial model.
+                    map.require_full_coverage();
+                    std::cout << "qwen_audit_strict=ok\n";
+                }
             }
             if (!args.inspect_tensor.empty()) {
                 const std::string* shard_name = index.shard_for_tensor(args.inspect_tensor);
@@ -1112,7 +1172,8 @@ int main(int argc, char** argv) {
                               << " checksum=" << result.checksum << "\n";
                 }
             }
-            if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect && !args.smoke_forward) {
+            if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect &&
+                !args.smoke_forward && !args.qwen_audit) {
                 std::cout << "inference_not_implemented=1\n";
             }
             return 0;
