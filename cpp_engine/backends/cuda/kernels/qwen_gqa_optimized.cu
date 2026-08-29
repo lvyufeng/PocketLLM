@@ -21,31 +21,36 @@ constexpr int kValuesPerThread = kMaxHeadDim / kThreads;
 constexpr int kPrefillCombos = kHeadsPerGroup * kQueryRows;
 // Hard ceiling for the tunable decode split count. Sizes the merge kernel's
 // shared weight array at 4 bytes per split, so 1024 costs 4 KiB of the 48 KiB
-// budget, and keeps the target honest to 64 positions per split at 65K context.
+// budget. The default target sits well under it; the headroom only matters for
+// A/B sweeps that ask for a finer split than the default.
 constexpr int kDecodeSplitCeiling = 1024;
-// Decode positions per split. The split kernel walks its slice serially and the
+// Target decode split count. The split kernel walks its slice serially and the
 // launch is only kv_heads*groups*splits blocks, so at the real TP4 shape (6 Q
-// heads, 1 KV head, 4 groups of blocks) positions per split, not bytes, set the
+// heads, 1 KV head, 2 groups) it is the split count, not bytes, that sets the
 // runtime: the old 2048-position target measured a flat 1.41 ms from 4K to 65K
-// context, about 47 GB/s of the 616 GB/s the card can sustain. A smaller target
-// buys parallelism.
-// Measured at the real TP4 shape against the reference score/value kernels,
-// fused kernel milliseconds, `bench_qwen_gqa_decode`:
+// context, about 47 GB/s of the 616 GB/s the card can sustain.
 //
-//   context   reference   2048   256    128    64
-//      4096      0.289    1.570  0.152  0.080  0.049
-//      8192      0.865    1.508  0.188  0.106  0.072
-//     16384      1.748    1.441  0.199  0.127  0.128
-//     32768      3.490    3.045  0.237  0.226  0.258
-//     65536      7.042    1.445  0.413  0.438  0.492
+// What matters is the number of blocks, not the slice length. The previous
+// default fixed 256 positions per split, which leaves 8K context with 32 splits
+// and 64 blocks -- under one block per SM on the 68-SM card, so most of the
+// device sits idle. Targeting a fixed split count instead scales the slice with
+// the context and keeps the grid at 512 blocks everywhere. Fused kernel
+// milliseconds from `bench_qwen_gqa_decode` at the real TP4 shape, and decode
+// tok/s from the serial full-network TP4 benchmark at TG128:
 //
-// 256 is the default rather than the faster-looking 128 because it is the
-// smallest target whose generated tokens stay bit-identical to a single
-// sequential split, at every context measured on the real TP4 model. 128 is
-// deterministic run to run but diverges from the sequential reference at token
-// 86 of 128 on the 8K prompt, and it is also slower end to end at 65K (28.3 vs
-// 29.2 tok/s) because it hits the split ceiling there.
-constexpr int kDecodeTargetPositionsDefault = 256;
+//   context   fixed 256 pos      target 256 splits
+//              kernel  tok/s      kernel  tok/s
+//      8192    0.2382  37.25      0.0920  39.49   (medians of 3 repetitions)
+//     16384    0.1923  36.69      0.1578  38.68
+//     32768    0.2247  35.37      0.2080  36.11
+//     65536    0.3873  32.05      0.3881  31.59   (same launch either way)
+//
+// 65536 already reached 256 splits under the old default, so its geometry is
+// unchanged and the difference there is run-to-run noise. Pushing past 256 splits
+// regresses: a 32-position slice at 65K asks for 2048 splits, gets clamped to the
+// ceiling, and drops decode to 30.75 tok/s. Generated tokens stay bit-identical to
+// the pre-change sequential baseline for all 128 steps at every context above.
+constexpr int kDecodeTargetSplitsDefault = 256;
 // Verify attention splits far more finely than decode: it has only a handful of
 // query rows to fill the device with, so a 32-position tile at 8192 context wants
 // 256 splits where the decode ceiling would force 128. Sizes the merge kernel's
@@ -56,13 +61,25 @@ constexpr int kVerifyMaxSplits = 256;
 constexpr int kDecodeMinContext = 4096;
 constexpr int kVerifyMaxRows = 8;
 
-// Positions per split and the split ceiling, overridable for A/B sweeps. Read
-// once: these are launch geometry, not per-call state.
-int decode_target_positions() {
+// Target split count, the split ceiling, and a positions-per-split override,
+// all available for A/B sweeps. Read once: these are launch geometry, not
+// per-call state.
+int decode_target_splits() {
+    static const int value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_TARGET_SPLITS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? parsed : kDecodeTargetSplitsDefault;
+    }();
+    return value;
+}
+
+// Setting this pins the slice length and ignores the split target, which is how
+// the fixed-positions geometry that shipped before can still be measured.
+int decode_forced_positions() {
     static const int value = [] {
         const char* env = std::getenv("DSV4_QWEN_DECODE_SPLIT_POSITIONS");
         const int parsed = env != nullptr ? std::atoi(env) : 0;
-        return parsed > 0 ? parsed : kDecodeTargetPositionsDefault;
+        return parsed > 0 ? parsed : 0;
     }();
     return value;
 }
@@ -124,6 +141,14 @@ __device__ __forceinline__ float warp_sum_all(float value) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ __forceinline__ float warp_sum_max(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
     }
     return value;
 }
@@ -1506,7 +1531,15 @@ __global__ void gqa_decode_split_f16_kernel(
     const SparseRanges ranges = sparse_ranges(context_len, window, sink);
     const int start = split * positions_per_split;
     const int end = min(ranges.total(), start + positions_per_split);
-    if (kv_head >= kv_heads || start >= end) return;
+    // An empty split still has to publish its partial. Rounding the slice length
+    // up leaves the last splits with nothing to scan whenever the split count
+    // does not divide the context -- 8193 positions over 256 splits is 33 each,
+    // so seven splits run dry. Returning early would leave their scratch slots
+    // uninitialized and the merge would read them, which showed up as -inf
+    // logits from the second decode step onward. Falling through with a zero-trip
+    // loop writes the neutral (-inf max, zero sum, zero accumulator) partial that
+    // the merge already handles: exp(-inf - max) contributes nothing.
+    if (kv_head >= kv_heads) return;
 
     __shared__ float warp_sums[kHeadsPerGroup][kWarps];
     __shared__ float scores[kHeadsPerGroup];
@@ -1585,7 +1618,11 @@ __global__ void gqa_decode_split_f16_kernel(
                     probability[h] * value[i];
             }
         }
-        __syncthreads();
+        // No trailing barrier is needed. Every thread reads only its own
+        // accumulator registers here, while rescale/probability cannot be
+        // overwritten by the next position until reduce_dot_products() reaches
+        // its first block-wide barrier. That barrier protects the shared
+        // softmax scalars before their next write.
     }
 
     const int partial_stride = head_dim + 2;
@@ -1960,27 +1997,62 @@ __global__ void gqa_decode_merge_f16_kernel(
     const int head = static_cast<int>(blockIdx.x);
     if (head >= q_heads) return;
     __shared__ float weights[kDecodeSplitCeiling];
-    if (threadIdx.x == 0) {
-        const int stride = head_dim + 2;
-        float maximum = -INFINITY;
-        for (int split = 0; split < splits; ++split) {
-            maximum = fmaxf(maximum,
-                partial_output[(static_cast<size_t>(head) * splits + split) * stride]);
+    __shared__ float shared_maximum;
+    const int stride = head_dim + 2;
+    // The running maxima are strided head_dim + 2 apart, so one thread walking
+    // them serializes up to 1024 dependent loads before any output work can
+    // start. fmaxf is associative and commutative, so spreading the scan over
+    // the block and reducing in shared memory finds the same maximum.
+    {
+        float local = -INFINITY;
+        for (int split = static_cast<int>(threadIdx.x); split < splits;
+             split += kThreads) {
+            local = fmaxf(local, partial_output[
+                (static_cast<size_t>(head) * splits + split) * stride]);
         }
+        local = warp_sum_max(local);
+        __shared__ float warp_maxima[kWarps];
+        const int lane = static_cast<int>(threadIdx.x) & 31;
+        const int warp = static_cast<int>(threadIdx.x) >> 5;
+        if (lane == 0) warp_maxima[warp] = local;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float maximum = warp_maxima[0];
+#pragma unroll
+            for (int w = 1; w < kWarps; ++w) {
+                maximum = fmaxf(maximum, warp_maxima[w]);
+            }
+            shared_maximum = maximum;
+        }
+        __syncthreads();
+    }
+    // The weights themselves are independent per split, so only the denominator
+    // needs the original left-to-right order; thread 0 sums the already-computed
+    // weights instead of also paying for the expf chain and the strided loads.
+    for (int split = static_cast<int>(threadIdx.x); split < splits;
+         split += kThreads) {
+        const float* source = partial_output +
+            (static_cast<size_t>(head) * splits + split) * stride;
+        weights[split] = expf(source[0] - shared_maximum);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
         float denominator = 0.0f;
         for (int split = 0; split < splits; ++split) {
-            const float* source = partial_output +
-                (static_cast<size_t>(head) * splits + split) * stride;
-            weights[split] = expf(source[0] - maximum);
-            denominator += weights[split] * source[1];
+            denominator += weights[split] * partial_output[
+                (static_cast<size_t>(head) * splits + split) * stride + 1];
         }
-        const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
-        for (int split = 0; split < splits; ++split) weights[split] *= inverse;
+        shared_maximum = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    }
+    __syncthreads();
+    const float inverse = shared_maximum;
+    for (int split = static_cast<int>(threadIdx.x); split < splits;
+         split += kThreads) {
+        weights[split] *= inverse;
     }
     __syncthreads();
     for (int d = static_cast<int>(threadIdx.x); d < head_dim; d += kThreads) {
         float value = 0.0f;
-        const int stride = head_dim + 2;
         for (int split = 0; split < splits; ++split) {
             const float* source = partial_output +
                 (static_cast<size_t>(head) * splits + split) * stride;
@@ -1995,12 +2067,22 @@ bool valid_shape(int q_heads, int kv_heads, int head_dim) {
         head_dim > 0 && head_dim <= kMaxHeadDim;
 }
 
+// Never splits finer than one position per split, so short contexts fall back to
+// however many splits they can actually fill.
 int decode_split_count(int attended_positions) {
     if (attended_positions <= 0) return 1;
-    const int splits = std::min(decode_max_splits(),
-        (attended_positions + decode_target_positions() - 1) /
-            decode_target_positions());
-    return std::max(splits, 1);
+    const int forced = decode_forced_positions();
+    const int requested = forced > 0
+        ? (attended_positions + forced - 1) / forced
+        : std::min(decode_target_splits(), attended_positions);
+    const int splits = std::max(std::min(decode_max_splits(), requested), 1);
+    // Rounding the slice up can leave trailing splits with nothing to scan (8193
+    // positions over 256 splits is 33 each, which only fills 249). Re-deriving
+    // the count from the slice length drops those, so the grid and the merge do
+    // not walk dead entries. The engine sizes the partial scratch from this same
+    // function, so the two cannot disagree.
+    const int positions = (attended_positions + splits - 1) / splits;
+    return std::max((attended_positions + positions - 1) / positions, 1);
 }
 
 struct GqaCublasWorkspace {
