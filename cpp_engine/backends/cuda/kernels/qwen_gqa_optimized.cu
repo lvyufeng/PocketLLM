@@ -46,11 +46,31 @@ constexpr int kDecodeSplitCeiling = 1024;
 //     65536    0.3873  32.05      0.3881  31.59   (same launch either way)
 //
 // 65536 already reached 256 splits under the old default, so its geometry is
-// unchanged and the difference there is run-to-run noise. Pushing past 256 splits
-// regresses: a 32-position slice at 65K asks for 2048 splits, gets clamped to the
-// ceiling, and drops decode to 30.75 tok/s. Generated tokens stay bit-identical to
-// the pre-change sequential baseline for all 128 steps at every context above.
-constexpr int kDecodeTargetSplitsDefault = 256;
+// unchanged and the difference there is run-to-run noise. Generated tokens stay
+// bit-identical to the pre-change sequential baseline for all 128 steps at every
+// context above.
+//
+// The target is now expressed as CTAs per SM rather than a round number, because
+// the optimum tracks occupancy exactly. Once the group covers the whole KV head
+// (see the split kernel) the CTA needs 80 registers, which allows 6 resident per
+// SM, so 68 * 6 = 408 splits is the largest grid that still fits one wave. Fused
+// kernel milliseconds, medians of 3 after discarding the warm-up repetition:
+//
+//   context   256    272 (4/SM)  340 (5/SM)  408 (6/SM)
+//      4096  0.0435    0.0436      0.0460      0.0491
+//      8192  0.0661    0.0665      0.0654      0.0691
+//     16384  0.1095    0.1075      0.1038      0.1035
+//     32768  0.1954    0.1888      0.1766      0.1767
+//     65536  0.3683    0.3487      0.3239      0.3193
+//
+// Long contexts want the full wave; short ones do not, because every CTA writes a
+// fixed (head_dim + 2) * kHPG partial and that scratch traffic stops being
+// amortised once the slice gets short. Splitting the default at 16384 takes the
+// better column on both sides. Going past one wave is strictly worse at every
+// context (476 splits: 0.1321 / 0.2271 / 0.4051), so the ceiling is a real edge.
+constexpr int kDecodeSplitsPerSm = 6;
+constexpr int kDecodeShortSplitsPerSm = 4;
+constexpr int kDecodeShortContext = 16384;
 // Verify attention splits far more finely than decode: it has only a handful of
 // query rows to fill the device with, so a 32-position tile at 8192 context wants
 // 256 splits where the decode ceiling would force 128. Sizes the merge kernel's
@@ -64,13 +84,29 @@ constexpr int kVerifyMaxRows = 8;
 // Target split count, the split ceiling, and a positions-per-split override,
 // all available for A/B sweeps. Read once: these are launch geometry, not
 // per-call state.
-int decode_target_splits() {
+int decode_sm_count() {
     static const int value = [] {
-        const char* env = std::getenv("DSV4_QWEN_DECODE_TARGET_SPLITS");
-        const int parsed = env != nullptr ? std::atoi(env) : 0;
-        return parsed > 0 ? parsed : kDecodeTargetSplitsDefault;
+        int device = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 68;
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+            return 68;  // SM75 2080 Ti, the shape every measurement above used.
+        }
+        return properties.multiProcessorCount;
     }();
     return value;
+}
+
+int decode_target_splits(int attended_positions) {
+    static const int override_value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_TARGET_SPLITS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? parsed : 0;
+    }();
+    if (override_value > 0) return override_value;
+    const int per_sm = attended_positions < kDecodeShortContext
+        ? kDecodeShortSplitsPerSm : kDecodeSplitsPerSm;
+    return decode_sm_count() * per_sm;
 }
 
 // Setting this pins the slice length and ignores the split target, which is how
@@ -1505,8 +1541,16 @@ __global__ void gqa_prefill_tiled_f16_kernel(
     }
 }
 
-// Each CTA computes exact online-softmax partials for three Q heads over one
-// context split while loading their shared K/V row only once.
+// Each CTA computes exact online-softmax partials for kHPG Q heads over one
+// context split while loading their shared K/V row only once. The width matters
+// at long context: with kHPG below q_per_kv the KV head is split across several
+// CTAs that each stream the whole slice, so a 65K step read the 64 MiB cache
+// twice per layer (2 groups x 6 Q heads / 3). Widening the group to cover every
+// Q head sharing the KV head removes that duplicate traffic outright. Per-head
+// arithmetic is untouched: the dot product still reduces over the same lanes in
+// the same warp_sum tree, and the softmax recurrence still walks positions in
+// order, so a given split count gives bit-identical output at any width.
+template <int kHPG>
 __global__ void gqa_decode_split_f16_kernel(
     const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ k_cache,
@@ -1521,13 +1565,12 @@ __global__ void gqa_decode_split_f16_kernel(
     int window,
     int sink) {
     const int q_per_kv = q_heads / kv_heads;
-    const int groups_per_kv =
-        (q_per_kv + kHeadsPerGroup - 1) / kHeadsPerGroup;
+    const int groups_per_kv = (q_per_kv + kHPG - 1) / kHPG;
     const int grouped = static_cast<int>(blockIdx.x) / splits;
     const int split = static_cast<int>(blockIdx.x) % splits;
     const int kv_head = grouped / groups_per_kv;
     const int group = grouped % groups_per_kv;
-    const int first_head = kv_head * q_per_kv + group * kHeadsPerGroup;
+    const int first_head = kv_head * q_per_kv + group * kHPG;
     const SparseRanges ranges = sparse_ranges(context_len, window, sink);
     const int start = split * positions_per_split;
     const int end = min(ranges.total(), start + positions_per_split);
@@ -1541,19 +1584,19 @@ __global__ void gqa_decode_split_f16_kernel(
     // the merge already handles: exp(-inf - max) contributes nothing.
     if (kv_head >= kv_heads) return;
 
-    __shared__ float warp_sums[kHeadsPerGroup][kWarps];
-    __shared__ float scores[kHeadsPerGroup];
-    __shared__ float running_max[kHeadsPerGroup];
-    __shared__ float running_sum[kHeadsPerGroup];
-    __shared__ float rescale[kHeadsPerGroup];
-    __shared__ float probability[kHeadsPerGroup];
+    __shared__ float warp_sums[kHPG][kWarps];
+    __shared__ float scores[kHPG];
+    __shared__ float running_max[kHPG];
+    __shared__ float running_sum[kHPG];
+    __shared__ float rescale[kHPG];
+    __shared__ float probability[kHPG];
 
     const int tid = static_cast<int>(threadIdx.x);
-    float query[kHeadsPerGroup][kValuesPerThread];
-    float accumulator[kHeadsPerGroup][kValuesPerThread] = {};
-    bool active[kHeadsPerGroup];
+    float query[kHPG][kValuesPerThread];
+    float accumulator[kHPG][kValuesPerThread] = {};
+    bool active[kHPG];
 #pragma unroll
-    for (int h = 0; h < kHeadsPerGroup; ++h) {
+    for (int h = 0; h < kHPG; ++h) {
         const int head = first_head + h;
         active[h] = head < (kv_head + 1) * q_per_kv && head < q_heads;
 #pragma unroll
@@ -1584,16 +1627,16 @@ __global__ void gqa_decode_split_f16_kernel(
             key[i] = d < head_dim ? half_to_float(k_cache[kv_base + d]) : 0.0f;
             value[i] = d < head_dim ? half_to_float(v_cache[kv_base + d]) : 0.0f;
         }
-        float dot[kHeadsPerGroup] = {};
+        float dot[kHPG] = {};
 #pragma unroll
-        for (int h = 0; h < kHeadsPerGroup; ++h) {
+        for (int h = 0; h < kHPG; ++h) {
 #pragma unroll
             for (int i = 0; i < kValuesPerThread; ++i) {
                 dot[h] += query[h][i] * key[i];
             }
         }
         reduce_dot_products(dot, warp_sums, scores, attention_scale);
-        if (tid < kHeadsPerGroup) {
+        if (tid < kHPG) {
             if (active[tid]) {
                 const float old_max = running_max[tid];
                 const float new_max = fmaxf(old_max, scores[tid]);
@@ -1611,7 +1654,7 @@ __global__ void gqa_decode_split_f16_kernel(
         }
         __syncthreads();
 #pragma unroll
-        for (int h = 0; h < kHeadsPerGroup; ++h) {
+        for (int h = 0; h < kHPG; ++h) {
 #pragma unroll
             for (int i = 0; i < kValuesPerThread; ++i) {
                 accumulator[h][i] = accumulator[h][i] * rescale[h] +
@@ -1627,7 +1670,7 @@ __global__ void gqa_decode_split_f16_kernel(
 
     const int partial_stride = head_dim + 2;
 #pragma unroll
-    for (int h = 0; h < kHeadsPerGroup; ++h) {
+    for (int h = 0; h < kHPG; ++h) {
         if (!active[h]) continue;
         const int head = first_head + h;
         float* destination = partial_output +
@@ -2074,7 +2117,7 @@ int decode_split_count(int attended_positions) {
     const int forced = decode_forced_positions();
     const int requested = forced > 0
         ? (attended_positions + forced - 1) / forced
-        : std::min(decode_target_splits(), attended_positions);
+        : std::min(decode_target_splits(attended_positions), attended_positions);
     const int splits = std::max(std::min(decode_max_splits(), requested), 1);
     // Rounding the slice up can leave trailing splits with nothing to scan (8193
     // positions over 256 splits is 33 each, which only fills 249). Re-deriving
@@ -2521,6 +2564,28 @@ int qwen_gqa_decode_split_count(int attended_positions) {
     return decode_split_count(attended_positions);
 }
 
+// Widest Q group the decode split kernel is instantiated for. Six covers the
+// TP4 full-attention shape (q_heads 6, kv_heads 1) in a single CTA, which is
+// what removes the duplicate KV stream.
+constexpr int kDecodeMaxHeadsPerGroup = 6;
+
+// Zero keeps the automatic choice: cover the whole KV group so its cache line is
+// read once. An override only exists for A/B sweeps.
+int decode_group_width_override() {
+    static const int value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_GROUP_HEADS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? parsed : 0;
+    }();
+    return value;
+}
+
+int decode_group_width(int q_per_kv) {
+    const int override_width = decode_group_width_override();
+    const int requested = override_width > 0 ? override_width : q_per_kv;
+    return std::max(std::min(requested, kDecodeMaxHeadsPerGroup), 1);
+}
+
 bool qwen_gqa_decode_attention_f16_fused_cuda(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
@@ -2536,14 +2601,26 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     const int attended = ranges.total();
     const int splits = decode_split_count(attended);
     const int positions_per_split = (attended + splits - 1) / splits;
+    const int group_heads = decode_group_width(q_heads / kv_heads);
     const int groups_per_kv =
-        (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
+        (q_heads / kv_heads + group_heads - 1) / group_heads;
     const int blocks = kv_heads * groups_per_kv * splits;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    gqa_decode_split_f16_kernel<<<blocks, kThreads, 0, cuda_stream>>>(
-        q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim,
-        context_len, splits, positions_per_split, attention_window,
-        sink_tokens);
+#define DSV4_LAUNCH_DECODE_SPLIT(HPG) \
+    gqa_decode_split_f16_kernel<HPG><<<blocks, kThreads, 0, cuda_stream>>>( \
+        q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim, \
+        context_len, splits, positions_per_split, attention_window, \
+        sink_tokens)
+    switch (group_heads) {
+        case 1: DSV4_LAUNCH_DECODE_SPLIT(1); break;
+        case 2: DSV4_LAUNCH_DECODE_SPLIT(2); break;
+        case 3: DSV4_LAUNCH_DECODE_SPLIT(3); break;
+        case 4: DSV4_LAUNCH_DECODE_SPLIT(4); break;
+        case 5: DSV4_LAUNCH_DECODE_SPLIT(5); break;
+        case 6: DSV4_LAUNCH_DECODE_SPLIT(6); break;
+        default: return false;
+    }
+#undef DSV4_LAUNCH_DECODE_SPLIT
     if (cudaGetLastError() != cudaSuccess) return false;
     gqa_decode_merge_f16_kernel<<<q_heads, kThreads, 0, cuda_stream>>>(
         partial_scratch, output, q_heads, head_dim, splits);
