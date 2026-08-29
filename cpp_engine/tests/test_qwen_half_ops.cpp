@@ -1991,6 +1991,133 @@ bool check_gated_delta_prenormalized(int rows = 8, int heads = 12,
     return true;
 }
 
+// The per-token step kernel and the sequence kernel must agree exactly. Decode
+// runs one token at a time, so whichever one the engine picks at rows == 1 has
+// to produce the same state and output as the other, otherwise switching the
+// gate would silently change generated tokens. The two differ only in where the
+// recurrent state lives: the step kernel round-trips it through global memory
+// while the sequence kernel holds it in registers.
+bool check_gated_delta_step_matches_sequence(int rows = 1, int heads = 12,
+                                            int key_heads = 4, int passes = 3,
+                                            float scale = 0.2f) {
+    constexpr int dim = 128;
+    const size_t state_elements = static_cast<size_t>(heads) * dim * dim;
+    const size_t key_elements = static_cast<size_t>(rows) * key_heads * dim;
+    const size_t value_elements = static_cast<size_t>(rows) * heads * dim;
+    const size_t gate_elements = static_cast<size_t>(rows) * heads;
+    std::mt19937 rng(24101 + rows * 13 + heads * 5 + key_heads);
+    std::uniform_real_distribution<float> dist(-scale, scale);
+    std::vector<float> state(state_elements);
+    for (float& value : state) value = dist(rng);
+    std::vector<uint16_t> q(key_elements), k(key_elements), v(value_elements);
+    std::vector<uint16_t> g(gate_elements), beta(gate_elements);
+    for (uint16_t& value : q) value = to_half(dist(rng));
+    for (uint16_t& value : k) value = to_half(dist(rng));
+    for (uint16_t& value : v) value = to_half(dist(rng));
+    for (uint16_t& value : g) value = to_half(dist(rng) - 0.3f);
+    for (uint16_t& value : beta) value = to_half(dist(rng) + 0.5f);
+
+    float* d_state_step = nullptr;
+    float* d_state_sequence = nullptr;
+    uint16_t* d_q = nullptr;
+    uint16_t* d_k = nullptr;
+    uint16_t* d_v = nullptr;
+    uint16_t* d_g = nullptr;
+    uint16_t* d_beta = nullptr;
+    uint16_t* d_step = nullptr;
+    uint16_t* d_sequence = nullptr;
+    auto malloc_copy = [](void** device, const void* host, size_t bytes) {
+        return cudaMalloc(device, bytes) == cudaSuccess &&
+               cudaMemcpy(*device, host, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (!malloc_copy(reinterpret_cast<void**>(&d_state_step), state.data(),
+                     state.size() * sizeof(float)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_state_sequence), state.data(),
+                     state.size() * sizeof(float)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_q), q.data(),
+                     q.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_k), k.data(),
+                     k.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_v), v.data(),
+                     v.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_g), g.data(),
+                     g.size() * sizeof(uint16_t)) ||
+        !malloc_copy(reinterpret_cast<void**>(&d_beta), beta.data(),
+                     beta.size() * sizeof(uint16_t)) ||
+        cudaMalloc(&d_step, value_elements * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_sequence, value_elements * sizeof(uint16_t)) != cudaSuccess) {
+        fail("gated delta step-vs-sequence allocation");
+        return false;
+    }
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(dim));
+    for (int pass = 0; pass < passes; ++pass) {
+        bool launched = true;
+        for (int row = 0; row < rows && launched; ++row) {
+            launched = dsv4::qwen_gated_delta_step_f16_cuda(
+                d_state_step,
+                d_q + static_cast<size_t>(row) * key_heads * dim,
+                d_k + static_cast<size_t>(row) * key_heads * dim,
+                d_v + static_cast<size_t>(row) * heads * dim,
+                d_g + static_cast<size_t>(row) * heads,
+                d_beta + static_cast<size_t>(row) * heads,
+                d_step + static_cast<size_t>(row) * heads * dim,
+                heads, key_heads, dim, dim, q_scale);
+        }
+        if (!launched ||
+            !dsv4::qwen_gated_delta_sequence_f16_cuda(
+                d_state_sequence, d_q, d_k, d_v, d_g, d_beta, d_sequence,
+                rows, heads, key_heads, dim, dim, q_scale) ||
+            cudaDeviceSynchronize() != cudaSuccess) {
+            fail("gated delta step-vs-sequence launch");
+            return false;
+        }
+    }
+    std::vector<uint16_t> step(value_elements), sequence(value_elements);
+    std::vector<float> step_state(state_elements), sequence_state(state_elements);
+    cudaMemcpy(step.data(), d_step, step.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(sequence.data(), d_sequence, sequence.size() * sizeof(uint16_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(step_state.data(), d_state_step,
+               step_state.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(sequence_state.data(), d_state_sequence,
+               sequence_state.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    double output_worst = 0.0;
+    double state_worst = 0.0;
+    bool finite = true;
+    for (size_t i = 0; i < step.size(); ++i) {
+        const double candidate = from_half(sequence[i]);
+        if (!std::isfinite(candidate)) finite = false;
+        output_worst = std::max(output_worst,
+                                std::fabs(from_half(step[i]) - candidate));
+    }
+    for (size_t i = 0; i < step_state.size(); ++i) {
+        if (!std::isfinite(sequence_state[i])) finite = false;
+        state_worst = std::max(
+            state_worst, std::fabs(static_cast<double>(step_state[i]) -
+                                   sequence_state[i]));
+    }
+    if (!finite) {
+        fail("gated delta step-vs-sequence finite");
+    } else if (output_worst != 0.0 || state_worst != 0.0) {
+        fail("gated delta step-vs-sequence bit exact");
+    } else {
+        std::printf("  gated delta step-vs-sequence rows=%d heads=%d "
+                    "key_heads=%d passes=%d output=%.3e state=%.3e\n",
+                    rows, heads, key_heads, passes, output_worst, state_worst);
+    }
+    cudaFree(d_state_step);
+    cudaFree(d_state_sequence);
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_g);
+    cudaFree(d_beta);
+    cudaFree(d_step);
+    cudaFree(d_sequence);
+    return true;
+}
+
 bool check_fp8_cache() {
     constexpr int q_heads = 6;
     constexpr int kv_heads = 1;
@@ -2139,6 +2266,13 @@ int main() {
     check_gated_delta_prenormalized(8, 12, 12);
     check_gated_delta_prenormalized(8, 4, 1);
     check_gated_delta_prenormalized(8, 12, 4, 3);
+    // rows == 1 is the decode shape the engine gate now routes to the sequence
+    // kernel; the wider rows guard the verify shapes that still use the step loop.
+    check_gated_delta_step_matches_sequence(1);
+    check_gated_delta_step_matches_sequence(2);
+    check_gated_delta_step_matches_sequence(4);
+    check_gated_delta_step_matches_sequence(1, 12, 12);
+    check_gated_delta_step_matches_sequence(1, 4, 1);
     check_gated_delta_prenormalized(8, 12, 4, 3, 2.0f);
     check_fp8_cache();
     if (failures != 0) {
