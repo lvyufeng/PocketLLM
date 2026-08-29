@@ -1,5 +1,5 @@
 // Numerical test for FlashQLA SM75 GDN kernel against baseline.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cmath>
@@ -97,7 +97,7 @@ void run_test(int rows, int heads, int key_heads, int key_dim, int value_dim) {
 
     // Baseline: existing serial kernel.
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
-    bool ok_baseline = dsv4::qwen_gated_delta_sequence_f16_cuda(
+    bool ok_baseline = dsv4::qwen_gated_delta_sequence_f16(
         d_state_baseline, d_q, d_k, d_v, d_g, d_beta, d_out_baseline,
         rows, heads, key_heads, key_dim, value_dim, q_scale);
     if (!ok_baseline) {
@@ -108,7 +108,7 @@ void run_test(int rows, int heads, int key_heads, int key_dim, int value_dim) {
 
     // FlashQLA SM75 kernel, consuming the same normalized Q/K tensors as the
     // normalized baseline. This keeps the normalization reduction order equal.
-    bool ok_normalize = dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+    bool ok_normalize = dsv4::qwen_normalize_gated_delta_qk_f16(
         d_q, d_k, d_q_normalized, d_k_normalized, rows, key_heads, key_dim);
     if (!ok_normalize) {
         std::fprintf(stderr, "Q/K normalization launch failed\n");

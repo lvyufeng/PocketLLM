@@ -121,6 +121,28 @@ void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count)
     for (size_t i = 0; i < count; ++i) dst[i] = qwen_bf16_to_fp16_bits(src[i]);
 }
 
+bool qwen_is_one_plus_norm_gamma(const std::string& name) {
+    // linear_attn.norm.weight is deliberately excluded: the gated RMSNorm applies
+    // it directly, so folding a +1 into it would change the result.
+    if (name.find("linear_attn.norm.weight") != std::string::npos) return false;
+    static const char* const suffixes[] = {
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    };
+    for (const char* suffix : suffixes) {
+        const std::string tail(suffix);
+        if (name.size() >= tail.size() &&
+            name.compare(name.size() - tail.size(), tail.size(), tail) == 0) {
+            return true;
+        }
+    }
+    // The two trunk-level norms, which have no layer prefix to key on.
+    return name == "model.language_model.norm.weight" ||
+           name == "mtp.norm.weight";
+}
+
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
     if (!ref.found) throw std::runtime_error("cannot materialize an absent Qwen tensor: " + ref.name);

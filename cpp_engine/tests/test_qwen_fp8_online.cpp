@@ -7,7 +7,7 @@
 // shows up as an error rather than as noise.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "qwen_weights.hpp"
 
 #include <cuda_runtime.h>

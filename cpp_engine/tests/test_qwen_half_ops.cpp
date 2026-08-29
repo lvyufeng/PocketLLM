@@ -1,5 +1,5 @@
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -84,9 +84,9 @@ bool check_fp16_cache(int context_len) {
     cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k_rows, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_v_rows, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    if (!dsv4::qwen_append_kv_cache_f16_cuda(d_k_rows, d_v_rows, d_k_cache, d_v_cache,
+    if (!dsv4::qwen_append_kv_cache_f16(d_k_rows, d_v_rows, d_k_cache, d_v_cache,
                                               context_len, kv_heads, head_dim, 0, max_context) ||
-        !dsv4::qwen_gqa_decode_attention_f16_cuda(d_q, d_k_cache, d_v_cache, d_out, d_scores,
+        !dsv4::qwen_gqa_decode_attention_f16(d_q, d_k_cache, d_v_cache, d_out, d_scores,
                                                    q_heads, kv_heads, head_dim, context_len,
                                                    max_context) || cudaDeviceSynchronize() != cudaSuccess) {
         fail("FP16 cache launch");
@@ -182,11 +182,11 @@ bool check_residual_add_rmsnorm_fused() {
                        cudaMemcpyHostToDevice) != cudaSuccess ||
             cudaMemcpy(d_ref_residual, d_hidden, elements * sizeof(uint16_t),
                        cudaMemcpyDeviceToDevice) != cudaSuccess ||
-            !dsv4::qwen_add_inplace_f16_cuda(
+            !dsv4::qwen_add_inplace_f16(
                 d_ref_residual, d_delta, static_cast<int>(elements)) ||
-            !dsv4::qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
+            !dsv4::qwen_rmsnorm_fp16_gamma_rows_f16(
                 d_ref_residual, d_gamma, d_ref_normalized, rows, cols, eps) ||
-            !dsv4::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+            !dsv4::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16(
                 d_hidden, d_delta, d_gamma, d_fused_residual,
                 d_fused_normalized, rows, cols, eps) ||
             cudaDeviceSynchronize() != cudaSuccess) {
@@ -259,7 +259,7 @@ bool check_prefill_tiled(int seq_len, int head_dim, int position_offset,
     if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
-        !dsv4::qwen_gqa_prefill_attention_f16_cuda(
+        !dsv4::qwen_gqa_prefill_attention_f16(
             d_q, d_k, d_v, d_old, seq_len, q_heads, kv_heads, head_dim,
             position_offset, max_context) ||
         !dsv4::qwen_gqa_prefill_attention_f16_tiled_cuda(
@@ -324,13 +324,13 @@ bool check_verify_split(int seq_len, int head_dim, int position_offset) {
     if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
-        !dsv4::qwen_gqa_prefill_attention_f16_cuda(
+        !dsv4::qwen_gqa_prefill_attention_f16(
             d_q, d_k, d_v, d_ref, seq_len, q_heads, kv_heads, head_dim,
             position_offset, max_context) ||
         !dsv4::qwen_gqa_verify_attention_f16_exact_cuda(
             d_q, d_k, d_v, d_exact, d_scores, seq_len, q_heads, kv_heads,
             head_dim, position_offset, max_context) ||
-        !dsv4::qwen_gqa_verify_attention_f16_cuda(
+        !dsv4::qwen_gqa_verify_attention_f16(
             d_q, d_k, d_v, d_verify, d_partial, seq_len, q_heads, kv_heads,
             head_dim, position_offset, max_context, splits) ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -389,7 +389,7 @@ bool check_decode_fused(int context_len, int head_dim) {
     if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice) != cudaSuccess ||
-        !dsv4::qwen_gqa_decode_attention_f16_cuda(
+        !dsv4::qwen_gqa_decode_attention_f16(
             d_q, d_k, d_v, d_old, d_scores, q_heads, kv_heads, head_dim,
             context_len, context_len) ||
         !dsv4::qwen_gqa_decode_attention_f16_fused_cuda(
@@ -527,7 +527,7 @@ bool check_decode_grid_256k() {
     if (cudaMemset(d_q, 0, q_heads * head_dim * sizeof(uint16_t)) != cudaSuccess ||
         cudaMemset(d_k_cache, 0, context_len * kv_heads * head_dim * sizeof(uint16_t)) != cudaSuccess ||
         cudaMemset(d_v_cache, 0, context_len * kv_heads * head_dim * sizeof(uint16_t)) != cudaSuccess ||
-        !dsv4::qwen_gqa_decode_attention_f16_cuda(
+        !dsv4::qwen_gqa_decode_attention_f16(
             d_q, d_k_cache, d_v_cache, d_out, d_scores, q_heads, kv_heads,
             head_dim, context_len, context_len) ||
         !dsv4::qwen_gqa_decode_attention_f16_fused_cuda(
@@ -1421,7 +1421,7 @@ bool check_region_copy() {
                    descriptors.size() * sizeof(descriptors[0]),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemset(d_packed, kGuard, packed_bytes + 32) != cudaSuccess ||
-        !dsv4::qwen_gather_copy_regions_cuda(
+        !dsv4::qwen_gather_copy_regions(
             d_regions, static_cast<int>(descriptors.size()), d_packed + 16,
             total_blocks) ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -1456,7 +1456,7 @@ bool check_region_copy() {
             return true;
         }
     }
-    if (!dsv4::qwen_scatter_copy_regions_cuda(
+    if (!dsv4::qwen_scatter_copy_regions(
             d_regions, static_cast<int>(descriptors.size()), d_packed + 16,
             total_blocks) ||
         cudaDeviceSynchronize() != cudaSuccess) {
@@ -1509,7 +1509,7 @@ bool check_strided_row_copy(int rows) {
         cudaMemcpy(d_destination, destination.data(),
                    destination.size() * sizeof(uint16_t),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
-        !dsv4::qwen_copy_rows_strided_f16_cuda(
+        !dsv4::qwen_copy_rows_strided_f16(
             d_source, source_stride, d_destination + destination_offset,
             destination_stride, rows, columns) ||
         cudaDeviceSynchronize() != cudaSuccess ||
@@ -1806,7 +1806,7 @@ bool check_fused_swiglu() {
                    cudaMemcpyHostToDevice) != cudaSuccess ||
         cudaMemcpy(d_up, up.data(), up.size() * sizeof(uint16_t),
                    cudaMemcpyHostToDevice) != cudaSuccess ||
-        !dsv4::qwen_fp16_swiglu_matmul_rows_f16_cuda(
+        !dsv4::qwen_fp16_swiglu_matmul_rows_f16(
             d_input, d_gate, d_up, d_output, batch, rows, cols, cols, rows,
             cols) || cudaDeviceSynchronize() != cudaSuccess) {
         fail("FP16 fused SwiGLU launch");
@@ -1905,15 +1905,15 @@ bool check_gated_delta_prenormalized(int rows = 8, int heads = 12,
     // speculative verify does. A kernel that mishandles the state load/store
     // shows up on the second pass even if the first one looks right.
     for (int pass = 0; pass < passes; ++pass) {
-        if (!dsv4::qwen_gated_delta_sequence_f16_cuda(
+        if (!dsv4::qwen_gated_delta_sequence_f16(
                 d_state_reference, d_q, d_k, d_v, d_g, d_beta, d_reference,
                 rows, heads, key_heads, dim, dim, q_scale) ||
-            !dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+            !dsv4::qwen_normalize_gated_delta_qk_f16(
                 d_q, d_k, d_q_normalized, d_k_normalized, rows, key_heads, dim) ||
-            !dsv4::qwen_gated_delta_sequence_normalized_f16_cuda(
+            !dsv4::qwen_gated_delta_sequence_normalized_f16(
                 d_state_normalized, d_q_normalized, d_k_normalized, d_v, d_g,
                 d_beta, d_normalized, rows, heads, key_heads, dim, dim, q_scale) ||
-            !dsv4::qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+            !dsv4::qwen_gated_delta_sequence_normalized_shared_f16(
                 d_state_shared, d_q_normalized, d_k_normalized, d_v, d_g,
                 d_beta, d_shared, rows, heads, key_heads, dim, dim, q_scale) ||
             cudaDeviceSynchronize() != cudaSuccess) {

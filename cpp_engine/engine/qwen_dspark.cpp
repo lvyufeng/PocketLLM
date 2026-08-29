@@ -3,7 +3,7 @@
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
 #include "json_lite.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "tp_comm.hpp"
 
 
@@ -711,7 +711,7 @@ struct QwenDSparkRuntime::Impl {
         allocate_half(hidden_a, hidden_elements,
                       {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden)});
         allocate_half(hidden_b, hidden_elements, hidden_a.shape);
-        require_launch(qwen_embedding_fp16_gather_f16_cuda(
+        require_launch(qwen_embedding_fp16_gather_f16(
             target_embedding.f16_data(), static_cast<const int*>(tokens.data),
             hidden_a.f16_data(), rows, hidden,
             static_cast<int>(target_head.vocab_start),
@@ -746,7 +746,7 @@ struct QwenDSparkRuntime::Impl {
                 config.head_dim, committed, max_context),
                 "dual-source GQA");
             projection(layer.out, q.f16_data(), output, rows);
-            require_launch(qwen_add_inplace_f16_cuda(
+            require_launch(qwen_add_inplace_f16(
                 output, current, static_cast<int>(hidden_elements)),
                 "attention residual");
             standard_norm(layer.post_norm, output, normalized.f16_data(),
@@ -761,12 +761,12 @@ struct QwenDSparkRuntime::Impl {
                           gate.shape);
             projection(layer.gate, normalized.f16_data(), gate.f16_data(), rows);
             projection(layer.up, normalized.f16_data(), up.f16_data(), rows);
-            require_launch(qwen_silu_mul_rows_f16_cuda(
+            require_launch(qwen_silu_mul_rows_f16(
                 gate.f16_data(), up.f16_data(), intermediate.f16_data(), rows,
                 intermediate_size), "dense SwiGLU");
             allocate_half(mlp, hidden_elements, hidden_a.shape);
             projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows);
-            require_launch(qwen_add_inplace_f16_cuda(
+            require_launch(qwen_add_inplace_f16(
                 output, mlp.f16_data(), static_cast<int>(hidden_elements)),
                 "MLP residual");
             current = output;

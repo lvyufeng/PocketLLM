@@ -2,7 +2,7 @@
 // 5120). The generic FP32 matmul launches a rows x batch grid and therefore
 // re-reads the whole weight matrix once per draft row. This measures that
 // against the weight-reuse small-batch kernel and cuBLAS on the same shape.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -97,7 +97,7 @@ int main() {
 
     // Current production path: FP32 output, small-batch reuse disabled.
     const Timing generic = time_kernel([&]() {
-        return qwen_fp16_matmul_rows_f16_f32_cuda(
+        return qwen_fp16_matmul_rows_f16_f32(
             d_x, d_w, d_generic, batch, rows, cols, x_stride, y_stride,
             weight_stride);
     }, rows, cols);

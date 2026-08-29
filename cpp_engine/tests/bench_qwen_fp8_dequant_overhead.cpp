@@ -14,7 +14,7 @@
 //
 // A large gap justifies the repack pipeline; a small one means the projections
 // are GEMM bound and Marlin buys almost nothing at these shapes.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

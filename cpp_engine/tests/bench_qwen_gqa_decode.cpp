@@ -13,7 +13,7 @@
 #include <random>
 #include <vector>
 
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 namespace {
 
@@ -85,7 +85,7 @@ struct Args {
 
 void run_reference(void* raw) {
     const Args& a = *static_cast<Args*>(raw);
-    if (!dsv4::qwen_gqa_decode_attention_f16_cuda(
+    if (!dsv4::qwen_gqa_decode_attention_f16(
             a.q, a.k, a.v, a.out, a.scratch, a.q_heads, a.kv_heads, a.head_dim,
             a.context_len, a.max_context)) {
         std::fprintf(stderr, "[FAIL] reference decode launch\n");

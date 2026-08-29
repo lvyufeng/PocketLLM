@@ -1,6 +1,6 @@
 #include "qwen_target_head.hpp"
 
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 namespace dsv4 {
 
@@ -29,7 +29,7 @@ bool QwenTargetHeadAdapter::project_f16_to_f32(
             ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
                   hidden, weight->f16_data(), logits, rows, local_vocab,
                   hidden_size, hidden_size, local_vocab, hidden_size, stream)
-            : qwen_fp16_matmul_rows_f16_f32_cuda(
+            : qwen_fp16_matmul_rows_f16_f32(
                   hidden, weight->f16_data(), logits, rows, local_vocab,
                   hidden_size, hidden_size, local_vocab, hidden_size, stream);
     }

@@ -3,7 +3,7 @@
 // block-per-row reduction so the speedup is measured, not asserted.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

@@ -1,5 +1,5 @@
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "qwen_weights.hpp"
 
 #include <cuda_fp16.h>

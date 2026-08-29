@@ -1,4 +1,4 @@
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "qwen_weights.hpp"
 
 #include <cuda_runtime.h>

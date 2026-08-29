@@ -2,7 +2,7 @@
 
 #include "device_runtime.hpp"
 #include "json_lite.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "tp_comm.hpp"
 
 
@@ -751,7 +751,7 @@ struct QwenDFlash2Runtime::Impl {
             const char* previous = std::getenv("QWEN_FP16_SMALL_BATCH");
             std::string saved = previous != nullptr ? previous : "";
             setenv("QWEN_FP16_SMALL_BATCH", "1", 1);
-            const bool launched = qwen_fp16_matmul_rows_f16_cuda(
+            const bool launched = qwen_fp16_matmul_rows_f16(
                 input, linear.weight.f16_data(), output, rows, output_rows,
                 columns, columns, output_rows, columns);
             if (previous != nullptr) {
@@ -859,7 +859,7 @@ struct QwenDFlash2Runtime::Impl {
                       {static_cast<uint64_t>(rows),
                        static_cast<uint64_t>(dynamic_row_stride)});
         profiler.begin("embedding");
-        require_launch(qwen_embedding_fp16_gather_f16_cuda(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_head.vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
+        require_launch(qwen_embedding_fp16_gather_f16(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_head.vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
         all_reduce_half(hidden_a.f16_data(), static_cast<int>(hidden_elements));
         profiler.end();
         profiler.begin("initial_residual");
@@ -1018,7 +1018,7 @@ struct QwenDFlash2Runtime::Impl {
             allocate_half(up, intermediate_elements, gate.shape);
             allocate_half(intermediate, intermediate_elements, gate.shape);
             if (fused_swiglu) {
-                require_launch(qwen_fp16_swiglu_matmul_rows_f16_cuda(
+                require_launch(qwen_fp16_swiglu_matmul_rows_f16(
                     conv_hidden.f16_data(), layer.gate.weight.f16_data(),
                     layer.up.weight.f16_data(), intermediate.f16_data(), rows,
                     local_intermediate, hidden, hidden,
@@ -1031,7 +1031,7 @@ struct QwenDFlash2Runtime::Impl {
                 projection(layer.up, conv_hidden.f16_data(), up.f16_data(),
                            rows, local_intermediate, hidden);
                 dump_half_sharded(prefix + "mlp.up", up.f16_data(), up.shape);
-                require_launch(qwen_silu_mul_rows_f16_cuda(
+                require_launch(qwen_silu_mul_rows_f16(
                     gate.f16_data(), up.f16_data(), intermediate.f16_data(), rows,
                     local_intermediate), "DFlash2 SwiGLU");
             }
@@ -1044,7 +1044,7 @@ struct QwenDFlash2Runtime::Impl {
                       branch_f32.f32_data(), rows, hidden,
                       local_intermediate, local_intermediate, hidden,
                       local_intermediate)
-                : qwen_fp16_matmul_rows_f16_f32_cuda(
+                : qwen_fp16_matmul_rows_f16_f32(
                       intermediate.f16_data(), layer.down.weight.f16_data(),
                       branch_f32.f32_data(), rows, hidden,
                       local_intermediate, local_intermediate, hidden,

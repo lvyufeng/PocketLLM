@@ -1,7 +1,7 @@
 // Compares the current per-layer Qwen transaction snapshot copies against one
 // descriptor-driven gather/scatter launch at the exact TP4 recurrent-state sizes.
 
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_runtime.h>
 
@@ -175,12 +175,12 @@ int main(int argc, char** argv) {
         return true;
     };
     auto gather = [&]() {
-        return dsv4::qwen_gather_copy_regions_cuda(
+        return dsv4::qwen_gather_copy_regions(
             buffers.descriptors, static_cast<int>(host_descriptors.size()),
             buffers.packed, total_blocks);
     };
     auto scatter = [&]() {
-        return dsv4::qwen_scatter_copy_regions_cuda(
+        return dsv4::qwen_scatter_copy_regions(
             buffers.descriptors, static_cast<int>(host_descriptors.size()),
             buffers.packed, total_blocks);
     };

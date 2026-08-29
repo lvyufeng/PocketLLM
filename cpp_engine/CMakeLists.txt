@@ -216,6 +216,12 @@ else()
         "${ASCEND_NNOPBASE_LIBRARY}")
     list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
 
+    # aclnn-backed operators: matrix products, normalizations, elementwise
+    # activations and the reshape-shaped ops. The recurrent and attention kernels
+    # have no aclnn equivalent on this install and are hand-written AscendC, which
+    # is not in this list yet.
+    list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/aclnn_ops.cpp)
+
     if(DSV4_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
         list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}")
@@ -520,6 +526,18 @@ set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_tp_comm_smoke tests/test_tp_comm_smoke.cpp)
 target_link_libraries(test_tp_comm_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_tp_comm_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Calls the operators through their neutral names in qwen_ops.hpp and checks them
+# against double-precision host references, so it is meaningful on either backend.
+add_executable(test_qwen_ascend_ops tests/test_qwen_ascend_ops.cpp)
+target_link_libraries(test_qwen_ascend_ops PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_ascend_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The (1 + weight) gamma fold is host arithmetic on the staged bytes, so this needs
+# no device. It still links dsv4_cpp_core because the policy body is backend-gated.
+add_executable(test_qwen_ascend_norm_gamma tests/test_qwen_ascend_norm_gamma.cpp)
+target_link_libraries(test_qwen_ascend_norm_gamma PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_ascend_norm_gamma PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # Config parsing is device-agnostic, so this test links pocket_core and runs on a
 # host with no vendor SDK.

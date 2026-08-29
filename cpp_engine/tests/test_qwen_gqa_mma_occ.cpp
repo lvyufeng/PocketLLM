@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 namespace {
 
