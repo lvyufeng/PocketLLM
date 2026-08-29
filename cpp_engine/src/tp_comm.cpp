@@ -304,7 +304,7 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
                              ncclFloat, comm, cuda_stream),
                "ncclAllGather device top-k logits");
     check_nccl(ncclGroupEnd(), "ncclGroupEnd device top-k");
-    if (!qwen_merge_topk_candidates_cuda(
+    if (!qwen_merge_topk_candidates(
             workspace.d_tokens, workspace.d_logits, d_global_tokens,
             d_global_logits, world, rows, top_k, cuda_stream)) {
         throw std::runtime_error("Qwen sampling device top-k merge launch failed");
