@@ -362,6 +362,36 @@ void exercise_prefix_cache(const std::string& dir,
     require(reset.reused_tokens == 0 && reset.computed_tokens == 3 &&
                 reset.resume_source == "empty",
             "reset must invalidate prefix cache");
+
+    // A chunk wider than the snapshot interval must not be subdivided by the
+    // dense early-snapshot grid: short chunks cost far more per token than the
+    // finer resume granularity is worth. Request-boundary reuse and correctness
+    // still hold, they just resume at chunk granularity.
+    // The snapshot grid no longer subdivides a chunk wider than the dense early
+    // interval. That interval is 256 tokens, past this fixture's context, so the
+    // saving itself is measured by the real long-context benchmark; what is
+    // checked here is that a chunk wider than the interval still prefills
+    // correctly and still serves an exact prefix hit.
+    dsv4::QwenEngineOptions wide_options = options;
+    wide_options.prefill_chunk_tokens = 8;
+    wide_options.state_snapshot_interval_tokens = 4;
+    dsv4::QwenEngine wide(dir, wide_options, 2, 8);
+    const dsv4::QwenForwardResult wide_baseline = wide.prefill({1, 2, 3, 4, 5, 6});
+    require(wide.prefix_cache_stats().computed_tokens == 6,
+            "wide chunk prefill accounting");
+    const dsv4::QwenForwardResult wide_again = wide.prefill({1, 2, 3, 4, 5, 6});
+    require(wide.prefix_cache_stats().resume_source == "live" &&
+                wide.prefix_cache_stats().computed_tokens == 0 &&
+                wide_again.top_token == wide_baseline.top_token,
+            "wide chunk must still serve an exact prefix hit");
+
+    dsv4::QwenEngineOptions wide_cold = wide_options;
+    wide_cold.prefix_cache = false;
+    dsv4::QwenEngine wide_cold_engine(dir, wide_cold, 2, 8);
+    const dsv4::QwenForwardResult wide_expected =
+        wide_cold_engine.prefill({1, 2, 3, 4, 5, 6});
+    require(wide_baseline.top_token == wide_expected.top_token,
+            "wide chunk prefill must match cold prefill");
 }
 
 void exercise_mtp(const std::string& dir,

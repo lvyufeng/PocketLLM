@@ -1353,25 +1353,56 @@ struct QwenEngine::Impl {
         return total;
     }
 
+    // Snapshots let a later shorter-prefix or branched request resume mid-prompt,
+    // but a snapshot position splits the prefill chunk, and a short chunk is far
+    // less efficient per token. So a snapshot grid finer than the chunk is not
+    // free: it silently caps the chunk size the prompt actually runs at.
+    //
+    // Measured on the real 64-layer TP4 model, chunk 4096, FP16 cache, identical
+    // generated tokens throughout:
+    //
+    //   context   dense grid split   grid at chunk   prefill
+    //     8192      1395 tok/s         1799 tok/s     1.29x
+    //    65536      1415 tok/s         1457 tok/s     1.03x
+    //
+    // The 8K case is the extreme one: the 256-token early grid cut the first 4096
+    // tokens into 16 chunks costing 3.59 s where a single 4096-row chunk does the
+    // same work in 1.40 s. Both grids are therefore rounded up to the chunk, and
+    // resume granularity becomes exactly the chunk boundary.
+    int snapshot_interval_tokens() const {
+        const int interval = options.state_snapshot_interval_tokens;
+        if (interval <= 0) return 0;
+        const int chunk = std::max(1, options.prefill_chunk_tokens);
+        if (interval >= chunk) return interval;
+        // Round up to a whole number of chunks so every snapshot position is also
+        // a chunk boundary and no chunk is ever split.
+        return ((chunk + interval - 1) / interval) * interval;
+    }
+
     int early_snapshot_interval() const {
-        if (options.state_snapshot_interval_tokens <= 0) return 0;
-        return std::min(256, options.state_snapshot_interval_tokens);
+        const int interval = snapshot_interval_tokens();
+        if (interval <= 0) return 0;
+        const int early = std::min(256, interval);
+        if (options.prefill_chunk_tokens > early) return 0;
+        return early;
     }
 
     bool is_periodic_snapshot_position(int position) const {
-        const int interval = options.state_snapshot_interval_tokens;
+        const int interval = snapshot_interval_tokens();
         if (interval <= 0 || position <= 0) return false;
         if (position % interval == 0) return true;
         const int early_interval = early_snapshot_interval();
+        if (early_interval <= 0) return false;
         return position <= 4096 && position % early_interval == 0;
     }
 
     int next_periodic_snapshot_after(int position) const {
-        const int interval = options.state_snapshot_interval_tokens;
+        const int interval = snapshot_interval_tokens();
         if (interval <= 0) return 0;
         const int next_regular = ((position / interval) + 1) * interval;
         if (position >= 4096) return next_regular;
         const int early_interval = early_snapshot_interval();
+        if (early_interval <= 0) return next_regular;
         const int next_early = ((position / early_interval) + 1) * early_interval;
         return std::min(next_regular, next_early);
     }
@@ -1394,6 +1425,14 @@ struct QwenEngine::Impl {
     class PhaseScope {
     public:
         PhaseScope(Impl* owner, std::string name) : owner_(owner), name_(std::move(name)) {
+            // The NVTX range is pushed without any synchronization, so a Nsight
+            // capture can attribute kernels to a site by launch correlation while
+            // the stream pipeline stays exactly as production runs it. Only the
+            // phase_profile timer needs the device drained.
+            if (owner_->nvtx_profile) {
+                nvtxRangePushA(name_.c_str());
+                nvtx_pushed_ = true;
+            }
             if (owner_->phase_profile) {
                 cudaDeviceSynchronize();
                 started_ = std::chrono::steady_clock::now();
@@ -1406,6 +1445,7 @@ struct QwenEngine::Impl {
                     std::chrono::steady_clock::now() - started_).count();
                 ++owner_->phase_calls[name_];
             }
+            if (nvtx_pushed_) nvtxRangePop();
         }
         PhaseScope(const PhaseScope&) = delete;
         PhaseScope& operator=(const PhaseScope&) = delete;
@@ -1414,6 +1454,7 @@ struct QwenEngine::Impl {
         Impl* owner_;
         std::string name_;
         std::chrono::steady_clock::time_point started_;
+        bool nvtx_pushed_ = false;
     };
 
     class NvtxScope {
@@ -1423,6 +1464,11 @@ struct QwenEngine::Impl {
         NvtxScope(const NvtxScope&) = delete;
         NvtxScope& operator=(const NvtxScope&) = delete;
     };
+
+    // Application-level NVTX ranges are opt-in: they only push/pop host-side
+    // markers so a Nsight capture can separate warmup, prefill and decode
+    // without the CUDA synchronization that `QWEN_PHASE_PROFILE` forces.
+    bool nvtx_profile = qwen_env_enabled("QWEN_NVTX_PROFILE");
 
     void report_phase_profile(const char* tag) const {
         if (!phase_profile) return;
@@ -3577,6 +3623,8 @@ QwenForwardResult QwenEngine::debug_prefill_dflash2(
 }
 
 void QwenEngine::warmup_tp() {
+    std::optional<Impl::NvtxScope> nvtx;
+    if (impl_->nvtx_profile) nvtx.emplace("qwen.warmup_tp");
     if (options_.tp_world == 1) return;
     QwenDeviceTensor scratch;
     allocate_half(scratch, 1, {1});
@@ -3604,6 +3652,8 @@ void QwenEngine::clear_prefix_cache() {
 }
 
 QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
+    std::optional<Impl::NvtxScope> nvtx;
+    if (impl_->nvtx_profile) nvtx.emplace("qwen.prefill");
     if (token_ids.empty()) {
         throw std::runtime_error("Qwen prefill requires at least one token");
     }
@@ -3784,6 +3834,8 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
 }
 
 QwenForwardResult QwenEngine::decode_step(int token_id) {
+    std::optional<Impl::NvtxScope> nvtx;
+    if (impl_->nvtx_profile) nvtx.emplace("qwen.decode_step");
     if (position_ >= max_context_) {
         throw std::runtime_error("Qwen context length exceeded");
     }
@@ -3811,6 +3863,8 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         static_cast<size_t>(max_context_)) {
         throw std::runtime_error("Qwen prompt plus generation exceeds context");
     }
+    std::optional<Impl::NvtxScope> nvtx_generate;
+    if (impl_->nvtx_profile) nvtx_generate.emplace("qwen.generate");
     mtp_stats_ = QwenMtpStats{};
     const auto prefill_started = std::chrono::steady_clock::now();
     QwenForwardResult next = prefill(prompt_ids);
@@ -3824,10 +3878,13 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     results.reserve(static_cast<size_t>(max_new_tokens));
     if (!options_.mtp && options_.dspark_checkpoint.empty() &&
         options_.dflash2_checkpoint.empty()) {
+        std::optional<Impl::NvtxScope> nvtx_decode;
+        if (impl_->nvtx_profile) nvtx_decode.emplace("qwen.decode_loop");
         for (int index = 0; index < max_new_tokens; ++index) {
             results.push_back(next);
             if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
         }
+        nvtx_decode.reset();
         impl_->report_phase_profile("decode");
         return results;
     }
