@@ -54,6 +54,10 @@ set(POCKET_ENGINE_SOURCES
 )
 
 set(POCKET_BACKEND_SOURCES)
+# The device runtime is kept apart from the rest of the backend sources so it can
+# be linked without any kernels. That is what makes it testable on hardware whose
+# kernels do not exist yet.
+set(POCKET_RUNTIME_SOURCES)
 set(POCKET_BACKEND_LIBS)
 set(POCKET_BACKEND_INCLUDES)
 set(POCKET_BACKEND_DEFINES)
@@ -91,6 +95,7 @@ if(POCKET_BACKEND STREQUAL "cuda")
         message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
     endif()
 
+    list(APPEND POCKET_RUNTIME_SOURCES backends/cuda/runtime/device_runtime_cuda.cpp)
     list(APPEND POCKET_BACKEND_SOURCES
         backends/cuda/collective/tp_comm.cpp
         backends/cuda/kernels/cuda_ops.cu
@@ -128,13 +133,59 @@ if(POCKET_BACKEND STREQUAL "cuda")
         list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_NCCL=1)
     endif()
 else()
-    # Ascend: ACL runtime, AscendC kernels and HCCL collectives land under
-    # backends/ascend. Until they exist this configuration is expected to fail at
-    # link time; it is wired up so the layering can be checked, not shipped.
+    # Ascend: ACL runtime, AscendC kernels and HCCL collectives under
+    # backends/ascend. The device runtime is implemented; kernels are not, so the
+    # full engine still does not link. What does link and run today is anything
+    # that needs only pocket_core plus the device runtime.
     set(DSV4_HAVE_NCCL OFF)
+
+    # CANN layout: $ASCEND_TOOLKIT_HOME/<arch>-linux/{include,lib64}. The arch
+    # directory name is not always the uname value (arm64-linux exists alongside
+    # aarch64-linux), so probe rather than compose it.
+    if(NOT ASCEND_TOOLKIT_HOME)
+        if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+            set(ASCEND_TOOLKIT_HOME "$ENV{ASCEND_TOOLKIT_HOME}")
+        else()
+            set(ASCEND_TOOLKIT_HOME "/usr/local/Ascend/cann-9.0.0")
+        endif()
+    endif()
+    set(ASCEND_TOOLKIT_HOME "${ASCEND_TOOLKIT_HOME}" CACHE PATH "CANN toolkit root")
+
+    set(ASCEND_ARCH_DIR "")
+    foreach(candidate aarch64-linux arm64-linux x86_64-linux)
+        if(EXISTS "${ASCEND_TOOLKIT_HOME}/${candidate}/include/acl/acl.h")
+            set(ASCEND_ARCH_DIR "${ASCEND_TOOLKIT_HOME}/${candidate}")
+            break()
+        endif()
+    endforeach()
+    if(NOT ASCEND_ARCH_DIR)
+        message(FATAL_ERROR
+            "No CANN include tree found under ${ASCEND_TOOLKIT_HOME}; "
+            "set -DASCEND_TOOLKIT_HOME=<cann root>")
+    endif()
+
+    find_library(ASCEND_ACL_LIBRARY NAMES ascendcl
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    if(NOT ASCEND_ACL_LIBRARY)
+        message(FATAL_ERROR "libascendcl not found under ${ASCEND_ARCH_DIR}/lib64")
+    endif()
+    message(STATUS "CANN found: ${ASCEND_ARCH_DIR}")
+
+    # First-generation 910 (Short_SoC_version=Ascend910). CANN's own
+    # host_config.cmake groups ascend910b with ascend910a here and ascend910b1..b4
+    # separately, so this value selects the first-generation codegen path. Kernel
+    # tiling is tuned for 30 AI cores / 32 MB L2 / 900 MHz cube; do not change
+    # this without re-tuning.
+    set(ASCEND_SOC_VERSION "ascend910b" CACHE STRING "AscendC target SoC version")
+
+    list(APPEND POCKET_RUNTIME_SOURCES backends/ascend/runtime/device_runtime_ascend.cpp)
+    list(APPEND POCKET_BACKEND_INCLUDES "${ASCEND_ARCH_DIR}/include")
+    list(APPEND POCKET_BACKEND_LIBS "${ASCEND_ACL_LIBRARY}")
+    list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
+
     message(WARNING
-        "POCKET_BACKEND=ascend has no kernel or runtime implementation yet; "
-        "configure succeeds but the engine will not link.")
+        "POCKET_BACKEND=ascend has a device runtime but no kernels yet; "
+        "pocket_core and the runtime build, the full engine will not link.")
 endif()
 
 # Device-agnostic core as its own library. Anything that links only this target
@@ -147,12 +198,30 @@ target_include_directories(pocket_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
+# The selected backend's device runtime, on its own. One vendor implementation is
+# linked, chosen at configure time, so a call through this costs the same as
+# calling the vendor API directly: no vtable, no dispatch.
+add_library(pocket_runtime STATIC ${POCKET_RUNTIME_SOURCES})
+target_link_libraries(pocket_runtime PUBLIC pocket_core)
+target_include_directories(pocket_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/api
+)
+if(POCKET_BACKEND_INCLUDES)
+    target_include_directories(pocket_runtime PRIVATE ${POCKET_BACKEND_INCLUDES})
+endif()
+if(POCKET_BACKEND_LIBS)
+    target_link_libraries(pocket_runtime PUBLIC ${POCKET_BACKEND_LIBS})
+endif()
+if(POCKET_BACKEND_DEFINES)
+    target_compile_definitions(pocket_runtime PUBLIC ${POCKET_BACKEND_DEFINES})
+endif()
+
 add_library(dsv4_cpp_core STATIC
     ${POCKET_ENGINE_SOURCES}
     ${POCKET_BACKEND_SOURCES}
 )
 
-target_link_libraries(dsv4_cpp_core PUBLIC pocket_core)
+target_link_libraries(dsv4_cpp_core PUBLIC pocket_core pocket_runtime)
 
 target_include_directories(dsv4_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -196,6 +265,12 @@ set_target_properties(inspect_safetensors PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${
 add_executable(qwen_audit tools/qwen_audit.cpp)
 target_link_libraries(qwen_audit PRIVATE pocket_core)
 set_target_properties(qwen_audit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
+
+# Backend-agnostic conformance test for the device runtime. Links pocket_runtime
+# only, with no kernels, which is what lets it run on a backend whose kernels do
+# not exist yet.
+add_executable(test_device_runtime tests/test_device_runtime.cpp)
+target_link_libraries(test_device_runtime PRIVATE pocket_runtime)
 
 add_executable(test_qwen_bf16_checkpoint tests/test_qwen_bf16_checkpoint.cpp)
 target_link_libraries(test_qwen_bf16_checkpoint PRIVATE pocket_core)

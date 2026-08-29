@@ -6,8 +6,12 @@
 # the shared code to one vendor. Backends are allowed, and expected, to include
 # whatever their SDK needs.
 #
+# backends/api/ is checked too, and is the strictest case: it declares the
+# contract both vendors implement, so a vendor type reaching it would defeat the
+# whole seam.
+#
 # engine/ is deliberately NOT checked yet. It still calls vendor runtime APIs
-# directly; routing that through backends/api is a later phase.
+# directly; routing that through backends/api is in progress, file by file.
 #
 # Run with: cmake --build <dir> --target check_layering
 
@@ -36,6 +40,7 @@ file(GLOB_RECURSE guarded_files
     "${POCKET_ENGINE_DIR}/include/*.hpp"
     "${POCKET_ENGINE_DIR}/include/*.h"
     "${POCKET_ENGINE_DIR}/core/*.cpp"
+    "${POCKET_ENGINE_DIR}/backends/api/*.hpp"
 )
 
 foreach(file ${guarded_files})
