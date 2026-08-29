@@ -40,9 +40,10 @@ set(POCKET_CORE_SOURCES
     third_party/httplib.cpp
 )
 
-# One engine implementation shared by every backend. These still call vendor
-# runtime APIs directly; extracting that into backends/api is the next phase and
-# is intentionally not part of this change.
+# One engine implementation shared by every backend. These reach the device only
+# through backends/api/device_runtime.hpp and the operator contracts in include/,
+# so they compile unchanged for either backend; check_layering enforces it. What
+# is still vendor-specific is the operator implementations they call.
 set(POCKET_ENGINE_SOURCES
     engine/qwen_weights.cpp
     engine/qwen_target_head.cpp
@@ -184,8 +185,10 @@ else()
     list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
 
     message(WARNING
-        "POCKET_BACKEND=ascend has a device runtime but no kernels yet; "
-        "pocket_core and the runtime build, the full engine will not link.")
+        "POCKET_BACKEND=ascend has a device runtime but almost no operators yet. "
+        "pocket_core, pocket_runtime, every engine object file and the host-only "
+        "tools and tests build; linking dsv4_cpp_engine still fails on the "
+        "unimplemented *_cuda operator contracts.")
 endif()
 
 # Device-agnostic core as its own library. Anything that links only this target

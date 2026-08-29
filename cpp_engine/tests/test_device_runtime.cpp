@@ -97,6 +97,101 @@ void check_sync_transfers() {
     require(dsv4::memcpy_d2h(host_out.data(), a.get(), 0), "zero-length D2H");
 }
 
+// The typed allocation wrappers exist so call sites can drop the void** cast.
+// Verify the pointer they hand back is usable and that the failure path reports
+// false rather than a stale pointer.
+void check_typed_allocation() {
+    constexpr size_t kCount = 256;
+
+    float* device_ptr = nullptr;
+    require(dsv4::device_malloc_into(device_ptr, kCount * sizeof(float)),
+            "device_malloc_into reports success");
+    require(device_ptr != nullptr, "device_malloc_into fills the typed pointer");
+
+    std::vector<float> host_in(kCount, 2.5f);
+    std::vector<float> host_out(kCount, 0.0f);
+    require(dsv4::memcpy_h2d(device_ptr, host_in.data(), kCount * sizeof(float)),
+            "H2D into device_malloc_into buffer");
+    require(dsv4::memcpy_d2h(host_out.data(), device_ptr, kCount * sizeof(float)),
+            "D2H from device_malloc_into buffer");
+    require(host_out == host_in, "device_malloc_into buffer round-trips");
+    dsv4::device_free(device_ptr);
+
+    uint32_t* pinned = nullptr;
+    require(dsv4::host_alloc_pinned_into(pinned, kCount * sizeof(uint32_t)),
+            "host_alloc_pinned_into reports success");
+    require(pinned != nullptr, "host_alloc_pinned_into fills the typed pointer");
+    pinned[0] = 7u;
+    pinned[kCount - 1] = 9u;
+    require(pinned[0] == 7u && pinned[kCount - 1] == 9u,
+            "pinned host memory is directly writable");
+    dsv4::host_free_pinned(pinned);
+}
+
+// Strided 2D copies back the engine's confidence-head concat, where a narrow
+// source is written into a wider destination row. Check that the untouched tail
+// of each destination row survives.
+void check_strided_2d_copy() {
+    constexpr size_t kRows = 8;
+    constexpr size_t kSrcCols = 4;
+    constexpr size_t kDstCols = 6;
+    const size_t src_pitch = kSrcCols * sizeof(uint32_t);
+    const size_t dst_pitch = kDstCols * sizeof(uint32_t);
+
+    std::vector<uint32_t> host_src(kRows * kSrcCols);
+    std::iota(host_src.begin(), host_src.end(), 100u);
+    std::vector<uint32_t> host_dst(kRows * kDstCols, 0xFFFFFFFFu);
+
+    DeviceBuffer src(host_src.size() * sizeof(uint32_t));
+    DeviceBuffer dst(host_dst.size() * sizeof(uint32_t));
+    require(dsv4::memcpy_h2d(src.get(), host_src.data(),
+                             host_src.size() * sizeof(uint32_t)),
+            "H2D 2D source");
+    require(dsv4::memcpy_h2d(dst.get(), host_dst.data(),
+                             host_dst.size() * sizeof(uint32_t)),
+            "H2D 2D destination sentinel");
+
+    require(dsv4::memcpy_2d_d2d(dst.get(), dst_pitch, src.get(), src_pitch,
+                                src_pitch, kRows),
+            "memcpy_2d_d2d succeeds");
+    require(dsv4::memcpy_d2h(host_dst.data(), dst.get(),
+                             host_dst.size() * sizeof(uint32_t)),
+            "D2H after 2D copy");
+
+    bool rows_ok = true;
+    for (size_t row = 0; row < kRows; ++row) {
+        for (size_t col = 0; col < kSrcCols; ++col) {
+            rows_ok = rows_ok && host_dst[row * kDstCols + col] ==
+                                     host_src[row * kSrcCols + col];
+        }
+        // The columns past the copied width must keep the sentinel.
+        for (size_t col = kSrcCols; col < kDstCols; ++col) {
+            rows_ok = rows_ok && host_dst[row * kDstCols + col] == 0xFFFFFFFFu;
+        }
+    }
+    require(rows_ok, "2D copy places each row at its pitch and leaves the tail");
+
+    // Host-to-device and device-to-host 2D forms, using the same strides.
+    std::vector<uint32_t> wide(kRows * kDstCols, 0u);
+    require(dsv4::memcpy_2d_h2d(dst.get(), dst_pitch, host_src.data(), src_pitch,
+                                src_pitch, kRows),
+            "memcpy_2d_h2d succeeds");
+    require(dsv4::memcpy_2d_d2h(wide.data(), dst_pitch, dst.get(), dst_pitch,
+                                src_pitch, kRows),
+            "memcpy_2d_d2h succeeds");
+    bool h2d_ok = true;
+    for (size_t row = 0; row < kRows; ++row) {
+        for (size_t col = 0; col < kSrcCols; ++col) {
+            h2d_ok = h2d_ok && wide[row * kDstCols + col] ==
+                                   host_src[row * kSrcCols + col];
+        }
+    }
+    require(h2d_ok, "2D H2D then D2H round-trips the strided region");
+
+    require(dsv4::memcpy_2d_d2d(dst.get(), dst_pitch, src.get(), src_pitch, 0, 0),
+            "zero-extent 2D copy is a no-op");
+}
+
 void check_streams_and_pinned() {
     constexpr size_t kCount = 8192;
     constexpr size_t kBytes = kCount * sizeof(uint32_t);
@@ -260,6 +355,8 @@ int main() {
         }
         check_device_query();
         check_sync_transfers();
+        check_typed_allocation();
+        check_strided_2d_copy();
         check_streams_and_pinned();
         check_events();
         check_second_device();

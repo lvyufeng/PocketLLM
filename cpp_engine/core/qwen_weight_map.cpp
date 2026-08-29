@@ -66,11 +66,21 @@ void validate_model_tp(const QwenConfig& config, int world) {
 }  // namespace
 
 SafeDType qwen_device_dtype(SafeDType storage_dtype) {
-    // CUDA/SM75 policy. RTX 2080 Ti has no native BF16 arithmetic or storage
-    // path, so every checkpoint BF16 tensor is materialized as IEEE FP16 before
-    // upload. This applies equally to the official BF16 Qwen3.8 checkpoint and to
-    // the BF16 scale metadata carried by FP8 checkpoints. FP8 and NVFP4 codes stay
-    // compressed for online unpack. A native-BF16 backend must not reuse this.
+    // Every checkpoint BF16 tensor is materialized as IEEE FP16 before upload.
+    // This applies equally to the official BF16 Qwen3.8 checkpoint and to the BF16
+    // scale metadata carried by FP8 checkpoints. FP8 and NVFP4 codes stay
+    // compressed for online unpack.
+    //
+    // Both currently supported backends need this, for unrelated reasons:
+    //
+    //   - RTX 2080 Ti (SM75) has no native BF16 arithmetic or storage path.
+    //   - First-generation Ascend 910 (Short_SoC_version=Ascend910, which includes
+    //     the product named "910B" with no trailing digit) has no BF16 at all: its
+    //     platform_config declares no support_bf16 and no BF16 conversion
+    //     intrinsic. Second-generation 910B1-910B4 do.
+    //
+    // A backend with native BF16 must not reuse this without re-deriving it; see
+    // CLAUDE.md for why the Ascend product name cannot be used to make that call.
     return storage_dtype == SafeDType::BF16 ? SafeDType::F16 : storage_dtype;
 }
 

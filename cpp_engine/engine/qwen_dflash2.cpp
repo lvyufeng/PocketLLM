@@ -1,10 +1,10 @@
 #include "qwen_dflash2.hpp"
 
+#include "device_runtime.hpp"
 #include "json_lite.hpp"
 #include "qwen_cuda_ops.hpp"
 #include "tp_comm.hpp"
 
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
@@ -170,12 +170,16 @@ struct DeviceLayer {
     QwenDeviceTensor context_v;
 };
 
-void check_cuda(cudaError_t status, const char* what) {
-    if (status != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+void check_device(bool ok, const char* what) {
+    if (!ok) {
+        const std::string detail = device_last_error();
+        throw std::runtime_error(detail.empty() ? std::string(what)
+                                                : std::string(what) + ": " + detail);
+    }
 }
 
 void require_launch(bool ok, const char* what) {
-    if (!ok) throw std::runtime_error(std::string("Qwen DFlash2 CUDA launch failed: ") + what);
+    if (!ok) throw std::runtime_error(std::string("Qwen DFlash2 device launch failed: ") + what);
 }
 
 class DFlash2StageProfiler {
@@ -189,8 +193,8 @@ public:
 
     ~DFlash2StageProfiler() {
         for (const Entry& entry : entries_) {
-            if (entry.start != nullptr) cudaEventDestroy(entry.start);
-            if (entry.stop != nullptr) cudaEventDestroy(entry.stop);
+            if (entry.start != nullptr) event_destroy(entry.start);
+            if (entry.stop != nullptr) event_destroy(entry.stop);
         }
     }
 
@@ -199,13 +203,13 @@ public:
         if (active_) throw std::runtime_error("nested DFlash2 profile stages");
         Entry entry;
         entry.name = name;
-        check_cuda(cudaEventCreate(&entry.start),
-                   "cudaEventCreate DFlash2 profile start");
-        check_cuda(cudaEventCreate(&entry.stop),
-                   "cudaEventCreate DFlash2 profile stop");
+        entry.start = event_create(/*with_timing=*/true);
+        check_device(entry.start != nullptr, "event_create DFlash2 profile start");
+        entry.stop = event_create(/*with_timing=*/true);
+        check_device(entry.stop != nullptr, "event_create DFlash2 profile stop");
         entry.host_start = std::chrono::steady_clock::now();
-        check_cuda(cudaEventRecord(entry.start, nullptr),
-                   "cudaEventRecord DFlash2 profile start");
+        check_device(event_record(entry.start, nullptr),
+                     "event_record DFlash2 profile start");
         entries_.push_back(std::move(entry));
         active_ = true;
     }
@@ -216,8 +220,8 @@ public:
             throw std::runtime_error("unbalanced DFlash2 profile stage");
         }
         Entry& entry = entries_.back();
-        check_cuda(cudaEventRecord(entry.stop, nullptr),
-                   "cudaEventRecord DFlash2 profile stop");
+        check_device(event_record(entry.stop, nullptr),
+                     "event_record DFlash2 profile stop");
         entry.host_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - entry.host_start).count();
         active_ = false;
@@ -226,18 +230,18 @@ public:
     void flush(const char* operation) {
         if (!enabled_ || entries_.empty()) return;
         if (active_) throw std::runtime_error("unfinished DFlash2 profile stage");
-        check_cuda(cudaDeviceSynchronize(), "sync DFlash2 profile");
+        check_device(device_synchronize(), "sync DFlash2 profile");
         std::cout << "dflash2_profile rank=" << rank_
                   << " op=" << operation << " stages=" << entries_.size()
                   << "\n";
         for (Entry& entry : entries_) {
-            float cuda_ms = 0.0f;
-            check_cuda(cudaEventElapsedTime(&cuda_ms, entry.start, entry.stop),
-                       "cudaEventElapsedTime DFlash2 profile");
-            std::cout << "  " << entry.name << " cuda_ms=" << cuda_ms
+            float device_ms = 0.0f;
+            check_device(event_elapsed_ms(entry.start, entry.stop, &device_ms),
+                         "event_elapsed_ms DFlash2 profile");
+            std::cout << "  " << entry.name << " device_ms=" << device_ms
                       << " host_ms=" << entry.host_ms << "\n";
-            cudaEventDestroy(entry.start);
-            cudaEventDestroy(entry.stop);
+            event_destroy(entry.start);
+            event_destroy(entry.stop);
             entry.start = nullptr;
             entry.stop = nullptr;
         }
@@ -247,8 +251,8 @@ public:
 private:
     struct Entry {
         std::string name;
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
+        void* start = nullptr;
+        void* stop = nullptr;
         std::chrono::steady_clock::time_point host_start;
         double host_ms = 0.0;
     };
@@ -270,8 +274,12 @@ void allocate(QwenDeviceTensor& tensor, size_t elements,
         tensor.nbytes = bytes;
         return;
     }
-    if (tensor.data != nullptr) check_cuda(cudaFree(tensor.data), "cudaFree DFlash2 workspace");
-    check_cuda(cudaMalloc(&tensor.data, bytes), "cudaMalloc DFlash2 workspace");
+    if (tensor.data != nullptr) {
+        device_free(tensor.data);
+        tensor.data = nullptr;
+    }
+    tensor.data = device_malloc(bytes);
+    check_device(tensor.data != nullptr, "device_malloc DFlash2 workspace");
     tensor.device_dtype = dtype;
     tensor.shape = shape;
     tensor.nbytes = bytes;
@@ -517,7 +525,7 @@ struct QwenDFlash2Runtime::Impl {
     QwenDeviceTensor intermediate;
     QwenDeviceTensor logits;
     // prepare_context() scratch. These were function locals, so every proposal
-    // paid five cudaMalloc/cudaFree pairs (~13 ms) before any drafting work.
+    // paid five device malloc/free pairs (~13 ms) before any drafting work.
     QwenDeviceTensor context_projected;
     QwenDeviceTensor context_normalized;
     QwenDeviceTensor context_k;
@@ -586,7 +594,7 @@ struct QwenDFlash2Runtime::Impl {
             !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DFlash2 runtime target tensors");
         }
-        check_cuda(cudaSetDevice(device), "select Qwen DFlash2 CUDA device");
+        check_device(device_set(device), "select Qwen DFlash2 device");
         grouped_attention = env_enabled("DSV4_DFLASH2_GROUPED_ATTN");
         fused_swiglu = env_enabled("DSV4_DFLASH2_FUSED_SWIGLU");
         cublas_fp32 = env_enabled("DSV4_DFLASH2_CUBLAS_FP32");
@@ -670,9 +678,8 @@ struct QwenDFlash2Runtime::Impl {
         tensor.dtype = dtype;
         tensor.shape = shape;
         tensor.bytes.resize(static_cast<size_t>(bytes));
-        check_cuda(cudaMemcpy(tensor.bytes.data(), data, tensor.bytes.size(),
-                              cudaMemcpyDeviceToHost),
-                   "download Qwen DFlash2 debug tensor");
+        check_device(memcpy_d2h(tensor.bytes.data(), data, tensor.bytes.size()),
+                     "download Qwen DFlash2 debug tensor");
         debug_callback(tensor);
     }
 
@@ -766,8 +773,8 @@ struct QwenDFlash2Runtime::Impl {
         const std::vector<uint64_t> tap_shape = {
             static_cast<uint64_t>(rows), static_cast<uint64_t>(width)};
         profiler.begin("context_append");
-        check_cuda(cudaMemcpy(context_taps.f16_data() + static_cast<size_t>(position_offset) * width,
-                              taps, static_cast<size_t>(rows) * width * sizeof(uint16_t), cudaMemcpyDeviceToDevice), "append DFlash2 target taps");
+        check_device(memcpy_d2d(context_taps.f16_data() + static_cast<size_t>(position_offset) * width,
+                                taps, static_cast<size_t>(rows) * width * sizeof(uint16_t)), "append DFlash2 target taps");
         profiler.end();
         dump_half("target_taps", taps, tap_shape);
         committed += rows;
@@ -817,8 +824,10 @@ struct QwenDFlash2Runtime::Impl {
             dump_half_sharded(prefix + "k_norm", knorm.f16_data(), knorm.shape);
             require_launch(qwen_dflash2_rope_k_rows_f16_cuda(knorm.f16_data(), rows, local_kv_heads, config.head_dim, position_offset, static_cast<float>(config.rope_theta)), "DFlash2 context K RoPE");
             dump_half_sharded(prefix + "k_rope", knorm.f16_data(), knorm.shape);
-            check_cuda(cudaMemcpy(layer.context_k.f16_data() + static_cast<size_t>(position_offset) * kv_dim, knorm.f16_data(), k.nbytes, cudaMemcpyDeviceToDevice), "append DFlash2 context K");
-            check_cuda(cudaMemcpy(layer.context_v.f16_data() + static_cast<size_t>(position_offset) * kv_dim, v.f16_data(), v.nbytes, cudaMemcpyDeviceToDevice), "append DFlash2 context V");
+            check_device(memcpy_d2d(layer.context_k.f16_data() + static_cast<size_t>(position_offset) * kv_dim,
+                                    knorm.f16_data(), k.nbytes), "append DFlash2 context K");
+            check_device(memcpy_d2d(layer.context_v.f16_data() + static_cast<size_t>(position_offset) * kv_dim,
+                                    v.f16_data(), v.nbytes), "append DFlash2 context V");
         }
         profiler.end();
         profiler.flush("prepare_context");
@@ -836,7 +845,7 @@ struct QwenDFlash2Runtime::Impl {
         const int kv_dim = local_kv_dim;
         const int local_vocab = target_head.local_vocab;
         allocate_int(tokens, rows, {static_cast<uint64_t>(rows)});
-        check_cuda(cudaMemcpy(tokens.data, host_tokens.data(), host_tokens.size() * sizeof(int), cudaMemcpyHostToDevice), "upload DFlash2 tokens");
+        check_device(memcpy_h2d(tokens.data, host_tokens.data(), host_tokens.size() * sizeof(int)), "upload DFlash2 tokens");
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden;
         allocate_half(hidden_a, hidden_elements, {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden)});
         allocate_half(hidden_b, hidden_elements, hidden_a.shape);
@@ -1136,25 +1145,19 @@ struct QwenDFlash2Runtime::Impl {
                 static_cast<int*>(global_candidates.data),
                 global_unary.f32_data());
         } else {
-            check_cuda(cudaMemcpy(global_candidates.data, local_candidates.data,
-                                  global_candidates.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "copy DFlash2 single-rank candidates");
-            check_cuda(cudaMemcpy(global_unary.data, local_unary.data,
-                                  local_unary.nbytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "copy DFlash2 single-rank logits");
+            check_device(memcpy_d2d(global_candidates.data, local_candidates.data,
+                                    global_candidates.nbytes),
+                         "copy DFlash2 single-rank candidates");
+            check_device(memcpy_d2d(global_unary.data, local_unary.data, local_unary.nbytes),
+                         "copy DFlash2 single-rank logits");
         }
 #else
         if (tp_world > 1) throw std::runtime_error("Qwen DFlash2 TP requires NCCL-enabled build");
-        check_cuda(cudaMemcpy(global_candidates.data, local_candidates.data,
-                              global_candidates.nbytes,
-                              cudaMemcpyDeviceToDevice),
-                   "copy DFlash2 single-rank candidates");
-        check_cuda(cudaMemcpy(global_unary.data, local_unary.data,
-                              local_unary.nbytes,
-                              cudaMemcpyDeviceToDevice),
-                   "copy DFlash2 single-rank logits");
+        check_device(memcpy_d2d(global_candidates.data, local_candidates.data,
+                                global_candidates.nbytes),
+                     "copy DFlash2 single-rank candidates");
+        check_device(memcpy_d2d(global_unary.data, local_unary.data, local_unary.nbytes),
+                     "copy DFlash2 single-rank logits");
 #endif
         profiler.end();
         dump_i32("topk.global.tokens", static_cast<const int*>(global_candidates.data),
@@ -1212,10 +1215,8 @@ struct QwenDFlash2Runtime::Impl {
         // acceptance, never the emitted tokens.
         for (int pass = 1; pass < refine_passes; ++pass) {
             std::vector<int> refined(static_cast<size_t>(draft_rows));
-            check_cuda(cudaMemcpy(refined.data(), path.data,
-                                  refined.size() * sizeof(int),
-                                  cudaMemcpyDeviceToHost),
-                       "download DFlash2 refinement seed");
+            check_device(memcpy_d2h(refined.data(), path.data, refined.size() * sizeof(int)),
+                         "download DFlash2 refinement seed");
             std::vector<int> next(static_cast<size_t>(rows));
             next[0] = anchor_token;
             for (int row = 0; row < draft_rows; ++row) {
@@ -1236,21 +1237,16 @@ struct QwenDFlash2Runtime::Impl {
             proposal.candidates.resize(
                 static_cast<size_t>(draft_rows) * config.selector_top_k);
             proposal.candidate_logits.resize(proposal.candidates.size());
-            check_cuda(cudaMemcpy(
-                proposal.candidates.data(), global_candidates.data,
-                proposal.candidates.size() * sizeof(int),
-                cudaMemcpyDeviceToHost),
-                "download DFlash2 global candidates");
-            check_cuda(cudaMemcpy(
-                proposal.candidate_logits.data(), global_unary.f32_data(),
-                proposal.candidate_logits.size() * sizeof(float),
-                cudaMemcpyDeviceToHost),
-                "download DFlash2 global logits");
+            check_device(memcpy_d2h(proposal.candidates.data(), global_candidates.data,
+                                    proposal.candidates.size() * sizeof(int)),
+                  "download DFlash2 global candidates");
+            check_device(memcpy_d2h(proposal.candidate_logits.data(), global_unary.f32_data(),
+                                    proposal.candidate_logits.size() * sizeof(float)),
+                  "download DFlash2 global logits");
         }
-        check_cuda(cudaMemcpy(proposal.tokens.data(), path.data,
-                              proposal.tokens.size() * sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "download DFlash2 path");
+        check_device(memcpy_d2h(proposal.tokens.data(), path.data,
+                                proposal.tokens.size() * sizeof(int)),
+                     "download DFlash2 path");
         return proposal;
     }
 
@@ -1292,10 +1288,8 @@ void QwenDFlash2Runtime::debug_load_target_taps(
     QwenDeviceTensor device_taps;
     allocate_half(device_taps, taps.size(),
                   {static_cast<uint64_t>(rows), static_cast<uint64_t>(width)});
-    check_cuda(cudaMemcpy(device_taps.data, taps.data(),
-                          taps.size() * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice),
-               "upload host Qwen DFlash2 target taps");
+    check_device(memcpy_h2d(device_taps.data, taps.data(), taps.size() * sizeof(uint16_t)),
+                 "upload host Qwen DFlash2 target taps");
     impl_->append_target_taps(device_taps.f16_data(), rows, position_offset);
 }
 QwenDFlash2Proposal QwenDFlash2Runtime::debug_propose_from_host(

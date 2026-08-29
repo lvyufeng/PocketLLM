@@ -206,6 +206,47 @@ bool memcpy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
     return copy_async(dst, src, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream);
 }
 
+namespace {
+
+bool copy_2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+             size_t width, size_t height, aclrtMemcpyKind kind) {
+    if (width == 0 || height == 0) return true;
+    return aclrtMemcpy2d(dst, dst_pitch, src, src_pitch, width, height, kind) ==
+           ACL_SUCCESS;
+}
+
+}  // namespace
+
+// aclrtMemcpy2d rejects ACL_MEMCPY_DEVICE_TO_DEVICE on this CANN release (rtMemcpy2d
+// reports "the feature is not supported", runtime result 207000), even though the
+// host-to-device and device-to-host directions work. Fall back to one linear copy
+// per row, which is what the strided form would have done anyway.
+bool memcpy_2d_d2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    if (width == 0 || height == 0) return true;
+    auto* dst_bytes = static_cast<uint8_t*>(dst);
+    const auto* src_bytes = static_cast<const uint8_t*>(src);
+    for (size_t row = 0; row < height; ++row) {
+        if (!copy(dst_bytes + row * dst_pitch, src_bytes + row * src_pitch, width,
+                  ACL_MEMCPY_DEVICE_TO_DEVICE)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool memcpy_2d_h2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    return copy_2d(dst, dst_pitch, src, src_pitch, width, height,
+                   ACL_MEMCPY_HOST_TO_DEVICE);
+}
+
+bool memcpy_2d_d2h(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    return copy_2d(dst, dst_pitch, src, src_pitch, width, height,
+                   ACL_MEMCPY_DEVICE_TO_HOST);
+}
+
 bool device_memset(void* dst, int value, size_t bytes) {
     if (bytes == 0) return true;
     return aclrtMemset(dst, bytes, value, bytes) == ACL_SUCCESS;

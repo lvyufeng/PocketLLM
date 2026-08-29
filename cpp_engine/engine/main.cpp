@@ -1,5 +1,6 @@
 #include "cmd_channel.hpp"
 #include "cuda_ops.hpp"
+#include "device_runtime.hpp"
 #include "dsv4_engine.hpp"
 #include "model_config.hpp"
 #include "openai_server.hpp"
@@ -11,7 +12,6 @@
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
 
-#include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -377,9 +377,9 @@ int main(int argc, char** argv) {
         const bool host_only = is_host_only_mode(args);
         if (!host_only) {
             if (args.device >= 0) {
-                if (cudaSetDevice(args.device) != cudaSuccess) throw std::runtime_error("failed to set CUDA device");
+                if (!dsv4::device_set(args.device)) throw std::runtime_error("failed to set device");
             } else if (args.tp_world > 1) {
-                if (cudaSetDevice(args.tp_rank) != cudaSuccess) throw std::runtime_error("failed to set CUDA device for tp rank");
+                if (!dsv4::device_set(args.tp_rank)) throw std::runtime_error("failed to set device for tp rank");
             }
         }
         if (args.tp_world > 1) {
@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
             std::cout << "format=safetensors tensors=" << index.tensor_count()
                       << " shards=" << index.shard_count()
                       << " total_size=" << index.total_size()
-                      << " cuda=" << (dsv4::cuda_runtime_available() ? "yes" : "no") << "\n";
+                      << " backend=" << dsv4::device_backend_name() << " device_runtime=" << (dsv4::device_runtime_available() ? "yes" : "no") << "\n";
             if (args.dump_config) {
                 if (qwen_checkpoint) {
                     const dsv4::QwenConfig qwen_config = dsv4::QwenConfig::from_hf_config(args.ckpt);
@@ -812,7 +812,7 @@ int main(int argc, char** argv) {
                         qwen_telemetry = qwen.runtime_telemetry();
                         size_t free_bytes = 0;
                         size_t total_bytes = 0;
-                        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                        if (!dsv4::device_mem_info(&free_bytes, &total_bytes)) {
                             free_bytes = 0;
                             total_bytes = 0;
                         }
@@ -1184,7 +1184,7 @@ int main(int argc, char** argv) {
                   << " tensors=" << engine.gguf().tensor_count()
                   << " metadata=" << engine.gguf().metadata_count()
                   << " alignment=" << engine.gguf().alignment()
-                  << " cuda=" << (dsv4::cuda_runtime_available() ? "yes" : "no") << "\n";
+                  << " backend=" << dsv4::device_backend_name() << " device_runtime=" << (dsv4::device_runtime_available() ? "yes" : "no") << "\n";
         if (args.dump_config) {
             std::cout << engine.config().to_string();
         }

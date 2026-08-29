@@ -55,6 +55,22 @@ void device_free(void* ptr);
 void* host_alloc_pinned(size_t bytes);
 void host_free_pinned(void* ptr);
 
+// Allocate into an already-typed pointer, so a call site does not have to name
+// its own element type. This is what cudaMalloc's void** out-parameter bought,
+// without the cast: `device_malloc_into(d_logits, bytes)`. Returns false when
+// the allocation failed, matching how the engine tests allocation results.
+template <typename T>
+bool device_malloc_into(T*& ptr, size_t bytes) {
+    ptr = static_cast<T*>(device_malloc(bytes));
+    return ptr != nullptr;
+}
+
+template <typename T>
+bool host_alloc_pinned_into(T*& ptr, size_t bytes) {
+    ptr = static_cast<T*>(host_alloc_pinned(bytes));
+    return ptr != nullptr;
+}
+
 // Synchronous transfers. `bytes` is the copy length for both source and
 // destination; the backend supplies whatever capacity argument its API wants.
 bool memcpy_h2d(void* dst, const void* src, size_t bytes);
@@ -65,6 +81,16 @@ bool memcpy_d2d(void* dst, const void* src, size_t bytes);
 bool memcpy_h2d_async(void* dst, const void* src, size_t bytes, void* stream);
 bool memcpy_d2h_async(void* dst, const void* src, size_t bytes, void* stream);
 bool memcpy_d2d_async(void* dst, const void* src, size_t bytes, void* stream);
+
+// Strided 2D transfer: `height` rows of `width` bytes, advancing `dst_pitch` and
+// `src_pitch` bytes per row. Both backends expose this natively (cudaMemcpy2D,
+// aclrtMemcpy2d), so the engine keeps using it instead of a row loop.
+bool memcpy_2d_d2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height);
+bool memcpy_2d_h2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height);
+bool memcpy_2d_d2h(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height);
 
 bool device_memset(void* dst, int value, size_t bytes);
 bool device_memset_async(void* dst, int value, size_t bytes, void* stream);

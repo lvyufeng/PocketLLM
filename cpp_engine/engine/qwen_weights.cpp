@@ -1,18 +1,20 @@
-// CUDA-side of the Qwen weight loader: device residency and host-to-device
-// upload. The checkpoint mapping, TP sharding and host materialization live in
-// core/qwen_weight_map.cpp and stay free of any vendor SDK, so a checkpoint can
-// be audited on a machine that has no CUDA toolkit at all.
+// Device side of the Qwen weight loader: device residency and host-to-device
+// upload, expressed against the vendor-neutral device runtime so the same code
+// serves CUDA and Ascend. The checkpoint mapping, TP sharding and host
+// materialization live in core/qwen_weight_map.cpp and stay free of any vendor
+// SDK, so a checkpoint can be audited on a machine that has no CUDA toolkit at
+// all.
 
 #include "qwen_weights.hpp"
 
-#include <cuda_runtime.h>
+#include "device_runtime.hpp"
 
 #include <stdexcept>
 
 namespace dsv4 {
 
 QwenDeviceTensor::~QwenDeviceTensor() {
-    if (data != nullptr) cudaFree(data);
+    if (data != nullptr) device_free(data);
 }
 
 QwenDeviceTensor::QwenDeviceTensor(QwenDeviceTensor&& other) noexcept
@@ -26,7 +28,7 @@ QwenDeviceTensor::QwenDeviceTensor(QwenDeviceTensor&& other) noexcept
 
 QwenDeviceTensor& QwenDeviceTensor::operator=(QwenDeviceTensor&& other) noexcept {
     if (this == &other) return *this;
-    if (data != nullptr) cudaFree(data);
+    if (data != nullptr) device_free(data);
     data = other.data;
     device_dtype = other.device_dtype;
     shape = std::move(other.shape);
@@ -108,14 +110,15 @@ QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
     device.shape = host.shape;
     device.nbytes = host.bytes.size();
     device.capacity = device.nbytes;
-    if (device.nbytes == 0 || cudaMalloc(&device.data, device.nbytes) != cudaSuccess) {
+    if (device.nbytes == 0) {
         throw std::runtime_error("failed to allocate Qwen device tensor: " + ref.name);
     }
-    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    const cudaError_t status = cudaMemcpyAsync(device.data, host.bytes.data(), device.nbytes,
-                                               cudaMemcpyHostToDevice, cuda_stream);
-    if (status != cudaSuccess) {
-        cudaFree(device.data);
+    device.data = device_malloc(device.nbytes);
+    if (device.data == nullptr) {
+        throw std::runtime_error("failed to allocate Qwen device tensor: " + ref.name);
+    }
+    if (!memcpy_h2d_async(device.data, host.bytes.data(), device.nbytes, stream)) {
+        device_free(device.data);
         device.data = nullptr;
         device.nbytes = 0;
         device.capacity = 0;
@@ -137,15 +140,15 @@ QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
     device.shape.push_back(sizeof(QwenNvfp4Block64));
     device.nbytes = host.blocks.size() * sizeof(QwenNvfp4Block64);
     device.capacity = device.nbytes;
-    if (device.nbytes == 0 || cudaMalloc(&device.data, device.nbytes) != cudaSuccess) {
+    if (device.nbytes == 0) {
         throw std::runtime_error("failed to allocate Qwen NVFP4 device linear");
     }
-    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-    const cudaError_t status = cudaMemcpyAsync(
-        device.data, host.blocks.data(), device.nbytes, cudaMemcpyHostToDevice,
-        cuda_stream);
-    if (status != cudaSuccess) {
-        cudaFree(device.data);
+    device.data = device_malloc(device.nbytes);
+    if (device.data == nullptr) {
+        throw std::runtime_error("failed to allocate Qwen NVFP4 device linear");
+    }
+    if (!memcpy_h2d_async(device.data, host.blocks.data(), device.nbytes, stream)) {
+        device_free(device.data);
         device.data = nullptr;
         device.nbytes = 0;
         device.capacity = 0;

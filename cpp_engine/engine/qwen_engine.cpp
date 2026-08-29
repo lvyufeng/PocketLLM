@@ -1,6 +1,7 @@
 #include "qwen_engine.hpp"
 
 #include "cuda_ops.hpp"
+#include "device_runtime.hpp"
 #include "qwen_cuda_ops.hpp"
 #include "qwen_dspark.hpp"
 #include "qwen_dflash2.hpp"
@@ -8,8 +9,6 @@
 #include "qwen_target_head.hpp"
 #include "tp_comm.hpp"
 
-#include <cuda_runtime.h>
-#include <nvtx3/nvToolsExt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -30,9 +29,11 @@ namespace {
 
 constexpr int kKvScaleBlock = 64;
 
-void check_cuda(cudaError_t status, const char* what) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+void check_device(bool ok, const char* what) {
+    if (!ok) {
+        const std::string detail = device_last_error();
+        throw std::runtime_error(detail.empty() ? std::string(what)
+                                                : std::string(what) + ": " + detail);
     }
 }
 
@@ -197,28 +198,22 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     const uint64_t columns = first.weight.shape[1];
     allocate(fused.weight, first.weight.nbytes + second.weight.nbytes,
              {first_rows + second_rows, columns}, first.weight.device_dtype);
-    check_cuda(cudaMemcpy(fused.weight.data, first.weight.data,
-                          first.weight.nbytes, cudaMemcpyDeviceToDevice),
-               "Qwen fused projection first weight copy");
-    check_cuda(cudaMemcpy(static_cast<uint8_t*>(fused.weight.data) +
-                              first.weight.nbytes,
-                          second.weight.data, second.weight.nbytes,
-                          cudaMemcpyDeviceToDevice),
-               "Qwen fused projection second weight copy");
+    check_device(memcpy_d2d(fused.weight.data, first.weight.data, first.weight.nbytes),
+                 "Qwen fused projection first weight copy");
+    check_device(memcpy_d2d(static_cast<uint8_t*>(fused.weight.data) + first.weight.nbytes,
+                            second.weight.data, second.weight.nbytes),
+                 "Qwen fused projection second weight copy");
     fused.fp8 = first.fp8;
     if (first.fp8) {
         const uint64_t scale_columns = first.scale.shape[1];
         allocate(fused.scale, first.scale.nbytes + second.scale.nbytes,
                  {first.scale.shape[0] + second.scale.shape[0], scale_columns},
                  first.scale.device_dtype);
-        check_cuda(cudaMemcpy(fused.scale.data, first.scale.data,
-                              first.scale.nbytes, cudaMemcpyDeviceToDevice),
-                   "Qwen fused projection first scale copy");
-        check_cuda(cudaMemcpy(static_cast<uint8_t*>(fused.scale.data) +
-                                  first.scale.nbytes,
-                              second.scale.data, second.scale.nbytes,
-                              cudaMemcpyDeviceToDevice),
-                   "Qwen fused projection second scale copy");
+        check_device(memcpy_d2d(fused.scale.data, first.scale.data, first.scale.nbytes),
+                     "Qwen fused projection first scale copy");
+        check_device(memcpy_d2d(static_cast<uint8_t*>(fused.scale.data) + first.scale.nbytes,
+                                second.scale.data, second.scale.nbytes),
+                     "Qwen fused projection second scale copy");
     }
     return fused;
 }
@@ -235,10 +230,12 @@ void allocate(QwenDeviceTensor& tensor, size_t bytes,
         return;
     }
     if (tensor.data != nullptr) {
-        check_cuda(cudaFree(tensor.data), "cudaFree Qwen runtime tensor");
+        device_free(tensor.data);
+        tensor.data = nullptr;
         tensor.data = nullptr;
     }
-    check_cuda(cudaMalloc(&tensor.data, bytes), "cudaMalloc Qwen runtime tensor");
+    tensor.data = device_malloc(bytes);
+    check_device(tensor.data != nullptr, "device_malloc Qwen runtime tensor");
     tensor.device_dtype = dtype;
     tensor.shape = shape;
     tensor.nbytes = bytes;
@@ -266,8 +263,8 @@ void allocate_half(QwenDeviceTensor& tensor, size_t elements,
 
 void zero_tensor(QwenDeviceTensor& tensor) {
     if (tensor.data != nullptr && tensor.nbytes != 0) {
-        check_cuda(cudaMemset(tensor.data, 0, tensor.nbytes),
-                   "cudaMemset Qwen runtime tensor");
+        check_device(device_memset(tensor.data, 0, tensor.nbytes),
+                       "device_memset Qwen runtime tensor");
     }
 }
 
@@ -439,16 +436,16 @@ struct QwenEngine::Impl {
     // collective; `=0` restores the single-stream behaviour.
     const bool use_nccl_comm_stream =
         qwen_env_enabled_default("QWEN_NCCL_COMM_STREAM");
-    cudaStream_t nccl_comm_stream = nullptr;
-    cudaEvent_t nccl_comm_ready = nullptr;
-    cudaEvent_t nccl_comm_done = nullptr;
+    void* nccl_comm_stream = nullptr;
+    void* nccl_comm_ready = nullptr;
+    void* nccl_comm_done = nullptr;
     bool nccl_comm_stream_initialized = false;
     // The overlapped path has two collectives in flight across a slice boundary,
     // so it cannot share the single ready/done pair above: recording ready for
     // slice i+1 could overwrite it before slice i's waiter has resolved. These are
     // allocated per slice index and reused across layers.
-    std::vector<cudaEvent_t> comm_slice_ready;
-    std::vector<cudaEvent_t> comm_slice_done;
+    std::vector<void*> comm_slice_ready;
+    std::vector<void*> comm_slice_done;
     // Reusable per-token INT8 activation buffers for the NVFP4 integer kernels.
     QwenDeviceTensor nvfp4_q8;
     QwenDeviceTensor nvfp4_q8_scale;
@@ -469,15 +466,13 @@ struct QwenEngine::Impl {
 
     void ensure_nccl_comm_stream() {
         if (!use_nccl_comm_stream || nccl_comm_stream_initialized) return;
-        check_cuda(cudaStreamCreateWithFlags(&nccl_comm_stream,
-                                             cudaStreamNonBlocking),
-                   "Qwen NCCL communication stream");
-        check_cuda(cudaEventCreateWithFlags(&nccl_comm_ready,
-                                            cudaEventDisableTiming),
-                   "Qwen NCCL ready event");
-        check_cuda(cudaEventCreateWithFlags(&nccl_comm_done,
-                                            cudaEventDisableTiming),
-                   "Qwen NCCL done event");
+        nccl_comm_stream = stream_create();
+        check_device(nccl_comm_stream != nullptr,
+                     "Qwen NCCL communication stream");
+        nccl_comm_ready = event_create();
+        check_device(nccl_comm_ready != nullptr, "Qwen NCCL ready event");
+        nccl_comm_done = event_create();
+        check_device(nccl_comm_done != nullptr, "Qwen NCCL done event");
         nccl_comm_stream_initialized = true;
     }
 
@@ -485,12 +480,10 @@ struct QwenEngine::Impl {
     void ensure_comm_slice_events(int slices) {
         while (static_cast<int>(comm_slice_ready.size()) <
                static_cast<size_t>(slices)) {
-            cudaEvent_t ready = nullptr;
-            cudaEvent_t done = nullptr;
-            check_cuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming),
-                       "Qwen comm slice ready event");
-            check_cuda(cudaEventCreateWithFlags(&done, cudaEventDisableTiming),
-                       "Qwen comm slice done event");
+            void* ready = event_create();
+            check_device(ready != nullptr, "Qwen comm slice ready event");
+            void* done = event_create();
+            check_device(done != nullptr, "Qwen comm slice done event");
             comm_slice_ready.push_back(ready);
             comm_slice_done.push_back(done);
         }
@@ -501,34 +494,34 @@ struct QwenEngine::Impl {
     // complete producer work and the next compute kernel sees its result.
     void begin_nccl_collective() {
         ensure_nccl_comm_stream();
-        check_cuda(cudaEventRecord(nccl_comm_ready, nullptr),
-                   "Qwen record NCCL ready event");
-        check_cuda(cudaStreamWaitEvent(nccl_comm_stream, nccl_comm_ready, 0),
-                   "Qwen NCCL stream wait");
+        check_device(event_record(nccl_comm_ready, nullptr),
+                     "Qwen record NCCL ready event");
+        check_device(stream_wait_event(nccl_comm_stream, nccl_comm_ready),
+                     "Qwen NCCL stream wait");
     }
 
     void end_nccl_collective() {
-        check_cuda(cudaEventRecord(nccl_comm_done, nccl_comm_stream),
-                   "Qwen record NCCL done event");
-        check_cuda(cudaStreamWaitEvent(nullptr, nccl_comm_done, 0),
-                   "Qwen compute stream wait");
+        check_device(event_record(nccl_comm_done, nccl_comm_stream),
+                     "Qwen record NCCL done event");
+        check_device(stream_wait_event(nullptr, nccl_comm_done),
+                     "Qwen compute stream wait");
     }
 
     ~Impl() {
         if (nccl_comm_stream != nullptr) {
             // The default stream wait above normally makes this unnecessary;
             // keep destruction safe if construction or a caller failed midway.
-            cudaStreamSynchronize(nccl_comm_stream);
+            stream_synchronize(nccl_comm_stream);
         }
-        for (cudaEvent_t event : comm_slice_ready) {
-            if (event != nullptr) cudaEventDestroy(event);
+        for (void* event : comm_slice_ready) {
+            if (event != nullptr) event_destroy(event);
         }
-        for (cudaEvent_t event : comm_slice_done) {
-            if (event != nullptr) cudaEventDestroy(event);
+        for (void* event : comm_slice_done) {
+            if (event != nullptr) event_destroy(event);
         }
-        if (nccl_comm_done != nullptr) cudaEventDestroy(nccl_comm_done);
-        if (nccl_comm_ready != nullptr) cudaEventDestroy(nccl_comm_ready);
-        if (nccl_comm_stream != nullptr) cudaStreamDestroy(nccl_comm_stream);
+        if (nccl_comm_done != nullptr) event_destroy(nccl_comm_done);
+        if (nccl_comm_ready != nullptr) event_destroy(nccl_comm_ready);
+        if (nccl_comm_stream != nullptr) stream_destroy(nccl_comm_stream);
     }
 
     Impl(SafeTensorsIndex& index_, QwenConfig& config_,
@@ -1103,10 +1096,9 @@ struct QwenEngine::Impl {
         allocate(transaction_regions, descriptor_bytes,
                  {static_cast<uint64_t>(host_transaction_regions.size())},
                  SafeDType::I8);
-        check_cuda(cudaMemcpy(transaction_regions.data,
-                              host_transaction_regions.data(), descriptor_bytes,
-                              cudaMemcpyHostToDevice),
-                   "Qwen transaction descriptor upload");
+        check_device(memcpy_h2d(transaction_regions.data, host_transaction_regions.data(),
+                                descriptor_bytes),
+                     "Qwen transaction descriptor upload");
     }
 
     // Copies the recurrent half of the network to device-resident snapshots.
@@ -1178,29 +1170,22 @@ struct QwenEngine::Impl {
             const size_t hidden_elements = static_cast<size_t>(config.hidden_size);
             allocate_half(snapshot.target_hidden, hidden_elements,
                           {config.hidden_size});
-            check_cuda(cudaMemcpy(snapshot.target_hidden.data,
-                                  target_last_hidden.data,
-                                  hidden_elements * sizeof(uint16_t),
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen target hidden snapshot copy");
+            check_device(memcpy_d2d(snapshot.target_hidden.data, target_last_hidden.data,
+                                    hidden_elements * sizeof(uint16_t)),
+                         "Qwen target hidden snapshot copy");
         }
         size_t state_offset = 0;
         size_t tail_offset = 0;
         for (const DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            check_cuda(cudaMemcpy(
-                           static_cast<uint8_t*>(snapshot.state.data) + state_offset,
-                           layer.linear.state.data, layer.linear.state.nbytes,
-                           cudaMemcpyDeviceToDevice),
-                       "Qwen recurrent state snapshot copy");
+            check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.state.data) + state_offset,
+                                    layer.linear.state.data, layer.linear.state.nbytes),
+                         "Qwen recurrent state snapshot copy");
             state_offset += layer.linear.state.nbytes;
             if (layer.linear.conv_tail.nbytes != 0) {
-                check_cuda(cudaMemcpy(
-                               static_cast<uint8_t*>(snapshot.conv_tail.data) + tail_offset,
-                               layer.linear.conv_tail.data,
-                               layer.linear.conv_tail.nbytes,
-                               cudaMemcpyDeviceToDevice),
-                           "Qwen convolution tail snapshot copy");
+                check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.conv_tail.data) + tail_offset,
+                                        layer.linear.conv_tail.data, layer.linear.conv_tail.nbytes),
+                             "Qwen convolution tail snapshot copy");
                 tail_offset += layer.linear.conv_tail.nbytes;
             }
         }
@@ -1229,10 +1214,9 @@ struct QwenEngine::Impl {
             }
             allocate_half(target_last_hidden, config.hidden_size,
                           {config.hidden_size});
-            check_cuda(cudaMemcpy(target_last_hidden.data,
-                                  snapshot.target_hidden.data, hidden_bytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen target hidden snapshot restore");
+            check_device(memcpy_d2d(target_last_hidden.data, snapshot.target_hidden.data,
+                                    hidden_bytes),
+                         "Qwen target hidden snapshot restore");
             has_target_last_hidden = true;
             mtp_seed_ready = false;
             mtp_position = snapshot.position;
@@ -1263,19 +1247,16 @@ struct QwenEngine::Impl {
         size_t tail_offset = 0;
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            check_cuda(cudaMemcpy(
-                           layer.linear.state.data,
-                           static_cast<const uint8_t*>(snapshot.state.data) + state_offset,
-                           layer.linear.state.nbytes, cudaMemcpyDeviceToDevice),
-                       "Qwen recurrent state snapshot restore");
+            check_device(memcpy_d2d(layer.linear.state.data,
+                                    static_cast<const uint8_t*>(snapshot.state.data) + state_offset,
+                                    layer.linear.state.nbytes),
+                         "Qwen recurrent state snapshot restore");
             state_offset += layer.linear.state.nbytes;
             if (layer.linear.conv_tail.nbytes != 0) {
-                check_cuda(cudaMemcpy(
-                               layer.linear.conv_tail.data,
-                               static_cast<const uint8_t*>(snapshot.conv_tail.data) + tail_offset,
-                               layer.linear.conv_tail.nbytes,
-                               cudaMemcpyDeviceToDevice),
-                           "Qwen convolution tail snapshot restore");
+                check_device(memcpy_d2d(layer.linear.conv_tail.data,
+                                        static_cast<const uint8_t*>(snapshot.conv_tail.data) + tail_offset,
+                                        layer.linear.conv_tail.nbytes),
+                             "Qwen convolution tail snapshot restore");
                 tail_offset += layer.linear.conv_tail.nbytes;
             }
         }
@@ -1425,27 +1406,27 @@ struct QwenEngine::Impl {
     class PhaseScope {
     public:
         PhaseScope(Impl* owner, std::string name) : owner_(owner), name_(std::move(name)) {
-            // The NVTX range is pushed without any synchronization, so a Nsight
+            // The profiler range is pushed without any synchronization, so a
             // capture can attribute kernels to a site by launch correlation while
             // the stream pipeline stays exactly as production runs it. Only the
             // phase_profile timer needs the device drained.
-            if (owner_->nvtx_profile) {
-                nvtxRangePushA(name_.c_str());
-                nvtx_pushed_ = true;
+            if (owner_->range_profile) {
+                device_range_push(name_.c_str());
+                range_pushed_ = true;
             }
             if (owner_->phase_profile) {
-                cudaDeviceSynchronize();
+                device_synchronize();
                 started_ = std::chrono::steady_clock::now();
             }
         }
         ~PhaseScope() {
             if (owner_->phase_profile) {
-                cudaDeviceSynchronize();
+                device_synchronize();
                 owner_->phase_seconds[name_] += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_).count();
                 ++owner_->phase_calls[name_];
             }
-            if (nvtx_pushed_) nvtxRangePop();
+            if (range_pushed_) device_range_pop();
         }
         PhaseScope(const PhaseScope&) = delete;
         PhaseScope& operator=(const PhaseScope&) = delete;
@@ -1454,21 +1435,22 @@ struct QwenEngine::Impl {
         Impl* owner_;
         std::string name_;
         std::chrono::steady_clock::time_point started_;
-        bool nvtx_pushed_ = false;
+        bool range_pushed_ = false;
     };
 
-    class NvtxScope {
+    class RangeScope {
     public:
-        explicit NvtxScope(const char* name) { nvtxRangePushA(name); }
-        ~NvtxScope() { nvtxRangePop(); }
-        NvtxScope(const NvtxScope&) = delete;
-        NvtxScope& operator=(const NvtxScope&) = delete;
+        explicit RangeScope(const char* name) { device_range_push(name); }
+        ~RangeScope() { device_range_pop(); }
+        RangeScope(const RangeScope&) = delete;
+        RangeScope& operator=(const RangeScope&) = delete;
     };
 
-    // Application-level NVTX ranges are opt-in: they only push/pop host-side
+    // Application-level profiler ranges are opt-in: they only push/pop host-side
     // markers so a Nsight capture can separate warmup, prefill and decode
     // without the CUDA synchronization that `QWEN_PHASE_PROFILE` forces.
-    bool nvtx_profile = qwen_env_enabled("QWEN_NVTX_PROFILE");
+    bool range_profile = qwen_env_enabled("QWEN_RANGE_PROFILE") ||
+                         qwen_env_enabled("QWEN_NVTX_PROFILE");
 
     void report_phase_profile(const char* tag) const {
         if (!phase_profile) return;
@@ -1561,33 +1543,33 @@ struct QwenEngine::Impl {
             // Wait for the previous slice's collective only now, so it had the
             // whole of this slice's GEMM to run underneath.
             if (pending) {
-                check_cuda(cudaStreamWaitEvent(
-                    nullptr, comm_slice_done[pending_index], 0),
+                check_device(stream_wait_event(
+                    nullptr, comm_slice_done[pending_index]),
                     "Qwen overlapped all-reduce wait");
                 pending = false;
             }
             // Deliberately no PhaseScope around the collective. PhaseScope calls
-            // cudaDeviceSynchronize() on entry and exit, which would drain the
+            // device_synchronize() on entry and exit, which would drain the
             // comm stream and serialize exactly the pipeline being built, so a
             // profiled run would report a slowdown caused by the profiler. The
             // enclosing per-layer scopes still attribute the exposed cost.
-            check_cuda(cudaEventRecord(comm_slice_ready[index], nullptr),
-                       "Qwen overlapped ready event");
-            check_cuda(cudaStreamWaitEvent(
-                nccl_comm_stream, comm_slice_ready[index], 0),
+            check_device(event_record(comm_slice_ready[index], nullptr),
+                         "Qwen overlapped ready event");
+            check_device(stream_wait_event(
+                nccl_comm_stream, comm_slice_ready[index]),
                 "Qwen overlapped comm wait");
             nccl_all_reduce_sum_f16_inplace(
                 options.tp_world, options.tp_rank, options.device,
                 options.nccl_id_path.c_str(), output + offset,
                 count * hidden, nccl_comm_stream);
-            check_cuda(cudaEventRecord(comm_slice_done[index], nccl_comm_stream),
-                       "Qwen overlapped done event");
+            check_device(event_record(comm_slice_done[index], nccl_comm_stream),
+                         "Qwen overlapped done event");
             pending = true;
             pending_index = index;
         }
         if (pending) {
-            check_cuda(cudaStreamWaitEvent(
-                nullptr, comm_slice_done[pending_index], 0),
+            check_device(stream_wait_event(
+                nullptr, comm_slice_done[pending_index]),
                 "Qwen overlapped final all-reduce wait");
         }
         return true;
@@ -2485,9 +2467,8 @@ struct QwenEngine::Impl {
         } else {
             {
                 PhaseScope scope(this, "resid_copy");
-                check_cuda(cudaMemcpy(output, hidden,
-                    hidden_elements * sizeof(uint16_t), cudaMemcpyDeviceToDevice),
-                    "Qwen FP16 residual copy");
+                check_device(memcpy_d2d(output, hidden, hidden_elements * sizeof(uint16_t)),
+                      "Qwen FP16 residual copy");
             }
             add(output, attention.f16_data(), rows * hidden_size);
             norm(layer.post_norm, output, post.f16_data(), rows, hidden_size);
@@ -2585,10 +2566,9 @@ struct QwenEngine::Impl {
                        {static_cast<uint64_t>(rows)});
 
         const float* uniforms = host_uniforms_for(rows);
-        check_cuda(cudaMemcpy(sample_uniforms.data, uniforms,
-                              static_cast<size_t>(rows) * sizeof(float),
-                              cudaMemcpyHostToDevice),
-                   "Qwen sampling uniform upload");
+        check_device(memcpy_h2d(sample_uniforms.data, uniforms,
+                                static_cast<size_t>(rows) * sizeof(float)),
+                     "Qwen sampling uniform upload");
 
         QwenVerifyBatch result;
         result.top_tokens.resize(static_cast<size_t>(rows));
@@ -2657,14 +2637,12 @@ struct QwenEngine::Impl {
                 "Qwen sampling single shard");
         }
 
-        check_cuda(cudaMemcpy(result.top_tokens.data(), argmax_token.data,
-                              static_cast<size_t>(rows) * sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "Qwen sampled token copy");
-        check_cuda(cudaMemcpy(result.top_logits.data(), argmax_logit.data,
-                              static_cast<size_t>(rows) * sizeof(float),
-                              cudaMemcpyDeviceToHost),
-                   "Qwen sampled logit copy");
+        check_device(memcpy_d2h(result.top_tokens.data(), argmax_token.data,
+                                static_cast<size_t>(rows) * sizeof(int)),
+                     "Qwen sampled token copy");
+        check_device(memcpy_d2h(result.top_logits.data(), argmax_logit.data,
+                                static_cast<size_t>(rows) * sizeof(float)),
+                     "Qwen sampled logit copy");
         result.local_logits = result.top_logits;
         return result;
     }
@@ -2687,11 +2665,9 @@ struct QwenEngine::Impl {
         if (output_norm != nullptr) {
             norm(*output_norm, hidden, normalized.f16_data(), rows, hidden_size);
         } else {
-            check_cuda(cudaMemcpy(normalized.data, hidden,
-                                  static_cast<size_t>(rows) * hidden_size *
-                                      sizeof(uint16_t),
-                                  cudaMemcpyDeviceToDevice),
-                       "Qwen normalized hidden copy");
+            check_device(memcpy_d2d(normalized.data, hidden,
+                                    static_cast<size_t>(rows) * hidden_size * sizeof(uint16_t)),
+                         "Qwen normalized hidden copy");
         }
         QwenDeviceTensor& local_logits = workspace_float(
             static_cast<size_t>(rows) * local_vocab,
@@ -2790,16 +2766,12 @@ struct QwenEngine::Impl {
                             static_cast<int*>(global_token.data),
                             global_logit.f32_data());
                     }
-                    check_cuda(cudaMemcpy(result.top_tokens.data(),
-                                          global_token.data,
-                                          static_cast<size_t>(rows) * sizeof(int),
-                                          cudaMemcpyDeviceToHost),
-                               "Qwen device top-1 token copy");
-                    check_cuda(cudaMemcpy(result.top_logits.data(),
-                                          global_logit.data,
-                                          static_cast<size_t>(rows) * sizeof(float),
-                                          cudaMemcpyDeviceToHost),
-                               "Qwen device top-1 logit copy");
+                    check_device(memcpy_d2h(result.top_tokens.data(), global_token.data,
+                                            static_cast<size_t>(rows) * sizeof(int)),
+                                 "Qwen device top-1 token copy");
+                    check_device(memcpy_d2h(result.top_logits.data(), global_logit.data,
+                                            static_cast<size_t>(rows) * sizeof(float)),
+                                 "Qwen device top-1 logit copy");
                 } else {
                     nccl_global_top1_rows(
                         options.tp_world, options.tp_rank, options.device,
@@ -2809,10 +2781,9 @@ struct QwenEngine::Impl {
                         result.top_logits.data());
                 }
             }
-            check_cuda(cudaMemcpy(result.local_logits.data(), argmax_logit.data,
-                                  static_cast<size_t>(rows) * sizeof(float),
-                                  cudaMemcpyDeviceToHost),
-                       "Qwen batched local logit copy");
+            check_device(memcpy_d2h(result.local_logits.data(), argmax_logit.data,
+                                    static_cast<size_t>(rows) * sizeof(float)),
+                         "Qwen batched local logit copy");
         } else
 #endif
         {
@@ -2822,14 +2793,12 @@ struct QwenEngine::Impl {
                     "Qwen TP requires an NCCL-enabled build");
             }
 #endif
-            check_cuda(cudaMemcpy(result.top_tokens.data(), argmax_token.data,
-                                  static_cast<size_t>(rows) * sizeof(int),
-                                  cudaMemcpyDeviceToHost),
-                       "Qwen batched argmax token copy");
-            check_cuda(cudaMemcpy(result.top_logits.data(), argmax_logit.data,
-                                  static_cast<size_t>(rows) * sizeof(float),
-                                  cudaMemcpyDeviceToHost),
-                       "Qwen batched argmax logit copy");
+            check_device(memcpy_d2h(result.top_tokens.data(), argmax_token.data,
+                                    static_cast<size_t>(rows) * sizeof(int)),
+                         "Qwen batched argmax token copy");
+            check_device(memcpy_d2h(result.top_logits.data(), argmax_logit.data,
+                                    static_cast<size_t>(rows) * sizeof(float)),
+                         "Qwen batched argmax logit copy");
             result.local_logits = result.top_logits;
         }
         return result;
@@ -2889,9 +2858,8 @@ struct QwenEngine::Impl {
             static_cast<uint64_t>(rows), config.hidden_size};
         allocate(d_tokens, tokens.size() * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
-        check_cuda(cudaMemcpy(d_tokens.data, tokens.data(),
-                              tokens.size() * sizeof(int), cudaMemcpyHostToDevice),
-                   "Qwen MTP token upload");
+        check_device(memcpy_h2d(d_tokens.data, tokens.data(), tokens.size() * sizeof(int)),
+                     "Qwen MTP token upload");
         allocate_half(mtp_embedding, hidden_elements, hidden_shape);
         require_launch(qwen_embedding_fp16_gather_f16_cuda(
             embed.f16_data(), static_cast<int*>(d_tokens.data),
@@ -2927,11 +2895,9 @@ struct QwenEngine::Impl {
         allocate_half(mtp_seed_hidden, hidden_size, {config.hidden_size});
         // Recursive Qwen3.5 MTP consumes the prior predictor's returned hidden,
         // and that return is after mtp.norm in both vLLM and SGLang.
-        check_cuda(cudaMemcpy(mtp_seed_hidden.data, last_hidden,
-                              static_cast<size_t>(hidden_size) *
-                                  sizeof(uint16_t),
-                              cudaMemcpyDeviceToDevice),
-                   "Qwen MTP seed hidden copy");
+        check_device(memcpy_d2d(mtp_seed_hidden.data, last_hidden,
+                                static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
+                     "Qwen MTP seed hidden copy");
         mtp_position = position + rows;
         mtp_seed_input_token = tokens.back();
         mtp_next_token = result.top_token;
@@ -3124,7 +3090,7 @@ struct QwenEngine::Impl {
         const auto draft_started = std::chrono::steady_clock::now();
         QwenDSparkProposal proposal;
         {
-            NvtxScope scope("qwen.dspark.draft");
+            RangeScope scope("qwen.dspark.draft");
             proposal = dspark->propose(input_token);
         }
         if (stats != nullptr) {
@@ -3157,7 +3123,7 @@ struct QwenEngine::Impl {
         QwenVerifyBatch verify;
         const auto verify_started = std::chrono::steady_clock::now();
         {
-            NvtxScope scope("qwen.target.verify");
+            RangeScope scope("qwen.target.verify");
             (void)run_chunk(verify_inputs, committed_position,
                             static_cast<int>(layers.size()), false, &verify);
         }
@@ -3315,9 +3281,7 @@ struct QwenEngine::Impl {
         local_tokens = token_ids;
         allocate(d_tokens, local_tokens.size() * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
-        check_cuda(cudaMemcpy(d_tokens.data, local_tokens.data(),
-                              local_tokens.size() * sizeof(int),
-                              cudaMemcpyHostToDevice), "Qwen token upload");
+        check_device(memcpy_h2d(d_tokens.data, local_tokens.data(), local_tokens.size() * sizeof(int)), "Qwen token upload");
         const int hidden_size = static_cast<int>(config.hidden_size);
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
         const std::vector<uint64_t> hidden_shape = {
@@ -3426,9 +3390,9 @@ struct QwenEngine::Impl {
                 tensor.dtype = QwenDFlash2DebugDType::F16;
                 tensor.shape = dflash2_target_taps.shape;
                 tensor.bytes.resize(static_cast<size_t>(dflash2_target_taps.nbytes));
-                check_cuda(cudaMemcpy(tensor.bytes.data(), dflash2_target_taps.data,
-                                      tensor.bytes.size(), cudaMemcpyDeviceToHost),
-                           "Qwen DFlash2 target tap debug copy");
+                check_device(memcpy_d2h(tensor.bytes.data(), dflash2_target_taps.data,
+                                        tensor.bytes.size()),
+                             "Qwen DFlash2 target tap debug copy");
                 dflash2_target_debug_callback(tensor);
             }
         }
@@ -3440,13 +3404,10 @@ struct QwenEngine::Impl {
                  hidden_size);
             allocate_half(target_last_hidden, hidden_size,
                           {config.hidden_size});
-            check_cuda(cudaMemcpy(
-                           target_last_hidden.data,
-                           target_hidden_rows.f16_data() +
-                               static_cast<size_t>(rows - 1) * hidden_size,
-                           static_cast<size_t>(hidden_size) * sizeof(uint16_t),
-                           cudaMemcpyDeviceToDevice),
-                       "Qwen target last hidden copy");
+            check_device(memcpy_d2d(target_last_hidden.data,
+                                    target_hidden_rows.f16_data() + static_cast<size_t>(rows - 1) * hidden_size,
+                                    static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
+                         "Qwen target last hidden copy");
             has_target_last_hidden = true;
             mtp_seed_ready = false;
             mtp_position = position_offset + rows;
@@ -3540,7 +3501,7 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
         throw std::runtime_error(
             "Qwen sparse attention currently requires an FP16 KV cache");
     }
-    if (cudaSetDevice(options_.device) != cudaSuccess) {
+    if (!device_set(options_.device)) {
         throw std::runtime_error("failed to set Qwen CUDA device");
     }
     if (layer_count <= 0) {
@@ -3625,14 +3586,14 @@ QwenForwardResult QwenEngine::debug_prefill_dflash2(
 }
 
 void QwenEngine::warmup_tp() {
-    std::optional<Impl::NvtxScope> nvtx;
-    if (impl_->nvtx_profile) nvtx.emplace("qwen.warmup_tp");
+    std::optional<Impl::RangeScope> range;
+    if (impl_->range_profile) range.emplace("qwen.warmup_tp");
     if (options_.tp_world == 1) return;
     QwenDeviceTensor scratch;
     allocate_half(scratch, 1, {1});
     zero_tensor(scratch);
     impl_->all_reduce_half(scratch.f16_data(), 1, "scratch");
-    check_cuda(cudaDeviceSynchronize(), "Qwen TP warmup synchronization");
+    check_device(device_synchronize(), "Qwen TP warmup synchronization");
 }
 
 void QwenEngine::reset() {
@@ -3654,8 +3615,8 @@ void QwenEngine::clear_prefix_cache() {
 }
 
 QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
-    std::optional<Impl::NvtxScope> nvtx;
-    if (impl_->nvtx_profile) nvtx.emplace("qwen.prefill");
+    std::optional<Impl::RangeScope> range;
+    if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
         throw std::runtime_error("Qwen prefill requires at least one token");
     }
@@ -3836,8 +3797,8 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
 }
 
 QwenForwardResult QwenEngine::decode_step(int token_id) {
-    std::optional<Impl::NvtxScope> nvtx;
-    if (impl_->nvtx_profile) nvtx.emplace("qwen.decode_step");
+    std::optional<Impl::RangeScope> range;
+    if (impl_->range_profile) range.emplace("qwen.decode_step");
     if (position_ >= max_context_) {
         throw std::runtime_error("Qwen context length exceeded");
     }
@@ -3865,8 +3826,8 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         static_cast<size_t>(max_context_)) {
         throw std::runtime_error("Qwen prompt plus generation exceeds context");
     }
-    std::optional<Impl::NvtxScope> nvtx_generate;
-    if (impl_->nvtx_profile) nvtx_generate.emplace("qwen.generate");
+    std::optional<Impl::RangeScope> range_generate;
+    if (impl_->range_profile) range_generate.emplace("qwen.generate");
     mtp_stats_ = QwenMtpStats{};
     const auto prefill_started = std::chrono::steady_clock::now();
     QwenForwardResult next = prefill(prompt_ids);
@@ -3880,13 +3841,13 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     results.reserve(static_cast<size_t>(max_new_tokens));
     if (!options_.mtp && options_.dspark_checkpoint.empty() &&
         options_.dflash2_checkpoint.empty()) {
-        std::optional<Impl::NvtxScope> nvtx_decode;
-        if (impl_->nvtx_profile) nvtx_decode.emplace("qwen.decode_loop");
+        std::optional<Impl::RangeScope> range_decode;
+        if (impl_->range_profile) range_decode.emplace("qwen.decode_loop");
         for (int index = 0; index < max_new_tokens; ++index) {
             results.push_back(next);
             if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
         }
-        nvtx_decode.reset();
+        range_decode.reset();
         impl_->report_phase_profile("decode");
         return results;
     }

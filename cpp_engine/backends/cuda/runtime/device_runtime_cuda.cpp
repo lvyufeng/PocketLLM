@@ -126,6 +126,27 @@ bool memcpy_d2d_async(void* dst, const void* src, size_t bytes, void* stream) {
                            as_stream(stream)) == cudaSuccess;
 }
 
+bool memcpy_2d_d2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    if (width == 0 || height == 0) return true;
+    return cudaMemcpy2D(dst, dst_pitch, src, src_pitch, width, height,
+                        cudaMemcpyDeviceToDevice) == cudaSuccess;
+}
+
+bool memcpy_2d_h2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    if (width == 0 || height == 0) return true;
+    return cudaMemcpy2D(dst, dst_pitch, src, src_pitch, width, height,
+                        cudaMemcpyHostToDevice) == cudaSuccess;
+}
+
+bool memcpy_2d_d2h(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
+                   size_t width, size_t height) {
+    if (width == 0 || height == 0) return true;
+    return cudaMemcpy2D(dst, dst_pitch, src, src_pitch, width, height,
+                        cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
 bool device_memset(void* dst, int value, size_t bytes) {
     return cudaMemset(dst, value, bytes) == cudaSuccess;
 }
