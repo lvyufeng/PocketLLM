@@ -1,5 +1,6 @@
 #include "dspark.hpp"
 #include "cuda_ops.hpp"
+#include "device_runtime.hpp"
 #include "json_lite.hpp"
 #include "safetensors_reader.hpp"
 #include "tp_comm.hpp"
@@ -11,16 +12,20 @@
 #include <algorithm>
 #include <map>
 #include <memory>
-#include <cuda_runtime.h>
 
 namespace dspark {
 
+// The device runtime lives in namespace dsv4; pull its names in so the migrated
+// allocation and transfer call sites read the same as they do in the dsv4 engine.
+using namespace dsv4;  // NOLINT(build/namespaces)
+
 namespace {
 
-void check_cuda(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA error in ") + what + ": " +
-                                 cudaGetErrorString(err));
+void check_device(bool ok, const char* what) {
+    if (!ok) {
+        const std::string detail = device_last_error();
+        throw std::runtime_error(std::string("device error in ") + what +
+                                 (detail.empty() ? "" : ": " + detail));
     }
 }
 
@@ -153,10 +158,10 @@ struct DSparkEngine::Impl {
         }
 #ifdef DSV4_HAVE_NCCL
         if (count > reduce_capacity) {
-            if (d_reduce_bf16 != nullptr) cudaFree(d_reduce_bf16);
+            if (d_reduce_bf16 != nullptr) device_free(d_reduce_bf16);
             d_reduce_bf16 = nullptr;
-            check_cuda(cudaMalloc(&d_reduce_bf16, static_cast<size_t>(count) * sizeof(uint16_t)),
-                       "cudaMalloc dspark reduce scratch");
+            check_device(device_malloc_into(d_reduce_bf16, static_cast<size_t>(count) * sizeof(uint16_t)),
+                         "device_malloc dspark reduce scratch");
             reduce_capacity = count;
         }
         if (!dsv4::fp32_to_bf16_cuda(d_values, d_reduce_bf16, count))
@@ -383,7 +388,7 @@ struct DSparkEngine::Impl {
         float* d_shared_up = nullptr;        // [block_size, moe_inter]
         float* d_shared_hidden = nullptr;    // [block_size, moe_inter]
         float* d_shared_out = nullptr;       // [block_size, dim]
-        // Grouped-MoE workspace, kept across calls: a cudaMalloc/cudaFree pair
+        // Grouped-MoE workspace, kept across calls: a device malloc/free pair
         // per call synchronizes the device and costs far more than the kernel.
         dsv4::MoePrefillFp4GroupedWorkspace moe_ws;
 
@@ -395,69 +400,69 @@ struct DSparkEngine::Impl {
             const int n_target = static_cast<int>(cfg.target_layer_ids.size());
             const int kv_len = ad.window_size + bsz;
 
-            cudaMalloc(&d_draft_input_ids, bsz * sizeof(int));
-            cudaMalloc(&d_main_concat, static_cast<size_t>(dim) * n_target * sizeof(float));
-            cudaMalloc(&d_main_proj_out, 1 * 1 * dim * sizeof(float));
-            cudaMalloc(&d_main_normed, 1 * 1 * dim * sizeof(float));
-            cudaMalloc(&d_draft_input, 1 * bsz * dim * sizeof(float));
-            cudaMalloc(&d_draft_x, 1 * bsz * hc * dim * sizeof(float));
-            cudaMalloc(&d_hidden, 1 * bsz * hc * dim * sizeof(float));
-            cudaMalloc(&d_logits, static_cast<size_t>(bsz) * vocab * sizeof(float));
+            device_malloc_into(d_draft_input_ids, bsz * sizeof(int));
+            device_malloc_into(d_main_concat, static_cast<size_t>(dim) * n_target * sizeof(float));
+            device_malloc_into(d_main_proj_out, 1 * 1 * dim * sizeof(float));
+            device_malloc_into(d_main_normed, 1 * 1 * dim * sizeof(float));
+            device_malloc_into(d_draft_input, 1 * bsz * dim * sizeof(float));
+            device_malloc_into(d_draft_x, 1 * bsz * hc * dim * sizeof(float));
+            device_malloc_into(d_hidden, 1 * bsz * hc * dim * sizeof(float));
+            device_malloc_into(d_logits, static_cast<size_t>(bsz) * vocab * sizeof(float));
 
             // Stage 2 head buffers
             const int mrank = cfg.markov_rank;
-            cudaMalloc(&d_head_x, static_cast<size_t>(bsz) * dim * sizeof(float));
-            cudaMalloc(&d_head_normed, static_cast<size_t>(bsz) * dim * sizeof(float));
-            cudaMalloc(&d_conf_in, static_cast<size_t>(bsz) * (dim + mrank) * sizeof(float));
-            cudaMalloc(&d_markov_bias, static_cast<size_t>(vocab) * sizeof(float));
-            cudaMalloc(&d_confidence, static_cast<size_t>(bsz) * sizeof(float));
-            cudaMalloc(&d_out_token_ids, (static_cast<size_t>(bsz) + 1) * sizeof(int));
-            cudaMalloc(&d_argmax_logit, sizeof(float));
+            device_malloc_into(d_head_x, static_cast<size_t>(bsz) * dim * sizeof(float));
+            device_malloc_into(d_head_normed, static_cast<size_t>(bsz) * dim * sizeof(float));
+            device_malloc_into(d_conf_in, static_cast<size_t>(bsz) * (dim + mrank) * sizeof(float));
+            device_malloc_into(d_markov_bias, static_cast<size_t>(vocab) * sizeof(float));
+            device_malloc_into(d_confidence, static_cast<size_t>(bsz) * sizeof(float));
+            device_malloc_into(d_out_token_ids, (static_cast<size_t>(bsz) + 1) * sizeof(int));
+            device_malloc_into(d_argmax_logit, sizeof(float));
 
             // Attention path buffers
-            cudaMalloc(&d_attn_x, bsz * dim * sizeof(float));
-            cudaMalloc(&d_attn_post, bsz * hc * sizeof(float));
-            cudaMalloc(&d_attn_comb, bsz * hc * hc * sizeof(float));
-            cudaMalloc(&d_attn_normed, bsz * dim * sizeof(float));
-            cudaMalloc(&d_attn_out, bsz * dim * sizeof(float));
+            device_malloc_into(d_attn_x, bsz * dim * sizeof(float));
+            device_malloc_into(d_attn_post, bsz * hc * sizeof(float));
+            device_malloc_into(d_attn_comb, bsz * hc * hc * sizeof(float));
+            device_malloc_into(d_attn_normed, bsz * dim * sizeof(float));
+            device_malloc_into(d_attn_out, bsz * dim * sizeof(float));
 
             // DSparkAttention internals
-            cudaMalloc(&d_q_a, static_cast<size_t>(bsz) * ad.q_a_dim * sizeof(float));
-            cudaMalloc(&d_q_normed, static_cast<size_t>(bsz) * ad.q_a_dim * sizeof(float));
-            cudaMalloc(&d_q, static_cast<size_t>(bsz) * ad.q_dim * sizeof(float));
-            cudaMalloc(&d_kv_a, static_cast<size_t>(bsz) * ad.kv_dim * sizeof(float));
-            cudaMalloc(&d_draft_kv, static_cast<size_t>(bsz) * ad.head_dim * sizeof(float));
-            cudaMalloc(&d_main_kv_a, static_cast<size_t>(ad.kv_dim) * sizeof(float));
-            cudaMalloc(&d_main_kv, static_cast<size_t>(ad.head_dim) * sizeof(float));
-            cudaMalloc(&d_kv_concat, static_cast<size_t>(kv_len) * ad.head_dim * sizeof(float));
-            cudaMalloc(&d_topk_indices, static_cast<size_t>(bsz) * kv_len * sizeof(int32_t));
-            cudaMalloc(&d_attn_value, static_cast<size_t>(bsz) * ad.q_dim * sizeof(float));
-            cudaMalloc(&d_attn_mid, static_cast<size_t>(bsz) * ad.attn_mid * sizeof(float));
+            device_malloc_into(d_q_a, static_cast<size_t>(bsz) * ad.q_a_dim * sizeof(float));
+            device_malloc_into(d_q_normed, static_cast<size_t>(bsz) * ad.q_a_dim * sizeof(float));
+            device_malloc_into(d_q, static_cast<size_t>(bsz) * ad.q_dim * sizeof(float));
+            device_malloc_into(d_kv_a, static_cast<size_t>(bsz) * ad.kv_dim * sizeof(float));
+            device_malloc_into(d_draft_kv, static_cast<size_t>(bsz) * ad.head_dim * sizeof(float));
+            device_malloc_into(d_main_kv_a, static_cast<size_t>(ad.kv_dim) * sizeof(float));
+            device_malloc_into(d_main_kv, static_cast<size_t>(ad.head_dim) * sizeof(float));
+            device_malloc_into(d_kv_concat, static_cast<size_t>(kv_len) * ad.head_dim * sizeof(float));
+            device_malloc_into(d_topk_indices, static_cast<size_t>(bsz) * kv_len * sizeof(int32_t));
+            device_malloc_into(d_attn_value, static_cast<size_t>(bsz) * ad.q_dim * sizeof(float));
+            device_malloc_into(d_attn_mid, static_cast<size_t>(bsz) * ad.attn_mid * sizeof(float));
 
             // FFN path buffers
-            cudaMalloc(&d_ffn_x, bsz * dim * sizeof(float));
-            cudaMalloc(&d_ffn_post, bsz * hc * sizeof(float));
-            cudaMalloc(&d_ffn_comb, bsz * hc * hc * sizeof(float));
-            cudaMalloc(&d_ffn_normed, bsz * dim * sizeof(float));
-            cudaMalloc(&d_ffn_out, bsz * dim * sizeof(float));
+            device_malloc_into(d_ffn_x, bsz * dim * sizeof(float));
+            device_malloc_into(d_ffn_post, bsz * hc * sizeof(float));
+            device_malloc_into(d_ffn_comb, bsz * hc * hc * sizeof(float));
+            device_malloc_into(d_ffn_normed, bsz * dim * sizeof(float));
+            device_malloc_into(d_ffn_out, bsz * dim * sizeof(float));
 
             // MoE routing scratch
             const int topk = cfg.topk;
             const int moe_inter = cfg.moe_inter;
             const size_t routes_cap = static_cast<size_t>(bsz) * topk;
-            cudaMalloc(&d_route_indices, routes_cap * sizeof(int64_t));
-            cudaMalloc(&d_route_weights, routes_cap * sizeof(float));
-            cudaMalloc(&d_group_route_tokens, routes_cap * sizeof(int64_t));
-            cudaMalloc(&d_group_route_weights, routes_cap * sizeof(float));
-            cudaMalloc(&d_seg_starts, (static_cast<size_t>(experts_per_rank) + 1) * sizeof(int32_t));
-            cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
-            cudaMalloc(&d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
-            cudaMalloc(&d_total_routes, sizeof(int32_t));
-            cudaMalloc(&d_token_slot_routes, routes_cap * sizeof(int32_t));
-            cudaMalloc(&d_shared_gate, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
-            cudaMalloc(&d_shared_up, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
-            cudaMalloc(&d_shared_hidden, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
-            cudaMalloc(&d_shared_out, bsz * dim * sizeof(float));
+            device_malloc_into(d_route_indices, routes_cap * sizeof(int64_t));
+            device_malloc_into(d_route_weights, routes_cap * sizeof(float));
+            device_malloc_into(d_group_route_tokens, routes_cap * sizeof(int64_t));
+            device_malloc_into(d_group_route_weights, routes_cap * sizeof(float));
+            device_malloc_into(d_seg_starts, (static_cast<size_t>(experts_per_rank) + 1) * sizeof(int32_t));
+            device_malloc_into(d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
+            device_malloc_into(d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t));
+            device_malloc_into(d_total_routes, sizeof(int32_t));
+            device_malloc_into(d_token_slot_routes, routes_cap * sizeof(int32_t));
+            device_malloc_into(d_shared_gate, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            device_malloc_into(d_shared_up, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            device_malloc_into(d_shared_hidden, static_cast<size_t>(bsz) * moe_inter * sizeof(float));
+            device_malloc_into(d_shared_out, bsz * dim * sizeof(float));
 
             // Grouped-MoE workspace. Every route belongs to one of block_size
             // tokens, so routes <= block_size * topk and the padded path needs
@@ -469,58 +474,58 @@ struct DSparkEngine::Impl {
             const size_t rd = routes_cap * dim;
             const size_t pd = static_cast<size_t>(moe_ws.padded_rows_cap) * dim;
             const size_t pi = static_cast<size_t>(moe_ws.padded_rows_cap) * moe_inter;
-            cudaMalloc(&moe_ws.d_x_sorted, rd * sizeof(float));
-            cudaMalloc(&moe_ws.d_partials, rd * sizeof(float));
-            cudaMalloc(&moe_ws.d_x_q, rd);
-            cudaMalloc(&moe_ws.d_x_scale, routes_cap * sizeof(float));
-            cudaMalloc(&moe_ws.d_x_pad, pd);
-            cudaMalloc(&moe_ws.d_x_scale_pad, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
-            cudaMalloc(&moe_ws.d_gate, pi * sizeof(float));
-            cudaMalloc(&moe_ws.d_up, pi * sizeof(float));
-            cudaMalloc(&moe_ws.d_hidden_q, pi);
-            cudaMalloc(&moe_ws.d_hidden_scale, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
+            device_malloc_into(moe_ws.d_x_sorted, rd * sizeof(float));
+            device_malloc_into(moe_ws.d_partials, rd * sizeof(float));
+            device_malloc_into(moe_ws.d_x_q, rd);
+            device_malloc_into(moe_ws.d_x_scale, routes_cap * sizeof(float));
+            device_malloc_into(moe_ws.d_x_pad, pd);
+            device_malloc_into(moe_ws.d_x_scale_pad, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
+            device_malloc_into(moe_ws.d_gate, pi * sizeof(float));
+            device_malloc_into(moe_ws.d_up, pi * sizeof(float));
+            device_malloc_into(moe_ws.d_hidden_q, pi);
+            device_malloc_into(moe_ws.d_hidden_scale, static_cast<size_t>(moe_ws.padded_rows_cap) * sizeof(float));
         }
 
         void free_all() {
-            if (d_draft_input_ids) cudaFree(d_draft_input_ids);
-            if (d_main_concat) cudaFree(d_main_concat);
-            if (d_main_proj_out) cudaFree(d_main_proj_out);
-            if (d_main_normed) cudaFree(d_main_normed);
-            if (d_draft_input) cudaFree(d_draft_input);
-            if (d_draft_x) cudaFree(d_draft_x);
-            if (d_hidden) cudaFree(d_hidden);
-            if (d_logits) cudaFree(d_logits);
-            if (d_head_x) cudaFree(d_head_x);
-            if (d_head_normed) cudaFree(d_head_normed);
-            if (d_conf_in) cudaFree(d_conf_in);
-            if (d_markov_bias) cudaFree(d_markov_bias);
-            if (d_confidence) cudaFree(d_confidence);
-            if (d_out_token_ids) cudaFree(d_out_token_ids);
-            if (d_argmax_logit) cudaFree(d_argmax_logit);
+            if (d_draft_input_ids) device_free(d_draft_input_ids);
+            if (d_main_concat) device_free(d_main_concat);
+            if (d_main_proj_out) device_free(d_main_proj_out);
+            if (d_main_normed) device_free(d_main_normed);
+            if (d_draft_input) device_free(d_draft_input);
+            if (d_draft_x) device_free(d_draft_x);
+            if (d_hidden) device_free(d_hidden);
+            if (d_logits) device_free(d_logits);
+            if (d_head_x) device_free(d_head_x);
+            if (d_head_normed) device_free(d_head_normed);
+            if (d_conf_in) device_free(d_conf_in);
+            if (d_markov_bias) device_free(d_markov_bias);
+            if (d_confidence) device_free(d_confidence);
+            if (d_out_token_ids) device_free(d_out_token_ids);
+            if (d_argmax_logit) device_free(d_argmax_logit);
 
-            if (d_attn_x) cudaFree(d_attn_x);
-            if (d_attn_post) cudaFree(d_attn_post);
-            if (d_attn_comb) cudaFree(d_attn_comb);
-            if (d_attn_normed) cudaFree(d_attn_normed);
-            if (d_attn_out) cudaFree(d_attn_out);
+            if (d_attn_x) device_free(d_attn_x);
+            if (d_attn_post) device_free(d_attn_post);
+            if (d_attn_comb) device_free(d_attn_comb);
+            if (d_attn_normed) device_free(d_attn_normed);
+            if (d_attn_out) device_free(d_attn_out);
 
-            if (d_q_a) cudaFree(d_q_a);
-            if (d_q_normed) cudaFree(d_q_normed);
-            if (d_q) cudaFree(d_q);
-            if (d_kv_a) cudaFree(d_kv_a);
-            if (d_draft_kv) cudaFree(d_draft_kv);
-            if (d_main_kv_a) cudaFree(d_main_kv_a);
-            if (d_main_kv) cudaFree(d_main_kv);
-            if (d_kv_concat) cudaFree(d_kv_concat);
-            if (d_topk_indices) cudaFree(d_topk_indices);
-            if (d_attn_value) cudaFree(d_attn_value);
-            if (d_attn_mid) cudaFree(d_attn_mid);
+            if (d_q_a) device_free(d_q_a);
+            if (d_q_normed) device_free(d_q_normed);
+            if (d_q) device_free(d_q);
+            if (d_kv_a) device_free(d_kv_a);
+            if (d_draft_kv) device_free(d_draft_kv);
+            if (d_main_kv_a) device_free(d_main_kv_a);
+            if (d_main_kv) device_free(d_main_kv);
+            if (d_kv_concat) device_free(d_kv_concat);
+            if (d_topk_indices) device_free(d_topk_indices);
+            if (d_attn_value) device_free(d_attn_value);
+            if (d_attn_mid) device_free(d_attn_mid);
 
-            if (d_ffn_x) cudaFree(d_ffn_x);
-            if (d_ffn_post) cudaFree(d_ffn_post);
-            if (d_ffn_comb) cudaFree(d_ffn_comb);
-            if (d_ffn_normed) cudaFree(d_ffn_normed);
-            if (d_ffn_out) cudaFree(d_ffn_out);
+            if (d_ffn_x) device_free(d_ffn_x);
+            if (d_ffn_post) device_free(d_ffn_post);
+            if (d_ffn_comb) device_free(d_ffn_comb);
+            if (d_ffn_normed) device_free(d_ffn_normed);
+            if (d_ffn_out) device_free(d_ffn_out);
 
             for (void* p : {(void*)d_route_indices, (void*)d_route_weights,
                             (void*)d_group_route_tokens, (void*)d_group_route_weights,
@@ -533,7 +538,7 @@ struct DSparkEngine::Impl {
                             (void*)moe_ws.d_x_pad, (void*)moe_ws.d_x_scale_pad,
                             (void*)moe_ws.d_gate, (void*)moe_ws.d_up,
                             (void*)moe_ws.d_hidden_q, (void*)moe_ws.d_hidden_scale}) {
-                if (p != nullptr) cudaFree(p);
+                if (p != nullptr) device_free(p);
             }
         }
     } buffers;
@@ -554,7 +559,7 @@ struct DSparkEngine::Impl {
     ~Impl() {
         buffers.free_all();
         free_weights();
-        if (d_reduce_bf16 != nullptr) cudaFree(d_reduce_bf16);
+        if (d_reduce_bf16 != nullptr) device_free(d_reduce_bf16);
     }
 
     void init_dims() {
@@ -588,26 +593,26 @@ struct DSparkEngine::Impl {
     // ------------------------------------------------------------------
 
     // Every device allocation made by load_weights, so the destructor can free
-    // them without each field needing its own cudaFree call.
+    // them without each field needing its own device_free call.
     std::vector<void*> owned_device_buffers;
 
     void* device_alloc(size_t bytes, const char* what) {
         void* p = nullptr;
-        check_cuda(cudaMalloc(&p, bytes), what);
+        check_device(device_malloc_into(p, bytes), what);
         owned_device_buffers.push_back(p);
         return p;
     }
 
     void free_weights() {
         for (void* p : owned_device_buffers) {
-            if (p != nullptr) cudaFree(p);
+            if (p != nullptr) device_free(p);
         }
         owned_device_buffers.clear();
     }
 
     void* upload(const void* host, size_t bytes, const char* what) {
         void* d = device_alloc(bytes, what);
-        check_cuda(cudaMemcpy(d, host, bytes, cudaMemcpyHostToDevice), what);
+        check_device(memcpy_h2d(d, host, bytes), what);
         return d;
     }
 
@@ -798,7 +803,7 @@ struct DSparkEngine::Impl {
                 const size_t bytes = static_cast<size_t>(adims.window_size) * adims.head_dim *
                                      sizeof(float);
                 b.attn.kv_cache = static_cast<float*>(device_alloc(bytes, "dspark kv_cache"));
-                check_cuda(cudaMemset(b.attn.kv_cache, 0, bytes), "zero dspark kv_cache");
+                check_device(device_memset(b.attn.kv_cache, 0, bytes), "zero dspark kv_cache");
             }
 
             // --- FFN ---
@@ -883,9 +888,9 @@ struct DSparkEngine::Impl {
                             throw std::runtime_error("DSpark: routed expert size mismatch for " +
                                                      expert_name(e, u.w, u.suffix));
                         }
-                        check_cuda(cudaMemcpy(u.dst + static_cast<size_t>(local) * u.stride,
-                                              t.data, u.stride, cudaMemcpyHostToDevice),
-                                   "upload dspark routed expert");
+                        check_device(memcpy_h2d(u.dst + static_cast<size_t>(local) * u.stride,
+                                                t.data, u.stride),
+                                     "upload dspark routed expert");
                     }
                 }
             }
@@ -968,12 +973,9 @@ struct DSparkEngine::Impl {
 
         // 1. Concat main_hidden_states from layers 40/41/42
         // main_hiddens[0/1/2] are [1, 1, dim] each
-        // TODO: implement concat kernel or use cudaMemcpy
+        // TODO: implement concat kernel or use a device copy
         for (int i = 0; i < 3; ++i) {
-            cudaMemcpy(buffers.d_main_concat + i * dim,
-                      main_hiddens[i],
-                      dim * sizeof(float),
-                      cudaMemcpyDeviceToDevice);
+            memcpy_d2d(buffers.d_main_concat + i * dim, main_hiddens[i], dim * sizeof(float));
         }
 
         // 2. FP8 linear: [1, dim*3] @ [dim, dim*3]^T -> [1, dim]
@@ -1015,8 +1017,7 @@ struct DSparkEngine::Impl {
 
         // 4. Embed draft_input_ids: [block_size] -> [block_size, dim]
         // Upload draft_input_ids to device
-        cudaMemcpy(buffers.d_draft_input_ids, draft_input_ids.data(),
-                   bsz * sizeof(int), cudaMemcpyHostToDevice);
+        memcpy_h2d(buffers.d_draft_input_ids, draft_input_ids.data(), bsz * sizeof(int));
 
         // Lookup embeddings using bf16_rows_to_float_cuda
         if (stage0.embed_weight == nullptr) {
@@ -1071,9 +1072,8 @@ struct DSparkEngine::Impl {
             std::memcpy(all.data() + static_cast<size_t>(t) * topk, row.data(),
                         row.size() * sizeof(int32_t));
         }
-        check_cuda(cudaMemcpy(buffers.d_topk_indices, all.data(),
-                              all.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                   "copy dspark topk indices");
+        check_device(memcpy_h2d(buffers.d_topk_indices, all.data(), all.size() * sizeof(int32_t)),
+                     "copy dspark topk indices");
         return topk;
     }
 
@@ -1154,15 +1154,12 @@ struct DSparkEngine::Impl {
             throw std::runtime_error("dspark draft kv act_quant failed");
 
         // --- Sparse attention over [ring window ++ draft keys] ---
-        check_cuda(cudaMemcpy(buffers.d_kv_concat, block->attn.kv_cache,
-                              static_cast<size_t>(win) * hd * sizeof(float),
-                              cudaMemcpyDeviceToDevice),
-                   "dspark kv concat window");
-        check_cuda(cudaMemcpy(buffers.d_kv_concat + static_cast<size_t>(win) * hd,
-                              buffers.d_draft_kv,
-                              static_cast<size_t>(bsz) * hd * sizeof(float),
-                              cudaMemcpyDeviceToDevice),
-                   "dspark kv concat draft");
+        check_device(memcpy_d2d(buffers.d_kv_concat, block->attn.kv_cache,
+                                static_cast<size_t>(win) * hd * sizeof(float)),
+                     "dspark kv concat window");
+        check_device(memcpy_d2d(buffers.d_kv_concat + static_cast<size_t>(win) * hd,
+                                buffers.d_draft_kv, static_cast<size_t>(bsz) * hd * sizeof(float)),
+                     "dspark kv concat draft");
         const int topk = build_topk_indices(start_pos);
         if (!prefill_sparse_attention_indexed_cuda(
                 buffers.d_q, buffers.d_kv_concat, block->attn.attn_sink,
@@ -1230,14 +1227,13 @@ struct DSparkEngine::Impl {
         }
 
         int32_t total_routes = 0;
-        check_cuda(cudaMemcpy(&total_routes, buffers.d_total_routes, sizeof(int32_t),
-                              cudaMemcpyDeviceToHost), "copy dspark total routes");
+        check_device(memcpy_d2h(&total_routes, buffers.d_total_routes, sizeof(int32_t)), "copy dspark total routes");
 
         if (total_routes > 0) {
             std::vector<int32_t> h_counts(static_cast<size_t>(experts_per_rank));
-            check_cuda(cudaMemcpy(h_counts.data(), buffers.d_counts,
-                                  h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
-                       "copy dspark route counts");
+            check_device(memcpy_d2h(h_counts.data(), buffers.d_counts,
+                                    h_counts.size() * sizeof(int32_t)),
+                         "copy dspark route counts");
             int max_count = 0;
             for (int32_t c : h_counts) max_count = std::max(max_count, static_cast<int>(c));
 
@@ -1255,9 +1251,8 @@ struct DSparkEngine::Impl {
                 throw std::runtime_error("dspark grouped fp4 moe failed");
             }
         } else {
-            check_cuda(cudaMemset(d_out, 0,
-                                  static_cast<size_t>(rows) * dim * sizeof(float)),
-                       "zero dspark moe out");
+            check_device(device_memset(d_out, 0, static_cast<size_t>(rows) * dim * sizeof(float)),
+                         "zero dspark moe out");
         }
 
         // Each rank only summed the routes landing on its own experts, so the
@@ -1324,14 +1319,13 @@ struct DSparkEngine::Impl {
         // The confidence head reads concat(hc_head output, markov embedding).
         // Copy the first half in now; the loop fills each row's second half as
         // that position's markov embedding is looked up.
-        check_cuda(cudaMemcpy2D(buffers.d_conf_in, conf_dim * sizeof(float),
-                                buffers.d_head_x, dim * sizeof(float),
-                                dim * sizeof(float), bsz, cudaMemcpyDeviceToDevice),
-                   "dspark confidence hidden copy");
+        check_device(memcpy_2d_d2d(buffers.d_conf_in, conf_dim * sizeof(float),
+                                   buffers.d_head_x, dim * sizeof(float),
+                                   dim * sizeof(float), bsz),
+                     "dspark confidence hidden copy");
 
-        check_cuda(cudaMemcpy(buffers.d_out_token_ids, &input_token, sizeof(int),
-                              cudaMemcpyHostToDevice),
-                   "dspark seed output token");
+        check_device(memcpy_h2d(buffers.d_out_token_ids, &input_token, sizeof(int)),
+                     "dspark seed output token");
 
         for (int i = 0; i < bsz; ++i) {
             // Bigram embedding of the token at position i, written straight
@@ -1519,28 +1513,27 @@ struct DSparkEngine::Impl {
         float* d_normed = nullptr;
         float* d_kv_a = nullptr;
         float* d_kv = nullptr;
-        check_cuda(cudaMalloc(&d_concat, static_cast<size_t>(rows) * stride * sizeof(float)),
-                   "cudaMalloc write_main_kv concat");
+        check_device(device_malloc_into(d_concat, static_cast<size_t>(rows) * stride * sizeof(float)),
+                     "device_malloc write_main_kv concat");
         auto cleanup = [&] {
-            if (d_concat) cudaFree(d_concat);
-            if (d_proj) cudaFree(d_proj);
-            if (d_normed) cudaFree(d_normed);
-            if (d_kv_a) cudaFree(d_kv_a);
-            if (d_kv) cudaFree(d_kv);
+            if (d_concat) device_free(d_concat);
+            if (d_proj) device_free(d_proj);
+            if (d_normed) device_free(d_normed);
+            if (d_kv_a) device_free(d_kv_a);
+            if (d_kv) device_free(d_kv);
         };
         try {
-            check_cuda(cudaMalloc(&d_proj, static_cast<size_t>(rows) * dim * sizeof(float)),
-                       "cudaMalloc write_main_kv proj");
-            check_cuda(cudaMalloc(&d_normed, static_cast<size_t>(rows) * dim * sizeof(float)),
-                       "cudaMalloc write_main_kv normed");
-            check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(rows) * adims.kv_dim * sizeof(float)),
-                       "cudaMalloc write_main_kv kv_a");
-            check_cuda(cudaMalloc(&d_kv, static_cast<size_t>(rows) * hd * sizeof(float)),
-                       "cudaMalloc write_main_kv kv");
-            check_cuda(cudaMemcpy(d_concat, h_main_hidden,
-                                  static_cast<size_t>(rows) * stride * sizeof(float),
-                                  cudaMemcpyHostToDevice),
-                       "copy write_main_kv hidden");
+            check_device(device_malloc_into(d_proj, static_cast<size_t>(rows) * dim * sizeof(float)),
+                         "device_malloc write_main_kv proj");
+            check_device(device_malloc_into(d_normed, static_cast<size_t>(rows) * dim * sizeof(float)),
+                         "device_malloc write_main_kv normed");
+            check_device(device_malloc_into(d_kv_a, static_cast<size_t>(rows) * adims.kv_dim * sizeof(float)),
+                         "device_malloc write_main_kv kv_a");
+            check_device(device_malloc_into(d_kv, static_cast<size_t>(rows) * hd * sizeof(float)),
+                         "device_malloc write_main_kv kv");
+            check_device(memcpy_h2d(d_concat, h_main_hidden,
+                                    static_cast<size_t>(rows) * stride * sizeof(float)),
+                         "copy write_main_kv hidden");
 
             // main_proj + main_norm, shared by every stage exactly as in draft().
             if (!fp8_e4m3_e8m0_matmul_cuda(d_concat, stage0.main_proj_weight,
@@ -1608,12 +1601,12 @@ struct DSparkEngine::Impl {
         forward_head(input_token, x);
 
         DraftOutput output(config.block_size);
-        check_cuda(cudaMemcpy(output.tokens.data(), buffers.d_out_token_ids,
-                              output.tokens.size() * sizeof(int), cudaMemcpyDeviceToHost),
-                   "copy dspark draft tokens");
-        check_cuda(cudaMemcpy(output.confidence.data(), buffers.d_confidence,
-                              output.confidence.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy dspark draft confidence");
+        check_device(memcpy_d2h(output.tokens.data(), buffers.d_out_token_ids,
+                                output.tokens.size() * sizeof(int)),
+                     "copy dspark draft tokens");
+        check_device(memcpy_d2h(output.confidence.data(), buffers.d_confidence,
+                                output.confidence.size() * sizeof(float)),
+                     "copy dspark draft confidence");
         return output;
     }
 };
@@ -1675,9 +1668,8 @@ void DSparkEngine::debug_set_kv_cache(int stage_id, const float* h_cache) {
     }
     const size_t bytes = static_cast<size_t>(impl_->adims.window_size) *
                          impl_->adims.head_dim * sizeof(float);
-    check_cuda(cudaMemcpy(impl_->stages[stage_id].attn.kv_cache, h_cache, bytes,
-                          cudaMemcpyHostToDevice),
-               "debug_set_kv_cache");
+    check_device(memcpy_h2d(impl_->stages[stage_id].attn.kv_cache, h_cache, bytes),
+                 "debug_set_kv_cache");
 }
 
 void DSparkEngine::debug_attention(int stage_id, const float* h_x, const float* h_main_x,
@@ -1690,24 +1682,21 @@ void DSparkEngine::debug_attention(int stage_id, const float* h_x, const float* 
     const int dim = impl.config.dim;
 
     // d_attn_normed / d_attn_out are the same scratch the real path uses.
-    check_cuda(cudaMemcpy(impl.buffers.d_attn_normed, h_x,
-                          static_cast<size_t>(bsz) * dim * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "debug_attention x");
-    check_cuda(cudaMemcpy(impl.buffers.d_main_normed, h_main_x,
-                          static_cast<size_t>(dim) * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "debug_attention main_x");
+    check_device(memcpy_h2d(impl.buffers.d_attn_normed, h_x,
+                            static_cast<size_t>(bsz) * dim * sizeof(float)),
+                 "debug_attention x");
+    check_device(memcpy_h2d(impl.buffers.d_main_normed, h_main_x,
+                            static_cast<size_t>(dim) * sizeof(float)),
+                 "debug_attention main_x");
 
     impl.forward_attention(&impl.stages[stage_id], impl.buffers.d_attn_normed,
                            impl.buffers.d_main_normed, start_pos,
                            impl.buffers.d_attn_out);
-    check_cuda(cudaDeviceSynchronize(), "debug_attention sync");
+    check_device(device_synchronize(), "debug_attention sync");
 
-    check_cuda(cudaMemcpy(h_out, impl.buffers.d_attn_out,
-                          static_cast<size_t>(bsz) * dim * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "debug_attention out");
+    check_device(memcpy_d2h(h_out, impl.buffers.d_attn_out,
+                            static_cast<size_t>(bsz) * dim * sizeof(float)),
+                 "debug_attention out");
 }
 
 void DSparkEngine::debug_moe(int stage_id, const float* h_x, int rows, float* h_out) {
@@ -1721,15 +1710,13 @@ void DSparkEngine::debug_moe(int stage_id, const float* h_x, int rows, float* h_
     }
     const size_t n = static_cast<size_t>(rows) * dim;
 
-    check_cuda(cudaMemcpy(impl.buffers.d_ffn_normed, h_x, n * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "debug_moe x");
+    check_device(memcpy_h2d(impl.buffers.d_ffn_normed, h_x, n * sizeof(float)),
+                 "debug_moe x");
     impl.forward_moe(&impl.stages[stage_id], impl.buffers.d_ffn_normed,
                      impl.buffers.d_ffn_out, rows);
-    check_cuda(cudaDeviceSynchronize(), "debug_moe sync");
-    check_cuda(cudaMemcpy(h_out, impl.buffers.d_ffn_out, n * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "debug_moe out");
+    check_device(device_synchronize(), "debug_moe sync");
+    check_device(memcpy_d2h(h_out, impl.buffers.d_ffn_out, n * sizeof(float)),
+                 "debug_moe out");
 }
 
 void DSparkEngine::debug_head(const float* h_x, int input_token, int* h_tokens,
@@ -1741,26 +1728,22 @@ void DSparkEngine::debug_head(const float* h_x, int input_token, int* h_tokens,
 
     // d_draft_x is the same [block_size, hc_mult, dim] scratch the real path
     // hands to the last stage.
-    check_cuda(cudaMemcpy(impl.buffers.d_draft_x, h_x,
-                          static_cast<size_t>(bsz) * hc * dim * sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "debug_head x");
+    check_device(memcpy_h2d(impl.buffers.d_draft_x, h_x,
+                            static_cast<size_t>(bsz) * hc * dim * sizeof(float)),
+                 "debug_head x");
     impl.forward_head(input_token, impl.buffers.d_draft_x);
-    check_cuda(cudaDeviceSynchronize(), "debug_head sync");
+    check_device(device_synchronize(), "debug_head sync");
 
-    check_cuda(cudaMemcpy(h_tokens, impl.buffers.d_out_token_ids,
-                          (static_cast<size_t>(bsz) + 1) * sizeof(int),
-                          cudaMemcpyDeviceToHost),
-               "debug_head tokens");
-    check_cuda(cudaMemcpy(h_confidence, impl.buffers.d_confidence,
-                          static_cast<size_t>(bsz) * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "debug_head confidence");
+    check_device(memcpy_d2h(h_tokens, impl.buffers.d_out_token_ids,
+                            (static_cast<size_t>(bsz) + 1) * sizeof(int)),
+                 "debug_head tokens");
+    check_device(memcpy_d2h(h_confidence, impl.buffers.d_confidence,
+                            static_cast<size_t>(bsz) * sizeof(float)),
+                 "debug_head confidence");
     if (h_logits != nullptr) {
-        check_cuda(cudaMemcpy(h_logits, impl.buffers.d_logits,
-                              static_cast<size_t>(bsz) * impl.config.vocab_size * sizeof(float),
-                              cudaMemcpyDeviceToHost),
-                   "debug_head logits");
+        check_device(memcpy_d2h(h_logits, impl.buffers.d_logits,
+                                static_cast<size_t>(bsz) * impl.config.vocab_size * sizeof(float)),
+                     "debug_head logits");
     }
 }
 

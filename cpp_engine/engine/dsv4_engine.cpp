@@ -1,6 +1,7 @@
 #include "dsv4_engine.hpp"
 
 #include "cuda_ops.hpp"
+#include "device_runtime.hpp"
 #include "flashmemory_ops.hpp"
 #include "cmd_channel.hpp"
 #include "persistent_engine.hpp"
@@ -12,7 +13,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cuda_runtime.h>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -33,8 +33,11 @@
 namespace dsv4 {
 namespace {
 
-void check_cuda(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+void check_device(bool ok, const char* what) {
+    if (!ok) {
+        const std::string detail = device_last_error();
+        throw std::runtime_error(std::string(what) + (detail.empty() ? "" : ": " + detail));
+    }
 }
 
 const SafeTensorInfo* require_tensor(const SafeTensorsShard& shard, const std::string& name) {
@@ -122,10 +125,10 @@ struct FlashMemoryDeviceWeights {
 
     void release() {
         for (auto& l : layers) {
-            cudaFree(l.wq_a);
-            cudaFree(l.wq_b);
-            cudaFree(l.q_norm_weight);
-            cudaFree(l.weights_proj);
+            device_free(l.wq_a);
+            device_free(l.wq_b);
+            device_free(l.q_norm_weight);
+            device_free(l.weights_proj);
             l.wq_a = nullptr;
             l.wq_b = nullptr;
             l.q_norm_weight = nullptr;
@@ -168,14 +171,14 @@ struct FlashMemoryRuntimeState {
     ~FlashMemoryRuntimeState() { release(); }
 
     void release() {
-        cudaFree(d_inv_freqs); d_inv_freqs = nullptr;
-        cudaFree(d_q_scratch); d_q_scratch = nullptr;
-        cudaFree(d_qlora_scratch); d_qlora_scratch = nullptr;
-        cudaFree(d_fused_w); d_fused_w = nullptr;
-        cudaFree(d_layer_scores); d_layer_scores = nullptr;
-        cudaFree(d_ensemble_scores); d_ensemble_scores = nullptr;
-        cudaFree(d_global_topk); d_global_topk = nullptr;
-        cudaFree(d_global_topk_scores); d_global_topk_scores = nullptr;
+        device_free(d_inv_freqs); d_inv_freqs = nullptr;
+        device_free(d_q_scratch); d_q_scratch = nullptr;
+        device_free(d_qlora_scratch); d_qlora_scratch = nullptr;
+        device_free(d_fused_w); d_fused_w = nullptr;
+        device_free(d_layer_scores); d_layer_scores = nullptr;
+        device_free(d_ensemble_scores); d_ensemble_scores = nullptr;
+        device_free(d_global_topk); d_global_topk = nullptr;
+        device_free(d_global_topk_scores); d_global_topk_scores = nullptr;
         enabled = false;
         weights = nullptr;
         global_keep = 0;
@@ -245,9 +248,9 @@ void* upload_flashmemory_tensor(const SafeTensorsShard& shard, const SafeTensorI
         throw std::runtime_error("FlashMemory plugin unsupported dtype for upload: " + info.name + " dtype=" + safe_dtype_name(info.dtype));
     }
     void* d = nullptr;
-    check_cuda(cudaMalloc(&d, info.nbytes), ("alloc FlashMemory tensor " + info.name).c_str());
-    check_cuda(cudaMemcpy(d, shard.tensor_data(info), info.nbytes, cudaMemcpyHostToDevice),
-               ("copy FlashMemory tensor " + info.name).c_str());
+    check_device(device_malloc_into(d, info.nbytes), ("alloc FlashMemory tensor " + info.name).c_str());
+    check_device(memcpy_h2d(d, shard.tensor_data(info), info.nbytes),
+                 ("copy FlashMemory tensor " + info.name).c_str());
     return d;
 }
 
@@ -299,7 +302,7 @@ uint64_t flashmemory_device_weight_smoke(FlashMemoryDeviceWeights& weights, uint
         const uint64_t n = std::min<uint64_t>(probe_bytes, tensor_bytes);
         if (n == 0) return;
         host.resize(static_cast<size_t>(n));
-        check_cuda(cudaMemcpy(host.data(), ptr, n, cudaMemcpyDeviceToHost), "FlashMemory mock scorer probe D2H");
+        check_device(memcpy_d2h(host.data(), ptr, n), "FlashMemory mock scorer probe D2H");
         checksum ^= static_cast<uint64_t>(dtype);
         checksum *= 1099511628211ULL;
         for (uint64_t i = 0; i < n; ++i) {
@@ -378,14 +381,14 @@ struct BF16AllReduceScratch {
     uint16_t* d_bf16 = nullptr;
     int capacity = 0;
     ~BF16AllReduceScratch() {
-        if (d_bf16 != nullptr) cudaFree(d_bf16);
+        if (d_bf16 != nullptr) device_free(d_bf16);
     }
     void ensure(int count) {
         if (count <= capacity) return;
-        if (d_bf16 != nullptr) cudaFree(d_bf16);
+        if (d_bf16 != nullptr) device_free(d_bf16);
         d_bf16 = nullptr;
-        cudaError_t err = cudaMalloc(&d_bf16, static_cast<size_t>(count) * sizeof(uint16_t));
-        if (err != cudaSuccess) throw std::runtime_error(std::string("cudaMalloc bf16 all-reduce scratch: ") + cudaGetErrorString(err));
+        check_device(device_malloc_into(d_bf16, static_cast<size_t>(count) * sizeof(uint16_t)),
+                     "device_malloc bf16 all-reduce scratch");
         capacity = count;
     }
 };
@@ -406,19 +409,19 @@ void all_reduce_sum_fp32_via_bf16_inplace(
     };
     if (detail && detail->enabled) {
         auto pre_t = Clock::now();
-        check_cuda(cudaDeviceSynchronize(), "sync reduce pre");
+        check_device(device_synchronize(), "sync reduce pre");
         detail->pre_sync_ms += elapsed_ms_local(pre_t, Clock::now());
         auto pack_t = Clock::now();
         if (!fp32_to_bf16_cuda(d_values, scratch.d_bf16, count)) throw std::runtime_error("fp32_to_bf16 launch failed");
-        check_cuda(cudaDeviceSynchronize(), "sync reduce pack");
+        check_device(device_synchronize(), "sync reduce pack");
         detail->pack_ms += elapsed_ms_local(pack_t, Clock::now());
         auto nccl_t = Clock::now();
         nccl_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
-        check_cuda(cudaDeviceSynchronize(), "sync reduce nccl");
+        check_device(device_synchronize(), "sync reduce nccl");
         detail->nccl_ms += elapsed_ms_local(nccl_t, Clock::now());
         auto unpack_t = Clock::now();
         if (!bf16_to_fp32_cuda(scratch.d_bf16, d_values, count)) throw std::runtime_error("bf16_to_fp32 launch failed");
-        check_cuda(cudaDeviceSynchronize(), "sync reduce unpack");
+        check_device(device_synchronize(), "sync reduce unpack");
         detail->unpack_ms += elapsed_ms_local(unpack_t, Clock::now());
         return;
     }
@@ -820,7 +823,7 @@ bool run_single_token_attention_smoke(
     float* d_attn_out,
     AttentionProfileBreakdown* profile = nullptr) {
     auto profile_stage_sync = [&](const char* what) {
-        if (profile != nullptr && profile->enabled) check_cuda(cudaDeviceSynchronize(), what);
+        if (profile != nullptr && profile->enabled) check_device(device_synchronize(), what);
     };
     auto profile_t = Clock::now();
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_attn_norm, dims.dim, 1e-6f)) return false;
@@ -847,7 +850,8 @@ bool run_single_token_attention_smoke(
     if (profile != nullptr && profile->enabled) profile->kv_ms += elapsed_ms(profile_t, Clock::now());
     profile_t = Clock::now();
     if (d_kv_cache != nullptr) {
-        if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+        if (!memcpy_d2d(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim,
+                        d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float))) return false;
         if (d_kv_indices != nullptr && index_count > 0) {
             if (!indexed_cached_single_token_attention_cuda(d_q, d_kv_cache, d_kv_indices, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, index_count, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
         } else if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
@@ -1011,7 +1015,7 @@ struct DeviceUndoJournal {
     bool pending = false;
 
     void release() {
-        for (BackupBlock& block : blocks) cudaFree(block.ptr);
+        for (BackupBlock& block : blocks) device_free(block.ptr);
         blocks.clear();
         entries.clear();
         pending = false;
@@ -1032,14 +1036,14 @@ struct DeviceUndoJournal {
         if (index == blocks.size()) blocks.push_back(BackupBlock{});
         BackupBlock& block = blocks[index];
         if (block.bytes < bytes) {
-            cudaFree(block.ptr);
+            device_free(block.ptr);
             block.ptr = nullptr;
             block.bytes = 0;
-            check_cuda(cudaMalloc(&block.ptr, bytes), "cudaMalloc continuation undo backup");
+            check_device(device_malloc_into(block.ptr, bytes), "device_malloc continuation undo backup");
             block.bytes = bytes;
         }
-        check_cuda(cudaMemcpy(block.ptr, destination, bytes, cudaMemcpyDeviceToDevice),
-                   "snapshot continuation device state");
+        check_device(memcpy_d2d(block.ptr, destination, bytes),
+                     "snapshot continuation device state");
         entries.push_back(Entry{destination, block.ptr, bytes, row});
     }
 
@@ -1048,11 +1052,10 @@ struct DeviceUndoJournal {
         if (committed_rows < 0) throw std::runtime_error("negative committed continuation rows");
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
             if (it->row < committed_rows) continue;
-            check_cuda(cudaMemcpy(it->destination, it->backup, it->bytes,
-                                  cudaMemcpyDeviceToDevice),
-                       "restore continuation device state");
+            check_device(memcpy_d2d(it->destination, it->backup, it->bytes),
+                         "restore continuation device state");
         }
-        check_cuda(cudaDeviceSynchronize(), "sync continuation transaction finalize");
+        check_device(device_synchronize(), "sync continuation transaction finalize");
         entries.clear();
         pending = false;
     }
@@ -1061,11 +1064,10 @@ struct DeviceUndoJournal {
         if (!pending) return;
         for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
             if (it->destination != nullptr && it->backup != nullptr && it->bytes != 0) {
-                (void)cudaMemcpy(it->destination, it->backup, it->bytes,
-                                 cudaMemcpyDeviceToDevice);
+                (void)memcpy_d2d(it->destination, it->backup, it->bytes);
             }
         }
-        (void)cudaDeviceSynchronize();
+        (void)device_synchronize();
         entries.clear();
         pending = false;
     }
@@ -1109,17 +1111,17 @@ struct DeviceMoeBatchWorkspace {
     int slots_cap = 0;
 
     void release() {
-        cudaFree(fp4.d_x_q);
-        cudaFree(fp4.d_x_scale);
-        cudaFree(fp4.d_gate);
-        cudaFree(fp4.d_up);
-        cudaFree(fp4.d_hidden_q);
-        cudaFree(fp4.d_hidden_scale);
-        cudaFree(fp4.d_partials);
-        cudaFree(slot_expert);
-        cudaFree(slot_starts);
-        cudaFree(slot_tokens);
-        cudaFree(pair_weights);
+        device_free(fp4.d_x_q);
+        device_free(fp4.d_x_scale);
+        device_free(fp4.d_gate);
+        device_free(fp4.d_up);
+        device_free(fp4.d_hidden_q);
+        device_free(fp4.d_hidden_scale);
+        device_free(fp4.d_partials);
+        device_free(slot_expert);
+        device_free(slot_starts);
+        device_free(slot_tokens);
+        device_free(pair_weights);
         *this = DeviceMoeBatchWorkspace{};
     }
 
@@ -1132,17 +1134,17 @@ struct DeviceMoeBatchWorkspace {
         fp4.dim = dim;
         fp4.inter_dim = inter_dim;
         slots_cap = slots;
-        check_cuda(cudaMalloc(&fp4.d_x_q, static_cast<size_t>(tokens) * dim), "cudaMalloc batch moe x q");
-        check_cuda(cudaMalloc(&fp4.d_x_scale, static_cast<size_t>(tokens) * sizeof(float)), "cudaMalloc batch moe x scale");
-        check_cuda(cudaMalloc(&fp4.d_gate, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "cudaMalloc batch moe gate");
-        check_cuda(cudaMalloc(&fp4.d_up, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "cudaMalloc batch moe up");
-        check_cuda(cudaMalloc(&fp4.d_hidden_q, static_cast<size_t>(pairs) * inter_dim), "cudaMalloc batch moe hidden q");
-        check_cuda(cudaMalloc(&fp4.d_hidden_scale, static_cast<size_t>(pairs) * sizeof(float)), "cudaMalloc batch moe hidden scale");
-        check_cuda(cudaMalloc(&fp4.d_partials, static_cast<size_t>(pairs) * dim * sizeof(float)), "cudaMalloc batch moe partials");
-        check_cuda(cudaMalloc(&slot_expert, static_cast<size_t>(slots) * sizeof(int32_t)), "cudaMalloc batch moe slot experts");
-        check_cuda(cudaMalloc(&slot_starts, static_cast<size_t>(slots + 1) * sizeof(int32_t)), "cudaMalloc batch moe slot starts");
-        check_cuda(cudaMalloc(&slot_tokens, static_cast<size_t>(pairs) * sizeof(int32_t)), "cudaMalloc batch moe slot tokens");
-        check_cuda(cudaMalloc(&pair_weights, static_cast<size_t>(pairs) * sizeof(float)), "cudaMalloc batch moe pair weights");
+        check_device(device_malloc_into(fp4.d_x_q, static_cast<size_t>(tokens) * dim), "device_malloc batch moe x q");
+        check_device(device_malloc_into(fp4.d_x_scale, static_cast<size_t>(tokens) * sizeof(float)), "device_malloc batch moe x scale");
+        check_device(device_malloc_into(fp4.d_gate, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "device_malloc batch moe gate");
+        check_device(device_malloc_into(fp4.d_up, static_cast<size_t>(pairs) * inter_dim * sizeof(float)), "device_malloc batch moe up");
+        check_device(device_malloc_into(fp4.d_hidden_q, static_cast<size_t>(pairs) * inter_dim), "device_malloc batch moe hidden q");
+        check_device(device_malloc_into(fp4.d_hidden_scale, static_cast<size_t>(pairs) * sizeof(float)), "device_malloc batch moe hidden scale");
+        check_device(device_malloc_into(fp4.d_partials, static_cast<size_t>(pairs) * dim * sizeof(float)), "device_malloc batch moe partials");
+        check_device(device_malloc_into(slot_expert, static_cast<size_t>(slots) * sizeof(int32_t)), "device_malloc batch moe slot experts");
+        check_device(device_malloc_into(slot_starts, static_cast<size_t>(slots + 1) * sizeof(int32_t)), "device_malloc batch moe slot starts");
+        check_device(device_malloc_into(slot_tokens, static_cast<size_t>(pairs) * sizeof(int32_t)), "device_malloc batch moe slot tokens");
+        check_device(device_malloc_into(pair_weights, static_cast<size_t>(pairs) * sizeof(float)), "device_malloc batch moe pair weights");
     }
 };
 
@@ -1203,16 +1205,16 @@ struct DeviceContinuationWorkspace {
     DeviceMoeBatchWorkspace moe_workspace;
 
     void release() {
-        cudaFree(token_ids); cudaFree(x); cudaFree(h4); cudaFree(h4_next); cudaFree(h4_bf16);
-        cudaFree(hc_post); cudaFree(hc_comb); cudaFree(attn_norm); cudaFree(q_a); cudaFree(q_norm);
-        cudaFree(q); cudaFree(kv_a); cudaFree(kv_norm); cudaFree(attn_value); cudaFree(attn_mid_rows);
-        cudaFree(attn_out); cudaFree(compressor_input_bf16); cudaFree(compressor_input_rounded);
-        cudaFree(compressor_kv); cudaFree(compressor_score); cudaFree(indexer_comp_kv);
-        cudaFree(indexer_comp_score); cudaFree(index_q); cudaFree(index_scores);
-        cudaFree(kv_row_starts); cudaFree(kv_indices); cudaFree(ffn_x); cudaFree(ffn_norm);
-        cudaFree(shared_gate); cudaFree(shared_up); cudaFree(shared_hidden); cudaFree(shared_out);
-        cudaFree(moe); cudaFree(route_indices); cudaFree(route_weights); cudaFree(final_x);
-        cudaFree(final_norm); cudaFree(logits); cudaFree(dspark_hidden);
+        device_free(token_ids); device_free(x); device_free(h4); device_free(h4_next); device_free(h4_bf16);
+        device_free(hc_post); device_free(hc_comb); device_free(attn_norm); device_free(q_a); device_free(q_norm);
+        device_free(q); device_free(kv_a); device_free(kv_norm); device_free(attn_value); device_free(attn_mid_rows);
+        device_free(attn_out); device_free(compressor_input_bf16); device_free(compressor_input_rounded);
+        device_free(compressor_kv); device_free(compressor_score); device_free(indexer_comp_kv);
+        device_free(indexer_comp_score); device_free(index_q); device_free(index_scores);
+        device_free(kv_row_starts); device_free(kv_indices); device_free(ffn_x); device_free(ffn_norm);
+        device_free(shared_gate); device_free(shared_up); device_free(shared_hidden); device_free(shared_out);
+        device_free(moe); device_free(route_indices); device_free(route_weights); device_free(final_x);
+        device_free(final_norm); device_free(logits); device_free(dspark_hidden);
         moe_workspace.release();
         *this = DeviceContinuationWorkspace{};
     }
@@ -1234,47 +1236,51 @@ struct DeviceContinuationWorkspace {
         index_q_dim = std::max(1, index_q_cols); index_head_dim = std::max(1, index_head);
         dspark_stride_cap = dspark_stride;
         const size_t r = static_cast<size_t>(rows_cap);
-        auto alloc_f = [](float** p, size_t n, const char* what) { check_cuda(cudaMalloc(p, n * sizeof(float)), what); };
-        auto alloc_i = [](int** p, size_t n, const char* what) { check_cuda(cudaMalloc(p, n * sizeof(int)), what); };
-        alloc_i(&token_ids, r, "cudaMalloc continuation token ids");
-        alloc_f(&x, r * dim, "cudaMalloc continuation x");
-        alloc_f(&h4, r * 4 * dim, "cudaMalloc continuation h4");
-        alloc_f(&h4_next, r * 4 * dim, "cudaMalloc continuation h4 next");
-        check_cuda(cudaMalloc(&h4_bf16, r * 4 * dim * sizeof(uint16_t)), "cudaMalloc continuation h4 bf16");
-        alloc_f(&hc_post, r * 4, "cudaMalloc continuation hc post");
-        alloc_f(&hc_comb, r * 16, "cudaMalloc continuation hc comb");
-        alloc_f(&attn_norm, r * dim, "cudaMalloc continuation attn norm");
-        alloc_f(&q_a, r * q_a_dim, "cudaMalloc continuation q a");
-        alloc_f(&q_norm, r * q_a_dim, "cudaMalloc continuation q norm");
-        alloc_f(&q, r * q_dim, "cudaMalloc continuation q");
-        alloc_f(&kv_a, r * kv_dim, "cudaMalloc continuation kv a");
-        alloc_f(&kv_norm, r * kv_dim, "cudaMalloc continuation kv norm");
-        alloc_f(&attn_value, r * q_dim, "cudaMalloc continuation attn value");
-        alloc_f(&attn_mid_rows, r * attn_mid, "cudaMalloc continuation attn mid");
-        alloc_f(&attn_out, r * dim, "cudaMalloc continuation attn out");
-        check_cuda(cudaMalloc(&compressor_input_bf16, r * dim * sizeof(uint16_t)), "cudaMalloc continuation compressor input");
-        alloc_f(&compressor_input_rounded, r * dim, "cudaMalloc continuation compressor rounded");
-        alloc_f(&compressor_kv, r * 1024, "cudaMalloc continuation compressor kv");
-        alloc_f(&compressor_score, r * 1024, "cudaMalloc continuation compressor score");
-        alloc_f(&indexer_comp_kv, r * index_head_dim * 2, "cudaMalloc continuation indexer comp kv");
-        alloc_f(&indexer_comp_score, r * index_head_dim * 2, "cudaMalloc continuation indexer comp score");
-        if (index_q_dim > 0) alloc_f(&index_q, r * index_q_dim, "cudaMalloc continuation index q");
-        alloc_f(&index_scores, static_cast<size_t>(max_indices + index_q_dim), "cudaMalloc continuation index scores");
-        check_cuda(cudaMalloc(&kv_row_starts, (r + 1) * sizeof(int32_t)), "cudaMalloc continuation row starts");
-        check_cuda(cudaMalloc(&kv_indices, r * max_kv_indices * sizeof(int32_t)), "cudaMalloc continuation kv indices");
-        alloc_f(&ffn_x, r * dim, "cudaMalloc continuation ffn x");
-        alloc_f(&ffn_norm, r * dim, "cudaMalloc continuation ffn norm");
-        alloc_f(&shared_gate, r * inter_dim, "cudaMalloc continuation shared gate");
-        alloc_f(&shared_up, r * inter_dim, "cudaMalloc continuation shared up");
-        alloc_f(&shared_hidden, r * inter_dim, "cudaMalloc continuation shared hidden");
-        alloc_f(&shared_out, r * dim, "cudaMalloc continuation shared out");
-        alloc_f(&moe, r * dim, "cudaMalloc continuation moe");
-        check_cuda(cudaMalloc(&route_indices, r * route_count * sizeof(int64_t)), "cudaMalloc continuation route indices");
-        alloc_f(&route_weights, r * route_count, "cudaMalloc continuation route weights");
-        alloc_f(&final_x, r * dim, "cudaMalloc continuation final x");
-        alloc_f(&final_norm, r * dim, "cudaMalloc continuation final norm");
-        alloc_f(&logits, r * local_head_rows, "cudaMalloc continuation logits");
-        if (dspark_stride_cap > 0) alloc_f(&dspark_hidden, r * dspark_stride_cap, "cudaMalloc continuation dspark hidden");
+        auto alloc_f = [](float** p, size_t n, const char* what) {
+            check_device(device_malloc_into(*p, n * sizeof(float)), what);
+        };
+        auto alloc_i = [](int** p, size_t n, const char* what) {
+            check_device(device_malloc_into(*p, n * sizeof(int)), what);
+        };
+        alloc_i(&token_ids, r, "device_malloc continuation token ids");
+        alloc_f(&x, r * dim, "device_malloc continuation x");
+        alloc_f(&h4, r * 4 * dim, "device_malloc continuation h4");
+        alloc_f(&h4_next, r * 4 * dim, "device_malloc continuation h4 next");
+        check_device(device_malloc_into(h4_bf16, r * 4 * dim * sizeof(uint16_t)), "device_malloc continuation h4 bf16");
+        alloc_f(&hc_post, r * 4, "device_malloc continuation hc post");
+        alloc_f(&hc_comb, r * 16, "device_malloc continuation hc comb");
+        alloc_f(&attn_norm, r * dim, "device_malloc continuation attn norm");
+        alloc_f(&q_a, r * q_a_dim, "device_malloc continuation q a");
+        alloc_f(&q_norm, r * q_a_dim, "device_malloc continuation q norm");
+        alloc_f(&q, r * q_dim, "device_malloc continuation q");
+        alloc_f(&kv_a, r * kv_dim, "device_malloc continuation kv a");
+        alloc_f(&kv_norm, r * kv_dim, "device_malloc continuation kv norm");
+        alloc_f(&attn_value, r * q_dim, "device_malloc continuation attn value");
+        alloc_f(&attn_mid_rows, r * attn_mid, "device_malloc continuation attn mid");
+        alloc_f(&attn_out, r * dim, "device_malloc continuation attn out");
+        check_device(device_malloc_into(compressor_input_bf16, r * dim * sizeof(uint16_t)), "device_malloc continuation compressor input");
+        alloc_f(&compressor_input_rounded, r * dim, "device_malloc continuation compressor rounded");
+        alloc_f(&compressor_kv, r * 1024, "device_malloc continuation compressor kv");
+        alloc_f(&compressor_score, r * 1024, "device_malloc continuation compressor score");
+        alloc_f(&indexer_comp_kv, r * index_head_dim * 2, "device_malloc continuation indexer comp kv");
+        alloc_f(&indexer_comp_score, r * index_head_dim * 2, "device_malloc continuation indexer comp score");
+        if (index_q_dim > 0) alloc_f(&index_q, r * index_q_dim, "device_malloc continuation index q");
+        alloc_f(&index_scores, static_cast<size_t>(max_indices + index_q_dim), "device_malloc continuation index scores");
+        check_device(device_malloc_into(kv_row_starts, (r + 1) * sizeof(int32_t)), "device_malloc continuation row starts");
+        check_device(device_malloc_into(kv_indices, r * max_kv_indices * sizeof(int32_t)), "device_malloc continuation kv indices");
+        alloc_f(&ffn_x, r * dim, "device_malloc continuation ffn x");
+        alloc_f(&ffn_norm, r * dim, "device_malloc continuation ffn norm");
+        alloc_f(&shared_gate, r * inter_dim, "device_malloc continuation shared gate");
+        alloc_f(&shared_up, r * inter_dim, "device_malloc continuation shared up");
+        alloc_f(&shared_hidden, r * inter_dim, "device_malloc continuation shared hidden");
+        alloc_f(&shared_out, r * dim, "device_malloc continuation shared out");
+        alloc_f(&moe, r * dim, "device_malloc continuation moe");
+        check_device(device_malloc_into(route_indices, r * route_count * sizeof(int64_t)), "device_malloc continuation route indices");
+        alloc_f(&route_weights, r * route_count, "device_malloc continuation route weights");
+        alloc_f(&final_x, r * dim, "device_malloc continuation final x");
+        alloc_f(&final_norm, r * dim, "device_malloc continuation final norm");
+        alloc_f(&logits, r * local_head_rows, "device_malloc continuation logits");
+        if (dspark_stride_cap > 0) alloc_f(&dspark_hidden, r * dspark_stride_cap, "device_malloc continuation dspark hidden");
     }
 };
 
@@ -1283,18 +1289,18 @@ struct DeviceMoePrefillWorkspace {
     ~DeviceMoePrefillWorkspace() { release(); }
 
     void release() {
-        cudaFree(fp4.d_x_sorted);
-        cudaFree(fp4.d_partials);
-        cudaFree(fp4.d_x_q);
-        cudaFree(fp4.d_x_scale);
-        cudaFree(fp4.d_x_pad);
-        cudaFree(fp4.d_x_scale_pad);
-        cudaFree(fp4.d_gate);
-        cudaFree(fp4.d_up);
-        cudaFree(fp4.d_hidden_q);
-        cudaFree(fp4.d_hidden_scale);
-        cudaFree(fp4.d_tile_experts);
-        cudaFree(fp4.d_tile_rows);
+        device_free(fp4.d_x_sorted);
+        device_free(fp4.d_partials);
+        device_free(fp4.d_x_q);
+        device_free(fp4.d_x_scale);
+        device_free(fp4.d_x_pad);
+        device_free(fp4.d_x_scale_pad);
+        device_free(fp4.d_gate);
+        device_free(fp4.d_up);
+        device_free(fp4.d_hidden_q);
+        device_free(fp4.d_hidden_scale);
+        device_free(fp4.d_tile_experts);
+        device_free(fp4.d_tile_rows);
         fp4 = MoePrefillFp4GroupedWorkspace{};
     }
 
@@ -1311,19 +1317,19 @@ struct DeviceMoePrefillWorkspace {
         const size_t routes_inter = static_cast<size_t>(routes_cap) * inter_dim;
         const size_t padded_dim = static_cast<size_t>(padded_rows_cap) * dim;
         const size_t padded_inter = static_cast<size_t>(padded_rows_cap) * inter_dim;
-        check_cuda(cudaMalloc(&fp4.d_x_sorted, routes_dim * sizeof(float)), "cudaMalloc prefill moe x sorted");
-        check_cuda(cudaMalloc(&fp4.d_partials, routes_dim * sizeof(float)), "cudaMalloc prefill moe partials");
-        check_cuda(cudaMalloc(&fp4.d_x_q, routes_dim), "cudaMalloc prefill moe x q");
-        check_cuda(cudaMalloc(&fp4.d_x_scale, static_cast<size_t>(routes_cap) * sizeof(float)), "cudaMalloc prefill moe x scale");
-        check_cuda(cudaMalloc(&fp4.d_x_pad, padded_dim), "cudaMalloc prefill moe x pad");
-        check_cuda(cudaMalloc(&fp4.d_x_scale_pad, static_cast<size_t>(padded_rows_cap) * sizeof(float)), "cudaMalloc prefill moe x scale pad");
-        check_cuda(cudaMalloc(&fp4.d_gate, padded_inter * sizeof(float)), "cudaMalloc prefill moe gate");
-        check_cuda(cudaMalloc(&fp4.d_up, padded_inter * sizeof(float)), "cudaMalloc prefill moe up");
-        check_cuda(cudaMalloc(&fp4.d_hidden_q, padded_inter), "cudaMalloc prefill moe hidden q");
-        check_cuda(cudaMalloc(&fp4.d_hidden_scale, static_cast<size_t>(padded_rows_cap) * sizeof(float)), "cudaMalloc prefill moe hidden scale");
+        check_device(device_malloc_into(fp4.d_x_sorted, routes_dim * sizeof(float)), "device_malloc prefill moe x sorted");
+        check_device(device_malloc_into(fp4.d_partials, routes_dim * sizeof(float)), "device_malloc prefill moe partials");
+        check_device(device_malloc_into(fp4.d_x_q, routes_dim), "device_malloc prefill moe x q");
+        check_device(device_malloc_into(fp4.d_x_scale, static_cast<size_t>(routes_cap) * sizeof(float)), "device_malloc prefill moe x scale");
+        check_device(device_malloc_into(fp4.d_x_pad, padded_dim), "device_malloc prefill moe x pad");
+        check_device(device_malloc_into(fp4.d_x_scale_pad, static_cast<size_t>(padded_rows_cap) * sizeof(float)), "device_malloc prefill moe x scale pad");
+        check_device(device_malloc_into(fp4.d_gate, padded_inter * sizeof(float)), "device_malloc prefill moe gate");
+        check_device(device_malloc_into(fp4.d_up, padded_inter * sizeof(float)), "device_malloc prefill moe up");
+        check_device(device_malloc_into(fp4.d_hidden_q, padded_inter), "device_malloc prefill moe hidden q");
+        check_device(device_malloc_into(fp4.d_hidden_scale, static_cast<size_t>(padded_rows_cap) * sizeof(float)), "device_malloc prefill moe hidden scale");
         if (tile_cap > 0) {
-            check_cuda(cudaMalloc(&fp4.d_tile_experts, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "cudaMalloc prefill moe tile experts");
-            check_cuda(cudaMalloc(&fp4.d_tile_rows, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "cudaMalloc prefill moe tile rows");
+            check_device(device_malloc_into(fp4.d_tile_experts, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "device_malloc prefill moe tile experts");
+            check_device(device_malloc_into(fp4.d_tile_rows, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "device_malloc prefill moe tile rows");
         }
     }
 };
@@ -1405,7 +1411,7 @@ int gguf_indexed_attn_mode_from_env() {
 
 void gguf_log_mem(const char* tag, int tp_rank) {
     size_t free_bytes = 0, total_bytes = 0;
-    check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), tag);
+    check_device(device_mem_info(&free_bytes, &total_bytes), tag);
     std::cout << "gguf_mem tag=" << tag
               << " tp_rank=" << tp_rank
               << " free_gib=" << (static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0))
@@ -1417,7 +1423,7 @@ void gguf_log_mem(const char* tag, int tp_rank) {
 void gguf_check_min_free(const char* tag, int tp_rank, int min_free_mib) {
     if (min_free_mib <= 0) return;
     size_t free_bytes = 0, total_bytes = 0;
-    check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), tag);
+    check_device(device_mem_info(&free_bytes, &total_bytes), tag);
     const size_t min_bytes = static_cast<size_t>(min_free_mib) * 1024ULL * 1024ULL;
     if (free_bytes < min_bytes) {
         std::ostringstream oss;
@@ -1432,7 +1438,7 @@ void gguf_check_min_free(const char* tag, int tp_rank, int min_free_mib) {
 struct GgufPinnedStageSlot {
     uint8_t* ptr = nullptr;
     size_t capacity = 0;
-    cudaEvent_t done = nullptr;
+    void* done = nullptr;
     bool in_flight = false;
 };
 
@@ -1462,10 +1468,9 @@ struct GgufPinnedStagingRing {
         slots.resize(static_cast<size_t>(slots_to_alloc));
         for (auto& slot : slots) {
             slot.capacity = slot_bytes;
-            check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&slot.ptr), slot.capacity, cudaHostAllocDefault),
-                       "cudaHostAlloc GGUF pinned staging slot");
-            check_cuda(cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming),
-                       "create GGUF pinned staging event");
+            check_device(host_alloc_pinned_into(slot.ptr, slot.capacity),
+                         "host_alloc_pinned GGUF pinned staging slot");
+            check_device((slot.done = event_create()) != nullptr, "create GGUF pinned staging event");
         }
         next = 0;
         if (tp_rank == 0) {
@@ -1479,9 +1484,9 @@ struct GgufPinnedStagingRing {
         }
     }
 
-    void copy_async(uint8_t* dst, const uint8_t* src, size_t bytes, cudaStream_t stream, const char* label) {
+    void copy_async(uint8_t* dst, const uint8_t* src, size_t bytes, void* stream, const char* label) {
         if (!enabled()) {
-            check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream), label);
+            check_device(memcpy_h2d_async(dst, src, bytes, stream), label);
             return;
         }
         GgufPinnedStageSlot& slot = slots[next];
@@ -1489,21 +1494,21 @@ struct GgufPinnedStagingRing {
             throw std::runtime_error("GGUF pinned staging slot too small");
         }
         if (slot.in_flight) {
-            check_cuda(cudaEventSynchronize(slot.done), "wait GGUF pinned staging slot");
+            check_device(event_synchronize(slot.done), "wait GGUF pinned staging slot");
             slot.in_flight = false;
         }
         std::memcpy(slot.ptr, src, bytes);
-        check_cuda(cudaMemcpyAsync(dst, slot.ptr, bytes, cudaMemcpyHostToDevice, stream), label);
-        check_cuda(cudaEventRecord(slot.done, stream), "record GGUF pinned staging slot");
+        check_device(memcpy_h2d_async(dst, slot.ptr, bytes, stream), label);
+        check_device(event_record(slot.done, stream), "record GGUF pinned staging slot");
         slot.in_flight = true;
         next = (next + 1) % slots.size();
     }
 
     void release() {
         for (auto& slot : slots) {
-            if (slot.in_flight && slot.done != nullptr) cudaEventSynchronize(slot.done);
-            if (slot.ptr != nullptr) cudaFreeHost(slot.ptr);
-            if (slot.done != nullptr) cudaEventDestroy(slot.done);
+            if (slot.in_flight && slot.done != nullptr) event_synchronize(slot.done);
+            if (slot.ptr != nullptr) host_free_pinned(slot.ptr);
+            if (slot.done != nullptr) event_destroy(slot.done);
             slot = GgufPinnedStageSlot{};
         }
         slots.clear();
@@ -1603,126 +1608,126 @@ struct SafeForwardContext {
     }
 
     ~SafeForwardContext() {
-        for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
-        for (auto& [_, ptr] : indexer_kv_cache) cudaFree(ptr);
-        for (auto& [_, ptr] : rope_inv_freqs_compress) cudaFree(ptr);
-        for (auto& [_, ptr] : rope_inv_freqs_plain) cudaFree(ptr);
+        for (auto& [_, ptr] : kv_cache) device_free(ptr);
+        for (auto& [_, ptr] : indexer_kv_cache) device_free(ptr);
+        for (auto& [_, ptr] : rope_inv_freqs_compress) device_free(ptr);
+        for (auto& [_, ptr] : rope_inv_freqs_plain) device_free(ptr);
         for (auto& [_, c] : attention_cache) {
-            cudaFree(c.attn_norm);
-            cudaFree(c.q_norm);
-            cudaFree(c.kv_norm);
-            cudaFree(c.ffn_norm);
-            cudaFree(c.wq_a);
-            cudaFree(c.wq_a_scale);
-            cudaFree(c.wq_b);
-            cudaFree(c.wq_b_scale);
-            cudaFree(c.wkv);
-            cudaFree(c.wkv_scale);
-            cudaFree(c.wo_a);
-            cudaFree(c.wo_a_scale);
-            cudaFree(c.wo_a_int8);
-            cudaFree(c.wo_a_int8_scale);
-            cudaFree(c.wo_b);
-            cudaFree(c.wo_b_scale);
-            cudaFree(c.attn_sink);
+            device_free(c.attn_norm);
+            device_free(c.q_norm);
+            device_free(c.kv_norm);
+            device_free(c.ffn_norm);
+            device_free(c.wq_a);
+            device_free(c.wq_a_scale);
+            device_free(c.wq_b);
+            device_free(c.wq_b_scale);
+            device_free(c.wkv);
+            device_free(c.wkv_scale);
+            device_free(c.wo_a);
+            device_free(c.wo_a_scale);
+            device_free(c.wo_a_int8);
+            device_free(c.wo_a_int8_scale);
+            device_free(c.wo_b);
+            device_free(c.wo_b_scale);
+            device_free(c.attn_sink);
         }
         for (auto& [_, c] : shared_cache) {
-            cudaFree(c.w1);
-            cudaFree(c.s1);
-            cudaFree(c.w2);
-            cudaFree(c.s2);
-            cudaFree(c.w3);
-            cudaFree(c.s3);
+            device_free(c.w1);
+            device_free(c.s1);
+            device_free(c.w2);
+            device_free(c.s2);
+            device_free(c.w3);
+            device_free(c.s3);
         }
         for (auto& [_, c] : expert_cache) {
-            cudaFree(c.w1);
-            cudaFree(c.s1);
-            cudaFree(c.w2);
-            cudaFree(c.s2);
-            cudaFree(c.w3);
-            cudaFree(c.s3);
+            device_free(c.w1);
+            device_free(c.s1);
+            device_free(c.w2);
+            device_free(c.s2);
+            device_free(c.w3);
+            device_free(c.s3);
         }
         for (auto& [_, c] : active_arena_cache) {
-            if (c.w1 != nullptr) cudaFree(c.w1);
-            if (c.s1 != nullptr) cudaFree(c.s1);
-            if (c.w2 != nullptr) cudaFree(c.w2);
-            if (c.s2 != nullptr) cudaFree(c.s2);
-            if (c.w3 != nullptr) cudaFree(c.w3);
-            if (c.s3 != nullptr) cudaFree(c.s3);
+            if (c.w1 != nullptr) device_free(c.w1);
+            if (c.s1 != nullptr) device_free(c.s1);
+            if (c.w2 != nullptr) device_free(c.w2);
+            if (c.s2 != nullptr) device_free(c.s2);
+            if (c.w3 != nullptr) device_free(c.w3);
+            if (c.s3 != nullptr) device_free(c.s3);
         }
         for (auto& blk : active_arena_device_freelist) {
-            if (blk.w1 != nullptr) cudaFree(blk.w1);
-            if (blk.s1 != nullptr) cudaFree(blk.s1);
-            if (blk.w2 != nullptr) cudaFree(blk.w2);
-            if (blk.s2 != nullptr) cudaFree(blk.s2);
-            if (blk.w3 != nullptr) cudaFree(blk.w3);
-            if (blk.s3 != nullptr) cudaFree(blk.s3);
+            if (blk.w1 != nullptr) device_free(blk.w1);
+            if (blk.s1 != nullptr) device_free(blk.s1);
+            if (blk.w2 != nullptr) device_free(blk.w2);
+            if (blk.s2 != nullptr) device_free(blk.s2);
+            if (blk.w3 != nullptr) device_free(blk.w3);
+            if (blk.s3 != nullptr) device_free(blk.s3);
         }
         active_arena_device_freelist.clear();
         for (auto& [_, c] : host_fp4_slot_cache) {
-            if (c.h_w1q != nullptr) cudaFreeHost(c.h_w1q);
-            if (c.h_w1s != nullptr) cudaFreeHost(c.h_w1s);
-            if (c.h_w2q != nullptr) cudaFreeHost(c.h_w2q);
-            if (c.h_w2s != nullptr) cudaFreeHost(c.h_w2s);
-            if (c.h_w3q != nullptr) cudaFreeHost(c.h_w3q);
-            if (c.h_w3s != nullptr) cudaFreeHost(c.h_w3s);
+            if (c.h_w1q != nullptr) host_free_pinned(c.h_w1q);
+            if (c.h_w1s != nullptr) host_free_pinned(c.h_w1s);
+            if (c.h_w2q != nullptr) host_free_pinned(c.h_w2q);
+            if (c.h_w2s != nullptr) host_free_pinned(c.h_w2s);
+            if (c.h_w3q != nullptr) host_free_pinned(c.h_w3q);
+            if (c.h_w3s != nullptr) host_free_pinned(c.h_w3s);
         }
         for (auto& [_, c] : gate_cache) {
-            cudaFree(c.weight);
-            cudaFree(c.bias);
-            cudaFree(c.tid2eid);
-            cudaFree(c.original);
-            cudaFree(c.scored);
+            device_free(c.weight);
+            device_free(c.bias);
+            device_free(c.tid2eid);
+            device_free(c.original);
+            device_free(c.scored);
         }
         for (auto& [_, c] : compressor_cache) {
-            cudaFree(c.wkv);
-            cudaFree(c.wgate);
-            cudaFree(c.ape);
-            cudaFree(c.norm);
+            device_free(c.wkv);
+            device_free(c.wgate);
+            device_free(c.ape);
+            device_free(c.norm);
         }
         for (auto& [_, c] : hc_cache) {
-            cudaFree(c.attn_fn);
-            cudaFree(c.attn_scale);
-            cudaFree(c.attn_base);
-            cudaFree(c.ffn_fn);
-            cudaFree(c.ffn_scale);
-            cudaFree(c.ffn_base);
+            device_free(c.attn_fn);
+            device_free(c.attn_scale);
+            device_free(c.attn_base);
+            device_free(c.ffn_fn);
+            device_free(c.ffn_scale);
+            device_free(c.ffn_base);
         }
         for (auto& [_, w] : moe_decode_workspace_cache) {
-            cudaFree(w.fp4.d_x_q);
-            cudaFree(w.fp4.d_x_scale);
-            cudaFree(w.fp4.d_gate);
-            cudaFree(w.fp4.d_up);
-            cudaFree(w.fp4.d_hidden_q);
-            cudaFree(w.fp4.d_hidden_scale);
-            cudaFree(w.fp4.d_route_y);
+            device_free(w.fp4.d_x_q);
+            device_free(w.fp4.d_x_scale);
+            device_free(w.fp4.d_gate);
+            device_free(w.fp4.d_up);
+            device_free(w.fp4.d_hidden_q);
+            device_free(w.fp4.d_hidden_scale);
+            device_free(w.fp4.d_route_y);
         }
         for (auto& [_, c] : indexer_compressor_cache) {
-            cudaFree(c.wkv);
-            cudaFree(c.wgate);
-            cudaFree(c.ape);
-            cudaFree(c.norm);
+            device_free(c.wkv);
+            device_free(c.wgate);
+            device_free(c.ape);
+            device_free(c.norm);
         }
         for (auto& [_, s] : compressor_device_state) {
-            cudaFree(s.kv);
-            cudaFree(s.score);
+            device_free(s.kv);
+            device_free(s.score);
         }
         for (auto& [_, s] : indexer_compressor_device_state) {
-            cudaFree(s.kv);
-            cudaFree(s.score);
+            device_free(s.kv);
+            device_free(s.score);
         }
         for (auto& [_, c] : indexer_cache) {
-            cudaFree(c.wq_b);
-            cudaFree(c.wq_b_scale);
-            cudaFree(c.weights_proj);
+            device_free(c.wq_b);
+            device_free(c.wq_b_scale);
+            device_free(c.weights_proj);
         }
         for (auto& [_, c] : dense_model_cache) {
-            cudaFree(c.embed);
-            cudaFree(c.head);
-            cudaFree(c.final_norm);
-            cudaFree(c.hc_head_fn);
-            cudaFree(c.hc_head_scale);
-            cudaFree(c.hc_head_base);
+            device_free(c.embed);
+            device_free(c.head);
+            device_free(c.final_norm);
+            device_free(c.hc_head_fn);
+            device_free(c.hc_head_scale);
+            device_free(c.hc_head_base);
         }
         continuation_workspace.release();
         continuation_journal.release();
@@ -1739,28 +1744,26 @@ struct SafeForwardContext {
         c.local_head_rows = head_rows / tp_world;
         c.local_head_start = tp_rank * c.local_head_rows;
         c.dim = dim;
-        check_cuda(cudaMalloc(&c.embed, embed->nbytes), "cudaMalloc cached embedding");
-        check_cuda(cudaMemcpy(c.embed, embed_shard.tensor_data(*embed), embed->nbytes,
-                              cudaMemcpyHostToDevice), "copy cached embedding");
-        check_cuda(cudaMalloc(&c.head, static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t)),
-                   "cudaMalloc cached head");
+        check_device(device_malloc_into(c.embed, embed->nbytes), "device_malloc cached embedding");
+        check_device(memcpy_h2d(c.embed, embed_shard.tensor_data(*embed), embed->nbytes), "copy cached embedding");
+        check_device(device_malloc_into(c.head, static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t)),
+                     "device_malloc cached head");
         const auto* head_data = reinterpret_cast<const uint16_t*>(head_shard.tensor_data(*head)) +
             static_cast<size_t>(c.local_head_start) * dim;
-        check_cuda(cudaMemcpy(c.head, head_data,
-                              static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t),
-                              cudaMemcpyHostToDevice), "copy cached head");
-        check_cuda(cudaMalloc(&c.final_norm, final_norm->nbytes), "cudaMalloc cached final norm");
-        check_cuda(cudaMemcpy(c.final_norm, final_norm_shard.tensor_data(*final_norm), final_norm->nbytes,
-                              cudaMemcpyHostToDevice), "copy cached final norm");
-        check_cuda(cudaMalloc(&c.hc_head_fn, hc_head_fn->nbytes), "cudaMalloc cached hc head fn");
-        check_cuda(cudaMalloc(&c.hc_head_scale, hc_head_scale->nbytes), "cudaMalloc cached hc head scale");
-        check_cuda(cudaMalloc(&c.hc_head_base, hc_head_base->nbytes), "cudaMalloc cached hc head base");
-        check_cuda(cudaMemcpy(c.hc_head_fn, hc_head_shard.tensor_data(*hc_head_fn), hc_head_fn->nbytes,
-                              cudaMemcpyHostToDevice), "copy cached hc head fn");
-        check_cuda(cudaMemcpy(c.hc_head_scale, hc_head_shard.tensor_data(*hc_head_scale), hc_head_scale->nbytes,
-                              cudaMemcpyHostToDevice), "copy cached hc head scale");
-        check_cuda(cudaMemcpy(c.hc_head_base, hc_head_shard.tensor_data(*hc_head_base), hc_head_base->nbytes,
-                              cudaMemcpyHostToDevice), "copy cached hc head base");
+        check_device(memcpy_h2d(c.head, head_data,
+                                static_cast<size_t>(c.local_head_rows) * dim * sizeof(uint16_t)), "copy cached head");
+        check_device(device_malloc_into(c.final_norm, final_norm->nbytes), "device_malloc cached final norm");
+        check_device(memcpy_h2d(c.final_norm, final_norm_shard.tensor_data(*final_norm),
+                                final_norm->nbytes), "copy cached final norm");
+        check_device(device_malloc_into(c.hc_head_fn, hc_head_fn->nbytes), "device_malloc cached hc head fn");
+        check_device(device_malloc_into(c.hc_head_scale, hc_head_scale->nbytes), "device_malloc cached hc head scale");
+        check_device(device_malloc_into(c.hc_head_base, hc_head_base->nbytes), "device_malloc cached hc head base");
+        check_device(memcpy_h2d(c.hc_head_fn, hc_head_shard.tensor_data(*hc_head_fn),
+                                hc_head_fn->nbytes), "copy cached hc head fn");
+        check_device(memcpy_h2d(c.hc_head_scale, hc_head_shard.tensor_data(*hc_head_scale),
+                                hc_head_scale->nbytes), "copy cached hc head scale");
+        check_device(memcpy_h2d(c.hc_head_base, hc_head_shard.tensor_data(*hc_head_base),
+                                hc_head_base->nbytes), "copy cached hc head base");
         auto inserted = dense_model_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -1797,17 +1800,17 @@ struct SafeForwardContext {
         DeviceGateCache c;
         c.experts = static_cast<int>(weight->shape[0]);
         c.dim = static_cast<int>(weight->shape[1]);
-        check_cuda(cudaMalloc(&c.weight, weight->nbytes), "cudaMalloc gate weight");
-        check_cuda(cudaMemcpy(c.weight, weight_shard.tensor_data(*weight), weight->nbytes, cudaMemcpyHostToDevice), "copy gate weight");
-        check_cuda(cudaMalloc(&c.original, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate original");
-        check_cuda(cudaMalloc(&c.scored, static_cast<size_t>(c.experts) * sizeof(float)), "cudaMalloc gate scored");
+        check_device(device_malloc_into(c.weight, weight->nbytes), "device_malloc gate weight");
+        check_device(memcpy_h2d(c.weight, weight_shard.tensor_data(*weight), weight->nbytes), "copy gate weight");
+        check_device(device_malloc_into(c.original, static_cast<size_t>(c.experts) * sizeof(float)), "device_malloc gate original");
+        check_device(device_malloc_into(c.scored, static_cast<size_t>(c.experts) * sizeof(float)), "device_malloc gate scored");
         const std::string tid_name = prefix + "ffn.gate.tid2eid";
         if (index.shard_for_tensor(tid_name) != nullptr) {
             SafeTensorsShard& tid_shard = shard_for_tensor(tid_name);
             const auto* tid = require_tensor(tid_shard, tid_name);
             c.hash_topk = static_cast<int>(tid->shape[1]);
-            check_cuda(cudaMalloc(&c.tid2eid, tid->nbytes), "cudaMalloc gate tid2eid");
-            check_cuda(cudaMemcpy(c.tid2eid, tid_shard.tensor_data(*tid), tid->nbytes, cudaMemcpyHostToDevice), "copy gate tid2eid");
+            check_device(device_malloc_into(c.tid2eid, tid->nbytes), "device_malloc gate tid2eid");
+            check_device(memcpy_h2d(c.tid2eid, tid_shard.tensor_data(*tid), tid->nbytes), "copy gate tid2eid");
         }
         const std::string bias_name = prefix + "ffn.gate.bias";
         const std::string* bias_shard_name = index.shard_for_tensor(bias_name);
@@ -1815,8 +1818,8 @@ struct SafeForwardContext {
             SafeTensorsShard& bias_shard = shard_for_tensor(bias_name);
             const auto* bias = bias_shard.find_tensor(bias_name);
             if (bias != nullptr) {
-                check_cuda(cudaMalloc(&c.bias, bias->nbytes), "cudaMalloc gate bias");
-                check_cuda(cudaMemcpy(c.bias, bias_shard.tensor_data(*bias), bias->nbytes, cudaMemcpyHostToDevice), "copy gate bias");
+                check_device(device_malloc_into(c.bias, bias->nbytes), "device_malloc gate bias");
+                check_device(memcpy_h2d(c.bias, bias_shard.tensor_data(*bias), bias->nbytes), "copy gate bias");
             }
         }
         auto inserted = gate_cache.emplace(key, c);
@@ -1849,30 +1852,31 @@ struct SafeForwardContext {
         const auto* wo_b = require_tensor(wo_b_shard, prefix + "attn.wo_b.weight");
         const auto* wo_b_scale = require_tensor(wo_b_shard, prefix + "attn.wo_b.scale");
         DeviceAttentionCache c;
-        check_cuda(cudaMalloc(&c.attn_norm, attn_norm->nbytes), "cudaMalloc cached attn norm");
-        check_cuda(cudaMalloc(&c.q_norm, q_norm->nbytes), "cudaMalloc cached q norm");
-        check_cuda(cudaMalloc(&c.kv_norm, kv_norm->nbytes), "cudaMalloc cached kv norm");
-        check_cuda(cudaMalloc(&c.ffn_norm, ffn_norm->nbytes), "cudaMalloc cached ffn norm");
-        check_cuda(cudaMemcpy(c.attn_norm, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy cached attn norm");
-        check_cuda(cudaMemcpy(c.q_norm, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy cached q norm");
-        check_cuda(cudaMemcpy(c.kv_norm, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy cached kv norm");
-        check_cuda(cudaMemcpy(c.ffn_norm, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy cached ffn norm");
-        check_cuda(cudaMalloc(&c.wq_a, wq_a->nbytes), "cudaMalloc cached wq_a");
-        check_cuda(cudaMalloc(&c.wq_a_scale, wq_a_scale->nbytes), "cudaMalloc cached wq_a scale");
-        check_cuda(cudaMemcpy(c.wq_a, qkv_shard.tensor_data(*wq_a), wq_a->nbytes, cudaMemcpyHostToDevice), "copy cached wq_a");
-        check_cuda(cudaMemcpy(c.wq_a_scale, qkv_shard.tensor_data(*wq_a_scale), wq_a_scale->nbytes, cudaMemcpyHostToDevice), "copy cached wq_a scale");
+        check_device(device_malloc_into(c.attn_norm, attn_norm->nbytes), "device_malloc cached attn norm");
+        check_device(device_malloc_into(c.q_norm, q_norm->nbytes), "device_malloc cached q norm");
+        check_device(device_malloc_into(c.kv_norm, kv_norm->nbytes), "device_malloc cached kv norm");
+        check_device(device_malloc_into(c.ffn_norm, ffn_norm->nbytes), "device_malloc cached ffn norm");
+        check_device(memcpy_h2d(c.attn_norm, attn_norm_shard.tensor_data(*attn_norm),
+                                attn_norm->nbytes), "copy cached attn norm");
+        check_device(memcpy_h2d(c.q_norm, qkv_shard.tensor_data(*q_norm), q_norm->nbytes), "copy cached q norm");
+        check_device(memcpy_h2d(c.kv_norm, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes), "copy cached kv norm");
+        check_device(memcpy_h2d(c.ffn_norm, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes), "copy cached ffn norm");
+        check_device(device_malloc_into(c.wq_a, wq_a->nbytes), "device_malloc cached wq_a");
+        check_device(device_malloc_into(c.wq_a_scale, wq_a_scale->nbytes), "device_malloc cached wq_a scale");
+        check_device(memcpy_h2d(c.wq_a, qkv_shard.tensor_data(*wq_a), wq_a->nbytes), "copy cached wq_a");
+        check_device(memcpy_h2d(c.wq_a_scale, qkv_shard.tensor_data(*wq_a_scale), wq_a_scale->nbytes), "copy cached wq_a scale");
         const int local_head_start = tp_rank * dims.heads;
         const int q_row_start = local_head_start * dims.head_dim;
         auto wq_b_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(qkv_shard.tensor_data(*wq_b)), q_row_start, dims.q_dim, dims.q_a_dim);
         auto wq_b_scale_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(qkv_shard.tensor_data(*wq_b_scale)), q_row_start / 128, dims.q_dim / 128, dims.q_a_dim / 128);
-        check_cuda(cudaMalloc(&c.wq_b, wq_b_local.size()), "cudaMalloc cached wq_b");
-        check_cuda(cudaMalloc(&c.wq_b_scale, wq_b_scale_local.size()), "cudaMalloc cached wq_b scale");
-        check_cuda(cudaMemcpy(c.wq_b, wq_b_local.data(), wq_b_local.size(), cudaMemcpyHostToDevice), "copy cached wq_b");
-        check_cuda(cudaMemcpy(c.wq_b_scale, wq_b_scale_local.data(), wq_b_scale_local.size(), cudaMemcpyHostToDevice), "copy cached wq_b scale");
-        check_cuda(cudaMalloc(&c.wkv, wkv->nbytes), "cudaMalloc cached wkv");
-        check_cuda(cudaMalloc(&c.wkv_scale, wkv_scale->nbytes), "cudaMalloc cached wkv scale");
-        check_cuda(cudaMemcpy(c.wkv, qkv_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy cached wkv");
-        check_cuda(cudaMemcpy(c.wkv_scale, qkv_shard.tensor_data(*wkv_scale), wkv_scale->nbytes, cudaMemcpyHostToDevice), "copy cached wkv scale");
+        check_device(device_malloc_into(c.wq_b, wq_b_local.size()), "device_malloc cached wq_b");
+        check_device(device_malloc_into(c.wq_b_scale, wq_b_scale_local.size()), "device_malloc cached wq_b scale");
+        check_device(memcpy_h2d(c.wq_b, wq_b_local.data(), wq_b_local.size()), "copy cached wq_b");
+        check_device(memcpy_h2d(c.wq_b_scale, wq_b_scale_local.data(), wq_b_scale_local.size()), "copy cached wq_b scale");
+        check_device(device_malloc_into(c.wkv, wkv->nbytes), "device_malloc cached wkv");
+        check_device(device_malloc_into(c.wkv_scale, wkv_scale->nbytes), "device_malloc cached wkv scale");
+        check_device(memcpy_h2d(c.wkv, qkv_shard.tensor_data(*wkv), wkv->nbytes), "copy cached wkv");
+        check_device(memcpy_h2d(c.wkv_scale, qkv_shard.tensor_data(*wkv_scale), wkv_scale->nbytes), "copy cached wkv scale");
         const int local_group_start = tp_rank * dims.groups;
         const int wo_a_row_start = local_group_start * dims.group_rank;
         auto wo_a_local = slice_rows_u8(reinterpret_cast<const uint8_t*>(wo_a_shard.tensor_data(*wo_a)), wo_a_row_start, dims.attn_mid, dims.dim);
@@ -1880,22 +1884,25 @@ struct SafeForwardContext {
         auto wo_b_local = slice_cols_u8(reinterpret_cast<const uint8_t*>(wo_b_shard.tensor_data(*wo_b)), dims.dim, static_cast<int>(config.o_lora_rank * config.o_groups), wo_a_row_start, dims.attn_mid);
         auto wo_b_scale_local = slice_cols_u8(reinterpret_cast<const uint8_t*>(wo_b_shard.tensor_data(*wo_b_scale)), dims.dim / 128, static_cast<int>((config.o_lora_rank * config.o_groups) / 128), wo_a_row_start / 128, dims.attn_mid / 128);
         auto attn_sink_local = slice_rows_f32(reinterpret_cast<const float*>(qkv_shard.tensor_data(*attn_sink)), local_head_start, dims.heads);
-        check_cuda(cudaMalloc(&c.wo_a, wo_a_local.size()), "cudaMalloc cached wo_a");
-        check_cuda(cudaMalloc(&c.wo_a_scale, wo_a_scale_local.size()), "cudaMalloc cached wo_a scale");
-        check_cuda(cudaMalloc(&c.wo_b, wo_b_local.size()), "cudaMalloc cached wo_b");
-        check_cuda(cudaMalloc(&c.wo_b_scale, wo_b_scale_local.size()), "cudaMalloc cached wo_b scale");
-        check_cuda(cudaMalloc(&c.attn_sink, attn_sink_local.size() * sizeof(float)), "cudaMalloc cached attn sink");
-        check_cuda(cudaMemcpy(c.wo_a, wo_a_local.data(), wo_a_local.size(), cudaMemcpyHostToDevice), "copy cached wo_a");
-        check_cuda(cudaMemcpy(c.wo_a_scale, wo_a_scale_local.data(), wo_a_scale_local.size(), cudaMemcpyHostToDevice), "copy cached wo_a scale");
-        check_cuda(cudaMemcpy(c.wo_b, wo_b_local.data(), wo_b_local.size(), cudaMemcpyHostToDevice), "copy cached wo_b");
-        check_cuda(cudaMemcpy(c.wo_b_scale, wo_b_scale_local.data(), wo_b_scale_local.size(), cudaMemcpyHostToDevice), "copy cached wo_b scale");
-        check_cuda(cudaMemcpy(c.attn_sink, attn_sink_local.data(), attn_sink_local.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached attn sink");
+        check_device(device_malloc_into(c.wo_a, wo_a_local.size()), "device_malloc cached wo_a");
+        check_device(device_malloc_into(c.wo_a_scale, wo_a_scale_local.size()), "device_malloc cached wo_a scale");
+        check_device(device_malloc_into(c.wo_b, wo_b_local.size()), "device_malloc cached wo_b");
+        check_device(device_malloc_into(c.wo_b_scale, wo_b_scale_local.size()), "device_malloc cached wo_b scale");
+        check_device(device_malloc_into(c.attn_sink, attn_sink_local.size() * sizeof(float)), "device_malloc cached attn sink");
+        check_device(memcpy_h2d(c.wo_a, wo_a_local.data(), wo_a_local.size()), "copy cached wo_a");
+        check_device(memcpy_h2d(c.wo_a_scale, wo_a_scale_local.data(), wo_a_scale_local.size()), "copy cached wo_a scale");
+        check_device(memcpy_h2d(c.wo_b, wo_b_local.data(), wo_b_local.size()), "copy cached wo_b");
+        check_device(memcpy_h2d(c.wo_b_scale, wo_b_scale_local.data(), wo_b_scale_local.size()), "copy cached wo_b scale");
+        check_device(memcpy_h2d(c.attn_sink, attn_sink_local.data(),
+                                attn_sink_local.size() * sizeof(float)), "copy cached attn sink");
         if (env_int_or_default("DSV4_CPP_DECODE_WO_A_INT8", 0) != 0) {
             WoAInt8Host wo_a_int8 = make_wo_a_int8_from_fp8(wo_a_local.data(), wo_a_scale_local.data(), dims.attn_mid, dims.dim, dims.dim / 128);
-            check_cuda(cudaMalloc(&c.wo_a_int8, wo_a_int8.weight.size() * sizeof(int8_t)), "cudaMalloc cached wo_a int8");
-            check_cuda(cudaMalloc(&c.wo_a_int8_scale, wo_a_int8.scale.size() * sizeof(float)), "cudaMalloc cached wo_a int8 scale");
-            check_cuda(cudaMemcpy(c.wo_a_int8, wo_a_int8.weight.data(), wo_a_int8.weight.size() * sizeof(int8_t), cudaMemcpyHostToDevice), "copy cached wo_a int8");
-            check_cuda(cudaMemcpy(c.wo_a_int8_scale, wo_a_int8.scale.data(), wo_a_int8.scale.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached wo_a int8 scale");
+            check_device(device_malloc_into(c.wo_a_int8, wo_a_int8.weight.size() * sizeof(int8_t)), "device_malloc cached wo_a int8");
+            check_device(device_malloc_into(c.wo_a_int8_scale, wo_a_int8.scale.size() * sizeof(float)), "device_malloc cached wo_a int8 scale");
+            check_device(memcpy_h2d(c.wo_a_int8, wo_a_int8.weight.data(),
+                                    wo_a_int8.weight.size() * sizeof(int8_t)), "copy cached wo_a int8");
+            check_device(memcpy_h2d(c.wo_a_int8_scale, wo_a_int8.scale.data(),
+                                    wo_a_int8.scale.size() * sizeof(float)), "copy cached wo_a int8 scale");
         }
         auto inserted = attention_cache.emplace(key, c);
         return inserted.first->second;
@@ -1913,14 +1920,14 @@ struct SafeForwardContext {
         DeviceCompressorCache c;
         c.cols = static_cast<int>(wkv->shape[0]);
         c.dim = static_cast<int>(wkv->shape[1]);
-        check_cuda(cudaMalloc(&c.wkv, wkv->nbytes), "cudaMalloc cached compressor wkv");
-        check_cuda(cudaMalloc(&c.wgate, wgate->nbytes), "cudaMalloc cached compressor wgate");
-        check_cuda(cudaMalloc(&c.ape, ape->nbytes), "cudaMalloc cached compressor ape");
-        check_cuda(cudaMalloc(&c.norm, norm->nbytes), "cudaMalloc cached compressor norm");
-        check_cuda(cudaMemcpy(c.wkv, comp_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy cached compressor wkv");
-        check_cuda(cudaMemcpy(c.wgate, comp_shard.tensor_data(*wgate), wgate->nbytes, cudaMemcpyHostToDevice), "copy cached compressor wgate");
-        check_cuda(cudaMemcpy(c.ape, comp_shard.tensor_data(*ape), ape->nbytes, cudaMemcpyHostToDevice), "copy cached compressor ape");
-        check_cuda(cudaMemcpy(c.norm, comp_shard.tensor_data(*norm), norm->nbytes, cudaMemcpyHostToDevice), "copy cached compressor norm");
+        check_device(device_malloc_into(c.wkv, wkv->nbytes), "device_malloc cached compressor wkv");
+        check_device(device_malloc_into(c.wgate, wgate->nbytes), "device_malloc cached compressor wgate");
+        check_device(device_malloc_into(c.ape, ape->nbytes), "device_malloc cached compressor ape");
+        check_device(device_malloc_into(c.norm, norm->nbytes), "device_malloc cached compressor norm");
+        check_device(memcpy_h2d(c.wkv, comp_shard.tensor_data(*wkv), wkv->nbytes), "copy cached compressor wkv");
+        check_device(memcpy_h2d(c.wgate, comp_shard.tensor_data(*wgate), wgate->nbytes), "copy cached compressor wgate");
+        check_device(memcpy_h2d(c.ape, comp_shard.tensor_data(*ape), ape->nbytes), "copy cached compressor ape");
+        check_device(memcpy_h2d(c.norm, comp_shard.tensor_data(*norm), norm->nbytes), "copy cached compressor norm");
         auto inserted = compressor_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -1938,14 +1945,14 @@ struct SafeForwardContext {
         DeviceCompressorCache c;
         c.cols = static_cast<int>(wkv->shape[0]);
         c.dim = static_cast<int>(wkv->shape[1]);
-        check_cuda(cudaMalloc(&c.wkv, wkv->nbytes), "cudaMalloc cached indexer compressor wkv");
-        check_cuda(cudaMalloc(&c.wgate, wgate->nbytes), "cudaMalloc cached indexer compressor wgate");
-        check_cuda(cudaMalloc(&c.ape, ape->nbytes), "cudaMalloc cached indexer compressor ape");
-        check_cuda(cudaMalloc(&c.norm, norm->nbytes), "cudaMalloc cached indexer compressor norm");
-        check_cuda(cudaMemcpy(c.wkv, idx_shard.tensor_data(*wkv), wkv->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor wkv");
-        check_cuda(cudaMemcpy(c.wgate, idx_shard.tensor_data(*wgate), wgate->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor wgate");
-        check_cuda(cudaMemcpy(c.ape, idx_shard.tensor_data(*ape), ape->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor ape");
-        check_cuda(cudaMemcpy(c.norm, idx_shard.tensor_data(*norm), norm->nbytes, cudaMemcpyHostToDevice), "copy cached indexer compressor norm");
+        check_device(device_malloc_into(c.wkv, wkv->nbytes), "device_malloc cached indexer compressor wkv");
+        check_device(device_malloc_into(c.wgate, wgate->nbytes), "device_malloc cached indexer compressor wgate");
+        check_device(device_malloc_into(c.ape, ape->nbytes), "device_malloc cached indexer compressor ape");
+        check_device(device_malloc_into(c.norm, norm->nbytes), "device_malloc cached indexer compressor norm");
+        check_device(memcpy_h2d(c.wkv, idx_shard.tensor_data(*wkv), wkv->nbytes), "copy cached indexer compressor wkv");
+        check_device(memcpy_h2d(c.wgate, idx_shard.tensor_data(*wgate), wgate->nbytes), "copy cached indexer compressor wgate");
+        check_device(memcpy_h2d(c.ape, idx_shard.tensor_data(*ape), ape->nbytes), "copy cached indexer compressor ape");
+        check_device(memcpy_h2d(c.norm, idx_shard.tensor_data(*norm), norm->nbytes), "copy cached indexer compressor norm");
         auto inserted = indexer_compressor_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -1961,12 +1968,12 @@ struct SafeForwardContext {
         const auto* wq_b_scale = require_tensor(idx_shard, prefix + "attn.indexer.wq_b.scale");
         const auto* weights = require_tensor(idx_shard, prefix + "attn.indexer.weights_proj.weight");
         DeviceIndexerCache c;
-        check_cuda(cudaMalloc(&c.wq_b, wq_b->nbytes), "cudaMalloc cached indexer wq_b");
-        check_cuda(cudaMalloc(&c.wq_b_scale, wq_b_scale->nbytes), "cudaMalloc cached indexer wq_b scale");
-        check_cuda(cudaMalloc(&c.weights_proj, weights->nbytes), "cudaMalloc cached indexer weights proj");
-        check_cuda(cudaMemcpy(c.wq_b, idx_shard.tensor_data(*wq_b), wq_b->nbytes, cudaMemcpyHostToDevice), "copy cached indexer wq_b");
-        check_cuda(cudaMemcpy(c.wq_b_scale, idx_shard.tensor_data(*wq_b_scale), wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy cached indexer wq_b scale");
-        check_cuda(cudaMemcpy(c.weights_proj, idx_shard.tensor_data(*weights), weights->nbytes, cudaMemcpyHostToDevice), "copy cached indexer weights proj");
+        check_device(device_malloc_into(c.wq_b, wq_b->nbytes), "device_malloc cached indexer wq_b");
+        check_device(device_malloc_into(c.wq_b_scale, wq_b_scale->nbytes), "device_malloc cached indexer wq_b scale");
+        check_device(device_malloc_into(c.weights_proj, weights->nbytes), "device_malloc cached indexer weights proj");
+        check_device(memcpy_h2d(c.wq_b, idx_shard.tensor_data(*wq_b), wq_b->nbytes), "copy cached indexer wq_b");
+        check_device(memcpy_h2d(c.wq_b_scale, idx_shard.tensor_data(*wq_b_scale), wq_b_scale->nbytes), "copy cached indexer wq_b scale");
+        check_device(memcpy_h2d(c.weights_proj, idx_shard.tensor_data(*weights), weights->nbytes), "copy cached indexer weights proj");
         auto inserted = indexer_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -1986,18 +1993,18 @@ struct SafeForwardContext {
         c.s2_bytes = w2.s->nbytes;
         c.w3_bytes = w3.w->nbytes;
         c.s3_bytes = w3.s->nbytes;
-        check_cuda(cudaMalloc(&c.w1, c.w1_bytes), "cudaMalloc cached expert w1");
-        check_cuda(cudaMalloc(&c.s1, c.s1_bytes), "cudaMalloc cached expert s1");
-        check_cuda(cudaMalloc(&c.w2, c.w2_bytes), "cudaMalloc cached expert w2");
-        check_cuda(cudaMalloc(&c.s2, c.s2_bytes), "cudaMalloc cached expert s2");
-        check_cuda(cudaMalloc(&c.w3, c.w3_bytes), "cudaMalloc cached expert w3");
-        check_cuda(cudaMalloc(&c.s3, c.s3_bytes), "cudaMalloc cached expert s3");
-        check_cuda(cudaMemcpy(c.w1, w1.shard->tensor_data(*w1.w), c.w1_bytes, cudaMemcpyHostToDevice), "copy cached expert w1");
-        check_cuda(cudaMemcpy(c.s1, w1.shard->tensor_data(*w1.s), c.s1_bytes, cudaMemcpyHostToDevice), "copy cached expert s1");
-        check_cuda(cudaMemcpy(c.w2, w2.shard->tensor_data(*w2.w), c.w2_bytes, cudaMemcpyHostToDevice), "copy cached expert w2");
-        check_cuda(cudaMemcpy(c.s2, w2.shard->tensor_data(*w2.s), c.s2_bytes, cudaMemcpyHostToDevice), "copy cached expert s2");
-        check_cuda(cudaMemcpy(c.w3, w3.shard->tensor_data(*w3.w), c.w3_bytes, cudaMemcpyHostToDevice), "copy cached expert w3");
-        check_cuda(cudaMemcpy(c.s3, w3.shard->tensor_data(*w3.s), c.s3_bytes, cudaMemcpyHostToDevice), "copy cached expert s3");
+        check_device(device_malloc_into(c.w1, c.w1_bytes), "device_malloc cached expert w1");
+        check_device(device_malloc_into(c.s1, c.s1_bytes), "device_malloc cached expert s1");
+        check_device(device_malloc_into(c.w2, c.w2_bytes), "device_malloc cached expert w2");
+        check_device(device_malloc_into(c.s2, c.s2_bytes), "device_malloc cached expert s2");
+        check_device(device_malloc_into(c.w3, c.w3_bytes), "device_malloc cached expert w3");
+        check_device(device_malloc_into(c.s3, c.s3_bytes), "device_malloc cached expert s3");
+        check_device(memcpy_h2d(c.w1, w1.shard->tensor_data(*w1.w), c.w1_bytes), "copy cached expert w1");
+        check_device(memcpy_h2d(c.s1, w1.shard->tensor_data(*w1.s), c.s1_bytes), "copy cached expert s1");
+        check_device(memcpy_h2d(c.w2, w2.shard->tensor_data(*w2.w), c.w2_bytes), "copy cached expert w2");
+        check_device(memcpy_h2d(c.s2, w2.shard->tensor_data(*w2.s), c.s2_bytes), "copy cached expert s2");
+        check_device(memcpy_h2d(c.w3, w3.shard->tensor_data(*w3.w), c.w3_bytes), "copy cached expert w3");
+        check_device(memcpy_h2d(c.s3, w3.shard->tensor_data(*w3.s), c.s3_bytes), "copy cached expert s3");
         auto inserted = expert_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -2099,12 +2106,12 @@ struct SafeForwardContext {
         slot.w2s_bytes = w2.s->nbytes;
         slot.w3q_bytes = w3.w->nbytes;
         slot.w3s_bytes = w3.s->nbytes;
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w1q), slot.w1q_bytes), "cudaMallocHost fp4 expert w1");
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w1s), slot.w1s_bytes), "cudaMallocHost fp4 expert s1");
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w2q), slot.w2q_bytes), "cudaMallocHost fp4 expert w2");
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w2s), slot.w2s_bytes), "cudaMallocHost fp4 expert s2");
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w3q), slot.w3q_bytes), "cudaMallocHost fp4 expert w3");
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&slot.h_w3s), slot.w3s_bytes), "cudaMallocHost fp4 expert s3");
+        check_device(host_alloc_pinned_into(slot.h_w1q, slot.w1q_bytes), "host_alloc_pinned fp4 expert w1");
+        check_device(host_alloc_pinned_into(slot.h_w1s, slot.w1s_bytes), "host_alloc_pinned fp4 expert s1");
+        check_device(host_alloc_pinned_into(slot.h_w2q, slot.w2q_bytes), "host_alloc_pinned fp4 expert w2");
+        check_device(host_alloc_pinned_into(slot.h_w2s, slot.w2s_bytes), "host_alloc_pinned fp4 expert s2");
+        check_device(host_alloc_pinned_into(slot.h_w3q, slot.w3q_bytes), "host_alloc_pinned fp4 expert w3");
+        check_device(host_alloc_pinned_into(slot.h_w3s, slot.w3s_bytes), "host_alloc_pinned fp4 expert s3");
         std::memcpy(slot.h_w1q, w1.shard->tensor_data(*w1.w), slot.w1q_bytes);
         std::memcpy(slot.h_w1s, w1.shard->tensor_data(*w1.s), slot.w1s_bytes);
         std::memcpy(slot.h_w2q, w2.shard->tensor_data(*w2.w), slot.w2q_bytes);
@@ -2161,14 +2168,14 @@ struct SafeForwardContext {
                 release_active_arena_device(cache_it->second);
             }
         }
-        // Free the now-stranded buffers so cudaMalloc can succeed below.
+        // Free the now-stranded buffers so the device allocation can succeed below.
         for (auto& blk : active_arena_device_freelist) {
-            if (blk.w1) cudaFree(blk.w1);
-            if (blk.s1) cudaFree(blk.s1);
-            if (blk.w2) cudaFree(blk.w2);
-            if (blk.s2) cudaFree(blk.s2);
-            if (blk.w3) cudaFree(blk.w3);
-            if (blk.s3) cudaFree(blk.s3);
+            if (blk.w1) device_free(blk.w1);
+            if (blk.s1) device_free(blk.s1);
+            if (blk.w2) device_free(blk.w2);
+            if (blk.s2) device_free(blk.s2);
+            if (blk.w3) device_free(blk.w3);
+            if (blk.s3) device_free(blk.s3);
         }
         active_arena_device_freelist.clear();
     }
@@ -2229,12 +2236,12 @@ struct SafeForwardContext {
                 if (!try_pop_active_arena_freelist(arena)) {
                     evict_active_arena_if_needed(key, tp_world);
                     if (!try_pop_active_arena_freelist(arena)) {
-                        check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(arena.capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
-                        check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(arena.capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
-                        check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(arena.capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
-                        check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(arena.capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
-                        check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(arena.capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
-                        check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(arena.capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+                        check_device(device_malloc_into(arena.w1, static_cast<size_t>(arena.capacity) * arena.w1_bytes), "device_malloc active arena w1");
+                        check_device(device_malloc_into(arena.s1, static_cast<size_t>(arena.capacity) * arena.s1_bytes), "device_malloc active arena s1");
+                        check_device(device_malloc_into(arena.w2, static_cast<size_t>(arena.capacity) * arena.w2_bytes), "device_malloc active arena w2");
+                        check_device(device_malloc_into(arena.s2, static_cast<size_t>(arena.capacity) * arena.s2_bytes), "device_malloc active arena s2");
+                        check_device(device_malloc_into(arena.w3, static_cast<size_t>(arena.capacity) * arena.w3_bytes), "device_malloc active arena w3");
+                        check_device(device_malloc_into(arena.s3, static_cast<size_t>(arena.capacity) * arena.s3_bytes), "device_malloc active arena s3");
                     }
                     arena.staged_local.clear();
                     if (arena.sparse_slots) {
@@ -2264,12 +2271,12 @@ struct SafeForwardContext {
         if (!try_pop_active_arena_freelist(arena)) {
             evict_active_arena_if_needed(key, tp_world);
             if (!try_pop_active_arena_freelist(arena)) {
-                check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
-                check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
-                check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
-                check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
-                check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
-                check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+                check_device(device_malloc_into(arena.w1, static_cast<size_t>(capacity) * arena.w1_bytes), "device_malloc active arena w1");
+                check_device(device_malloc_into(arena.s1, static_cast<size_t>(capacity) * arena.s1_bytes), "device_malloc active arena s1");
+                check_device(device_malloc_into(arena.w2, static_cast<size_t>(capacity) * arena.w2_bytes), "device_malloc active arena w2");
+                check_device(device_malloc_into(arena.s2, static_cast<size_t>(capacity) * arena.s2_bytes), "device_malloc active arena s2");
+                check_device(device_malloc_into(arena.w3, static_cast<size_t>(capacity) * arena.w3_bytes), "device_malloc active arena w3");
+                check_device(device_malloc_into(arena.s3, static_cast<size_t>(capacity) * arena.s3_bytes), "device_malloc active arena s3");
             }
         }
         auto inserted = active_arena_cache.emplace(key, arena);
@@ -2329,18 +2336,18 @@ struct SafeForwardContext {
         const auto* w3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.weight");
         const auto* s3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.scale");
         DeviceSharedCache c;
-        check_cuda(cudaMalloc(&c.w1, w1->nbytes), "cudaMalloc cached shared w1");
-        check_cuda(cudaMalloc(&c.s1, s1->nbytes), "cudaMalloc cached shared s1");
-        check_cuda(cudaMalloc(&c.w2, w2->nbytes), "cudaMalloc cached shared w2");
-        check_cuda(cudaMalloc(&c.s2, s2->nbytes), "cudaMalloc cached shared s2");
-        check_cuda(cudaMalloc(&c.w3, w3->nbytes), "cudaMalloc cached shared w3");
-        check_cuda(cudaMalloc(&c.s3, s3->nbytes), "cudaMalloc cached shared s3");
-        check_cuda(cudaMemcpy(c.w1, shared_shard.tensor_data(*w1), w1->nbytes, cudaMemcpyHostToDevice), "copy cached shared w1");
-        check_cuda(cudaMemcpy(c.s1, shared_shard.tensor_data(*s1), s1->nbytes, cudaMemcpyHostToDevice), "copy cached shared s1");
-        check_cuda(cudaMemcpy(c.w2, shared_shard.tensor_data(*w2), w2->nbytes, cudaMemcpyHostToDevice), "copy cached shared w2");
-        check_cuda(cudaMemcpy(c.s2, shared_shard.tensor_data(*s2), s2->nbytes, cudaMemcpyHostToDevice), "copy cached shared s2");
-        check_cuda(cudaMemcpy(c.w3, shared_shard.tensor_data(*w3), w3->nbytes, cudaMemcpyHostToDevice), "copy cached shared w3");
-        check_cuda(cudaMemcpy(c.s3, shared_shard.tensor_data(*s3), s3->nbytes, cudaMemcpyHostToDevice), "copy cached shared s3");
+        check_device(device_malloc_into(c.w1, w1->nbytes), "device_malloc cached shared w1");
+        check_device(device_malloc_into(c.s1, s1->nbytes), "device_malloc cached shared s1");
+        check_device(device_malloc_into(c.w2, w2->nbytes), "device_malloc cached shared w2");
+        check_device(device_malloc_into(c.s2, s2->nbytes), "device_malloc cached shared s2");
+        check_device(device_malloc_into(c.w3, w3->nbytes), "device_malloc cached shared w3");
+        check_device(device_malloc_into(c.s3, s3->nbytes), "device_malloc cached shared s3");
+        check_device(memcpy_h2d(c.w1, shared_shard.tensor_data(*w1), w1->nbytes), "copy cached shared w1");
+        check_device(memcpy_h2d(c.s1, shared_shard.tensor_data(*s1), s1->nbytes), "copy cached shared s1");
+        check_device(memcpy_h2d(c.w2, shared_shard.tensor_data(*w2), w2->nbytes), "copy cached shared w2");
+        check_device(memcpy_h2d(c.s2, shared_shard.tensor_data(*s2), s2->nbytes), "copy cached shared s2");
+        check_device(memcpy_h2d(c.w3, shared_shard.tensor_data(*w3), w3->nbytes), "copy cached shared w3");
+        check_device(memcpy_h2d(c.s3, shared_shard.tensor_data(*s3), s3->nbytes), "copy cached shared s3");
         auto inserted = shared_cache.emplace(key, c);
         return inserted.first->second;
     }
@@ -2363,13 +2370,13 @@ struct SafeForwardContext {
         w.fp4.topk = topk;
         w.fp4.dim = dim;
         w.fp4.inter_dim = inter_dim;
-        check_cuda(cudaMalloc(&w.fp4.d_x_q, static_cast<size_t>(dim)), "cudaMalloc moe decode x q");
-        check_cuda(cudaMalloc(&w.fp4.d_x_scale, sizeof(float)), "cudaMalloc moe decode x scale");
-        check_cuda(cudaMalloc(&w.fp4.d_gate, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "cudaMalloc moe decode gate");
-        check_cuda(cudaMalloc(&w.fp4.d_up, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "cudaMalloc moe decode up");
-        check_cuda(cudaMalloc(&w.fp4.d_hidden_q, static_cast<size_t>(topk) * inter_dim), "cudaMalloc moe decode hidden q");
-        check_cuda(cudaMalloc(&w.fp4.d_hidden_scale, static_cast<size_t>(topk) * sizeof(float)), "cudaMalloc moe decode hidden scale");
-        check_cuda(cudaMalloc(&w.fp4.d_route_y, static_cast<size_t>(topk) * dim * sizeof(float)), "cudaMalloc moe decode route y");
+        check_device(device_malloc_into(w.fp4.d_x_q, static_cast<size_t>(dim)), "device_malloc moe decode x q");
+        check_device(device_malloc_into(w.fp4.d_x_scale, sizeof(float)), "device_malloc moe decode x scale");
+        check_device(device_malloc_into(w.fp4.d_gate, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "device_malloc moe decode gate");
+        check_device(device_malloc_into(w.fp4.d_up, static_cast<size_t>(topk) * inter_dim * sizeof(float)), "device_malloc moe decode up");
+        check_device(device_malloc_into(w.fp4.d_hidden_q, static_cast<size_t>(topk) * inter_dim), "device_malloc moe decode hidden q");
+        check_device(device_malloc_into(w.fp4.d_hidden_scale, static_cast<size_t>(topk) * sizeof(float)), "device_malloc moe decode hidden scale");
+        check_device(device_malloc_into(w.fp4.d_route_y, static_cast<size_t>(topk) * dim * sizeof(float)), "device_malloc moe decode route y");
         auto inserted = moe_decode_workspace_cache.emplace(key, w);
         return inserted.first->second;
     }
@@ -2386,18 +2393,18 @@ struct SafeForwardContext {
         const auto* ffn_scale = require_tensor(shard, prefix + "hc_ffn_scale");
         const auto* ffn_base = require_tensor(shard, prefix + "hc_ffn_base");
         DeviceHcCache c;
-        check_cuda(cudaMalloc(&c.attn_fn, attn_fn->nbytes), "cudaMalloc hc attn fn");
-        check_cuda(cudaMalloc(&c.attn_scale, attn_scale->nbytes), "cudaMalloc hc attn scale");
-        check_cuda(cudaMalloc(&c.attn_base, attn_base->nbytes), "cudaMalloc hc attn base");
-        check_cuda(cudaMalloc(&c.ffn_fn, ffn_fn->nbytes), "cudaMalloc hc ffn fn");
-        check_cuda(cudaMalloc(&c.ffn_scale, ffn_scale->nbytes), "cudaMalloc hc ffn scale");
-        check_cuda(cudaMalloc(&c.ffn_base, ffn_base->nbytes), "cudaMalloc hc ffn base");
-        check_cuda(cudaMemcpy(c.attn_fn, shard.tensor_data(*attn_fn), attn_fn->nbytes, cudaMemcpyHostToDevice), "copy hc attn fn");
-        check_cuda(cudaMemcpy(c.attn_scale, shard.tensor_data(*attn_scale), attn_scale->nbytes, cudaMemcpyHostToDevice), "copy hc attn scale");
-        check_cuda(cudaMemcpy(c.attn_base, shard.tensor_data(*attn_base), attn_base->nbytes, cudaMemcpyHostToDevice), "copy hc attn base");
-        check_cuda(cudaMemcpy(c.ffn_fn, shard.tensor_data(*ffn_fn), ffn_fn->nbytes, cudaMemcpyHostToDevice), "copy hc ffn fn");
-        check_cuda(cudaMemcpy(c.ffn_scale, shard.tensor_data(*ffn_scale), ffn_scale->nbytes, cudaMemcpyHostToDevice), "copy hc ffn scale");
-        check_cuda(cudaMemcpy(c.ffn_base, shard.tensor_data(*ffn_base), ffn_base->nbytes, cudaMemcpyHostToDevice), "copy hc ffn base");
+        check_device(device_malloc_into(c.attn_fn, attn_fn->nbytes), "device_malloc hc attn fn");
+        check_device(device_malloc_into(c.attn_scale, attn_scale->nbytes), "device_malloc hc attn scale");
+        check_device(device_malloc_into(c.attn_base, attn_base->nbytes), "device_malloc hc attn base");
+        check_device(device_malloc_into(c.ffn_fn, ffn_fn->nbytes), "device_malloc hc ffn fn");
+        check_device(device_malloc_into(c.ffn_scale, ffn_scale->nbytes), "device_malloc hc ffn scale");
+        check_device(device_malloc_into(c.ffn_base, ffn_base->nbytes), "device_malloc hc ffn base");
+        check_device(memcpy_h2d(c.attn_fn, shard.tensor_data(*attn_fn), attn_fn->nbytes), "copy hc attn fn");
+        check_device(memcpy_h2d(c.attn_scale, shard.tensor_data(*attn_scale), attn_scale->nbytes), "copy hc attn scale");
+        check_device(memcpy_h2d(c.attn_base, shard.tensor_data(*attn_base), attn_base->nbytes), "copy hc attn base");
+        check_device(memcpy_h2d(c.ffn_fn, shard.tensor_data(*ffn_fn), ffn_fn->nbytes), "copy hc ffn fn");
+        check_device(memcpy_h2d(c.ffn_scale, shard.tensor_data(*ffn_scale), ffn_scale->nbytes), "copy hc ffn scale");
+        check_device(memcpy_h2d(c.ffn_base, shard.tensor_data(*ffn_base), ffn_base->nbytes), "copy hc ffn base");
         auto inserted = hc_cache.emplace(layer_id, c);
         return inserted.first->second;
     }
@@ -2408,11 +2415,11 @@ struct SafeForwardContext {
         DeviceCompressorState state;
         state.slots = slots;
         state.cols = cols;
-        check_cuda(cudaMalloc(&state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc compressor kv state");
-        check_cuda(cudaMalloc(&state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc compressor score state");
-        check_cuda(cudaMemset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero compressor kv state");
+        check_device(device_malloc_into(state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc compressor kv state");
+        check_device(device_malloc_into(state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc compressor score state");
+        check_device(device_memset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero compressor kv state");
         std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
-        check_cuda(cudaMemcpy(state.score, init.data(), init.size() * sizeof(float), cudaMemcpyHostToDevice), "init compressor score state");
+        check_device(memcpy_h2d(state.score, init.data(), init.size() * sizeof(float)), "init compressor score state");
         auto inserted = compressor_device_state.emplace(layer_id, state);
         return inserted.first->second;
     }
@@ -2423,11 +2430,11 @@ struct SafeForwardContext {
         DeviceCompressorState state;
         state.slots = slots;
         state.cols = cols;
-        check_cuda(cudaMalloc(&state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc indexer compressor kv state");
-        check_cuda(cudaMalloc(&state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "cudaMalloc indexer compressor score state");
-        check_cuda(cudaMemset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero indexer compressor kv state");
+        check_device(device_malloc_into(state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc indexer compressor kv state");
+        check_device(device_malloc_into(state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc indexer compressor score state");
+        check_device(device_memset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero indexer compressor kv state");
         std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
-        check_cuda(cudaMemcpy(state.score, init.data(), init.size() * sizeof(float), cudaMemcpyHostToDevice), "init indexer compressor score state");
+        check_device(memcpy_h2d(state.score, init.data(), init.size() * sizeof(float)), "init indexer compressor score state");
         auto inserted = indexer_compressor_device_state.emplace(layer_id, state);
         return inserted.first->second;
     }
@@ -2445,9 +2452,9 @@ struct SafeForwardContext {
         auto reset_one = [](DeviceCompressorState& s) {
             if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) return;
             const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
-            check_cuda(cudaMemset(s.kv, 0, n * sizeof(float)), "reset compressor kv state");
+            check_device(device_memset(s.kv, 0, n * sizeof(float)), "reset compressor kv state");
             std::vector<float> init(n, -INFINITY);
-            check_cuda(cudaMemcpy(s.score, init.data(), n * sizeof(float), cudaMemcpyHostToDevice), "reset compressor score state");
+            check_device(memcpy_h2d(s.score, init.data(), n * sizeof(float)), "reset compressor score state");
         };
         for (auto& [_, s] : compressor_device_state) reset_one(s);
         for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
@@ -2463,10 +2470,10 @@ struct SafeForwardContext {
             const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
             cs.kv.resize(n);
             cs.score.resize(n);
-            check_cuda(cudaMemcpy(cs.kv.data(), s.kv, n * sizeof(float), cudaMemcpyDeviceToHost),
-                       "snapshot compressor kv");
-            check_cuda(cudaMemcpy(cs.score.data(), s.score, n * sizeof(float), cudaMemcpyDeviceToHost),
-                       "snapshot compressor score");
+            check_device(memcpy_d2h(cs.kv.data(), s.kv, n * sizeof(float)),
+                         "snapshot compressor kv");
+            check_device(memcpy_d2h(cs.score.data(), s.score, n * sizeof(float)),
+                         "snapshot compressor score");
         }
     }
 
@@ -2478,10 +2485,10 @@ struct SafeForwardContext {
             DeviceCompressorState& s = it->second;
             if (s.kv == nullptr || s.score == nullptr || s.slots != cs.slots || s.cols != cs.cols) continue;
             const size_t n = static_cast<size_t>(cs.slots) * static_cast<size_t>(cs.cols);
-            check_cuda(cudaMemcpy(s.kv, cs.kv.data(), n * sizeof(float), cudaMemcpyHostToDevice),
-                       "restore compressor kv");
-            check_cuda(cudaMemcpy(s.score, cs.score.data(), n * sizeof(float), cudaMemcpyHostToDevice),
-                       "restore compressor score");
+            check_device(memcpy_h2d(s.kv, cs.kv.data(), n * sizeof(float)),
+                         "restore compressor kv");
+            check_device(memcpy_h2d(s.score, cs.score.data(), n * sizeof(float)),
+                         "restore compressor score");
         }
     }
 
@@ -2498,7 +2505,7 @@ struct SafeForwardContext {
         if (it != kv_cache.end()) return it->second;
         float* ptr = nullptr;
         const int capacity = kv_cache_capacity_for_layer(layer_id);
-        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "cudaMalloc kv cache");
+        check_device(device_malloc_into(ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "device_malloc kv cache");
         kv_cache[layer_id] = ptr;
         return ptr;
     }
@@ -2508,7 +2515,7 @@ struct SafeForwardContext {
         if (it != indexer_kv_cache.end()) return it->second;
         const int capacity = std::max(1, (kv_cache_tokens + 3) / 4);
         float* ptr = nullptr;
-        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "cudaMalloc indexer kv cache");
+        check_device(device_malloc_into(ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "device_malloc indexer kv cache");
         indexer_kv_cache[layer_id] = ptr;
         return ptr;
     }
@@ -2547,8 +2554,8 @@ struct SafeForwardContext {
             }
         }
         float* ptr = nullptr;
-        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(n) * sizeof(float)), "cudaMalloc rope inv freqs");
-        check_cuda(cudaMemcpy(ptr, host.data(), static_cast<size_t>(n) * sizeof(float), cudaMemcpyHostToDevice), "copy rope inv freqs");
+        check_device(device_malloc_into(ptr, static_cast<size_t>(n) * sizeof(float)), "device_malloc rope inv freqs");
+        check_device(memcpy_h2d(ptr, host.data(), static_cast<size_t>(n) * sizeof(float)), "copy rope inv freqs");
         store[layer_id] = ptr;
         return ptr;
     }
@@ -2748,7 +2755,7 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(con
 }
 
 ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count) {
-    if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
+    if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
     SafeTensorsIndex& index = ctx.index;
     ModelConfig& config = ctx.config;
@@ -2795,15 +2802,21 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                 Fp4View w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w2.weight");
                 Fp4View w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w3.weight");
                 HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, w1, w2, w3);
-                check_cuda(cudaMemcpyAsync(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes, slot.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "prestage w1");
-                check_cuda(cudaMemcpyAsync(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes, slot.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "prestage s1");
-                check_cuda(cudaMemcpyAsync(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes, slot.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "prestage w2");
-                check_cuda(cudaMemcpyAsync(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes, slot.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "prestage s2");
-                check_cuda(cudaMemcpyAsync(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes, slot.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "prestage w3");
-                check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "prestage s3");
+                check_device(memcpy_h2d_async(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes,
+                                              slot.h_w1q, arena.w1_bytes, nullptr), "prestage w1");
+                check_device(memcpy_h2d_async(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes,
+                                              slot.h_w1s, arena.s1_bytes, nullptr), "prestage s1");
+                check_device(memcpy_h2d_async(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes,
+                                              slot.h_w2q, arena.w2_bytes, nullptr), "prestage w2");
+                check_device(memcpy_h2d_async(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes,
+                                              slot.h_w2s, arena.s2_bytes, nullptr), "prestage s2");
+                check_device(memcpy_h2d_async(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes,
+                                              slot.h_w3q, arena.w3_bytes, nullptr), "prestage w3");
+                check_device(memcpy_h2d_async(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes,
+                                              slot.h_w3s, arena.s3_bytes, nullptr), "prestage s3");
             }
         }
-        check_cuda(cudaDeviceSynchronize(), "prestage sync");
+        check_device(device_synchronize(), "prestage sync");
     }
     const int head_rows = static_cast<int>(head->shape[0]);
     if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
@@ -2817,24 +2830,24 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
 
     const bool prefill_moe_prefetch_enabled = env_int_or_default("DSV4_CPP_PREFILL_MOE_PREFETCH", 0) != 0;
     const bool prefill_moe_copy_stream_enabled = prefill_moe_prefetch_enabled || env_int_or_default("DSV4_CPP_PREFILL_MOE_COPY_STREAM", 0) != 0;
-    cudaStream_t prefill_moe_copy_stream = nullptr;
-    cudaEvent_t prefill_moe_stage_event = nullptr;
+    void* prefill_moe_copy_stream = nullptr;
+    void* prefill_moe_stage_event = nullptr;
     if (prefill_moe_copy_stream_enabled) {
-        check_cuda(cudaStreamCreateWithFlags(&prefill_moe_copy_stream, cudaStreamNonBlocking), "create prefill moe copy stream");
-        check_cuda(cudaEventCreateWithFlags(&prefill_moe_stage_event, cudaEventDisableTiming), "create prefill moe stage event");
+        check_device((prefill_moe_copy_stream = stream_create()) != nullptr, "create prefill moe copy stream");
+        check_device((prefill_moe_stage_event = event_create()) != nullptr, "create prefill moe stage event");
     }
     const bool prefill_shared_overlap_enabled = env_int_or_default("DSV4_CPP_PREFILL_SHARED_OVERLAP", 1) != 0;
-    cudaStream_t prefill_shared_stream = nullptr;
-    cudaEvent_t prefill_shared_ready_event = nullptr;
-    cudaEvent_t prefill_shared_done_event = nullptr;
+    void* prefill_shared_stream = nullptr;
+    void* prefill_shared_ready_event = nullptr;
+    void* prefill_shared_done_event = nullptr;
     if (prefill_shared_overlap_enabled) {
-        check_cuda(cudaStreamCreateWithFlags(&prefill_shared_stream, cudaStreamNonBlocking), "create prefill shared stream");
-        check_cuda(cudaEventCreateWithFlags(&prefill_shared_ready_event, cudaEventDisableTiming), "create prefill shared ready event");
-        check_cuda(cudaEventCreateWithFlags(&prefill_shared_done_event, cudaEventDisableTiming), "create prefill shared done event");
+        check_device((prefill_shared_stream = stream_create()) != nullptr, "create prefill shared stream");
+        check_device((prefill_shared_ready_event = event_create()) != nullptr, "create prefill shared ready event");
+        check_device((prefill_shared_done_event = event_create()) != nullptr, "create prefill shared done event");
     }
     std::vector<int> prev_layer_active_locals;
 
-    auto stage_experts_for_layer = [&](int layer_idx, const std::vector<int>& locals, cudaStream_t stream) -> int {
+    auto stage_experts_for_layer = [&](int layer_idx, const std::vector<int>& locals, void* stream) -> int {
         if (locals.empty()) return 0;
         const std::string layer_prefix = "layers." + std::to_string(layer_idx) + ".";
         DeviceFp4ExpertCache sample;
@@ -2856,12 +2869,18 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             Fp4View w2 = ctx.fp4_view(layer_prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w2.weight");
             Fp4View w3 = ctx.fp4_view(layer_prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w3.weight");
             HostFp4ExpertSlot& slot = ctx.host_fp4_slot(layer_idx, expert_start + local, w1, w2, w3);
-            check_cuda(cudaMemcpyAsync(arena_l.w1 + static_cast<size_t>(local) * arena_l.w1_bytes, slot.h_w1q, arena_l.w1_bytes, cudaMemcpyHostToDevice, stream), "prefetch w1");
-            check_cuda(cudaMemcpyAsync(arena_l.s1 + static_cast<size_t>(local) * arena_l.s1_bytes, slot.h_w1s, arena_l.s1_bytes, cudaMemcpyHostToDevice, stream), "prefetch s1");
-            check_cuda(cudaMemcpyAsync(arena_l.w2 + static_cast<size_t>(local) * arena_l.w2_bytes, slot.h_w2q, arena_l.w2_bytes, cudaMemcpyHostToDevice, stream), "prefetch w2");
-            check_cuda(cudaMemcpyAsync(arena_l.s2 + static_cast<size_t>(local) * arena_l.s2_bytes, slot.h_w2s, arena_l.s2_bytes, cudaMemcpyHostToDevice, stream), "prefetch s2");
-            check_cuda(cudaMemcpyAsync(arena_l.w3 + static_cast<size_t>(local) * arena_l.w3_bytes, slot.h_w3q, arena_l.w3_bytes, cudaMemcpyHostToDevice, stream), "prefetch w3");
-            check_cuda(cudaMemcpyAsync(arena_l.s3 + static_cast<size_t>(local) * arena_l.s3_bytes, slot.h_w3s, arena_l.s3_bytes, cudaMemcpyHostToDevice, stream), "prefetch s3");
+            check_device(memcpy_h2d_async(arena_l.w1 + static_cast<size_t>(local) * arena_l.w1_bytes,
+                                          slot.h_w1q, arena_l.w1_bytes, stream), "prefetch w1");
+            check_device(memcpy_h2d_async(arena_l.s1 + static_cast<size_t>(local) * arena_l.s1_bytes,
+                                          slot.h_w1s, arena_l.s1_bytes, stream), "prefetch s1");
+            check_device(memcpy_h2d_async(arena_l.w2 + static_cast<size_t>(local) * arena_l.w2_bytes,
+                                          slot.h_w2q, arena_l.w2_bytes, stream), "prefetch w2");
+            check_device(memcpy_h2d_async(arena_l.s2 + static_cast<size_t>(local) * arena_l.s2_bytes,
+                                          slot.h_w2s, arena_l.s2_bytes, stream), "prefetch s2");
+            check_device(memcpy_h2d_async(arena_l.w3 + static_cast<size_t>(local) * arena_l.w3_bytes,
+                                          slot.h_w3q, arena_l.w3_bytes, stream), "prefetch w3");
+            check_device(memcpy_h2d_async(arena_l.s3 + static_cast<size_t>(local) * arena_l.s3_bytes,
+                                          slot.h_w3s, arena_l.s3_bytes, stream), "prefetch s3");
             ++staged;
         }
         return staged;
@@ -2948,81 +2967,83 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     const size_t token_dim = static_cast<size_t>(token_count) * dim;
     const size_t chunk_dim = static_cast<size_t>(chunk_alloc) * dim;
     const size_t routes_cap_chunk = static_cast<size_t>(chunk_alloc) * route_count;
-    check_cuda(cudaMalloc(&d_token_ids, static_cast<size_t>(token_count) * sizeof(int)), "cudaMalloc token ids");
-    check_cuda(cudaMalloc(&d_embed_matrix, ctx.embed->nbytes), "cudaMalloc embed matrix");
-    check_cuda(cudaMalloc(&d_x_rows, chunk_dim * sizeof(float)), "cudaMalloc x rows");
-    check_cuda(cudaMalloc(&d_h4_rows, token_dim * 4 * sizeof(float)), "cudaMalloc prefill hc h4 rows");
-    check_cuda(cudaMalloc(&d_h4_next_rows, chunk_dim * 4 * sizeof(float)), "cudaMalloc prefill hc h4 next rows");
-    check_cuda(cudaMalloc(&d_h4_bf16_rows, chunk_dim * 4 * sizeof(uint16_t)), "cudaMalloc prefill hc h4 bf16 rows");
-    check_cuda(cudaMalloc(&d_hc_post_rows, static_cast<size_t>(chunk_alloc) * 4 * sizeof(float)), "cudaMalloc prefill hc post rows");
-    check_cuda(cudaMalloc(&d_hc_comb_rows, static_cast<size_t>(chunk_alloc) * 16 * sizeof(float)), "cudaMalloc prefill hc comb rows");
-    check_cuda(cudaMalloc(&d_attn_out_rows, chunk_dim * sizeof(float)), "cudaMalloc prefill attn out rows");
-    check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
-    check_cuda(cudaMalloc(&d_ffn_norm_rows, chunk_dim * sizeof(float)), "cudaMalloc ffn norm rows");
-    check_cuda(cudaMalloc(&d_route_indices, routes_cap_chunk * sizeof(int64_t)), "cudaMalloc prefill route indices");
-    check_cuda(cudaMalloc(&d_route_weights, routes_cap_chunk * sizeof(float)), "cudaMalloc prefill route weights");
-    check_cuda(cudaMalloc(&d_group_route_tokens, routes_cap_chunk * sizeof(int64_t)), "cudaMalloc grouped route tokens");
+    check_device(device_malloc_into(d_token_ids, static_cast<size_t>(token_count) * sizeof(int)), "device_malloc token ids");
+    check_device(device_malloc_into(d_embed_matrix, ctx.embed->nbytes), "device_malloc embed matrix");
+    check_device(device_malloc_into(d_x_rows, chunk_dim * sizeof(float)), "device_malloc x rows");
+    check_device(device_malloc_into(d_h4_rows, token_dim * 4 * sizeof(float)), "device_malloc prefill hc h4 rows");
+    check_device(device_malloc_into(d_h4_next_rows, chunk_dim * 4 * sizeof(float)), "device_malloc prefill hc h4 next rows");
+    check_device(device_malloc_into(d_h4_bf16_rows, chunk_dim * 4 * sizeof(uint16_t)), "device_malloc prefill hc h4 bf16 rows");
+    check_device(device_malloc_into(d_hc_post_rows, static_cast<size_t>(chunk_alloc) * 4 * sizeof(float)), "device_malloc prefill hc post rows");
+    check_device(device_malloc_into(d_hc_comb_rows, static_cast<size_t>(chunk_alloc) * 16 * sizeof(float)), "device_malloc prefill hc comb rows");
+    check_device(device_malloc_into(d_attn_out_rows, chunk_dim * sizeof(float)), "device_malloc prefill attn out rows");
+    check_device(device_malloc_into(d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "device_malloc ffn gamma");
+    check_device(device_malloc_into(d_ffn_norm_rows, chunk_dim * sizeof(float)), "device_malloc ffn norm rows");
+    check_device(device_malloc_into(d_route_indices, routes_cap_chunk * sizeof(int64_t)), "device_malloc prefill route indices");
+    check_device(device_malloc_into(d_route_weights, routes_cap_chunk * sizeof(float)), "device_malloc prefill route weights");
+    check_device(device_malloc_into(d_group_route_tokens, routes_cap_chunk * sizeof(int64_t)), "device_malloc grouped route tokens");
     // [chunk_tokens, route_count] slot->route map, used to reduce the MoE w2
     // output in a fixed order instead of by atomicAdd. Same size as the route
     // arrays, so it scales linearly with the chunk, not quadratically.
     int32_t* d_token_slot_routes = nullptr;
-    check_cuda(cudaMalloc(&d_token_slot_routes, routes_cap_chunk * sizeof(int32_t)), "cudaMalloc token slot routes");
-    check_cuda(cudaMalloc(&d_group_route_weights, routes_cap_chunk * sizeof(float)), "cudaMalloc grouped route weights");
-    check_cuda(cudaMalloc(&d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "cudaMalloc seg starts");
-    check_cuda(cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "cudaMalloc route counts");
-    check_cuda(cudaMalloc(&d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "cudaMalloc route offsets");
-    check_cuda(cudaMalloc(&d_total_routes, sizeof(int32_t)), "cudaMalloc total routes");
+    check_device(device_malloc_into(d_token_slot_routes, routes_cap_chunk * sizeof(int32_t)), "device_malloc token slot routes");
+    check_device(device_malloc_into(d_group_route_weights, routes_cap_chunk * sizeof(float)), "device_malloc grouped route weights");
+    check_device(device_malloc_into(d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "device_malloc seg starts");
+    check_device(device_malloc_into(d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "device_malloc route counts");
+    check_device(device_malloc_into(d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "device_malloc route offsets");
+    check_device(device_malloc_into(d_total_routes, sizeof(int32_t)), "device_malloc total routes");
     AttentionSmokeDims attn_dims = make_attention_dims(config, dim, tp_world, 0);
-    check_cuda(cudaMalloc(&d_attn_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn x");
-    check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn norm");
-    check_cuda(cudaMalloc(&d_attn_norm_rows, chunk_dim * sizeof(float)), "cudaMalloc prefill attn norm rows");
-    check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_a");
-    check_cuda(cudaMalloc(&d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_norm");
-    check_cuda(cudaMalloc(&d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill q");
-    check_cuda(cudaMalloc(&d_q_a_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_a_dim * sizeof(float)), "cudaMalloc prefill q_a rows");
-    check_cuda(cudaMalloc(&d_q_norm_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_a_dim * sizeof(float)), "cudaMalloc prefill q_norm rows");
-    check_cuda(cudaMalloc(&d_q_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_dim * sizeof(float)), "cudaMalloc prefill q rows");
-    check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_a");
-    check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_norm");
-    check_cuda(cudaMalloc(&d_kv_a_rows, static_cast<size_t>(chunk_alloc) * attn_dims.kv_dim * sizeof(float)), "cudaMalloc prefill kv_a rows");
+    check_device(device_malloc_into(d_attn_x, static_cast<size_t>(dim) * sizeof(float)), "device_malloc prefill attn x");
+    check_device(device_malloc_into(d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "device_malloc prefill attn norm");
+    check_device(device_malloc_into(d_attn_norm_rows, chunk_dim * sizeof(float)), "device_malloc prefill attn norm rows");
+    check_device(device_malloc_into(d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "device_malloc prefill q_a");
+    check_device(device_malloc_into(d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "device_malloc prefill q_norm");
+    check_device(device_malloc_into(d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "device_malloc prefill q");
+    check_device(device_malloc_into(d_q_a_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_a_dim * sizeof(float)), "device_malloc prefill q_a rows");
+    check_device(device_malloc_into(d_q_norm_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_a_dim * sizeof(float)), "device_malloc prefill q_norm rows");
+    check_device(device_malloc_into(d_q_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_dim * sizeof(float)), "device_malloc prefill q rows");
+    check_device(device_malloc_into(d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "device_malloc prefill kv_a");
+    check_device(device_malloc_into(d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "device_malloc prefill kv_norm");
+    check_device(device_malloc_into(d_kv_a_rows, static_cast<size_t>(chunk_alloc) * attn_dims.kv_dim * sizeof(float)), "device_malloc prefill kv_a rows");
     // d_kv_norm_rows stays full-N: chunked sparse attention reads KV for absolute
     // positions 0..ce of the current layer, so each chunk's KV slice accumulates
     // into the same per-layer buffer (reused across layers).
-    check_cuda(cudaMalloc(&d_kv_norm_rows, static_cast<size_t>(token_count) * attn_dims.kv_dim * sizeof(float)), "cudaMalloc prefill kv_norm rows");
-    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill attn value");
-    check_cuda(cudaMalloc(&d_attn_value_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_dim * sizeof(float)), "cudaMalloc prefill attn value rows");
-    check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc prefill attn mid");
-    check_cuda(cudaMalloc(&d_attn_mid_rows, static_cast<size_t>(chunk_alloc) * attn_dims.attn_mid * sizeof(float)), "cudaMalloc prefill attn mid rows");
-    check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn out");
+    check_device(device_malloc_into(d_kv_norm_rows, static_cast<size_t>(token_count) * attn_dims.kv_dim * sizeof(float)), "device_malloc prefill kv_norm rows");
+    check_device(device_malloc_into(d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "device_malloc prefill attn value");
+    check_device(device_malloc_into(d_attn_value_rows, static_cast<size_t>(chunk_alloc) * attn_dims.q_dim * sizeof(float)), "device_malloc prefill attn value rows");
+    check_device(device_malloc_into(d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "device_malloc prefill attn mid");
+    check_device(device_malloc_into(d_attn_mid_rows, static_cast<size_t>(chunk_alloc) * attn_dims.attn_mid * sizeof(float)), "device_malloc prefill attn mid rows");
+    check_device(device_malloc_into(d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "device_malloc prefill attn out");
     int window_topk_global = 0;
     {
         const int window_topk = static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(token_count), std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)));
         window_topk_global = window_topk;
         // Window indices depend only on (token_count, window_size) — precompute once
         // and reuse across all layers; for chunked queries we slice by cs * topk.
-        check_cuda(cudaMalloc(&d_prefill_window_indices, static_cast<size_t>(token_count) * window_topk * sizeof(int32_t)), "cudaMalloc prefill window indices");
+        check_device(device_malloc_into(d_prefill_window_indices, static_cast<size_t>(token_count) * window_topk * sizeof(int32_t)), "device_malloc prefill window indices");
     }
-    check_cuda(cudaMalloc(&d_moe_rows, chunk_dim * sizeof(float)), "cudaMalloc moe rows");
-    check_cuda(cudaMalloc(&d_shared_gate, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "cudaMalloc shared gate rows");
-    check_cuda(cudaMalloc(&d_shared_up, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "cudaMalloc shared up rows");
-    check_cuda(cudaMalloc(&d_shared_hidden, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "cudaMalloc shared hidden rows");
-    check_cuda(cudaMalloc(&d_shared_out, chunk_dim * sizeof(float)), "cudaMalloc shared out rows");
-    check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
-    check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
-    check_cuda(cudaMalloc(&d_last_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc last x");
-    check_cuda(cudaMalloc(&d_final_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc final norm");
-    check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+    check_device(device_malloc_into(d_moe_rows, chunk_dim * sizeof(float)), "device_malloc moe rows");
+    check_device(device_malloc_into(d_shared_gate, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "device_malloc shared gate rows");
+    check_device(device_malloc_into(d_shared_up, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "device_malloc shared up rows");
+    check_device(device_malloc_into(d_shared_hidden, static_cast<size_t>(chunk_alloc) * inter * sizeof(float)), "device_malloc shared hidden rows");
+    check_device(device_malloc_into(d_shared_out, chunk_dim * sizeof(float)), "device_malloc shared out rows");
+    check_device(device_malloc_into(d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "device_malloc head");
+    check_device(device_malloc_into(d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "device_malloc final norm gamma");
+    check_device(device_malloc_into(d_last_x, static_cast<size_t>(dim) * sizeof(float)), "device_malloc last x");
+    check_device(device_malloc_into(d_final_norm, static_cast<size_t>(dim) * sizeof(float)), "device_malloc final norm");
+    check_device(device_malloc_into(d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "device_malloc logits");
     if (dspark_capture_slot >= 0) {
-        check_cuda(cudaMalloc(&d_dspark_hidden,
-                              static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride *
-                                  sizeof(float)),
-                   "cudaMalloc prefill dspark hidden");
+        check_device(device_malloc_into(d_dspark_hidden, static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride * sizeof(float)),
+                     "device_malloc prefill dspark hidden");
     }
 
-    check_cuda(cudaMemcpy(d_token_ids, token_ids.data(), static_cast<size_t>(token_count) * sizeof(int), cudaMemcpyHostToDevice), "copy token ids");
-    check_cuda(cudaMemcpy(d_embed_matrix, ctx.embed_shard.tensor_data(*embed), ctx.embed->nbytes, cudaMemcpyHostToDevice), "copy embed matrix");
-    check_cuda(cudaMemcpy(d_head, reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
-    check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
+    check_device(memcpy_h2d(d_token_ids, token_ids.data(),
+                            static_cast<size_t>(token_count) * sizeof(int)), "copy token ids");
+    check_device(memcpy_h2d(d_embed_matrix, ctx.embed_shard.tensor_data(*embed), ctx.embed->nbytes), "copy embed matrix");
+    check_device(memcpy_h2d(d_head,
+                            reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim,
+                            static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "copy head");
+    check_device(memcpy_h2d(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm),
+                            ctx.final_norm->nbytes), "copy final norm gamma");
     // Initial embed + hc_repeat: process the prompt chunk-by-chunk so d_x_rows
     // can stay chunk-sized while d_h4_rows accumulates full-N.
     for (int cs = 0; cs < token_count; cs += prefill_chunk_size) {
@@ -3045,7 +3066,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     double total_prefill_shared_ms = 0.0;
     double total_prefill_ffn_post_ms = 0.0;
     auto sync_prefill_profile = [&](const char* what) {
-        if (profile_forward) check_cuda(cudaDeviceSynchronize(), what);
+        if (profile_forward) check_device(device_synchronize(), what);
     };
 
     for (int li = 0; li < layer_count; ++li) {
@@ -3071,7 +3092,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         if (prefill_moe_prefetch_enabled && prefill_moe_copy_stream_enabled && li > 0 && !prev_layer_active_locals.empty()) {
             const int prefetched = stage_experts_for_layer(li, prev_layer_active_locals, prefill_moe_copy_stream);
             if (prefetched > 0) {
-                check_cuda(cudaEventRecord(prefill_moe_stage_event, prefill_moe_copy_stream), "record prefill moe prefetch event");
+                check_device(event_record(prefill_moe_stage_event, prefill_moe_copy_stream), "record prefill moe prefetch event");
                 if (profile_forward && tp_rank == 0) {
                     std::cerr << "CPP_PREFILL_MOE_PREFETCH layer=" << li << " hinted=" << static_cast<int>(prev_layer_active_locals.size()) << " staged=" << prefetched << "\n";
                 }
@@ -3094,7 +3115,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             if (env_int_or_default("DSV4_CPP_PREFILL_BATCHED_ATTN", 1) != 0) {
                 const bool profile_attn = profile_forward && env_int_or_default("DSV4_CPP_PROFILE_ATTN", 0) != 0;
                 auto attn_stage_sync = [&](const char* what) {
-                    if (profile_attn) check_cuda(cudaDeviceSynchronize(), what);
+                    if (profile_attn) check_device(device_synchronize(), what);
                 };
                 auto attn_t = Clock::now();
                 if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_attn_gamma_ptr, d_attn_norm_rows, cn, dim, 1e-6f)) throw std::runtime_error("prefill attn norm rows launch failed");
@@ -3165,7 +3186,8 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     attn_dims.cache_write_slot = t % attn_dims.window_size;
                     const int window_len = std::min(t + 1, attn_dims.window_size);
                     const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len);
-                    check_cuda(cudaMemcpy(d_attn_x, d_x_rows + static_cast<size_t>(t - cs) * dim, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "copy prefill attn token x");
+                    check_device(memcpy_d2d(d_attn_x, d_x_rows + static_cast<size_t>(t - cs) * dim,
+                                            static_cast<size_t>(dim) * sizeof(float)), "copy prefill attn token x");
                     if (!run_single_token_attention_smoke(
                             attn_dims,
                             d_attn_x,
@@ -3208,7 +3230,8 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                         all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
                     }
 #endif
-                    check_cuda(cudaMemcpy(d_attn_out_rows + static_cast<size_t>(t - cs) * dim, d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "copy prefill attn out token");
+                    check_device(memcpy_d2d(d_attn_out_rows + static_cast<size_t>(t - cs) * dim,
+                                            d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "copy prefill attn out token");
                 }
             }
             sync_prefill_profile("profile sync prefill attention");
@@ -3230,13 +3253,13 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             if (prefill_shared_overlap_enabled) {
                 DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
                 const int shared_inter = inter;
-                check_cuda(cudaEventRecord(prefill_shared_ready_event, nullptr), "record prefill shared ready event");
-                check_cuda(cudaStreamWaitEvent(prefill_shared_stream, prefill_shared_ready_event, 0), "prefill shared stream wait ready");
+                check_device(event_record(prefill_shared_ready_event, nullptr), "record prefill shared ready event");
+                check_device(stream_wait_event(prefill_shared_stream, prefill_shared_ready_event), "prefill shared stream wait ready");
                 if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, cn, shared_inter, dim, prefill_shared_stream)) throw std::runtime_error("prefill shared w1 overlap launch failed");
                 if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w3, shared.s3, d_shared_up, cn, shared_inter, dim, prefill_shared_stream)) throw std::runtime_error("prefill shared w3 overlap launch failed");
                 if (!silu_mul_rows_cuda(d_shared_gate, d_shared_up, d_shared_hidden, cn, shared_inter, prefill_shared_stream)) throw std::runtime_error("prefill shared silu overlap launch failed");
                 if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, cn, dim, shared_inter, prefill_shared_stream)) throw std::runtime_error("prefill shared w2 overlap launch failed");
-                check_cuda(cudaEventRecord(prefill_shared_done_event, prefill_shared_stream), "record prefill shared done event");
+                check_device(event_record(prefill_shared_done_event, prefill_shared_stream), "record prefill shared done event");
             }
 
             DeviceGateCache& gate = ctx.gate_device_cache(li);
@@ -3245,7 +3268,8 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                 if (!gate_hash_bf16_rows_cuda(d_ffn_norm_rows, gate.weight, gate.tid2eid, d_token_ids + cs, d_route_indices, d_route_weights, cn, gate.dim, gate.hash_topk, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("prefill hash gate rows launch failed");
             } else if (static_cast<uint64_t>(li) < config.n_hash_layers && gate.tid2eid != nullptr) {
                 std::vector<float> ffn_norm_host(cn_dim_sz);
-                check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm_rows, cn_dim_sz * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill ffn norm for host hash gate");
+                check_device(memcpy_d2h(ffn_norm_host.data(), d_ffn_norm_rows,
+                                        cn_dim_sz * sizeof(float)), "copy prefill ffn norm for host hash gate");
                 SafeTensorsShard& gate_shard = ctx.shard_for_tensor(prefix + "ffn.gate.tid2eid");
                 const auto* tid2eid = require_tensor(gate_shard, prefix + "ffn.gate.tid2eid");
                 const auto* ids = reinterpret_cast<const int64_t*>(gate_shard.tensor_data(*tid2eid));
@@ -3270,8 +3294,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     if (denom == 0.0f) denom = 1.0f;
                     for (int k = 0; k < route_count; ++k) h_weights[static_cast<size_t>(t) * route_count + k] = h_weights[static_cast<size_t>(t) * route_count + k] / denom * static_cast<float>(config.route_scale);
                 }
-                check_cuda(cudaMemcpy(d_route_indices, h_indices.data(), cn_routes_cap * sizeof(int64_t), cudaMemcpyHostToDevice), "copy hash route indices rows");
-                check_cuda(cudaMemcpy(d_route_weights, h_weights.data(), cn_routes_cap * sizeof(float), cudaMemcpyHostToDevice), "copy hash route weights rows");
+                check_device(memcpy_h2d(d_route_indices, h_indices.data(),
+                                        cn_routes_cap * sizeof(int64_t)), "copy hash route indices rows");
+                check_device(memcpy_h2d(d_route_weights, h_weights.data(),
+                                        cn_routes_cap * sizeof(float)), "copy hash route weights rows");
             } else {
                 if (!gate_topk_bf16_rows_cuda(d_ffn_norm_rows, gate.weight, gate.bias, d_route_indices, d_route_weights, cn, gate.experts, gate.dim, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("prefill gate topk rows launch failed");
             }
@@ -3284,8 +3310,8 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             auto moe_host_t0 = Clock::now();
             int32_t total_routes = 0;
             std::vector<int32_t> h_counts(experts_per_rank);
-            check_cuda(cudaMemcpy(&total_routes, d_total_routes, sizeof(int32_t), cudaMemcpyDeviceToHost), "copy total routes");
-            check_cuda(cudaMemcpy(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy route counts");
+            check_device(memcpy_d2h(&total_routes, d_total_routes, sizeof(int32_t)), "copy total routes");
+            check_device(memcpy_d2h(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t)), "copy route counts");
             const double moe_d2h_ms = profile_moe_host ? elapsed_ms(moe_host_t0, Clock::now()) : 0.0;
             int max_count = 0;
             int active_experts = 0;
@@ -3321,11 +3347,12 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                 DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
                 int staged_this_layer = 0;
                 const bool profile_stage = profile_forward && env_int_or_default("DSV4_CPP_PROFILE_MOE_STAGE", 0) != 0;
-                cudaEvent_t stage_evt_begin = nullptr, stage_evt_end = nullptr;
+                void* stage_evt_begin = nullptr;
+                void* stage_evt_end = nullptr;
                 if (profile_stage) {
-                    cudaEventCreate(&stage_evt_begin);
-                    cudaEventCreate(&stage_evt_end);
-                    cudaEventRecord(stage_evt_begin);
+                    stage_evt_begin = event_create(/*with_timing=*/true);
+                    stage_evt_end = event_create(/*with_timing=*/true);
+                    event_record(stage_evt_begin, nullptr);
                 }
                 for (int local = 0; local < experts_per_rank; ++local) {
                     if (h_counts[static_cast<size_t>(local)] == 0) continue;
@@ -3334,23 +3361,29 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                         Fp4View w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w2.weight");
                         Fp4View w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start + local) + ".w3.weight");
                         HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, w1, w2, w3);
-                        cudaStream_t stage_stream = prefill_moe_copy_stream_enabled ? prefill_moe_copy_stream : nullptr;
-                        check_cuda(cudaMemcpyAsync(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes, slot.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill w1");
-                        check_cuda(cudaMemcpyAsync(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes, slot.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill s1");
-                        check_cuda(cudaMemcpyAsync(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes, slot.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill w2");
-                        check_cuda(cudaMemcpyAsync(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes, slot.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill s2");
-                        check_cuda(cudaMemcpyAsync(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes, slot.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill w3");
-                        check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice, stage_stream), "stage prefill s3");
+                        void* stage_stream = prefill_moe_copy_stream_enabled ? prefill_moe_copy_stream : nullptr;
+                        check_device(memcpy_h2d_async(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes,
+                                                      slot.h_w1q, arena.w1_bytes, stage_stream), "stage prefill w1");
+                        check_device(memcpy_h2d_async(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes,
+                                                      slot.h_w1s, arena.s1_bytes, stage_stream), "stage prefill s1");
+                        check_device(memcpy_h2d_async(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes,
+                                                      slot.h_w2q, arena.w2_bytes, stage_stream), "stage prefill w2");
+                        check_device(memcpy_h2d_async(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes,
+                                                      slot.h_w2s, arena.s2_bytes, stage_stream), "stage prefill s2");
+                        check_device(memcpy_h2d_async(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes,
+                                                      slot.h_w3q, arena.w3_bytes, stage_stream), "stage prefill w3");
+                        check_device(memcpy_h2d_async(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes,
+                                                      slot.h_w3s, arena.s3_bytes, stage_stream), "stage prefill s3");
                         ++staged_this_layer;
                     }
                 }
                 if (profile_stage) {
-                    cudaEventRecord(stage_evt_end);
-                    cudaEventSynchronize(stage_evt_end);
+                    event_record(stage_evt_end, nullptr);
+                    event_synchronize(stage_evt_end);
                     float ms = 0.0f;
-                    cudaEventElapsedTime(&ms, stage_evt_begin, stage_evt_end);
-                    cudaEventDestroy(stage_evt_begin);
-                    cudaEventDestroy(stage_evt_end);
+                    event_elapsed_ms(stage_evt_begin, stage_evt_end, &ms);
+                    event_destroy(stage_evt_begin);
+                    event_destroy(stage_evt_end);
                     if (tp_rank == 0 && staged_this_layer > 0) {
                         std::cerr << "CPP_PREFILL_MOE_STAGE_TIME layer=" << li
                                   << " experts=" << staged_this_layer
@@ -3371,7 +3404,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     }
                 }
                 if (prefill_moe_copy_stream_enabled && staged_this_layer > 0) {
-                    check_cuda(cudaEventRecord(prefill_moe_stage_event, prefill_moe_copy_stream), "record prefill moe stage event");
+                    check_device(event_record(prefill_moe_stage_event, prefill_moe_copy_stream), "record prefill moe stage event");
                 }
                 const bool force_padded_moe = env_int_or_default("DSV4_CPP_MOE_FORCE_PADDED", 0) != 0;
                 auto moe_build_t0 = profile_moe_host ? Clock::now() : moe_host_t0;
@@ -3394,17 +3427,20 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                 prefill_moe_workspace.ensure(total_routes, static_cast<int>(h_tile_experts.size()), dim, inter, padded_rows_cap);
                 prefill_moe_workspace.fp4.tile_count = force_padded_moe ? 0 : static_cast<int>(h_tile_experts.size());
                 if (!force_padded_moe) {
-                    check_cuda(cudaMemcpy(prefill_moe_workspace.fp4.d_tile_experts, h_tile_experts.data(), h_tile_experts.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy prefill moe tile experts");
-                    check_cuda(cudaMemcpy(prefill_moe_workspace.fp4.d_tile_rows, h_tile_rows.data(), h_tile_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy prefill moe tile rows");
+                    check_device(memcpy_h2d(prefill_moe_workspace.fp4.d_tile_experts,
+                                            h_tile_experts.data(),
+                                            h_tile_experts.size() * sizeof(int32_t)), "copy prefill moe tile experts");
+                    check_device(memcpy_h2d(prefill_moe_workspace.fp4.d_tile_rows,
+                                            h_tile_rows.data(), h_tile_rows.size() * sizeof(int32_t)), "copy prefill moe tile rows");
                 }
                 const double moe_h2d_ms = profile_moe_host ? elapsed_ms(moe_h2d_t0, Clock::now()) : 0.0;
                 if (prefill_moe_copy_stream_enabled && staged_this_layer > 0) {
-                    check_cuda(cudaStreamWaitEvent(nullptr, prefill_moe_stage_event, 0), "wait prefill moe stage");
+                    check_device(stream_wait_event(nullptr, prefill_moe_stage_event), "wait prefill moe stage");
                 }
                 auto moe_kernel_t0 = profile_moe_host ? Clock::now() : moe_host_t0;
                 if (!moe_prefill_fp4_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, cn, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit), prefill_moe_workspace.fp4, d_token_slot_routes)) throw std::runtime_error("prefill grouped fp4 moe launch failed");
                 if (profile_moe_host) {
-                    check_cuda(cudaDeviceSynchronize(), "sync prefill moe kernel host profile");
+                    check_device(device_synchronize(), "sync prefill moe kernel host profile");
                     const double moe_kernel_ms = elapsed_ms(moe_kernel_t0, Clock::now());
                     if (tp_rank == 0) {
                         std::cerr << "CPP_PREFILL_MOE_HOST layer=" << li
@@ -3417,7 +3453,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     }
                 }
             } else {
-                check_cuda(cudaMemset(d_moe_rows, 0, cn_dim_sz * sizeof(float)), "zero empty prefill moe rows");
+                check_device(device_memset(d_moe_rows, 0, cn_dim_sz * sizeof(float)), "zero empty prefill moe rows");
             }
             sync_prefill_profile("profile sync prefill moe");
             total_prefill_moe_ms += elapsed_ms(stage_t, Clock::now());
@@ -3432,7 +3468,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             total_prefill_reduce_ms += elapsed_ms(stage_t, Clock::now());
             stage_t = Clock::now();
             if (prefill_shared_overlap_enabled) {
-                check_cuda(cudaStreamWaitEvent(nullptr, prefill_shared_done_event, 0), "default stream wait shared done");
+                check_device(stream_wait_event(nullptr, prefill_shared_done_event), "default stream wait shared done");
                 if (!vector_accum_rows_cuda(d_shared_out, d_moe_rows, cn, dim, 1.0f)) throw std::runtime_error("prefill shared accum overlap failed");
             } else {
                 DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
@@ -3488,14 +3524,16 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     }
 
     std::vector<float> last_h4(4 * static_cast<size_t>(dim));
-    check_cuda(cudaMemcpy(last_h4.data(), d_h4_rows + static_cast<size_t>(token_count - 1) * 4 * dim, 4 * static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill last h4");
+    check_device(memcpy_d2h(last_h4.data(),
+                            d_h4_rows + static_cast<size_t>(token_count - 1) * 4 * dim,
+                            4 * static_cast<size_t>(dim) * sizeof(float)), "copy prefill last h4");
     std::vector<float> host_x = hc_head_cpu(last_h4, reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_fn)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_scale)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_base)), dim);
-    check_cuda(cudaMemcpy(d_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy prefill hc head");
+    check_device(memcpy_h2d(d_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float)), "copy prefill hc head");
     if (!rmsnorm_bf16_gamma_cuda(d_last_x, d_final_norm_gamma, d_final_norm, dim, 1e-6f)) throw std::runtime_error("prefill final norm launch failed");
     if (!bf16_matvec_cuda(d_final_norm, d_head, d_logits, local_head_rows, dim)) throw std::runtime_error("prefill head launch failed");
-    check_cuda(cudaDeviceSynchronize(), "sync prefill kernels");
+    check_device(device_synchronize(), "sync prefill kernels");
     std::vector<float> logits(local_head_rows);
-    check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill logits");
+    check_device(memcpy_d2h(logits.data(), d_logits, logits.size() * sizeof(float)), "copy prefill logits");
     float checksum = 0.0f;
     int top_token = local_head_start;
     float top_logit = -INFINITY;
@@ -3513,28 +3551,28 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
 
     if (dspark_capture_slot >= 0) {
         ctx.dspark_hidden.resize(static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride);
-        check_cuda(cudaMemcpy(ctx.dspark_hidden.data(), d_dspark_hidden,
-                              ctx.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy prefill dspark hidden");
+        check_device(memcpy_d2h(ctx.dspark_hidden.data(), d_dspark_hidden,
+                                ctx.dspark_hidden.size() * sizeof(float)),
+                     "copy prefill dspark hidden");
         ctx.dspark_hidden_positions = dspark_capture_rows;
     } else {
         ctx.dspark_hidden.clear();
         ctx.dspark_hidden_positions = 0;
     }
 
-    cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_attn_out_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
-    cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_token_slot_routes); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
-    cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_attn_norm_rows); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_q_a_rows); cudaFree(d_q_norm_rows); cudaFree(d_q_rows); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_kv_a_rows); cudaFree(d_kv_norm_rows); cudaFree(d_attn_value); cudaFree(d_attn_value_rows); cudaFree(d_attn_mid); cudaFree(d_attn_mid_rows); cudaFree(d_attn_out); cudaFree(d_prefill_window_indices);
-    cudaFree(d_moe_rows); cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden); cudaFree(d_shared_out);
-    cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits); cudaFree(d_dspark_hidden);
+    device_free(d_token_ids); device_free(d_embed_matrix); device_free(d_x_rows); device_free(d_h4_rows); device_free(d_h4_next_rows); device_free(d_h4_bf16_rows); device_free(d_hc_post_rows); device_free(d_hc_comb_rows); device_free(d_attn_out_rows); device_free(d_ffn_gamma); device_free(d_ffn_norm_rows);
+    device_free(d_route_indices); device_free(d_route_weights); device_free(d_group_route_tokens); device_free(d_group_route_weights); device_free(d_token_slot_routes); device_free(d_seg_starts); device_free(d_counts); device_free(d_offsets); device_free(d_total_routes);
+    device_free(d_attn_x); device_free(d_attn_norm); device_free(d_attn_norm_rows); device_free(d_q_a); device_free(d_q_norm); device_free(d_q); device_free(d_q_a_rows); device_free(d_q_norm_rows); device_free(d_q_rows); device_free(d_kv_a); device_free(d_kv_norm); device_free(d_kv_a_rows); device_free(d_kv_norm_rows); device_free(d_attn_value); device_free(d_attn_value_rows); device_free(d_attn_mid); device_free(d_attn_mid_rows); device_free(d_attn_out); device_free(d_prefill_window_indices);
+    device_free(d_moe_rows); device_free(d_shared_gate); device_free(d_shared_up); device_free(d_shared_hidden); device_free(d_shared_out);
+    device_free(d_head); device_free(d_final_norm_gamma); device_free(d_last_x); device_free(d_final_norm); device_free(d_logits); device_free(d_dspark_hidden);
     if (prefill_moe_copy_stream_enabled) {
-        cudaEventDestroy(prefill_moe_stage_event);
-        cudaStreamDestroy(prefill_moe_copy_stream);
+        event_destroy(prefill_moe_stage_event);
+        stream_destroy(prefill_moe_copy_stream);
     }
     if (prefill_shared_overlap_enabled) {
-        cudaEventDestroy(prefill_shared_ready_event);
-        cudaEventDestroy(prefill_shared_done_event);
-        cudaStreamDestroy(prefill_shared_stream);
+        event_destroy(prefill_shared_ready_event);
+        event_destroy(prefill_shared_done_event);
+        stream_destroy(prefill_shared_stream);
     }
     return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
@@ -3544,7 +3582,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         const std::vector<int>& tokens,
         int layer_count,
         int start_position) {
-    if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
+    if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
     if (tokens.empty() || tokens.size() > DeviceContinuationWorkspace::kMaxRows) {
         throw std::runtime_error("continuation batch must contain 1..8 tokens");
     }
@@ -3592,8 +3630,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     const int expert_start = tp_rank * experts_per_rank;
     const float attn_scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
 
-    check_cuda(cudaMemcpy(w.token_ids, tokens.data(), static_cast<size_t>(rows) * sizeof(int),
-                          cudaMemcpyHostToDevice), "copy continuation token ids");
+    check_device(memcpy_h2d(w.token_ids, tokens.data(), static_cast<size_t>(rows) * sizeof(int)), "copy continuation token ids");
     if (!bf16_rows_to_float_cuda(dense.embed, w.token_ids, w.x, rows, dim)) {
         throw std::runtime_error("continuation embedding rows launch failed");
     }
@@ -3792,13 +3829,12 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         if (static_cast<int>(indices.size()) > rows * w.max_kv_indices) {
             throw std::runtime_error("continuation KV index workspace is too small");
         }
-        check_cuda(cudaMemcpy(w.kv_row_starts, row_starts.data(),
-                              row_starts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                   "copy continuation row starts");
+        check_device(memcpy_h2d(w.kv_row_starts, row_starts.data(),
+                                row_starts.size() * sizeof(int32_t)),
+                     "copy continuation row starts");
         if (!indices.empty()) {
-            check_cuda(cudaMemcpy(w.kv_indices, indices.data(),
-                                  indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                       "copy continuation KV indices");
+            check_device(memcpy_h2d(w.kv_indices, indices.data(), indices.size() * sizeof(int32_t)),
+                         "copy continuation KV indices");
         }
         if (use_indexer) {
             const int idx_heads = static_cast<int>(ctx.config.index_n_heads);
@@ -3893,9 +3929,8 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             // The prefill GPU hash gate is not parity-safe on TP4. Reuse its host
             // ordering for this tiny continuation block.
             std::vector<float> norm_host(static_cast<size_t>(rows) * dim);
-            check_cuda(cudaMemcpy(norm_host.data(), w.ffn_norm,
-                                  norm_host.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                       "copy continuation norm for hash gate");
+            check_device(memcpy_d2h(norm_host.data(), w.ffn_norm, norm_host.size() * sizeof(float)),
+                         "copy continuation norm for hash gate");
             SafeTensorsShard& tid_shard = ctx.shard_for_tensor(prefix + "ffn.gate.tid2eid");
             const auto* tid = require_tensor(tid_shard, prefix + "ffn.gate.tid2eid");
             const auto* ids = reinterpret_cast<const int64_t*>(tid_shard.tensor_data(*tid));
@@ -3926,12 +3961,12 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                         static_cast<float>(ctx.config.route_scale);
                 }
             }
-            check_cuda(cudaMemcpy(w.route_indices, route_ids.data(),
-                                  route_ids.size() * sizeof(int64_t), cudaMemcpyHostToDevice),
-                       "copy continuation hash route ids");
-            check_cuda(cudaMemcpy(w.route_weights, route_weights.data(),
-                                  route_weights.size() * sizeof(float), cudaMemcpyHostToDevice),
-                       "copy continuation hash route weights");
+            check_device(memcpy_h2d(w.route_indices, route_ids.data(),
+                                    route_ids.size() * sizeof(int64_t)),
+                         "copy continuation hash route ids");
+            check_device(memcpy_h2d(w.route_weights, route_weights.data(),
+                                    route_weights.size() * sizeof(float)),
+                         "copy continuation hash route weights");
         } else if (!gate_topk_bf16_rows_cuda(
                        w.ffn_norm, gate.weight, gate.bias, w.route_indices,
                        w.route_weights, rows, gate.experts, gate.dim, route_count,
@@ -3941,12 +3976,11 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
 
         std::vector<int64_t> route_ids(static_cast<size_t>(rows) * route_count);
         std::vector<float> route_weights(route_ids.size());
-        check_cuda(cudaMemcpy(route_ids.data(), w.route_indices,
-                              route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost),
-                   "copy continuation route ids");
-        check_cuda(cudaMemcpy(route_weights.data(), w.route_weights,
-                              route_weights.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy continuation route weights");
+        check_device(memcpy_d2h(route_ids.data(), w.route_indices, route_ids.size() * sizeof(int64_t)),
+                     "copy continuation route ids");
+        check_device(memcpy_d2h(route_weights.data(), w.route_weights,
+                                route_weights.size() * sizeof(float)),
+                     "copy continuation route weights");
         std::vector<int32_t> slot_experts;
         std::vector<int32_t> slot_starts(1, 0);
         std::vector<int32_t> slot_tokens;
@@ -3968,8 +4002,8 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             }
             if (active) slot_starts.push_back(static_cast<int32_t>(slot_tokens.size()));
         }
-        check_cuda(cudaMemset(w.moe, 0, static_cast<size_t>(rows) * dim * sizeof(float)),
-                   "zero continuation MoE rows");
+        check_device(device_memset(w.moe, 0, static_cast<size_t>(rows) * dim * sizeof(float)),
+                     "zero continuation MoE rows");
         if (!slot_experts.empty()) {
             Fp4View sample_w1 = ctx.fp4_view(prefix + "ffn.experts." +
                                              std::to_string(expert_start) + ".w1.weight");
@@ -3990,34 +4024,34 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                 Fp4View w2 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(global) + ".w2.weight");
                 Fp4View w3 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(global) + ".w3.weight");
                 HostFp4ExpertSlot& host = ctx.host_fp4_slot(li, global, w1, w2, w3);
-                check_cuda(cudaMemcpy(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes,
-                                      host.h_w1q, arena.w1_bytes, cudaMemcpyHostToDevice), "stage continuation w1");
-                check_cuda(cudaMemcpy(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes,
-                                      host.h_w1s, arena.s1_bytes, cudaMemcpyHostToDevice), "stage continuation s1");
-                check_cuda(cudaMemcpy(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes,
-                                      host.h_w2q, arena.w2_bytes, cudaMemcpyHostToDevice), "stage continuation w2");
-                check_cuda(cudaMemcpy(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes,
-                                      host.h_w2s, arena.s2_bytes, cudaMemcpyHostToDevice), "stage continuation s2");
-                check_cuda(cudaMemcpy(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes,
-                                      host.h_w3q, arena.w3_bytes, cudaMemcpyHostToDevice), "stage continuation w3");
-                check_cuda(cudaMemcpy(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes,
-                                      host.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage continuation s3");
+                check_device(memcpy_h2d(arena.w1 + static_cast<size_t>(local) * arena.w1_bytes,
+                                        host.h_w1q, arena.w1_bytes), "stage continuation w1");
+                check_device(memcpy_h2d(arena.s1 + static_cast<size_t>(local) * arena.s1_bytes,
+                                        host.h_w1s, arena.s1_bytes), "stage continuation s1");
+                check_device(memcpy_h2d(arena.w2 + static_cast<size_t>(local) * arena.w2_bytes,
+                                        host.h_w2q, arena.w2_bytes), "stage continuation w2");
+                check_device(memcpy_h2d(arena.s2 + static_cast<size_t>(local) * arena.s2_bytes,
+                                        host.h_w2s, arena.s2_bytes), "stage continuation s2");
+                check_device(memcpy_h2d(arena.w3 + static_cast<size_t>(local) * arena.w3_bytes,
+                                        host.h_w3q, arena.w3_bytes), "stage continuation w3");
+                check_device(memcpy_h2d(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes,
+                                        host.h_w3s, arena.s3_bytes), "stage continuation s3");
             }
             DeviceMoeBatchWorkspace& mw = w.moe_workspace;
             mw.ensure(rows, static_cast<int>(slot_tokens.size()),
                       static_cast<int>(slot_experts.size()), dim, inter);
-            check_cuda(cudaMemcpy(mw.slot_expert, slot_experts.data(),
-                                  slot_experts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                       "copy continuation slot experts");
-            check_cuda(cudaMemcpy(mw.slot_starts, slot_starts.data(),
-                                  slot_starts.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                       "copy continuation slot starts");
-            check_cuda(cudaMemcpy(mw.slot_tokens, slot_tokens.data(),
-                                  slot_tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice),
-                       "copy continuation slot tokens");
-            check_cuda(cudaMemcpy(mw.pair_weights, pair_weights.data(),
-                                  pair_weights.size() * sizeof(float), cudaMemcpyHostToDevice),
-                       "copy continuation pair weights");
+            check_device(memcpy_h2d(mw.slot_expert, slot_experts.data(),
+                                    slot_experts.size() * sizeof(int32_t)),
+                         "copy continuation slot experts");
+            check_device(memcpy_h2d(mw.slot_starts, slot_starts.data(),
+                                    slot_starts.size() * sizeof(int32_t)),
+                         "copy continuation slot starts");
+            check_device(memcpy_h2d(mw.slot_tokens, slot_tokens.data(),
+                                    slot_tokens.size() * sizeof(int32_t)),
+                         "copy continuation slot tokens");
+            check_device(memcpy_h2d(mw.pair_weights, pair_weights.data(),
+                                    pair_weights.size() * sizeof(float)),
+                         "copy continuation pair weights");
             if (!moe_multi_token_fp4_cuda_with_workspace(
                     w.ffn_norm, mw.slot_expert, mw.slot_starts, mw.slot_tokens,
                     mw.pair_weights, arena.w1, arena.s1, arena.w2, arena.s2,
@@ -4210,11 +4244,10 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             float* destination = layer_kv + static_cast<size_t>(slot) * dims.head_dim;
             ctx.continuation_journal.record(
                 destination, static_cast<size_t>(dims.head_dim) * sizeof(float), row);
-            check_cuda(cudaMemcpy(destination,
-                                  w.kv_norm + static_cast<size_t>(row) * dims.head_dim,
-                                  static_cast<size_t>(dims.head_dim) * sizeof(float),
-                                  cudaMemcpyDeviceToDevice),
-                       "publish continuation KV row");
+            check_device(memcpy_d2d(destination,
+                                    w.kv_norm + static_cast<size_t>(row) * dims.head_dim,
+                                    static_cast<size_t>(dims.head_dim) * sizeof(float)),
+                         "publish continuation KV row");
         }
     }
 
@@ -4226,28 +4259,28 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                               dense.local_head_rows, dim)) {
         throw std::runtime_error("continuation final head rows launch failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync continuation batch forward");
+    check_device(device_synchronize(), "sync continuation batch forward");
 
     ContinuationBatchResult result;
     result.rows = rows;
     result.local_head_rows = dense.local_head_rows;
     result.local_head_start = dense.local_head_start;
     result.local_logits.resize(static_cast<size_t>(rows) * dense.local_head_rows);
-    check_cuda(cudaMemcpy(result.local_logits.data(), w.logits,
-                          result.local_logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
-               "copy continuation logits");
+    check_device(memcpy_d2h(result.local_logits.data(), w.logits,
+                            result.local_logits.size() * sizeof(float)),
+                 "copy continuation logits");
     if (dspark_stride > 0) {
         result.dspark_hidden.resize(static_cast<size_t>(rows) * dspark_stride);
-        check_cuda(cudaMemcpy(result.dspark_hidden.data(), w.dspark_hidden,
-                              result.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy continuation DSpark hidden");
+        check_device(memcpy_d2h(result.dspark_hidden.data(), w.dspark_hidden,
+                                result.dspark_hidden.size() * sizeof(float)),
+                     "copy continuation DSpark hidden");
     }
     transaction.leave_pending();
     return result;
 }
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {
-    if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
+    if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
     SafeTensorsIndex& index = ctx.index;
     ModelConfig& config = ctx.config;
     if (layer_count <= 0) layer_count = 1;
@@ -4332,78 +4365,79 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     const int dspark_capture_slot = dspark_n_target > 0 ? 0 : -1;
 
     const auto* embed_data = reinterpret_cast<const uint16_t*>(ctx.embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
-    check_cuda(cudaMalloc(&d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc embed");
-    check_cuda(cudaMalloc(&d_w1, static_cast<size_t>(inter) * dim), "cudaMalloc w1");
-    check_cuda(cudaMalloc(&d_s1, first_w1.s->nbytes), "cudaMalloc s1");
-    check_cuda(cudaMalloc(&d_w2, static_cast<size_t>(dim) * inter), "cudaMalloc w2");
-    check_cuda(cudaMalloc(&d_s2, first_w2.s->nbytes), "cudaMalloc s2");
-    check_cuda(cudaMalloc(&d_w3, static_cast<size_t>(inter) * dim), "cudaMalloc w3");
-    check_cuda(cudaMalloc(&d_s3, first_w3.s->nbytes), "cudaMalloc s3");
-    check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
-    check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
-    check_cuda(cudaMalloc(&d_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc x");
-    check_cuda(cudaMalloc(&d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "cudaMalloc hc h4");
-    check_cuda(cudaMalloc(&d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "cudaMalloc hc h4 next");
-    check_cuda(cudaMalloc(&d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "cudaMalloc hc h4 bf16");
-    check_cuda(cudaMalloc(&d_hc_post, static_cast<size_t>(4) * sizeof(float)), "cudaMalloc hc post");
-    check_cuda(cudaMalloc(&d_hc_comb, static_cast<size_t>(16) * sizeof(float)), "cudaMalloc hc comb");
-    check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn norm");
-    check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc q_a");
-    check_cuda(cudaMalloc(&d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc q_norm");
-    check_cuda(cudaMalloc(&d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc q");
-    check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc kv_a");
-    check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc kv_norm");
-    check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc attn value");
-    check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc attn mid");
-    check_cuda(cudaMalloc(&d_wo_a_x_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(int8_t)), "cudaMalloc wo_a x q");
-    check_cuda(cudaMalloc(&d_wo_a_x_scale, static_cast<size_t>(attn_dims.groups) * sizeof(float)), "cudaMalloc wo_a x scale");
-    check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
+    check_device(device_malloc_into(d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "device_malloc embed");
+    check_device(device_malloc_into(d_w1, static_cast<size_t>(inter) * dim), "device_malloc w1");
+    check_device(device_malloc_into(d_s1, first_w1.s->nbytes), "device_malloc s1");
+    check_device(device_malloc_into(d_w2, static_cast<size_t>(dim) * inter), "device_malloc w2");
+    check_device(device_malloc_into(d_s2, first_w2.s->nbytes), "device_malloc s2");
+    check_device(device_malloc_into(d_w3, static_cast<size_t>(inter) * dim), "device_malloc w3");
+    check_device(device_malloc_into(d_s3, first_w3.s->nbytes), "device_malloc s3");
+    check_device(device_malloc_into(d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "device_malloc head");
+    check_device(device_malloc_into(d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "device_malloc final norm gamma");
+    check_device(device_malloc_into(d_x, static_cast<size_t>(dim) * sizeof(float)), "device_malloc x");
+    check_device(device_malloc_into(d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "device_malloc hc h4");
+    check_device(device_malloc_into(d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "device_malloc hc h4 next");
+    check_device(device_malloc_into(d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "device_malloc hc h4 bf16");
+    check_device(device_malloc_into(d_hc_post, static_cast<size_t>(4) * sizeof(float)), "device_malloc hc post");
+    check_device(device_malloc_into(d_hc_comb, static_cast<size_t>(16) * sizeof(float)), "device_malloc hc comb");
+    check_device(device_malloc_into(d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "device_malloc attn norm");
+    check_device(device_malloc_into(d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "device_malloc q_a");
+    check_device(device_malloc_into(d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "device_malloc q_norm");
+    check_device(device_malloc_into(d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "device_malloc q");
+    check_device(device_malloc_into(d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "device_malloc kv_a");
+    check_device(device_malloc_into(d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "device_malloc kv_norm");
+    check_device(device_malloc_into(d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "device_malloc attn value");
+    check_device(device_malloc_into(d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "device_malloc attn mid");
+    check_device(device_malloc_into(d_wo_a_x_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(int8_t)), "device_malloc wo_a x q");
+    check_device(device_malloc_into(d_wo_a_x_scale, static_cast<size_t>(attn_dims.groups) * sizeof(float)), "device_malloc wo_a x scale");
+    check_device(device_malloc_into(d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "device_malloc attn out");
     if (ctx.use_gpu_compressor != 0) {
-        check_cuda(cudaMalloc(&d_compressor_input_bf16, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc compressor input bf16");
-        check_cuda(cudaMalloc(&d_compressor_input_rounded, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc compressor input rounded");
-        check_cuda(cudaMalloc(&d_compressor_kv, static_cast<size_t>(1024) * sizeof(float)), "cudaMalloc compressor kv");
-        check_cuda(cudaMalloc(&d_compressor_score, static_cast<size_t>(1024) * sizeof(float)), "cudaMalloc compressor score");
-        check_cuda(cudaMalloc(&d_indexer_comp_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "cudaMalloc indexer compressor kv");
-        check_cuda(cudaMalloc(&d_indexer_comp_score, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "cudaMalloc indexer compressor score");
+        check_device(device_malloc_into(d_compressor_input_bf16, static_cast<size_t>(dim) * sizeof(uint16_t)), "device_malloc compressor input bf16");
+        check_device(device_malloc_into(d_compressor_input_rounded, static_cast<size_t>(dim) * sizeof(float)), "device_malloc compressor input rounded");
+        check_device(device_malloc_into(d_compressor_kv, static_cast<size_t>(1024) * sizeof(float)), "device_malloc compressor kv");
+        check_device(device_malloc_into(d_compressor_score, static_cast<size_t>(1024) * sizeof(float)), "device_malloc compressor score");
+        check_device(device_malloc_into(d_indexer_comp_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "device_malloc indexer compressor kv");
+        check_device(device_malloc_into(d_indexer_comp_score, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim * 2)) * sizeof(float)), "device_malloc indexer compressor score");
     }
-    check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.index_head_dim)) * sizeof(float)), "cudaMalloc index q");
-    check_cuda(cudaMalloc(&d_indexer_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim)) * sizeof(float)), "cudaMalloc indexer kv tmp");
-    check_cuda(cudaMalloc(&d_index_weight_proj, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.dim)) * sizeof(uint16_t)), "cudaMalloc index weight proj");
+    check_device(device_malloc_into(d_index_q, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.index_head_dim)) * sizeof(float)), "device_malloc index q");
+    check_device(device_malloc_into(d_indexer_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim)) * sizeof(float)), "device_malloc indexer kv tmp");
+    check_device(device_malloc_into(d_index_weight_proj, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.dim)) * sizeof(uint16_t)), "device_malloc index weight proj");
     {
         const int max_compressed = std::max(1, (ctx.kv_cache_tokens + 3) / 4);
         const int max_keep = static_cast<int>(std::max<uint64_t>(1, config.index_topk));
         const int max_kv_indices = static_cast<int>(std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)) + std::max(max_keep, max_compressed);
         const int max_index_heads = static_cast<int>(std::max<uint64_t>(1, config.index_n_heads));
-        check_cuda(cudaMalloc(&d_index_scores, static_cast<size_t>(max_compressed + max_index_heads) * sizeof(float)), "cudaMalloc index scores");
-        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_indices) * sizeof(int)), "cudaMalloc kv indices");
+        check_device(device_malloc_into(d_index_scores, static_cast<size_t>(max_compressed + max_index_heads) * sizeof(float)), "device_malloc index scores");
+        check_device(device_malloc_into(d_kv_indices, static_cast<size_t>(max_kv_indices) * sizeof(int)), "device_malloc kv indices");
     }
-    check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
-    check_cuda(cudaMalloc(&d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc ffn norm");
-    check_cuda(cudaMalloc(&d_gate, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc gate");
-    check_cuda(cudaMalloc(&d_up, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc up");
-    check_cuda(cudaMalloc(&d_hidden, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc hidden");
-    check_cuda(cudaMalloc(&d_moe, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc moe");
-    check_cuda(cudaMalloc(&d_resid2, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid2");
-    check_cuda(cudaMalloc(&d_shared_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc shared out");
-    check_cuda(cudaMalloc(&d_route_indices, static_cast<size_t>(config.n_activated_experts) * sizeof(int64_t)), "cudaMalloc route indices");
-    check_cuda(cudaMalloc(&d_route_weights, static_cast<size_t>(config.n_activated_experts) * sizeof(float)), "cudaMalloc route weights");
-    check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
+    check_device(device_malloc_into(d_resid1, static_cast<size_t>(dim) * sizeof(float)), "device_malloc resid1");
+    check_device(device_malloc_into(d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "device_malloc ffn norm");
+    check_device(device_malloc_into(d_gate, static_cast<size_t>(inter) * sizeof(float)), "device_malloc gate");
+    check_device(device_malloc_into(d_up, static_cast<size_t>(inter) * sizeof(float)), "device_malloc up");
+    check_device(device_malloc_into(d_hidden, static_cast<size_t>(inter) * sizeof(float)), "device_malloc hidden");
+    check_device(device_malloc_into(d_moe, static_cast<size_t>(dim) * sizeof(float)), "device_malloc moe");
+    check_device(device_malloc_into(d_resid2, static_cast<size_t>(dim) * sizeof(float)), "device_malloc resid2");
+    check_device(device_malloc_into(d_shared_out, static_cast<size_t>(dim) * sizeof(float)), "device_malloc shared out");
+    check_device(device_malloc_into(d_route_indices, static_cast<size_t>(config.n_activated_experts) * sizeof(int64_t)), "device_malloc route indices");
+    check_device(device_malloc_into(d_route_weights, static_cast<size_t>(config.n_activated_experts) * sizeof(float)), "device_malloc route weights");
+    check_device(device_malloc_into(d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "device_malloc logits");
     if (dspark_capture_slot >= 0) {
-        check_cuda(cudaMalloc(&d_dspark_hidden,
-                              static_cast<size_t>(dspark_hidden_stride) * sizeof(float)),
-                   "cudaMalloc dspark hidden");
+        check_device(device_malloc_into(d_dspark_hidden, static_cast<size_t>(dspark_hidden_stride) * sizeof(float)),
+                     "device_malloc dspark hidden");
     }
 
-    cudaStream_t moe_copy_stream = nullptr;
-    cudaEvent_t moe_stage_event = nullptr;
+    void* moe_copy_stream = nullptr;
+    void* moe_stage_event = nullptr;
     bool moe_stage_event_recorded = false;
-    check_cuda(cudaStreamCreateWithFlags(&moe_copy_stream, cudaStreamNonBlocking), "create moe copy stream");
-    check_cuda(cudaEventCreateWithFlags(&moe_stage_event, cudaEventDisableTiming), "create moe stage event");
+    check_device((moe_copy_stream = stream_create()) != nullptr, "create moe copy stream");
+    check_device((moe_stage_event = event_create()) != nullptr, "create moe stage event");
 
-    check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
+    check_device(memcpy_h2d(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t)), "copy embed");
     const auto* head_data = reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim;
-    check_cuda(cudaMemcpy(d_head, head_data, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
-    check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
+    check_device(memcpy_h2d(d_head, head_data,
+                            static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "copy head");
+    check_device(memcpy_h2d(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm),
+                            ctx.final_norm->nbytes), "copy final norm gamma");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
     const bool debug_forward = debug_forward_enabled();
     const bool profile_forward = profile_forward_enabled();
@@ -4437,9 +4471,9 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     double total_post_ms = 0.0;
     std::vector<float> h4(static_cast<size_t>(4) * dim);
     std::vector<float> host_x(dim);
-    check_cuda(cudaMemcpy(host_x.data(), d_x, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy embed host");
+    check_device(memcpy_d2h(host_x.data(), d_x, static_cast<size_t>(dim) * sizeof(float)), "copy embed host");
     for (int m = 0; m < 4; ++m) std::copy(host_x.begin(), host_x.end(), h4.begin() + static_cast<size_t>(m) * dim);
-    check_cuda(cudaMemcpy(d_h4, h4.data(), static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyHostToDevice), "copy initial hc h4");
+    check_device(memcpy_h2d(d_h4, h4.data(), static_cast<size_t>(4) * dim * sizeof(float)), "copy initial hc h4");
     const int decode_window_len = std::min(position + 1, attn_dims.window_size);
     const int decode_window_start = std::max(0, position - decode_window_len + 1);
     if (decode_window_len > 0) {
@@ -4494,7 +4528,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 
         DeviceHcCache& hc_cache = ctx.hc_device_cache(li);
         if (!hc_pre_float_cuda(d_h4, hc_cache.attn_fn, hc_cache.attn_scale, hc_cache.attn_base, d_x, d_hc_post, d_hc_comb, dim)) throw std::runtime_error("hc attn pre launch failed");
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync hc pre");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync hc pre");
         hc_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         auto route_stage_t = stage_t;
@@ -4526,7 +4560,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             }
             if (debug_forward) {
                 compressor_input_host.resize(dim);
-                check_cuda(cudaMemcpy(compressor_input_host.data(), d_compressor_input_rounded, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy compressor input debug");
+                check_device(memcpy_d2h(compressor_input_host.data(), d_compressor_input_rounded,
+                                        static_cast<size_t>(dim) * sizeof(float)), "copy compressor input debug");
                 print_summary("layer=" + std::to_string(li) + ".compressor_input", compressor_input_host);
             }
             const int offset = position % ratio;
@@ -4546,7 +4581,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                     if (!fp8_act_quant_dequant_cuda(d_pooled_slot, attn_dims.head_dim - attn_dims.rope_dim, 64)) throw std::runtime_error("compressed kv act quant failed");
                     if (debug_forward) {
                         std::vector<float> pooled_slot(attn_dims.head_dim);
-                        check_cuda(cudaMemcpy(pooled_slot.data(), d_pooled_slot, static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy compressed kv debug");
+                        check_device(memcpy_d2h(pooled_slot.data(), d_pooled_slot,
+                                                static_cast<size_t>(attn_dims.head_dim) * sizeof(float)), "copy compressed kv debug");
                         print_summary("layer=" + std::to_string(li) + ".compressed_kv", pooled_slot);
                     }
                 }
@@ -4593,7 +4629,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                     if (!fp4_fake_quant128_rows_cuda(d_idx_slot, 1)) throw std::runtime_error("indexer compressed kv fp4 quant failed");
                     if (debug_forward) {
                         std::vector<float> idx_slot(idx_head_dim);
-                        check_cuda(cudaMemcpy(idx_slot.data(), d_idx_slot, static_cast<size_t>(idx_head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy indexer compressed kv debug");
+                        check_device(memcpy_d2h(idx_slot.data(), d_idx_slot,
+                                                static_cast<size_t>(idx_head_dim) * sizeof(float)), "copy indexer compressed kv debug");
                         print_summary("layer=" + std::to_string(li) + ".indexer_compressed_kv", idx_slot);
                     }
                     if (idx_overlap && !compressor_shift_overlap_state_cuda(idx_state.kv, idx_state.score, 4, idx_state_cols)) throw std::runtime_error("indexer compressor state shift launch failed");
@@ -4641,14 +4678,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             }
             if (debug_forward) {
                 std::vector<int> kv_indices(static_cast<size_t>(kv_index_count));
-                if (kv_index_count > 0) check_cuda(cudaMemcpy(kv_indices.data(), d_kv_indices, kv_indices.size() * sizeof(int), cudaMemcpyDeviceToHost), "copy kv indices debug");
+                if (kv_index_count > 0) check_device(memcpy_d2h(kv_indices.data(), d_kv_indices,
+                                                                kv_indices.size() * sizeof(int)), "copy kv indices debug");
                 std::cout << "CPP layer=" << li << ".kv_indices count=" << kv_indices.size();
                 for (int idx : kv_indices) std::cout << ' ' << idx;
                 std::cout << "\n";
             }
         }
 
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync route block");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync route block");
         route_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         if (!run_single_token_attention_smoke(
@@ -4694,16 +4732,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             auto reduce_t = Clock::now();
             all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch, profile_reduce_detail ? &attn_reduce_detail : nullptr);
             if (profile_attn) {
-                check_cuda(cudaDeviceSynchronize(), "sync attn reduce");
+                check_device(device_synchronize(), "sync attn reduce");
                 attn_profile.reduce_ms += elapsed_ms(reduce_t, Clock::now());
             }
         }
 #endif
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync attn");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync attn");
         attn_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         if (debug_forward) {
-            check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out debug");
+            check_device(memcpy_d2h(host_x.data(), d_attn_out,
+                                    static_cast<size_t>(dim) * sizeof(float)), "copy attn out debug");
             print_summary("layer=" + std::to_string(li) + ".attn_out", host_x);
         }
         if (!hc_post_float_cuda(d_attn_out, d_h4, d_hc_post, d_hc_comb, d_h4_next, dim)) throw std::runtime_error("hc attn post launch failed");
@@ -4712,19 +4751,19 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         post_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         if (debug_forward) {
-            check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy attn post debug");
+            check_device(memcpy_d2h(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "copy attn post debug");
             print_summary("layer=" + std::to_string(li) + ".attn_post", h4);
         }
         if (!hc_pre_float_cuda(d_h4, hc_cache.ffn_fn, hc_cache.ffn_scale, hc_cache.ffn_base, d_resid1, d_hc_post, d_hc_comb, dim)) throw std::runtime_error("hc ffn pre launch failed");
         if (debug_forward) {
-            check_cuda(cudaMemcpy(host_x.data(), d_resid1, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy ffn hc pre debug");
+            check_device(memcpy_d2h(host_x.data(), d_resid1, static_cast<size_t>(dim) * sizeof(float)), "copy ffn hc pre debug");
             print_summary("layer=" + std::to_string(li) + ".ffn_hc_pre", host_x);
         }
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, attn_cache.ffn_norm, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
         const int route_count = static_cast<int>(std::min<uint64_t>(config.n_activated_experts, config.n_routed_experts));
         std::vector<RoutedExpert> routed;
         std::vector<int64_t> selected_route_ids;
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync before gate");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync before gate");
         route_stage_t = Clock::now();
         DeviceGateCache& gate = ctx.gate_device_cache(li);
         if (static_cast<uint64_t>(li) < config.n_hash_layers && gate.tid2eid != nullptr) {
@@ -4735,12 +4774,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         double route_gate_kernel_ms = 0.0;
         double route_d2h_ms = 0.0;
         if (profile_decode_sync) {
-            check_cuda(cudaDeviceSynchronize(), "sync route gate kernel");
+            check_device(device_synchronize(), "sync route gate kernel");
             route_gate_kernel_ms = elapsed_ms(route_stage_t, Clock::now());
         }
         auto d2h_t0 = Clock::now();
         selected_route_ids.resize(route_count);
-        check_cuda(cudaMemcpy(selected_route_ids.data(), d_route_indices, selected_route_ids.size() * sizeof(int64_t), cudaMemcpyDeviceToHost), "copy gate route ids");
+        check_device(memcpy_d2h(selected_route_ids.data(), d_route_indices,
+                                selected_route_ids.size() * sizeof(int64_t)), "copy gate route ids");
         if (profile_decode_sync) {
             route_d2h_ms = elapsed_ms(d2h_t0, Clock::now());
         }
@@ -4749,7 +4789,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         for (int64_t route_id : selected_route_ids) routed.push_back(RoutedExpert{static_cast<int>(route_id), 0.0f});
         route_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-        check_cuda(cudaMemset(d_moe, 0, static_cast<size_t>(dim) * sizeof(float)), "zero moe");
+        check_device(device_memset(d_moe, 0, static_cast<size_t>(dim) * sizeof(float)), "zero moe");
         moe_stage_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
@@ -4783,7 +4823,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             sample.w3_bytes = active_w3.front().w->nbytes;
             sample.s3_bytes = active_w3.front().s->nbytes;
             active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, use_sparse_arena ? sparse_slots_per_layer : experts_per_rank, sample, use_sparse_arena);
-            if (moe_stage_event_recorded) check_cuda(cudaStreamWaitEvent(moe_copy_stream, moe_stage_event, 0), "wait prior moe stage event");
+            if (moe_stage_event_recorded) check_device(stream_wait_event(moe_copy_stream, moe_stage_event), "wait prior moe stage event");
             std::vector<int64_t> route_indices_kernel = route_indices;
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
                 const int local = active_local_ids[ri];
@@ -4799,19 +4839,33 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 }
                 if (need_stage) {
                     HostFp4ExpertSlot& slot_h = ctx.host_fp4_slot(li, expert_start + local, active_w1[ri], active_w2[ri], active_w3[ri]);
-                    check_cuda(cudaMemcpyAsync(active_arena->w1 + static_cast<size_t>(slot) * active_arena->w1_bytes, slot_h.h_w1q, active_arena->w1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w1");
-                    check_cuda(cudaMemcpyAsync(active_arena->s1 + static_cast<size_t>(slot) * active_arena->s1_bytes, slot_h.h_w1s, active_arena->s1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s1");
-                    check_cuda(cudaMemcpyAsync(active_arena->w2 + static_cast<size_t>(slot) * active_arena->w2_bytes, slot_h.h_w2q, active_arena->w2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w2");
-                    check_cuda(cudaMemcpyAsync(active_arena->s2 + static_cast<size_t>(slot) * active_arena->s2_bytes, slot_h.h_w2s, active_arena->s2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s2");
-                    check_cuda(cudaMemcpyAsync(active_arena->w3 + static_cast<size_t>(slot) * active_arena->w3_bytes, slot_h.h_w3q, active_arena->w3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w3");
-                    check_cuda(cudaMemcpyAsync(active_arena->s3 + static_cast<size_t>(slot) * active_arena->s3_bytes, slot_h.h_w3s, active_arena->s3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s3");
+                    check_device(memcpy_h2d_async(active_arena->w1 + static_cast<size_t>(slot) * active_arena->w1_bytes,
+                                                  slot_h.h_w1q, active_arena->w1_bytes,
+                                                  moe_copy_stream), "stage active w1");
+                    check_device(memcpy_h2d_async(active_arena->s1 + static_cast<size_t>(slot) * active_arena->s1_bytes,
+                                                  slot_h.h_w1s, active_arena->s1_bytes,
+                                                  moe_copy_stream), "stage active s1");
+                    check_device(memcpy_h2d_async(active_arena->w2 + static_cast<size_t>(slot) * active_arena->w2_bytes,
+                                                  slot_h.h_w2q, active_arena->w2_bytes,
+                                                  moe_copy_stream), "stage active w2");
+                    check_device(memcpy_h2d_async(active_arena->s2 + static_cast<size_t>(slot) * active_arena->s2_bytes,
+                                                  slot_h.h_w2s, active_arena->s2_bytes,
+                                                  moe_copy_stream), "stage active s2");
+                    check_device(memcpy_h2d_async(active_arena->w3 + static_cast<size_t>(slot) * active_arena->w3_bytes,
+                                                  slot_h.h_w3q, active_arena->w3_bytes,
+                                                  moe_copy_stream), "stage active w3");
+                    check_device(memcpy_h2d_async(active_arena->s3 + static_cast<size_t>(slot) * active_arena->s3_bytes,
+                                                  slot_h.h_w3s, active_arena->s3_bytes,
+                                                  moe_copy_stream), "stage active s3");
                 }
             }
-            check_cuda(cudaMemcpyAsync(d_route_indices, route_indices_kernel.data(), route_indices_kernel.size() * sizeof(int64_t), cudaMemcpyHostToDevice, moe_copy_stream), "copy active route indices");
-            check_cuda(cudaEventRecord(moe_stage_event, moe_copy_stream), "record moe stage event");
+            check_device(memcpy_h2d_async(d_route_indices, route_indices_kernel.data(),
+                                          route_indices_kernel.size() * sizeof(int64_t),
+                                          moe_copy_stream), "copy active route indices");
+            check_device(event_record(moe_stage_event, moe_copy_stream), "record moe stage event");
             moe_stage_event_recorded = true;
         }
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync moe stage");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync moe stage");
         moe_stage_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         {
@@ -4822,11 +4876,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             if (!silu_mul_cuda(d_gate, d_up, d_hidden, shared_inter)) throw std::runtime_error("shared silu launch failed");
             if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, shared.w2, shared.s2, d_shared_out, dim, shared_inter)) throw std::runtime_error("shared w2 launch failed");
         }
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync shared moe");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync shared moe");
         shared_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         if (has_active_moe) {
-            check_cuda(cudaStreamWaitEvent(nullptr, moe_stage_event, 0), "wait active moe stage");
+            check_device(stream_wait_event(nullptr, moe_stage_event), "wait active moe stage");
             DeviceMoeDecodeWorkspace& moe_workspace = ctx.moe_decode_workspace(route_count, dim, inter);
             const int moe_n_local = use_sparse_arena ? active_arena->capacity : experts_per_rank;
             if (!moe_single_token_fp4_cuda_with_workspace(d_ffn_norm, d_route_indices, d_route_weights, active_arena->w1, active_arena->s1, active_arena->w2, active_arena->s2, active_arena->w3, active_arena->s3, d_resid2, route_count, expert_start, moe_n_local, dim, inter, static_cast<float>(config.swiglu_limit), moe_workspace.fp4)) {
@@ -4834,7 +4888,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             }
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");
         }
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync moe kernel");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync moe kernel");
         moe_kernel_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
 #ifdef DSV4_HAVE_NCCL
@@ -4843,7 +4897,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe, dim, bf16_reduce_scratch, profile_reduce_detail ? &moe_reduce_detail : nullptr);
         }
 #endif
-        if (profile_decode_sync) check_cuda(cudaDeviceSynchronize(), "sync moe reduce");
+        if (profile_decode_sync) check_device(device_synchronize(), "sync moe reduce");
         moe_reduce_ms += elapsed_ms(stage_t, Clock::now());
         moe_ms += moe_stage_ms + moe_kernel_ms + moe_reduce_ms;
         stage_t = Clock::now();
@@ -4851,7 +4905,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         shared_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
         if (debug_forward) {
-            check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe debug");
+            check_device(memcpy_d2h(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float)), "copy moe debug");
             print_summary("layer=" + std::to_string(li) + ".moe_out", host_x);
         }
         if (!hc_post_float_cuda(d_moe, d_h4, d_hc_post, d_hc_comb, d_h4_next, dim)) throw std::runtime_error("hc ffn post launch failed");
@@ -4947,7 +5001,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         total_shared_ms += shared_ms;
         total_post_ms += post_ms;
         if (debug_forward) {
-            check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy layer h4 debug");
+            check_device(memcpy_d2h(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "copy layer h4 debug");
             print_summary("layer=" + std::to_string(li), h4);
         }
     }
@@ -4991,7 +5045,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         std::cout << " shared_ms=" << total_shared_ms
                   << " post_ms=" << total_post_ms << "\n";
     }
-    check_cuda(cudaMemcpy(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost), "copy final hc h4");
+    check_device(memcpy_d2h(h4.data(), d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "copy final hc h4");
     if (debug_forward) print_summary("final_h", h4);
     host_x = hc_head_cpu(
         h4,
@@ -4999,13 +5053,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_scale)),
         reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_base)),
         dim);
-    check_cuda(cudaMemcpy(d_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc head");
+    check_device(memcpy_h2d(d_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float)), "copy hc head");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_resid1, dim, 1e-6f)) throw std::runtime_error("final norm launch failed");
     if (!bf16_matvec_cuda(d_resid1, d_head, d_logits, local_head_rows, dim)) throw std::runtime_error("head launch failed");
-    check_cuda(cudaDeviceSynchronize(), "sync kernels");
+    check_device(device_synchronize(), "sync kernels");
 
     std::vector<float> logits(local_head_rows);
-    check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy logits");
+    check_device(memcpy_d2h(logits.data(), d_logits, logits.size() * sizeof(float)), "copy logits");
     float checksum = 0.0f;
     int top_token = local_head_start;
     float top_logit = -INFINITY;
@@ -5024,67 +5078,67 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 
     if (dspark_capture_slot >= 0) {
         ctx.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
-        check_cuda(cudaMemcpy(ctx.dspark_hidden.data(), d_dspark_hidden,
-                              ctx.dspark_hidden.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                   "copy dspark hidden");
+        check_device(memcpy_d2h(ctx.dspark_hidden.data(), d_dspark_hidden,
+                                ctx.dspark_hidden.size() * sizeof(float)),
+                     "copy dspark hidden");
         ctx.dspark_hidden_positions = 1;
     } else {
         ctx.dspark_hidden.clear();
         ctx.dspark_hidden_positions = 0;
     }
 
-    cudaFree(d_embed);
-    cudaFree(d_w1);
-    cudaFree(d_s1);
-    cudaFree(d_w2);
-    cudaFree(d_s2);
-    cudaFree(d_w3);
-    cudaFree(d_s3);
-    cudaFree(d_head);
-    cudaFree(d_final_norm_gamma);
-    cudaFree(d_x);
-    cudaFree(d_h4);
-    cudaFree(d_h4_next);
-    cudaFree(d_h4_bf16);
-    cudaFree(d_hc_post);
-    cudaFree(d_hc_comb);
-    cudaFree(d_attn_norm);
-    cudaFree(d_q_a);
-    cudaFree(d_q_norm);
-    cudaFree(d_q);
-    cudaFree(d_kv_a);
-    cudaFree(d_kv_norm);
-    cudaFree(d_attn_value);
-    cudaFree(d_attn_mid);
-    cudaFree(d_wo_a_x_q);
-    cudaFree(d_wo_a_x_scale);
-    cudaFree(d_attn_out);
-    cudaFree(d_compressor_input_bf16);
-    cudaFree(d_compressor_input_rounded);
-    cudaFree(d_compressor_kv);
-    cudaFree(d_compressor_score);
-    cudaFree(d_indexer_comp_kv);
-    cudaFree(d_indexer_comp_score);
-    cudaFree(d_index_q);
-    cudaFree(d_indexer_kv);
-    cudaFree(d_index_weight_proj);
-    cudaFree(d_index_scores);
-    cudaFree(d_kv_indices);
-    cudaFree(d_resid1);
-    cudaFree(d_ffn_norm);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden);
-    cudaFree(d_moe);
-    cudaFree(d_resid2);
-    cudaFree(d_shared_out);
-    cudaFree(d_route_indices);
-    cudaFree(d_route_weights);
-    cudaFree(d_logits);
-    cudaFree(d_dspark_hidden);
+    device_free(d_embed);
+    device_free(d_w1);
+    device_free(d_s1);
+    device_free(d_w2);
+    device_free(d_s2);
+    device_free(d_w3);
+    device_free(d_s3);
+    device_free(d_head);
+    device_free(d_final_norm_gamma);
+    device_free(d_x);
+    device_free(d_h4);
+    device_free(d_h4_next);
+    device_free(d_h4_bf16);
+    device_free(d_hc_post);
+    device_free(d_hc_comb);
+    device_free(d_attn_norm);
+    device_free(d_q_a);
+    device_free(d_q_norm);
+    device_free(d_q);
+    device_free(d_kv_a);
+    device_free(d_kv_norm);
+    device_free(d_attn_value);
+    device_free(d_attn_mid);
+    device_free(d_wo_a_x_q);
+    device_free(d_wo_a_x_scale);
+    device_free(d_attn_out);
+    device_free(d_compressor_input_bf16);
+    device_free(d_compressor_input_rounded);
+    device_free(d_compressor_kv);
+    device_free(d_compressor_score);
+    device_free(d_indexer_comp_kv);
+    device_free(d_indexer_comp_score);
+    device_free(d_index_q);
+    device_free(d_indexer_kv);
+    device_free(d_index_weight_proj);
+    device_free(d_index_scores);
+    device_free(d_kv_indices);
+    device_free(d_resid1);
+    device_free(d_ffn_norm);
+    device_free(d_gate);
+    device_free(d_up);
+    device_free(d_hidden);
+    device_free(d_moe);
+    device_free(d_resid2);
+    device_free(d_shared_out);
+    device_free(d_route_indices);
+    device_free(d_route_weights);
+    device_free(d_logits);
+    device_free(d_dspark_hidden);
 
-    cudaEventDestroy(moe_stage_event);
-    cudaStreamDestroy(moe_copy_stream);
+    event_destroy(moe_stage_event);
+    stream_destroy(moe_copy_stream);
 
     return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
@@ -5206,8 +5260,8 @@ std::vector<float> f16_to_f32_host(const uint16_t* src, size_t n) {
 
 float device_vector_rms(const float* d_x, int n) {
     std::vector<float> h(n);
-    check_cuda(cudaMemcpy(h.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost),
-               "device_vector_rms memcpy");
+    check_device(memcpy_d2h(h.data(), d_x, n * sizeof(float)),
+                 "device_vector_rms memcpy");
     double s = 0.0;
     for (float v : h) s += static_cast<double>(v) * static_cast<double>(v);
     return n > 0 ? static_cast<float>(std::sqrt(s / n)) : 0.0f;
@@ -5284,8 +5338,8 @@ struct GgufKvSwapLayerState {
         kv_dim = kv_dim_in;
         window = window_in;
         const size_t bytes = static_cast<size_t>(compressed_cap) * static_cast<size_t>(kv_dim) * sizeof(float);
-        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&h_compressed_kv), bytes),
-                   "cudaMallocHost GGUF KV swap compressed cache");
+        check_device(host_alloc_pinned_into(h_compressed_kv, bytes),
+                     "host_alloc_pinned GGUF KV swap compressed cache");
         host_ready.assign(static_cast<size_t>(compressed_cap), 0);
         gpu_slot_logical.assign(static_cast<size_t>(gpu_chunks), -1);
         slot_by_logical.clear();
@@ -5294,7 +5348,7 @@ struct GgufKvSwapLayerState {
     }
 
     void release() {
-        if (h_compressed_kv != nullptr) cudaFreeHost(h_compressed_kv);
+        if (h_compressed_kv != nullptr) host_free_pinned(h_compressed_kv);
         h_compressed_kv = nullptr;
         enabled = false;
         compressed_cap = gpu_chunks = kv_dim = window = 0;
@@ -5353,8 +5407,8 @@ void gguf_kv_swap_store_chunk(GgufKvSwapLayerState* st,
     if (logical < 0 || logical >= st->compressed_cap) return;
     const size_t bytes = static_cast<size_t>(st->kv_dim) * sizeof(float);
     float* h_dst = st->h_compressed_kv + static_cast<size_t>(logical) * st->kv_dim;
-    check_cuda(cudaMemcpy(h_dst, d_slot, bytes, cudaMemcpyDeviceToHost),
-               "GGUF KV swap store compressed chunk");
+    check_device(memcpy_d2h(h_dst, d_slot, bytes),
+                 "GGUF KV swap store compressed chunk");
     st->host_ready[static_cast<size_t>(logical)] = 1;
     st->d2h_bytes += bytes;
     ++st->swap_outs;
@@ -5365,8 +5419,8 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
                               int* d_kv_indices,
                               int window_len,
                               int extra_count,
-                              cudaStream_t copy_stream,
-                              cudaEvent_t stage_event,
+                              void* copy_stream,
+                              void* stage_event,
                               bool async_h2d) {
     if (st == nullptr || !st->enabled || extra_count <= 0) return;
     if (extra_count > st->gpu_chunks) {
@@ -5376,10 +5430,9 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
         throw std::runtime_error("GGUF KV swap async H2D requested without copy stream/event");
     }
     std::vector<int> h_indices(static_cast<size_t>(extra_count));
-    check_cuda(cudaMemcpy(h_indices.data(), d_kv_indices + window_len,
-                          static_cast<size_t>(extra_count) * sizeof(int),
-                          cudaMemcpyDeviceToHost),
-               "GGUF KV swap copy selected indices");
+    check_device(memcpy_d2h(h_indices.data(), d_kv_indices + window_len,
+                            static_cast<size_t>(extra_count) * sizeof(int)),
+                 "GGUF KV swap copy selected indices");
     const size_t bytes = static_cast<size_t>(st->kv_dim) * sizeof(float);
     bool queued_async_work = false;
     for (int i = 0; i < extra_count; ++i) {
@@ -5401,12 +5454,12 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
             const float* h_src = st->h_compressed_kv + static_cast<size_t>(logical) * st->kv_dim;
             float* d_dst = d_kv_cache + static_cast<size_t>(st->window + physical) * st->kv_dim;
             if (async_h2d) {
-                check_cuda(cudaMemcpyAsync(d_dst, h_src, bytes, cudaMemcpyHostToDevice, copy_stream),
-                           "GGUF KV swap async load compressed chunk");
+                check_device(memcpy_h2d_async(d_dst, h_src, bytes, copy_stream),
+                             "GGUF KV swap async load compressed chunk");
                 queued_async_work = true;
             } else {
-                check_cuda(cudaMemcpy(d_dst, h_src, bytes, cudaMemcpyHostToDevice),
-                           "GGUF KV swap load compressed chunk");
+                check_device(memcpy_h2d(d_dst, h_src, bytes),
+                             "GGUF KV swap load compressed chunk");
             }
             st->h2d_bytes += bytes;
         }
@@ -5414,22 +5467,20 @@ void gguf_kv_swap_in_selected(GgufKvSwapLayerState* st,
     }
     if (async_h2d) {
         if (queued_async_work) {
-            check_cuda(cudaEventRecord(stage_event, copy_stream),
-                       "record GGUF KV swap stage event");
+            check_device(event_record(stage_event, copy_stream),
+                         "record GGUF KV swap stage event");
         }
-        check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
-                              static_cast<size_t>(extra_count) * sizeof(int),
-                              cudaMemcpyHostToDevice),
-                   "GGUF KV swap rewrite selected indices");
+        check_device(memcpy_h2d(d_kv_indices + window_len, h_indices.data(),
+                                static_cast<size_t>(extra_count) * sizeof(int)),
+                     "GGUF KV swap rewrite selected indices");
         if (queued_async_work) {
-            check_cuda(cudaStreamWaitEvent(nullptr, stage_event, 0),
-                       "default stream wait GGUF KV swap stage event");
+            check_device(stream_wait_event(nullptr, stage_event),
+                         "default stream wait GGUF KV swap stage event");
         }
     } else {
-        check_cuda(cudaMemcpy(d_kv_indices + window_len, h_indices.data(),
-                              static_cast<size_t>(extra_count) * sizeof(int),
-                              cudaMemcpyHostToDevice),
-                   "GGUF KV swap rewrite selected indices");
+        check_device(memcpy_h2d(d_kv_indices + window_len, h_indices.data(),
+                                static_cast<size_t>(extra_count) * sizeof(int)),
+                     "GGUF KV swap rewrite selected indices");
     }
 }
 
@@ -5485,8 +5536,8 @@ struct GgufLayerDeviceWeights {
     GgufSparseLayerState* sparse_state = nullptr;
     const FlashMemoryRuntimeState* fm_runtime = nullptr;
     GgufKvSwapLayerState* kv_swap = nullptr;
-    cudaStream_t kv_swap_stream = nullptr;
-    cudaEvent_t kv_swap_stage_event = nullptr;
+    void* kv_swap_stream = nullptr;
+    void* kv_swap_stage_event = nullptr;
     bool kv_swap_async_h2d = false;
     int compress_ratio = 0;
     int sparse_window_size = 0;
@@ -5604,8 +5655,7 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                w.d_hc_attn_base, s.d_x, s.d_hc_post, s.d_hc_comb, d.dim))
             throw std::runtime_error("gguf hc attn pre failed");
     } else {
-        check_cuda(cudaMemcpy(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float),
-                              cudaMemcpyDeviceToDevice), "save x_pre_attn");
+        check_device(memcpy_d2d(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float)), "save x_pre_attn");
     }
     if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_attn_gamma, s.d_x_normed, d.dim, 1e-6f))
         throw std::runtime_error("attn_norm failed");
@@ -5750,9 +5800,8 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
             if (position < 0 || s.cache_capacity <= window)
                 throw std::runtime_error("invalid GGUF sparse KV cache capacity");
             const int write_pos = position % window;
-            check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(write_pos) * d.kv_dim,
-                                  s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
-                                  cudaMemcpyDeviceToDevice), "write sparse kv to cache");
+            check_device(memcpy_d2d(s.d_kv_cache + static_cast<size_t>(write_pos) * d.kv_dim, s.d_kv,
+                                    static_cast<size_t>(d.kv_dim) * sizeof(float)), "write sparse kv to cache");
             const int window_len = std::min(position + 1, window);
             const int window_start = std::max(0, position - window_len + 1);
             if (!build_decode_kv_indices_cuda(s.d_kv_indices, window_start, window_len,
@@ -5829,9 +5878,8 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                 throw std::runtime_error("position out of KV cache capacity");
             // Write current step's MLA latent K/V into the per-layer cache at slot
             // `position`, then run cached attention over [0..position] + attn_sink.
-            check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(position) * d.kv_dim,
-                                  s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
-                                  cudaMemcpyDeviceToDevice), "write kv to cache");
+            check_device(memcpy_d2d(s.d_kv_cache + static_cast<size_t>(position) * d.kv_dim, s.d_kv,
+                                    static_cast<size_t>(d.kv_dim) * sizeof(float)), "write kv to cache");
             if (s.d_kv_indices != nullptr && s.kv_index_count > 0) {
                 if (!indexed_cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, s.d_kv_indices,
                                                                 w.d_attn_sink, s.d_attn_value,
@@ -5895,8 +5943,7 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
             throw std::runtime_error("attn residual add failed");
 
         // ===== FFN: norm + shared expert + gate =====
-        check_cuda(cudaMemcpy(s.d_x_pre_ffn, s.d_x, d.dim * sizeof(float),
-                              cudaMemcpyDeviceToDevice), "save x_pre_ffn");
+        check_device(memcpy_d2d(s.d_x_pre_ffn, s.d_x, d.dim * sizeof(float)), "save x_pre_ffn");
         if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_ffn_gamma, s.d_x_normed_ffn, d.dim, 1e-6f))
             throw std::runtime_error("ffn_norm failed");
     }
@@ -5943,7 +5990,7 @@ void gguf_layer_forward_moe(const GgufLayerDeviceWeights& w,
                             const GgufReduceContext* reduce_ctx) {
     const int routes = d.topk;
 
-    check_cuda(cudaMemset(s.d_moe_out, 0, d.dim * sizeof(float)), "zero moe_out");
+    check_device(device_memset(s.d_moe_out, 0, d.dim * sizeof(float)), "zero moe_out");
     const bool q2_recipe =
         w.routed_w1_dtype == DType::IQ2_XXS &&
         w.routed_w3_dtype == DType::IQ2_XXS &&
@@ -6109,10 +6156,9 @@ GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_embed_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_embed_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16_row_to_float_cuda failed");
     }
@@ -6120,28 +6166,27 @@ GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path
     // 2. Convert attn_norm F32 gamma to BF16 (host-side) and upload.
     auto bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
     uint16_t* d_attn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
-    check_cuda(cudaMemcpy(d_attn_gamma, bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy attn_norm gamma");
+    check_device(device_malloc_into(d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_device(memcpy_h2d(d_attn_gamma, bf16.data(), dim * sizeof(uint16_t)), "copy attn_norm gamma");
 
     // 3. RMSNorm.
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("rmsnorm_bf16_gamma_cuda failed");
     }
 
     // 4. Upload wq_a Q8_0 blocks and run matvec.
     uint8_t* d_wq_a = nullptr;
-    check_cuda(cudaMalloc(&d_wq_a, wq_a.nbytes), "alloc d_wq_a");
-    check_cuda(cudaMemcpy(d_wq_a, wq_a.data, wq_a.nbytes, cudaMemcpyHostToDevice),
-               "copy wq_a");
+    check_device(device_malloc_into(d_wq_a, wq_a.nbytes), "alloc d_wq_a");
+    check_device(memcpy_h2d(d_wq_a, wq_a.data, wq_a.nbytes),
+                 "copy wq_a");
     float* d_q_a = nullptr;
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
     if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
         throw std::runtime_error("q8_0_matvec_cuda failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after wq_a");
+    check_device(device_synchronize(), "sync after wq_a");
 
     // 5. Collect diagnostics.
     GgufAttnNormWqaResult r;
@@ -6151,16 +6196,15 @@ GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path
     r.normed_rms = device_vector_rms(d_x_normed, dim);
     r.q_a_rms = device_vector_rms(d_q_a, q_a_dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_q_a, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy q_a first");
+    check_device(memcpy_d2h(first.data(), d_q_a, 4 * sizeof(float)), "copy q_a first");
     for (int i = 0; i < 4; ++i) r.q_a_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_wq_a);
-    cudaFree(d_q_a);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_attn_gamma);
+    device_free(d_x_normed);
+    device_free(d_wq_a);
+    device_free(d_q_a);
     return r;
 }
 
@@ -6212,10 +6256,9 @@ GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16_row_to_float_cuda failed");
     }
@@ -6223,21 +6266,20 @@ GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
     // ----- attn_norm gamma -----
     auto attn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
     uint16_t* d_attn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
-    check_cuda(cudaMemcpy(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy attn_gamma");
+    check_device(device_malloc_into(d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_device(memcpy_h2d(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t)), "copy attn_gamma");
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("rmsnorm attn failed");
     }
 
     // ----- wq_a -----
     uint8_t* d_wq_a = nullptr;
-    check_cuda(cudaMalloc(&d_wq_a, wq_a.nbytes), "alloc d_wq_a");
-    check_cuda(cudaMemcpy(d_wq_a, wq_a.data, wq_a.nbytes, cudaMemcpyHostToDevice), "copy wq_a");
+    check_device(device_malloc_into(d_wq_a, wq_a.nbytes), "alloc d_wq_a");
+    check_device(memcpy_h2d(d_wq_a, wq_a.data, wq_a.nbytes), "copy wq_a");
     float* d_q_a = nullptr;
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
     if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
         throw std::runtime_error("q8_0 wq_a failed");
     }
@@ -6245,25 +6287,24 @@ GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
     // ----- q_norm gamma -----
     auto q_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(q_norm.data), q_a_dim);
     uint16_t* d_q_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_q_gamma, q_a_dim * sizeof(uint16_t)), "alloc d_q_gamma");
-    check_cuda(cudaMemcpy(d_q_gamma, q_bf16.data(), q_a_dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy q_gamma");
+    check_device(device_malloc_into(d_q_gamma, q_a_dim * sizeof(uint16_t)), "alloc d_q_gamma");
+    check_device(memcpy_h2d(d_q_gamma, q_bf16.data(), q_a_dim * sizeof(uint16_t)), "copy q_gamma");
     float* d_q_normed = nullptr;
-    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_device(device_malloc_into(d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_normed, q_a_dim, 1e-6f)) {
         throw std::runtime_error("rmsnorm q failed");
     }
 
     // ----- wq_b -> q[heads*head_dim] -----
     uint8_t* d_wq_b = nullptr;
-    check_cuda(cudaMalloc(&d_wq_b, wq_b.nbytes), "alloc d_wq_b");
-    check_cuda(cudaMemcpy(d_wq_b, wq_b.data, wq_b.nbytes, cudaMemcpyHostToDevice), "copy wq_b");
+    check_device(device_malloc_into(d_wq_b, wq_b.nbytes), "alloc d_wq_b");
+    check_device(memcpy_h2d(d_wq_b, wq_b.data, wq_b.nbytes), "copy wq_b");
     float* d_q = nullptr;
-    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
+    check_device(device_malloc_into(d_q, q_full * sizeof(float)), "alloc d_q");
     if (!q8_0_matvec_cuda(d_q_normed, d_wq_b, d_q, q_full, q_a_dim)) {
         throw std::runtime_error("q8_0 wq_b failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after wq_b");
+    check_device(device_synchronize(), "sync after wq_b");
 
     GgufAttnQPathResult r;
     r.dim = dim;
@@ -6281,24 +6322,24 @@ GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
                                 false, 1e-6f)) {
         throw std::runtime_error("head_rmsnorm_rope failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after head rope");
+    check_device(device_synchronize(), "sync after head rope");
 
     r.q_post_rope_rms = device_vector_rms(d_q, q_full);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_q, 4 * sizeof(float), cudaMemcpyDeviceToHost),
-               "copy q first");
+    check_device(memcpy_d2h(first.data(), d_q, 4 * sizeof(float)),
+                 "copy q first");
     for (int i = 0; i < 4; ++i) r.q_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_wq_a);
-    cudaFree(d_q_a);
-    cudaFree(d_q_gamma);
-    cudaFree(d_q_normed);
-    cudaFree(d_wq_b);
-    cudaFree(d_q);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_attn_gamma);
+    device_free(d_x_normed);
+    device_free(d_wq_a);
+    device_free(d_q_a);
+    device_free(d_q_gamma);
+    device_free(d_q_normed);
+    device_free(d_wq_b);
+    device_free(d_q);
     return r;
 }
 
@@ -6344,10 +6385,9 @@ GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16_row_to_float_cuda failed");
     }
@@ -6355,21 +6395,20 @@ GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
     // ----- attn_norm gamma -----
     auto attn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
     uint16_t* d_attn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
-    check_cuda(cudaMemcpy(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy attn_gamma");
+    check_device(device_malloc_into(d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_device(memcpy_h2d(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t)), "copy attn_gamma");
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("rmsnorm attn failed");
     }
 
     // ----- wkv: dim -> kv_dim -----
     uint8_t* d_wkv = nullptr;
-    check_cuda(cudaMalloc(&d_wkv, wkv.nbytes), "alloc d_wkv");
-    check_cuda(cudaMemcpy(d_wkv, wkv.data, wkv.nbytes, cudaMemcpyHostToDevice), "copy wkv");
+    check_device(device_malloc_into(d_wkv, wkv.nbytes), "alloc d_wkv");
+    check_device(memcpy_h2d(d_wkv, wkv.data, wkv.nbytes), "copy wkv");
     float* d_kv_a = nullptr;
-    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_device(device_malloc_into(d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
     if (!q8_0_matvec_cuda(d_x_normed, d_wkv, d_kv_a, kv_dim, dim)) {
         throw std::runtime_error("q8_0 wkv failed");
     }
@@ -6377,15 +6416,14 @@ GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
     // ----- kv_norm RMSNorm (full kv_dim gamma) -----
     auto kv_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(kv_norm.data), kv_dim);
     uint16_t* d_kv_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_kv_gamma, kv_dim * sizeof(uint16_t)), "alloc d_kv_gamma");
-    check_cuda(cudaMemcpy(d_kv_gamma, kv_bf16.data(), kv_dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy kv_gamma");
+    check_device(device_malloc_into(d_kv_gamma, kv_dim * sizeof(uint16_t)), "alloc d_kv_gamma");
+    check_device(memcpy_h2d(d_kv_gamma, kv_bf16.data(), kv_dim * sizeof(uint16_t)), "copy kv_gamma");
     float* d_kv = nullptr;
-    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_device(device_malloc_into(d_kv, kv_dim * sizeof(float)), "alloc d_kv");
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv, kv_dim, 1e-6f)) {
         throw std::runtime_error("rmsnorm kv failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after kv rmsnorm");
+    check_device(device_synchronize(), "sync after kv rmsnorm");
 
     GgufAttnKvPathResult r;
     r.dim = dim;
@@ -6402,22 +6440,22 @@ GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
                                 false, 0.0f)) {
         throw std::runtime_error("head_rmsnorm_rope kv failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after kv rope");
+    check_device(device_synchronize(), "sync after kv rope");
 
     r.kv_post_rope_rms = device_vector_rms(d_kv, kv_dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_kv, 4 * sizeof(float), cudaMemcpyDeviceToHost),
-               "copy kv first");
+    check_device(memcpy_d2h(first.data(), d_kv, 4 * sizeof(float)),
+                 "copy kv first");
     for (int i = 0; i < 4; ++i) r.kv_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_wkv);
-    cudaFree(d_kv_a);
-    cudaFree(d_kv_gamma);
-    cudaFree(d_kv);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_attn_gamma);
+    device_free(d_x_normed);
+    device_free(d_wkv);
+    device_free(d_kv_a);
+    device_free(d_kv_gamma);
+    device_free(d_kv);
     return r;
 }
 
@@ -6492,22 +6530,22 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
     // ----- upload all weights / norms -----
     auto upload_u8 = [](const void* src, size_t bytes) {
         uint8_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, bytes), "alloc");
-        check_cuda(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice), "copy");
+        check_device(device_malloc_into(d, bytes), "alloc");
+        check_device(memcpy_h2d(d, src, bytes), "copy");
         return d;
     };
     auto upload_f32 = [](const void* src, size_t n) {
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32");
-        check_cuda(cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice), "copy f32");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32");
+        check_device(memcpy_h2d(d, src, n * sizeof(float)), "copy f32");
         return d;
     };
     auto upload_bf16_from_f32 = [&](const void* src, size_t n) {
         auto bf = f32_to_bf16_host(reinterpret_cast<const float*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice),
-                   "copy bf16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)),
+                     "copy bf16");
         return d;
     };
 
@@ -6515,9 +6553,8 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
         reinterpret_cast<const uint16_t*>(embed.data) +
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
 
     uint16_t* d_attn_gamma = upload_bf16_from_f32(attn_norm.data, dim);
     uint16_t* d_q_gamma = upload_bf16_from_f32(q_norm.data, q_a_dim);
@@ -6541,16 +6578,16 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
     float* d_attn_value = nullptr;
     float* d_attn_mid = nullptr;
     float* d_attn_out = nullptr;
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
-    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
-    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
-    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
-    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
-    check_cuda(cudaMalloc(&d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
-    check_cuda(cudaMalloc(&d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
-    check_cuda(cudaMalloc(&d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_device(device_malloc_into(d_q, q_full * sizeof(float)), "alloc d_q");
+    check_device(device_malloc_into(d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_device(device_malloc_into(d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_device(device_malloc_into(d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
+    check_device(device_malloc_into(d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
+    check_device(device_malloc_into(d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
 
     // ----- compute -----
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
@@ -6590,7 +6627,7 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
                                 false, 0.0f)) {
         throw std::runtime_error("kv head rope failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after q/kv");
+    check_device(device_synchronize(), "sync after q/kv");
 
     GgufAttnFullResult r;
     r.dim = dim;
@@ -6611,7 +6648,7 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
                                             heads, head_dim, scale)) {
         throw std::runtime_error("single_token_sparse_attention failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after attn");
+    check_device(device_synchronize(), "sync after attn");
     r.attn_value_rms = device_vector_rms(d_attn_value, q_full);
 
     // Inverse RoPE on the rope-tail of each head (V was rope-rotated as part of
@@ -6623,7 +6660,7 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
                                 /*inverse=*/true, 0.0f)) {
         throw std::runtime_error("inverse rope failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after inverse rope");
+    check_device(device_synchronize(), "sync after inverse rope");
     r.attn_value_post_inv_rms = device_vector_rms(d_attn_value, q_full);
 
     // Grouped wo_a: per-group matvec [group_in_dim] -> [o_lora_rank].
@@ -6646,35 +6683,34 @@ GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
     if (!q8_0_matvec_cuda(d_attn_mid, d_wo_b, d_attn_out, dim, attn_mid)) {
         throw std::runtime_error("wo_b failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after wo_b");
+    check_device(device_synchronize(), "sync after wo_b");
 
     r.attn_mid_rms = device_vector_rms(d_attn_mid, attn_mid);
     r.attn_out_rms = device_vector_rms(d_attn_out, dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_attn_out, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy attn_out first");
+    check_device(memcpy_d2h(first.data(), d_attn_out, 4 * sizeof(float)), "copy attn_out first");
     for (int i = 0; i < 4; ++i) r.attn_out_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_q_gamma);
-    cudaFree(d_kv_gamma);
-    cudaFree(d_wq_a);
-    cudaFree(d_wq_b);
-    cudaFree(d_wkv);
-    cudaFree(d_wo_a);
-    cudaFree(d_wo_b);
-    cudaFree(d_attn_sink);
-    cudaFree(d_x);
-    cudaFree(d_x_normed);
-    cudaFree(d_q_a);
-    cudaFree(d_q_normed);
-    cudaFree(d_q);
-    cudaFree(d_kv_a);
-    cudaFree(d_kv);
-    cudaFree(d_attn_value);
-    cudaFree(d_attn_mid);
-    cudaFree(d_attn_out);
+    device_free(d_row_f16);
+    device_free(d_attn_gamma);
+    device_free(d_q_gamma);
+    device_free(d_kv_gamma);
+    device_free(d_wq_a);
+    device_free(d_wq_b);
+    device_free(d_wkv);
+    device_free(d_wo_a);
+    device_free(d_wo_b);
+    device_free(d_attn_sink);
+    device_free(d_x);
+    device_free(d_x_normed);
+    device_free(d_q_a);
+    device_free(d_q_normed);
+    device_free(d_q);
+    device_free(d_kv_a);
+    device_free(d_kv);
+    device_free(d_attn_value);
+    device_free(d_attn_mid);
+    device_free(d_attn_out);
     return r;
 }
 
@@ -6721,10 +6757,9 @@ GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16_row_to_float_cuda failed");
     }
@@ -6732,11 +6767,10 @@ GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path
     // ----- ffn_norm -----
     auto ffn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(ffn_norm.data), dim);
     uint16_t* d_ffn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
-    check_cuda(cudaMemcpy(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy ffn_gamma");
+    check_device(device_malloc_into(d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
+    check_device(memcpy_h2d(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t)), "copy ffn_gamma");
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("ffn_norm failed");
     }
@@ -6745,21 +6779,21 @@ GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path
     uint8_t* d_w1 = nullptr;
     uint8_t* d_w2 = nullptr;
     uint8_t* d_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_w1, w1.nbytes), "alloc d_w1");
-    check_cuda(cudaMalloc(&d_w2, w2.nbytes), "alloc d_w2");
-    check_cuda(cudaMalloc(&d_w3, w3.nbytes), "alloc d_w3");
-    check_cuda(cudaMemcpy(d_w1, w1.data, w1.nbytes, cudaMemcpyHostToDevice), "copy w1");
-    check_cuda(cudaMemcpy(d_w2, w2.data, w2.nbytes, cudaMemcpyHostToDevice), "copy w2");
-    check_cuda(cudaMemcpy(d_w3, w3.data, w3.nbytes, cudaMemcpyHostToDevice), "copy w3");
+    check_device(device_malloc_into(d_w1, w1.nbytes), "alloc d_w1");
+    check_device(device_malloc_into(d_w2, w2.nbytes), "alloc d_w2");
+    check_device(device_malloc_into(d_w3, w3.nbytes), "alloc d_w3");
+    check_device(memcpy_h2d(d_w1, w1.data, w1.nbytes), "copy w1");
+    check_device(memcpy_h2d(d_w2, w2.data, w2.nbytes), "copy w2");
+    check_device(memcpy_h2d(d_w3, w3.data, w3.nbytes), "copy w3");
 
     float* d_gate = nullptr;
     float* d_up = nullptr;
     float* d_hidden = nullptr;
     float* d_shared_out = nullptr;
-    check_cuda(cudaMalloc(&d_gate, moe_inter * sizeof(float)), "alloc d_gate");
-    check_cuda(cudaMalloc(&d_up, moe_inter * sizeof(float)), "alloc d_up");
-    check_cuda(cudaMalloc(&d_hidden, moe_inter * sizeof(float)), "alloc d_hidden");
-    check_cuda(cudaMalloc(&d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
+    check_device(device_malloc_into(d_gate, moe_inter * sizeof(float)), "alloc d_gate");
+    check_device(device_malloc_into(d_up, moe_inter * sizeof(float)), "alloc d_up");
+    check_device(device_malloc_into(d_hidden, moe_inter * sizeof(float)), "alloc d_hidden");
+    check_device(device_malloc_into(d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
 
     if (!q8_0_matvec_cuda(d_x_normed, d_w1, d_gate, moe_inter, dim)) {
         throw std::runtime_error("shared w1 failed");
@@ -6773,7 +6807,7 @@ GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path
     if (!q8_0_matvec_cuda(d_hidden, d_w2, d_shared_out, dim, moe_inter)) {
         throw std::runtime_error("shared w2 failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after shared expert");
+    check_device(device_synchronize(), "sync after shared expert");
 
     GgufSharedExpertResult r;
     r.dim = dim;
@@ -6784,21 +6818,20 @@ GgufSharedExpertResult run_gguf_shared_expert_smoke(const std::string& ckpt_path
     r.hidden_rms = device_vector_rms(d_hidden, moe_inter);
     r.shared_out_rms = device_vector_rms(d_shared_out, dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_shared_out, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy shared_out first");
+    check_device(memcpy_d2h(first.data(), d_shared_out, 4 * sizeof(float)), "copy shared_out first");
     for (int i = 0; i < 4; ++i) r.shared_out_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_ffn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_w1);
-    cudaFree(d_w2);
-    cudaFree(d_w3);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden);
-    cudaFree(d_shared_out);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_ffn_gamma);
+    device_free(d_x_normed);
+    device_free(d_w1);
+    device_free(d_w2);
+    device_free(d_w3);
+    device_free(d_gate);
+    device_free(d_up);
+    device_free(d_hidden);
+    device_free(d_shared_out);
     return r;
 }
 
@@ -6850,21 +6883,19 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16 embed failed");
     }
 
     auto ffn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(ffn_norm.data), dim);
     uint16_t* d_ffn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
-    check_cuda(cudaMemcpy(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy ffn_gamma");
+    check_device(device_malloc_into(d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
+    check_device(memcpy_h2d(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t)), "copy ffn_gamma");
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("ffn_norm failed");
     }
@@ -6890,28 +6921,26 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
     float* d_hidden_scale = nullptr;
     float* d_y = nullptr;
 
-    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
-    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
-    check_cuda(cudaMalloc(&d_w1, w1.nbytes), "alloc d_w1");
-    check_cuda(cudaMalloc(&d_w2, w2.nbytes), "alloc d_w2");
-    check_cuda(cudaMalloc(&d_w3, w3.nbytes), "alloc d_w3");
-    check_cuda(cudaMalloc(&d_route_slots, sizeof(int64_t)), "alloc d_route_slots");
-    check_cuda(cudaMalloc(&d_route_weights, sizeof(float)), "alloc d_route_weights");
-    check_cuda(cudaMalloc(&d_gate, moe_inter * sizeof(float)), "alloc d_gate");
-    check_cuda(cudaMalloc(&d_up, moe_inter * sizeof(float)), "alloc d_up");
-    check_cuda(cudaMalloc(&d_hidden_q, moe_inter), "alloc d_hidden_q");
-    check_cuda(cudaMalloc(&d_hidden_scale, hidden_groups * sizeof(float)),
-               "alloc d_hidden_scale");
-    check_cuda(cudaMalloc(&d_y, dim * sizeof(float)), "alloc d_y");
+    check_device(device_malloc_into(d_x_q, dim), "alloc d_x_q");
+    check_device(device_malloc_into(d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_device(device_malloc_into(d_w1, w1.nbytes), "alloc d_w1");
+    check_device(device_malloc_into(d_w2, w2.nbytes), "alloc d_w2");
+    check_device(device_malloc_into(d_w3, w3.nbytes), "alloc d_w3");
+    check_device(device_malloc_into(d_route_slots, sizeof(int64_t)), "alloc d_route_slots");
+    check_device(device_malloc_into(d_route_weights, sizeof(float)), "alloc d_route_weights");
+    check_device(device_malloc_into(d_gate, moe_inter * sizeof(float)), "alloc d_gate");
+    check_device(device_malloc_into(d_up, moe_inter * sizeof(float)), "alloc d_up");
+    check_device(device_malloc_into(d_hidden_q, moe_inter), "alloc d_hidden_q");
+    check_device(device_malloc_into(d_hidden_scale, hidden_groups * sizeof(float)),
+                 "alloc d_hidden_scale");
+    check_device(device_malloc_into(d_y, dim * sizeof(float)), "alloc d_y");
 
-    check_cuda(cudaMemcpy(d_w1, w1.data, w1.nbytes, cudaMemcpyHostToDevice), "copy w1");
-    check_cuda(cudaMemcpy(d_w2, w2.data, w2.nbytes, cudaMemcpyHostToDevice), "copy w2");
-    check_cuda(cudaMemcpy(d_w3, w3.data, w3.nbytes, cudaMemcpyHostToDevice), "copy w3");
-    check_cuda(cudaMemcpy(d_route_slots, &h_route_slot, sizeof(int64_t),
-                          cudaMemcpyHostToDevice), "copy route_slots");
-    check_cuda(cudaMemcpy(d_route_weights, &h_route_weight, sizeof(float),
-                          cudaMemcpyHostToDevice), "copy route_weights");
-    check_cuda(cudaMemset(d_y, 0, dim * sizeof(float)), "zero d_y");
+    check_device(memcpy_h2d(d_w1, w1.data, w1.nbytes), "copy w1");
+    check_device(memcpy_h2d(d_w2, w2.data, w2.nbytes), "copy w2");
+    check_device(memcpy_h2d(d_w3, w3.data, w3.nbytes), "copy w3");
+    check_device(memcpy_h2d(d_route_slots, &h_route_slot, sizeof(int64_t)), "copy route_slots");
+    check_device(memcpy_h2d(d_route_weights, &h_route_weight, sizeof(float)), "copy route_weights");
+    check_device(device_memset(d_y, 0, dim * sizeof(float)), "zero d_y");
 
     if (!q2_quantize_x_q8_1_cuda(d_x_normed, d_x_q, d_x_scale, routes, dim)) {
         throw std::runtime_error("q2_quantize_x_q8_1 failed");
@@ -6933,7 +6962,7 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
                                     dim, moe_inter)) {
         throw std::runtime_error("q2 w2 q2k failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after routed expert");
+    check_device(device_synchronize(), "sync after routed expert");
 
     GgufRoutedExpertResult r;
     r.dim = dim;
@@ -6948,10 +6977,9 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
     {
         std::vector<int8_t> hq(moe_inter);
         std::vector<float> hs(hidden_groups);
-        check_cuda(cudaMemcpy(hq.data(), d_hidden_q, moe_inter, cudaMemcpyDeviceToHost),
-                   "copy hidden_q");
-        check_cuda(cudaMemcpy(hs.data(), d_hidden_scale, hidden_groups * sizeof(float),
-                              cudaMemcpyDeviceToHost), "copy hidden_scale");
+        check_device(memcpy_d2h(hq.data(), d_hidden_q, moe_inter),
+                     "copy hidden_q");
+        check_device(memcpy_d2h(hs.data(), d_hidden_scale, hidden_groups * sizeof(float)), "copy hidden_scale");
         double s = 0.0;
         for (int i = 0; i < moe_inter; ++i) {
             const float v = static_cast<float>(hq[i]) * hs[i / 16];
@@ -6961,26 +6989,25 @@ GgufRoutedExpertResult run_gguf_routed_expert_smoke(const std::string& ckpt_path
     }
     r.route_out_rms = device_vector_rms(d_y, dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_y, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy route_out first");
+    check_device(memcpy_d2h(first.data(), d_y, 4 * sizeof(float)), "copy route_out first");
     for (int i = 0; i < 4; ++i) r.route_out_first[i] = first[i];
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_ffn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_x_q);
-    cudaFree(d_x_scale);
-    cudaFree(d_w1);
-    cudaFree(d_w2);
-    cudaFree(d_w3);
-    cudaFree(d_route_slots);
-    cudaFree(d_route_weights);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden_q);
-    cudaFree(d_hidden_scale);
-    cudaFree(d_y);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_ffn_gamma);
+    device_free(d_x_normed);
+    device_free(d_x_q);
+    device_free(d_x_scale);
+    device_free(d_w1);
+    device_free(d_w2);
+    device_free(d_w3);
+    device_free(d_route_slots);
+    device_free(d_route_weights);
+    device_free(d_gate);
+    device_free(d_up);
+    device_free(d_hidden_q);
+    device_free(d_hidden_scale);
+    device_free(d_y);
     return r;
 }
 
@@ -7029,20 +7056,18 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
     float* d_x = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16 embed failed");
     }
     auto ffn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(ffn_norm.data), dim);
     uint16_t* d_ffn_gamma = nullptr;
-    check_cuda(cudaMalloc(&d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
-    check_cuda(cudaMemcpy(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy ffn_gamma");
+    check_device(device_malloc_into(d_ffn_gamma, dim * sizeof(uint16_t)), "alloc d_ffn_gamma");
+    check_device(memcpy_h2d(d_ffn_gamma, ffn_bf16.data(), dim * sizeof(uint16_t)), "copy ffn_gamma");
     float* d_x_normed = nullptr;
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed, dim, 1e-6f)) {
         throw std::runtime_error("ffn_norm failed");
     }
@@ -7069,9 +7094,9 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     uint8_t* d_w1 = nullptr;
     uint8_t* d_w2 = nullptr;
     uint8_t* d_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_w1, staged_w1_bytes), "alloc staged d_w1");
-    check_cuda(cudaMalloc(&d_w2, staged_w2_bytes), "alloc staged d_w2");
-    check_cuda(cudaMalloc(&d_w3, staged_w3_bytes), "alloc staged d_w3");
+    check_device(device_malloc_into(d_w1, staged_w1_bytes), "alloc staged d_w1");
+    check_device(device_malloc_into(d_w2, staged_w2_bytes), "alloc staged d_w2");
+    check_device(device_malloc_into(d_w3, staged_w3_bytes), "alloc staged d_w3");
     for (int k = 0; k < topk; ++k) {
         const int eid = h_expert_ids[k];
         auto wv1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
@@ -7083,12 +7108,9 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
         if (!wv1.found || !wv2.found || !wv3.found) {
             throw std::runtime_error("get_expert failed for active expert");
         }
-        check_cuda(cudaMemcpy(d_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                              cudaMemcpyHostToDevice), "stage w1");
-        check_cuda(cudaMemcpy(d_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                              cudaMemcpyHostToDevice), "stage w2");
-        check_cuda(cudaMemcpy(d_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                              cudaMemcpyHostToDevice), "stage w3");
+        check_device(memcpy_h2d(d_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes), "stage w1");
+        check_device(memcpy_h2d(d_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes), "stage w2");
+        check_device(memcpy_h2d(d_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes), "stage w3");
     }
 
     // ----- Routes / quant buffers -----
@@ -7104,28 +7126,26 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     int8_t* d_hidden_q = nullptr;
     float* d_hidden_scale = nullptr;
     float* d_y = nullptr;
-    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
-    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
-    check_cuda(cudaMalloc(&d_route_slots, routes * sizeof(int64_t)), "alloc slots");
-    check_cuda(cudaMalloc(&d_route_weights, routes * sizeof(float)), "alloc weights");
+    check_device(device_malloc_into(d_x_q, dim), "alloc d_x_q");
+    check_device(device_malloc_into(d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_device(device_malloc_into(d_route_slots, routes * sizeof(int64_t)), "alloc slots");
+    check_device(device_malloc_into(d_route_weights, routes * sizeof(float)), "alloc weights");
     // Per-route gate / up / hidden buffers (kernel addresses by route).
-    check_cuda(cudaMalloc(&d_gate, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
-               "alloc d_gate");
-    check_cuda(cudaMalloc(&d_up, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
-               "alloc d_up");
-    check_cuda(cudaMalloc(&d_hidden_q, static_cast<size_t>(routes) * moe_inter),
-               "alloc d_hidden_q");
-    check_cuda(cudaMalloc(&d_hidden_scale,
-                          static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
-               "alloc d_hidden_scale");
-    check_cuda(cudaMalloc(&d_y, dim * sizeof(float)), "alloc d_y");
-    check_cuda(cudaMemset(d_y, 0, dim * sizeof(float)), "zero d_y");
+    check_device(device_malloc_into(d_gate, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+                 "alloc d_gate");
+    check_device(device_malloc_into(d_up, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+                 "alloc d_up");
+    check_device(device_malloc_into(d_hidden_q, static_cast<size_t>(routes) * moe_inter),
+                 "alloc d_hidden_q");
+    check_device(device_malloc_into(d_hidden_scale, static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
+                 "alloc d_hidden_scale");
+    check_device(device_malloc_into(d_y, dim * sizeof(float)), "alloc d_y");
+    check_device(device_memset(d_y, 0, dim * sizeof(float)), "zero d_y");
 
     // Staged expert buffer holds K experts back-to-back; slots index 0..K-1.
     std::vector<int64_t> h_slots(routes);
     for (int k = 0; k < routes; ++k) h_slots[k] = k;
-    check_cuda(cudaMemcpy(d_route_slots, h_slots.data(), routes * sizeof(int64_t),
-                          cudaMemcpyHostToDevice), "copy slots");
+    check_device(memcpy_h2d(d_route_slots, h_slots.data(), routes * sizeof(int64_t)), "copy slots");
 
     // ----- Hash-gate route weights: gate W matvec → sqrt_softplus → gather →
     // normalize → ×route_scale. PyTorch reference at runtime/transformer.py:1682
@@ -7151,24 +7171,21 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     int64_t* d_tid2eid_i64 = nullptr;
     float* d_gate_scores_scratch = nullptr;
     int64_t* d_gate_indices = nullptr;
-    check_cuda(cudaMalloc(&d_gate_w_bf16, gate_w_bf16.size() * sizeof(uint16_t)),
-               "alloc d_gate_w_bf16");
-    check_cuda(cudaMemcpy(d_gate_w_bf16, gate_w_bf16.data(),
-                          gate_w_bf16.size() * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy gate_w_bf16");
+    check_device(device_malloc_into(d_gate_w_bf16, gate_w_bf16.size() * sizeof(uint16_t)),
+                 "alloc d_gate_w_bf16");
+    check_device(memcpy_h2d(d_gate_w_bf16, gate_w_bf16.data(), gate_w_bf16.size() * sizeof(uint16_t)), "copy gate_w_bf16");
     // Stage just the per-token tid2eid slice as int64[topk]; kernel will
     // index it with token=0, table_topk=topk so it reads positions [0..topk).
     std::vector<int64_t> h_tid2eid_slice(topk);
     for (int k = 0; k < topk; ++k) h_tid2eid_slice[k] = h_expert_ids[k];
-    check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)),
-               "alloc d_tid2eid_i64");
-    check_cuda(cudaMemcpy(d_tid2eid_i64, h_tid2eid_slice.data(),
-                          topk * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "copy d_tid2eid_i64");
-    check_cuda(cudaMalloc(&d_gate_scores_scratch, topk * sizeof(float)),
-               "alloc d_gate_scores_scratch");
-    check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)),
-               "alloc d_gate_indices");
+    check_device(device_malloc_into(d_tid2eid_i64, topk * sizeof(int64_t)),
+                 "alloc d_tid2eid_i64");
+    check_device(memcpy_h2d(d_tid2eid_i64, h_tid2eid_slice.data(), topk * sizeof(int64_t)),
+                 "copy d_tid2eid_i64");
+    check_device(device_malloc_into(d_gate_scores_scratch, topk * sizeof(float)),
+                 "alloc d_gate_scores_scratch");
+    check_device(device_malloc_into(d_gate_indices, topk * sizeof(int64_t)),
+                 "alloc d_gate_indices");
     const float route_scale = static_cast<float>(ctx.config.route_scale);
     if (!gate_hash_bf16_cuda(d_x_normed, d_gate_w_bf16, d_tid2eid_i64,
                              d_gate_scores_scratch, d_gate_indices,
@@ -7207,7 +7224,7 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
                                     dim, moe_inter)) {
         throw std::runtime_error("q2 w2 q2k failed");
     }
-    check_cuda(cudaDeviceSynchronize(), "sync after routed moe");
+    check_device(device_synchronize(), "sync after routed moe");
 
     GgufRoutedMoeResult r;
     r.dim = dim;
@@ -7217,12 +7234,10 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     r.ffn_normed_rms = device_vector_rms(d_x_normed, dim);
     r.moe_out_rms = device_vector_rms(d_y, dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_y, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy moe_out first");
+    check_device(memcpy_d2h(first.data(), d_y, 4 * sizeof(float)), "copy moe_out first");
     for (int i = 0; i < 4; ++i) r.moe_out_first[i] = first[i];
     std::vector<float> h_rw(topk);
-    check_cuda(cudaMemcpy(h_rw.data(), d_route_weights, topk * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy route_weights");
+    check_device(memcpy_d2h(h_rw.data(), d_route_weights, topk * sizeof(float)), "copy route_weights");
     float sum = 0.0f;
     for (int k = 0; k < topk; ++k) {
         r.route_weights[k] = h_rw[k];
@@ -7230,26 +7245,26 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     }
     r.route_weights_sum = sum;
 
-    cudaFree(d_row_f16);
-    cudaFree(d_x);
-    cudaFree(d_ffn_gamma);
-    cudaFree(d_x_normed);
-    cudaFree(d_w1);
-    cudaFree(d_w2);
-    cudaFree(d_w3);
-    cudaFree(d_x_q);
-    cudaFree(d_x_scale);
-    cudaFree(d_route_slots);
-    cudaFree(d_route_weights);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden_q);
-    cudaFree(d_hidden_scale);
-    cudaFree(d_y);
-    cudaFree(d_gate_w_bf16);
-    cudaFree(d_tid2eid_i64);
-    cudaFree(d_gate_scores_scratch);
-    cudaFree(d_gate_indices);
+    device_free(d_row_f16);
+    device_free(d_x);
+    device_free(d_ffn_gamma);
+    device_free(d_x_normed);
+    device_free(d_w1);
+    device_free(d_w2);
+    device_free(d_w3);
+    device_free(d_x_q);
+    device_free(d_x_scale);
+    device_free(d_route_slots);
+    device_free(d_route_weights);
+    device_free(d_gate);
+    device_free(d_up);
+    device_free(d_hidden_q);
+    device_free(d_hidden_scale);
+    device_free(d_y);
+    device_free(d_gate_w_bf16);
+    device_free(d_tid2eid_i64);
+    device_free(d_gate_scores_scratch);
+    device_free(d_gate_indices);
     return r;
 }
 
@@ -7338,22 +7353,22 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     // ----- upload helpers -----
     auto upload_u8 = [](const void* src, size_t bytes) {
         uint8_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, bytes), "alloc");
-        check_cuda(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice), "copy");
+        check_device(device_malloc_into(d, bytes), "alloc");
+        check_device(memcpy_h2d(d, src, bytes), "copy");
         return d;
     };
     auto upload_f32 = [](const void* src, size_t n) {
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32");
-        check_cuda(cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice), "copy f32");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32");
+        check_device(memcpy_h2d(d, src, n * sizeof(float)), "copy f32");
         return d;
     };
     auto upload_bf16_from_f32 = [&](const void* src, size_t n) {
         auto bf = f32_to_bf16_host(reinterpret_cast<const float*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice),
-                   "copy bf16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)),
+                     "copy bf16");
         return d;
     };
 
@@ -7362,9 +7377,8 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
         reinterpret_cast<const uint16_t*>(embed.data) +
         static_cast<size_t>(token) * dim;
     uint16_t* d_row_f16 = nullptr;
-    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
-    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(device_malloc_into(d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_device(memcpy_h2d(d_row_f16, host_row, dim * sizeof(uint16_t)), "copy embed row");
 
     // Attention norm gammas.
     uint16_t* d_attn_gamma = upload_bf16_from_f32(attn_norm.data, dim);
@@ -7387,11 +7401,9 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
         reinterpret_cast<const uint16_t*>(gate_w.data),
         static_cast<size_t>(dim) * static_cast<size_t>(n_experts));
     uint16_t* d_gate_w_bf16 = nullptr;
-    check_cuda(cudaMalloc(&d_gate_w_bf16, gate_w_bf16.size() * sizeof(uint16_t)),
-               "alloc d_gate_w_bf16");
-    check_cuda(cudaMemcpy(d_gate_w_bf16, gate_w_bf16.data(),
-                          gate_w_bf16.size() * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy gate_w_bf16");
+    check_device(device_malloc_into(d_gate_w_bf16, gate_w_bf16.size() * sizeof(uint16_t)),
+                 "alloc d_gate_w_bf16");
+    check_device(memcpy_h2d(d_gate_w_bf16, gate_w_bf16.data(), gate_w_bf16.size() * sizeof(uint16_t)), "copy gate_w_bf16");
 
     // Stage top-k routed experts.
     auto first_w1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
@@ -7409,9 +7421,9 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     uint8_t* d_routed_w1 = nullptr;
     uint8_t* d_routed_w2 = nullptr;
     uint8_t* d_routed_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_routed_w1, per_w1_bytes * topk), "alloc routed_w1");
-    check_cuda(cudaMalloc(&d_routed_w2, per_w2_bytes * topk), "alloc routed_w2");
-    check_cuda(cudaMalloc(&d_routed_w3, per_w3_bytes * topk), "alloc routed_w3");
+    check_device(device_malloc_into(d_routed_w1, per_w1_bytes * topk), "alloc routed_w1");
+    check_device(device_malloc_into(d_routed_w2, per_w2_bytes * topk), "alloc routed_w2");
+    check_device(device_malloc_into(d_routed_w3, per_w3_bytes * topk), "alloc routed_w3");
     for (int k = 0; k < topk; ++k) {
         const int eid = h_expert_ids[k];
         auto wv1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
@@ -7423,12 +7435,9 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
         if (!wv1.found || !wv2.found || !wv3.found) {
             throw std::runtime_error("get_expert failed for active expert");
         }
-        check_cuda(cudaMemcpy(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes,
-                              cudaMemcpyHostToDevice), "stage routed_w1");
-        check_cuda(cudaMemcpy(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes,
-                              cudaMemcpyHostToDevice), "stage routed_w2");
-        check_cuda(cudaMemcpy(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
-                              cudaMemcpyHostToDevice), "stage routed_w3");
+        check_device(memcpy_h2d(d_routed_w1 + per_w1_bytes * k, wv1.data, per_w1_bytes), "stage routed_w1");
+        check_device(memcpy_h2d(d_routed_w2 + per_w2_bytes * k, wv2.data, per_w2_bytes), "stage routed_w2");
+        check_device(memcpy_h2d(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes), "stage routed_w3");
     }
 
     // tid2eid slice + scratch for gate scoring.
@@ -7437,14 +7446,13 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     int64_t* d_tid2eid_i64 = nullptr;
     float* d_gate_scores_scratch = nullptr;
     int64_t* d_gate_indices = nullptr;
-    check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
-    check_cuda(cudaMemcpy(d_tid2eid_i64, h_tid2eid_slice.data(),
-                          topk * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "copy d_tid2eid_i64");
-    check_cuda(cudaMalloc(&d_gate_scores_scratch, topk * sizeof(float)),
-               "alloc d_gate_scores_scratch");
-    check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)),
-               "alloc d_gate_indices");
+    check_device(device_malloc_into(d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
+    check_device(memcpy_h2d(d_tid2eid_i64, h_tid2eid_slice.data(), topk * sizeof(int64_t)),
+                 "copy d_tid2eid_i64");
+    check_device(device_malloc_into(d_gate_scores_scratch, topk * sizeof(float)),
+                 "alloc d_gate_scores_scratch");
+    check_device(device_malloc_into(d_gate_indices, topk * sizeof(int64_t)),
+                 "alloc d_gate_indices");
 
     // ----- activation buffers -----
     float* d_x = nullptr;            // working hidden state (residual-updated)
@@ -7466,26 +7474,26 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     float* d_shared_out = nullptr;
     float* d_moe_out = nullptr;
     float* d_ffn_combined = nullptr;
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMalloc(&d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
-    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
-    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
-    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
-    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
-    check_cuda(cudaMalloc(&d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
-    check_cuda(cudaMalloc(&d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
-    check_cuda(cudaMalloc(&d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
-    check_cuda(cudaMalloc(&d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
-    check_cuda(cudaMalloc(&d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
-    check_cuda(cudaMalloc(&d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
-    check_cuda(cudaMalloc(&d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
-    check_cuda(cudaMalloc(&d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
-    check_cuda(cudaMalloc(&d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
-    check_cuda(cudaMalloc(&d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
-    check_cuda(cudaMalloc(&d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
-    check_cuda(cudaMemset(d_moe_out, 0, dim * sizeof(float)), "zero d_moe_out");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(device_malloc_into(d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_device(device_malloc_into(d_q, q_full * sizeof(float)), "alloc d_q");
+    check_device(device_malloc_into(d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_device(device_malloc_into(d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_device(device_malloc_into(d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
+    check_device(device_malloc_into(d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
+    check_device(device_malloc_into(d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
+    check_device(device_malloc_into(d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
+    check_device(device_malloc_into(d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
+    check_device(device_malloc_into(d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
+    check_device(device_malloc_into(d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
+    check_device(device_malloc_into(d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
+    check_device(device_malloc_into(d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
+    check_device(device_malloc_into(d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
+    check_device(device_malloc_into(d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
+    check_device(device_memset(d_moe_out, 0, dim * sizeof(float)), "zero d_moe_out");
 
     // Routed MoE staging buffers.
     const int routes = topk;
@@ -7500,26 +7508,24 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     int8_t* d_route_hidden_q = nullptr;
     float* d_route_hidden_scale = nullptr;
     float* d_route_hidden = nullptr;
-    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
-    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
-    check_cuda(cudaMalloc(&d_route_slots, routes * sizeof(int64_t)), "alloc d_route_slots");
-    check_cuda(cudaMalloc(&d_route_weights, routes * sizeof(float)), "alloc d_route_weights");
-    check_cuda(cudaMalloc(&d_route_gate, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
-               "alloc d_route_gate");
-    check_cuda(cudaMalloc(&d_route_up, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
-               "alloc d_route_up");
-    check_cuda(cudaMalloc(&d_route_hidden_q, static_cast<size_t>(routes) * moe_inter),
-               "alloc d_route_hidden_q");
-    check_cuda(cudaMalloc(&d_route_hidden_scale,
-                          static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
-               "alloc d_route_hidden_scale");
-    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
-               "alloc d_route_hidden");
+    check_device(device_malloc_into(d_x_q, dim), "alloc d_x_q");
+    check_device(device_malloc_into(d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_device(device_malloc_into(d_route_slots, routes * sizeof(int64_t)), "alloc d_route_slots");
+    check_device(device_malloc_into(d_route_weights, routes * sizeof(float)), "alloc d_route_weights");
+    check_device(device_malloc_into(d_route_gate, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+                 "alloc d_route_gate");
+    check_device(device_malloc_into(d_route_up, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+                 "alloc d_route_up");
+    check_device(device_malloc_into(d_route_hidden_q, static_cast<size_t>(routes) * moe_inter),
+                 "alloc d_route_hidden_q");
+    check_device(device_malloc_into(d_route_hidden_scale, static_cast<size_t>(routes) * hidden_groups * sizeof(float)),
+                 "alloc d_route_hidden_scale");
+    check_device(device_malloc_into(d_route_hidden, static_cast<size_t>(routes) * moe_inter * sizeof(float)),
+                 "alloc d_route_hidden");
     std::vector<int64_t> h_route_slots(routes);
     for (int k = 0; k < routes; ++k) h_route_slots[k] = k;
-    check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
-                          routes * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "copy d_route_slots");
+    check_device(memcpy_h2d(d_route_slots, h_route_slots.data(), routes * sizeof(int64_t)),
+                 "copy d_route_slots");
 
     // ===== compute =====
 
@@ -7609,7 +7615,7 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     ls.d_gate_indices = d_gate_indices;
 
     gguf_layer_forward(lw, ls, ld, token, position);
-    check_cuda(cudaDeviceSynchronize(), "sync after layer-0 forward");
+    check_device(device_synchronize(), "sync after layer-0 forward");
 
     GgufLayer0FullResult r;
     r.dim = dim;
@@ -7627,65 +7633,63 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
     r.ffn_combined_rms = device_vector_rms(d_ffn_combined, dim);
     r.x_post_ffn_rms = device_vector_rms(d_x, dim);
     std::vector<float> first(4);
-    check_cuda(cudaMemcpy(first.data(), d_x, 4 * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy x_post_ffn first");
+    check_device(memcpy_d2h(first.data(), d_x, 4 * sizeof(float)), "copy x_post_ffn first");
     for (int i = 0; i < 4; ++i) r.x_post_ffn_first[i] = first[i];
     std::vector<float> h_rw(topk);
-    check_cuda(cudaMemcpy(h_rw.data(), d_route_weights, topk * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy route_weights");
+    check_device(memcpy_d2h(h_rw.data(), d_route_weights, topk * sizeof(float)), "copy route_weights");
     float sum = 0.0f;
     for (int k = 0; k < topk; ++k) sum += h_rw[k];
     r.route_weights_sum = sum;
 
-    cudaFree(d_row_f16);
-    cudaFree(d_attn_gamma);
-    cudaFree(d_q_gamma);
-    cudaFree(d_kv_gamma);
-    cudaFree(d_ffn_gamma);
-    cudaFree(d_wq_a);
-    cudaFree(d_wq_b);
-    cudaFree(d_wkv);
-    cudaFree(d_wo_a);
-    cudaFree(d_wo_b);
-    cudaFree(d_attn_sink);
-    cudaFree(d_shared_w1);
-    cudaFree(d_shared_w2);
-    cudaFree(d_shared_w3);
-    cudaFree(d_gate_w_bf16);
-    cudaFree(d_routed_w1);
-    cudaFree(d_routed_w2);
-    cudaFree(d_routed_w3);
-    cudaFree(d_tid2eid_i64);
-    cudaFree(d_gate_scores_scratch);
-    cudaFree(d_gate_indices);
-    cudaFree(d_x);
-    cudaFree(d_x_pre_attn);
-    cudaFree(d_x_normed);
-    cudaFree(d_q_a);
-    cudaFree(d_q_normed);
-    cudaFree(d_q);
-    cudaFree(d_kv_a);
-    cudaFree(d_kv);
-    cudaFree(d_attn_value);
-    cudaFree(d_attn_mid);
-    cudaFree(d_attn_out);
-    cudaFree(d_x_pre_ffn);
-    cudaFree(d_x_normed_ffn);
-    cudaFree(d_shared_gate);
-    cudaFree(d_shared_up);
-    cudaFree(d_shared_hidden);
-    cudaFree(d_shared_out);
-    cudaFree(d_moe_out);
-    cudaFree(d_ffn_combined);
-    cudaFree(d_x_q);
-    cudaFree(d_x_scale);
-    cudaFree(d_route_slots);
-    cudaFree(d_route_weights);
-    cudaFree(d_route_gate);
-    cudaFree(d_route_up);
-    cudaFree(d_route_hidden_q);
-    cudaFree(d_route_hidden_scale);
-    cudaFree(d_route_hidden);
+    device_free(d_row_f16);
+    device_free(d_attn_gamma);
+    device_free(d_q_gamma);
+    device_free(d_kv_gamma);
+    device_free(d_ffn_gamma);
+    device_free(d_wq_a);
+    device_free(d_wq_b);
+    device_free(d_wkv);
+    device_free(d_wo_a);
+    device_free(d_wo_b);
+    device_free(d_attn_sink);
+    device_free(d_shared_w1);
+    device_free(d_shared_w2);
+    device_free(d_shared_w3);
+    device_free(d_gate_w_bf16);
+    device_free(d_routed_w1);
+    device_free(d_routed_w2);
+    device_free(d_routed_w3);
+    device_free(d_tid2eid_i64);
+    device_free(d_gate_scores_scratch);
+    device_free(d_gate_indices);
+    device_free(d_x);
+    device_free(d_x_pre_attn);
+    device_free(d_x_normed);
+    device_free(d_q_a);
+    device_free(d_q_normed);
+    device_free(d_q);
+    device_free(d_kv_a);
+    device_free(d_kv);
+    device_free(d_attn_value);
+    device_free(d_attn_mid);
+    device_free(d_attn_out);
+    device_free(d_x_pre_ffn);
+    device_free(d_x_normed_ffn);
+    device_free(d_shared_gate);
+    device_free(d_shared_up);
+    device_free(d_shared_hidden);
+    device_free(d_shared_out);
+    device_free(d_moe_out);
+    device_free(d_ffn_combined);
+    device_free(d_x_q);
+    device_free(d_x_scale);
+    device_free(d_route_slots);
+    device_free(d_route_weights);
+    device_free(d_route_gate);
+    device_free(d_route_up);
+    device_free(d_route_hidden_q);
+    device_free(d_route_hidden_scale);
+    device_free(d_route_hidden);
     return r;
 }
 
@@ -7736,35 +7740,35 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     // ===== upload helpers =====
     auto upload_u8 = [](const void* src, size_t bytes) {
         uint8_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, bytes), "alloc u8");
-        check_cuda(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice), "copy u8");
+        check_device(device_malloc_into(d, bytes), "alloc u8");
+        check_device(memcpy_h2d(d, src, bytes), "copy u8");
         return d;
     };
     auto upload_f32 = [](const void* src, size_t n) {
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32");
-        check_cuda(cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice), "copy f32");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32");
+        check_device(memcpy_h2d(d, src, n * sizeof(float)), "copy f32");
         return d;
     };
     auto upload_bf16_from_f32 = [&](const void* src, size_t n) {
         auto bf = f32_to_bf16_host(reinterpret_cast<const float*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)), "copy bf16");
         return d;
     };
     auto upload_bf16_from_f16 = [&](const void* src, size_t n) {
         auto bf = f16_to_bf16_host(reinterpret_cast<const uint16_t*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16-from-f16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16-from-f16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16-from-f16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)), "copy bf16-from-f16");
         return d;
     };
     auto upload_f32_from_f16 = [&](const void* src, size_t n) {
         auto f32 = f16_to_f32_host(reinterpret_cast<const uint16_t*>(src), n);
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32-from-f16");
-        check_cuda(cudaMemcpy(d, f32.data(), n * sizeof(float), cudaMemcpyHostToDevice), "copy f32-from-f16");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32-from-f16");
+        check_device(memcpy_h2d(d, f32.data(), n * sizeof(float)), "copy f32-from-f16");
         return d;
     };
 
@@ -7883,9 +7887,9 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     uint8_t* d_routed_w1 = nullptr;
     uint8_t* d_routed_w2 = nullptr;
     uint8_t* d_routed_w3 = nullptr;
-    check_cuda(cudaMalloc(&d_routed_w1, max_per_w1_bytes * topk), "alloc routed_w1");
-    check_cuda(cudaMalloc(&d_routed_w2, max_per_w2_bytes * topk), "alloc routed_w2");
-    check_cuda(cudaMalloc(&d_routed_w3, max_per_w3_bytes * topk), "alloc routed_w3");
+    check_device(device_malloc_into(d_routed_w1, max_per_w1_bytes * topk), "alloc routed_w1");
+    check_device(device_malloc_into(d_routed_w2, max_per_w2_bytes * topk), "alloc routed_w2");
+    check_device(device_malloc_into(d_routed_w3, max_per_w3_bytes * topk), "alloc routed_w3");
 
     // ===== per-layer KV cache buffers (sized for this smoke's single step) =====
     // Cache capacity = position + 1: enough to write the current step's KV into
@@ -7895,14 +7899,11 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     const int cache_capacity = position + 1;
     std::vector<float*> d_kv_cache(n_layers, nullptr);
     for (int L = 0; L < n_layers; ++L) {
-        check_cuda(cudaMalloc(&d_kv_cache[L],
-                              static_cast<size_t>(cache_capacity) *
-                                  static_cast<size_t>(kv_dim) * sizeof(float)),
-                   "alloc d_kv_cache");
-        check_cuda(cudaMemset(d_kv_cache[L], 0,
-                              static_cast<size_t>(cache_capacity) *
-                                  static_cast<size_t>(kv_dim) * sizeof(float)),
-                   "memset d_kv_cache");
+        check_device(device_malloc_into(d_kv_cache[L], static_cast<size_t>(cache_capacity) * static_cast<size_t>(kv_dim) * sizeof(float)),
+                     "alloc d_kv_cache");
+        check_device(device_memset(d_kv_cache[L], 0,
+                                   static_cast<size_t>(cache_capacity) * static_cast<size_t>(kv_dim) * sizeof(float)),
+                     "memset d_kv_cache");
     }
 
     // ===== activation + scratch buffers (allocated once, reused per layer) =====
@@ -7951,61 +7952,58 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     float* d_index_q = nullptr;
     float* d_index_scores = nullptr;
     float* d_logits = nullptr;
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMalloc(&d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
-    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
-    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
-    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
-    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
-    check_cuda(cudaMalloc(&d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
-    check_cuda(cudaMalloc(&d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
-    check_cuda(cudaMalloc(&d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
-    check_cuda(cudaMalloc(&d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
-    check_cuda(cudaMalloc(&d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
-    check_cuda(cudaMalloc(&d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
-    check_cuda(cudaMalloc(&d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
-    check_cuda(cudaMalloc(&d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
-    check_cuda(cudaMalloc(&d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
-    check_cuda(cudaMalloc(&d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
-    check_cuda(cudaMalloc(&d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
-    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
-    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
-    check_cuda(cudaMalloc(&d_route_slots, topk * sizeof(int64_t)), "alloc d_route_slots");
-    check_cuda(cudaMalloc(&d_route_weights, topk * sizeof(float)), "alloc d_route_weights");
-    check_cuda(cudaMalloc(&d_route_gate, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_gate");
-    check_cuda(cudaMalloc(&d_route_up, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_up");
-    check_cuda(cudaMalloc(&d_route_hidden_q, static_cast<size_t>(topk) * moe_inter),
-               "alloc d_route_hidden_q");
-    check_cuda(cudaMalloc(&d_route_hidden_scale,
-                          static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
-               "alloc d_route_hidden_scale");
-    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_hidden");
-    check_cuda(cudaMalloc(&d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
-               "alloc d_gate_scores_scratch");
-    check_cuda(cudaMalloc(&d_gate_scored_scratch, n_experts * sizeof(float)),
-               "alloc d_gate_scored_scratch");
-    check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
-    check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
-    check_cuda(cudaMalloc(&d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
-    check_cuda(cudaMalloc(&d_logits, vocab * sizeof(float)), "alloc d_logits");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(device_malloc_into(d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_device(device_malloc_into(d_q, q_full * sizeof(float)), "alloc d_q");
+    check_device(device_malloc_into(d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_device(device_malloc_into(d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_device(device_malloc_into(d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
+    check_device(device_malloc_into(d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
+    check_device(device_malloc_into(d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
+    check_device(device_malloc_into(d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
+    check_device(device_malloc_into(d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
+    check_device(device_malloc_into(d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
+    check_device(device_malloc_into(d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
+    check_device(device_malloc_into(d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
+    check_device(device_malloc_into(d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
+    check_device(device_malloc_into(d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
+    check_device(device_malloc_into(d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
+    check_device(device_malloc_into(d_x_q, dim), "alloc d_x_q");
+    check_device(device_malloc_into(d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_device(device_malloc_into(d_route_slots, topk * sizeof(int64_t)), "alloc d_route_slots");
+    check_device(device_malloc_into(d_route_weights, topk * sizeof(float)), "alloc d_route_weights");
+    check_device(device_malloc_into(d_route_gate, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_gate");
+    check_device(device_malloc_into(d_route_up, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_up");
+    check_device(device_malloc_into(d_route_hidden_q, static_cast<size_t>(topk) * moe_inter),
+                 "alloc d_route_hidden_q");
+    check_device(device_malloc_into(d_route_hidden_scale, static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
+                 "alloc d_route_hidden_scale");
+    check_device(device_malloc_into(d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_hidden");
+    check_device(device_malloc_into(d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
+                 "alloc d_gate_scores_scratch");
+    check_device(device_malloc_into(d_gate_scored_scratch, n_experts * sizeof(float)),
+                 "alloc d_gate_scored_scratch");
+    check_device(device_malloc_into(d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
+    check_device(device_malloc_into(d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
+    check_device(device_malloc_into(d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
+    check_device(device_malloc_into(d_logits, vocab * sizeof(float)), "alloc d_logits");
 
     std::vector<int64_t> h_route_slots(topk);
     for (int k = 0; k < topk; ++k) h_route_slots[k] = k;
-    check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
-                          topk * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "copy d_route_slots");
+    check_device(memcpy_h2d(d_route_slots, h_route_slots.data(), topk * sizeof(int64_t)),
+                 "copy d_route_slots");
 
     // ===== embed =====
     const uint16_t* host_embed_row =
         reinterpret_cast<const uint16_t*>(embed.data) +
         static_cast<size_t>(token) * dim;
-    check_cuda(cudaMemcpy(d_embed_row_f16, host_embed_row, dim * sizeof(uint16_t),
-                          cudaMemcpyHostToDevice), "copy embed row");
+    check_device(memcpy_h2d(d_embed_row_f16, host_embed_row, dim * sizeof(uint16_t)), "copy embed row");
     if (!f16_row_to_float_cuda(d_embed_row_f16, d_x, /*row=*/0, dim))
         throw std::runtime_error("f16 embed failed");
 
@@ -8067,8 +8065,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
             const int32_t* row = h_tid2eid_table[L] + static_cast<size_t>(token) * topk;
             int64_t h_slice[8];
             for (int k = 0; k < topk; ++k) h_slice[k] = row[k];
-            check_cuda(cudaMemcpy(d_tid2eid_i64, h_slice, topk * sizeof(int64_t),
-                                  cudaMemcpyHostToDevice), "copy tid2eid slice");
+            check_device(memcpy_h2d(d_tid2eid_i64, h_slice, topk * sizeof(int64_t)), "copy tid2eid slice");
             lw.d_tid2eid_i64 = d_tid2eid_i64;
             lw.d_gate_bias_f32 = nullptr;
         } else {
@@ -8080,8 +8077,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         gguf_layer_forward_attn_to_gate(lw, ls, ld, position, nullptr);
 
         // Read gate's chosen expert ids, then stage those experts H2D.
-        check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
-                              cudaMemcpyDeviceToHost), "copy gate indices");
+        check_device(memcpy_d2h(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t)), "copy gate indices");
         const std::string lp = "layers." + std::to_string(L);
         const std::string w1_name = lp + ".ffn.experts.routed.w1";
         const std::string w2_name = lp + ".ffn.experts.routed.w2";
@@ -8097,12 +8093,9 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
                 throw std::runtime_error("get_expert failed during full forward staging");
             if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
                 throw std::runtime_error("routed expert dtype changed within full forward layer");
-            check_cuda(cudaMemcpy(d_routed_w1 + layer_w1_bytes[L] * k, wv1.data, layer_w1_bytes[L],
-                                  cudaMemcpyHostToDevice), "stage routed_w1");
-            check_cuda(cudaMemcpy(d_routed_w2 + layer_w2_bytes[L] * k, wv2.data, layer_w2_bytes[L],
-                                  cudaMemcpyHostToDevice), "stage routed_w2");
-            check_cuda(cudaMemcpy(d_routed_w3 + layer_w3_bytes[L] * k, wv3.data, layer_w3_bytes[L],
-                                  cudaMemcpyHostToDevice), "stage routed_w3");
+            check_device(memcpy_h2d(d_routed_w1 + layer_w1_bytes[L] * k, wv1.data, layer_w1_bytes[L]), "stage routed_w1");
+            check_device(memcpy_h2d(d_routed_w2 + layer_w2_bytes[L] * k, wv2.data, layer_w2_bytes[L]), "stage routed_w2");
+            check_device(memcpy_h2d(d_routed_w3 + layer_w3_bytes[L] * k, wv3.data, layer_w3_bytes[L]), "stage routed_w3");
         }
 
         // Phase B: routed MoE + FFN residual.
@@ -8114,11 +8107,10 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         throw std::runtime_error("final norm failed");
     if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, vocab, dim))
         throw std::runtime_error("head matvec failed");
-    check_cuda(cudaDeviceSynchronize(), "sync after head");
+    check_device(device_synchronize(), "sync after head");
 
     std::vector<float> h_logits(vocab);
-    check_cuda(cudaMemcpy(h_logits.data(), d_logits, vocab * sizeof(float),
-                          cudaMemcpyDeviceToHost), "copy logits");
+    check_device(memcpy_d2h(h_logits.data(), d_logits, vocab * sizeof(float)), "copy logits");
 
     int top_token = 0;
     float top_logit = -INFINITY;
@@ -8144,31 +8136,31 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     for (int i = 0; i < 4; ++i) r.logits_first[i] = h_logits[i];
 
     // ===== cleanup =====
-    auto free_vec_u8 = [](std::vector<uint8_t*>& v) { for (auto* p : v) cudaFree(p); };
-    auto free_vec_u16 = [](std::vector<uint16_t*>& v) { for (auto* p : v) cudaFree(p); };
-    auto free_vec_f32 = [](std::vector<float*>& v) { for (auto* p : v) cudaFree(p); };
+    auto free_vec_u8 = [](std::vector<uint8_t*>& v) { for (auto* p : v) device_free(p); };
+    auto free_vec_u16 = [](std::vector<uint16_t*>& v) { for (auto* p : v) device_free(p); };
+    auto free_vec_f32 = [](std::vector<float*>& v) { for (auto* p : v) device_free(p); };
     free_vec_u16(d_attn_gamma); free_vec_u16(d_q_gamma); free_vec_u16(d_kv_gamma);
     free_vec_u16(d_ffn_gamma); free_vec_f32(d_attn_sink);
     free_vec_u8(d_wq_a); free_vec_u8(d_wq_b); free_vec_u8(d_wkv);
     free_vec_u8(d_wo_a); free_vec_u8(d_wo_b);
     free_vec_u8(d_shared_w1); free_vec_u8(d_shared_w2); free_vec_u8(d_shared_w3);
     free_vec_u16(d_gate_w); free_vec_f32(d_gate_bias);
-    cudaFree(d_final_norm_gamma); cudaFree(d_head);
-    cudaFree(d_routed_w1); cudaFree(d_routed_w2); cudaFree(d_routed_w3);
+    device_free(d_final_norm_gamma); device_free(d_head);
+    device_free(d_routed_w1); device_free(d_routed_w2); device_free(d_routed_w3);
     free_vec_f32(d_kv_cache);
-    cudaFree(d_x); cudaFree(d_x_pre_attn); cudaFree(d_x_normed);
-    cudaFree(d_q_a); cudaFree(d_q_normed); cudaFree(d_q);
-    cudaFree(d_kv_a); cudaFree(d_kv); cudaFree(d_attn_value);
-    cudaFree(d_attn_mid); cudaFree(d_attn_out);
-    cudaFree(d_x_pre_ffn); cudaFree(d_x_normed_ffn);
-    cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden);
-    cudaFree(d_shared_out); cudaFree(d_moe_out); cudaFree(d_ffn_combined);
-    cudaFree(d_x_q); cudaFree(d_x_scale);
-    cudaFree(d_route_slots); cudaFree(d_route_weights);
-    cudaFree(d_route_gate); cudaFree(d_route_up);
-    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale); cudaFree(d_route_hidden);
-    cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
-    cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16); cudaFree(d_logits);
+    device_free(d_x); device_free(d_x_pre_attn); device_free(d_x_normed);
+    device_free(d_q_a); device_free(d_q_normed); device_free(d_q);
+    device_free(d_kv_a); device_free(d_kv); device_free(d_attn_value);
+    device_free(d_attn_mid); device_free(d_attn_out);
+    device_free(d_x_pre_ffn); device_free(d_x_normed_ffn);
+    device_free(d_shared_gate); device_free(d_shared_up); device_free(d_shared_hidden);
+    device_free(d_shared_out); device_free(d_moe_out); device_free(d_ffn_combined);
+    device_free(d_x_q); device_free(d_x_scale);
+    device_free(d_route_slots); device_free(d_route_weights);
+    device_free(d_route_gate); device_free(d_route_up);
+    device_free(d_route_hidden_q); device_free(d_route_hidden_scale); device_free(d_route_hidden);
+    device_free(d_gate_scores_scratch); device_free(d_gate_scored_scratch); device_free(d_gate_indices);
+    device_free(d_tid2eid_i64); device_free(d_embed_row_f16); device_free(d_logits);
     return r;
 }
 
@@ -8192,7 +8184,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     GGUFWeightSource& gws = *ctx.weight_source;
 
     // ===== whole-GGUF mmap pinning is BANNED =====
-    // Never cudaHostRegister the whole GGUF mmap. Registering a file-backed
+    // Never pin-register the whole GGUF mmap. Registering a file-backed
     // 80GB+ mapping pins file pages and poisons Linux dirty-page accounting /
     // writeback: with TP4 an ~86 GiB GGUF is accounted ~344 GiB dirty, which
     // wedges balance_dirty_pages and stalls all unrelated fsync/git/build I/O
@@ -8333,7 +8325,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         if (gguf_flashmemory_load_device) {
             flashmemory_device_weights = std::make_unique<FlashMemoryDeviceWeights>(
                 load_flashmemory_device_weights(gguf_flashmemory_ckpt));
-            check_cuda(cudaDeviceSynchronize(), "sync FlashMemory device weight load");
+            check_device(device_synchronize(), "sync FlashMemory device weight load");
             if (gguf_flashmemory_mock_smoke) {
                 flashmemory_probed = flashmemory_device_weight_smoke(*flashmemory_device_weights, /*probe_bytes=*/64);
             }
@@ -8373,35 +8365,35 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 
     auto upload_u8 = [](const void* src, size_t bytes) {
         uint8_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, bytes), "alloc u8");
-        check_cuda(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice), "copy u8");
+        check_device(device_malloc_into(d, bytes), "alloc u8");
+        check_device(memcpy_h2d(d, src, bytes), "copy u8");
         return d;
     };
     auto upload_f32 = [](const void* src, size_t n) {
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32");
-        check_cuda(cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice), "copy f32");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32");
+        check_device(memcpy_h2d(d, src, n * sizeof(float)), "copy f32");
         return d;
     };
     auto upload_bf16_from_f32 = [&](const void* src, size_t n) {
         auto bf = f32_to_bf16_host(reinterpret_cast<const float*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)), "copy bf16");
         return d;
     };
     auto upload_bf16_from_f16 = [&](const void* src, size_t n) {
         auto bf = f16_to_bf16_host(reinterpret_cast<const uint16_t*>(src), n);
         uint16_t* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16-from-f16");
-        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy bf16-from-f16");
+        check_device(device_malloc_into(d, n * sizeof(uint16_t)), "alloc bf16-from-f16");
+        check_device(memcpy_h2d(d, bf.data(), n * sizeof(uint16_t)), "copy bf16-from-f16");
         return d;
     };
     auto upload_f32_from_f16 = [&](const void* src, size_t n) {
         auto f32 = f16_to_f32_host(reinterpret_cast<const uint16_t*>(src), n);
         float* d = nullptr;
-        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32-from-f16");
-        check_cuda(cudaMemcpy(d, f32.data(), n * sizeof(float), cudaMemcpyHostToDevice), "copy f32-from-f16");
+        check_device(device_malloc_into(d, n * sizeof(float)), "alloc f32-from-f16");
+        check_device(memcpy_h2d(d, f32.data(), n * sizeof(float)), "copy f32-from-f16");
         return d;
     };
 
@@ -8474,11 +8466,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 std::vector<int64_t> tid2eid_i64(entries);
                 const int32_t* src = h_tid2eid_table[L];
                 for (size_t i = 0; i < entries; ++i) tid2eid_i64[i] = src[i];
-                check_cuda(cudaMalloc(&d_tid2eid_table[L], entries * sizeof(int64_t)),
-                           "alloc resident tid2eid table");
-                check_cuda(cudaMemcpy(d_tid2eid_table[L], tid2eid_i64.data(),
-                                      entries * sizeof(int64_t), cudaMemcpyHostToDevice),
-                           "copy resident tid2eid table");
+                check_device(device_malloc_into(d_tid2eid_table[L], entries * sizeof(int64_t)),
+                             "alloc resident tid2eid table");
+                check_device(memcpy_h2d(d_tid2eid_table[L], tid2eid_i64.data(),
+                                        entries * sizeof(int64_t)),
+                             "copy resident tid2eid table");
             }
         } else {
             WeightView bias = gws.require(lp + ".ffn.gate.bias");
@@ -8650,9 +8642,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     uint8_t* d_routed_w2 = nullptr;
     uint8_t* d_routed_w3 = nullptr;
     const int routed_stage_slots = std::max(topk, experts_per_rank);
-    check_cuda(cudaMalloc(&d_routed_w1, max_per_w1_bytes * routed_stage_slots), "alloc routed_w1");
-    check_cuda(cudaMalloc(&d_routed_w2, max_per_w2_bytes * routed_stage_slots), "alloc routed_w2");
-    check_cuda(cudaMalloc(&d_routed_w3, max_per_w3_bytes * routed_stage_slots), "alloc routed_w3");
+    check_device(device_malloc_into(d_routed_w1, max_per_w1_bytes * routed_stage_slots), "alloc routed_w1");
+    check_device(device_malloc_into(d_routed_w2, max_per_w2_bytes * routed_stage_slots), "alloc routed_w2");
+    check_device(device_malloc_into(d_routed_w3, max_per_w3_bytes * routed_stage_slots), "alloc routed_w3");
 
     // Optional resident local routed experts. The legacy path stages active top-k
     // experts every token/layer from the GGUF mmap; with TP=4 that H2D staging
@@ -8700,9 +8692,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             const size_t w1_layer_bytes = static_cast<size_t>(layer_w1_bytes[L]) * experts_per_rank;
             const size_t w2_layer_bytes = static_cast<size_t>(layer_w2_bytes[L]) * experts_per_rank;
             const size_t w3_layer_bytes = static_cast<size_t>(layer_w3_bytes[L]) * experts_per_rank;
-            check_cuda(cudaMalloc(&d_resident_w1[L], w1_layer_bytes), "alloc resident routed_w1");
-            check_cuda(cudaMalloc(&d_resident_w2[L], w2_layer_bytes), "alloc resident routed_w2");
-            check_cuda(cudaMalloc(&d_resident_w3[L], w3_layer_bytes), "alloc resident routed_w3");
+            check_device(device_malloc_into(d_resident_w1[L], w1_layer_bytes), "alloc resident routed_w1");
+            check_device(device_malloc_into(d_resident_w2[L], w2_layer_bytes), "alloc resident routed_w2");
+            check_device(device_malloc_into(d_resident_w3[L], w3_layer_bytes), "alloc resident routed_w3");
             resident_bytes += static_cast<uint64_t>(w1_layer_bytes + w2_layer_bytes + w3_layer_bytes);
             for (int local_e = 0; local_e < experts_per_rank; ++local_e) {
                 const int eid = expert_start + local_e;
@@ -8713,19 +8705,19 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     throw std::runtime_error("get_expert failed during resident routed load");
                 if (wv1.dtype != layer_w1_dtype[L] || wv2.dtype != layer_w2_dtype[L] || wv3.dtype != layer_w3_dtype[L])
                     throw std::runtime_error("routed expert dtype changed during resident load");
-                check_cuda(cudaMemcpy(d_resident_w1[L] + layer_w1_bytes[L] * local_e,
-                                      wv1.data, layer_w1_bytes[L], cudaMemcpyHostToDevice),
-                           "copy resident routed_w1");
-                check_cuda(cudaMemcpy(d_resident_w2[L] + layer_w2_bytes[L] * local_e,
-                                      wv2.data, layer_w2_bytes[L], cudaMemcpyHostToDevice),
-                           "copy resident routed_w2");
-                check_cuda(cudaMemcpy(d_resident_w3[L] + layer_w3_bytes[L] * local_e,
-                                      wv3.data, layer_w3_bytes[L], cudaMemcpyHostToDevice),
-                           "copy resident routed_w3");
+                check_device(memcpy_h2d(d_resident_w1[L] + layer_w1_bytes[L] * local_e, wv1.data,
+                                        layer_w1_bytes[L]),
+                             "copy resident routed_w1");
+                check_device(memcpy_h2d(d_resident_w2[L] + layer_w2_bytes[L] * local_e, wv2.data,
+                                        layer_w2_bytes[L]),
+                             "copy resident routed_w2");
+                check_device(memcpy_h2d(d_resident_w3[L] + layer_w3_bytes[L] * local_e, wv3.data,
+                                        layer_w3_bytes[L]),
+                             "copy resident routed_w3");
             }
         }
         size_t free_bytes = 0, total_bytes = 0;
-        check_cuda(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo resident routed");
+        check_device(device_mem_info(&free_bytes, &total_bytes), "device_mem_info resident routed");
         std::cout << "gguf_resident_routed_experts=1 tp_rank=" << tp_rank
                   << " layers=" << resident_routed_layers << "/" << n_layers
                   << " local_experts=" << experts_per_rank
@@ -8819,14 +8811,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const int cache_capacity = max_layer_cache_capacity;
     std::vector<float*> d_kv_cache(n_layers, nullptr);
     for (int L = 0; L < n_layers; ++L) {
-        check_cuda(cudaMalloc(&d_kv_cache[L],
-                              static_cast<size_t>(layer_cache_capacity[L]) *
-                                  static_cast<size_t>(kv_dim) * sizeof(float)),
-                   "alloc d_kv_cache");
-        check_cuda(cudaMemset(d_kv_cache[L], 0,
-                              static_cast<size_t>(layer_cache_capacity[L]) *
-                                  static_cast<size_t>(kv_dim) * sizeof(float)),
-                   "memset d_kv_cache");
+        check_device(device_malloc_into(d_kv_cache[L], static_cast<size_t>(layer_cache_capacity[L]) * static_cast<size_t>(kv_dim) * sizeof(float)),
+                     "alloc d_kv_cache");
+        check_device(device_memset(d_kv_cache[L], 0,
+                                   static_cast<size_t>(layer_cache_capacity[L]) * static_cast<size_t>(kv_dim) * sizeof(float)),
+                     "memset d_kv_cache");
     }
     std::vector<GgufKvSwapLayerState> d_kv_swap_state(n_layers);
     if (gguf_kv_swap_enabled) {
@@ -8851,43 +8840,36 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             if (!c.present) continue;
             auto init_score = [](float* ptr, size_t n, const char* label) {
                 std::vector<float> neg_inf(n, -INFINITY);
-                check_cuda(cudaMemcpy(ptr, neg_inf.data(), n * sizeof(float), cudaMemcpyHostToDevice), label);
+                check_device(memcpy_h2d(ptr, neg_inf.data(), n * sizeof(float)), label);
             };
-            check_cuda(cudaMalloc(&d_sparse_state[L].compressor_kv,
-                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
-                       "alloc GGUF sparse compressor kv state");
-            check_cuda(cudaMalloc(&d_sparse_state[L].compressor_score,
-                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
-                       "alloc GGUF sparse compressor score state");
-            check_cuda(cudaMemset(d_sparse_state[L].compressor_kv, 0,
-                                  static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
-                       "zero GGUF sparse compressor kv state");
+            check_device(device_malloc_into(d_sparse_state[L].compressor_kv, static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                         "alloc GGUF sparse compressor kv state");
+            check_device(device_malloc_into(d_sparse_state[L].compressor_score, static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                         "alloc GGUF sparse compressor score state");
+            check_device(device_memset(d_sparse_state[L].compressor_kv, 0,
+                                       static_cast<size_t>(c.slots) * c.state_cols * sizeof(float)),
+                         "zero GGUF sparse compressor kv state");
             init_score(d_sparse_state[L].compressor_score,
                        static_cast<size_t>(c.slots) * c.state_cols,
                        "init GGUF sparse compressor score state");
             if (d_indexer_w[L].present && d_indexer_w[L].comp.present) {
                 const auto& ic = d_indexer_w[L].comp;
-                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_comp_kv,
-                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
-                           "alloc GGUF sparse indexer compressor kv state");
-                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_comp_score,
-                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
-                           "alloc GGUF sparse indexer compressor score state");
-                check_cuda(cudaMemset(d_sparse_state[L].indexer_comp_kv, 0,
-                                      static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
-                           "zero GGUF sparse indexer compressor kv state");
+                check_device(device_malloc_into(d_sparse_state[L].indexer_comp_kv, static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                             "alloc GGUF sparse indexer compressor kv state");
+                check_device(device_malloc_into(d_sparse_state[L].indexer_comp_score, static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                             "alloc GGUF sparse indexer compressor score state");
+                check_device(device_memset(d_sparse_state[L].indexer_comp_kv, 0,
+                                           static_cast<size_t>(ic.slots) * ic.state_cols * sizeof(float)),
+                             "zero GGUF sparse indexer compressor kv state");
                 init_score(d_sparse_state[L].indexer_comp_score,
                            static_cast<size_t>(ic.slots) * ic.state_cols,
                            "init GGUF sparse indexer compressor score state");
                 const int indexer_cache_cap = std::max(1, max_sparse_compressed_cap);
-                check_cuda(cudaMalloc(&d_sparse_state[L].indexer_kv_cache,
-                                      static_cast<size_t>(indexer_cache_cap) *
-                                          static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
-                           "alloc GGUF sparse indexer kv cache");
-                check_cuda(cudaMemset(d_sparse_state[L].indexer_kv_cache, 0,
-                                      static_cast<size_t>(indexer_cache_cap) *
-                                          static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
-                           "zero GGUF sparse indexer kv cache");
+                check_device(device_malloc_into(d_sparse_state[L].indexer_kv_cache, static_cast<size_t>(indexer_cache_cap) * static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
+                             "alloc GGUF sparse indexer kv cache");
+                check_device(device_memset(d_sparse_state[L].indexer_kv_cache, 0,
+                                           static_cast<size_t>(indexer_cache_cap) * static_cast<size_t>(d_indexer_w[L].head_dim) * sizeof(float)),
+                             "zero GGUF sparse indexer kv cache");
             }
         }
     }
@@ -8948,24 +8930,25 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 
         std::vector<float> fm_inv_freqs = flashmemory_yarn_inv_freqs(
             fm_runtime.rope_dim, 160000.0, 16.0, 65536, 32.0, 1.0);
-        check_cuda(cudaMalloc(&fm_runtime.d_inv_freqs, fm_inv_freqs.size() * sizeof(float)),
-                   "alloc FlashMemory inv freqs");
-        check_cuda(cudaMemcpy(fm_runtime.d_inv_freqs, fm_inv_freqs.data(), fm_inv_freqs.size() * sizeof(float), cudaMemcpyHostToDevice),
-                   "copy FlashMemory inv freqs");
-        check_cuda(cudaMalloc(&fm_runtime.d_q_scratch, static_cast<size_t>(fm_runtime.n_heads) * fm_runtime.head_dim * sizeof(float)),
-                   "alloc FlashMemory q scratch");
-        check_cuda(cudaMalloc(&fm_runtime.d_qlora_scratch, static_cast<size_t>(fm_runtime.q_lora_rank) * sizeof(float)),
-                   "alloc FlashMemory qlora scratch");
-        check_cuda(cudaMalloc(&fm_runtime.d_fused_w, static_cast<size_t>(fm_runtime.n_heads) * sizeof(float)),
-                   "alloc FlashMemory fused_w scratch");
-        check_cuda(cudaMalloc(&fm_runtime.d_layer_scores, static_cast<size_t>(fm_runtime.n_fm_layers) * fm_runtime.max_chunks * sizeof(float)),
-                   "alloc FlashMemory layer scores");
-        check_cuda(cudaMalloc(&fm_runtime.d_ensemble_scores, static_cast<size_t>(fm_runtime.max_chunks) * sizeof(float)),
-                   "alloc FlashMemory ensemble scores");
-        check_cuda(cudaMalloc(&fm_runtime.d_global_topk, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(int)),
-                   "alloc FlashMemory global topk");
-        check_cuda(cudaMalloc(&fm_runtime.d_global_topk_scores, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(float)),
-                   "alloc FlashMemory global topk scores");
+        check_device(device_malloc_into(fm_runtime.d_inv_freqs, fm_inv_freqs.size() * sizeof(float)),
+                     "alloc FlashMemory inv freqs");
+        check_device(memcpy_h2d(fm_runtime.d_inv_freqs, fm_inv_freqs.data(),
+                                fm_inv_freqs.size() * sizeof(float)),
+                     "copy FlashMemory inv freqs");
+        check_device(device_malloc_into(fm_runtime.d_q_scratch, static_cast<size_t>(fm_runtime.n_heads) * fm_runtime.head_dim * sizeof(float)),
+                     "alloc FlashMemory q scratch");
+        check_device(device_malloc_into(fm_runtime.d_qlora_scratch, static_cast<size_t>(fm_runtime.q_lora_rank) * sizeof(float)),
+                     "alloc FlashMemory qlora scratch");
+        check_device(device_malloc_into(fm_runtime.d_fused_w, static_cast<size_t>(fm_runtime.n_heads) * sizeof(float)),
+                     "alloc FlashMemory fused_w scratch");
+        check_device(device_malloc_into(fm_runtime.d_layer_scores, static_cast<size_t>(fm_runtime.n_fm_layers) * fm_runtime.max_chunks * sizeof(float)),
+                     "alloc FlashMemory layer scores");
+        check_device(device_malloc_into(fm_runtime.d_ensemble_scores, static_cast<size_t>(fm_runtime.max_chunks) * sizeof(float)),
+                     "alloc FlashMemory ensemble scores");
+        check_device(device_malloc_into(fm_runtime.d_global_topk, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(int)),
+                     "alloc FlashMemory global topk");
+        check_device(device_malloc_into(fm_runtime.d_global_topk_scores, static_cast<size_t>(fm_runtime.global_keep_capacity) * sizeof(float)),
+                     "alloc FlashMemory global topk scores");
         if (tp_rank == 0) {
             std::cout << "gguf_flashmemory_runtime_scoring=1 src_layer=" << fm_runtime.src_layer
                       << " source_ratio=" << fm_runtime.source_ratio
@@ -9005,17 +8988,16 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     // uses one global [heads, cache_capacity] scratch buffer reused by all layers.
     float* d_attn_weight_scratch = nullptr;
     if (gguf_indexed_attn != 1) {
-        check_cuda(cudaMalloc(&d_attn_weight_scratch,
-                              static_cast<size_t>(heads) * static_cast<size_t>(cache_capacity) * sizeof(float)),
-                   "alloc d_attn_weight_scratch");
+        check_device(device_malloc_into(d_attn_weight_scratch, static_cast<size_t>(heads) * static_cast<size_t>(cache_capacity) * sizeof(float)),
+                     "alloc d_attn_weight_scratch");
     }
     int* d_kv_indices = nullptr;
     if (gguf_indexed_attn != 0 || gguf_sparse_compressor) {
         const int max_kv_index_count = gguf_sparse_compressor
             ? std::min(cache_capacity, gguf_sparse_window + std::max(1, max_sparse_compressed_cap))
             : std::min(cache_capacity, gguf_indexed_attn_window);
-        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_index_count) * sizeof(int)),
-                   "alloc d_kv_indices");
+        check_device(device_malloc_into(d_kv_indices, static_cast<size_t>(max_kv_index_count) * sizeof(int)),
+                     "alloc d_kv_indices");
     }
     if (gguf_mem_profile && tp_rank == 0) {
         std::cout << "gguf_indexed_attn mode=" << gguf_indexed_attn
@@ -9083,47 +9065,46 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     float* d_hc_comb = nullptr;
     int* d_argmax_token = nullptr;
     float* d_argmax_logit = nullptr;
-    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
-    check_cuda(cudaMalloc(&d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
-    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
-    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
-    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
-    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
-    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
-    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
-    check_cuda(cudaMalloc(&d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
-    check_cuda(cudaMalloc(&d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
-    check_cuda(cudaMalloc(&d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
-    check_cuda(cudaMalloc(&d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
-    check_cuda(cudaMalloc(&d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
-    check_cuda(cudaMalloc(&d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
-    check_cuda(cudaMalloc(&d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
-    check_cuda(cudaMalloc(&d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
-    check_cuda(cudaMalloc(&d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
-    check_cuda(cudaMalloc(&d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
-    check_cuda(cudaMalloc(&d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
-    check_cuda(cudaMalloc(&d_x_q, dim), "alloc d_x_q");
-    check_cuda(cudaMalloc(&d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
-    check_cuda(cudaMalloc(&d_route_slots, topk * sizeof(int64_t)), "alloc d_route_slots");
-    check_cuda(cudaMalloc(&d_route_weights, topk * sizeof(float)), "alloc d_route_weights");
-    check_cuda(cudaMalloc(&d_route_gate, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_gate");
-    check_cuda(cudaMalloc(&d_route_up, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_up");
-    check_cuda(cudaMalloc(&d_route_hidden_q, static_cast<size_t>(topk) * moe_inter),
-               "alloc d_route_hidden_q");
-    check_cuda(cudaMalloc(&d_route_hidden_scale,
-                          static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
-               "alloc d_route_hidden_scale");
-    check_cuda(cudaMalloc(&d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
-               "alloc d_route_hidden");
-    check_cuda(cudaMalloc(&d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
-               "alloc d_gate_scores_scratch");
-    check_cuda(cudaMalloc(&d_gate_scored_scratch, n_experts * sizeof(float)),
-               "alloc d_gate_scored_scratch");
-    check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
-    check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
-    check_cuda(cudaMalloc(&d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
+    check_device(device_malloc_into(d_x, dim * sizeof(float)), "alloc d_x");
+    check_device(device_malloc_into(d_x_pre_attn, dim * sizeof(float)), "alloc d_x_pre_attn");
+    check_device(device_malloc_into(d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_device(device_malloc_into(d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_device(device_malloc_into(d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_device(device_malloc_into(d_q, q_full * sizeof(float)), "alloc d_q");
+    check_device(device_malloc_into(d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_device(device_malloc_into(d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_device(device_malloc_into(d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
+    check_device(device_malloc_into(d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
+    check_device(device_malloc_into(d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
+    check_device(device_malloc_into(d_x_pre_ffn, dim * sizeof(float)), "alloc d_x_pre_ffn");
+    check_device(device_malloc_into(d_x_normed_ffn, dim * sizeof(float)), "alloc d_x_normed_ffn");
+    check_device(device_malloc_into(d_shared_gate, moe_inter * sizeof(float)), "alloc d_shared_gate");
+    check_device(device_malloc_into(d_shared_up, moe_inter * sizeof(float)), "alloc d_shared_up");
+    check_device(device_malloc_into(d_shared_hidden, moe_inter * sizeof(float)), "alloc d_shared_hidden");
+    check_device(device_malloc_into(d_shared_out, dim * sizeof(float)), "alloc d_shared_out");
+    check_device(device_malloc_into(d_moe_out, dim * sizeof(float)), "alloc d_moe_out");
+    check_device(device_malloc_into(d_ffn_combined, dim * sizeof(float)), "alloc d_ffn_combined");
+    check_device(device_malloc_into(d_x_q, dim), "alloc d_x_q");
+    check_device(device_malloc_into(d_x_scale, x_groups * sizeof(float)), "alloc d_x_scale");
+    check_device(device_malloc_into(d_route_slots, topk * sizeof(int64_t)), "alloc d_route_slots");
+    check_device(device_malloc_into(d_route_weights, topk * sizeof(float)), "alloc d_route_weights");
+    check_device(device_malloc_into(d_route_gate, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_gate");
+    check_device(device_malloc_into(d_route_up, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_up");
+    check_device(device_malloc_into(d_route_hidden_q, static_cast<size_t>(topk) * moe_inter),
+                 "alloc d_route_hidden_q");
+    check_device(device_malloc_into(d_route_hidden_scale, static_cast<size_t>(topk) * hidden_groups * sizeof(float)),
+                 "alloc d_route_hidden_scale");
+    check_device(device_malloc_into(d_route_hidden, static_cast<size_t>(topk) * moe_inter * sizeof(float)),
+                 "alloc d_route_hidden");
+    check_device(device_malloc_into(d_gate_scores_scratch, gate_scratch_n * sizeof(float)),
+                 "alloc d_gate_scores_scratch");
+    check_device(device_malloc_into(d_gate_scored_scratch, n_experts * sizeof(float)),
+                 "alloc d_gate_scored_scratch");
+    check_device(device_malloc_into(d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
+    check_device(device_malloc_into(d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
+    check_device(device_malloc_into(d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
     if (gguf_sparse_compressor) {
         int max_comp_cols = 1;
         int max_index_q_dim = 1;
@@ -9136,45 +9117,42 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 max_index_heads = std::max(max_index_heads, d_indexer_w[L].heads);
             }
         }
-        check_cuda(cudaMalloc(&d_compressor_input_bf16, dim * sizeof(uint16_t)),
-                   "alloc GGUF sparse compressor input bf16");
-        check_cuda(cudaMalloc(&d_compressor_input_rounded, dim * sizeof(float)),
-                   "alloc GGUF sparse compressor input rounded");
-        check_cuda(cudaMalloc(&d_compressor_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
-                   "alloc GGUF sparse compressor kv scratch");
-        check_cuda(cudaMalloc(&d_compressor_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
-                   "alloc GGUF sparse compressor score scratch");
-        check_cuda(cudaMalloc(&d_indexer_comp_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
-                   "alloc GGUF sparse indexer compressor kv scratch");
-        check_cuda(cudaMalloc(&d_indexer_comp_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
-                   "alloc GGUF sparse indexer compressor score scratch");
-        check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(max_index_q_dim) * sizeof(float)),
-                   "alloc GGUF sparse index q scratch");
-        check_cuda(cudaMalloc(&d_index_scores,
-                              static_cast<size_t>(max_index_heads + std::max(1, max_sparse_compressed_cap)) * sizeof(float)),
-                   "alloc GGUF sparse index score scratch");
+        check_device(device_malloc_into(d_compressor_input_bf16, dim * sizeof(uint16_t)),
+                     "alloc GGUF sparse compressor input bf16");
+        check_device(device_malloc_into(d_compressor_input_rounded, dim * sizeof(float)),
+                     "alloc GGUF sparse compressor input rounded");
+        check_device(device_malloc_into(d_compressor_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                     "alloc GGUF sparse compressor kv scratch");
+        check_device(device_malloc_into(d_compressor_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                     "alloc GGUF sparse compressor score scratch");
+        check_device(device_malloc_into(d_indexer_comp_kv, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                     "alloc GGUF sparse indexer compressor kv scratch");
+        check_device(device_malloc_into(d_indexer_comp_score, static_cast<size_t>(max_comp_cols) * sizeof(float)),
+                     "alloc GGUF sparse indexer compressor score scratch");
+        check_device(device_malloc_into(d_index_q, static_cast<size_t>(max_index_q_dim) * sizeof(float)),
+                     "alloc GGUF sparse index q scratch");
+        check_device(device_malloc_into(d_index_scores, static_cast<size_t>(max_index_heads + std::max(1, max_sparse_compressed_cap)) * sizeof(float)),
+                     "alloc GGUF sparse index score scratch");
     }
-    check_cuda(cudaMalloc(&d_logits, local_vocab * sizeof(float)), "alloc d_logits");
-    check_cuda(cudaMalloc(&d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4");
-    check_cuda(cudaMalloc(&d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4_next");
-    check_cuda(cudaMalloc(&d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "alloc d_h4_bf16");
-    check_cuda(cudaMalloc(&d_hc_post, 4 * sizeof(float)), "alloc d_hc_post");
-    check_cuda(cudaMalloc(&d_hc_comb, 16 * sizeof(float)), "alloc d_hc_comb");
-    check_cuda(cudaMalloc(&d_argmax_token, sizeof(int)), "alloc d_argmax_token");
-    check_cuda(cudaMalloc(&d_argmax_logit, sizeof(float)), "alloc d_argmax_logit");
+    check_device(device_malloc_into(d_logits, local_vocab * sizeof(float)), "alloc d_logits");
+    check_device(device_malloc_into(d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4");
+    check_device(device_malloc_into(d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4_next");
+    check_device(device_malloc_into(d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "alloc d_h4_bf16");
+    check_device(device_malloc_into(d_hc_post, 4 * sizeof(float)), "alloc d_hc_post");
+    check_device(device_malloc_into(d_hc_comb, 16 * sizeof(float)), "alloc d_hc_comb");
+    check_device(device_malloc_into(d_argmax_token, sizeof(int)), "alloc d_argmax_token");
+    check_device(device_malloc_into(d_argmax_logit, sizeof(float)), "alloc d_argmax_logit");
     if (gguf_mem_profile) gguf_log_mem("after_scratch", tp_rank);
     gguf_check_min_free("after_scratch", tp_rank, gguf_min_free_mib);
 
     // Optional GGUF KV swap copy stream. Only used when the plugin is enabled
     // and DSV4_GGUF_KV_SWAP_SYNC=0; the default sync=1 path is unchanged.
     const bool gguf_kv_swap_async_h2d = gguf_kv_swap_enabled && gguf_kv_swap_sync == 0;
-    cudaStream_t gguf_kv_swap_copy_stream = nullptr;
-    cudaEvent_t gguf_kv_swap_stage_event = nullptr;
+    void* gguf_kv_swap_copy_stream = nullptr;
+    void* gguf_kv_swap_stage_event = nullptr;
     if (gguf_kv_swap_async_h2d) {
-        check_cuda(cudaStreamCreateWithFlags(&gguf_kv_swap_copy_stream, cudaStreamNonBlocking),
-                   "create gguf kv swap copy stream");
-        check_cuda(cudaEventCreateWithFlags(&gguf_kv_swap_stage_event, cudaEventDisableTiming),
-                   "create gguf kv swap stage event");
+        check_device((gguf_kv_swap_copy_stream = stream_create()) != nullptr, "create gguf kv swap copy stream");
+        check_device((gguf_kv_swap_stage_event = event_create()) != nullptr, "create gguf kv swap stage event");
     }
 
     // Dedicated copy stream for staging (H2D for routed Q2 experts). Currently
@@ -9184,30 +9162,24 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     // copy_stream while the prior step's MoE drains on default.
     const bool moe_copy_stream_enabled =
         env_int_or_default("DSV4_GGUF_MOE_COPY_STREAM", 1) != 0;
-    cudaStream_t gguf_moe_copy_stream = nullptr;
-    cudaEvent_t gguf_moe_stage_event = nullptr;
-    cudaEvent_t gguf_moe_consume_event = nullptr;
+    void* gguf_moe_copy_stream = nullptr;
+    void* gguf_moe_stage_event = nullptr;
+    void* gguf_moe_consume_event = nullptr;
     if (moe_copy_stream_enabled) {
-        check_cuda(cudaStreamCreateWithFlags(&gguf_moe_copy_stream, cudaStreamNonBlocking),
-                   "create gguf moe copy stream");
-        check_cuda(cudaEventCreateWithFlags(&gguf_moe_stage_event, cudaEventDisableTiming),
-                   "create gguf moe stage event");
-        check_cuda(cudaEventCreateWithFlags(&gguf_moe_consume_event, cudaEventDisableTiming),
-                   "create gguf moe consume event");
-        check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
-                   "record initial gguf moe consume event");
+        check_device((gguf_moe_copy_stream = stream_create()) != nullptr, "create gguf moe copy stream");
+        check_device((gguf_moe_stage_event = event_create()) != nullptr, "create gguf moe stage event");
+        check_device((gguf_moe_consume_event = event_create()) != nullptr, "create gguf moe consume event");
+        check_device(event_record(gguf_moe_consume_event, nullptr),
+                     "record initial gguf moe consume event");
     }
     const bool gguf_prefill_shared_overlap_enabled = env_int_or_default("DSV4_GGUF_PREFILL_SHARED_OVERLAP", 0) != 0;
-    cudaStream_t gguf_prefill_shared_stream = nullptr;
-    cudaEvent_t gguf_prefill_shared_ready_event = nullptr;
-    cudaEvent_t gguf_prefill_shared_done_event = nullptr;
+    void* gguf_prefill_shared_stream = nullptr;
+    void* gguf_prefill_shared_ready_event = nullptr;
+    void* gguf_prefill_shared_done_event = nullptr;
     if (gguf_prefill_shared_overlap_enabled) {
-        check_cuda(cudaStreamCreateWithFlags(&gguf_prefill_shared_stream, cudaStreamNonBlocking),
-                   "create GGUF prefill shared stream");
-        check_cuda(cudaEventCreateWithFlags(&gguf_prefill_shared_ready_event, cudaEventDisableTiming),
-                   "create GGUF prefill shared ready event");
-        check_cuda(cudaEventCreateWithFlags(&gguf_prefill_shared_done_event, cudaEventDisableTiming),
-                   "create GGUF prefill shared done event");
+        check_device((gguf_prefill_shared_stream = stream_create()) != nullptr, "create GGUF prefill shared stream");
+        check_device((gguf_prefill_shared_ready_event = event_create()) != nullptr, "create GGUF prefill shared ready event");
+        check_device((gguf_prefill_shared_done_event = event_create()) != nullptr, "create GGUF prefill shared done event");
     }
 
 #ifdef DSV4_HAVE_NCCL
@@ -9288,7 +9260,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     long long prof_sparse_attn_indices = 0;
     int prof_steps = 0;
     auto sync_now = [&]() {
-        if (profile_gguf) check_cuda(cudaDeviceSynchronize(), "profile sync");
+        if (profile_gguf) check_device(device_synchronize(), "profile sync");
         return std::chrono::steady_clock::now();
     };
     std::vector<int64_t> h_gate_indices(topk);
@@ -9306,7 +9278,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         if (debug_logit_tokens.empty()) return;
         const int final_prompt_pos = static_cast<int>(seed_tokens.size()) - 1;
         if (position != final_prompt_pos) return;
-        check_cuda(cudaDeviceSynchronize(), "sync GGUF debug logits");
+        check_device(device_synchronize(), "sync GGUF debug logits");
         std::ostringstream oss;
         oss << "gguf_debug_logits tag=" << tag << " rank=" << tp_rank
             << " position=" << position << " top=" << top_t << ":" << top_l;
@@ -9314,7 +9286,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             oss << " token" << tok << "=";
             if (tok >= local_vocab_start && tok < local_vocab_start + local_vocab) {
                 float v = -INFINITY;
-                check_cuda(cudaMemcpy(&v, d_logits + (tok - local_vocab_start), sizeof(float), cudaMemcpyDeviceToHost), "copy GGUF debug logit");
+                check_device(memcpy_d2h(&v, d_logits + (tok - local_vocab_start), sizeof(float)), "copy GGUF debug logit");
                 oss << v;
             } else {
                 oss << "NA";
@@ -9327,8 +9299,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         const uint16_t* host_embed_row =
             reinterpret_cast<const uint16_t*>(embed.data) +
             static_cast<size_t>(token) * dim;
-        check_cuda(cudaMemcpy(d_embed_row_f16, host_embed_row, dim * sizeof(uint16_t),
-                              cudaMemcpyHostToDevice), "copy embed row");
+        check_device(memcpy_h2d(d_embed_row_f16, host_embed_row, dim * sizeof(uint16_t)), "copy embed row");
         if (!f16_row_to_float_cuda(d_embed_row_f16, d_x, /*row=*/0, dim))
             throw std::runtime_error("f16 embed failed");
         // DeepSeek-V4-Flash HC residual stream starts as 4 copies of the token
@@ -9479,8 +9450,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     lw.hash_token = token;
                     lw.hash_table_topk = topk;
                 } else {
-                    check_cuda(cudaMemcpy(d_tid2eid_i64, h_slice, topk * sizeof(int64_t),
-                                          cudaMemcpyHostToDevice), "copy tid2eid slice");
+                    check_device(memcpy_h2d(d_tid2eid_i64, h_slice, topk * sizeof(int64_t)), "copy tid2eid slice");
                     lw.d_tid2eid_i64 = d_tid2eid_i64;
                     lw.hash_token = 0;
                     lw.hash_table_topk = topk;
@@ -9499,8 +9469,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                         h_route_slots[k] = is_local ? static_cast<int64_t>(eid - expert_start) : -1;
                     }
                 } else if (!decode_only_attention_only && moe_copy_stream_enabled) {
-                    check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
-                               "copy stream wait prior GGUF MoE consume event");
+                    check_device(stream_wait_event(gguf_moe_copy_stream, gguf_moe_consume_event),
+                                 "copy stream wait prior GGUF MoE consume event");
                     for (int k = 0; k < topk; ++k) {
                         const int eid = static_cast<int>(h_slice[k]);
                         if (eid < 0 || eid >= n_experts)
@@ -9530,8 +9500,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                                  static_cast<size_t>(topk) * sizeof(int64_t),
                                                  gguf_moe_copy_stream,
                                                  "prestage d_route_slots");
-                    check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
-                               "record gguf moe stage event (hash prestage)");
+                    check_device(event_record(gguf_moe_stage_event, gguf_moe_copy_stream),
+                                 "record gguf moe stage event (hash prestage)");
                     hash_prestaged = true;
                 }
             } else {
@@ -9552,8 +9522,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                                                 topk, expert_start, experts_per_rank))
                             throw std::runtime_error("gguf_route_slots_from_indices_cuda failed");
                     } else {
-                        check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
-                                              cudaMemcpyDeviceToHost), "copy gate indices");
+                        check_device(memcpy_d2h(h_gate_indices.data(), d_gate_indices,
+                                                topk * sizeof(int64_t)), "copy gate indices");
                         for (int k = 0; k < topk; ++k) {
                             const int eid = static_cast<int>(h_gate_indices[k]);
                             if (eid < 0 || eid >= n_experts)
@@ -9564,8 +9534,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                 : -1;
                             if (layer_resident_routed || !is_local) continue;
                             if (moe_copy_stream_enabled) {
-                                check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
-                                           "copy stream wait prior GGUF MoE consume event");
+                                check_device(stream_wait_event(gguf_moe_copy_stream, gguf_moe_consume_event),
+                                             "copy stream wait prior GGUF MoE consume event");
                             }
                             auto wv1 = gws.get_expert(w1_name, w1_name, eid);
                             auto wv2 = gws.get_expert(w2_name, w2_name, eid);
@@ -9585,14 +9555,13 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                                          gguf_moe_copy_stream, "stage routed_w3");
                         }
                         if (layer_resident_routed) {
-                            check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
-                                                  topk * sizeof(int64_t),
-                                                  cudaMemcpyHostToDevice),
-                                       "copy resident d_route_slots");
+                            check_device(memcpy_h2d(d_route_slots, h_route_slots.data(),
+                                                    topk * sizeof(int64_t)),
+                                         "copy resident d_route_slots");
                         } else {
                             if (moe_copy_stream_enabled) {
-                                check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
-                                           "copy stream wait prior GGUF route-slot consume event");
+                                check_device(stream_wait_event(gguf_moe_copy_stream, gguf_moe_consume_event),
+                                             "copy stream wait prior GGUF route-slot consume event");
                             }
                             gguf_pinned_stage.copy_async(reinterpret_cast<uint8_t*>(d_route_slots),
                                                          reinterpret_cast<const uint8_t*>(h_route_slots.data()),
@@ -9600,15 +9569,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                                          gguf_moe_copy_stream,
                                                          "copy d_route_slots");
                             if (moe_copy_stream_enabled) {
-                                check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
-                                           "record gguf moe stage event");
+                                check_device(event_record(gguf_moe_stage_event, gguf_moe_copy_stream),
+                                             "record gguf moe stage event");
                             }
                         }
                     }
                 }
                 if (moe_copy_stream_enabled && !layer_resident_routed) {
-                    check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
-                               "default stream wait stage event");
+                    check_device(stream_wait_event(nullptr, gguf_moe_stage_event),
+                                 "default stream wait stage event");
                 }
             }
             auto t_stage_end = sync_now();
@@ -9616,8 +9585,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             if (!decode_only_attention_only) {
                 gguf_layer_forward_moe(lw, ls, ld, reduce_ctx_ptr);
                 if (moe_copy_stream_enabled) {
-                    check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
-                               "record GGUF MoE consume event");
+                    check_device(event_record(gguf_moe_consume_event, nullptr),
+                                 "record GGUF MoE consume event");
                 }
             }
             auto t_moe_end = sync_now();
@@ -9626,14 +9595,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         auto t_head_start = sync_now();
         {
             std::vector<float> last_h4(static_cast<size_t>(4) * dim);
-            check_cuda(cudaMemcpy(last_h4.data(), d_h4,
-                                  static_cast<size_t>(4) * dim * sizeof(float),
-                                  cudaMemcpyDeviceToHost), "copy final hc h4");
+            check_device(memcpy_d2h(last_h4.data(), d_h4,
+                                    static_cast<size_t>(4) * dim * sizeof(float)), "copy final hc h4");
             std::vector<float> host_x = hc_head_cpu(last_h4, h_hc_head_fn.data(),
                                                     h_hc_head_scale.data(),
                                                     h_hc_head_base.data(), dim);
-            check_cuda(cudaMemcpy(d_x, host_x.data(), dim * sizeof(float),
-                                  cudaMemcpyHostToDevice), "copy hc head x");
+            check_device(memcpy_h2d(d_x, host_x.data(), dim * sizeof(float)), "copy hc head x");
         }
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_x_normed, dim, 1e-6f))
             throw std::runtime_error("final norm failed");
@@ -9642,9 +9609,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         int top_t = local_vocab_start;
         float top_l = -INFINITY;
         if (gguf_host_logits) {
-            check_cuda(cudaDeviceSynchronize(), "sync after head");
-            check_cuda(cudaMemcpy(h_logits.data(), d_logits, local_vocab * sizeof(float),
-                                  cudaMemcpyDeviceToHost), "copy logits");
+            check_device(device_synchronize(), "sync after head");
+            check_device(memcpy_d2h(h_logits.data(), d_logits, local_vocab * sizeof(float)), "copy logits");
             int local_t = 0;
             float local_l = -INFINITY;
             for (int i = 0; i < local_vocab; ++i) {
@@ -9656,10 +9622,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             if (!argmax_fp32_cuda(d_logits, d_argmax_token, d_argmax_logit,
                                   local_vocab, local_vocab_start))
                 throw std::runtime_error("argmax_fp32_cuda failed");
-            check_cuda(cudaMemcpy(&top_t, d_argmax_token, sizeof(int),
-                                  cudaMemcpyDeviceToHost), "copy argmax token");
-            check_cuda(cudaMemcpy(&top_l, d_argmax_logit, sizeof(float),
-                                  cudaMemcpyDeviceToHost), "copy argmax logit");
+            check_device(memcpy_d2h(&top_t, d_argmax_token, sizeof(int)), "copy argmax token");
+            check_device(memcpy_d2h(&top_l, d_argmax_logit, sizeof(float)), "copy argmax logit");
         }
 #ifdef DSV4_HAVE_NCCL
         if (tp_world > 1 && !options.nccl_id_path.empty()) {
@@ -9786,34 +9750,34 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             need_iq1_gemm_ws = need_iq1_gemm_ws || iq1_all_recipe;
         }
 
-        check_cuda(cudaMalloc(&d_embed_chunk_f16, chunk_dim * sizeof(uint16_t)), "alloc GGUF prefill embed chunk");
-        check_cuda(cudaMalloc(&d_prefill_token_ids, static_cast<size_t>(prompt_tokens) * sizeof(int)), "alloc GGUF prefill token ids");
-        check_cuda(cudaMalloc(&d_state_rows, static_cast<size_t>(prompt_tokens) * dim * sizeof(float)), "alloc GGUF prefill state rows");
-        check_cuda(cudaMalloc(&d_attn_norm_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill attn norm rows");
-        check_cuda(cudaMalloc(&d_q_a_rows, chunk_q_a * sizeof(float)), "alloc GGUF prefill q_a rows");
-        check_cuda(cudaMalloc(&d_q_norm_rows, chunk_q_a * sizeof(float)), "alloc GGUF prefill q_norm rows");
-        check_cuda(cudaMalloc(&d_q_rows, chunk_q * sizeof(float)), "alloc GGUF prefill q rows");
-        check_cuda(cudaMalloc(&d_kv_a_rows, chunk_kv * sizeof(float)), "alloc GGUF prefill kv_a rows");
-        check_cuda(cudaMalloc(&d_kv_rows, chunk_kv * sizeof(float)), "alloc GGUF prefill kv rows");
-        check_cuda(cudaMalloc(&d_attn_value_rows, chunk_q * sizeof(float)), "alloc GGUF prefill attn value rows");
-        check_cuda(cudaMalloc(&d_attn_mid_rows, chunk_attn_mid * sizeof(float)), "alloc GGUF prefill attn mid rows");
-        check_cuda(cudaMalloc(&d_attn_out_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill attn out rows");
-        check_cuda(cudaMalloc(&d_ffn_norm_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill ffn norm rows");
-        check_cuda(cudaMalloc(&d_shared_gate_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared gate rows");
-        check_cuda(cudaMalloc(&d_shared_up_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared up rows");
-        check_cuda(cudaMalloc(&d_shared_hidden_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared hidden rows");
-        check_cuda(cudaMalloc(&d_shared_out_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill shared out rows");
-        check_cuda(cudaMalloc(&d_moe_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill moe rows");
-        check_cuda(cudaMalloc(&d_prefill_route_indices, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill route indices");
-        check_cuda(cudaMalloc(&d_prefill_route_weights, static_cast<size_t>(routes_cap) * sizeof(float)), "alloc GGUF prefill route weights");
-        check_cuda(cudaMalloc(&d_group_route_tokens, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill grouped route tokens");
-        check_cuda(cudaMalloc(&d_group_route_weights, static_cast<size_t>(routes_cap) * sizeof(float)), "alloc GGUF prefill grouped route weights");
-        check_cuda(cudaMalloc(&d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "alloc GGUF prefill seg starts");
-        check_cuda(cudaMalloc(&d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "alloc GGUF prefill route counts");
-        check_cuda(cudaMalloc(&d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "alloc GGUF prefill route offsets");
-        check_cuda(cudaMalloc(&d_total_routes, sizeof(int32_t)), "alloc GGUF prefill total routes");
+        check_device(device_malloc_into(d_embed_chunk_f16, chunk_dim * sizeof(uint16_t)), "alloc GGUF prefill embed chunk");
+        check_device(device_malloc_into(d_prefill_token_ids, static_cast<size_t>(prompt_tokens) * sizeof(int)), "alloc GGUF prefill token ids");
+        check_device(device_malloc_into(d_state_rows, static_cast<size_t>(prompt_tokens) * dim * sizeof(float)), "alloc GGUF prefill state rows");
+        check_device(device_malloc_into(d_attn_norm_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill attn norm rows");
+        check_device(device_malloc_into(d_q_a_rows, chunk_q_a * sizeof(float)), "alloc GGUF prefill q_a rows");
+        check_device(device_malloc_into(d_q_norm_rows, chunk_q_a * sizeof(float)), "alloc GGUF prefill q_norm rows");
+        check_device(device_malloc_into(d_q_rows, chunk_q * sizeof(float)), "alloc GGUF prefill q rows");
+        check_device(device_malloc_into(d_kv_a_rows, chunk_kv * sizeof(float)), "alloc GGUF prefill kv_a rows");
+        check_device(device_malloc_into(d_kv_rows, chunk_kv * sizeof(float)), "alloc GGUF prefill kv rows");
+        check_device(device_malloc_into(d_attn_value_rows, chunk_q * sizeof(float)), "alloc GGUF prefill attn value rows");
+        check_device(device_malloc_into(d_attn_mid_rows, chunk_attn_mid * sizeof(float)), "alloc GGUF prefill attn mid rows");
+        check_device(device_malloc_into(d_attn_out_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill attn out rows");
+        check_device(device_malloc_into(d_ffn_norm_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill ffn norm rows");
+        check_device(device_malloc_into(d_shared_gate_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared gate rows");
+        check_device(device_malloc_into(d_shared_up_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared up rows");
+        check_device(device_malloc_into(d_shared_hidden_rows, chunk_inter * sizeof(float)), "alloc GGUF prefill shared hidden rows");
+        check_device(device_malloc_into(d_shared_out_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill shared out rows");
+        check_device(device_malloc_into(d_moe_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill moe rows");
+        check_device(device_malloc_into(d_prefill_route_indices, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill route indices");
+        check_device(device_malloc_into(d_prefill_route_weights, static_cast<size_t>(routes_cap) * sizeof(float)), "alloc GGUF prefill route weights");
+        check_device(device_malloc_into(d_group_route_tokens, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill grouped route tokens");
+        check_device(device_malloc_into(d_group_route_weights, static_cast<size_t>(routes_cap) * sizeof(float)), "alloc GGUF prefill grouped route weights");
+        check_device(device_malloc_into(d_seg_starts, static_cast<size_t>(experts_per_rank + 1) * sizeof(int32_t)), "alloc GGUF prefill seg starts");
+        check_device(device_malloc_into(d_counts, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "alloc GGUF prefill route counts");
+        check_device(device_malloc_into(d_offsets, static_cast<size_t>(experts_per_rank) * sizeof(int32_t)), "alloc GGUF prefill route offsets");
+        check_device(device_malloc_into(d_total_routes, sizeof(int32_t)), "alloc GGUF prefill total routes");
         if (use_prefill_indexed_attn) {
-            check_cuda(cudaMalloc(&d_prefill_attn_indices, static_cast<size_t>(prefill_attn_index_elems) * sizeof(int32_t)), "alloc GGUF prefill attention indices");
+            check_device(device_malloc_into(d_prefill_attn_indices, static_cast<size_t>(prefill_attn_index_elems) * sizeof(int32_t)), "alloc GGUF prefill attention indices");
             if (!build_prefill_window_indices_cuda(d_prefill_attn_indices, prompt_tokens, prefill_attn_window, prefill_attn_topk))
                 throw std::runtime_error("GGUF prefill attention window indices failed");
         } else if (tp_rank == 0 && env_int_or_default("DSV4_GGUF_VERBOSE", 0) != 0) {
@@ -9822,45 +9786,46 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " index_elems=" << prefill_attn_index_elems
                       << " max_index_elems=" << prefill_attn_max_index_elems << "\n";
         }
-        check_cuda(cudaMalloc(&d_final_norm_rows, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill final norm");
+        check_device(device_malloc_into(d_final_norm_rows, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill final norm");
         if (use_hc) {
-            check_cuda(cudaMalloc(&d_h4_rows, static_cast<size_t>(prompt_tokens) * 4 * dim * sizeof(float)), "alloc GGUF prefill hc h4 rows");
-            check_cuda(cudaMalloc(&d_h4_next_rows, chunk_dim * 4 * sizeof(float)), "alloc GGUF prefill hc h4 next rows");
-            check_cuda(cudaMalloc(&d_h4_bf16_rows, chunk_dim * 4 * sizeof(uint16_t)), "alloc GGUF prefill hc h4 bf16 rows");
-            check_cuda(cudaMalloc(&d_hc_post_rows, static_cast<size_t>(chunk_alloc) * 4 * sizeof(float)), "alloc GGUF prefill hc post rows");
-            check_cuda(cudaMalloc(&d_hc_comb_rows, static_cast<size_t>(chunk_alloc) * 16 * sizeof(float)), "alloc GGUF prefill hc comb rows");
-            check_cuda(cudaMalloc(&d_x_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill hc x rows");
-            check_cuda(cudaMalloc(&d_hc_last_x, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill hc last x");
+            check_device(device_malloc_into(d_h4_rows, static_cast<size_t>(prompt_tokens) * 4 * dim * sizeof(float)), "alloc GGUF prefill hc h4 rows");
+            check_device(device_malloc_into(d_h4_next_rows, chunk_dim * 4 * sizeof(float)), "alloc GGUF prefill hc h4 next rows");
+            check_device(device_malloc_into(d_h4_bf16_rows, chunk_dim * 4 * sizeof(uint16_t)), "alloc GGUF prefill hc h4 bf16 rows");
+            check_device(device_malloc_into(d_hc_post_rows, static_cast<size_t>(chunk_alloc) * 4 * sizeof(float)), "alloc GGUF prefill hc post rows");
+            check_device(device_malloc_into(d_hc_comb_rows, static_cast<size_t>(chunk_alloc) * 16 * sizeof(float)), "alloc GGUF prefill hc comb rows");
+            check_device(device_malloc_into(d_x_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill hc x rows");
+            check_device(device_malloc_into(d_hc_last_x, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill hc last x");
         }
         if (need_q2_ws) {
             q2_ws.routes_cap = routes_cap; q2_ws.dim = dim; q2_ws.inter_dim = moe_inter;
-            check_cuda(cudaMalloc(&q2_ws.d_x_route, routes_dim * sizeof(float)), "alloc GGUF prefill q2 x route");
-            check_cuda(cudaMalloc(&q2_ws.d_x_q, routes_dim), "alloc GGUF prefill q2 x q");
-            check_cuda(cudaMalloc(&q2_ws.d_x_scale, static_cast<size_t>(routes_cap) * x_groups * sizeof(float)), "alloc GGUF prefill q2 x scale");
-            check_cuda(cudaMalloc(&q2_ws.d_route_slots, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill q2 route slots");
-            check_cuda(cudaMalloc(&q2_ws.d_gate, routes_inter * sizeof(float)), "alloc GGUF prefill q2 gate");
-            check_cuda(cudaMalloc(&q2_ws.d_up, routes_inter * sizeof(float)), "alloc GGUF prefill q2 up");
-            check_cuda(cudaMalloc(&q2_ws.d_hidden_q, routes_inter), "alloc GGUF prefill q2 hidden q");
-            check_cuda(cudaMalloc(&q2_ws.d_hidden_scale, static_cast<size_t>(routes_cap) * hidden_groups * sizeof(float)), "alloc GGUF prefill q2 hidden scale");
+            check_device(device_malloc_into(q2_ws.d_x_route, routes_dim * sizeof(float)), "alloc GGUF prefill q2 x route");
+            check_device(device_malloc_into(q2_ws.d_x_q, routes_dim), "alloc GGUF prefill q2 x q");
+            check_device(device_malloc_into(q2_ws.d_x_scale, static_cast<size_t>(routes_cap) * x_groups * sizeof(float)), "alloc GGUF prefill q2 x scale");
+            check_device(device_malloc_into(q2_ws.d_route_slots, static_cast<size_t>(routes_cap) * sizeof(int64_t)), "alloc GGUF prefill q2 route slots");
+            check_device(device_malloc_into(q2_ws.d_gate, routes_inter * sizeof(float)), "alloc GGUF prefill q2 gate");
+            check_device(device_malloc_into(q2_ws.d_up, routes_inter * sizeof(float)), "alloc GGUF prefill q2 up");
+            check_device(device_malloc_into(q2_ws.d_hidden_q, routes_inter), "alloc GGUF prefill q2 hidden q");
+            check_device(device_malloc_into(q2_ws.d_hidden_scale, static_cast<size_t>(routes_cap) * hidden_groups * sizeof(float)), "alloc GGUF prefill q2 hidden scale");
         }
         if (need_iq1_ws) {
             iq1_ws.routes_cap = routes_cap; iq1_ws.dim = dim; iq1_ws.inter_dim = moe_inter;
-            check_cuda(cudaMalloc(&iq1_ws.d_hidden, routes_inter * sizeof(float)), "alloc GGUF prefill iq1 hidden");
+            check_device(device_malloc_into(iq1_ws.d_hidden, routes_inter * sizeof(float)), "alloc GGUF prefill iq1 hidden");
             if (need_iq1_q2_ws || iq1_grouped_w2_q8_enabled) {
-                check_cuda(cudaMalloc(&iq1_ws.d_hidden_q, routes_inter), "alloc GGUF prefill iq1 hidden q");
-                check_cuda(cudaMalloc(&iq1_ws.d_hidden_scale, static_cast<size_t>(routes_cap) * hidden_groups * sizeof(float)), "alloc GGUF prefill iq1 hidden scale");
+                check_device(device_malloc_into(iq1_ws.d_hidden_q, routes_inter), "alloc GGUF prefill iq1 hidden q");
+                check_device(device_malloc_into(iq1_ws.d_hidden_scale, static_cast<size_t>(routes_cap) * hidden_groups * sizeof(float)), "alloc GGUF prefill iq1 hidden scale");
             }
             if (iq1_grouped_gemm_enabled && need_iq1_gemm_ws) {
                 const int tile_cap = (routes_cap + 15) / 16 + experts_per_rank;
                 iq1_ws.tile_cap = tile_cap;
-                check_cuda(cudaMalloc(&iq1_ws.d_x_q, routes_dim), "alloc GGUF prefill iq1 x q");
-                check_cuda(cudaMalloc(&iq1_ws.d_x_scale, static_cast<size_t>(routes_cap) * iq1_x_groups16 * sizeof(float)), "alloc GGUF prefill iq1 x scale");
-                check_cuda(cudaMalloc(&iq1_ws.d_tile_experts, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "alloc GGUF prefill iq1 tile experts");
-                check_cuda(cudaMalloc(&iq1_ws.d_tile_rows, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "alloc GGUF prefill iq1 tile rows");
+                check_device(device_malloc_into(iq1_ws.d_x_q, routes_dim), "alloc GGUF prefill iq1 x q");
+                check_device(device_malloc_into(iq1_ws.d_x_scale, static_cast<size_t>(routes_cap) * iq1_x_groups16 * sizeof(float)), "alloc GGUF prefill iq1 x scale");
+                check_device(device_malloc_into(iq1_ws.d_tile_experts, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "alloc GGUF prefill iq1 tile experts");
+                check_device(device_malloc_into(iq1_ws.d_tile_rows, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "alloc GGUF prefill iq1 tile rows");
             }
         }
 
-        check_cuda(cudaMemcpy(d_prefill_token_ids, seed_tokens.data(), static_cast<size_t>(prompt_tokens) * sizeof(int), cudaMemcpyHostToDevice), "copy GGUF prefill token ids");
+        check_device(memcpy_h2d(d_prefill_token_ids, seed_tokens.data(),
+                                static_cast<size_t>(prompt_tokens) * sizeof(int)), "copy GGUF prefill token ids");
         const uint16_t* embed_f16 = reinterpret_cast<const uint16_t*>(embed.data);
         for (int cs = 0; cs < prompt_tokens; cs += chunk_tokens) {
             const int cn = std::min(chunk_tokens, prompt_tokens - cs);
@@ -9870,7 +9835,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                             embed_f16 + static_cast<size_t>(tok) * dim,
                             static_cast<size_t>(dim) * sizeof(uint16_t));
             }
-            check_cuda(cudaMemcpy(d_embed_chunk_f16, h_embed_chunk.data(), static_cast<size_t>(cn) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy GGUF prefill embed chunk");
+            check_device(memcpy_h2d(d_embed_chunk_f16, h_embed_chunk.data(),
+                                    static_cast<size_t>(cn) * dim * sizeof(uint16_t)), "copy GGUF prefill embed chunk");
             if (use_hc) {
                 if (!f16_contiguous_rows_to_float_cuda(d_embed_chunk_f16, d_x_rows, cn, dim))
                     throw std::runtime_error("GGUF prefill embed rows (hc) failed");
@@ -9963,8 +9929,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 
                 if (!moe_group_routes_cuda(d_prefill_route_indices, d_prefill_route_weights, d_group_route_tokens, d_group_route_weights, d_seg_starts, d_counts, d_offsets, d_total_routes, cn, topk, expert_start, experts_per_rank)) throw std::runtime_error("GGUF prefill group routes failed");
                 int32_t total_routes = 0;
-                check_cuda(cudaMemcpy(&total_routes, d_total_routes, sizeof(int32_t), cudaMemcpyDeviceToHost), "copy GGUF prefill total routes");
-                check_cuda(cudaMemcpy(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy GGUF prefill route counts");
+                check_device(memcpy_d2h(&total_routes, d_total_routes, sizeof(int32_t)), "copy GGUF prefill total routes");
+                check_device(memcpy_d2h(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t)), "copy GGUF prefill route counts");
                 int max_count = 0;
                 for (int32_t c : h_counts) max_count = std::max(max_count, static_cast<int>(c));
                 if (iq1_grouped_gemm_enabled && iq1_all_recipe && iq1_ws.d_tile_experts != nullptr && iq1_ws.d_tile_rows != nullptr) {
@@ -9982,8 +9948,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     iq1_ws.tile_count = static_cast<int>(h_iq1_tile_experts.size());
                     if (iq1_ws.tile_count > iq1_ws.tile_cap) throw std::runtime_error("GGUF prefill IQ1 tile capacity exceeded");
                     if (iq1_ws.tile_count > 0) {
-                        check_cuda(cudaMemcpy(iq1_ws.d_tile_experts, h_iq1_tile_experts.data(), h_iq1_tile_experts.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy GGUF prefill iq1 tile experts");
-                        check_cuda(cudaMemcpy(iq1_ws.d_tile_rows, h_iq1_tile_rows.data(), h_iq1_tile_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy GGUF prefill iq1 tile rows");
+                        check_device(memcpy_h2d(iq1_ws.d_tile_experts, h_iq1_tile_experts.data(),
+                                                h_iq1_tile_experts.size() * sizeof(int32_t)), "copy GGUF prefill iq1 tile experts");
+                        check_device(memcpy_h2d(iq1_ws.d_tile_rows, h_iq1_tile_rows.data(),
+                                                h_iq1_tile_rows.size() * sizeof(int32_t)), "copy GGUF prefill iq1 tile rows");
                     }
                 } else if (need_iq1_ws) {
                     iq1_ws.tile_count = 0;
@@ -10002,12 +9970,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     const size_t w3_layer_bytes = static_cast<size_t>(layer_w3_bytes[L]);
                     const std::string lp = "layers." + std::to_string(L);
                     bool copy_stream_waited = false;
-                    cudaStream_t stage_stream = moe_copy_stream_enabled ? gguf_moe_copy_stream : nullptr;
+                    void* stage_stream = moe_copy_stream_enabled ? gguf_moe_copy_stream : nullptr;
                     for (int local = 0; local < experts_per_rank; ++local) {
                         if (h_counts[static_cast<size_t>(local)] == 0 || h_prefill_staged_local[static_cast<size_t>(local)] != 0) continue;
                         if (moe_copy_stream_enabled && !copy_stream_waited) {
-                            check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
-                                       "GGUF prefill copy stream wait prior MoE consume event");
+                            check_device(stream_wait_event(gguf_moe_copy_stream, gguf_moe_consume_event),
+                                         "GGUF prefill copy stream wait prior MoE consume event");
                             copy_stream_waited = true;
                         }
                         const int eid = expert_start + local;
@@ -10022,24 +9990,24 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                         staged_this_chunk = true;
                     }
                     if (moe_copy_stream_enabled && staged_this_chunk) {
-                        check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
-                                   "record GGUF prefill MoE stage event");
+                        check_device(event_record(gguf_moe_stage_event, gguf_moe_copy_stream),
+                                     "record GGUF prefill MoE stage event");
                     }
                 }
                 if (profile_gguf) prof_prefill_stage_ms += elapsed_ms(stage_t, sync_now());
 
                 auto shared_t = std::chrono::steady_clock::now();
                 if (gguf_prefill_shared_overlap_enabled) {
-                    check_cuda(cudaEventRecord(gguf_prefill_shared_ready_event, nullptr),
-                               "record GGUF prefill shared ready event");
-                    check_cuda(cudaStreamWaitEvent(gguf_prefill_shared_stream, gguf_prefill_shared_ready_event, 0),
-                               "GGUF prefill shared stream wait ready event");
+                    check_device(event_record(gguf_prefill_shared_ready_event, nullptr),
+                                 "record GGUF prefill shared ready event");
+                    check_device(stream_wait_event(gguf_prefill_shared_stream, gguf_prefill_shared_ready_event),
+                                 "GGUF prefill shared stream wait ready event");
                     if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w1[L], d_shared_gate_rows, cn, moe_inter, dim, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w1 overlap rows failed");
                     if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w3[L], d_shared_up_rows, cn, moe_inter, dim, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w3 overlap rows failed");
                     if (!silu_mul_rows_cuda(d_shared_gate_rows, d_shared_up_rows, d_shared_hidden_rows, cn, moe_inter, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared silu overlap rows failed");
                     if (!q8_0_matmul_rows_cuda(d_shared_hidden_rows, d_shared_w2[L], d_shared_out_rows, cn, dim, moe_inter, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w2 overlap rows failed");
-                    check_cuda(cudaEventRecord(gguf_prefill_shared_done_event, gguf_prefill_shared_stream),
-                               "record GGUF prefill shared done event");
+                    check_device(event_record(gguf_prefill_shared_done_event, gguf_prefill_shared_stream),
+                                 "record GGUF prefill shared done event");
                 } else {
                     if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w1[L], d_shared_gate_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w1 rows failed");
                     if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w3[L], d_shared_up_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w3 rows failed");
@@ -10051,8 +10019,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 stage_t = sync_now();
                 if (have_routes) {
                     if (moe_copy_stream_enabled && staged_this_chunk) {
-                        check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
-                                   "GGUF prefill default stream wait MoE stage event");
+                        check_device(stream_wait_event(nullptr, gguf_moe_stage_event),
+                                     "GGUF prefill default stream wait MoE stage event");
                     }
                     if (q2_recipe) {
                         if (!moe_prefill_q2_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, routed_w1, routed_w2, routed_w3, d_moe_rows, cn, total_routes, routed_n, max_count, dim, moe_inter, ld.swiglu_limit, q2_ws)) throw std::runtime_error("GGUF prefill grouped Q2 MoE failed");
@@ -10066,16 +10034,16 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                         throw std::runtime_error("GGUF prefill unsupported routed dtype recipe");
                     }
                     if (moe_copy_stream_enabled && !is_resident_routed_layer[L]) {
-                        check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
-                                   "record GGUF prefill MoE consume event");
+                        check_device(event_record(gguf_moe_consume_event, nullptr),
+                                     "record GGUF prefill MoE consume event");
                     }
                 } else {
-                    check_cuda(cudaMemset(d_moe_rows, 0, cn_dim * sizeof(float)), "zero GGUF prefill empty moe rows");
+                    check_device(device_memset(d_moe_rows, 0, cn_dim * sizeof(float)), "zero GGUF prefill empty moe rows");
                 }
                 gguf_all_reduce_sum_fp32_inplace(d_moe_rows, static_cast<int>(cn_dim), reduce_ctx_ptr, "GGUF prefill MoE all-reduce");
                 if (gguf_prefill_shared_overlap_enabled) {
-                    check_cuda(cudaStreamWaitEvent(nullptr, gguf_prefill_shared_done_event, 0),
-                               "GGUF prefill default stream wait shared done event");
+                    check_device(stream_wait_event(nullptr, gguf_prefill_shared_done_event),
+                                 "GGUF prefill default stream wait shared done event");
                 }
                 if (!vector_accum_rows_cuda(d_shared_out_rows, d_moe_rows, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill shared accum failed");
                 if (use_hc) {
@@ -10092,12 +10060,14 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         const float* last_row = d_state_rows + static_cast<size_t>(prompt_tokens - 1) * dim;
         if (use_hc) {
             std::vector<float> last_h4(static_cast<size_t>(4) * dim);
-            check_cuda(cudaMemcpy(last_h4.data(), d_h4_rows + static_cast<size_t>(prompt_tokens - 1) * 4 * dim,
-                                  static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost),
-                       "copy GGUF prefill final hc h4");
+            check_device(memcpy_d2h(last_h4.data(),
+                                    d_h4_rows + static_cast<size_t>(prompt_tokens - 1) * 4 * dim,
+                                    static_cast<size_t>(4) * dim * sizeof(float)),
+                         "copy GGUF prefill final hc h4");
             std::vector<float> host_x = hc_head_cpu(last_h4, h_hc_head_fn.data(), h_hc_head_scale.data(), h_hc_head_base.data(), dim);
-            check_cuda(cudaMemcpy(d_hc_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice),
-                       "copy GGUF prefill hc head x");
+            check_device(memcpy_h2d(d_hc_last_x, host_x.data(),
+                                    static_cast<size_t>(dim) * sizeof(float)),
+                         "copy GGUF prefill hc head x");
             last_row = d_hc_last_x;
         }
         if (!rmsnorm_bf16_gamma_cuda(last_row, d_final_norm_gamma, d_final_norm_rows, dim, 1e-6f)) throw std::runtime_error("GGUF prefill final norm failed");
@@ -10105,8 +10075,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         int top_t = local_vocab_start;
         float top_l = -INFINITY;
         if (gguf_host_logits) {
-            check_cuda(cudaDeviceSynchronize(), "sync GGUF prefill head");
-            check_cuda(cudaMemcpy(h_logits.data(), d_logits, local_vocab * sizeof(float), cudaMemcpyDeviceToHost), "copy GGUF prefill logits");
+            check_device(device_synchronize(), "sync GGUF prefill head");
+            check_device(memcpy_d2h(h_logits.data(), d_logits, local_vocab * sizeof(float)), "copy GGUF prefill logits");
             int local_t = 0;
             float local_l = -INFINITY;
             for (int i = 0; i < local_vocab; ++i) {
@@ -10116,8 +10086,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             top_l = local_l;
         } else {
             if (!argmax_fp32_cuda(d_logits, d_argmax_token, d_argmax_logit, local_vocab, local_vocab_start)) throw std::runtime_error("GGUF prefill argmax failed");
-            check_cuda(cudaMemcpy(&top_t, d_argmax_token, sizeof(int), cudaMemcpyDeviceToHost), "copy GGUF prefill argmax token");
-            check_cuda(cudaMemcpy(&top_l, d_argmax_logit, sizeof(float), cudaMemcpyDeviceToHost), "copy GGUF prefill argmax logit");
+            check_device(memcpy_d2h(&top_t, d_argmax_token, sizeof(int)), "copy GGUF prefill argmax token");
+            check_device(memcpy_d2h(&top_l, d_argmax_logit, sizeof(float)), "copy GGUF prefill argmax logit");
         }
 #ifdef DSV4_HAVE_NCCL
         if (tp_world > 1 && !options.nccl_id_path.empty()) {
@@ -10142,7 +10112,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             }
             if (profile_gguf) prof_prefill_refine_ms = elapsed_ms(refine_t, sync_now());
         }
-        check_cuda(cudaDeviceSynchronize(), "sync GGUF chunked prefill");
+        check_device(device_synchronize(), "sync GGUF chunked prefill");
         if (profile_gguf && tp_rank == 0) {
             std::cout << "gguf_chunked_prefill_profile chunk_tokens=" << chunk_tokens
                       << " iq1_w2_q8=" << (iq1_grouped_w2_q8_enabled ? 1 : 0)
@@ -10161,15 +10131,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " refine_last_ms=" << prof_prefill_refine_ms << "\n";
         }
 
-        cudaFree(d_embed_chunk_f16); cudaFree(d_prefill_token_ids); cudaFree(d_state_rows);
-        cudaFree(d_attn_norm_rows); cudaFree(d_q_a_rows); cudaFree(d_q_norm_rows); cudaFree(d_q_rows);
-        cudaFree(d_kv_a_rows); cudaFree(d_kv_rows); cudaFree(d_attn_value_rows); cudaFree(d_attn_mid_rows); cudaFree(d_attn_out_rows);
-        cudaFree(d_ffn_norm_rows); cudaFree(d_shared_gate_rows); cudaFree(d_shared_up_rows); cudaFree(d_shared_hidden_rows); cudaFree(d_shared_out_rows); cudaFree(d_moe_rows);
-        cudaFree(d_prefill_route_indices); cudaFree(d_prefill_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights);
-        cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes); cudaFree(d_prefill_attn_indices); cudaFree(d_final_norm_rows);
-        cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_x_rows); cudaFree(d_hc_last_x);
-        cudaFree(q2_ws.d_x_route); cudaFree(q2_ws.d_x_q); cudaFree(q2_ws.d_x_scale); cudaFree(q2_ws.d_route_slots); cudaFree(q2_ws.d_gate); cudaFree(q2_ws.d_up); cudaFree(q2_ws.d_hidden_q); cudaFree(q2_ws.d_hidden_scale);
-        cudaFree(iq1_ws.d_hidden); cudaFree(iq1_ws.d_hidden_q); cudaFree(iq1_ws.d_hidden_scale); cudaFree(iq1_ws.d_x_q); cudaFree(iq1_ws.d_x_scale); cudaFree(iq1_ws.d_tile_experts); cudaFree(iq1_ws.d_tile_rows);
+        device_free(d_embed_chunk_f16); device_free(d_prefill_token_ids); device_free(d_state_rows);
+        device_free(d_attn_norm_rows); device_free(d_q_a_rows); device_free(d_q_norm_rows); device_free(d_q_rows);
+        device_free(d_kv_a_rows); device_free(d_kv_rows); device_free(d_attn_value_rows); device_free(d_attn_mid_rows); device_free(d_attn_out_rows);
+        device_free(d_ffn_norm_rows); device_free(d_shared_gate_rows); device_free(d_shared_up_rows); device_free(d_shared_hidden_rows); device_free(d_shared_out_rows); device_free(d_moe_rows);
+        device_free(d_prefill_route_indices); device_free(d_prefill_route_weights); device_free(d_group_route_tokens); device_free(d_group_route_weights);
+        device_free(d_seg_starts); device_free(d_counts); device_free(d_offsets); device_free(d_total_routes); device_free(d_prefill_attn_indices); device_free(d_final_norm_rows);
+        device_free(d_h4_rows); device_free(d_h4_next_rows); device_free(d_h4_bf16_rows); device_free(d_hc_post_rows); device_free(d_hc_comb_rows); device_free(d_x_rows); device_free(d_hc_last_x);
+        device_free(q2_ws.d_x_route); device_free(q2_ws.d_x_q); device_free(q2_ws.d_x_scale); device_free(q2_ws.d_route_slots); device_free(q2_ws.d_gate); device_free(q2_ws.d_up); device_free(q2_ws.d_hidden_q); device_free(q2_ws.d_hidden_scale);
+        device_free(iq1_ws.d_hidden); device_free(iq1_ws.d_hidden_q); device_free(iq1_ws.d_hidden_scale); device_free(iq1_ws.d_x_q); device_free(iq1_ws.d_x_scale); device_free(iq1_ws.d_tile_experts); device_free(iq1_ws.d_tile_rows);
         return {top_t, top_l};
     };
 
@@ -10321,9 +10291,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     }
 
     // ===== cleanup =====
-    auto free_vec_u8 = [](std::vector<uint8_t*>& v) { for (auto* p : v) cudaFree(p); };
-    auto free_vec_u16 = [](std::vector<uint16_t*>& v) { for (auto* p : v) cudaFree(p); };
-    auto free_vec_f32 = [](std::vector<float*>& v) { for (auto* p : v) cudaFree(p); };
+    auto free_vec_u8 = [](std::vector<uint8_t*>& v) { for (auto* p : v) device_free(p); };
+    auto free_vec_u16 = [](std::vector<uint16_t*>& v) { for (auto* p : v) device_free(p); };
+    auto free_vec_f32 = [](std::vector<float*>& v) { for (auto* p : v) device_free(p); };
     free_vec_u16(d_attn_gamma); free_vec_u16(d_q_gamma); free_vec_u16(d_kv_gamma);
     free_vec_u16(d_ffn_gamma); free_vec_f32(d_attn_sink);
     free_vec_u8(d_wq_a); free_vec_u8(d_wq_b); free_vec_u8(d_wkv);
@@ -10333,67 +10303,67 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     free_vec_f32(d_hc_attn_fn); free_vec_f32(d_hc_attn_scale); free_vec_f32(d_hc_attn_base);
     free_vec_f32(d_hc_ffn_fn); free_vec_f32(d_hc_ffn_scale); free_vec_f32(d_hc_ffn_base);
     for (auto& c : d_compressor_w) {
-        cudaFree(const_cast<uint16_t*>(c.wkv));
-        cudaFree(const_cast<uint16_t*>(c.wgate));
-        cudaFree(const_cast<float*>(c.ape));
-        cudaFree(const_cast<uint16_t*>(c.norm));
+        device_free(const_cast<uint16_t*>(c.wkv));
+        device_free(const_cast<uint16_t*>(c.wgate));
+        device_free(const_cast<float*>(c.ape));
+        device_free(const_cast<uint16_t*>(c.norm));
     }
     for (auto& idx : d_indexer_w) {
-        cudaFree(const_cast<uint16_t*>(idx.wq_b));
-        cudaFree(const_cast<uint16_t*>(idx.weights_proj));
-        cudaFree(const_cast<uint16_t*>(idx.comp.wkv));
-        cudaFree(const_cast<uint16_t*>(idx.comp.wgate));
-        cudaFree(const_cast<float*>(idx.comp.ape));
-        cudaFree(const_cast<uint16_t*>(idx.comp.norm));
+        device_free(const_cast<uint16_t*>(idx.wq_b));
+        device_free(const_cast<uint16_t*>(idx.weights_proj));
+        device_free(const_cast<uint16_t*>(idx.comp.wkv));
+        device_free(const_cast<uint16_t*>(idx.comp.wgate));
+        device_free(const_cast<float*>(idx.comp.ape));
+        device_free(const_cast<uint16_t*>(idx.comp.norm));
     }
     fm_runtime.release();
     for (auto& st : d_sparse_state) {
-        cudaFree(st.compressor_kv);
-        cudaFree(st.compressor_score);
-        cudaFree(st.indexer_kv_cache);
-        cudaFree(st.indexer_comp_kv);
-        cudaFree(st.indexer_comp_score);
+        device_free(st.compressor_kv);
+        device_free(st.compressor_score);
+        device_free(st.indexer_kv_cache);
+        device_free(st.indexer_comp_kv);
+        device_free(st.indexer_comp_score);
     }
-    for (auto* p : d_tid2eid_table) cudaFree(p);
-    cudaFree(d_final_norm_gamma); cudaFree(d_head);
-    cudaFree(d_routed_w1); cudaFree(d_routed_w2); cudaFree(d_routed_w3);
-    cudaFree(d_attn_weight_scratch); cudaFree(d_kv_indices);
+    for (auto* p : d_tid2eid_table) device_free(p);
+    device_free(d_final_norm_gamma); device_free(d_head);
+    device_free(d_routed_w1); device_free(d_routed_w2); device_free(d_routed_w3);
+    device_free(d_attn_weight_scratch); device_free(d_kv_indices);
     free_vec_f32(d_kv_cache);
-    cudaFree(d_x); cudaFree(d_x_pre_attn); cudaFree(d_x_normed);
-    cudaFree(d_q_a); cudaFree(d_q_normed); cudaFree(d_q);
-    cudaFree(d_kv_a); cudaFree(d_kv); cudaFree(d_attn_value);
-    cudaFree(d_attn_mid); cudaFree(d_attn_out);
-    cudaFree(d_x_pre_ffn); cudaFree(d_x_normed_ffn);
-    cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden);
-    cudaFree(d_shared_out); cudaFree(d_moe_out); cudaFree(d_ffn_combined);
-    cudaFree(d_x_q); cudaFree(d_x_scale);
-    cudaFree(d_route_slots); cudaFree(d_route_weights);
-    cudaFree(d_route_gate); cudaFree(d_route_up);
-    cudaFree(d_route_hidden_q); cudaFree(d_route_hidden_scale); cudaFree(d_route_hidden);
-    cudaFree(d_gate_scores_scratch); cudaFree(d_gate_scored_scratch); cudaFree(d_gate_indices);
-    cudaFree(d_tid2eid_i64); cudaFree(d_embed_row_f16);
-    cudaFree(d_compressor_input_bf16); cudaFree(d_compressor_input_rounded);
-    cudaFree(d_compressor_kv); cudaFree(d_compressor_score);
-    cudaFree(d_indexer_comp_kv); cudaFree(d_indexer_comp_score);
-    cudaFree(d_index_q); cudaFree(d_index_scores);
-    cudaFree(d_logits);
-    cudaFree(d_h4); cudaFree(d_h4_next); cudaFree(d_h4_bf16);
-    cudaFree(d_hc_post); cudaFree(d_hc_comb);
-    cudaFree(d_argmax_token); cudaFree(d_argmax_logit);
+    device_free(d_x); device_free(d_x_pre_attn); device_free(d_x_normed);
+    device_free(d_q_a); device_free(d_q_normed); device_free(d_q);
+    device_free(d_kv_a); device_free(d_kv); device_free(d_attn_value);
+    device_free(d_attn_mid); device_free(d_attn_out);
+    device_free(d_x_pre_ffn); device_free(d_x_normed_ffn);
+    device_free(d_shared_gate); device_free(d_shared_up); device_free(d_shared_hidden);
+    device_free(d_shared_out); device_free(d_moe_out); device_free(d_ffn_combined);
+    device_free(d_x_q); device_free(d_x_scale);
+    device_free(d_route_slots); device_free(d_route_weights);
+    device_free(d_route_gate); device_free(d_route_up);
+    device_free(d_route_hidden_q); device_free(d_route_hidden_scale); device_free(d_route_hidden);
+    device_free(d_gate_scores_scratch); device_free(d_gate_scored_scratch); device_free(d_gate_indices);
+    device_free(d_tid2eid_i64); device_free(d_embed_row_f16);
+    device_free(d_compressor_input_bf16); device_free(d_compressor_input_rounded);
+    device_free(d_compressor_kv); device_free(d_compressor_score);
+    device_free(d_indexer_comp_kv); device_free(d_indexer_comp_score);
+    device_free(d_index_q); device_free(d_index_scores);
+    device_free(d_logits);
+    device_free(d_h4); device_free(d_h4_next); device_free(d_h4_bf16);
+    device_free(d_hc_post); device_free(d_hc_comb);
+    device_free(d_argmax_token); device_free(d_argmax_logit);
     free_vec_u8(d_resident_w1); free_vec_u8(d_resident_w2); free_vec_u8(d_resident_w3);
     if (moe_copy_stream_enabled) {
-        cudaEventDestroy(gguf_moe_stage_event);
-        cudaEventDestroy(gguf_moe_consume_event);
-        cudaStreamDestroy(gguf_moe_copy_stream);
+        event_destroy(gguf_moe_stage_event);
+        event_destroy(gguf_moe_consume_event);
+        stream_destroy(gguf_moe_copy_stream);
     }
     if (gguf_prefill_shared_overlap_enabled) {
-        cudaEventDestroy(gguf_prefill_shared_ready_event);
-        cudaEventDestroy(gguf_prefill_shared_done_event);
-        cudaStreamDestroy(gguf_prefill_shared_stream);
+        event_destroy(gguf_prefill_shared_ready_event);
+        event_destroy(gguf_prefill_shared_done_event);
+        stream_destroy(gguf_prefill_shared_stream);
     }
     if (gguf_kv_swap_async_h2d) {
-        cudaEventDestroy(gguf_kv_swap_stage_event);
-        cudaStreamDestroy(gguf_kv_swap_copy_stream);
+        event_destroy(gguf_kv_swap_stage_event);
+        stream_destroy(gguf_kv_swap_copy_stream);
     }
     return r;
 }
@@ -10438,7 +10408,7 @@ struct PersistentEngine::State {
     }
 
     ~State() {
-        if (d_dspark_main_hidden != nullptr) cudaFree(d_dspark_main_hidden);
+        if (d_dspark_main_hidden != nullptr) device_free(d_dspark_main_hidden);
     }
 };
 
@@ -10475,7 +10445,7 @@ void PersistentEngine::reset_session() {
     state_->verify_dspark_hidden.clear();
     ctx.reset_streaming_compressor_states();
     // Sync to drain any in-flight stream work from the previous request.
-    cudaDeviceSynchronize();
+    device_synchronize();
 }
 
 namespace {
@@ -10973,9 +10943,8 @@ void PersistentEngine::load_dspark(const std::string& ckpt_dir) {
     set_dspark_capture_layers(targets, std::max(1, dcfg.window_size));
 
     s.dspark_hidden_stride = static_cast<int>(targets.size()) * dcfg.dim;
-    check_cuda(cudaMalloc(&s.d_dspark_main_hidden,
-                          static_cast<size_t>(s.dspark_hidden_stride) * sizeof(float)),
-               "cudaMalloc dspark main hidden staging");
+    check_device(device_malloc_into(s.d_dspark_main_hidden, static_cast<size_t>(s.dspark_hidden_stride) * sizeof(float)),
+                 "device_malloc dspark main hidden staging");
     s.dspark = std::move(engine);
 }
 
@@ -10991,9 +10960,8 @@ dspark::DraftOutput PersistentEngine::draft_tokens(int input_token, int start_po
                                  std::to_string(hidden.size()));
     }
 
-    check_cuda(cudaMemcpy(s.d_dspark_main_hidden, hidden.data(),
-                          hidden.size() * sizeof(float), cudaMemcpyHostToDevice),
-               "upload dspark main hidden");
+    check_device(memcpy_h2d(s.d_dspark_main_hidden, hidden.data(), hidden.size() * sizeof(float)),
+                 "upload dspark main hidden");
 
     // The capture concatenates the target layers on the last axis; the draft
     // wants one pointer per layer, so slice the staged row rather than copying
@@ -11265,7 +11233,7 @@ void PersistentEngine::run_worker_loop() {
                 s.verify_dspark_hidden.clear();
             }
             std::cerr << "[worker rank " << s.opts.tp_rank << "] caught: " << ex.what() << "\n";
-            cudaGetLastError();  // clear sticky CUDA error so next request starts clean
+            device_last_error();  // clear the sticky device error so the next request starts clean
         }
     }
 }

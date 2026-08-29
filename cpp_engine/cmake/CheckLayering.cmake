@@ -6,8 +6,16 @@
 # the shared code to one vendor. Backends are allowed, and expected, to include
 # whatever their SDK needs.
 #
-# engine/ is deliberately NOT checked yet. It still calls vendor runtime APIs
-# directly; routing that through backends/api is a later phase.
+# backends/api/ is checked too, and is the strictest case: it declares the
+# contract both vendors implement, so a vendor type reaching it would defeat the
+# whole seam.
+#
+# engine/ is checked as well, and gets a second, stricter test: its sources must
+# not name a vendor runtime entry point either. An include check alone would not
+# catch a stray cudaMalloc that compiles only because some other header pulled the
+# SDK in transitively, and that is exactly the regression this seam exists to
+# prevent. Kernel launches still live in backends/<vendor>/kernels, which is not
+# checked.
 #
 # Run with: cmake --build <dir> --target check_layering
 
@@ -36,6 +44,8 @@ file(GLOB_RECURSE guarded_files
     "${POCKET_ENGINE_DIR}/include/*.hpp"
     "${POCKET_ENGINE_DIR}/include/*.h"
     "${POCKET_ENGINE_DIR}/core/*.cpp"
+    "${POCKET_ENGINE_DIR}/backends/api/*.hpp"
+    "${POCKET_ENGINE_DIR}/engine/*.cpp"
 )
 
 foreach(file ${guarded_files})
@@ -60,5 +70,51 @@ if(violations)
         "opaque handle instead (see include/qwen_sampler.hpp for the pattern).")
 endif()
 
+# Vendor runtime entry points the shared layers must call through
+# backends/api/device_runtime.hpp instead. Matched as whole words so an error
+# string or a comment mentioning the old name is not a violation; the patterns
+# below target call syntax and type names.
+set(vendor_symbols
+    "cudaMalloc" "cudaFree" "cudaMallocHost" "cudaFreeHost" "cudaHostAlloc"
+    "cudaHostRegister" "cudaMemcpy" "cudaMemcpyAsync" "cudaMemcpy2D"
+    "cudaMemset" "cudaMemsetAsync" "cudaMemGetInfo"
+    "cudaStreamCreate" "cudaStreamCreateWithFlags" "cudaStreamDestroy"
+    "cudaStreamSynchronize" "cudaStreamWaitEvent"
+    "cudaEventCreate" "cudaEventCreateWithFlags" "cudaEventDestroy"
+    "cudaEventRecord" "cudaEventSynchronize" "cudaEventElapsedTime"
+    "cudaDeviceSynchronize" "cudaSetDevice" "cudaGetDevice"
+    "cudaGetLastError" "cudaGetErrorString" "cudaStream_t" "cudaEvent_t"
+    "cudaError_t" "cudaSuccess"
+    "nvtxRangePush" "nvtxRangePushA" "nvtxRangePop"
+    "aclrtMalloc" "aclrtFree" "aclrtMemcpy" "aclrtMemset"
+    "aclrtCreateStream" "aclrtCreateEvent" "aclrtSynchronizeDevice"
+    "aclrtStream" "aclrtEvent" "aclError"
+)
+
+set(symbol_violations "")
+
+foreach(file ${guarded_files})
+    file(READ "${file}" contents)
+    foreach(symbol ${vendor_symbols})
+        # Call sites and declarations: the symbol followed by '(' or whitespace
+        # then an identifier. Quoted mentions are skipped by requiring that the
+        # character before the symbol is not a double quote.
+        if(contents MATCHES "[^\"_A-Za-z0-9]${symbol}[ \t]*[(*&]")
+            file(RELATIVE_PATH rel "${POCKET_ENGINE_DIR}" "${file}")
+            list(APPEND symbol_violations "${rel}: ${symbol}")
+        endif()
+    endforeach()
+endforeach()
+
+if(symbol_violations)
+    list(REMOVE_DUPLICATES symbol_violations)
+    string(REPLACE ";" "\n  " pretty "${symbol_violations}")
+    message(FATAL_ERROR
+        "Vendor runtime calls in a device-agnostic layer:\n  ${pretty}\n"
+        "Call the equivalent in backends/api/device_runtime.hpp instead, and add "
+        "the backend implementation under backends/<vendor>/runtime/.")
+endif()
+
 list(LENGTH guarded_files checked)
-message(STATUS "check_layering: ${checked} files clean of vendor SDK includes")
+message(STATUS
+    "check_layering: ${checked} files clean of vendor SDK includes and runtime calls")

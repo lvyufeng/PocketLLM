@@ -1,11 +1,11 @@
 #include "qwen_dspark.hpp"
 
 #include "cuda_ops.hpp"
+#include "device_runtime.hpp"
 #include "json_lite.hpp"
 #include "qwen_cuda_ops.hpp"
 #include "tp_comm.hpp"
 
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cmath>
@@ -118,14 +118,15 @@ void shard_range(uint64_t total, int world, int rank,
     *start = *size * static_cast<uint64_t>(rank);
 }
 
-void check_cuda(cudaError_t status, const std::string& what) {
-    if (status != cudaSuccess) {
-        throw std::runtime_error(what + ": " + cudaGetErrorString(status));
+void check_device(bool ok, const std::string& what) {
+    if (!ok) {
+        const std::string detail = device_last_error();
+        throw std::runtime_error(detail.empty() ? what : what + ": " + detail);
     }
 }
 
 void require_launch(bool ok, const std::string& what) {
-    if (!ok) throw std::runtime_error("Qwen DSpark CUDA launch failed: " + what);
+    if (!ok) throw std::runtime_error("Qwen DSpark device launch failed: " + what);
 }
 
 void allocate_tensor(QwenDeviceTensor& tensor, size_t elements,
@@ -143,11 +144,11 @@ void allocate_tensor(QwenDeviceTensor& tensor, size_t elements,
         return;
     }
     if (tensor.data != nullptr) {
-        check_cuda(cudaFree(tensor.data), "free Qwen DSpark device tensor");
+        device_free(tensor.data);
         tensor.data = nullptr;
     }
-    check_cuda(cudaMalloc(&tensor.data, bytes),
-               "allocate Qwen DSpark device tensor");
+    tensor.data = device_malloc(bytes);
+    check_device(tensor.data != nullptr, "allocate Qwen DSpark device tensor");
     tensor.device_dtype = dtype;
     tensor.shape = shape;
     tensor.nbytes = bytes;
@@ -482,7 +483,7 @@ struct QwenDSparkRuntime::Impl {
             !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DSpark runtime target tensors");
         }
-        check_cuda(cudaSetDevice(device), "select Qwen DSpark CUDA device");
+        check_device(device_set(device), "select Qwen DSpark device");
         projector = qwen_upload_tensor_cuda(index, weight_map.projector());
         hidden_norm = qwen_upload_tensor_cuda(index, weight_map.hidden_norm());
         final_norm = qwen_upload_tensor_cuda(index, weight_map.final_norm());
@@ -539,10 +540,9 @@ struct QwenDSparkRuntime::Impl {
             qwen_dspark_yarn_inv_freqs(config);
         allocate_float(inverse_frequencies, host_frequencies.size(),
                        {static_cast<uint64_t>(host_frequencies.size())});
-        check_cuda(cudaMemcpy(inverse_frequencies.data, host_frequencies.data(),
-                              host_frequencies.size() * sizeof(float),
-                              cudaMemcpyHostToDevice),
-                   "upload Qwen DSpark YaRN frequencies");
+        check_device(memcpy_h2d(inverse_frequencies.data, host_frequencies.data(),
+                                host_frequencies.size() * sizeof(float)),
+                     "upload Qwen DSpark YaRN frequencies");
     }
 
     // The draft LM head is a batch=block_size by vocab by hidden GEMM. The
@@ -632,13 +632,13 @@ struct QwenDSparkRuntime::Impl {
                       rows, kv_heads);
             apply_rope(normalized.f16_data(), rows, kv_heads, position_offset);
             const size_t offset = static_cast<size_t>(position_offset) * kv_dim;
-            check_cuda(cudaMemcpy(
+            check_device(memcpy_d2d(
                 layer.context_k.f16_data() + offset, normalized.f16_data(),
-                kv_elements * sizeof(uint16_t), cudaMemcpyDeviceToDevice),
+                kv_elements * sizeof(uint16_t)),
                 "append Qwen DSpark context K");
-            check_cuda(cudaMemcpy(
+            check_device(memcpy_d2d(
                 layer.context_v.f16_data() + offset, block_v.f16_data(),
-                kv_elements * sizeof(uint16_t), cudaMemcpyDeviceToDevice),
+                kv_elements * sizeof(uint16_t)),
                 "append Qwen DSpark context V");
         }
         committed += rows;
@@ -669,12 +669,10 @@ struct QwenDSparkRuntime::Impl {
             throw std::runtime_error("Qwen DSpark TP requires NCCL-enabled build");
         }
 #endif
-        check_cuda(cudaMemcpy(&token, local_argmax_tokens.data, sizeof(int),
-                              cudaMemcpyDeviceToHost),
-                   "download Qwen DSpark token");
-        check_cuda(cudaMemcpy(&value, local_argmax_logits.data, sizeof(float),
-                              cudaMemcpyDeviceToHost),
-                   "download Qwen DSpark logit");
+        check_device(memcpy_d2h(&token, local_argmax_tokens.data, sizeof(int)),
+                     "download Qwen DSpark token");
+        check_device(memcpy_d2h(&value, local_argmax_logits.data, sizeof(float)),
+                     "download Qwen DSpark logit");
         return {token, value};
     }
 
@@ -706,10 +704,9 @@ struct QwenDSparkRuntime::Impl {
         host_tokens[0] = anchor_token;
         allocate_tensor(tokens, rows, {static_cast<uint64_t>(rows)},
                         SafeDType::I64);
-        check_cuda(cudaMemcpy(tokens.data, host_tokens.data(),
-                              host_tokens.size() * sizeof(int),
-                              cudaMemcpyHostToDevice),
-                   "upload Qwen DSpark noise tokens");
+        check_device(memcpy_h2d(tokens.data, host_tokens.data(),
+                                host_tokens.size() * sizeof(int)),
+                     "upload Qwen DSpark noise tokens");
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden;
         allocate_half(hidden_a, hidden_elements,
                       {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden)});
@@ -804,9 +801,8 @@ struct QwenDSparkRuntime::Impl {
             const int previous = row == 0
                 ? anchor_token : proposal.tokens.back();
             previous_tokens[static_cast<size_t>(row)] = previous;
-            check_cuda(cudaMemcpy(tokens.data, &previous, sizeof(int),
-                                  cudaMemcpyHostToDevice),
-                       "upload Qwen DSpark Markov token");
+            check_device(memcpy_h2d(tokens.data, &previous, sizeof(int)),
+                         "upload Qwen DSpark Markov token");
             require_launch(qwen_dspark_embedding_gather_f16_cuda(
                 markov_w1.f16_data(), static_cast<const int*>(tokens.data),
                 markov_embeddings.f16_data() +
@@ -831,10 +827,9 @@ struct QwenDSparkRuntime::Impl {
             confidence.f32_data(), rows, hidden, config.markov_rank),
             "confidence predictor");
         proposal.confidences.resize(static_cast<size_t>(rows));
-        check_cuda(cudaMemcpy(proposal.confidences.data(), confidence.data,
-                              proposal.confidences.size() * sizeof(float),
-                              cudaMemcpyDeviceToHost),
-                   "download Qwen DSpark confidence");
+        check_device(memcpy_d2h(proposal.confidences.data(), confidence.data,
+                                proposal.confidences.size() * sizeof(float)),
+                     "download Qwen DSpark confidence");
         return proposal;
     }
 };
