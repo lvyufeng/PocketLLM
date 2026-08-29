@@ -432,6 +432,14 @@ add_executable(bench_qwen_gqa_prefill tests/bench_qwen_gqa_prefill.cpp)
 target_link_libraries(bench_qwen_gqa_prefill PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_gqa_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(bench_qwen_gqa_decode tests/bench_qwen_gqa_decode.cpp)
+target_link_libraries(bench_qwen_gqa_decode PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_gqa_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_fp8_swiglu_decode tests/bench_qwen_fp8_swiglu_decode.cpp)
+target_link_libraries(bench_qwen_fp8_swiglu_decode PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_fp8_swiglu_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(bench_qwen_gqa_verify tests/bench_qwen_gqa_verify.cpp)
 target_link_libraries(bench_qwen_gqa_verify PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_gqa_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

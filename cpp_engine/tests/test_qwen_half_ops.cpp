@@ -1538,6 +1538,143 @@ bool check_strided_row_copy(int rows) {
     return true;
 }
 
+// The decode fused gate/up SwiGLU matvec is the largest kernel in a decode
+// step, so it has a vectorized variant that widens FP8 codes with bit
+// arithmetic rather than a table. That shortcut only holds for E4M3's normal
+// codes, so cover every code including the exponent-zero subnormals and both
+// signs, and check the vectorized result against the scalar kernel it replaces.
+bool check_fp8_swiglu_decode_vectorized() {
+    // 5120 is the real Qwen3.8 MLP input width. 2052 is not a multiple of 128,
+    // so it exercises a partial scale block, and 300 leaves a ragged tail that
+    // the vectorized loop hands to the scalar path.
+    struct Case {
+        int rows;
+        int cols;
+    };
+    const Case cases[] = {{4352, 5120}, {136, 2052}, {72, 300}};
+    std::mt19937 rng(5150);
+    std::uniform_real_distribution<float> x_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> scale_dist(0.01f, 0.05f);
+
+    for (const Case& item : cases) {
+        const int weight_stride = item.cols;
+        const int scale_stride = (item.cols + 127) / 128;
+        const size_t weight_elements =
+            static_cast<size_t>(item.rows) * weight_stride;
+        std::vector<uint16_t> host_x(item.cols);
+        std::vector<uint8_t> host_gate(weight_elements);
+        std::vector<uint8_t> host_up(weight_elements);
+        std::vector<uint16_t> host_gate_scale(
+            static_cast<size_t>((item.rows + 127) / 128) * scale_stride);
+        std::vector<uint16_t> host_up_scale(host_gate_scale.size());
+        for (uint16_t& value : host_x) value = to_half(x_dist(rng));
+        // Walk all 256 codes so the subnormal and NaN encodings are covered at
+        // every lane position rather than sampled.
+        for (size_t i = 0; i < weight_elements; ++i) {
+            host_gate[i] = static_cast<uint8_t>(i & 0xffu);
+            host_up[i] = static_cast<uint8_t>((i * 7u + 3u) & 0xffu);
+        }
+        for (uint16_t& value : host_gate_scale) value = to_half(scale_dist(rng));
+        for (uint16_t& value : host_up_scale) value = to_half(scale_dist(rng));
+
+        DeviceBuffer dx, dg, du, dgs, dus, d_vec, d_scalar;
+        uint16_t* px = dx.allocate<uint16_t>(host_x.size());
+        uint8_t* pg = dg.allocate<uint8_t>(host_gate.size());
+        uint8_t* pu = du.allocate<uint8_t>(host_up.size());
+        uint16_t* pgs = dgs.allocate<uint16_t>(host_gate_scale.size());
+        uint16_t* pus = dus.allocate<uint16_t>(host_up_scale.size());
+        uint16_t* py_vec = d_vec.allocate<uint16_t>(item.rows);
+        uint16_t* py_scalar = d_scalar.allocate<uint16_t>(item.rows);
+        if (!px || !pg || !pu || !pgs || !pus || !py_vec || !py_scalar ||
+            cudaMemcpy(px, host_x.data(), host_x.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pg, host_gate.data(), host_gate.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pu, host_up.data(), host_up.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pgs, host_gate_scale.data(),
+                       host_gate_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(pus, host_up_scale.data(),
+                       host_up_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            fail("FP8 SwiGLU decode vectorized allocation/copy");
+            return true;
+        }
+
+        // Multi-row dispatch has its own kernel; pin the single-row path so the
+        // comparison is vectorized against scalar and nothing else.
+        setenv("QWEN_FP8_F16_MULTIROW", "0", 1);
+        setenv("QWEN_FP8_F16_SWIGLU_VECTORIZE", "1", 1);
+        const bool vec_ok = dsv4::qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
+                                px, pg, pgs, pu, pus, py_vec, item.rows,
+                                item.cols, weight_stride, scale_stride) &&
+                            cudaDeviceSynchronize() == cudaSuccess;
+        setenv("QWEN_FP8_F16_SWIGLU_VECTORIZE", "0", 1);
+        const bool scalar_ok = dsv4::qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
+                                   px, pg, pgs, pu, pus, py_scalar, item.rows,
+                                   item.cols, weight_stride, scale_stride) &&
+                               cudaDeviceSynchronize() == cudaSuccess;
+        unsetenv("QWEN_FP8_F16_SWIGLU_VECTORIZE");
+        unsetenv("QWEN_FP8_F16_MULTIROW");
+        if (!vec_ok || !scalar_ok) {
+            fail("FP8 SwiGLU decode vectorized launch");
+            return true;
+        }
+
+        std::vector<uint16_t> got(item.rows), want(item.rows);
+        cudaMemcpy(got.data(), py_vec, got.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(want.data(), py_scalar, want.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost);
+
+        double worst_vs_scalar = 0.0;
+        double worst_vs_host = 0.0;
+        double worst_relative = 0.0;
+        for (int row = 0; row < item.rows; ++row) {
+            double gate = 0.0;
+            double up = 0.0;
+            const size_t base = static_cast<size_t>(row) * weight_stride;
+            const size_t scale_base =
+                static_cast<size_t>(row / 128) * scale_stride;
+            for (int col = 0; col < item.cols; ++col) {
+                const double xv = from_half(host_x[col]);
+                gate += xv * from_fp8_e4m3(host_gate[base + col]) *
+                        from_half(host_gate_scale[scale_base + col / 128]);
+                up += xv * from_fp8_e4m3(host_up[base + col]) *
+                      from_half(host_up_scale[scale_base + col / 128]);
+            }
+            const double reference =
+                (gate / (1.0 + std::exp(-gate))) * up;
+            const double vectorized = from_half(got[row]);
+            const double scalar = from_half(want[row]);
+            if (!std::isfinite(vectorized) || !std::isfinite(scalar)) {
+                fail("FP8 SwiGLU decode vectorized produced a non-finite row");
+                return true;
+            }
+            worst_vs_scalar = std::max(worst_vs_scalar,
+                                       std::fabs(vectorized - scalar));
+            worst_vs_host = std::max(worst_vs_host,
+                                     std::fabs(vectorized - reference));
+            const double magnitude = std::max(std::fabs(reference), 1.0e-3);
+            worst_relative = std::max(worst_relative,
+                                      std::fabs(vectorized - reference) / magnitude);
+        }
+        // The vectorized kernel sums four products before applying the block
+        // scale, so it is not bit exact against the scalar kernel; hold it to
+        // the same relative accuracy instead.
+        if (worst_relative > 5.0e-3) {
+            fail("FP8 SwiGLU decode vectorized numerical check");
+            return true;
+        }
+        std::printf("  FP8 SwiGLU decode vectorized rows=%d cols=%d "
+                    "vs_scalar=%.3e vs_host=%.3e rel=%.3e\n",
+                    item.rows, item.cols, worst_vs_scalar, worst_vs_host,
+                    worst_relative);
+    }
+    return true;
+}
+
 // The FP8 fused gate/up SwiGLU kernel runs on every speculative verify batch.
 // Its shared-activation variant must stay bit exact against the register-only
 // kernel or greedy near ties would diverge from plain decode.
@@ -1984,6 +2121,7 @@ int main() {
     check_decode_window_reference();
     check_decode_grid_256k();
     check_fp8_f16_projection();
+    check_fp8_swiglu_decode_vectorized();
     check_resident_fp16_projection();
     check_fp8_channel_projection();
     check_batched_argmax();

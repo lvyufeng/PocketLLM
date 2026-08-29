@@ -50,6 +50,42 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t code) {
     return __uint_as_float(bits);
 }
 
+// Four E4M3 codes become two packed FP16 words whose values are 2^-8 of the
+// decoded FP8 values. For normal codes the field layout is exact: FP8's
+// exponent bias is 8 lower than FP16's, so one multiply by 256 after the dot
+// product restores the original values. Keep the existing helper for E4M3's
+// unusual exponent-zero encodings instead of silently changing their semantics.
+struct Fp8x4AsHalf2 {
+    uint32_t lo;
+    uint32_t hi;
+};
+
+__device__ __forceinline__ uint16_t fp8_e4m3_to_half_scaled(uint8_t code) {
+    // Exponent zero is E4M3's subnormal range; its value spacing does not match
+    // FP16's at this shift, so decode those few codes the slow way.
+    if ((code & 0x78u) == 0u) {
+        return float_to_half(fp8_e4m3_to_float(code) * (1.0f / 256.0f));
+    }
+    // Normal codes: E4M3 is [s|eeee|mmm] and FP16 is [s|eeeee|mmmmmmmmmm].
+    // Shifting the exponent+mantissa field left by 7 lands the 3 mantissa bits
+    // at FP16's top 3 mantissa bits and the 4 exponent bits at FP16's low 4
+    // exponent bits, leaving FP16's exponent MSB clear. That encodes
+    // 2^(e-7-8) * 1.m, i.e. exactly 2^-8 of the FP8 value.
+    return static_cast<uint16_t>((static_cast<uint16_t>(code & 0x7fu) << 7) |
+                                 (static_cast<uint16_t>(code & 0x80u) << 8));
+}
+
+__device__ __forceinline__ Fp8x4AsHalf2 fp8x4_as_half2_scaled(uchar4 codes) {
+    Fp8x4AsHalf2 out;
+    out.lo = static_cast<uint32_t>(fp8_e4m3_to_half_scaled(codes.x)) |
+             (static_cast<uint32_t>(fp8_e4m3_to_half_scaled(codes.y)) << 16);
+    out.hi = static_cast<uint32_t>(fp8_e4m3_to_half_scaled(codes.z)) |
+             (static_cast<uint32_t>(fp8_e4m3_to_half_scaled(codes.w)) << 16);
+    return out;
+}
+
+constexpr float kFp8E4m3HalfFixup = 256.0f;
+
 __device__ __forceinline__ uint8_t float_to_fp8_e4m3(float value) {
     const bool negative = signbit(value);
     float magnitude = fminf(fabsf(value), 448.0f);
@@ -118,17 +154,19 @@ __global__ void fp8_matvec_f16_kernel(
 // Same decode arithmetic as fp8_matvec_f16_kernel, but each warp owns
 // kRowsPerWarp output rows and reads every FP16 activation element once for
 // all of them. Column order and per-row accumulation order are unchanged, so
-// only the number of activation loads differs.
-template <int kWarps, int kRowsPerWarp>
+// only the number of activation loads differs. The vectorized body widens FP8
+// codes with bit arithmetic; the shared LUT it replaced cost four
+// data-dependent shared loads per weight word, which serialize across banks.
+//
+// kColsPerLane is the columns a lane takes per step. 8 issues one 64-bit weight
+// load instead of two 32-bit ones and halves the loop trip count; measured on
+// the fused gate/up twin of this kernel it lifted the FP8 weight stream from
+// 318 GB/s to 434 GB/s at the TP4 decode shape.
+template <int kWarps, int kRowsPerWarp, int kColsPerLane = 4>
 __global__ void fp8_matvec_f16_multirow_kernel(
     const uint16_t* __restrict__ x, const uint8_t* __restrict__ weight,
     const uint16_t* __restrict__ scale, uint16_t* __restrict__ y,
     int rows, int cols, int weight_stride, int scale_stride) {
-    __shared__ float lut[256];
-    for (int i = static_cast<int>(threadIdx.x); i < 256; i += blockDim.x) {
-        lut[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
-    }
-    __syncthreads();
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int row_base = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
@@ -145,29 +183,48 @@ __global__ void fp8_matvec_f16_multirow_kernel(
     }
 
     float sums[kRowsPerWarp] = {};
-    const int vec_cols = cols & ~3;
-    for (int col = lane * 4; col < vec_cols; col += 128) {
-        const uint2 packed = *reinterpret_cast<const uint2*>(x + col);
-        const float x0 = half_to_float(static_cast<uint16_t>(packed.x));
-        const float x1 = half_to_float(static_cast<uint16_t>(packed.x >> 16));
-        const float x2 = half_to_float(static_cast<uint16_t>(packed.y));
-        const float x3 = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+    constexpr int kQuads = kColsPerLane / 4;
+    constexpr int kStride = 32 * kColsPerLane;
+    const int vec_cols = cols & ~(kColsPerLane - 1);
+    for (int col = lane * kColsPerLane; col < vec_cols; col += kStride) {
+        float xv[kColsPerLane];
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(x + col + q * 4);
+            xv[q * 4 + 0] = half_to_float(static_cast<uint16_t>(packed.x));
+            xv[q * 4 + 1] = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+            xv[q * 4 + 2] = half_to_float(static_cast<uint16_t>(packed.y));
+            xv[q * 4 + 3] = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+        }
         const int block_col = col / kFp8WeightBlock;
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
             if (r >= active) break;
-            const uchar4 codes = *reinterpret_cast<const uchar4*>(weight_rows[r] + col);
             const float s = half_to_float(scale_rows[r][block_col]);
-            sums[r] += (x0 * lut[codes.x] + x1 * lut[codes.y] +
-                        x2 * lut[codes.z] + x3 * lut[codes.w]) * s;
+            float span = 0.0f;
+#pragma unroll
+            for (int q = 0; q < kQuads; ++q) {
+                const Fp8x4AsHalf2 w = fp8x4_as_half2_scaled(
+                    *reinterpret_cast<const uchar4*>(
+                        weight_rows[r] + col + q * 4));
+                span +=
+                    xv[q * 4 + 0] * half_to_float(static_cast<uint16_t>(w.lo)) +
+                    xv[q * 4 + 1] * half_to_float(static_cast<uint16_t>(w.lo >> 16)) +
+                    xv[q * 4 + 2] * half_to_float(static_cast<uint16_t>(w.hi)) +
+                    xv[q * 4 + 3] * half_to_float(static_cast<uint16_t>(w.hi >> 16));
+            }
+            sums[r] += span * s;
         }
     }
+    // Exact: the bias correction is a power of two.
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) sums[r] *= kFp8E4m3HalfFixup;
     for (int col = vec_cols + lane; col < cols; col += 32) {
         const float xv = half_to_float(x[col]);
 #pragma unroll
         for (int r = 0; r < kRowsPerWarp; ++r) {
             if (r >= active) break;
-            sums[r] += xv * lut[weight_rows[r][col]] *
+            sums[r] += xv * fp8_e4m3_to_float(weight_rows[r][col]) *
                        half_to_float(scale_rows[r][col / kFp8WeightBlock]);
         }
     }
@@ -660,6 +717,135 @@ __global__ void fp8_swiglu_small_batch_f16_kernel(
             y[static_cast<size_t>(sample) * y_stride + row] =
                 float_to_half(silu(gate_sum) * up_sum);
         }
+    }
+}
+
+// Same fused gate/up decode arithmetic as fp8_swiglu_matvec_f16_kernel, but
+// each lane consumes four contiguous columns per iteration so the FP8 weight
+// stream is read as uchar4 instead of one byte per lane per step. The decode
+// MLP is weight-bandwidth bound, and the scalar loop only reaches ~250 GB/s
+// where the already-vectorized down projection reaches ~480 GB/s.
+//
+// Codes are widened with bit arithmetic instead of the shared LUT. Every lane
+// decodes four data-dependent indices per weight plane per step, and on Turing
+// those scatter across shared banks; the bit path has no such serialization.
+// The E4M3 exponent bias (7) is corrected against the FP16 bias (15) by
+// scaling the accumulated result once per block, so subnormal codes stay exact
+// and the reduction order is unchanged.
+
+// kColsPerLane is the columns a lane takes per step: 4 issues one 32-bit weight
+// load per plane, 8 issues one 64-bit load. Wider means fewer, larger requests
+// and half the loop overhead, at the cost of registers.
+template <int kWarps, int kRowsPerWarp, int kColsPerLane = 4>
+__global__ void fp8_swiglu_matvec_vec4_f16_kernel(
+    const uint16_t* __restrict__ x,
+    const uint8_t* __restrict__ gate_weight,
+    const uint16_t* __restrict__ gate_scale,
+    const uint8_t* __restrict__ up_weight,
+    const uint16_t* __restrict__ up_scale,
+    uint16_t* __restrict__ y, int rows, int cols, int weight_stride,
+    int scale_stride) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row_base = (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
+    if (row_base >= rows) return;
+    const int active = min(kRowsPerWarp, rows - row_base);
+
+    const uint8_t* gate_rows[kRowsPerWarp];
+    const uint8_t* up_rows[kRowsPerWarp];
+    const uint16_t* gate_scales[kRowsPerWarp];
+    const uint16_t* up_scales[kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        const int row = min(row_base + r, rows - 1);
+        gate_rows[r] = gate_weight + static_cast<size_t>(row) * weight_stride;
+        up_rows[r] = up_weight + static_cast<size_t>(row) * weight_stride;
+        const size_t block_row =
+            static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+        gate_scales[r] = gate_scale + block_row;
+        up_scales[r] = up_scale + block_row;
+    }
+
+    float gate_sum[kRowsPerWarp] = {};
+    float up_sum[kRowsPerWarp] = {};
+    constexpr int kStride = 32 * kColsPerLane;
+    constexpr int kQuads = kColsPerLane / 4;
+    const int vec_cols = cols & ~(kColsPerLane - 1);
+    for (int col = lane * kColsPerLane; col < vec_cols; col += kStride) {
+        float xv[kColsPerLane];
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(x + col + q * 4);
+            xv[q * 4 + 0] = half_to_float(static_cast<uint16_t>(packed.x));
+            xv[q * 4 + 1] = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+            xv[q * 4 + 2] = half_to_float(static_cast<uint16_t>(packed.y));
+            xv[q * 4 + 3] = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+        }
+        // The whole span shares a scale block: kFp8WeightBlock is a multiple of
+        // kColsPerLane and `col` is kColsPerLane-aligned.
+        const int block_col = col / kFp8WeightBlock;
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            Fp8x4AsHalf2 g[kQuads];
+            Fp8x4AsHalf2 u[kQuads];
+#pragma unroll
+            for (int q = 0; q < kQuads; ++q) {
+                g[q] = fp8x4_as_half2_scaled(*reinterpret_cast<const uchar4*>(
+                    gate_rows[r] + col + q * 4));
+                u[q] = fp8x4_as_half2_scaled(*reinterpret_cast<const uchar4*>(
+                    up_rows[r] + col + q * 4));
+            }
+            // The scale absorbs the 2^8 the packed decode left out. The span's
+            // products are summed before the scale multiply, which is a
+            // different FP32 association than the scalar kernel's; the
+            // generated tokens are checked against it on the real model.
+            const float gs =
+                half_to_float(gate_scales[r][block_col]) * kFp8E4m3HalfFixup;
+            const float us =
+                half_to_float(up_scales[r][block_col]) * kFp8E4m3HalfFixup;
+            float gate_span = 0.0f;
+            float up_span = 0.0f;
+#pragma unroll
+            for (int q = 0; q < kQuads; ++q) {
+                gate_span +=
+                    xv[q * 4 + 0] * half_to_float(static_cast<uint16_t>(g[q].lo)) +
+                    xv[q * 4 + 1] * half_to_float(static_cast<uint16_t>(g[q].lo >> 16)) +
+                    xv[q * 4 + 2] * half_to_float(static_cast<uint16_t>(g[q].hi)) +
+                    xv[q * 4 + 3] * half_to_float(static_cast<uint16_t>(g[q].hi >> 16));
+                up_span +=
+                    xv[q * 4 + 0] * half_to_float(static_cast<uint16_t>(u[q].lo)) +
+                    xv[q * 4 + 1] * half_to_float(static_cast<uint16_t>(u[q].lo >> 16)) +
+                    xv[q * 4 + 2] * half_to_float(static_cast<uint16_t>(u[q].hi)) +
+                    xv[q * 4 + 3] * half_to_float(static_cast<uint16_t>(u[q].hi >> 16));
+            }
+            gate_sum[r] += gate_span * gs;
+            up_sum[r] += up_span * us;
+        }
+    }
+    // The ragged tail decodes through the scalar helper; `cols` is a multiple
+    // of kColsPerLane for every real projection, so this normally runs zero
+    // times.
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float xv = half_to_float(x[col]);
+        const int block_col = col / kFp8WeightBlock;
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            gate_sum[r] += xv * fp8_e4m3_to_float(gate_rows[r][col]) *
+                           half_to_float(gate_scales[r][block_col]);
+            up_sum[r] += xv * fp8_e4m3_to_float(up_rows[r][col]) *
+                         half_to_float(up_scales[r][block_col]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        if (r >= active) break;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            gate_sum[r] += __shfl_xor_sync(0xffffffffu, gate_sum[r], offset);
+            up_sum[r] += __shfl_xor_sync(0xffffffffu, up_sum[r], offset);
+        }
+        if (lane == 0) y[row_base + r] = float_to_half(silu(gate_sum[r]) * up_sum[r]);
     }
 }
 
@@ -2416,6 +2602,11 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
         !multirow_disabled &&
         (vectorized == nullptr || std::strcmp(vectorized, "0") != 0);
     const int requested_rows = rows_env != nullptr ? std::atoi(rows_env) : 0;
+    // Eight columns per lane per step is the default; `=4` restores the narrower
+    // load for A/B.
+    const char* lane_span = std::getenv("QWEN_FP8_F16_COLS_PER_LANE");
+    const bool narrow_lane_span =
+        lane_span != nullptr && std::strcmp(lane_span, "4") == 0;
     constexpr int kMinBlocks = 136;
     auto blocks_for = [&](int rows_per_warp) {
         return (rows + kWarps * rows_per_warp - 1) / (kWarps * rows_per_warp);
@@ -2428,9 +2619,16 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
                blocks_for(2) >= kMinBlocks) {
         fp8_matvec_f16_multirow_kernel<kWarps, 2><<<blocks_for(2), kWarps * 32, 0, s>>>(
             x, weight, scale, y, rows, cols, weight_stride, scale_stride);
+    } else if (use_vectorized && weight_stride % 8 == 0 && cols % 8 == 0 &&
+               kFp8WeightBlock % 8 == 0 &&
+               reinterpret_cast<uintptr_t>(x) % 8 == 0 && !narrow_lane_span) {
+        fp8_matvec_f16_multirow_kernel<kWarps, 1, 8>
+            <<<blocks_for(1), kWarps * 32, 0, s>>>(
+                x, weight, scale, y, rows, cols, weight_stride, scale_stride);
     } else if (use_vectorized && weight_stride % 4 == 0) {
-        fp8_matvec_f16_multirow_kernel<kWarps, 1><<<blocks_for(1), kWarps * 32, 0, s>>>(
-            x, weight, scale, y, rows, cols, weight_stride, scale_stride);
+        fp8_matvec_f16_multirow_kernel<kWarps, 1, 4>
+            <<<blocks_for(1), kWarps * 32, 0, s>>>(
+                x, weight, scale, y, rows, cols, weight_stride, scale_stride);
     } else {
         fp8_matvec_f16_kernel<kWarps><<<(rows + kWarps - 1) / kWarps,
             kWarps * 32, 0, s>>>(x, weight, scale, y, rows, cols,
@@ -2451,13 +2649,31 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
     const char* multirow = std::getenv("QWEN_FP8_F16_MULTIROW");
     const char* rows_env = std::getenv("QWEN_FP8_F16_MULTIROW_ROWS");
+    const char* vectorized = std::getenv("QWEN_FP8_F16_SWIGLU_VECTORIZE");
     const bool use_multirow =
         multirow != nullptr && std::strcmp(multirow, "0") != 0;
     const int requested_rows = rows_env != nullptr ? std::atoi(rows_env) : 0;
+    // The vectorized variant groups four columns per scale multiply, so it is a
+    // different (still deterministic) reduction order than the scalar loop.
+    // `=0` restores the scalar loop for A/B.
+    const bool use_vectorized =
+        vectorized == nullptr || std::strcmp(vectorized, "0") != 0;
     constexpr int kMinBlocks = 136;
     auto blocks_for = [&](int rows_per_warp) {
         return (rows + kWarps * rows_per_warp - 1) / (kWarps * rows_per_warp);
     };
+    const bool aligned = cols % 4 == 0 && weight_stride % 4 == 0 &&
+                         kFp8WeightBlock % 4 == 0 &&
+                         reinterpret_cast<uintptr_t>(x) % 8 == 0;
+    // Columns per lane per step. 8 halves the loop trip count and the weight
+    // request count; `=4` restores the narrower load for A/B.
+    int cols_per_lane = 8;
+    if (const char* width = std::getenv("QWEN_FP8_F16_SWIGLU_COLS_PER_LANE")) {
+        const int parsed = std::atoi(width);
+        if (parsed == 4 || parsed == 8 || parsed == 16) cols_per_lane = parsed;
+    }
+    const bool aligned8 = aligned && cols % 8 == 0 && weight_stride % 8 == 0 &&
+                          kFp8WeightBlock % 8 == 0;
     if (use_multirow && weight_stride % 4 == 0 && requested_rows == 4 &&
         blocks_for(4) >= kMinBlocks) {
         fp8_swiglu_matvec_f16_kernel<kWarps, 4><<<blocks_for(4), kWarps * 32, 0, s>>>(
@@ -2468,9 +2684,25 @@ bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
         fp8_swiglu_matvec_f16_kernel<kWarps, 2><<<blocks_for(2), kWarps * 32, 0, s>>>(
             x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
             weight_stride, scale_stride);
+    } else if (use_vectorized && aligned8 && cols % 16 == 0 &&
+               weight_stride % 16 == 0 && kFp8WeightBlock % 16 == 0 &&
+               cols_per_lane == 16) {
+        fp8_swiglu_matvec_vec4_f16_kernel<kWarps, 1, 16>
+            <<<blocks_for(1), kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+                weight_stride, scale_stride);
+    } else if (use_vectorized && aligned8 && cols_per_lane >= 8) {
+        fp8_swiglu_matvec_vec4_f16_kernel<kWarps, 1, 8>
+            <<<blocks_for(1), kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+                weight_stride, scale_stride);
+    } else if (use_vectorized && aligned) {
+        fp8_swiglu_matvec_vec4_f16_kernel<kWarps, 1, 4>
+            <<<blocks_for(1), kWarps * 32, 0, s>>>(
+                x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
+                weight_stride, scale_stride);
     } else {
-        // The fused gate/up kernel has no aligned vectorized variant yet; keep
-        // its one-row path independent of the weight stride alignment.
+        // Unaligned strides or activations fall back to the scalar loop.
         fp8_swiglu_matvec_f16_kernel<kWarps, 1><<<blocks_for(1), kWarps * 32, 0, s>>>(
             x, gate_weight, gate_scale, up_weight, up_scale, y, rows, cols,
             weight_stride, scale_stride);

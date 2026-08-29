@@ -777,6 +777,10 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     float* d_partial_scratch, int q_heads, int kv_heads, int head_dim,
     int context_len, int max_context, int attention_window = 0,
     int sink_tokens = 0, void* stream = nullptr);
+// Splits the fused decode kernel will use for this many attended positions. The
+// caller must size `d_partial_scratch` as q_heads * splits * (head_dim + 2), so
+// this has to be the same number the launch computes.
+int qwen_gqa_decode_split_count(int attended_positions);
 bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,

@@ -2140,13 +2140,14 @@ struct QwenEngine::Impl {
             const bool optimized_attention =
                 qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
                 attention_window > 0;
-            // The compact split/merge decode path crosses over the reference
-            // score/value kernels only at long contexts on SM75.
-            constexpr int kOptimizedDecodeMinContext = 16384;
+            // The split/merge decode path used to lose below 16384 context
+            // because it walked 2048 positions per split serially, leaving the
+            // device idle. At 128 positions per split it wins everywhere it is
+            // allowed to run: 3.6x the reference kernels at 4096 context and
+            // 16.1x at 65536. Its own guard still declines contexts under 4096.
             const bool optimized_decode = cache_dtype == QwenKvCacheDType::Fp16 &&
                 optimized_attention &&
-                (context_length >= kOptimizedDecodeMinContext ||
-                 attention_window > 0);
+                (context_length >= 4096 || attention_window > 0);
             int attended_positions = context_length;
             if (attention_window > 0) {
                 const int sink_count = std::min(sink_tokens, context_length);
@@ -2154,8 +2155,9 @@ struct QwenEngine::Impl {
                     context_length - attention_window, sink_count);
                 attended_positions = sink_count + (context_length - window_start);
             }
-            const int optimized_splits = std::max(1, std::min(
-                64, (attended_positions + 2048 - 1) / 2048));
+            // Must match the launch exactly; it sizes the partial scratch.
+            const int optimized_splits =
+                qwen_gqa_decode_split_count(attended_positions);
             const size_t score_elements = optimized_decode
                 ? static_cast<size_t>(q_heads) * optimized_splits *
                       static_cast<size_t>(head_dim + 2)

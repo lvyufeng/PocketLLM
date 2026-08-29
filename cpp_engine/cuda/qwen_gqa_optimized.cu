@@ -19,15 +19,63 @@ constexpr int kQueryRows = 2;
 constexpr int kMaxHeadDim = 256;
 constexpr int kValuesPerThread = kMaxHeadDim / kThreads;
 constexpr int kPrefillCombos = kHeadsPerGroup * kQueryRows;
-constexpr int kDecodeMaxSplits = 64;
+// Hard ceiling for the tunable decode split count. Sizes the merge kernel's
+// shared weight array at 4 bytes per split, so 1024 costs 4 KiB of the 48 KiB
+// budget, and keeps the target honest to 64 positions per split at 65K context.
+constexpr int kDecodeSplitCeiling = 1024;
+// Decode positions per split. The split kernel walks its slice serially and the
+// launch is only kv_heads*groups*splits blocks, so at the real TP4 shape (6 Q
+// heads, 1 KV head, 4 groups of blocks) positions per split, not bytes, set the
+// runtime: the old 2048-position target measured a flat 1.41 ms from 4K to 65K
+// context, about 47 GB/s of the 616 GB/s the card can sustain. A smaller target
+// buys parallelism.
+// Measured at the real TP4 shape against the reference score/value kernels,
+// fused kernel milliseconds, `bench_qwen_gqa_decode`:
+//
+//   context   reference   2048   256    128    64
+//      4096      0.289    1.570  0.152  0.080  0.049
+//      8192      0.865    1.508  0.188  0.106  0.072
+//     16384      1.748    1.441  0.199  0.127  0.128
+//     32768      3.490    3.045  0.237  0.226  0.258
+//     65536      7.042    1.445  0.413  0.438  0.492
+//
+// 256 is the default rather than the faster-looking 128 because it is the
+// smallest target whose generated tokens stay bit-identical to a single
+// sequential split, at every context measured on the real TP4 model. 128 is
+// deterministic run to run but diverges from the sequential reference at token
+// 86 of 128 on the 8K prompt, and it is also slower end to end at 65K (28.3 vs
+// 29.2 tok/s) because it hits the split ceiling there.
+constexpr int kDecodeTargetPositionsDefault = 256;
 // Verify attention splits far more finely than decode: it has only a handful of
 // query rows to fill the device with, so a 32-position tile at 8192 context wants
 // 256 splits where the decode ceiling would force 128. Sizes the merge kernel's
 // shared weight array, so 256 costs 1 KiB of shared memory per merge block.
 constexpr int kVerifyMaxSplits = 256;
-constexpr int kDecodeTargetPositions = 2048;
+// Below this the reference score/value kernels win; the fused launch refuses
+// short contexts so the engine gate has to agree with it.
 constexpr int kDecodeMinContext = 4096;
 constexpr int kVerifyMaxRows = 8;
+
+// Positions per split and the split ceiling, overridable for A/B sweeps. Read
+// once: these are launch geometry, not per-call state.
+int decode_target_positions() {
+    static const int value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_SPLIT_POSITIONS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? parsed : kDecodeTargetPositionsDefault;
+    }();
+    return value;
+}
+
+int decode_max_splits() {
+    static const int value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_MAX_SPLITS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? std::min(parsed, kDecodeSplitCeiling)
+                          : kDecodeSplitCeiling;
+    }();
+    return value;
+}
 
 // A window of 0 keeps exact full attention. Otherwise every query attends to
 // the leading sink prefix plus the most recent window positions, expressed as
@@ -1911,7 +1959,7 @@ __global__ void gqa_decode_merge_f16_kernel(
     int splits) {
     const int head = static_cast<int>(blockIdx.x);
     if (head >= q_heads) return;
-    __shared__ float weights[kDecodeMaxSplits];
+    __shared__ float weights[kDecodeSplitCeiling];
     if (threadIdx.x == 0) {
         const int stride = head_dim + 2;
         float maximum = -INFINITY;
@@ -1945,6 +1993,14 @@ __global__ void gqa_decode_merge_f16_kernel(
 bool valid_shape(int q_heads, int kv_heads, int head_dim) {
     return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 &&
         head_dim > 0 && head_dim <= kMaxHeadDim;
+}
+
+int decode_split_count(int attended_positions) {
+    if (attended_positions <= 0) return 1;
+    const int splits = std::min(decode_max_splits(),
+        (attended_positions + decode_target_positions() - 1) /
+            decode_target_positions());
+    return std::max(splits, 1);
 }
 
 struct GqaCublasWorkspace {
@@ -2379,6 +2435,10 @@ bool qwen_gqa_verify_attention_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+int qwen_gqa_decode_split_count(int attended_positions) {
+    return decode_split_count(attended_positions);
+}
+
 bool qwen_gqa_decode_attention_f16_fused_cuda(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
@@ -2392,9 +2452,7 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     const SparseRanges ranges =
         sparse_ranges(context_len, attention_window, sink_tokens);
     const int attended = ranges.total();
-    int splits = std::min(kDecodeMaxSplits,
-        (attended + kDecodeTargetPositions - 1) / kDecodeTargetPositions);
-    splits = std::max(splits, 1);
+    const int splits = decode_split_count(attended);
     const int positions_per_split = (attended + splits - 1) / splits;
     const int groups_per_kv =
         (q_heads / kv_heads + kHeadsPerGroup - 1) / kHeadsPerGroup;
