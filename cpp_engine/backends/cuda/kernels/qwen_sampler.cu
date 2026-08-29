@@ -300,48 +300,53 @@ __global__ void init_curand_kernel(curandState* states, int count,
 
 }  // namespace
 
-bool init_curand_states(curandState* states, int count,
-                               unsigned long long seed, cudaStream_t stream) {
+size_t qwen_sampler_rng_state_size() { return sizeof(curandState); }
+
+bool qwen_init_rng_states(DeviceRngState* states, int count,
+                          unsigned long long seed, void* stream) {
     if (states == nullptr || count <= 0) return false;
     const int threads = 256;
     const int blocks = (count + threads - 1) / threads;
-    init_curand_kernel<<<blocks, threads, 0, stream>>>(states, count, seed);
+    init_curand_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<curandState*>(states), count, seed);
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool qwen_sample_top_k_top_p_rows_cuda(
+bool qwen_sample_top_k_top_p_rows(
     const float* logits, int* out_tokens, float* out_logits, int rows,
     int vocab, int vocab_start, float temperature, float top_p, int top_k,
-    curandState* rng_states, const float* uniforms, cudaStream_t stream) {
+    DeviceRngState* rng_states, const float* uniforms, void* stream) {
     if (logits == nullptr || out_tokens == nullptr || out_logits == nullptr) {
         return false;
     }
     if (rows <= 0 || vocab <= 0) return false;
     if (uniforms == nullptr && rng_states == nullptr) return false;
-    sample_top_k_top_p_kernel<<<rows, kBlockThreads, 0, stream>>>(
+    sample_top_k_top_p_kernel<<<rows, kBlockThreads, 0,
+                               static_cast<cudaStream_t>(stream)>>>(
         logits, out_tokens, out_logits, rows, vocab, vocab_start, temperature,
-        top_p, top_k, rng_states, uniforms);
+        top_p, top_k, reinterpret_cast<curandState*>(rng_states), uniforms);
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool qwen_local_topk_candidates_cuda(
+bool qwen_local_topk_candidates(
     const float* logits, int* out_tokens, float* out_logits, int rows,
-    int vocab, int vocab_start, int top_k, cudaStream_t stream) {
+    int vocab, int vocab_start, int top_k, void* stream) {
     if (logits == nullptr || out_tokens == nullptr || out_logits == nullptr) {
         return false;
     }
     if (rows <= 0 || vocab <= 0 || top_k <= 0 || top_k > kMaxTopK) {
         return false;
     }
-    local_topk_candidates_kernel<<<rows, kBlockThreads, 0, stream>>>(
+    local_topk_candidates_kernel<<<rows, kBlockThreads, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(
         logits, out_tokens, out_logits, rows, vocab, vocab_start, top_k);
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool qwen_merge_topk_candidates_cuda(
+bool qwen_merge_topk_candidates(
     const int* gathered_tokens, const float* gathered_logits,
     int* out_tokens, float* out_logits, int world, int rows, int top_k,
-    cudaStream_t stream) {
+    void* stream) {
     if (gathered_tokens == nullptr || gathered_logits == nullptr ||
         out_tokens == nullptr || out_logits == nullptr) {
         return false;
@@ -349,26 +354,29 @@ bool qwen_merge_topk_candidates_cuda(
     if (world <= 0 || rows <= 0 || top_k <= 0 || top_k > kMaxTopK) {
         return false;
     }
-    merge_topk_candidates_kernel<<<rows, 1, 0, stream>>>(
+    merge_topk_candidates_kernel<<<rows, 1, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(
         gathered_tokens, gathered_logits, out_tokens, out_logits, world, rows,
         top_k);
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool qwen_sample_from_candidates_cuda(
+bool qwen_sample_from_candidates(
     const int* cand_tokens, const float* cand_logits, int* out_tokens,
     float* out_logits, int rows, int cand_stride, float temperature,
-    float top_p, int top_k, curandState* rng_states, const float* uniforms,
-    cudaStream_t stream) {
+    float top_p, int top_k, DeviceRngState* rng_states, const float* uniforms,
+    void* stream) {
     if (cand_tokens == nullptr || cand_logits == nullptr ||
         out_tokens == nullptr || out_logits == nullptr) {
         return false;
     }
     if (rows <= 0 || cand_stride <= 0) return false;
     if (uniforms == nullptr && rng_states == nullptr) return false;
-    sample_from_candidates_kernel<<<rows, 1, 0, stream>>>(
+    sample_from_candidates_kernel<<<rows, 1, 0,
+                                    static_cast<cudaStream_t>(stream)>>>(
         cand_tokens, cand_logits, out_tokens, out_logits, rows, cand_stride,
-        temperature, top_p, top_k, rng_states, uniforms);
+        temperature, top_p, top_k, reinterpret_cast<curandState*>(rng_states),
+        uniforms);
     return cudaGetLastError() == cudaSuccess;
 }
 

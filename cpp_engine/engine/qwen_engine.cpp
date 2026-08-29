@@ -2575,7 +2575,7 @@ struct QwenEngine::Impl {
         if (top_k > local_vocab) top_k = local_vocab;
 
         allocate(sample_rng_states,
-                 static_cast<size_t>(rows) * sizeof(curandState),
+                 static_cast<size_t>(rows) * qwen_sampler_rng_state_size(),
                  {static_cast<uint64_t>(rows)}, SafeDType::I8);
         allocate_float(sample_uniforms, static_cast<size_t>(rows),
                        {static_cast<uint64_t>(rows)});
@@ -2614,7 +2614,7 @@ struct QwenEngine::Impl {
             allocate_float(sample_merged_logit, cand,
                            {static_cast<uint64_t>(cand)});
 
-            require_launch(qwen_local_topk_candidates_cuda(
+            require_launch(qwen_local_topk_candidates(
                 local_logits.f32_data(),
                 static_cast<int*>(sample_cand_token.data),
                 sample_cand_logit.f32_data(), rows, local_vocab, vocab_start,
@@ -2629,13 +2629,13 @@ struct QwenEngine::Impl {
                 static_cast<int*>(sample_merged_token.data),
                 sample_merged_logit.f32_data());
 
-            require_launch(qwen_sample_from_candidates_cuda(
+            require_launch(qwen_sample_from_candidates(
                 static_cast<const int*>(sample_merged_token.data),
                 sample_merged_logit.f32_data(),
                 static_cast<int*>(argmax_token.data), argmax_logit.f32_data(),
                 rows, top_k, options.temperature,
                 options.top_p, top_k,
-                static_cast<curandState*>(sample_rng_states.data),
+                static_cast<DeviceRngState*>(sample_rng_states.data),
                 sample_uniforms.f32_data(), nullptr),
                 "Qwen sampling from merged candidates");
         } else
@@ -2647,12 +2647,12 @@ struct QwenEngine::Impl {
                     "Qwen TP requires an NCCL-enabled build");
             }
 #endif
-            require_launch(qwen_sample_top_k_top_p_rows_cuda(
+            require_launch(qwen_sample_top_k_top_p_rows(
                 local_logits.f32_data(),
                 static_cast<int*>(argmax_token.data), argmax_logit.f32_data(),
                 rows, local_vocab, vocab_start, options.temperature,
                 options.top_p, top_k,
-                static_cast<curandState*>(sample_rng_states.data),
+                static_cast<DeviceRngState*>(sample_rng_states.data),
                 sample_uniforms.f32_data(), nullptr),
                 "Qwen sampling single shard");
         }

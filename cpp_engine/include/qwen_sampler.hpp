@@ -1,9 +1,17 @@
 #pragma once
 
-#include <cuda_runtime.h>
-#include <curand_kernel.h>
+#include <cstddef>
 
 namespace dsv4 {
+
+// Opaque per-row RNG state. The concrete type is backend-private (curandState on
+// CUDA), so callers only ever handle it as a byte buffer sized by
+// `qwen_sampler_rng_state_size()`. Keeping it opaque is what lets this header
+// stay free of vendor SDK includes.
+struct DeviceRngState;
+
+// Byte size of one `DeviceRngState`, for allocating an [rows] array.
+size_t qwen_sampler_rng_state_size();
 
 // Device top-k -> temperature -> top-p sampling over FP32 logit rows.
 //
@@ -20,7 +28,7 @@ namespace dsv4 {
 // temperature:  <= 1e-5 falls back to argmax
 // top_p:        nucleus threshold; <= 0 or >= 1 disables truncation
 // top_k:        candidates retained; clamped to 64
-// rng_states:   [rows] curandState, used only when `uniforms` is null
+// rng_states:   [rows] DeviceRngState, used only when `uniforms` is null
 // uniforms:     optional [rows] host-drawn uniforms in [0,1). Supplying these
 //               is what keeps a TP group's draw identical across ranks; the
 //               device generator would otherwise diverge per rank.
@@ -28,7 +36,7 @@ namespace dsv4 {
 // TP note: with vocab sharding each rank sees only its own shard, so the
 // caller must still reduce across ranks to pick one global token. Passing a
 // shared `uniforms` row makes that reduction agree on every rank.
-bool qwen_sample_top_k_top_p_rows_cuda(
+bool qwen_sample_top_k_top_p_rows(
     const float* logits,
     int* out_tokens,
     float* out_logits,
@@ -38,14 +46,14 @@ bool qwen_sample_top_k_top_p_rows_cuda(
     float temperature,
     float top_p,
     int top_k,
-    curandState* rng_states,
+    DeviceRngState* rng_states,
     const float* uniforms,
-    cudaStream_t stream);
+    void* stream = nullptr);
 
 // TP stage 1: reduce each sharded row to its local top-k, emitted as global ids
 // into [rows, top_k] buffers so NCCL can merge candidates across ranks. Short
 // rows are padded with token -1 and logit -inf.
-bool qwen_local_topk_candidates_cuda(
+bool qwen_local_topk_candidates(
     const float* logits,
     int* out_tokens,
     float* out_logits,
@@ -53,13 +61,13 @@ bool qwen_local_topk_candidates_cuda(
     int vocab,
     int vocab_start,
     int top_k,
-    cudaStream_t stream);
+    void* stream = nullptr);
 
 // Merge NCCL all-gathered local top-k lists into one exact top-k list per row.
 // Input layout is world-major [world, rows, top_k], matching ncclAllGather;
 // output layout is row-major [rows, top_k]. Ordering is descending logit with
 // ascending global token id as the deterministic tie-break.
-bool qwen_merge_topk_candidates_cuda(
+bool qwen_merge_topk_candidates(
     const int* gathered_tokens,
     const float* gathered_logits,
     int* out_tokens,
@@ -67,12 +75,12 @@ bool qwen_merge_topk_candidates_cuda(
     int world,
     int rows,
     int top_k,
-    cudaStream_t stream);
+    void* stream = nullptr);
 
 // TP stage 2: sample from candidates already merged across ranks. `cand_tokens`
 // are global ids, so no vocab_start offset is applied. Pass the same `uniforms`
 // on every rank to make all ranks commit the same token.
-bool qwen_sample_from_candidates_cuda(
+bool qwen_sample_from_candidates(
     const int* cand_tokens,
     const float* cand_logits,
     int* out_tokens,
@@ -82,18 +90,18 @@ bool qwen_sample_from_candidates_cuda(
     float temperature,
     float top_p,
     int top_k,
-    curandState* rng_states,
+    DeviceRngState* rng_states,
     const float* uniforms,
-    cudaStream_t stream);
+    void* stream = nullptr);
 
 // Largest supported top_k; callers must not request more.
 int qwen_sampler_max_top_k();
 
 // Initialize one generator per row. Seed identically across TP ranks.
-bool init_curand_states(
-    curandState* states,
+bool qwen_init_rng_states(
+    DeviceRngState* states,
     int count,
     unsigned long long seed,
-    cudaStream_t stream);
+    void* stream = nullptr);
 
 }  // namespace dsv4
