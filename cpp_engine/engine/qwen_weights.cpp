@@ -101,7 +101,7 @@ const uint8_t* QwenDeviceTensor::u8_data() const {
     return static_cast<const uint8_t*>(data);
 }
 
-QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
+QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
                                         const QwenTensorRef& ref,
                                         void* stream) {
     QwenHostTensor host = qwen_materialize_host_tensor(index, ref);

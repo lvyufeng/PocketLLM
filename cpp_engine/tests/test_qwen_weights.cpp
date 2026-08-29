@@ -442,7 +442,7 @@ void check_rank(const dsv4::SafeTensorsIndex& index, const dsv4::QwenConfig& con
             "BF16 -1.0 converts to FP16 -1.0");
     if (dsv4::cuda_runtime_available()) {
         dsv4::QwenDeviceTensor device_scale =
-            dsv4::qwen_upload_tensor_cuda(index, linear.in_proj_qkv.scale);
+            dsv4::qwen_upload_tensor(index, linear.in_proj_qkv.scale);
         require(device_scale.device_dtype == dsv4::SafeDType::F16,
                 "uploaded scale dtype");
         std::vector<uint8_t> device_bytes(scale_host.bytes.size(), 0);

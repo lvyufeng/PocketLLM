@@ -137,7 +137,7 @@ struct DeviceLayer {
 };
 
 QwenDeviceTensor upload(const SafeTensorsIndex& index, const QwenTensorRef& ref) {
-    return qwen_upload_tensor_cuda(index, ref);
+    return qwen_upload_tensor(index, ref);
 }
 
 DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& ref) {
@@ -1519,7 +1519,7 @@ struct QwenEngine::Impl {
         if (options.tp_world == 1 || slices <= 1 || rows < slices * 2) {
             return false;
         }
-#ifndef DSV4_HAVE_NCCL
+#ifndef DSV4_HAVE_TP_COMM
         return false;
 #else
         if (!use_nccl_comm_stream || options.nccl_id_path.empty()) return false;
@@ -1558,7 +1558,7 @@ struct QwenEngine::Impl {
             check_device(stream_wait_event(
                 nccl_comm_stream, comm_slice_ready[index]),
                 "Qwen overlapped comm wait");
-            nccl_all_reduce_sum_f16_inplace(
+            tp_all_reduce_sum_f16_inplace(
                 options.tp_world, options.tp_rank, options.device,
                 options.nccl_id_path.c_str(), output + offset,
                 count * hidden, nccl_comm_stream);
@@ -1583,7 +1583,7 @@ struct QwenEngine::Impl {
     void all_reduce_half(uint16_t* values, int count, const char* site = "other") {
         PhaseScope scope(this, std::string("ar.") + site);
         if (options.tp_world == 1) return;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (options.nccl_id_path.empty()) {
             throw std::runtime_error("Qwen TP requires --nccl-id-path");
         }
@@ -1591,13 +1591,13 @@ struct QwenEngine::Impl {
             PhaseScope scope(this, "tp_all_reduce");
             if (use_nccl_comm_stream) {
                 begin_nccl_collective();
-                nccl_all_reduce_sum_f16_inplace(
+                tp_all_reduce_sum_f16_inplace(
                     options.tp_world, options.tp_rank, options.device,
                     options.nccl_id_path.c_str(), values, count,
                     nccl_comm_stream);
                 end_nccl_collective();
             } else {
-                nccl_all_reduce_sum_f16_inplace(
+                tp_all_reduce_sum_f16_inplace(
                     options.tp_world, options.tp_rank, options.device,
                     options.nccl_id_path.c_str(), values, count);
             }
@@ -2576,12 +2576,12 @@ struct QwenEngine::Impl {
         result.local_logits.resize(static_cast<size_t>(rows));
         result.position_after = position_after;
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (options.tp_world > 1) {
             if (options.nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen TP requires --nccl-id-path");
             }
-            // nccl_global_topk_rows_device reduces the gathered candidates back
+            // tp_global_topk_rows_device reduces the gathered candidates back
             // down to top_k per row, so the merged buffers are rows * top_k --
             // not rows * top_k * tp_world. The gathered staging lives inside
             // tp_comm's own workspace.
@@ -2601,7 +2601,7 @@ struct QwenEngine::Impl {
                 top_k, nullptr),
                 "Qwen sampling local top-k");
 
-            nccl_global_topk_rows_device(
+            tp_global_topk_rows_device(
                 options.tp_world, options.tp_rank, options.device,
                 options.nccl_id_path.c_str(),
                 static_cast<const int*>(sample_cand_token.data),
@@ -2621,7 +2621,7 @@ struct QwenEngine::Impl {
         } else
 #endif
         {
-#ifndef DSV4_HAVE_NCCL
+#ifndef DSV4_HAVE_TP_COMM
             if (options.tp_world > 1) {
                 throw std::runtime_error(
                     "Qwen TP requires an NCCL-enabled build");
@@ -2726,7 +2726,7 @@ struct QwenEngine::Impl {
         result.top_logits.resize(static_cast<size_t>(rows));
         result.local_logits.resize(static_cast<size_t>(rows));
         result.position_after = position_after;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (options.tp_world > 1) {
             if (options.nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen TP requires --nccl-id-path");
@@ -2750,7 +2750,7 @@ struct QwenEngine::Impl {
                         static_cast<size_t>(rows),
                         {static_cast<uint64_t>(rows)});
                     if (packed_device_top1) {
-                        nccl_global_top1_rows_packed_device(
+                        tp_global_top1_rows_packed_device(
                             options.tp_world, options.tp_rank, options.device,
                             options.nccl_id_path.c_str(),
                             static_cast<const int*>(argmax_token.data),
@@ -2758,7 +2758,7 @@ struct QwenEngine::Impl {
                             static_cast<int*>(global_token.data),
                             global_logit.f32_data());
                     } else {
-                        nccl_global_top1_rows_device(
+                        tp_global_top1_rows_device(
                             options.tp_world, options.tp_rank, options.device,
                             options.nccl_id_path.c_str(),
                             static_cast<const int*>(argmax_token.data),
@@ -2773,7 +2773,7 @@ struct QwenEngine::Impl {
                                             static_cast<size_t>(rows) * sizeof(float)),
                                  "Qwen device top-1 logit copy");
                 } else {
-                    nccl_global_top1_rows(
+                    tp_global_top1_rows(
                         options.tp_world, options.tp_rank, options.device,
                         options.nccl_id_path.c_str(),
                         static_cast<const int*>(argmax_token.data),
@@ -2787,7 +2787,7 @@ struct QwenEngine::Impl {
         } else
 #endif
         {
-#ifndef DSV4_HAVE_NCCL
+#ifndef DSV4_HAVE_TP_COMM
             if (options.tp_world > 1) {
                 throw std::runtime_error(
                     "Qwen TP requires an NCCL-enabled build");

@@ -272,13 +272,14 @@ uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
 void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count);
 
 // Materialize a local tensor from its mmap'd source shard. The output is ready
-// for a Turing GPU upload: BF16 storage is converted to FP16 and packed/row
-// slices are copied without expanding FP8 weights.
+// for upload: BF16 storage is converted to FP16 and packed/row slices are copied
+// without expanding FP8 weights. Both supported backends want FP16 here, for
+// unrelated reasons; see qwen_device_dtype in core/qwen_weight_map.cpp.
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref);
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
     const SafeTensorsIndex& index, const QwenLinearRef& ref);
-QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
+QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(

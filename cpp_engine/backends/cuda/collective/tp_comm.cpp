@@ -1,6 +1,6 @@
 #include "tp_comm.hpp"
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
 // Both are required: qwen_sampler.hpp for the sampler uniforms and
 // qwen_cuda_ops.hpp for the DFlash2 top-k pack/merge kernels used by the
 // global-top1 collective below. The latter is only visible in NCCL builds,
@@ -27,15 +27,15 @@
 
 namespace dsv4 {
 
-bool nccl_available() {
-#ifdef DSV4_HAVE_NCCL
+bool tp_comm_available() {
+#ifdef DSV4_HAVE_TP_COMM
     return true;
 #else
     return false;
 #endif
 }
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
 namespace {
 
 void check_cuda(cudaError_t err, const char* what) {
@@ -197,7 +197,7 @@ ncclComm_t cached_comm(int world, int rank, int device, const char* id_path) {
 
 }  // namespace
 
-void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_path, float value) {
+void run_tp_float_sum_smoke(int world, int rank, int device, const char* id_path, float value) {
     if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
     check_cuda(cudaSetDevice(device), "cudaSetDevice");
     ncclUniqueId id = load_or_create_id(rank, id_path);
@@ -218,7 +218,7 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
     ncclCommDestroy(comm);
 }
 
-void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
+void tp_global_topk_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows, int top_k,
                            int* global_tokens, float* global_logits,
@@ -279,7 +279,7 @@ void nccl_global_topk_rows(int world, int rank, int device, const char* id_path,
     }
 }
 
-void nccl_global_topk_rows_device(int world, int rank, int device,
+void tp_global_topk_rows_device(int world, int rank, int device,
                                   const char* id_path,
                                   const int* d_local_tokens,
                                   const float* d_local_logits, int rows,
@@ -311,7 +311,7 @@ void nccl_global_topk_rows_device(int world, int rank, int device,
     }
 }
 
-void nccl_global_top1_rows_device(int world, int rank, int device,
+void tp_global_top1_rows_device(int world, int rank, int device,
                                   const char* id_path,
                                   const int* d_local_tokens,
                                   const float* d_local_logits, int rows,
@@ -342,7 +342,7 @@ void nccl_global_top1_rows_device(int world, int rank, int device,
     }
 }
 
-void nccl_global_top1_rows_packed_device(
+void tp_global_top1_rows_packed_device(
     int world, int rank, int device, const char* id_path,
     const int* d_local_tokens, const float* d_local_logits, int rows,
     int* d_global_tokens, float* d_global_logits, void* stream) {
@@ -363,7 +363,7 @@ void nccl_global_top1_rows_packed_device(
                        rows, cuda_stream);
 }
 
-void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
+void tp_global_top1_rows(int world, int rank, int device, const char* id_path,
                            const int* d_local_tokens,
                            const float* d_local_logits, int rows,
                            int* global_tokens, float* global_logits,
@@ -420,28 +420,28 @@ void nccl_global_top1_rows(int world, int rank, int device, const char* id_path,
     }
 }
 
-void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count, void* stream) {
+void tp_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm,
                              static_cast<cudaStream_t>(stream)), "ncclAllReduce inplace");
 }
 
-void nccl_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
+void tp_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL fp16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclHalf, ncclSum, comm,
                              static_cast<cudaStream_t>(stream)), "ncclAllReduce fp16 inplace");
 }
 
-void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
+void tp_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bf16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclBfloat16, ncclSum, comm,
                              static_cast<cudaStream_t>(stream)), "ncclAllReduce bf16 inplace");
 }
 
-void nccl_broadcast_int32(int world, int rank, int device, const char* id_path, int32_t* buf, int count, int root) {
+void tp_broadcast_int32(int world, int rank, int device, const char* id_path, int32_t* buf, int count, int root) {
     if (world <= 0 || rank < 0 || rank >= world || buf == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bcast args");
     if (root < 0 || root >= world) throw std::runtime_error("invalid NCCL bcast root");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
@@ -458,7 +458,7 @@ void nccl_broadcast_int32(int world, int rank, int device, const char* id_path, 
     cudaFree(d_buf);
 }
 
-void nccl_gather_floats_to_root(int world, int rank, int device, const char* id_path, const float* h_local, int local_count, float* h_root_out, int root) {
+void tp_gather_floats_to_root(int world, int rank, int device, const char* id_path, const float* h_local, int local_count, float* h_root_out, int root) {
     if (world <= 0 || rank < 0 || rank >= world || h_local == nullptr || local_count <= 0) throw std::runtime_error("invalid NCCL gather args");
     if (root < 0 || root >= world) throw std::runtime_error("invalid NCCL gather root");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
@@ -478,7 +478,7 @@ void nccl_gather_floats_to_root(int world, int rank, int device, const char* id_
     cudaFree(d_all);
 }
 
-TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
+TpTopResult tp_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
     if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);
     float local[2] = {local_logit, static_cast<float>(local_token)};
