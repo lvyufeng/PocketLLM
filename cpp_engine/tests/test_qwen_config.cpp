@@ -48,6 +48,24 @@ std::string qwen38_config_json() {
     out << "{\n"
         << "  \"architectures\": [\"Qwen3_5ForConditionalGeneration\"],\n"
         << "  \"model_type\": \"qwen3_5\",\n"
+        // The official checkpoint is multimodal at the root: a vision tower sits
+        // beside text_config and language_model_only is false. The text runtime
+        // has to parse straight through these instead of tripping over them.
+        << "  \"language_model_only\": false,\n"
+        << "  \"tie_word_embeddings\": false,\n"
+        << "  \"image_token_id\": 248056,\n"
+        << "  \"bos_token_id\": 248044,\n"
+        << "  \"eos_token_id\": 248044,\n"
+        << "  \"dtype\": \"bfloat16\",\n"
+        << "  \"vision_config\": {\n"
+        << "    \"model_type\": \"qwen3_5_vit\",\n"
+        << "    \"depth\": 27,\n"
+        << "    \"hidden_size\": 1152,\n"
+        << "    \"num_heads\": 16,\n"
+        << "    \"out_hidden_size\": 5120,\n"
+        << "    \"patch_size\": 16,\n"
+        << "    \"temporal_patch_size\": 2\n"
+        << "  },\n"
         << "  \"text_config\": {\n"
         << "    \"model_type\": \"qwen3_5_text\",\n"
         << "    \"vocab_size\": 248320,\n"
@@ -109,6 +127,8 @@ int main() {
     }
 
     check(dsv4::is_qwen3_5_checkpoint(dir), "is_qwen3_5_checkpoint detects qwen3_5 root model_type");
+    check(dsv4::is_qwen3_5_checkpoint(dir),
+          "a multimodal root with language_model_only=false still dispatches to Qwen");
 
     const dsv4::QwenConfig cfg = dsv4::QwenConfig::from_hf_config(dir);
     check(cfg.is_qwen3_5(), "config reports qwen3_5 architecture");

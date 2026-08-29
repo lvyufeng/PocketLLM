@@ -19,6 +19,7 @@ PocketLLM uses model-specific runtimes rather than treating every checkpoint as 
 | GLM-5.2 | DSA/MLA-indexed attention + dense prefix + MoE | GGUF `UD-Q2_K_XL` | PyTorch orchestration + raw-block CUDA | Validated text generation | No dedicated adapter | [GLM-5.2](glm-5.2.md) |
 | Qwen3.8-27B-FP8 | 48 Gated DeltaNet + 16 GQA layers, dense MLP | Safetensors FP8 E4M3 | Native C++/CUDA | Validated TP4 text CLI | Not implemented | [Qwen3.8-27B-FP8](qwen3.8-27b-fp8.md) |
 | Qwen3.8-27B-NVFP4 | Same text architecture as the FP8 checkpoint | Safetensors mixed NVFP4 group-16 + FP8 per-channel | Native C++/CUDA | Validated TP2 text CLI | Not implemented | [Qwen3.8-27B-NVFP4](qwen3.8-27b-nvfp4.md) |
+| Qwen3.8-27B (official BF16) | Same text architecture as the FP8 checkpoint | Safetensors BF16, vision tower bundled | Native C++/CUDA | Inspect only: TP audit validated, generation unvalidated | Not implemented | [Qwen3.8-27B BF16](qwen3.8-27b-bf16.md) |
 
 ## Shared baseline
 

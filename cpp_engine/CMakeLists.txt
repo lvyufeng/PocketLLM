@@ -30,6 +30,7 @@ set(POCKET_CORE_SOURCES
     core/weight_source.cpp
     core/model_config.cpp
     core/qwen_config.cpp
+    core/qwen_weight_map.cpp
     core/tokenizer.cpp
     core/tensor.cpp
     core/sampler.cpp
@@ -136,11 +137,22 @@ else()
         "configure succeeds but the engine will not link.")
 endif()
 
+# Device-agnostic core as its own library. Anything that links only this target
+# is proof the layering holds: checkpoint loading, config parsing, tokenization
+# and the Qwen weight map build and run with no vendor SDK present at all, which
+# is what lets a checkpoint be audited on a host without the accelerator toolkit.
+add_library(pocket_core STATIC ${POCKET_CORE_SOURCES})
+target_include_directories(pocket_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
 add_library(dsv4_cpp_core STATIC
-    ${POCKET_CORE_SOURCES}
     ${POCKET_ENGINE_SOURCES}
     ${POCKET_BACKEND_SOURCES}
 )
+
+target_link_libraries(dsv4_cpp_core PUBLIC pocket_core)
 
 target_include_directories(dsv4_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -179,6 +191,15 @@ set_target_properties(inspect_gguf PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_B
 add_executable(inspect_safetensors tools/inspect_safetensors.cpp)
 target_link_libraries(inspect_safetensors PRIVATE dsv4_cpp_core)
 set_target_properties(inspect_safetensors PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
+
+# Links pocket_core only, so it builds and runs without a vendor SDK.
+add_executable(qwen_audit tools/qwen_audit.cpp)
+target_link_libraries(qwen_audit PRIVATE pocket_core)
+set_target_properties(qwen_audit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
+
+add_executable(test_qwen_bf16_checkpoint tests/test_qwen_bf16_checkpoint.cpp)
+target_link_libraries(test_qwen_bf16_checkpoint PRIVATE pocket_core)
+set_target_properties(test_qwen_bf16_checkpoint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(minimax_gguf_tokenizer tools/minimax_gguf_tokenizer.cpp)
 target_link_libraries(minimax_gguf_tokenizer PRIVATE dsv4_cpp_core)
@@ -384,8 +405,10 @@ add_executable(test_nccl_smoke tests/test_nccl_smoke.cpp)
 target_link_libraries(test_nccl_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# Config parsing is device-agnostic, so this test links pocket_core and runs on a
+# host with no vendor SDK.
 add_executable(test_qwen_config tests/test_qwen_config.cpp)
-target_link_libraries(test_qwen_config PRIVATE dsv4_cpp_core)
+target_link_libraries(test_qwen_config PRIVATE pocket_core)
 set_target_properties(test_qwen_config PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_dspark tests/test_qwen_dspark.cpp)

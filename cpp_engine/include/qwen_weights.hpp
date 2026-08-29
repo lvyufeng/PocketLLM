@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -68,6 +69,26 @@ struct QwenNvfp4HostLinear {
     std::vector<QwenNvfp4Block64> blocks;
     float weight_global_factor = 0.0f;
     float input_global_scale = 0.0f;
+};
+
+// Which checkpoint tensors the text runtime actually reads. Official Qwen3.8
+// checkpoints bundle a vision tower in the same shards, so a complete audit has
+// to account for every index entry as either mapped, deliberately ignored
+// vision weights, or unexpected.
+struct QwenCoverage {
+    size_t index_tensors = 0;
+    size_t mapped_tensors = 0;
+    size_t visual_tensors = 0;
+    size_t unexpected_tensors = 0;
+    // Full (unsharded) bytes of every mapped tensor, i.e. the text share of the
+    // checkpoint. Independent of TP world size.
+    uint64_t checkpoint_text_bytes = 0;
+    // Local resident bytes split by whether a rank holds a full copy or a shard.
+    // Replicated bytes are present on every rank, so per-rank totals must not be
+    // expected to sum to checkpoint_text_bytes.
+    uint64_t replicated_local_bytes = 0;
+    uint64_t sharded_local_bytes = 0;
+    std::vector<std::string> unexpected_examples;
 };
 
 struct QwenLinearKindCounts {
@@ -195,6 +216,11 @@ public:
     }
     size_t tensor_count() const { return tensor_count_; }
 
+    // Classify every checkpoint index entry against what this map claims.
+    QwenCoverage coverage() const;
+    // Throw unless every index entry is either mapped or a vision tensor.
+    void require_full_coverage() const;
+
 private:
     QwenTensorRef require_tensor(const std::string& name,
                                  SafeDType dtype,
@@ -207,6 +233,7 @@ private:
                                  int shard_dim) const;
     void record(const QwenTensorRef& ref, bool scale);
     void record_linear(const QwenLinearRef& ref);
+    void claim(const QwenTensorRef& ref);
 
     const SafeTensorsIndex& index_;
     QwenConfig config_;
@@ -222,13 +249,24 @@ private:
     uint64_t host_global_metadata_bytes_ = 0;
     QwenLinearKindCounts checkpoint_linear_kind_counts_;
     size_t tensor_count_ = 0;
+    std::set<std::string> claimed_tensors_;
+    uint64_t checkpoint_text_bytes_ = 0;
+    uint64_t replicated_local_bytes_ = 0;
+    uint64_t sharded_local_bytes_ = 0;
 };
 
 const char* qwen_shard_rule_name(QwenShardRule rule);
 const char* qwen_linear_kind_name(QwenLinearKind kind);
+// True for vision-tower tensors bundled into an official multimodal checkpoint.
+bool qwen_is_visual_tensor(const std::string& name);
 
-// Qwen checkpoint tensors retain their source dtype for validation. On Turing,
-// BF16 tensors must be materialized as IEEE FP16 before device upload.
+// Qwen checkpoint tensors retain their source dtype for validation. Storage
+// dtype is what the checkpoint holds; device dtype is what the backend keeps
+// resident. This is the CUDA/SM75 policy: Turing has no native BF16 arithmetic,
+// so every BF16 tensor -- whether it comes from the official BF16 checkpoint or
+// from the BF16 scale metadata of an FP8 checkpoint -- is converted to IEEE FP16
+// at the upload boundary, while FP8 and NVFP4 codes stay compressed. A native
+// BF16 backend must supply its own policy here rather than inherit this one.
 SafeDType qwen_device_dtype(SafeDType storage_dtype);
 uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
 void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count);
