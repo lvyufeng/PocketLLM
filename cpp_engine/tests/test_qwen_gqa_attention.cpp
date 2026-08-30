@@ -14,6 +14,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -458,6 +460,212 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
     return true;
 }
 
+// Decode: the tensor-core split kernel and the scalar fused path at the real TP4
+// decode shape, both launched from this process against the same inputs and both
+// compared to the CPU softmax. The candidate reassociates both dot products and
+// rounds the softmax numerator to half for the MMA operand, so it gets its own
+// tolerance rather than inheriting the scalar kernel's bit-identical guarantee;
+// the two are compared to each other on tolerance, never for equality.
+//
+// The explicit variant entry point exists because the production selector caches
+// its environment on first use, so a single process cannot otherwise reach both
+// kernels. It refuses an unsupported shape rather than falling back, so a
+// candidate result here cannot secretly be the scalar kernel.
+//
+// `target_splits` is the expected candidate geometry for this context on the
+// 68-SM SM75 test host. Contexts that do not divide it leave the last KV tile
+// partial, and `expect_empty_splits` covers the separate case where trailing
+// splits scan nothing at all: an early return there left scratch uninitialized
+// and produced -inf logits from the second decode step onward.
+bool run_decode_mma(int context_len, int target_splits,
+                    int split_override = 0, bool expect_empty_splits = false) {
+    constexpr int q_heads = 6;
+    constexpr int kv_heads = 1;
+    constexpr int head_dim = 256;
+    const int max_context = context_len + 16;
+    const size_t q_elements = static_cast<size_t>(q_heads) * head_dim;
+    const size_t kv_elements =
+        static_cast<size_t>(max_context) * kv_heads * head_dim;
+    std::mt19937 rng(24681 + context_len * 31 + target_splits);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+    std::vector<uint16_t> q(q_elements), k(kv_elements, 0), v(kv_elements, 0);
+    for (uint16_t& value : q) value = to_half(dist(rng));
+    for (size_t i = 0;
+         i < static_cast<size_t>(context_len) * kv_heads * head_dim; ++i) {
+        k[i] = to_half(dist(rng));
+        v[i] = to_half(dist(rng));
+    }
+
+    const int mma_splits = dsv4::qwen_gqa_decode_split_count_variant(
+        context_len, dsv4::QwenGqaDecodeVariant::TensorCore, split_override);
+    const int scalar_splits = dsv4::qwen_gqa_decode_split_count_variant(
+        context_len, dsv4::QwenGqaDecodeVariant::Scalar, split_override);
+    if (split_override == 0 && mma_splits != target_splits) {
+        fail("gqa decode candidate split count ctx=" +
+             std::to_string(context_len) + " got=" +
+             std::to_string(mma_splits) + " want=" +
+             std::to_string(target_splits));
+        return true;
+    }
+    // Trailing splits scan nothing exactly when the count exceeds what the slice
+    // length can fill. Production geometry re-derives the count to drop those, so
+    // only the preserved override can reach the case.
+    const int positions_per_split =
+        (context_len + mma_splits - 1) / mma_splits;
+    const int filled_splits =
+        (context_len + positions_per_split - 1) / positions_per_split;
+    const bool has_empty_splits = filled_splits < mma_splits;
+    if (expect_empty_splits && !has_empty_splits) {
+        fail("gqa decode empty-split case ctx=" + std::to_string(context_len) +
+             " splits=" + std::to_string(mma_splits) + " filled=" +
+             std::to_string(filled_splits) + " has no dry split");
+        return true;
+    }
+    if (expect_empty_splits && scalar_splits != mma_splits) {
+        fail("gqa decode empty-split case ctx=" + std::to_string(context_len) +
+             " needs both variants on the same geometry, got scalar=" +
+             std::to_string(scalar_splits) + " mma=" +
+             std::to_string(mma_splits));
+        return true;
+    }
+
+    uint16_t* d_q = nullptr;
+    uint16_t* d_k = nullptr;
+    uint16_t* d_v = nullptr;
+    uint16_t* d_scalar = nullptr;
+    uint16_t* d_mma = nullptr;
+    float* d_partials = nullptr;
+    auto release = [&]() {
+        cudaFree(d_q); cudaFree(d_k); cudaFree(d_v);
+        cudaFree(d_scalar); cudaFree(d_mma); cudaFree(d_partials);
+    };
+    // One scratch buffer serves both launches, so it is sized for whichever
+    // variant asks for more splits. Reusing it also means a kernel that fails to
+    // publish a partial reads the other kernel's leftovers, which is exactly the
+    // failure the empty-split case is looking for.
+    const size_t partial_elements = static_cast<size_t>(q_heads) *
+        std::max(mma_splits, scalar_splits) *
+        static_cast<size_t>(head_dim + 2);
+    if (cudaMalloc(&d_q, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_k, k.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_v, v.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_scalar, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_mma, q.size() * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_partials, partial_elements * sizeof(float)) != cudaSuccess) {
+        release();
+        return false;
+    }
+    if (cudaMemcpy(d_q, q.data(), q.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_k, k.data(), k.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_v, v.data(), v.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        release();
+        return false;
+    }
+    if (!dsv4::qwen_gqa_decode_attention_f16_fused_variant_cuda(
+            d_q, d_k, d_v, d_scalar, d_partials, q_heads, kv_heads, head_dim,
+            context_len, max_context, 0, 0,
+            dsv4::QwenGqaDecodeVariant::Scalar, split_override) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa decode scalar launch ctx=" + std::to_string(context_len));
+        release();
+        return true;
+    }
+    if (!dsv4::qwen_gqa_decode_attention_f16_fused_variant_cuda(
+            d_q, d_k, d_v, d_mma, d_partials, q_heads, kv_heads, head_dim,
+            context_len, max_context, 0, 0,
+            dsv4::QwenGqaDecodeVariant::TensorCore, split_override) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("gqa decode candidate launch ctx=" + std::to_string(context_len));
+        release();
+        return true;
+    }
+    std::vector<uint16_t> scalar(q_elements), candidate(q_elements);
+    if (cudaMemcpy(scalar.data(), d_scalar, scalar.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(candidate.data(), d_mma, candidate.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        release();
+        return false;
+    }
+    // Repeat the candidate on the same inputs. Its accumulator lives in shared
+    // memory with one owning lane per element, so a repeat mismatch would mean a
+    // race rather than a reassociation difference.
+    std::vector<uint16_t> repeat(q_elements);
+    if (!dsv4::qwen_gqa_decode_attention_f16_fused_variant_cuda(
+            d_q, d_k, d_v, d_mma, d_partials, q_heads, kv_heads, head_dim,
+            context_len, max_context, 0, 0,
+            dsv4::QwenGqaDecodeVariant::TensorCore, split_override) ||
+        cudaDeviceSynchronize() != cudaSuccess ||
+        cudaMemcpy(repeat.data(), d_mma, repeat.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        fail("gqa decode candidate repeat ctx=" + std::to_string(context_len));
+        release();
+        return true;
+    }
+    release();
+    size_t repeat_mismatches = 0;
+    for (size_t i = 0; i < repeat.size(); ++i) {
+        if (repeat[i] != candidate[i]) ++repeat_mismatches;
+    }
+    if (repeat_mismatches != 0) {
+        fail("gqa decode candidate is not repeatable ctx=" +
+             std::to_string(context_len) + " mismatches=" +
+             std::to_string(repeat_mismatches));
+    }
+
+    // CPU reference over the exact FP16 values the kernels consumed.
+    std::vector<float> q_ref(q_elements), k_ref(kv_elements), v_ref(kv_elements);
+    for (size_t i = 0; i < q_elements; ++i) q_ref[i] = from_half(q[i]);
+    for (size_t i = 0; i < kv_elements; ++i) {
+        k_ref[i] = from_half(k[i]);
+        v_ref[i] = from_half(v[i]);
+    }
+    std::vector<float> want(q_elements);
+    attention_reference(q_ref, k_ref, v_ref, want, q_heads, kv_heads, head_dim,
+                        context_len);
+    double worst_scalar = 0.0;
+    double worst_candidate = 0.0;
+    double worst_cross = 0.0;
+    bool finite = true;
+    size_t cross_mismatches = 0;
+    for (size_t i = 0; i < candidate.size(); ++i) {
+        const double scalar_value = from_half(scalar[i]);
+        const double candidate_value = from_half(candidate[i]);
+        if (!std::isfinite(scalar_value) || !std::isfinite(candidate_value)) {
+            finite = false;
+        }
+        worst_scalar = std::max(worst_scalar, std::fabs(scalar_value - want[i]));
+        worst_candidate =
+            std::max(worst_candidate, std::fabs(candidate_value - want[i]));
+        worst_cross =
+            std::max(worst_cross, std::fabs(candidate_value - scalar_value));
+        if (scalar[i] != candidate[i]) ++cross_mismatches;
+    }
+    // The scalar path is the exact reference implementation, so it keeps the
+    // tighter band; the candidate's extra half rounding of the softmax numerator
+    // gets 4e-3, matching the prefill MMA gate.
+    if (!finite || worst_scalar > 2.0e-3 || worst_candidate > 4.0e-3 ||
+        worst_cross > 4.0e-3) {
+        fail("gqa decode ctx=" + std::to_string(context_len) +
+             " splits=" + std::to_string(mma_splits) +
+             " finite=" + std::to_string(static_cast<int>(finite)) +
+             " scalar=" + std::to_string(worst_scalar) +
+             " mma=" + std::to_string(worst_candidate) +
+             " cross=" + std::to_string(worst_cross));
+    } else {
+        std::printf("  gqa decode ctx=%6d mma_splits=%4d scalar_splits=%4d "
+                    "empty=%d scalar_ref=%.3e mma_ref=%.3e cross=%.3e "
+                    "bitdiff=%zu\n",
+                    context_len, mma_splits, scalar_splits,
+                    static_cast<int>(has_empty_splits), worst_scalar,
+                    worst_candidate, worst_cross, cross_mismatches);
+    }
+    return true;
+}
+
 bool run_verify_crossover(int context_len) {
     constexpr int rows = 8;
     constexpr int q_heads = 6;
@@ -603,6 +811,29 @@ int main() {
     // final KV tile, so this covers both partial-tile masks at once. A kernel that
     // mishandles either would still pass the aligned case above.
     if (!run_prefill_tiled(150, 6, 1, 256, 2048, 2198, true)) {
+        std::printf("[SKIP] device allocation failed\n");
+        return 0;
+    }
+    // Decode at the real TP4 shape. 4096 is the minimum context the fused path
+    // accepts; 8199 and 65537 leave the last KV tile partial. Both kernels run in
+    // this process against the same inputs, so every case checks scalar against
+    // the CPU reference, the candidate against the CPU reference, and the two
+    // against each other, regardless of what DSV4_QWEN_DECODE_MMA selects.
+    const int decode_cases[][2] = {
+        {4096, 68}, {8199, 68}, {16384, 136}, {65537, 136},
+    };
+    for (const auto& decode_case : decode_cases) {
+        if (!run_decode_mma(decode_case[0], decode_case[1])) {
+            std::printf("[SKIP] device allocation failed\n");
+            return 0;
+        }
+    }
+    // Empty trailing splits. 4100 positions over 200 splits is 21 each, which 196
+    // splits already cover, so the last four CTAs scan nothing and must still
+    // publish the neutral partial the merge expects. Production re-derives the
+    // count to 196, so this needs the preserved-count test override. Silent
+    // -inf logits from step two onward were the original failure here.
+    if (!run_decode_mma(4100, 0, 200, true)) {
         std::printf("[SKIP] device allocation failed\n");
         return 0;
     }

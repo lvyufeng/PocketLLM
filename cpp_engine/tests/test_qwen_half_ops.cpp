@@ -2216,6 +2216,87 @@ bool check_fp8_cache() {
     return true;
 }
 
+// Decode LM head. The matvec kernel splits each row across a warp instead of a
+// block, so its summation order differs from the reference path and the two are
+// compared on tolerance against a CPU double reference rather than for equality.
+// The greedy pick is compared as well, since that is what actually reaches the
+// caller: a logit spread that does not move the argmax cannot change a token.
+bool check_fp16_matvec_logits(int rows, int cols) {
+    std::mt19937 rng(0x5eed1234u ^ (static_cast<unsigned>(rows) << 8) ^
+                     static_cast<unsigned>(cols));
+    std::uniform_real_distribution<float> dist(-0.08f, 0.08f);
+    std::vector<uint16_t> x(static_cast<size_t>(cols));
+    std::vector<uint16_t> weight(static_cast<size_t>(rows) * cols);
+    for (uint16_t& v : x) v = to_half(dist(rng));
+    for (uint16_t& v : weight) v = to_half(dist(rng));
+
+    DeviceBuffer dx, dw, d_reference, d_matvec;
+    uint16_t* px = dx.allocate<uint16_t>(x.size());
+    uint16_t* pw = dw.allocate<uint16_t>(weight.size());
+    float* p_reference = d_reference.allocate<float>(static_cast<size_t>(rows));
+    float* p_matvec = d_matvec.allocate<float>(static_cast<size_t>(rows));
+    if (!px || !pw || !p_reference || !p_matvec ||
+        cudaMemcpy(px, x.data(), x.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(pw, weight.data(), weight.size() * sizeof(uint16_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        fail("FP16 matvec logits allocation/copy");
+        return true;
+    }
+    if (!dsv4::qwen_fp16_matmul_rows_f16_f32_cuda(
+            px, pw, p_reference, 1, rows, cols, cols, rows, cols) ||
+        !dsv4::qwen_fp16_matvec_rows_f16_f32_cuda(
+            px, pw, p_matvec, 1, rows, cols, cols, rows, cols) ||
+        cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP16 matvec logits launch");
+        return true;
+    }
+    std::vector<float> reference(static_cast<size_t>(rows));
+    std::vector<float> candidate(reference.size());
+    cudaMemcpy(reference.data(), p_reference, reference.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaMemcpy(candidate.data(), p_matvec, candidate.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+
+    double worst_reference = 0.0;
+    double worst_candidate = 0.0;
+    bool finite = true;
+    int best_reference = 0;
+    int best_candidate = 0;
+    for (int row = 0; row < rows; ++row) {
+        double expected = 0.0;
+        for (int col = 0; col < cols; ++col) {
+            expected += static_cast<double>(from_half(x[col])) *
+                        from_half(weight[static_cast<size_t>(row) * cols + col]);
+        }
+        if (!std::isfinite(candidate[row]) || !std::isfinite(reference[row])) {
+            finite = false;
+        }
+        worst_reference = std::max(worst_reference,
+                                   std::fabs(reference[row] - expected));
+        worst_candidate = std::max(worst_candidate,
+                                   std::fabs(candidate[row] - expected));
+        if (reference[row] > reference[best_reference]) best_reference = row;
+        if (candidate[row] > candidate[best_candidate]) best_candidate = row;
+    }
+    // Batched shapes must be refused, not silently run on the reference path.
+    const bool rejects_batch = !dsv4::qwen_fp16_matvec_rows_f16_f32_cuda(
+        px, pw, p_matvec, 2, rows, cols, cols, rows, cols);
+    if (!finite || worst_reference > 2.0e-3 || worst_candidate > 2.0e-3 ||
+        best_reference != best_candidate || !rejects_batch) {
+        std::printf("  rows=%d cols=%d ref=%.3e cand=%.3e argmax %d/%d batch_refused=%d\n",
+                    rows, cols, worst_reference, worst_candidate,
+                    best_reference, best_candidate,
+                    static_cast<int>(rejects_batch));
+        fail("FP16 matvec logits numerical check");
+    } else {
+        std::printf("  fp16 matvec logits rows=%6d cols=%5d ref=%.3e cand=%.3e "
+                    "argmax=%d\n", rows, cols, worst_reference, worst_candidate,
+                    best_candidate);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -2274,6 +2355,12 @@ int main() {
     check_gated_delta_step_matches_sequence(1, 12, 12);
     check_gated_delta_step_matches_sequence(1, 4, 1);
     check_gated_delta_prenormalized(8, 12, 4, 3, 2.0f);
+    // Decode LM head. 62080x5120 is the real TP4 shard; the odd shapes cover a
+    // row count that does not fill the last warp pair and a column count that
+    // leaves a scalar tail past the 8-wide vector body.
+    check_fp16_matvec_logits(62080, 5120);
+    check_fp16_matvec_logits(1021, 5120);
+    check_fp16_matvec_logits(255, 516);
     check_fp8_cache();
     if (failures != 0) {
         std::printf("test_qwen_half_ops failures=%d\n", failures);

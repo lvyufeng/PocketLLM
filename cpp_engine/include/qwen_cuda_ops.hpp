@@ -599,6 +599,19 @@ bool qwen_fp16_matmul_rows_f16_f32_cuda(const uint16_t* d_x_fp16,
                                         float* d_y, int batch, int rows,
                                         int cols, int x_stride, int y_stride,
                                         int weight_stride, void* stream = nullptr);
+// Decode form of the call above. A warp owns two output rows and each lane takes
+// eight consecutive columns, which turns the weight stream into 16-byte loads and
+// replaces the per-row block reduction with a shuffle. Products and the reduction
+// stay FP32, but each lane sums a strided column subset, so the result is close to
+// the call above rather than bit-identical; greedy argmax can turn on a near tie,
+// so callers select this explicitly instead of inheriting it. Returns false for
+// anything other than a single row with 4-element-aligned strides, rather than
+// falling back, so an A/B cannot silently measure the reference path.
+bool qwen_fp16_matvec_rows_f16_f32_cuda(const uint16_t* d_x_fp16,
+                                        const uint16_t* d_w_fp16,
+                                        float* d_y, int batch, int rows,
+                                        int cols, int x_stride, int y_stride,
+                                        int weight_stride, void* stream = nullptr);
 // Fused FP16 gate/up projections and SiLU multiplication for small batches.
 // The output is [batch, rows] with the supplied row strides.
 bool qwen_fp16_swiglu_matmul_rows_f16_cuda(
@@ -781,6 +794,37 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
 // caller must size `d_partial_scratch` as q_heads * splits * (head_dim + 2), so
 // this has to be the same number the launch computes.
 int qwen_gqa_decode_split_count(int attended_positions);
+
+// Which split kernel the fused decode path runs. Production selects this from
+// the environment once per process, which makes an in-process comparison of the
+// two impossible; the explicit variant below exists so one test can drive both
+// against the same inputs. `Selected` is exactly what the production entry point
+// would do.
+enum class QwenGqaDecodeVariant {
+    Selected = 0,
+    Scalar = 1,
+    TensorCore = 2,
+};
+
+// Splits the given variant would use. Scalar and tensor-core geometry differ, so
+// scratch has to be sized from the variant actually being launched.
+int qwen_gqa_decode_split_count_variant(
+    int attended_positions, QwenGqaDecodeVariant variant,
+    int split_count_override = 0);
+
+// Fused decode with the split kernel chosen explicitly. Returns false when the
+// requested variant does not support the shape (the tensor-core kernel is
+// specialized for q_heads=6, kv_heads=1, head_dim=256, full causal attention),
+// so a test cannot silently measure a fallback. A positive split override is a
+// correctness-test seam: unlike production geometry, it preserves the requested
+// count so trailing empty splits reach the kernel and merge.
+bool qwen_gqa_decode_attention_f16_fused_variant_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_partial_scratch, int q_heads, int kv_heads, int head_dim,
+    int context_len, int max_context, int attention_window, int sink_tokens,
+    QwenGqaDecodeVariant variant, int split_count_override = 0,
+    void* stream = nullptr);
 bool qwen_gqa_prefill_attention_f16_tiled_cuda(
     const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16,
