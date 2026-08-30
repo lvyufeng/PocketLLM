@@ -1977,7 +1977,13 @@ struct QwenEngine::Impl {
                         static_cast<int>(config.linear_attention.key_head_dim),
                         static_cast<int>(config.linear_attention.value_head_dim),
                         q_scale));
-        } else if (rows > 1) {
+        } else {
+            // Also covers rows == 1. Decode used to fall through to the step
+            // loop below, which round-trips the [128, 128] state through global
+            // memory twice per token; the sequence kernel holds it in registers
+            // and is bit-exact against the step kernel, so there is no reason to
+            // reserve it for multi-token chunks. See the step-vs-sequence parity
+            // check in test_qwen_half_ops.
             sequenced = qwen_gated_delta_sequence_f16_cuda(
                 layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
                 v.f16_data(), gates.f16_data(), beta.f16_data(),
