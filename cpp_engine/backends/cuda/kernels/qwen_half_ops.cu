@@ -1675,6 +1675,95 @@ __global__ void fp16_matmul_f16_kernel(
     }
 }
 
+// Single-row form of fp16_matmul_f16_kernel. That kernel gives each output row a
+// whole 256-thread block and reduces through shared memory, which at the decode
+// LM head shape means 62080 blocks each paying eight barriers and issuing 2-byte
+// loads; measured 359 GB/s against the 477 GB/s the FP8 decode matvec already
+// reaches on the same card. Here a warp owns kRowsPerWarp rows and each lane
+// takes kColsPerLane consecutive columns, so the weight stream becomes 16-byte
+// loads and the reduction is a shuffle with no barrier at all.
+//
+// Products and the reduction stay FP32, but each lane now accumulates a strided
+// column subset instead of contributing one term to a shared-memory tree, so the
+// summation order differs from the reference path. Greedy argmax can turn on a
+// near tie, so the caller keeps this behind an explicit opt-in rather than
+// swapping it in for the established order.
+template <bool kFloatOutput, int kWarps, int kRowsPerWarp, int kColsPerLane>
+__global__ void fp16_matvec_f16_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ weight,
+    void* __restrict__ output, int rows, int cols, int weight_stride) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int row_base =
+        (static_cast<int>(blockIdx.x) * kWarps + warp) * kRowsPerWarp;
+    if (row_base >= rows) return;
+    const int active = min(kRowsPerWarp, rows - row_base);
+
+    // Clamped so a tail warp still forms legal pointers; the write below is what
+    // actually drops the inactive rows.
+    const uint16_t* weight_rows[kRowsPerWarp];
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        weight_rows[r] = weight +
+            static_cast<size_t>(min(row_base + r, rows - 1)) * weight_stride;
+    }
+
+    float sums[kRowsPerWarp] = {};
+    constexpr int kQuads = kColsPerLane / 4;
+    constexpr int kStride = 32 * kColsPerLane;
+    const int vec_cols = cols & ~(kColsPerLane - 1);
+    for (int col = lane * kColsPerLane; col < vec_cols; col += kStride) {
+        // The activation is a single row, so every warp on the device reads the
+        // same few KB of it; it stays resident and only the weight rows stream.
+        float xv[kColsPerLane];
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(x + col + q * 4);
+            xv[q * 4 + 0] = half_to_float(static_cast<uint16_t>(packed.x));
+            xv[q * 4 + 1] = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+            xv[q * 4 + 2] = half_to_float(static_cast<uint16_t>(packed.y));
+            xv[q * 4 + 3] = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+        }
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            float span = 0.0f;
+#pragma unroll
+            for (int q = 0; q < kQuads; ++q) {
+                const uint2 packed_w = *reinterpret_cast<const uint2*>(
+                    weight_rows[r] + col + q * 4);
+                span +=
+                    xv[q * 4 + 0] * half_to_float(static_cast<uint16_t>(packed_w.x)) +
+                    xv[q * 4 + 1] * half_to_float(static_cast<uint16_t>(packed_w.x >> 16)) +
+                    xv[q * 4 + 2] * half_to_float(static_cast<uint16_t>(packed_w.y)) +
+                    xv[q * 4 + 3] * half_to_float(static_cast<uint16_t>(packed_w.y >> 16));
+            }
+            sums[r] += span;
+        }
+    }
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        const float xv = half_to_float(x[col]);
+#pragma unroll
+        for (int r = 0; r < kRowsPerWarp; ++r) {
+            if (r >= active) break;
+            sums[r] += xv * half_to_float(weight_rows[r][col]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsPerWarp; ++r) {
+        if (r >= active) break;
+        float sum = sums[r];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0) {
+            const int row = row_base + r;
+            if constexpr (kFloatOutput) static_cast<float*>(output)[row] = sum;
+            else static_cast<uint16_t*>(output)[row] = float_to_half(sum);
+        }
+    }
+}
+
 __global__ void embedding_f16_kernel(const uint16_t* table, const int* tokens,
                                      uint16_t* output, int count, int cols,
                                      int row_start, int row_count) {
@@ -2927,7 +3016,8 @@ template <bool kFloatOutput>
 bool launch_fp16_matmul_rows_f16(
     const uint16_t* x, const uint16_t* weight, void* y,
     int batch, int rows, int cols, int x_stride, int y_stride,
-    int weight_stride, bool allow_small_batch, void* stream) {
+    int weight_stride, bool allow_small_batch, bool allow_matvec,
+    void* stream) {
     if (!x || !weight || !y || batch <= 0 || rows <= 0 || cols <= 0 ||
         x_stride < cols || y_stride < rows || weight_stride < cols) return false;
     const cudaStream_t s = static_cast<cudaStream_t>(stream);
@@ -2935,7 +3025,18 @@ bool launch_fp16_matmul_rows_f16(
     const bool use_small_batch = small_batch_env == nullptr ||
         std::strcmp(small_batch_env, "0") != 0;
     constexpr int kWarps = 8;
-    if (allow_small_batch && use_small_batch && batch > 1 && batch <= 8 &&
+    if (allow_matvec && batch == 1 && x_stride % 4 == 0 &&
+        weight_stride % 4 == 0) {
+        // Decode. Warp-per-row with wide weight loads; see the kernel comment for
+        // why this is not the default reduction order.
+        constexpr int kRowsPerWarp = 2;
+        constexpr int kColsPerLane = 8;
+        const int rows_per_block = kWarps * kRowsPerWarp;
+        const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+        fp16_matvec_f16_kernel<kFloatOutput, kWarps, kRowsPerWarp, kColsPerLane>
+            <<<blocks, kWarps * 32, 0, s>>>(x, weight, y, rows, cols,
+                                            weight_stride);
+    } else if (allow_small_batch && use_small_batch && batch > 1 && batch <= 8 &&
         x_stride % 4 == 0 &&
         weight_stride % 4 == 0) {
         const int blocks = (rows + kWarps - 1) / kWarps;
@@ -2965,7 +3066,7 @@ bool qwen_fp16_matmul_rows_f16_cuda(
     int weight_stride, void* stream) {
     return launch_fp16_matmul_rows_f16<false>(
         x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
-        true, stream);
+        true, false, stream);
 }
 
 bool qwen_fp16_matmul_rows_f16_f32_cuda(
@@ -2979,7 +3080,19 @@ bool qwen_fp16_matmul_rows_f16_f32_cuda(
     // is preserved and cannot overflow in an intermediate FP16 result.
     return launch_fp16_matmul_rows_f16<true>(
         x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
-        false, stream);
+        false, false, stream);
+}
+
+bool qwen_fp16_matvec_rows_f16_f32_cuda(
+    const uint16_t* x, const uint16_t* weight, float* y,
+    int batch, int rows, int cols, int x_stride, int y_stride,
+    int weight_stride, void* stream) {
+    // Decode only. Refuse anything else rather than falling back, so an A/B that
+    // asked for this kernel cannot silently measure the reference path.
+    if (batch != 1 || x_stride % 4 != 0 || weight_stride % 4 != 0) return false;
+    return launch_fp16_matmul_rows_f16<true>(
+        x, weight, y, batch, rows, cols, x_stride, y_stride, weight_stride,
+        false, true, stream);
 }
 
 bool qwen_fp16_matmul_rows_f16_f32_cublas_cuda(

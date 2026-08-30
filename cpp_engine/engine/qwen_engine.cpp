@@ -2680,18 +2680,30 @@ struct QwenEngine::Impl {
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
         bool logits_ok = false;
         if (lm_head.kind == QwenLinearKind::DenseF16) {
+            // Decode. The warp-per-row matvec reorders the reduction, so it is a
+            // separate entry point rather than a retune of the reference path;
+            // it is the default because the tokens it produces are identical to
+            // that path for 128 greedy steps at 512/4096/8192/32768/65536 on the
+            // real checkpoint, while decode is 2.0-5.2% faster.
+            const bool matvec_logits = rows == 1 &&
+                qwen_env_enabled_default("QWEN_FP16_LOGITS_MATVEC");
             const bool cublas_logits = rows > 1 &&
                 qwen_env_enabled_default("QWEN_FP16_LOGITS_CUBLAS");
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
-            logits_ok = cublas_logits
-                ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+            logits_ok = matvec_logits
+                ? qwen_fp16_matvec_rows_f16_f32_cuda(
                       normalized.f16_data(), lm_head.weight.f16_data(),
                       local_logits.f32_data(), rows, local_vocab, hidden_size,
                       hidden_size, local_vocab, hidden_size)
-                : qwen_fp16_matmul_rows_f16_f32(
-                      normalized.f16_data(), lm_head.weight.f16_data(),
-                      local_logits.f32_data(), rows, local_vocab, hidden_size,
-                      hidden_size, local_vocab, hidden_size);
+                : cublas_logits
+                    ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
+                          normalized.f16_data(), lm_head.weight.f16_data(),
+                          local_logits.f32_data(), rows, local_vocab, hidden_size,
+                          hidden_size, local_vocab, hidden_size)
+                    : qwen_fp16_matmul_rows_f16_f32(
+                          normalized.f16_data(), lm_head.weight.f16_data(),
+                          local_logits.f32_data(), rows, local_vocab, hidden_size,
+                          hidden_size, local_vocab, hidden_size);
         } else if (lm_head.kind == QwenLinearKind::Fp8Channel) {
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
             logits_ok = qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(

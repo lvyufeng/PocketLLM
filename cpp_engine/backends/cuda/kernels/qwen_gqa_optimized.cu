@@ -97,12 +97,77 @@ int decode_sm_count() {
     return value;
 }
 
-int decode_target_splits(int attended_positions) {
+// The tensor-core split kernel reassociates both dot products, so it is not
+// bit-identical to the scalar kernel. Keep short contexts on the established
+// exact path by default, where its measured gain is small and near ties are more
+// visible; select the candidate automatically once the scan is long enough to
+// matter. `=1` forces it at every context for A/B, while `=0` forces scalar.
+constexpr int kDecodeMmaDefaultMinContext = 16384;
+bool decode_mma_enabled(int attended_positions) {
+    static const int mode = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_MMA");
+        if (env == nullptr) return -1;  // automatic context-based selection
+        return std::strcmp(env, "0") == 0 ? 0 : 1;
+    }();
+    return mode < 0 ? attended_positions >= kDecodeMmaDefaultMinContext
+                    : mode != 0;
+}
+
+int decode_mma_target_splits() {
+    static const int value = [] {
+        const char* env = std::getenv("DSV4_QWEN_DECODE_MMA_TARGET_SPLITS");
+        const int parsed = env != nullptr ? std::atoi(env) : 0;
+        return parsed > 0 ? parsed : 0;
+    }();
+    return value;
+}
+
+bool decode_mma_device_supported() {
+    static const bool value = [] {
+        int device = 0;
+        cudaDeviceProp properties{};
+        return cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+            (properties.major > 7 ||
+             (properties.major == 7 && properties.minor >= 5));
+    }();
+    return value;
+}
+
+// `mma` is passed in rather than read from the environment so a caller can ask
+// for one variant's geometry while the process default selects the other.
+int decode_target_splits(int attended_positions, bool mma) {
     static const int override_value = [] {
         const char* env = std::getenv("DSV4_QWEN_DECODE_TARGET_SPLITS");
         const int parsed = env != nullptr ? std::atoi(env) : 0;
         return parsed > 0 ? parsed : 0;
     }();
+    if (mma) {
+        const int mma_override = decode_mma_target_splits();
+        if (mma_override > 0) return mma_override;
+        // The tensor-core CTA is 128 threads with a 26 KiB shared footprint, so
+        // only two fit per SM. As with the scalar kernel the optimum lands on a
+        // whole wave, but one wave lower: the candidate does six heads' worth of
+        // work per CTA, so it needs fewer CTAs to saturate. Fused milliseconds
+        // from `bench_qwen_gqa_decode` at the real TP4 shape, medians of the
+        // second and third repetitions:
+        //
+        //   context   scalar   68 (1/SM)  102   136 (2/SM)  204   272   408
+        //      4096   0.0428     0.0204     -      0.0234  0.0333 0.0411 0.0598
+        //      8192   0.0655     0.0362  0.0376    0.0377  0.0515 0.0490 0.0690
+        //     16384   0.1020     0.0610  0.0611    0.0584  0.0729 0.0722 0.1006
+        //     32768   0.1742     0.1107  0.1024    0.0986  0.1194 0.1142 0.1362
+        //     65536   0.3149     0.2052  0.1832    0.1784  0.1999 0.1939 0.2239
+        //
+        // Long contexts want both waves because the slice is long enough to
+        // amortise the per-CTA partial write; short ones do not. The split at
+        // 16384 takes the better column on both sides. Anything that is not a
+        // whole wave (119, 153, 170) is strictly worse than the wave below it.
+        if (override_value <= 0) {
+            const int per_sm = attended_positions < kDecodeShortContext ? 1 : 2;
+            return decode_sm_count() * per_sm;
+        }
+    }
     if (override_value > 0) return override_value;
     const int per_sm = attended_positions < kDecodeShortContext
         ? kDecodeShortSplitsPerSm : kDecodeSplitsPerSm;
@@ -1687,6 +1752,255 @@ __global__ void gqa_decode_split_f16_kernel(
     }
 }
 
+// The real TP4 decode shape has six Q rows sharing one KV head. This candidate
+// maps those rows to the M dimension of SM75's m16n8k8 instruction, padding ten
+// inactive rows, and maps four warps to four eight-position N tiles. The same
+// 32-position tile is then used for P*V. Unlike the scalar split kernel, a CTA
+// scans a longer slice and performs the two 256-wide products on tensor cores.
+// The softmax remains an ordered FP32 recurrence and the probability operand is
+// rounded to half before P*V, matching the proven prefill MMA path. Consequently
+// this is numerically close rather than bit-identical and is opt-in.
+constexpr int kDecodeMmaThreads = 128;
+constexpr int kDecodeMmaWarps = kDecodeMmaThreads / 32;
+constexpr int kDecodeMmaRows = 16;
+constexpr int kDecodeMmaValidRows = 6;
+constexpr int kDecodeMmaKvTile = 32;
+constexpr int kDecodeMmaDim = 256;
+constexpr int kDecodeMmaSteps = kDecodeMmaDim / 8;
+constexpr int kDecodeMmaKsStride = kDecodeMmaDim + 8;
+constexpr int kDecodeMmaVtStride = kDecodeMmaKvTile + 2;
+
+__global__ __launch_bounds__(kDecodeMmaThreads, 1)
+void gqa_decode_split_mma_f16_kernel(
+    const uint16_t* __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    float* __restrict__ partial_output,
+    int context_len,
+    int splits,
+    int positions_per_split) {
+    __shared__ __align__(16) uint16_t kv_stage[
+        kDecodeMmaDim * kDecodeMmaVtStride];
+    uint16_t (*ks)[kDecodeMmaKsStride] =
+        reinterpret_cast<uint16_t (*)[kDecodeMmaKsStride]>(kv_stage);
+    uint16_t (*vt)[kDecodeMmaVtStride] =
+        reinterpret_cast<uint16_t (*)[kDecodeMmaVtStride]>(kv_stage);
+    __shared__ float scores[kDecodeMmaRows][kDecodeMmaKvTile];
+    __shared__ uint16_t probability[kDecodeMmaRows][kDecodeMmaKvTile];
+    __shared__ float running_max[kDecodeMmaValidRows];
+    __shared__ float running_sum[kDecodeMmaValidRows];
+    __shared__ float rescale[kDecodeMmaValidRows];
+    __shared__ float accumulator[kDecodeMmaValidRows][kDecodeMmaDim];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int gid = lane >> 2;
+    const int tig = lane & 3;
+    const int lrow0 = gid;
+    const int lrow1 = gid + 8;
+    const int split = static_cast<int>(blockIdx.x);
+    const int start = split * positions_per_split;
+    const int end = min(context_len, start + positions_per_split);
+
+    for (int index = tid;
+         index < kDecodeMmaValidRows * kDecodeMmaDim;
+         index += kDecodeMmaThreads) {
+        accumulator[index / kDecodeMmaDim][index % kDecodeMmaDim] = 0.0f;
+    }
+    if (tid < kDecodeMmaValidRows) {
+        running_max[tid] = -INFINITY;
+        running_sum[tid] = 0.0f;
+        rescale[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    // Each lane keeps the fragment for two rows of the padded 16-row Q matrix.
+    // Q is reused for every K/V tile, so keeping it in registers avoids a second
+    // global read of the query vector.
+    uint32_t qfrag[kDecodeMmaSteps][2];
+#pragma unroll
+    for (int k = 0; k < kDecodeMmaSteps; ++k) {
+        const int col = k * 8 + tig * 2;
+        uint32_t first = 0u;
+        uint32_t second = 0u;
+        if (lrow0 < kDecodeMmaValidRows) {
+            first = *reinterpret_cast<const uint32_t*>(q +
+                static_cast<size_t>(lrow0) * kDecodeMmaDim + col);
+        }
+        if (lrow1 < kDecodeMmaValidRows) {
+            second = *reinterpret_cast<const uint32_t*>(q +
+                static_cast<size_t>(lrow1) * kDecodeMmaDim + col);
+        }
+        qfrag[k][0] = first;
+        qfrag[k][1] = second;
+    }
+
+    const float attention_scale = rsqrtf(static_cast<float>(kDecodeMmaDim));
+    for (int base = start; base < end; base += kDecodeMmaKvTile) {
+        const int count = min(kDecodeMmaKvTile, end - base);
+        const size_t kv_stride = kDecodeMmaDim;
+        for (int index = tid;
+             index < kDecodeMmaKvTile * kDecodeMmaSteps;
+             index += kDecodeMmaThreads) {
+            const int slot = index / kDecodeMmaSteps;
+            const int chunk = index - slot * kDecodeMmaSteps;
+            uint4 key = make_uint4(0u, 0u, 0u, 0u);
+            if (slot < count) {
+                key = *reinterpret_cast<const uint4*>(k_cache +
+                    static_cast<size_t>(base + slot) * kv_stride + chunk * 8);
+            }
+            *reinterpret_cast<uint4*>(&ks[slot][chunk * 8]) = key;
+        }
+        __syncthreads();
+
+        float score_fragment[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int k = 0; k < kDecodeMmaSteps; ++k) {
+            const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                &ks[warp * 8 + gid][k * 8 + tig * 2]);
+            mma_m16n8k8_f16_f32(score_fragment, qfrag[k], b);
+        }
+        const int score_col = warp * 8 + tig * 2;
+        if (lrow0 < kDecodeMmaValidRows) {
+            scores[lrow0][score_col] = score_fragment[0];
+            scores[lrow0][score_col + 1] = score_fragment[1];
+        }
+        __syncthreads();
+
+        // Eight threads own one score row and reduce its 32 columns. Invalid
+        // positions in the final tile are represented as -inf/zero.
+        const int row = tid >> 3;
+        const int row_lane = tid & 7;
+        // All eight-lane row groups must execute the warp reductions with the
+        // full mask. Padded rows participate with -inf and are discarded after
+        // the reduction; branching before __shfl_xor would leave lanes 6/7 of
+        // the second warp out of a full-mask collective.
+        if (row < kDecodeMmaRows) {
+            const int col0 = row_lane * 4;
+            const bool valid_row = row < kDecodeMmaValidRows;
+            const float old_max = valid_row ? running_max[row] : -INFINITY;
+            const float old_sum = valid_row ? running_sum[row] : 0.0f;
+            float local_max = -INFINITY;
+            float values[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = col0 + i;
+                const float value = col < count
+                    ? scores[row][col] * attention_scale : -INFINITY;
+                values[i] = value;
+                local_max = fmaxf(local_max, value);
+            }
+#pragma unroll
+            for (int offset = 1; offset < 8; offset <<= 1) {
+                local_max = fmaxf(local_max,
+                    __shfl_xor_sync(0xffffffffu, local_max, offset));
+            }
+            const float new_max = fmaxf(old_max, local_max);
+            float local_sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                uint16_t bits = 0;
+                if (new_max != -INFINITY && values[i] != -INFINITY) {
+                    bits = float_to_half(expf(values[i] - new_max));
+                    local_sum += half_to_float(bits);
+                }
+                probability[row][col0 + i] = bits;
+            }
+#pragma unroll
+            for (int offset = 1; offset < 8; offset <<= 1) {
+                local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+            }
+            if (valid_row && row_lane == 0) {
+                rescale[row] = old_max == -INFINITY
+                    ? 0.0f : expf(old_max - new_max);
+                running_max[row] = new_max;
+                running_sum[row] = old_sum * rescale[row] + local_sum;
+            }
+        }
+        __syncthreads();
+
+        // The V tile reuses the K staging buffer after Q*K and score reduction
+        // have completed. Transposing it makes each B fragment a coalesced 32-bit
+        // shared load, as in the prefill MMA kernel.
+        for (int index = tid;
+             index < kDecodeMmaKvTile * kDecodeMmaSteps;
+             index += kDecodeMmaThreads) {
+            const int slot = index / kDecodeMmaSteps;
+            const int chunk = index - slot * kDecodeMmaSteps;
+            uint4 value = make_uint4(0u, 0u, 0u, 0u);
+            if (slot < count) {
+                value = *reinterpret_cast<const uint4*>(v_cache +
+                    static_cast<size_t>(base + slot) * kv_stride + chunk * 8);
+            }
+            const uint16_t* source = reinterpret_cast<const uint16_t*>(&value);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                vt[chunk * 8 + i][slot] = source[i];
+            }
+        }
+        __syncthreads();
+
+        // Each warp covers a distinct 64-channel output slice. The B operand is
+        // column-major in the transposed V staging buffer; `gid` selects one of
+        // the eight output columns in the MMA fragment while `tig` selects its
+        // two values written by this lane. Every output element is therefore
+        // owned by one lane and the shared accumulator needs no atomics.
+        const int slice = warp;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int channel = slice * 64 + j * 8;
+            float value_fragment[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int kt = 0; kt < kDecodeMmaKvTile / 8; ++kt) {
+                uint32_t a[2] = {0u, 0u};
+                if (lrow0 < kDecodeMmaValidRows) {
+                    a[0] = *reinterpret_cast<const uint32_t*>(
+                        &probability[lrow0][kt * 8 + tig * 2]);
+                }
+                if (lrow1 < kDecodeMmaValidRows) {
+                    a[1] = *reinterpret_cast<const uint32_t*>(
+                        &probability[lrow1][kt * 8 + tig * 2]);
+                }
+                const uint32_t b = *reinterpret_cast<const uint32_t*>(
+                    &vt[channel + gid][kt * 8 + tig * 2]);
+                mma_m16n8k8_f16_f32(value_fragment, a, b);
+            }
+            if (lrow0 < kDecodeMmaValidRows) {
+                const int d0 = channel + tig * 2;
+                accumulator[lrow0][d0] =
+                    accumulator[lrow0][d0] * rescale[lrow0] + value_fragment[0];
+                accumulator[lrow0][d0 + 1] =
+                    accumulator[lrow0][d0 + 1] * rescale[lrow0] + value_fragment[1];
+            }
+            if (lrow1 < kDecodeMmaValidRows) {
+                const int d1 = channel + tig * 2;
+                accumulator[lrow1][d1] =
+                    accumulator[lrow1][d1] * rescale[lrow1] + value_fragment[2];
+                accumulator[lrow1][d1 + 1] =
+                    accumulator[lrow1][d1 + 1] * rescale[lrow1] + value_fragment[3];
+            }
+        }
+        __syncthreads();
+    }
+
+    const int partial_stride = kDecodeMmaDim + 2;
+    if (tid < kDecodeMmaValidRows) {
+        float* destination = partial_output +
+            (static_cast<size_t>(tid) * splits + split) * partial_stride;
+        destination[0] = running_max[tid];
+        destination[1] = running_sum[tid];
+    }
+    for (int index = tid;
+         index < kDecodeMmaValidRows * kDecodeMmaDim;
+         index += kDecodeMmaThreads) {
+        const int head = index / kDecodeMmaDim;
+        const int d = index - head * kDecodeMmaDim;
+        partial_output[(static_cast<size_t>(head) * splits + split) *
+                           partial_stride + 2 + d] = accumulator[head][d];
+    }
+}
+
 // Speculative verification scans one context split per CTA. A CTA owns one
 // KV head, one group of three Q heads, and every query row, so each K/V element
 // is loaded once for up to rows * 3 outputs. Splitting the history restores
@@ -2112,13 +2426,20 @@ bool valid_shape(int q_heads, int kv_heads, int head_dim) {
 
 // Never splits finer than one position per split, so short contexts fall back to
 // however many splits they can actually fill.
-int decode_split_count(int attended_positions) {
+int decode_split_count_for_variant(int attended_positions, bool mma,
+                                    int split_count_override) {
     if (attended_positions <= 0) return 1;
     const int forced = decode_forced_positions();
-    const int requested = forced > 0
-        ? (attended_positions + forced - 1) / forced
-        : std::min(decode_target_splits(attended_positions), attended_positions);
+    const int requested = split_count_override > 0
+        ? split_count_override
+        : forced > 0
+            ? (attended_positions + forced - 1) / forced
+            : std::min(decode_target_splits(attended_positions, mma), attended_positions);
     const int splits = std::max(std::min(decode_max_splits(), requested), 1);
+    // Correctness tests may deliberately preserve an oversized split count to
+    // exercise the neutral partial written by an empty CTA. Production geometry
+    // re-derives the count below so dead trailing entries are not launched.
+    if (split_count_override > 0) return splits;
     // Rounding the slice up can leave trailing splits with nothing to scan (8193
     // positions over 256 splits is 33 each, which only fills 249). Re-deriving
     // the count from the slice length drops those, so the grid and the merge do
@@ -2126,6 +2447,11 @@ int decode_split_count(int attended_positions) {
     // function, so the two cannot disagree.
     const int positions = (attended_positions + splits - 1) / splits;
     return std::max((attended_positions + positions - 1) / positions, 1);
+}
+
+int decode_split_count(int attended_positions) {
+    return decode_split_count_for_variant(
+        attended_positions, decode_mma_enabled(attended_positions), 0);
 }
 
 struct GqaCublasWorkspace {
@@ -2564,6 +2890,16 @@ int qwen_gqa_decode_split_count(int attended_positions) {
     return decode_split_count(attended_positions);
 }
 
+int qwen_gqa_decode_split_count_variant(
+    int attended_positions, QwenGqaDecodeVariant variant,
+    int split_count_override) {
+    const bool mma = variant == QwenGqaDecodeVariant::Selected
+        ? decode_mma_enabled(attended_positions)
+        : variant == QwenGqaDecodeVariant::TensorCore;
+    return decode_split_count_for_variant(attended_positions, mma,
+                                          split_count_override);
+}
+
 // Widest Q group the decode split kernel is instantiated for. Six covers the
 // TP4 full-attention shape (q_heads 6, kv_heads 1) in a single CTA, which is
 // what removes the duplicate KV stream.
@@ -2586,11 +2922,14 @@ int decode_group_width(int q_per_kv) {
     return std::max(std::min(requested, kDecodeMaxHeadsPerGroup), 1);
 }
 
-bool qwen_gqa_decode_attention_f16_fused_cuda(
+namespace {
+
+bool launch_decode_fused(
     const uint16_t* q, const uint16_t* k_cache,
     const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
     int q_heads, int kv_heads, int head_dim, int context_len,
-    int max_context, int attention_window, int sink_tokens, void* stream) {
+    int max_context, int attention_window, int sink_tokens,
+    QwenGqaDecodeVariant variant, int split_count_override, void* stream) {
     if (!q || !k_cache || !v_cache || !output || !partial_scratch ||
         context_len > max_context ||
         attention_window < 0 || sink_tokens < 0 ||
@@ -2599,13 +2938,44 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     const SparseRanges ranges =
         sparse_ranges(context_len, attention_window, sink_tokens);
     const int attended = ranges.total();
-    const int splits = decode_split_count(attended);
+    // The candidate has one CTA per split and embeds the six TP4 Q heads in
+    // one padded MMA matrix. Keep it restricted to its supported shape and
+    // refuse unsupported requests so setting the variable cannot silently
+    // change other attention paths.
+    const bool want_mma = variant == QwenGqaDecodeVariant::Selected
+        ? decode_mma_enabled(attended)
+        : variant == QwenGqaDecodeVariant::TensorCore;
+    // Geometry follows the variant being launched, and the same query is public
+    // so the engine's scratch sizing cannot disagree with the grid.
+    const int splits = decode_split_count_for_variant(
+        attended, want_mma, split_count_override);
     const int positions_per_split = (attended + splits - 1) / splits;
     const int group_heads = decode_group_width(q_heads / kv_heads);
     const int groups_per_kv =
         (q_heads / kv_heads + group_heads - 1) / group_heads;
-    const int blocks = kv_heads * groups_per_kv * splits;
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const bool mma_supported = decode_mma_device_supported() &&
+        attention_window <= 0 && sink_tokens == 0 &&
+        q_heads == 6 && kv_heads == 1 && head_dim == kDecodeMmaDim &&
+        splits <= kDecodeSplitCeiling;
+    // An explicit tensor-core request on an unsupported shape is an error, not a
+    // silent fallback: a test that asked for the candidate must not measure the
+    // scalar kernel instead.
+    if (variant == QwenGqaDecodeVariant::TensorCore && !mma_supported) {
+        return false;
+    }
+    const bool use_decode_mma = want_mma && mma_supported;
+    if (use_decode_mma) {
+        gqa_decode_split_mma_f16_kernel<<<splits, kDecodeMmaThreads, 0,
+                                           cuda_stream>>>(
+            q, k_cache, v_cache, partial_scratch, context_len, splits,
+            positions_per_split);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        gqa_decode_merge_f16_kernel<<<q_heads, kThreads, 0, cuda_stream>>>(
+            partial_scratch, output, q_heads, head_dim, splits);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    const int blocks = kv_heads * groups_per_kv * splits;
 #define DSV4_LAUNCH_DECODE_SPLIT(HPG) \
     gqa_decode_split_f16_kernel<HPG><<<blocks, kThreads, 0, cuda_stream>>>( \
         q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim, \
@@ -2625,6 +2995,31 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
     gqa_decode_merge_f16_kernel<<<q_heads, kThreads, 0, cuda_stream>>>(
         partial_scratch, output, q_heads, head_dim, splits);
     return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool qwen_gqa_decode_attention_f16_fused_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
+    int q_heads, int kv_heads, int head_dim, int context_len,
+    int max_context, int attention_window, int sink_tokens, void* stream) {
+    return launch_decode_fused(
+        q, k_cache, v_cache, output, partial_scratch, q_heads, kv_heads,
+        head_dim, context_len, max_context, attention_window, sink_tokens,
+        QwenGqaDecodeVariant::Selected, 0, stream);
+}
+
+bool qwen_gqa_decode_attention_f16_fused_variant_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
+    int q_heads, int kv_heads, int head_dim, int context_len,
+    int max_context, int attention_window, int sink_tokens,
+    QwenGqaDecodeVariant variant, int split_count_override, void* stream) {
+    return launch_decode_fused(
+        q, k_cache, v_cache, output, partial_scratch, q_heads, kv_heads,
+        head_dim, context_len, max_context, attention_window, sink_tokens,
+        variant, split_count_override, stream);
 }
 
 }  // namespace dsv4

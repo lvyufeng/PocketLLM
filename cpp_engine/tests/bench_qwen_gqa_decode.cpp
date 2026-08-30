@@ -110,8 +110,8 @@ int main(int argc, char** argv) {
     const int q_heads = argc > 1 ? std::atoi(argv[1]) : 6;
     const int kv_heads = argc > 2 ? std::atoi(argv[2]) : 1;
     const int head_dim = argc > 3 ? std::atoi(argv[3]) : 256;
-    const int max_context = 65552;
-    const int iterations = 50;
+    const int max_context = argc > 4 ? std::atoi(argv[4]) + 16 : 65552;
+    const int iterations = argc > 5 ? std::atoi(argv[5]) : 50;
 
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -158,7 +158,10 @@ int main(int argc, char** argv) {
 
     // The fused kernel declines contexts below its own minimum, so start there.
     const int contexts[] = {4096, 8192, 16384, 32768, 65536};
-    for (int context_len : contexts) {
+    const int context_count = max_context < 65552 ? 1 : 5;
+    for (int context_index = 0; context_index < context_count; ++context_index) {
+        const int context_len = contexts[context_index];
+        if (context_len >= max_context) continue;
         Args args{q, k, v, out_a, scratch, q_heads, kv_heads, head_dim,
                   context_len, max_context};
         const double reference_ms = time_ms(run_reference, &args, iterations);
