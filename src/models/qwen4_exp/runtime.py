@@ -1,15 +1,19 @@
 """TP4 heterogeneous runtime for Qwen4-Exp.
 
 Launch layout: one process per GPU, NCCL for the per-layer all-reduce.  Dense
-weights are sharded (see `builder.build_heterogeneous`); routed experts and the
-95 GiB PLE table stay in host RAM and are read through the shared page cache, so
-the four ranks pay for one copy between them.
+weights are sharded (see `builder.build_heterogeneous`); routed experts are
+loaded into each rank's disjoint host-RAM shard at startup, and the 95 GiB PLE
+table stays host-resident through the existing mapping.  Only active experts are
+staged to GPU during a step.
 
-Memory per rank (BF16, 4 ranks):
+Device memory per rank (BF16, 4 ranks):
   dense sharded weights   ~2.6 GiB   (attn/linear-attn projections, HC mixers)
   lm_head shard            0.30 GiB
   KV + conv/recurrent      grows with context
   staged experts        top_k * 6.6 MiB per layer, freed each step
+
+Host memory per rank:
+  resident expert shard    56.25 GiB (128 of 512 experts x 48 layers)
 
 Entry point: `python -m src.models.qwen4_exp.runtime --model DIR --prompt ...`
 under torchrun, or `run_tp4()` from another module.
@@ -93,10 +97,37 @@ def load_model(
     *,
     dtype: torch.dtype = torch.bfloat16,
     expert_cache_capacity: int = 0,
+    host_expert_memory: bool = True,
+    pin_experts: bool = True,
     profiler=None,
 ) -> tuple[Qwen4ExpModel, Qwen4ExpConfig]:
     config = Qwen4ExpConfig.from_pretrained(model_dir)
     checkpoint = Qwen4ExpCheckpoint(model_dir, store=MmapSafetensors(model_dir))
+    if host_expert_memory:
+        # Pull this rank's routed experts off the disk-backed mapping and into
+        # host RAM before any step runs, so steady-state staging never seeks.
+        import torch.distributed as dist
+
+        distributed = ctx.world_size > 1 and dist.is_initialized()
+        started = time.perf_counter()
+        shard = checkpoint.preload_experts(
+            config.text_config.num_hidden_layers,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
+            pin=pin_experts,
+            progress=ctx.rank == 0 and os.environ.get("QWEN4EXP_PRELOAD_PROGRESS") == "1",
+            barrier=dist.barrier if distributed else None,
+        )
+        elapsed = time.perf_counter() - started
+        print(
+            f"[qwen4exp] rank {ctx.rank}: {shard.num_local_experts} experts/layer "
+            f"x {shard.stats()['layers']} layers resident, "
+            f"{shard.resident_bytes / (1 << 30):.2f} GiB "
+            f"({'pinned' if shard.pinned else 'pageable'}) in {elapsed:.1f}s",
+            flush=True,
+        )
+        if distributed:
+            dist.barrier()
     model = build_heterogeneous(
         config.text_config,
         checkpoint,
@@ -206,6 +237,8 @@ def run_tp4(
     chunk_size: int = 512,
     dtype: torch.dtype = torch.bfloat16,
     expert_cache_capacity: int = 0,
+    host_expert_memory: bool = True,
+    pin_experts: bool = True,
     raw_prompt: bool = False,
     enable_profile: bool = False,
 ) -> dict:
@@ -219,7 +252,13 @@ def run_tp4(
 
     t0 = time.perf_counter()
     model, config = load_model(
-        model_dir, ctx, dtype=dtype, expert_cache_capacity=expert_cache_capacity, profiler=profiler
+        model_dir,
+        ctx,
+        dtype=dtype,
+        expert_cache_capacity=expert_cache_capacity,
+        host_expert_memory=host_expert_memory,
+        pin_experts=pin_experts,
+        profiler=profiler,
     )
     load_s = time.perf_counter() - t0
     if ctx.rank == 0:
@@ -293,6 +332,16 @@ def main() -> None:
         default=0,
         help="number of staged experts to keep on device (0 = restage every step)",
     )
+    parser.add_argument(
+        "--mmap-experts",
+        action="store_true",
+        help="diagnostic fallback: read routed experts from the mmap on demand",
+    )
+    parser.add_argument(
+        "--pageable-experts",
+        action="store_true",
+        help="keep the resident host shard pageable instead of requesting pinned memory",
+    )
     parser.add_argument("--raw-prompt", action="store_true", help="skip the chat template")
     parser.add_argument("--profile", action="store_true", help="enable hierarchical profiler")
     args = parser.parse_args()
@@ -309,6 +358,8 @@ def main() -> None:
         chunk_size=args.chunk_size,
         dtype=getattr(torch, args.dtype),
         expert_cache_capacity=args.expert_cache,
+        host_expert_memory=not args.mmap_experts,
+        pin_experts=not args.pageable_experts,
         raw_prompt=args.raw_prompt,
         enable_profile=args.profile,
     )

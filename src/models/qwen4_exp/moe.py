@@ -4,10 +4,12 @@ Two implementations share one interface:
 
 * `InMemoryMoE` keeps `gate_up_proj`/`down_proj` as dense tensors on whatever
   device they were handed.  Used by tests and small models.
-* `HostExpertMoE` reads expert rows straight out of the mmap'd safetensors on
-  demand and runs the SwiGLU on the GPU, staging only the active experts.  This
-  is what makes the 225 GiB expert set usable on 4x22 GiB cards: a decode step
-  touches at most `top_k` experts per layer (6.6 MiB each in BF16).
+* `HostExpertMoE` reads expert rows from the host through
+  `reader.expert_rows()` and runs the SwiGLU on the GPU, staging only the active
+  experts.  This is what makes the 225 GiB expert set usable on 4x22 GiB cards: a
+  decode step touches at most `top_k` experts per layer (6.6 MiB each in BF16).
+  The reader normally serves those rows from this rank's resident host shard (see
+  `weights.HostExpertShard`); the mmap is only the fallback.
 """
 
 from __future__ import annotations
@@ -133,12 +135,12 @@ class InMemoryMoE:
 
 
 class HostExpertMoE:
-    """Experts stay in host RAM (mmap'd checkpoint); active ones are staged to GPU.
+    """Experts stay in host RAM; active ones are staged to GPU per step.
 
-    The reader must expose `expert_rows(layer_idx, expert_id)` returning CPU
-    tensors that alias the mapping.  A small LRU keeps recently used experts on
-    device, which pays off during prefill where consecutive chunks reuse the same
-    hot experts.
+    The reader must expose `expert_rows(layer_idx, expert_id)` returning host
+    tensors — resident shard rows when preloaded, mmap views otherwise.  A small
+    LRU keeps recently used experts on device, which pays off during prefill where
+    consecutive chunks reuse the same hot experts.
     """
 
     def __init__(
