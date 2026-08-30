@@ -1,4 +1,4 @@
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -100,22 +100,22 @@ int main(int argc, char** argv) {
     fill(beta, gate_elements, 0.5f);
 
     auto sequence = [&]() {
-        return dsv4::qwen_gated_delta_sequence_f16_cuda(
+        return dsv4::qwen_gated_delta_sequence_f16(
             state, q, k, v, g, beta, output, rows, kHeads, kKeyHeads,
             kDim, kDim, 1.0f / 11.3137085f);
     };
     auto normalized = [&]() {
-        return dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+        return dsv4::qwen_normalize_gated_delta_qk_f16(
                    q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
-               dsv4::qwen_gated_delta_sequence_normalized_f16_cuda(
+               dsv4::qwen_gated_delta_sequence_normalized_f16(
                    state, q_normalized, k_normalized, v, g, beta, output,
                    rows, kHeads, kKeyHeads, kDim, kDim,
                    1.0f / 11.3137085f);
     };
     auto shared_state_variant = [&]() {
-        return dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+        return dsv4::qwen_normalize_gated_delta_qk_f16(
                    q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
-               dsv4::qwen_gated_delta_sequence_normalized_shared_f16_cuda(
+               dsv4::qwen_gated_delta_sequence_normalized_shared_f16(
                    state, q_normalized, k_normalized, v, g, beta, output,
                    rows, kHeads, kKeyHeads, kDim, kDim,
                    1.0f / 11.3137085f);
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     // columns each, so the [D, D] state is spread over 8 warps instead of one
     // thread per value dimension. Same serial recurrence, different sharding.
     auto flashqla = [&]() {
-        return dsv4::qwen_normalize_gated_delta_qk_f16_cuda(
+        return dsv4::qwen_normalize_gated_delta_qk_f16(
                    q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
                dsv4::qwen_gated_delta_flashqla_sm75_f16_cuda(
                    state, q_normalized, k_normalized, v, g, beta, output,
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
     };
     auto steps = [&]() {
         for (int row = 0; row < rows; ++row) {
-            if (!dsv4::qwen_gated_delta_step_f16_cuda(
+            if (!dsv4::qwen_gated_delta_step_f16(
                     state, q + static_cast<size_t>(row) * kKeyHeads * kDim,
                     k + static_cast<size_t>(row) * kKeyHeads * kDim,
                     v + static_cast<size_t>(row) * kHeads * kDim,

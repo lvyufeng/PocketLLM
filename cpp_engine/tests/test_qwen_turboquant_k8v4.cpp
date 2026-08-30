@@ -1,5 +1,5 @@
 // Numerical test for TurboQuant K8V4 KV-cache against reference.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

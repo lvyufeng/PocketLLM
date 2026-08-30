@@ -133,14 +133,14 @@ int main(int argc, char** argv) {
         const dsv4::SafeTensorsIndex target_index(target_checkpoint);
         const dsv4::QwenWeightMap target_weights(
             target_index, target_config, tp_world, tp_rank);
-        dsv4::QwenDeviceTensor embedding = dsv4::qwen_upload_tensor_cuda(
+        dsv4::QwenDeviceTensor embedding = dsv4::qwen_upload_tensor(
             target_index, target_weights.embed_tokens());
         const dsv4::QwenLinearRef& head_ref = target_weights.lm_head();
-        dsv4::QwenDeviceTensor lm_head = dsv4::qwen_upload_tensor_cuda(
+        dsv4::QwenDeviceTensor lm_head = dsv4::qwen_upload_tensor(
             target_index, head_ref.weight);
         dsv4::QwenDeviceTensor lm_head_scale;
         if (head_ref.has_scale) {
-            lm_head_scale = dsv4::qwen_upload_tensor_cuda(
+            lm_head_scale = dsv4::qwen_upload_tensor(
                 target_index, head_ref.scale);
         }
         const dsv4::QwenTargetHeadAdapter target_head{

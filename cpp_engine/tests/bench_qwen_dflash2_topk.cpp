@@ -1,5 +1,5 @@
 // Times the two local top-k paths at the real DFlash2 shape in isolation.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <random>

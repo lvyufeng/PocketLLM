@@ -1019,9 +1019,9 @@ int main(int argc, char** argv) {
                         dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward_with_options(args.ckpt, prompt_ids, args.smoke_layers, opts);
                         int top_token = result.top_token;
                         float top_logit = result.top_logit;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
                         if (args.tp_world > 1 && !args.nccl_id_path.empty()) {
-                            dsv4::TpTopResult global = dsv4::nccl_global_top1(
+                            dsv4::TpTopResult global = dsv4::tp_global_top1(
                                 args.tp_world,
                                 args.tp_rank,
                                 args.device >= 0 ? args.device : args.tp_rank,

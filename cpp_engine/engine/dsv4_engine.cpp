@@ -376,7 +376,7 @@ struct ReduceBreakdown {
     double unpack_ms = 0.0;
 };
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
 struct BF16AllReduceScratch {
     uint16_t* d_bf16 = nullptr;
     int capacity = 0;
@@ -416,7 +416,7 @@ void all_reduce_sum_fp32_via_bf16_inplace(
         check_device(device_synchronize(), "sync reduce pack");
         detail->pack_ms += elapsed_ms_local(pack_t, Clock::now());
         auto nccl_t = Clock::now();
-        nccl_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
+        tp_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
         check_device(device_synchronize(), "sync reduce nccl");
         detail->nccl_ms += elapsed_ms_local(nccl_t, Clock::now());
         auto unpack_t = Clock::now();
@@ -426,7 +426,7 @@ void all_reduce_sum_fp32_via_bf16_inplace(
         return;
     }
     if (!fp32_to_bf16_cuda(d_values, scratch.d_bf16, count)) throw std::runtime_error("fp32_to_bf16 launch failed");
-    nccl_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
+    tp_all_reduce_sum_bf16_inplace(world, rank, device, id_path, scratch.d_bf16, count);
     if (!bf16_to_fp32_cuda(scratch.d_bf16, d_values, count)) throw std::runtime_error("bf16_to_fp32 launch failed");
 }
 #endif
@@ -436,14 +436,14 @@ struct GgufReduceContext {
     int rank = 0;
     int device = 0;
     const char* id_path = nullptr;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     BF16AllReduceScratch* scratch = nullptr;
 #endif
 };
 
 void gguf_all_reduce_sum_fp32_inplace(float* d_values, int count, const GgufReduceContext* ctx, const char* what) {
     if (ctx == nullptr || ctx->world <= 1) return;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     if (ctx->id_path == nullptr || ctx->id_path[0] == '\0') throw std::runtime_error(std::string(what) + " requires NCCL id path");
     static const bool use_fp32_reduce = [] {
         const char* v = std::getenv("DSV4_GGUF_REDUCE_FP32");
@@ -451,7 +451,7 @@ void gguf_all_reduce_sum_fp32_inplace(float* d_values, int count, const GgufRedu
         try { return std::stoi(v) != 0; } catch (...) { return true; }
     }();
     if (use_fp32_reduce) {
-        nccl_all_reduce_sum_float_inplace(ctx->world, ctx->rank, ctx->device, ctx->id_path, d_values, count);
+        tp_all_reduce_sum_float_inplace(ctx->world, ctx->rank, ctx->device, ctx->id_path, d_values, count);
         return;
     }
     if (ctx->scratch == nullptr) throw std::runtime_error(std::string(what) + " requires BF16 reduce scratch");
@@ -459,7 +459,7 @@ void gguf_all_reduce_sum_fp32_inplace(float* d_values, int count, const GgufRedu
 #else
     (void)d_values;
     (void)count;
-    throw std::runtime_error(std::string(what) + " requires DSV4_HAVE_NCCL");
+    throw std::runtime_error(std::string(what) + " requires DSV4_HAVE_TP_COMM");
 #endif
 }
 
@@ -2702,9 +2702,9 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     const auto prefill_t0 = timed_t0;
     ForwardSmokeResult result = run_safetensors_prompt_prefill_impl(ctx, seed_tokens, layer_count);
     int token = result.top_token;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     if (options.tp_world > 1 && !options.nccl_id_path.empty()) {
-        TpTopResult global = nccl_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
+        TpTopResult global = tp_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
         token = global.token;
         result.top_token = global.token;
         result.top_logit = global.logit;
@@ -2727,9 +2727,9 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     const auto decode_t0 = Clock::now();
     for (int step = 1; step < max_new_tokens; ++step) {
         result = run_safetensors_token_forward_impl(ctx, token, layer_count, position + step - 1);
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (options.tp_world > 1 && !options.nccl_id_path.empty()) {
-            TpTopResult global = nccl_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
+            TpTopResult global = tp_global_top1(options.tp_world, options.tp_rank, options.device, options.nccl_id_path.c_str(), result.top_token, result.top_logit);
             result.top_token = global.token;
             result.top_logit = global.logit;
         }
@@ -2823,7 +2823,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     const int local_head_rows = head_rows / tp_world;
     const int local_head_start = tp_rank * local_head_rows;
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
     DeviceMoePrefillWorkspace prefill_moe_workspace;
@@ -3156,7 +3156,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                 if (!fp8_e4m3_e8m0_matmul_cuda(d_attn_mid_rows, attn_cache.wo_b, attn_cache.wo_b_scale, d_attn_out_rows, cn, dim, attn_dims.attn_mid)) throw std::runtime_error("prefill wo_b rows launch failed");
                 attn_stage_sync("attn wo");
                 double attn_wo_ms = elapsed_ms(attn_t, Clock::now());
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
                 attn_t = Clock::now();
                 if (ctx.options.tp_world > 1) {
                     if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
@@ -3224,7 +3224,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                             d_attn_out)) {
                         throw std::runtime_error("prefill attention launch failed");
                     }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
                     if (ctx.options.tp_world > 1) {
                         if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
                         all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
@@ -3458,7 +3458,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             sync_prefill_profile("profile sync prefill moe");
             total_prefill_moe_ms += elapsed_ms(stage_t, Clock::now());
             stage_t = Clock::now();
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
             if (ctx.options.tp_world > 1) {
                 if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill MoE all-reduce requires --nccl-id-path");
                 all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe_rows, static_cast<int>(cn_dim_sz), bf16_reduce_scratch);
@@ -3621,7 +3621,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     // layer loop updates streaming compressor state in position order, while
     // dense projections and TP reductions remain row-batched.
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
     const int experts_per_rank = tp_world > 1
@@ -3888,7 +3888,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                                        w.attn_out, rows, dim, dims.attn_mid)) {
             throw std::runtime_error("continuation WO-B rows launch failed");
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) {
                 throw std::runtime_error("TP continuation attention all-reduce requires --nccl-id-path");
@@ -4062,7 +4062,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                 throw std::runtime_error("continuation active FP4 MoE launch failed");
             }
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) {
                 throw std::runtime_error("TP continuation MoE all-reduce requires --nccl-id-path");
@@ -4304,7 +4304,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     const int local_head_rows = head_rows / tp_world;
     const int local_head_start = tp_rank * local_head_rows;
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
 
@@ -4726,7 +4726,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 profile_attn ? &attn_profile : nullptr)) {
             throw std::runtime_error("single-token attention smoke launch failed");
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP attention all-reduce requires --nccl-id-path");
             auto reduce_t = Clock::now();
@@ -4891,7 +4891,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         if (profile_decode_sync) check_device(device_synchronize(), "sync moe kernel");
         moe_kernel_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP MoE all-reduce requires --nccl-id-path");
             all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe, dim, bf16_reduce_scratch, profile_reduce_detail ? &moe_reduce_detail : nullptr);
@@ -9182,7 +9182,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         check_device((gguf_prefill_shared_done_event = event_create()) != nullptr, "create GGUF prefill shared done event");
     }
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
     GgufReduceContext reduce_ctx;
@@ -9190,7 +9190,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     reduce_ctx.rank = tp_rank;
     reduce_ctx.device = tp_device;
     reduce_ctx.id_path = options.nccl_id_path.empty() ? nullptr : options.nccl_id_path.c_str();
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     reduce_ctx.scratch = &bf16_reduce_scratch;
 #endif
     const GgufReduceContext* reduce_ctx_ptr = (tp_world > 1) ? &reduce_ctx : nullptr;
@@ -9625,9 +9625,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             check_device(memcpy_d2h(&top_t, d_argmax_token, sizeof(int)), "copy argmax token");
             check_device(memcpy_d2h(&top_l, d_argmax_logit, sizeof(float)), "copy argmax logit");
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1 && !options.nccl_id_path.empty()) {
-            TpTopResult global = nccl_global_top1(tp_world, tp_rank, tp_device,
+            TpTopResult global = tp_global_top1(tp_world, tp_rank, tp_device,
                                                    options.nccl_id_path.c_str(),
                                                    top_t, top_l);
             top_t = global.token;
@@ -10089,9 +10089,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             check_device(memcpy_d2h(&top_t, d_argmax_token, sizeof(int)), "copy GGUF prefill argmax token");
             check_device(memcpy_d2h(&top_l, d_argmax_logit, sizeof(float)), "copy GGUF prefill argmax logit");
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1 && !options.nccl_id_path.empty()) {
-            TpTopResult global = nccl_global_top1(tp_world, tp_rank, tp_device,
+            TpTopResult global = tp_global_top1(tp_world, tp_rank, tp_device,
                                                    options.nccl_id_path.c_str(),
                                                    top_t, top_l);
             top_t = global.token;
@@ -10485,11 +10485,11 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
     const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
     const int topk_diag = env_int_or_default("DSV4_CPP_TOPK_DIAG", 0);
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
         std::vector<float> all;
         if (opts.tp_rank == 0) all.resize(static_cast<size_t>(opts.tp_world) * static_cast<size_t>(local));
-        nccl_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
+        tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
                                    opts.nccl_id_path.c_str(),
                                    ctx.last_local_logits.data(), local,
                                    opts.tp_rank == 0 ? all.data() : nullptr, 0);
@@ -10510,7 +10510,7 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
                 token_buf[0] = sample_token_top_p(all.data(), vocab, sp.temperature, sp.top_p, rng);
             }
         }
-        nccl_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
+        tp_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
                              opts.nccl_id_path.c_str(), token_buf, 1, 0);
         return token_buf[0];
     }
@@ -10567,7 +10567,7 @@ std::vector<int> select_continuation_tokens(const ContinuationBatchResult& resul
     const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
     std::vector<int> tokens(static_cast<size_t>(result.rows));
 
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
         std::vector<float> gathered;
         if (opts.tp_rank == 0) {
@@ -10580,7 +10580,7 @@ std::vector<int> select_continuation_tokens(const ContinuationBatchResult& resul
         for (int row = 0; row < result.rows; ++row) {
             const float* local = result.local_logits.data() +
                 static_cast<size_t>(row) * result.local_head_rows;
-            nccl_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
+            tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
                                        opts.nccl_id_path.c_str(), local,
                                        result.local_head_rows,
                                        opts.tp_rank == 0 ? gathered.data() : nullptr, 0);
@@ -10601,7 +10601,7 @@ std::vector<int> select_continuation_tokens(const ContinuationBatchResult& resul
                         full_logits.data(), vocab, sp.temperature, sp.top_p, rng);
                 }
             }
-            nccl_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
+            tp_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
                                  opts.nccl_id_path.c_str(), token_buf, 1, 0);
             tokens[static_cast<size_t>(row)] = token_buf[0];
         }
@@ -11251,10 +11251,10 @@ void PersistentEngine::warmup_tp() {
     // file is written and the comm is ready before the first request. This
     // is the only NCCL bcast we keep — actual workload bcasts (allgather
     // logits, token bcast) happen inside prefill/decode.
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
     if (!s.opts.nccl_id_path.empty()) {
         int32_t warm[kCmdHeaderInts] = {0, 0, 0, 0};
-        nccl_broadcast_int32(s.opts.tp_world, s.opts.tp_rank, s.opts.device,
+        tp_broadcast_int32(s.opts.tp_world, s.opts.tp_rank, s.opts.device,
                              s.opts.nccl_id_path.c_str(), warm, kCmdHeaderInts, 0);
     }
 #endif

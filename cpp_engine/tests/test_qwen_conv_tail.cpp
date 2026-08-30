@@ -6,7 +6,7 @@
 // history instead of shifting it, so decode diverged from token 2 onward.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_runtime.h>
 

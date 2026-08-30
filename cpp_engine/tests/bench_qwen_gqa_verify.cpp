@@ -1,4 +1,4 @@
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(v, host_v.data(), host_v.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy v");
 
     auto split = [&]() {
-        return dsv4::qwen_gqa_verify_attention_f16_cuda(
+        return dsv4::qwen_gqa_verify_attention_f16(
             q, k, v, split_output, split_scratch, rows, q_heads, kv_heads,
             head_dim, position_offset, context, splits);
     };

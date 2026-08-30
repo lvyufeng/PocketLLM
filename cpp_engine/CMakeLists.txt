@@ -76,9 +76,12 @@ if(POCKET_BACKEND STREQUAL "cuda")
 
     find_package(CUDAToolkit REQUIRED)
 
+    # DSV4_HAVE_TP_COMM means "a collective library is linked", not "NCCL is
+    # linked": the Ascend branch below sets the same flag from HCCL. The engine's
+    # TP paths are guarded on the neutral flag so they compile on either backend.
     set(NCCL_ROOT "" CACHE PATH "Optional NCCL root directory")
     option(DSV4_REQUIRE_NCCL "Fail configuration when NCCL is unavailable" OFF)
-    set(DSV4_HAVE_NCCL OFF)
+    set(DSV4_HAVE_TP_COMM OFF)
     if(NCCL_ROOT)
         find_path(NCCL_INCLUDE_DIR nccl.h PATHS "${NCCL_ROOT}/include" NO_DEFAULT_PATH)
         find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2 PATHS "${NCCL_ROOT}/lib" NO_DEFAULT_PATH)
@@ -87,7 +90,7 @@ if(POCKET_BACKEND STREQUAL "cuda")
         find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2)
     endif()
     if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
-        set(DSV4_HAVE_NCCL ON)
+        set(DSV4_HAVE_TP_COMM ON)
         message(STATUS "NCCL found: ${NCCL_LIBRARY}")
     else()
         if(DSV4_REQUIRE_NCCL)
@@ -128,17 +131,17 @@ if(POCKET_BACKEND STREQUAL "cuda")
     else()
         message(FATAL_ERROR "NVTX is required but was not found in the CUDA toolkit")
     endif()
-    if(DSV4_HAVE_NCCL)
+    if(DSV4_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_INCLUDES ${NCCL_INCLUDE_DIR})
         list(APPEND POCKET_BACKEND_LIBS ${NCCL_LIBRARY})
-        list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_NCCL=1)
+        list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_TP_COMM=1)
     endif()
 else()
     # Ascend: ACL runtime, AscendC kernels and HCCL collectives under
     # backends/ascend. The device runtime is implemented; kernels are not, so the
     # full engine still does not link. What does link and run today is anything
     # that needs only pocket_core plus the device runtime.
-    set(DSV4_HAVE_NCCL OFF)
+    set(DSV4_HAVE_TP_COMM OFF)
 
     # CANN layout: $ASCEND_TOOLKIT_HOME/<arch>-linux/{include,lib64}. The arch
     # directory name is not always the uname value (arm64-linux exists alongside
@@ -179,16 +182,57 @@ else()
     # this without re-tuning.
     set(ASCEND_SOC_VERSION "ascend910b" CACHE STRING "AscendC target SoC version")
 
+    # aclnn operator libraries. libnnopbase carries aclCreateTensor and the
+    # aclOpExecutor type, so linking libopapi alone leaves those undefined even
+    # though the aclnn* entry points themselves resolve.
+    find_library(ASCEND_OPAPI_LIBRARY NAMES opapi
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    find_library(ASCEND_NNOPBASE_LIBRARY NAMES nnopbase
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    if(NOT ASCEND_OPAPI_LIBRARY OR NOT ASCEND_NNOPBASE_LIBRARY)
+        message(FATAL_ERROR
+            "libopapi / libnnopbase not found under ${ASCEND_ARCH_DIR}/lib64; "
+            "the aclnn operator implementations need both")
+    endif()
+
+    # HCCL. Every init entry point in hccl_comm.h is declared
+    # __attribute__((weak)), so omitting this library is not a link error: the
+    # call goes to address zero and segfaults at run time. Treat a missing
+    # libhccl as fatal rather than letting DSV4_HAVE_TP_COMM silently stay off.
+    find_library(ASCEND_HCCL_LIBRARY NAMES hccl
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    if(ASCEND_HCCL_LIBRARY)
+        set(DSV4_HAVE_TP_COMM ON)
+        message(STATUS "HCCL found: ${ASCEND_HCCL_LIBRARY}")
+    else()
+        message(STATUS "libhccl not found; tensor parallelism disabled on Ascend")
+    endif()
+
     list(APPEND POCKET_RUNTIME_SOURCES backends/ascend/runtime/device_runtime_ascend.cpp)
     list(APPEND POCKET_BACKEND_INCLUDES "${ASCEND_ARCH_DIR}/include")
-    list(APPEND POCKET_BACKEND_LIBS "${ASCEND_ACL_LIBRARY}")
+    list(APPEND POCKET_BACKEND_LIBS
+        "${ASCEND_ACL_LIBRARY}"
+        "${ASCEND_OPAPI_LIBRARY}"
+        "${ASCEND_NNOPBASE_LIBRARY}")
     list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
 
+    # aclnn-backed operators: matrix products, normalizations, elementwise
+    # activations and the reshape-shaped ops. The recurrent and attention kernels
+    # have no aclnn equivalent on this install and are hand-written AscendC, which
+    # is not in this list yet.
+    list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/aclnn_ops.cpp)
+
+    if(DSV4_HAVE_TP_COMM)
+        list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
+        list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}")
+        list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_TP_COMM=1)
+    endif()
+
     message(WARNING
-        "POCKET_BACKEND=ascend has a device runtime but almost no operators yet. "
-        "pocket_core, pocket_runtime, every engine object file and the host-only "
-        "tools and tests build; linking dsv4_cpp_engine still fails on the "
-        "unimplemented *_cuda operator contracts.")
+        "POCKET_BACKEND=ascend has a device runtime and HCCL collectives but not "
+        "yet a full operator set. pocket_core, pocket_runtime, every engine object "
+        "file and the host-only tools and tests build; linking dsv4_cpp_engine "
+        "still fails on the unimplemented operator contracts.")
 endif()
 
 # Device-agnostic core as its own library. Anything that links only this target
@@ -479,9 +523,21 @@ add_executable(test_min_layer_smoke tests/test_min_layer_smoke.cpp)
 target_link_libraries(test_min_layer_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
-add_executable(test_nccl_smoke tests/test_nccl_smoke.cpp)
-target_link_libraries(test_nccl_smoke PRIVATE dsv4_cpp_core)
-set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+add_executable(test_tp_comm_smoke tests/test_tp_comm_smoke.cpp)
+target_link_libraries(test_tp_comm_smoke PRIVATE dsv4_cpp_core)
+set_target_properties(test_tp_comm_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Calls the operators through their neutral names in qwen_ops.hpp and checks them
+# against double-precision host references, so it is meaningful on either backend.
+add_executable(test_qwen_ascend_ops tests/test_qwen_ascend_ops.cpp)
+target_link_libraries(test_qwen_ascend_ops PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_ascend_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The (1 + weight) gamma fold is host arithmetic on the staged bytes, so this needs
+# no device. It still links dsv4_cpp_core because the policy body is backend-gated.
+add_executable(test_qwen_ascend_norm_gamma tests/test_qwen_ascend_norm_gamma.cpp)
+target_link_libraries(test_qwen_ascend_norm_gamma PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_ascend_norm_gamma PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # Config parsing is device-agnostic, so this test links pocket_core and runs on a
 # host with no vendor SDK.
@@ -581,7 +637,7 @@ add_executable(test_qwen_gqa_mma_occ tests/test_qwen_gqa_mma_occ.cpp)
 target_link_libraries(test_qwen_gqa_mma_occ PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_gqa_mma_occ PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
-if(DSV4_HAVE_NCCL)
+if(DSV4_HAVE_TP_COMM)
     add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
     target_link_libraries(bench_qwen_tp_allreduce PRIVATE dsv4_cpp_core)
     set_target_properties(bench_qwen_tp_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

@@ -156,7 +156,7 @@ struct DSparkEngine::Impl {
             throw std::runtime_error(
                 "DSpark TP>1 needs an NCCL id path; construct with the 5-argument form");
         }
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (count > reduce_capacity) {
             if (d_reduce_bf16 != nullptr) device_free(d_reduce_bf16);
             d_reduce_bf16 = nullptr;
@@ -166,7 +166,7 @@ struct DSparkEngine::Impl {
         }
         if (!dsv4::fp32_to_bf16_cuda(d_values, d_reduce_bf16, count))
             throw std::runtime_error("dspark reduce pack failed");
-        dsv4::nccl_all_reduce_sum_bf16_inplace(tp_world_size, tp_rank, tp_device,
+        dsv4::tp_all_reduce_sum_bf16_inplace(tp_world_size, tp_rank, tp_device,
                                                nccl_id_path.c_str(), d_reduce_bf16, count);
         if (!dsv4::bf16_to_fp32_cuda(d_reduce_bf16, d_values, count))
             throw std::runtime_error("dspark reduce unpack failed");

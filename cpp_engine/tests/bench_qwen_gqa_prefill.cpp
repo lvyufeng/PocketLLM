@@ -6,7 +6,7 @@
 // here is far cheaper than a full four-rank prefill for each candidate.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

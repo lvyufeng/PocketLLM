@@ -272,13 +272,34 @@ uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
 void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count);
 
 // Materialize a local tensor from its mmap'd source shard. The output is ready
-// for a Turing GPU upload: BF16 storage is converted to FP16 and packed/row
-// slices are copied without expanding FP8 weights.
+// for upload: BF16 storage is converted to FP16 and packed/row slices are copied
+// without expanding FP8 weights. Both supported backends want FP16 here, for
+// unrelated reasons; see qwen_device_dtype in core/qwen_weight_map.cpp.
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref);
+
+// True for the RMSNorm affine weights that the Qwen3.5 runtime applies as
+// (1 + weight): the layer input/post norms, the final norm, and the per-head
+// q/k norms. False for linear_attn.norm.weight, which the gated norm applies
+// directly, and for everything that is not a norm weight.
+bool qwen_is_one_plus_norm_gamma(const std::string& name);
+
+// Backend policy hook applied between materialization and upload.
+//
+// On CUDA this is a no-op: the kernels carry the (1 + weight) convention in the
+// arithmetic. On Ascend the normalization comes from aclnnRmsNorm, which applies
+// gamma directly and rejects an FP32 gamma against FP16 activations, so the +1 is
+// folded into the FP16 weight here instead. Doing it once at load time rather than
+// as a per-layer fixup op keeps 64 layers x 3 norms off the hot path.
+//
+// Folding in FP16 loses precision relative to the CUDA path, which adds 1.0 in
+// FP32 at use time. Gamma values sit near zero where FP16 has ~2^-24 resolution
+// but 1+gamma sits near one where it has 2^-11, so the folded value is the FP16
+// neighbour of the exact sum. See test_qwen_ascend_norm_gamma for the bound.
+void qwen_apply_norm_gamma_policy(const QwenTensorRef& ref, QwenHostTensor& host);
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
     const SafeTensorsIndex& index, const QwenLinearRef& ref);
-QwenDeviceTensor qwen_upload_tensor_cuda(const SafeTensorsIndex& index,
+QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(

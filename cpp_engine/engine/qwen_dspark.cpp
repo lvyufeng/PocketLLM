@@ -3,7 +3,7 @@
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
 #include "json_lite.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "tp_comm.hpp"
 
 
@@ -188,7 +188,7 @@ struct DSparkDeviceLayer {
 DSparkDeviceLinear upload_linear(const SafeTensorsIndex& index,
                                  const QwenLinearRef& ref) {
     DSparkDeviceLinear output;
-    output.weight = qwen_upload_tensor_cuda(index, ref.weight);
+    output.weight = qwen_upload_tensor(index, ref.weight);
     return output;
 }
 
@@ -484,15 +484,15 @@ struct QwenDSparkRuntime::Impl {
             throw std::runtime_error("invalid Qwen DSpark runtime target tensors");
         }
         check_device(device_set(device), "select Qwen DSpark device");
-        projector = qwen_upload_tensor_cuda(index, weight_map.projector());
-        hidden_norm = qwen_upload_tensor_cuda(index, weight_map.hidden_norm());
-        final_norm = qwen_upload_tensor_cuda(index, weight_map.final_norm());
-        markov_w1 = qwen_upload_tensor_cuda(index, weight_map.markov_w1());
-        markov_w2 = qwen_upload_tensor_cuda(index, weight_map.markov_w2());
+        projector = qwen_upload_tensor(index, weight_map.projector());
+        hidden_norm = qwen_upload_tensor(index, weight_map.hidden_norm());
+        final_norm = qwen_upload_tensor(index, weight_map.final_norm());
+        markov_w1 = qwen_upload_tensor(index, weight_map.markov_w1());
+        markov_w2 = qwen_upload_tensor(index, weight_map.markov_w2());
         confidence_weight =
-            qwen_upload_tensor_cuda(index, weight_map.confidence_weight());
+            qwen_upload_tensor(index, weight_map.confidence_weight());
         confidence_bias =
-            qwen_upload_tensor_cuda(index, weight_map.confidence_bias());
+            qwen_upload_tensor(index, weight_map.confidence_bias());
         weight_bytes = weight_map.projector().device_nbytes +
             weight_map.hidden_norm().device_nbytes +
             weight_map.final_norm().device_nbytes +
@@ -511,14 +511,14 @@ struct QwenDSparkRuntime::Impl {
         layers.reserve(weight_map.layers().size());
         for (const QwenDSparkLayerWeights& source : weight_map.layers()) {
             DSparkDeviceLayer layer;
-            layer.input_norm = qwen_upload_tensor_cuda(index, source.input_layernorm);
-            layer.post_norm = qwen_upload_tensor_cuda(index, source.post_attention_layernorm);
+            layer.input_norm = qwen_upload_tensor(index, source.input_layernorm);
+            layer.post_norm = qwen_upload_tensor(index, source.post_attention_layernorm);
             layer.q = upload_linear(index, source.q_proj);
             layer.k = upload_linear(index, source.k_proj);
             layer.v = upload_linear(index, source.v_proj);
             layer.out = upload_linear(index, source.o_proj);
-            layer.q_norm = qwen_upload_tensor_cuda(index, source.q_norm);
-            layer.k_norm = qwen_upload_tensor_cuda(index, source.k_norm);
+            layer.q_norm = qwen_upload_tensor(index, source.q_norm);
+            layer.k_norm = qwen_upload_tensor(index, source.k_norm);
             layer.gate = upload_linear(index, source.gate_proj);
             layer.up = upload_linear(index, source.up_proj);
             layer.down = upload_linear(index, source.down_proj);
@@ -557,11 +557,11 @@ struct QwenDSparkRuntime::Impl {
 
     void all_reduce_half(uint16_t* values, int count) {
         if (tp_world == 1) return;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (nccl_id_path.empty()) {
             throw std::runtime_error("Qwen DSpark TP requires NCCL ID path");
         }
-        nccl_all_reduce_sum_f16_inplace(
+        tp_all_reduce_sum_f16_inplace(
             tp_world, tp_rank, device, nccl_id_path.c_str(), values, count);
 #else
         (void)values;
@@ -653,12 +653,12 @@ struct QwenDSparkRuntime::Impl {
             static_cast<int>(target_head.vocab_start)), "local Markov argmax");
         int token = 0;
         float value = 0.0f;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1) {
             if (nccl_id_path.empty()) {
                 throw std::runtime_error("Qwen DSpark TP requires NCCL ID path");
             }
-            nccl_global_top1_rows(
+            tp_global_top1_rows(
                 tp_world, tp_rank, device, nccl_id_path.c_str(),
                 static_cast<const int*>(local_argmax_tokens.data),
                 local_argmax_logits.f32_data(), 1, &token, &value);
@@ -711,7 +711,7 @@ struct QwenDSparkRuntime::Impl {
         allocate_half(hidden_a, hidden_elements,
                       {static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden)});
         allocate_half(hidden_b, hidden_elements, hidden_a.shape);
-        require_launch(qwen_embedding_fp16_gather_f16_cuda(
+        require_launch(qwen_embedding_fp16_gather_f16(
             target_embedding.f16_data(), static_cast<const int*>(tokens.data),
             hidden_a.f16_data(), rows, hidden,
             static_cast<int>(target_head.vocab_start),
@@ -746,7 +746,7 @@ struct QwenDSparkRuntime::Impl {
                 config.head_dim, committed, max_context),
                 "dual-source GQA");
             projection(layer.out, q.f16_data(), output, rows);
-            require_launch(qwen_add_inplace_f16_cuda(
+            require_launch(qwen_add_inplace_f16(
                 output, current, static_cast<int>(hidden_elements)),
                 "attention residual");
             standard_norm(layer.post_norm, output, normalized.f16_data(),
@@ -761,12 +761,12 @@ struct QwenDSparkRuntime::Impl {
                           gate.shape);
             projection(layer.gate, normalized.f16_data(), gate.f16_data(), rows);
             projection(layer.up, normalized.f16_data(), up.f16_data(), rows);
-            require_launch(qwen_silu_mul_rows_f16_cuda(
+            require_launch(qwen_silu_mul_rows_f16(
                 gate.f16_data(), up.f16_data(), intermediate.f16_data(), rows,
                 intermediate_size), "dense SwiGLU");
             allocate_half(mlp, hidden_elements, hidden_a.shape);
             projection(layer.down, intermediate.f16_data(), mlp.f16_data(), rows);
-            require_launch(qwen_add_inplace_f16_cuda(
+            require_launch(qwen_add_inplace_f16(
                 output, mlp.f16_data(), static_cast<int>(hidden_elements)),
                 "MLP residual");
             current = output;

@@ -4,7 +4,7 @@
 // this benchmark reports that ratio per projection so the speculative ceiling is
 // measured instead of assumed.
 
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -199,7 +199,7 @@ void bench_full_kv_projection(int iters, std::mt19937& rng) {
             return dsv4::qwen_fp16_matmul_rows_f16_cublas_cuda(
                        x, kv_weight, kv_packed, rows, 2 * kRows, kCols, kCols,
                        2 * kRows, kCols) &&
-                   dsv4::qwen_split_rows_pair_f16_cuda(
+                   dsv4::qwen_split_rows_pair_f16(
                        kv_packed, k_fused, v_fused, rows, kRows);
         };
         const double separate_ms = time_launch(
@@ -283,7 +283,7 @@ void bench_linear_ab(int batch, int iters, std::mt19937& rng) {
                      cudaMemcpyHostToDevice), "copy linear.ab weight");
 
     auto generic = [&]() {
-        return dsv4::qwen_fp16_matmul_rows_f16_cuda(
+        return dsv4::qwen_fp16_matmul_rows_f16(
             x, weight, generic_y, batch, kRows, kCols, kCols, kRows, kCols);
     };
     auto cublas = [&]() {
@@ -339,7 +339,7 @@ double time_resident_swiglu(const DeviceBuffers& gate, const DeviceBuffers& up,
                dsv4::qwen_fp16_matmul_rows_f16_cublas_cuda(
                    gate.x, up.weight_f16, up_output, batch, out_rows, cols,
                    cols, out_rows, cols) &&
-               dsv4::qwen_silu_mul_rows_f16_cuda(
+               dsv4::qwen_silu_mul_rows_f16(
                    gate_output, up_output, gate.y, batch, out_rows);
     };
     const double result = time_launch(launch, "resident FP16 SwiGLU", iters);
@@ -410,13 +410,13 @@ void bench_residual_rmsnorm(int rows, int iters, std::mt19937& rng) {
     auto reference = [&]() {
         if (cudaMemcpy(residual, hidden, elements * sizeof(uint16_t),
                        cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
-        return dsv4::qwen_add_inplace_f16_cuda(
+        return dsv4::qwen_add_inplace_f16(
                    residual, delta, static_cast<int>(elements)) &&
-               dsv4::qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
+               dsv4::qwen_rmsnorm_fp16_gamma_rows_f16(
                    residual, gamma, normalized, rows, kCols, kEps);
     };
     auto fused = [&]() {
-        return dsv4::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
+        return dsv4::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16(
             hidden, delta, gamma, residual, normalized, rows, kCols, kEps);
     };
     auto event_time = [&](auto launch) {
@@ -511,7 +511,7 @@ double time_f16(const F16Buffers& buffers, int batch, int out_rows, int cols,
         // Cost probe for the warp-per-output-channel path. The FP16-output entry
         // point is the only one that currently allows the small-batch kernel; the
         // arithmetic and memory traffic match the FP32-output variant.
-        return dsv4::qwen_fp16_matmul_rows_f16_cuda(
+        return dsv4::qwen_fp16_matmul_rows_f16(
             buffers.x, buffers.weight,
             reinterpret_cast<uint16_t*>(buffers.y), batch, out_rows, cols, cols,
             out_rows, cols);

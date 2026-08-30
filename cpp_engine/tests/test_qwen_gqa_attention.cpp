@@ -5,7 +5,7 @@
 // head_dim=256 and 24-over-4 heads match the Qwen3.8 TP1 full-attention layout.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -274,7 +274,7 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
         position_offset, max_context, 0, 0);
     unsetenv("DSV4_QWEN_GQA_WARP_COMBO");
     unsetenv("DSV4_QWEN_GQA_POS_TILE");
-    const bool plain_ok = dsv4::qwen_gqa_prefill_attention_f16_cuda(
+    const bool plain_ok = dsv4::qwen_gqa_prefill_attention_f16(
         d_q, d_k, d_v, d_plain, rows, q_heads, kv_heads, head_dim,
         position_offset, max_context);
     if (!tiled_ok || !plain_ok || !long_qr2_ok || !long_ok || !flash_ok ||
@@ -510,7 +510,7 @@ bool run_verify_crossover(int context_len) {
         !dsv4::qwen_gqa_verify_attention_f16_exact_cuda(
             d_q, d_k, d_v, d_exact, d_scores, rows, q_heads, kv_heads,
             head_dim, position_offset, context_len) ||
-        !dsv4::qwen_gqa_verify_attention_f16_cuda(
+        !dsv4::qwen_gqa_verify_attention_f16(
             d_q, d_k, d_v, d_split, d_partials, rows, q_heads, kv_heads,
             head_dim, position_offset, context_len, splits) ||
         !dsv4::qwen_gqa_verify_attention_f16_cublas_qk_cuda(

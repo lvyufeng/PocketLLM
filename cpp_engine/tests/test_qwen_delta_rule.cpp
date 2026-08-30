@@ -6,7 +6,7 @@
 // regression here, so this uses random inputs and verifies the evolving state.
 
 #include "cuda_ops.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 
 #include <cuda_runtime.h>
 

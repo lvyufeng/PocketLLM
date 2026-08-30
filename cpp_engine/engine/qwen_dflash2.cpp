@@ -2,7 +2,7 @@
 
 #include "device_runtime.hpp"
 #include "json_lite.hpp"
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include "tp_comm.hpp"
 
 
@@ -629,12 +629,12 @@ struct QwenDFlash2Runtime::Impl {
             local_q_heads % local_kv_heads != 0) {
             throw std::runtime_error("invalid Qwen DFlash2 local shard extents");
         }
-        projector = qwen_upload_tensor_cuda(index, weight_map.projector());
-        hidden_norm = qwen_upload_tensor_cuda(index, weight_map.hidden_norm());
-        final_norm = qwen_upload_tensor_cuda(index, weight_map.final_norm());
-        predecessor = qwen_upload_tensor_cuda(index, weight_map.predecessor_codebook());
-        successor = qwen_upload_tensor_cuda(index, weight_map.successor_codebook());
-        selector_projection = qwen_upload_tensor_cuda(index, weight_map.selector_projection());
+        projector = qwen_upload_tensor(index, weight_map.projector());
+        hidden_norm = qwen_upload_tensor(index, weight_map.hidden_norm());
+        final_norm = qwen_upload_tensor(index, weight_map.final_norm());
+        predecessor = qwen_upload_tensor(index, weight_map.predecessor_codebook());
+        successor = qwen_upload_tensor(index, weight_map.successor_codebook());
+        selector_projection = qwen_upload_tensor(index, weight_map.selector_projection());
         weight_bytes = weight_map.local_device_bytes();
         const size_t tap_elements = static_cast<size_t>(max_context) * config.hidden_size * config.target_layer_ids.size();
         allocate_half(context_taps, tap_elements, {static_cast<uint64_t>(max_context), static_cast<uint64_t>(config.hidden_size * config.target_layer_ids.size())});
@@ -642,21 +642,21 @@ struct QwenDFlash2Runtime::Impl {
         const size_t context_elements = static_cast<size_t>(max_context) * local_kv_dim;
         for (const QwenDFlash2LayerWeights& source : weight_map.layers()) {
             DeviceLayer layer;
-            layer.input_norm = qwen_upload_tensor_cuda(index, source.input_layernorm);
-            layer.post_norm = qwen_upload_tensor_cuda(index, source.post_attention_layernorm);
-            layer.q.weight = qwen_upload_tensor_cuda(index, source.q_proj.weight);
-            layer.k.weight = qwen_upload_tensor_cuda(index, source.k_proj.weight);
-            layer.v.weight = qwen_upload_tensor_cuda(index, source.v_proj.weight);
-            layer.out.weight = qwen_upload_tensor_cuda(index, source.o_proj.weight);
-            layer.q_norm = qwen_upload_tensor_cuda(index, source.q_norm);
-            layer.k_norm = qwen_upload_tensor_cuda(index, source.k_norm);
-            layer.gate.weight = qwen_upload_tensor_cuda(index, source.gate_proj.weight);
-            layer.up.weight = qwen_upload_tensor_cuda(index, source.up_proj.weight);
-            layer.down.weight = qwen_upload_tensor_cuda(index, source.down_proj.weight);
-            layer.attention_conv.base = qwen_upload_tensor_cuda(index, source.attention_conv.base_kernel);
-            layer.attention_conv.projection.weight = qwen_upload_tensor_cuda(index, source.attention_conv.kernel_projection.weight);
-            layer.mlp_conv.base = qwen_upload_tensor_cuda(index, source.mlp_conv.base_kernel);
-            layer.mlp_conv.projection.weight = qwen_upload_tensor_cuda(index, source.mlp_conv.kernel_projection.weight);
+            layer.input_norm = qwen_upload_tensor(index, source.input_layernorm);
+            layer.post_norm = qwen_upload_tensor(index, source.post_attention_layernorm);
+            layer.q.weight = qwen_upload_tensor(index, source.q_proj.weight);
+            layer.k.weight = qwen_upload_tensor(index, source.k_proj.weight);
+            layer.v.weight = qwen_upload_tensor(index, source.v_proj.weight);
+            layer.out.weight = qwen_upload_tensor(index, source.o_proj.weight);
+            layer.q_norm = qwen_upload_tensor(index, source.q_norm);
+            layer.k_norm = qwen_upload_tensor(index, source.k_norm);
+            layer.gate.weight = qwen_upload_tensor(index, source.gate_proj.weight);
+            layer.up.weight = qwen_upload_tensor(index, source.up_proj.weight);
+            layer.down.weight = qwen_upload_tensor(index, source.down_proj.weight);
+            layer.attention_conv.base = qwen_upload_tensor(index, source.attention_conv.base_kernel);
+            layer.attention_conv.projection.weight = qwen_upload_tensor(index, source.attention_conv.kernel_projection.weight);
+            layer.mlp_conv.base = qwen_upload_tensor(index, source.mlp_conv.base_kernel);
+            layer.mlp_conv.projection.weight = qwen_upload_tensor(index, source.mlp_conv.kernel_projection.weight);
             allocate_half(layer.context_k, context_elements, {static_cast<uint64_t>(max_context), static_cast<uint64_t>(local_kv_heads), static_cast<uint64_t>(config.head_dim)});
             allocate_half(layer.context_v, context_elements, layer.context_k.shape);
             cache_bytes += layer.context_k.nbytes + layer.context_v.nbytes;
@@ -725,9 +725,9 @@ struct QwenDFlash2Runtime::Impl {
 
     void all_reduce_half(uint16_t* values, int count) {
         if (tp_world == 1) return;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (nccl_id_path.empty()) throw std::runtime_error("Qwen DFlash2 TP requires NCCL ID path");
-        nccl_all_reduce_sum_f16_inplace(tp_world, tp_rank, device, nccl_id_path.c_str(), values, count);
+        tp_all_reduce_sum_f16_inplace(tp_world, tp_rank, device, nccl_id_path.c_str(), values, count);
 #else
         (void)values; (void)count;
         throw std::runtime_error("Qwen DFlash2 TP requires NCCL-enabled build");
@@ -736,9 +736,9 @@ struct QwenDFlash2Runtime::Impl {
 
     void all_reduce_float(float* values, int count) {
         if (tp_world == 1) return;
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (nccl_id_path.empty()) throw std::runtime_error("Qwen DFlash2 TP requires NCCL ID path");
-        nccl_all_reduce_sum_float_inplace(tp_world, tp_rank, device, nccl_id_path.c_str(), values, count);
+        tp_all_reduce_sum_float_inplace(tp_world, tp_rank, device, nccl_id_path.c_str(), values, count);
 #else
         (void)values; (void)count;
         throw std::runtime_error("Qwen DFlash2 TP requires NCCL-enabled build");
@@ -751,7 +751,7 @@ struct QwenDFlash2Runtime::Impl {
             const char* previous = std::getenv("QWEN_FP16_SMALL_BATCH");
             std::string saved = previous != nullptr ? previous : "";
             setenv("QWEN_FP16_SMALL_BATCH", "1", 1);
-            const bool launched = qwen_fp16_matmul_rows_f16_cuda(
+            const bool launched = qwen_fp16_matmul_rows_f16(
                 input, linear.weight.f16_data(), output, rows, output_rows,
                 columns, columns, output_rows, columns);
             if (previous != nullptr) {
@@ -859,7 +859,7 @@ struct QwenDFlash2Runtime::Impl {
                       {static_cast<uint64_t>(rows),
                        static_cast<uint64_t>(dynamic_row_stride)});
         profiler.begin("embedding");
-        require_launch(qwen_embedding_fp16_gather_f16_cuda(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_head.vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
+        require_launch(qwen_embedding_fp16_gather_f16(target_embedding.f16_data(), static_cast<const int*>(tokens.data), hidden_a.f16_data(), rows, hidden, static_cast<int>(target_head.vocab_start), static_cast<int>(target_embedding.shape.at(0))), "DFlash2 embedding gather");
         all_reduce_half(hidden_a.f16_data(), static_cast<int>(hidden_elements));
         profiler.end();
         profiler.begin("initial_residual");
@@ -1018,7 +1018,7 @@ struct QwenDFlash2Runtime::Impl {
             allocate_half(up, intermediate_elements, gate.shape);
             allocate_half(intermediate, intermediate_elements, gate.shape);
             if (fused_swiglu) {
-                require_launch(qwen_fp16_swiglu_matmul_rows_f16_cuda(
+                require_launch(qwen_fp16_swiglu_matmul_rows_f16(
                     conv_hidden.f16_data(), layer.gate.weight.f16_data(),
                     layer.up.weight.f16_data(), intermediate.f16_data(), rows,
                     local_intermediate, hidden, hidden,
@@ -1031,7 +1031,7 @@ struct QwenDFlash2Runtime::Impl {
                 projection(layer.up, conv_hidden.f16_data(), up.f16_data(),
                            rows, local_intermediate, hidden);
                 dump_half_sharded(prefix + "mlp.up", up.f16_data(), up.shape);
-                require_launch(qwen_silu_mul_rows_f16_cuda(
+                require_launch(qwen_silu_mul_rows_f16(
                     gate.f16_data(), up.f16_data(), intermediate.f16_data(), rows,
                     local_intermediate), "DFlash2 SwiGLU");
             }
@@ -1044,7 +1044,7 @@ struct QwenDFlash2Runtime::Impl {
                       branch_f32.f32_data(), rows, hidden,
                       local_intermediate, local_intermediate, hidden,
                       local_intermediate)
-                : qwen_fp16_matmul_rows_f16_f32_cuda(
+                : qwen_fp16_matmul_rows_f16_f32(
                       intermediate.f16_data(), layer.down.weight.f16_data(),
                       branch_f32.f32_data(), rows, hidden,
                       local_intermediate, local_intermediate, hidden,
@@ -1135,10 +1135,10 @@ struct QwenDFlash2Runtime::Impl {
         dump_float_sharded("topk.local.logits", local_unary.f32_data(),
                            local_unary.shape);
         profiler.begin("tp_global_topk");
-#ifdef DSV4_HAVE_NCCL
+#ifdef DSV4_HAVE_TP_COMM
         if (tp_world > 1) {
             if (nccl_id_path.empty()) throw std::runtime_error("Qwen DFlash2 TP requires NCCL ID path");
-            nccl_global_topk_rows_device(
+            tp_global_topk_rows_device(
                 tp_world, tp_rank, device, nccl_id_path.c_str(),
                 static_cast<const int*>(local_candidates.data),
                 local_unary.f32_data(), draft_rows, config.selector_top_k,

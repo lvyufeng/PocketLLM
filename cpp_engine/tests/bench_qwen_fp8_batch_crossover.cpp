@@ -1,7 +1,7 @@
 // Finds the batch at which the FP8 cuBLAS dequant-and-GEMM path overtakes the
 // warp-per-output-channel kernel. The verify path runs batch 2..8, which the
 // current batch>=96 gate never routes to cuBLAS.
-#include "qwen_cuda_ops.hpp"
+#include "qwen_ops.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdio>
