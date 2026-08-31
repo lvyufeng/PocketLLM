@@ -295,3 +295,168 @@ PYTHONPATH=. \
   --prompts chinese,english,code \
   --arms dense_fp32_hc_down_up_fp32
 ```
+
+## Theoretical ceilings of the heterogeneous scheme
+
+All constants in this section were measured on this machine (4x RTX 2080 Ti,
+TP4, PCIe Gen3) with `.scratch/probe_*.py`. Rows marked *projected* combine
+measured constants arithmetically and have not been observed end to end.
+
+### Hardware roofs
+
+| Roof | Measured |
+|---|---:|
+| Pinned H2D, one GPU active | 10.49-10.82 GiB/s |
+| Pinned H2D, all four GPUs concurrent | 42.42 GiB/s aggregate (10.61 GiB/s per GPU) |
+| GEMM, BF16, 8192x4096x4096 | 7.50 TFLOP/s |
+| GEMM, FP16, 8192x4096x4096 | 54.71 TFLOP/s |
+| DRAM copy | 494.5 GiB/s effective |
+| NCCL all_reduce 8192x2560 BF16 | 7.146 ms (5.47 GiB/s) |
+| NCCL all_reduce 1x2560 BF16 | 0.092 ms |
+
+Two of these matter more than the rest. **H2D does not contend across the four
+GPUs**: each rank keeps its full ~10.6 GiB/s while all four copy at once, so
+per-rank staging math is additive, not shared. And **BF16 GEMM runs 7.3x slower
+than FP16** on SM75, because Turing has no BF16 tensor-core path — this single
+ratio dominates the prefill ceiling.
+
+### Prefill ceiling
+
+Summing the measured per-kernel costs of one 8192-token TP4 pass (36
+`linear_attention` + 12 `qwen_sparse_attention` layers, per-rank shapes):
+
+| Arm | Floor | Ceiling |
+|---|---:|---:|
+| BF16 everywhere | 7.217 s | 1135 tok/s |
+| FP16 dense, BF16 MoE (this PR's arm) | 4.123 s | 1987 tok/s |
+| FP16 dense + FP16 MoE (projected) | 2.979 s | 2750 tok/s |
+| + tensor-core QSA core, 3.44x (projected) | 2.126 s | 3853 tok/s |
+
+Measured end to end for comparison: BF16 786.27 tok/s, FP16 dense + CUDA HC
+949.41 tok/s, no-H2D compute floor 909.07 tok/s. The shipped arm therefore runs
+at **48% of its own GEMM floor**; the missing 1.44-2.1x is launch overhead,
+elementwise traffic, and Python dispatch, not arithmetic.
+
+Phase attribution of the floor:
+
+| Phase | BF16 | FP16 dense |
+|---|---:|---:|
+| routed MoE (x48) | 1.326 s / 18.4% | 1.326 s / 32.2% |
+| QSA core (x12) | 1.202 s / 16.7% | 1.202 s / 29.2% |
+| hyper-connection (x48) | 1.444 s / 20.0% | 0.234 s / 5.7% |
+| GDN dense proj (x36) | 1.154 s / 16.0% | 0.158 s / 3.8% |
+| NCCL all_reduce (x96) | 0.686 s / 9.5% | 0.686 s / 16.6% |
+| shared + router (x48) | 0.657 s / 9.1% | 0.095 s / 2.3% |
+| GDN recurrence (x36) | 0.290 s / 4.0% | 0.290 s / 7.0% |
+| QSA dense proj (x12) | 0.378 s / 5.2% | 0.053 s / 1.3% |
+| QSA indexer (x12) | 0.081 s / 1.1% | 0.081 s / 2.0% |
+
+The hyper-connection is the largest single BF16 phase at 20%, which is why the
+FP16 path bought 20.7% end to end. Once dense projections are FP16, the profile
+inverts: routed MoE and the QSA core become 61% of the floor together, and both
+are still BF16.
+
+The QSA core sustains only 1.03 TFLOP/s, 14% of the BF16 GEMM roof, because it
+runs as two `einsum` calls with an FP32 softmax between them. This is the same
+shape of problem the `cpp_engine` Qwen path already solved with an SM75
+`m16n8k8` kernel, where the analogous exact-GQA prefill gained 3.44x.
+
+**H2D is not the prefill bound and cannot become one soon.** A cold 8192-token
+chunk touches all 128 local experts across 48 layers = 56.25 GiB/rank = 5.31 s
+at 10.6 GiB/s. Measured exposed staging was only 1.492 s of a 10.504 s wall, so
+3.81 s already hides behind compute. Staging becomes the wall only if compute
+drops below 5.31 s, i.e. past **1544 tok/s**. Between today's 949 tok/s and
+1544 tok/s, every gain must come from compute; above 1544 tok/s the scheme turns
+PCIe-bound and needs quantized experts to go further.
+
+### Decode ceiling
+
+Decode is bound by bytes, not arithmetic, and the gap is 3x.
+
+Per token per rank: top-10 of 512 experts, round-robin ownership, 48 layers =
+120 expert copies = 1125 MiB = 1.099 GiB -> **103.6 ms of H2D**. Measured decode
+compute at 8192 context is 35.0 ms (dense 11.2 + full attention 8.8 + routed MoE
+4.4 + NCCL 8.8 + lm_head 1.8), i.e. 28.6 tok/s if H2D were free.
+
+| Scenario | ms/token | Ceiling |
+|---|---:|---:|
+| Serial H2D + compute | 138.6 | 7.2 tok/s |
+| Perfect H2D/compute overlap | 103.6 | 9.6 tok/s |
+| + 31% resident cache, uniform routing | 71.5 | 14.0 tok/s |
+| INT8 experts | 51.8 | 19.3 tok/s |
+| INT8 + 62% resident | 35.0 | 28.6 tok/s |
+| INT4 experts | 35.0 | 28.6 tok/s |
+| Any scheme with no expert H2D | 35.0 | 28.6 tok/s |
+
+**28.6 tok/s is the hard decode ceiling of this model on this hardware**, and it
+is a compute number, not a transfer number. Nothing done to the expert pipeline
+can pass it; INT4 experts and fully-GPU-resident experts land on exactly the
+same 35.0 ms because at that point H2D has fallen under the compute time. Past
+28.6 tok/s the levers are NCCL (8.8 ms, 25% — 96 small all_reduces), the
+`linear_attention` dense projections (11.2 ms, 32%), and full attention (8.8 ms,
+25%).
+
+Residency is set by the memory budget: 22.0 GiB per card minus 2.54 GiB dense
+per rank minus ~2 GiB KV and activations leaves 17.46 GiB, or 1907 of the 6144
+local experts (31%). That is what makes the 14.0 tok/s row reachable with BF16
+experts and no quantization.
+
+Quantized residency changes the picture qualitatively:
+
+| Expert dtype | Total | Per rank | + dense | Fits 22 GiB |
+|---|---:|---:|---:|---|
+| BF16 | 229.7 GiB | 57.4 GiB | 60.0 GiB | no |
+| INT8 | 112.5 GiB | 28.1 GiB | 30.7 GiB | no |
+| Q4_K-ish (4.5 bit) | 63.3 GiB | 15.8 GiB | 18.4 GiB | **yes** |
+| INT4 | 56.2 GiB | 14.1 GiB | 16.6 GiB | **yes** |
+
+At 4 bits the entire routed-expert set fits in GPU memory across the four
+ranks, which removes the heterogeneous H2D path from decode altogether and puts
+decode at its 28.6 tok/s compute floor — a 3.0x lift over the 9.6 tok/s
+overlap-only ceiling. This is the one structural change that moves decode by
+more than a fraction.
+
+**Speculative decoding does not help the bytes.** Expert selection is nearly
+independent across positions: verifying 8 tokens touches 74.7 distinct experts
+per layer instead of 8x10=80, only 6.6% fewer bytes per token. Batched verify
+amortizes compute, which decode is not bound by, and leaves the actual bound
+untouched.
+
+### Ranked levers
+
+Prefill, in order of measured headroom:
+
+1. FP16 or INT8 routed-expert MoE — 32.2% of the FP16-dense floor, still BF16.
+2. Tensor-core QSA core — 29.2% of that floor at 14% of the GEMM roof; the
+   `cpp_engine` `m16n8k8` kernel is the existing template.
+3. Close the 1.44-2.1x gap between the 4.123 s floor and the 8.629 s wall —
+   kernel fusion and launch reduction, not new math.
+4. HC projection TP slicing — element-wise validated, real all-gather cost
+   still unmeasured.
+
+Decode, in order:
+
+1. 4-bit routed experts, fully resident — 9.6 to 28.6 tok/s, 3.0x, and the only
+   lever that removes the bound rather than shrinking it.
+2. Fewer, larger NCCL calls — 8.8 ms of the 35.0 ms compute floor.
+3. `linear_attention` dense projections — 11.2 ms, the largest compute phase.
+
+### Probes
+
+```bash
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+  .scratch/probe_h2d_roof.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+  .scratch/probe_compute_roof.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+  .scratch/probe_attn_roof.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+  .scratch/probe_decode_layer.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python .scratch/probe_gdn_and_budget.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python .scratch/ceiling_model.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python .scratch/ceiling_breakdown.py
+```
+
+A caveat on one number: an earlier PyTorch loop measured the GDN recurrence at
+596 ms per 8192 rows. That is the naive Python scan, not the shipped kernel,
+which measures 8.05 ms. Only the kernel number is used above.
