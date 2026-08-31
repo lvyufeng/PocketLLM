@@ -45,6 +45,10 @@ setup(
                 str(CSRC / "cuda_kernel_impl.cu"),
                 str(CSRC / "minimax_rope_kernel.cu"),
                 str(CSRC / "llama_mmq" / "gguf_mma_wrapper.cu"),
+                str(CSRC / "qwen4_exp_moe.cu"),
+                str(CSRC / "qwen4_exp_gated_delta.cu"),
+                str(CSRC / "qwen4_exp_qsa.cu"),
+                str(CSRC / "qwen4_exp_hyper_connection.cu"),
             ],
             libraries=["cublas"],
             extra_compile_args={

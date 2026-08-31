@@ -132,6 +132,18 @@ def test_greedy_chain_matches(built, golden):
     assert produced == expected[0, input_ids.shape[1] :].tolist()
 
 
+def test_last_token_only_matches_full_logits(built, golden):
+    _config, model = built
+    input_ids = golden["input_ids"]
+
+    full = model.forward(input_ids)
+    last = model.forward(input_ids, last_token_only=True)
+
+    assert last.shape == full[:, -1:].shape
+    torch.testing.assert_close(last, full[:, -1:], rtol=1e-5, atol=1e-7)
+    assert torch.equal(last.argmax(-1), full[:, -1:].argmax(-1))
+
+
 def test_chunked_prefill_matches_single_shot(built, golden):
     """Splitting prefill into chunks must not change the final logits.
 

@@ -307,6 +307,10 @@ class HostExpertShard:
         local = self.local_index(expert_id)
         return self._gate_up[layer_idx][local], self._down[layer_idx][local]
 
+    def layer_tensors(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return this rank's contiguous local expert tensors for grouped prefill."""
+        return self._gate_up[layer_idx], self._down[layer_idx]
+
     def stats(self) -> dict[str, object]:
         return {
             "rank": self.rank,

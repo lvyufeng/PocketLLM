@@ -178,6 +178,215 @@ torch::Tensor moe_prefill_int8_grouped_forward_cuda(
     const torch::Tensor& w3s,
     double swiglu_limit);
 
+torch::Tensor qwen4_exp_moe_prefill_bf16_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& gate_up,
+    const torch::Tensor& down,
+    double swiglu_limit);
+
+std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& gate,
+    const torch::Tensor& beta,
+    const torch::Tensor& initial_state,
+    double norm_eps,
+    int64_t groups_per_block);
+
+torch::Tensor qwen4_exp_qsa_bf16_forward_cuda(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale);
+
+torch::Tensor qwen4_exp_grouped_rms_norm_cuda(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    int64_t group_size,
+    double eps);
+
+torch::Tensor qwen4_exp_inject_cuda(
+    const torch::Tensor& block_output,
+    const torch::Tensor& hyper_input,
+    const torch::Tensor& injection_weights,
+    int64_t groups);
+
+torch::Tensor qwen4_exp_hc_silu_bf16_cuda(
+    const torch::Tensor& input,
+    int64_t groups);
+
+torch::Tensor qwen4_exp_hc_inject_gate_bf16_cuda(
+    const torch::Tensor& input,
+    int64_t groups);
+
+torch::Tensor qwen4_exp_grouped_rms_norm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    int64_t group_size,
+    double eps) {
+    TORCH_CHECK(input.dim() >= 2, "input must have at least two dimensions");
+    TORCH_CHECK(weight.dim() == 1, "weight must be one-dimensional");
+    TORCH_CHECK(group_size > 0 && input.size(-1) % group_size == 0, "group_size must divide the last dimension");
+    TORCH_CHECK(weight.size(0) == input.size(-1), "weight size must match the last input dimension");
+    TORCH_CHECK(input.is_cuda() && weight.is_cuda(), "input and weight must be CUDA tensors");
+    TORCH_CHECK(input.device() == weight.device(), "input and weight must share one CUDA device");
+    TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(), "input and weight must be contiguous");
+    TORCH_CHECK(input.scalar_type() == weight.scalar_type(), "input and weight dtype must match");
+    TORCH_CHECK(
+        input.scalar_type() == torch::kFloat16 ||
+        input.scalar_type() == torch::kBFloat16 ||
+        input.scalar_type() == torch::kFloat32,
+        "input must be float16, bfloat16, or float32");
+    TORCH_CHECK(eps > 0.0, "eps must be positive");
+    return qwen4_exp_grouped_rms_norm_cuda(input, weight, group_size, eps);
+}
+
+torch::Tensor qwen4_exp_inject(
+    const torch::Tensor& block_output,
+    const torch::Tensor& hyper_input,
+    const torch::Tensor& injection_weights,
+    int64_t groups) {
+    TORCH_CHECK(block_output.dim() >= 2, "block_output must have at least two dimensions");
+    TORCH_CHECK(hyper_input.dim() == block_output.dim(), "hyper_input rank must match block_output");
+    TORCH_CHECK(injection_weights.dim() == block_output.dim(), "injection_weights rank mismatch");
+    TORCH_CHECK(groups > 0, "groups must be positive");
+    TORCH_CHECK(hyper_input.size(-1) == groups * block_output.size(-1), "hyper_input last dimension mismatch");
+    for (int64_t dim = 0; dim + 1 < block_output.dim(); ++dim) {
+        TORCH_CHECK(block_output.size(dim) == hyper_input.size(dim), "block_output/hyper_input shape mismatch");
+        TORCH_CHECK(block_output.size(dim) == injection_weights.size(dim), "block_output/injection_weights shape mismatch");
+    }
+    TORCH_CHECK(injection_weights.size(-1) == groups, "injection_weights group dimension mismatch");
+    TORCH_CHECK(block_output.is_cuda() && hyper_input.is_cuda() && injection_weights.is_cuda(), "all inputs must be CUDA tensors");
+    TORCH_CHECK(block_output.device() == hyper_input.device() && block_output.device() == injection_weights.device(), "all inputs must share one CUDA device");
+    TORCH_CHECK(block_output.is_contiguous() && hyper_input.is_contiguous() && injection_weights.is_contiguous(), "all inputs must be contiguous");
+    TORCH_CHECK(block_output.scalar_type() == hyper_input.scalar_type() && block_output.scalar_type() == injection_weights.scalar_type(), "all inputs must have the same dtype");
+    TORCH_CHECK(
+        block_output.scalar_type() == torch::kFloat16 ||
+        block_output.scalar_type() == torch::kBFloat16 ||
+        block_output.scalar_type() == torch::kFloat32,
+        "inputs must be float16, bfloat16, or float32");
+    return qwen4_exp_inject_cuda(block_output, hyper_input, injection_weights, groups);
+}
+
+namespace {
+
+void check_qwen4_exp_hc_activation(const torch::Tensor& input, int64_t groups) {
+    TORCH_CHECK(groups > 0, "groups must be positive");
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "input must be bfloat16");
+}
+
+}  // namespace
+
+torch::Tensor qwen4_exp_hc_silu(const torch::Tensor& input, int64_t groups) {
+    check_qwen4_exp_hc_activation(input, groups);
+    return qwen4_exp_hc_silu_bf16_cuda(input, groups);
+}
+
+torch::Tensor qwen4_exp_hc_inject_gate(const torch::Tensor& input, int64_t groups) {
+    check_qwen4_exp_hc_activation(input, groups);
+    return qwen4_exp_hc_inject_gate_bf16_cuda(input, groups);
+}
+
+torch::Tensor qwen4_exp_qsa_bf16_forward(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& selected,
+    double softmax_scale) {
+    TORCH_CHECK(query.dim() == 4, "query must have shape [B, Q, Hq, 256]");
+    TORCH_CHECK(key.dim() == 4, "key must have shape [B, Hkv, K, 256]");
+    TORCH_CHECK(value.sizes() == key.sizes(), "value shape must match key");
+    TORCH_CHECK(selected.dim() == 3, "selected must have shape [B, Q, S]");
+    TORCH_CHECK(query.size(0) == key.size(0), "query/key batch mismatch");
+    TORCH_CHECK(selected.size(0) == query.size(0) && selected.size(1) == query.size(1), "selected/query shape mismatch");
+    TORCH_CHECK(query.size(3) == 256 && key.size(3) == 256, "Qwen4-Exp QSA requires 256-dimensional heads");
+    TORCH_CHECK(key.size(1) > 0 && query.size(2) % key.size(1) == 0, "query heads must be divisible by KV heads");
+    TORCH_CHECK(query.size(2) / key.size(1) <= 12, "Qwen4-Exp QSA supports at most 12 query heads per KV head");
+    TORCH_CHECK(selected.size(2) > 0, "selected must contain at least one slot");
+    TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && selected.is_cuda(), "QSA inputs must be CUDA tensors");
+    TORCH_CHECK(query.device() == key.device() && query.device() == value.device() && query.device() == selected.device(), "QSA inputs must share one CUDA device");
+    TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && selected.is_contiguous(), "QSA inputs must be contiguous");
+    TORCH_CHECK(query.scalar_type() == torch::kBFloat16 && key.scalar_type() == torch::kBFloat16 && value.scalar_type() == torch::kBFloat16, "query/key/value must be bfloat16");
+    TORCH_CHECK(selected.scalar_type() == torch::kInt32, "selected must be int32");
+    TORCH_CHECK(softmax_scale > 0.0, "softmax_scale must be positive");
+    return qwen4_exp_qsa_bf16_forward_cuda(
+        query, key, value, selected, softmax_scale);
+}
+
+std::vector<torch::Tensor> qwen4_exp_gated_delta_bf16_forward(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& gate,
+    const torch::Tensor& beta,
+    const torch::Tensor& initial_state,
+    double norm_eps,
+    int64_t groups_per_block) {
+    TORCH_CHECK(query.dim() == 4, "query must have shape [B, T, Hk, 128]");
+    TORCH_CHECK(key.sizes() == query.sizes(), "key shape must match query");
+    TORCH_CHECK(value.dim() == 4, "value must have shape [B, T, Hv, 128]");
+    TORCH_CHECK(gate.dim() == 3, "gate must have shape [B, T, Hv]");
+    TORCH_CHECK(beta.sizes() == gate.sizes(), "beta shape must match gate");
+    TORCH_CHECK(initial_state.dim() == 4, "initial_state must have shape [B, Hv, 128, 128]");
+    TORCH_CHECK(query.size(0) == 1, "Qwen4-Exp gated delta currently supports batch size 1");
+    TORCH_CHECK(query.size(1) == value.size(1), "query/value token count mismatch");
+    TORCH_CHECK(query.size(3) == 128 && value.size(3) == 128, "Qwen4-Exp gated delta requires 128-dimensional heads");
+    TORCH_CHECK(value.size(0) == 1 && gate.size(0) == 1 && initial_state.size(0) == 1, "batch dimensions must match");
+    TORCH_CHECK(gate.size(1) == value.size(1) && gate.size(2) == value.size(2), "gate/value shape mismatch");
+    TORCH_CHECK(initial_state.size(1) == value.size(2) && initial_state.size(2) == 128 && initial_state.size(3) == 128, "state/value shape mismatch");
+    TORCH_CHECK(value.size(2) % query.size(2) == 0, "value heads must be divisible by key heads");
+    TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && gate.is_cuda() && beta.is_cuda() && initial_state.is_cuda(), "gated delta inputs must be CUDA tensors");
+    TORCH_CHECK(query.device() == key.device() && query.device() == value.device() && query.device() == gate.device() && query.device() == beta.device() && query.device() == initial_state.device(), "gated delta inputs must share one CUDA device");
+    TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() && gate.is_contiguous() && beta.is_contiguous() && initial_state.is_contiguous(), "gated delta inputs must be contiguous");
+    TORCH_CHECK(query.scalar_type() == torch::kBFloat16 && key.scalar_type() == torch::kBFloat16 && value.scalar_type() == torch::kBFloat16 && beta.scalar_type() == torch::kBFloat16, "query/key/value/beta must be bfloat16");
+    TORCH_CHECK(gate.scalar_type() == torch::kFloat32 && initial_state.scalar_type() == torch::kFloat32, "gate/state must be float32");
+    TORCH_CHECK(norm_eps > 0.0, "norm_eps must be positive");
+    TORCH_CHECK(groups_per_block == 1 || groups_per_block == 2 || groups_per_block == 4 || groups_per_block == 8, "groups_per_block must be 1, 2, 4, or 8");
+    return qwen4_exp_gated_delta_bf16_forward_cuda(
+        query, key, value, gate, beta, initial_state, norm_eps, groups_per_block);
+}
+
+torch::Tensor qwen4_exp_moe_prefill_bf16_forward(
+    const torch::Tensor& x,
+    const torch::Tensor& route_tokens,
+    const torch::Tensor& route_weights,
+    const torch::Tensor& seg_starts,
+    const torch::Tensor& gate_up,
+    const torch::Tensor& down,
+    double swiglu_limit) {
+    TORCH_CHECK(x.dim() == 2, "x must have shape [T, H]");
+    TORCH_CHECK(route_tokens.dim() == 1, "route_tokens must have shape [R]");
+    TORCH_CHECK(route_weights.dim() == 1, "route_weights must have shape [R]");
+    TORCH_CHECK(seg_starts.dim() == 1, "seg_starts must have shape [E + 1]");
+    TORCH_CHECK(gate_up.dim() == 3, "gate_up must have shape [E, 2I, H]");
+    TORCH_CHECK(down.dim() == 3, "down must have shape [E, H, I]");
+    TORCH_CHECK(route_tokens.size(0) == route_weights.size(0), "route count mismatch");
+    TORCH_CHECK(seg_starts.size(0) == gate_up.size(0) + 1, "segment/expert count mismatch");
+    TORCH_CHECK(gate_up.size(0) == down.size(0), "expert count mismatch");
+    TORCH_CHECK(gate_up.size(1) % 2 == 0, "gate_up intermediate dimension must be even");
+    TORCH_CHECK(gate_up.size(2) == x.size(1), "gate_up input dimension mismatch");
+    TORCH_CHECK(down.size(1) == x.size(1), "down output dimension mismatch");
+    TORCH_CHECK(down.size(2) == gate_up.size(1) / 2, "down input dimension mismatch");
+    TORCH_CHECK(x.is_cuda() && route_tokens.is_cuda() && route_weights.is_cuda() && seg_starts.is_cuda(), "inputs must be CUDA tensors");
+    TORCH_CHECK(gate_up.is_cuda() && down.is_cuda(), "weights must be CUDA tensors");
+    TORCH_CHECK(x.is_contiguous() && route_tokens.is_contiguous() && route_weights.is_contiguous() && seg_starts.is_contiguous(), "inputs must be contiguous");
+    TORCH_CHECK(gate_up.is_contiguous() && down.is_contiguous(), "weights must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(gate_up.scalar_type() == torch::kBFloat16 && down.scalar_type() == torch::kBFloat16, "weights must be bfloat16");
+    TORCH_CHECK(route_tokens.scalar_type() == torch::kInt64, "route_tokens must be int64");
+    TORCH_CHECK(route_weights.scalar_type() == torch::kFloat32, "route_weights must be float32");
+    TORCH_CHECK(seg_starts.scalar_type() == torch::kInt32 || seg_starts.scalar_type() == torch::kInt64, "seg_starts must be int32 or int64");
+    return qwen4_exp_moe_prefill_bf16_forward_cuda(
+        x, route_tokens, route_weights, seg_starts, gate_up, down, swiglu_limit);
+}
+
 torch::Tensor moe_prefill_int8_grouped_gemm_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
@@ -2021,6 +2230,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
     m.def("moe_multi_token_fp4_forward", &moe_multi_token_fp4_forward, "small-batch top-k MoE FP4 forward, active experts only (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
+    m.def("qwen4_exp_moe_prefill_bf16_forward", &qwen4_exp_moe_prefill_bf16_forward, "Qwen4-Exp raw BF16 grouped prefill MoE forward (CUDA)");
+    m.def("qwen4_exp_gated_delta_bf16_forward", &qwen4_exp_gated_delta_bf16_forward, "Qwen4-Exp BF16 gated-delta recurrent scan (CUDA)");
+    m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
+    m.def("qwen4_exp_grouped_rms_norm", &qwen4_exp_grouped_rms_norm, "Qwen4-Exp grouped RMSNorm with centered gain (CUDA)");
+    m.def("qwen4_exp_inject", &qwen4_exp_inject, "Qwen4-Exp hyper-connection stream injection (CUDA)");
+    m.def("qwen4_exp_hc_silu", &qwen4_exp_hc_silu, "Qwen4-Exp hyper-connection scaled SiLU (CUDA)");
+    m.def("qwen4_exp_hc_inject_gate", &qwen4_exp_hc_inject_gate, "Qwen4-Exp hyper-connection injection gate (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");
     m.def("moe_prefill_fp4_grouped_gemm_forward", &moe_prefill_fp4_grouped_gemm_forward, "prefill MoE grouped-GEMM FP4 forward (CUDA)");
     m.def("fp4_weight_to_int8_forward", &fp4_weight_to_int8_forward, "convert FP4 block-scaled weights to int8 row-scaled weights (CUDA)");

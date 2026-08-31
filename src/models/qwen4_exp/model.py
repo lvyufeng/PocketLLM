@@ -29,6 +29,7 @@ from src.models.qwen4_exp.layers import (
     RMSNorm,
     TopKRouter,
     inject_into_streams,
+    prefill_linear,
 )
 from src.models.qwen4_exp.moe import MoEBackend
 
@@ -119,10 +120,10 @@ class PLELayer:
     ) -> torch.Tensor:
         row_ids = self.hasher.row_ids(token_history, out_len)
         embeddings = self.ngram_table(row_ids).flatten(-2).to(hidden_states.dtype)
-        key_normed = self.norm_key(F.linear(embeddings, self.key_proj)).unflatten(
+        key_normed = self.norm_key(prefill_linear(embeddings, self.key_proj)).unflatten(
             -1, (self.hc_count, self.hidden_size)
         )
-        value = F.linear(embeddings, self.value_proj)
+        value = prefill_linear(embeddings, self.value_proj)
         query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         # Signed sqrt keeps the gate's sign while compressing its magnitude.
@@ -248,6 +249,11 @@ class Qwen4ExpDecoderLayer:
                 else:
                     attn_out = self.attn(mixed, cos, sin, cache, past_len=past_len)
 
+            if profiler is not None and hasattr(self.attn, "last_profile"):
+                for name, elapsed in self.attn.last_profile.items():
+                    profiler.add_external(f"attention_{name}", elapsed)
+                self.attn.last_profile.clear()
+
             if self.all_reduce is not None:
                 with prof_scope("attn_reduce"):
                     attn_out = self.all_reduce(attn_out)
@@ -268,7 +274,9 @@ class Qwen4ExpDecoderLayer:
 
             with prof_scope("shared_expert"):
                 shared = self.shared_expert(flat)
-                shared = torch.sigmoid(F.linear(flat, self.shared_expert_gate)) * shared
+                shared = torch.sigmoid(
+                    prefill_linear(flat, self.shared_expert_gate)
+                ) * shared
 
             mlp_out = (routed + shared).reshape(mixed.shape)
 
@@ -357,6 +365,7 @@ class Qwen4ExpModel:
         *,
         cache: Qwen4ExpCache | None = None,
         past_len: int = 0,
+        last_token_only: bool = False,
     ) -> torch.Tensor:
         prof_scope = self.profiler.scope if self.profiler else lambda x: _noop_context()
 
@@ -403,6 +412,8 @@ class Qwen4ExpModel:
             if token_history is not None:
                 cache.ple_token_history = token_history[:, -(self.config.ngram_size - 1) :].clone()
 
+        if last_token_only:
+            hidden = hidden[:, -1:]
         with prof_scope("final_mixer"):
             hidden = self.final_mixer(hidden)
 

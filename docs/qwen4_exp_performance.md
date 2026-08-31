@@ -1,190 +1,297 @@
-# Qwen4-Exp 异构 TP4 性能分析
+# Qwen4-Exp Heterogeneous TP4 Performance
 
-**日期**：2026-08-28
-**硬件**：4×RTX 2080 Ti（TP4，PCIe Gen3）
-**模型**：Qwen3.8-Flash-Next，真实 checkpoint 位于
+**Date:** 2026-08-31
+
+**Hardware:** 4 x RTX 2080 Ti, TP4 over PCIe Gen3
+**Model:** Qwen3.8-Flash-Next, real checkpoint at
 `/mnt/data1/modelscope/Qwen/Qwen3.8-Flash-Next`
 
-## 模型和测量方法
+## Runtime architecture
 
-真实配置为 48 层、hidden size 2560、512 个 routed experts、top-10，单个
-BF16 expert 为 9.38 MiB，全 expert 集合约 225 GiB。routed experts 在启动时
-按 rank 装入 host 内存（每 rank 56.25 GiB，4 份互不相交），PLE 表继续通过
-mmap 留在 host，active experts 按需复制到各 GPU。运行时默认启用该预加载；
-`--mmap-experts` 仅用于诊断旧的按需 fault 路径。市面上说的“host resident”
-在本文特指这份显式拷贝，不把 page cache 命中当作实现保证。
+The real model has 48 layers, hidden size 2560, 512 routed experts, and top-10
+routing. One BF16 routed expert is 9.375 MiB, and the full routed-expert set is
+about 225 GiB.
 
-运行时通过 `--profile` 开启层级 profiler；加入
-`DSV4_QWEN4_MOE_PHASE_PROFILE=1` 后，额外统计 expert staging 和计算时间。
-完整的 staging 微基准可以运行：
+The routed experts are copied explicitly into host RAM during model startup:
+
+- expert ownership is round-robin: `expert_id % world_size == rank`;
+- every rank owns 128 experts per layer, or 56.25 GiB across 48 layers;
+- the four disjoint rank shards together hold exactly one copy of the expert
+  set;
+- the shard is pinned by default, with an all-or-nothing pageable fallback;
+- only active experts are copied to the rank's GPU and all MoE arithmetic runs
+  on the GPU;
+- the 95 GiB PLE table remains host-side.
+
+This document uses *host-resident* only for the explicit 56.25 GiB/rank copy.
+A warm mmap or page-cache hit is not treated as host residency. The latest warm
+preload took about 53 seconds per rank; it is a one-time load cost and is not
+included in steady-state throughput.
+
+## Authoritative 8K TP4 prefill result
+
+Measurement conditions:
+
+- 8192 real tokenizer tokens;
+- one 8192-token chunk;
+- TP4;
+- expert cache capacity 1024;
+- pinned 56.25 GiB host expert shard per rank;
+- first pass discarded as warmup;
+- no synchronization-heavy profiler in the timed region;
+- all rows below produced token 97792;
+- preload excluded.
+
+### Accuracy-first path
+
+The accuracy-first candidate uses transient FP16 tensor-core dense projections
+and the CUDA hyper-connection RMSNorm/injection path. Decode rows stay BF16
+because all prefill precision gates require at least 128 rows.
+
+| Path | Warm samples | Mean wall | Mean throughput | Peak/rank |
+|---|---:|---:|---:|---:|
+| BF16 baseline | 788.07 / 784.47 tok/s | 10.419 s | **786.27 tok/s** | 14.108 GiB |
+| FP16 dense + CUDA HC | 951.04 / 947.77 tok/s | 8.629 s | **949.41 tok/s** | 13.839 GiB |
+| BF16 baseline recheck | 770.43 / 767.59 tok/s | 10.653 s | **769.01 tok/s** | 14.108 GiB |
+
+The candidate is a 20.7% gain over the first baseline mean and reaches a stable
+about 950 tok/s, just below the 1000 tok/s target.
+
+A 512-token prompt plus 32 forced-token decisions was checked on Chinese,
+English, and code inputs. Chinese and code matched all greedy decisions. The
+English arm changed decisions 4 and 23; the baseline margins were 0.7500 and
+0.1875 respectively. Therefore this path is still opt-in rather than a strict
+parity default.
+
+The prefill precision switches do not affect single-token decode. With cache
+1024 and a 512-token prefix, a separate 32-step forced-token A/B measured:
+
+| Prompt | BF16 decode | Candidate decode |
+|---|---:|---:|
+| Chinese | 4.365 tok/s | 4.363 tok/s |
+| English | 4.378 tok/s | 4.388 tok/s |
+| Code | 4.367 tok/s | 4.370 tok/s |
+
+This is within run noise and confirms the rows=1 BF16 fallback protects decode.
+
+### Throughput-first path: target exceeded, not promoted
+
+A more accurate FP16 GEMM form uses FP16 tensor-core inputs, FP32 accumulation,
+and one BF16 output cast. Applying it to dense projections and the HC mix-down
+and mix-up projections gives:
+
+| Path | Warm samples | Mean wall | Mean throughput | Peak/rank |
+|---|---:|---:|---:|---:|
+| BF16 baseline | 784.68 / 780.69 / 777.29 tok/s | 10.491 s | **780.89 tok/s** | 14.108 GiB |
+| FP32-output dense + HC down/up | 1063.42 / 1061.49 / 1059.48 tok/s | 7.718 s | **1061.46 tok/s** | 13.961 GiB |
+| BF16 baseline recheck | 765.46 / 762.26 / 760.08 tok/s | 10.742 s | **762.60 tok/s** | 14.108 GiB |
+
+This exceeds the 1000 tok/s goal by 6.1% and is 35.9% faster than the first
+baseline mean. It is not promoted as a correctness-safe default:
+
+- 512-token Chinese and code prompts matched all 33 decisions;
+- the English prompt changed decisions 19 and 23;
+- decision 19 was an exact baseline tie, but decision 23 had a baseline margin
+  of 0.1875 and the candidate selected the other token with a 0.9375 margin;
+- a 2048-token plus 8-decision matrix matched all decisions on all three
+  prompts, so the mismatch is prompt- and margin-sensitive rather than a
+  general runtime failure.
+
+The correct status is therefore: **the performance target is reached by an
+experimental precision mode, while the accuracy-first mode remains about
+950 tok/s**.
+
+The 8192-token chunk is also the correct operating point. A clean strict-BF16
+sweep measured 154.70, 257.88, 409.14, 580.68, and 753.25 tok/s for chunks 512,
+1024, 2048, 4096, and 8192 respectively. Smaller chunks do not improve
+correctness and sharply increase repeated per-layer dispatch, communication,
+and active-expert staging overhead.
+
+## Remaining prefill attribution
+
+A synchronization-heavy real TP4 profile is for attribution only. Under the
+accuracy-first configuration, the main 8K phases were:
+
+| Phase | Calls | Total | Per call |
+|---|---:|---:|---:|
+| Routed MoE | 48 | 7.777 s | 162.03 ms |
+| Attention | 48 | 1.484 s | 30.92 ms |
+| MLP hyper-connection | 48 | 0.863 s | 17.97 ms |
+| Attention hyper-connection | 48 | 0.844 s | 17.58 ms |
+| MLP all-reduce | 48 | 0.666 s | 13.88 ms |
+| Attention all-reduce | 48 | 0.356 s | 7.41 ms |
+| Router | 48 | 0.207 s | 4.31 ms |
+| PLE | 1 | 0.149 s | 148.98 ms |
+
+MoE attribution on rank 0 reported 4.189 seconds staging, 3.090 seconds
+compute, 4652 active expert calls, and 42.59 GiB H2D. Turning off the existing
+copy-stream prefetch reduced the no-profile path from about 950 tok/s to about
+727 tok/s, so the overlap must remain enabled.
+
+Attention sub-phases were:
+
+| Sub-phase | Calls | Total | Per call |
+|---|---:|---:|---:|
+| Core | 48 | 0.808 s | 16.84 ms |
+| Projection | 48 | 0.294 s | 6.12 ms |
+| QSA indexer | 12 | 0.165 s | 13.73 ms |
+| Output | 48 | 0.139 s | 2.89 ms |
+| GatedDeltaNet convolution | 36 | 0.076 s | 2.12 ms |
+
+The isolated 8K GatedDeltaNet layer measured about 20.2 ms with transient FP16
+projections. Its recurrent core was 8.66 ms. Sweeping 1/2/4/8 work groups per
+CTA did not improve the full layer, so CTA grouping is not the next lever.
+
+A synchronization-free 512-token PyTorch trace also showed that all 96 NCCL
+collectives ran on the default compute stream: NCCL occupied 327.46 ms, BF16
+GEMMs 1.353 s, and pinned H2D copies 2.651 s, with zero timeline overlap between
+NCCL and either GEMM or H2D. Moving NCCL to a separate stream reduced an
+isolated 8192 x 2560 all-reduce from 7.54 to 7.28 ms, but an independent 0.58 ms
+GEMM still did not overlap because both kernels saturate SM resources. The real
+8K path gained only about 0.8%, so simple stream reassignment is not a path to
+strict-parity 1000 tok/s. Projection slicing or a reduce-scatter formulation is
+needed to create useful pipeline granularity.
+
+## Numerical gates and rejected candidates
+
+The parity harness generates one BF16 greedy chain per prompt, feeds that same
+chain to every candidate, and reports the BF16 top-1/top-2 margin for every
+mismatch. Exact ties are separated from real flips.
+
+### Rejected or diagnostic precision paths
+
+| Candidate | Kernel or 8K result | Parity verdict |
+|---|---:|---|
+| FP16 dense projections alone | fast | English decision 1 flips at BF16 margin 3.4375 |
+| FP32-output dense projections alone | 885.48 tok/s | Only an exact-tie English decision changes; no non-tie flip in the 512+32 matrix |
+| FP32-output dense + CUDA HC | 956.80 tok/s | English decision 23 flips at margin 0.1875; grouped RMSNorm is not bit-exact |
+| FP32-output dense + HC mix-down only | 1013.28 tok/s | English decisions 0 and 1 flip at margins 4.3750 and 3.4375 |
+| FP32-output dense + HC mix-up only | 1005.89 tok/s | English decision 0 flips at margin 4.3750 |
+| FP32-output dense + HC injection only | 940.27 tok/s | English decision 23 flips at margin 0.1875 |
+| FP16 dense + FP16 HC down/up | earlier 1043.35 tok/s was not reproducible | Chinese decision 5 flips at margin 0.9375 |
+| FP32-output dense + HC down/up | 1061.46 tok/s | English decision 23 flips at margin 0.1875 |
+| Full FP16 routed MoE | 2.65x kernel speedup | English decision 0 flips at margin 4.375 |
+| FP16 gate / BF16 down MoE | 1.75x kernel speedup | real Chinese and English flips |
+| BF16 gate / FP16 down MoE | 1.23x kernel speedup | English decision 23 flips at margin 0.1875 |
+
+The routed-MoE FP16 experiments are kept opt-in and disabled by default. Their
+small average activation error is not sufficient to preserve real generation.
+
+### Exact-BF16 hyper-connection limits
+
+Two scale-then-activation pairs now use dedicated CUDA kernels when
+`DSV4_QWEN4_HC_CUDA=1`: HC mix-down divide plus SiLU, and block-injection divide
+plus `2 * sigmoid`. Direct tests at 1, 7, and 8192 rows are bit-identical to the
+PyTorch BF16 expressions. At 8192 rows the isolated pairs improved from about
+0.069 to 0.054 ms and from 0.083 to 0.049 ms respectively. Their aggregate
+end-to-end ceiling is only about 5 ms per 8192-token prefill because each pair is
+small relative to the model wall.
+
+The larger CUDA grouped RMSNorm used by the same HC switch is not strictly
+bit-exact to PyTorch: on real layer-0 weights at 8192 rows, 99.999541% of values
+were equal and the maximum absolute difference was 0.0625. Therefore references
+to the CUDA HC configuration mean an accuracy-tested near-parity path, not a
+bit-exact implementation. The activation kernels themselves remain exact.
+
+A steady-state TP4 run with two global 8K warmups is the usable end-to-end
+measurement for the two activation fusions. With prompt=8192, chunk=8192,
+TP4, and expert cache=1024, strict BF16 measured 769.12 / 765.31 tok/s
+(767.21 mean), CUDA HC measured 801.09 / 799.17 tok/s (800.13 mean), and the
+BF16 recheck measured 752.99 / 750.73 tok/s (751.86 mean). All arms produced
+token 97792. This comparison includes the pre-existing non-exact CUDA grouped
+RMSNorm and injection kernels; it does not isolate the roughly 5 ms activation
+fusion gain. A later confirmatory run suffered an external machine-wide
+slowdown from about 786 to 428 tok/s and is discarded rather than averaged into
+these numbers. A 512-token Chinese prompt plus eight forced decode decisions
+also kept every greedy decision unchanged; the full-logit delta reflects the
+pre-existing grouped-RMSNorm approximation rather than rows=1 activation use.
+
+An isolated strict-BF16 HC call at 8192 rows measured 25.363 ms. The two BF16
+mix GEMMs consumed 7.071 and 7.610 ms; a kernel trace attributed 14.134 of
+16.950 ms of CUDA time to `aten::mm`. On SM75 these GEMMs use
+`magma_sgemmEx_kernel` at about 50% occupancy.
+
+A separate optimistic compute-floor probe replaced every staged expert pair by
+one GPU-resident pair, removing all 42.76 GiB of expert H2D while preserving the
+same dispatch and GEMM shapes. At prompt=8192/chunk=8192/TP4, the real path
+measured 779.93 tok/s (10.504 s) and the no-H2D floor measured 909.07 tok/s
+(9.011 s). Perfect staging overlap therefore still cannot reach 1000 tok/s,
+which requires 8.192 s; at least 0.819 s of compute and/or launch overhead must
+also be removed. Elementwise or reduction fusion cannot supply that margin. The
+remaining strict-path work must target the HC/attention/MoE compute structure,
+not H2D overlap alone.
+
+The weighted mean is already a 100%-occupancy BF16 multiply followed by a
+100%-occupancy `MeanOps` reduction. Replacing `.mean(-2)` with
+`.sum(-2) / hc_count` is bit-identical but slower. Hand-written left-to-right,
+pairwise, and `einsum` reductions do not reproduce PyTorch's reduction order;
+`einsum` is also much slower. These variants were rejected.
+
+### Split-K and cached FP16 weight experiments
+
+Splitting the K dimension into FP16 tensor-core partial GEMMs does not reproduce
+the SM75 BF16 linear result. Equal-element fractions remained roughly
+0.9984-0.9997 for every tested chunk size, while BF16 itself was not bit-equal
+to an FP32 reference. Chunk sizes below 256 were also slower than BF16.
+
+Caching FP16 mirrors of dense weights did not materially improve isolated GEMMs:
+for example, the 8K GatedDeltaNet QKV projection was 2.360 ms with a transient
+weight conversion and 2.365 ms with a cached FP16 weight. Permanent mirrors
+would consume substantial VRAM without a measurable benefit, so weights remain
+BF16 and conversion is transient.
+
+## Confirmed architecture decisions
+
+1. **Keep routed experts explicitly resident in host RAM.** Mechanical-disk mmap
+   faults must never be part of steady-state inference.
+2. **Keep per-rank round-robin ownership.** TP4 stages one disjoint 56.25 GiB
+   shard per rank and never duplicates routed-expert work.
+3. **Keep active-only H2D.** The full-local-layer grouped BF16 path increases
+   H2D bytes by about 31.6% and regressed real 8K TP4 prefill to 577.13 tok/s.
+   `DSV4_QWEN4_MOE_GROUPED` stays disabled by default.
+4. **Keep MoE copy-stream prefetch enabled.** It is worth about 950 versus
+   727 tok/s in the current accuracy-first path.
+5. **Keep prefill and decode precision paths separate.** Large prefill rows may
+   use the experimental FP16 tensor-core modes; rows=1 remain BF16.
+6. **Do not promote a candidate from token 0 alone.** Real forced-token matrices
+   and baseline margins are required.
+
+## Reproduction commands
+
+Accuracy-first 8K A/B:
 
 ```bash
-PYTHONPATH=. python tests/bench_qwen4_exp_staging.py
+PYTHONPATH=. \
+DSV4_QWEN4_DENSE_FP16=1 \
+DSV4_QWEN4_HC_CUDA=1 \
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun \
+  --standalone --nproc_per_node=4 \
+  .scratch/bench_qwen4_exp_tp_fp16_matrix.py \
+  --prompt-tokens 8192 --chunk-size 8192 \
+  --expert-cache 1024 --repeat 3 --global-warmup 2 \
+  --arms baseline,dense_hc_cuda,baseline_recheck
 ```
 
-## 实测基线
+Throughput-first 8K A/B:
 
-以下是 clean run（不启用 profiler）的结果：
-
-| 场景 | chunk | expert cache | prefill | decode |
-|---|---:|---:|---:|---:|
-| 60-token prompt，32-token generation | 512 | 64 | 6.78 tok/s | 1.05 tok/s |
-| 60-token prompt，32-token generation | 512 | 1024 | 6.73 tok/s | **2.75 tok/s** |
-| 570-token prompt，1-token generation | 512 | 64 | 32.6 tok/s | — |
-| 4162-token prompt，1-token generation | 512 | 64 | 38.1 tok/s | — |
-| 4162-token prompt，1-token generation | 4096 | 64 | **151.4 tok/s** | — |
-| 8272-token prompt，1-token generation | 8192 | 64 | **244.1 tok/s** | — |
-
-因此，早先的 0.42/0.95 tok/s 组合不应作为模型能力基线：它对应很短
-生成、chunk=512 和较小 expert cache。长 prefill 的 chunk 大小和 decode
-的 cache 容量必须一起记录。
-
-### host 常驻 vs 按需 mmap 的 A/B（2026-08-29，同机连续两跑）
-
-60-token prompt、8-token generation、chunk 512、expert cache 1024，TP4：
-
-| 模式 | 加载 | prefill | decode | 每 rank H2D 速率 | 生成期磁盘读 |
-|---|---:|---:|---:|---:|---:|
-| `resident`（默认） | 732 s 一次性 | **18.96 tok/s** | 1.97 tok/s | 2.741 GiB/s | 0.01 GiB |
-| `--mmap-experts` | 1.3 s | 9.16 tok/s | 2.38 tok/s | 2.006 GiB/s | 0.00 GiB |
-
-读法（不要过度解读）：
-
-- prefill 2.07×、H2D 速率 1.37×，来自 pinned host 内存的 DMA 而不是 pageable
-  mmap 页；两跑 staging 字节数完全相同（19.89 GiB，2173 miss / 567 hit），
-  所以差异纯粹是搬运路径；
-- decode 一列两跑都只有 8 个 token，差值 0.4 tok/s 在这个长度上不可引用
-  （见 memory `perf_claims_need_tg_length`）；要结论必须跑 ≥32 token；
-- **mmap 臂的磁盘读也是 0.00 GiB**：它紧跟在 resident 跑之后，expert 页还在
-  page cache 里。这个 A/B 因此只测出了"pinned 拷贝 vs 暖 page cache"，
-  没测出"vs 冷盘"。冷盘对比需要 drop_caches（需要 root），当前未做；
-- 732 s 的加载在第一次冷读时是 0.10–0.12 GiB/s 的盘瓶颈；暖 page cache 下
-  同样的预加载只要约 4 s（实测 1.19–1.24 GiB/s，4 层 4.69 GiB）。
-
-## 瓶颈结论
-
-### Prefill
-
-60-token profile 的 48 层累计时间中，MoE 占 68.8%，NCCL MLP reduce 占
-10.4%，attention 占 9.6%。MoE 的分相测量为：
-
-```text
-stage 5.091 s   compute 0.601 s   1874 expert calls / 48 MoE calls
-17.16 GiB H2D，cache hit 0%
+```bash
+PYTHONPATH=. \
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun \
+  --standalone --nproc_per_node=4 \
+  .scratch/bench_qwen4_exp_tp_fp16_matrix.py \
+  --prompt-tokens 8192 --chunk-size 8192 \
+  --expert-cache 1024 --repeat 4 --global-warmup 2 \
+  --arms baseline,dense_fp32_hc_down_up_fp32,baseline_recheck
 ```
 
-在 8K prefill 中，单 rank 约搬运 48 GiB，实测有效吞吐约 1.39 GiB/s/rank。
+Forced-token margin matrix:
 
-**修正（2026-08-29）**：此前的"主要地板是共享 PCIe 带宽"结论已被证伪。
-原推理把 4 rank 的**聚合**吞吐（5.55 GiB/s）与单进程**单链路**微基准
-（5.4–5.7 GiB/s）相比，属于量级错配。重测的 4 进程聚合吞吐为：
-
-```text
-mmap  20.86 GiB/s    ram  21.37 GiB/s    pinned  42.54 GiB/s
+```bash
+PYTHONPATH=. \
+/home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun \
+  --standalone --nproc_per_node=4 \
+  .scratch/check_qwen4_exp_tp_long_matrix.py \
+  --prompt-tokens 512 --decode-tokens 32 --expert-cache 0 \
+  --prompts chinese,english,code \
+  --arms dense_fp32_hc_down_up_fp32
 ```
-
-即真实 run 的 1.39 GiB/s/rank 比同一代码路径孤立跑低 3.6×，PCIe 远未饱和。
-
-真正的地板是 checkpoint 所在的机械盘 `sdc`（ST4000VX015）：
-
-```text
-裸 O_DIRECT 顺序读        0.109 GiB/s（1/2/4/8 线程均为 0.112–0.125，并行无效）
-未触碰层（30/31）冷读     0.06  GiB/s
-同层暖 page cache         1.09–1.14 GiB/s   → 冷/暖差 18.8×
-暖 mmap → GPU             5.2–6.5 GiB/s
-```
-
-此前"cold/warm 只差 1.16–1.37×"的测量无效：它的冷臂重读了已经 fault
-过的第 17 层，两臂实际都命中 page cache。
-
-### Decode
-
-32-token decode、cache=1024 的层内累计时间为：MoE 46.6%、attention
-18.6%、MLP NCCL reduce 16.2%、attention NCCL reduce 3.8%。层外约 18%
-花在每一步对 248320 词表做 `all_gather`，以及随后由 `.item()` 引入的
-同步。
-
-cache=64→1024 将 decode 从 1.05 提到 2.75 tok/s；cache=2048 在当前
-BF16 staging 下 OOM。输出在两种 cache 容量下逐字一致。
-
-## 已验证和已否定的方向
-
-1. **增大 prefill chunk 是当前最大的免费收益**：8K prompt 上
-   chunk=512→8192 达到约 4×（38.1→244.1 tok/s），因为 active expert
-   集合很快接近每 rank 的 128 个上限，搬运成本被更多 token 摊薄。
-2. **增大 decode cache 有效**：容量 1024 能保留跨步复用的
-   `(layer, expert)`，但需要 O(1) LRU 实现，不能继续使用
-   `list.pop(0)`。
-3. **合并 active expert H2D 没有收益**：108 expert 的实测为逐 expert
-   loop 155 ms、host gather 后的 batched 方案 215 ms（0.72×）；host
-   `index_select` 本身约 76 ms。不要仅凭减少 DMA call 数就合并 staging。
-4. **TP 分片没有重复搬运**：`ShardedMoE` 的每个 rank 只 fetch 自己的
-   expert，实测 duplication=1.00×。
-5. **grouped expert GEMM 有效**：`_dispatch_experts` 的 per-expert Python
-   循环换成 grouped `bmm`，decode 形状 2.41×/2.90×，prefill 形状
-   4.45×/5.03×，max_abs_diff 0–3.9e-03。
-6. **NUMA pinning 影响很大**：pinned-bounce 路径在 node0 与 node1 之间
-   差 3.3×（9.66 vs 2.90 GiB/s）。GPU0/1 挂 node0，GPU2/3 挂 node1
-   （两者 NV2 互连，但对 host 都是 SYS）。
-7. **vocab reduce 可省**：full-vocab all_gather 换成 local argmax +
-   `(value, index)` all_gather，3.112 → 2.497 ms/step，argmax 逐位一致。
-
-## 朝 500 / 10 的工作分解
-
-当前最佳实测点是长 prefill 244 tok/s、短 decode 2.75 tok/s。
-
-### P0：默认值和低风险运行时修正
-
-- 默认 chunk 调到 4096–8192，并依据可用显存夹取；
-- expert cache 默认 1024；把 LRU 替换为 `OrderedDict` 或 ring；
-- decode 不再 all-gather 全词表，只在各 rank 做 local argmax，然后
-  all-gather `(value, index)`。
-
-### P1：routed expert 常驻 host 内存（已实现）
-
-目标是消掉机械盘，而不是换一块更快的盘。本机 MemFree 约 962 GiB，BF16
-expert 全集 225 GiB，完全装得下；暖 mmap→GPU 5.2–6.5 GiB/s 也高于本机
-NVMe 的 2.2 GiB/s，所以迁 NVMe 严格劣于常驻 host 内存。
-
-实现形态（`weights.HostExpertShard` + `Qwen4ExpCheckpoint.preload_experts`）：
-启动时每个 rank 把**自己那份** routed expert 从 mmap 拷进 host 内存，之后
-`expert_rows()` 只读这份常驻拷贝，稳态 staging 不再有机会 fault 到盘上。
-
-- 无需 POSIX-shm 第二份拷贝：ownership 是 `expert_id % world_size == rank`
-  （`ShardedMoE` 的既有规则），4 个 shard 互不相交、加起来正好是 225 GiB
-  的一份全量，每 rank 56.25 GiB。`SharedCPUMoEWeightArena` 只作布局参考，
-  它的 `build_specs()` 是写死 int8 的，存不了 BF16；
-- pin 是可行的：`ulimit -l` ≈ 126 GiB 是**每进程**上限，56.25 GiB 在限内。
-  实测每层 1.172 GiB/rank pin 成功。pin 失败时退回 pageable 并把已装载的
-  层一起转成 pageable，不留下半 pin 状态（`--pageable-experts` 可强制）；
-- 每层两个连续 host tensor（`[128, 1280, 2560]` / `[128, 2560, 640]`），
-  48 层共 96 次分配，而不是 12,288 次 per-expert 分配；
-- 装载按 layer 推进并在 rank 间设 barrier：4 个进程读同一批文件区域，让
-  盘头留在一个区域内，而不是各自在 225 GiB 上乱跳；
-- 已知陷阱（都已避开）：不要对整个 mmap 做 `cudaHostRegister`（会造出巨量
-  Dirty 页并拖慢无关 I/O）；routed expert 的**计算**仍在 GPU，没有走 GLM
-  上已证伪的 CPU 侧 MoE；
-- 首次装载仍要过一次机械盘，这是一次性成本：实测 0.102 GiB/s，
-  56.25 GiB/rank ≈ 9.2 min，属于加载期而不是稳态延迟，报性能时必须分开算。
-
-### P2：dispatch、NUMA、词表
-
-- 用 grouped `bmm` 替换 `_dispatch_experts` 的 per-expert 循环（已测
-  2.41–5.03×），并把 `HostExpertMoE` 的 `list.pop(0)` LRU 换成 O(1)；
-- 按 rank 做 CPU/NUMA 亲和，复用
-  `_cpu_affinity_for_rank`（`src/models/deepseek_v4/generation.py:67`），
-  让 GPU0/1 的 staging 落在 node0、GPU2/3 落在 node1；
-- decode 不再 all-gather 全词表，只做 local argmax + `(value, index)`
-  all_gather（3.112 → 2.497 ms/step）。
-
-### P3：量化和通信收尾
-
-- host 常驻之后再评估 FP8/INT4 storage：此时它的作用是压 PCIe bytes 和
-  放宽 pin 上限，而不是绕开盘；
-- 尝试将两次每层 NCCL reduce 与下一段计算 overlap；
-- 重新评估 cross-layer prefetch，只有在 staging 不再是盘 I/O 之后才有
-  意义。
-
-结论：**prefill 和 decode 的第一必要条件都是 routed expert 常驻 host
-内存并在 4 rank 间共享单份拷贝**。在仍然向机械盘要页的前提下，优化
-Python dispatch、attention 或量化都会被 0.06–0.11 GiB/s 的冷读吃掉。
