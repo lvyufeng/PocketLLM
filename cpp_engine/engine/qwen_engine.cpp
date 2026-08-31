@@ -84,7 +84,6 @@ struct DeviceLinear {
     // Optional dense FP16 expansion used only by batched target verification.
     // The raw FP8 matrix remains canonical and serves decode/prefill.
     QwenDeviceTensor verify_weight;
-    bool fp8 = false;
     // NVFP4 tensor-level scaling. The factor is reciprocal(weight_global_scale);
     // input_global_scale is calibration metadata the SM75 path does not apply.
     float weight_global_factor = 1.0f;
@@ -167,8 +166,7 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     if (first.weight.data == nullptr || second.weight.data == nullptr) return fused;
     if (first.weight.shape.size() != 2 || second.weight.shape.size() != 2) return fused;
     if (first.weight.shape[1] != second.weight.shape[1] ||
-        first.weight.device_dtype != second.weight.device_dtype ||
-        first.fp8 != second.fp8) {
+        first.weight.device_dtype != second.weight.device_dtype) {
         return fused;
     }
     // The two operands must dispatch to the same kernel family, and both must
@@ -177,12 +175,17 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     // pick the wrong kernel or throw. NVFP4 is never fused because its packed
     // rows and per-tensor factors do not concatenate.
     if (first.kind != second.kind ||
-        first.kind == QwenLinearKind::NvFp4Group16 ||
+        (first.kind != QwenLinearKind::DenseF16 &&
+         first.kind != QwenLinearKind::Fp8Block128) ||
         first.logical_shape.size() != 2 || second.logical_shape.size() != 2 ||
         first.logical_shape[1] != second.logical_shape[1]) {
         return fused;
     }
-    if (first.fp8 &&
+    // Block-128 FP8 scale rows track output-row blocks and therefore concatenate
+    // with the weight rows. Other compressed formats have different layouts and
+    // are rejected above until a fused consumer for them is validated.
+    const bool has_fp8_scale = first.kind == QwenLinearKind::Fp8Block128;
+    if (has_fp8_scale &&
         (first.scale.data == nullptr || second.scale.data == nullptr ||
          first.scale.shape.size() != 2 || second.scale.shape.size() != 2 ||
          first.scale.shape[1] != second.scale.shape[1] ||
@@ -198,18 +201,19 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     const uint64_t columns = first.weight.shape[1];
     allocate(fused.weight, first.weight.nbytes + second.weight.nbytes,
              {first_rows + second_rows, columns}, first.weight.device_dtype);
-    check_device(memcpy_d2d(fused.weight.data, first.weight.data, first.weight.nbytes),
+    check_device(memcpy_d2d(fused.weight.data, first.weight.data,
+                            first.weight.nbytes),
                  "Qwen fused projection first weight copy");
     check_device(memcpy_d2d(static_cast<uint8_t*>(fused.weight.data) + first.weight.nbytes,
                             second.weight.data, second.weight.nbytes),
                  "Qwen fused projection second weight copy");
-    fused.fp8 = first.fp8;
-    if (first.fp8) {
+    if (has_fp8_scale) {
         const uint64_t scale_columns = first.scale.shape[1];
         allocate(fused.scale, first.scale.nbytes + second.scale.nbytes,
                  {first.scale.shape[0] + second.scale.shape[0], scale_columns},
                  first.scale.device_dtype);
-        check_device(memcpy_d2d(fused.scale.data, first.scale.data, first.scale.nbytes),
+        check_device(memcpy_d2d(fused.scale.data, first.scale.data,
+                                first.scale.nbytes),
                      "Qwen fused projection first scale copy");
         check_device(memcpy_d2d(static_cast<uint8_t*>(fused.scale.data) + first.scale.nbytes,
                                 second.scale.data, second.scale.nbytes),
@@ -823,8 +827,8 @@ struct QwenEngine::Impl {
             qwen_env_enabled_default("QWEN_VERIFY_RESIDENT_FP16");
         if (verify_resident_weights) {
             auto materialize_verify_weight = [this](DeviceLinear& linear) {
-                if (!linear.fp8 || linear.weight.data == nullptr ||
-                    linear.weight.shape.size() != 2 ||
+                if (linear.kind != QwenLinearKind::Fp8Block128 ||
+                    linear.weight.data == nullptr || linear.weight.shape.size() != 2 ||
                     linear.scale.data == nullptr || linear.scale.shape.size() != 2) {
                     return;
                 }
@@ -1896,7 +1900,25 @@ struct QwenEngine::Impl {
             k_normalized = &workspace_float(key_elements, q_normalized->shape);
         }
 
-        projection(layer.linear.qkv, hidden, packed.f16_data(), rows, "lin.qkv");
+        const bool dual_qkvz = rows == 1 &&
+            layer.linear.qkv.kind == QwenLinearKind::Fp8Block128 &&
+            layer.linear.z.kind == QwenLinearKind::Fp8Block128 &&
+            qwen_env_enabled("QWEN_FUSE_QKVZ_DECODE");
+        if (dual_qkvz) {
+            PhaseScope dual_scope(this, "pd.lin.qkvz");
+            require_launch(qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
+                hidden,
+                layer.linear.qkv.weight.fp8_data(),
+                layer.linear.qkv.scale.f16_data(), packed.f16_data(), packed_dim,
+                hidden_size, static_cast<int>(layer.linear.qkv.scale.shape[1]),
+                layer.linear.z.weight.fp8_data(),
+                layer.linear.z.scale.f16_data(), z.f16_data(), value_dim,
+                hidden_size, static_cast<int>(layer.linear.z.scale.shape[1]),
+                hidden_size), "dual FP8 QKV/Z decode projection");
+        } else {
+            projection(layer.linear.qkv, hidden, packed.f16_data(), rows,
+                       "lin.qkv");
+        }
         require_launch(qwen_causal_depthwise_conv_silu_f16(
             packed.f16_data(), layer.linear.conv.f16_data(),
             layer.linear.conv_tail.f16_data(), convolved.f16_data(), rows,
@@ -2006,7 +2028,9 @@ struct QwenEngine::Impl {
                 "FP16 linear recurrent state");
         }
         delta_scope.reset();
-        projection(layer.linear.z, hidden, z.f16_data(), rows, "lin.z");
+        if (!dual_qkvz) {
+            projection(layer.linear.z, hidden, z.f16_data(), rows, "lin.z");
+        }
         require_launch(qwen_gated_rmsnorm_fp16_gamma_rows_f16(
             core.f16_data(), layer.linear.norm.f16_data(), z.f16_data(),
             normalized.f16_data(), rows * value_heads,
@@ -2069,17 +2093,39 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& attention = workspace_half(attention_elements, q.shape);
         QwenDeviceTensor& merged = workspace_half(attention_elements, q.shape);
 
-        { PhaseScope sub(this, "full.q_proj"); projection(layer.full.q, hidden, q_projection.f16_data(), rows, "full.q"); }
-        if (fused_kv) {
-            { PhaseScope sub(this, "full.kv_proj"); projection(
-                layer.full.kv, hidden, kv_projection->f16_data(), rows,
-                "full.kv"); }
-            require_launch(qwen_split_rows_pair_f16(
-                kv_projection->f16_data(), k.f16_data(), v.f16_data(), rows,
-                kv_heads * head_dim), "FP16 fused full K/V split");
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        const bool grouped_qkv = rows == 1 && !fused_kv &&
+            layer.full.q.kind == QwenLinearKind::Fp8Block128 &&
+            layer.full.k.kind == QwenLinearKind::Fp8Block128 &&
+            layer.full.v.kind == QwenLinearKind::Fp8Block128 &&
+            qwen_env_enabled("QWEN_FUSE_FULL_QKV_DECODE");
+        if (grouped_qkv) {
+            PhaseScope sub(this, "pd.full.qkv");
+            require_launch(qwen_fp8_e4m3_fp16scale_matvec_triple_f16_cuda(
+                hidden, layer.full.q.weight.fp8_data(),
+                layer.full.q.scale.f16_data(), q_projection.f16_data(),
+                q_projection_dim, hidden_size,
+                static_cast<int>(layer.full.q.scale.shape[1]),
+                layer.full.k.weight.fp8_data(), layer.full.k.scale.f16_data(),
+                k.f16_data(), kv_heads * head_dim, hidden_size,
+                static_cast<int>(layer.full.k.scale.shape[1]),
+                layer.full.v.weight.fp8_data(), layer.full.v.scale.f16_data(),
+                v.f16_data(), kv_heads * head_dim, hidden_size,
+                static_cast<int>(layer.full.v.scale.shape[1]), hidden_size),
+                "triple FP8 full Q/K/V decode projection");
         } else {
-            { PhaseScope sub(this, "full.k_proj"); projection(layer.full.k, hidden, k.f16_data(), rows, "full.k"); }
-            { PhaseScope sub(this, "full.v_proj"); projection(layer.full.v, hidden, v.f16_data(), rows, "full.v"); }
+            { PhaseScope sub(this, "full.q_proj"); projection(layer.full.q, hidden, q_projection.f16_data(), rows, "full.q"); }
+            if (fused_kv) {
+                { PhaseScope sub(this, "full.kv_proj"); projection(
+                    layer.full.kv, hidden, kv_projection->f16_data(), rows,
+                    "full.kv"); }
+                require_launch(qwen_split_rows_pair_f16(
+                    kv_projection->f16_data(), k.f16_data(), v.f16_data(), rows,
+                    kv_heads * head_dim), "FP16 fused full K/V split");
+            } else {
+                { PhaseScope sub(this, "full.k_proj"); projection(layer.full.k, hidden, k.f16_data(), rows, "full.k"); }
+                { PhaseScope sub(this, "full.v_proj"); projection(layer.full.v, hidden, v.f16_data(), rows, "full.v"); }
+            }
         }
         require_launch(qwen_split_q_gate_f16(
             q_projection.f16_data(), q.f16_data(), gate.f16_data(), rows,
@@ -2144,8 +2190,10 @@ struct QwenEngine::Impl {
                 attended_positions = sink_count + (context_length - window_start);
             }
             // Must match the launch exactly; it sizes the partial scratch.
-            const int optimized_splits =
-                qwen_gqa_decode_split_count(attended_positions);
+            const bool tensor_core_decode_shape = attention_window <= 0 &&
+                sink_tokens == 0 && q_heads == kv_heads * 6 && head_dim == 256;
+            const int optimized_splits = qwen_gqa_decode_split_count(
+                attended_positions, kv_heads, tensor_core_decode_shape);
             const size_t score_elements = optimized_decode
                 ? static_cast<size_t>(q_heads) * optimized_splits *
                       static_cast<size_t>(head_dim + 2)

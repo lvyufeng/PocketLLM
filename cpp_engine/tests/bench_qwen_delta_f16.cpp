@@ -55,13 +55,17 @@ int main(int argc, char** argv) {
     int iters = 1000;
     if (argc > 1) rows = std::atoi(argv[1]);
     if (argc > 2) iters = std::atoi(argv[2]);
-    constexpr int kHeads = 12;
-    constexpr int kKeyHeads = 4;
+    const int heads = argc > 3 ? std::atoi(argv[3]) : 12;
+    const int key_heads = argc > 4 ? std::atoi(argv[4]) : 4;
     constexpr int kDim = 128;
-    const size_t state_elements = static_cast<size_t>(kHeads) * kDim * kDim;
-    const size_t key_elements = static_cast<size_t>(rows) * kKeyHeads * kDim;
-    const size_t value_elements = static_cast<size_t>(rows) * kHeads * kDim;
-    const size_t gate_elements = static_cast<size_t>(rows) * kHeads;
+    if (heads <= 0 || key_heads <= 0 || heads % key_heads != 0) {
+        std::fprintf(stderr, "invalid heads=%d key_heads=%d\n", heads, key_heads);
+        return 1;
+    }
+    const size_t state_elements = static_cast<size_t>(heads) * kDim * kDim;
+    const size_t key_elements = static_cast<size_t>(rows) * key_heads * kDim;
+    const size_t value_elements = static_cast<size_t>(rows) * heads * kDim;
+    const size_t gate_elements = static_cast<size_t>(rows) * heads;
 
     float* state = nullptr;
     uint16_t* q = nullptr;
@@ -101,23 +105,23 @@ int main(int argc, char** argv) {
 
     auto sequence = [&]() {
         return dsv4::qwen_gated_delta_sequence_f16(
-            state, q, k, v, g, beta, output, rows, kHeads, kKeyHeads,
+            state, q, k, v, g, beta, output, rows, heads, key_heads,
             kDim, kDim, 1.0f / 11.3137085f);
     };
     auto normalized = [&]() {
         return dsv4::qwen_normalize_gated_delta_qk_f16(
-                   q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
+                   q, k, q_normalized, k_normalized, rows, key_heads, kDim) &&
                dsv4::qwen_gated_delta_sequence_normalized_f16(
                    state, q_normalized, k_normalized, v, g, beta, output,
-                   rows, kHeads, kKeyHeads, kDim, kDim,
+                   rows, heads, key_heads, kDim, kDim,
                    1.0f / 11.3137085f);
     };
     auto shared_state_variant = [&]() {
         return dsv4::qwen_normalize_gated_delta_qk_f16(
-                   q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
+                   q, k, q_normalized, k_normalized, rows, key_heads, kDim) &&
                dsv4::qwen_gated_delta_sequence_normalized_shared_f16(
                    state, q_normalized, k_normalized, v, g, beta, output,
-                   rows, kHeads, kKeyHeads, kDim, kDim,
+                   rows, heads, key_heads, kDim, kDim,
                    1.0f / 11.3137085f);
     };
     // FlashQLA SM75 subgroup-sharded kernel: WIDTH=16 lanes hold COLS=4 state
@@ -125,22 +129,22 @@ int main(int argc, char** argv) {
     // thread per value dimension. Same serial recurrence, different sharding.
     auto flashqla = [&]() {
         return dsv4::qwen_normalize_gated_delta_qk_f16(
-                   q, k, q_normalized, k_normalized, rows, kKeyHeads, kDim) &&
+                   q, k, q_normalized, k_normalized, rows, key_heads, kDim) &&
                dsv4::qwen_gated_delta_flashqla_sm75_f16_cuda(
                    state, q_normalized, k_normalized, v, g, beta, output,
-                   rows, kHeads, kKeyHeads, kDim, kDim,
+                   rows, heads, key_heads, kDim, kDim,
                    1.0f / 11.3137085f);
     };
     auto steps = [&]() {
         for (int row = 0; row < rows; ++row) {
             if (!dsv4::qwen_gated_delta_step_f16(
-                    state, q + static_cast<size_t>(row) * kKeyHeads * kDim,
-                    k + static_cast<size_t>(row) * kKeyHeads * kDim,
-                    v + static_cast<size_t>(row) * kHeads * kDim,
-                    g + static_cast<size_t>(row) * kHeads,
-                    beta + static_cast<size_t>(row) * kHeads,
-                    output + static_cast<size_t>(row) * kHeads * kDim,
-                    kHeads, kKeyHeads, kDim, kDim,
+                    state, q + static_cast<size_t>(row) * key_heads * kDim,
+                    k + static_cast<size_t>(row) * key_heads * kDim,
+                    v + static_cast<size_t>(row) * heads * kDim,
+                    g + static_cast<size_t>(row) * heads,
+                    beta + static_cast<size_t>(row) * heads,
+                    output + static_cast<size_t>(row) * heads * kDim,
+                    heads, key_heads, kDim, kDim,
                     1.0f / 11.3137085f)) return false;
         }
         return true;
@@ -159,7 +163,7 @@ int main(int argc, char** argv) {
                 "flashqla=%.6f ms steps=%.6f ms normalized_speedup=%.3f "
                 "shared_speedup=%.3f flashqla_speedup=%.3f "
                 "sequence_speedup=%.3f\n",
-                rows, kHeads, kKeyHeads, kDim, seq_ms, normalized_ms, shared_ms,
+                rows, heads, key_heads, kDim, seq_ms, normalized_ms, shared_ms,
                 flashqla_ms, step_ms, seq_ms / normalized_ms,
                 normalized_ms / shared_ms, normalized_ms / flashqla_ms,
                 step_ms / seq_ms);

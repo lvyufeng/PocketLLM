@@ -478,16 +478,18 @@ bool run_prefill_tiled(int rows, int q_heads, int kv_heads, int head_dim,
 // splits scan nothing at all: an early return there left scratch uninitialized
 // and produced -inf logits from the second decode step onward.
 bool run_decode_mma(int context_len, int target_splits,
-                    int split_override = 0, bool expect_empty_splits = false) {
-    constexpr int q_heads = 6;
-    constexpr int kv_heads = 1;
+                    int split_override = 0, bool expect_empty_splits = false,
+                    int kv_heads = 1, bool check_variant_geometry = true,
+                    float minimum_value = -0.1f,
+                    float maximum_value = 0.1f) {
+    const int q_heads = kv_heads * 6;
     constexpr int head_dim = 256;
     const int max_context = context_len + 16;
     const size_t q_elements = static_cast<size_t>(q_heads) * head_dim;
     const size_t kv_elements =
         static_cast<size_t>(max_context) * kv_heads * head_dim;
     std::mt19937 rng(24681 + context_len * 31 + target_splits);
-    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+    std::uniform_real_distribution<float> dist(minimum_value, maximum_value);
     std::vector<uint16_t> q(q_elements), k(kv_elements, 0), v(kv_elements, 0);
     for (uint16_t& value : q) value = to_half(dist(rng));
     for (size_t i = 0;
@@ -496,11 +498,17 @@ bool run_decode_mma(int context_len, int target_splits,
         v[i] = to_half(dist(rng));
     }
 
-    const int mma_splits = dsv4::qwen_gqa_decode_split_count_variant(
-        context_len, dsv4::QwenGqaDecodeVariant::TensorCore, split_override);
+    const int mma_splits = split_override > 0
+        ? dsv4::qwen_gqa_decode_split_count_variant(
+              context_len, dsv4::QwenGqaDecodeVariant::TensorCore,
+              split_override)
+        : dsv4::qwen_gqa_decode_split_count_variant(
+              context_len, dsv4::QwenGqaDecodeVariant::TensorCore);
     const int scalar_splits = dsv4::qwen_gqa_decode_split_count_variant(
         context_len, dsv4::QwenGqaDecodeVariant::Scalar, split_override);
-    if (split_override == 0 && mma_splits != target_splits) {
+    if (check_variant_geometry && split_override == 0 &&
+        std::getenv("DSV4_QWEN_DECODE_MMA_TARGET_SPLITS") == nullptr &&
+        mma_splits != target_splits) {
         fail("gqa decode candidate split count ctx=" +
              std::to_string(context_len) + " got=" +
              std::to_string(mma_splits) + " want=" +
@@ -819,14 +827,45 @@ int main() {
     // this process against the same inputs, so every case checks scalar against
     // the CPU reference, the candidate against the CPU reference, and the two
     // against each other, regardless of what DSV4_QWEN_DECODE_MMA selects.
+    // The candidate targets two CTA waves (136 on this host) at every context.
+    // 4096 and 8199 land below that because the count is re-derived from the
+    // rounded slice length: 31 positions cover 4096 in 133 splits and 61 cover
+    // 8199 in 135, so the dead trailing CTAs are dropped.
     const int decode_cases[][2] = {
-        {4096, 68}, {8199, 68}, {16384, 136}, {65537, 136},
+        {4096, 133}, {8199, 135}, {16384, 136}, {65537, 136},
     };
     for (const auto& decode_case : decode_cases) {
         if (!run_decode_mma(decode_case[0], decode_case[1])) {
             std::printf("[SKIP] device allocation failed\n");
             return 0;
         }
+    }
+    // TP2 has two independent 6Q:1KV groups in each rank. The same kernel grid
+    // must address the interleaved [position, kv_head, channel] cache correctly
+    // and publish both groups into the q-head-major partial layout.
+    if (!run_decode_mma(8199, 135, 0, false, 2)) {
+        std::printf("[SKIP] device allocation failed\n");
+        return 0;
+    }
+    // Positive-only inputs expose stale scores from the ten padded MMA rows. Their
+    // shared score slots are never written, so they must be masked before reduction;
+    // otherwise a previous valid row can survive and make a full-mask shuffle group
+    // use an arbitrary maximum. This was invisible to symmetric random fixtures.
+    if (!run_decode_mma(4096, 133, 0, false, 2, true, 0.01f, 0.1f)) {
+        std::printf("[SKIP] device allocation failed\n");
+        return 0;
+    }
+    const int tp2_long_splits = dsv4::qwen_gqa_decode_split_count(65537, 2, true);
+    const char* mma_split_env =
+        std::getenv("DSV4_QWEN_DECODE_MMA_TARGET_SPLITS");
+    const int mma_split_override =
+        mma_split_env != nullptr ? std::atoi(mma_split_env) : 0;
+    const int expected_tp2_long_splits =
+        mma_split_override > 0 ? mma_split_override : 68;
+    if (tp2_long_splits != expected_tp2_long_splits) {
+        fail("gqa decode TP2 shape-aware split count got=" +
+             std::to_string(tp2_long_splits) + " want=" +
+             std::to_string(expected_tp2_long_splits));
     }
     // Empty trailing splits. 4100 positions over 200 splits is 21 each, which 196
     // splits already cover, so the last four CTAs scan nothing and must still
