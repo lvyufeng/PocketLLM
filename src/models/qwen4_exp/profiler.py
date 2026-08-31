@@ -68,10 +68,66 @@ class Profiler:
             stats.count += 1
             stats.total_s += elapsed
 
+    def add_external(self, name: str, elapsed_s: float) -> None:
+        """Add a timer measured by a lower-level implementation."""
+        if not self.enabled or elapsed_s <= 0.0:
+            return
+        parent = self.root
+        for scope_name, _, _ in self._stack:
+            parent = parent.children.setdefault(scope_name, ScopeStats())
+        stats = parent.children.setdefault(name, ScopeStats())
+        stats.count += 1
+        stats.total_s += elapsed_s
+
     def reset(self):
         """Clear all accumulated stats."""
         self.root = ScopeStats()
         self._stack.clear()
+
+    def aggregate(self, scope_prefix: str = "layer_") -> dict[str, ScopeStats]:
+        """Sum matching children across repeated layer scopes."""
+        aggregated: dict[str, ScopeStats] = {}
+
+        def merge(dst: ScopeStats, src: ScopeStats) -> None:
+            dst.count += src.count
+            dst.total_s += src.total_s
+            for name, child in src.children.items():
+                merge(dst.children.setdefault(name, ScopeStats()), child)
+
+        def visit(node: ScopeStats) -> None:
+            for name, child in node.children.items():
+                if name.startswith(scope_prefix):
+                    for child_name, child_stats in child.children.items():
+                        merge(
+                            aggregated.setdefault(child_name, ScopeStats()),
+                            child_stats,
+                        )
+                else:
+                    visit(child)
+
+        visit(self.root)
+        return aggregated
+
+    def aggregate_report(self, scope_prefix: str = "layer_") -> str:
+        """Report child scopes summed across all matching layer scopes."""
+        aggregated = self.aggregate(scope_prefix)
+        if not aggregated:
+            return "(no matching layer scopes)"
+        total_s = sum(stats.total_s for stats in aggregated.values())
+        lines = [
+            f"{'=== Aggregate Layer Report ===':<50s}  Total: {total_s:.3f}s"
+        ]
+        for name, stats in sorted(
+            aggregated.items(), key=lambda item: item[1].total_s, reverse=True
+        ):
+            percent = 100.0 * stats.total_s / total_s if total_s else 0.0
+            average_ms = 1000.0 * stats.total_s / stats.count if stats.count else 0.0
+            lines.append(
+                f"{name:30s}  {stats.count:6d} calls  "
+                f"{stats.total_s:7.3f}s ({percent:5.1f}%)  "
+                f"{average_ms:7.2f} ms/call"
+            )
+        return "\n".join(lines)
 
     def report(self, min_percent: float = 0.5) -> str:
         """Generate a tree report of accumulated times.

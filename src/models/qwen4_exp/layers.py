@@ -9,16 +9,165 @@ goldens captured from it.  Nothing here is TP-aware; sharding happens in
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 
+from src.kernels.cuda_loader import load_cuda_kernel
 from src.models.qwen4_exp.config import Qwen4ExpTextConfig
 
 
 # ---------------------------------------------------------------------------
 # Norms
 # ---------------------------------------------------------------------------
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes"}
+
+
+def _dense_fp16_enabled(rows: int) -> bool:
+    min_rows = max(
+        1,
+        int(os.environ.get("DSV4_QWEN4_DENSE_FP16_MIN_ROWS", "128")),
+    )
+    return _env_enabled("DSV4_QWEN4_DENSE_FP16", "0") and rows >= min_rows
+
+
+def _dense_fp16_fp32_output_enabled(rows: int) -> bool:
+    min_rows = max(
+        1,
+        int(os.environ.get("DSV4_QWEN4_DENSE_FP16_MIN_ROWS", "128")),
+    )
+    return (
+        _env_enabled("DSV4_QWEN4_DENSE_FP16_FP32_OUTPUT", "0")
+        and rows >= min_rows
+    )
+
+
+def _fp16_fp32_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    flat = x.reshape(-1, x.shape[-1]).to(torch.float16)
+    output = torch.mm(
+        flat,
+        weight.to(torch.float16).t(),
+        out_dtype=torch.float32,
+    )
+    return output.to(torch.bfloat16).reshape(
+        *x.shape[:-1],
+        weight.shape[0],
+    )
+
+
+def prefill_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Use optional SM75 tensor-core GEMM for large BF16 projections."""
+    rows = x.numel() // x.shape[-1]
+    supported = (
+        x.device.type == "cuda"
+        and x.dtype is torch.bfloat16
+        and weight.device == x.device
+        and weight.dtype is torch.bfloat16
+    )
+    if supported and _dense_fp16_fp32_output_enabled(rows):
+        return _fp16_fp32_linear(x, weight)
+    if supported and _dense_fp16_enabled(rows):
+        return F.linear(
+            x.to(torch.float16),
+            weight.to(torch.float16),
+        ).to(torch.bfloat16)
+    return F.linear(x, weight)
+
+
+def _hc_fp16_components(rows: int) -> tuple[bool, bool, bool]:
+    min_rows = max(
+        1,
+        int(os.environ.get("DSV4_QWEN4_HC_FP16_MIN_ROWS", "128")),
+    )
+    if rows < min_rows:
+        return False, False, False
+    all_enabled = _env_enabled("DSV4_QWEN4_HC_FP16", "0")
+    return (
+        all_enabled or _env_enabled("DSV4_QWEN4_HC_FP16_MIX_DOWN", "0"),
+        all_enabled or _env_enabled("DSV4_QWEN4_HC_FP16_MIX_UP", "0"),
+        all_enabled or _env_enabled("DSV4_QWEN4_HC_FP16_INJECT", "0"),
+    )
+
+
+def _hc_fp16_enabled(rows: int) -> bool:
+    return any(_hc_fp16_components(rows))
+
+
+def _hc_fp16_fp32_output_enabled(rows: int) -> bool:
+    return (
+        _hc_fp16_enabled(rows)
+        and _env_enabled("DSV4_QWEN4_HC_FP16_FP32_OUTPUT", "0")
+    )
+
+
+def _hc_cuda_enabled(rows: int) -> bool:
+    min_rows = max(
+        1,
+        int(os.environ.get("DSV4_QWEN4_HC_CUDA_MIN_ROWS", "128")),
+    )
+    return (
+        _env_enabled("DSV4_QWEN4_HC_CUDA", "0")
+        and rows >= min_rows
+    ) or _hc_fp16_enabled(rows)
+
+
+def _cuda_hc_activation(
+    name: str,
+    x: torch.Tensor,
+    groups: int,
+) -> torch.Tensor | None:
+    """Fuse an HC scale-then-activation pair without changing its rounding.
+
+    The reference path divides a BF16 GEMM result by `hc_count` and then applies
+    the activation in BF16.  Both kernels keep the divide and the activation in
+    float32 and round once on store, which is bit-identical to the reference on
+    every value measured so far, so this stays on the exact path.
+    """
+    if (
+        not _hc_cuda_enabled(x.numel() // x.shape[-1])
+        or x.device.type != "cuda"
+        or x.dtype is not torch.bfloat16
+        or not x.is_contiguous()
+    ):
+        return None
+    ext = load_cuda_kernel()
+    if ext is None or not hasattr(ext, name):
+        return None
+    return getattr(ext, name)(x, groups)
+
+
+def _cuda_grouped_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+) -> torch.Tensor | None:
+    if (
+        not _hc_cuda_enabled(x.numel() // x.shape[-1])
+        or x.device.type != "cuda"
+        or not x.is_contiguous()
+        or not weight.is_contiguous()
+        or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or weight.dtype is not x.dtype
+        or weight.device != x.device
+        or x.shape[-1] != weight.numel()
+        or x.shape[-1] % group_size != 0
+    ):
+        return None
+    ext = load_cuda_kernel()
+    if ext is None or not hasattr(ext, "qwen4_exp_grouped_rms_norm"):
+        return None
+    return ext.qwen4_exp_grouped_rms_norm(x, weight, group_size, eps)
 
 
 class RMSNorm:
@@ -35,6 +184,15 @@ class RMSNorm:
         self.group_size = group_size
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.group_size is not None:
+            output = _cuda_grouped_rms_norm(
+                x,
+                self.weight,
+                self.group_size,
+                self.eps,
+            )
+            if output is not None:
+                return output
         in_dtype = x.dtype
         h = x.to(torch.float32)
         if self.group_size is not None:
@@ -167,13 +325,108 @@ class GatedResidual:
 
     def __call__(self, hyper_input: torch.Tensor):
         normed = self.hc_norm(hyper_input)
-        w = F.silu(F.linear(normed, self.mix_down) / self.hc_count)
-        w = torch.sigmoid(F.linear(w, self.mix_up))
+        rows = hyper_input.numel() // hyper_input.shape[-1]
+        fp16_down, fp16_up, fp16_inject = _hc_fp16_components(rows)
+        fp16_supported = (
+            normed.device.type == "cuda"
+            and normed.dtype is torch.bfloat16
+            and self.mix_down.dtype is torch.bfloat16
+            and self.mix_up.dtype is torch.bfloat16
+            and (
+                self.block_inject is None
+                or self.block_inject.dtype is torch.bfloat16
+            )
+        )
+        if not fp16_supported:
+            fp16_down = fp16_up = fp16_inject = False
+
+        fp32_output = (
+            fp16_supported and _hc_fp16_fp32_output_enabled(rows)
+        )
+        compute_input_fp16 = (
+            normed.to(torch.float16)
+            if (fp16_down or fp16_inject) and not fp32_output
+            else None
+        )
+        if fp16_down:
+            if fp32_output:
+                down = F.silu(
+                    _fp16_fp32_linear(normed, self.mix_down)
+                    / self.hc_count
+                )
+            else:
+                assert compute_input_fp16 is not None
+                down = F.silu(
+                    F.linear(
+                        compute_input_fp16,
+                        self.mix_down.to(torch.float16),
+                    )
+                    / self.hc_count
+                )
+        else:
+            raw_down = F.linear(normed, self.mix_down)
+            down = _cuda_hc_activation(
+                "qwen4_exp_hc_silu",
+                raw_down,
+                self.hc_count,
+            )
+            if down is None:
+                down = F.silu(raw_down / self.hc_count)
+
+        if fp16_up:
+            if fp32_output:
+                w = torch.sigmoid(
+                    _fp16_fp32_linear(
+                        down.to(normed.dtype),
+                        self.mix_up,
+                    )
+                )
+            else:
+                up_input = (
+                    down
+                    if down.dtype is torch.float16
+                    else down.to(torch.float16)
+                )
+                w = torch.sigmoid(
+                    F.linear(up_input, self.mix_up.to(torch.float16))
+                ).to(normed.dtype)
+        else:
+            up_input = (
+                down
+                if down.dtype is normed.dtype
+                else down.to(normed.dtype)
+            )
+            w = torch.sigmoid(F.linear(up_input, self.mix_up))
+
         w = w.unflatten(-1, (self.hc_count, self.hidden_size))
         mixed = (w * normed.unflatten(-1, (self.hc_count, self.hidden_size))).mean(dim=-2)
         if self.block_inject is None:
             return mixed
-        inject = 2 * torch.sigmoid(F.linear(normed, self.block_inject) / self.hc_count)
+        if fp16_inject:
+            if fp32_output:
+                inject = 2 * torch.sigmoid(
+                    _fp16_fp32_linear(normed, self.block_inject)
+                    / self.hc_count
+                )
+            else:
+                assert compute_input_fp16 is not None
+                inject = 2 * torch.sigmoid(
+                    F.linear(
+                        compute_input_fp16,
+                        self.block_inject.to(torch.float16),
+                    )
+                    / self.hc_count
+                )
+                inject = inject.to(normed.dtype)
+        else:
+            raw_inject = F.linear(normed, self.block_inject)
+            inject = _cuda_hc_activation(
+                "qwen4_exp_hc_inject_gate",
+                raw_inject,
+                self.hc_count,
+            )
+            if inject is None:
+                inject = 2 * torch.sigmoid(raw_inject / self.hc_count)
         return mixed, hyper_input, inject
 
 
@@ -181,6 +434,31 @@ def inject_into_streams(
     block_output: torch.Tensor, hyper_input: torch.Tensor, injection_weights: torch.Tensor
 ) -> torch.Tensor:
     """Scatter a block's output back into all hyper-connection streams."""
+    groups = injection_weights.shape[-1]
+    if (
+        _hc_cuda_enabled(
+            block_output.numel() // block_output.shape[-1]
+        )
+        and block_output.device.type == "cuda"
+        and block_output.is_contiguous()
+        and hyper_input.is_contiguous()
+        and injection_weights.is_contiguous()
+        and block_output.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and hyper_input.dtype is block_output.dtype
+        and injection_weights.dtype is block_output.dtype
+        and block_output.device == hyper_input.device == injection_weights.device
+        and hyper_input.shape[:-1] == block_output.shape[:-1]
+        and injection_weights.shape[:-1] == block_output.shape[:-1]
+        and hyper_input.shape[-1] == groups * block_output.shape[-1]
+    ):
+        ext = load_cuda_kernel()
+        if ext is not None and hasattr(ext, "qwen4_exp_inject"):
+            return ext.qwen4_exp_inject(
+                block_output,
+                hyper_input,
+                injection_weights,
+                groups,
+            )
     injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
     return hyper_input + injection.flatten(-2)
 
@@ -308,7 +586,10 @@ class DenseMLP:
         self.down_proj = down_proj
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(F.silu(F.linear(x, self.gate_proj)) * F.linear(x, self.up_proj), self.down_proj)
+        hidden = F.silu(
+            prefill_linear(x, self.gate_proj)
+        ) * prefill_linear(x, self.up_proj)
+        return prefill_linear(hidden, self.down_proj)
 
 
 def swiglu_expert(

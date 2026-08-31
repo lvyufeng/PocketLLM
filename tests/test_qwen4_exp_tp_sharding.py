@@ -210,3 +210,166 @@ def test_host_expert_rows_match_dense(checkpoint_dir):
         gate_up, down = checkpoint.expert_rows(0, expert_id)
         torch.testing.assert_close(gate_up, gate_up_all[expert_id], rtol=0, atol=0)
         torch.testing.assert_close(down, down_all[expert_id], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+def test_resident_shard_partitions_experts(checkpoint_dir, world_size):
+    """Preloaded shards must cover every expert exactly once, sized to their share."""
+    config = Qwen4ExpConfig.from_pretrained(checkpoint_dir).text_config
+    num_experts = config.num_experts
+    owned: list[int] = []
+    for rank in range(world_size):
+        checkpoint = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+        shard = checkpoint.preload_experts(
+            config.num_hidden_layers, rank=rank, world_size=world_size, pin=False
+        )
+        ids = shard.local_expert_ids(num_experts)
+        owned.extend(ids)
+        assert shard.num_local_experts == len(ids)
+        assert shard.stats()["layers"] == config.num_hidden_layers
+        gate_up, down = shard.rows(0, ids[0])
+        assert gate_up.shape == (2 * config.moe_intermediate_size, config.hidden_size)
+        assert down.shape == (config.hidden_size, config.moe_intermediate_size)
+        per_expert = (
+            gate_up.numel() * gate_up.element_size() + down.numel() * down.element_size()
+        )
+        assert shard.resident_bytes == per_expert * len(ids) * config.num_hidden_layers
+        # Local indices are dense: the last owned expert sits at len(ids) - 1.
+        assert shard.local_index(ids[-1]) == len(ids) - 1
+    assert sorted(owned) == list(range(num_experts))
+
+
+def test_release_mapping_keeps_rows_readable(checkpoint_dir):
+    """MADV_DONTNEED must free pages without changing what the mapping returns.
+
+    The advice only drops this process's resident pages; touching the view again
+    faults them back, so both the resident copy and a later mmap read of the same
+    tensor must still be bit-exact.
+    """
+    from safetensors import safe_open
+
+    config = Qwen4ExpConfig.from_pretrained(checkpoint_dir).text_config
+    checkpoint = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+    key = checkpoint.expert_key(0, "gate_up_proj")
+    reference = checkpoint.store.view(key).clone()
+
+    checkpoint.preload_experts(
+        config.num_hidden_layers, rank=0, world_size=1, pin=False, release_mapping=True
+    )
+    torch.testing.assert_close(checkpoint.store.view(key), reference, rtol=0, atol=0)
+    with safe_open(
+        os.path.join(checkpoint_dir, checkpoint.store.entries[key].file_name), framework="pt"
+    ) as f:
+        torch.testing.assert_close(checkpoint.store.view(key), f.get_tensor(key), rtol=0, atol=0)
+
+
+def test_resident_shard_rows_match_mmap(checkpoint_dir):
+    """Rows served from host RAM must be bit-identical to the mapped rows."""
+    config = Qwen4ExpConfig.from_pretrained(checkpoint_dir).text_config
+    world_size = 4
+    for rank in range(world_size):
+        mapped = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+        resident = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+        resident.preload_experts(
+            config.num_hidden_layers, rank=rank, world_size=world_size, pin=False
+        )
+        for layer_idx in range(config.num_hidden_layers):
+            for expert_id in range(config.num_experts):
+                if expert_id % world_size != rank:
+                    continue
+                got_gate_up, got_down = resident.expert_rows(layer_idx, expert_id)
+                want_gate_up, want_down = mapped.expert_rows(layer_idx, expert_id)
+                torch.testing.assert_close(got_gate_up, want_gate_up, rtol=0, atol=0)
+                torch.testing.assert_close(got_down, want_down, rtol=0, atol=0)
+        # The shard is a copy, not a view into the mapping.
+        owned = rank
+        row, _ = resident.expert_rows(0, owned)
+        assert row.data_ptr() != mapped.expert_rows(0, owned)[0].data_ptr()
+
+
+def test_resident_shard_matches_mmap_logits(checkpoint_dir, golden):
+    """A TP forward over resident experts must reproduce the mmap-path logits."""
+    config = Qwen4ExpConfig.from_pretrained(checkpoint_dir)
+    world_size = 4
+    models = []
+    for rank in range(world_size):
+        checkpoint = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+        checkpoint.preload_experts(
+            config.text_config.num_hidden_layers, rank=rank, world_size=world_size, pin=False
+        )
+        models.append(
+            build_heterogeneous(
+                config.text_config,
+                checkpoint,
+                device="cpu",
+                dtype=torch.float32,
+                rank=rank,
+                world_size=world_size,
+                all_reduce=lambda t: t,
+            )
+        )
+    logits = _lockstep_forward(models, golden["input_ids"], world_size)
+    torch.testing.assert_close(logits, golden["prefill_logits"].float(), rtol=1e-4, atol=1e-4)
+
+
+def test_host_expert_moe_resident_matches_mmap(checkpoint_dir):
+    """`HostExpertMoE` output must not depend on where the rows came from."""
+    from src.models.qwen4_exp.moe import HostExpertMoE
+
+    config = Qwen4ExpConfig.from_pretrained(checkpoint_dir).text_config
+    mapped = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+    resident = Qwen4ExpCheckpoint(checkpoint_dir, store=MmapSafetensors(checkpoint_dir))
+    resident.preload_experts(config.num_hidden_layers, rank=0, world_size=1, pin=False)
+
+    device = torch.device("cpu")
+    backends = [
+        HostExpertMoE(reader, config.num_experts, device, torch.float32)
+        for reader in (mapped, resident)
+    ]
+
+    torch.manual_seed(0)
+    tokens = 6
+    hidden = torch.randn(tokens, config.hidden_size)
+    indices = torch.randint(0, config.num_experts, (tokens, config.num_experts_per_tok))
+    weights = torch.rand(tokens, config.num_experts_per_tok)
+
+    out_mapped = backends[0](1, hidden, indices, weights)
+    out_resident = backends[1](1, hidden, indices, weights)
+    torch.testing.assert_close(out_resident, out_mapped, rtol=0, atol=0)
+
+
+def test_resident_shard_pin_fallback_is_uniform():
+    """A mid-load pin failure must leave no pinned tensors behind."""
+    from src.models.qwen4_exp.weights import HostExpertShard
+
+    shard = HostExpertShard(num_layers=2, rank=0, world_size=1, pin_memory=True)
+    gate_up_all = torch.randn(4, 6, 8)
+    down_all = torch.randn(4, 8, 3)
+    shard.load_layer(0, gate_up_all, down_all)
+    if not shard.pinned:
+        pytest.skip("pinned host memory unavailable in this environment")
+
+    real_empty = torch.empty
+    # Fail on the *second* pinned allocation of the layer, which is the case that
+    # could otherwise leave one layer with a pinned gate_up and a pageable down.
+    remaining = [1]
+
+    def failing_empty(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            if remaining[0] <= 0:
+                raise RuntimeError("simulated memlock limit")
+            remaining[0] -= 1
+        return real_empty(*args, **kwargs)
+
+    torch.empty = failing_empty
+    try:
+        shard.load_layer(1, gate_up_all, down_all)
+    finally:
+        torch.empty = real_empty
+
+    assert not shard.pinned
+    for layer_idx in (0, 1):
+        gate_up, down = shard.rows(layer_idx, 0)
+        assert not gate_up.is_pinned() and not down.is_pinned()
+        torch.testing.assert_close(gate_up, gate_up_all[0], rtol=0, atol=0)
+        torch.testing.assert_close(down, down_all[0], rtol=0, atol=0)

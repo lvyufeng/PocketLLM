@@ -8,12 +8,19 @@ a regular KV cache plus the indexer's raw pre-pool key cache.
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 
+from src.kernels.cuda_loader import load_cuda_kernel
 from src.models.qwen4_exp.config import Qwen4ExpTextConfig
-from src.models.qwen4_exp.layers import RMSNorm, RMSNormGated, apply_rotary_pos_emb
+from src.models.qwen4_exp.layers import (
+    RMSNorm,
+    RMSNormGated,
+    apply_rotary_pos_emb,
+    prefill_linear,
+)
 
 
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -71,6 +78,107 @@ def recurrent_gated_delta_rule(
         out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
     return out.transpose(1, 2).contiguous().to(initial_dtype), state
+
+
+def cuda_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """SM75 recurrent scan for the real BF16, D=128, batch-one path.
+
+    The kernel retains the float32 recurrent state and pre-normalizes Q/K in
+    float32, but shards each 128x128 state across sub-warps so a long prefill is
+    one CUDA launch rather than Python-controlled chunk algebra. Unsupported
+    shapes return ``None`` and leave the established PyTorch path untouched.
+    """
+    if (
+        query.device.type != "cuda"
+        or query.dtype is not torch.bfloat16
+        or query.shape[0] != 1
+        or query.shape[-1] != 128
+        or key.shape != query.shape
+        or value.shape[0] != 1
+        or value.shape[1] != query.shape[1]
+        or value.shape[-1] != 128
+        or value.shape[2] % query.shape[2] != 0
+        or beta.dtype is not torch.bfloat16
+        or g.dtype is not torch.float32
+    ):
+        return None
+
+    ext = load_cuda_kernel()
+    if ext is None or not hasattr(ext, "qwen4_exp_gated_delta_bf16_forward"):
+        return None
+
+    if initial_state is None:
+        initial_state = torch.zeros(
+            query.shape[0],
+            value.shape[2],
+            query.shape[-1],
+            value.shape[-1],
+            device=query.device,
+            dtype=torch.float32,
+        )
+    groups_per_block = int(os.environ.get("DSV4_QWEN4_GDN_GROUPS_PER_CTA", "1"))
+    if groups_per_block not in (1, 2, 4, 8):
+        groups_per_block = 1
+    output, state = ext.qwen4_exp_gated_delta_bf16_forward(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+        initial_state.contiguous(),
+        1e-6,
+        groups_per_block,
+    )
+    return output, state
+
+
+def cuda_qsa_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    selected_indices: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor | None:
+    """Indexed BF16 GQA attention for the real TP4 sparse-attention shape."""
+    enabled = os.environ.get("DSV4_QWEN4_QSA_CUDA", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if (
+        not enabled
+        or query.device.type != "cuda"
+        or query.dtype is not torch.bfloat16
+        or key.dtype is not torch.bfloat16
+        or value.dtype is not torch.bfloat16
+        or query.shape[0] != 1
+        or query.shape[-1] != 256
+        or key.shape != value.shape
+        or key.shape[0] != query.shape[0]
+        or key.shape[-1] != query.shape[-1]
+        or query.shape[1] % key.shape[1] != 0
+        or query.shape[1] // key.shape[1] > 12
+        or selected_indices.shape[:2] != (query.shape[0], query.shape[2])
+    ):
+        return None
+
+    ext = load_cuda_kernel()
+    if ext is None or not hasattr(ext, "qwen4_exp_qsa_bf16_forward"):
+        return None
+    return ext.qwen4_exp_qsa_bf16_forward(
+        query.transpose(1, 2).contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        selected_indices.contiguous().to(torch.int32),
+        float(softmax_scale),
+    )
 
 
 def chunk_gated_delta_rule(
@@ -231,14 +339,31 @@ class GatedDeltaNet:
         self.norm = RMSNormGated(
             weights["norm"], config.rms_norm_eps, activation=config.output_gate_type or config.hidden_act
         )
+        self.cuda_rule_enabled = os.environ.get(
+            "DSV4_QWEN4_GDN_CUDA", "1"
+        ).lower() in {"1", "true", "yes"}
+        self.last_profile: dict[str, float] = {}
 
     def __call__(self, hidden_states: torch.Tensor, cache: GatedDeltaNetCache | None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
+        profile = os.environ.get("DSV4_QWEN4_ATTN_PHASE_PROFILE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if profile:
+            import time
 
-        mixed_qkv = F.linear(hidden_states, self.in_proj_qkv).transpose(1, 2)  # (b, conv_dim, seq)
-        z = F.linear(hidden_states, self.in_proj_z).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = F.linear(hidden_states, self.in_proj_b)
-        a = F.linear(hidden_states, self.in_proj_a)
+            torch.cuda.synchronize(hidden_states.device)
+            started = time.perf_counter()
+
+        mixed_qkv = prefill_linear(hidden_states, self.in_proj_qkv).transpose(1, 2)  # (b, conv_dim, seq)
+        z = prefill_linear(hidden_states, self.in_proj_z).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b = prefill_linear(hidden_states, self.in_proj_b)
+        a = prefill_linear(hidden_states, self.in_proj_a)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_projection = time.perf_counter()
 
         conv_weight = self.conv1d_weight.squeeze(1)
         channels = conv_weight.shape[0]
@@ -252,6 +377,9 @@ class GatedDeltaNet:
             conv_in = F.pad(mixed_qkv, (self.conv_kernel_size - 1, 0))
         conv_out = F.conv1d(conv_in, conv_weight.unsqueeze(1), None, padding=0, groups=channels)
         mixed_qkv = F.silu(conv_out[:, :, -seq_len:])
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_conv = time.perf_counter()
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -265,14 +393,24 @@ class GatedDeltaNet:
         # float32 on A_log: in bf16 exp() of a large magnitude saturates to inf.
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
 
-        repeat = self.num_v_heads // self.num_k_heads
-        if repeat > 1:
-            query = query.repeat_interleave(repeat, dim=2)
-            key = key.repeat_interleave(repeat, dim=2)
-
         initial_state = cache.recurrent_state if (cache is not None and cache.initialized) else None
-        rule = recurrent_gated_delta_rule if seq_len == 1 else chunk_gated_delta_rule
-        core_attn_out, last_state = rule(query, key, value, g, beta, initial_state)
+        cuda_result = (
+            cuda_gated_delta_rule(query, key, value, g, beta, initial_state)
+            if self.cuda_rule_enabled and seq_len > 1
+            else None
+        )
+        if cuda_result is None:
+            repeat = self.num_v_heads // self.num_k_heads
+            if repeat > 1:
+                query = query.repeat_interleave(repeat, dim=2)
+                key = key.repeat_interleave(repeat, dim=2)
+            rule = recurrent_gated_delta_rule if seq_len == 1 else chunk_gated_delta_rule
+            core_attn_out, last_state = rule(query, key, value, g, beta, initial_state)
+        else:
+            core_attn_out, last_state = cuda_result
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_core = time.perf_counter()
         if cache is not None:
             cache.recurrent_state = last_state
             cache.initialized = True
@@ -280,7 +418,17 @@ class GatedDeltaNet:
         core_attn_out = self.norm(
             core_attn_out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
         ).reshape(batch_size, seq_len, -1)
-        return F.linear(core_attn_out, self.out_proj)
+        output = prefill_linear(core_attn_out, self.out_proj)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            finished = time.perf_counter()
+            self.last_profile = {
+                "projection": after_projection - started,
+                "conv": after_conv - after_projection,
+                "core": after_core - after_conv,
+                "output": finished - after_core,
+            }
+        return output
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +488,9 @@ class QSAIndexer:
         past_len: int,
         raw_keys_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns a bool mask (batch, 1, seq, kv_len): True where a token is selected."""
+        """Return padded selected token indices with ``-1`` marking invalid slots."""
         batch_size, seq_len, _ = hidden_states.shape
-        qk = F.linear(hidden_states, self.qk_proj)
+        qk = prefill_linear(hidden_states, self.qk_proj)
         q, token_k = torch.split(
             qk, [self.n_heads * self.head_dim, self.kv_heads * self.head_dim], dim=-1
         )
@@ -362,8 +510,29 @@ class QSAIndexer:
         # Every query at absolute position p sees keys [0, p]; block boundaries
         # are therefore query-dependent only through how many keys are visible.
         num_blocks_total = kv_len // self.compress_ratio
+        if kv_len <= self.budget:
+            selected_width = kv_len
+            key_ids = torch.arange(kv_len, device=hidden_states.device)
+            visible_keys = past_len + torch.arange(seq_len, device=hidden_states.device) + 1
+            indices = key_ids.view(1, 1, -1).expand(batch_size, seq_len, -1)
+            return indices.masked_fill(
+                key_ids.view(1, 1, -1) >= visible_keys.view(1, -1, 1), -1
+            ).to(torch.int32)
+
+        selected_width = min(
+            kv_len,
+            self.budget + self.compress_ratio - 1,
+        )
         if num_blocks_total == 0:
-            return torch.ones(batch_size, 1, seq_len, kv_len, dtype=torch.bool, device=hidden_states.device)
+            key_ids = torch.arange(kv_len, device=hidden_states.device)
+            visible_keys = past_len + torch.arange(seq_len, device=hidden_states.device) + 1
+            indices = key_ids.view(1, 1, -1).expand(batch_size, seq_len, -1)
+            indices = indices.masked_fill(
+                key_ids.view(1, 1, -1) >= visible_keys.view(1, -1, 1), -1
+            )
+            if kv_len < selected_width:
+                indices = F.pad(indices, (0, selected_width - kv_len), value=-1)
+            return indices[:, :, :selected_width].to(torch.int32)
 
         # Pool + RoPE all complete blocks once (shared across queries).
         block_tokens = torch.arange(
@@ -397,19 +566,32 @@ class QSAIndexer:
         # -inf rows mean "fewer visible blocks than topk"; drop those picks.
         selected_valid = torch.gather(block_ok.unsqueeze(0).expand(batch_size, -1, -1), 2, selected_blocks)
 
-        mask = torch.zeros(batch_size, seq_len, kv_len, dtype=torch.bool, device=hidden_states.device)
         block_expand = block_tokens[selected_blocks]  # (batch, seq, topk, compress_ratio)
         valid_expand = selected_valid.unsqueeze(-1).expand_as(block_expand)
-        flat_idx = block_expand.reshape(batch_size, seq_len, -1)
-        flat_valid = valid_expand.reshape(batch_size, seq_len, -1)
-        mask.scatter_(2, flat_idx, flat_valid)
+        selected_tokens = block_expand.reshape(batch_size, seq_len, -1)
+        selected_tokens = selected_tokens.masked_fill(
+            ~valid_expand.reshape(batch_size, seq_len, -1), -1
+        )
 
-        # The tail past the last complete visible block is always attendable.
-        key_ids = torch.arange(kv_len, device=hidden_states.device)
-        tail_start = (blocks_visible * self.compress_ratio).view(-1, 1)
-        tail = (key_ids.view(1, -1) >= tail_start) & (key_ids.view(1, -1) < visible_keys.view(-1, 1))
-        mask |= tail.unsqueeze(0)
-        return mask.unsqueeze(1)
+        # Append every possible partial-block tail slot. Invalid positions stay -1,
+        # which keeps the output rectangular without constructing a dense mask.
+        tail_offsets = torch.arange(
+            self.compress_ratio - 1, device=hidden_states.device
+        ).view(1, 1, -1)
+        tail_start = (blocks_visible * self.compress_ratio).view(1, seq_len, 1)
+        tail_tokens = tail_start + tail_offsets
+        tail_valid = tail_tokens < visible_keys.view(1, seq_len, 1)
+        tail_tokens = tail_tokens.expand(batch_size, -1, -1).masked_fill(
+            ~tail_valid.expand(batch_size, -1, -1), -1
+        )
+        selected_tokens = torch.cat([selected_tokens, tail_tokens], dim=-1)
+        if selected_tokens.shape[-1] < selected_width:
+            selected_tokens = F.pad(
+                selected_tokens,
+                (0, selected_width - selected_tokens.shape[-1]),
+                value=-1,
+            )
+        return selected_tokens[:, :, :selected_width].to(torch.int32)
 
 
 class QSAAttention:
@@ -435,6 +617,7 @@ class QSAAttention:
         self.q_norm = RMSNorm(weights["q_norm"], config.rms_norm_eps)
         self.k_norm = RMSNorm(weights["k_norm"], config.rms_norm_eps)
         self.indexer = QSAIndexer(config, weights, n_heads=indexer_heads)
+        self.last_profile: dict[str, float] = {}
 
     def __call__(
         self,
@@ -446,16 +629,29 @@ class QSAAttention:
         past_len: int,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        selected = self.indexer(hidden_states, cos, sin, cache, past_len=past_len)
+        profile = os.environ.get("DSV4_QWEN4_ATTN_PHASE_PROFILE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if profile:
+            import time
 
-        qg = F.linear(hidden_states, self.q_proj).view(batch_size, seq_len, -1, self.head_dim * 2)
+            torch.cuda.synchronize(hidden_states.device)
+            started = time.perf_counter()
+        selected = self.indexer(hidden_states, cos, sin, cache, past_len=past_len)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_indexer = time.perf_counter()
+
+        qg = prefill_linear(hidden_states, self.q_proj).view(batch_size, seq_len, -1, self.head_dim * 2)
         query, gate = torch.chunk(qg, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
         query = self.q_norm(query).transpose(1, 2)
         key = self.k_norm(
-            F.linear(hidden_states, self.k_proj).view(batch_size, seq_len, -1, self.head_dim)
+            prefill_linear(hidden_states, self.k_proj).view(batch_size, seq_len, -1, self.head_dim)
         ).transpose(1, 2)
-        value = F.linear(hidden_states, self.v_proj).view(batch_size, seq_len, -1, self.head_dim).transpose(1, 2)
+        value = prefill_linear(hidden_states, self.v_proj).view(batch_size, seq_len, -1, self.head_dim).transpose(1, 2)
 
         cur_cos, cur_sin = cos[:, -seq_len:], sin[:, -seq_len:]
         query, key = apply_rotary_pos_emb(query, cur_cos, cur_sin, k=key, unsqueeze_dim=1)
@@ -466,18 +662,76 @@ class QSAAttention:
             cache.length = past_len + seq_len
             key = cache.k[:, :, : cache.length]
             value = cache.v[:, :, : cache.length]
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_projection = time.perf_counter()
 
-        kv_len = key.shape[2]
-        query_abs = past_len + torch.arange(seq_len, device=hidden_states.device)
-        causal = torch.arange(kv_len, device=hidden_states.device).view(1, -1) <= query_abs.view(-1, 1)
-        allow = causal.view(1, 1, seq_len, kv_len) & selected
-
-        key = key.repeat_interleave(self.num_kv_groups, dim=1)
-        value = value.repeat_interleave(self.num_kv_groups, dim=1)
-        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scaling
-        attn_weights = attn_weights.masked_fill(~allow, torch.finfo(attn_weights.dtype).min)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-        attn_out = torch.matmul(attn_weights, value).transpose(1, 2).reshape(batch_size, seq_len, -1)
+        indexed_out = cuda_qsa_attention(
+            query, key, value, selected, self.scaling
+        )
+        if indexed_out is None:
+            # Bound fallback workspace by query rows and keep the KV-head axis
+            # explicit. Repeating gathered K/V across every query head allocates
+            # several GiB even at 2K and can OOM before the optional extension is
+            # available.
+            query_rows = max(
+                1,
+                int(os.environ.get("DSV4_QWEN4_QSA_FALLBACK_ROWS", "16")),
+            )
+            key_tokens = key.transpose(1, 2)
+            value_tokens = value.transpose(1, 2)
+            chunks = []
+            for begin in range(0, seq_len, query_rows):
+                end = min(seq_len, begin + query_rows)
+                selected_chunk = selected[:, begin:end]
+                safe_selected = selected_chunk.clamp_min(0).to(torch.long)
+                batch_index = torch.arange(
+                    batch_size, device=hidden_states.device
+                ).view(batch_size, 1, 1).expand_as(safe_selected)
+                gathered_key = key_tokens[batch_index, safe_selected]
+                gathered_value = value_tokens[batch_index, safe_selected]
+                query_chunk = query.transpose(1, 2)[:, begin:end]
+                query_chunk = query_chunk.unflatten(
+                    2,
+                    (self.num_kv_heads, self.num_kv_groups),
+                )
+                scores = torch.einsum(
+                    "bqkgd,bqskd->bqkgs",
+                    query_chunk,
+                    gathered_key,
+                ) * self.scaling
+                scores = scores.masked_fill(
+                    (selected_chunk < 0).unsqueeze(2).unsqueeze(2),
+                    torch.finfo(scores.dtype).min,
+                )
+                probabilities = F.softmax(
+                    scores,
+                    dim=-1,
+                    dtype=torch.float32,
+                ).to(query.dtype)
+                chunk = torch.einsum(
+                    "bqkgs,bqskd->bqkgd",
+                    probabilities,
+                    gathered_value,
+                )
+                chunks.append(
+                    chunk.flatten(2, 3)
+                )
+            indexed_out = torch.cat(chunks, dim=1)
+        attn_out = indexed_out.reshape(batch_size, seq_len, -1)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            after_core = time.perf_counter()
 
         attn_out = attn_out * torch.sigmoid(gate)
-        return F.linear(attn_out, self.o_proj)
+        output = prefill_linear(attn_out, self.o_proj)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            finished = time.perf_counter()
+            self.last_profile = {
+                "indexer": after_indexer - started,
+                "projection": after_projection - after_indexer,
+                "core": after_core - after_projection,
+                "output": finished - after_core,
+            }
+        return output

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # TP4 heterogeneous inference for Qwen3.8-Flash-Next.
 #
-# Dense weights are sharded across the four 2080 Ti cards; the 225 GiB routed
-# experts and 95 GiB PLE table stay in host RAM and are read through the shared
-# page cache, so the four ranks pay for one copy between them.
+# Dense weights are sharded across the four 2080 Ti cards.  Each rank loads its
+# disjoint 56.25 GiB share of the 225 GiB routed experts into host RAM at
+# startup (round-robin by expert id, so the four shards are one full copy); the
+# 95 GiB PLE table stays host-resident through the mapping.
 #
 # Usage: scripts/run_qwen4_exp_tp4.sh [prompt] [max_new_tokens]
 set -euo pipefail
