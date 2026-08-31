@@ -18,6 +18,12 @@ ASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/cann-9.0.0}"
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/ascend_env.sh"
 
+# The nested AscendC ExternalProject builds select a GCC 12 toolchain while this
+# image provides GCC 11's C++ headers. Environment inheritance is the reliable
+# way to make every nested compiler invocation see the installed headers.
+GCC_CXX_INCLUDE="/usr/include/c++/11:/usr/include/aarch64-linux-gnu/c++/11"
+export CPLUS_INCLUDE_PATH="${GCC_CXX_INCLUDE}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+
 cmake -S "${ENGINE_DIR}" -B "${BUILD_DIR}" \
     -DPOCKET_BACKEND=ascend \
     -DASCEND_TOOLKIT_HOME="${ASCEND_TOOLKIT_HOME}"
@@ -29,6 +35,7 @@ cmake --build "${BUILD_DIR}" -j"$(nproc)" --target \
     test_qwen_bf16_checkpoint \
     test_qwen_ascend_norm_gamma \
     test_qwen_ascend_ops \
+    test_qwen_ascend_group_b \
     test_tp_comm_smoke
 
 if [ "${1:-test}" = "build" ]; then
@@ -41,7 +48,8 @@ status=0
 # Single-process tests. Binaries land in different directories depending on
 # whether the target sets RUNTIME_OUTPUT_DIRECTORY, so search rather than assume.
 for name in test_device_runtime test_qwen_config test_qwen_bf16_checkpoint \
-            test_qwen_ascend_norm_gamma test_qwen_ascend_ops; do
+            test_qwen_ascend_norm_gamma test_qwen_ascend_ops \
+            test_qwen_ascend_group_b; do
     binary="$(find "${BUILD_DIR}" -name "${name}" -type f -perm -u+x | head -1)"
     if [ -z "${binary}" ]; then
         echo "build_ascend: ${name} not built"

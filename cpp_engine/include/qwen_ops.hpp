@@ -36,6 +36,17 @@ inline bool qwen_add_inplace_f16(uint16_t* d_y_fp16, const uint16_t* d_x_fp16, i
 #endif
 }
 
+// Greedy row-wise top-1 over FP32 logits. The CUDA symbol is spelled without the
+// qwen_ prefix because it predates the Qwen engine and is shared with the legacy
+// DSV4 path; the neutral name follows this header's convention.
+inline bool qwen_argmax_fp32_rows(const float* d_logits, int* d_tokens, float* d_logits_out, int rows, int count, int token_offset, void* stream = nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_argmax_fp32_rows_ascend(d_logits, d_tokens, d_logits_out, rows, count, token_offset, stream);
+#else
+    return argmax_fp32_rows_cuda(d_logits, d_tokens, d_logits_out, rows, count, token_offset, stream);
+#endif
+}
+
 inline bool qwen_append_kv_cache_f16(const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16, uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len, int kv_heads, int head_dim, int start_pos, int max_context, void* stream = nullptr) {
 #ifdef POCKET_BACKEND_ASCEND
     return qwen_append_kv_cache_f16_ascend(d_k_rows_fp16, d_v_rows_fp16, d_k_cache_fp16, d_v_cache_fp16, seq_len, kv_heads, head_dim, start_pos, max_context, stream);

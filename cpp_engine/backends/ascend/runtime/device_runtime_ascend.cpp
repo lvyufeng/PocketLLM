@@ -77,8 +77,20 @@ aclrtEvent as_event(void* event) {
     return static_cast<aclrtEvent>(event);
 }
 
+// The blocking copy, and the third structural difference from CUDA. Nothing
+// reports an error when this one is missed, which is what makes it expensive.
+//
+// cudaMemcpy is ordered against the null stream: it waits for previously issued
+// work before it touches memory. aclrtMemcpy blocks only the *host* -- it does
+// not join the default stream -- so a read issued straight after a kernel launch
+// returns whatever the buffer held before the kernel ran. Engine code is written
+// to the CUDA contract (launch, then copy the result out) throughout, so the
+// ordering is restored at this one point rather than by auditing every call site.
+// The _async variants keep ACL's semantics untouched, so a caller that manages
+// its own stream ordering pays nothing for this.
 bool copy(void* dst, const void* src, size_t bytes, aclrtMemcpyKind kind) {
     if (bytes == 0) return true;
+    if (aclrtSynchronizeStream(nullptr) != ACL_SUCCESS) return false;
     return aclrtMemcpy(dst, bytes, src, bytes, kind) == ACL_SUCCESS;
 }
 
@@ -211,6 +223,8 @@ namespace {
 bool copy_2d(void* dst, size_t dst_pitch, const void* src, size_t src_pitch,
              size_t width, size_t height, aclrtMemcpyKind kind) {
     if (width == 0 || height == 0) return true;
+    // Stream-ordered for the same reason `copy` above is; see the note there.
+    if (aclrtSynchronizeStream(nullptr) != ACL_SUCCESS) return false;
     return aclrtMemcpy2d(dst, dst_pitch, src, src_pitch, width, height, kind) ==
            ACL_SUCCESS;
 }
@@ -249,6 +263,9 @@ bool memcpy_2d_d2h(void* dst, size_t dst_pitch, const void* src, size_t src_pitc
 
 bool device_memset(void* dst, int value, size_t bytes) {
     if (bytes == 0) return true;
+    // cudaMemset is ordered against the null stream, so a caller may legitimately
+    // clear a buffer that queued work still reads. Same fence as `copy`.
+    if (aclrtSynchronizeStream(nullptr) != ACL_SUCCESS) return false;
     return aclrtMemset(dst, bytes, value, bytes) == ACL_SUCCESS;
 }
 

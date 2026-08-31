@@ -23,6 +23,12 @@ namespace dsv4 {
 
 bool qwen_add_inplace_f16_ascend(uint16_t* d_y_fp16, const uint16_t* d_x_fp16, int count, void* stream);
 
+// Row-wise greedy top-1. Named for Qwen like the rest of this header even though
+// the CUDA counterpart lives in cuda_ops.hpp as argmax_fp32_rows_cuda: the neutral
+// forwarder in qwen_ops.hpp is what the engine calls, and it keeps the argmax with
+// the operators the Qwen forward actually uses.
+bool qwen_argmax_fp32_rows_ascend(const float* d_logits, int* d_tokens, float* d_logits_out, int rows, int count, int token_offset, void* stream);
+
 bool qwen_append_kv_cache_f16_ascend(const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16, uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len, int kv_heads, int head_dim, int start_pos, int max_context, void* stream);
 
 bool qwen_causal_depthwise_conv_silu_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16, uint16_t* d_tail_fp16, uint16_t* d_y_fp16, int seq_len, int channels, int kernel, bool update_tail, void* stream);
