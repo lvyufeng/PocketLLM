@@ -201,10 +201,55 @@ class Qwen4ExpTextConfig:
         return cls(**kwargs)
 
 
+@dataclass(frozen=True)
+class FP8QuantSpec:
+    """Block-scaled FP8 weight layout declared by `quantization_config`.
+
+    The Flash-Next FP8 build quantizes only the routed experts and the PLE
+    n-gram table; everything listed in `modules_to_not_convert` (943 entries:
+    dense projections, norms, the router, lm_head, embeddings) stays BF16.  Two
+    scale granularities appear:
+
+    * routed experts — one `weight_scale_inv` per `block_size` tile, stored as
+      `[ceil(out/128), ceil(in/128)]` BF16.
+    * PLE n-gram table — a single scalar `weight_scale` shared by all 128 shards.
+
+    Both are *multipliers*: `value = code.to(f32) * scale`.
+    """
+
+    method: str = "fp8"
+    activation_scheme: str = "dynamic"
+    block_size: tuple[int, int] = (128, 128)
+    weight_per_tensor: bool = False
+    skip_modules: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, raw: dict | None) -> "FP8QuantSpec | None":
+        if not raw or str(raw.get("quant_method", "")).lower() != "fp8":
+            return None
+        block = raw.get("weight_block_size") or [128, 128]
+        return cls(
+            method="fp8",
+            activation_scheme=str(raw.get("activation_scheme", "dynamic")),
+            block_size=(int(block[0]), int(block[1])),
+            weight_per_tensor=bool(raw.get("weight_per_tensor", False)),
+            skip_modules=tuple(raw.get("modules_to_not_convert") or ()),
+        )
+
+    def skips(self, name: str) -> bool:
+        """True when `name` is excluded from quantization by the config."""
+        stripped = name[: -len(".weight")] if name.endswith(".weight") else name
+        return stripped in self.skip_modules
+
+
 @dataclass
 class Qwen4ExpConfig:
     text_config: Qwen4ExpTextConfig
     architecture: str = "qwen4_exp"
+    # Quantization metadata lives at the root of the multimodal config, not in
+    # `text_config`.  Keep it optional so the original BF16 checkpoint follows
+    # the unchanged path.
+    quantization: dict | None = None
     image_token_id: int | None = None
     video_token_id: int | None = None
     vision_start_token_id: int | None = None
@@ -218,6 +263,7 @@ class Qwen4ExpConfig:
         return cls(
             text_config=Qwen4ExpTextConfig.from_dict(text_raw),
             architecture=(raw.get("architectures") or ["qwen4_exp"])[0],
+            quantization=raw.get("quantization_config"),
             image_token_id=raw.get("image_token_id"),
             video_token_id=raw.get("video_token_id"),
             vision_start_token_id=raw.get("vision_start_token_id"),
@@ -230,3 +276,19 @@ class Qwen4ExpConfig:
     def from_pretrained(cls, model_dir: str) -> "Qwen4ExpConfig":
         with open(os.path.join(model_dir, "config.json")) as f:
             return cls.from_dict(json.load(f))
+
+    @property
+    def fp8(self) -> FP8QuantSpec | None:
+        """FP8 layout spec, or None for an unquantized checkpoint."""
+        return FP8QuantSpec.from_dict(self.quantization)
+
+    @property
+    def is_fp8(self) -> bool:
+        """Whether the root config declares block-scaled FP8 weights."""
+        return self.fp8 is not None
+
+    @property
+    def weight_block_size(self) -> tuple[int, int]:
+        """Block geometry used by FP8 weights (128x128 by default)."""
+        spec = self.fp8
+        return spec.block_size if spec is not None else (128, 128)

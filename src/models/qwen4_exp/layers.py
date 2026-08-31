@@ -46,17 +46,30 @@ def _dense_fp16_fp32_output_enabled(rows: int) -> bool:
     )
 
 
+def dequant_fp8_block(
+    codes: torch.Tensor,
+    scale: torch.Tensor,
+    block: tuple[int, int] = (128, 128),
+    out_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Reference dequantization for a block-scaled FP8 matrix."""
+    from src.models.qwen4_exp.quant import dequantize_block_fp8
+
+    return dequantize_block_fp8(codes, scale, block, out_dtype)
+
+
 def _fp16_fp32_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
+    """FP16 tensor-core GEMM with an FP32 accumulator and input dtype output."""
     flat = x.reshape(-1, x.shape[-1]).to(torch.float16)
     output = torch.mm(
         flat,
         weight.to(torch.float16).t(),
         out_dtype=torch.float32,
     )
-    return output.to(torch.bfloat16).reshape(
+    return output.to(x.dtype).reshape(
         *x.shape[:-1],
         weight.shape[0],
     )
@@ -66,21 +79,35 @@ def prefill_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
 ) -> torch.Tensor:
-    """Use optional SM75 tensor-core GEMM for large BF16 projections."""
+    """Use tensor-core GEMM for BF16 projections, including explicit FP16 mode.
+
+    The environment gates are an optimization for BF16 checkpoints.  When the
+    whole model was deliberately loaded as FP16, matching FP16 inputs/weights
+    are already the native SM75 fast path and must not be cast back to BF16.
+    """
     rows = x.numel() // x.shape[-1]
-    supported = (
+    same_device = weight.device == x.device
+    native_fp16 = (
+        x.device.type == "cuda"
+        and x.dtype is torch.float16
+        and weight.dtype is torch.float16
+        and same_device
+    )
+    if native_fp16:
+        if _dense_fp16_fp32_output_enabled(rows):
+            return _fp16_fp32_linear(x, weight)
+        return F.linear(x, weight)
+
+    supported_bf16 = (
         x.device.type == "cuda"
         and x.dtype is torch.bfloat16
-        and weight.device == x.device
         and weight.dtype is torch.bfloat16
+        and same_device
     )
-    if supported and _dense_fp16_fp32_output_enabled(rows):
+    if supported_bf16 and _dense_fp16_fp32_output_enabled(rows):
         return _fp16_fp32_linear(x, weight)
-    if supported and _dense_fp16_enabled(rows):
-        return F.linear(
-            x.to(torch.float16),
-            weight.to(torch.float16),
-        ).to(torch.bfloat16)
+    if supported_bf16 and _dense_fp16_enabled(rows):
+        return F.linear(x.to(torch.float16), weight.to(torch.float16)).to(torch.bfloat16)
     return F.linear(x, weight)
 
 

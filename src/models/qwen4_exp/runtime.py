@@ -220,6 +220,7 @@ def load_model(
         started = time.perf_counter()
         shard = checkpoint.preload_experts(
             config.text_config.num_hidden_layers,
+            num_experts=config.text_config.num_experts,
             rank=ctx.rank,
             world_size=ctx.world_size,
             pin=pin_experts,

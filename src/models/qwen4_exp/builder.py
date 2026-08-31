@@ -168,7 +168,12 @@ def build_from_state_dict(
             shards = [state_dict[table_key]] if table_key in state_dict else _gather_shards(
                 state_dict, f"{prefix}.layers.{layer_idx}.ple.ple_embedding.ngram_embedding"
             )
-            table = HostNGramTable(shards, device=device, dtype=dtype)
+            ple_scale = (
+                state_dict.get(f"{prefix}.layers.{layer_idx}.ple.ple_embedding.ngram_embedding.weight_scale")
+                if hasattr(state_dict, "get")
+                else None
+            )
+            table = HostNGramTable(shards, device=device, dtype=dtype, scale=ple_scale)
             ple = PLELayer(
                 config,
                 _ple_weights(getter, layer_idx, prefix=prefix),
@@ -387,7 +392,10 @@ def build_heterogeneous(
         if ple_index is not None:
             shard_keys = checkpoint.ngram_shard_keys(layer_idx)
             table = HostNGramTable(
-                [store.view(k) for k in shard_keys], device=device, dtype=dtype
+                [store.view(k) for k in shard_keys],
+                device=device,
+                dtype=dtype,
+                scale=checkpoint.ngram_scale(layer_idx),
             )
             ple = PLELayer(
                 config,
