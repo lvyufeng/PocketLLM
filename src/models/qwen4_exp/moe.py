@@ -10,6 +10,10 @@ Two implementations share one interface:
   decode step touches at most `top_k` experts per layer (6.6 MiB each in BF16).
   The reader normally serves those rows from this rank's resident host shard (see
   `weights.HostExpertShard`); the mmap is only the fallback.
+
+When the reader is FP8 it hands back `FP8Tensor`s instead of plain tensors.  Only
+the codes and their 128x128 block scales cross PCIe — half the bytes of BF16 —
+and the dequantization happens on the device right before the GEMM.
 """
 
 from __future__ import annotations
@@ -23,12 +27,13 @@ import torch
 
 from src.kernels.cuda_loader import load_cuda_kernel
 from src.models.qwen4_exp.layers import swiglu_expert
+from src.models.qwen4_exp.quant import FP8Tensor
 
 
 @dataclass
 class _PendingExpert:
-    gate_up: torch.Tensor
-    down: torch.Tensor
+    gate_up: torch.Tensor | FP8Tensor
+    down: torch.Tensor | FP8Tensor
     ready: torch.cuda.Event | None
 
 
@@ -44,6 +49,23 @@ class MoEBackend(Protocol):
         ...
 
 
+def _expert_matrix(
+    weight,
+    compute_dtype: torch.dtype | None,
+    default_dtype: torch.dtype,
+) -> torch.Tensor:
+    """One expert projection as a GEMM-ready dense matrix.
+
+    An `FP8Tensor` is dequantized here, at the last moment before the GEMM, so
+    only the codes and scales occupy device memory and cross PCIe.
+    """
+    if isinstance(weight, FP8Tensor):
+        return weight.dequantize(compute_dtype or default_dtype)
+    if compute_dtype is not None:
+        return weight.to(compute_dtype)
+    return weight
+
+
 def _dispatch_experts(
     hidden_states: torch.Tensor,
     indices: torch.Tensor,
@@ -56,9 +78,10 @@ def _dispatch_experts(
 ) -> torch.Tensor:
     """Group tokens by expert, run each expert once, scatter-add the results.
 
-    `expert_weights(expert_id)` returns `(gate_up, down)` on the compute device.
-    Experts are visited in ascending id so the accumulation order is fixed and
-    the result is run-to-run reproducible.
+    `expert_weights(expert_id)` returns `(gate_up, down)` on the compute device,
+    either as dense tensors or as `FP8Tensor`s.  Experts are visited in ascending
+    id so the accumulation order is fixed and the result is run-to-run
+    reproducible.
 
     When `stats` is given, per-phase wall time is accumulated into it.  The
     timing path synchronizes and is meant for profiling runs only.
@@ -87,8 +110,8 @@ def _dispatch_experts(
             expert_input = hidden_states[token_idx]
             if compute_dtype is not None:
                 expert_input = expert_input.to(compute_dtype)
-                gate_up = gate_up.to(compute_dtype)
-                down = down.to(compute_dtype)
+            gate_up = _expert_matrix(gate_up, compute_dtype, expert_input.dtype)
+            down = _expert_matrix(down, compute_dtype, expert_input.dtype)
             contrib = swiglu_expert(expert_input, gate_up, down)
             contrib = contrib * weights[token_idx, k_idx].unsqueeze(-1).to(contrib.dtype)
             out.index_add_(0, token_idx, contrib.to(out.dtype))
@@ -118,8 +141,8 @@ def _dispatch_experts(
         expert_input = hidden_states[token_idx]
         if compute_dtype is not None:
             expert_input = expert_input.to(compute_dtype)
-            gate_up = gate_up.to(compute_dtype)
-            down = down.to(compute_dtype)
+        gate_up = _expert_matrix(gate_up, compute_dtype, expert_input.dtype)
+        down = _expert_matrix(down, compute_dtype, expert_input.dtype)
         contrib = swiglu_expert(expert_input, gate_up, down)
         contrib = contrib * weights[token_idx, k_idx].unsqueeze(-1).to(contrib.dtype)
         out.index_add_(0, token_idx, contrib.to(out.dtype))
@@ -182,7 +205,7 @@ class HostExpertMoE:
         self.device = device
         self.dtype = dtype
         self.cache_capacity = cache_capacity
-        self._cache: OrderedDict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._cache: OrderedDict[tuple[int, int], tuple[torch.Tensor | FP8Tensor, torch.Tensor | FP8Tensor]] = OrderedDict()
         self.stage_bytes = 0
         self.stage_calls = 0
         self.cache_hits = 0
@@ -221,18 +244,47 @@ class HostExpertMoE:
             self.cache_hits += 1
         return hit
 
-    def _fetch(self, layer_idx: int, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _stage_weight(weight, device: torch.device, dtype: torch.dtype):
+        if isinstance(weight, FP8Tensor):
+            return weight.to(device, non_blocking=True)
+        return weight.to(device, dtype=dtype, non_blocking=True)
+
+    @staticmethod
+    def _weight_nbytes(weight) -> int:
+        return weight.nbytes() if isinstance(weight, FP8Tensor) else weight.numel() * weight.element_size()
+
+    @staticmethod
+    def _record_stream(weight, stream) -> None:
+        if isinstance(weight, FP8Tensor):
+            weight.code.record_stream(stream)
+            weight.scale.record_stream(stream)
+        else:
+            weight.record_stream(stream)
+
+    def _fetch(self, layer_idx: int, expert_id: int):
         key = (layer_idx, expert_id)
         hit = self._cache_get(key)
         if hit is not None:
             return hit
         gate_up_cpu, down_cpu = self.reader.expert_rows(layer_idx, expert_id)
-        gate_up = gate_up_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
-        down = down_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
-        self.stage_bytes += gate_up.numel() * gate_up.element_size() + down.numel() * down.element_size()
+        gate_up = self._stage_weight(gate_up_cpu, self.device, self.dtype)
+        down = self._stage_weight(down_cpu, self.device, self.dtype)
+        self.stage_bytes += self._weight_nbytes(gate_up) + self._weight_nbytes(down)
         self.stage_calls += 1
         self._cache_put(key, (gate_up, down))
         return gate_up, down
+
+    def _dequantized_layer_tensors(self, layer_idx: int):
+        """Return a dense local layer only when a grouped path can consume it."""
+        tensors = self.reader.expert_shard.layer_tensors(layer_idx)
+        if isinstance(tensors[0], FP8Tensor):
+            return None
+        return tensors
+
+    def _cache_clear(self) -> None:
+        self._cache.clear()
+
 
     def _grouped_bf16(self, layer_idx: int, hidden_states, indices, weights):
         """Run a dense-local-expert BF16 grouped prefill, or return None."""
@@ -254,7 +306,10 @@ class HostExpertMoE:
         ):
             return None
 
-        gate_up_cpu, down_cpu = shard.layer_tensors(layer_idx)
+        layer_tensors = self._dequantized_layer_tensors(layer_idx)
+        if layer_tensors is None:
+            return None
+        gate_up_cpu, down_cpu = layer_tensors
         layer_bytes = (
             gate_up_cpu.numel() * gate_up_cpu.element_size()
             + down_cpu.numel() * down_cpu.element_size()
@@ -316,14 +371,14 @@ class HostExpertMoE:
             self._copy_stream = torch.cuda.Stream(device=self.device)
         current = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self._copy_stream):
-            gate_up = gate_up_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
-            down = down_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
+            gate_up = self._stage_weight(gate_up_cpu, self.device, self.dtype)
+            down = self._stage_weight(down_cpu, self.device, self.dtype)
             ready = torch.cuda.Event()
             ready.record(self._copy_stream)
         current.wait_event(ready)
-        gate_up.record_stream(current)
-        down.record_stream(current)
-        self.stage_bytes += gate_up.numel() * gate_up.element_size() + down.numel() * down.element_size()
+        self._record_stream(gate_up, current)
+        self._record_stream(down, current)
+        self.stage_bytes += self._weight_nbytes(gate_up) + self._weight_nbytes(down)
         self.stage_calls += 1
         return self._cuda_ext.qwen4_exp_moe_prefill_bf16_forward(
             hidden_states.contiguous(),
@@ -336,7 +391,12 @@ class HostExpertMoE:
         )
 
     def _prefetch(self, layer_idx: int, expert_ids: list[int]):
-        """Stage one layer's active experts on a copy stream in expert-id order."""
+        """Stage one layer's active experts on a copy stream in expert-id order.
+
+        FP8 entries are cached as code/scale pairs; dequantization is performed
+        after the copy-stream event and immediately before their GEMM in the
+        dispatch loop.  This preserves the FP8 residency advantage.
+        """
         if self._copy_stream is None:
             self._copy_stream = torch.cuda.Stream(device=self.device)
         current = torch.cuda.current_stream(self.device)
@@ -349,12 +409,12 @@ class HostExpertMoE:
                     pending.append(_PendingExpert(hit[0], hit[1], None))
                     continue
                 gate_up_cpu, down_cpu = self.reader.expert_rows(layer_idx, expert_id)
-                gate_up = gate_up_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
-                down = down_cpu.to(self.device, dtype=self.dtype, non_blocking=True)
+                gate_up = self._stage_weight(gate_up_cpu, self.device, self.dtype)
+                down = self._stage_weight(down_cpu, self.device, self.dtype)
                 event = torch.cuda.Event()
                 event.record(self._copy_stream)
                 pending.append(_PendingExpert(gate_up, down, event))
-                self.stage_bytes += gate_up.numel() * gate_up.element_size() + down.numel() * down.element_size()
+                self.stage_bytes += self._weight_nbytes(gate_up) + self._weight_nbytes(down)
                 self.stage_calls += 1
                 self._cache_put(key, (gate_up, down))
 
@@ -362,8 +422,8 @@ class HostExpertMoE:
             for item in pending:
                 if item.ready is not None:
                     current.wait_event(item.ready)
-                item.gate_up.record_stream(current)
-                item.down.record_stream(current)
+                self._record_stream(item.gate_up, current)
+                self._record_stream(item.down, current)
                 yield item.gate_up, item.down
 
         return consume()
