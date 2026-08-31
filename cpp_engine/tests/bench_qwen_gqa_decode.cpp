@@ -106,7 +106,8 @@ void run_fused(void* raw) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // Real TP4 rank shape unless overridden.
+    // Real six-Q-heads-per-KV-group shape unless overridden. TP4 uses 6/1;
+    // TP2 uses 12/2 with the same per-group kernel geometry.
     const int q_heads = argc > 1 ? std::atoi(argv[1]) : 6;
     const int kv_heads = argc > 2 ? std::atoi(argv[2]) : 1;
     const int head_dim = argc > 3 ? std::atoi(argv[3]) : 256;
@@ -139,10 +140,14 @@ int main(int argc, char** argv) {
     // Large enough for either layout: q_heads*context for the reference path,
     // q_heads*splits*(head_dim+2) for the fused one. The split count is tunable,
     // so ask the kernel rather than assuming it.
+    const bool tensor_core_shape =
+        q_heads == kv_heads * 6 && head_dim == 256;
     const size_t scratch_elements =
         static_cast<size_t>(q_heads) * max_context +
         static_cast<size_t>(q_heads) *
-            dsv4::qwen_gqa_decode_split_count(max_context) * (head_dim + 2);
+            dsv4::qwen_gqa_decode_split_count(
+                max_context, kv_heads, tensor_core_shape) *
+            (head_dim + 2);
     check(cudaMalloc(&scratch, scratch_elements * sizeof(float)), "malloc scratch");
     check(cudaMemcpy(q, host_q.data(), host_q.size() * sizeof(uint16_t),
                      cudaMemcpyHostToDevice), "copy q");

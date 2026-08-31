@@ -98,11 +98,17 @@ int decode_sm_count() {
 }
 
 // The tensor-core split kernel reassociates both dot products, so it is not
-// bit-identical to the scalar kernel. Keep short contexts on the established
-// exact path by default, where its measured gain is small and near ties are more
-// visible; select the candidate automatically once the scan is long enough to
-// matter. `=1` forces it at every context for A/B, while `=0` forces scalar.
-constexpr int kDecodeMmaDefaultMinContext = 16384;
+// bit-identical to the scalar kernel. Its gain used to be small at short context,
+// where near ties are more visible, so the default kept those on the exact path.
+// Raising the CTA occupancy to three per SM removed that trade: the candidate now
+// wins from the minimum context the fused path accepts. Full-network TP2 decode
+// at 8192 and TG128, serial fresh processes, three repetitions each:
+//
+//   scalar   29.5123  29.3403  29.2454
+//   candidate 30.6626  30.4263  30.3284
+//
+// `=1` forces it at every context for A/B, while `=0` forces scalar.
+constexpr int kDecodeMmaDefaultMinContext = 0;
 bool decode_mma_enabled(int attended_positions) {
     static const int mode = [] {
         const char* env = std::getenv("DSV4_QWEN_DECODE_MMA");
@@ -159,13 +165,25 @@ int decode_target_splits(int attended_positions, bool mma) {
         //     32768   0.1742     0.1107  0.1024    0.0986  0.1194 0.1142 0.1362
         //     65536   0.3149     0.2052  0.1832    0.1784  0.1999 0.1939 0.2239
         //
-        // Long contexts want both waves because the slice is long enough to
-        // amortise the per-CTA partial write; short ones do not. The split at
-        // 16384 takes the better column on both sides. Anything that is not a
-        // whole wave (119, 153, 170) is strictly worse than the wave below it.
+        // Cutting the shared footprint to 18632 bytes raised the CTA occupancy
+        // from two to three per SM, which moved the optimum. Re-measured at the
+        // TP4 shape, fused milliseconds, medians of the second and third
+        // repetitions:
+        //
+        //   context   scalar   68 (1 wave)  136 (2)   204 (3)   272 (4)
+        //      4096   0.2728      0.0598     0.0413    0.0413    0.0412
+        //      8192   0.8359      0.0889     0.0633    0.0633    0.0633
+        //     16384   1.6727      0.0550     0.0546    0.0629    0.0699
+        //     32768   3.3562      0.0973     0.0904    0.1009    0.1088
+        //     65536   6.7720      0.1788     0.1589    0.1648    0.1822
+        //
+        // Two waves now win at every context, so the short-context exception
+        // that the one-CTA geometry needed is gone. Past two waves the per-CTA
+        // partial write stops being amortised and the long contexts regress.
+        // The TP2 shape agrees: with 68 splits per KV group, 65536 costs
+        // 0.2844 ms against 0.3204 ms for twice as many.
         if (override_value <= 0) {
-            const int per_sm = attended_positions < kDecodeShortContext ? 1 : 2;
-            return decode_sm_count() * per_sm;
+            return decode_sm_count() * 2;
         }
     }
     if (override_value > 0) return override_value;
@@ -1752,8 +1770,8 @@ __global__ void gqa_decode_split_f16_kernel(
     }
 }
 
-// The real TP4 decode shape has six Q rows sharing one KV head. This candidate
-// maps those rows to the M dimension of SM75's m16n8k8 instruction, padding ten
+// The decode tensor-core shape has six Q rows sharing each KV head. This candidate
+// maps one group to the M dimension of SM75's m16n8k8 instruction, padding ten
 // inactive rows, and maps four warps to four eight-position N tiles. The same
 // 32-position tile is then used for P*V. Unlike the scalar split kernel, a CTA
 // scans a longer slice and performs the two 256-wide products on tensor cores.
@@ -1761,21 +1779,39 @@ __global__ void gqa_decode_split_f16_kernel(
 // rounded to half before P*V, matching the proven prefill MMA path. Consequently
 // this is numerically close rather than bit-identical and is opt-in.
 constexpr int kDecodeMmaThreads = 128;
-constexpr int kDecodeMmaWarps = kDecodeMmaThreads / 32;
 constexpr int kDecodeMmaRows = 16;
 constexpr int kDecodeMmaValidRows = 6;
+// The tile stays at 32 positions. Halving it to 16 cuts shared memory to 9864
+// bytes but the CTA still needs 133 registers, so 4 * 128 * 133 = 68096 exceeds
+// the 65536-register file and occupancy stays at three CTAs per SM either way.
+// The same register wall blocks `__launch_bounds__(128, 4)`: capping registers at
+// 128 fits the file but 4 * 18632 bytes of shared memory does not, and the
+// microbenchmark confirmed no change (65536: 0.3068 ms against 0.3066 ms).
 constexpr int kDecodeMmaKvTile = 32;
 constexpr int kDecodeMmaDim = 256;
 constexpr int kDecodeMmaSteps = kDecodeMmaDim / 8;
 constexpr int kDecodeMmaKsStride = kDecodeMmaDim + 8;
 constexpr int kDecodeMmaVtStride = kDecodeMmaKvTile + 2;
 
-__global__ __launch_bounds__(kDecodeMmaThreads, 1)
+// Six valid rows all fall in the first half of the MMA M dimension, so the
+// second row a lane owns (`gid + 8`) is never active at this shape. Only the
+// first half of every accumulator fragment is therefore consumed, and the
+// per-lane output set is small enough to live in registers.
+static_assert(kDecodeMmaValidRows <= 8,
+              "the decode MMA epilogue assumes the padded row half is inactive");
+
+// Shared memory is what limits this kernel's occupancy: the register budget
+// admits four CTAs per SM but every byte above 21845 costs a resident CTA. So
+// the score and probability tiles are cut to the valid rows and the output
+// accumulator is held in registers, where each element already had exactly one
+// writer.
+__global__ __launch_bounds__(kDecodeMmaThreads, 3)
 void gqa_decode_split_mma_f16_kernel(
     const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ k_cache,
     const uint16_t* __restrict__ v_cache,
     float* __restrict__ partial_output,
+    int kv_groups,
     int context_len,
     int splits,
     int positions_per_split) {
@@ -1785,12 +1821,11 @@ void gqa_decode_split_mma_f16_kernel(
         reinterpret_cast<uint16_t (*)[kDecodeMmaKsStride]>(kv_stage);
     uint16_t (*vt)[kDecodeMmaVtStride] =
         reinterpret_cast<uint16_t (*)[kDecodeMmaVtStride]>(kv_stage);
-    __shared__ float scores[kDecodeMmaRows][kDecodeMmaKvTile];
-    __shared__ uint16_t probability[kDecodeMmaRows][kDecodeMmaKvTile];
+    __shared__ float scores[kDecodeMmaValidRows][kDecodeMmaKvTile];
+    __shared__ uint16_t probability[kDecodeMmaValidRows][kDecodeMmaKvTile];
     __shared__ float running_max[kDecodeMmaValidRows];
     __shared__ float running_sum[kDecodeMmaValidRows];
     __shared__ float rescale[kDecodeMmaValidRows];
-    __shared__ float accumulator[kDecodeMmaValidRows][kDecodeMmaDim];
 
     const int tid = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
@@ -1800,13 +1835,25 @@ void gqa_decode_split_mma_f16_kernel(
     const int lrow0 = gid;
     const int lrow1 = gid + 8;
     const int split = static_cast<int>(blockIdx.x);
+    const int kv_group = static_cast<int>(blockIdx.y);
+    if (kv_group >= kv_groups) return;
+    const size_t q_offset =
+        static_cast<size_t>(kv_group) * kDecodeMmaValidRows * kDecodeMmaDim;
+    const size_t kv_offset = static_cast<size_t>(kv_group) * kDecodeMmaDim;
+    const size_t partial_group_offset =
+        static_cast<size_t>(kv_group) * kDecodeMmaValidRows * splits *
+        (kDecodeMmaDim + 2);
     const int start = split * positions_per_split;
     const int end = min(context_len, start + positions_per_split);
 
-    for (int index = tid;
-         index < kDecodeMmaValidRows * kDecodeMmaDim;
-         index += kDecodeMmaThreads) {
-        accumulator[index / kDecodeMmaDim][index % kDecodeMmaDim] = 0.0f;
+    // The eight P*V fragments a lane accumulates. Lane `lane` owns row `gid` and
+    // channels `slice * 64 + j * 8 + tig * 2` for j in [0, 8), which is a
+    // disjoint set across the CTA.
+    float accumulator[8][2];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        accumulator[j][0] = 0.0f;
+        accumulator[j][1] = 0.0f;
     }
     if (tid < kDecodeMmaValidRows) {
         running_max[tid] = -INFINITY;
@@ -1825,11 +1872,11 @@ void gqa_decode_split_mma_f16_kernel(
         uint32_t first = 0u;
         uint32_t second = 0u;
         if (lrow0 < kDecodeMmaValidRows) {
-            first = *reinterpret_cast<const uint32_t*>(q +
+            first = *reinterpret_cast<const uint32_t*>(q + q_offset +
                 static_cast<size_t>(lrow0) * kDecodeMmaDim + col);
         }
         if (lrow1 < kDecodeMmaValidRows) {
-            second = *reinterpret_cast<const uint32_t*>(q +
+            second = *reinterpret_cast<const uint32_t*>(q + q_offset +
                 static_cast<size_t>(lrow1) * kDecodeMmaDim + col);
         }
         qfrag[k][0] = first;
@@ -1848,7 +1895,8 @@ void gqa_decode_split_mma_f16_kernel(
             uint4 key = make_uint4(0u, 0u, 0u, 0u);
             if (slot < count) {
                 key = *reinterpret_cast<const uint4*>(k_cache +
-                    static_cast<size_t>(base + slot) * kv_stride + chunk * 8);
+                    static_cast<size_t>(base + slot) * kv_groups * kv_stride +
+                    kv_offset + chunk * 8);
             }
             *reinterpret_cast<uint4*>(&ks[slot][chunk * 8]) = key;
         }
@@ -1886,8 +1934,10 @@ void gqa_decode_split_mma_f16_kernel(
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int col = col0 + i;
-                const float value = col < count
-                    ? scores[row][col] * attention_scale : -INFINITY;
+                const float value = valid_row && col < count
+                    ? scores[row < kDecodeMmaValidRows ? row : 0][col] *
+                          attention_scale
+                    : -INFINITY;
                 values[i] = value;
                 local_max = fmaxf(local_max, value);
             }
@@ -1905,7 +1955,9 @@ void gqa_decode_split_mma_f16_kernel(
                     bits = float_to_half(expf(values[i] - new_max));
                     local_sum += half_to_float(bits);
                 }
-                probability[row][col0 + i] = bits;
+                if (valid_row) {
+                    probability[row][col0 + i] = bits;
+                }
             }
 #pragma unroll
             for (int offset = 1; offset < 8; offset <<= 1) {
@@ -1931,7 +1983,8 @@ void gqa_decode_split_mma_f16_kernel(
             uint4 value = make_uint4(0u, 0u, 0u, 0u);
             if (slot < count) {
                 value = *reinterpret_cast<const uint4*>(v_cache +
-                    static_cast<size_t>(base + slot) * kv_stride + chunk * 8);
+                    static_cast<size_t>(base + slot) * kv_groups * kv_stride +
+                    kv_offset + chunk * 8);
             }
             const uint16_t* source = reinterpret_cast<const uint16_t*>(&value);
 #pragma unroll
@@ -1953,32 +2006,23 @@ void gqa_decode_split_mma_f16_kernel(
             float value_fragment[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int kt = 0; kt < kDecodeMmaKvTile / 8; ++kt) {
+                // The second row half is inactive, so its A fragment stays zero
+                // and is never read out of the six-row probability tile.
                 uint32_t a[2] = {0u, 0u};
                 if (lrow0 < kDecodeMmaValidRows) {
                     a[0] = *reinterpret_cast<const uint32_t*>(
                         &probability[lrow0][kt * 8 + tig * 2]);
-                }
-                if (lrow1 < kDecodeMmaValidRows) {
-                    a[1] = *reinterpret_cast<const uint32_t*>(
-                        &probability[lrow1][kt * 8 + tig * 2]);
                 }
                 const uint32_t b = *reinterpret_cast<const uint32_t*>(
                     &vt[channel + gid][kt * 8 + tig * 2]);
                 mma_m16n8k8_f16_f32(value_fragment, a, b);
             }
             if (lrow0 < kDecodeMmaValidRows) {
-                const int d0 = channel + tig * 2;
-                accumulator[lrow0][d0] =
-                    accumulator[lrow0][d0] * rescale[lrow0] + value_fragment[0];
-                accumulator[lrow0][d0 + 1] =
-                    accumulator[lrow0][d0 + 1] * rescale[lrow0] + value_fragment[1];
-            }
-            if (lrow1 < kDecodeMmaValidRows) {
-                const int d1 = channel + tig * 2;
-                accumulator[lrow1][d1] =
-                    accumulator[lrow1][d1] * rescale[lrow1] + value_fragment[2];
-                accumulator[lrow1][d1 + 1] =
-                    accumulator[lrow1][d1 + 1] * rescale[lrow1] + value_fragment[3];
+                const float row_rescale = rescale[lrow0];
+                accumulator[j][0] =
+                    accumulator[j][0] * row_rescale + value_fragment[0];
+                accumulator[j][1] =
+                    accumulator[j][1] * row_rescale + value_fragment[1];
             }
         }
         __syncthreads();
@@ -1986,18 +2030,20 @@ void gqa_decode_split_mma_f16_kernel(
 
     const int partial_stride = kDecodeMmaDim + 2;
     if (tid < kDecodeMmaValidRows) {
-        float* destination = partial_output +
+        float* destination = partial_output + partial_group_offset +
             (static_cast<size_t>(tid) * splits + split) * partial_stride;
         destination[0] = running_max[tid];
         destination[1] = running_sum[tid];
     }
-    for (int index = tid;
-         index < kDecodeMmaValidRows * kDecodeMmaDim;
-         index += kDecodeMmaThreads) {
-        const int head = index / kDecodeMmaDim;
-        const int d = index - head * kDecodeMmaDim;
-        partial_output[(static_cast<size_t>(head) * splits + split) *
-                           partial_stride + 2 + d] = accumulator[head][d];
+    if (lrow0 < kDecodeMmaValidRows) {
+        float* destination = partial_output + partial_group_offset +
+            (static_cast<size_t>(lrow0) * splits + split) * partial_stride + 2;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int d0 = warp * 64 + j * 8 + tig * 2;
+            *reinterpret_cast<float2*>(destination + d0) =
+                make_float2(accumulator[j][0], accumulator[j][1]);
+        }
     }
 }
 
@@ -2425,16 +2471,25 @@ bool valid_shape(int q_heads, int kv_heads, int head_dim) {
 }
 
 // Never splits finer than one position per split, so short contexts fall back to
-// however many splits they can actually fill.
+// however many splits they can actually fill. The automatic tensor-core target
+// is expressed as a total grid size: one CTA covers one KV head, so divide that
+// target across KV heads instead of launching an extra full wave for every head.
+// The MMA-specific environment override and the explicit test override remain
+// per KV head for reproducible A/B sweeps.
 int decode_split_count_for_variant(int attended_positions, bool mma,
-                                    int split_count_override) {
+                                    int split_count_override, int kv_heads = 1) {
     if (attended_positions <= 0) return 1;
     const int forced = decode_forced_positions();
+    const int total_target = decode_target_splits(attended_positions, mma);
+    const int mma_override = mma ? decode_mma_target_splits() : 0;
+    const int shape_target = mma && mma_override <= 0
+        ? (total_target + std::max(kv_heads, 1) - 1) / std::max(kv_heads, 1)
+        : total_target;
     const int requested = split_count_override > 0
         ? split_count_override
         : forced > 0
             ? (attended_positions + forced - 1) / forced
-            : std::min(decode_target_splits(attended_positions, mma), attended_positions);
+            : std::min(shape_target, attended_positions);
     const int splits = std::max(std::min(decode_max_splits(), requested), 1);
     // Correctness tests may deliberately preserve an oversized split count to
     // exercise the neutral partial written by an empty CTA. Production geometry
@@ -2449,9 +2504,11 @@ int decode_split_count_for_variant(int attended_positions, bool mma,
     return std::max((attended_positions + positions - 1) / positions, 1);
 }
 
-int decode_split_count(int attended_positions) {
+int decode_split_count(int attended_positions, int kv_heads,
+                       bool tensor_core_shape) {
+    const bool mma = tensor_core_shape && decode_mma_enabled(attended_positions);
     return decode_split_count_for_variant(
-        attended_positions, decode_mma_enabled(attended_positions), 0);
+        attended_positions, mma, 0, kv_heads);
 }
 
 struct GqaCublasWorkspace {
@@ -2886,8 +2943,9 @@ bool qwen_gqa_verify_attention_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
-int qwen_gqa_decode_split_count(int attended_positions) {
-    return decode_split_count(attended_positions);
+int qwen_gqa_decode_split_count(int attended_positions, int kv_heads,
+                                bool tensor_core_shape) {
+    return decode_split_count(attended_positions, kv_heads, tensor_core_shape);
 }
 
 int qwen_gqa_decode_split_count_variant(
@@ -2897,12 +2955,12 @@ int qwen_gqa_decode_split_count_variant(
         ? decode_mma_enabled(attended_positions)
         : variant == QwenGqaDecodeVariant::TensorCore;
     return decode_split_count_for_variant(attended_positions, mma,
-                                          split_count_override);
+                                          split_count_override, 1);
 }
 
-// Widest Q group the decode split kernel is instantiated for. Six covers the
-// TP4 full-attention shape (q_heads 6, kv_heads 1) in a single CTA, which is
-// what removes the duplicate KV stream.
+// Widest Q group the decode split kernel is instantiated for. Six covers one
+// full-attention KV group in both TP4 (6/1) and TP2 (12/2), which is what removes
+// the duplicate KV stream.
 constexpr int kDecodeMaxHeadsPerGroup = 6;
 
 // Zero keeps the automatic choice: cover the whole KV group so its cache line is
@@ -2948,7 +3006,7 @@ bool launch_decode_fused(
     // Geometry follows the variant being launched, and the same query is public
     // so the engine's scratch sizing cannot disagree with the grid.
     const int splits = decode_split_count_for_variant(
-        attended, want_mma, split_count_override);
+        attended, want_mma, split_count_override, kv_heads);
     const int positions_per_split = (attended + splits - 1) / splits;
     const int group_heads = decode_group_width(q_heads / kv_heads);
     const int groups_per_kv =
@@ -2956,8 +3014,8 @@ bool launch_decode_fused(
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     const bool mma_supported = decode_mma_device_supported() &&
         attention_window <= 0 && sink_tokens == 0 &&
-        q_heads == 6 && kv_heads == 1 && head_dim == kDecodeMmaDim &&
-        splits <= kDecodeSplitCeiling;
+        q_heads == kv_heads * kDecodeMmaValidRows &&
+        head_dim == kDecodeMmaDim && splits <= kDecodeSplitCeiling;
     // An explicit tensor-core request on an unsupported shape is an error, not a
     // silent fallback: a test that asked for the candidate must not measure the
     // scalar kernel instead.
@@ -2966,10 +3024,12 @@ bool launch_decode_fused(
     }
     const bool use_decode_mma = want_mma && mma_supported;
     if (use_decode_mma) {
-        gqa_decode_split_mma_f16_kernel<<<splits, kDecodeMmaThreads, 0,
-                                           cuda_stream>>>(
-            q, k_cache, v_cache, partial_scratch, context_len, splits,
-            positions_per_split);
+        const dim3 grid(static_cast<unsigned>(splits),
+                        static_cast<unsigned>(kv_heads), 1);
+        gqa_decode_split_mma_f16_kernel<<<
+            grid, kDecodeMmaThreads, 0, cuda_stream>>>(
+            q, k_cache, v_cache, partial_scratch, kv_heads, context_len,
+            splits, positions_per_split);
         if (cudaGetLastError() != cudaSuccess) return false;
         gqa_decode_merge_f16_kernel<<<q_heads, kThreads, 0, cuda_stream>>>(
             partial_scratch, output, q_heads, head_dim, splits);

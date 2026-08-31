@@ -667,6 +667,171 @@ bool check_fp8_f16_projection() {
                     decode_vector_dispatch_error, decode_multi_dispatch_error);
     }
 
+    // The DeltaNet decode path can issue QKV and Z as one grid without copying
+    // their raw FP8 tensors into permanent concatenated storage. The dual grid
+    // must remain bit exact against the two established wide-8 launches.
+    {
+        constexpr int dual_cols = 512;
+        constexpr int first_rows = 640;
+        constexpr int second_rows = 384;
+        constexpr int third_rows = 256;
+        constexpr int first_scale_stride = dual_cols / 128;
+        constexpr int second_scale_stride = dual_cols / 128;
+        std::vector<uint16_t> dual_x(dual_cols);
+        std::vector<uint8_t> first_weight(
+            static_cast<size_t>(first_rows) * dual_cols);
+        std::vector<uint8_t> second_weight(
+            static_cast<size_t>(second_rows) * dual_cols);
+        std::vector<uint16_t> first_scale(
+            static_cast<size_t>((first_rows + 127) / 128) *
+            first_scale_stride);
+        std::vector<uint16_t> second_scale(
+            static_cast<size_t>((second_rows + 127) / 128) *
+            second_scale_stride);
+        std::vector<uint8_t> third_weight(
+            static_cast<size_t>(third_rows) * dual_cols);
+        std::vector<uint16_t> third_scale(
+            static_cast<size_t>((third_rows + 127) / 128) *
+            second_scale_stride);
+        for (uint16_t& value : dual_x) value = to_half(x_dist(rng));
+        for (uint8_t& value : first_weight) value = random_code();
+        for (uint8_t& value : second_weight) value = random_code();
+        for (uint8_t& value : third_weight) value = random_code();
+        for (uint16_t& value : first_scale) value = to_half(scale_dist(rng));
+        for (uint16_t& value : second_scale) value = to_half(scale_dist(rng));
+        for (uint16_t& value : third_scale) value = to_half(scale_dist(rng));
+
+        DeviceBuffer d_dual_x, d_first_weight, d_second_weight, d_first_scale,
+            d_second_scale, d_first_reference, d_second_reference,
+            d_first_dual, d_second_dual, d_third_weight, d_third_scale,
+            d_third_reference, d_third_grouped;
+        uint16_t* dual_px = d_dual_x.allocate<uint16_t>(dual_x.size());
+        uint8_t* first_pw = d_first_weight.allocate<uint8_t>(
+            first_weight.size());
+        uint8_t* second_pw = d_second_weight.allocate<uint8_t>(
+            second_weight.size());
+        uint16_t* first_ps = d_first_scale.allocate<uint16_t>(
+            first_scale.size());
+        uint16_t* second_ps = d_second_scale.allocate<uint16_t>(
+            second_scale.size());
+        uint16_t* first_reference =
+            d_first_reference.allocate<uint16_t>(first_rows);
+        uint16_t* second_reference =
+            d_second_reference.allocate<uint16_t>(second_rows);
+        uint16_t* first_dual = d_first_dual.allocate<uint16_t>(first_rows);
+        uint16_t* second_dual = d_second_dual.allocate<uint16_t>(second_rows);
+        uint8_t* third_pw = d_third_weight.allocate<uint8_t>(
+            third_weight.size());
+        uint16_t* third_ps = d_third_scale.allocate<uint16_t>(
+            third_scale.size());
+        uint16_t* third_reference =
+            d_third_reference.allocate<uint16_t>(third_rows);
+        uint16_t* third_grouped =
+            d_third_grouped.allocate<uint16_t>(third_rows);
+        if (!dual_px || !first_pw || !second_pw || !first_ps || !second_ps ||
+            !first_reference || !second_reference || !first_dual ||
+            !second_dual || !third_pw || !third_ps || !third_reference ||
+            !third_grouped ||
+            cudaMemcpy(dual_px, dual_x.data(), dual_x.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(first_pw, first_weight.data(), first_weight.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(second_pw, second_weight.data(), second_weight.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(first_ps, first_scale.data(),
+                       first_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(second_ps, second_scale.data(),
+                       second_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(third_pw, third_weight.data(), third_weight.size(),
+                       cudaMemcpyHostToDevice) != cudaSuccess ||
+            cudaMemcpy(third_ps, third_scale.data(),
+                       third_scale.size() * sizeof(uint16_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            fail("FP16 FP8 dual projection allocation/copy");
+            return false;
+        }
+        setenv("QWEN_FP8_F16_VECTORIZE", "1", 1);
+        setenv("QWEN_FP8_F16_COLS_PER_LANE", "8", 1);
+        unsetenv("QWEN_FP8_F16_MULTIROW");
+        bool dual_ok = true;
+        for (int pass = 0; pass < 3 && dual_ok; ++pass) {
+            dual_ok =
+                dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+                    dual_px, first_pw, first_ps, first_reference, first_rows,
+                    dual_cols, dual_cols, first_scale_stride) &&
+                dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+                    dual_px, second_pw, second_ps, second_reference,
+                    second_rows, dual_cols, dual_cols, second_scale_stride) &&
+                dsv4::qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
+                    dual_px, first_pw, first_ps, first_dual, first_rows,
+                    dual_cols, first_scale_stride, second_pw, second_ps,
+                    second_dual, second_rows, dual_cols, second_scale_stride,
+                    dual_cols) &&
+                cudaDeviceSynchronize() == cudaSuccess;
+        }
+        unsetenv("QWEN_FP8_F16_COLS_PER_LANE");
+        unsetenv("QWEN_FP8_F16_VECTORIZE");
+        if (!dual_ok) {
+            fail("FP16 FP8 dual projection launch");
+            return false;
+        }
+        std::vector<uint16_t> first_got(first_rows), first_want(first_rows);
+        std::vector<uint16_t> second_got(second_rows), second_want(second_rows);
+        cudaMemcpy(first_got.data(), first_dual,
+                   first_got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(first_want.data(), first_reference,
+                   first_want.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(second_got.data(), second_dual,
+                   second_got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(second_want.data(), second_reference,
+                   second_want.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        if (first_got != first_want || second_got != second_want) {
+            fail("FP16 FP8 dual projection bit exactness");
+        } else {
+            std::printf("  FP16 FP8 dual projection first=%d second=%d "
+                        "cols=%d bit exact\n",
+                        first_rows, second_rows, dual_cols);
+        }
+
+        bool triple_ok = true;
+        for (int pass = 0; pass < 3 && triple_ok; ++pass) {
+            triple_ok =
+                dsv4::qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
+                    dual_px, third_pw, third_ps, third_reference, third_rows,
+                    dual_cols, dual_cols, second_scale_stride) &&
+                dsv4::qwen_fp8_e4m3_fp16scale_matvec_triple_f16_cuda(
+                    dual_px, first_pw, first_ps, first_dual, first_rows,
+                    dual_cols, first_scale_stride, second_pw, second_ps,
+                    second_dual, second_rows, dual_cols, second_scale_stride,
+                    third_pw, third_ps, third_grouped, third_rows, dual_cols,
+                    second_scale_stride, dual_cols) &&
+                cudaDeviceSynchronize() == cudaSuccess;
+        }
+        if (!triple_ok) {
+            fail("FP16 FP8 triple projection launch");
+            return false;
+        }
+        std::vector<uint16_t> third_got(third_rows), third_want(third_rows);
+        cudaMemcpy(first_got.data(), first_dual,
+                   first_got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(second_got.data(), second_dual,
+                   second_got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(third_got.data(), third_grouped,
+                   third_got.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(third_want.data(), third_reference,
+                   third_want.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        if (first_got != first_want || second_got != second_want ||
+            third_got != third_want) {
+            fail("FP16 FP8 triple projection bit exactness");
+        } else {
+            std::printf("  FP16 FP8 triple projection rows=%d+%d+%d "
+                        "cols=%d bit exact\n",
+                        first_rows, second_rows, third_rows, dual_cols);
+        }
+    }
+
     // Small speculative batches reuse each FP8 weight across all input rows.
     constexpr int small_batch = 5;
     constexpr int small_rows = 130;

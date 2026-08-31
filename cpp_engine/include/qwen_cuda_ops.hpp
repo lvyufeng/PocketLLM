@@ -220,6 +220,46 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+bool qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_first_weight,
+    const uint16_t* d_first_scale_fp16,
+    uint16_t* d_first_y_fp16,
+    int first_rows,
+    int first_weight_stride,
+    int first_scale_stride,
+    const uint8_t* d_second_weight,
+    const uint16_t* d_second_scale_fp16,
+    uint16_t* d_second_y_fp16,
+    int second_rows,
+    int second_weight_stride,
+    int second_scale_stride,
+    int cols,
+    void* stream = nullptr);
+
+bool qwen_fp8_e4m3_fp16scale_matvec_triple_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_first_weight,
+    const uint16_t* d_first_scale_fp16,
+    uint16_t* d_first_y_fp16,
+    int first_rows,
+    int first_weight_stride,
+    int first_scale_stride,
+    const uint8_t* d_second_weight,
+    const uint16_t* d_second_scale_fp16,
+    uint16_t* d_second_y_fp16,
+    int second_rows,
+    int second_weight_stride,
+    int second_scale_stride,
+    const uint8_t* d_third_weight,
+    const uint16_t* d_third_scale_fp16,
+    uint16_t* d_third_y_fp16,
+    int third_rows,
+    int third_weight_stride,
+    int third_scale_stride,
+    int cols,
+    void* stream = nullptr);
+
 bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     const uint16_t* d_x_fp16,
     const uint8_t* d_gate_weight,
@@ -793,7 +833,8 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
 // Splits the fused decode kernel will use for this many attended positions. The
 // caller must size `d_partial_scratch` as q_heads * splits * (head_dim + 2), so
 // this has to be the same number the launch computes.
-int qwen_gqa_decode_split_count(int attended_positions);
+int qwen_gqa_decode_split_count(int attended_positions, int kv_heads = 1,
+                                bool tensor_core_shape = false);
 
 // Which split kernel the fused decode path runs. Production selects this from
 // the environment once per process, which makes an in-process comparison of the
@@ -813,8 +854,8 @@ int qwen_gqa_decode_split_count_variant(
     int split_count_override = 0);
 
 // Fused decode with the split kernel chosen explicitly. Returns false when the
-// requested variant does not support the shape (the tensor-core kernel is
-// specialized for q_heads=6, kv_heads=1, head_dim=256, full causal attention),
+// requested variant does not support the shape (the tensor-core kernel requires
+// six Q heads per KV head, head_dim=256, and full causal attention),
 // so a test cannot silently measure a fallback. A positive split override is a
 // correctness-test seam: unlike production geometry, it preserves the requested
 // count so trailing empty splits reach the kernel and merge.

@@ -3,6 +3,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <algorithm>
 #include <cmath>
@@ -237,6 +238,92 @@ __global__ void fp8_matvec_f16_multirow_kernel(
         }
         if (lane == 0) y[row_base + r] = float_to_half(sum);
     }
+}
+
+// Decode-only row concatenation without concatenating the stored matrices.
+// Every projection consumes the same activation but lives in an independent
+// checkpoint tensor. One grid selects its source per output row and preserves
+// the established wide-8 arithmetic within each row.
+template <int kWarps, int kColsPerLane, int kGroups>
+__global__ void fp8_matvec_f16_grouped_kernel(
+    const uint16_t* __restrict__ x,
+    const uint8_t* __restrict__ first_weight,
+    const uint16_t* __restrict__ first_scale,
+    uint16_t* __restrict__ first_y, int first_rows, int first_weight_stride,
+    int first_scale_stride,
+    const uint8_t* __restrict__ second_weight,
+    const uint16_t* __restrict__ second_scale,
+    uint16_t* __restrict__ second_y, int second_rows, int second_weight_stride,
+    int second_scale_stride,
+    const uint8_t* __restrict__ third_weight,
+    const uint16_t* __restrict__ third_scale,
+    uint16_t* __restrict__ third_y, int third_rows, int third_weight_stride,
+    int third_scale_stride, int cols) {
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int combined_row = static_cast<int>(blockIdx.x) * kWarps + warp;
+    const int first_end = first_rows;
+    const int second_end = first_end + second_rows;
+    const int total_rows = second_end + (kGroups == 3 ? third_rows : 0);
+    if (combined_row >= total_rows) return;
+
+    const bool use_second = combined_row >= first_end && combined_row < second_end;
+    const bool use_third = combined_row >= second_end;
+    const int row = use_third ? combined_row - second_end
+                              : use_second ? combined_row - first_end
+                                           : combined_row;
+    const int weight_stride = use_third ? third_weight_stride
+        : use_second ? second_weight_stride : first_weight_stride;
+    const int scale_stride = use_third ? third_scale_stride
+        : use_second ? second_scale_stride : first_scale_stride;
+    const uint8_t* weight = (use_third ? third_weight
+        : use_second ? second_weight : first_weight) +
+        static_cast<size_t>(row) * weight_stride;
+    const uint16_t* scale = (use_third ? third_scale
+        : use_second ? second_scale : first_scale) +
+        static_cast<size_t>(row / kFp8WeightBlock) * scale_stride;
+    uint16_t* output = use_third ? third_y : use_second ? second_y : first_y;
+
+    float sum = 0.0f;
+    constexpr int kQuads = kColsPerLane / 4;
+    constexpr int kStride = 32 * kColsPerLane;
+    const int vec_cols = cols & ~(kColsPerLane - 1);
+    for (int col = lane * kColsPerLane; col < vec_cols; col += kStride) {
+        float xv[kColsPerLane];
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            const uint2 packed = *reinterpret_cast<const uint2*>(x + col + q * 4);
+            xv[q * 4 + 0] = half_to_float(static_cast<uint16_t>(packed.x));
+            xv[q * 4 + 1] = half_to_float(static_cast<uint16_t>(packed.x >> 16));
+            xv[q * 4 + 2] = half_to_float(static_cast<uint16_t>(packed.y));
+            xv[q * 4 + 3] = half_to_float(static_cast<uint16_t>(packed.y >> 16));
+        }
+        Fp8x4AsHalf2 w[kQuads];
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            w[q] = fp8x4_as_half2_scaled(
+                *reinterpret_cast<const uchar4*>(weight + col + q * 4));
+        }
+        float span = 0.0f;
+#pragma unroll
+        for (int q = 0; q < kQuads; ++q) {
+            span +=
+                xv[q * 4 + 0] * half_to_float(static_cast<uint16_t>(w[q].lo)) +
+                xv[q * 4 + 1] * half_to_float(static_cast<uint16_t>(w[q].lo >> 16)) +
+                xv[q * 4 + 2] * half_to_float(static_cast<uint16_t>(w[q].hi)) +
+                xv[q * 4 + 3] * half_to_float(static_cast<uint16_t>(w[q].hi >> 16));
+        }
+        sum += span * half_to_float(scale[col / kFp8WeightBlock]);
+    }
+    sum *= kFp8E4m3HalfFixup;
+    for (int col = vec_cols + lane; col < cols; col += 32) {
+        sum += half_to_float(x[col]) * fp8_e4m3_to_float(weight[col]) *
+               half_to_float(scale[col / kFp8WeightBlock]);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, offset);
+    }
+    if (lane == 0) output[row] = float_to_half(sum);
 }
 
 // Small speculative batches are weight-bandwidth bound. One warp owns one
@@ -1792,6 +1879,175 @@ __global__ void concat_rows_f16_kernel(const uint16_t* left, const uint16_t* rig
     }
 }
 
+template <int kBlockThreads>
+__global__ void rmsnorm_f16_vector_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ gamma,
+    uint16_t* __restrict__ y, int rows, int cols, float eps) {
+    using BlockReduce = cub::BlockReduce<float, kBlockThreads>;
+    __shared__ typename BlockReduce::TempStorage reduce_storage;
+    __shared__ float inverse_rms;
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const uint16_t* src = x + static_cast<size_t>(row) * cols;
+    uint16_t* dst = y + static_cast<size_t>(row) * cols;
+    const int quads = cols / 8;
+    float sum = 0.0f;
+    for (int quad = threadIdx.x; quad < quads; quad += kBlockThreads) {
+        const uint4 values = reinterpret_cast<const uint4*>(src)[quad];
+        const uint32_t halves[4] = {values.x, values.y, values.z, values.w};
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float first = half_to_float(static_cast<uint16_t>(halves[pair]));
+            const float second =
+                half_to_float(static_cast<uint16_t>(halves[pair] >> 16));
+            sum += first * first;
+            sum += second * second;
+        }
+    }
+    for (int col = quads * 8 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        const float value = half_to_float(src[col]);
+        sum += value * value;
+    }
+    const float total = BlockReduce(reduce_storage).Sum(sum);
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(total / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+    for (int quad = threadIdx.x; quad < quads; quad += kBlockThreads) {
+        const uint4 values = reinterpret_cast<const uint4*>(src)[quad];
+        const uint4 weights = reinterpret_cast<const uint4*>(gamma)[quad];
+        const uint32_t input_halves[4] = {
+            values.x, values.y, values.z, values.w};
+        const uint32_t weight_halves[4] = {
+            weights.x, weights.y, weights.z, weights.w};
+        uint32_t output_halves[4];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float first = half_to_float(
+                static_cast<uint16_t>(input_halves[pair]));
+            const float second = half_to_float(
+                static_cast<uint16_t>(input_halves[pair] >> 16));
+            const float first_weight = 1.0f + half_to_float(
+                static_cast<uint16_t>(weight_halves[pair]));
+            const float second_weight = 1.0f + half_to_float(
+                static_cast<uint16_t>(weight_halves[pair] >> 16));
+            output_halves[pair] =
+                static_cast<uint32_t>(float_to_half(
+                    first * inverse_rms * first_weight)) |
+                (static_cast<uint32_t>(float_to_half(
+                    second * inverse_rms * second_weight)) << 16);
+        }
+        reinterpret_cast<uint4*>(dst)[quad] =
+            make_uint4(output_halves[0], output_halves[1],
+                       output_halves[2], output_halves[3]);
+    }
+    for (int col = quads * 8 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        dst[col] = float_to_half(
+            half_to_float(src[col]) * inverse_rms *
+            (1.0f + half_to_float(gamma[col])));
+    }
+}
+
+template <int kBlockThreads>
+__global__ void residual_add_rmsnorm_f16_vector_kernel(
+    const uint16_t* __restrict__ hidden,
+    const uint16_t* __restrict__ delta,
+    const uint16_t* __restrict__ gamma,
+    uint16_t* __restrict__ residual,
+    uint16_t* __restrict__ normalized,
+    int rows, int cols, float eps) {
+    using BlockReduce = cub::BlockReduce<float, kBlockThreads>;
+    __shared__ typename BlockReduce::TempStorage reduce_storage;
+    __shared__ float inverse_rms;
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+    const uint16_t* hidden_row = hidden + row_offset;
+    const uint16_t* delta_row = delta + row_offset;
+    uint16_t* residual_row = residual + row_offset;
+    uint16_t* normalized_row = normalized + row_offset;
+    const int quads = cols / 8;
+    float sum = 0.0f;
+    for (int quad = threadIdx.x; quad < quads; quad += kBlockThreads) {
+        const uint4 hidden_values =
+            reinterpret_cast<const uint4*>(hidden_row)[quad];
+        const uint4 delta_values =
+            reinterpret_cast<const uint4*>(delta_row)[quad];
+        const uint32_t hidden_halves[4] = {
+            hidden_values.x, hidden_values.y, hidden_values.z, hidden_values.w};
+        const uint32_t delta_halves[4] = {
+            delta_values.x, delta_values.y, delta_values.z, delta_values.w};
+        uint32_t residual_halves[4];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const uint16_t first = float_to_half(
+                half_to_float(static_cast<uint16_t>(hidden_halves[pair])) +
+                half_to_float(static_cast<uint16_t>(delta_halves[pair])));
+            const uint16_t second = float_to_half(
+                half_to_float(static_cast<uint16_t>(hidden_halves[pair] >> 16)) +
+                half_to_float(static_cast<uint16_t>(delta_halves[pair] >> 16)));
+            residual_halves[pair] = static_cast<uint32_t>(first) |
+                (static_cast<uint32_t>(second) << 16);
+            const float first_value = half_to_float(first);
+            const float second_value = half_to_float(second);
+            sum += first_value * first_value;
+            sum += second_value * second_value;
+        }
+        reinterpret_cast<uint4*>(residual_row)[quad] =
+            make_uint4(residual_halves[0], residual_halves[1],
+                       residual_halves[2], residual_halves[3]);
+    }
+    for (int col = quads * 8 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        const uint16_t value = float_to_half(
+            half_to_float(hidden_row[col]) + half_to_float(delta_row[col]));
+        residual_row[col] = value;
+        const float rounded = half_to_float(value);
+        sum += rounded * rounded;
+    }
+    const float total = BlockReduce(reduce_storage).Sum(sum);
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(total / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+    for (int quad = threadIdx.x; quad < quads; quad += kBlockThreads) {
+        const uint4 values = reinterpret_cast<const uint4*>(residual_row)[quad];
+        const uint4 weights = reinterpret_cast<const uint4*>(gamma)[quad];
+        const uint32_t residual_halves[4] = {
+            values.x, values.y, values.z, values.w};
+        const uint32_t weight_halves[4] = {
+            weights.x, weights.y, weights.z, weights.w};
+        uint32_t output_halves[4];
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float first = half_to_float(
+                static_cast<uint16_t>(residual_halves[pair]));
+            const float second = half_to_float(
+                static_cast<uint16_t>(residual_halves[pair] >> 16));
+            const float first_weight = 1.0f + half_to_float(
+                static_cast<uint16_t>(weight_halves[pair]));
+            const float second_weight = 1.0f + half_to_float(
+                static_cast<uint16_t>(weight_halves[pair] >> 16));
+            output_halves[pair] =
+                static_cast<uint32_t>(float_to_half(
+                    first * inverse_rms * first_weight)) |
+                (static_cast<uint32_t>(float_to_half(
+                    second * inverse_rms * second_weight)) << 16);
+        }
+        reinterpret_cast<uint4*>(normalized_row)[quad] =
+            make_uint4(output_halves[0], output_halves[1],
+                       output_halves[2], output_halves[3]);
+    }
+    for (int col = quads * 8 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        normalized_row[col] = float_to_half(
+            half_to_float(residual_row[col]) * inverse_rms *
+            (1.0f + half_to_float(gamma[col])));
+    }
+}
+
 __global__ void rmsnorm_f16_kernel(const uint16_t* x, const uint16_t* gamma,
                                    uint16_t* y, int rows, int cols, float eps) {
     const int row = static_cast<int>(blockIdx.x);
@@ -1804,9 +2060,12 @@ __global__ void rmsnorm_f16_kernel(const uint16_t* x, const uint16_t* gamma,
         sum += value * value;
     }
     extern __shared__ float scratch[];
-    const float inv = rsqrtf(block_reduce_sum(sum, scratch) / static_cast<float>(cols) + eps);
+    const float inv = rsqrtf(
+        block_reduce_sum(sum, scratch) / static_cast<float>(cols) + eps);
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
-        dst[col] = float_to_half(half_to_float(src[col]) * inv * (1.0f + half_to_float(gamma[col])));
+        dst[col] = float_to_half(
+            half_to_float(src[col]) * inv *
+            (1.0f + half_to_float(gamma[col])));
     }
 }
 
@@ -1835,6 +2094,69 @@ __global__ void residual_add_rmsnorm_f16_kernel(
         normalized_row[col] = float_to_half(
             half_to_float(residual_row[col]) * inv *
             (1.0f + half_to_float(gamma[col])));
+    }
+}
+
+template <int kBlockThreads>
+__global__ void gated_rmsnorm_f16_vector_kernel(
+    const uint16_t* __restrict__ x,
+    const uint16_t* __restrict__ gamma,
+    const uint16_t* __restrict__ gate,
+    uint16_t* __restrict__ y,
+    int rows, int cols, float eps) {
+    using BlockReduce = cub::BlockReduce<float, kBlockThreads>;
+    __shared__ typename BlockReduce::TempStorage reduce_storage;
+    __shared__ float inverse_rms;
+    const int row = static_cast<int>(blockIdx.x);
+    if (row >= rows) return;
+    const size_t row_offset = static_cast<size_t>(row) * cols;
+    const uint16_t* src = x + row_offset;
+    const uint16_t* gate_row = gate + row_offset;
+    uint16_t* dst = y + row_offset;
+    const int pairs = cols / 2;
+    float sum = 0.0f;
+    for (int pair = threadIdx.x; pair < pairs; pair += kBlockThreads) {
+        const uint32_t values = reinterpret_cast<const uint32_t*>(src)[pair];
+        const float first = half_to_float(static_cast<uint16_t>(values));
+        const float second = half_to_float(static_cast<uint16_t>(values >> 16));
+        sum += first * first;
+        sum += second * second;
+    }
+    for (int col = pairs * 2 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        const float value = half_to_float(src[col]);
+        sum += value * value;
+    }
+    const float total = BlockReduce(reduce_storage).Sum(sum);
+    if (threadIdx.x == 0) {
+        inverse_rms = rsqrtf(total / static_cast<float>(cols) + eps);
+    }
+    __syncthreads();
+    for (int pair = threadIdx.x; pair < pairs; pair += kBlockThreads) {
+        const uint32_t values = reinterpret_cast<const uint32_t*>(src)[pair];
+        const uint32_t weights = reinterpret_cast<const uint32_t*>(gamma)[pair];
+        const uint32_t gates = reinterpret_cast<const uint32_t*>(gate_row)[pair];
+        const float first = half_to_float(static_cast<uint16_t>(values));
+        const float second = half_to_float(static_cast<uint16_t>(values >> 16));
+        const float first_weight = half_to_float(static_cast<uint16_t>(weights));
+        const float second_weight =
+            half_to_float(static_cast<uint16_t>(weights >> 16));
+        const float first_gate = half_to_float(static_cast<uint16_t>(gates));
+        const float second_gate =
+            half_to_float(static_cast<uint16_t>(gates >> 16));
+        const uint16_t first_output = float_to_half(
+            first * inverse_rms * first_weight * silu(first_gate));
+        const uint16_t second_output = float_to_half(
+            second * inverse_rms * second_weight * silu(second_gate));
+        reinterpret_cast<uint32_t*>(dst)[pair] =
+            static_cast<uint32_t>(first_output) |
+            (static_cast<uint32_t>(second_output) << 16);
+    }
+    for (int col = pairs * 2 + threadIdx.x; col < cols;
+         col += kBlockThreads) {
+        const float value = half_to_float(src[col]) * inverse_rms *
+            half_to_float(gamma[col]);
+        dst[col] = float_to_half(value * silu(half_to_float(gate_row[col])));
     }
 }
 
@@ -2726,6 +3048,82 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
+    const uint16_t* x,
+    const uint8_t* first_weight, const uint16_t* first_scale,
+    uint16_t* first_y, int first_rows, int first_weight_stride,
+    int first_scale_stride,
+    const uint8_t* second_weight, const uint16_t* second_scale,
+    uint16_t* second_y, int second_rows, int second_weight_stride,
+    int second_scale_stride, int cols, void* stream) {
+    const int minimum_scale_stride =
+        (cols + kFp8WeightBlock - 1) / kFp8WeightBlock;
+    if (!x || !first_weight || !first_scale || !first_y || first_rows <= 0 ||
+        first_weight_stride < cols || first_scale_stride < minimum_scale_stride ||
+        !second_weight || !second_scale || !second_y || second_rows <= 0 ||
+        second_weight_stride < cols ||
+        second_scale_stride < minimum_scale_stride || cols <= 0) {
+        return false;
+    }
+    if (cols % 8 != 0 || first_weight_stride % 8 != 0 ||
+        second_weight_stride % 8 != 0 || kFp8WeightBlock % 8 != 0 ||
+        reinterpret_cast<uintptr_t>(x) % 8 != 0) {
+        return false;
+    }
+    constexpr int kWarps = 8;
+    const int blocks =
+        (first_rows + second_rows + kWarps - 1) / kWarps;
+    fp8_matvec_f16_grouped_kernel<kWarps, 8, 2>
+        <<<blocks, kWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, first_weight, first_scale, first_y, first_rows,
+            first_weight_stride, first_scale_stride, second_weight,
+            second_scale, second_y, second_rows, second_weight_stride,
+            second_scale_stride, nullptr, nullptr, nullptr, 0, 0, 0, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_fp8_e4m3_fp16scale_matvec_triple_f16_cuda(
+    const uint16_t* x,
+    const uint8_t* first_weight, const uint16_t* first_scale,
+    uint16_t* first_y, int first_rows, int first_weight_stride,
+    int first_scale_stride,
+    const uint8_t* second_weight, const uint16_t* second_scale,
+    uint16_t* second_y, int second_rows, int second_weight_stride,
+    int second_scale_stride,
+    const uint8_t* third_weight, const uint16_t* third_scale,
+    uint16_t* third_y, int third_rows, int third_weight_stride,
+    int third_scale_stride, int cols, void* stream) {
+    const int minimum_scale_stride =
+        (cols + kFp8WeightBlock - 1) / kFp8WeightBlock;
+    if (!x || !first_weight || !first_scale || !first_y || first_rows <= 0 ||
+        first_weight_stride < cols || first_scale_stride < minimum_scale_stride ||
+        !second_weight || !second_scale || !second_y || second_rows <= 0 ||
+        second_weight_stride < cols ||
+        second_scale_stride < minimum_scale_stride ||
+        !third_weight || !third_scale || !third_y || third_rows <= 0 ||
+        third_weight_stride < cols ||
+        third_scale_stride < minimum_scale_stride || cols <= 0) {
+        return false;
+    }
+    if (cols % 8 != 0 || first_weight_stride % 8 != 0 ||
+        second_weight_stride % 8 != 0 || third_weight_stride % 8 != 0 ||
+        kFp8WeightBlock % 8 != 0 ||
+        reinterpret_cast<uintptr_t>(x) % 8 != 0) {
+        return false;
+    }
+    constexpr int kWarps = 8;
+    const int blocks =
+        (first_rows + second_rows + third_rows + kWarps - 1) / kWarps;
+    fp8_matvec_f16_grouped_kernel<kWarps, 8, 3>
+        <<<blocks, kWarps * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, first_weight, first_scale, first_y, first_rows,
+            first_weight_stride, first_scale_stride, second_weight,
+            second_scale, second_y, second_rows, second_weight_stride,
+            second_scale_stride, third_weight, third_scale, third_y, third_rows,
+            third_weight_stride, third_scale_stride, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
     const uint16_t* x, const uint8_t* gate_weight,
     const uint16_t* gate_scale, const uint8_t* up_weight,
@@ -3275,8 +3673,31 @@ bool qwen_rmsnorm_fp16_gamma_rows_f16_cuda(
     const uint16_t* x, const uint16_t* gamma, uint16_t* y,
     int rows, int cols, float eps, void* stream) {
     if (!x || !gamma || !y || rows <= 0 || cols <= 0 || eps < 0.0f) return false;
-    rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
-        static_cast<cudaStream_t>(stream)>>>(x, gamma, y, rows, cols, eps);
+    static const bool vectorized = [] {
+        const char* raw = std::getenv("QWEN_RMSNORM_VECTOR");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    const bool aligned_16 =
+        (reinterpret_cast<uintptr_t>(x) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(gamma) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(y) & 15u) == 0;
+    if (vectorized && rows == 1 && cols == 5120 && aligned_16) {
+        constexpr int kVectorThreads = 640;
+        rmsnorm_f16_vector_kernel<kVectorThreads><<<
+            rows, kVectorThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, gamma, y, rows, cols, eps);
+    // Decode Q/K norm over the full-attention head width. One warp covers the
+    // row through 8-wide loads, so the CTA carries no idle threads and the
+    // reduction stays inside a single warp.
+    } else if (vectorized && rows <= 64 && cols == 256 && aligned_16) {
+        constexpr int kVectorThreads = 32;
+        rmsnorm_f16_vector_kernel<kVectorThreads><<<
+            rows, kVectorThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, gamma, y, rows, cols, eps);
+    } else {
+        rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
+            static_cast<cudaStream_t>(stream)>>>(x, gamma, y, rows, cols, eps);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3289,10 +3710,26 @@ bool qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_cuda(
         normalized == hidden || normalized == delta || normalized == residual) {
         return false;
     }
-    residual_add_rmsnorm_f16_kernel<<<
-        rows, kThreads, kThreads * sizeof(float),
-        static_cast<cudaStream_t>(stream)>>>(
-        hidden, delta, gamma, residual, normalized, rows, cols, eps);
+    static const bool vectorized = [] {
+        const char* raw = std::getenv("QWEN_RMSNORM_VECTOR");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    if (vectorized && rows == 1 && cols == 5120 &&
+        (reinterpret_cast<uintptr_t>(hidden) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(delta) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(gamma) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(residual) & 15u) == 0 &&
+        (reinterpret_cast<uintptr_t>(normalized) & 15u) == 0) {
+        constexpr int kVectorThreads = 640;
+        residual_add_rmsnorm_f16_vector_kernel<kVectorThreads><<<
+            rows, kVectorThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, delta, gamma, residual, normalized, rows, cols, eps);
+    } else {
+        residual_add_rmsnorm_f16_kernel<<<
+            rows, kThreads, kThreads * sizeof(float),
+            static_cast<cudaStream_t>(stream)>>>(
+            hidden, delta, gamma, residual, normalized, rows, cols, eps);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3300,8 +3737,27 @@ bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_cuda(
     const uint16_t* x, const uint16_t* gamma, const uint16_t* gate,
     uint16_t* y, int rows, int cols, float eps, void* stream) {
     if (!x || !gamma || !gate || !y || rows <= 0 || cols <= 0 || eps < 0.0f) return false;
-    gated_rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
-        static_cast<cudaStream_t>(stream)>>>(x, gamma, gate, y, rows, cols, eps);
+    static const bool vectorized = [] {
+        const char* raw = std::getenv("QWEN_RMSNORM_VECTOR");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+    }();
+    // The DeltaNet head width is 128, so one lane per FP16 pair covers a row
+    // exactly. The scalar path spends a 256-thread shared-memory tree on it and
+    // leaves half the block idle.
+    if (vectorized && cols == 128 &&
+        (reinterpret_cast<uintptr_t>(x) & 3u) == 0 &&
+        (reinterpret_cast<uintptr_t>(gamma) & 3u) == 0 &&
+        (reinterpret_cast<uintptr_t>(gate) & 3u) == 0 &&
+        (reinterpret_cast<uintptr_t>(y) & 3u) == 0) {
+        constexpr int kVectorThreads = 64;
+        gated_rmsnorm_f16_vector_kernel<kVectorThreads><<<
+            rows, kVectorThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            x, gamma, gate, y, rows, cols, eps);
+    } else {
+        gated_rmsnorm_f16_kernel<<<rows, kThreads, kThreads * sizeof(float),
+            static_cast<cudaStream_t>(stream)>>>(x, gamma, gate, y, rows, cols,
+                                                 eps);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 

@@ -328,6 +328,10 @@ def environment_metadata() -> dict[str, str]:
         "QWEN_FP16_LOGITS_MATVEC",
         "QWEN_FUSE_ATTN_RESID_NORM",
         "QWEN_GATED_DELTA_FLASHQLA_SM75",
+        "QWEN_RMSNORM_HYBRID_REDUCTION",
+        "QWEN_RMSNORM_VECTOR",
+        "QWEN_FUSE_QKVZ_DECODE",
+        "QWEN_FUSE_FULL_QKV_DECODE",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
 
