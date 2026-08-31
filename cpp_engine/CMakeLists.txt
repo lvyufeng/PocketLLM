@@ -47,9 +47,17 @@ set(POCKET_CORE_SOURCES
 set(POCKET_ENGINE_SOURCES
     engine/qwen_weights.cpp
     engine/qwen_target_head.cpp
+    engine/qwen_engine.cpp
+)
+
+# Engines that still call CUDA kernels by name. A runtime guard cannot help here:
+# a CUDA symbol referenced from any object in the link must resolve even when its
+# branch is unreachable, so these are excluded from a non-CUDA target and
+# engine/backend_unimplemented_ascend.cpp supplies throwing definitions for the
+# entry points their remaining callers name.
+set(POCKET_CUDA_ONLY_ENGINE_SOURCES
     engine/qwen_dspark.cpp
     engine/qwen_dflash2.cpp
-    engine/qwen_engine.cpp
     engine/dsv4_engine.cpp
     engine/dspark_engine.cpp
 )
@@ -62,6 +70,11 @@ set(POCKET_RUNTIME_SOURCES)
 set(POCKET_BACKEND_LIBS)
 set(POCKET_BACKEND_INCLUDES)
 set(POCKET_BACKEND_DEFINES)
+# AscendC's generated device library is consumed by the engine, but must not be
+# linked into pocket_runtime: the latter is intentionally kernel-free so the
+# runtime conformance test can exercise ACL without any device binary.
+set(POCKET_ASCEND_KERNEL_LIBS)
+set(POCKET_ASCEND_KERNEL_INCLUDES)
 
 if(POCKET_BACKEND STREQUAL "cuda")
     set(CMAKE_CUDA_STANDARD 17)
@@ -99,6 +112,7 @@ if(POCKET_BACKEND STREQUAL "cuda")
         message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
     endif()
 
+    list(APPEND POCKET_ENGINE_SOURCES ${POCKET_CUDA_ONLY_ENGINE_SOURCES})
     list(APPEND POCKET_RUNTIME_SOURCES backends/cuda/runtime/device_runtime_cuda.cpp)
     list(APPEND POCKET_BACKEND_SOURCES
         backends/cuda/collective/tp_comm.cpp
@@ -138,9 +152,8 @@ if(POCKET_BACKEND STREQUAL "cuda")
     endif()
 else()
     # Ascend: ACL runtime, AscendC kernels and HCCL collectives under
-    # backends/ascend. The device runtime is implemented; kernels are not, so the
-    # full engine still does not link. What does link and run today is anything
-    # that needs only pocket_core plus the device runtime.
+    # backends/ascend. The dense-FP16 Qwen path is complete through the linked
+    # engine; CUDA-only engines and quantized Qwen modes stay outside this build.
     set(DSV4_HAVE_TP_COMM OFF)
 
     # CANN layout: $ASCEND_TOOLKIT_HOME/<arch>-linux/{include,lib64}. The arch
@@ -216,11 +229,42 @@ else()
         "${ASCEND_NNOPBASE_LIBRARY}")
     list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
 
+    # Stands in for POCKET_CUDA_ONLY_ENGINE_SOURCES, which is not built here.
+    list(APPEND POCKET_ENGINE_SOURCES engine/backend_unimplemented_ascend.cpp)
+
     # aclnn-backed operators: matrix products, normalizations, elementwise
     # activations and the reshape-shaped ops. The recurrent and attention kernels
-    # have no aclnn equivalent on this install and are hand-written AscendC, which
-    # is not in this list yet.
+    # have no aclnn equivalent on this install and are hand-written AscendC below.
     list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/aclnn_ops.cpp)
+
+    # Hand-written AscendC device code. These are the operators with no aclnn
+    # equivalent: the gated-delta recurrence, its gates and normalizations, the
+    # causal depthwise convolution, partial RoPE, KV-cache append and GQA
+    # attention.
+    set(POCKET_ASCEND_KERNEL_SOURCES
+        backends/ascend/kernels/qwen_gated_delta_f16.cpp
+        backends/ascend/kernels/qwen_linear_f16.cpp
+        backends/ascend/kernels/qwen_attention_f16.cpp
+        backends/ascend/kernels/qwen_argmax_f32.cpp
+    )
+    # ascendc.cmake reads these three variables by name out of the enclosing
+    # scope and fails unhelpfully if any is unset, so set them here rather than
+    # making every caller pass -D flags.
+    set(SOC_VERSION "${ASCEND_SOC_VERSION}")
+    set(RUN_MODE "npu")
+    set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
+    include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+    ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
+
+    # ascendc_library() emits one aclrtlaunch_<kernel>.h per
+    # `extern "C" __global__ __aicore__` entry point into
+    # ${CMAKE_BINARY_DIR}/include/<target>. The launcher below is the only file
+    # that includes them, but the directory has to be on the include path of
+    # whatever compiles it, which is dsv4_cpp_core.
+    list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
+    list(APPEND POCKET_ASCEND_KERNEL_INCLUDES
+        "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
+    list(APPEND POCKET_ASCEND_KERNEL_LIBS pocket_ascend_kernels)
 
     if(DSV4_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
@@ -228,11 +272,11 @@ else()
         list(APPEND POCKET_BACKEND_DEFINES DSV4_HAVE_TP_COMM=1)
     endif()
 
-    message(WARNING
-        "POCKET_BACKEND=ascend has a device runtime and HCCL collectives but not "
-        "yet a full operator set. pocket_core, pocket_runtime, every engine object "
-        "file and the host-only tools and tests build; linking dsv4_cpp_engine "
-        "still fails on the unimplemented operator contracts.")
+    message(STATUS
+        "POCKET_BACKEND=ascend builds the Qwen FP16 path: device runtime, HCCL "
+        "collectives, the neutral operator set and dsv4_cpp_engine. Quantized "
+        "weights and KV caches, external drafters, device sampling and the DSV4 "
+        "engine are rejected at runtime, not implemented.")
 endif()
 
 # Device-agnostic core as its own library. Anything that links only this target
@@ -280,11 +324,24 @@ endif()
 if(POCKET_BACKEND_LIBS)
     target_link_libraries(dsv4_cpp_core PUBLIC ${POCKET_BACKEND_LIBS})
 endif()
+if(POCKET_ASCEND_KERNEL_INCLUDES)
+    target_include_directories(dsv4_cpp_core PUBLIC ${POCKET_ASCEND_KERNEL_INCLUDES})
+endif()
+if(POCKET_ASCEND_KERNEL_LIBS)
+    target_link_libraries(dsv4_cpp_core PUBLIC ${POCKET_ASCEND_KERNEL_LIBS})
+endif()
 if(POCKET_BACKEND_DEFINES)
     target_compile_definitions(dsv4_cpp_core PUBLIC ${POCKET_BACKEND_DEFINES})
 endif()
 if(POCKET_BACKEND STREQUAL "cuda")
     set_target_properties(dsv4_cpp_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+else()
+    # Keep legacy CUDA-heavy methods in discardable sections while the Ascend
+    # executable uses only the dense FP16 Qwen path. This prevents unused GGUF,
+    # DSpark and DFlash2 methods from imposing link-time CUDA dependencies; all
+    # reachable unsupported paths still reject their formats at runtime.
+    target_compile_options(dsv4_cpp_core PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(dsv4_cpp_core INTERFACE -Wl,--gc-sections)
 endif()
 
 # Fail the build if a vendor SDK leaks into the shared layers. This is the
@@ -532,6 +589,14 @@ set_target_properties(test_tp_comm_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 add_executable(test_qwen_ascend_ops tests/test_qwen_ascend_ops.cpp)
 target_link_libraries(test_qwen_ascend_ops PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_ascend_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The twelve operators with no aclnn equivalent, i.e. the hand-written AscendC
+# kernels. Same neutral-name discipline as test_qwen_ascend_ops; it is a separate
+# binary because these are the kernels most likely to fault the device, and a fault
+# there should not take the aclnn coverage with it.
+add_executable(test_qwen_ascend_group_b tests/test_qwen_ascend_group_b.cpp)
+target_link_libraries(test_qwen_ascend_group_b PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_ascend_group_b PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # The (1 + weight) gamma fold is host arithmetic on the staged bytes, so this needs
 # no device. It still links dsv4_cpp_core because the policy body is backend-gated.

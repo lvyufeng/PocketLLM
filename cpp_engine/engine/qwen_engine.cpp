@@ -38,7 +38,10 @@ void check_device(bool ok, const char* what) {
 }
 
 void require_launch(bool ok, const char* what) {
-    if (!ok) throw std::runtime_error(std::string("Qwen CUDA launch failed: ") + what);
+    if (!ok) {
+        throw std::runtime_error(
+            std::string("Qwen ") + device_backend_name() + " launch failed: " + what);
+    }
 }
 
 bool qwen_env_enabled(const char* name) {
@@ -144,11 +147,22 @@ DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& r
     DeviceLinear output;
     output.kind = ref.kind;
     output.logical_shape = ref.logical_local_shape;
+#ifdef POCKET_BACKEND_ASCEND
+    // NVFP4 repacks into the SM75 WMMA block layout, and only the CUDA kernels
+    // read that layout. Reject the kind at load time so the Ascend build carries
+    // no reference to the repacking uploader.
+    if (ref.kind == QwenLinearKind::NvFp4Group16) {
+        throw std::runtime_error(
+            "Qwen NVFP4 weights are not implemented on the Ascend backend");
+    }
+    {
+#else
     if (ref.kind == QwenLinearKind::NvFp4Group16) {
         output.weight = qwen_upload_nvfp4_linear_cuda(
             index, ref, &output.weight_global_factor,
             &output.input_global_scale);
     } else {
+#endif
         output.weight = upload(index, ref.weight);
         if (ref.has_scale) output.scale = upload(index, ref.scale);
     }
@@ -365,6 +379,12 @@ struct QwenEngine::Impl {
     bool mtp_enabled = false;
     bool dspark_enabled = false;
     bool dflash2_enabled = false;
+    // The external drafters stay declared on every backend. Their bookkeeping is
+    // woven through run_chunk and the speculative steps, so compiling the members
+    // out fragments code that is otherwise backend-neutral; the Ascend build
+    // instead links throwing stubs for the two runtimes
+    // (engine/backend_unimplemented_ascend.cpp)
+    // and rejects a drafter checkpoint at construction.
     // Caps the verified draft block width. 0 verifies the full seven-draft
     // proposal, which is the upstream behaviour and stays the default.
     int dflash2_draft_width = qwen_env_int("DSV4_DFLASH2_DRAFT_WIDTH", 0);
@@ -821,6 +841,11 @@ struct QwenEngine::Impl {
         // cache unless this engine actually owns a speculative target.
         const bool verify_resident_weights = speculative_target &&
             qwen_env_enabled_default("QWEN_VERIFY_RESIDENT_FP16");
+#ifdef POCKET_BACKEND_ASCEND
+        // The resident cache only ever expands FP8 weights, and no FP8 kind is
+        // loadable on this backend, so there is nothing for it to materialize.
+        (void)verify_resident_weights;
+#else
         if (verify_resident_weights) {
             auto materialize_verify_weight = [this](DeviceLinear& linear) {
                 if (!linear.fp8 || linear.weight.data == nullptr ||
@@ -857,7 +882,16 @@ struct QwenEngine::Impl {
                 }
             }
         }
+#endif
 
+#ifdef POCKET_BACKEND_ASCEND
+        if (!options.dspark_checkpoint.empty() ||
+            !options.dflash2_checkpoint.empty()) {
+            throw std::runtime_error(
+                "Qwen DSpark and DFlash2 drafters are not implemented on the "
+                "Ascend backend");
+        }
+#else
         if (!options.dspark_checkpoint.empty()) {
             if (active_layers > 0 &&
                 active_layers != static_cast<int>(config.num_hidden_layers)) {
@@ -918,6 +952,7 @@ struct QwenEngine::Impl {
             uploaded_weight_bytes += dflash2->resident_weight_bytes();
             cache_data_bytes += dflash2->context_cache_bytes();
         }
+#endif
 
         if (options.mtp) {
             if (!map.mtp().found) {
@@ -1627,6 +1662,7 @@ struct QwenEngine::Impl {
         telemetry.active_linear_kinds = active_linear_kinds;
     }
 
+#ifndef POCKET_BACKEND_ASCEND
     void allocate_nvfp4_q8(int rows, int columns) {
         allocate(nvfp4_q8, static_cast<size_t>(rows) * columns,
                  {static_cast<uint64_t>(rows),
@@ -1723,6 +1759,7 @@ struct QwenEngine::Impl {
             up.weight_global_factor, output, rows, output_rows, columns,
             columns, output_rows, columns / 64);
     }
+#endif
 
     void projection(const DeviceLinear& linear, const uint16_t* input,
                     uint16_t* output, int rows, const char* site = "other") {
@@ -1732,6 +1769,22 @@ struct QwenEngine::Impl {
         }
         const int output_rows = static_cast<int>(linear.logical_shape[0]);
         const int columns = static_cast<int>(linear.logical_shape[1]);
+#ifdef POCKET_BACKEND_ASCEND
+        // Only the dense FP16 kind has an Ascend implementation. The quantized
+        // kinds are rejected here rather than left to a runtime branch: a
+        // reference to their CUDA kernels in this object would make the whole
+        // executable require the CUDA toolchain to link.
+        if (linear.kind != QwenLinearKind::DenseF16) {
+            throw std::runtime_error(
+                std::string("Qwen Ascend path is not implemented for ") +
+                qwen_linear_kind_name(linear.kind));
+        }
+        require_launch(qwen_fp16_matmul_rows_f16(
+            input, linear.weight.f16_data(), output, rows, output_rows,
+            columns, columns, output_rows, columns),
+            "FP16 activation/weight projection");
+        return;
+#else
         if (linear.kind == QwenLinearKind::Fp8Block128) {
             if (rows == 1) {
                 require_launch(qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
@@ -1820,6 +1873,7 @@ struct QwenEngine::Impl {
                 std::string("Qwen linear CUDA path is not implemented for ") +
                 qwen_linear_kind_name(linear.kind));
         }
+#endif
     }
 
     void norm(const QwenDeviceTensor& gamma, const uint16_t* input,
@@ -1885,6 +1939,11 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& core = workspace_half(value_elements, v.shape);
         QwenDeviceTensor& z = workspace_half(value_elements, v.shape);
         QwenDeviceTensor& normalized = workspace_half(value_elements, v.shape);
+        // FlashQLA is an SM75 register/subgroup layout of the same recurrence,
+        // not a distinct operation, so the Ascend build simply does not have the
+        // selector: the normalized sequence kernel below produces the same
+        // result from the same FP32 normalized Q/K.
+#ifndef POCKET_BACKEND_ASCEND
         QwenDeviceTensor* q_normalized = nullptr;
         QwenDeviceTensor* k_normalized = nullptr;
         const bool flashqla = rows >= 8 &&
@@ -1895,6 +1954,7 @@ struct QwenEngine::Impl {
                 {static_cast<uint64_t>(rows), static_cast<uint64_t>(key_dim)});
             k_normalized = &workspace_float(key_elements, q_normalized->shape);
         }
+#endif
 
         projection(layer.linear.qkv, hidden, packed.f16_data(), rows, "lin.qkv");
         require_launch(qwen_causal_depthwise_conv_silu_f16(
@@ -1930,6 +1990,7 @@ struct QwenEngine::Impl {
         std::optional<PhaseScope> delta_scope;
         delta_scope.emplace(this, "gated_delta");
         bool sequenced = false;
+#ifndef POCKET_BACKEND_ASCEND
         if (flashqla) {
             // FlashQLA SM75 subgroup-sharded kernel. Still a serial recurrence,
             // but sharding the [128, 128] state over 16-lane subgroups replaces
@@ -1949,7 +2010,9 @@ struct QwenEngine::Impl {
                     static_cast<int>(config.linear_attention.key_head_dim),
                     static_cast<int>(config.linear_attention.value_head_dim),
                     q_scale);
-        } else if (rows >= 5 && key_heads < value_heads &&
+        } else
+#endif
+        if (rows >= 5 && key_heads < value_heads &&
             qwen_env_enabled_default("QWEN_GATED_DELTA_PRENORMALIZE")) {
             QwenDeviceTensor& q_normalized = workspace_float(
                 key_elements, {static_cast<uint64_t>(rows),
@@ -2097,6 +2160,59 @@ struct QwenEngine::Impl {
         const QwenKvCacheDType cache_dtype = options.kv_cache_dtype;
         const int attention_window = options.attention_window;
         const int sink_tokens = options.attention_sink_tokens;
+#ifdef POCKET_BACKEND_ASCEND
+        // The engine constructor rejects every non-FP16 cache dtype on this
+        // backend, so only the FP16 append and the three neutral attention
+        // launchers are compiled. The quantized caches are not merely disabled:
+        // naming their kernels here would put a CUDA dependency in this object.
+        require_launch(qwen_append_kv_cache_f16(
+            k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
+            layer.full.v_cache.f16_data(), rows, kv_heads, head_dim,
+            position_offset, max_context), "append FP16 full KV cache");
+
+        if (rows == 1) {
+            const int context_length = position_offset + 1;
+            QwenDeviceTensor& scores = workspace_float(
+                static_cast<size_t>(q_heads) * context_length,
+                {static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(context_length)});
+            require_launch(qwen_gqa_decode_attention_f16(
+                q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                layer.full.v_cache.f16_data(), attention.f16_data(),
+                scores.f32_data(), q_heads, kv_heads, head_dim,
+                context_length, max_context), "decode FP16-cache GQA");
+        } else if (rows <= 8) {
+            const int context_length = position_offset + rows;
+            // Same split geometry the CUDA verify path uses, so a verify block
+            // reduces its partials in the same order on both backends.
+            const int default_splits = context_length >= 1024 ? 64 : 32;
+            int target_splits = qwen_env_int(
+                "QWEN_GQA_VERIFY_SPLITS", default_splits);
+            if (target_splits <= 0) target_splits = default_splits;
+            const int verify_splits = std::max(
+                1, std::min(target_splits, context_length));
+            QwenDeviceTensor& partials = workspace_float(
+                static_cast<size_t>(rows) * q_heads * verify_splits *
+                    static_cast<size_t>(head_dim + 2),
+                {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(verify_splits),
+                 static_cast<uint64_t>(head_dim + 2)});
+            PhaseScope sub(this, "full.attn_kernel");
+            require_launch(qwen_gqa_verify_attention_f16(
+                q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                layer.full.v_cache.f16_data(), attention.f16_data(),
+                partials.f32_data(), rows, q_heads, kv_heads, head_dim,
+                position_offset, max_context, verify_splits),
+                "verify split FP16-cache GQA");
+        } else {
+            require_launch(qwen_gqa_prefill_attention_f16(
+                q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                layer.full.v_cache.f16_data(), attention.f16_data(), rows,
+                q_heads, kv_heads, head_dim, position_offset, max_context),
+                "prefill FP16-cache GQA");
+        }
+        (void)sink_tokens;
+#else
         if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
@@ -2381,6 +2497,7 @@ struct QwenEngine::Impl {
                 q_heads, kv_heads, head_dim, position_offset, max_context),
                 "prefill FP16-cache GQA");
         }
+#endif
         require_launch(qwen_sigmoid_mul_f16(
             attention.f16_data(), gate.f16_data(), merged.f16_data(),
             rows * attention_dim), "FP16 full attention output gate");
@@ -2409,6 +2526,15 @@ struct QwenEngine::Impl {
                               static_cast<uint64_t>(hidden_size)});
         QwenDeviceTensor& attention = workspace_half(hidden_elements, normalized.shape);
         QwenDeviceTensor& post = workspace_half(hidden_elements, normalized.shape);
+#ifdef POCKET_BACKEND_ASCEND
+        // Every fused SwiGLU variant below is a quantized-weight kernel, and no
+        // quantized kind loads on this backend. Keeping the flags as constants
+        // lets the shared control flow read identically on both backends while
+        // the dead arms are removed before codegen.
+        constexpr bool fused_decode_swiglu = false;
+        constexpr bool fused_small_batch_swiglu = false;
+        constexpr bool fused_nvfp4_swiglu = false;
+#else
         const bool compatible_fp8_swiglu =
             layer.gate.kind == QwenLinearKind::Fp8Block128 &&
             layer.up.kind == QwenLinearKind::Fp8Block128 &&
@@ -2437,6 +2563,7 @@ struct QwenEngine::Impl {
             layer.gate.kind == QwenLinearKind::NvFp4Group16 &&
             layer.up.kind == QwenLinearKind::NvFp4Group16 &&
             layer.gate.logical_shape == layer.up.logical_shape;
+#endif
         QwenDeviceTensor* gate = nullptr;
         QwenDeviceTensor* up = nullptr;
         if (!fused_decode_swiglu && !fused_small_batch_swiglu &&
@@ -2479,6 +2606,15 @@ struct QwenEngine::Impl {
             add(output, attention.f16_data(), rows * hidden_size);
             norm(layer.post_norm, output, post.f16_data(), rows, hidden_size);
         }
+#ifdef POCKET_BACKEND_ASCEND
+        {
+            projection(layer.gate, post.f16_data(), gate->f16_data(), rows, "mlp.gate");
+            projection(layer.up, post.f16_data(), up->f16_data(), rows, "mlp.up");
+            require_launch(qwen_silu_mul_rows_f16(
+                gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
+                static_cast<int>(layer.gate.logical_shape[0])), "FP16 SwiGLU");
+        }
+#else
         if (fused_decode_swiglu) {
             PhaseScope scope(this, "swiglu.d");
             require_launch(qwen_fp8_e4m3_fp16scale_swiglu_matvec_f16_cuda(
@@ -2520,6 +2656,7 @@ struct QwenEngine::Impl {
                 gate->f16_data(), up->f16_data(), intermediate.f16_data(), rows,
                 static_cast<int>(layer.gate.logical_shape[0])), "FP16 SwiGLU");
         }
+#endif
         // ar.mlp is the largest single collective (3.58 s of the 7.24 s
         // tp_all_reduce leaf at 32K), and down is a large GEMM, so this is the
         // best overlap candidate in the layer.
@@ -2553,6 +2690,10 @@ struct QwenEngine::Impl {
     // Under TP the vocabulary is sharded, so each rank emits its local top-k as
     // global ids, NCCL merges the candidates, and the draw happens over the
     // merged set with a uniform every rank already agrees on.
+    //
+    // The Ascend build has no device sampler yet, so the whole routine is
+    // compiled out and the constructor rejects a nonzero temperature up front.
+#ifndef POCKET_BACKEND_ASCEND
     QwenVerifyBatch sample_tokens_for(QwenDeviceTensor& local_logits, int rows,
                                       int local_vocab, int vocab_start,
                                       int position_after) {
@@ -2652,6 +2793,7 @@ struct QwenEngine::Impl {
         result.local_logits = result.top_logits;
         return result;
     }
+#endif
 
     QwenVerifyBatch top_tokens_for(const uint16_t* hidden, int rows,
                                    const QwenDeviceTensor* output_norm,
@@ -2679,6 +2821,23 @@ struct QwenEngine::Impl {
             static_cast<size_t>(rows) * local_vocab,
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
         bool logits_ok = false;
+#ifdef POCKET_BACKEND_ASCEND
+        // The cuBLAS row variant is an alternative implementation of the same
+        // GEMM, so the Ascend build has only the neutral launcher. Fp8Channel is
+        // rejected for the same reason projection() rejects the quantized kinds.
+        if (lm_head.kind != QwenLinearKind::DenseF16) {
+            throw std::runtime_error(
+                std::string("Qwen Ascend target head is not implemented for ") +
+                qwen_linear_kind_name(lm_head.kind));
+        }
+        {
+            PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
+            logits_ok = qwen_fp16_matmul_rows_f16_f32(
+                normalized.f16_data(), lm_head.weight.f16_data(),
+                local_logits.f32_data(), rows, local_vocab, hidden_size,
+                hidden_size, local_vocab, hidden_size);
+        }
+#else
         if (lm_head.kind == QwenLinearKind::DenseF16) {
             // Decode. The warp-per-row matvec reorders the reduction, so it is a
             // separate entry point rather than a retune of the reference path;
@@ -2716,6 +2875,7 @@ struct QwenEngine::Impl {
                 std::string("Qwen target-head CUDA path is not implemented for ") +
                 qwen_linear_kind_name(lm_head.kind));
         }
+#endif
         require_launch(logits_ok, "Qwen batched FP32 logits");
         allocate(argmax_token, static_cast<size_t>(rows) * sizeof(int),
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
@@ -2726,19 +2886,20 @@ struct QwenEngine::Impl {
         // Sampled path. Kept ahead of the argmax launch so a sampled run does
         // not pay for a top-1 reduction it discards; greedy falls through to
         // the original code unchanged.
+#ifndef POCKET_BACKEND_ASCEND
         if (sampling_enabled()) {
             return sample_tokens_for(local_logits, rows, local_vocab,
                                      vocab_start, position_after);
         }
+#endif
 
         {
             PhaseScope scope(this, "argmax");
-            require_launch(argmax_fp32_rows_cuda(
+            require_launch(qwen_argmax_fp32_rows(
                 local_logits.f32_data(), static_cast<int*>(argmax_token.data),
                 argmax_logit.f32_data(), rows, local_vocab, vocab_start),
                 "Qwen batched local argmax");
         }
-
         QwenVerifyBatch result;
         result.top_tokens.resize(static_cast<size_t>(rows));
         result.top_logits.resize(static_cast<size_t>(rows));
@@ -3519,8 +3680,24 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
         throw std::runtime_error(
             "Qwen sparse attention currently requires an FP16 KV cache");
     }
+#ifdef POCKET_BACKEND_ASCEND
+    // full_attention only compiles the FP16 cache path on this backend, so the
+    // rejection belongs here where the option is still reportable rather than
+    // deep inside a layer.
+    if (options_.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+        throw std::runtime_error(
+            "Qwen Ascend backend currently supports only an FP16 KV cache");
+    }
+    if (options_.temperature > 1.0e-5f) {
+        throw std::runtime_error(
+            "Qwen sampling is not implemented on the Ascend backend; use greedy "
+            "decoding (--temperature 0)");
+    }
+#endif
     if (!device_set(options_.device)) {
-        throw std::runtime_error("failed to set Qwen CUDA device");
+        throw std::runtime_error(
+            std::string("failed to set Qwen ") + device_backend_name() +
+            " device");
     }
     if (layer_count <= 0) {
         active_layers_ = static_cast<int>(config_.num_hidden_layers);

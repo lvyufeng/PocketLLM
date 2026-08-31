@@ -25,6 +25,14 @@ bool QwenTargetHeadAdapter::project_f16_to_f32(
         return false;
     }
     if (kind == QwenLinearKind::DenseF16) {
+#ifdef POCKET_BACKEND_ASCEND
+        // The portable Ascend path is the only dense implementation available
+        // here; cublas_fp32 is a CUDA tuning hint and must not affect it.
+        (void)cublas_fp32;
+        return qwen_fp16_matmul_rows_f16_f32(
+            hidden, weight->f16_data(), logits, rows, local_vocab,
+            hidden_size, hidden_size, local_vocab, hidden_size, stream);
+#else
         return cublas_fp32
             ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
                   hidden, weight->f16_data(), logits, rows, local_vocab,
@@ -32,11 +40,18 @@ bool QwenTargetHeadAdapter::project_f16_to_f32(
             : qwen_fp16_matmul_rows_f16_f32(
                   hidden, weight->f16_data(), logits, rows, local_vocab,
                   hidden_size, hidden_size, local_vocab, hidden_size, stream);
+#endif
     }
+#ifdef POCKET_BACKEND_ASCEND
+    (void)stream;
+    // First-generation Ascend bring-up supports dense FP16 target heads only.
+    return false;
+#else
     return qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(
         hidden, weight->fp8_data(), scale->f16_data(), logits, rows,
         local_vocab, hidden_size, hidden_size, local_vocab, hidden_size,
         stream);
+#endif
 }
 
 }  // namespace dsv4
