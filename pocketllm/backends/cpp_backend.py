@@ -8,6 +8,8 @@ SDK at import time.
 from __future__ import annotations
 
 import importlib
+import json
+import os
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -60,6 +62,43 @@ def _native_kv_cache_dtype(value: str) -> str:
     """Resolve the public ``auto`` value to the native Qwen default."""
     normalized = str(value or "auto").lower()
     return "fp16" if normalized == "auto" else normalized
+
+
+def _coerce_eos_ids(value: Any, *, source: str) -> tuple[int, ...]:
+    """Normalize a configured EOS value into a tuple of token ids."""
+    if value is None:
+        return ()
+    if isinstance(value, bool):
+        raise ConfigurationError(f"{source} eos_token_id must be an integer or list of integers")
+    if isinstance(value, int):
+        return (int(value),)
+    if isinstance(value, (list, tuple)):
+        ids: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ConfigurationError(f"{source} eos_token_id list must contain integers only")
+            ids.append(int(item))
+        return tuple(dict.fromkeys(ids))
+    raise ConfigurationError(f"{source} eos_token_id must be an integer or list of integers")
+
+
+def _checkpoint_eos_ids(checkpoint_dir: str) -> tuple[tuple[int, ...], str]:
+    """Read the EOS ids a checkpoint declares, preferring generation_config.json."""
+    if not checkpoint_dir:
+        return (), ""
+    for name in ("generation_config.json", "config.json"):
+        path = os.path.join(checkpoint_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        ids = _coerce_eos_ids(data.get("eos_token_id"), source=name)
+        if ids:
+            return ids, name
+    return (), ""
 
 
 def _native_device_index(value: str | int | None) -> int:
@@ -117,7 +156,56 @@ class CppBackend(BackendBase):
         # without guaranteeing that every next() call uses the same thread.
         self._request_lock = threading.Lock()
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
+        self._eos_ids, self._eos_source = self._resolve_eos_ids()
         self._ready = True
+
+    def _resolve_eos_ids(self) -> tuple[frozenset[int], str]:
+        """Resolve the stop tokens without guessing a vocabulary-specific id.
+
+        ``backend_options["eos_token_id"]`` wins so an operator can override a
+        checkpoint.  Otherwise the native engine, the tokenizer, and finally the
+        checkpoint's ``generation_config.json``/``config.json`` are consulted.
+        An empty result means only the token budget can end generation, which the
+        adapter reports as ``finish_reason="length"``.
+        """
+        override = _coerce_eos_ids(self.args.backend_options.get("eos_token_id"), source="backend_options")
+        if override:
+            return frozenset(override), "backend_options"
+        for holder, attribute, source in (
+            (self._engine, "eos_id", "native engine"),
+            (self._engine, "eos_token_id", "native engine"),
+        ):
+            if holder is None:
+                continue
+            value = getattr(holder, attribute, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    continue
+            ids = _coerce_eos_ids(value, source=source)
+            if ids:
+                return frozenset(ids), source
+        config = getattr(self._engine, "config", None)
+        if isinstance(config, dict):
+            ids = _coerce_eos_ids(config.get("eos_token_id"), source="native config")
+            if ids:
+                return frozenset(ids), "native config"
+        # generation_config.json is consulted before the tokenizer because it is
+        # what the checkpoint declares for generation. Chat checkpoints commonly
+        # stop on a turn-end token that differs from the tokenizer's EOS.
+        ids, name = _checkpoint_eos_ids(self.args.checkpoint_dir)
+        if ids:
+            return frozenset(ids), name
+        value = getattr(self._tokenizer, "eos_token_id", None) if self._tokenizer is not None else None
+        ids = _coerce_eos_ids(value, source="tokenizer")
+        if ids:
+            return frozenset(ids), "tokenizer"
+        return frozenset(), ""
+
+    @property
+    def eos_token_ids(self) -> frozenset[int]:
+        return self._eos_ids
 
     @staticmethod
     def native_available() -> bool:
@@ -151,6 +239,8 @@ class CppBackend(BackendBase):
                 "scheduler": "serialized compatibility session",
                 "device_backend": native_backend or "unknown",
                 "cancellation": "safe boundary only",
+                "eos_token_ids": sorted(self._eos_ids),
+                "eos_source": self._eos_source or "none",
             },
         )
 
@@ -241,6 +331,37 @@ class CppBackend(BackendBase):
             return int(item)
         return int(getattr(item, "top_token", getattr(item, "token", item)))
 
+    def _is_eos(self, token: int) -> bool:
+        return token in self._eos_ids
+
+    def _generate_until_eos(
+        self, request: GenerationRequest, prompt_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        """Step the native session so it never advances past EOS.
+
+        ``QwenEngine.generate`` takes no EOS argument and keeps mutating its
+        session for the whole token budget.  Calling it and truncating the result
+        would leave the recurrent state and prefix cache positioned after text
+        the caller never sees, corrupting reuse for the next request.  Driving
+        prefill/decode here keeps the session and the returned tokens in step,
+        and matches what the streamed path does.
+        """
+        engine = self._engine
+        if engine is None:
+            raise RuntimeError("native C++ engine is closed")
+        result = engine.prefill(prompt_ids)
+        token_ids: list[int] = []
+        for index in range(request.sampling_params.max_tokens):
+            self._ensure_open()
+            self._check_cancelled(request.request_id)
+            token = self._native_token(result)
+            if self._is_eos(token):
+                return token_ids, True
+            token_ids.append(token)
+            if index + 1 < request.sampling_params.max_tokens:
+                result = engine.decode_step(token)
+        return token_ids, False
+
     def _decode(self, token_ids: list[int]) -> str:
         if self._tokenizer is None:
             return ""
@@ -266,22 +387,27 @@ class CppBackend(BackendBase):
                 with self._request_lock:
                     self._ensure_open()
                     self._check_cancelled(request.request_id)
-                    engine = self._engine
-                    if engine is None:
-                        raise RuntimeError("native C++ engine is closed")
-                    raw = engine.generate(
-                        prompt_ids, request.sampling_params.max_tokens
-                    )
+                    if self._eos_ids:
+                        token_ids, hit_eos = self._generate_until_eos(request, prompt_ids)
+                    else:
+                        engine = self._engine
+                        if engine is None:
+                            raise RuntimeError("native C++ engine is closed")
+                        raw = engine.generate(prompt_ids, request.sampling_params.max_tokens)
+                        token_ids = [self._native_token(item) for item in raw]
+                        hit_eos = False
                     self._ensure_open()
                 self._check_cancelled(request.request_id)
-                token_ids = [self._native_token(item) for item in raw]
+                # `completion_tokens` counts the EOS step the engine executed, so
+                # usage stays comparable with the streamed path.
+                completion_tokens = len(token_ids) + (1 if hit_eos else 0)
                 outputs.append(
                     GenerationResult(
                         request_id=request.request_id,
                         token_ids=token_ids,
                         text=self._decode(token_ids),
-                        finish_reason="length",
-                        usage=Usage(len(prompt_ids), len(token_ids)),
+                        finish_reason="stop" if hit_eos else "length",
+                        usage=Usage(len(prompt_ids), completion_tokens),
                         timings=TimingMetrics(
                             total_seconds=time.perf_counter() - started,
                             ttft_seconds=0.0,
@@ -315,6 +441,15 @@ class CppBackend(BackendBase):
             self._ensure_open()
             self._check_cancelled(request.request_id)
             token = self._native_token(result)
+            if self._is_eos(token):
+                # Stop before another decode_step. EOS is counted as a generated
+                # step but is not emitted as visible text.
+                yield TokenEvent(
+                    request.request_id,
+                    finish_reason="stop",
+                    usage=Usage(len(prompt_ids), len(generated) + 1),
+                )
+                return
             generated.append(token)
             decoded = self._decode(generated)
             # Decode the complete sequence so BPE/UTF-8 token boundaries are handled

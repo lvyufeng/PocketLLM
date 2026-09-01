@@ -71,6 +71,7 @@ from src.runtime.pd_scheduler import PDExecutionFacade, PDScheduler
 from src.server.engine import DeepSeekServingEngine
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
+from pocketllm import protocol  # noqa: E402
 from src.encoding.dsv4 import dsml_token, encode_messages, eos_token, parse_message_from_completion_text  # noqa: E402
 
 
@@ -202,109 +203,13 @@ def _openai_error(message: str, error_type: str = "invalid_request_error", param
     return {"error": {"message": message, "type": error_type, "param": param, "code": code}}
 
 
-def _normalize_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-            elif isinstance(block, dict):
-                parts.append(f"[Unsupported {block.get('type', 'content')}]")
-            else:
-                parts.append(str(block))
-        return "\n".join(parts)
-    if content is None:
-        return ""
-    return str(content)
-
-
-def _tool_names(tools: Any) -> set[str]:
-    names: set[str] = set()
-    if not isinstance(tools, list):
-        return names
-    for tool in tools:
-        if isinstance(tool, dict) and tool.get("type") == "function" and isinstance(tool.get("function"), dict):
-            name = tool["function"].get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
-
-
-def _tool_choice_instruction(tool_choice: Any, tools: Any) -> tuple[bool, str | None]:
-    if tool_choice is None or tool_choice == "auto":
-        names = _tool_names(tools)
-        return True, None
-    if tool_choice == "none":
-        return False, "Do not call any tools. Answer directly."
-    if tool_choice == "required":
-        return True, "You must call at least one available tool if the user request can be answered with a tool."
-    if isinstance(tool_choice, dict):
-        if tool_choice.get("type") != "function" or not isinstance(tool_choice.get("function"), dict):
-            raise ValueError("tool_choice object must be {type:'function', function:{name:'...'}}")
-        name = tool_choice["function"].get("name")
-        if not isinstance(name, str) or not name:
-            raise ValueError("tool_choice.function.name must be a non-empty string")
-        names = _tool_names(tools)
-        if names and name not in names:
-            raise ValueError(f"tool_choice references unknown tool: {name}")
-        return True, f"You must call the tool named {name}. Do not call any other tool."
-    raise ValueError("tool_choice must be 'auto', 'none', 'required', or a function choice object")
-
-
-def _prepare_messages(body: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_messages = body.get("messages", [])
-    if not isinstance(raw_messages, list) or not raw_messages:
-        raise ValueError("messages must be a non-empty list")
-    messages = []
-    for msg in raw_messages:
-        if not isinstance(msg, dict):
-            raise ValueError("each message must be an object")
-        copied = dict(msg)
-        role = copied.get("role")
-        if "content" in copied and role != "tool":
-            copied["content"] = _normalize_content(copied["content"])
-        elif role == "tool" and isinstance(copied.get("content"), list):
-            copied["content"] = _normalize_content(copied.get("content"))
-        messages.append(copied)
-    tools = body.get("tools")
-    tool_choice = body.get("tool_choice")
-    attach_tools, instruction = _tool_choice_instruction(tool_choice, tools)
-    tool_attach_idx = None
-    for idx, msg in enumerate(messages):
-        if msg.get("role") in {"system", "developer"}:
-            tool_attach_idx = idx
-            break
-    if tools is not None and attach_tools and tool_attach_idx is None:
-        messages.insert(0, {"role": "system", "content": ""})
-        tool_attach_idx = 0
-    last_user_idx = None
-    for idx in range(len(messages) - 1, -1, -1):
-        if messages[idx].get("role") in {"user", "developer", "system"}:
-            last_user_idx = idx
-            break
-    if tools is not None and attach_tools and tool_attach_idx is not None:
-        messages[tool_attach_idx]["tools"] = tools
-    if last_user_idx is not None:
-        if body.get("response_format") is not None:
-            messages[last_user_idx]["response_format"] = body["response_format"]
-        if instruction:
-            content = messages[last_user_idx].get("content") or ""
-            messages[last_user_idx]["content"] = f"{content}\n\n{instruction}" if content else instruction
-    return messages
-
-
-def _thinking_config(body: dict[str, Any]) -> tuple[str, str | None]:
-    reasoning = body.get("reasoning")
-    effort = body.get("reasoning_effort")
-    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
-        effort = reasoning.get("effort")
-    if reasoning is None and effort is None:
-        return "chat", None
-    if effort not in {None, "minimal", "low", "medium", "high", "max"}:
-        effort = None
-    return "thinking", effort
+# Request normalization lives in the backend-neutral protocol package so the
+# unified PocketLLM server shares one implementation with this legacy server.
+_normalize_content = protocol.normalize_content
+_tool_names = protocol.tool_names
+_tool_choice_instruction = protocol.tool_choice_instruction
+_prepare_messages = protocol.prepare_messages
+_thinking_config = protocol.thinking_config
 
 
 def _strip_special_eos(text: str) -> str:
@@ -332,48 +237,14 @@ def _timing_metrics(prefill_time: float, decode_time: float, prefill_tokens: int
     }
 
 
-def _normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
-    normalized = []
-    if not isinstance(tool_calls, list):
-        return normalized
-    for tool_call in tool_calls:
-        if not isinstance(tool_call, dict):
-            continue
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
-        name = function.get("name") or tool_call.get("name")
-        arguments = function.get("arguments", tool_call.get("arguments", "{}"))
-        if not isinstance(arguments, str):
-            arguments = json.dumps(arguments, ensure_ascii=False)
-        if not name:
-            continue
-        normalized.append({
-            "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
-            "type": "function",
-            "function": {"name": str(name), "arguments": arguments},
-        })
-    return normalized
-
-
-def _stop_strings(stop: Any) -> list[str]:
-    if isinstance(stop, str):
-        return [stop]
-    if isinstance(stop, list):
-        return [s for s in stop if isinstance(s, str) and s]
-    return []
+_normalize_tool_calls = protocol.normalize_tool_calls
+_stop_strings = protocol.stop_strings
 
 
 def _apply_stop_to_result(result: dict[str, Any], stop: Any) -> None:
-    stops = _stop_strings(stop)
-    if not stops:
-        return
-    content = result.get("content") or ""
-    earliest = None
-    for item in stops:
-        pos = content.find(item)
-        if pos >= 0 and (earliest is None or pos < earliest):
-            earliest = pos
-    if earliest is not None:
-        result["content"] = content[:earliest]
+    content, stopped = protocol.apply_stop_to_text(result.get("content") or "", stop)
+    if stopped:
+        result["content"] = content
         result["finish_reason"] = "stop"
 
 

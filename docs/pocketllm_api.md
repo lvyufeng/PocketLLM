@@ -120,6 +120,47 @@ Capabilities reported by the C++ adapter follow the linked device backend. An As
 only the speculative methods it implements, since the external DSpark and DFlash2 drafters are
 CUDA-only.
 
+## Request normalization
+
+`pocketllm.protocol` holds the request normalization shared by the unified server and the legacy
+`src.server.openai` server: OpenAI content-block flattening, tool attachment and `tool_choice`
+instructions, `reasoning`/`reasoning_effort` handling, tool-call shaping, and stop-string truncation.
+There is one implementation, and it imports neither Torch nor the native module.
+
+`/v1/chat/completions` puts the normalized messages, thinking mode, reasoning effort, and tool
+metadata in `GenerationRequest.metadata`, so a backend applies its own chat template. The Torch
+adapter encodes them with the DeepSeek template that the legacy server uses, so both servers build
+the same prompt. `GenerationRequest.prompt` still carries a deterministic `role: content` rendering as
+a fallback for backends that have no template of their own. `/v1/completions` passes `prompt` through
+unchanged and validates that a list prompt contains only strings.
+
+A backend that separates reasoning from content can set `reasoning_content` and `tool_calls` in its
+result or event metadata; those are forwarded to the response and to streamed deltas. A backend that
+does not simply omits them.
+
+## Termination semantics
+
+The C++ adapter decides when generation stops. The first EOS token ends the request, is excluded from
+the returned token ids and text, and yields `finish_reason="stop"`. `finish_reason="length"` means the
+token budget ended first. Usage counts the EOS step the engine executed, so streaming and offline
+usage agree.
+
+`QwenEngine.generate` takes no EOS argument and keeps mutating its session for the whole token budget,
+so when an EOS id is known both the offline and streamed paths drive `prefill`/`decode_step`
+themselves and stop at EOS. Running `generate()` and truncating afterwards would leave the recurrent
+state and prefix cache positioned past text the caller never saw, corrupting reuse for the next
+request. Native `generate()` is still used when no EOS id is available, where the token budget is the
+only stopping rule.
+
+EOS ids are resolved in order: `backend_options["eos_token_id"]`, the native engine's `eos_id`, the
+native config, the checkpoint's `generation_config.json`, the checkpoint's `config.json`, then the
+tokenizer. `generation_config.json` is preferred over the tokenizer because chat checkpoints commonly
+stop on a turn-end token that differs from the tokenizer's EOS. A non-integer override is rejected
+rather than guessed. When no EOS is available, `capabilities.details["eos_source"]` reports `none` and
+only the token budget can end generation. Streaming never issues another `decode_step` after EOS, and
+it never calls `reset()` per request, since `QwenEngine::reset()` would clear the prefix cache that
+`prefill()` relies on.
+
 ## Cancellation semantics
 
 `cancel(request_id)` returns `True` only for a request that is currently active, and cancellation is
