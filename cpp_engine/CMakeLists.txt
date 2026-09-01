@@ -19,6 +19,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Python bindings are optional so the native CLI and inspection tools keep their
+# existing dependency footprint.  When enabled, pybind11 is discovered through
+# the active Python environment and the module links the same selected backend.
+option(POCKET_BUILD_PYTHON "Build the optional pocketllm_cpp Python module" OFF)
+
+# The Python module is a shared object, so every static library it links must be
+# position independent.  This is scoped to the Python build so the executables
+# keep their existing code generation, including GOT-free direct addressing.
+set(POCKET_STATIC_PIC ${POCKET_BUILD_PYTHON})
+
 # Sources that touch no vendor SDK. Keeping this list free of vendor headers is
 # what lets a second backend reuse the loaders, tokenizer and HTTP server
 # unchanged; see check_layering below, which enforces it.
@@ -284,6 +294,7 @@ endif()
 # and the Qwen weight map build and run with no vendor SDK present at all, which
 # is what lets a checkpoint be audited on a host without the accelerator toolkit.
 add_library(pocket_core STATIC ${POCKET_CORE_SOURCES})
+set_target_properties(pocket_core PROPERTIES POSITION_INDEPENDENT_CODE ${POCKET_STATIC_PIC})
 target_include_directories(pocket_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
@@ -293,6 +304,7 @@ target_include_directories(pocket_core PUBLIC
 # linked, chosen at configure time, so a call through this costs the same as
 # calling the vendor API directly: no vtable, no dispatch.
 add_library(pocket_runtime STATIC ${POCKET_RUNTIME_SOURCES})
+set_target_properties(pocket_runtime PROPERTIES POSITION_INDEPENDENT_CODE ${POCKET_STATIC_PIC})
 target_link_libraries(pocket_runtime PUBLIC pocket_core)
 target_include_directories(pocket_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/api
@@ -311,6 +323,7 @@ add_library(dsv4_cpp_core STATIC
     ${POCKET_ENGINE_SOURCES}
     ${POCKET_BACKEND_SOURCES}
 )
+set_target_properties(dsv4_cpp_core PROPERTIES POSITION_INDEPENDENT_CODE ${POCKET_STATIC_PIC})
 
 target_link_libraries(dsv4_cpp_core PUBLIC pocket_core pocket_runtime)
 
@@ -356,6 +369,36 @@ add_custom_target(check_layering
 
 add_executable(dsv4_cpp_engine engine/main.cpp)
 target_link_libraries(dsv4_cpp_engine PRIVATE dsv4_cpp_core)
+
+if(POCKET_BUILD_PYTHON)
+    find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+    find_package(pybind11 CONFIG REQUIRED)
+    # Do not enable pybind11's LTO/strip extras here.  The selected backend
+    # contains CUDA device-link objects whose fatbin registration data must stay
+    # visible while the shared extension is linked.
+    pybind11_add_module(pocketllm_cpp NO_EXTRAS python/bindings.cpp)
+    target_link_libraries(pocketllm_cpp PRIVATE dsv4_cpp_core)
+    target_include_directories(pocketllm_cpp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/backends/api
+    )
+    if(POCKET_BACKEND_INCLUDES)
+        target_include_directories(pocketllm_cpp PRIVATE ${POCKET_BACKEND_INCLUDES})
+    endif()
+    if(POCKET_ASCEND_KERNEL_INCLUDES)
+        target_include_directories(pocketllm_cpp PRIVATE ${POCKET_ASCEND_KERNEL_INCLUDES})
+    endif()
+    if(POCKET_BACKEND_DEFINES)
+        target_compile_definitions(pocketllm_cpp PRIVATE ${POCKET_BACKEND_DEFINES})
+    endif()
+    set_target_properties(pocketllm_cpp PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/python
+    )
+    message(STATUS "POCKET_BUILD_PYTHON=ON: building pocketllm_cpp")
+endif()
 
 add_executable(inspect_gguf tools/inspect_gguf.cpp)
 target_link_libraries(inspect_gguf PRIVATE dsv4_cpp_core)

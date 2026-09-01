@@ -36,7 +36,16 @@ setup(
         "src.models.minimax_m2",
         "src.runtime",
         "src.server",
+        "pocketllm",
+        "pocketllm.api",
+        "pocketllm.backends",
+        "pocketllm.server",
     ],
+    entry_points={
+        "console_scripts": [
+            "pocketllm=pocketllm.cli:main",
+        ],
+    },
     ext_modules=[
         CUDAExtension(
             name="cuda_kernel",
