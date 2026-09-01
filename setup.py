@@ -39,6 +39,7 @@ setup(
         "pocketllm",
         "pocketllm.api",
         "pocketllm.backends",
+        "pocketllm.protocol",
         "pocketllm.server",
     ],
     entry_points={

@@ -20,12 +20,14 @@ class ContractBackend(BackendBase):
         super().__init__()
         self._ready = True
         self._fail = fail
+        self.seen: list = []
 
     @property
     def capabilities(self):
         return BackendCapabilities(name="fake", supports_streaming=True, supports_cancellation=True)
 
     def generate(self, requests):
+        self.seen.extend(requests)
         if self._fail:
             raise UnsupportedFeatureError("logprobs are not exposed by this backend")
         return [GenerationResult(
@@ -47,8 +49,8 @@ class ContractBackend(BackendBase):
             self._clear_request(req.request_id)
 
 
-def _server(fail: bool = False):
-    backend = ContractBackend(fail=fail)
+def _server(fail: bool = False, backend: ContractBackend | None = None):
+    backend = backend or ContractBackend(fail=fail)
     server = PocketLLMHTTPServer(("127.0.0.1", 0), OpenAIHandler, backend, "fake-model")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -165,6 +167,96 @@ def test_stream_backend_failure_is_reported_in_band():
         assert payloads[-1] == "[DONE]"
         errors = [json.loads(item) for item in payloads if item != "[DONE]" and "error" in item]
         assert errors and errors[-1]["error"]["type"] == "unsupported_feature"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_chat_requests_carry_normalized_messages_to_the_backend():
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        _post(base, "/v1/chat/completions", {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "required",
+            "reasoning_effort": "high",
+        })
+        request = backend.seen[-1]
+        # The backend receives the normalized messages so it can apply its own
+        # chat template rather than a flattened "role: content" string.
+        assert request.metadata["messages"][0]["role"] == "system"
+        assert request.metadata["messages"][0]["tools"] == [
+            {"type": "function", "function": {"name": "weather"}}
+        ]
+        assert request.metadata["thinking_mode"] == "thinking"
+        assert request.metadata["reasoning_effort"] == "high"
+        assert "must call at least one available tool" in request.metadata["messages"][-1]["content"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_invalid_chat_and_completion_bodies_are_rejected():
+    server, base = _server()
+    try:
+        for path, body in (
+            ("/v1/chat/completions", {"messages": []}),
+            ("/v1/chat/completions", {"messages": ["hi"]}),
+            ("/v1/completions", {"prompt": ""}),
+            ("/v1/completions", {"prompt": [1]}),
+        ):
+            try:
+                _post(base, path, body)
+                raise AssertionError(f"expected an HTTP error for {path} {body}")
+            except error.HTTPError as exc:
+                assert exc.code == 400
+                assert json.loads(exc.read().decode())["error"]["type"] == "invalid_request_error"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_reasoning_and_tool_calls_are_forwarded_in_responses():
+    class ReasoningBackend(ContractBackend):
+        def generate(self, requests):
+            return [GenerationResult(
+                request_id=req.request_id,
+                token_ids=[11],
+                text="answer",
+                usage=Usage(1, 1),
+                metadata={
+                    "reasoning_content": "because",
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                                    "function": {"name": "weather", "arguments": "{}"}}],
+                },
+            ) for req in requests]
+
+        def stream(self, req):
+            self._begin_request(req.request_id)
+            try:
+                yield TokenEvent(req.request_id, text="", metadata={"reasoning_content": "because"})
+                yield TokenEvent(req.request_id, text="answer", token_id=11, finish_reason="stop",
+                                 usage=Usage(1, 1))
+            finally:
+                self._clear_request(req.request_id)
+
+    server, base = _server(backend=ReasoningBackend())
+    try:
+        chat = _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        message = chat["choices"][0]["message"]
+        assert message["reasoning_content"] == "because"
+        assert message["tool_calls"][0]["function"]["name"] == "weather"
+
+        raw = _post_raw(base, "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}], "stream": True,
+        })
+        chunks = [json.loads(item) for item in
+                  (line[len("data: "):] for line in raw.splitlines() if line.startswith("data: "))
+                  if item != "[DONE]"]
+        assert any(chunk["choices"][0]["delta"].get("reasoning_content") == "because" for chunk in chunks)
     finally:
         server.shutdown()
         server.server_close()

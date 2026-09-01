@@ -132,6 +132,7 @@ def test_generate_converts_native_results_and_usage() -> None:
 
     result = backend.generate([request])[0]
 
+    # Without a known EOS the adapter delegates to native generate().
     assert engine.calls == [("generate", [5, 7], 3)]
     assert result.request_id == "req-generate"
     assert result.token_ids == [10, 11, 12]
@@ -368,6 +369,157 @@ def test_stream_text_deltas_use_cumulative_tokenizer_decode() -> None:
 
     assert [event.text for event in events] == ["a", "b", "a"]
     backend.close()
+
+
+def test_generate_stops_at_eos_and_reports_stop() -> None:
+    engine = FakeEngine()
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp", backend_options={"eos_token_id": 11}),
+        engine=engine,
+        tokenizer=FakeTokenizer(),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[4, 5],
+        request_id="req-eos-generate",
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    result = backend.generate([request])[0]
+
+    # With a known EOS the adapter drives prefill/decode itself so the session is
+    # never advanced past EOS, and EOS stays out of the visible output.
+    assert engine.calls == [("prefill", [4, 5]), ("decode_step", 10)]
+    assert result.token_ids == [10]
+    assert result.text == "<10>"
+    assert result.finish_reason == "stop"
+    assert result.usage.as_dict() == {
+        "prompt_tokens": 2,
+        "completion_tokens": 2,
+        "total_tokens": 4,
+    }
+    backend.close()
+
+
+def test_stream_stops_at_eos_without_another_decode_step() -> None:
+    engine = FakeEngine()
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp", backend_options={"eos_token_id": [12]}),
+        engine=engine,
+        tokenizer=FakeTokenizer(),
+    )
+    request = GenerationRequest(
+        prompt_tokens=[4, 5],
+        request_id="req-eos-stream",
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+
+    events = list(backend.stream(request))
+
+    assert engine.calls == [
+        ("prefill", [4, 5]),
+        ("decode_step", 10),
+        ("decode_step", 11),
+    ]
+    assert [event.token_id for event in events] == [10, 11, None]
+    assert [event.text for event in events] == ["<10>", "<11>", ""]
+    assert [event.finish_reason for event in events] == [None, None, "stop"]
+    assert events[-1].usage is not None
+    assert events[-1].usage.as_dict() == {
+        "prompt_tokens": 2,
+        "completion_tokens": 3,
+        "total_tokens": 5,
+    }
+    backend.close()
+
+
+def test_generate_does_not_advance_the_session_past_eos() -> None:
+    engine = FakeEngine()
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp", backend_options={"eos_token_id": 11}),
+        engine=engine,
+        tokenizer=FakeTokenizer(),
+    )
+
+    backend.generate([
+        GenerationRequest(
+            prompt_tokens=[4],
+            request_id="req-a",
+            sampling_params=SamplingParams(max_tokens=6),
+        )
+    ])
+    backend.generate([
+        GenerationRequest(
+            prompt_tokens=[5],
+            request_id="req-b",
+            sampling_params=SamplingParams(max_tokens=6),
+        )
+    ])
+
+    # Each request stops at the EOS step, so no decode runs on text the caller
+    # never received and the next request starts from a clean position.
+    assert engine.calls == [
+        ("prefill", [4]),
+        ("decode_step", 10),
+        ("prefill", [5]),
+        ("decode_step", 10),
+    ]
+    backend.close()
+
+
+def test_eos_comes_from_the_native_engine_when_available() -> None:
+    class EosEngine(FakeEngine):
+        def eos_id(self) -> int:
+            return 11
+
+    backend, _ = make_backend(EosEngine())
+
+    assert backend.eos_token_ids == frozenset({11})
+    assert backend.capabilities.details["eos_source"] == "native engine"
+    backend.close()
+
+
+def test_eos_falls_back_to_generation_config(tmp_path) -> None:
+    (tmp_path / "generation_config.json").write_text('{"eos_token_id": [7, 9]}', encoding="utf-8")
+    (tmp_path / "config.json").write_text('{"eos_token_id": 1}', encoding="utf-8")
+
+    backend = CppBackend(
+        EngineArgs(model=str(tmp_path), backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=FakeTokenizer(),
+    )
+
+    # generation_config.json wins over config.json because it is what the
+    # checkpoint declares for generation.
+    assert backend.eos_token_ids == frozenset({7, 9})
+    assert backend.capabilities.details["eos_source"] == "generation_config.json"
+    backend.close()
+
+
+def test_without_any_eos_generation_ends_on_the_token_budget() -> None:
+    backend, _ = make_backend()
+
+    assert backend.eos_token_ids == frozenset()
+    assert backend.capabilities.details["eos_source"] == "none"
+    result = backend.generate(
+        [
+            GenerationRequest(
+                prompt_tokens=[1],
+                request_id="req-no-eos",
+                sampling_params=SamplingParams(max_tokens=2),
+            )
+        ]
+    )[0]
+    assert result.finish_reason == "length"
+    backend.close()
+
+
+def test_invalid_eos_override_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="eos_token_id"):
+        CppBackend(
+            EngineArgs(model="model", backend="cpp", backend_options={"eos_token_id": "11"}),
+            engine=FakeEngine(),
+            tokenizer=FakeTokenizer(),
+        )
 
 
 def test_cpp_backend_rejects_unexposed_sampling_controls() -> None:

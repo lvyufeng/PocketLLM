@@ -71,6 +71,11 @@ checked between native decode steps and never interrupts a device kernel.
 preemption. These require a request-aware scheduler and must not be implemented by sharing the
 current mutable session unsafely. The Torch adapter continues to reuse its existing serving queue.
 
+Phase 1.1 hardened protocol and termination behavior only. Chat requests now carry normalized
+messages so each backend applies its own chat template, and the C++ adapter stops at EOS with a
+correct `stop`/`length` finish reason instead of always reporting `length`. Neither change touches
+scheduling: the native path remains one serialized session, and `supports_batch` stays `False`.
+
 ## 3. Configuration
 
 ### vLLM/SGLang

@@ -25,6 +25,7 @@ from pocketllm.api import (
     TokenEvent,
     UnsupportedFeatureError,
 )
+from pocketllm.protocol import ChatRequest, render_fallback_prompt
 
 from .metrics import Metrics
 
@@ -37,28 +38,17 @@ def _openai_error(message: str, error_type: str = "invalid_request_error") -> di
     return {"error": {"message": message, "type": error_type}}
 
 
-def _messages_text(messages: Any) -> str:
-    if not isinstance(messages, list) or not messages:
-        raise ValueError("messages must be a non-empty list")
-    parts: list[str] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            raise ValueError("each message must be an object")
-        role = str(message.get("role", "user"))
-        content = message.get("content", "")
-        if isinstance(content, list):
-            content = "\n".join(
-                str(block.get("text", "")) if isinstance(block, dict) else str(block)
-                for block in content
-            )
-        parts.append(f"{role}: {content}")
-    return "\n".join(parts)
-
-
 def _result_response(result: GenerationResult, model: str, request_id: str) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": result.text}
+    reasoning = result.metadata.get("reasoning_content")
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    tool_calls = result.metadata.get("tool_calls")
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     choice = {
         "index": 0,
-        "message": {"role": "assistant", "content": result.text},
+        "message": message,
         "finish_reason": result.finish_reason,
     }
     if result.logprobs is not None:
@@ -113,6 +103,12 @@ def _event_json(event: TokenEvent, model: str, *, completion: bool = False) -> d
         delta["content"] = event.text
     if event.metadata.get("role"):
         delta["role"] = event.metadata["role"]
+    # A backend that separates reasoning from content forwards both; a backend
+    # that does not simply leaves these keys absent.
+    if event.metadata.get("reasoning_content"):
+        delta["reasoning_content"] = event.metadata["reasoning_content"]
+    if event.metadata.get("tool_calls"):
+        delta["tool_calls"] = event.metadata["tool_calls"]
     item = {
         "id": event.request_id,
         "object": "chat.completion.chunk",
@@ -215,11 +211,17 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     def _request(self, body: dict[str, Any], *, completion: bool = False) -> GenerationRequest:
         request_id = str(body.get("request_id") or f"chatcmpl-{uuid.uuid4().hex}")
         params = SamplingParams.from_openai(body)
-        prompt = body.get("prompt") if completion else _messages_text(body.get("messages"))
-        return GenerationRequest(prompt=prompt, sampling_params=params, request_id=request_id, metadata={
-            "stream_options": body.get("stream_options") or {},
-            "response_format": body.get("response_format"),
-        })
+        chat = ChatRequest.from_body(body, completion=completion)
+        # Chat requests carry the normalized messages so a backend can apply its
+        # own chat template.  `prompt` stays populated as a deterministic
+        # fallback for backends that have no template of their own.
+        prompt = chat.prompt if completion else render_fallback_prompt(chat.messages)
+        return GenerationRequest(
+            prompt=prompt,
+            sampling_params=params,
+            request_id=request_id,
+            metadata=chat.metadata(),
+        )
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
