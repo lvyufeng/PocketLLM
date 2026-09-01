@@ -17,10 +17,12 @@ from .chat import (
     tool_choice_instruction,
     tool_names,
 )
+from .prompt import encode_chat_prompt
 
 __all__ = [
     "ChatRequest",
     "apply_stop_to_text",
+    "encode_chat_prompt",
     "normalize_content",
     "normalize_tool_calls",
     "prepare_messages",

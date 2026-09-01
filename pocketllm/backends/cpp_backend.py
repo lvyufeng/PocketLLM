@@ -29,6 +29,7 @@ from pocketllm.api import (
     Usage,
     UnsupportedFeatureError,
 )
+from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 
 from .base import BackendBase
 
@@ -314,7 +315,21 @@ class CppBackend(BackendBase):
             return list(request.prompt_tokens)
         if self._tokenizer is None:
             raise ConfigurationError("C++ backend needs tokenizer_path for text prompts")
-        encoded = self._tokenizer.encode(request.prompt or "")
+        messages = request.metadata.get("messages")
+        if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
+            encoded = encode_chat_prompt(
+                self._tokenizer,
+                messages,
+                thinking_mode=str(request.metadata.get("thinking_mode", "chat")),
+                reasoning_effort=request.metadata.get("reasoning_effort"),
+                tools=request.metadata.get("tools"),
+            )
+            if encoded is not None:
+                return encoded
+            prompt = request.prompt or render_fallback_prompt(messages)
+        else:
+            prompt = request.prompt or ""
+        encoded = self._tokenizer.encode(prompt)
         return [int(token) for token in encoded]
 
     def _check_sampling(self, params: SamplingParams) -> None:

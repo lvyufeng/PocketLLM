@@ -72,9 +72,11 @@ preemption. These require a request-aware scheduler and must not be implemented 
 current mutable session unsafely. The Torch adapter continues to reuse its existing serving queue.
 
 Phase 1.1 hardened protocol and termination behavior only. Chat requests now carry normalized
-messages so each backend applies its own chat template, and the C++ adapter stops at EOS with a
-correct `stop`/`length` finish reason instead of always reporting `length`. Neither change touches
-scheduling: the native path remains one serialized session, and `supports_batch` stays `False`.
+messages through a shared prompt boundary: checkpoint-owned `chat_template` is preferred, the
+validated DeepSeek encoder is used for its no-template checkpoints, and deterministic `role: content`
+is only a generic last resort. The C++ adapter stops at EOS with a correct `stop`/`length` finish reason
+instead of always reporting `length`. Neither change touches scheduling: the native path remains one
+serialized session, and `supports_batch` stays `False`.
 
 ## 3. Configuration
 
