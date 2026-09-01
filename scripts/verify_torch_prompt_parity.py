@@ -155,22 +155,21 @@ def main() -> int:
             metadata=chat.metadata(),
         )
         adapter_ids = backend._prompt_ids(request)
-        adapter_text = backend._prompt_text(request)
 
         ids_match = adapter_ids == legacy_ids
-        text_match = adapter_text == legacy_text
-        # The old flattening is what this change replaced; if it happened to
-        # agree the test would prove nothing, so record the contrast.
+        # The shared boundary returns ids, while each backend may retain its
+        # own textual rendering for runtime payloads.  Token ids are the
+        # authoritative parity check because those are what the model sees.
         flattened = "\n".join(
             f"{message.get('role', 'user')}: {message.get('content', '')}" for message in chat.messages
         )
-        differs_from_flattened = adapter_text != flattened
+        fallback_ids = [int(token) for token in tokenizer.encode(flattened)]
+        differs_from_flattened = adapter_ids != fallback_ids
 
-        passed = ids_match and text_match and differs_from_flattened
+        passed = ids_match and differs_from_flattened
         all_ok = all_ok and passed
         checks = {
             "ids_match_legacy": ids_match,
-            "text_match_legacy": text_match,
             "differs_from_old_flattening": differs_from_flattened,
         }
         cases.append(
@@ -180,14 +179,14 @@ def main() -> int:
                 "legacy_tokens": len(legacy_ids),
                 "checks": checks,
                 "pass": passed,
-                "prompt_head": adapter_text[:160],
+                "fallback_tokens": len(fallback_ids),
             }
         )
         print(f"[{label}] adapter={len(adapter_ids)} legacy={len(legacy_ids)} tokens", flush=True)
         print(f"  {'PASS' if passed else 'FAIL'} {checks}", flush=True)
         if not passed:
-            print(f"  adapter_text={adapter_text!r}", flush=True)
-            print(f"  legacy_text ={legacy_text!r}", flush=True)
+            print(f"  adapter_ids={adapter_ids[:32]}", flush=True)
+            print(f"  legacy_ids ={legacy_ids[:32]}", flush=True)
 
     payload = {"ckpt": args.ckpt, "cases": cases, "pass": all_ok}
     if args.json_out:

@@ -24,6 +24,18 @@ class FakeTokenizer:
         return "".join(f"<{token}>" for token in token_ids)
 
 
+class TemplateTokenizer(FakeTokenizer):
+    chat_template = "{{ messages }}"
+
+    def __init__(self) -> None:
+        self.template_calls: list[tuple[list[dict], dict]] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_calls.append(([dict(message) for message in messages], dict(kwargs)))
+        return [71, 72]
+
+
+
 class FakeResult:
     def __init__(self, top_token: int) -> None:
         self.top_token = top_token
@@ -120,6 +132,57 @@ def make_backend(engine: FakeEngine | None = None) -> tuple[CppBackend, FakeEngi
         tokenizer=FakeTokenizer(),
     )
     return backend, fake_engine
+
+
+def test_cpp_chat_prompt_uses_tokenizer_owned_template() -> None:
+    tokenizer = TemplateTokenizer()
+    backend, _ = make_backend()
+    backend._tokenizer = tokenizer
+    request = GenerationRequest(
+        prompt="user: hi",
+        request_id="req-template",
+        sampling_params=SamplingParams(max_tokens=1),
+        metadata={
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking_mode": "chat",
+        },
+    )
+
+    assert backend._prompt_ids(request) == [71, 72]
+    assert tokenizer.template_calls[0][0] == [{"role": "user", "content": "hi"}]
+    assert tokenizer.template_calls[0][1]["add_generation_prompt"] is True
+    backend.close()
+
+
+def test_cpp_pre_tokenized_prompt_bypasses_chat_template() -> None:
+    tokenizer = TemplateTokenizer()
+    backend, _ = make_backend()
+    backend._tokenizer = tokenizer
+    request = GenerationRequest(
+        prompt_tokens=[7, 8],
+        request_id="req-template-tokens",
+        sampling_params=SamplingParams(max_tokens=1),
+        metadata={"messages": [{"role": "user", "content": "ignored"}]},
+    )
+
+    assert backend._prompt_ids(request) == [7, 8]
+    assert tokenizer.template_calls == []
+    backend.close()
+
+
+def test_cpp_raw_prompt_bypasses_chat_template() -> None:
+    tokenizer = TemplateTokenizer()
+    backend, _ = make_backend()
+    backend._tokenizer = tokenizer
+    request = GenerationRequest(
+        prompt="raw completion",
+        request_id="req-template-raw",
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+
+    assert backend._prompt_ids(request) == [len("raw completion"), 7]
+    assert tokenizer.template_calls == []
+    backend.close()
 
 
 def test_generate_converts_native_results_and_usage() -> None:

@@ -212,9 +212,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         request_id = str(body.get("request_id") or f"chatcmpl-{uuid.uuid4().hex}")
         params = SamplingParams.from_openai(body)
         chat = ChatRequest.from_body(body, completion=completion)
-        # Chat requests carry the normalized messages so a backend can apply its
-        # own chat template.  `prompt` stays populated as a deterministic
-        # fallback for backends that have no template of their own.
+        # Chat requests carry normalized messages for the shared prompt boundary.
+        # `prompt` remains a deterministic fallback for generic tokenizers.
         prompt = chat.prompt if completion else render_fallback_prompt(chat.messages)
         return GenerationRequest(
             prompt=prompt,

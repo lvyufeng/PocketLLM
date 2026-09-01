@@ -11,20 +11,6 @@ from pocketllm.backends.torch_backend import TorchBackend
 from src.encoding.dsv4 import encode_messages
 
 
-class RecordingTokenizer:
-    eos_token_id = 1
-
-    def __init__(self) -> None:
-        self.encoded: list[str] = []
-
-    def encode(self, text: str) -> list[int]:
-        self.encoded.append(text)
-        return [11, 12]
-
-    def decode(self, token_ids: list[int]) -> str:
-        return "".join(f"<{token}>" for token in token_ids)
-
-
 class RecordingServingEngine:
     def __init__(self) -> None:
         self.payloads: list[dict] = []
@@ -40,6 +26,32 @@ class RecordingServingEngine:
 
     def close(self) -> None:
         pass
+
+
+class RecordingTokenizer:
+    eos_token_id = 1
+
+    def __init__(self) -> None:
+        self.encoded: list[str] = []
+
+    def encode(self, text: str) -> list[int]:
+        self.encoded.append(text)
+        return [11, 12]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return "".join(f"<{token}>" for token in token_ids)
+
+
+class TemplateRecordingTokenizer(RecordingTokenizer):
+    chat_template = "{{ messages }}"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.template_calls: list[tuple[list[dict], dict]] = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_calls.append(([dict(message) for message in messages], dict(kwargs)))
+        return [91, 92]
 
 
 def _backend(tokenizer: RecordingTokenizer) -> tuple[TorchBackend, RecordingServingEngine]:
@@ -65,10 +77,7 @@ def test_chat_metadata_is_rendered_with_the_deepseek_template():
 
     backend.generate([request])
 
-    # The adapter must reuse the runtime's own chat encoding rather than the
-    # server's plain fallback text.
     assert tokenizer.encoded == [encode_messages(messages, thinking_mode="chat")]
-    # The normalized messages are forwarded so the runtime can re-encode.
     assert engine.payloads[-1]["messages"] == messages
     assert engine.payloads[-1]["thinking_mode"] == "chat"
     backend.close()
@@ -87,10 +96,27 @@ def test_thinking_mode_and_effort_reach_the_template():
 
     backend.generate([request])
 
-    assert tokenizer.encoded == [
-        encode_messages(messages, thinking_mode="thinking", reasoning_effort="max")
-    ]
+    assert tokenizer.encoded == [encode_messages(messages, thinking_mode="thinking", reasoning_effort="max")]
     assert engine.payloads[-1]["reasoning_effort"] == "max"
+    backend.close()
+
+
+def test_tokenizer_owned_template_takes_precedence():
+    tokenizer = TemplateRecordingTokenizer()
+    backend, _ = _backend(tokenizer)
+    messages = [{"role": "user", "content": "hi"}]
+    request = GenerationRequest(
+        prompt="user: hi",
+        request_id="req-owned-template",
+        sampling_params=SamplingParams(max_tokens=1),
+        metadata={"messages": messages, "thinking_mode": "chat"},
+    )
+
+    assert backend._prompt_ids(request) == [91, 92]
+    assert tokenizer.encoded == []
+    assert tokenizer.template_calls[0][0] == messages
+    assert tokenizer.template_calls[0][1]["add_generation_prompt"] is True
+    assert tokenizer.template_calls[0][1]["enable_thinking"] is False
     backend.close()
 
 
@@ -111,17 +137,19 @@ def test_raw_prompts_are_encoded_unchanged():
 
 
 def test_prompt_tokens_bypass_the_tokenizer():
-    tokenizer = RecordingTokenizer()
+    tokenizer = TemplateRecordingTokenizer()
     backend, engine = _backend(tokenizer)
     request = GenerationRequest(
         prompt_tokens=[7, 8],
         request_id="req-tokens",
         sampling_params=SamplingParams(max_tokens=1),
+        metadata={"messages": [{"role": "user", "content": "ignored"}]},
     )
 
     backend.generate([request])
 
     assert tokenizer.encoded == []
+    assert tokenizer.template_calls == []
     assert engine.payloads[-1]["_prompt_ids"] == [7, 8]
     backend.close()
 
@@ -140,4 +168,5 @@ def test_streaming_uses_the_same_prompt_rendering():
     list(backend.stream(request))
 
     assert tokenizer.encoded[0] == encode_messages(messages, thinking_mode="chat")
+    assert engine.payloads[-1]["_prompt_ids"] == [11, 12]
     backend.close()

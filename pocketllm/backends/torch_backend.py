@@ -24,6 +24,7 @@ from pocketllm.api import (
     Usage,
     UnsupportedFeatureError,
 )
+from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 
 from .base import BackendBase
 
@@ -150,37 +151,37 @@ class TorchBackend(BackendBase):
                 return normalized
         return None
 
-    def _prompt_text(self, request: GenerationRequest) -> str:
-        """Render the prompt, preferring the runtime's own chat encoding.
-
-        Chat requests are encoded with the DeepSeek template that the legacy
-        server uses, so the unified API produces the same prompt as
-        ``src.server.openai``.  Raw prompts and non-DeepSeek encodings fall back
-        to the request text unchanged.
-        """
-        messages = self._messages(request)
-        if messages is None:
-            return request.prompt or ""
-        try:
-            from src.encoding.dsv4 import encode_messages
-        except Exception:
-            return request.prompt or ""
-        return encode_messages(
-            messages,
-            thinking_mode=str(request.metadata.get("thinking_mode", "chat")),
-            reasoning_effort=request.metadata.get("reasoning_effort"),
-        )
-
     def _prompt_ids(self, request: GenerationRequest) -> list[int]:
         if request.prompt_tokens is not None:
             return list(request.prompt_tokens)
         tokenizer = self._tokenizer()
         if tokenizer is None:
             raise ValueError("TorchBackend needs a tokenizer for text prompts")
+        messages = self._messages(request)
+        if messages is not None:
+            encoded = encode_chat_prompt(
+                tokenizer,
+                messages,
+                thinking_mode=str(request.metadata.get("thinking_mode", "chat")),
+                reasoning_effort=request.metadata.get("reasoning_effort"),
+                tools=request.metadata.get("tools"),
+                # The current Torch runtime is the DeepSeek runtime; use its
+                # validated encoder when the checkpoint has no HF template.
+                deepseek_fallback=True,
+            )
+            if encoded is not None:
+                return encoded
         encoded = tokenizer.encode(self._prompt_text(request))
         if hasattr(encoded, "tolist"):
             encoded = encoded.tolist()
         return [int(token) for token in encoded]
+
+    def _prompt_text(self, request: GenerationRequest) -> str:
+        """Return a deterministic text fallback for generic tokenizers."""
+        messages = self._messages(request)
+        if messages is not None:
+            return request.prompt or render_fallback_prompt(messages)
+        return request.prompt or ""
 
     def _payload(self, request: GenerationRequest, *, stream: bool) -> dict[str, Any]:
         params = request.sampling_params

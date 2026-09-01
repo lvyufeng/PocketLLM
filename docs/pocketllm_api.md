@@ -128,11 +128,19 @@ instructions, `reasoning`/`reasoning_effort` handling, tool-call shaping, and st
 There is one implementation, and it imports neither Torch nor the native module.
 
 `/v1/chat/completions` puts the normalized messages, thinking mode, reasoning effort, and tool
-metadata in `GenerationRequest.metadata`, so a backend applies its own chat template. The Torch
-adapter encodes them with the DeepSeek template that the legacy server uses, so both servers build
-the same prompt. `GenerationRequest.prompt` still carries a deterministic `role: content` rendering as
-a fallback for backends that have no template of their own. `/v1/completions` passes `prompt` through
+metadata in `GenerationRequest.metadata`. The shared prompt boundary first asks the selected
+checkpoint tokenizer to apply its own `chat_template` with an assistant generation prompt. This is
+the same model-owned-template contract used by vLLM/SGLang and preserves model-specific special
+tokens, reasoning controls, and tool formatting. For DeepSeek checkpoints whose tokenizer has no
+chat template, the validated legacy `src.encoding.dsv4.encode_messages` format is used instead.
+`GenerationRequest.prompt` still carries a deterministic `role: content` rendering only as a last-resort
+fallback for generic tokenizers that provide neither format. `/v1/completions` passes `prompt` through
 unchanged and validates that a list prompt contains only strings.
+
+The template receives normalized tool definitions and a private compatibility copy of prior tool-call
+arguments; public request metadata is never mutated. Template-specific reasoning names are mapped to
+the vocabulary accepted by the checkpoint (for example, `high`/`max` map to Qwen's `xhigh`).
+Unsupported model-specific template features remain the responsibility of the selected backend.
 
 A backend that separates reasoning from content can set `reasoning_content` and `tool_calls` in its
 result or event metadata; those are forwarded to the response and to streamed deltas. A backend that
