@@ -28,6 +28,15 @@
 
 namespace dsv4 {
 
+#ifndef POCKET_BACKEND_ASCEND
+// The legacy row-wise argmax is shared with the DSV4 path and is declared in
+// cuda_ops.hpp when that header is included. Keep a no-default declaration here
+// for Qwen-only translation units that do not include the legacy header.
+bool argmax_fp32_rows_cuda(const float* d_logits, int* d_tokens,
+                           float* d_logits_out, int rows, int count,
+                           int token_offset, void* stream);
+#endif
+
 inline bool qwen_add_inplace_f16(uint16_t* d_y_fp16, const uint16_t* d_x_fp16, int count, void* stream = nullptr) {
 #ifdef POCKET_BACKEND_ASCEND
     return qwen_add_inplace_f16_ascend(d_y_fp16, d_x_fp16, count, stream);

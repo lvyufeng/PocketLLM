@@ -11,6 +11,7 @@ __pycache__/
 **/build/
 **/build-ascend/
 **/build-cuda/
+**/build-python/
 **/develop-eggs/
 **/dist/
 **/downloads/
