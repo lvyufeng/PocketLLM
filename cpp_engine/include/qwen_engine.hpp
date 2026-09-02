@@ -233,6 +233,22 @@ public:
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,
                                              int max_new_tokens);
 
+    // TP rank > 0 entry point. Blocks on a small NCCL int32 broadcast channel
+    // driven by rank 0; runs the requested op until SHUTDOWN.
+    void run_worker_loop();
+
+    // Rank 0 utilities to drive the worker loop. No-op for tp_world == 1.
+    enum class WorkerCommand : int32_t {
+        Prefill = 0,
+        DecodeStep = 1,
+        Reset = 2,
+        Shutdown = 3,
+    };
+    void worker_command_prefill(const std::vector<int>& token_ids);
+    void worker_command_decode(int32_t last_token);
+    void worker_command_reset();
+    void worker_command_shutdown();
+
 private:
     struct Impl;
 

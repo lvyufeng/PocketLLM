@@ -1,5 +1,6 @@
 #include "qwen_engine.hpp"
 
+#include "cmd_channel.hpp"
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
 #include "qwen_ops.hpp"
@@ -464,6 +465,8 @@ struct QwenEngine::Impl {
     void* nccl_comm_ready = nullptr;
     void* nccl_comm_done = nullptr;
     bool nccl_comm_stream_initialized = false;
+    // Command channel for TP worker loop
+    std::unique_ptr<CmdChannel> cmd;
     // The overlapped path has two collectives in flight across a slice boundary,
     // so it cannot share the single ready/done pair above: recording ready for
     // slice i+1 could overwrite it before slice i's waiter has resolved. These are
@@ -3832,6 +3835,13 @@ void QwenEngine::warmup_tp() {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.warmup_tp");
     if (options_.tp_world == 1) return;
+
+    // Initialize command channel for worker loop
+    if (!impl_->cmd && !options_.nccl_id_path.empty()) {
+        impl_->cmd = CmdChannel::create(options_.tp_world, options_.tp_rank,
+                                        options_.nccl_id_path);
+    }
+
     QwenDeviceTensor scratch;
     allocate_half(scratch, 1, {1});
     zero_tensor(scratch);
@@ -4178,6 +4188,130 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     }
     impl_->report_phase_profile("spec_decode");
     return results;
+}
+
+// TP worker loop implementation
+void QwenEngine::run_worker_loop() {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank == 0) {
+        throw std::runtime_error("run_worker_loop: rank 0 must not enter worker loop");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("run_worker_loop: command channel not initialized (call warmup_tp first)");
+    }
+
+    while (true) {
+        int32_t header[4] = {0, 0, 0, 0};
+        impl_->cmd->recv_from_root(header, 4);
+
+        const auto cmd = static_cast<WorkerCommand>(header[0]);
+        if (cmd == WorkerCommand::Shutdown) return;
+
+        const int payload_len = header[3];
+        std::vector<int> tokens;
+
+        if (payload_len > 0) {
+            std::vector<int32_t> payload(static_cast<size_t>(payload_len));
+            impl_->cmd->recv_from_root(payload.data(),
+                                       static_cast<std::size_t>(payload_len));
+            tokens.assign(payload.begin(), payload.end());
+        }
+
+        // A failed collective leaves this rank out of step with rank 0, so the
+        // loop must not continue past an error. Propagating exits the process
+        // and lets the launcher tear the whole group down.
+        switch (cmd) {
+            case WorkerCommand::Prefill:
+                (void)prefill(tokens);
+                break;
+            case WorkerCommand::DecodeStep:
+                (void)decode_step(header[1]);
+                break;
+            case WorkerCommand::Reset:
+                reset();
+                break;
+            default:
+                throw std::runtime_error(
+                    "run_worker_loop: unknown command " + std::to_string(header[0]));
+        }
+    }
+}
+
+void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids) {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error("worker_command_prefill: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("worker_command_prefill: command channel not initialized (call warmup_tp first)");
+    }
+
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::Prefill),
+        0,
+        0,
+        static_cast<int32_t>(token_ids.size())
+    };
+    impl_->cmd->send_to_workers(header, 4);
+
+    if (!token_ids.empty()) {
+        std::vector<int32_t> payload(token_ids.begin(), token_ids.end());
+        impl_->cmd->send_to_workers(payload.data(), payload.size());
+    }
+}
+
+void QwenEngine::worker_command_decode(int32_t last_token) {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error("worker_command_decode: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("worker_command_decode: command channel not initialized (call warmup_tp first)");
+    }
+
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::DecodeStep),
+        last_token,
+        0,
+        0
+    };
+    impl_->cmd->send_to_workers(header, 4);
+}
+
+void QwenEngine::worker_command_reset() {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error("worker_command_reset: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("worker_command_reset: command channel not initialized (call warmup_tp first)");
+    }
+
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::Reset),
+        0,
+        0,
+        0
+    };
+    impl_->cmd->send_to_workers(header, 4);
+}
+
+void QwenEngine::worker_command_shutdown() {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error("worker_command_shutdown: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("worker_command_shutdown: command channel not initialized (call warmup_tp first)");
+    }
+
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::Shutdown),
+        0,
+        0,
+        0
+    };
+    impl_->cmd->send_to_workers(header, 4);
 }
 
 }  // namespace dsv4

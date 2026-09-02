@@ -83,13 +83,45 @@ class TorchBackend(BackendBase):
     def runtime(self) -> Mapping[str, Any] | None:
         return self._runtime
 
+    def _detect_expert_dtype(self) -> str | None:
+        """Detect expert dtype from checkpoint config.json if available.
+
+        Returns "fp4", "int8", or None if detection is not possible.
+        """
+        import json
+        import pathlib
+
+        checkpoint_dir = pathlib.Path(self.args.checkpoint_dir)
+        config_json = checkpoint_dir / "config.json"
+
+        if not config_json.exists():
+            return None
+
+        try:
+            with open(config_json) as f:
+                config = json.load(f)
+            expert_dtype = config.get("expert_dtype")
+            if expert_dtype in ("fp4", "int8"):
+                return expert_dtype
+        except (OSError, ValueError, KeyError):
+            pass
+
+        return None
+
     def _runtime_namespace(self) -> argparse.Namespace:
         import pathlib
         config_path = self.args.config_path
         if not config_path:
-            # Match legacy server default: repo_root/configs/config_w8a8.json
+            # Auto-detect config based on checkpoint metadata when available
+            detected_dtype = self._detect_expert_dtype()
             repo_root = pathlib.Path(__file__).resolve().parents[2]
-            default_config = repo_root / "configs" / "config_w8a8.json"
+
+            if detected_dtype == "fp4":
+                default_config = repo_root / "configs" / "config_fp4_active.json"
+            else:
+                # Default to W8A8 for int8 or when detection fails
+                default_config = repo_root / "configs" / "config_w8a8.json"
+
             config_path = str(default_config) if default_config.is_file() else ""
         return argparse.Namespace(
             ckpt_format=self.args.model_format,
