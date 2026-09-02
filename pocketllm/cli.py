@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
-from .api import EngineArgs
-from .backends.factory import create_backend
+from .api import ConfigurationError, EngineArgs, UnsupportedFeatureError
+from .backends.factory import create_backend, select_backend
 from .server.openai import serve
+from .supervisor import TensorParallelSupervisor
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +24,29 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--model-format", choices=["auto", "safetensors", "gguf"], default="auto")
     serve_parser.add_argument("--tensor-parallel-size", type=int, default=1)
     serve_parser.add_argument("--tensor-parallel-rank", type=int, default=0)
+    serve_parser.add_argument(
+        "--tensor-parallel-supervisor",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="supervise local TP ranks automatically (default: enabled)",
+    )
+    serve_parser.add_argument(
+        "--tensor-parallel-startup-timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="rank startup timeout in seconds (default: 300)",
+    )
+    serve_parser.add_argument(
+        "--tensor-parallel-shutdown-timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="rank shutdown timeout in seconds (default: 30)",
+    )
+    serve_parser.add_argument("--tensor-parallel-master-addr")
+    serve_parser.add_argument("--tensor-parallel-master-port", type=int)
+    serve_parser.add_argument("--tensor-parallel-rendezvous-dir")
     serve_parser.add_argument("--device")
     serve_parser.add_argument("--max-model-len", type=int)
     serve_parser.add_argument("--dtype")
@@ -45,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="backend-specific option; repeatable and parsed as JSON when possible",
     )
+    serve_parser.add_argument(
+        "--supervised-child",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal flag for supervisor-launched children
+    )
     return parser
 
 
@@ -54,6 +85,9 @@ def _backend_options(namespace: argparse.Namespace) -> dict[str, object]:
         "routed_experts_device": namespace.routed_experts_device,
         "pd_mode": namespace.pd_mode,
     }
+    nccl_id_path = os.getenv("POCKETLLM_NCCL_ID_PATH") or os.getenv("NCCL_ID_PATH")
+    if nccl_id_path:
+        options["nccl_id_path"] = nccl_id_path
     for item in namespace.backend_option or []:
         key, separator, raw = str(item).partition("=")
         if not separator or not key.strip():
@@ -92,18 +126,108 @@ def _args(namespace: argparse.Namespace) -> EngineArgs:
     )
 
 
+def _emit_readiness(rank: int) -> None:
+    """Emit the exact marker the supervisor waits for."""
+    print(f"POCKETLLM_RANK_READY rank={rank}", flush=True)
+
+
+def _supervised_command(original_argv: list[str]) -> list[str]:
+    """Build child argv from parent argv, preserving all serve arguments."""
+    result: list[str] = []
+    excluded = {
+        "--tensor-parallel-supervisor",
+        "--no-tensor-parallel-supervisor",
+        "--tensor-parallel-rank",
+        "--supervised-child",
+    }
+    skip_next = False
+    for index, item in enumerate(original_argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if item in excluded:
+            if index + 1 < len(original_argv) and not original_argv[index + 1].startswith("-"):
+                skip_next = True
+            continue
+        if any(item.startswith(prefix + "=") for prefix in excluded):
+            continue
+        result.append(item)
+    result.extend(("--no-tensor-parallel-supervisor", "--supervised-child"))
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "serve":
-        engine_args = _args(args)
-        backend = create_backend(engine_args)
-        model_name = args.served_model_name or args.model
+    if args.command != "serve":
+        return 2
+
+    engine_args = _args(args)
+    world = engine_args.tensor_parallel_size
+    rank = engine_args.tensor_parallel_rank
+    supervised = (
+        world > 1
+        and rank == 0
+        and getattr(args, "tensor_parallel_supervisor", True)
+        and not getattr(args, "supervised_child", False)
+    )
+
+    # Supervised parent: spawn ranks and monitor.
+    if world > 1 and rank == 0 and supervised:
+        if args.device is not None:
+            raise ConfigurationError(
+                "--device cannot be used with automatic TP supervision; "
+                "use --no-tensor-parallel-supervisor for manual rank control"
+            )
+        selected_backend = select_backend(engine_args)
+        if selected_backend == "cpp":
+            raise UnsupportedFeatureError(
+                "automatic TP supervision is not available for the Python C++ Qwen adapter; "
+                "use the legacy dsv4_cpp_engine executable or --no-tensor-parallel-supervisor"
+            )
+        supervisor = TensorParallelSupervisor(
+            command=[sys.executable, "-m", "pocketllm", *_supervised_command(argv or sys.argv[1:])],
+            world_size=world,
+            startup_timeout=args.tensor_parallel_startup_timeout,
+            shutdown_timeout=args.tensor_parallel_shutdown_timeout,
+            master_addr=args.tensor_parallel_master_addr,
+            master_port=args.tensor_parallel_master_port,
+            rendezvous_dir=args.tensor_parallel_rendezvous_dir,
+        )
         try:
-            serve(backend, host=args.host, port=args.port, model=model_name)
+            return supervisor.run()
         except KeyboardInterrupt:
-            backend.close()
-        return 0
-    return 2
+            supervisor.cleanup()
+            return 0
+
+    # Rank child or manual launch: construct one backend and dispatch by role.
+    backend = create_backend(engine_args)
+    try:
+        if rank == 0:
+            # A supervised rank 0 must join collectives and finish model loading
+            # before any worker can become ready. Single-rank and manual launches
+            # retain their existing lazy-loading behavior.
+            if getattr(args, "supervised_child", False):
+                backend.prepare()
+            model_name = args.served_model_name or args.model
+            on_ready = (lambda: _emit_readiness(rank)) if getattr(args, "supervised_child", False) else None
+            serve(backend, host=args.host, port=args.port, model=model_name, on_ready=on_ready)
+        else:
+            # Nonzero rank enters backend worker loop.
+            on_ready = (lambda: _emit_readiness(rank)) if getattr(args, "supervised_child", False) else None
+            try:
+                backend.run_worker(on_ready=on_ready)
+            except UnsupportedFeatureError as exc:
+                if supervised:
+                    raise ConfigurationError(
+                        f"{engine_args.backend} backend does not support automatic TP supervision; "
+                        f"use an external launcher or the legacy native executable: {exc}"
+                    ) from exc
+                raise
+    except KeyboardInterrupt:
+        pass
+    finally:
+        backend.close()
+    return 0
 
 
 if __name__ == "__main__":

@@ -8,9 +8,10 @@ extensions.
 from __future__ import annotations
 
 import argparse
+import os
 import threading
-from collections.abc import Iterator, Sequence
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, Mapping
 
 from pocketllm.api import (
     BackendCapabilities,
@@ -82,42 +83,47 @@ class TorchBackend(BackendBase):
     def runtime(self) -> Mapping[str, Any] | None:
         return self._runtime
 
+    def _runtime_namespace(self) -> argparse.Namespace:
+        return argparse.Namespace(
+            ckpt_format=self.args.model_format,
+            partition_policy=str(self.args.backend_options.get("partition_policy", "legacy")),
+            pd_mode=str(self.args.backend_options.get("pd_mode", "scheduler")),
+            routed_experts_device=str(self.args.backend_options.get("routed_experts_device", "gpu")),
+            config=self.args.config_path or "",
+            ckpt_path=self.args.checkpoint_dir,
+            tokenizer_path=self.args.tokenizer_path,
+            model=self._model_id,
+            max_model_len=self.args.max_model_len or 0,
+        )
+
+    def _load_runtime(self) -> Mapping[str, Any]:
+        if self._runtime is not None:
+            return self._runtime
+        if self._runtime_loader is not None:
+            loader = self._runtime_loader
+        else:
+            from src.server.openai import _init_runtime
+
+            loader = _init_runtime
+        self._runtime = loader(self._runtime_namespace())
+        return self._runtime
+
     def _load(self) -> None:
         if self._runtime is not None and self._serving_engine is not None:
             self._ready = True
             return
-        if self._runtime is None:
-            if self._runtime_loader is not None:
-                loader = self._runtime_loader
-            else:
-                from src.server.openai import _init_runtime
-
-                loader = _init_runtime
-            ckpt = self.args.checkpoint_dir
-            config = self.args.config_path or ""
-            namespace = argparse.Namespace(
-                ckpt_format=self.args.model_format,
-                partition_policy=str(self.args.backend_options.get("partition_policy", "legacy")),
-                pd_mode=str(self.args.backend_options.get("pd_mode", "scheduler")),
-                routed_experts_device=str(self.args.backend_options.get("routed_experts_device", "gpu")),
-                config=config,
-                ckpt_path=ckpt,
-                tokenizer_path=self.args.tokenizer_path,
-                model=self._model_id,
-                max_model_len=self.args.max_model_len or 0,
-            )
-            self._runtime = loader(namespace)
+        runtime = self._load_runtime()
         if self._serving_engine is None:
             from src.server.engine import DeepSeekServingEngine
             from src.server.openai import _broadcast_payload, _run_payload, _run_payload_stream
 
             self._serving_engine = DeepSeekServingEngine(
-                self._runtime,
+                runtime,
                 _broadcast_payload,
                 _run_payload,
                 _run_payload_stream,
             )
-        runtime_model_id = self._runtime.get("model_id") if self._runtime else None
+        runtime_model_id = runtime.get("model_id")
         if runtime_model_id:
             self._model_id = str(runtime_model_id)
         self._ready = True
@@ -327,6 +333,24 @@ class TorchBackend(BackendBase):
         # The flag is checked at safe request boundaries.  The legacy
         # generation callback is not interruptible inside a device kernel.
         return super().cancel(request_id)
+
+    def prepare(self) -> None:
+        """Eagerly load the model and serving engine for supervised rank 0."""
+        self._ensure_loaded()
+
+    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
+        """Enter the Torch runtime worker loop for supervised ranks > 0."""
+        self._ensure_open()
+        runtime = self._load_runtime()
+        rank = int(runtime.get("rank", os.getenv("RANK", "0")))
+        if rank == 0:
+            raise RuntimeError("run_worker must not be called on rank 0")
+        if on_ready is not None:
+            on_ready()
+        # Delegate to the existing Gloo/NCCL broadcast worker protocol.
+        from src.server.openai import _worker_loop
+
+        _worker_loop(runtime)
 
     def close(self) -> None:
         if self._serving_engine is not None and hasattr(self._serving_engine, "close"):

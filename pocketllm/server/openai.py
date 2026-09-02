@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -296,10 +297,25 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def serve(backend: EngineBackend, *, host: str = "0.0.0.0", port: int = 8000, model: str = "local", metrics: Metrics | None = None) -> None:
-    """Run the unified HTTP server until interrupted."""
+def serve(
+    backend: EngineBackend,
+    *,
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    model: str = "local",
+    metrics: Metrics | None = None,
+    on_ready: Callable[[], None] | None = None,
+) -> None:
+    """Run the unified HTTP server until interrupted.
+
+    ``on_ready`` runs after the listening socket has been bound and before the
+    request loop starts. It is used by the local TP supervisor; ordinary callers
+    can leave it unset.
+    """
     server = PocketLLMHTTPServer((host, port), OpenAIHandler, backend, model, metrics)
     try:
+        if on_ready is not None:
+            on_ready()
         server.serve_forever()
     finally:
         backend.close()

@@ -4,7 +4,23 @@
 > where explicitly noted. Phase 1 adds the `pocketllm` control plane without merging the Torch and
 > native C++ data planes.
 
-## Phase 1 / Phase 2.1 status
+## Phase 1 / Phase 2.1 / Phase 2.2 status
+
+Phase 2.2 adds a local tensor-parallel process supervisor to the CLI. For `--tensor-parallel-size N`
+the default `pocketllm serve` path creates per-run rendezvous state, assigns rank environment
+variables, starts all local ranks, waits for a flushed readiness marker from every rank, exposes HTTP
+only from rank 0, forwards termination signals, propagates rank failures, and reaps all children.
+`--no-tensor-parallel-supervisor` preserves existing `torchrun`/manual rank launch workflows.
+
+Automatic supervision is backend-gated: Torch delegates nonzero ranks to the existing
+`src.server.openai._worker_loop`, while the Python C++ Qwen adapter still has no worker-loop binding
+and therefore requires an external/legacy native launcher. The supervisor controls process lifecycle
+only; it is not a request scheduler and does not add request-local KV state or continuous batching.
+
+The supervisor uses backend-specific rendezvous protocols unchanged. Physical KV layouts, recurrent
+state, NCCL/Gloo/HCCL collectives, and CUDA/Ascend kernels remain private to each execution plane.
+
+## Phase 1 / Phase 2.1 baseline status
 
 The new `pocketllm` package provides:
 

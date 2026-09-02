@@ -12,7 +12,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from pocketllm.api import (
@@ -505,6 +505,18 @@ class CppBackend(BackendBase):
         close = getattr(engine, "close", None)
         if callable(close):
             close()
+
+    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
+        """Supervised C++ worker is unsupported with the current binding shape.
+
+        The Python Qwen binding does not expose a worker-loop entry point.  The
+        legacy `dsv4_cpp_engine` executable handles rank workers natively and
+        remains supported outside the unified supervisor.
+        """
+        raise UnsupportedFeatureError(
+            "C++ backend does not support unified TP supervision; "
+            "use the legacy dsv4_cpp_engine executable or an external launcher"
+        )
 
     def close(self) -> None:
         if self._closed:
