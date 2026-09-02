@@ -274,8 +274,8 @@ public:
     // Drops every cached prefix so the next prefill recomputes from zero.
     void clear_prefix_cache();
     void warmup_tp();
-    QwenForwardResult prefill(const std::vector<int>& token_ids);
-    QwenForwardResult decode_step(int token_id);
+    QwenForwardResult prefill(const std::vector<int>& token_ids, int slot_id = 0);
+    QwenForwardResult decode_step(int token_id, int slot_id = 0);
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,
                                              int max_new_tokens);
 

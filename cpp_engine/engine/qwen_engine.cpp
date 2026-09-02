@@ -500,8 +500,7 @@ struct QwenEngine::Impl {
     std::unordered_map<uint64_t, int> request_to_slot;
     std::vector<int> free_slots;
 
-    // Current slot_id for kernel calls (Phase 3.2)
-    int current_slot_id = 0;
+    // Phase 3.3: Removed current_slot_id (now passed explicitly as parameter)
 
     // Calculate element offset for a given slot_id in KV cache (Phase 3.2)
     size_t kv_slot_offset_elements(int slot_id, int local_kv_heads, int head_dim) const {
@@ -2147,7 +2146,8 @@ struct QwenEngine::Impl {
     }
 
     void full_attention(DeviceLayer& layer, const uint16_t* hidden,
-                        uint16_t* output, int rows, int position_offset) {
+                        uint16_t* output, int rows, int position_offset,
+                        int slot_id) {
         PhaseScope scope(this, "full_attention");
         const int q_heads = static_cast<int>(
             config.full_attention.num_heads / options.tp_world);
@@ -2246,8 +2246,7 @@ struct QwenEngine::Impl {
         // launchers are compiled. The quantized caches are not merely disabled:
         // naming their kernels here would put a CUDA dependency in this object.
 
-        // Phase 3.2: Calculate slot offset for multi-slot KV cache
-        const int slot_id = current_slot_id;
+        // Phase 3.3: Use slot_id parameter instead of global current_slot_id
         const size_t slot_offset = kv_slot_offset_elements(slot_id, kv_heads, head_dim);
 
         require_launch(qwen_append_kv_cache_f16(
@@ -2306,8 +2305,7 @@ struct QwenEngine::Impl {
         }
         (void)sink_tokens;
 #else
-        // Phase 3.2: Calculate slot offset for multi-slot KV cache
-        const int slot_id = current_slot_id;
+        // Phase 3.3: Use slot_id parameter instead of global current_slot_id
         const size_t slot_offset = kv_slot_offset_elements(slot_id, kv_heads, head_dim);
 
         if (cache_dtype == QwenKvCacheDType::Fp8) {
@@ -2660,7 +2658,7 @@ struct QwenEngine::Impl {
     }
 
     void layer_forward(DeviceLayer& layer, const uint16_t* hidden,
-                       uint16_t* output, int rows, int position_offset) {
+                       uint16_t* output, int rows, int position_offset, int slot_id) {
         const int hidden_size = static_cast<int>(config.hidden_size);
         begin_workspace();
         const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
@@ -2728,7 +2726,7 @@ struct QwenEngine::Impl {
                              rows, position_offset);
         } else {
             full_attention(layer, normalized.f16_data(), attention.f16_data(),
-                           rows, position_offset);
+                           rows, position_offset, slot_id);
         }
         // One fused pass replaces the residual copy, the add, and the norm. It is
         // the default: measured on the real 65K TP4 prefill it saves 1.51 s
@@ -3209,7 +3207,7 @@ struct QwenEngine::Impl {
         projection(mtp_fc, mtp_concat.f16_data(), mtp_fused.f16_data(), rows, "mtp.fc");
         allocate_half(mtp_next_hidden, hidden_elements, hidden_shape);
         layer_forward(mtp_layer, mtp_fused.f16_data(),
-                      mtp_next_hidden.f16_data(), rows, position);
+                      mtp_next_hidden.f16_data(), rows, position, 0);  // slot_id=0 for MTP
         allocate_half(mtp_normalized_output, hidden_elements, hidden_shape);
         norm(mtp_norm, mtp_next_hidden.f16_data(),
              mtp_normalized_output.f16_data(), rows, hidden_size);
@@ -3593,7 +3591,8 @@ struct QwenEngine::Impl {
                                 int position_offset, int active_layers,
                                 bool compute_logits,
                                 QwenVerifyBatch* verify_batch = nullptr,
-                                const std::vector<int>* mtp_shifted_tokens = nullptr) {
+                                const std::vector<int>* mtp_shifted_tokens = nullptr,
+                                int slot_id = 0) {
         if (token_ids.empty()) {
             throw std::runtime_error("Qwen forward requires at least one token");
         }
@@ -3648,7 +3647,7 @@ struct QwenEngine::Impl {
             {
                 PhaseScope scope(this, rows == 1 ? "STACK.d" : "STACK.r");
                 layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
-                              output, rows, position_offset);
+                              output, rows, position_offset, slot_id);
             }
             std::swap(hidden, output);
             if (dspark_enabled && dspark_tap_index < dspark_tap_count &&
@@ -4040,9 +4039,8 @@ QwenBatchPrefillResult QwenEngine::batch_prefill(
             throw std::runtime_error("QwenEngine::batch_prefill: invalid request");
         }
 
-        // Single-session prefill path for now
-        // TODO Phase 3.1: Use slot_id to offset KV cache access
-        QwenForwardResult fwd_result = prefill(req->prompt_tokens);
+        // Phase 3.3: Use req->slot_id to isolate KV cache
+        QwenForwardResult fwd_result = prefill(req->prompt_tokens, req->slot_id);
 
         req->seq_len = static_cast<int>(req->prompt_tokens.size());
         req->last_token = fwd_result.top_token;
@@ -4081,8 +4079,8 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
             throw std::runtime_error("QwenEngine::batch_decode_step: null request");
         }
 
-        // TODO Phase 3.1: Use slot_id to offset KV cache access
-        QwenForwardResult fwd_result = decode_step(req->last_token);
+        // Phase 3.3: Use req->slot_id to isolate KV cache
+        QwenForwardResult fwd_result = decode_step(req->last_token, req->slot_id);
 
         req->last_token = fwd_result.top_token;
         req->last_result = fwd_result;
@@ -4105,7 +4103,7 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
     return result;
 }
 
-QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
+QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slot_id) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
@@ -4245,16 +4243,17 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
             if (shifted.back() < 0) {
                 // The last shifted input is the target token predicted by this
                 // final prompt row, so obtain its logits before priming MTP.
-                result = impl_->run_chunk(chunk, offset, active_layers_, true);
+                result = impl_->run_chunk(chunk, offset, active_layers_, true,
+                                          nullptr, nullptr, slot_id);
                 shifted.back() = result.top_token;
                 (void)impl_->prime_target_mtp(shifted, offset);
             } else {
                 result = impl_->run_chunk(chunk, offset, active_layers_,
-                                          snapshot_result, nullptr, &shifted);
+                                          snapshot_result, nullptr, &shifted, slot_id);
             }
         } else {
             result = impl_->run_chunk(chunk, offset, active_layers_,
-                                      snapshot_result);
+                                      snapshot_result, nullptr, nullptr, slot_id);
         }
         if (periodic_snapshot || end == target_position) {
             impl_->record_snapshot(end, &result, periodic_snapshot);
@@ -4287,14 +4286,14 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
     return result;
 }
 
-QwenForwardResult QwenEngine::decode_step(int token_id) {
+QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.decode_step");
     if (position_ >= max_context_) {
         throw std::runtime_error("Qwen context length exceeded");
     }
     QwenForwardResult result = impl_->run_chunk(
-        {token_id}, position_, active_layers_, true);
+        {token_id}, position_, active_layers_, true, nullptr, nullptr, slot_id);
     ++position_;
     if (options_.prefix_cache) {
         impl_->cached_prompt.push_back(token_id);
