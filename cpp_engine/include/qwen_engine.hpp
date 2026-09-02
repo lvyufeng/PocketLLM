@@ -97,6 +97,13 @@ struct QwenEngineOptions {
     float top_p = 1.0f;
     int top_k = 20;
     unsigned long long sampling_seed = 0;
+    // Maximum concurrent requests for batched execution (Phase 3.2).
+    // 1 = single-session mode (default, backward compatible, zero overhead)
+    // 2-8 = multi-slot mode (enables continuous batching)
+    // KV cache is allocated as [max_batch_size, max_seq_len, kv_heads, head_dim]
+    // at construction time. Memory scales linearly: 2-slot ≈ 2× single-session.
+    // Recommended: 2 for most workloads, 4-8 for high-concurrency scenarios.
+    int max_batch_size = 1;
 };
 
 struct QwenForwardResult {
