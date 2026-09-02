@@ -199,6 +199,72 @@ def test_chat_requests_carry_normalized_messages_to_the_backend():
         server.server_close()
 
 
+def test_http_chat_uses_shared_request_builder():
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        _post(base, "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}],
+            "request_id": "http-chat-1",
+            "max_completion_tokens": 9,
+        })
+        request = backend.seen[-1]
+        assert request.request_id == "http-chat-1"
+        assert request.prompt == "user: hi"
+        assert request.sampling_params.max_tokens == 9
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+
+def test_completion_requests_keep_raw_prompt_path():
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        _post(base, "/v1/completions", {
+            "prompt": "raw completion",
+            "request_id": "completion-1",
+            "max_tokens": 5,
+        })
+        request = backend.seen[-1]
+        assert request.request_id == "completion-1"
+        assert request.prompt == "raw completion"
+        assert "messages" not in request.metadata
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+
+def test_http_and_protocol_builder_construct_equivalent_chat_requests():
+    from pocketllm.api import SamplingParams
+    from pocketllm.protocol import build_chat_request
+
+    body = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [{"type": "function", "function": {"name": "weather"}}],
+        "tool_choice": "required",
+        "reasoning_effort": "high",
+        "response_format": {"type": "json_object"},
+        "max_tokens": 9,
+    }
+    expected = build_chat_request(body, SamplingParams.from_openai(body), request_id="parity")
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        _post(base, "/v1/chat/completions", body)
+        actual = backend.seen[-1]
+        assert actual.prompt == expected.prompt
+        assert actual.metadata == expected.metadata
+        assert actual.sampling_params == expected.sampling_params
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+
+
 def test_invalid_chat_and_completion_bodies_are_rejected():
     server, base = _server()
     try:

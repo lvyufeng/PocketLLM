@@ -27,11 +27,11 @@ from pocketllm.backends.factory import create_backend
 _original_create_backend = create_backend
 
 
-
 class FakeBackend(BackendBase):
     def __init__(self):
         super().__init__()
         self._ready = True
+        self.seen: list[GenerationRequest] = []
 
     @property
     def capabilities(self):
@@ -40,6 +40,7 @@ class FakeBackend(BackendBase):
         )
 
     def generate(self, requests):
+        self.seen.extend(requests)
         result = []
         for request in requests:
             self._begin_request(request.request_id)
@@ -56,6 +57,7 @@ class FakeBackend(BackendBase):
         return result
 
     def stream(self, request):
+        self.seen.append(request)
         self._begin_request(request.request_id)
         try:
             self._check_cancelled(request.request_id)
@@ -102,6 +104,88 @@ def test_fake_backend_sync_and_stream():
     llm.close()
     with pytest.raises(RuntimeError):
         llm.generate("closed")
+
+
+def test_chat_normalizes_messages_and_optional_fields():
+    llm = InjectedLLM()
+    messages = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    result = llm.chat(
+        messages,
+        SamplingParams(max_tokens=3),
+        reasoning_effort="high",
+        tools=tools,
+        tool_choice="required",
+        response_format={"type": "json_object"},
+        request_id="chat-1",
+    )[0]
+
+    assert result.request_id == "chat-1"
+    assert result.text.startswith("system: ")
+    assert messages == [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    llm.close()
+
+
+def test_chat_stream_uses_shared_request_path():
+    llm = InjectedLLM()
+    events = list(llm.chat_stream([{"role": "user", "content": "hello"}], request_id="chat-stream"))
+    assert [event.request_id for event in events] == ["chat-stream", "chat-stream"]
+    assert "".join(event.text for event in events) == "ab"
+    request = llm.backend.seen[-1]
+    assert request.prompt == "user: hello"
+    llm.close()
+
+
+def test_chat_and_generate_preserve_sampling_fields():
+    llm = InjectedLLM()
+    params = SamplingParams(max_tokens=4, temperature=0.2)
+    llm.chat(
+        [{"role": "user", "content": "hi"}],
+        params,
+        response_format={"type": "json_object"},
+    )
+    request = llm.backend.seen[-1]
+    assert request.sampling_params is not params
+    assert request.sampling_params.max_tokens == 4
+    assert request.sampling_params.temperature == 0.2
+    assert request.sampling_params.response_format == {"type": "json_object"}
+    assert params.response_format is None
+    llm.close()
+
+
+def test_async_chat_and_chat_stream_use_sync_facade():
+    from pocketllm.engine import AsyncLLM
+
+    async def run():
+        async_llm = AsyncLLM.__new__(AsyncLLM)
+        async_llm._llm = InjectedLLM()
+        from concurrent.futures import ThreadPoolExecutor
+        async_llm._executor = ThreadPoolExecutor(max_workers=1)
+        async_llm._closed = False
+        result = (await async_llm.chat(
+            [{"role": "user", "content": "hello"}],
+            request_id="async-chat",
+        ))[0]
+        assert result.request_id == "async-chat"
+        values = []
+        async for event in async_llm.chat_stream(
+            [{"role": "user", "content": "stream"}],
+            reasoning_effort="high",
+            request_id="async-stream",
+        ):
+            values.append(event.text)
+        assert values == ["a", "b"]
+        assert async_llm._llm.backend.seen[-1].metadata["reasoning_effort"] == "high"
+        await async_llm.close()
+
+    asyncio.run(run())
+
+
+def test_chat_rejects_invalid_messages():
+    llm = InjectedLLM()
+    with pytest.raises(ValueError, match="messages"):
+        llm.chat([])
+    llm.close()
 
 
 def test_cancel_requires_an_active_request():

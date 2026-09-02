@@ -4,7 +4,7 @@
 > where explicitly noted. Phase 1 adds the `pocketllm` control plane without merging the Torch and
 > native C++ data planes.
 
-## Phase 1 status
+## Phase 1 / Phase 2.1 status
 
 The new `pocketllm` package provides:
 
@@ -14,6 +14,8 @@ The new `pocketllm` package provides:
 - shared `/health`, `/alive`, `/ready`, `/metrics`, `/v1/chat/completions`, and
   `/v1/completions` endpoints;
 - request IDs, safe-boundary cancellation, streaming token events, and usage metrics;
+- library-first `LLM.chat()` / `chat_stream()` and matching `AsyncLLM` methods;
+- one shared chat request builder for offline and HTTP entry points;
 - optional pybind11 bindings for the token-oriented native Qwen engine.
 
 The C++ compatibility adapter is intentionally serialized around one mutable native session. True
@@ -39,18 +41,26 @@ The native runtime was primarily CLI-oriented:
 `QwenEngine` and `PersistentEngine` were C++ classes for native callers, not a supported Python
 library surface. The existing executable and its CLI remain supported.
 
-### PocketLLM Phase 1
+### PocketLLM Phase 2.1
 
 ```python
 from pocketllm import EngineArgs, LLM, SamplingParams
 
 llm = LLM(EngineArgs(model="/path/to/qwen3.5", backend="cpp"))
-outputs = llm.generate(["hello"], SamplingParams(max_tokens=32))
+outputs = llm.chat(
+    [{"role": "user", "content": "hello"}],
+    SamplingParams(max_tokens=32),
+)
 ```
 
-The public facade accepts text or pre-tokenized IDs and returns backend-neutral result/event types.
-The native binding remains token-oriented and does not expose Torch tensors, CUDA handles, ACL
-handles, or a shared physical KV-cache layout.
+The public facade accepts raw text, pre-tokenized IDs, and OpenAI-style chat messages. `chat()` and
+`chat_stream()` use the same backend-neutral normalization and prompt-construction path as the
+HTTP chat endpoint; async variants mirror them through the existing executor wrapper. Results and
+stream events remain backend-neutral. The native binding remains token-oriented and does not expose
+Torch tensors, CUDA handles, ACL handles, or a shared physical KV-cache layout.
+
+This is a library-first request surface, not a continuous-batching implementation: the C++ adapter
+still serializes access to one mutable native session and reports `supports_batch=False`.
 
 ## 2. Request processing and batching
 

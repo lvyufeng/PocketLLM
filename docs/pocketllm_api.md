@@ -33,9 +33,39 @@ Pre-tokenized input is also accepted:
 outputs = llm.generate([[1, 42, 17]], SamplingParams(max_tokens=16))
 ```
 
-Use `generate_stream()` for token events and `cancel(request_id)` to request cancellation at a safe generation boundary. The initial C++ compatibility adapter is serialized and exposes native greedy generation; unsupported sampling or request features report `UnsupportedFeatureError` rather than being silently ignored. Native streaming decodes the cumulative token sequence before emitting each delta, so BPE and UTF-8 token boundaries are handled by the tokenizer.
+For chat-shaped inputs, use the library-first chat surface. It accepts the same normalized message
+and optional fields as `/v1/chat/completions`, and returns the same list-shaped result as
+`generate()` (one result for the supplied conversation):
+
+```python
+messages = [
+    {"role": "system", "content": "Answer concisely."},
+    {"role": "user", "content": "What is 2+2?"},
+]
+outputs = llm.chat(
+    messages,
+    SamplingParams(max_tokens=32, temperature=0.0),
+    reasoning_effort="low",
+)
+print(outputs[0].text)
+```
+
+`chat()` also accepts `reasoning`, `tools`, `tool_choice`, `response_format`, and an optional
+`request_id`. The request body is normalized through the same backend-neutral builder used by the
+HTTP endpoint; checkpoint-owned chat templates remain the authority for model-specific prompt
+encoding. Caller-owned message and tool structures are not mutated.
+
+Use `generate_stream()` or `chat_stream()` for token events and `cancel(request_id)` to request
+cancellation at a safe generation boundary. The initial C++ compatibility adapter is serialized and
+exposes native greedy generation; unsupported sampling or request features report
+`UnsupportedFeatureError` rather than being silently ignored. Native streaming decodes the cumulative
+token sequence before emitting each delta, so BPE and UTF-8 token boundaries are handled by the
+tokenizer.
 
 ## Async API
+
+`AsyncLLM` mirrors every offline entry point: `generate`, `generate_stream`, `chat`, and
+`chat_stream`.
 
 ```python
 from pocketllm import AsyncLLM, EngineArgs, SamplingParams
@@ -44,9 +74,19 @@ async with AsyncLLM(EngineArgs(model="/path/to/checkpoint")) as llm:
     result = (await llm.generate("Hello", SamplingParams(max_tokens=32)))[0]
     async for event in llm.generate_stream("Stream this"):
         print(event.text, end="", flush=True)
+
+    chat_result = (await llm.chat(
+        [{"role": "user", "content": "Explain KV caching."}],
+        SamplingParams(max_tokens=32),
+    ))[0]
+    print(chat_result.text)
+    async for event in llm.chat_stream(
+        [{"role": "user", "content": "Stream a short answer."}],
+    ):
+        print(event.text, end="", flush=True)
 ```
 
-`AsyncLLM` currently provides non-blocking application integration around the backend contract. It does not claim device-level continuous batching. Backend schedulers will add that capability independently.
+`AsyncLLM` currently provides non-blocking application integration around the backend contract. It does not claim device-level continuous batching. Backend schedulers will add that capability independently. The async chat methods reuse the same executor-backed lifecycle and `TokenEvent` contract as the sync facade; they do not add a scheduler.
 
 ## CLI and server
 
