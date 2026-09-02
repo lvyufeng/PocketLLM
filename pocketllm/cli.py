@@ -57,7 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--engine-kind", default="qwen")
-    serve_parser.add_argument("--routed-experts-device", choices=["gpu", "cpu"], default="gpu")
+    # Matches the legacy server default: routed experts live in host memory so
+    # a 4x2080Ti box can hold the model. "gpu" needs far more device memory.
+    serve_parser.add_argument("--routed-experts-device", choices=["gpu", "cpu"], default="cpu")
     serve_parser.add_argument("--pd-mode", choices=["off", "scheduler"], default="scheduler")
     serve_parser.add_argument("--attention-window", type=int, default=0)
     serve_parser.add_argument("--attention-sink-tokens", type=int, default=0)

@@ -84,12 +84,19 @@ class TorchBackend(BackendBase):
         return self._runtime
 
     def _runtime_namespace(self) -> argparse.Namespace:
+        import pathlib
+        config_path = self.args.config_path
+        if not config_path:
+            # Match legacy server default: repo_root/configs/config_w8a8.json
+            repo_root = pathlib.Path(__file__).resolve().parents[2]
+            default_config = repo_root / "configs" / "config_w8a8.json"
+            config_path = str(default_config) if default_config.is_file() else ""
         return argparse.Namespace(
             ckpt_format=self.args.model_format,
             partition_policy=str(self.args.backend_options.get("partition_policy", "legacy")),
             pd_mode=str(self.args.backend_options.get("pd_mode", "scheduler")),
-            routed_experts_device=str(self.args.backend_options.get("routed_experts_device", "gpu")),
-            config=self.args.config_path or "",
+            routed_experts_device=str(self.args.backend_options.get("routed_experts_device", "cpu")),
+            config=config_path,
             ckpt_path=self.args.checkpoint_dir,
             tokenizer_path=self.args.tokenizer_path,
             model=self._model_id,

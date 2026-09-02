@@ -12,12 +12,17 @@ _PRELOADED_TORCH_LIBS = False
 
 def _find_built_extension(module_name: str) -> Optional[Path]:
     suffixes = sorted(importlib.machinery.EXTENSION_SUFFIXES, key=len, reverse=True)
+    search_dirs = (_EXT_DIR, _REPO_ROOT)
     candidates = [f"{module_name}.so"] + [f"{module_name}{suffix}" for suffix in suffixes]
-    for name in candidates:
-        path = _EXT_DIR / name
-        if path.exists():
-            return path
-    matches = sorted(_EXT_DIR.glob(f"{module_name}*.so"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for directory in search_dirs:
+        for name in candidates:
+            path = directory / name
+            if path.exists():
+                return path
+    matches = []
+    for directory in search_dirs:
+        matches.extend(directory.glob(f"{module_name}*.so"))
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0] if matches else None
 
 
