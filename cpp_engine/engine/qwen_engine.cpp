@@ -290,6 +290,25 @@ void zero_tensor(QwenDeviceTensor& tensor) {
     }
 }
 
+// Phase 3.4: Zeroes one leading-dimension row of a per-slot arena. Used for the
+// recurrent state, where resetting one request must not disturb the others.
+void zero_slot_region(QwenDeviceTensor& tensor, int slot_id) {
+    if (tensor.data == nullptr || tensor.nbytes == 0) return;
+    const uint64_t slots = tensor.shape.empty() ? 1 : tensor.shape[0];
+    if (slots <= 1) {
+        zero_tensor(tensor);
+        return;
+    }
+    const size_t slot_bytes = tensor.nbytes / static_cast<size_t>(slots);
+    if (slot_id < 0 || static_cast<uint64_t>(slot_id) >= slots) {
+        throw std::runtime_error("Qwen recurrent slot index out of range");
+    }
+    check_device(device_memset(static_cast<uint8_t*>(tensor.data) +
+                                   static_cast<size_t>(slot_id) * slot_bytes,
+                               0, slot_bytes),
+                 "device_memset Qwen recurrent slot");
+}
+
 // One rollback point for the recurrent half of the network. The 16 full
 // attention layers need nothing here because their KV cache is indexed by
 // absolute position and is never invalidated by a longer prompt.
@@ -499,6 +518,7 @@ struct QwenEngine::Impl {
     bool batch_mode_enabled = false;
     std::unordered_map<uint64_t, int> request_to_slot;
     std::vector<int> free_slots;
+    std::vector<int> slot_positions;  // Phase 3.4: per-slot position tracker
 
     // Phase 3.3: Removed current_slot_id (now passed explicitly as parameter)
 
@@ -506,6 +526,35 @@ struct QwenEngine::Impl {
     size_t kv_slot_offset_elements(int slot_id, int local_kv_heads, int head_dim) const {
         if (max_batch_size == 1) return 0;  // Fast path for single session
         return static_cast<size_t>(slot_id) * max_context * local_kv_heads * head_dim;
+    }
+
+    // Phase 3.4: Element offsets into the per-slot recurrent state arenas. Both
+    // tensors carry the slot count as their leading dimension, so the stride is
+    // whatever remains. Deriving it from the shape keeps these correct without
+    // restating the head geometry, which differs per rank under TP.
+    static size_t slot_stride_elements(const QwenDeviceTensor& tensor) {
+        if (tensor.data == nullptr || tensor.shape.empty()) return 0;
+        size_t stride = 1;
+        for (size_t dim = 1; dim < tensor.shape.size(); ++dim) {
+            stride *= static_cast<size_t>(tensor.shape[dim]);
+        }
+        return stride;
+    }
+
+    size_t recurrent_slot_offset(int slot_id,
+                                 const QwenDeviceTensor& tensor) const {
+        if (max_batch_size == 1 || slot_id == 0) return 0;  // Fast path
+        return static_cast<size_t>(slot_id) * slot_stride_elements(tensor);
+    }
+
+    // Bytes belonging to a single slot. The prefix-cache snapshot and the
+    // packed transaction both operate on one session's state, so they must size
+    // themselves per slot rather than over the whole arena.
+    static size_t recurrent_slot_bytes(const QwenDeviceTensor& tensor) {
+        if (tensor.data == nullptr || tensor.nbytes == 0) return 0;
+        const uint64_t slots = tensor.shape.empty() ? 1 : tensor.shape[0];
+        if (slots <= 1) return tensor.nbytes;
+        return tensor.nbytes / static_cast<size_t>(slots);
     }
 
     void ensure_nccl_comm_stream() {
@@ -576,6 +625,17 @@ struct QwenEngine::Impl {
         // Phase 3.2: Initialize max_batch_size from options
         max_batch_size = options_.max_batch_size;
         batch_mode_enabled = (max_batch_size > 1);
+        slot_positions.resize(max_batch_size, 0);  // Phase 3.4: per-slot positions
+        // Phase 3.4: The KV arena is sized here, so the free list must be
+        // seeded here as well. Seeding it only from allocate_batch_slots()
+        // left the batch API unreachable: that function throws once
+        // batch_mode_enabled is set, so allocate_slot() only ever saw an
+        // empty list and returned -1. Descending order makes back() hand out
+        // slot 0 first, matching single-session addressing.
+        for (int slot = max_batch_size - 1; batch_mode_enabled && slot >= 0;
+             --slot) {
+            free_slots.push_back(slot);
+        }
 
         telemetry.checkpoint_linear_kinds =
             map.checkpoint_linear_kind_counts();
@@ -760,19 +820,30 @@ struct QwenEngine::Impl {
                     upload(index, source.linear_attention.dt_bias);
                 destination.linear.norm =
                     upload(index, source.linear_attention.norm);
-                allocate_float(destination.linear.state,
+                // Phase 3.4: The recurrent state carries the whole history of a
+                // linear-attention layer, so batched requests need one copy
+                // each. It is allocated as [slot, value_heads, k_dim, v_dim]
+                // and indexed by offset, mirroring the KV cache arena. At TP4
+                // this is 36.7 MiB per slot per rank across all 48 linear
+                // layers, cheap enough to hold resident; copying it in and out
+                // on every slot switch would cost that much D2D traffic per
+                // token instead.
+                const int state_slots = options.max_batch_size;
+                const size_t state_elements_per_slot =
                     static_cast<size_t>(local_value_heads) *
                         config.linear_attention.key_head_dim *
-                        config.linear_attention.value_head_dim,
-                    {static_cast<uint64_t>(local_value_heads),
+                        config.linear_attention.value_head_dim;
+                allocate_float(destination.linear.state,
+                    static_cast<size_t>(state_slots) * state_elements_per_slot,
+                    {static_cast<uint64_t>(state_slots),
+                     static_cast<uint64_t>(local_value_heads),
                      config.linear_attention.key_head_dim,
                      config.linear_attention.value_head_dim});
+                const uint64_t tail_rows = static_cast<uint64_t>(std::max(
+                    0, static_cast<int>(config.linear_attention.conv_kernel_dim) - 1));
                 allocate_half(destination.linear.conv_tail,
-                    static_cast<size_t>(std::max(
-                        0, static_cast<int>(config.linear_attention.conv_kernel_dim) - 1)) *
-                        local_qkv_dim,
-                    {static_cast<uint64_t>(std::max(
-                         0, static_cast<int>(config.linear_attention.conv_kernel_dim) - 1)),
+                    static_cast<size_t>(state_slots) * tail_rows * local_qkv_dim,
+                    {static_cast<uint64_t>(state_slots), tail_rows,
                      static_cast<uint64_t>(local_qkv_dim)});
                 zero_tensor(destination.linear.state);
                 zero_tensor(destination.linear.conv_tail);
@@ -1097,11 +1168,14 @@ struct QwenEngine::Impl {
         return false;
     }
 
-    void zero_recurrent_state() {
+    // Phase 3.4: Clears one slot's recurrent state. The MTP and drafter fields
+    // below are still single-session, so slot != 0 only resets the arena rows
+    // it owns; see the shared-state limits in the Phase 3.4 notes.
+    void zero_recurrent_state(int slot_id = 0) {
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            zero_tensor(layer.linear.state);
-            zero_tensor(layer.linear.conv_tail);
+            zero_slot_region(layer.linear.state, slot_id);
+            zero_slot_region(layer.linear.conv_tail, slot_id);
         }
         if (dspark_enabled) dspark->reset();
         if (dflash2_enabled) dflash2->reset();
@@ -1142,10 +1216,13 @@ struct QwenEngine::Impl {
                                          (mtp_enabled ? 1 : 0));
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
+            // Phase 3.4: MTP rollback is single-session, so the transaction
+            // covers slot 0's rows only rather than the whole arena.
             append_transaction_region(layer.linear.state.data,
-                                      layer.linear.state.nbytes, packed_bytes);
+                                      recurrent_slot_bytes(layer.linear.state),
+                                      packed_bytes);
             append_transaction_region(layer.linear.conv_tail.data,
-                                      layer.linear.conv_tail.nbytes,
+                                      recurrent_slot_bytes(layer.linear.conv_tail),
                                       packed_bytes);
         }
         if (mtp_enabled) {
@@ -1219,12 +1296,15 @@ struct QwenEngine::Impl {
             snapshot.result = *result;
             snapshot.has_result = true;
         }
+        // Phase 3.4: One slot's worth per layer. The prefix cache is still
+        // single-session (slot 0), so a snapshot must not size itself over the
+        // whole multi-slot arena.
         size_t state_bytes = 0;
         size_t tail_bytes = 0;
         for (const DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            state_bytes += layer.linear.state.nbytes;
-            tail_bytes += layer.linear.conv_tail.nbytes;
+            state_bytes += recurrent_slot_bytes(layer.linear.state);
+            tail_bytes += recurrent_slot_bytes(layer.linear.conv_tail);
         }
         if (state_bytes != 0) {
             allocate(snapshot.state, state_bytes, {state_bytes / sizeof(float)},
@@ -1250,15 +1330,18 @@ struct QwenEngine::Impl {
         size_t tail_offset = 0;
         for (const DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
+            // Slot 0 only: the prefix cache has no slot dimension yet.
+            const size_t layer_state_bytes = recurrent_slot_bytes(layer.linear.state);
+            const size_t layer_tail_bytes = recurrent_slot_bytes(layer.linear.conv_tail);
             check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.state.data) + state_offset,
-                                    layer.linear.state.data, layer.linear.state.nbytes),
+                                    layer.linear.state.data, layer_state_bytes),
                          "Qwen recurrent state snapshot copy");
-            state_offset += layer.linear.state.nbytes;
-            if (layer.linear.conv_tail.nbytes != 0) {
+            state_offset += layer_state_bytes;
+            if (layer_tail_bytes != 0) {
                 check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.conv_tail.data) + tail_offset,
-                                        layer.linear.conv_tail.data, layer.linear.conv_tail.nbytes),
+                                        layer.linear.conv_tail.data, layer_tail_bytes),
                              "Qwen convolution tail snapshot copy");
-                tail_offset += layer.linear.conv_tail.nbytes;
+                tail_offset += layer_tail_bytes;
             }
         }
         return snapshot;
@@ -1270,8 +1353,8 @@ struct QwenEngine::Impl {
         size_t expected_tail_bytes = 0;
         for (const DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            expected_state_bytes += layer.linear.state.nbytes;
-            expected_tail_bytes += layer.linear.conv_tail.nbytes;
+            expected_state_bytes += recurrent_slot_bytes(layer.linear.state);
+            expected_tail_bytes += recurrent_slot_bytes(layer.linear.conv_tail);
         }
         if (snapshot.state.nbytes != expected_state_bytes ||
             snapshot.conv_tail.nbytes != expected_tail_bytes) {
@@ -1319,17 +1402,20 @@ struct QwenEngine::Impl {
         size_t tail_offset = 0;
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
+            // Restores into slot 0 only, matching capture_recurrent_state.
+            const size_t layer_state_bytes = recurrent_slot_bytes(layer.linear.state);
+            const size_t layer_tail_bytes = recurrent_slot_bytes(layer.linear.conv_tail);
             check_device(memcpy_d2d(layer.linear.state.data,
                                     static_cast<const uint8_t*>(snapshot.state.data) + state_offset,
-                                    layer.linear.state.nbytes),
+                                    layer_state_bytes),
                          "Qwen recurrent state snapshot restore");
-            state_offset += layer.linear.state.nbytes;
-            if (layer.linear.conv_tail.nbytes != 0) {
+            state_offset += layer_state_bytes;
+            if (layer_tail_bytes != 0) {
                 check_device(memcpy_d2d(layer.linear.conv_tail.data,
                                         static_cast<const uint8_t*>(snapshot.conv_tail.data) + tail_offset,
-                                        layer.linear.conv_tail.nbytes),
+                                        layer_tail_bytes),
                              "Qwen convolution tail snapshot restore");
-                tail_offset += layer.linear.conv_tail.nbytes;
+                tail_offset += layer_tail_bytes;
             }
         }
     }
@@ -1940,7 +2026,14 @@ struct QwenEngine::Impl {
     }
 
     void linear_attention(DeviceLayer& layer, const uint16_t* hidden,
-                          uint16_t* output, int rows, int position_offset) {
+                          uint16_t* output, int rows, int position_offset,
+                          int slot_id) {
+        // Phase 3.4: Every kernel below advances this slot's own recurrent
+        // state. Resolved once here so the many call sites cannot disagree.
+        const size_t state_offset = recurrent_slot_offset(slot_id, layer.linear.state);
+        const size_t tail_offset = recurrent_slot_offset(slot_id, layer.linear.conv_tail);
+        float* const state = layer.linear.state.f32_data() + state_offset;
+        uint16_t* const conv_tail = layer.linear.conv_tail.f16_data() + tail_offset;
         const int key_heads = static_cast<int>(
             config.linear_attention.key_heads / options.tp_world);
         const int value_heads = static_cast<int>(
@@ -2014,7 +2107,7 @@ struct QwenEngine::Impl {
         }
         require_launch(qwen_causal_depthwise_conv_silu_f16(
             packed.f16_data(), layer.linear.conv.f16_data(),
-            layer.linear.conv_tail.f16_data(), convolved.f16_data(), rows,
+            conv_tail, convolved.f16_data(), rows,
             packed_dim, kernel, true), "FP16 linear causal convolution");
         require_launch(qwen_split_packed_qkv_f16(
             convolved.f16_data(), q.f16_data(), k.f16_data(), v.f16_data(),
@@ -2058,7 +2151,7 @@ struct QwenEngine::Impl {
                 k_normalized->f32_data(), rows, key_heads,
                 static_cast<int>(config.linear_attention.key_head_dim)) &&
                 qwen_gated_delta_flashqla_sm75_f16_cuda(
-                    layer.linear.state.f32_data(), q_normalized->f32_data(),
+                    state, q_normalized->f32_data(),
                     k_normalized->f32_data(), v.f16_data(), gates.f16_data(),
                     beta.f16_data(), core.f16_data(), rows, value_heads,
                     key_heads,
@@ -2080,7 +2173,7 @@ struct QwenEngine::Impl {
                 static_cast<int>(config.linear_attention.key_head_dim)) &&
                 (qwen_env_enabled("QWEN_GATED_DELTA_SHARED_STATE")
                  ? qwen_gated_delta_sequence_normalized_shared_f16(
-                        layer.linear.state.f32_data(), q_normalized.f32_data(),
+                        state, q_normalized.f32_data(),
                         k_normalized.f32_data(), v.f16_data(), gates.f16_data(),
                         beta.f16_data(), core.f16_data(), rows, value_heads,
                         key_heads,
@@ -2088,7 +2181,7 @@ struct QwenEngine::Impl {
                         static_cast<int>(config.linear_attention.value_head_dim),
                         q_scale)
                     : qwen_gated_delta_sequence_normalized_f16(
-                        layer.linear.state.f32_data(), q_normalized.f32_data(),
+                        state, q_normalized.f32_data(),
                         k_normalized.f32_data(), v.f16_data(), gates.f16_data(),
                         beta.f16_data(), core.f16_data(), rows, value_heads,
                         key_heads,
@@ -2103,7 +2196,7 @@ struct QwenEngine::Impl {
             // reserve it for multi-token chunks. See the step-vs-sequence parity
             // check in test_qwen_half_ops.
             sequenced = qwen_gated_delta_sequence_f16(
-                layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
+                state, q.f16_data(), k.f16_data(),
                 v.f16_data(), gates.f16_data(), beta.f16_data(),
                 core.f16_data(), rows, value_heads, key_heads,
                 static_cast<int>(config.linear_attention.key_head_dim),
@@ -2111,7 +2204,7 @@ struct QwenEngine::Impl {
         }
         for (int token = 0; !sequenced && token < rows; ++token) {
             require_launch(qwen_gated_delta_step_f16(
-                layer.linear.state.f32_data(),
+                state,
                 q.f16_data() + static_cast<size_t>(token) * key_dim,
                 k.f16_data() + static_cast<size_t>(token) * key_dim,
                 v.f16_data() + static_cast<size_t>(token) * value_dim,
@@ -2723,7 +2816,7 @@ struct QwenEngine::Impl {
         norm(layer.input_norm, hidden, normalized.f16_data(), rows, hidden_size);
         if (layer.linear.qkv.weight.data != nullptr) {
             linear_attention(layer, normalized.f16_data(), attention.f16_data(),
-                             rows, position_offset);
+                             rows, position_offset, slot_id);
         } else {
             full_attention(layer, normalized.f16_data(), attention.f16_data(),
                            rows, position_offset, slot_id);
@@ -3970,24 +4063,38 @@ void QwenEngine::allocate_batch_slots(int max_batch_size) {
     if (max_batch_size < 1) {
         throw std::runtime_error("QwenEngine::allocate_batch_slots: max_batch_size must be >= 1");
     }
-    if (impl_->batch_mode_enabled) {
-        throw std::runtime_error("QwenEngine::allocate_batch_slots: batch slots already allocated");
+    // The KV arena was sized at construction from options.max_batch_size and
+    // cannot grow here, so this call can only ever confirm that capacity or
+    // ask for less of it. Growing past it would hand out slots whose offsets
+    // run off the end of the cache.
+    if (max_batch_size > impl_->max_batch_size) {
+        throw std::runtime_error(
+            "QwenEngine::allocate_batch_slots: requested " +
+            std::to_string(max_batch_size) +
+            " slots but the KV cache was built for " +
+            std::to_string(impl_->max_batch_size) +
+            "; set QwenEngineOptions::max_batch_size before construction");
+    }
+    // Phase 3.4: Reject a shrink that would orphan a live request rather than
+    // silently stranding its KV cache.
+    if (!impl_->request_to_slot.empty()) {
+        throw std::runtime_error(
+            "QwenEngine::allocate_batch_slots: cannot resize while " +
+            std::to_string(impl_->request_to_slot.size()) +
+            " request(s) still hold slots");
     }
 
     impl_->max_batch_size = max_batch_size;
     impl_->batch_mode_enabled = (max_batch_size > 1);
 
-    // Single session mode: no reallocation needed
-    if (max_batch_size == 1) {
-        return;
-    }
-
-    // Phase 3.2: Multi-slot KV cache is allocated at construction time via
-    // QwenEngineOptions.max_batch_size. This function now only updates bookkeeping.
-    // Initialize free slots
+    // Phase 3.2: the multi-slot KV cache itself is allocated at construction
+    // time; this only rebuilds the bookkeeping. Descending order makes back()
+    // hand out slot 0 first.
     impl_->free_slots.clear();
-    for (int i = 0; i < max_batch_size; ++i) {
-        impl_->free_slots.push_back(i);
+    impl_->request_to_slot.clear();
+    for (int slot = max_batch_size - 1; impl_->batch_mode_enabled && slot >= 0;
+         --slot) {
+        impl_->free_slots.push_back(slot);
     }
 }
 
@@ -4113,11 +4220,20 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
         throw std::runtime_error("Qwen context length exceeded");
     }
 
+    if (slot_id < 0 || slot_id >= impl_->max_batch_size) {
+        throw std::runtime_error("Qwen prefill slot " + std::to_string(slot_id) +
+                                 " is outside the allocated batch");
+    }
+
     prefix_stats_ = QwenPrefixCacheStats{};
     prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
     impl_->phase_seconds.clear();
     impl_->phase_calls.clear();
-    const bool can_reuse = options_.prefix_cache &&
+    // Phase 3.4: cached_prompt, position_ and the snapshot ring still describe
+    // slot 0 only, so reuse is confined to it. Other slots always prefill cold;
+    // their recurrent state is isolated by the arena, which is what makes the
+    // result correct rather than merely uncached.
+    const bool can_reuse = options_.prefix_cache && slot_id == 0 &&
         !impl_->cached_prompt.empty() && position_ ==
             static_cast<int>(impl_->cached_prompt.size());
     size_t common = 0;
@@ -4186,16 +4302,18 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
             prefix_stats_.resume_source = "snapshot";
             ++impl_->prefix_hits;
         } else {
-            impl_->zero_recurrent_state();
+            impl_->zero_recurrent_state(slot_id);
             prefix_stats_.resume_source = "empty";
             ++impl_->prefix_misses;
         }
-        impl_->drop_snapshots_after(start_position);
+        if (slot_id == 0) impl_->drop_snapshots_after(start_position);
     } else {
-        impl_->zero_recurrent_state();
+        // Clears this slot's rows only; a concurrent request on another slot
+        // keeps its state.
+        impl_->zero_recurrent_state(slot_id);
         prefix_stats_.resume_source = "empty";
         if (can_reuse) ++impl_->prefix_misses;
-        impl_->drop_snapshots_after(0);
+        if (slot_id == 0) impl_->drop_snapshots_after(0);
     }
 
     const int target_position = static_cast<int>(token_ids.size());
@@ -4268,6 +4386,11 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
         throw std::runtime_error("Qwen prefix cache failed to produce logits");
     }
     position_ = target_position;
+    // Phase 3.4: Track per-slot position independently
+    if (impl_->batch_mode_enabled && slot_id >= 0 &&
+        slot_id < static_cast<int>(impl_->slot_positions.size())) {
+        impl_->slot_positions[static_cast<size_t>(slot_id)] = target_position;
+    }
     if (options_.prefix_cache) {
         impl_->cached_prompt = token_ids;
         cached_result_ = result;
@@ -4289,12 +4412,29 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
 QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.decode_step");
-    if (position_ >= max_context_) {
+
+    // Phase 3.4: Use per-slot position when batch mode is enabled
+    int current_position = position_;
+    if (impl_->batch_mode_enabled && slot_id >= 0 &&
+        slot_id < static_cast<int>(impl_->slot_positions.size())) {
+        current_position = impl_->slot_positions[static_cast<size_t>(slot_id)];
+    }
+
+    if (current_position >= max_context_) {
         throw std::runtime_error("Qwen context length exceeded");
     }
     QwenForwardResult result = impl_->run_chunk(
-        {token_id}, position_, active_layers_, true, nullptr, nullptr, slot_id);
-    ++position_;
+        {token_id}, current_position, active_layers_, true, nullptr, nullptr, slot_id);
+
+    ++current_position;
+    position_ = current_position;
+
+    // Phase 3.4: Update per-slot position
+    if (impl_->batch_mode_enabled && slot_id >= 0 &&
+        slot_id < static_cast<int>(impl_->slot_positions.size())) {
+        impl_->slot_positions[static_cast<size_t>(slot_id)] = current_position;
+    }
+
     if (options_.prefix_cache) {
         impl_->cached_prompt.push_back(token_id);
         cached_result_ = result;
