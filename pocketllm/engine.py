@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 
 from pocketllm.api import (
@@ -17,6 +18,7 @@ from pocketllm.api import (
     TokenEvent,
 )
 from pocketllm.backends.factory import create_backend
+from pocketllm.protocol import build_chat_request
 
 
 _TOKEN_DONE = object()
@@ -27,8 +29,6 @@ def _next_event(iterator: Iterator[TokenEvent]) -> TokenEvent | object:
         return next(iterator)
     except StopIteration:
         return _TOKEN_DONE
-
-
 
 
 class LLM:
@@ -86,6 +86,109 @@ class LLM:
             raise RuntimeError("LLM is closed")
         params = sampling_params or SamplingParams()
         request = self._requests([prompt], params)[0]
+        return self._backend.stream(request)
+
+    @staticmethod
+    def _chat_body(
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+    ) -> dict[str, Any]:
+        """Build an OpenAI-shaped body for the shared chat normalizer."""
+        normalized_messages = [
+            dict(message) if isinstance(message, Mapping) else message
+            for message in messages
+        ]
+        body: dict[str, Any] = {"messages": normalized_messages}
+        for name, value in (
+            ("reasoning", reasoning),
+            ("reasoning_effort", reasoning_effort),
+            ("tools", tools),
+            ("tool_choice", tool_choice),
+            ("response_format", response_format),
+        ):
+            if value is not None:
+                body[name] = value
+        return body
+
+    def _chat_request(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+        request_id: str | None = None,
+    ) -> GenerationRequest:
+        body = self._chat_body(
+            messages,
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+        )
+        return build_chat_request(body, sampling_params, request_id=request_id)
+
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+        request_id: str | None = None,
+    ) -> list[GenerationResult]:
+        """Generate a response for normalized OpenAI-style chat messages."""
+        if self._closed:
+            raise RuntimeError("LLM is closed")
+        request = self._chat_request(
+            messages,
+            sampling_params,
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            request_id=request_id,
+        )
+        return self._backend.generate([request])
+
+    def chat_stream(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+        request_id: str | None = None,
+    ) -> Iterator[TokenEvent]:
+        """Stream token events for normalized OpenAI-style chat messages."""
+        if self._closed:
+            raise RuntimeError("LLM is closed")
+        request = self._chat_request(
+            messages,
+            sampling_params,
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            request_id=request_id,
+        )
         return self._backend.stream(request)
 
     def cancel(self, request_id: str) -> bool:
@@ -152,6 +255,67 @@ class AsyncLLM:
             prompt,
             sampling_params,
         )
+        while True:
+            event = await loop.run_in_executor(self._executor, _next_event, iterator)
+            if event is _TOKEN_DONE:
+                return
+            yield event
+
+    async def chat(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+        request_id: str | None = None,
+    ) -> list[GenerationResult]:
+        if self._closed:
+            raise RuntimeError("AsyncLLM is closed")
+        loop = asyncio.get_running_loop()
+        call = partial(
+            self._llm.chat,
+            messages,
+            sampling_params,
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            request_id=request_id,
+        )
+        return await loop.run_in_executor(self._executor, call)
+
+    async def chat_stream(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        sampling_params: SamplingParams | None = None,
+        *,
+        reasoning: Any = None,
+        reasoning_effort: Any = None,
+        tools: Any = None,
+        tool_choice: Any = None,
+        response_format: Any = None,
+        request_id: str | None = None,
+    ) -> AsyncIterator[TokenEvent]:
+        if self._closed:
+            raise RuntimeError("AsyncLLM is closed")
+        loop = asyncio.get_running_loop()
+        call = partial(
+            self._llm.chat_stream,
+            messages,
+            sampling_params,
+            reasoning=reasoning,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            response_format=response_format,
+            request_id=request_id,
+        )
+        iterator = await loop.run_in_executor(self._executor, call)
         while True:
             event = await loop.run_in_executor(self._executor, _next_event, iterator)
             if event is _TOKEN_DONE:

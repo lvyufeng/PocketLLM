@@ -21,11 +21,10 @@ from pocketllm.api import (
     GenerationRequest,
     GenerationResult,
     RequestCancelledError,
-    SamplingParams,
     TokenEvent,
     UnsupportedFeatureError,
 )
-from pocketllm.protocol import ChatRequest, render_fallback_prompt
+from pocketllm.protocol import build_chat_request, build_completion_request
 
 from .metrics import Metrics
 
@@ -210,17 +209,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def _request(self, body: dict[str, Any], *, completion: bool = False) -> GenerationRequest:
         request_id = str(body.get("request_id") or f"chatcmpl-{uuid.uuid4().hex}")
-        params = SamplingParams.from_openai(body)
-        chat = ChatRequest.from_body(body, completion=completion)
-        # Chat requests carry normalized messages for the shared prompt boundary.
-        # `prompt` remains a deterministic fallback for generic tokenizers.
-        prompt = chat.prompt if completion else render_fallback_prompt(chat.messages)
-        return GenerationRequest(
-            prompt=prompt,
-            sampling_params=params,
-            request_id=request_id,
-            metadata=chat.metadata(),
-        )
+        if completion:
+            return build_completion_request(body, request_id=request_id)
+        return build_chat_request(body, request_id=request_id)
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path

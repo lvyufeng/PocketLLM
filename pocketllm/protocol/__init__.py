@@ -18,9 +18,12 @@ from .chat import (
     tool_names,
 )
 from .prompt import encode_chat_prompt
+from .requests import build_chat_request, build_completion_request
 
 __all__ = [
     "ChatRequest",
+    "build_chat_request",
+    "build_completion_request",
     "apply_stop_to_text",
     "encode_chat_prompt",
     "normalize_content",
