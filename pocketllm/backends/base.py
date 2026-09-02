@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from pocketllm.api import (
@@ -12,6 +12,7 @@ from pocketllm.api import (
     GenerationResult,
     HealthStatus,
     RequestCancelledError,
+    TensorParallelSupervisorError,
     TokenEvent,
 )
 
@@ -86,11 +87,30 @@ class BackendBase:
         if self._closed:
             raise RuntimeError("backend is closed")
 
+    def prepare(self) -> None:
+        """Eagerly initialize a backend before a supervised rank announces readiness."""
+        self._ensure_open()
+
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         raise NotImplementedError
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         raise NotImplementedError
+
+    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
+        """Enter a backend-specific worker loop for supervised TP ranks > 0.
+
+        This method is only called on nonzero ranks when the CLI uses its
+        built-in process supervisor.  Backends without native TP worker support
+        must raise UnsupportedFeatureError rather than silently returning.
+
+        ``on_ready`` is called exactly once after the worker has initialized and
+        is ready to participate in collectives, immediately before entering the
+        blocking worker loop.
+        """
+        raise TensorParallelSupervisorError(
+            "backend does not implement a supervised TP worker entry point"
+        )
 
     @staticmethod
     def _metadata_copy(value: Any) -> dict[str, Any]:

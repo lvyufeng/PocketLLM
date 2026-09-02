@@ -21,3 +21,7 @@ class UnsupportedFeatureError(PocketLLMError, NotImplementedError):
 
 class RequestCancelledError(PocketLLMError):
     """Generation was cancelled before it completed."""
+
+
+class TensorParallelSupervisorError(PocketLLMError):
+    """A supervised tensor-parallel rank failed to start or remain alive."""

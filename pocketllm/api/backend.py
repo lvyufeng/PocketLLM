@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from typing import Iterator, Protocol, Sequence
+from typing import Callable, Iterator, Protocol, Sequence
 
 from .types import (
     BackendCapabilities,
@@ -28,6 +28,14 @@ class EngineBackend(Protocol):
         ...
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        ...
+
+    def prepare(self) -> None:
+        """Eagerly initialize the backend for a supervised rank."""
+        ...
+
+    def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
+        """Enter the backend-specific worker loop for a nonzero TP rank."""
         ...
 
     def cancel(self, request_id: str) -> bool:

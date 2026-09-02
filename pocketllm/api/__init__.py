@@ -6,6 +6,7 @@ from .errors import (
     ConfigurationError,
     PocketLLMError,
     RequestCancelledError,
+    TensorParallelSupervisorError,
     UnsupportedFeatureError,
 )
 from .types import (
@@ -32,6 +33,7 @@ __all__ = [
     "PocketLLMError",
     "RequestCancelledError",
     "SamplingParams",
+    "TensorParallelSupervisorError",
     "TimingMetrics",
     "TokenEvent",
     "UnsupportedFeatureError",

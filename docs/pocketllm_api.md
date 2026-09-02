@@ -108,8 +108,23 @@ python -m pocketllm serve \
   --port 8000
 ``` 
 
-The CLI does not automatically launch tensor-parallel worker processes; start the configured
-workers using the deployment's existing launcher when `tensor_parallel_size > 1`.
+For `tensor_parallel_size > 1`, the CLI supervises local tensor-parallel ranks by default. It creates a
+private per-run rendezvous directory and NCCL-ID path, assigns `RANK`/`LOCAL_RANK`/`WORLD_SIZE` and
+`TP_RANK`/`TP_WORLD`, starts every rank without a shell, and waits for all ranks to finish loading
+before rank 0 is considered ready. Only rank 0 binds the HTTP listener. A rank failure, startup
+timeout, or received `SIGINT`/`SIGTERM` causes the supervisor to stop and reap the whole group.
+Use `--tensor-parallel-startup-timeout SECONDS` and `--tensor-parallel-shutdown-timeout SECONDS`
+to tune lifecycle bounds; `--tensor-parallel-master-addr`, `--tensor-parallel-master-port`, and
+`--tensor-parallel-rendezvous-dir` are available for deployments that need explicit rendezvous
+placement. A caller-provided rendezvous directory is treated as a parent for a fresh private run
+directory and is never removed by PocketLLM.
+
+The built-in supervisor currently works with the Torch backend by reusing its existing NCCL/Gloo
+worker loop. The Python C++ Qwen adapter does not yet expose a native worker entry point, so
+`backend="cpp"` must use the legacy `dsv4_cpp_engine` launcher or opt out with
+`--no-tensor-parallel-supervisor`. Existing `torchrun` and manual rank launchers remain compatible
+through that opt-out. This process supervisor is not a scheduler and does not provide continuous
+batching or request-local native state.
 
 The unified server provides:
 
