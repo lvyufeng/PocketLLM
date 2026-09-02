@@ -145,6 +145,11 @@ class GPUPrefillMoEBackend:
         # grouped path, which launches over all n_local_experts and restages the
         # layer as int8; measured at +619ms of MoE for one extra token.
         self.multi_token_fp4_enabled = os.getenv("DEEPSEEK_GPU_MOE_MULTI_TOKEN_FP4", "0").lower() in {"1", "true", "yes"}
+        # Read the decode routing row to the host once instead of three times.
+        # Default on; the flag exists so the two can be A/B'd in one process,
+        # since run-to-run decode variance (374-421ms/token observed) is wider
+        # than the effect being measured.
+        self.decode_single_host_sync = os.getenv("DEEPSEEK_GPU_MOE_DECODE_SINGLE_SYNC", "1").lower() in {"1", "true", "yes"}
         self.multi_token_fp4_max_tokens = max(0, int(os.getenv("DEEPSEEK_GPU_MOE_MULTI_TOKEN_FP4_MAX_TOKENS", "8")))
 
     @staticmethod
@@ -660,20 +665,49 @@ class GPUPrefillMoEBackend:
         ):
             indices_row = indices[0].contiguous().to(torch.int64)
             weights_row = weights[0].contiguous().to(torch.float32)
-            local_ids = indices_row - self.experts_start_idx
-            local_mask = (local_ids >= 0) & (local_ids < self.n_local_experts)
-            if not bool(local_mask.any().item()):
-                return torch.zeros((1, self.dim), device=x.device, dtype=torch.float32)
-            local_ids = local_ids[local_mask].to(torch.long).unique()
-            route_count = int(local_ids.numel())
+            if self.decode_single_host_sync:
+                # One host transfer for the whole routing decision. Every branch
+                # below needs these ids on the host (to pick which experts to
+                # stage, and to diff against the staged set), and each read of a
+                # CUDA tensor's values is a sync that drains the stream -- 43
+                # layers x 3 reads serializes the expert H2D against the GEMM.
+                # The row is topk ints, so the transfer itself is negligible
+                # next to the sync it replaces.
+                local_id_list = sorted({
+                    int(e) for e in (indices_row - self.experts_start_idx).tolist()
+                    if 0 <= int(e) < self.n_local_experts
+                })
+                if not local_id_list:
+                    return torch.zeros((1, self.dim), device=x.device, dtype=torch.float32)
+                route_count = len(local_id_list)
+                # CPU tensors on purpose below: _expert_ids_for_stage does
+                # .to("cpu"), a no-op here instead of another sync.
+                stage_all = torch.tensor(local_id_list, dtype=torch.long)
+            else:
+                local_ids = indices_row - self.experts_start_idx
+                local_mask = (local_ids >= 0) & (local_ids < self.n_local_experts)
+                if not bool(local_mask.any().item()):
+                    return torch.zeros((1, self.dim), device=x.device, dtype=torch.float32)
+                local_ids = local_ids[local_mask].to(torch.long).unique()
+                route_count = int(local_ids.numel())
+                local_id_list = None
+                stage_all = local_ids
             if self._w1q is None or self._prepared_device != x.device or (self._staged_arena_format != "fp4" and hasattr(self.cpu_backend, "get_fp4_arena") and self.cpu_backend.get_fp4_arena() is not None):
-                self._stage_local_experts(x.device, local_ids)
+                self._stage_local_experts(x.device, stage_all)
             elif len(self._staged_local_experts) < self.n_local_experts:
-                unstaged_local_ids = [local_id for local_id in local_ids.tolist() if int(local_id) not in self._staged_local_experts]
+                ids_for_diff = (local_id_list if local_id_list is not None
+                                else local_ids.tolist())
+                unstaged_local_ids = [
+                    local_id for local_id in ids_for_diff
+                    if int(local_id) not in self._staged_local_experts
+                ]
                 if unstaged_local_ids:
                     self._stage_local_experts(
                         x.device,
-                        torch.tensor(unstaged_local_ids, device=indices.device, dtype=torch.long),
+                        torch.tensor(unstaged_local_ids, dtype=torch.long)
+                        if self.decode_single_host_sync
+                        else torch.tensor(unstaged_local_ids, device=indices.device,
+                                          dtype=torch.long),
                     )
             if self.profile_enabled:
                 torch.cuda.synchronize(x.device)
