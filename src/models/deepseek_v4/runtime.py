@@ -2599,6 +2599,27 @@ class Expert(nn.Module):
             w1 = _dequant_fp4_weight_torch(self._cpu_w1, self._cpu_w1_scale, block_size=fp4_block_size)
             w2 = _dequant_fp4_weight_torch(self._cpu_w2, self._cpu_w2_scale, block_size=fp4_block_size)
             w3 = _dequant_fp4_weight_torch(self._cpu_w3, self._cpu_w3_scale, block_size=fp4_block_size)
+        elif isinstance(self._cpu_w1, torch.Tensor) and self._cpu_w1.dtype == torch.uint8:
+            # The FP4 arena keeps the physical checkpoint representation as
+            # uint8 bytes (two FP4 values per byte) and stores UE8M0 scales as
+            # uint8 bytes. Reinterpret both views before dequantizing; passing
+            # the packed half-width matrix to F.linear would silently produce
+            # a shape mismatch (or, for other dimensions, incorrect results).
+            w1_packed = Packed4BitWeightAlongK.convert_from(
+                self._cpu_w1.view(torch.int8).view(torch.float4_e2m1fn_x2)
+            )
+            w2_packed = Packed4BitWeightAlongK.convert_from(
+                self._cpu_w2.view(torch.int8).view(torch.float4_e2m1fn_x2)
+            )
+            w3_packed = Packed4BitWeightAlongK.convert_from(
+                self._cpu_w3.view(torch.int8).view(torch.float4_e2m1fn_x2)
+            )
+            w1_scale = self._cpu_w1_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w2_scale = self._cpu_w2_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w3_scale = self._cpu_w3_scale.view(torch.float8_e8m0fnu).to(torch.float32).contiguous()
+            w1 = _dequant_fp4_weight_torch(w1_packed, w1_scale, block_size=fp4_block_size)
+            w2 = _dequant_fp4_weight_torch(w2_packed, w2_scale, block_size=fp4_block_size)
+            w3 = _dequant_fp4_weight_torch(w3_packed, w3_scale, block_size=fp4_block_size)
         else:
             w1 = self._cpu_w1
             w2 = self._cpu_w2

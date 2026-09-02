@@ -115,14 +115,21 @@ def _get_worker_executor() -> ThreadPoolExecutor:
 def _find_extension_path() -> Path | None:
     import sysconfig
 
+    search_dirs = (_EXT_DIR, _EXT_DIR.parent.parent)
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
     if ext_suffix:
-        abi_path = _EXT_DIR / f"deepseek_cpu_moe_ext{ext_suffix}"
-        if abi_path.exists():
-            return abi_path
-    if _EXT_PATH.exists():
-        return _EXT_PATH
-    matches = sorted(_EXT_DIR.glob("deepseek_cpu_moe_ext*.so"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for directory in search_dirs:
+            abi_path = directory / f"deepseek_cpu_moe_ext{ext_suffix}"
+            if abi_path.exists():
+                return abi_path
+    for directory in search_dirs:
+        path = directory / "deepseek_cpu_moe_ext.so"
+        if path.exists():
+            return path
+    matches = []
+    for directory in search_dirs:
+        matches.extend(directory.glob("deepseek_cpu_moe_ext*.so"))
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if matches:
         return matches[0]
     return None
