@@ -184,6 +184,45 @@ struct QwenPrefixCacheStats {
     int misses = 0;
 };
 
+// ========== Batched request types (Phase 3.1) ==========
+
+// Sampling parameters for one batched request
+struct QwenBatchSamplingParams {
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 20;
+    unsigned long long seed = 0;
+    int max_new_tokens = 128;
+};
+
+// Per-request state for batched continuous execution
+struct QwenBatchedRequest {
+    uint64_t request_id = 0;
+    std::vector<int> prompt_tokens;
+    int seq_len = 0;
+    int slot_id = -1;
+    int cached_prefix_len = 0;
+    QwenBatchSamplingParams sampling;
+    bool finished = false;
+    int last_token = 0;
+    std::vector<int> generated_tokens;
+    QwenForwardResult last_result;
+};
+
+// Result from batch_prefill
+struct QwenBatchPrefillResult {
+    std::vector<QwenForwardResult> results;
+    int total_tokens = 0;
+    double seconds = 0.0;
+};
+
+// Result from batch_decode_step
+struct QwenBatchDecodeResult {
+    std::vector<int> next_tokens;
+    std::vector<bool> finished;
+    double seconds = 0.0;
+};
+
 // Independent Qwen3.5 hybrid dense runtime. Checkpoint BF16 tensors are
 // materialized as FP16 on Turing; FP8 projections retain their compressed
 // codes and BF16 block scales are uploaded as FP16 for online unpack.
@@ -232,6 +271,36 @@ public:
     QwenForwardResult decode_step(int token_id);
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,
                                              int max_new_tokens);
+
+    // ========== Batched API (Phase 3.1) ==========
+
+    // Allocate KV cache slots for batched execution
+    // Must be called before using batch_prefill/batch_decode_step
+    // max_batch_size: maximum number of concurrent requests
+    void allocate_batch_slots(int max_batch_size);
+
+    // Allocate a KV cache slot for a new request
+    // Returns slot_id on success, -1 if no slots available
+    int allocate_slot(uint64_t request_id);
+
+    // Free a KV cache slot when request completes
+    void free_slot(uint64_t request_id);
+
+    // Batch prefill: process multiple requests in their prefill phase
+    // Each request in the batch may have different prompt lengths
+    // Currently processes requests sequentially (one at a time) to avoid
+    // mixed-length batching complexity; returns after all prefills complete
+    QwenBatchPrefillResult batch_prefill(
+        const std::vector<QwenBatchedRequest*>& requests);
+
+    // Batch decode step: process one decode step for all active requests
+    // All requests must be at the same decode position (post-prefill)
+    // Returns next token for each request
+    QwenBatchDecodeResult batch_decode_step(
+        const std::vector<QwenBatchedRequest*>& requests);
+
+    // Check if batched API is supported (depends on build config)
+    bool supports_batching() const;
 
     // TP rank > 0 entry point. Blocks on a small NCCL int32 broadcast channel
     // driven by rank 0; runs the requested op until SHUTDOWN.

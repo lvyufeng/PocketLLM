@@ -1,5 +1,8 @@
 #include "qwen_engine.hpp"
 
+#include <chrono>
+#include <unordered_map>
+
 #include "cmd_channel.hpp"
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
@@ -490,6 +493,12 @@ struct QwenEngine::Impl {
     std::vector<QwenRecurrentSnapshot> snapshots;
     int prefix_hits = 0;
     int prefix_misses = 0;
+
+    // ========== Batch slot management (Phase 3.1) ==========
+    int max_batch_size = 1;  // Default single session
+    bool batch_mode_enabled = false;
+    std::unordered_map<uint64_t, int> request_to_slot;
+    std::vector<int> free_slots;
 
     void ensure_nccl_comm_stream() {
         if (!use_nccl_comm_stream || nccl_comm_stream_initialized) return;
@@ -3865,6 +3874,154 @@ void QwenEngine::clear_prefix_cache() {
     impl_->zero_recurrent_state();
     // KV storage is overwritten before it is read. Avoid clearing several GiB
     // on every request; position_ bounds all attention reads.
+}
+
+// ========== Batch API implementation (Phase 3.1) ==========
+
+bool QwenEngine::supports_batching() const {
+    return true;  // Phase 3.1: always supported, opt-in via allocate_batch_slots
+}
+
+void QwenEngine::allocate_batch_slots(int max_batch_size) {
+    if (max_batch_size < 1) {
+        throw std::runtime_error("QwenEngine::allocate_batch_slots: max_batch_size must be >= 1");
+    }
+    if (impl_->batch_mode_enabled) {
+        throw std::runtime_error("QwenEngine::allocate_batch_slots: batch slots already allocated");
+    }
+
+    impl_->max_batch_size = max_batch_size;
+    impl_->batch_mode_enabled = (max_batch_size > 1);
+
+    // Single session mode: no reallocation needed
+    if (max_batch_size == 1) {
+        return;
+    }
+
+    // TODO Phase 3.1: Reallocate KV cache as [max_batch_size, max_seq_len, kv_heads, head_dim]
+    // For now, throw to indicate multi-slot KV reallocation is not yet implemented
+    throw std::runtime_error(
+        "QwenEngine::allocate_batch_slots: multi-slot KV cache reallocation "
+        "not yet implemented (Phase 3.1 WIP)");
+
+    // Initialize free slots
+    impl_->free_slots.clear();
+    for (int i = 0; i < max_batch_size; ++i) {
+        impl_->free_slots.push_back(i);
+    }
+}
+
+int QwenEngine::allocate_slot(uint64_t request_id) {
+    if (!impl_->batch_mode_enabled) {
+        // Single session mode: always use slot 0
+        return 0;
+    }
+
+    if (impl_->free_slots.empty()) {
+        return -1;  // No slots available
+    }
+
+    int slot_id = impl_->free_slots.back();
+    impl_->free_slots.pop_back();
+    impl_->request_to_slot[request_id] = slot_id;
+    return slot_id;
+}
+
+void QwenEngine::free_slot(uint64_t request_id) {
+    if (!impl_->batch_mode_enabled) {
+        return;  // Single session mode: nothing to free
+    }
+
+    auto it = impl_->request_to_slot.find(request_id);
+    if (it == impl_->request_to_slot.end()) {
+        return;  // Request not found
+    }
+
+    int slot_id = it->second;
+    impl_->request_to_slot.erase(it);
+    impl_->free_slots.push_back(slot_id);
+}
+
+QwenBatchPrefillResult QwenEngine::batch_prefill(
+    const std::vector<QwenBatchedRequest*>& requests) {
+
+    // Phase 3.1: Process requests sequentially (FCFS)
+    // Mixed-length batching is deferred to Phase 4
+
+    QwenBatchPrefillResult result;
+    result.results.reserve(requests.size());
+    result.total_tokens = 0;
+
+    auto start = std::chrono::steady_clock::now();
+
+    for (QwenBatchedRequest* req : requests) {
+        if (!req || req->prompt_tokens.empty()) {
+            throw std::runtime_error("QwenEngine::batch_prefill: invalid request");
+        }
+
+        // Single-session prefill path for now
+        // TODO Phase 3.1: Use slot_id to offset KV cache access
+        QwenForwardResult fwd_result = prefill(req->prompt_tokens);
+
+        req->seq_len = static_cast<int>(req->prompt_tokens.size());
+        req->last_token = fwd_result.top_token;
+        req->last_result = fwd_result;
+
+        result.results.push_back(fwd_result);
+        result.total_tokens += static_cast<int>(req->prompt_tokens.size());
+
+        // Clear prompt_tokens after prefill to save memory
+        req->prompt_tokens.clear();
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    result.seconds = std::chrono::duration<double>(end - start).count();
+
+    return result;
+}
+
+QwenBatchDecodeResult QwenEngine::batch_decode_step(
+    const std::vector<QwenBatchedRequest*>& requests) {
+
+    QwenBatchDecodeResult result;
+    result.next_tokens.reserve(requests.size());
+    result.finished.reserve(requests.size());
+
+    if (requests.empty()) {
+        return result;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Phase 3.1: Process decode steps sequentially
+    // True batched decode kernel is deferred to Phase 3.2
+    for (QwenBatchedRequest* req : requests) {
+        if (!req) {
+            throw std::runtime_error("QwenEngine::batch_decode_step: null request");
+        }
+
+        // TODO Phase 3.1: Use slot_id to offset KV cache access
+        QwenForwardResult fwd_result = decode_step(req->last_token);
+
+        req->last_token = fwd_result.top_token;
+        req->last_result = fwd_result;
+        req->seq_len++;
+        req->generated_tokens.push_back(fwd_result.top_token);
+
+        // Check finish conditions
+        bool finished = (static_cast<int>(req->generated_tokens.size()) >=
+                        req->sampling.max_new_tokens);
+        // TODO: Add EOS token check
+
+        req->finished = finished;
+        result.next_tokens.push_back(fwd_result.top_token);
+        result.finished.push_back(finished);
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    result.seconds = std::chrono::duration<double>(end - start).count();
+
+    return result;
 }
 
 QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids) {
