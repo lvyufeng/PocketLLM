@@ -288,6 +288,26 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("prefill", &qwen_prefill)
         .def("decode_step", &qwen_decode)
         .def("generate", &qwen_generate)
+        .def("run_worker_loop", [](QwenEngine& engine) {
+            py::gil_scoped_release release;
+            engine.run_worker_loop();
+        }, "TP rank > 0 entry point: blocks on NCCL command channel until shutdown")
+        .def("worker_command_prefill", [](QwenEngine& engine, const std::vector<int>& token_ids) {
+            py::gil_scoped_release release;
+            engine.worker_command_prefill(token_ids);
+        }, py::arg("token_ids"))
+        .def("worker_command_decode", [](QwenEngine& engine, int32_t last_token) {
+            py::gil_scoped_release release;
+            engine.worker_command_decode(last_token);
+        }, py::arg("last_token"))
+        .def("worker_command_reset", [](QwenEngine& engine) {
+            py::gil_scoped_release release;
+            engine.worker_command_reset();
+        })
+        .def("worker_command_shutdown", [](QwenEngine& engine) {
+            py::gil_scoped_release release;
+            engine.worker_command_shutdown();
+        })
         .def_property_readonly("position", &QwenEngine::position)
         .def_property_readonly("max_context", &QwenEngine::max_context)
         .def_property_readonly("resident_weight_bytes", &QwenEngine::resident_weight_bytes)

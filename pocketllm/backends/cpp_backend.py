@@ -37,7 +37,24 @@ from .base import BackendBase
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
 
 
+def _preload_torch_runtime() -> None:
+    """Let torch bind its own NCCL before the native module loads one.
+
+    The extension links its own libnccl.  If it is imported first, that copy
+    wins the global symbol lookup and a newer ``libtorch_cuda.so`` can then fail
+    on a symbol it does not provide (observed: ``undefined symbol:
+    ncclCommResume``).  Importing torch first is enough to fix the order.  Torch
+    is optional for this backend, so a missing or broken install is ignored here
+    and reported later by whatever actually needs it.
+    """
+    try:
+        importlib.import_module("torch")
+    except Exception:
+        return
+
+
 def load_native_module() -> Any:
+    _preload_torch_runtime()
     errors: list[str] = []
     for name in _NATIVE_MODULE_NAMES:
         try:
@@ -151,6 +168,7 @@ class CppBackend(BackendBase):
             self._native = load_native_module()
         else:
             self._native = None
+        self._tokenizer_error: str | None = None
         self._engine = engine if engine is not None else self._construct_engine()
         # A primitive lock may be released by a different worker thread.  This
         # matters for AsyncLLM, which advances one generator through an executor
@@ -248,21 +266,27 @@ class CppBackend(BackendBase):
     def _load_tokenizer(self) -> Any | None:
         tokenizer_path = self.args.tokenizer_path or self.args.checkpoint_dir
         if not tokenizer_path:
+            self._tokenizer_error = "no tokenizer_path and no checkpoint_dir"
             return None
         try:
             from transformers import AutoTokenizer
 
             return AutoTokenizer.from_pretrained(tokenizer_path)
-        except Exception:
+        except Exception as exc:
+            # Keep the reason. A token-only caller still works without a
+            # tokenizer, so this is not fatal here, but swallowing it turns a
+            # broken transformers/torch install into a misleading "needs
+            # tokenizer_path" error at the first text prompt.
+            self._tokenizer_error = f"{type(exc).__name__}: {exc}"
             return None
 
     def _construct_engine(self) -> Any:
-        kind = str(self.args.backend_options.get("engine_kind", "persistent")).lower()
-
-        # Use PersistentEngine for TP > 1 (has run_worker_loop support)
-        # Use QwenEngine for single rank (simpler API)
-        if self.args.tensor_parallel_size > 1:
-            kind = "persistent"
+        # QwenEngine is the default at every world size.  It has its own worker
+        # loop, so TP no longer has to fall back to PersistentEngine — that
+        # fallback silently routed Qwen checkpoints into the DeepSeek-V4 loader,
+        # which fails on `embed.weight`.  PersistentEngine stays opt-in for
+        # DeepSeek-V4 checkpoints via backend_options["engine_kind"].
+        kind = str(self.args.backend_options.get("engine_kind", "qwen")).lower()
 
         if kind == "persistent":
             return self._construct_persistent_engine()
@@ -293,16 +317,22 @@ class CppBackend(BackendBase):
         return cls(self.args.checkpoint_dir, options, layer_count, max_context)
 
     def _construct_qwen_engine(self) -> Any:
-        """Construct QwenEngine (single-rank only, richer options)."""
+        """Construct QwenEngine, which drives TP through its own worker loop."""
         cls = getattr(self._native, "QwenEngine", None)
         options_cls = getattr(self._native, "QwenEngineOptions", None)
         if cls is None or options_cls is None:
             raise BackendUnavailableError("native module does not expose QwenEngine bindings")
+        nccl_id_path = str(self.args.backend_options.get("nccl_id_path", ""))
+        if self.args.tensor_parallel_size > 1 and not nccl_id_path:
+            raise ConfigurationError(
+                "C++ backend TP requires backend_options['nccl_id_path'] "
+                "(the supervisor exports POCKETLLM_NCCL_ID_PATH)"
+            )
         options = options_cls()
         mappings = {
             "tp_world": self.args.tensor_parallel_size,
             "tp_rank": self.args.tensor_parallel_rank,
-            "device": _native_device_index(self.args.device),
+            "device": self._native_rank_device(),
             "prefill_chunk_tokens": self.args.prefill_chunk_tokens or 8192,
             "attention_window": self.args.attention_window,
             "attention_sink_tokens": self.args.attention_sink_tokens,
@@ -314,7 +344,7 @@ class CppBackend(BackendBase):
             "mtp_adaptive": bool(self.args.backend_options.get("mtp_adaptive", False)),
             "dspark_checkpoint": str(self.args.backend_options.get("dspark_checkpoint", "")),
             "dflash2_checkpoint": str(self.args.backend_options.get("dflash2_checkpoint", "")),
-            "nccl_id_path": str(self.args.backend_options.get("nccl_id_path", "")),
+            "nccl_id_path": nccl_id_path,
         }
         for name, value in mappings.items():
             if hasattr(options, name):
@@ -333,7 +363,34 @@ class CppBackend(BackendBase):
         }.items():
             if hasattr(options, name):
                 setattr(options, name, value)
-        return cls(self.args.checkpoint_dir, options, 0, self.args.max_model_len or 8192)
+        engine = cls(self.args.checkpoint_dir, options, 0, self.args.max_model_len or 8192)
+        # warmup_tp() builds the command channel and forces the NCCL
+        # communicator up.  Both ranks must do it before any rank issues a
+        # collective, and a worker cannot enter run_worker_loop() without it.
+        if self.args.tensor_parallel_size > 1:
+            engine.warmup_tp()
+        return engine
+
+    def _native_rank_device(self) -> int:
+        """Resolve this rank's device index.
+
+        An explicit --device wins.  Otherwise a TP rank claims device
+        ``tensor_parallel_rank``, since the supervisor gives every rank the same
+        visible device list; leaving the default 0 would stack the whole world
+        onto one GPU.  When the launcher already narrowed CUDA_VISIBLE_DEVICES to
+        one device per rank, that device is renumbered to 0 for this process, so
+        the rank offset must not be applied on top of it.
+        """
+        if self.args.device is not None:
+            return _native_device_index(self.args.device)
+        if self.args.tensor_parallel_size <= 1:
+            return 0
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible is not None:
+            entries = [item for item in visible.split(",") if item.strip()]
+            if len(entries) <= 1:
+                return 0
+        return self.args.tensor_parallel_rank
 
     def health(self) -> HealthStatus:
         status = super().health()
@@ -345,7 +402,10 @@ class CppBackend(BackendBase):
         if request.prompt_tokens is not None:
             return list(request.prompt_tokens)
         if self._tokenizer is None:
-            raise ConfigurationError("C++ backend needs tokenizer_path for text prompts")
+            detail = f" (tokenizer load failed: {self._tokenizer_error})" if self._tokenizer_error else ""
+            raise ConfigurationError(
+                f"C++ backend needs a working tokenizer for text prompts{detail}"
+            )
         messages = request.metadata.get("messages")
         if isinstance(messages, Sequence) and not isinstance(messages, (str, bytes)):
             encoded = encode_chat_prompt(
@@ -377,6 +437,39 @@ class CppBackend(BackendBase):
             return int(item)
         return int(getattr(item, "top_token", getattr(item, "token", item)))
 
+    # --- TP command fan-out -------------------------------------------------
+    # Under TP the worker ranks sit in run_worker_loop() waiting for a command.
+    # Every rank has to enter the same collective in the same order, so rank 0
+    # announces the op before it runs the op itself.  At world size 1 the
+    # worker_command_* calls are native no-ops, so these wrappers stay on the
+    # single-rank path unchanged.
+
+    def _engine_or_raise(self) -> Any:
+        engine = self._engine
+        if engine is None:
+            raise RuntimeError("native C++ engine is closed")
+        return engine
+
+    def _tp_command(self, name: str, *args: Any) -> None:
+        if self.args.tensor_parallel_size <= 1:
+            return
+        engine = self._engine_or_raise()
+        command = getattr(engine, name, None)
+        if command is None:
+            raise UnsupportedFeatureError(
+                f"native engine does not expose {name}; "
+                "rebuild cpp_engine with -DPOCKET_BUILD_PYTHON=ON"
+            )
+        command(*args)
+
+    def _tp_prefill(self, prompt_ids: list[int]) -> Any:
+        self._tp_command("worker_command_prefill", prompt_ids)
+        return self._engine_or_raise().prefill(prompt_ids)
+
+    def _tp_decode_step(self, token: int) -> Any:
+        self._tp_command("worker_command_decode", token)
+        return self._engine_or_raise().decode_step(token)
+
     def _is_eos(self, token: int) -> bool:
         return token in self._eos_ids
 
@@ -392,10 +485,7 @@ class CppBackend(BackendBase):
         prefill/decode here keeps the session and the returned tokens in step,
         and matches what the streamed path does.
         """
-        engine = self._engine
-        if engine is None:
-            raise RuntimeError("native C++ engine is closed")
-        result = engine.prefill(prompt_ids)
+        result = self._tp_prefill(prompt_ids)
         token_ids: list[int] = []
         for index in range(request.sampling_params.max_tokens):
             self._ensure_open()
@@ -405,7 +495,7 @@ class CppBackend(BackendBase):
                 return token_ids, True
             token_ids.append(token)
             if index + 1 < request.sampling_params.max_tokens:
-                result = engine.decode_step(token)
+                result = self._tp_decode_step(token)
         return token_ids, False
 
     def _decode(self, token_ids: list[int]) -> str:
@@ -433,13 +523,16 @@ class CppBackend(BackendBase):
                 with self._request_lock:
                     self._ensure_open()
                     self._check_cancelled(request.request_id)
-                    if self._eos_ids:
+                    # Native generate() drives its own prefill/decode loop
+                    # internally, so rank 0 cannot announce those steps to the
+                    # workers. Under TP always take the stepped path, which
+                    # broadcasts each command.
+                    if self._eos_ids or self.args.tensor_parallel_size > 1:
                         token_ids, hit_eos = self._generate_until_eos(request, prompt_ids)
                     else:
-                        engine = self._engine
-                        if engine is None:
-                            raise RuntimeError("native C++ engine is closed")
-                        raw = engine.generate(prompt_ids, request.sampling_params.max_tokens)
+                        raw = self._engine_or_raise().generate(
+                            prompt_ids, request.sampling_params.max_tokens
+                        )
                         token_ids = [self._native_token(item) for item in raw]
                         hit_eos = False
                     self._ensure_open()
@@ -470,9 +563,7 @@ class CppBackend(BackendBase):
         self._check_sampling(request.sampling_params)
         prompt_ids = self._prompt_ids(request)
         max_tokens = request.sampling_params.max_tokens
-        engine = self._engine
-        if engine is None:
-            raise RuntimeError("native C++ engine is closed")
+        self._engine_or_raise()
         # Do not reset() here.  QwenEngine::reset() clears the prefix cache, so
         # calling it per request would disable configured prefix reuse.  prefill()
         # already matches the common prefix, restores a snapshot, or zeroes the
@@ -480,7 +571,7 @@ class CppBackend(BackendBase):
         # QwenEngine.prefill predicts the first token without consuming it. The
         # following decode steps consume the previous prediction and predict the
         # next one, matching the native generate() result ordering.
-        result = engine.prefill(prompt_ids)
+        result = self._tp_prefill(prompt_ids)
         generated: list[int] = []
         previous_text = ""
         for index in range(max_tokens):
@@ -510,7 +601,7 @@ class CppBackend(BackendBase):
             if index + 1 < max_tokens:
                 self._ensure_open()
                 self._check_cancelled(request.request_id)
-                result = engine.decode_step(token)
+                result = self._tp_decode_step(token)
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         # A primitive lock can span generator yields even when AsyncLLM resumes
@@ -529,6 +620,21 @@ class CppBackend(BackendBase):
 
     def _release_native(self) -> None:
         engine = self._engine
+        # Workers block in read() on the command channel. Without a shutdown
+        # they never return from run_worker_loop() and the supervisor has to
+        # escalate to SIGKILL.
+        if (
+            engine is not None
+            and self.args.tensor_parallel_size > 1
+            and self.args.tensor_parallel_rank == 0
+        ):
+            shutdown = getattr(engine, "worker_command_shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown()
+                except Exception:
+                    # The workers may already be gone; closing is best effort.
+                    pass
         self._engine = None
         self._tokenizer = None
         self._native = None
