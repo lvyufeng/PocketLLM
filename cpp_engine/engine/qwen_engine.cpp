@@ -500,6 +500,15 @@ struct QwenEngine::Impl {
     std::unordered_map<uint64_t, int> request_to_slot;
     std::vector<int> free_slots;
 
+    // Current slot_id for kernel calls (Phase 3.2)
+    int current_slot_id = 0;
+
+    // Calculate element offset for a given slot_id in KV cache (Phase 3.2)
+    size_t kv_slot_offset_elements(int slot_id, int local_kv_heads, int head_dim) const {
+        if (max_batch_size == 1) return 0;  // Fast path for single session
+        return static_cast<size_t>(slot_id) * max_context * local_kv_heads * head_dim;
+    }
+
     void ensure_nccl_comm_stream() {
         if (!use_nccl_comm_stream || nccl_comm_stream_initialized) return;
         nccl_comm_stream = stream_create();
@@ -565,6 +574,10 @@ struct QwenEngine::Impl {
          int max_context_, int active_layers)
         : index(index_), config(config_), options(options_),
           max_context(max_context_) {
+        // Phase 3.2: Initialize max_batch_size from options
+        max_batch_size = options_.max_batch_size;
+        batch_mode_enabled = (max_batch_size > 1);
+
         telemetry.checkpoint_linear_kinds =
             map.checkpoint_linear_kind_counts();
         telemetry.host_global_metadata_bytes = map.host_global_metadata_bytes();
@@ -775,12 +788,17 @@ struct QwenEngine::Impl {
                 destination.full.out = upload_linear(index, source.full_attention.o_proj);
                 destination.full.q_norm = upload(index, source.full_attention.q_norm);
                 destination.full.k_norm = upload(index, source.full_attention.k_norm);
-                const size_t cache_elements = static_cast<size_t>(max_context) *
-                    local_kv_heads * head_dim;
+
+                // Phase 3.2: Multi-slot KV cache allocation
+                const int slot_count = options.max_batch_size;
+                const size_t cache_elements = static_cast<size_t>(slot_count) *
+                    static_cast<size_t>(max_context) * local_kv_heads * head_dim;
                 const std::vector<uint64_t> cache_shape = {
+                    static_cast<uint64_t>(slot_count),
                     static_cast<uint64_t>(max_context),
                     static_cast<uint64_t>(local_kv_heads),
                     static_cast<uint64_t>(head_dim)};
+
                 if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
                     allocate_half(destination.full.k_cache, cache_elements, cache_shape);
                     allocate_half(destination.full.v_cache, cache_elements, cache_shape);
@@ -791,9 +809,10 @@ struct QwenEngine::Impl {
                                       cache_shape, SafeDType::F8_E4M3);
                     allocate_elements(destination.full.v_cache, cache_elements,
                                       cache_shape, SafeDType::F8_E4M3);
-                    const size_t scale_elements = static_cast<size_t>(max_context) *
-                        local_kv_heads * (head_dim / kKvScaleBlock);
+                    const size_t scale_elements = static_cast<size_t>(slot_count) *
+                        static_cast<size_t>(max_context) * local_kv_heads * (head_dim / kKvScaleBlock);
                     const std::vector<uint64_t> scale_shape = {
+                        static_cast<uint64_t>(slot_count),
                         static_cast<uint64_t>(max_context),
                         static_cast<uint64_t>(local_kv_heads),
                         static_cast<uint64_t>(head_dim / kKvScaleBlock)};
@@ -808,9 +827,10 @@ struct QwenEngine::Impl {
                     // from head_dim (196 bytes at 128, 388 at 256).
                     const int slot_bytes =
                         qwen_turboquant_k8v4_slot_bytes(head_dim);
-                    const size_t slot_elements = static_cast<size_t>(max_context) *
-                        local_kv_heads * slot_bytes;
+                    const size_t slot_elements = static_cast<size_t>(slot_count) *
+                        static_cast<size_t>(max_context) * local_kv_heads * slot_bytes;
                     const std::vector<uint64_t> slot_shape = {
+                        static_cast<uint64_t>(slot_count),
                         static_cast<uint64_t>(max_context),
                         static_cast<uint64_t>(local_kv_heads),
                         static_cast<uint64_t>(slot_bytes)};
@@ -823,8 +843,10 @@ struct QwenEngine::Impl {
                                       cache_shape, SafeDType::I8);
                     allocate_elements(destination.full.v_cache, cache_elements,
                                       cache_shape, SafeDType::I8);
-                    const size_t scale_elements = static_cast<size_t>(max_context) * local_kv_heads;
+                    const size_t scale_elements = static_cast<size_t>(slot_count) *
+                        static_cast<size_t>(max_context) * local_kv_heads;
                     const std::vector<uint64_t> scale_shape = {
+                        static_cast<uint64_t>(slot_count),
                         static_cast<uint64_t>(max_context),
                         static_cast<uint64_t>(local_kv_heads)};
                     allocate_half(destination.full.k_scale, scale_elements, scale_shape);
@@ -2223,9 +2245,16 @@ struct QwenEngine::Impl {
         // backend, so only the FP16 append and the three neutral attention
         // launchers are compiled. The quantized caches are not merely disabled:
         // naming their kernels here would put a CUDA dependency in this object.
+
+        // Phase 3.2: Calculate slot offset for multi-slot KV cache
+        const int slot_id = current_slot_id;
+        const size_t slot_offset = kv_slot_offset_elements(slot_id, kv_heads, head_dim);
+
         require_launch(qwen_append_kv_cache_f16(
-            k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
-            layer.full.v_cache.f16_data(), rows, kv_heads, head_dim,
+            k_norm.f16_data(), v.f16_data(),
+            layer.full.k_cache.f16_data() + slot_offset,
+            layer.full.v_cache.f16_data() + slot_offset,
+            rows, kv_heads, head_dim,
             position_offset, max_context), "append FP16 full KV cache");
 
         if (rows == 1) {
@@ -2235,8 +2264,10 @@ struct QwenEngine::Impl {
                 {static_cast<uint64_t>(q_heads),
                  static_cast<uint64_t>(context_length)});
             require_launch(qwen_gqa_decode_attention_f16(
-                q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), attention.f16_data(),
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(),
                 scores.f32_data(), q_heads, kv_heads, head_dim,
                 context_length, max_context), "decode FP16-cache GQA");
         } else if (rows <= 8) {
@@ -2257,43 +2288,64 @@ struct QwenEngine::Impl {
                  static_cast<uint64_t>(head_dim + 2)});
             PhaseScope sub(this, "full.attn_kernel");
             require_launch(qwen_gqa_verify_attention_f16(
-                q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), attention.f16_data(),
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(),
                 partials.f32_data(), rows, q_heads, kv_heads, head_dim,
                 position_offset, max_context, verify_splits),
                 "verify split FP16-cache GQA");
         } else {
             require_launch(qwen_gqa_prefill_attention_f16(
-                q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), attention.f16_data(), rows,
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, position_offset, max_context),
                 "prefill FP16-cache GQA");
         }
         (void)sink_tokens;
 #else
+        // Phase 3.2: Calculate slot offset for multi-slot KV cache
+        const int slot_id = current_slot_id;
+        const size_t slot_offset = kv_slot_offset_elements(slot_id, kv_heads, head_dim);
+
         if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
-                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
-                layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
-                layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.fp8_data() + slot_offset,
+                layer.full.v_cache.fp8_data() + slot_offset,
+                layer.full.k_scale.f16_data() + slot_offset / kKvScaleBlock,
+                layer.full.v_scale.f16_data() + slot_offset / kKvScaleBlock,
+                rows, kv_heads, head_dim,
                 kKvScaleBlock, position_offset, max_context),
                 "append FP8 full KV cache");
         } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+            const size_t turboquant_slot_offset = static_cast<size_t>(slot_id) *
+                max_context * kv_heads * slot_bytes;
             require_launch(qwen_append_kv_cache_turboquant_k8v4_cuda(
-                k_norm.f16_data(), v.f16_data(), layer.full.turboquant_cache.byte_data(),
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.turboquant_cache.byte_data() + turboquant_slot_offset,
                 rows, kv_heads, head_dim, position_offset, max_context),
                 "append TurboQuant K8V4 full KV cache");
         } else if (cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+            const size_t scale_offset = static_cast<size_t>(slot_id) * max_context * kv_heads;
             require_launch(qwen_append_kv_cache_int8_per_token_head_cuda(
-                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.int8_data(),
-                layer.full.v_cache.int8_data(), layer.full.k_scale.f16_data(),
-                layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.int8_data() + slot_offset,
+                layer.full.v_cache.int8_data() + slot_offset,
+                layer.full.k_scale.f16_data() + scale_offset,
+                layer.full.v_scale.f16_data() + scale_offset,
+                rows, kv_heads, head_dim,
                 position_offset, max_context),
                 "append INT8 per-token-head full KV cache");
         } else {
             require_launch(qwen_append_kv_cache_f16(
-                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), rows, kv_heads, head_dim,
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                rows, kv_heads, head_dim,
                 position_offset, max_context), "append FP16 full KV cache");
         }
 
@@ -2336,37 +2388,52 @@ struct QwenEngine::Impl {
                                              static_cast<uint64_t>(context_length)});
             if (cache_dtype == QwenKvCacheDType::Fp8) {
                 require_launch(qwen_gqa_decode_attention_fp8_cuda(
-                    q_norm.f16_data(), layer.full.k_cache.fp8_data(),
-                    layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
-                    layer.full.v_scale.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.fp8_data() + slot_offset,
+                    layer.full.v_cache.fp8_data() + slot_offset,
+                    layer.full.k_scale.f16_data() + slot_offset / kKvScaleBlock,
+                    layer.full.v_scale.f16_data() + slot_offset / kKvScaleBlock,
+                    attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     kKvScaleBlock, context_length, max_context),
                     "decode FP8-cache GQA");
             } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+                const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+                const size_t turboquant_slot_offset = static_cast<size_t>(slot_id) *
+                    max_context * kv_heads * slot_bytes;
                 require_launch(qwen_gqa_decode_attention_turboquant_k8v4_cuda(
-                    q_norm.f16_data(), layer.full.turboquant_cache.byte_data(),
+                    q_norm.f16_data(),
+                    layer.full.turboquant_cache.byte_data() + turboquant_slot_offset,
                     attention.f16_data(), scores.f32_data(), q_heads, kv_heads,
                     head_dim, context_length, max_context, attention_window,
                     sink_tokens), "decode TurboQuant K8V4 GQA");
             } else if (cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
+                const size_t scale_offset = static_cast<size_t>(slot_id) * max_context * kv_heads;
                 require_launch(qwen_gqa_decode_attention_int8_per_token_head_cuda(
-                    q_norm.f16_data(), layer.full.k_cache.int8_data(),
-                    layer.full.v_cache.int8_data(), layer.full.k_scale.f16_data(),
-                    layer.full.v_scale.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.int8_data() + slot_offset,
+                    layer.full.v_cache.int8_data() + slot_offset,
+                    layer.full.k_scale.f16_data() + scale_offset,
+                    layer.full.v_scale.f16_data() + scale_offset,
+                    attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context, attention_window, sink_tokens),
                     "decode INT8 per-token-head GQA");
             } else if (optimized_decode) {
                 require_launch(qwen_gqa_decode_attention_f16_fused_cuda(
-                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.f16_data() + slot_offset,
+                    layer.full.v_cache.f16_data() + slot_offset,
+                    attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context, attention_window, sink_tokens),
                     "decode optimized FP16-cache GQA");
             } else {
                 require_launch(qwen_gqa_decode_attention_f16(
-                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.f16_data() + slot_offset,
+                    layer.full.v_cache.f16_data() + slot_offset,
+                    attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context), "decode FP16-cache GQA");
             }
@@ -2387,8 +2454,10 @@ struct QwenEngine::Impl {
                  static_cast<uint64_t>(kv_heads),
                  static_cast<uint64_t>(head_dim)});
             require_launch(qwen_fp8_dequant_kv_cache_cuda(
-                layer.full.k_cache.fp8_data(), layer.full.v_cache.fp8_data(),
-                layer.full.k_scale.f16_data(), layer.full.v_scale.f16_data(),
+                layer.full.k_cache.fp8_data() + slot_offset,
+                layer.full.v_cache.fp8_data() + slot_offset,
+                layer.full.k_scale.f16_data() + slot_offset / kKvScaleBlock,
+                layer.full.v_scale.f16_data() + slot_offset / kKvScaleBlock,
                 k_dense.f16_data(), v_dense.f16_data(), context_length,
                 kv_heads, head_dim, kKvScaleBlock, max_context),
                 "dequant FP8 cache to dense FP16");
@@ -2419,9 +2488,12 @@ struct QwenEngine::Impl {
                 {static_cast<uint64_t>(context_length),
                  static_cast<uint64_t>(kv_heads),
                  static_cast<uint64_t>(head_dim)});
+            const size_t scale_offset = static_cast<size_t>(slot_id) * max_context * kv_heads;
             require_launch(qwen_int8_dequant_kv_cache_cuda(
-                layer.full.k_cache.int8_data(), layer.full.v_cache.int8_data(),
-                layer.full.k_scale.f16_data(), layer.full.v_scale.f16_data(),
+                layer.full.k_cache.int8_data() + slot_offset,
+                layer.full.v_cache.int8_data() + slot_offset,
+                layer.full.k_scale.f16_data() + scale_offset,
+                layer.full.v_scale.f16_data() + scale_offset,
                 k_dense.f16_data(), v_dense.f16_data(), context_length,
                 kv_heads, head_dim, max_context),
                 "dequant INT8 cache to dense FP16");
@@ -2455,8 +2527,11 @@ struct QwenEngine::Impl {
                 {static_cast<uint64_t>(context_length),
                  static_cast<uint64_t>(kv_heads),
                  static_cast<uint64_t>(head_dim)});
+            const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+            const size_t turboquant_slot_offset = static_cast<size_t>(slot_id) *
+                max_context * kv_heads * slot_bytes;
             require_launch(qwen_turboquant_k8v4_dequant_kv_cuda(
-                layer.full.turboquant_cache.byte_data(), k_dense.f16_data(),
+                layer.full.turboquant_cache.byte_data() + turboquant_slot_offset, k_dense.f16_data(),
                 v_dense.f16_data(), context_length, kv_heads, head_dim,
                 max_context), "dequant TurboQuant cache to dense FP16");
             if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
@@ -2489,8 +2564,10 @@ struct QwenEngine::Impl {
                      static_cast<uint64_t>(context_length)});
                 PhaseScope sub(this, "full.attn_kernel");
                 require_launch(qwen_gqa_verify_attention_f16_cublas_qk_cuda(
-                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.f16_data() + slot_offset,
+                    layer.full.v_cache.f16_data() + slot_offset,
+                    attention.f16_data(),
                     scores.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context),
                     "verify cuBLAS-QK FP16-cache GQA");
@@ -2519,8 +2596,10 @@ struct QwenEngine::Impl {
                      static_cast<uint64_t>(head_dim + 2)});
                 PhaseScope sub(this, "full.attn_kernel");
                 require_launch(qwen_gqa_verify_attention_f16(
-                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.f16_data() + slot_offset,
+                    layer.full.v_cache.f16_data() + slot_offset,
+                    attention.f16_data(),
                     partials.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context, verify_splits),
                     "verify split FP16-cache GQA");
@@ -2533,8 +2612,10 @@ struct QwenEngine::Impl {
                      static_cast<uint64_t>(q_heads),
                      static_cast<uint64_t>(context_length)});
                 { PhaseScope sub(this, "full.attn_kernel"); require_launch(qwen_gqa_verify_attention_f16_exact_cuda(
-                    q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                    layer.full.v_cache.f16_data(), attention.f16_data(),
+                    q_norm.f16_data(),
+                    layer.full.k_cache.f16_data() + slot_offset,
+                    layer.full.v_cache.f16_data() + slot_offset,
+                    attention.f16_data(),
                     scores.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context),
                     "verify exact FP16-cache GQA"); }
@@ -2545,15 +2626,19 @@ struct QwenEngine::Impl {
         } else if (qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
                    attention_window > 0) {
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
-                q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), attention.f16_data(), rows,
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, position_offset, max_context,
                 attention_window, sink_tokens),
                 "prefill optimized FP16-cache GQA");
         } else {
             require_launch(qwen_gqa_prefill_attention_f16(
-                q_norm.f16_data(), layer.full.k_cache.f16_data(),
-                layer.full.v_cache.f16_data(), attention.f16_data(), rows,
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, position_offset, max_context),
                 "prefill FP16-cache GQA");
         }
@@ -3898,12 +3983,8 @@ void QwenEngine::allocate_batch_slots(int max_batch_size) {
         return;
     }
 
-    // TODO Phase 3.1: Reallocate KV cache as [max_batch_size, max_seq_len, kv_heads, head_dim]
-    // For now, throw to indicate multi-slot KV reallocation is not yet implemented
-    throw std::runtime_error(
-        "QwenEngine::allocate_batch_slots: multi-slot KV cache reallocation "
-        "not yet implemented (Phase 3.1 WIP)");
-
+    // Phase 3.2: Multi-slot KV cache is allocated at construction time via
+    // QwenEngineOptions.max_batch_size. This function now only updates bookkeeping.
     // Initialize free slots
     impl_->free_slots.clear();
     for (int i = 0; i < max_batch_size; ++i) {
