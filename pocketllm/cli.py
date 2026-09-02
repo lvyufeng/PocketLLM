@@ -180,12 +180,6 @@ def main(argv: list[str] | None = None) -> int:
                 "--device cannot be used with automatic TP supervision; "
                 "use --no-tensor-parallel-supervisor for manual rank control"
             )
-        selected_backend = select_backend(engine_args)
-        if selected_backend == "cpp":
-            raise UnsupportedFeatureError(
-                "automatic TP supervision is not available for the Python C++ Qwen adapter; "
-                "use the legacy dsv4_cpp_engine executable or --no-tensor-parallel-supervisor"
-            )
         supervisor = TensorParallelSupervisor(
             command=[sys.executable, "-m", "pocketllm", *_supervised_command(argv or sys.argv[1:])],
             world_size=world,

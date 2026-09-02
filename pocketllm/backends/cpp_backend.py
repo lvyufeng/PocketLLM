@@ -257,12 +257,43 @@ class CppBackend(BackendBase):
             return None
 
     def _construct_engine(self) -> Any:
-        kind = str(self.args.backend_options.get("engine_kind", "qwen")).lower()
-        if kind != "qwen":
+        kind = str(self.args.backend_options.get("engine_kind", "persistent")).lower()
+
+        # Use PersistentEngine for TP > 1 (has run_worker_loop support)
+        # Use QwenEngine for single rank (simpler API)
+        if self.args.tensor_parallel_size > 1:
+            kind = "persistent"
+
+        if kind == "persistent":
+            return self._construct_persistent_engine()
+        elif kind == "qwen":
+            return self._construct_qwen_engine()
+        else:
             raise UnsupportedFeatureError(
-                "the initial Python C++ adapter supports QwenEngine; "
-                "PersistentEngine bindings are available for low-level use"
+                f"unsupported engine_kind: {kind}; use 'persistent' or 'qwen'"
             )
+
+    def _construct_persistent_engine(self) -> Any:
+        """Construct PersistentEngine (supports TP worker loop)."""
+        cls = getattr(self._native, "PersistentEngine", None)
+        options_cls = getattr(self._native, "ForwardSmokeOptions", None)
+        if cls is None or options_cls is None:
+            raise BackendUnavailableError("native module does not expose PersistentEngine bindings")
+
+        options = options_cls()
+        options.tp_world = self.args.tensor_parallel_size
+        options.tp_rank = self.args.tensor_parallel_rank
+        options.device = _native_device_index(self.args.device)
+        options.skip_fp4_host_prepare = False
+        options.nccl_id_path = str(self.args.backend_options.get("nccl_id_path", ""))
+
+        layer_count = 0  # auto-detect from checkpoint
+        max_context = self.args.max_model_len or 8192
+
+        return cls(self.args.checkpoint_dir, options, layer_count, max_context)
+
+    def _construct_qwen_engine(self) -> Any:
+        """Construct QwenEngine (single-rank only, richer options)."""
         cls = getattr(self._native, "QwenEngine", None)
         options_cls = getattr(self._native, "QwenEngineOptions", None)
         if cls is None or options_cls is None:
@@ -507,16 +538,25 @@ class CppBackend(BackendBase):
             close()
 
     def run_worker(self, on_ready: Callable[[], None] | None = None) -> None:
-        """Supervised C++ worker is unsupported with the current binding shape.
+        """Enter the native worker loop for a nonzero TP rank.
 
-        The Python Qwen binding does not expose a worker-loop entry point.  The
-        legacy `dsv4_cpp_engine` executable handles rank workers natively and
-        remains supported outside the unified supervisor.
+        This blocks until rank 0 sends a shutdown command through the command
+        channel. The engine must already be constructed.
         """
-        raise UnsupportedFeatureError(
-            "C++ backend does not support unified TP supervision; "
-            "use the legacy dsv4_cpp_engine executable or an external launcher"
-        )
+        self._ensure_open()
+        if self.args.tensor_parallel_rank == 0:
+            raise RuntimeError("run_worker must not be called on rank 0")
+        if self._engine is None:
+            raise RuntimeError("native engine is not constructed")
+        if not hasattr(self._engine, "run_worker_loop"):
+            raise UnsupportedFeatureError(
+                "native engine does not expose run_worker_loop; "
+                "rebuild cpp_engine with -DPOCKET_BUILD_PYTHON=ON"
+            )
+        if on_ready is not None:
+            on_ready()
+        # run_worker_loop() blocks until rank 0 sends shutdown
+        self._engine.run_worker_loop()
 
     def close(self) -> None:
         if self._closed:
