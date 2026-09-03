@@ -8,6 +8,7 @@
 #include "qwen_config.hpp"
 #include "qwen_engine.hpp"
 #include "qwen_weights.hpp"
+#include "qwen_batch_scheduler.hpp"
 #include "device_runtime.hpp"
 
 #include <pybind11/functional.h>
@@ -393,6 +394,83 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("worker_command_draft", &PersistentEngine::worker_command_draft)
         .def("worker_command_speculative_decode", &PersistentEngine::worker_command_speculative_decode)
         .def("worker_command_prime_draft_kv", &PersistentEngine::worker_command_prime_draft_kv);
+
+    // QwenBatchScheduler bindings (Phase 3.4)
+    py::class_<QwenBatchSamplingParams>(module, "QwenBatchSamplingParams")
+        .def(py::init<>())
+        .def_readwrite("temperature", &QwenBatchSamplingParams::temperature)
+        .def_readwrite("top_p", &QwenBatchSamplingParams::top_p)
+        .def_readwrite("top_k", &QwenBatchSamplingParams::top_k)
+        .def_readwrite("seed", &QwenBatchSamplingParams::seed)
+        .def_readwrite("max_new_tokens", &QwenBatchSamplingParams::max_new_tokens);
+
+    py::class_<SchedulerGenerationResult>(module, "SchedulerGenerationResult")
+        .def(py::init<>())
+        .def_readwrite("request_id", &SchedulerGenerationResult::request_id)
+        .def_readwrite("generated_tokens", &SchedulerGenerationResult::generated_tokens)
+        .def_readwrite("finish_reason", &SchedulerGenerationResult::finish_reason)
+        .def_readwrite("prompt_tokens", &SchedulerGenerationResult::prompt_tokens)
+        .def_readwrite("completion_tokens", &SchedulerGenerationResult::completion_tokens)
+        .def_readwrite("total_seconds", &SchedulerGenerationResult::total_seconds)
+        .def_readwrite("ttft_seconds", &SchedulerGenerationResult::ttft_seconds);
+
+    py::class_<QwenBatchScheduler::Stats>(module, "QwenBatchSchedulerStats")
+        .def(py::init<>())
+        .def_readwrite("waiting_requests", &QwenBatchScheduler::Stats::waiting_requests)
+        .def_readwrite("running_requests", &QwenBatchScheduler::Stats::running_requests)
+        .def_readwrite("completed_requests", &QwenBatchScheduler::Stats::completed_requests)
+        .def_readwrite("cancelled_requests", &QwenBatchScheduler::Stats::cancelled_requests)
+        .def_readwrite("free_slots", &QwenBatchScheduler::Stats::free_slots);
+
+    py::class_<QwenBatchScheduler>(module, "QwenBatchScheduler")
+        .def(py::init<QwenEngine*, int>(),
+             py::arg("engine"), py::arg("max_batch_size"))
+        .def("submit_request", [](QwenBatchScheduler& scheduler,
+                                   const std::vector<int>& prompt_tokens,
+                                   const QwenBatchSamplingParams& sampling,
+                                   py::object callback) {
+            // Convert Python callback to C++ std::function
+            std::function<void(const SchedulerGenerationResult&)> cpp_callback;
+            if (!callback.is_none()) {
+                cpp_callback = [callback](const SchedulerGenerationResult& result) {
+                    py::gil_scoped_acquire acquire;
+                    try {
+                        callback(result);
+                    } catch (const py::error_already_set& e) {
+                        // Re-raise Python exceptions
+                        throw;
+                    }
+                };
+            }
+
+            py::gil_scoped_release release;
+            return scheduler.submit_request(prompt_tokens, sampling, cpp_callback);
+        }, py::arg("prompt_tokens"), py::arg("sampling"), py::arg("callback") = py::none())
+        .def("cancel_request", [](QwenBatchScheduler& scheduler, uint64_t request_id) {
+            py::gil_scoped_release release;
+            return scheduler.cancel_request(request_id);
+        }, py::arg("request_id"))
+        .def("poll_result", [](QwenBatchScheduler& scheduler, uint64_t request_id, int timeout_ms) -> py::object {
+            SchedulerGenerationResult result;
+            bool success;
+            {
+                py::gil_scoped_release release;
+                success = scheduler.poll_result(request_id, &result, timeout_ms);
+            }
+            if (success) {
+                return py::cast(result);
+            } else {
+                return py::none();
+            }
+        }, py::arg("request_id"), py::arg("timeout_ms") = 30000)
+        .def("get_stats", [](QwenBatchScheduler& scheduler) {
+            return scheduler.get_stats();
+        })
+        .def("is_running", &QwenBatchScheduler::is_running)
+        .def("stop", [](QwenBatchScheduler& scheduler) {
+            py::gil_scoped_release release;
+            scheduler.stop();
+        });
 
     module.attr("backend") = device_backend_name();
 }

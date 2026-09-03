@@ -176,6 +176,13 @@ class CppBackend(BackendBase):
         self._request_lock = threading.Lock()
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
         self._eos_ids, self._eos_source = self._resolve_eos_ids()
+
+        # Phase 3.4: Optional batch scheduler
+        self._scheduler = None
+        self._batching_enabled = False
+        if self.args.backend_options.get("enable_batching", False):
+            self._batching_enabled = self._init_batch_scheduler()
+
         self._ready = True
 
     def _resolve_eos_ids(self) -> tuple[frozenset[int], str]:
@@ -226,6 +233,28 @@ class CppBackend(BackendBase):
     def eos_token_ids(self) -> frozenset[int]:
         return self._eos_ids
 
+    def _init_batch_scheduler(self) -> bool:
+        """Initialize the batch scheduler if available."""
+        if not hasattr(self._native, "QwenBatchScheduler"):
+            import warnings
+            warnings.warn(
+                "enable_batching=True but native module does not expose QwenBatchScheduler; "
+                "falling back to serial execution"
+            )
+            return False
+
+        max_batch_size = self.args.backend_options.get("max_batch_size", 8)
+        if max_batch_size <= 0:
+            return False
+
+        try:
+            self._scheduler = self._native.QwenBatchScheduler(self._engine, max_batch_size)
+            return True
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Failed to create QwenBatchScheduler: {e}; falling back to serial execution")
+            return False
+
     @staticmethod
     def native_available() -> bool:
         try:
@@ -245,7 +274,7 @@ class CppBackend(BackendBase):
             models=("qwen3.5",),
             model_formats=("safetensors",),
             devices=(native_backend,) if native_backend else ("cuda", "ascend"),
-            supports_batch=False,
+            supports_batch=self._batching_enabled,  # Phase 3.4: dynamic based on scheduler
             supports_streaming=True,
             supports_cancellation=True,
             supports_embeddings=False,
@@ -255,11 +284,12 @@ class CppBackend(BackendBase):
             supports_speculative_decoding=speculative,
             details={
                 "execution": "native C++",
-                "scheduler": "serialized compatibility session",
+                "scheduler": "batch scheduler" if self._batching_enabled else "serialized compatibility session",
                 "device_backend": native_backend or "unknown",
                 "cancellation": "safe boundary only",
                 "eos_token_ids": sorted(self._eos_ids),
                 "eos_source": self._eos_source or "none",
+                "max_batch_size": self.args.backend_options.get("max_batch_size", 8) if self._batching_enabled else 1,
             },
         )
 
@@ -510,8 +540,18 @@ class CppBackend(BackendBase):
         return ""
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
-        """Generate requests serially until a request-aware cache scheduler exists."""
+        """Generate requests with optional batch scheduler."""
         self._ensure_open()
+
+        # Phase 3.4: Use batch scheduler if enabled
+        if self._batching_enabled and self._scheduler is not None:
+            return self._generate_batched(requests)
+
+        # Legacy serial path
+        return self._generate_serial(requests)
+
+    def _generate_serial(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        """Generate requests serially (legacy path)."""
         outputs: list[GenerationResult] = []
         for request in requests:
             self._begin_request(request.request_id)
@@ -557,6 +597,76 @@ class CppBackend(BackendBase):
                 self._clear_request(request.request_id)
                 if self._closed:
                     self._release_native()
+        return outputs
+
+    def _generate_batched(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
+        """Generate requests using the batch scheduler."""
+        if not requests:
+            return []
+
+        # Submit all requests to scheduler
+        request_map: dict[int, GenerationRequest] = {}
+        native_request_ids: list[int] = []
+
+        for request in requests:
+            self._begin_request(request.request_id)
+            try:
+                self._check_sampling(request.sampling_params)
+                prompt_ids = self._prompt_ids(request)
+
+                # Create native sampling params
+                sampling = self._native.QwenBatchSamplingParams()
+                sampling.max_new_tokens = request.sampling_params.max_tokens
+                sampling.temperature = request.sampling_params.temperature or 0.0
+                sampling.top_p = request.sampling_params.top_p or 1.0
+                sampling.top_k = request.sampling_params.top_k or 20
+
+                # Submit to scheduler
+                native_req_id = self._scheduler.submit_request(prompt_ids, sampling, None)
+                if native_req_id > 0:
+                    native_request_ids.append(native_req_id)
+                    request_map[native_req_id] = request
+                else:
+                    # Submission failed
+                    self._clear_request(request.request_id)
+
+            except Exception as e:
+                self._clear_request(request.request_id)
+                raise
+
+        # Poll for results
+        outputs: list[GenerationResult] = []
+        timeout_ms = 60000  # 60 seconds per request
+
+        for native_req_id in native_request_ids:
+            request = request_map[native_req_id]
+            result = self._scheduler.poll_result(native_req_id, timeout_ms)
+
+            if result is None:
+                # Timeout
+                self._clear_request(request.request_id)
+                raise TimeoutError(f"Request {request.request_id} timed out after {timeout_ms}ms")
+
+            # Convert native result to GenerationResult
+            token_ids = result.generated_tokens
+            text = self._decode(token_ids)
+
+            outputs.append(
+                GenerationResult(
+                    request_id=request.request_id,
+                    token_ids=token_ids,
+                    text=text,
+                    finish_reason=result.finish_reason,
+                    usage=Usage(result.prompt_tokens, result.completion_tokens),
+                    timings=TimingMetrics(
+                        total_seconds=result.total_seconds,
+                        ttft_seconds=result.ttft_seconds,
+                    ),
+                )
+            )
+
+            self._clear_request(request.request_id)
+
         return outputs
 
     def _stream_native(self, request: GenerationRequest) -> Iterator[TokenEvent]:
