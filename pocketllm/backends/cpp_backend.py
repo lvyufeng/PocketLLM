@@ -177,10 +177,15 @@ class CppBackend(BackendBase):
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
         self._eos_ids, self._eos_source = self._resolve_eos_ids()
 
-        # Phase 3.4: Optional batch scheduler
+        # Phase 3.4: Optional batch scheduler.  Only rank 0 drives scheduling:
+        # the scheduler runs a background thread that issues collectives, and on
+        # a worker rank that would race run_worker_loop() and deadlock NCCL.
         self._scheduler = None
         self._batching_enabled = False
-        if self.args.backend_options.get("enable_batching", False):
+        if (
+            self.args.backend_options.get("enable_batching", False)
+            and self.args.tensor_parallel_rank == 0
+        ):
             self._batching_enabled = self._init_batch_scheduler()
 
         self._ready = True
@@ -233,6 +238,21 @@ class CppBackend(BackendBase):
     def eos_token_ids(self) -> frozenset[int]:
         return self._eos_ids
 
+    def _configured_max_batch_size(self) -> int:
+        """Batch width for this backend, shared by the engine and the scheduler.
+
+        The engine sizes its KV cache from this at construction, so the scheduler
+        must not ask for more slots later.  Batching off means a single slot,
+        which keeps the serial path's memory footprint unchanged.
+        """
+        if not self.args.backend_options.get("enable_batching", False):
+            return 1
+        try:
+            requested = int(self.args.backend_options.get("max_batch_size", 8))
+        except (TypeError, ValueError):
+            return 1
+        return requested if requested >= 1 else 1
+
     def _init_batch_scheduler(self) -> bool:
         """Initialize the batch scheduler if available."""
         if not hasattr(self._native, "QwenBatchScheduler"):
@@ -243,8 +263,8 @@ class CppBackend(BackendBase):
             )
             return False
 
-        max_batch_size = self.args.backend_options.get("max_batch_size", 8)
-        if max_batch_size <= 0:
+        max_batch_size = self._configured_max_batch_size()
+        if max_batch_size <= 1:
             return False
 
         try:
@@ -289,7 +309,7 @@ class CppBackend(BackendBase):
                 "cancellation": "safe boundary only",
                 "eos_token_ids": sorted(self._eos_ids),
                 "eos_source": self._eos_source or "none",
-                "max_batch_size": self.args.backend_options.get("max_batch_size", 8) if self._batching_enabled else 1,
+                "max_batch_size": self._configured_max_batch_size() if self._batching_enabled else 1,
             },
         )
 
@@ -362,6 +382,9 @@ class CppBackend(BackendBase):
             "tp_world": self.args.tensor_parallel_size,
             "tp_rank": self.args.tensor_parallel_rank,
             "device": self._native_rank_device(),
+            # The KV cache is sized at construction, so the batch width must be
+            # known here; the scheduler cannot grow it afterwards.
+            "max_batch_size": self._configured_max_batch_size(),
             "prefill_chunk_tokens": self.args.prefill_chunk_tokens or 8192,
             "attention_window": self.args.attention_window,
             "attention_sink_tokens": self.args.attention_sink_tokens,

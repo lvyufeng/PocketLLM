@@ -145,12 +145,19 @@ def create_backend(args: EngineArgs, **injected: Any):
 
             # Build environment for worker processes
             # Note: NCCL ID path will be set by supervisor after rendezvous setup
+            # Every field that changes how a rank executes has to be forwarded.
+            # A worker that falls back to an EngineArgs default takes a different
+            # branch from rank 0 and enters a different number of collectives,
+            # which hangs the whole group instead of failing.  enable_prefix_caching
+            # and max_batch_size are the ones that bite: the first decides whether
+            # prefill resumes from a snapshot, the second sizes the KV arena.
             worker_env = {
                 "POCKETLLM_CHECKPOINT": args.checkpoint_dir,
                 "POCKETLLM_TP_SIZE": str(args.tensor_parallel_size),
                 "POCKETLLM_MAX_MODEL_LEN": str(args.max_model_len or 8192),
                 "POCKETLLM_KV_CACHE_DTYPE": str(args.kv_cache_dtype or "auto"),
                 "POCKETLLM_BACKEND_OPTIONS": json.dumps(args.backend_options),
+                "POCKETLLM_WORKER_ARGS": json.dumps(_worker_arg_overrides(args)),
             }
 
             # Create supervisor configuration
@@ -196,6 +203,28 @@ def create_backend(args: EngineArgs, **injected: Any):
     raise BackendUnavailableError(f"unsupported backend {selected!r}")
 
 
+# EngineArgs fields that change control flow or memory layout inside the native
+# engine.  Ranks must agree on all of them; see the comment at the worker_env
+# construction site.  Fields that are per-rank (tensor_parallel_rank, device) or
+# already forwarded explicitly are deliberately absent.
+_WORKER_SHARED_ARGS = (
+    "prefill_chunk_tokens",
+    "enable_prefix_caching",
+    "attention_window",
+    "attention_sink_tokens",
+    "speculative_method",
+    "speculative_tokens",
+    "max_batch_size",
+    "model_format",
+    "dtype",
+)
+
+
+def _worker_arg_overrides(args: EngineArgs) -> dict[str, Any]:
+    """Collect the EngineArgs values a worker rank must match."""
+    return {name: getattr(args, name) for name in _WORKER_SHARED_ARGS}
+
+
 def _worker_script() -> str:
     """Generate Python code for worker processes (ranks 1, 2, 3, ...).
 
@@ -220,6 +249,8 @@ nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
 max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
 kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
 backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
+# Fields rank 0 resolved; a default here would desynchronize the collectives.
+shared_args = json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}"))
 
 # Add NCCL ID to backend options
 backend_options["nccl_id_path"] = nccl_id_path
@@ -233,6 +264,7 @@ args = EngineArgs(
     max_model_len=max_model_len,
     kv_cache_dtype=kv_cache_dtype,
     backend_options=backend_options,
+    **shared_args,
 )
 
 # Create backend and enter worker loop

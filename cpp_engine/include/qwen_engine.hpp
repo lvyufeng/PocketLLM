@@ -320,8 +320,11 @@ public:
         Reset = 2,
         Shutdown = 3,
     };
-    void worker_command_prefill(const std::vector<int>& token_ids);
-    void worker_command_decode(int32_t last_token);
+    // slot_id selects the KV cache slot the workers must use, so it has to match
+    // the slot rank 0 computes into.  It defaults to 0 for the single-session
+    // path, where only slot 0 ever exists.
+    void worker_command_prefill(const std::vector<int>& token_ids, int32_t slot_id = 0);
+    void worker_command_decode(int32_t last_token, int32_t slot_id = 0);
     void worker_command_reset();
     void worker_command_shutdown();
 
@@ -340,8 +343,8 @@ private:
     uint64_t resident_scale_bytes_ = 0;
     QwenPrefixCacheStats prefix_stats_;
     QwenMtpStats mtp_stats_;
-    QwenForwardResult cached_result_;
-    bool has_cached_result_ = false;
+    // The cached prompt/result and snapshot ring live per KV slot inside Impl,
+    // so that a batch cannot match one sequence's prefix against another's.
     Impl* impl_ = nullptr;
 };
 

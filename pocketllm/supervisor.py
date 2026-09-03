@@ -28,6 +28,58 @@ from .api.errors import ConfigurationError, TensorParallelSupervisorError
 
 _READY_RE = re.compile(r"^POCKETLLM_RANK_READY\s+rank=(?P<rank>[0-9]+)\s*$")
 
+# prctl(2) PR_SET_PDEATHSIG.  Not exposed by the stdlib before 3.13, so the value
+# is inlined; it is part of the kernel ABI and identical on every Linux arch.
+_PR_SET_PDEATHSIG = 1
+
+
+def _resolve_prctl() -> Callable[..., int] | None:
+    """Look up libc's prctl, or None where it is unavailable (non-Linux)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.CDLL("libc.so.6", use_errno=True).prctl
+    except (OSError, AttributeError, ImportError):
+        return None
+
+
+# Resolved at import, deliberately: the hook below runs post-fork in a process
+# that already has output-reader threads, where allocating (as dlopen and ctypes
+# both do) can deadlock on a lock another thread held at fork time.  Doing the
+# lookup here keeps the child down to one bare syscall.
+_PRCTL = _resolve_prctl()
+
+
+def _child_guard(parent_pid: int) -> None:
+    """Make this child die with its parent.  Runs in the child, post-fork.
+
+    ``start_new_session=True`` puts each rank in its own session so the
+    supervisor can ``killpg`` the whole subtree.  The cost is that the child no
+    longer shares the parent's process group, so a signal sent to the parent's
+    group never reaches it.  When the parent dies in a way it cannot handle -- a
+    segfault in a native extension, or SIGKILL from a test harness timeout --
+    none of the Python-level cleanup runs, and the ranks are left spinning on
+    NCCL holding their share of device memory until killed by hand.
+
+    PR_SET_PDEATHSIG is the only mechanism that covers that case: the kernel
+    delivers the signal on parent death, so it needs no cooperation from the
+    parent.  It triggers on the death of the parent *thread*, which is why the
+    supervisor spawns ranks from its main thread.
+    """
+    if _PRCTL is not None:
+        # Losing the guard is not worth failing the launch over, so the return
+        # value is ignored; the supervisor's normal shutdown path still covers
+        # every graceful exit.
+        _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+
+    # The parent may have died between fork and prctl, in which case the signal
+    # just armed will never fire.  Re-parenting is the visible symptom, so check
+    # for it rather than linger as an orphan.
+    if os.getppid() != parent_pid:
+        os._exit(1)
+
 
 @dataclass(frozen=True, slots=True)
 class TensorParallelConfig:
@@ -321,6 +373,8 @@ class TensorParallelSupervisor:
     def _spawn(self, rank: int) -> RankProcess:
         env = self._child_env(rank)
         command = self._command_for_rank(rank, env)
+        # Read in the parent: inside preexec_fn, os.getpid() is the child.
+        supervisor_pid = os.getpid()
         try:
             process = subprocess.Popen(
                 command,
@@ -335,6 +389,10 @@ class TensorParallelSupervisor:
                 bufsize=1,
                 close_fds=True,
                 start_new_session=True,
+                # Backstop for supervisor death that skips Python cleanup; see
+                # _child_guard.  Popen runs this after its own setsid, so the
+                # new session is already in place.
+                preexec_fn=lambda: _child_guard(supervisor_pid),
             )
         except OSError as exc:
             raise TensorParallelSupervisorError(
