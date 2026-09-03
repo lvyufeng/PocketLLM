@@ -57,6 +57,7 @@ set(POCKET_ENGINE_SOURCES
     engine/qwen_weights.cpp
     engine/qwen_target_head.cpp
     engine/qwen_engine.cpp
+    engine/qwen_batch_scheduler.cpp
 )
 
 # Engines that still call CUDA kernels by name. A runtime guard cannot help here:
@@ -824,6 +825,10 @@ endif()
 add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
 target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)
 set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_batch_scheduler tests/test_qwen_batch_scheduler.cpp)
+target_link_libraries(test_qwen_batch_scheduler PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_batch_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_fp8_batch_crossover tests/bench_qwen_fp8_batch_crossover.cpp)
 target_link_libraries(bench_qwen_fp8_batch_crossover PRIVATE dsv4_cpp_core)
