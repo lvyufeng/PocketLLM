@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -176,17 +177,40 @@ def create_backend(args: EngineArgs, **injected: Any):
             # Get NCCL ID path created by supervisor
             nccl_id_path = str(supervisor.nccl_id_path)
 
-            # Set NCCL ID path for main process (rank 0)
+            # Rank 0 needs the rendezvous path too, but it belongs to this
+            # supervisor only.  Leaking it into os.environ makes the *next*
+            # create_backend() in the same process see a non-empty
+            # POCKETLLM_NCCL_ID_PATH, conclude it is externally supervised, skip
+            # spawning workers, and then block forever in the NCCL rendezvous
+            # waiting for ranks nobody started.  Pass it through backend_options,
+            # which is scoped to this backend, and restore the environment.
+            previous_nccl_id_path = os.environ.get("POCKETLLM_NCCL_ID_PATH")
             os.environ["POCKETLLM_NCCL_ID_PATH"] = nccl_id_path
-            args.backend_options["nccl_id_path"] = nccl_id_path
-
-            # Main process creates rank-0 backend
-            backend = CppBackend(
+            # backend_options is caller-owned; a copy keeps the mutation from
+            # persisting in the EngineArgs a caller may reuse for another engine.
+            args = replace(
                 args,
-                native_module=injected.get("native_module"),
-                engine=injected.get("engine"),
-                tokenizer=injected.get("tokenizer"),
+                backend_options={**args.backend_options, "nccl_id_path": nccl_id_path},
             )
+
+            try:
+                # Main process creates rank-0 backend
+                backend = CppBackend(
+                    args,
+                    native_module=injected.get("native_module"),
+                    engine=injected.get("engine"),
+                    tokenizer=injected.get("tokenizer"),
+                )
+            except BaseException:
+                # The workers are useless without rank 0, and leaving them alive
+                # would hold device memory and block a retry.
+                try:
+                    supervisor.stop()
+                finally:
+                    _restore_env("POCKETLLM_NCCL_ID_PATH", previous_nccl_id_path)
+                raise
+
+            _restore_env("POCKETLLM_NCCL_ID_PATH", previous_nccl_id_path)
 
             # Store supervisor reference so it can be cleaned up
             backend._supervisor = supervisor
@@ -223,6 +247,14 @@ _WORKER_SHARED_ARGS = (
 def _worker_arg_overrides(args: EngineArgs) -> dict[str, Any]:
     """Collect the EngineArgs values a worker rank must match."""
     return {name: getattr(args, name) for name in _WORKER_SHARED_ARGS}
+
+
+def _restore_env(name: str, previous: str | None) -> None:
+    """Put ``name`` back the way it was, distinguishing unset from empty."""
+    if previous is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = previous
 
 
 def _worker_script() -> str:

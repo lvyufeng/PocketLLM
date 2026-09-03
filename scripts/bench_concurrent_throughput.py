@@ -10,6 +10,7 @@ with concurrent requests. Target improvements:
 """
 
 import argparse
+import json
 import sys
 import time
 import threading
@@ -93,6 +94,7 @@ def benchmark_concurrent(
     test_runs: int = 3,
     prompt_length: int = 32,
     tensor_parallel_size: int = 1,
+    max_model_len: int = 4096,
 ):
     """Benchmark concurrent request throughput."""
 
@@ -106,9 +108,13 @@ def benchmark_concurrent(
         model=checkpoint,
         backend="cpp",
         tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
         backend_options={
             "enable_batching": enable_batching,
-            "max_batch_size": max(8, num_concurrent) if enable_batching else 1,
+            # Size the arena to this level's concurrency rather than a fixed 8.
+            # max(8, n) made the 2-concurrent run reserve 8 slots' worth of KV
+            # cache, so the low levels paid memory they never used.
+            "max_batch_size": num_concurrent if enable_batching else 1,
         }
     )
 
@@ -120,6 +126,16 @@ def benchmark_concurrent(
     print(f"Scheduler: {caps.details.get('scheduler')}")
     print(f"Supports batch: {caps.supports_batch}")
     print(f"Max batch size: {caps.details.get('max_batch_size', 1)}")
+
+    # A silent fall back to the serial path would be reported as a batch result
+    # and make the comparison meaningless, so fail loudly instead.
+    actually_batching = bool(getattr(llm.backend, "_batching_enabled", False))
+    if actually_batching != enable_batching:
+        llm.close()
+        raise SystemExit(
+            f"requested enable_batching={enable_batching} but backend reports "
+            f"{actually_batching}; refusing to report this as a {mode} measurement"
+        )
 
     # Create test configuration
     prompt_tokens = list(range(1, prompt_length + 1))
@@ -134,27 +150,47 @@ def benchmark_concurrent(
 
     benchmark = ConcurrentBenchmark(llm, prompt_tokens, sampling)
 
-    # Warmup
-    print(f"\nWarmup ({warmup_runs} runs)...")
-    for i in range(warmup_runs):
-        results, total_time = benchmark.run_concurrent(num_concurrent)
-        successful = sum(1 for r in results if r["success"])
-        print(f"  Run {i+1}: {total_time:.3f}s ({successful}/{num_concurrent} successful)")
-
-    # Benchmark
-    print(f"\nBenchmark ({test_runs} runs)...")
     all_total_times = []
     all_request_latencies = []
+    failures = 0
+    try:
+        # Warmup
+        print(f"\nWarmup ({warmup_runs} runs)...")
+        for i in range(warmup_runs):
+            results, total_time = benchmark.run_concurrent(num_concurrent)
+            successful = sum(1 for r in results if r["success"])
+            print(f"  Run {i+1}: {total_time:.3f}s ({successful}/{num_concurrent} successful)")
 
-    for i in range(test_runs):
-        results, total_time = benchmark.run_concurrent(num_concurrent)
-        all_total_times.append(total_time)
+        # Benchmark
+        print(f"\nBenchmark ({test_runs} runs)...")
 
-        successful = sum(1 for r in results if r["success"])
-        avg_latency = sum(r["latency"] for r in results if r["success"]) / max(successful, 1)
-        all_request_latencies.extend([r["latency"] for r in results if r["success"]])
+        for i in range(test_runs):
+            results, total_time = benchmark.run_concurrent(num_concurrent)
+            all_total_times.append(total_time)
 
-        print(f"  Run {i+1}: {total_time:.3f}s total, {avg_latency:.3f}s avg latency ({successful}/{num_concurrent} successful)")
+            successful = sum(1 for r in results if r["success"])
+            failures += num_concurrent - successful
+            avg_latency = sum(r["latency"] for r in results if r["success"]) / max(successful, 1)
+            all_request_latencies.extend([r["latency"] for r in results if r["success"]])
+
+            for failed in (r for r in results if not r["success"]):
+                print(f"    request {failed['request_id']} failed: {failed.get('error')}")
+
+            print(f"  Run {i+1}: {total_time:.3f}s total, {avg_latency:.3f}s avg latency ({successful}/{num_concurrent} successful)")
+    finally:
+        # Each concurrency level builds its own LLM.  Without an explicit close
+        # the engine is only reclaimed at interpreter exit, so rank 0 never sends
+        # the shutdown command and every previous level's TP workers stay alive
+        # holding their share of device memory.  Six levels deep that is six
+        # resident copies of the model.
+        llm.close()
+
+    # A level that dropped requests is not comparable against one that did not.
+    if failures:
+        raise SystemExit(
+            f"{failures} request(s) failed in {mode} mode at {num_concurrent} "
+            "concurrent; results would be misleading"
+        )
 
     # Statistics
     avg_total_time = sum(all_total_times) / len(all_total_times)
@@ -197,6 +233,21 @@ def main():
         "checkpoint",
         help="Path to Qwen3.5 checkpoint directory"
     )
+    # Building a second engine in one process costs the *second* one about 10%,
+    # whichever mode it is -- measured with four serial engines in a row, where
+    # only #1 was slow (0.735s vs 0.672s) at identical clocks.  Comparing modes
+    # inside one process therefore charges that to whichever ran second.  The
+    # driver (run_phase35_benchmarks.sh) gives each measurement its own process
+    # and this flag emits the one result for it to collect.
+    parser.add_argument(
+        "--single",
+        choices=["serial", "batch"],
+        help="Measure only this mode, then write --json-out and exit"
+    )
+    parser.add_argument(
+        "--json-out",
+        help="Write the --single measurement here as JSON"
+    )
     parser.add_argument(
         "--num-concurrent",
         type=int,
@@ -234,6 +285,12 @@ def main():
         default=1,
         help="Tensor parallel size (default: 1)"
     )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=4096,
+        help="Max sequence length; bounds per-slot KV cache (default: 4096)"
+    )
 
     args = parser.parse_args()
 
@@ -242,6 +299,24 @@ def main():
     print("="*60)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Tensor parallel size: {args.tensor_parallel_size}")
+
+    if args.single:
+        if len(args.num_concurrent) != 1:
+            raise SystemExit("--single takes exactly one --num-concurrent level")
+        result = benchmark_concurrent(
+            args.checkpoint,
+            enable_batching=args.single == "batch",
+            num_concurrent=args.num_concurrent[0],
+            max_tokens=args.max_tokens,
+            warmup_runs=args.warmup_runs,
+            test_runs=args.test_runs,
+            prompt_length=args.prompt_length,
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+        )
+        if args.json_out:
+            Path(args.json_out).write_text(json.dumps(result, indent=2))
+        return 0
 
     # Expected improvements
     targets = {
@@ -264,6 +339,7 @@ def main():
             test_runs=args.test_runs,
             prompt_length=args.prompt_length,
             tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
         )
 
         # Batch mode
@@ -276,6 +352,7 @@ def main():
             test_runs=args.test_runs,
             prompt_length=args.prompt_length,
             tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
         )
 
         all_results[num_concurrent] = {
