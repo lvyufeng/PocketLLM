@@ -1,5 +1,6 @@
 #include "qwen_batch_scheduler.hpp"
 #include "qwen_engine.hpp"
+#include "device_runtime.hpp"
 #include <iostream>
 #include <algorithm>
 
@@ -142,6 +143,17 @@ QwenBatchScheduler::Stats QwenBatchScheduler::get_stats() const {
 }
 
 void QwenBatchScheduler::schedule_loop() {
+    // The current device is per-thread, and the engine bound it on the thread
+    // that constructed it.  This loop runs every forward pass from its own
+    // thread, so it has to bind the same device before touching device memory.
+    if (!device_set(engine_->options().device)) {
+        std::cerr << "QwenBatchScheduler: failed to select device "
+                  << engine_->options().device
+                  << "; scheduler thread stopping" << std::endl;
+        running_.store(false);
+        return;
+    }
+
     while (running_.load()) {
         try {
             admit_requests();
@@ -325,17 +337,25 @@ void QwenBatchScheduler::run_decode_batch() {
 
 void QwenBatchScheduler::handle_completions() {
     std::vector<std::unique_ptr<SchedulerRequest>> completed;
+    std::vector<bool> cancelled_completions;
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
 
-        // Find completed or cancelled requests
+        // Find completed or cancelled requests.  Moving the unique_ptr out of the
+        // map leaves the mapped value null, so read every field this loop and the
+        // erase pass need *before* the move rather than through the moved-from
+        // slot.
         std::vector<int> slots_to_remove;
         for (auto& [slot_id, req] : slot_to_request_) {
-            bool is_cancelled = cancelled_requests_.count(req->request_id) > 0;
+            const uint64_t request_id = req->request_id;
+            const bool is_cancelled = cancelled_requests_.count(request_id) > 0;
 
             if (req->finished || is_cancelled) {
                 slots_to_remove.push_back(slot_id);
+                // The cancelled set is erased below and is guarded by this mutex,
+                // so the stats pass outside the lock cannot re-derive this.
+                cancelled_completions.push_back(is_cancelled);
 
                 // Record completion time
                 req->completion_time = std::chrono::steady_clock::now();
@@ -345,23 +365,22 @@ void QwenBatchScheduler::handle_completions() {
 
                 // Clean up cancelled set
                 if (is_cancelled) {
-                    cancelled_requests_.erase(req->request_id);
+                    cancelled_requests_.erase(request_id);
                 }
+
+                request_id_to_slot_.erase(request_id);
             }
         }
 
         // Remove from active maps
         for (int slot_id : slots_to_remove) {
-            auto it = slot_to_request_.find(slot_id);
-            if (it != slot_to_request_.end()) {
-                request_id_to_slot_.erase(it->second->request_id);
-                slot_to_request_.erase(it);
-            }
+            slot_to_request_.erase(slot_id);
         }
     }
 
     // Process completed requests (outside lock to avoid deadlock with callbacks)
-    for (auto& req : completed) {
+    for (size_t i = 0; i < completed.size(); ++i) {
+        auto& req = completed[i];
         // Free slot
         if (req->slot_id >= 0) {
             engine_->free_slot(req->request_id);
@@ -371,8 +390,7 @@ void QwenBatchScheduler::handle_completions() {
         notify_result(req.get());
 
         // Update stats
-        bool was_cancelled = cancelled_requests_.count(req->request_id) > 0;
-        if (was_cancelled) {
+        if (cancelled_completions[i]) {
             total_cancelled_.fetch_add(1);
         } else {
             total_completed_.fetch_add(1);

@@ -133,14 +133,15 @@ py::dict options_dict(const ForwardSmokeOptions& options) {
     return out;
 }
 
-QwenForwardResult qwen_prefill(QwenEngine& engine, const std::vector<int>& tokens) {
+QwenForwardResult qwen_prefill(QwenEngine& engine, const std::vector<int>& tokens,
+                               int slot_id) {
     py::gil_scoped_release release;
-    return engine.prefill(tokens);
+    return engine.prefill(tokens, slot_id);
 }
 
-QwenForwardResult qwen_decode(QwenEngine& engine, int token) {
+QwenForwardResult qwen_decode(QwenEngine& engine, int token, int slot_id) {
     py::gil_scoped_release release;
-    return engine.decode_step(token);
+    return engine.decode_step(token, slot_id);
 }
 
 std::vector<QwenForwardResult> qwen_generate(QwenEngine& engine,
@@ -199,6 +200,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("tp_world", &QwenEngineOptions::tp_world)
         .def_readwrite("tp_rank", &QwenEngineOptions::tp_rank)
         .def_readwrite("device", &QwenEngineOptions::device)
+        .def_readwrite("max_batch_size", &QwenEngineOptions::max_batch_size)
         .def_readwrite("prefill_chunk_tokens", &QwenEngineOptions::prefill_chunk_tokens)
         .def_readwrite("kv_cache_dtype", &QwenEngineOptions::kv_cache_dtype)
         .def_readwrite("attention_window", &QwenEngineOptions::attention_window)
@@ -286,21 +288,23 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
             py::gil_scoped_release release;
             engine.clear_prefix_cache();
         })
-        .def("prefill", &qwen_prefill)
-        .def("decode_step", &qwen_decode)
+        .def("prefill", &qwen_prefill, py::arg("token_ids"), py::arg("slot_id") = 0)
+        .def("decode_step", &qwen_decode, py::arg("token_id"), py::arg("slot_id") = 0)
         .def("generate", &qwen_generate)
         .def("run_worker_loop", [](QwenEngine& engine) {
             py::gil_scoped_release release;
             engine.run_worker_loop();
         }, "TP rank > 0 entry point: blocks on NCCL command channel until shutdown")
-        .def("worker_command_prefill", [](QwenEngine& engine, const std::vector<int>& token_ids) {
+        .def("worker_command_prefill", [](QwenEngine& engine, const std::vector<int>& token_ids,
+                                          int32_t slot_id) {
             py::gil_scoped_release release;
-            engine.worker_command_prefill(token_ids);
-        }, py::arg("token_ids"))
-        .def("worker_command_decode", [](QwenEngine& engine, int32_t last_token) {
+            engine.worker_command_prefill(token_ids, slot_id);
+        }, py::arg("token_ids"), py::arg("slot_id") = 0)
+        .def("worker_command_decode", [](QwenEngine& engine, int32_t last_token,
+                                         int32_t slot_id) {
             py::gil_scoped_release release;
-            engine.worker_command_decode(last_token);
-        }, py::arg("last_token"))
+            engine.worker_command_decode(last_token, slot_id);
+        }, py::arg("last_token"), py::arg("slot_id") = 0)
         .def("worker_command_reset", [](QwenEngine& engine) {
             py::gil_scoped_release release;
             engine.worker_command_reset();

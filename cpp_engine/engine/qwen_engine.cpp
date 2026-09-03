@@ -505,13 +505,56 @@ struct QwenEngine::Impl {
     uint64_t cache_data_bytes = 0;
     uint64_t cache_scale_bytes = 0;
     QwenRuntimeTelemetry telemetry;
-    // Prompt whose KV cache and recurrent state are currently materialized.
-    std::vector<int> cached_prompt;
-    // Ordered by ascending position. Index 0 is always the implicit empty
-    // state, which is not stored.
-    std::vector<QwenRecurrentSnapshot> snapshots;
+
+    // Prefix-reuse bookkeeping for one KV slot.  Every field describes the state
+    // materialized in that slot's rows, so it has to be per-slot: a single shared
+    // copy lets one sequence's tokens be matched as another's prefix, and the
+    // reuse then resumes from recurrent state that belongs to a different
+    // sequence.  Snapshots are per-slot for the same reason, and because
+    // capture/restore address one slot's rows.
+    struct SlotPrefixState {
+        // Prompt whose KV cache and recurrent state are currently materialized.
+        std::vector<int> cached_prompt;
+        // Ordered by ascending position. Index 0 is always the implicit empty
+        // state, which is not stored.
+        std::vector<QwenRecurrentSnapshot> snapshots;
+        QwenForwardResult cached_result;
+        bool has_cached_result = false;
+    };
+    std::vector<SlotPrefixState> slot_prefix;
+    // Hit/miss counters stay engine-wide: they are reported as one aggregate
+    // statistic and carry no per-sequence correctness meaning.
     int prefix_hits = 0;
     int prefix_misses = 0;
+
+    SlotPrefixState& prefix_for(int slot_id) {
+        if (slot_id < 0 || slot_id >= static_cast<int>(slot_prefix.size())) {
+            throw std::runtime_error("Qwen prefix state slot " +
+                                     std::to_string(slot_id) + " is out of range");
+        }
+        return slot_prefix[static_cast<size_t>(slot_id)];
+    }
+
+    // Position of one slot's sequence.  Outside batch mode there is only the
+    // engine-wide position_, which the caller passes in as the fallback so the
+    // single-session path keeps behaving exactly as before.
+    int slot_position(int slot_id, int engine_position) const {
+        if (!batch_mode_enabled || slot_id < 0 ||
+            slot_id >= static_cast<int>(slot_positions.size())) {
+            return engine_position;
+        }
+        return slot_positions[static_cast<size_t>(slot_id)];
+    }
+
+    // Records a slot's new position.  engine_position is updated too because the
+    // non-batch code paths and telemetry still read position_.
+    void set_slot_position(int slot_id, int position, int& engine_position) {
+        engine_position = position;
+        if (batch_mode_enabled && slot_id >= 0 &&
+            slot_id < static_cast<int>(slot_positions.size())) {
+            slot_positions[static_cast<size_t>(slot_id)] = position;
+        }
+    }
 
     // ========== Batch slot management (Phase 3.1) ==========
     int max_batch_size = 1;  // Default single session
@@ -555,6 +598,20 @@ struct QwenEngine::Impl {
         const uint64_t slots = tensor.shape.empty() ? 1 : tensor.shape[0];
         if (slots <= 1) return tensor.nbytes;
         return tensor.nbytes / static_cast<size_t>(slots);
+    }
+
+    // Byte offset of one slot's rows within a recurrent tensor.  Snapshot
+    // capture and restore both need it so they touch only the slot they were
+    // asked about; addressing slot 0 unconditionally would copy another
+    // sequence's state.
+    static size_t recurrent_slot_offset(const QwenDeviceTensor& tensor, int slot_id) {
+        if (tensor.data == nullptr || tensor.nbytes == 0) return 0;
+        const uint64_t slots = tensor.shape.empty() ? 1 : tensor.shape[0];
+        if (slots <= 1) return 0;
+        if (slot_id < 0 || static_cast<uint64_t>(slot_id) >= slots) {
+            throw std::runtime_error("Qwen recurrent slot index out of range");
+        }
+        return static_cast<size_t>(slot_id) * (tensor.nbytes / static_cast<size_t>(slots));
     }
 
     void ensure_nccl_comm_stream() {
@@ -626,6 +683,8 @@ struct QwenEngine::Impl {
         max_batch_size = options_.max_batch_size;
         batch_mode_enabled = (max_batch_size > 1);
         slot_positions.resize(max_batch_size, 0);  // Phase 3.4: per-slot positions
+        // One prefix-reuse record per slot, sized with the KV arena.
+        slot_prefix.resize(static_cast<size_t>(max_batch_size));
         // Phase 3.4: The KV arena is sized here, so the free list must be
         // seeded here as well. Seeding it only from allocate_batch_slots()
         // left the batch API unreachable: that function throws once
@@ -1288,7 +1347,7 @@ struct QwenEngine::Impl {
 
     QwenRecurrentSnapshot capture_recurrent_state(
         int position, const QwenForwardResult* result = nullptr,
-        bool periodic = false) {
+        bool periodic = false, int slot_id = 0) {
         QwenRecurrentSnapshot snapshot;
         snapshot.position = position;
         snapshot.periodic = periodic;
@@ -1296,8 +1355,7 @@ struct QwenEngine::Impl {
             snapshot.result = *result;
             snapshot.has_result = true;
         }
-        // Phase 3.4: One slot's worth per layer. The prefix cache is still
-        // single-session (slot 0), so a snapshot must not size itself over the
+        // One slot's worth per layer: a snapshot must not size itself over the
         // whole multi-slot arena.
         size_t state_bytes = 0;
         size_t tail_bytes = 0;
@@ -1330,16 +1388,19 @@ struct QwenEngine::Impl {
         size_t tail_offset = 0;
         for (const DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            // Slot 0 only: the prefix cache has no slot dimension yet.
             const size_t layer_state_bytes = recurrent_slot_bytes(layer.linear.state);
             const size_t layer_tail_bytes = recurrent_slot_bytes(layer.linear.conv_tail);
             check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.state.data) + state_offset,
-                                    layer.linear.state.data, layer_state_bytes),
+                                    static_cast<const uint8_t*>(layer.linear.state.data) +
+                                        recurrent_slot_offset(layer.linear.state, slot_id),
+                                    layer_state_bytes),
                          "Qwen recurrent state snapshot copy");
             state_offset += layer_state_bytes;
             if (layer_tail_bytes != 0) {
                 check_device(memcpy_d2d(static_cast<uint8_t*>(snapshot.conv_tail.data) + tail_offset,
-                                        layer.linear.conv_tail.data, layer_tail_bytes),
+                                        static_cast<const uint8_t*>(layer.linear.conv_tail.data) +
+                                            recurrent_slot_offset(layer.linear.conv_tail, slot_id),
+                                        layer_tail_bytes),
                              "Qwen convolution tail snapshot copy");
                 tail_offset += layer_tail_bytes;
             }
@@ -1348,7 +1409,8 @@ struct QwenEngine::Impl {
     }
 
     void restore_recurrent_state(const QwenRecurrentSnapshot& snapshot,
-                                 bool restore_target_hidden = true) {
+                                 bool restore_target_hidden = true,
+                                 int slot_id = 0) {
         size_t expected_state_bytes = 0;
         size_t expected_tail_bytes = 0;
         for (const DeviceLayer& layer : layers) {
@@ -1402,16 +1464,18 @@ struct QwenEngine::Impl {
         size_t tail_offset = 0;
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
-            // Restores into slot 0 only, matching capture_recurrent_state.
+            // Restores into the requested slot, matching capture_recurrent_state.
             const size_t layer_state_bytes = recurrent_slot_bytes(layer.linear.state);
             const size_t layer_tail_bytes = recurrent_slot_bytes(layer.linear.conv_tail);
-            check_device(memcpy_d2d(layer.linear.state.data,
+            check_device(memcpy_d2d(static_cast<uint8_t*>(layer.linear.state.data) +
+                                        recurrent_slot_offset(layer.linear.state, slot_id),
                                     static_cast<const uint8_t*>(snapshot.state.data) + state_offset,
                                     layer_state_bytes),
                          "Qwen recurrent state snapshot restore");
             state_offset += layer_state_bytes;
             if (layer_tail_bytes != 0) {
-                check_device(memcpy_d2d(layer.linear.conv_tail.data,
+                check_device(memcpy_d2d(static_cast<uint8_t*>(layer.linear.conv_tail.data) +
+                                            recurrent_slot_offset(layer.linear.conv_tail, slot_id),
                                         static_cast<const uint8_t*>(snapshot.conv_tail.data) + tail_offset,
                                         layer_tail_bytes),
                              "Qwen convolution tail snapshot restore");
@@ -1423,14 +1487,15 @@ struct QwenEngine::Impl {
     // Keeps snapshots ordered and bounded. The newest position wins because a
     // monotonically growing prompt resumes from the deepest available point.
     void record_snapshot(int position, const QwenForwardResult* result = nullptr,
-                         bool periodic = false) {
+                         bool periodic = false, int slot_id = 0) {
         if (!options.prefix_cache ||
             options.state_snapshot_interval_tokens <= 0 ||
             options.max_state_snapshots <= 0 || position <= 0) {
             return;
         }
         if (!has_recurrent_state() && !mtp_enabled && !dspark_enabled) return;
-        for (QwenRecurrentSnapshot& entry : snapshots) {
+        std::vector<QwenRecurrentSnapshot>& ring = prefix_for(slot_id).snapshots;
+        for (QwenRecurrentSnapshot& entry : ring) {
             if (entry.position != position) continue;
             entry.periodic = entry.periodic || periodic;
             if (result != nullptr && !entry.has_result) {
@@ -1439,29 +1504,31 @@ struct QwenEngine::Impl {
             }
             return;
         }
-        snapshots.push_back(capture_recurrent_state(position, result, periodic));
-        std::sort(snapshots.begin(), snapshots.end(),
+        ring.push_back(capture_recurrent_state(position, result, periodic, slot_id));
+        std::sort(ring.begin(), ring.end(),
                   [](const QwenRecurrentSnapshot& a,
                      const QwenRecurrentSnapshot& b) {
                       return a.position < b.position;
                   });
         // Preserve periodic coverage. Request-boundary snapshots improve exact
         // repeats but are expendable; evict their oldest entries first.
-        while (static_cast<int>(snapshots.size()) > options.max_state_snapshots) {
+        // The budget is per slot, so a batch cannot let one sequence starve
+        // another's rollback points.
+        while (static_cast<int>(ring.size()) > options.max_state_snapshots) {
             auto evict = std::find_if(
-                snapshots.begin(), snapshots.end(),
+                ring.begin(), ring.end(),
                 [](const QwenRecurrentSnapshot& entry) {
                     return !entry.periodic;
                 });
-            if (evict == snapshots.end()) evict = snapshots.begin();
-            snapshots.erase(evict);
+            if (evict == ring.end()) evict = ring.begin();
+            ring.erase(evict);
         }
     }
 
     // Deepest snapshot at or before limit, or nullptr for the empty state.
-    const QwenRecurrentSnapshot* snapshot_at_or_before(int limit) const {
+    const QwenRecurrentSnapshot* snapshot_at_or_before(int limit, int slot_id = 0) {
         const QwenRecurrentSnapshot* best = nullptr;
-        for (const QwenRecurrentSnapshot& entry : snapshots) {
+        for (const QwenRecurrentSnapshot& entry : prefix_for(slot_id).snapshots) {
             if (entry.position <= limit &&
                 (best == nullptr || entry.position > best->position)) {
                 best = &entry;
@@ -1473,9 +1540,9 @@ struct QwenEngine::Impl {
     // A prompt result needs the hidden/logits for its final token. If the
     // chosen state is already after that token, use an earlier snapshot so the
     // final token is executed again rather than returning stale logits.
-    const QwenRecurrentSnapshot* snapshot_strictly_before(int limit) const {
+    const QwenRecurrentSnapshot* snapshot_strictly_before(int limit, int slot_id = 0) {
         const QwenRecurrentSnapshot* best = nullptr;
-        for (const QwenRecurrentSnapshot& entry : snapshots) {
+        for (const QwenRecurrentSnapshot& entry : prefix_for(slot_id).snapshots) {
             if (entry.position < limit &&
                 (best == nullptr || entry.position > best->position)) {
                 best = &entry;
@@ -1484,12 +1551,19 @@ struct QwenEngine::Impl {
         return best;
     }
 
+    // Totalled across slots: this is reported as engine-wide memory use.
     uint64_t snapshot_bytes() const {
         uint64_t total = 0;
-        for (const QwenRecurrentSnapshot& entry : snapshots) {
-            total += entry.bytes();
+        for (const SlotPrefixState& slot : slot_prefix) {
+            for (const QwenRecurrentSnapshot& entry : slot.snapshots) {
+                total += entry.bytes();
+            }
         }
         return total;
+    }
+
+    int snapshot_count(int slot_id) {
+        return static_cast<int>(prefix_for(slot_id).snapshots.size());
     }
 
     // Snapshots let a later shorter-prefix or branched request resume mid-prompt,
@@ -1546,13 +1620,14 @@ struct QwenEngine::Impl {
         return std::min(next_regular, next_early);
     }
 
-    void drop_snapshots_after(int position) {
-        snapshots.erase(
-            std::remove_if(snapshots.begin(), snapshots.end(),
+    void drop_snapshots_after(int position, int slot_id = 0) {
+        std::vector<QwenRecurrentSnapshot>& ring = prefix_for(slot_id).snapshots;
+        ring.erase(
+            std::remove_if(ring.begin(), ring.end(),
                            [position](const QwenRecurrentSnapshot& entry) {
                                return entry.position > position;
                            }),
-            snapshots.end());
+            ring.end());
     }
 
     // Opt-in prefill phase attribution. Each scope synchronises the device, so it
@@ -4051,14 +4126,21 @@ void QwenEngine::reset() {
 
 void QwenEngine::clear_prefix_cache() {
     position_ = 0;
-    has_cached_result_ = false;
-    cached_result_ = QwenForwardResult{};
     prefix_stats_ = QwenPrefixCacheStats{};
-    impl_->cached_prompt.clear();
-    impl_->snapshots.clear();
+    // Every slot's reuse state, not just slot 0's: a stale entry on any slot
+    // would survive the clear and be matched by the next request there.
+    for (Impl::SlotPrefixState& slot : impl_->slot_prefix) {
+        slot.cached_prompt.clear();
+        slot.snapshots.clear();
+        slot.cached_result = QwenForwardResult{};
+        slot.has_cached_result = false;
+    }
+    std::fill(impl_->slot_positions.begin(), impl_->slot_positions.end(), 0);
     impl_->prefix_hits = 0;
     impl_->prefix_misses = 0;
-    impl_->zero_recurrent_state();
+    for (int slot = 0; slot < impl_->max_batch_size; ++slot) {
+        impl_->zero_recurrent_state(slot);
+    }
     // KV storage is overwritten before it is read. Avoid clearing several GiB
     // on every request; position_ bounds all attention reads.
 }
@@ -4156,6 +4238,11 @@ QwenBatchPrefillResult QwenEngine::batch_prefill(
             throw std::runtime_error("QwenEngine::batch_prefill: invalid request");
         }
 
+        // Under TP the workers sit in run_worker_loop() waiting to be told which
+        // collective to join; rank 0 must announce the op before running it, or
+        // the group deadlocks with rank 0 computing alone.  No-op at world size 1.
+        worker_command_prefill(req->prompt_tokens, req->slot_id);
+
         // Phase 3.3: Use req->slot_id to isolate KV cache
         QwenForwardResult fwd_result = prefill(req->prompt_tokens, req->slot_id);
 
@@ -4195,6 +4282,10 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
         if (!req) {
             throw std::runtime_error("QwenEngine::batch_decode_step: null request");
         }
+
+        // Announce before computing, as in batch_prefill: every rank has to enter
+        // the same collective in the same order.
+        worker_command_decode(req->last_token, req->slot_id);
 
         // Phase 3.3: Use req->slot_id to isolate KV cache
         QwenForwardResult fwd_result = decode_step(req->last_token, req->slot_id);
@@ -4239,17 +4330,19 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
     prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
     impl_->phase_seconds.clear();
     impl_->phase_calls.clear();
-    // Phase 3.4: cached_prompt, position_ and the snapshot ring still describe
-    // slot 0 only, so reuse is confined to it. Other slots always prefill cold;
-    // their recurrent state is isolated by the arena, which is what makes the
-    // result correct rather than merely uncached.
-    const bool can_reuse = options_.prefix_cache && slot_id == 0 &&
-        !impl_->cached_prompt.empty() && position_ ==
-            static_cast<int>(impl_->cached_prompt.size());
+    // Prefix reuse is scoped to this slot.  Each slot keeps its own cached
+    // prompt, snapshot ring and cached result, so a batch can reuse on every
+    // slot independently; sharing one copy would let a prompt match against
+    // another sequence's tokens and resume from its recurrent state.
+    Impl::SlotPrefixState& prefix = impl_->prefix_for(slot_id);
+    const int slot_position = impl_->slot_position(slot_id, position_);
+    const bool can_reuse = options_.prefix_cache &&
+        !prefix.cached_prompt.empty() && slot_position ==
+            static_cast<int>(prefix.cached_prompt.size());
     size_t common = 0;
     if (can_reuse) {
-        const size_t limit = std::min(token_ids.size(), impl_->cached_prompt.size());
-        while (common < limit && token_ids[common] == impl_->cached_prompt[common]) {
+        const size_t limit = std::min(token_ids.size(), prefix.cached_prompt.size());
+        while (common < limit && token_ids[common] == prefix.cached_prompt[common]) {
             ++common;
         }
     }
@@ -4257,20 +4350,20 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
 
     // Exact repeat: the cached final logits are already the requested result.
     if (can_reuse && common == token_ids.size() &&
-        token_ids.size() == impl_->cached_prompt.size() && has_cached_result_) {
+        token_ids.size() == prefix.cached_prompt.size() && prefix.has_cached_result) {
         ++impl_->prefix_hits;
         prefix_stats_.hits = impl_->prefix_hits;
         prefix_stats_.misses = impl_->prefix_misses;
         prefix_stats_.reused_tokens = static_cast<int>(token_ids.size());
         prefix_stats_.resume_source = "live";
-        prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+        prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
         prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
-        return cached_result_;
+        return prefix.cached_result;
     }
 
     int start_position = 0;
     const QwenRecurrentSnapshot* resume_snapshot = nullptr;
-    if (can_reuse && common == impl_->cached_prompt.size() &&
+    if (can_reuse && common == prefix.cached_prompt.size() &&
         common <= token_ids.size()) {
         // The current recurrent state is exactly the state after the common
         // prefix. This is the hot path for monotonically growing prompts.
@@ -4282,32 +4375,32 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
         // A request-boundary snapshot also carries the final-token result, so
         // an exact shorter-prefix request can finish without recomputation.
         resume_snapshot = impl_->snapshot_at_or_before(
-            static_cast<int>(common));
+            static_cast<int>(common), slot_id);
         if (resume_snapshot != nullptr &&
             resume_snapshot->position == static_cast<int>(common) &&
             resume_snapshot->has_result && token_ids.size() == common) {
-            impl_->restore_recurrent_state(*resume_snapshot);
-            position_ = static_cast<int>(common);
-            impl_->cached_prompt = token_ids;
-            cached_result_ = resume_snapshot->result;
-            has_cached_result_ = true;
-            impl_->drop_snapshots_after(position_);
+            impl_->restore_recurrent_state(*resume_snapshot, true, slot_id);
+            impl_->set_slot_position(slot_id, static_cast<int>(common), position_);
+            prefix.cached_prompt = token_ids;
+            prefix.cached_result = resume_snapshot->result;
+            prefix.has_cached_result = true;
+            impl_->drop_snapshots_after(static_cast<int>(common), slot_id);
             prefix_stats_.resume_source = "snapshot";
             prefix_stats_.reused_tokens = static_cast<int>(common);
-            prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+            prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
             prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
             ++impl_->prefix_hits;
             prefix_stats_.hits = impl_->prefix_hits;
             prefix_stats_.misses = impl_->prefix_misses;
-            return cached_result_;
+            return prefix.cached_result;
         }
         if (resume_snapshot != nullptr &&
             resume_snapshot->position == static_cast<int>(token_ids.size())) {
             resume_snapshot = impl_->snapshot_strictly_before(
-                static_cast<int>(token_ids.size()));
+                static_cast<int>(token_ids.size()), slot_id);
         }
         if (resume_snapshot != nullptr) {
-            impl_->restore_recurrent_state(*resume_snapshot);
+            impl_->restore_recurrent_state(*resume_snapshot, true, slot_id);
             start_position = resume_snapshot->position;
             prefix_stats_.resume_source = "snapshot";
             ++impl_->prefix_hits;
@@ -4316,14 +4409,14 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
             prefix_stats_.resume_source = "empty";
             ++impl_->prefix_misses;
         }
-        if (slot_id == 0) impl_->drop_snapshots_after(start_position);
+        impl_->drop_snapshots_after(start_position, slot_id);
     } else {
         // Clears this slot's rows only; a concurrent request on another slot
         // keeps its state.
         impl_->zero_recurrent_state(slot_id);
         prefix_stats_.resume_source = "empty";
         if (can_reuse) ++impl_->prefix_misses;
-        if (slot_id == 0) impl_->drop_snapshots_after(0);
+        impl_->drop_snapshots_after(0, slot_id);
     }
 
     const int target_position = static_cast<int>(token_ids.size());
@@ -4384,7 +4477,7 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
                                       snapshot_result, nullptr, nullptr, slot_id);
         }
         if (periodic_snapshot || end == target_position) {
-            impl_->record_snapshot(end, &result, periodic_snapshot);
+            impl_->record_snapshot(end, &result, periodic_snapshot, slot_id);
         }
 
         offset = end;
@@ -4395,23 +4488,18 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
     if (start_position == target_position) {
         throw std::runtime_error("Qwen prefix cache failed to produce logits");
     }
-    position_ = target_position;
-    // Phase 3.4: Track per-slot position independently
-    if (impl_->batch_mode_enabled && slot_id >= 0 &&
-        slot_id < static_cast<int>(impl_->slot_positions.size())) {
-        impl_->slot_positions[static_cast<size_t>(slot_id)] = target_position;
-    }
+    impl_->set_slot_position(slot_id, target_position, position_);
     if (options_.prefix_cache) {
-        impl_->cached_prompt = token_ids;
-        cached_result_ = result;
-        has_cached_result_ = true;
+        prefix.cached_prompt = token_ids;
+        prefix.cached_result = result;
+        prefix.has_cached_result = true;
     } else {
-        impl_->cached_prompt.clear();
-        has_cached_result_ = false;
+        prefix.cached_prompt.clear();
+        prefix.has_cached_result = false;
     }
     prefix_stats_.reused_tokens = start_position;
     prefix_stats_.computed_tokens = target_position - start_position;
-    prefix_stats_.snapshots = static_cast<int>(impl_->snapshots.size());
+    prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
     prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
     prefix_stats_.hits = impl_->prefix_hits;
     prefix_stats_.misses = impl_->prefix_misses;
@@ -4437,20 +4525,17 @@ QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
         {token_id}, current_position, active_layers_, true, nullptr, nullptr, slot_id);
 
     ++current_position;
-    position_ = current_position;
-
-    // Phase 3.4: Update per-slot position
-    if (impl_->batch_mode_enabled && slot_id >= 0 &&
-        slot_id < static_cast<int>(impl_->slot_positions.size())) {
-        impl_->slot_positions[static_cast<size_t>(slot_id)] = current_position;
-    }
+    impl_->set_slot_position(slot_id, current_position, position_);
 
     if (options_.prefix_cache) {
-        impl_->cached_prompt.push_back(token_id);
-        cached_result_ = result;
-        has_cached_result_ = true;
-        if (impl_->is_periodic_snapshot_position(position_)) {
-            impl_->record_snapshot(position_, &result, true);
+        // Appends to this slot's prompt only.  A shared buffer would splice the
+        // slots' token streams together and corrupt the next prefix match.
+        Impl::SlotPrefixState& prefix = impl_->prefix_for(slot_id);
+        prefix.cached_prompt.push_back(token_id);
+        prefix.cached_result = result;
+        prefix.has_cached_result = true;
+        if (impl_->is_periodic_snapshot_position(current_position)) {
+            impl_->record_snapshot(current_position, &result, true, slot_id);
         }
     }
     return result;
@@ -4551,12 +4636,15 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         const int consumed = 1 + correct;
         position_ += consumed;
         if (options_.prefix_cache) {
-            impl_->cached_prompt.push_back(current_token);
-            impl_->cached_prompt.insert(impl_->cached_prompt.end(),
+            // generate() is the single-session speculative path and has no slot
+            // parameter, so it always drives slot 0.
+            Impl::SlotPrefixState& prefix = impl_->prefix_for(0);
+            prefix.cached_prompt.push_back(current_token);
+            prefix.cached_prompt.insert(prefix.cached_prompt.end(),
                                         next.accept_tokens.begin(),
                                         next.accept_tokens.end());
-            cached_result_ = next;
-            has_cached_result_ = true;
+            prefix.cached_result = next;
+            prefix.has_cached_result = true;
         }
 
         for (size_t index = 0; index < next.accept_tokens.size(); ++index) {
@@ -4607,12 +4695,17 @@ void QwenEngine::run_worker_loop() {
         // A failed collective leaves this rank out of step with rank 0, so the
         // loop must not continue past an error. Propagating exits the process
         // and lets the launcher tear the whole group down.
+        // header[2] carries the KV slot rank 0 is computing into.  A worker that
+        // ignored it would read and write slot 0 while rank 0 used another slot,
+        // so batched decode would silently cross-contaminate sequences.
+        const int slot_id = static_cast<int>(header[2]);
+
         switch (cmd) {
             case WorkerCommand::Prefill:
-                (void)prefill(tokens);
+                (void)prefill(tokens, slot_id);
                 break;
             case WorkerCommand::DecodeStep:
-                (void)decode_step(header[1]);
+                (void)decode_step(header[1], slot_id);
                 break;
             case WorkerCommand::Reset:
                 reset();
@@ -4624,7 +4717,8 @@ void QwenEngine::run_worker_loop() {
     }
 }
 
-void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids) {
+void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids,
+                                        int32_t slot_id) {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_prefill: rank 0 only");
@@ -4636,7 +4730,7 @@ void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids) {
     int32_t header[4] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
         0,
-        0,
+        slot_id,
         static_cast<int32_t>(token_ids.size())
     };
     impl_->cmd->send_to_workers(header, 4);
@@ -4647,7 +4741,7 @@ void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids) {
     }
 }
 
-void QwenEngine::worker_command_decode(int32_t last_token) {
+void QwenEngine::worker_command_decode(int32_t last_token, int32_t slot_id) {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_decode: rank 0 only");
@@ -4659,7 +4753,7 @@ void QwenEngine::worker_command_decode(int32_t last_token) {
     int32_t header[4] = {
         static_cast<int32_t>(WorkerCommand::DecodeStep),
         last_token,
-        0,
+        slot_id,
         0
     };
     impl_->cmd->send_to_workers(header, 4);
