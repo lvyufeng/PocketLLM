@@ -9,7 +9,6 @@ set_property(CACHE POCKET_BACKEND PROPERTY STRINGS cuda ascend)
 if(POCKET_BACKEND STREQUAL "cuda")
     project(dsv4_cpp_engine LANGUAGES CXX CUDA)
 elseif(POCKET_BACKEND STREQUAL "ascend")
-    # The Ascend backend has no kernels yet, so CXX alone is enough to configure.
     project(dsv4_cpp_engine LANGUAGES CXX)
 else()
     message(FATAL_ERROR "Unsupported POCKET_BACKEND '${POCKET_BACKEND}' (expected cuda or ascend)")
@@ -263,6 +262,11 @@ else()
     set(SOC_VERSION "${ASCEND_SOC_VERSION}")
     set(RUN_MODE "npu")
     set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
+    # The nested ExternalProject builds spawned by ascendc.cmake use GCC 12's
+    # compiler driver but need to find GCC 11's C++ headers (the ones installed
+    # on this system). Pass them via ASCENDC_COMPILE_OPTIONS which ascendc.cmake
+    # appends to every nested compile command.
+    set(ASCENDC_COMPILE_OPTIONS "-isystem;/usr/include/c++/11;-isystem;/usr/include/aarch64-linux-gnu/c++/11")
     include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
     ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
 
@@ -414,8 +418,8 @@ target_link_libraries(qwen_audit PRIVATE pocket_core)
 set_target_properties(qwen_audit PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
 
 # Backend-agnostic conformance test for the device runtime. Links pocket_runtime
-# only, with no kernels, which is what lets it run on a backend whose kernels do
-# not exist yet.
+# only, with no model kernels, so runtime behavior is tested independently of
+# the AscendC archive.
 add_executable(test_device_runtime tests/test_device_runtime.cpp)
 target_link_libraries(test_device_runtime PRIVATE pocket_runtime)
 
@@ -741,9 +745,75 @@ add_executable(bench_qwen_transaction_copy tests/bench_qwen_transaction_copy.cpp
 target_link_libraries(bench_qwen_transaction_copy PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_transaction_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
-add_executable(test_qwen_gqa_mma_occ tests/test_qwen_gqa_mma_occ.cpp)
-target_link_libraries(test_qwen_gqa_mma_occ PRIVATE dsv4_cpp_core)
-set_target_properties(test_qwen_gqa_mma_occ PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+if(POCKET_BACKEND STREQUAL "cuda")
+    add_executable(test_qwen_gqa_mma_occ tests/test_qwen_gqa_mma_occ.cpp)
+    target_link_libraries(test_qwen_gqa_mma_occ PRIVATE dsv4_cpp_core)
+    set_target_properties(test_qwen_gqa_mma_occ PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+else()
+    # Experimental MMAD probe test targets temporarily disabled (source files removed)
+    # add_executable(test_qwen_gqa_mmad_qk_probe tests/test_qwen_gqa_mmad_qk_probe.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_probe PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    # Experimental MMAD probe test targets temporarily disabled (source files removed)
+    # add_executable(test_qwen_gqa_mmad_qk_fulltile_probe tests/test_qwen_gqa_mmad_qk_fulltile_probe.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_fulltile_probe PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_fulltile_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    # add_executable(test_qwen_gqa_mmad_qk_multihead_probe tests/test_qwen_gqa_mmad_qk_multihead_probe.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_multihead_probe PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_multihead_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    # add_executable(test_qwen_gqa_mmad_qk_queryrow_probe tests/test_qwen_gqa_mmad_qk_queryrow_probe.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_queryrow_probe PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_queryrow_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_queryrow_optimized tests/test_qwen_gqa_mmad_qk_queryrow_optimized.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_queryrow_optimized PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_queryrow_optimized PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_batched tests/test_qwen_gqa_mmad_qk_batched.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # Experimental MMAD QK test variants temporarily disabled (source files removed)
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core tests/test_qwen_gqa_mmad_qk_batched_30core.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core_n128 tests/test_qwen_gqa_mmad_qk_batched_30core_n128.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core_n128 PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core_n128 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core_n128_fused tests/test_qwen_gqa_mmad_qk_batched_30core_n128_fused.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core_n128_fused PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core_n128_fused PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core_n128_pingpong tests/test_qwen_gqa_mmad_qk_batched_30core_n128_pingpong.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core_n128_pingpong PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core_n128_pingpong PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core_n128_persistent_a2 tests/test_qwen_gqa_mmad_qk_batched_30core_n128_persistent_a2.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core_n128_persistent_a2 PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core_n128_persistent_a2 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_qk_batched_30core_n128_batched_extraction tests/test_qwen_gqa_mmad_qk_batched_30core_n128_batched_extraction.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_qk_batched_30core_n128_batched_extraction PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_qk_batched_30core_n128_batched_extraction PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # Experimental MMAD test targets temporarily disabled (source files removed)
+    # add_executable(test_qwen_gqa_decode_mmad_integrated tests/test_qwen_gqa_decode_mmad_integrated.cpp)
+    # target_link_libraries(test_qwen_gqa_decode_mmad_integrated PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_decode_mmad_integrated PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_mmad_smoke tests/test_qwen_gqa_mmad_smoke.cpp)
+    # target_link_libraries(test_qwen_gqa_mmad_smoke PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_mmad_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_fused_online_softmax tests/test_qwen_gqa_fused_online_softmax.cpp)
+    # target_link_libraries(test_qwen_gqa_fused_online_softmax PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_fused_online_softmax PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+    # add_executable(test_qwen_gqa_fused_online_softmax_direct tests/test_qwen_gqa_fused_online_softmax_direct.cpp)
+    # target_link_libraries(test_qwen_gqa_fused_online_softmax_direct PRIVATE dsv4_cpp_core)
+    # set_target_properties(test_qwen_gqa_fused_online_softmax_direct PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
 
 if(DSV4_HAVE_TP_COMM)
     add_executable(bench_qwen_tp_allreduce tests/bench_qwen_tp_allreduce.cpp)
@@ -767,9 +837,17 @@ add_executable(bench_qwen_gqa_prefill tests/bench_qwen_gqa_prefill.cpp)
 target_link_libraries(bench_qwen_gqa_prefill PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_gqa_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
-add_executable(bench_qwen_gqa_decode tests/bench_qwen_gqa_decode.cpp)
-target_link_libraries(bench_qwen_gqa_decode PRIVATE dsv4_cpp_core)
-set_target_properties(bench_qwen_gqa_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+if(POCKET_BACKEND STREQUAL "cuda")
+    add_executable(bench_qwen_gqa_decode tests/bench_qwen_gqa_decode.cpp)
+    target_link_libraries(bench_qwen_gqa_decode PRIVATE dsv4_cpp_core)
+    set_target_properties(bench_qwen_gqa_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+else()
+    # Ascend bench temporarily disabled (source file removed)
+    # add_executable(bench_qwen_gqa_decode tests/bench_qwen_gqa_decode_ascend.cpp)
+    # target_link_libraries(bench_qwen_gqa_decode PRIVATE dsv4_cpp_core)
+    # set_target_properties(bench_qwen_gqa_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+endif()
 
 add_executable(bench_qwen_fp8_swiglu_decode tests/bench_qwen_fp8_swiglu_decode.cpp)
 target_link_libraries(bench_qwen_fp8_swiglu_decode PRIVATE dsv4_cpp_core)

@@ -16,9 +16,11 @@
 //   3. Vector `Reciprocal` and `Rsqrt` are ~2e-3 hardware approximations, not FP32.
 //      Where a reciprocal has to be exact, take it as a scalar division instead.
 //
-// FP32 `ReduceSum` is also unavailable: its generic path instantiates vcmax, which
-// this SoC supports for float16 only (`Intrinsic_vcmax|float16` in Ascend910B.ini),
-// so it does not compile. The halving folds below use nothing but vadd.
+// FP32 block/pair reductions are unavailable: their generic paths instantiate
+// vcgadd/vcpadd, which this SoC supports for float16 only. FP32 WholeReduceSum
+// lowers to vcadd and is supported (`Intrinsic_vcadd|float16,float32` in
+// Ascend910B.ini); use it only after arranging each logical row as one repeat.
+// The halving folds below use nothing but vadd.
 
 #ifndef POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
 #define POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
@@ -216,9 +218,9 @@ __aicore__ inline float scalar_exp(const AscendC::LocalTensor<float>& work,
 //
 // This is the shape a scalar-per-key-row multiply needs, and it is the hot spot of
 // the recurrence: one Duplicate per row. The dsts do not overlap, so no barrier is
-// needed between them, but it is still `rows` instruction issues. Brcb plus four
-// strided doublings would do the same job in five ops and is the known next
-// optimization here; it is left out until the numbers are trusted.
+// needed between them, but it is still `rows` instruction issues. Brcb would reduce
+// that issue count, but it is an unsupported stub on first-generation dav_c100, so
+// the scalar broadcast loop is intentional for this target.
 __aicore__ inline void broadcast_rows(const AscendC::LocalTensor<float>& dst,
                                       const AscendC::LocalTensor<float>& src,
                                       uint32_t rows, uint32_t width) {

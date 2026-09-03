@@ -2086,10 +2086,15 @@ struct QwenEngine::Impl {
         }
 #endif
 
-        const bool dual_qkvz = rows == 1 &&
+#ifndef POCKET_BACKEND_ASCEND
+        bool dual_qkvz = rows == 1 &&
             layer.linear.qkv.kind == QwenLinearKind::Fp8Block128 &&
             layer.linear.z.kind == QwenLinearKind::Fp8Block128 &&
             qwen_env_enabled("QWEN_FUSE_QKVZ_DECODE");
+#else
+        const bool dual_qkvz = false;
+#endif
+#ifndef POCKET_BACKEND_ASCEND
         if (dual_qkvz) {
             PhaseScope dual_scope(this, "pd.lin.qkvz");
             require_launch(qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
@@ -2101,7 +2106,9 @@ struct QwenEngine::Impl {
                 layer.linear.z.scale.f16_data(), z.f16_data(), value_dim,
                 hidden_size, static_cast<int>(layer.linear.z.scale.shape[1]),
                 hidden_size), "dual FP8 QKV/Z decode projection");
-        } else {
+        } else
+#endif
+        {
             projection(layer.linear.qkv, hidden, packed.f16_data(), rows,
                        "lin.qkv");
         }
@@ -2284,6 +2291,7 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& merged = workspace_half(attention_elements, q.shape);
 
         const int hidden_size = static_cast<int>(config.hidden_size);
+#ifndef POCKET_BACKEND_ASCEND
         const bool grouped_qkv = rows == 1 && !fused_kv &&
             layer.full.q.kind == QwenLinearKind::Fp8Block128 &&
             layer.full.k.kind == QwenLinearKind::Fp8Block128 &&
@@ -2303,7 +2311,9 @@ struct QwenEngine::Impl {
                 v.f16_data(), kv_heads * head_dim, hidden_size,
                 static_cast<int>(layer.full.v.scale.shape[1]), hidden_size),
                 "triple FP8 full Q/K/V decode projection");
-        } else {
+        } else
+#endif
+        {
             { PhaseScope sub(this, "full.q_proj"); projection(layer.full.q, hidden, q_projection.f16_data(), rows, "full.q"); }
             if (fused_kv) {
                 { PhaseScope sub(this, "full.kv_proj"); projection(

@@ -58,6 +58,7 @@ bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_ascend(const uint16_t* d_x_fp16, con
 bool qwen_gather_copy_regions_ascend(const QwenCopyRegion* d_regions, int region_count, uint8_t* d_packed, uint64_t total_blocks, void* stream);
 
 bool qwen_gqa_decode_attention_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_score_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, void* stream);
+bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink, int tile_count, void* stream);
 
 bool qwen_gqa_prefill_attention_f16_ascend(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, int seq_len, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, void* stream);
 

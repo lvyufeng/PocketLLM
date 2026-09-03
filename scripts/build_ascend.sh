@@ -36,7 +36,14 @@ cmake --build "${BUILD_DIR}" -j"$(nproc)" --target \
     test_qwen_ascend_norm_gamma \
     test_qwen_ascend_ops \
     test_qwen_ascend_group_b \
+    test_qwen_gqa_mmad_qk_probe \
+    test_qwen_gqa_decode_mmad_integrated \
+    dsv4_cpp_engine \
     test_tp_comm_smoke
+
+# The MMAD probe is an isolated hardware experiment, not a production attention
+# path. Build it explicitly so stale generated launcher headers cannot mask a
+# source or ABI error.
 
 if [ "${1:-test}" = "build" ]; then
     echo "build_ascend: build only, skipping tests"
@@ -49,7 +56,7 @@ status=0
 # whether the target sets RUNTIME_OUTPUT_DIRECTORY, so search rather than assume.
 for name in test_device_runtime test_qwen_config test_qwen_bf16_checkpoint \
             test_qwen_ascend_norm_gamma test_qwen_ascend_ops \
-            test_qwen_ascend_group_b; do
+            test_qwen_ascend_group_b test_qwen_gqa_decode_mmad_integrated; do
     binary="$(find "${BUILD_DIR}" -name "${name}" -type f -perm -u+x | head -1)"
     if [ -z "${binary}" ]; then
         echo "build_ascend: ${name} not built"
