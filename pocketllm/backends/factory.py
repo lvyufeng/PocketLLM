@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -120,10 +123,121 @@ def create_backend(args: EngineArgs, **injected: Any):
             runtime_loader=injected.get("runtime_loader"),
         )
     if selected == "cpp":
-        return CppBackend(
-            args,
-            native_module=injected.get("native_module"),
-            engine=injected.get("engine"),
-            tokenizer=injected.get("tokenizer"),
+        # Check if we need automatic tensor-parallel supervision
+        needs_supervision = (
+            args.tensor_parallel_size > 1
+            and args.tensor_parallel_rank == 0
+            and not args.backend_options.get("nccl_id_path")
+            and not os.environ.get("POCKETLLM_NCCL_ID_PATH")
+            and not injected.get("_supervised_child")
         )
+
+        if needs_supervision:
+            # Auto-launch supervisor for multi-GPU setup
+            from ..supervisor import TensorParallelSupervisor, TensorParallelConfig
+
+            # Build command for worker processes (rank 1, 2, 3, ...)
+            worker_command = [
+                sys.executable,
+                "-c",
+                _worker_script(),
+            ]
+
+            # Build environment for worker processes
+            # Note: NCCL ID path will be set by supervisor after rendezvous setup
+            worker_env = {
+                "POCKETLLM_CHECKPOINT": args.checkpoint_dir,
+                "POCKETLLM_TP_SIZE": str(args.tensor_parallel_size),
+                "POCKETLLM_MAX_MODEL_LEN": str(args.max_model_len or 8192),
+                "POCKETLLM_KV_CACHE_DTYPE": str(args.kv_cache_dtype or "auto"),
+                "POCKETLLM_BACKEND_OPTIONS": json.dumps(args.backend_options),
+            }
+
+            # Create supervisor configuration
+            # Supervisor will spawn workers for ranks 1, 2, 3
+            # (it starts from rank 0 in its own numbering, which we map to our rank 1)
+            config = TensorParallelConfig(
+                command=tuple(worker_command),
+                world_size=args.tensor_parallel_size - 1,  # Spawn N-1 workers (ranks 1..N-1)
+                env=worker_env,
+            )
+
+            # Launch worker processes - supervisor creates NCCL ID file during start()
+            supervisor = TensorParallelSupervisor(config)
+            supervisor.start()
+
+            # Get NCCL ID path created by supervisor
+            nccl_id_path = str(supervisor.nccl_id_path)
+
+            # Set NCCL ID path for main process (rank 0)
+            os.environ["POCKETLLM_NCCL_ID_PATH"] = nccl_id_path
+            args.backend_options["nccl_id_path"] = nccl_id_path
+
+            # Main process creates rank-0 backend
+            backend = CppBackend(
+                args,
+                native_module=injected.get("native_module"),
+                engine=injected.get("engine"),
+                tokenizer=injected.get("tokenizer"),
+            )
+
+            # Store supervisor reference so it can be cleaned up
+            backend._supervisor = supervisor
+
+            return backend
+        else:
+            # Single GPU or externally supervised
+            return CppBackend(
+                args,
+                native_module=injected.get("native_module"),
+                engine=injected.get("engine"),
+                tokenizer=injected.get("tokenizer"),
+            )
     raise BackendUnavailableError(f"unsupported backend {selected!r}")
+
+
+def _worker_script() -> str:
+    """Generate Python code for worker processes (ranks 1, 2, 3, ...).
+
+    The supervisor spawns world_size-1 processes with TP_RANK 0, 1, 2, ...
+    We map them to actual tensor-parallel ranks 1, 2, 3, ...
+    """
+    return """
+import os
+import json
+from pocketllm import EngineArgs
+from pocketllm.backends.cpp_backend import CppBackend
+
+# Get configuration from environment
+# TP_RANK is set by supervisor (0, 1, 2, ... for world_size-1 workers)
+# Map to actual TP ranks 1, 2, 3, ... (rank 0 is the main process)
+supervisor_rank = int(os.environ.get("TP_RANK", "0"))
+actual_rank = supervisor_rank + 1
+
+tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
+checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
+nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
+max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
+kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
+backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
+
+# Add NCCL ID to backend options
+backend_options["nccl_id_path"] = nccl_id_path
+
+# Create EngineArgs for this worker rank
+args = EngineArgs(
+    model=checkpoint,
+    backend="cpp",
+    tensor_parallel_size=tp_size,
+    tensor_parallel_rank=actual_rank,
+    max_model_len=max_model_len,
+    kv_cache_dtype=kv_cache_dtype,
+    backend_options=backend_options,
+)
+
+# Create backend and enter worker loop
+backend = CppBackend(args)
+print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
+backend.run_worker(on_ready=None)
+"""
+
