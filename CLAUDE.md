@@ -118,3 +118,92 @@ The multi-backend refactor uses a **single repository with layered separation** 
 repos: a device-agnostic core is shared (GGUF parsing, tokenizer, HTTP server, scheduling skeleton),
 while each vendor owns its own kernel implementations so that per-hardware optimization is never
 compromised. Backend selection happens at build time.
+
+## Git workflow
+
+**All development work must follow the feature branch workflow with pull requests.**
+
+### Branch naming conventions
+
+- `feature/<description>` — New features (e.g., `feature/cpp-engine-batch-scheduler`)
+- `fix/<description>` — Bug fixes (e.g., `fix/decode-eos-handling`)
+- `refactor/<description>` — Code refactoring (e.g., `refactor/unified-api-phase1`)
+- `docs/<description>` — Documentation updates (e.g., `docs/phase3-completion-summary`)
+- `perf/<description>` — Performance optimizations (e.g., `perf/gqa-tensor-core`)
+
+### Development process
+
+1. **Never commit directly to `master`**. Always create a feature branch:
+   ```bash
+   git checkout -b feature/your-feature-name
+   ```
+
+2. **Make commits with clear messages**:
+   ```bash
+   git add <files>
+   git commit -m "Brief description
+   
+   Detailed explanation of what changed and why.
+   Include any relevant context, benchmarks, or references.
+   
+   Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+   ```
+
+3. **Push the branch to remote**:
+   ```bash
+   git push -u origin feature/your-feature-name
+   ```
+
+4. **Create a pull request using `gh` CLI**:
+   ```bash
+   gh pr create --title "Brief PR title" \
+                --body "Detailed description" \
+                --base master
+   ```
+   
+   The PR description should include:
+   - Summary of changes
+   - Implementation details
+   - Testing status
+   - Performance impact (if applicable)
+   - Checklist of completed/pending items
+
+5. **After PR is merged**, the feature branch will be automatically deleted by GitHub.
+   Update your local repository:
+   ```bash
+   git checkout master
+   git pull origin master
+   git branch -d feature/your-feature-name  # Delete local branch
+   ```
+
+### PR requirements
+
+- PR title should be concise and descriptive (< 72 characters)
+- PR body must include a summary, implementation notes, and testing status
+- All PRs must end with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
+- Large features should be broken into multiple smaller PRs when possible
+- Each PR should be focused on a single concern (no "kitchen sink" PRs)
+
+### Commit message format
+
+```
+Brief one-line summary (< 72 chars)
+
+Detailed explanation starting on line 3. Include:
+- What changed and why
+- Any relevant context or background
+- Performance impact if applicable
+- Related issues or PRs
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+```
+
+### Emergency hotfixes
+
+For critical production issues only, a hotfix may be committed directly to `master` with:
+1. Clear commit message explaining the emergency
+2. Immediate follow-up PR for review and documentation
+3. Post-mortem analysis if the issue was severe
+
+This should be extremely rare (< 1% of commits).
+
