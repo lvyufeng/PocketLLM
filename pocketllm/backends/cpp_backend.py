@@ -526,8 +526,8 @@ class CppBackend(BackendBase):
         return token in self._eos_ids
 
     def _generate_until_eos(
-        self, request: GenerationRequest, prompt_ids: list[int]
-    ) -> tuple[list[int], bool]:
+        self, request: GenerationRequest, prompt_ids: list[int], started: float
+    ) -> tuple[list[int], bool, float]:
         """Step the native session so it never advances past EOS.
 
         ``QwenEngine.generate`` takes no EOS argument and keeps mutating its
@@ -536,19 +536,25 @@ class CppBackend(BackendBase):
         the caller never sees, corrupting reuse for the next request.  Driving
         prefill/decode here keeps the session and the returned tokens in step,
         and matches what the streamed path does.
+
+        Returns the tokens, whether EOS stopped generation, and the time to the
+        first token measured from ``started``.  TTFT is observable only here: the
+        loop is what learns when prefill produced a token, so reporting 0.0 as
+        this path used to made every serial timing comparison degenerate.
         """
         result = self._tp_prefill(prompt_ids)
+        ttft = time.perf_counter() - started
         token_ids: list[int] = []
         for index in range(request.sampling_params.max_tokens):
             self._ensure_open()
             self._check_cancelled(request.request_id)
             token = self._native_token(result)
             if self._is_eos(token):
-                return token_ids, True
+                return token_ids, True, ttft
             token_ids.append(token)
             if index + 1 < request.sampling_params.max_tokens:
                 result = self._tp_decode_step(token)
-        return token_ids, False
+        return token_ids, False, ttft
 
     def _decode(self, token_ids: list[int]) -> str:
         if self._tokenizer is None:
@@ -590,13 +596,19 @@ class CppBackend(BackendBase):
                     # workers. Under TP always take the stepped path, which
                     # broadcasts each command.
                     if self._eos_ids or self.args.tensor_parallel_size > 1:
-                        token_ids, hit_eos = self._generate_until_eos(request, prompt_ids)
+                        token_ids, hit_eos, ttft = self._generate_until_eos(
+                            request, prompt_ids, started
+                        )
                     else:
                         raw = self._engine_or_raise().generate(
                             prompt_ids, request.sampling_params.max_tokens
                         )
                         token_ids = [self._native_token(item) for item in raw]
                         hit_eos = False
+                        # Native generate() drives its own loop and reports no
+                        # per-token boundary, so the first token is not separable
+                        # from the whole call here.
+                        ttft = 0.0
                     self._ensure_open()
                 self._check_cancelled(request.request_id)
                 # `completion_tokens` counts the EOS step the engine executed, so
@@ -611,7 +623,7 @@ class CppBackend(BackendBase):
                         usage=Usage(len(prompt_ids), completion_tokens),
                         timings=TimingMetrics(
                             total_seconds=time.perf_counter() - started,
-                            ttft_seconds=0.0,
+                            ttft_seconds=ttft,
                         ),
                     )
                 )

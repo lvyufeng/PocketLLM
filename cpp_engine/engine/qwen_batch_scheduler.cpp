@@ -32,6 +32,13 @@ void QwenBatchScheduler::stop() {
         return;  // Already stopped
     }
 
+    // An idle loop is parked on work_cv_; without this it only notices the
+    // cleared flag after its wait times out.
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+    }
+    work_cv_.notify_all();
+
     // Wait for scheduler thread to exit
     if (schedule_thread_.joinable()) {
         schedule_thread_.join();
@@ -73,6 +80,8 @@ uint64_t QwenBatchScheduler::submit_request(
         std::lock_guard<std::mutex> lock(queue_mutex_);
         waiting_queue_.push(std::move(req));
     }
+    // Wake an idle loop now rather than letting it wait out its tick.
+    work_cv_.notify_one();
 
     return request_id;
 }
@@ -91,6 +100,7 @@ bool QwenBatchScheduler::cancel_request(uint64_t request_id) {
 
     // Mark running request as cancelled
     cancelled_requests_.insert(request_id);
+    work_cv_.notify_one();
     return true;
 }
 
@@ -155,18 +165,33 @@ void QwenBatchScheduler::schedule_loop() {
     }
 
     while (running_.load()) {
+        // Whether this iteration ran a forward pass.  Only an iteration that did
+        // nothing should park the thread: sleeping unconditionally cost a
+        // millisecond per decode step -- one iteration produces one token per
+        // running request -- which showed up as a 1.14x single-request latency
+        // regression against the serial path at 32 tokens.
+        bool progressed = false;
         try {
             admit_requests();
-            run_prefill_batch();
-            run_decode_batch();
+            progressed |= run_prefill_batch();
+            progressed |= run_decode_batch();
             handle_completions();
         } catch (const std::exception& e) {
             std::cerr << "QwenBatchScheduler: exception in schedule loop: "
                      << e.what() << std::endl;
         }
 
-        // Small sleep to avoid busy loop
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (progressed) {
+            continue;
+        }
+
+        // Nothing advanced, so park until a submission arrives.  The timeout is
+        // only a backstop for a state change that forgot to notify; both real
+        // triggers (submit_request, cancel_request) signal work_cv_.
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        work_cv_.wait_for(lock, std::chrono::milliseconds(20), [this] {
+            return !running_.load() || !waiting_queue_.empty();
+        });
     }
 }
 
@@ -200,7 +225,7 @@ void QwenBatchScheduler::admit_requests() {
     }
 }
 
-void QwenBatchScheduler::run_prefill_batch() {
+bool QwenBatchScheduler::run_prefill_batch() {
     std::vector<QwenBatchedRequest*> prefill_batch;
     std::vector<SchedulerRequest*> prefill_requests;
 
@@ -229,7 +254,7 @@ void QwenBatchScheduler::run_prefill_batch() {
     }
 
     if (prefill_batch.empty()) {
-        return;
+        return false;
     }
 
     // Call engine batch_prefill
@@ -259,9 +284,11 @@ void QwenBatchScheduler::run_prefill_batch() {
     for (auto* batch_req : prefill_batch) {
         delete batch_req;
     }
+
+    return true;
 }
 
-void QwenBatchScheduler::run_decode_batch() {
+bool QwenBatchScheduler::run_decode_batch() {
     std::vector<QwenBatchedRequest*> decode_batch;
     std::vector<SchedulerRequest*> decode_requests;
 
@@ -291,7 +318,7 @@ void QwenBatchScheduler::run_decode_batch() {
     }
 
     if (decode_batch.empty()) {
-        return;
+        return false;
     }
 
     // Call engine batch_decode_step
@@ -333,6 +360,8 @@ void QwenBatchScheduler::run_decode_batch() {
     for (auto* batch_req : decode_batch) {
         delete batch_req;
     }
+
+    return true;
 }
 
 void QwenBatchScheduler::handle_completions() {

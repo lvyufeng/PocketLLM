@@ -109,11 +109,11 @@ private:
     // Admit new requests from waiting queue
     void admit_requests();
 
-    // Run prefill batch
-    void run_prefill_batch();
+    // Run prefill batch.  Returns true if a forward pass ran.
+    bool run_prefill_batch();
 
-    // Run decode batch
-    void run_decode_batch();
+    // Run decode batch.  Returns true if a forward pass ran.
+    bool run_decode_batch();
 
     // Handle completed requests
     void handle_completions();
@@ -128,6 +128,9 @@ private:
 
     // Request queues (protected by queue_mutex_)
     mutable std::mutex queue_mutex_;
+    // Signalled when work arrives, so an idle loop wakes on submission instead
+    // of on a fixed timer.
+    std::condition_variable work_cv_;
     std::queue<std::unique_ptr<SchedulerRequest>> waiting_queue_;
     std::unordered_map<int, std::unique_ptr<SchedulerRequest>> slot_to_request_;
     std::unordered_map<uint64_t, int> request_id_to_slot_;
