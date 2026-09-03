@@ -34,7 +34,7 @@ class ConcurrentBenchmark:
         start = time.perf_counter()
         try:
             result = self.llm.generate(
-                prompt_tokens=self.prompt_tokens,
+                [self.prompt_tokens],
                 sampling_params=self.sampling_params
             )
             end = time.perf_counter()
@@ -43,9 +43,9 @@ class ConcurrentBenchmark:
                 "request_id": request_id,
                 "success": True,
                 "latency": end - start,
-                "ttft": result.timings.ttft_seconds,
-                "tokens": len(result.token_ids),
-                "finish_reason": result.finish_reason,
+                "ttft": result[0].timings.ttft_seconds,
+                "tokens": len(result[0].token_ids),
+                "finish_reason": result[0].finish_reason,
             })
         except Exception as e:
             end = time.perf_counter()
@@ -92,6 +92,7 @@ def benchmark_concurrent(
     warmup_runs: int = 1,
     test_runs: int = 3,
     prompt_length: int = 32,
+    tensor_parallel_size: int = 1,
 ):
     """Benchmark concurrent request throughput."""
 
@@ -104,6 +105,7 @@ def benchmark_concurrent(
     args = EngineArgs(
         model=checkpoint,
         backend="cpp",
+        tensor_parallel_size=tensor_parallel_size,
         backend_options={
             "enable_batching": enable_batching,
             "max_batch_size": max(8, num_concurrent) if enable_batching else 1,
@@ -226,6 +228,12 @@ def main():
         default=32,
         help="Prompt length in tokens (default: 32)"
     )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size (default: 1)"
+    )
 
     args = parser.parse_args()
 
@@ -233,6 +241,7 @@ def main():
     print("Concurrent Request Throughput Benchmark")
     print("="*60)
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"Tensor parallel size: {args.tensor_parallel_size}")
 
     # Expected improvements
     targets = {
@@ -254,6 +263,7 @@ def main():
             warmup_runs=args.warmup_runs,
             test_runs=args.test_runs,
             prompt_length=args.prompt_length,
+            tensor_parallel_size=args.tensor_parallel_size,
         )
 
         # Batch mode
@@ -265,6 +275,7 @@ def main():
             warmup_runs=args.warmup_runs,
             test_runs=args.test_runs,
             prompt_length=args.prompt_length,
+            tensor_parallel_size=args.tensor_parallel_size,
         )
 
         all_results[num_concurrent] = {

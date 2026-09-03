@@ -23,6 +23,7 @@ def benchmark_single_request(
     warmup_runs: int = 3,
     test_runs: int = 10,
     prompt_length: int = 32,
+    tensor_parallel_size: int = 1,
 ):
     """Benchmark single request latency."""
 
@@ -35,6 +36,7 @@ def benchmark_single_request(
     args = EngineArgs(
         model=checkpoint,
         backend="cpp",
+        tensor_parallel_size=tensor_parallel_size,
         backend_options={
             "enable_batching": enable_batching,
             "max_batch_size": 8 if enable_batching else 1,
@@ -148,6 +150,12 @@ def main():
         default=32,
         help="Prompt length in tokens (default: 32)"
     )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size (default: 1)"
+    )
 
     args = parser.parse_args()
 
@@ -155,6 +163,7 @@ def main():
     print("Single-Request Latency Benchmark")
     print("="*60)
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"Tensor parallel size: {args.tensor_parallel_size}")
 
     # Benchmark serial mode (baseline)
     serial_result = benchmark_single_request(
@@ -164,6 +173,7 @@ def main():
         warmup_runs=args.warmup_runs,
         test_runs=args.test_runs,
         prompt_length=args.prompt_length,
+        tensor_parallel_size=args.tensor_parallel_size,
     )
 
     # Benchmark batch mode
@@ -174,6 +184,7 @@ def main():
         warmup_runs=args.warmup_runs,
         test_runs=args.test_runs,
         prompt_length=args.prompt_length,
+        tensor_parallel_size=args.tensor_parallel_size,
     )
 
     # Compare results

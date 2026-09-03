@@ -352,12 +352,11 @@ class CppBackend(BackendBase):
         options_cls = getattr(self._native, "QwenEngineOptions", None)
         if cls is None or options_cls is None:
             raise BackendUnavailableError("native module does not expose QwenEngine bindings")
+
+        # Get NCCL ID path from backend_options or environment
         nccl_id_path = str(self.args.backend_options.get("nccl_id_path", ""))
-        if self.args.tensor_parallel_size > 1 and not nccl_id_path:
-            raise ConfigurationError(
-                "C++ backend TP requires backend_options['nccl_id_path'] "
-                "(the supervisor exports POCKETLLM_NCCL_ID_PATH)"
-            )
+        if not nccl_id_path:
+            nccl_id_path = os.environ.get("POCKETLLM_NCCL_ID_PATH", "")
         options = options_cls()
         mappings = {
             "tp_world": self.args.tensor_parallel_size,
@@ -785,3 +784,10 @@ class CppBackend(BackendBase):
                 self._release_native()
             finally:
                 self._request_lock.release()
+
+        # Clean up supervisor if this backend owns it
+        if hasattr(self, "_supervisor"):
+            try:
+                self._supervisor.stop()
+            except Exception:
+                pass
