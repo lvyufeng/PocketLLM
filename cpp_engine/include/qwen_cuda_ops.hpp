@@ -730,6 +730,13 @@ bool qwen_causal_depthwise_conv_silu_f16_cuda(
     const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
     uint16_t* d_tail_fp16, uint16_t* d_y_fp16, int seq_len, int channels,
     int kernel, bool update_tail, void* stream = nullptr);
+// Batched decode variant: `rows` sequences each contribute one new token and
+// carry their own tail at `row * tail_slot_stride` elements. The tail is always
+// updated, since a decode step by definition consumes its token.
+bool qwen_causal_depthwise_conv_silu_f16_batched_cuda(
+    const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
+    uint16_t* d_tail_fp16, uint16_t* d_y_fp16, const int* d_slot_ids, int rows,
+    int channels, int kernel, size_t tail_slot_stride, void* stream = nullptr);
 bool qwen_linear_attn_gates_f16_cuda(
     const uint16_t* d_a_fp16, const uint16_t* d_b_fp16,
     const uint16_t* d_a_log_fp16, const uint16_t* d_dt_bias_fp16,
@@ -741,6 +748,17 @@ bool qwen_gated_delta_step_f16_cuda(
     const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int heads,
     int key_heads, int key_dim, int value_dim, float q_scale,
     void* stream = nullptr);
+// Batched single step: `rows` sequences each advance one token against their own
+// recurrent state slot at `row * state_slot_stride` elements. Q/K/V/gates and
+// the output are row-major over rows.
+// `d_slot_ids` maps each row to the state slot it owns; pass null when the rows
+// occupy slots 0..rows-1 in order.
+bool qwen_gated_delta_step_batched_f16_cuda(
+    float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, const int* d_slot_ids,
+    int rows, int heads, int key_heads, int key_dim, int value_dim,
+    float q_scale, size_t state_slot_stride, void* stream = nullptr);
 bool qwen_gated_delta_sequence_f16_cuda(
     float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
     const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
@@ -782,6 +800,12 @@ bool qwen_partial_rope_rows_f16_cuda(
     uint16_t* d_q_fp16, uint16_t* d_k_fp16, int start_position, int rows,
     int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim,
     void* stream = nullptr);
+// Batched variant: each row uses its own position from d_positions[row].
+// When d_positions is null, falls back to start_position + row.
+bool qwen_partial_rope_rows_f16_batched_cuda(
+    uint16_t* d_q_fp16, uint16_t* d_k_fp16, const int* d_positions, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim,
+    void* stream = nullptr);
 bool qwen_split_q_gate_f16_cuda(const uint16_t* d_q_proj_fp16,
                                 uint16_t* d_q_fp16,
                                 uint16_t* d_gate_fp16, int rows,
@@ -806,12 +830,34 @@ bool qwen_append_kv_cache_f16_cuda(
     uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len,
     int kv_heads, int head_dim, int start_pos, int max_context,
     void* stream = nullptr);
+// Batched variant: row `r` writes its K/V into its own cache slot at
+// `r * kv_slot_stride` elements, at position d_start_positions[r] within that
+// slot. Every sequence contributes exactly one token, so `rows` is the batch
+// width rather than a sequence length.
+// `d_slot_ids` maps each row to the cache slot it owns, because slots are
+// allocated as requests arrive: a four-row batch can hold slots 1/3/5/6. Pass
+// null when the rows occupy slots 0..rows-1 in order.
+bool qwen_append_kv_cache_f16_batched_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int rows,
+    int kv_heads, int head_dim, const int* d_start_positions,
+    const int* d_slot_ids, int max_context, size_t kv_slot_stride,
+    void* stream = nullptr);
 bool qwen_append_kv_cache_fp8_cuda(
     const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
     uint8_t* d_k_cache_fp8, uint8_t* d_v_cache_fp8,
     uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16, int seq_len,
     int kv_heads, int head_dim, int scale_block, int start_pos,
     int max_context, void* stream = nullptr);
+// Batched variant for FP8 cache. `kv_slot_stride` is in cache elements; the
+// scale array is strided by kv_slot_stride / scale_block to match.
+bool qwen_append_kv_cache_fp8_batched_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_k_cache_fp8, uint8_t* d_v_cache_fp8,
+    uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16, int rows,
+    int kv_heads, int head_dim, int scale_block, const int* d_start_positions,
+    const int* d_slot_ids, int max_context, size_t kv_slot_stride,
+    void* stream = nullptr);
 bool qwen_gqa_decode_attention_f16_cuda(
     const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
@@ -852,6 +898,28 @@ enum class QwenGqaDecodeVariant {
 int qwen_gqa_decode_split_count_variant(
     int attended_positions, QwenGqaDecodeVariant variant,
     int split_count_override = 0);
+
+// Batched decode: one launch serves `rows` sequences, each reading its own KV
+// slot at `row * kv_slot_stride` elements and attending its own context length
+// from `d_context_lens`. Split geometry is derived from `max_context_len`, the
+// longest row in the batch, so every row shares one grid. Q, output and the
+// partial scratch are row-major over rows.
+//
+// Scratch must be sized rows * q_heads * splits * (head_dim + 2) using the
+// split count below, which is the same number the launch computes.
+int qwen_gqa_decode_batched_split_count(
+    int max_context_len, int kv_heads, int attention_window = 0,
+    int sink_tokens = 0);
+// `d_slot_ids` maps each row to the KV slot it owns; pass null when the rows
+// occupy slots 0..rows-1 in order.
+bool qwen_gqa_decode_attention_f16_batched_cuda(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_partial_scratch, const int* d_context_lens,
+    const int* d_slot_ids, int rows, int max_context_len,
+    size_t kv_slot_stride, int q_heads, int kv_heads, int head_dim,
+    int max_context, int attention_window = 0, int sink_tokens = 0,
+    void* stream = nullptr);
 
 // Fused decode with the split kernel chosen explicitly. Returns false when the
 // requested variant does not support the shape (the tensor-core kernel requires

@@ -706,6 +706,18 @@ add_executable(test_qwen_half_ops tests/test_qwen_half_ops.cpp)
 target_link_libraries(test_qwen_half_ops PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_half_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_batched_decode tests/test_qwen_batched_decode.cpp)
+target_link_libraries(test_qwen_batched_decode PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_batched_decode PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_batched_engine_parity tests/test_qwen_batched_engine_parity.cpp)
+target_link_libraries(test_qwen_batched_engine_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_batched_engine_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_batched_throughput tests/bench_qwen_batched_throughput.cpp)
+target_link_libraries(bench_qwen_batched_throughput PRIVATE dsv4_cpp_core)
+set_target_properties(bench_qwen_batched_throughput PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_qwen_nvfp4 tests/test_qwen_nvfp4.cpp)
 target_link_libraries(test_qwen_nvfp4 PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

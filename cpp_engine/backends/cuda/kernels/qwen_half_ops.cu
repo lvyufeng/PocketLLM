@@ -2227,6 +2227,41 @@ __global__ void conv_silu_f16_kernel(
     }
 }
 
+// Batched decode variant: one token per sequence, each against its own
+// convolution tail. blockIdx.y selects the sequence. Distinct from the seq_len
+// loop above, where the rows are consecutive tokens of one sequence.
+__global__ void conv_silu_f16_batched_kernel(
+    const uint16_t* x, const uint16_t* weight, uint16_t* tail,
+    uint16_t* y, const int* slot_ids, int rows, int channels, int kernel,
+    size_t tail_slot_stride) {
+    const int channel = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = static_cast<int>(blockIdx.y);
+    if (channel >= channels || row >= rows) return;
+    const uint16_t* w = weight + static_cast<size_t>(channel) * kernel;
+    const int tail_len = kernel - 1;
+    // The tail slot is not the batch index; slots are assigned per request.
+    uint16_t* row_tail = tail +
+        static_cast<size_t>(slot_ids != nullptr ? slot_ids[row] : row) *
+        tail_slot_stride;
+    const size_t index = static_cast<size_t>(row) * channels + channel;
+    // The single new token is the last kernel tap; the earlier taps come from
+    // this sequence's tail.
+    float value = half_to_float(x[index]) * half_to_float(w[tail_len]);
+    for (int j = 0; j < tail_len; ++j) {
+        value += half_to_float(row_tail[static_cast<size_t>(j) * channels + channel]) *
+            half_to_float(w[j]);
+    }
+    y[index] = float_to_half(silu(value));
+    // Shift the tail by one and append the new token.
+    for (int j = 0; j + 1 < tail_len; ++j) {
+        row_tail[static_cast<size_t>(j) * channels + channel] =
+            row_tail[static_cast<size_t>(j + 1) * channels + channel];
+    }
+    if (tail_len > 0) {
+        row_tail[static_cast<size_t>(tail_len - 1) * channels + channel] = x[index];
+    }
+}
+
 __global__ void linear_gates_f16_kernel(
     const uint16_t* a, const uint16_t* b, const uint16_t* a_log,
     const uint16_t* dt_bias, uint16_t* g, uint16_t* beta,
@@ -2253,6 +2288,84 @@ __global__ void gated_delta_step_f16_kernel(
     const int value = static_cast<int>(threadIdx.x);
     const int repeat = heads / key_heads;
     const int key_head = head / repeat;
+    extern __shared__ float smem[];
+    float* k_shared = smem;
+    float* q_shared = smem + key_dim;
+    float* reduce = smem + 2 * key_dim;
+    const int tid = static_cast<int>(threadIdx.x);
+    float q_partial = 0.0f;
+    float k_partial = 0.0f;
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        const float qv = half_to_float(q[static_cast<size_t>(key_head) * key_dim + i]);
+        const float kv = half_to_float(k[static_cast<size_t>(key_head) * key_dim + i]);
+        q_partial += qv * qv;
+        k_partial += kv * kv;
+    }
+    reduce[tid] = q_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float q_inv = rsqrtf(reduce[0] + 1.0e-6f);
+    __syncthreads();
+    reduce[tid] = k_partial;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) reduce[tid] += reduce[tid + stride];
+        __syncthreads();
+    }
+    const float k_inv = rsqrtf(reduce[0] + 1.0e-6f);
+    for (int i = tid; i < key_dim; i += blockDim.x) {
+        q_shared[i] = half_to_float(q[static_cast<size_t>(key_head) * key_dim + i]) * q_inv;
+        k_shared[i] = half_to_float(k[static_cast<size_t>(key_head) * key_dim + i]) * k_inv;
+    }
+    __syncthreads();
+    if (head >= heads || value >= value_dim) return;
+    float* sh = state + static_cast<size_t>(head) * key_dim * value_dim;
+    const float decay = expf(half_to_float(g[head]));
+    const float b = half_to_float(beta[head]);
+    float kv_mem = 0.0f;
+    for (int i = 0; i < key_dim; ++i) {
+        const size_t index = static_cast<size_t>(i) * value_dim + value;
+        const float cell = sh[index] * decay;
+        sh[index] = cell;
+        kv_mem += cell * k_shared[i];
+    }
+    const float delta = (half_to_float(v[static_cast<size_t>(head) * value_dim + value]) - kv_mem) * b;
+    float result = 0.0f;
+    for (int i = 0; i < key_dim; ++i) {
+        const size_t index = static_cast<size_t>(i) * value_dim + value;
+        const float cell = sh[index] + k_shared[i] * delta;
+        sh[index] = cell;
+        result += cell * q_shared[i];
+    }
+    output[static_cast<size_t>(head) * value_dim + value] = float_to_half(result * q_scale);
+}
+
+// Batched single-step recurrence: blockIdx.y selects the sequence, which owns
+// its own recurrent state slot. Every sequence advances one token, so the rows
+// are independent and the arithmetic per row is identical to the step kernel
+// above -- only the base pointers differ.
+__global__ void gated_delta_step_batched_f16_kernel(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, const int* slot_ids, int heads, int key_heads,
+    int key_dim, int value_dim, float q_scale, size_t state_slot_stride) {
+    const int head = static_cast<int>(blockIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    const int value = static_cast<int>(threadIdx.x);
+    const int repeat = heads / key_heads;
+    const int key_head = head / repeat;
+    // The state slot is not the batch index; slots are assigned per request.
+    state += static_cast<size_t>(slot_ids != nullptr ? slot_ids[row] : row) *
+        state_slot_stride;
+    q += static_cast<size_t>(row) * key_heads * key_dim;
+    k += static_cast<size_t>(row) * key_heads * key_dim;
+    v += static_cast<size_t>(row) * heads * value_dim;
+    g += static_cast<size_t>(row) * heads;
+    beta += static_cast<size_t>(row) * heads;
+    output += static_cast<size_t>(row) * heads * value_dim;
     extern __shared__ float smem[];
     float* k_shared = smem;
     float* q_shared = smem + key_dim;
@@ -2571,6 +2684,35 @@ __global__ void partial_rope_f16_kernel(
     }
 }
 
+__global__ void partial_rope_f16_batched_kernel(
+    uint16_t* q, uint16_t* k, const int* positions, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim) {
+    const int half = rotary_dim / 2;
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = static_cast<int>(blockIdx.y);
+    if (index >= half || row >= rows) return;
+    const int position = positions[row];
+    const float angle = static_cast<float>(position) * rope_inv_freq(index, rotary_dim, theta);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
+    uint16_t* qr = q + static_cast<size_t>(row) * q_heads * head_dim;
+    uint16_t* kr = k + static_cast<size_t>(row) * kv_heads * head_dim;
+    for (int head = 0; head < q_heads; ++head) {
+        uint16_t* line = qr + static_cast<size_t>(head) * head_dim;
+        const float a = half_to_float(line[index]);
+        const float b = half_to_float(line[index + half]);
+        line[index] = float_to_half(a * c - b * s);
+        line[index + half] = float_to_half(b * c + a * s);
+    }
+    for (int head = 0; head < kv_heads; ++head) {
+        uint16_t* line = kr + static_cast<size_t>(head) * head_dim;
+        const float a = half_to_float(line[index]);
+        const float b = half_to_float(line[index + half]);
+        line[index] = float_to_half(a * c - b * s);
+        line[index + half] = float_to_half(b * c + a * s);
+    }
+}
+
 __global__ void split_q_gate_f16_kernel(
     const uint16_t* source, uint16_t* q, uint16_t* gate,
     int rows, int q_heads, int head_dim) {
@@ -2617,6 +2759,32 @@ __global__ void append_kv_f16_kernel(
     v_cache[destination] = v_rows[index];
 }
 
+// Batched decode append: one token per sequence, each into its own KV slot at
+// its own position. Distinct from the kernel above, where the rows are
+// consecutive tokens of a single sequence sharing one slot.
+//
+// The slot a row occupies is not its index in the batch: slots are allocated and
+// freed as requests arrive and finish, so a four-row batch can hold slots
+// 1/3/5/6. `slot_ids` carries that mapping; passing null means slot == row.
+__global__ void append_kv_f16_batched_kernel(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, const int* start_positions,
+    const int* slot_ids, int rows, int kv_heads, int head_dim, int max_context,
+    size_t kv_slot_stride) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = rows * kv_heads * head_dim;
+    if (index >= total) return;
+    const int row = index / (kv_heads * head_dim);
+    const int within = index % (kv_heads * head_dim);
+    const int destination_token = start_positions[row];
+    if (destination_token >= max_context) return;
+    const int slot = slot_ids != nullptr ? slot_ids[row] : row;
+    const size_t destination = static_cast<size_t>(slot) * kv_slot_stride +
+        static_cast<size_t>(destination_token) * kv_heads * head_dim + within;
+    k_cache[destination] = k_rows[index];
+    v_cache[destination] = v_rows[index];
+}
+
 __global__ void append_kv_fp8_kernel(
     const uint16_t* k_rows, const uint16_t* v_rows,
     uint8_t* k_cache, uint8_t* v_cache,
@@ -2652,6 +2820,61 @@ __global__ void append_kv_fp8_kernel(
     const float ks = reduce_k[0] > 0.0f ? reduce_k[0] / 448.0f : 1.0f;
     const float vs = reduce_v[0] > 0.0f ? reduce_v[0] / 448.0f : 1.0f;
     const int destination_token = start_pos + token;
+    const size_t scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) * blocks_per_head + channel_block;
+    if (threadIdx.x == 0) {
+        k_scale[scale_index] = float_to_half(ks);
+        v_scale[scale_index] = float_to_half(vs);
+    }
+    const size_t destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) * head_dim + channel_block * scale_block;
+    for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
+        k_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(k_rows[source_base + d]) / ks);
+        v_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(v_rows[source_base + d]) / vs);
+    }
+}
+
+__global__ void append_kv_fp8_batched_kernel(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint8_t* k_cache, uint8_t* v_cache,
+    uint16_t* k_scale, uint16_t* v_scale,
+    const int* start_positions, const int* slot_ids, int rows, int kv_heads,
+    int head_dim, int scale_block, int max_context, size_t kv_slot_stride) {
+    const int block_index = static_cast<int>(blockIdx.x);
+    const int blocks_per_head = head_dim / scale_block;
+    const int row = block_index / (kv_heads * blocks_per_head);
+    const int within = block_index % (kv_heads * blocks_per_head);
+    const int head = within / blocks_per_head;
+    const int channel_block = within % blocks_per_head;
+    if (row >= rows) return;
+    const int destination_token = start_positions[row];
+    if (destination_token >= max_context) return;
+    // Each sequence owns a contiguous cache slot, which is not its batch index;
+    // the scale array is strided by the same slot count over the block width.
+    const int slot = slot_ids != nullptr ? slot_ids[row] : row;
+    k_cache += static_cast<size_t>(slot) * kv_slot_stride;
+    v_cache += static_cast<size_t>(slot) * kv_slot_stride;
+    k_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
+    v_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
+    const int source_base = (row * kv_heads + head) * head_dim + channel_block * scale_block;
+    float k_max = 0.0f;
+    float v_max = 0.0f;
+    for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
+        k_max = fmaxf(k_max, fabsf(half_to_float(k_rows[source_base + d])));
+        v_max = fmaxf(v_max, fabsf(half_to_float(v_rows[source_base + d])));
+    }
+    __shared__ float reduce_k[128];
+    __shared__ float reduce_v[128];
+    reduce_k[threadIdx.x] = k_max;
+    reduce_v[threadIdx.x] = v_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce_k[threadIdx.x] = fmaxf(reduce_k[threadIdx.x], reduce_k[threadIdx.x + stride]);
+            reduce_v[threadIdx.x] = fmaxf(reduce_v[threadIdx.x], reduce_v[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float ks = reduce_k[0] > 0.0f ? reduce_k[0] / 448.0f : 1.0f;
+    const float vs = reduce_v[0] > 0.0f ? reduce_v[0] / 448.0f : 1.0f;
     const size_t scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) * blocks_per_head + channel_block;
     if (threadIdx.x == 0) {
         k_scale[scale_index] = float_to_half(ks);
@@ -3805,6 +4028,20 @@ bool qwen_causal_depthwise_conv_silu_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_causal_depthwise_conv_silu_f16_batched_cuda(
+    const uint16_t* x, const uint16_t* weight, uint16_t* tail,
+    uint16_t* y, const int* slot_ids, int rows, int channels, int kernel,
+    size_t tail_slot_stride, void* stream) {
+    if (!x || !weight || !y || !tail || rows <= 0 || channels <= 0 ||
+        kernel <= 0 || kernel - 1 > 8 || tail_slot_stride == 0) return false;
+    const dim3 grid(static_cast<unsigned>((channels + kThreads - 1) / kThreads),
+                    static_cast<unsigned>(rows), 1);
+    conv_silu_f16_batched_kernel<<<grid, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(x, weight, tail, y, slot_ids, rows,
+        channels, kernel, tail_slot_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_linear_attn_gates_f16_cuda(
     const uint16_t* a, const uint16_t* b, const uint16_t* a_log,
     const uint16_t* dt_bias, uint16_t* g, uint16_t* beta,
@@ -3828,6 +4065,29 @@ bool qwen_gated_delta_step_f16_cuda(
     const size_t shared = (2u * static_cast<size_t>(key_dim) + threads) * sizeof(float);
     gated_delta_step_f16_kernel<<<heads, threads, shared, static_cast<cudaStream_t>(stream)>>>(
         state, q, k, v, g, beta, output, heads, key_heads, key_dim, value_dim, q_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gated_delta_step_batched_f16_cuda(
+    float* state, const uint16_t* q, const uint16_t* k,
+    const uint16_t* v, const uint16_t* g, const uint16_t* beta,
+    uint16_t* output, const int* slot_ids, int rows, int heads, int key_heads,
+    int key_dim, int value_dim, float q_scale, size_t state_slot_stride,
+    void* stream) {
+    if (!state || !q || !k || !v || !g || !beta || !output || rows <= 0 ||
+        heads <= 0 || key_heads <= 0 || heads % key_heads != 0 ||
+        key_dim <= 0 || value_dim <= 0 || q_scale <= 0.0f ||
+        state_slot_stride == 0) return false;
+    int threads = 32;
+    while (threads < value_dim) threads <<= 1;
+    if (threads > 1024) return false;
+    const size_t shared = (2u * static_cast<size_t>(key_dim) + threads) * sizeof(float);
+    const dim3 grid(static_cast<unsigned>(heads),
+                    static_cast<unsigned>(rows), 1);
+    gated_delta_step_batched_f16_kernel<<<grid, threads, shared,
+        static_cast<cudaStream_t>(stream)>>>(
+        state, q, k, v, g, beta, output, slot_ids, heads, key_heads, key_dim,
+        value_dim, q_scale, state_slot_stride);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3969,6 +4229,20 @@ bool qwen_partial_rope_rows_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_partial_rope_rows_f16_batched_cuda(
+    uint16_t* q, uint16_t* k, const int* positions, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads,
+    int head_dim, void* stream) {
+    if (!q || !k || !positions || rows <= 0 || rotary_dim <= 0 ||
+        (rotary_dim & 1) != 0 || rotary_dim > head_dim || theta <= 0.0f ||
+        q_heads <= 0 || kv_heads <= 0 || head_dim <= 0) return false;
+    dim3 grid(static_cast<unsigned>((rotary_dim / 2 + kThreads - 1) / kThreads),
+              static_cast<unsigned>(rows), 1);
+    partial_rope_f16_batched_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        q, k, positions, rows, rotary_dim, theta, q_heads, kv_heads, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_split_q_gate_f16_cuda(
     const uint16_t* source, uint16_t* q, uint16_t* gate,
     int rows, int q_heads, int head_dim, void* stream) {
@@ -4021,6 +4295,22 @@ bool qwen_append_kv_cache_f16_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool qwen_append_kv_cache_f16_batched_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, int rows,
+    int kv_heads, int head_dim, const int* start_positions,
+    const int* slot_ids, int max_context, size_t kv_slot_stride, void* stream) {
+    if (!k_rows || !v_rows || !k_cache || !v_cache || !start_positions ||
+        rows <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        max_context <= 0 || kv_slot_stride == 0) return false;
+    const int total = rows * kv_heads * head_dim;
+    append_kv_f16_batched_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(k_rows, v_rows, k_cache, v_cache,
+        start_positions, slot_ids, rows, kv_heads, head_dim, max_context,
+        kv_slot_stride);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool qwen_append_kv_cache_fp8_cuda(
     const uint16_t* k_rows, const uint16_t* v_rows,
     uint8_t* k_cache, uint8_t* v_cache, uint16_t* k_scale,
@@ -4034,6 +4324,24 @@ bool qwen_append_kv_cache_fp8_cuda(
     append_kv_fp8_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
         k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, seq_len,
         kv_heads, head_dim, scale_block, start_pos, max_context);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_fp8_batched_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint8_t* k_cache, uint8_t* v_cache, uint16_t* k_scale,
+    uint16_t* v_scale, int rows, int kv_heads, int head_dim,
+    int scale_block, const int* start_positions, const int* slot_ids,
+    int max_context, size_t kv_slot_stride, void* stream) {
+    if (!k_rows || !v_rows || !k_cache || !v_cache || !k_scale || !v_scale ||
+        !start_positions || rows <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        scale_block <= 0 || scale_block > 128 || head_dim % scale_block != 0 ||
+        max_context <= 0 || kv_slot_stride == 0) return false;
+    const int blocks = rows * kv_heads * (head_dim / scale_block);
+    append_kv_fp8_batched_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, start_positions,
+        slot_ids, rows, kv_heads, head_dim, scale_block, max_context,
+        kv_slot_stride);
     return cudaGetLastError() == cudaSuccess;
 }
 
