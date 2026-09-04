@@ -462,6 +462,27 @@ struct QwenEngine::Impl {
     QwenDeviceTensor hidden_b;
     QwenDeviceTensor argmax_token;
     QwenDeviceTensor argmax_logit;
+    // Batched decode row metadata. Each row of a batched decode step sits at a
+    // different position in a different slot, so the kernels read these arrays
+    // instead of the scalar position/slot the single-sequence path passes down.
+    // Null in `batch_rows` is what tells every layer it is on the single-row
+    // path, which keeps the existing launches byte-for-byte unchanged.
+    struct BatchRows {
+        // Device arrays, all `rows` long.
+        const int* slot_ids = nullptr;
+        // Position of each row's new token, i.e. its context length minus one.
+        const int* positions = nullptr;
+        // Context length after the new token is appended: positions[i] + 1.
+        const int* context_lens = nullptr;
+        // Host mirrors. The launchers need the widest context to size the split
+        // geometry and the scratch, and that is a host-side decision.
+        int rows = 0;
+        int max_context_len = 0;
+    };
+    const BatchRows* batch_rows = nullptr;
+    QwenDeviceTensor batch_slot_ids;
+    QwenDeviceTensor batch_positions;
+    QwenDeviceTensor batch_context_lens;
     // Sampling scratch. Allocated lazily on the first sampled step so greedy
     // runs pay nothing.
     QwenDeviceTensor sample_cand_token;
@@ -2151,7 +2172,11 @@ struct QwenEngine::Impl {
 #ifndef POCKET_BACKEND_ASCEND
         QwenDeviceTensor* q_normalized = nullptr;
         QwenDeviceTensor* k_normalized = nullptr;
-        const bool flashqla = rows >= 8 &&
+        // Every sequence-recurrence kernel below reads `rows` as consecutive
+        // tokens of one stream. A batched decode step is the opposite: `rows`
+        // independent sequences each advancing one token, so none of them apply
+        // and the batched step kernel handles it instead.
+        const bool flashqla = batch_rows == nullptr && rows >= 8 &&
             qwen_env_enabled_default("QWEN_GATED_DELTA_FLASHQLA_SM75");
         if (flashqla) {
             q_normalized = &workspace_float(
@@ -2187,6 +2212,19 @@ struct QwenEngine::Impl {
             projection(layer.linear.qkv, hidden, packed.f16_data(), rows,
                        "lin.qkv");
         }
+#ifndef POCKET_BACKEND_ASCEND
+        if (batch_rows != nullptr) {
+            // One token per sequence against that sequence's own tail. The
+            // pointer is the arena base here, not this slot's rows, because the
+            // kernel resolves the slot per row.
+            require_launch(qwen_causal_depthwise_conv_silu_f16_batched_cuda(
+                packed.f16_data(), layer.linear.conv.f16_data(),
+                layer.linear.conv_tail.f16_data(), convolved.f16_data(),
+                batch_rows->slot_ids, rows, packed_dim, kernel,
+                slot_stride_elements(layer.linear.conv_tail)),
+                "FP16 batched linear causal convolution");
+        } else
+#endif
         require_launch(qwen_causal_depthwise_conv_silu_f16(
             packed.f16_data(), layer.linear.conv.f16_data(),
             conv_tail, convolved.f16_data(), rows,
@@ -2221,7 +2259,17 @@ struct QwenEngine::Impl {
         delta_scope.emplace(this, "gated_delta");
         bool sequenced = false;
 #ifndef POCKET_BACKEND_ASCEND
-        if (flashqla) {
+        if (batch_rows != nullptr) {
+            sequenced = qwen_gated_delta_step_batched_f16_cuda(
+                layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
+                v.f16_data(), gates.f16_data(), beta.f16_data(),
+                core.f16_data(), batch_rows->slot_ids, rows, value_heads,
+                key_heads,
+                static_cast<int>(config.linear_attention.key_head_dim),
+                static_cast<int>(config.linear_attention.value_head_dim),
+                q_scale, slot_stride_elements(layer.linear.state));
+            require_launch(sequenced, "FP16 batched linear recurrent state");
+        } else if (flashqla) {
             // FlashQLA SM75 subgroup-sharded kernel. Still a serial recurrence,
             // but sharding the [128, 128] state over 16-lane subgroups replaces
             // the baseline's 128-element per-thread register vector: 1.85x on the
@@ -2409,6 +2457,17 @@ struct QwenEngine::Impl {
              rows * q_heads, head_dim);
         norm(layer.full.k_norm, k.f16_data(), k_norm.f16_data(),
              rows * kv_heads, head_dim);
+#ifndef POCKET_BACKEND_ASCEND
+        if (batch_rows != nullptr) {
+            // Each row is a different sequence at its own position, so the
+            // rotation angle is per row rather than position_offset + row.
+            require_launch(qwen_partial_rope_rows_f16_batched_cuda(
+                q_norm.f16_data(), k_norm.f16_data(), batch_rows->positions,
+                rows, static_cast<int>(config.partial_rotary_dim()),
+                static_cast<float>(config.rope_theta), q_heads, kv_heads,
+                head_dim), "FP16 batched partial RoPE");
+        } else
+#endif
         require_launch(qwen_partial_rope_rows_f16(
             q_norm.f16_data(), k_norm.f16_data(), position_offset, rows,
             static_cast<int>(config.partial_rotary_dim()),
@@ -2485,8 +2544,21 @@ struct QwenEngine::Impl {
 #else
         // Phase 3.3: Use slot_id parameter instead of global current_slot_id
         const size_t slot_offset = kv_slot_offset_elements(slot_id, kv_heads, head_dim);
+        // Distance between slots in the KV arena. kv_slot_offset_elements folds
+        // this to zero for a single session, so the stride is recomputed rather
+        // than divided out of it.
+        const size_t kv_slot_stride = static_cast<size_t>(max_context) *
+            kv_heads * head_dim;
 
-        if (cache_dtype == QwenKvCacheDType::Fp8) {
+        if (batch_rows != nullptr) {
+            // Each row appends its new K/V at its own position in its own slot.
+            require_launch(qwen_append_kv_cache_f16_batched_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                rows, kv_heads, head_dim, batch_rows->positions,
+                batch_rows->slot_ids, max_context, kv_slot_stride),
+                "append batched FP16 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(),
                 layer.full.k_cache.fp8_data() + slot_offset,
@@ -2525,7 +2597,29 @@ struct QwenEngine::Impl {
                 position_offset, max_context), "append FP16 full KV cache");
         }
 
-        if (rows == 1) {
+        if (batch_rows != nullptr) {
+            // One launch for the whole batch. The split geometry comes from the
+            // longest row, so the scratch is sized from that same query the
+            // launcher uses; shorter rows leave their trailing splits empty.
+            const int splits = qwen_gqa_decode_batched_split_count(
+                batch_rows->max_context_len, kv_heads, attention_window,
+                sink_tokens);
+            require_launch(splits > 0, "batched decode split geometry");
+            QwenDeviceTensor& partials = workspace_float(
+                static_cast<size_t>(rows) * q_heads * splits *
+                    static_cast<size_t>(head_dim + 2),
+                {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(splits),
+                 static_cast<uint64_t>(head_dim + 2)});
+            PhaseScope sub(this, "full.attn_kernel");
+            require_launch(qwen_gqa_decode_attention_f16_batched_cuda(
+                q_norm.f16_data(), layer.full.k_cache.f16_data(),
+                layer.full.v_cache.f16_data(), attention.f16_data(),
+                partials.f32_data(), batch_rows->context_lens,
+                batch_rows->slot_ids, rows, batch_rows->max_context_len,
+                kv_slot_stride, q_heads, kv_heads, head_dim, max_context,
+                attention_window, sink_tokens), "batched decode FP16-cache GQA");
+        } else if (rows == 1) {
             const int context_length = position_offset + 1;
             const bool optimized_attention =
                 qwen_env_enabled_default("DSV4_QWEN_GQA_OPTIMIZED") ||
@@ -3947,6 +4041,137 @@ struct QwenEngine::Impl {
         return result;
     }
 
+    // One decode step for `rows` independent sequences in a single forward pass.
+    //
+    // This is not run_chunk with a wider row count: there, the rows are
+    // consecutive tokens of one sequence sharing a position offset and a KV
+    // slot. Here each row is its own sequence with its own position, its own KV
+    // slot, and its own recurrent state, which is why the per-row metadata goes
+    // to the device and the attention and recurrence kernels switch to their
+    // batched variants. Everything between those points -- embedding, norms,
+    // projections, SwiGLU, the LM head -- is already row-wise and is reused
+    // unchanged. Amortizing the weight loads over the rows is the whole point:
+    // decode is weight-bandwidth bound, so the batch is close to free.
+    QwenVerifyBatch run_batched_decode(const std::vector<int>& tokens,
+                                       const std::vector<int>& positions,
+                                       const std::vector<int>& slot_ids,
+                                       int active_layers) {
+        const int rows = static_cast<int>(tokens.size());
+        if (rows <= 0) {
+            throw std::runtime_error("Qwen batched decode requires a row");
+        }
+        if (positions.size() != tokens.size() ||
+            slot_ids.size() != tokens.size()) {
+            throw std::runtime_error(
+                "Qwen batched decode row metadata has mismatched extents");
+        }
+        // The speculative and MTP paths each keep a single-sequence context
+        // (committed position, target taps, seed hidden) that a batch of
+        // independent sequences would interleave into nonsense. They are
+        // rejected rather than silently producing a wrong result.
+        if (mtp_enabled || dspark_enabled || dflash2_enabled) {
+            throw std::runtime_error(
+                "Qwen batched decode is not compatible with MTP or speculative "
+                "decoding");
+        }
+#ifdef POCKET_BACKEND_ASCEND
+        throw std::runtime_error(
+            "Qwen batched decode has no Ascend kernels yet");
+#else
+        // The batched append and attention kernels are FP16-cache only. A
+        // quantized cache would have the FP16 append write raw halves into
+        // packed codes, so it is refused rather than silently corrupted.
+        if (options.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+            throw std::runtime_error(
+                "Qwen batched decode requires an FP16 KV cache");
+        }
+        std::vector<int> context_lens(static_cast<size_t>(rows));
+        int max_context_len = 0;
+        for (int row = 0; row < rows; ++row) {
+            const int position = positions[static_cast<size_t>(row)];
+            const int slot = slot_ids[static_cast<size_t>(row)];
+            if (position < 0 || position >= max_context) {
+                throw std::runtime_error(
+                    "Qwen batched decode position is out of range");
+            }
+            if (slot < 0 || slot >= max_batch_size) {
+                throw std::runtime_error(
+                    "Qwen batched decode slot is out of range");
+            }
+            context_lens[static_cast<size_t>(row)] = position + 1;
+            max_context_len = std::max(max_context_len, position + 1);
+        }
+
+        const size_t row_bytes = static_cast<size_t>(rows) * sizeof(int);
+        allocate(batch_positions, row_bytes, {static_cast<uint64_t>(rows)},
+                 SafeDType::I64);
+        allocate(batch_slot_ids, row_bytes, {static_cast<uint64_t>(rows)},
+                 SafeDType::I64);
+        allocate(batch_context_lens, row_bytes, {static_cast<uint64_t>(rows)},
+                 SafeDType::I64);
+        check_device(memcpy_h2d(batch_positions.data, positions.data(), row_bytes),
+                     "Qwen batched decode position upload");
+        check_device(memcpy_h2d(batch_slot_ids.data, slot_ids.data(), row_bytes),
+                     "Qwen batched decode slot upload");
+        check_device(memcpy_h2d(batch_context_lens.data, context_lens.data(),
+                                row_bytes),
+                     "Qwen batched decode context length upload");
+
+        BatchRows metadata;
+        metadata.positions = static_cast<const int*>(batch_positions.data);
+        metadata.slot_ids = static_cast<const int*>(batch_slot_ids.data);
+        metadata.context_lens = static_cast<const int*>(batch_context_lens.data);
+        metadata.rows = rows;
+        metadata.max_context_len = max_context_len;
+
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        const size_t hidden_elements = static_cast<size_t>(rows) * hidden_size;
+        const std::vector<uint64_t> hidden_shape = {
+            static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)};
+        local_tokens = tokens;
+        allocate(d_tokens, local_tokens.size() * sizeof(int),
+                 {static_cast<uint64_t>(rows)}, SafeDType::I64);
+        check_device(memcpy_h2d(d_tokens.data, local_tokens.data(),
+                                local_tokens.size() * sizeof(int)),
+                     "Qwen batched decode token upload");
+        allocate_half(hidden_a, hidden_elements, hidden_shape);
+        allocate_half(hidden_b, hidden_elements, hidden_shape);
+        require_launch(qwen_embedding_fp16_gather_f16(
+            embed.f16_data(), static_cast<int*>(d_tokens.data),
+            hidden_a.f16_data(), rows, hidden_size,
+            static_cast<int>(weights_vocab_start()),
+            static_cast<int>(embed.shape[0])),
+            "Qwen batched decode embedding lookup");
+        all_reduce_half(hidden_a.f16_data(), rows * hidden_size, "hidden_a");
+
+        uint16_t* hidden = hidden_a.f16_data();
+        uint16_t* output = hidden_b.f16_data();
+        // Scoped so an exception inside a layer cannot leave the batched flag
+        // set and silently redirect the next single-sequence forward.
+        struct BatchScope {
+            Impl* impl;
+            explicit BatchScope(Impl* self, const BatchRows* rows) : impl(self) {
+                impl->batch_rows = rows;
+            }
+            ~BatchScope() { impl->batch_rows = nullptr; }
+        } scope(this, &metadata);
+        for (int layer_index = 0; layer_index < active_layers; ++layer_index) {
+            {
+                PhaseScope phase(this, "STACK.b");
+                // position_offset and slot_id are unused on the batched path:
+                // both are per row and come from the uploaded metadata.
+                layer_forward(layers[static_cast<size_t>(layer_index)], hidden,
+                              output, rows, 0, 0);
+            }
+            std::swap(hidden, output);
+        }
+        // One LM head GEMM over all rows, which is the same amortization the
+        // rest of the step gets. position_after is reported per row by the
+        // caller, so the batch-wide value here is only the widest context.
+        return target_logits_for(hidden, rows, max_context_len);
+#endif
+    }
+
     uint64_t activation_capacity_bytes() const {
         return hidden_a.capacity + hidden_b.capacity + d_tokens.capacity +
                argmax_token.capacity + argmax_logit.capacity +
@@ -4263,6 +4488,66 @@ QwenBatchPrefillResult QwenEngine::batch_prefill(
     return result;
 }
 
+std::vector<QwenForwardResult> QwenEngine::batch_decode_tokens(
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids) {
+    if (tokens.size() != slot_ids.size()) {
+        throw std::runtime_error(
+            "QwenEngine::batch_decode_tokens: token and slot extents differ");
+    }
+    const int rows = static_cast<int>(tokens.size());
+    if (rows == 0) return {};
+    std::optional<Impl::RangeScope> range;
+    if (impl_->range_profile) range.emplace("qwen.batch_decode");
+
+    // Two rows in the same slot would have the second read the KV the first
+    // wrote at the same position, so the batch has to be over distinct slots.
+    std::vector<int> positions(static_cast<size_t>(rows));
+    for (int row = 0; row < rows; ++row) {
+        const int slot = slot_ids[static_cast<size_t>(row)];
+        for (int earlier = 0; earlier < row; ++earlier) {
+            if (slot_ids[static_cast<size_t>(earlier)] == slot) {
+                throw std::runtime_error(
+                    "QwenEngine::batch_decode_tokens: slot " +
+                    std::to_string(slot) + " appears twice in one batch");
+            }
+        }
+        const int position = impl_->slot_position(slot, position_);
+        if (position >= max_context_) {
+            throw std::runtime_error("Qwen context length exceeded");
+        }
+        positions[static_cast<size_t>(row)] = position;
+    }
+
+    QwenVerifyBatch batch = impl_->run_batched_decode(
+        tokens, positions, slot_ids, active_layers_);
+
+    std::vector<QwenForwardResult> results(static_cast<size_t>(rows));
+    for (int row = 0; row < rows; ++row) {
+        const size_t index = static_cast<size_t>(row);
+        const int slot = slot_ids[index];
+        const int position_after = positions[index] + 1;
+        QwenForwardResult& forward = results[index];
+        forward.layers = active_layers_;
+        forward.dim = static_cast<int>(config_.hidden_size);
+        forward.logits = static_cast<int>(config_.vocab_size);
+        forward.top_token = batch.top_tokens[index];
+        forward.top_logit = batch.top_logits[index];
+        forward.checksum = batch.local_logits[index];
+        forward.position = position_after;
+        impl_->set_slot_position(slot, position_after, position_);
+        if (options_.prefix_cache) {
+            Impl::SlotPrefixState& prefix = impl_->prefix_for(slot);
+            prefix.cached_prompt.push_back(tokens[index]);
+            prefix.cached_result = forward;
+            prefix.has_cached_result = true;
+            if (impl_->is_periodic_snapshot_position(position_after)) {
+                impl_->record_snapshot(position_after, &forward, true, slot);
+            }
+        }
+    }
+    return results;
+}
+
 QwenBatchDecodeResult QwenEngine::batch_decode_step(
     const std::vector<QwenBatchedRequest*>& requests) {
 
@@ -4276,24 +4561,32 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
 
     auto start = std::chrono::steady_clock::now();
 
-    // Phase 3.1: Process decode steps sequentially
-    // True batched decode kernel is deferred to Phase 3.2
+    std::vector<int> tokens;
+    std::vector<int> slots;
+    tokens.reserve(requests.size());
+    slots.reserve(requests.size());
     for (QwenBatchedRequest* req : requests) {
         if (!req) {
             throw std::runtime_error("QwenEngine::batch_decode_step: null request");
         }
+        tokens.push_back(req->last_token);
+        slots.push_back(req->slot_id);
+    }
 
-        // Announce before computing, as in batch_prefill: every rank has to enter
-        // the same collective in the same order.
-        worker_command_decode(req->last_token, req->slot_id);
+    // One forward for the whole batch. Under TP the workers sit in
+    // run_worker_loop() waiting to be told which collective to join, so rank 0
+    // announces the batch before running it or the group deadlocks with rank 0
+    // computing alone. No-op at world size 1.
+    worker_command_batch_decode(tokens, slots);
+    std::vector<QwenForwardResult> forwards = batch_decode_tokens(tokens, slots);
 
-        // Phase 3.3: Use req->slot_id to isolate KV cache
-        QwenForwardResult fwd_result = decode_step(req->last_token, req->slot_id);
-
-        req->last_token = fwd_result.top_token;
-        req->last_result = fwd_result;
+    for (size_t index = 0; index < requests.size(); ++index) {
+        QwenBatchedRequest* req = requests[index];
+        const QwenForwardResult& forward = forwards[index];
+        req->last_token = forward.top_token;
+        req->last_result = forward;
         req->seq_len++;
-        req->generated_tokens.push_back(fwd_result.top_token);
+        req->generated_tokens.push_back(forward.top_token);
 
         // Check finish conditions
         bool finished = (static_cast<int>(req->generated_tokens.size()) >=
@@ -4301,7 +4594,7 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
         // TODO: Add EOS token check
 
         req->finished = finished;
-        result.next_tokens.push_back(fwd_result.top_token);
+        result.next_tokens.push_back(forward.top_token);
         result.finished.push_back(finished);
     }
 
@@ -4707,6 +5000,26 @@ void QwenEngine::run_worker_loop() {
             case WorkerCommand::DecodeStep:
                 (void)decode_step(header[1], slot_id);
                 break;
+            case WorkerCommand::BatchDecodeStep: {
+                // The payload interleaves token and slot per row, because the
+                // header carries only one slot field. header[1] is the row count.
+                const int batch_rows = static_cast<int>(header[1]);
+                if (batch_rows <= 0 ||
+                    tokens.size() != static_cast<size_t>(batch_rows) * 2) {
+                    throw std::runtime_error(
+                        "run_worker_loop: malformed batched decode payload");
+                }
+                std::vector<int> batch_tokens(static_cast<size_t>(batch_rows));
+                std::vector<int> batch_slots(static_cast<size_t>(batch_rows));
+                for (int row = 0; row < batch_rows; ++row) {
+                    batch_tokens[static_cast<size_t>(row)] =
+                        tokens[static_cast<size_t>(row) * 2];
+                    batch_slots[static_cast<size_t>(row)] =
+                        tokens[static_cast<size_t>(row) * 2 + 1];
+                }
+                (void)batch_decode_tokens(batch_tokens, batch_slots);
+                break;
+            }
             case WorkerCommand::Reset:
                 reset();
                 break;
@@ -4757,6 +5070,39 @@ void QwenEngine::worker_command_decode(int32_t last_token, int32_t slot_id) {
         0
     };
     impl_->cmd->send_to_workers(header, 4);
+}
+
+void QwenEngine::worker_command_batch_decode(
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids) {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error("worker_command_batch_decode: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error("worker_command_batch_decode: command channel not initialized (call warmup_tp first)");
+    }
+    if (tokens.size() != slot_ids.size()) {
+        throw std::runtime_error(
+            "worker_command_batch_decode: token and slot extents differ");
+    }
+    if (tokens.empty()) return;
+
+    const int32_t rows = static_cast<int32_t>(tokens.size());
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::BatchDecodeStep),
+        rows,
+        0,
+        rows * 2
+    };
+    impl_->cmd->send_to_workers(header, 4);
+
+    std::vector<int32_t> payload(static_cast<size_t>(rows) * 2);
+    for (int32_t row = 0; row < rows; ++row) {
+        payload[static_cast<size_t>(row) * 2] = tokens[static_cast<size_t>(row)];
+        payload[static_cast<size_t>(row) * 2 + 1] =
+            slot_ids[static_cast<size_t>(row)];
+    }
+    impl_->cmd->send_to_workers(payload.data(), payload.size());
 }
 
 void QwenEngine::worker_command_reset() {

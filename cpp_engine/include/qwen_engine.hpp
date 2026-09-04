@@ -301,10 +301,19 @@ public:
         const std::vector<QwenBatchedRequest*>& requests);
 
     // Batch decode step: process one decode step for all active requests
-    // All requests must be at the same decode position (post-prefill)
+    // Every request advances one token in a single batched forward, so the
+    // requests may sit at different positions; they must occupy distinct slots.
     // Returns next token for each request
     QwenBatchDecodeResult batch_decode_step(
         const std::vector<QwenBatchedRequest*>& requests);
+
+    // One batched decode step over raw tokens and the slots they belong to.
+    // batch_decode_step is the request-oriented wrapper around this; tests and
+    // the TP worker loop use this form because they carry no request objects.
+    // Does not announce anything to the TP workers: callers on rank 0 drive that
+    // themselves so a batch is announced exactly once.
+    std::vector<QwenForwardResult> batch_decode_tokens(
+        const std::vector<int>& tokens, const std::vector<int>& slot_ids);
 
     // Check if batched API is supported (depends on build config)
     bool supports_batching() const;
@@ -319,12 +328,17 @@ public:
         DecodeStep = 1,
         Reset = 2,
         Shutdown = 3,
+        BatchDecodeStep = 4,
     };
     // slot_id selects the KV cache slot the workers must use, so it has to match
     // the slot rank 0 computes into.  It defaults to 0 for the single-session
     // path, where only slot 0 ever exists.
     void worker_command_prefill(const std::vector<int>& token_ids, int32_t slot_id = 0);
     void worker_command_decode(int32_t last_token, int32_t slot_id = 0);
+    // A batched step's slots do not fit the single slot_id header field, so the
+    // tokens and their slots travel together as one interleaved payload.
+    void worker_command_batch_decode(const std::vector<int>& tokens,
+                                     const std::vector<int>& slot_ids);
     void worker_command_reset();
     void worker_command_shutdown();
 

@@ -1633,7 +1633,12 @@ __global__ void gqa_prefill_tiled_f16_kernel(
 // arithmetic is untouched: the dot product still reduces over the same lanes in
 // the same warp_sum tree, and the softmax recurrence still walks positions in
 // order, so a given split count gives bit-identical output at any width.
-template <int kHPG>
+// Batched decode drives one CTA row per sequence through blockIdx.y. Every
+// row-dependent value is resolved before the position loop, so the arithmetic
+// inside it -- and therefore the result for a given split count -- is identical
+// to the single-row instantiation. `kBatched=false` keeps the original codegen
+// with no extra registers for the unused row indirection.
+template <int kHPG, bool kBatched = false>
 __global__ void gqa_decode_split_f16_kernel(
     const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ k_cache,
@@ -1646,7 +1651,10 @@ __global__ void gqa_decode_split_f16_kernel(
     int splits,
     int positions_per_split,
     int window,
-    int sink) {
+    int sink,
+    const int* __restrict__ context_lens = nullptr,
+    const int* __restrict__ slot_ids = nullptr,
+    size_t kv_slot_stride = 0) {
     const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv = (q_per_kv + kHPG - 1) / kHPG;
     const int grouped = static_cast<int>(blockIdx.x) / splits;
@@ -1654,6 +1662,22 @@ __global__ void gqa_decode_split_f16_kernel(
     const int kv_head = grouped / groups_per_kv;
     const int group = grouped % groups_per_kv;
     const int first_head = kv_head * q_per_kv + group * kHPG;
+    // Each sequence owns a contiguous KV slot and its own context length. The
+    // launch sizes the split geometry from the longest row, so shorter rows run
+    // some splits dry and publish the neutral partial the merge already handles.
+    // The slot is not the batch index: slots are allocated as requests arrive,
+    // so a four-row batch can hold slots 1/3/5/6.
+    if constexpr (kBatched) {
+        const int row = static_cast<int>(blockIdx.y);
+        context_len = context_lens[row];
+        const size_t slot = static_cast<size_t>(
+            slot_ids != nullptr ? slot_ids[row] : row) * kv_slot_stride;
+        k_cache += slot;
+        v_cache += slot;
+        q += static_cast<size_t>(row) * q_heads * head_dim;
+        partial_output += static_cast<size_t>(row) * q_heads * splits *
+            (head_dim + 2);
+    }
     const SparseRanges ranges = sparse_ranges(context_len, window, sink);
     const int start = split * positions_per_split;
     const int end = min(ranges.total(), start + positions_per_split);
@@ -2399,6 +2423,13 @@ __global__ void gqa_decode_merge_f16_kernel(
     int splits) {
     const int head = static_cast<int>(blockIdx.x);
     if (head >= q_heads) return;
+    // blockIdx.y indexes the sequence when batched decode launches this; the
+    // single-row grid leaves it at zero, so the offsets below vanish.
+    {
+        const size_t row = static_cast<size_t>(blockIdx.y);
+        partial_output += row * q_heads * splits * (head_dim + 2);
+        output += row * q_heads * head_dim;
+    }
     __shared__ float weights[kDecodeSplitCeiling];
     __shared__ float shared_maximum;
     const int stride = head_dim + 2;
@@ -3068,6 +3099,67 @@ bool qwen_gqa_decode_attention_f16_fused_cuda(
         q, k_cache, v_cache, output, partial_scratch, q_heads, kv_heads,
         head_dim, context_len, max_context, attention_window, sink_tokens,
         QwenGqaDecodeVariant::Selected, 0, stream);
+}
+
+int qwen_gqa_decode_batched_split_count(
+    int max_context_len, int kv_heads, int attention_window, int sink_tokens) {
+    const SparseRanges ranges =
+        sparse_ranges(max_context_len, attention_window, sink_tokens);
+    // Always the scalar geometry: the batched path does not launch the MMA
+    // variant, whose CTA embeds exactly one row's six Q heads.
+    return decode_split_count_for_variant(ranges.total(), false, 0, kv_heads);
+}
+
+bool qwen_gqa_decode_attention_f16_batched_cuda(
+    const uint16_t* q, const uint16_t* k_cache,
+    const uint16_t* v_cache, uint16_t* output, float* partial_scratch,
+    const int* d_context_lens, const int* d_slot_ids, int rows,
+    int max_context_len, size_t kv_slot_stride, int q_heads, int kv_heads,
+    int head_dim, int max_context, int attention_window, int sink_tokens,
+    void* stream) {
+    if (!q || !k_cache || !v_cache || !output || !partial_scratch ||
+        !d_context_lens || rows <= 0 || max_context_len <= 0 ||
+        max_context_len > max_context || attention_window < 0 ||
+        sink_tokens < 0 || !valid_shape(q_heads, kv_heads, head_dim)) {
+        return false;
+    }
+    // One grid covers every sequence. The split count comes from the longest
+    // row so a single launch serves the whole batch; shorter rows leave their
+    // trailing splits empty, which publishes the neutral partial.
+    const SparseRanges ranges =
+        sparse_ranges(max_context_len, attention_window, sink_tokens);
+    const int attended = ranges.total();
+    const int splits = decode_split_count_for_variant(
+        attended, false, 0, kv_heads);
+    if (splits > kDecodeSplitCeiling) return false;
+    const int positions_per_split = (attended + splits - 1) / splits;
+    const int group_heads = decode_group_width(q_heads / kv_heads);
+    const int groups_per_kv =
+        (q_heads / kv_heads + group_heads - 1) / group_heads;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const dim3 grid(static_cast<unsigned>(kv_heads * groups_per_kv * splits),
+                    static_cast<unsigned>(rows), 1);
+#define DSV4_LAUNCH_DECODE_SPLIT_BATCHED(HPG) \
+    gqa_decode_split_f16_kernel<HPG, true><<<grid, kThreads, 0, cuda_stream>>>( \
+        q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim, \
+        max_context_len, splits, positions_per_split, attention_window, \
+        sink_tokens, d_context_lens, d_slot_ids, kv_slot_stride)
+    switch (group_heads) {
+        case 1: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(1); break;
+        case 2: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(2); break;
+        case 3: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(3); break;
+        case 4: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(4); break;
+        case 5: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(5); break;
+        case 6: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(6); break;
+        default: return false;
+    }
+#undef DSV4_LAUNCH_DECODE_SPLIT_BATCHED
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const dim3 merge_grid(static_cast<unsigned>(q_heads),
+                          static_cast<unsigned>(rows), 1);
+    gqa_decode_merge_f16_kernel<<<merge_grid, kThreads, 0, cuda_stream>>>(
+        partial_scratch, output, q_heads, head_dim, splits);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool qwen_gqa_decode_attention_f16_fused_variant_cuda(
