@@ -6,6 +6,8 @@
 #include <chrono>
 #include <thread>
 #include <cassert>
+#include <cstdlib>
+#include <string>
 
 using namespace dsv4;
 
@@ -48,7 +50,7 @@ int main(int argc, char** argv) {
     std::cout << "==============================" << std::endl;
 
     if (argc < 2) {
-        std::cout << "\nUsage: " << argv[0] << " <checkpoint_dir>" << std::endl;
+        std::cout << "\nUsage: " << argv[0] << " <checkpoint_dir> [layers]" << std::endl;
         std::cout << "\nRunning API validation tests only...\n" << std::endl;
 
         test_stats();
@@ -59,6 +61,10 @@ int main(int argc, char** argv) {
     }
 
     std::string ckpt_dir = argv[1];
+    // Optional layer count. The full 64-layer checkpoint does not fit on one
+    // 22 GB card at TP1, which this test is, so a subset is the only way to run
+    // it on a single GPU. 0 keeps the previous behaviour of loading every layer.
+    const int layers = argc > 2 ? std::atoi(argv[2]) : 0;
 
     try {
         // Initialize engine
@@ -68,9 +74,15 @@ int main(int argc, char** argv) {
         options.device = 0;
         options.prefill_chunk_tokens = 512;
         options.max_state_snapshots = 10;
+        // The KV cache is sized at construction, so this has to match the
+        // scheduler's max_batch_size below or allocate_batch_slots throws.
+        options.max_batch_size = 4;
 
-        std::cout << "Loading checkpoint: " << ckpt_dir << std::endl;
-        QwenEngine engine(ckpt_dir, options, 0, 8192);
+        std::cout << "Loading checkpoint: " << ckpt_dir
+                  << " (layers: " << (layers == 0 ? std::string("all")
+                                                  : std::to_string(layers))
+                  << ")" << std::endl;
+        QwenEngine engine(ckpt_dir, options, layers, 8192);
 
         std::cout << "Creating scheduler with max_batch_size=4" << std::endl;
         QwenBatchScheduler scheduler(&engine, 4);

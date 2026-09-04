@@ -406,7 +406,12 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("top_p", &QwenBatchSamplingParams::top_p)
         .def_readwrite("top_k", &QwenBatchSamplingParams::top_k)
         .def_readwrite("seed", &QwenBatchSamplingParams::seed)
-        .def_readwrite("max_new_tokens", &QwenBatchSamplingParams::max_new_tokens);
+        .def_readwrite("max_new_tokens", &QwenBatchSamplingParams::max_new_tokens)
+        // Exposed so a Python benchmark can keep its token counts fixed
+        // (ignore_eos) or stop on its own tokenizer's ids (stop_token_ids)
+        // instead of the checkpoint's.
+        .def_readwrite("stop_token_ids", &QwenBatchSamplingParams::stop_token_ids)
+        .def_readwrite("ignore_eos", &QwenBatchSamplingParams::ignore_eos);
 
     py::class_<SchedulerGenerationResult>(module, "SchedulerGenerationResult")
         .def(py::init<>())

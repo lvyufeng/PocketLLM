@@ -43,6 +43,12 @@ struct SchedulerRequest {
     int prefilled_tokens = 0;
     bool prefill_complete = false;
     bool finished = false;
+    // Whether generation ended on a stop token rather than on max_new_tokens.
+    // `finished` is true for both, so it cannot distinguish them on its own.
+    bool stopped_on_token = false;
+    // Cancelled before finishing. Recorded here because the cancelled set is
+    // erased before results are reported.
+    bool cancelled = false;
     int last_token = 0;
     std::vector<int> generated_tokens;
 

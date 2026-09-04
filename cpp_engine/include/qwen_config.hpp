@@ -58,6 +58,12 @@ struct QwenConfig {
     QwenFullAttentionConfig full_attention;
     QwenDenseMlpConfig mlp;
     std::vector<QwenLayerType> layer_types;
+    // Tokens that end generation. Read from generation_config.json, whose
+    // eos_token_id is a list on the published Qwen3.5 checkpoints
+    // ([248046, 248044] on 27B), so this is a set rather than one id. Empty when
+    // the checkpoint ships no generation_config.json, which leaves generation
+    // bounded only by max_new_tokens as it was before.
+    std::vector<int> eos_token_ids;
 
     bool is_qwen3_5() const;
     uint64_t linear_attention_layers() const;

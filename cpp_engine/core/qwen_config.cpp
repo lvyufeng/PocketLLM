@@ -2,6 +2,7 @@
 
 #include "json_lite.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -16,6 +17,57 @@ std::string read_file(const std::string& path) {
     std::ostringstream out;
     out << in.rdbuf();
     return out.str();
+}
+
+// generation_config.json is optional: a checkpoint without one simply has no
+// stop tokens, so this returns false rather than throwing.
+bool try_read_file(const std::string& path, std::string* out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    *out = buffer.str();
+    return true;
+}
+
+int checked_token_id(const JsonValue& value, uint64_t vocab_size) {
+    if (!value.is_number()) {
+        throw std::runtime_error("Qwen eos_token_id entry is not a number");
+    }
+    const double number = value.number();
+    const double rounded = std::round(number);
+    if (number < 0.0 || std::fabs(number - rounded) > 1.0e-9) {
+        throw std::runtime_error("Qwen eos_token_id is not a non-negative integer");
+    }
+    const uint64_t id = static_cast<uint64_t>(rounded);
+    // An out-of-range stop id can never be produced by sampling, so it would
+    // silently never fire. Fail loudly instead of shipping a dead stop token.
+    if (id >= vocab_size) {
+        throw std::runtime_error("Qwen eos_token_id is outside the vocabulary");
+    }
+    return static_cast<int>(id);
+}
+
+// Accepts both shapes HF uses: a bare id, or a list of them.
+std::vector<int> parse_eos_token_ids(const std::string& ckpt_dir,
+                                    uint64_t vocab_size) {
+    std::string text;
+    if (!try_read_file(ckpt_dir + "/generation_config.json", &text)) return {};
+    const JsonValue root_value = parse_json(text);
+    if (!root_value.is_object()) return {};
+    const JsonValue* eos = object_get(root_value.object(), "eos_token_id");
+    if (eos == nullptr || eos->is_null()) return {};
+
+    std::vector<int> ids;
+    if (eos->is_array()) {
+        for (const JsonValue& entry : eos->array()) {
+            const int id = checked_token_id(entry, vocab_size);
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+        }
+    } else {
+        ids.push_back(checked_token_id(*eos, vocab_size));
+    }
+    return ids;
 }
 
 const JsonObject& text_config(const JsonObject& root) {
@@ -154,6 +206,8 @@ QwenConfig QwenConfig::from_hf_config(const std::string& ckpt_dir) {
             throw std::runtime_error("unsupported Qwen layer type at " + std::to_string(i) + ": " + value.string());
         }
     }
+
+    cfg.eos_token_ids = parse_eos_token_ids(ckpt_dir, cfg.vocab_size);
 
     if (!cfg.is_qwen3_5()) throw std::runtime_error("config is not a Qwen3.5 text checkpoint");
     if (cfg.hidden_size == 0 || cfg.num_hidden_layers == 0 || cfg.vocab_size == 0 || cfg.max_position_embeddings == 0) {

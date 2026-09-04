@@ -200,6 +200,12 @@ struct QwenBatchSamplingParams {
     int top_k = 20;
     unsigned long long seed = 0;
     int max_new_tokens = 128;
+    // Tokens that end this request. Left empty, the engine falls back to the
+    // checkpoint's eos ids from generation_config.json; set it to override for
+    // this request only. `ignore_eos` runs to max_new_tokens regardless, which
+    // is what benchmarks want so their token counts stay fixed.
+    std::vector<int> stop_token_ids;
+    bool ignore_eos = false;
 };
 
 // Per-request state for batched continuous execution
@@ -241,6 +247,10 @@ struct QwenPartialPrefillResult {
 struct QwenBatchDecodeResult {
     std::vector<int> next_tokens;
     std::vector<bool> finished;
+    // Rows that stopped on a stop token rather than on max_new_tokens, parallel
+    // to `next_tokens`. Callers need the distinction to report finish_reason,
+    // which cannot be recovered from `finished` alone.
+    std::vector<bool> hit_stop_token;
     double seconds = 0.0;
 };
 
@@ -301,8 +311,14 @@ public:
     QwenPartialPrefillResult prefill_partial(const std::vector<int>& token_ids,
                                              int slot_id, int max_tokens);
     QwenForwardResult decode_step(int token_id, int slot_id = 0);
+    // `stop_at_eos` ends generation on one of the checkpoint's eos ids, keeping
+    // that token as the last element. It defaults to false so existing callers
+    // and benchmarks keep returning exactly max_new_tokens results; under TP
+    // every rank runs this loop and decides independently, so the flag has to be
+    // the same on all of them or they stop at different lengths.
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,
-                                             int max_new_tokens);
+                                             int max_new_tokens,
+                                             bool stop_at_eos = false);
 
     // ========== Batched API (Phase 3.1) ==========
 
@@ -382,6 +398,10 @@ private:
     // the same work it was before the bounded entry point existed.
     QwenPartialPrefillResult prefill_bounded(const std::vector<int>& token_ids,
                                              int slot_id, int max_tokens);
+
+    // Whether `token` ends generation under these params: the request's own
+    // stop_token_ids when set, otherwise the checkpoint's eos ids.
+    bool is_stop_token(const QwenBatchSamplingParams& sampling, int token) const;
 
     std::string ckpt_dir_;
     QwenEngineOptions options_;
