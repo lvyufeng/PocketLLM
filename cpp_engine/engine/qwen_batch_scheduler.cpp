@@ -238,14 +238,16 @@ bool QwenBatchScheduler::run_prefill_batch() {
                 continue;
             }
 
-            // Check if needs prefill (seq_len == 0)
-            if (req->seq_len == 0) {
-                // Create QwenBatchedRequest wrapper
+            if (!req->prefill_complete) {
+                // Create QwenBatchedRequest wrapper. seq_len carries how far the
+                // prompt already got so batch_prefill can charge only the new
+                // tokens to its token total.
                 auto* batch_req = new QwenBatchedRequest();
                 batch_req->request_id = req->request_id;
                 batch_req->prompt_tokens = req->prompt_tokens;
                 batch_req->slot_id = req->slot_id;
                 batch_req->sampling = req->sampling;
+                batch_req->seq_len = req->prefilled_tokens;
 
                 prefill_batch.push_back(batch_req);
                 prefill_requests.push_back(req.get());
@@ -257,23 +259,36 @@ bool QwenBatchScheduler::run_prefill_batch() {
         return false;
     }
 
-    // Call engine batch_prefill
+    // Advance each prompt by at most prefill_token_budget_ tokens so a long
+    // prompt cannot hold the device for its whole length while running decodes
+    // stall behind it.
     try {
-        auto result = engine_->batch_prefill(prefill_batch);
+        auto result = engine_->batch_prefill(prefill_batch, prefill_token_budget_);
 
         // Update request states
         std::lock_guard<std::mutex> lock(queue_mutex_);
         for (size_t i = 0; i < prefill_batch.size(); ++i) {
             auto* req = prefill_requests[i];
-            if (i < result.results.size()) {
-                req->last_token = result.results[i].top_token;
-                req->generated_tokens.push_back(req->last_token);
-                req->seq_len = static_cast<int>(req->prompt_tokens.size());
+            if (i >= result.results.size()) continue;
 
-                // Record TTFT
-                if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
-                    req->first_token_time = std::chrono::steady_clock::now();
-                }
+            req->prefilled_tokens = prefill_batch[i]->seq_len;
+            const bool complete =
+                i < result.incomplete.size() && !result.incomplete[i];
+            if (!complete) {
+                // Interior logits predict the next prompt token, which the prompt
+                // already supplies. Emitting it would inject a token the caller
+                // never asked for, so this row just waits for its next chunk.
+                continue;
+            }
+
+            req->prefill_complete = true;
+            req->last_token = result.results[i].top_token;
+            req->generated_tokens.push_back(req->last_token);
+            req->seq_len = req->prefilled_tokens;
+
+            // Record TTFT
+            if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
+                req->first_token_time = std::chrono::steady_clock::now();
             }
         }
     } catch (const std::exception& e) {
@@ -301,8 +316,11 @@ bool QwenBatchScheduler::run_decode_batch() {
                 continue;
             }
 
-            // Check if in decode phase (seq_len > 0, not finished)
-            if (req->seq_len > 0 && !req->finished) {
+            // Decode only rows whose prompt is fully consumed. A chunked
+            // prefill leaves seq_len > 0 partway through the prompt, and
+            // decoding there would append a generated token into the middle of
+            // the prompt's own KV positions.
+            if (req->prefill_complete && !req->finished) {
                 // Create QwenBatchedRequest wrapper
                 auto* batch_req = new QwenBatchedRequest();
                 batch_req->request_id = req->request_id;

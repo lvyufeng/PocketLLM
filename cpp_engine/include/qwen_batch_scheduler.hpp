@@ -36,6 +36,12 @@ struct SchedulerRequest {
     QwenBatchSamplingParams sampling;
     int slot_id = -1;
     int seq_len = 0;  // Tokens processed (prompt + generated)
+    // Prompt tokens prefilled so far. Chunked prefill advances this a bounded
+    // step at a time, so it is what distinguishes "prompt still in progress"
+    // from "ready to decode"; seq_len alone cannot, since a half-prefilled
+    // request has seq_len > 0 while having produced no token yet.
+    int prefilled_tokens = 0;
+    bool prefill_complete = false;
     bool finished = false;
     int last_token = 0;
     std::vector<int> generated_tokens;
@@ -81,6 +87,18 @@ public:
     // Returns true if the request was found and marked for cancellation
     bool cancel_request(uint64_t request_id);
 
+    // Prompt tokens each request may advance per schedule iteration. Smaller
+    // values let decode interleave sooner at some cost in prefill efficiency:
+    // measured on TP4 27B, 4096 tokens runs at 1890 tok/s and 2048 at 1780
+    // (0.94x), while 512 drops to 1330 (0.71x). 4096 keeps full prefill
+    // throughput while capping a 65K prompt's uninterrupted hold at about 2.2s
+    // instead of 56s. 0 disables chunking and restores the previous behaviour of
+    // running each prompt to completion.
+    void set_prefill_token_budget(int tokens) {
+        prefill_token_budget_ = tokens < 0 ? 0 : tokens;
+    }
+    int prefill_token_budget() const { return prefill_token_budget_; }
+
     // Blocking poll for a request result (for sync API)
     // Returns true if result was populated, false on timeout
     bool poll_result(uint64_t request_id, SchedulerGenerationResult* out,
@@ -124,6 +142,9 @@ private:
     // Internal state
     QwenEngine* engine_;
     int max_batch_size_;
+    // Default 4096: the largest chunk that still measured full prefill
+    // throughput on TP4 27B, so interleaving costs nothing on the prefill side.
+    int prefill_token_budget_ = 4096;
     std::atomic<uint64_t> next_request_id_{1};
 
     // Request queues (protected by queue_mutex_)
