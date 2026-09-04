@@ -285,6 +285,12 @@ bool QwenBatchScheduler::run_prefill_batch() {
             req->last_token = result.results[i].top_token;
             req->generated_tokens.push_back(req->last_token);
             req->seq_len = req->prefilled_tokens;
+            // batch_prefill flags a prompt whose very first predicted token is a
+            // stop token; such a request must never reach the decode batch.
+            if (prefill_batch[i]->finished) {
+                req->finished = true;
+                req->stopped_on_token = true;
+            }
 
             // Record TTFT
             if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
@@ -362,6 +368,9 @@ bool QwenBatchScheduler::run_decode_batch() {
                 if (i < result.finished.size() && result.finished[i]) {
                     req->finished = true;
                 }
+                if (i < result.hit_stop_token.size() && result.hit_stop_token[i]) {
+                    req->stopped_on_token = true;
+                }
 
                 // Check max_new_tokens
                 if (req->generated_tokens.size() >=
@@ -403,6 +412,10 @@ void QwenBatchScheduler::handle_completions() {
                 // The cancelled set is erased below and is guarded by this mutex,
                 // so the stats pass outside the lock cannot re-derive this.
                 cancelled_completions.push_back(is_cancelled);
+                // notify_result runs after the erase, so it cannot consult the
+                // cancelled set either; record the reason on the request while
+                // the answer is still available.
+                if (is_cancelled && !req->finished) req->cancelled = true;
 
                 // Record completion time
                 req->completion_time = std::chrono::steady_clock::now();
@@ -453,7 +466,14 @@ void QwenBatchScheduler::notify_result(SchedulerRequest* req) {
     SchedulerGenerationResult result;
     result.request_id = req->request_id;
     result.generated_tokens = req->generated_tokens;
-    result.finish_reason = req->finished ? "length" : "stop";
+    // Previously `finished ? "length" : "stop"`, which was backwards: `finished`
+    // was only ever set by the length cap, so a normal completion reported
+    // "length" and "stop" was reachable only via cancellation.
+    if (req->cancelled) {
+        result.finish_reason = "cancelled";
+    } else {
+        result.finish_reason = req->stopped_on_token ? "stop" : "length";
+    }
     result.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
     result.completion_tokens = static_cast<int>(req->generated_tokens.size());
 

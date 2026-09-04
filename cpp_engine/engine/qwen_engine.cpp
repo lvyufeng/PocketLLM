@@ -4491,6 +4491,10 @@ QwenBatchPrefillResult QwenEngine::batch_prefill(
         if (step.complete) {
             // Only a finished prompt yields a token to generate from.
             req->last_token = step.result.top_token;
+            // The prompt's first predicted token can itself be a stop token, so
+            // the flag has to be set here too; a scheduler that only checked it
+            // during decode would emit one spurious token past the stop.
+            if (is_stop_token(req->sampling, req->last_token)) req->finished = true;
             // Freeing the prompt is safe only once nothing needs to resume from
             // it; a partial row is resumed by re-matching these same tokens.
             req->prompt_tokens.clear();
@@ -4563,12 +4567,22 @@ std::vector<QwenForwardResult> QwenEngine::batch_decode_tokens(
     return results;
 }
 
+bool QwenEngine::is_stop_token(const QwenBatchSamplingParams& sampling,
+                               int token) const {
+    if (sampling.ignore_eos) return false;
+    const std::vector<int>& stops = sampling.stop_token_ids.empty()
+        ? config_.eos_token_ids
+        : sampling.stop_token_ids;
+    return std::find(stops.begin(), stops.end(), token) != stops.end();
+}
+
 QwenBatchDecodeResult QwenEngine::batch_decode_step(
     const std::vector<QwenBatchedRequest*>& requests) {
 
     QwenBatchDecodeResult result;
     result.next_tokens.reserve(requests.size());
     result.finished.reserve(requests.size());
+    result.hit_stop_token.reserve(requests.size());
 
     if (requests.empty()) {
         return result;
@@ -4603,14 +4617,18 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
         req->seq_len++;
         req->generated_tokens.push_back(forward.top_token);
 
-        // Check finish conditions
-        bool finished = (static_cast<int>(req->generated_tokens.size()) >=
-                        req->sampling.max_new_tokens);
-        // TODO: Add EOS token check
+        // A stop token is the last token of the output, so it is still appended
+        // above and counted: truncating it here would make the returned
+        // sequence disagree with the KV cache this slot now holds, and a
+        // resumed request would then diverge. Callers strip it when detokenizing.
+        const bool stopped = is_stop_token(req->sampling, forward.top_token);
+        const bool length_capped = static_cast<int>(req->generated_tokens.size()) >=
+                                   req->sampling.max_new_tokens;
 
-        req->finished = finished;
+        req->finished = stopped || length_capped;
         result.next_tokens.push_back(forward.top_token);
-        result.finished.push_back(finished);
+        result.finished.push_back(req->finished);
+        result.hit_stop_token.push_back(stopped);
     }
 
     auto end = std::chrono::steady_clock::now();
@@ -4884,7 +4902,14 @@ QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
 }
 
 std::vector<QwenForwardResult> QwenEngine::generate(
-    const std::vector<int>& prompt_ids, int max_new_tokens) {
+    const std::vector<int>& prompt_ids, int max_new_tokens, bool stop_at_eos) {
+    // Checked against config_.eos_token_ids directly: this path has no
+    // per-request sampling params, and an empty list makes this always false.
+    const auto is_eos = [&](int token) {
+        return stop_at_eos &&
+               std::find(config_.eos_token_ids.begin(), config_.eos_token_ids.end(),
+                         token) != config_.eos_token_ids.end();
+    };
     if (max_new_tokens <= 0) return {};
     if (prompt_ids.empty()) {
         throw std::runtime_error("Qwen generation requires a non-empty prompt");
@@ -4912,6 +4937,9 @@ std::vector<QwenForwardResult> QwenEngine::generate(
         if (impl_->range_profile) range_decode.emplace("qwen.decode_loop");
         for (int index = 0; index < max_new_tokens; ++index) {
             results.push_back(next);
+            // The stop token stays in `results` as its last element, matching
+            // the batched path.
+            if (is_eos(next.top_token)) break;
             if (index + 1 < max_new_tokens) next = decode_step(next.top_token);
         }
         range_decode.reset();
@@ -4924,6 +4952,10 @@ std::vector<QwenForwardResult> QwenEngine::generate(
     // any correct drafts, then returns a bonus token which remains unconsumed
     // until the next transaction.
     results.push_back(next);
+    if (is_eos(next.top_token)) {
+        impl_->report_phase_profile("spec_decode");
+        return results;
+    }
     int current_token = next.top_token;
     const bool use_dspark = !options_.dspark_checkpoint.empty();
     const bool use_dflash2 = !options_.dflash2_checkpoint.empty();
@@ -4947,6 +4979,7 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             while (static_cast<int>(results.size()) < max_new_tokens) {
                 next = decode_step(current_token);
                 results.push_back(next);
+                if (is_eos(next.top_token)) break;
                 current_token = next.top_token;
             }
             break;
@@ -4989,6 +5022,7 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             prefix.has_cached_result = true;
         }
 
+        bool stop_in_block = false;
         for (size_t index = 0; index < next.accept_tokens.size(); ++index) {
             if (static_cast<int>(results.size()) == max_new_tokens) break;
             QwenForwardResult token_result = next;
@@ -4996,10 +5030,23 @@ std::vector<QwenForwardResult> QwenEngine::generate(
             token_result.top_logit = next.accept_logits[index];
             token_result.checksum = next.accept_checksums[index];
             token_result.position = position_ - correct + static_cast<int>(index);
+            const bool token_is_eos = is_eos(token_result.top_token);
             results.push_back(std::move(token_result));
+            // A verified block can contain a stop token before its end. The rest
+            // of the block is dropped from the output, but the KV cache and
+            // position_ have already advanced over the whole block, so this
+            // session must not be reused for further decoding after an early
+            // stop here. generate() is a whole-generation call, so that only
+            // matters to a caller that continues from the same session.
+            if (token_is_eos) {
+                stop_in_block = true;
+                break;
+            }
         }
+        if (stop_in_block) break;
         if (static_cast<int>(results.size()) < max_new_tokens) {
             results.push_back(next);
+            if (is_eos(next.top_token)) break;
         }
         current_token = next.bonus_token;
     }

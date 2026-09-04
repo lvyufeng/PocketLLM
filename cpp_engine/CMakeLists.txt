@@ -726,6 +726,10 @@ add_executable(test_qwen_chunked_prefill tests/test_qwen_chunked_prefill.cpp)
 target_link_libraries(test_qwen_chunked_prefill PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_chunked_prefill PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_qwen_eos_stop tests/test_qwen_eos_stop.cpp)
+target_link_libraries(test_qwen_eos_stop PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_eos_stop PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(bench_qwen_prefill_interleave tests/bench_qwen_prefill_interleave.cpp)
 target_link_libraries(bench_qwen_prefill_interleave PRIVATE dsv4_cpp_core)
 set_target_properties(bench_qwen_prefill_interleave PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
