@@ -221,6 +221,20 @@ struct QwenBatchPrefillResult {
     std::vector<QwenForwardResult> results;
     int total_tokens = 0;
     double seconds = 0.0;
+    // Rows whose prompt is not yet fully consumed, parallel to `results`. A
+    // partial row's `results` entry holds the last chunk's logits, which are
+    // not a prediction for the prompt's final token and must not be sampled.
+    std::vector<bool> incomplete;
+};
+
+// Outcome of one bounded prefill step.
+struct QwenPartialPrefillResult {
+    QwenForwardResult result;
+    // Prompt tokens consumed so far, i.e. where the next step resumes.
+    int consumed_tokens = 0;
+    // False while tokens remain; `result` is only a sampleable prediction for
+    // the prompt once this is true.
+    bool complete = false;
 };
 
 // Result from batch_decode_step
@@ -275,6 +289,17 @@ public:
     void clear_prefix_cache();
     void warmup_tp();
     QwenForwardResult prefill(const std::vector<int>& token_ids, int slot_id = 0);
+    // Prefill that consumes at most `max_tokens` prompt tokens and returns,
+    // leaving the rest for a later call. This is what lets a scheduler keep a
+    // long prompt from monopolising the GPU: a 65K prompt run in 8192-token
+    // steps yields control roughly every 4.3s at TP4 instead of holding it for
+    // the full ~56s, so running decodes still make progress.
+    //
+    // Resumption rides the existing growing-prompt prefix path, so callers pass
+    // the same full `token_ids` every time and the engine skips what this slot
+    // already holds. `max_tokens <= 0` consumes the whole remainder.
+    QwenPartialPrefillResult prefill_partial(const std::vector<int>& token_ids,
+                                             int slot_id, int max_tokens);
     QwenForwardResult decode_step(int token_id, int slot_id = 0);
     std::vector<QwenForwardResult> generate(const std::vector<int>& prompt_ids,
                                              int max_new_tokens);
@@ -293,12 +318,18 @@ public:
     // Free a KV cache slot when request completes
     void free_slot(uint64_t request_id);
 
-    // Batch prefill: process multiple requests in their prefill phase
-    // Each request in the batch may have different prompt lengths
-    // Currently processes requests sequentially (one at a time) to avoid
-    // mixed-length batching complexity; returns after all prefills complete
+    // Batch prefill: process multiple requests in their prefill phase.
+    // Each request may have a different prompt length, and requests are still
+    // processed one at a time rather than merged into one variable-length
+    // forward -- see the note in the definition for the measurements behind that.
+    //
+    // `token_budget` bounds how many prompt tokens each request advances in this
+    // call; 0 runs every prompt to completion as before. With a budget, a row
+    // whose prompt is unfinished is reported through `result.incomplete` and its
+    // logits must not be sampled. Call again with the same requests to continue.
     QwenBatchPrefillResult batch_prefill(
-        const std::vector<QwenBatchedRequest*>& requests);
+        const std::vector<QwenBatchedRequest*>& requests,
+        int token_budget = 0);
 
     // Batch decode step: process one decode step for all active requests
     // Every request advances one token in a single batched forward, so the
@@ -333,7 +364,8 @@ public:
     // slot_id selects the KV cache slot the workers must use, so it has to match
     // the slot rank 0 computes into.  It defaults to 0 for the single-session
     // path, where only slot 0 ever exists.
-    void worker_command_prefill(const std::vector<int>& token_ids, int32_t slot_id = 0);
+    void worker_command_prefill(const std::vector<int>& token_ids,
+                                int32_t slot_id = 0, int32_t token_budget = 0);
     void worker_command_decode(int32_t last_token, int32_t slot_id = 0);
     // A batched step's slots do not fit the single slot_id header field, so the
     // tokens and their slots travel together as one interleaved payload.
@@ -344,6 +376,12 @@ public:
 
 private:
     struct Impl;
+
+    // Shared body behind prefill() and prefill_partial(). `max_tokens` of 0
+    // means unbounded, which is what makes the full-prompt path byte-for-byte
+    // the same work it was before the bounded entry point existed.
+    QwenPartialPrefillResult prefill_bounded(const std::vector<int>& token_ids,
+                                             int slot_id, int max_tokens);
 
     std::string ckpt_dir_;
     QwenEngineOptions options_;

@@ -4447,13 +4447,19 @@ void QwenEngine::free_slot(uint64_t request_id) {
 }
 
 QwenBatchPrefillResult QwenEngine::batch_prefill(
-    const std::vector<QwenBatchedRequest*>& requests) {
+    const std::vector<QwenBatchedRequest*>& requests, int token_budget) {
 
-    // Phase 3.1: Process requests sequentially (FCFS)
-    // Mixed-length batching is deferred to Phase 4
-
+    // Requests still run one at a time: the saturation sweep
+    // (bench_qwen_prefill_saturation) measured 1890 tok/s at a 4096-token chunk
+    // against 1330 at 512 on TP4, so a single chunk of a few thousand rows
+    // already feeds the GEMMs and merging prompts into one variable-length
+    // forward would buy ~1.06x at 2048. What that sweep does not fix is a long
+    // prompt holding the device: with `token_budget` set, each request advances
+    // by at most that many tokens per call, so the scheduler regains control
+    // between chunks and can interleave decode.
     QwenBatchPrefillResult result;
     result.results.reserve(requests.size());
+    result.incomplete.reserve(requests.size());
     result.total_tokens = 0;
 
     auto start = std::chrono::steady_clock::now();
@@ -4466,20 +4472,29 @@ QwenBatchPrefillResult QwenEngine::batch_prefill(
         // Under TP the workers sit in run_worker_loop() waiting to be told which
         // collective to join; rank 0 must announce the op before running it, or
         // the group deadlocks with rank 0 computing alone.  No-op at world size 1.
-        worker_command_prefill(req->prompt_tokens, req->slot_id);
+        // The budget goes across too: the workers run the same bounded loop, so
+        // every rank has to stop at the same token or the next collective pairs
+        // mismatched shapes.
+        worker_command_prefill(req->prompt_tokens, req->slot_id, token_budget);
 
         // Phase 3.3: Use req->slot_id to isolate KV cache
-        QwenForwardResult fwd_result = prefill(req->prompt_tokens, req->slot_id);
+        QwenPartialPrefillResult step =
+            prefill_bounded(req->prompt_tokens, req->slot_id,
+                            std::max(0, token_budget));
 
-        req->seq_len = static_cast<int>(req->prompt_tokens.size());
-        req->last_token = fwd_result.top_token;
-        req->last_result = fwd_result;
+        result.total_tokens += step.consumed_tokens - req->seq_len;
+        req->seq_len = step.consumed_tokens;
+        req->last_result = step.result;
+        result.results.push_back(step.result);
+        result.incomplete.push_back(!step.complete);
 
-        result.results.push_back(fwd_result);
-        result.total_tokens += static_cast<int>(req->prompt_tokens.size());
-
-        // Clear prompt_tokens after prefill to save memory
-        req->prompt_tokens.clear();
+        if (step.complete) {
+            // Only a finished prompt yields a token to generate from.
+            req->last_token = step.result.top_token;
+            // Freeing the prompt is safe only once nothing needs to resume from
+            // it; a partial row is resumed by re-matching these same tokens.
+            req->prompt_tokens.clear();
+        }
     }
 
     auto end = std::chrono::steady_clock::now();
@@ -4605,6 +4620,18 @@ QwenBatchDecodeResult QwenEngine::batch_decode_step(
 }
 
 QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slot_id) {
+    // Budget 0 means "no bound", so this is the whole prompt in one call and the
+    // result is always complete.
+    return prefill_bounded(token_ids, slot_id, 0).result;
+}
+
+QwenPartialPrefillResult QwenEngine::prefill_partial(
+    const std::vector<int>& token_ids, int slot_id, int max_tokens) {
+    return prefill_bounded(token_ids, slot_id, std::max(0, max_tokens));
+}
+
+QwenPartialPrefillResult QwenEngine::prefill_bounded(
+    const std::vector<int>& token_ids, int slot_id, int max_tokens) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
@@ -4651,7 +4678,7 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
         prefix_stats_.resume_source = "live";
         prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
         prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
-        return prefix.cached_result;
+        return {prefix.cached_result, static_cast<int>(token_ids.size()), true};
     }
 
     int start_position = 0;
@@ -4685,7 +4712,7 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
             ++impl_->prefix_hits;
             prefix_stats_.hits = impl_->prefix_hits;
             prefix_stats_.misses = impl_->prefix_misses;
-            return prefix.cached_result;
+            return {prefix.cached_result, static_cast<int>(common), true};
         }
         if (resume_snapshot != nullptr &&
             resume_snapshot->position == static_cast<int>(token_ids.size())) {
@@ -4723,9 +4750,21 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
             start_position - 1);
     }
     QwenForwardResult result;
-    const int chunk_size = std::max(1, options_.prefill_chunk_tokens);
-    for (int offset = start_position; offset < target_position;) {
-        int end = std::min(target_position, offset + chunk_size);
+    // A budget both caps how far this call advances and shrinks the chunk, since
+    // a budget under prefill_chunk_tokens would otherwise be rounded up to a
+    // whole chunk and silently consume the entire prompt. Stopping at an
+    // arbitrary token is safe: the next call resumes through the growing-prompt
+    // live path, which matches the cached prompt rather than needing a snapshot
+    // at the boundary.
+    const int chunk_size =
+        max_tokens > 0 ? std::max(1, std::min(options_.prefill_chunk_tokens, max_tokens))
+                       : std::max(1, options_.prefill_chunk_tokens);
+    const int budget_limit =
+        max_tokens > 0
+            ? std::min(target_position, start_position + std::max(1, max_tokens))
+            : target_position;
+    for (int offset = start_position; offset < budget_limit;) {
+        int end = std::min(budget_limit, offset + chunk_size);
         // Split at exact snapshot boundaries even when a request begins at an
         // arbitrary position. Otherwise a 512-token append starting at 100 can
         // step over 4096 forever and never create the rollback point.
@@ -4778,26 +4817,36 @@ QwenForwardResult QwenEngine::prefill(const std::vector<int>& token_ids, int slo
 
     // A same-length prompt resumed from an interior snapshot always computes
     // at least one token; the only zero-work case returned above was exact hit.
-    if (start_position == target_position) {
+    if (start_position == budget_limit) {
         throw std::runtime_error("Qwen prefix cache failed to produce logits");
     }
-    impl_->set_slot_position(slot_id, target_position, position_);
+    // Commit only what was actually consumed. A partial call must leave the slot
+    // position and the cached prompt at the boundary it truly reached, because
+    // the next call finds its resume point by matching against exactly these
+    // two: an over-long cached_prompt would make the remainder look already
+    // computed and silently skip those tokens.
+    const bool complete = budget_limit == target_position;
+    impl_->set_slot_position(slot_id, budget_limit, position_);
     if (options_.prefix_cache) {
-        prefix.cached_prompt = token_ids;
+        prefix.cached_prompt.assign(
+            token_ids.begin(),
+            token_ids.begin() + static_cast<ptrdiff_t>(budget_limit));
         prefix.cached_result = result;
-        prefix.has_cached_result = true;
+        // Interior logits predict the next prompt token, not the prompt's
+        // continuation, so they must not satisfy a later exact-repeat hit.
+        prefix.has_cached_result = complete;
     } else {
         prefix.cached_prompt.clear();
         prefix.has_cached_result = false;
     }
     prefix_stats_.reused_tokens = start_position;
-    prefix_stats_.computed_tokens = target_position - start_position;
+    prefix_stats_.computed_tokens = budget_limit - start_position;
     prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
     prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
     prefix_stats_.hits = impl_->prefix_hits;
     prefix_stats_.misses = impl_->prefix_misses;
     impl_->report_phase_profile("prefill");
-    return result;
+    return {result, budget_limit, complete};
 }
 
 QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
@@ -4995,7 +5044,9 @@ void QwenEngine::run_worker_loop() {
 
         switch (cmd) {
             case WorkerCommand::Prefill:
-                (void)prefill(tokens, slot_id);
+                // header[1] is the token budget rank 0 applied; 0 is unbounded.
+                (void)prefill_bounded(tokens, slot_id,
+                                      std::max(0, static_cast<int>(header[1])));
                 break;
             case WorkerCommand::DecodeStep:
                 (void)decode_step(header[1], slot_id);
@@ -5031,7 +5082,7 @@ void QwenEngine::run_worker_loop() {
 }
 
 void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids,
-                                        int32_t slot_id) {
+                                        int32_t slot_id, int32_t token_budget) {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_prefill: rank 0 only");
@@ -5040,9 +5091,13 @@ void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids,
         throw std::runtime_error("worker_command_prefill: command channel not initialized (call warmup_tp first)");
     }
 
+    // header[1] carries the prefill token budget, which was unused for this
+    // command before bounded prefill existed. Every rank must apply the same
+    // bound: a worker that ran the whole prompt while rank 0 stopped at a chunk
+    // would arrive at the next collective with a different row count.
     int32_t header[4] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
-        0,
+        token_budget,
         slot_id,
         static_cast<int32_t>(token_ids.size())
     };
