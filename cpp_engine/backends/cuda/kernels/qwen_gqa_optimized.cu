@@ -1638,7 +1638,13 @@ __global__ void gqa_prefill_tiled_f16_kernel(
 // inside it -- and therefore the result for a given split count -- is identical
 // to the single-row instantiation. `kBatched=false` keeps the original codegen
 // with no extra registers for the unused row indirection.
-template <int kHPG, bool kBatched = false>
+//
+// `kPaged` selects the paged KV cache, where a sequence's positions live in
+// fixed-size blocks scattered through one shared arena instead of in a
+// contiguous per-slot reservation. It is a separate template parameter rather
+// than a runtime null check so the contiguous instantiation keeps its exact
+// register count and address arithmetic.
+template <int kHPG, bool kBatched = false, bool kPaged = false>
 __global__ void gqa_decode_split_f16_kernel(
     const uint16_t* __restrict__ q,
     const uint16_t* __restrict__ k_cache,
@@ -1654,7 +1660,10 @@ __global__ void gqa_decode_split_f16_kernel(
     int sink,
     const int* __restrict__ context_lens = nullptr,
     const int* __restrict__ slot_ids = nullptr,
-    size_t kv_slot_stride = 0) {
+    size_t kv_slot_stride = 0,
+    const int* __restrict__ block_table = nullptr,
+    int block_size = 0,
+    int max_blocks_per_seq = 0) {
     const int q_per_kv = q_heads / kv_heads;
     const int groups_per_kv = (q_per_kv + kHPG - 1) / kHPG;
     const int grouped = static_cast<int>(blockIdx.x) / splits;
@@ -1667,13 +1676,22 @@ __global__ void gqa_decode_split_f16_kernel(
     // some splits dry and publish the neutral partial the merge already handles.
     // The slot is not the batch index: slots are allocated as requests arrive,
     // so a four-row batch can hold slots 1/3/5/6.
+    const int* __restrict__ slot_blocks = nullptr;
     if constexpr (kBatched) {
         const int row = static_cast<int>(blockIdx.y);
         context_len = context_lens[row];
-        const size_t slot = static_cast<size_t>(
-            slot_ids != nullptr ? slot_ids[row] : row) * kv_slot_stride;
-        k_cache += slot;
-        v_cache += slot;
+        const int slot_index = slot_ids != nullptr ? slot_ids[row] : row;
+        if constexpr (kPaged) {
+            // Paged rows share one arena, so the row's base is the table it
+            // indexes through rather than an offset added to the pointer.
+            slot_blocks = block_table +
+                static_cast<size_t>(slot_index) * max_blocks_per_seq;
+        } else {
+            const size_t slot =
+                static_cast<size_t>(slot_index) * kv_slot_stride;
+            k_cache += slot;
+            v_cache += slot;
+        }
         q += static_cast<size_t>(row) * q_heads * head_dim;
         partial_output += static_cast<size_t>(row) * q_heads * splits *
             (head_dim + 2);
@@ -1722,10 +1740,31 @@ __global__ void gqa_decode_split_f16_kernel(
 
     const float attention_scale = rsqrtf(static_cast<float>(head_dim));
     const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    // Paged translation is loop-invariant within a block, so the block id is
+    // cached and refetched only when the scan leaves it. The sparse ranges walk
+    // positions in ascending order within a split, and the sink-to-window jump
+    // is the only discontinuity, so a one-entry cache covers the whole scan with
+    // one table read per `block_size` positions rather than one per position.
+    int cached_block_index = -1;
+    size_t cached_block_base = 0;
     for (int logical = start; logical < end; ++logical) {
         const int position = ranges.position(logical);
-        const size_t kv_base = static_cast<size_t>(position) * kv_stride +
-            static_cast<size_t>(kv_head) * head_dim;
+        size_t kv_base;
+        if constexpr (kPaged) {
+            const int block_index = position / block_size;
+            if (block_index != cached_block_index) {
+                cached_block_index = block_index;
+                cached_block_base =
+                    static_cast<size_t>(slot_blocks[block_index]) *
+                    block_size * kv_stride;
+            }
+            kv_base = cached_block_base +
+                static_cast<size_t>(position % block_size) * kv_stride +
+                static_cast<size_t>(kv_head) * head_dim;
+        } else {
+            kv_base = static_cast<size_t>(position) * kv_stride +
+                static_cast<size_t>(kv_head) * head_dim;
+        }
         float key[kValuesPerThread];
         float value[kValuesPerThread];
 #pragma unroll
@@ -3116,11 +3155,24 @@ bool qwen_gqa_decode_attention_f16_batched_cuda(
     const int* d_context_lens, const int* d_slot_ids, int rows,
     int max_context_len, size_t kv_slot_stride, int q_heads, int kv_heads,
     int head_dim, int max_context, int attention_window, int sink_tokens,
+    const int* d_block_table, int block_size, int max_blocks_per_seq,
     void* stream) {
     if (!q || !k_cache || !v_cache || !output || !partial_scratch ||
         !d_context_lens || rows <= 0 || max_context_len <= 0 ||
-        max_context_len > max_context || attention_window < 0 ||
+        attention_window < 0 ||
         sink_tokens < 0 || !valid_shape(q_heads, kv_heads, head_dim)) {
+        return false;
+    }
+    // A paged cache holds no per-slot reservation, so `max_context` bounds the
+    // logical sequence rather than the arena and the block table supplies the
+    // extent. The contiguous path keeps its arena bound.
+    const bool paged = d_block_table != nullptr;
+    if (paged) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0 ||
+            max_context_len > block_size * max_blocks_per_seq) {
+            return false;
+        }
+    } else if (max_context_len > max_context) {
         return false;
     }
     // One grid covers every sequence. The split count comes from the longest
@@ -3139,20 +3191,29 @@ bool qwen_gqa_decode_attention_f16_batched_cuda(
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     const dim3 grid(static_cast<unsigned>(kv_heads * groups_per_kv * splits),
                     static_cast<unsigned>(rows), 1);
-#define DSV4_LAUNCH_DECODE_SPLIT_BATCHED(HPG) \
-    gqa_decode_split_f16_kernel<HPG, true><<<grid, kThreads, 0, cuda_stream>>>( \
+#define DSV4_LAUNCH_DECODE_SPLIT_BATCHED(HPG, PAGED) \
+    gqa_decode_split_f16_kernel<HPG, true, PAGED> \
+        <<<grid, kThreads, 0, cuda_stream>>>( \
         q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim, \
         max_context_len, splits, positions_per_split, attention_window, \
-        sink_tokens, d_context_lens, d_slot_ids, kv_slot_stride)
-    switch (group_heads) {
-        case 1: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(1); break;
-        case 2: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(2); break;
-        case 3: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(3); break;
-        case 4: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(4); break;
-        case 5: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(5); break;
-        case 6: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(6); break;
-        default: return false;
+        sink_tokens, d_context_lens, d_slot_ids, kv_slot_stride, \
+        d_block_table, block_size, max_blocks_per_seq)
+#define DSV4_LAUNCH_DECODE_SPLIT_BATCHED_WIDTH(PAGED) \
+    switch (group_heads) { \
+        case 1: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(1, PAGED); break; \
+        case 2: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(2, PAGED); break; \
+        case 3: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(3, PAGED); break; \
+        case 4: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(4, PAGED); break; \
+        case 5: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(5, PAGED); break; \
+        case 6: DSV4_LAUNCH_DECODE_SPLIT_BATCHED(6, PAGED); break; \
+        default: return false; \
     }
+    if (paged) {
+        DSV4_LAUNCH_DECODE_SPLIT_BATCHED_WIDTH(true);
+    } else {
+        DSV4_LAUNCH_DECODE_SPLIT_BATCHED_WIDTH(false);
+    }
+#undef DSV4_LAUNCH_DECODE_SPLIT_BATCHED_WIDTH
 #undef DSV4_LAUNCH_DECODE_SPLIT_BATCHED
     if (cudaGetLastError() != cudaSuccess) return false;
     const dim3 merge_grid(static_cast<unsigned>(q_heads),

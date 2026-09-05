@@ -2766,11 +2766,70 @@ __global__ void append_kv_f16_kernel(
 // The slot a row occupies is not its index in the batch: slots are allocated and
 // freed as requests arrive and finish, so a four-row batch can hold slots
 // 1/3/5/6. `slot_ids` carries that mapping; passing null means slot == row.
+// Paged single-sequence append: consecutive tokens of one sequence, scattered
+// across that sequence's blocks. `block_table` is the one sequence's row, so it
+// needs no slot indirection; the caller offsets into the table itself.
+__global__ void append_kv_f16_paged_kernel(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, int total,
+    int kv_heads, int head_dim, int start_pos, const int* block_table,
+    int block_size) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total) return;
+    const int kv_stride = kv_heads * head_dim;
+    const int token = index / kv_stride;
+    const int within = index % kv_stride;
+    const int destination_token = start_pos + token;
+    const int block = block_table[destination_token / block_size];
+    const size_t destination =
+        (static_cast<size_t>(block) * block_size +
+         static_cast<size_t>(destination_token % block_size)) * kv_stride +
+        within;
+    k_cache[destination] = k_rows[index];
+    v_cache[destination] = v_rows[index];
+}
+
+// Collects one sequence's paged K/V history into the dense
+// `[context_len, kv_heads, head_dim]` layout the attention kernels already read.
+// The prefill and single-row decode kernels have five tuned variants between
+// them, all of which compute addresses from that layout; gathering once per
+// layer keeps every one of them untouched, and it is the same dequant-once
+// architecture the FP8 and TurboQuant caches use for the same reason.
+__global__ void gather_kv_f16_paged_kernel(
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    uint16_t* __restrict__ k_dense, uint16_t* __restrict__ v_dense,
+    int context_len, int kv_heads, int head_dim, const int* block_table,
+    int block_size) {
+    const int position = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    if (position >= context_len || kv_head >= kv_heads) return;
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    const int block = block_table[position / block_size];
+    const size_t source =
+        (static_cast<size_t>(block) * block_size +
+         static_cast<size_t>(position % block_size)) * kv_stride +
+        static_cast<size_t>(kv_head) * head_dim;
+    const size_t destination =
+        (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+    for (int channel = static_cast<int>(threadIdx.x); channel < head_dim;
+         channel += static_cast<int>(blockDim.x)) {
+        k_dense[destination + channel] = k_cache[source + channel];
+        v_dense[destination + channel] = v_cache[source + channel];
+    }
+}
+
+//
+// Under a paged cache the slot owns scattered blocks in one shared arena rather
+// than a contiguous reservation, so `block_table` replaces the slot stride: the
+// row's block list is read at `slot * max_blocks_per_seq` and the destination
+// token's block supplies the base.
 __global__ void append_kv_f16_batched_kernel(
     const uint16_t* k_rows, const uint16_t* v_rows,
     uint16_t* k_cache, uint16_t* v_cache, const int* start_positions,
     const int* slot_ids, int rows, int kv_heads, int head_dim, int max_context,
-    size_t kv_slot_stride) {
+    size_t kv_slot_stride, const int* block_table, int block_size,
+    int max_blocks_per_seq) {
     const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int total = rows * kv_heads * head_dim;
     if (index >= total) return;
@@ -2779,8 +2838,19 @@ __global__ void append_kv_f16_batched_kernel(
     const int destination_token = start_positions[row];
     if (destination_token >= max_context) return;
     const int slot = slot_ids != nullptr ? slot_ids[row] : row;
-    const size_t destination = static_cast<size_t>(slot) * kv_slot_stride +
-        static_cast<size_t>(destination_token) * kv_heads * head_dim + within;
+    const size_t kv_stride = static_cast<size_t>(kv_heads) * head_dim;
+    size_t destination;
+    if (block_table != nullptr) {
+        const int block = block_table[
+            static_cast<size_t>(slot) * max_blocks_per_seq +
+            destination_token / block_size];
+        destination = (static_cast<size_t>(block) * block_size +
+                       static_cast<size_t>(destination_token % block_size)) *
+                      kv_stride + within;
+    } else {
+        destination = static_cast<size_t>(slot) * kv_slot_stride +
+            static_cast<size_t>(destination_token) * kv_stride + within;
+    }
     k_cache[destination] = k_rows[index];
     v_cache[destination] = v_rows[index];
 }
@@ -4299,15 +4369,54 @@ bool qwen_append_kv_cache_f16_batched_cuda(
     const uint16_t* k_rows, const uint16_t* v_rows,
     uint16_t* k_cache, uint16_t* v_cache, int rows,
     int kv_heads, int head_dim, const int* start_positions,
-    const int* slot_ids, int max_context, size_t kv_slot_stride, void* stream) {
+    const int* slot_ids, int max_context, size_t kv_slot_stride,
+    const int* block_table, int block_size, int max_blocks_per_seq,
+    void* stream) {
     if (!k_rows || !v_rows || !k_cache || !v_cache || !start_positions ||
         rows <= 0 || kv_heads <= 0 || head_dim <= 0 ||
-        max_context <= 0 || kv_slot_stride == 0) return false;
+        max_context <= 0) return false;
+    // The paged cache has no per-slot stride to validate; the block table and
+    // its geometry take that role.
+    if (block_table != nullptr) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0) return false;
+    } else if (kv_slot_stride == 0) {
+        return false;
+    }
     const int total = rows * kv_heads * head_dim;
     append_kv_f16_batched_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
         static_cast<cudaStream_t>(stream)>>>(k_rows, v_rows, k_cache, v_cache,
         start_positions, slot_ids, rows, kv_heads, head_dim, max_context,
-        kv_slot_stride);
+        kv_slot_stride, block_table, block_size, max_blocks_per_seq);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_f16_paged_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint16_t* k_cache, uint16_t* v_cache, int seq_len, int kv_heads,
+    int head_dim, int start_pos, const int* block_table, int block_size,
+    void* stream) {
+    if (!k_rows || !v_rows || !k_cache || !v_cache || !block_table ||
+        seq_len <= 0 || kv_heads <= 0 || head_dim <= 0 || start_pos < 0 ||
+        block_size <= 0) return false;
+    const int total = seq_len * kv_heads * head_dim;
+    append_kv_f16_paged_kernel<<<(total + kThreads - 1) / kThreads, kThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(k_rows, v_rows, k_cache, v_cache,
+        total, kv_heads, head_dim, start_pos, block_table, block_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gather_kv_cache_f16_paged_cuda(
+    const uint16_t* k_cache, const uint16_t* v_cache,
+    uint16_t* k_dense, uint16_t* v_dense, int context_len, int kv_heads,
+    int head_dim, const int* block_table, int block_size, void* stream) {
+    if (!k_cache || !v_cache || !k_dense || !v_dense || !block_table ||
+        context_len <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        block_size <= 0) return false;
+    const dim3 grid(static_cast<unsigned>(context_len),
+                    static_cast<unsigned>(kv_heads), 1);
+    gather_kv_f16_paged_kernel<<<grid, 256, 0,
+        static_cast<cudaStream_t>(stream)>>>(k_cache, v_cache, k_dense, v_dense,
+        context_len, kv_heads, head_dim, block_table, block_size);
     return cudaGetLastError() == cudaSuccess;
 }
 

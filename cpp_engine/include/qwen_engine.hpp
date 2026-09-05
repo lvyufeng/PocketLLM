@@ -104,6 +104,29 @@ struct QwenEngineOptions {
     // at construction time. Memory scales linearly: 2-slot ≈ 2× single-session.
     // Recommended: 2 for most workloads, 4-8 for high-concurrency scenarios.
     int max_batch_size = 1;
+    // Paged KV cache. The arena above reserves max_context per slot whether the
+    // request holds 100 tokens or 100K, so at 128K context the reservation alone
+    // is 2 GiB per slot per rank and concurrency is capped by the reservation
+    // rather than by real token use. With this enabled the cache is one pool of
+    // fixed-size blocks handed out as tokens arrive, so batch size scales with
+    // what the requests actually hold.
+    //
+    // FP16 only: batched decode already routes to the FP16 kernels before the
+    // dtype branches are reached, so paging FP16 covers all of batched decode
+    // while the quantized caches keep their validated scale and packed-slot
+    // arithmetic untouched. Construction rejects the other dtypes rather than
+    // silently falling back.
+    bool kv_paged = false;
+    // Tokens per block. 16 follows vLLM; at kv_heads * head_dim = 1024 FP16
+    // elements that is 32 KiB of contiguity per block, so reads stay coalesced
+    // within a block.
+    int kv_block_size = 16;
+    // Pool budget in bytes for the paged K and V arenas together, across all
+    // full-attention layers on this rank. 0 derives it from what
+    // max_batch_size * max_context would have reserved, which makes enabling
+    // paging alone memory-neutral and lets the block count be raised
+    // deliberately.
+    uint64_t kv_cache_bytes = 0;
 };
 
 struct QwenForwardResult {
@@ -172,6 +195,9 @@ struct QwenRuntimeTelemetry {
     std::string target_head_path = "unknown";
     uint64_t host_global_metadata_bytes = 0;
     uint64_t nvfp4_q8_workspace_peak_bytes = 0;
+    // Paged KV cache geometry. 0 blocks means the contiguous arena is in use.
+    int kv_paged_blocks = 0;
+    int kv_paged_block_size = 0;
 };
 
 struct QwenPrefixCacheStats {

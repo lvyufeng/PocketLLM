@@ -837,11 +837,34 @@ bool qwen_append_kv_cache_f16_cuda(
 // `d_slot_ids` maps each row to the cache slot it owns, because slots are
 // allocated as requests arrive: a four-row batch can hold slots 1/3/5/6. Pass
 // null when the rows occupy slots 0..rows-1 in order.
+// A non-null `d_block_table` selects the paged cache: the arena is shared and
+// `[max_slots, max_blocks_per_seq]` int32 block ids replace the per-slot stride,
+// so position `p` of slot `s` lives at
+// `(table[s][p / block_size] * block_size + p % block_size) * kv_heads *
+// head_dim`. `kv_slot_stride` is then unused.
 bool qwen_append_kv_cache_f16_batched_cuda(
     const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
     uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int rows,
     int kv_heads, int head_dim, const int* d_start_positions,
     const int* d_slot_ids, int max_context, size_t kv_slot_stride,
+    const int* d_block_table = nullptr, int block_size = 0,
+    int max_blocks_per_seq = 0, void* stream = nullptr);
+// Paged single-sequence append. `d_block_table` is one sequence's row of block
+// ids, so consecutive tokens land in whichever blocks that row names.
+bool qwen_append_kv_cache_f16_paged_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len,
+    int kv_heads, int head_dim, int start_pos, const int* d_block_table,
+    int block_size, void* stream = nullptr);
+// Collects one sequence's paged history into a dense
+// `[context_len, kv_heads, head_dim]` buffer, which is the layout every prefill
+// and single-row decode kernel already indexes. Gathering once per layer keeps
+// those five tuned variants unchanged, the same way the FP8 and TurboQuant
+// caches dequantize once before calling them.
+bool qwen_gather_kv_cache_f16_paged_cuda(
+    const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16, int context_len,
+    int kv_heads, int head_dim, const int* d_block_table, int block_size,
     void* stream = nullptr);
 bool qwen_append_kv_cache_fp8_cuda(
     const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
@@ -912,6 +935,11 @@ int qwen_gqa_decode_batched_split_count(
     int sink_tokens = 0);
 // `d_slot_ids` maps each row to the KV slot it owns; pass null when the rows
 // occupy slots 0..rows-1 in order.
+// A non-null `d_block_table` selects the paged cache, translating each scanned
+// position through the same block table the append above writes into. The
+// translation is loop-invariant within a block, so it costs one table read per
+// `block_size` positions rather than one per position. `max_context` then bounds
+// only the logical sequence; the arena extent comes from the pool.
 bool qwen_gqa_decode_attention_f16_batched_cuda(
     const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
@@ -919,7 +947,8 @@ bool qwen_gqa_decode_attention_f16_batched_cuda(
     const int* d_slot_ids, int rows, int max_context_len,
     size_t kv_slot_stride, int q_heads, int kv_heads, int head_dim,
     int max_context, int attention_window = 0, int sink_tokens = 0,
-    void* stream = nullptr);
+    const int* d_block_table = nullptr, int block_size = 0,
+    int max_blocks_per_seq = 0, void* stream = nullptr);
 
 // Fused decode with the split kernel chosen explicitly. Returns false when the
 // requested variant does not support the shape (the tensor-core kernel requires
