@@ -6,6 +6,8 @@
 #include "cmd_channel.hpp"
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
+#include "qwen_block_pool.hpp"
+#include "qwen_block_table.hpp"
 #include "qwen_ops.hpp"
 #include "qwen_dspark.hpp"
 #include "qwen_dflash2.hpp"
@@ -22,6 +24,7 @@
 #include <chrono>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -592,6 +595,73 @@ struct QwenEngine::Impl {
         return static_cast<size_t>(slot_id) * max_context * local_kv_heads * head_dim;
     }
 
+    // ========== Paged KV cache ==========
+    // Present only when options.kv_paged is set. The pool owns the block
+    // bookkeeping and the table owns the per-slot logical-to-physical map; the
+    // device arenas stay in the per-layer k_cache/v_cache tensors, sized to the
+    // pool rather than to max_batch_size * max_context.
+    std::unique_ptr<QwenBlockPool> block_pool;
+    std::unique_ptr<QwenBlockTable> block_table;
+    // Device mirror of the table, `[max_slots, max_blocks_per_seq]` int32.
+    QwenDeviceTensor block_table_device;
+
+    bool kv_paged() const { return block_table != nullptr; }
+
+    // Grows `slot` to cover `tokens` logical positions, throwing when the pool
+    // is exhausted. The scheduler-facing entry points convert that into
+    // backpressure; inside a forward there is nothing to fall back to, since the
+    // K/V for those positions has to land somewhere.
+    void reserve_paged_slot(int slot_id, int tokens) {
+        if (!kv_paged()) return;
+        if (!block_table->ensure_capacity(slot_id, tokens)) {
+            throw std::runtime_error(
+                "Qwen paged KV cache exhausted: slot " +
+                std::to_string(slot_id) + " needs " + std::to_string(tokens) +
+                " tokens but only " +
+                std::to_string(block_pool->free_blocks()) +
+                " of " + std::to_string(block_pool->total_blocks()) +
+                " blocks are free");
+        }
+    }
+
+    // Uploads the table when a row changed. A decode step that crosses no block
+    // boundary leaves it clean and pays nothing.
+    void sync_block_table() {
+        if (!kv_paged()) return;
+        if (!block_table->dirty()) return;
+        const std::vector<int32_t>& image = block_table->device_image();
+        check_device(memcpy_h2d(block_table_device.data, image.data(),
+                                image.size() * sizeof(int32_t)),
+                     "Qwen block table upload");
+    }
+
+    const int* block_table_data() const {
+        return kv_paged()
+            ? static_cast<const int*>(block_table_device.data) : nullptr;
+    }
+
+    int paged_block_size() const {
+        return kv_paged() ? block_table->block_size() : 0;
+    }
+
+    int paged_blocks_per_seq() const {
+        return kv_paged() ? block_table->max_blocks_per_seq() : 0;
+    }
+
+    // One slot's row of the device image, which is what the single-sequence
+    // paged kernels take: they address one sequence and need no slot
+    // indirection.
+    const int* block_table_row(int slot_id) const {
+        if (!kv_paged()) return nullptr;
+        return static_cast<const int*>(block_table_device.data) +
+               static_cast<size_t>(slot_id) * block_table->max_blocks_per_seq();
+    }
+
+    void release_paged_slot(int slot_id) {
+        if (!kv_paged()) return;
+        block_table->release(slot_id);
+    }
+
     // Phase 3.4: Element offsets into the per-slot recurrent state arenas. Both
     // tensors carry the slot count as their leading dimension, so the stride is
     // whatever remains. Deriving it from the shape keeps these correct without
@@ -806,6 +876,69 @@ struct QwenEngine::Impl {
         const bool fuse_kv_projection = speculative_target &&
             qwen_env_enabled("QWEN_FUSE_KV_PROJECTION");
 
+        // The paged pool is sized before any layer is uploaded, because every
+        // full-attention layer then allocates its arena from the same block
+        // count. Counting the layers up front rather than growing per layer is
+        // what makes the budget a single decision.
+        if (options.kv_paged) {
+            size_t full_attention_layers = 0;
+            for (size_t index = 0; index < layer_limit; ++index) {
+                if (!map.layers()[index].linear_attention.in_proj_qkv.weight.found) {
+                    ++full_attention_layers;
+                }
+            }
+            const size_t elements_per_token =
+                static_cast<size_t>(local_kv_heads) * head_dim;
+            // Bytes one block costs across every full-attention layer, K and V
+            // together. That is the unit the budget divides.
+            const size_t bytes_per_block = static_cast<size_t>(
+                options.kv_block_size) * elements_per_token * sizeof(uint16_t) *
+                2 * full_attention_layers;
+            if (full_attention_layers == 0 || bytes_per_block == 0) {
+                throw std::runtime_error(
+                    "Qwen paged KV cache requires at least one full-attention "
+                    "layer");
+            }
+            // A zero budget reproduces what the contiguous arena would have
+            // reserved, so turning paging on is memory-neutral and only changes
+            // how the same bytes are handed out.
+            const uint64_t budget = options.kv_cache_bytes != 0
+                ? options.kv_cache_bytes
+                : static_cast<uint64_t>(options.max_batch_size) * max_context *
+                      elements_per_token * sizeof(uint16_t) * 2 *
+                      full_attention_layers;
+            const int num_blocks = static_cast<int>(budget / bytes_per_block);
+            // A slot must be able to reach max_context, or a long request would
+            // fail at a boundary no scheduler could anticipate.
+            const int blocks_per_seq =
+                (max_context + options.kv_block_size - 1) /
+                options.kv_block_size;
+            if (num_blocks < blocks_per_seq) {
+                throw std::runtime_error(
+                    "Qwen paged KV cache budget covers " +
+                    std::to_string(num_blocks) + " blocks but a single " +
+                    std::to_string(max_context) +
+                    "-token sequence needs " + std::to_string(blocks_per_seq) +
+                    "; raise QwenEngineOptions::kv_cache_bytes");
+            }
+            block_pool = std::make_unique<QwenBlockPool>(
+                num_blocks, options.kv_block_size);
+            block_table = std::make_unique<QwenBlockTable>(
+                block_pool.get(), options.max_batch_size, max_context);
+            const size_t image_elements =
+                static_cast<size_t>(block_table->max_slots()) *
+                block_table->max_blocks_per_seq();
+            allocate(block_table_device, image_elements * sizeof(int32_t),
+                     {static_cast<uint64_t>(block_table->max_slots()),
+                      static_cast<uint64_t>(block_table->max_blocks_per_seq())},
+                     // Tagged like the other int row buffers in this engine
+                     // (batch_positions, batch_slot_ids): the allocation is
+                     // sized in bytes and nothing reads the dtype back.
+                     SafeDType::I64);
+            telemetry.kv_paged_blocks = num_blocks;
+            telemetry.kv_paged_block_size = options.kv_block_size;
+        }
+
         for (size_t layer_index = 0; layer_index < layer_limit; ++layer_index) {
             const QwenLayerWeights& source = map.layers()[layer_index];
             for (const QwenTensorRef* ref : {
@@ -949,7 +1082,28 @@ struct QwenEngine::Impl {
                     static_cast<uint64_t>(local_kv_heads),
                     static_cast<uint64_t>(head_dim)};
 
-                if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
+                if (block_pool != nullptr) {
+                    // Paged: one arena of blocks shared by every slot. The
+                    // leading dimension is the block count, not the slot count,
+                    // which is the whole difference: a slot's extent is now what
+                    // it has been handed rather than what it reserved.
+                    // Construction rejects the quantized dtypes, so this branch
+                    // is FP16 by definition.
+                    const size_t paged_elements =
+                        static_cast<size_t>(block_pool->total_blocks()) *
+                        block_pool->block_size() * local_kv_heads * head_dim;
+                    const std::vector<uint64_t> paged_shape = {
+                        static_cast<uint64_t>(block_pool->total_blocks()),
+                        static_cast<uint64_t>(block_pool->block_size()),
+                        static_cast<uint64_t>(local_kv_heads),
+                        static_cast<uint64_t>(head_dim)};
+                    allocate_half(destination.full.k_cache, paged_elements,
+                                  paged_shape);
+                    allocate_half(destination.full.v_cache, paged_elements,
+                                  paged_shape);
+                    cache_data_bytes += destination.full.k_cache.nbytes +
+                                        destination.full.v_cache.nbytes;
+                } else if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
                     allocate_half(destination.full.k_cache, cache_elements, cache_shape);
                     allocate_half(destination.full.v_cache, cache_elements, cache_shape);
                     cache_data_bytes += destination.full.k_cache.nbytes +
@@ -2552,12 +2706,25 @@ struct QwenEngine::Impl {
 
         if (batch_rows != nullptr) {
             // Each row appends its new K/V at its own position in its own slot.
+            // Under paging the slot stride is replaced by the block table, which
+            // the caller has already grown and uploaded for these positions.
             require_launch(qwen_append_kv_cache_f16_batched_cuda(
                 k_norm.f16_data(), v.f16_data(),
                 layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
                 rows, kv_heads, head_dim, batch_rows->positions,
-                batch_rows->slot_ids, max_context, kv_slot_stride),
+                batch_rows->slot_ids, max_context, kv_slot_stride,
+                block_table_data(), paged_block_size(),
+                paged_blocks_per_seq()),
                 "append batched FP16 full KV cache");
+        } else if (kv_paged()) {
+            // Single-sequence paged append: consecutive positions of one
+            // sequence, scattered across the blocks its row names.
+            require_launch(qwen_append_kv_cache_f16_paged_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                rows, kv_heads, head_dim, position_offset,
+                block_table_row(slot_id), paged_block_size()),
+                "append paged FP16 full KV cache");
         } else if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_append_kv_cache_fp8_cuda(
                 k_norm.f16_data(), v.f16_data(),
@@ -2597,6 +2764,45 @@ struct QwenEngine::Impl {
                 position_offset, max_context), "append FP16 full KV cache");
         }
 
+        // Where the read kernels find this sequence's history. Contiguous, that
+        // is the slot's own span of the arena. Paged and single-sequence, the
+        // blocks are gathered once per layer into the dense
+        // `[context, kv_heads, head_dim]` layout every read kernel already
+        // indexes, so the five tuned prefill and decode variants stay untouched.
+        // This is the same dequant-once trade the FP8 and TurboQuant paths make:
+        // one O(context) pass instead of translating inside O(rows * context)
+        // inner loops. Batched decode does not come through here; it reads the
+        // blocks natively, which is the path that has to scale with batch size.
+        // Only the FP16 cache stores halves here; the quantized caches keep
+        // their own packed buffers and reach for them inside their own branches
+        // below, so binding these eagerly would trip f16_data()'s dtype check.
+        const bool fp16_cache = cache_dtype == QwenKvCacheDType::Fp16;
+        const uint16_t* k_read = fp16_cache
+            ? layer.full.k_cache.f16_data() + slot_offset : nullptr;
+        const uint16_t* v_read = fp16_cache
+            ? layer.full.v_cache.f16_data() + slot_offset : nullptr;
+        if (kv_paged() && batch_rows == nullptr) {
+            const int context_length = position_offset + rows;
+            const std::vector<uint64_t> dense_shape = {
+                static_cast<uint64_t>(context_length),
+                static_cast<uint64_t>(kv_heads),
+                static_cast<uint64_t>(head_dim)};
+            const size_t dense_elements =
+                static_cast<size_t>(context_length) * kv_heads * head_dim;
+            QwenDeviceTensor& k_dense =
+                workspace_half(dense_elements, dense_shape);
+            QwenDeviceTensor& v_dense =
+                workspace_half(dense_elements, dense_shape);
+            PhaseScope sub(this, "full.kv_gather");
+            require_launch(qwen_gather_kv_cache_f16_paged_cuda(
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                k_dense.f16_data(), v_dense.f16_data(), context_length,
+                kv_heads, head_dim, block_table_row(slot_id),
+                paged_block_size()), "gather paged FP16 KV cache");
+            k_read = k_dense.f16_data();
+            v_read = v_dense.f16_data();
+        }
+
         if (batch_rows != nullptr) {
             // One launch for the whole batch. The split geometry comes from the
             // longest row, so the scratch is sized from that same query the
@@ -2618,7 +2824,9 @@ struct QwenEngine::Impl {
                 partials.f32_data(), batch_rows->context_lens,
                 batch_rows->slot_ids, rows, batch_rows->max_context_len,
                 kv_slot_stride, q_heads, kv_heads, head_dim, max_context,
-                attention_window, sink_tokens), "batched decode FP16-cache GQA");
+                attention_window, sink_tokens, block_table_data(),
+                paged_block_size(), paged_blocks_per_seq()),
+                "batched decode FP16-cache GQA");
         } else if (rows == 1) {
             const int context_length = position_offset + 1;
             const bool optimized_attention =
@@ -2692,8 +2900,8 @@ struct QwenEngine::Impl {
             } else if (optimized_decode) {
                 require_launch(qwen_gqa_decode_attention_f16_fused_cuda(
                     q_norm.f16_data(),
-                    layer.full.k_cache.f16_data() + slot_offset,
-                    layer.full.v_cache.f16_data() + slot_offset,
+                    k_read,
+                    v_read,
                     attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context, attention_window, sink_tokens),
@@ -2701,8 +2909,8 @@ struct QwenEngine::Impl {
             } else {
                 require_launch(qwen_gqa_decode_attention_f16(
                     q_norm.f16_data(),
-                    layer.full.k_cache.f16_data() + slot_offset,
-                    layer.full.v_cache.f16_data() + slot_offset,
+                    k_read,
+                    v_read,
                     attention.f16_data(),
                     scores.f32_data(), q_heads, kv_heads, head_dim,
                     context_length, max_context), "decode FP16-cache GQA");
@@ -2835,8 +3043,8 @@ struct QwenEngine::Impl {
                 PhaseScope sub(this, "full.attn_kernel");
                 require_launch(qwen_gqa_verify_attention_f16_cublas_qk_cuda(
                     q_norm.f16_data(),
-                    layer.full.k_cache.f16_data() + slot_offset,
-                    layer.full.v_cache.f16_data() + slot_offset,
+                    k_read,
+                    v_read,
                     attention.f16_data(),
                     scores.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context),
@@ -2867,8 +3075,8 @@ struct QwenEngine::Impl {
                 PhaseScope sub(this, "full.attn_kernel");
                 require_launch(qwen_gqa_verify_attention_f16(
                     q_norm.f16_data(),
-                    layer.full.k_cache.f16_data() + slot_offset,
-                    layer.full.v_cache.f16_data() + slot_offset,
+                    k_read,
+                    v_read,
                     attention.f16_data(),
                     partials.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context, verify_splits),
@@ -2883,8 +3091,8 @@ struct QwenEngine::Impl {
                      static_cast<uint64_t>(context_length)});
                 { PhaseScope sub(this, "full.attn_kernel"); require_launch(qwen_gqa_verify_attention_f16_exact_cuda(
                     q_norm.f16_data(),
-                    layer.full.k_cache.f16_data() + slot_offset,
-                    layer.full.v_cache.f16_data() + slot_offset,
+                    k_read,
+                    v_read,
                     attention.f16_data(),
                     scores.f32_data(), rows, q_heads, kv_heads, head_dim,
                     position_offset, max_context),
@@ -2897,8 +3105,8 @@ struct QwenEngine::Impl {
                    attention_window > 0) {
             require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
                 q_norm.f16_data(),
-                layer.full.k_cache.f16_data() + slot_offset,
-                layer.full.v_cache.f16_data() + slot_offset,
+                k_read,
+                v_read,
                 attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, position_offset, max_context,
                 attention_window, sink_tokens),
@@ -2906,8 +3114,8 @@ struct QwenEngine::Impl {
         } else {
             require_launch(qwen_gqa_prefill_attention_f16(
                 q_norm.f16_data(),
-                layer.full.k_cache.f16_data() + slot_offset,
-                layer.full.v_cache.f16_data() + slot_offset,
+                k_read,
+                v_read,
                 attention.f16_data(), rows,
                 q_heads, kv_heads, head_dim, position_offset, max_context),
                 "prefill FP16-cache GQA");
@@ -4227,6 +4435,22 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
         throw std::runtime_error(
             "Qwen sparse attention currently requires an FP16 KV cache");
     }
+    if (options_.kv_paged) {
+        // FP16 only. The quantized caches carry their own scale and packed-slot
+        // offset arithmetic, and paging them would mean reworking each one's
+        // addressing with no coverage from the batched path, which is FP16
+        // already. Refusing is what keeps the restriction visible instead of
+        // silently degrading to a contiguous cache.
+        if (options_.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+            throw std::runtime_error(
+                std::string("Qwen paged KV cache requires an FP16 cache; got ") +
+                qwen_kv_cache_dtype_name(options_.kv_cache_dtype));
+        }
+        if (options_.kv_block_size <= 0) {
+            throw std::runtime_error(
+                "Qwen paged KV block size must be positive");
+        }
+    }
 #ifdef POCKET_BACKEND_ASCEND
     // full_attention only compiles the FP16 cache path on this backend, so the
     // rejection belongs here where the option is still reportable rather than
@@ -4368,6 +4592,14 @@ void QwenEngine::clear_prefix_cache() {
     }
     // KV storage is overwritten before it is read. Avoid clearing several GiB
     // on every request; position_ bounds all attention reads.
+    //
+    // A paged cache is the exception: its blocks are a finite pool, so clearing
+    // the positions without returning the blocks would leak the whole pool over
+    // a few requests. The bytes still are not touched, only the bookkeeping.
+    if (impl_->kv_paged()) {
+        impl_->block_table->release_all();
+        impl_->sync_block_table();
+    }
 }
 
 // ========== Batch API implementation (Phase 3.1) ==========
@@ -4444,6 +4676,21 @@ void QwenEngine::free_slot(uint64_t request_id) {
     int slot_id = it->second;
     impl_->request_to_slot.erase(it);
     impl_->free_slots.push_back(slot_id);
+    // Returning the slot returns its blocks. Under paging this is what makes
+    // capacity dynamic: the next request draws from a pool the finished one has
+    // already given back, rather than inheriting a fixed reservation.
+    impl_->release_paged_slot(slot_id);
+    impl_->sync_block_table();
+    // The slot's reuse state described KV that is no longer backed by these
+    // blocks, so it must not survive into the next request on this slot.
+    if (impl_->kv_paged()) {
+        Impl::SlotPrefixState& prefix = impl_->prefix_for(slot_id);
+        prefix.cached_prompt.clear();
+        prefix.snapshots.clear();
+        prefix.cached_result = QwenForwardResult{};
+        prefix.has_cached_result = false;
+        impl_->set_slot_position(slot_id, 0, position_);
+    }
 }
 
 QwenBatchPrefillResult QwenEngine::batch_prefill(
@@ -4536,6 +4783,15 @@ std::vector<QwenForwardResult> QwenEngine::batch_decode_tokens(
         }
         positions[static_cast<size_t>(row)] = position;
     }
+
+    // Every row grows by one token. Reserving all of them before the forward
+    // keeps the failure at a batch boundary: a mid-forward throw would leave
+    // some rows appended and others not.
+    for (int row = 0; row < rows; ++row) {
+        impl_->reserve_paged_slot(slot_ids[static_cast<size_t>(row)],
+                                  positions[static_cast<size_t>(row)] + 1);
+    }
+    impl_->sync_block_table();
 
     QwenVerifyBatch batch = impl_->run_batched_decode(
         tokens, positions, slot_ids, active_layers_);
@@ -4781,6 +5037,13 @@ QwenPartialPrefillResult QwenEngine::prefill_bounded(
         max_tokens > 0
             ? std::min(target_position, start_position + std::max(1, max_tokens))
             : target_position;
+    // Blocks for everything this call will write, taken before the first chunk
+    // so an exhausted pool surfaces here rather than part-way through a prompt
+    // whose earlier chunks already advanced the recurrent state. The block table
+    // is uploaded once for the whole prefill: it does not change again until the
+    // next call, so the per-chunk forwards read the same rows.
+    impl_->reserve_paged_slot(slot_id, budget_limit);
+    impl_->sync_block_table();
     for (int offset = start_position; offset < budget_limit;) {
         int end = std::min(budget_limit, offset + chunk_size);
         // Split at exact snapshot boundaries even when a request begins at an
@@ -4881,6 +5144,10 @@ QwenForwardResult QwenEngine::decode_step(int token_id, int slot_id) {
     if (current_position >= max_context_) {
         throw std::runtime_error("Qwen context length exceeded");
     }
+    // One more token to hold. This is a no-op except on the step that crosses a
+    // block boundary, and the table upload is skipped when nothing changed.
+    impl_->reserve_paged_slot(slot_id, current_position + 1);
+    impl_->sync_block_table();
     QwenForwardResult result = impl_->run_chunk(
         {token_id}, current_position, active_layers_, true, nullptr, nullptr, slot_id);
 

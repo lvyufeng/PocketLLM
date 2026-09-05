@@ -39,6 +39,8 @@ set(POCKET_CORE_SOURCES
     core/weight_source.cpp
     core/model_config.cpp
     core/qwen_config.cpp
+    core/qwen_block_pool.cpp
+    core/qwen_block_table.cpp
     core/qwen_weight_map.cpp
     core/tokenizer.cpp
     core/tensor.cpp
@@ -729,6 +731,18 @@ set_target_properties(test_qwen_chunked_prefill PROPERTIES RUNTIME_OUTPUT_DIRECT
 add_executable(test_qwen_eos_stop tests/test_qwen_eos_stop.cpp)
 target_link_libraries(test_qwen_eos_stop PRIVATE dsv4_cpp_core)
 set_target_properties(test_qwen_eos_stop PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_block_pool tests/test_qwen_block_pool.cpp)
+target_link_libraries(test_qwen_block_pool PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_block_pool PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_paged_kv_kernels tests/test_qwen_paged_kv_kernels.cpp)
+target_link_libraries(test_qwen_paged_kv_kernels PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_paged_kv_kernels PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_paged_engine_parity tests/test_qwen_paged_engine_parity.cpp)
+target_link_libraries(test_qwen_paged_engine_parity PRIVATE dsv4_cpp_core)
+set_target_properties(test_qwen_paged_engine_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_prefill_interleave tests/bench_qwen_prefill_interleave.cpp)
 target_link_libraries(bench_qwen_prefill_interleave PRIVATE dsv4_cpp_core)
