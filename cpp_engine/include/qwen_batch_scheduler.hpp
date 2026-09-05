@@ -117,6 +117,10 @@ public:
         int completed_requests = 0;
         int cancelled_requests = 0;
         int free_slots = 0;
+        // Paged KV admission state; all 0 under the contiguous arena.
+        int reserved_blocks = 0;
+        int total_blocks = 0;
+        int free_blocks = 0;
     };
     Stats get_stats() const;
 
@@ -142,6 +146,10 @@ private:
     // Handle completed requests
     void handle_completions();
 
+    // Blocks a request may end up holding: prompt plus its full generation
+    // allowance. 0 under the contiguous arena, where slots are the only budget.
+    int worst_case_blocks(const SchedulerRequest& req) const;
+
     // Notify result (invoke callback or store for poll)
     void notify_result(SchedulerRequest* req);
 
@@ -161,6 +169,11 @@ private:
     std::queue<std::unique_ptr<SchedulerRequest>> waiting_queue_;
     std::unordered_map<int, std::unique_ptr<SchedulerRequest>> slot_to_request_;
     std::unordered_map<uint64_t, int> request_id_to_slot_;
+    // Sum of worst_case_blocks over admitted requests. Admission compares against
+    // the pool total minus this, not against the pool's free count: the engine
+    // takes blocks only as tokens arrive, so free blocks include capacity a
+    // running request will still need for its remaining decode.
+    int reserved_blocks_ = 0;
 
     // Cancelled requests (protected by queue_mutex_)
     std::unordered_set<uint64_t> cancelled_requests_;
