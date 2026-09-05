@@ -4647,6 +4647,22 @@ void QwenEngine::allocate_batch_slots(int max_batch_size) {
     }
 }
 
+bool QwenEngine::kv_paged() const { return impl_->kv_paged(); }
+
+int QwenEngine::kv_free_blocks() const {
+    return impl_->kv_paged() ? impl_->block_pool->free_blocks() : 0;
+}
+
+int QwenEngine::kv_total_blocks() const {
+    return impl_->kv_paged() ? impl_->block_pool->total_blocks() : 0;
+}
+
+int QwenEngine::kv_blocks_for_tokens(int tokens) const {
+    if (!impl_->kv_paged() || tokens <= 0) return 0;
+    const int block_size = impl_->paged_block_size();
+    return (tokens + block_size - 1) / block_size;
+}
+
 int QwenEngine::allocate_slot(uint64_t request_id) {
     if (!impl_->batch_mode_enabled) {
         // Single session mode: always use slot 0

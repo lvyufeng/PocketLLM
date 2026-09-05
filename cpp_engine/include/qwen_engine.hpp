@@ -360,6 +360,23 @@ public:
     // Free a KV cache slot when request completes
     void free_slot(uint64_t request_id);
 
+    // ========== Paged KV admission (for the scheduler) ==========
+
+    // Whether the paged block pool is in use. False means the contiguous arena
+    // is, in which case a slot already owns max_context tokens and the block
+    // accounting below carries no information.
+    bool kv_paged() const;
+
+    // Blocks free right now, and the pool total. Under the contiguous arena both
+    // are 0.
+    int kv_free_blocks() const;
+    int kv_total_blocks() const;
+
+    // Blocks a sequence of `tokens` logical positions needs in total. This is
+    // the unit admission has to reason in: a request's cost is set by the blocks
+    // its context will span, not by the single slot it occupies.
+    int kv_blocks_for_tokens(int tokens) const;
+
     // Batch prefill: process multiple requests in their prefill phase.
     // Each request may have a different prompt length, and requests are still
     // processed one at a time rather than merged into one variable-length

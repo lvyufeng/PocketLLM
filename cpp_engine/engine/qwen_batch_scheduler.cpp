@@ -56,6 +56,7 @@ void QwenBatchScheduler::stop() {
     }
     slot_to_request_.clear();
     request_id_to_slot_.clear();
+    reserved_blocks_ = 0;
 }
 
 uint64_t QwenBatchScheduler::submit_request(
@@ -75,6 +76,16 @@ uint64_t QwenBatchScheduler::submit_request(
     req->sampling = sampling;
     req->callback = std::move(callback);
     req->submit_time = std::chrono::steady_clock::now();
+
+    // A request whose worst case exceeds the entire pool can never be admitted,
+    // so reject it here instead of letting it sit at the head of the queue
+    // blocking everything behind it forever. Safe outside queue_mutex_: this
+    // reads only the pool geometry, fixed once the engine is constructed, and
+    // the request's own fields, which no other thread can see yet.
+    if (engine_->kv_paged() &&
+        worst_case_blocks(*req) > engine_->kv_total_blocks()) {
+        return 0;
+    }
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -148,6 +159,9 @@ QwenBatchScheduler::Stats QwenBatchScheduler::get_stats() const {
     stats.completed_requests = total_completed_.load();
     stats.cancelled_requests = total_cancelled_.load();
     stats.free_slots = max_batch_size_ - stats.running_requests;
+    stats.reserved_blocks = reserved_blocks_;
+    stats.total_blocks = engine_->kv_total_blocks();
+    stats.free_blocks = engine_->kv_free_blocks();
 
     return stats;
 }
@@ -195,11 +209,46 @@ void QwenBatchScheduler::schedule_loop() {
     }
 }
 
+int QwenBatchScheduler::worst_case_blocks(const SchedulerRequest& req) const {
+    if (!engine_->kv_paged()) return 0;
+    // Prompt plus every token the request is still allowed to generate. Charging
+    // only the prompt would admit a request whose decode cannot be backed, and a
+    // decode step must write its K/V somewhere. Requests therefore hold their
+    // full future footprint for their whole life; this trades some admission
+    // headroom for never failing a request that was already accepted.
+    const int max_context_tokens =
+        static_cast<int>(req.prompt_tokens.size()) + req.sampling.max_new_tokens;
+    return engine_->kv_blocks_for_tokens(max_context_tokens);
+}
+
 void QwenBatchScheduler::admit_requests() {
     std::lock_guard<std::mutex> lock(queue_mutex_);
 
     while (!waiting_queue_.empty() &&
            slot_to_request_.size() < static_cast<size_t>(max_batch_size_)) {
+
+        // Under paging, capacity is blocks rather than slots: a request costs the
+        // blocks its context will span, so a queue of short prompts can run at
+        // full width while long ones are held back. The contiguous arena gives
+        // every slot max_context up front, so there is nothing to weigh and the
+        // slot bound above is the whole admission rule.
+        if (engine_->kv_paged()) {
+            const int needed =
+                worst_case_blocks(*waiting_queue_.front());
+            // Checked against the pool total minus what admitted requests may
+            // still grow into, not against free_blocks. The engine takes blocks
+            // as tokens arrive, so free_blocks counts a running request's future
+            // decode blocks as available; admitting against it would overcommit
+            // and exhaust the pool inside a decode forward, which has nowhere to
+            // put the K/V it must write and no way to back out.
+            if (needed > engine_->kv_total_blocks() - reserved_blocks_) {
+                // Head-of-line blocking is deliberate: taking a later, smaller
+                // request first would starve long prompts indefinitely under a
+                // steady stream of short ones. The request waits for blocks its
+                // predecessors return.
+                break;
+            }
+        }
 
         auto req = std::move(waiting_queue_.front());
         waiting_queue_.pop();
@@ -220,6 +269,9 @@ void QwenBatchScheduler::admit_requests() {
         }
 
         req->slot_id = slot_id;
+        // Held until the request completes, so later passes see this request's
+        // full future footprint rather than only the blocks it has taken so far.
+        reserved_blocks_ += worst_case_blocks(*req);
         request_id_to_slot_[req->request_id] = slot_id;
         slot_to_request_[slot_id] = std::move(req);
     }
@@ -419,6 +471,13 @@ void QwenBatchScheduler::handle_completions() {
 
                 // Record completion time
                 req->completion_time = std::chrono::steady_clock::now();
+
+                // Drop this request's admission reservation here, under the same
+                // mutex that guards it, rather than beside the free_slot call
+                // below which runs unlocked. engine_->free_slot returns the
+                // blocks themselves; this returns the right to count on them.
+                reserved_blocks_ -= worst_case_blocks(*req);
+                if (reserved_blocks_ < 0) reserved_blocks_ = 0;
 
                 // Move to completed list
                 completed.push_back(std::move(req));
