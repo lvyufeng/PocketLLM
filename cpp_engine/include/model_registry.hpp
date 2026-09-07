@@ -42,6 +42,16 @@ struct EngineOptions {
     // Paged pool budget in bytes on this rank; 0 derives it from what the
     // contiguous arena would have reserved.
     uint64_t kv_cache_bytes = 0;
+    // Sampling, for engines that fix it at construction rather than reading it
+    // off each request. Nothing about a temperature is model-specific, and an
+    // engine reporting caps().per_request_sampling == false has no other way to
+    // be told: a caller that could not set these here would be stuck with
+    // greedy decoding for the life of the process. Engines that sample per
+    // request ignore them.
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 20;
+    unsigned long long seed = 0;
 };
 
 // Builds one engine for one checkpoint. Registered per architecture.

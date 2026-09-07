@@ -27,8 +27,7 @@ namespace pocket {
 // TP is handled the way QwenEngine's batched entry points handle it: each forward
 // announces itself on the worker command channel first, so a scheduler driving
 // this adapter is TP-safe without knowing the protocol exists. Rank 0 drives;
-// worker ranks stay in PersistentEngine::run_worker_loop(), which the owner
-// reaches through engine().
+// worker ranks stay in run_worker_loop(), which the interface exposes.
 class PersistentEngineAdapter : public InferenceEngine {
 public:
     // Owning form: constructs the PersistentEngine. This is what the model
@@ -49,8 +48,8 @@ public:
     PersistentEngineAdapter& operator=(const PersistentEngineAdapter&) = delete;
 
     // The wrapped engine, for the model-specific surface the interface does not
-    // carry: warmup_tp(), run_worker_loop(), worker_command_shutdown(),
-    // speculative decoding, the tokenizer.
+    // carry: speculative decoding, the tokenizer, the per-forward worker
+    // commands. TP bring-up and teardown are on the interface itself.
     PersistentEngine& engine() { return *engine_; }
     const PersistentEngine& engine() const { return *engine_; }
 
@@ -82,6 +81,13 @@ public:
                                      int token_budget) override;
     BatchDecodeResult batch_decode_step(
         const std::vector<BatchedRequest*>& requests) override;
+
+    // Straight forwards. PersistentEngine spells the last one
+    // worker_command_shutdown(); the interface asks for the intent, not the
+    // wire op.
+    void warmup_tp() override { engine_->warmup_tp(); }
+    void run_worker_loop() override { engine_->run_worker_loop(); }
+    void shutdown_tp_workers() override { engine_->worker_command_shutdown(); }
 
 private:
     bool is_stop_token(const BatchSamplingParams& sampling, int token) const;

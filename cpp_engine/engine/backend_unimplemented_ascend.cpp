@@ -11,8 +11,9 @@
 // in the link has to resolve even when its branch is unreachable. Excluding the
 // sources removes those references, and this translation unit supplies the
 // handful of definitions the surviving callers still need -- main.cpp and
-// core/openai_server.cpp for the DeepSeek-V4 entry points, and engine/qwen_engine.cpp
-// for the drafter runtime methods its shared bookkeeping calls.
+// engine/persistent_engine_adapter.cpp for the DeepSeek-V4 entry points, and
+// engine/qwen_engine.cpp for the drafter runtime methods its shared bookkeeping
+// calls.
 //
 // Every entry point throws. None of them is reachable from the Qwen FP16 path
 // that this backend does implement: QwenEngine's constructor rejects a drafter

@@ -14,6 +14,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace pocket {
@@ -27,7 +28,24 @@ struct SchedulerGenerationResult {
     int completion_tokens = 0;
     double total_seconds = 0.0;
     double ttft_seconds = 0.0;  // Time to first token
+    // Non-empty when the engine rejected or failed a forward. The old direct
+    // server path surfaced that exception as HTTP 500; routing through a
+    // background scheduler must preserve it rather than retrying forever until
+    // the HTTP request times out.
+    std::string error;
 };
+
+// Invoked once per generated token, from the scheduler thread, as soon as the
+// token is produced rather than when the request completes. This is what a
+// streaming server needs: waiting for the completion callback would buffer the
+// whole answer and defeat the point.
+//
+// It runs inline in the schedule loop, so it MUST NOT BLOCK. Time spent here
+// delays every other running request, and writing to a socket from it would let
+// one slow client stall the batch. Push the token onto a queue and return.
+// Re-entering the scheduler from it (submit_request, cancel_request) is safe --
+// it is called with no scheduler lock held -- but still counts as time spent.
+using TokenCallback = std::function<void(uint64_t request_id, int token)>;
 
 // Internal request wrapper with scheduling metadata
 struct SchedulerRequest {
@@ -49,6 +67,9 @@ struct SchedulerRequest {
     // Cancelled before finishing. Recorded here because the cancelled set is
     // erased before results are reported.
     bool cancelled = false;
+    // Terminal engine failure. Kept separate from cancellation because callers
+    // report it as an error, not as a finish_reason.
+    std::string error;
     int last_token = 0;
     std::vector<int> generated_tokens;
 
@@ -60,6 +81,8 @@ struct SchedulerRequest {
     // Result notification
     std::function<void(const SchedulerGenerationResult&)> callback;
     bool callback_invoked = false;
+    // Fired per token; see TokenCallback.
+    TokenCallback token_callback;
 };
 
 // Continuous batching scheduler over any InferenceEngine.
@@ -82,12 +105,16 @@ public:
     BatchScheduler& operator=(const BatchScheduler&) = delete;
 
     // Submit a new generation request
-    // Returns request_id (> 0) on success, 0 on failure
-    // The callback will be invoked from the scheduler thread when generation completes
+    // Returns request_id (> 0) on success, 0 on failure.
+    // With `callback`, completion is delivered from the scheduler thread and is
+    // not duplicated into poll_result(); without one, poll_result is the result
+    // channel. `on_token`, when supplied, additionally fires per token as it is
+    // produced.
     uint64_t submit_request(
         const std::vector<int>& prompt_tokens,
         const BatchSamplingParams& sampling,
-        std::function<void(const SchedulerGenerationResult&)> callback = nullptr);
+        std::function<void(const SchedulerGenerationResult&)> callback = nullptr,
+        TokenCallback on_token = nullptr);
 
     // Cancel a pending or running request
     // Returns true if the request was found and marked for cancellation
@@ -154,6 +181,10 @@ private:
 
     // Handle completed requests
     void handle_completions();
+
+    // Fire the per-token callbacks recorded during a prefill or decode pass.
+    // Separate from those passes because it must run with queue_mutex_ released.
+    void deliver_tokens(const std::vector<std::pair<SchedulerRequest*, int>>& emitted);
 
     // Blocks a request may end up holding: prompt plus its full generation
     // allowance. 0 under the contiguous arena, where slots are the only budget.

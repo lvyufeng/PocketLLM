@@ -29,6 +29,25 @@ struct Capabilities {
     bool chunked_prefill = false;
     // Concurrent request slots. 1 means one mutable session at a time.
     int max_slots = 1;
+    // BatchSamplingParams' temperature / top_p / seed are applied per row. When
+    // false the engine samples every row with whatever it was constructed with
+    // and reads only max_new_tokens, stop_token_ids and ignore_eos off the
+    // request -- so a server must refuse a request that asks for different
+    // sampling rather than quietly returning something else.
+    bool per_request_sampling = false;
+    // Top-k is separate because the DeepSeek-V4 sampler varies temperature,
+    // top_p and seed per request but has no top-k stage at all.
+    bool per_request_top_k = false;
+    // What every row gets when the corresponding per-request flag is false.
+    // Without these a server can only choose between rejecting every request
+    // that names a temperature -- which is most OpenAI clients, since they send
+    // the default explicitly -- and silently substituting its own. With them it
+    // can tell "asked for exactly what it will get" from "asked for something
+    // else". fixed_top_k == 0 means no top-k cap.
+    float fixed_temperature = 0.0f;
+    float fixed_top_p = 1.0f;
+    int fixed_top_k = 0;
+    unsigned long long fixed_seed = 0;
 };
 
 // One forward pass over one sequence.
@@ -134,7 +153,9 @@ public:
 
     // Device this engine bound at construction. The current device is
     // per-thread, so a scheduler thread has to re-select it before touching
-    // device memory.
+    // device memory. -1 means the engine has no accelerator context (used by
+    // host-only engines and scheduler conformance stubs), in which case there
+    // is nothing to select.
     virtual int device() const = 0;
 
     // ---- Slot lifecycle ----
@@ -178,6 +199,32 @@ public:
     // but must occupy distinct slots.
     virtual BatchDecodeResult batch_decode_step(
         const std::vector<BatchedRequest*>& requests) = 0;
+
+    // ---- Tensor-parallel process lifecycle ----
+    //
+    // Only these three, not the whole worker protocol. The per-forward
+    // worker_command_* announcements stay on the concrete engine, where the
+    // batched entry points above already issue them; a caller driving the
+    // engine through batch_prefill/batch_decode_step never sends one by hand.
+    // What a caller *cannot* do without knowing the model is bring the group up
+    // and take it down, and a process that serves whichever engine the registry
+    // handed it has to do exactly that. Called at most twice per process, so
+    // dispatching them virtually costs nothing.
+    //
+    // Default no-ops: an engine with no tensor parallelism needs no boilerplate
+    // to be driven by the same main().
+
+    // Establish the TP command channel and collectives. Must precede any
+    // batched call at world size > 1. No-op at world size 1.
+    virtual void warmup_tp() {}
+
+    // Entry point for ranks other than 0: block on the command channel and
+    // serve whatever rank 0 announces until it sends shutdown. Returns only
+    // once the group is torn down.
+    virtual void run_worker_loop() {}
+
+    // Rank 0 only: tell every worker rank to leave run_worker_loop().
+    virtual void shutdown_tp_workers() {}
 };
 
 }  // namespace pocket

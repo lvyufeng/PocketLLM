@@ -6,7 +6,6 @@
 #include "model_registry.hpp"
 #include "openai_server.hpp"
 #include "persistent_engine.hpp"
-#include "persistent_engine_adapter.hpp"
 #include "qwen_config.hpp"
 #include "qwen_engine.hpp"
 #include "python_sidecar.hpp"
@@ -35,6 +34,10 @@ struct Args {
     std::string token_ids_csv;
     std::string token_ids_file;
     int smoke_layers = 1;
+    // Lets serving default to the checkpoint's full depth while preserving the
+    // one-layer default of the standalone smoke commands. The same option is an
+    // explicit reduced-depth server request only when it appeared on the CLI.
+    bool smoke_layers_explicit = false;
     int forward_token = -1;
     int position = 0;
     int max_new_tokens = 1;
@@ -75,6 +78,15 @@ struct Args {
     bool serve = false;
     int port = 8000;
     std::string host = "0.0.0.0";
+    // Completions the server may run at once. Clamped down to whatever the
+    // engine declares, so leaving this at 8 costs nothing on an engine that
+    // serves one session at a time.
+    int max_batch_size = 8;
+    // Paged KV is what lets several requests share one pool instead of each
+    // reserving max_context. Off by default so the serve path keeps the
+    // contiguous arena's behaviour unless asked.
+    bool kv_paged = false;
+    int kv_block_size = 16;
     std::string python_bin = "python";
     std::string sidecar_script;
 };
@@ -125,6 +137,7 @@ Args parse_args(int argc, char** argv) {
             args.qwen_persistent_stdin = true;
         } else if (arg == "--smoke-layers" && i + 1 < argc) {
             args.smoke_forward = true;
+            args.smoke_layers_explicit = true;
             args.smoke_layers = std::stoi(argv[++i]);
         } else if (arg == "--forward-token" && i + 1 < argc) {
             args.smoke_forward = true;
@@ -209,6 +222,12 @@ Args parse_args(int argc, char** argv) {
             args.port = std::stoi(argv[++i]);
         } else if (arg == "--host" && i + 1 < argc) {
             args.host = argv[++i];
+        } else if (arg == "--max-batch-size" && i + 1 < argc) {
+            args.max_batch_size = std::stoi(argv[++i]);
+        } else if (arg == "--kv-paged") {
+            args.kv_paged = true;
+        } else if (arg == "--kv-block-size" && i + 1 < argc) {
+            args.kv_block_size = std::stoi(argv[++i]);
         } else if (arg == "--python" && i + 1 < argc) {
             args.python_bin = argv[++i];
         } else if (arg == "--sidecar" && i + 1 < argc) {
@@ -229,6 +248,15 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.qwen_mtp_tokens <= 0) {
         throw std::runtime_error("--qwen-mtp-tokens must be positive");
+    }
+    if (args.smoke_layers < 0) {
+        throw std::runtime_error("--smoke-layers must not be negative");
+    }
+    if (args.max_batch_size <= 0) {
+        throw std::runtime_error("--max-batch-size must be positive");
+    }
+    if (args.kv_block_size <= 0) {
+        throw std::runtime_error("--kv-block-size must be positive");
     }
     const int external_drafter_count =
         (!args.qwen_dspark_checkpoint.empty() ? 1 : 0) +
@@ -391,56 +419,58 @@ int main(int argc, char** argv) {
         if (args.serve) {
             if (args.ckpt.empty()) throw std::runtime_error("--serve requires --ckpt");
             pocket::register_builtin_engines();
-            // The remaining restriction is the server's, not the checkpoint's:
-            // OpenAIServer still takes a PersistentEngine& and drives it through
-            // prefill/decode_step by hand, so only the engine behind that type
-            // can be served. Checked before construction, because otherwise a
-            // Qwen checkpoint would load 27B of weights only to be rejected.
-            // Giving the server an InferenceEngine& deletes this whole guard.
+            // Whatever the registry has a factory for can be served. The server
+            // takes an InferenceEngine& and drives it through BatchScheduler, so
+            // nothing here needs to know which model it got -- an engine that
+            // declares paged KV and continuous batching gets both, and one that
+            // declares a single session is serialised for free.
             const std::string architecture = pocket::detect_architecture(args.ckpt);
-            if (architecture != "deepseek_v4") {
-                throw std::runtime_error(
-                    "the OpenAI server currently accepts only the DeepSeek-V4 persistent "
-                    "engine; '" + (architecture.empty() ? std::string("<undeclared>") : architecture) +
-                    "' checkpoints are served through the Python backend for now");
-            }
             const int max_context = args.max_context > 0 ? args.max_context : 8192;
             pocket::EngineOptions engine_options;
             engine_options.tp_world = args.tp_world;
             engine_options.tp_rank = args.tp_rank;
             engine_options.device = args.device >= 0 ? args.device : args.tp_rank;
             engine_options.nccl_id_path = args.nccl_id_path;
-            engine_options.layer_count = args.smoke_layers;
+            // A production server loads the checkpoint's full depth unless the
+            // operator explicitly asks for a reduced-depth smoke server.
+            engine_options.layer_count =
+                args.smoke_layers_explicit ? args.smoke_layers : 0;
             engine_options.max_context = max_context;
-            const pocket::ModelConfig model_cfg = pocket::ModelConfig::from_hf_config(args.ckpt);
-            std::unique_ptr<pocket::InferenceEngine> runtime =
+            engine_options.max_batch_size = args.max_batch_size;
+            engine_options.kv_paged = args.kv_paged;
+            engine_options.kv_block_size = args.kv_block_size;
+            engine_options.temperature = args.qwen_temperature;
+            engine_options.top_p = args.qwen_top_p;
+            engine_options.top_k = args.qwen_top_k;
+            engine_options.seed = args.qwen_seed;
+            std::unique_ptr<pocket::InferenceEngine> engine =
                 pocket::create_engine(args.ckpt, engine_options);
-            auto* adapter = dynamic_cast<pocket::PersistentEngineAdapter*>(runtime.get());
-            if (adapter == nullptr) {
-                throw std::runtime_error(
-                    "the engine registered for '" + architecture +
-                    "' is not the persistent engine the OpenAI server drives");
-            }
-            pocket::PersistentEngine& engine = adapter->engine();
-            std::cout << "server_max_context=" << max_context << "\n";
-            std::cout << "model_context_length=" << model_cfg.context_length << "\n";
-            engine.warmup_tp();
+            std::cout << "server_architecture=" << architecture << "\n";
+            std::cout << "server_max_context=" << engine->max_context() << "\n";
+            engine->warmup_tp();
             if (args.tp_rank > 0) {
                 // Worker rank: park on the NCCL command channel until rank 0
                 // sends SHUTDOWN.
-                engine.run_worker_loop();
+                engine->run_worker_loop();
                 return 0;
             }
             const std::string sidecar_script = args.sidecar_script.empty()
                 ? std::string("src/server/cpp_sidecar.py")
                 : args.sidecar_script;
-            pocket::PythonSidecar sidecar(args.python_bin, sidecar_script, args.ckpt);
+            pocket::PythonSidecar sidecar(args.python_bin, sidecar_script, args.ckpt,
+                                           architecture);
+            // The server's own tokenizer, not the engine's: detokenizing a
+            // response is a serving concern, and QwenEngine carries no Tokenizer
+            // at all.
+            const pocket::Tokenizer tokenizer(args.ckpt);
             pocket::OpenAIServerConfig cfg;
             cfg.port = args.port;
             cfg.host = args.host;
-            pocket::OpenAIServer server(engine, sidecar, cfg);
+            cfg.model_name = architecture.empty() ? std::string("pocketllm") : architecture;
+            cfg.max_batch_size = args.max_batch_size;
+            pocket::OpenAIServer server(*engine, tokenizer, sidecar, cfg);
             server.run();
-            engine.worker_command_shutdown();
+            engine->shutdown_tp_workers();
             return 0;
         }
         if (!args.ckpt.empty()) {

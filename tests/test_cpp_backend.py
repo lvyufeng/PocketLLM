@@ -217,6 +217,51 @@ def test_generate_converts_native_results_and_usage() -> None:
     }
 
 
+def test_batched_native_error_is_raised_and_clears_request() -> None:
+    class NativeSamplingParams:
+        pass
+
+    class NativeModule:
+        QwenBatchSamplingParams = NativeSamplingParams
+
+    class NativeResult:
+        error = "synthetic failure"
+
+    class Scheduler:
+        def __init__(self) -> None:
+            self.next_id = 16
+            self.polled = []
+
+        def submit_request(self, prompt_ids, sampling, callback):
+            self.next_id += 1
+            return self.next_id
+
+        def poll_result(self, request_id, timeout_ms):
+            self.polled.append(request_id)
+            return NativeResult()
+
+    backend, _ = make_backend()
+    backend._native = NativeModule()
+    scheduler = Scheduler()
+    backend._scheduler = scheduler
+    backend._batching_enabled = True
+    requests = [
+        GenerationRequest(
+            prompt_tokens=[4, 5],
+            request_id=f"req-native-error-{index}",
+            sampling_params=SamplingParams(max_tokens=1),
+        )
+        for index in range(2)
+    ]
+
+    with pytest.raises(RuntimeError, match="native C\\+\\+ generation failed: synthetic failure"):
+        backend.generate(requests)
+
+    assert scheduler.polled == [17, 18]
+    assert backend.active_request_count() == 0
+    backend.close()
+
+
 def test_stream_matches_native_prefill_decode_order() -> None:
     backend, engine = make_backend()
     request = GenerationRequest(

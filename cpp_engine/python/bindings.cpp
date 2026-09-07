@@ -443,7 +443,8 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("prompt_tokens", &SchedulerGenerationResult::prompt_tokens)
         .def_readwrite("completion_tokens", &SchedulerGenerationResult::completion_tokens)
         .def_readwrite("total_seconds", &SchedulerGenerationResult::total_seconds)
-        .def_readwrite("ttft_seconds", &SchedulerGenerationResult::ttft_seconds);
+        .def_readwrite("ttft_seconds", &SchedulerGenerationResult::ttft_seconds)
+        .def_readwrite("error", &SchedulerGenerationResult::error);
 
     py::class_<BatchScheduler::Stats>(module, "QwenBatchSchedulerStats")
         .def(py::init<>())
