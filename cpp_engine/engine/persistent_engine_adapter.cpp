@@ -49,6 +49,12 @@ Capabilities PersistentEngineAdapter::caps() const {
     c.continuous_batching = false;
     c.chunked_prefill = false;
     c.max_slots = 1;
+    // One request at a time, so "per row" is trivially satisfiable: each
+    // request's temperature/top_p/seed go straight onto the SamplingParams for
+    // its own forward.
+    c.per_request_sampling = true;
+    c.per_request_top_k = false;
+    c.fixed_top_k = 0;
     return c;
 }
 

@@ -87,7 +87,8 @@ void BatchScheduler::stop() {
 uint64_t BatchScheduler::submit_request(
     const std::vector<int>& prompt_tokens,
     const BatchSamplingParams& sampling,
-    std::function<void(const SchedulerGenerationResult&)> callback) {
+    std::function<void(const SchedulerGenerationResult&)> callback,
+    TokenCallback on_token) {
 
     if (prompt_tokens.empty()) {
         return 0;  // Invalid request
@@ -100,6 +101,7 @@ uint64_t BatchScheduler::submit_request(
     req->prompt_tokens = prompt_tokens;
     req->sampling = sampling;
     req->callback = std::move(callback);
+    req->token_callback = std::move(on_token);
     req->submit_time = std::chrono::steady_clock::now();
 
     // A request whose worst case exceeds the entire pool can never be admitted,
@@ -195,9 +197,11 @@ void BatchScheduler::schedule_loop() {
     // The current device is per-thread, and the engine bound it on the thread
     // that constructed it.  This loop runs every forward pass from its own
     // thread, so it has to bind the same device before touching device memory.
-    if (!device_set(engine_->device())) {
+    // A host-only engine reports -1 and needs no device context.
+    const int engine_device = engine_->device();
+    if (engine_device >= 0 && !device_set(engine_device)) {
         std::cerr << "BatchScheduler: failed to select device "
-                  << engine_->device()
+                  << engine_device
                   << "; scheduler thread stopping" << std::endl;
         running_.store(false);
         return;
@@ -342,44 +346,82 @@ bool BatchScheduler::run_prefill_batch() {
     // Advance each prompt by at most prefill_token_budget_ tokens so a long
     // prompt cannot hold the device for its whole length while running decodes
     // stall behind it.
+    //
+    // Tokens are recorded here and delivered after the lock is released. A
+    // caller's token callback is arbitrary code; running it under queue_mutex_
+    // would let a slow consumer block admission and completion for every other
+    // request, and would deadlock outright if it called cancel_request().
+    std::vector<std::pair<SchedulerRequest*, int>> emitted;
     try {
         auto result = engine_->batch_prefill(prefill_batch, prefill_token_budget_);
+        if (result.results.size() != prefill_batch.size() ||
+            result.incomplete.size() != prefill_batch.size()) {
+            throw std::runtime_error(
+                "batch_prefill returned " + std::to_string(result.results.size()) +
+                " result rows and " + std::to_string(result.incomplete.size()) +
+                " completion flags for " + std::to_string(prefill_batch.size()) +
+                " requests");
+        }
 
         // Update request states
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (size_t i = 0; i < prefill_batch.size(); ++i) {
-            auto* req = prefill_requests[i];
-            if (i >= result.results.size()) continue;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (size_t i = 0; i < prefill_batch.size(); ++i) {
+                auto* req = prefill_requests[i];
+                if (i >= result.results.size()) continue;
 
-            req->prefilled_tokens = prefill_batch[i]->seq_len;
-            const bool complete =
-                i < result.incomplete.size() && !result.incomplete[i];
-            if (!complete) {
-                // Interior logits predict the next prompt token, which the prompt
-                // already supplies. Emitting it would inject a token the caller
-                // never asked for, so this row just waits for its next chunk.
-                continue;
-            }
+                req->prefilled_tokens = prefill_batch[i]->seq_len;
+                const bool complete =
+                    i < result.incomplete.size() && !result.incomplete[i];
+                if (!complete) {
+                    // Interior logits predict the next prompt token, which the
+                    // prompt already supplies. Emitting it would inject a token
+                    // the caller never asked for, so this row just waits for its
+                    // next chunk.
+                    continue;
+                }
 
-            req->prefill_complete = true;
-            req->last_token = result.results[i].top_token;
-            req->generated_tokens.push_back(req->last_token);
-            req->seq_len = req->prefilled_tokens;
-            // batch_prefill flags a prompt whose very first predicted token is a
-            // stop token; such a request must never reach the decode batch.
-            if (prefill_batch[i]->finished) {
-                req->finished = true;
-                req->stopped_on_token = true;
-            }
+                req->prefill_complete = true;
+                req->last_token = result.results[i].top_token;
+                req->generated_tokens.push_back(req->last_token);
+                req->seq_len = req->prefilled_tokens;
+                // batch_prefill flags a prompt whose very first predicted token
+                // is a stop token; such a request must never reach the decode
+                // batch or be exposed to a streaming caller.
+                const bool stopped = prefill_batch[i]->finished;
+                if (stopped) {
+                    req->finished = true;
+                    req->stopped_on_token = true;
+                }
+                // The token sampled from prefill is generation token number one.
+                // Without this check max_new_tokens=1 ran one decode step and
+                // returned two tokens because the length cap existed only in the
+                // decode path.
+                if (req->generated_tokens.size() >=
+                    static_cast<size_t>(req->sampling.max_new_tokens)) {
+                    req->finished = true;
+                }
+                if (req->token_callback && !stopped) {
+                    emitted.emplace_back(req, req->last_token);
+                }
 
-            // Record TTFT
-            if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
-                req->first_token_time = std::chrono::steady_clock::now();
+                // Record TTFT
+                if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
+                    req->first_token_time = std::chrono::steady_clock::now();
+                }
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "BatchScheduler: prefill failed: " << e.what() << std::endl;
+        const std::string message = std::string("prefill failed: ") + e.what();
+        std::cerr << "BatchScheduler: " << message << std::endl;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (SchedulerRequest* req : prefill_requests) {
+            req->error = message;
+            req->finished = true;
+        }
     }
+
+    deliver_tokens(emitted);
 
     // Clean up temporary batch requests
     for (auto* batch_req : prefill_batch) {
@@ -426,42 +468,71 @@ bool BatchScheduler::run_decode_batch() {
     }
 
     // Call engine batch_decode_step
+    std::vector<std::pair<SchedulerRequest*, int>> emitted;
     try {
         auto result = engine_->batch_decode_step(decode_batch);
+        if (result.next_tokens.size() != decode_batch.size() ||
+            result.finished.size() != decode_batch.size() ||
+            result.hit_stop_token.size() != decode_batch.size()) {
+            throw std::runtime_error(
+                "batch_decode_step returned " +
+                std::to_string(result.next_tokens.size()) + " tokens, " +
+                std::to_string(result.finished.size()) + " finished flags and " +
+                std::to_string(result.hit_stop_token.size()) +
+                " stop flags for " + std::to_string(decode_batch.size()) +
+                " requests");
+        }
 
         // Update request states
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (size_t i = 0; i < decode_batch.size(); ++i) {
-            auto* req = decode_requests[i];
-            if (i < result.next_tokens.size()) {
-                req->last_token = result.next_tokens[i];
-                req->generated_tokens.push_back(req->last_token);
-                req->seq_len++;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (size_t i = 0; i < decode_batch.size(); ++i) {
+                auto* req = decode_requests[i];
+                if (i < result.next_tokens.size()) {
+                    req->last_token = result.next_tokens[i];
+                    req->generated_tokens.push_back(req->last_token);
+                    req->seq_len++;
 
-                // Record TTFT for first decode token (if prefill didn't set it)
-                if (req->first_token_time == std::chrono::steady_clock::time_point{} &&
-                    req->generated_tokens.size() == 1) {
-                    req->first_token_time = std::chrono::steady_clock::now();
-                }
+                    // Record TTFT for first decode token (if prefill didn't set it)
+                    if (req->first_token_time == std::chrono::steady_clock::time_point{} &&
+                        req->generated_tokens.size() == 1) {
+                        req->first_token_time = std::chrono::steady_clock::now();
+                    }
 
-                // Check if finished
-                if (i < result.finished.size() && result.finished[i]) {
-                    req->finished = true;
-                }
-                if (i < result.hit_stop_token.size() && result.hit_stop_token[i]) {
-                    req->stopped_on_token = true;
-                }
+                    // Check if finished. A stop token remains in the scheduler's
+                    // sequence so it agrees with the engine's KV state, but it is
+                    // not delivered to a streaming caller.
+                    const bool stopped =
+                        i < result.hit_stop_token.size() && result.hit_stop_token[i];
+                    if (i < result.finished.size() && result.finished[i]) {
+                        req->finished = true;
+                    }
+                    if (stopped) {
+                        req->stopped_on_token = true;
+                    }
+                    if (req->token_callback && !stopped) {
+                        emitted.emplace_back(req, req->last_token);
+                    }
 
-                // Check max_new_tokens
-                if (req->generated_tokens.size() >=
-                    static_cast<size_t>(req->sampling.max_new_tokens)) {
-                    req->finished = true;
+                    // Check max_new_tokens
+                    if (req->generated_tokens.size() >=
+                        static_cast<size_t>(req->sampling.max_new_tokens)) {
+                        req->finished = true;
+                    }
                 }
             }
         }
     } catch (const std::exception& e) {
-        std::cerr << "BatchScheduler: decode failed: " << e.what() << std::endl;
+        const std::string message = std::string("decode failed: ") + e.what();
+        std::cerr << "BatchScheduler: " << message << std::endl;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (SchedulerRequest* req : decode_requests) {
+            req->error = message;
+            req->finished = true;
+        }
     }
+
+    deliver_tokens(emitted);
 
     // Clean up temporary batch requests
     for (auto* batch_req : decode_batch) {
@@ -469,6 +540,22 @@ bool BatchScheduler::run_decode_batch() {
     }
 
     return true;
+}
+
+void BatchScheduler::deliver_tokens(
+    const std::vector<std::pair<SchedulerRequest*, int>>& emitted) {
+    // Called from the schedule loop with no lock held, and before
+    // handle_completions(), which is the only place a SchedulerRequest is
+    // destroyed and which runs on this same thread -- so every pointer here is
+    // still alive.
+    for (const auto& [req, token] : emitted) {
+        try {
+            req->token_callback(req->request_id, token);
+        } catch (const std::exception& e) {
+            std::cerr << "BatchScheduler: token callback exception: " << e.what()
+                      << std::endl;
+        }
+    }
 }
 
 void BatchScheduler::handle_completions() {
@@ -556,7 +643,10 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     // Previously `finished ? "length" : "stop"`, which was backwards: `finished`
     // was only ever set by the length cap, so a normal completion reported
     // "length" and "stop" was reachable only via cancellation.
-    if (req->cancelled) {
+    if (!req->error.empty()) {
+        result.finish_reason = "error";
+        result.error = req->error;
+    } else if (req->cancelled) {
         result.finish_reason = "cancelled";
     } else {
         result.finish_reason = req->stopped_on_token ? "stop" : "length";
@@ -578,16 +668,19 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
 
     req->callback_invoked = true;
 
-    // Invoke callback if provided
+    // A request chooses one completion channel. Storing every callback result as
+    // well made a streaming server leak one completed result per request, because
+    // it consumes the callback and never polls the duplicate map entry.
     if (req->callback) {
         try {
             req->callback(result);
         } catch (const std::exception& e) {
             std::cerr << "BatchScheduler: callback exception: " << e.what() << std::endl;
         }
+        return;
     }
 
-    // Store result for polling
+    // No callback: store for the blocking poll API.
     {
         std::lock_guard<std::mutex> lock(results_mutex_);
         completed_results_[req->request_id] = result;

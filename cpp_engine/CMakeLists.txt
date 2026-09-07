@@ -48,7 +48,6 @@ set(POCKET_CORE_SOURCES
     core/sampler.cpp
     core/cmd_channel.cpp
     core/python_sidecar.cpp
-    core/openai_server.cpp
     third_party/httplib.cpp
 )
 
@@ -63,6 +62,10 @@ set(POCKET_ENGINE_SOURCES
     engine/batch_scheduler.cpp
     engine/persistent_engine_adapter.cpp
     engine/engine_registry_builtin.cpp
+    # Drives the engine through BatchScheduler, which reaches the device
+    # runtime, so it sits with the engine rather than in pocket_core -- which
+    # must stay linkable on its own by the checkpoint-inspection tools.
+    engine/openai_server.cpp
 )
 
 # Engines that still call CUDA kernels by name. A runtime guard cannot help here:
@@ -894,6 +897,10 @@ set_target_properties(test_batch_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_model_registry tests/test_model_registry.cpp)
 target_link_libraries(test_model_registry PRIVATE pocket_cpp_core)
 set_target_properties(test_model_registry PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_scheduler_callbacks tests/test_scheduler_callbacks.cpp)
+target_link_libraries(test_scheduler_callbacks PRIVATE pocket_cpp_core)
+set_target_properties(test_scheduler_callbacks PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(bench_qwen_fp8_batch_crossover tests/bench_qwen_fp8_batch_crossover.cpp)
 target_link_libraries(bench_qwen_fp8_batch_crossover PRIVATE pocket_cpp_core)

@@ -145,11 +145,12 @@ def _native_device_index(value: str | int | None) -> int:
 
 
 class CppBackend(BackendBase):
-    """Serialized compatibility adapter for the stateful native engines.
+    """Native C++ engine adapter with optional scheduler-backed batching.
 
-    The initial bridge intentionally supports Qwen's token-oriented API.  The
-    native engine still owns its optimized KV layout and TP protocol; this
-    adapter does not turn it into a Torch module or copy its buffers.
+    The native runtime keeps ownership of its optimized KV layout and tensor-
+    parallel protocol. This adapter handles model selection, request conversion,
+    lifecycle, and the serial or scheduler result path without turning an engine
+    into a Torch module or copying its buffers.
     """
 
     def __init__(
@@ -741,6 +742,7 @@ class CppBackend(BackendBase):
 
         # Poll for results
         outputs: list[GenerationResult] = []
+        native_errors: list[str] = []
         timeout_ms = 60000  # 60 seconds per request
 
         for native_req_id in native_request_ids:
@@ -751,6 +753,17 @@ class CppBackend(BackendBase):
                 # Timeout
                 self._clear_request(request.request_id)
                 raise TimeoutError(f"Request {request.request_id} timed out after {timeout_ms}ms")
+
+            native_error = str(getattr(result, "error", "") or "")
+            if native_error:
+                # Poll the rest of this submitted batch before raising. A failed
+                # native forward normally completes every participating row with
+                # an error; abandoning their poll results here would retain one
+                # native completed-result entry and one public active request per
+                # row after the first.
+                native_errors.append(native_error)
+                self._clear_request(request.request_id)
+                continue
 
             # Convert native result to GenerationResult
             token_ids = result.generated_tokens
@@ -771,6 +784,10 @@ class CppBackend(BackendBase):
             )
 
             self._clear_request(request.request_id)
+
+        if native_errors:
+            joined = "; ".join(dict.fromkeys(native_errors))
+            raise RuntimeError(f"native C++ generation failed: {joined}")
 
         return outputs
 

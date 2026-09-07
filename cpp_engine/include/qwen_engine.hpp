@@ -253,7 +253,7 @@ public:
     void reset();
     // Drops every cached prefix so the next prefill recomputes from zero.
     void clear_prefix_cache();
-    void warmup_tp();
+    void warmup_tp() override;
     ForwardResult prefill(const std::vector<int>& token_ids, int slot_id = 0);
     // Prefill that consumes at most `max_tokens` prompt tokens and returns,
     // leaving the rest for a later call. This is what lets a scheduler keep a
@@ -340,7 +340,11 @@ public:
 
     // TP rank > 0 entry point. Blocks on a small NCCL int32 broadcast channel
     // driven by rank 0; runs the requested op until SHUTDOWN.
-    void run_worker_loop();
+    void run_worker_loop() override;
+
+    // InferenceEngine's name for worker_command_shutdown(), so a caller holding
+    // only the interface can tear the group down.
+    void shutdown_tp_workers() override { worker_command_shutdown(); }
 
     // Rank 0 utilities to drive the worker loop. No-op for tp_world == 1.
     enum class WorkerCommand : int32_t {

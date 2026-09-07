@@ -35,6 +35,13 @@ std::unique_ptr<InferenceEngine> make_qwen_engine(const std::string& ckpt_dir,
     qwen.kv_paged = options.kv_paged;
     qwen.kv_block_size = options.kv_block_size;
     qwen.kv_cache_bytes = options.kv_cache_bytes;
+    // Fixed at construction here, which is why EngineOptions carries it:
+    // QwenEngine reports caps().per_request_sampling == false, so this is the
+    // only place its temperature can be set.
+    qwen.temperature = options.temperature;
+    qwen.top_p = options.top_p;
+    qwen.top_k = options.top_k;
+    qwen.sampling_seed = options.seed;
     // Everything else -- prefill chunk, KV dtype, prefix cache, snapshots, the
     // drafters -- keeps its tuned default. A caller that needs to move one of
     // those knows it is talking to Qwen and can construct QwenEngine directly.

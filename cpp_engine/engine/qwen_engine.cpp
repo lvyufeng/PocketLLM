@@ -4634,6 +4634,17 @@ Capabilities QwenEngine::caps() const {
     // batch_prefill honours its token budget on every configuration.
     c.chunked_prefill = true;
     c.max_slots = options_.max_batch_size;
+    // Sampling is an engine option here, not a per-row one: one temperature,
+    // top_p, top_k and seed are baked into the batch sampler at construction.
+    // Varying them per request would take a kernel change, not a plumbing one.
+    // Reporting the configured values lets a server accept a request that asks
+    // for exactly this and reject one that asks for anything else.
+    c.per_request_sampling = false;
+    c.per_request_top_k = false;
+    c.fixed_temperature = options_.temperature;
+    c.fixed_top_p = options_.top_p;
+    c.fixed_top_k = options_.top_k;
+    c.fixed_seed = options_.sampling_seed;
     return c;
 }
 

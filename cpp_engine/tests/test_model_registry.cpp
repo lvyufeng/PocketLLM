@@ -215,10 +215,14 @@ void test_registry_dispatch() {
 
     std::string seen_ckpt;
     int seen_slots = 0;
+    float seen_temperature = 0.0f;
+    int seen_top_k = 0;
     pocket::register_engine("stub_arch", [&](const std::string& ckpt,
                                              const pocket::EngineOptions& options) {
         seen_ckpt = ckpt;
         seen_slots = options.max_batch_size;
+        seen_temperature = options.temperature;
+        seen_top_k = options.top_k;
         return std::unique_ptr<pocket::InferenceEngine>(
             new StubEngine(paged_batched_caps(options.max_batch_size)));
     });
@@ -227,11 +231,15 @@ void test_registry_dispatch() {
 
     pocket::EngineOptions options;
     options.max_batch_size = 3;
+    options.temperature = 0.75f;
+    options.top_k = 17;
     std::unique_ptr<pocket::InferenceEngine> engine =
         pocket::create_engine(dir, options);
     check(engine != nullptr, "create_engine builds the registered engine");
     check_eq(seen_ckpt, dir, "the factory receives the checkpoint path");
-    check(seen_slots == 3, "the factory receives the caller's options");
+    check(seen_slots == 3, "the factory receives the caller's topology options");
+    check(seen_temperature == 0.75f && seen_top_k == 17,
+          "the factory receives the caller's sampling options");
     check(engine->caps().max_slots == 3, "the built engine's caps reach the caller");
 
     // Silently replacing a registration would make which engine runs depend on

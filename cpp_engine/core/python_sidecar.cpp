@@ -81,7 +81,8 @@ void write_all(int fd, const std::string& s) {
 
 PythonSidecar::PythonSidecar(const std::string& python_bin,
                              const std::string& script_path,
-                             const std::string& ckpt_dir) {
+                             const std::string& ckpt_dir,
+                             const std::string& architecture) {
     int parent_to_child[2] = {-1, -1};
     int child_to_parent[2] = {-1, -1};
     if (::pipe(parent_to_child) != 0) throw std::runtime_error("pipe1 failed");
@@ -108,6 +109,10 @@ PythonSidecar::PythonSidecar(const std::string& python_bin,
         argv.push_back(const_cast<char*>(script_path.c_str()));
         argv.push_back(const_cast<char*>("--ckpt"));
         argv.push_back(const_cast<char*>(ckpt_dir.c_str()));
+        if (!architecture.empty()) {
+            argv.push_back(const_cast<char*>("--architecture"));
+            argv.push_back(const_cast<char*>(architecture.c_str()));
+        }
         argv.push_back(nullptr);
         ::execvp(python_bin.c_str(), argv.data());
         std::cerr << "execvp python failed: " << std::strerror(errno) << "\n";

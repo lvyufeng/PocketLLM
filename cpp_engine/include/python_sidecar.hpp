@@ -31,15 +31,16 @@ struct ParsedMessage {
     std::string tool_calls_json;      // raw JSON array string, may be "[]"
 };
 
-// Thin C++ wrapper around a long-running python helper. The helper renders
-// DeepSeek-V4 chat templates and parses generated text into structured fields.
-// One sidecar instance per server process; calls are serialised via the
-// internal mutex.
+// Thin C++ wrapper around a long-running Python helper. The helper selects the
+// checkpoint's chat template, tokenizes requests, and parses generated text into
+// structured fields. One sidecar instance per server process; calls are
+// serialised via the internal mutex.
 class PythonSidecar {
 public:
     PythonSidecar(const std::string& python_bin,
                   const std::string& script_path,
-                  const std::string& ckpt_dir);
+                  const std::string& ckpt_dir,
+                  const std::string& architecture = "");
     ~PythonSidecar();
 
     PythonSidecar(const PythonSidecar&) = delete;
