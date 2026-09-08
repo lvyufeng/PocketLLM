@@ -332,8 +332,11 @@ public:
     // the TP worker loop use this form because they carry no request objects.
     // Does not announce anything to the TP workers: callers on rank 0 drive that
     // themselves so a batch is announced exactly once.
+    // per_row_params, when non-null, carries one entry per token and overrides
+    // the engine's global temperature/top_k/top_p for that row's sample step.
     std::vector<ForwardResult> batch_decode_tokens(
-        const std::vector<int>& tokens, const std::vector<int>& slot_ids);
+        const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+        const std::vector<BatchSamplingParams>* per_row_params = nullptr);
 
     // Check if batched API is supported (depends on build config)
     bool supports_batching() const;

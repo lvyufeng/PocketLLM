@@ -2191,12 +2191,71 @@ struct QwenEngine::Impl {
     // global ids, NCCL merges the candidates, and the draw happens over the
     // merged set with a uniform every rank already agrees on.
     //
+    // When per_row_params is non-null it carries one BatchSamplingParams entry
+    // per row. Rows that differ in temperature/top_k/top_p are sampled one at a
+    // time (rows=1 kernel call per row) so the per-row values take effect.
+    // Rows that share the engine defaults are batched together exactly as before.
+    // A null pointer means every row uses the engine's global options.
+    //
     // The Ascend build has no device sampler yet, so the whole routine is
     // compiled out and the constructor rejects a nonzero temperature up front.
 #ifndef POCKET_BACKEND_ASCEND
     QwenVerifyBatch sample_tokens_for(QwenDeviceTensor& local_logits, int rows,
                                       int local_vocab, int vocab_start,
-                                      int position_after) {
+                                      int position_after,
+                                      const BatchSamplingParams* per_row_params = nullptr) {
+        // When per-row params differ from the engine defaults, sample each row
+        // independently. This is correct but O(rows) in kernel launches; for
+        // homogeneous batches (all greedy, or all same temperature) the fast
+        // batched path below is taken instead.
+        if (per_row_params != nullptr) {
+            bool needs_per_row = false;
+            for (int row = 0; row < rows; ++row) {
+                const BatchSamplingParams& p = per_row_params[row];
+                if (p.temperature != options.temperature ||
+                    p.top_p != options.top_p ||
+                    p.top_k != options.top_k) {
+                    needs_per_row = true;
+                    break;
+                }
+            }
+            if (needs_per_row) {
+                QwenVerifyBatch combined;
+                combined.top_tokens.resize(static_cast<size_t>(rows));
+                combined.top_logits.resize(static_cast<size_t>(rows));
+                combined.local_logits.resize(static_cast<size_t>(rows));
+                combined.position_after = position_after;
+                // Temporarily override the engine options for each row and
+                // invoke the standard sampler on a 1-row slice.
+                const float saved_temp = options.temperature;
+                const float saved_top_p = options.top_p;
+                const int saved_top_k = options.top_k;
+                for (int row = 0; row < rows; ++row) {
+                    const BatchSamplingParams& p = per_row_params[row];
+                    options.temperature = p.temperature;
+                    options.top_p = p.top_p;
+                    options.top_k = p.top_k > 0 ? p.top_k : saved_top_k;
+                    // Build a 1-row view into the logit buffer for this row.
+                    // The logit layout is [rows, local_vocab] contiguous, so
+                    // row i starts at offset i * local_vocab floats.
+                    QwenDeviceTensor row_logits;
+                    row_logits.data = static_cast<uint8_t*>(local_logits.data) +
+                        static_cast<size_t>(row) * static_cast<size_t>(local_vocab) * sizeof(float);
+                    row_logits.capacity = static_cast<size_t>(local_vocab) * sizeof(float);
+                    row_logits.nbytes = static_cast<size_t>(local_vocab) * sizeof(float);
+                    row_logits.shape = {1, static_cast<uint64_t>(local_vocab)};
+                    QwenVerifyBatch row_result = sample_tokens_for(
+                        row_logits, 1, local_vocab, vocab_start, position_after);
+                    combined.top_tokens[static_cast<size_t>(row)] = row_result.top_tokens[0];
+                    combined.top_logits[static_cast<size_t>(row)] = row_result.top_logits[0];
+                    combined.local_logits[static_cast<size_t>(row)] = row_result.local_logits[0];
+                }
+                options.temperature = saved_temp;
+                options.top_p = saved_top_p;
+                options.top_k = saved_top_k;
+                return combined;
+            }
+        }
         int top_k = options.top_k;
         const int max_top_k = sampler_max_top_k();
         if (top_k <= 0 || top_k > max_top_k) top_k = max_top_k;
@@ -2297,7 +2356,8 @@ struct QwenEngine::Impl {
 
     QwenVerifyBatch top_tokens_for(const uint16_t* hidden, int rows,
                                    const QwenDeviceTensor* output_norm,
-                                   int position_after) {
+                                   int position_after,
+                                   const BatchSamplingParams* per_row_params = nullptr) {
         if (rows <= 0) {
             throw std::runtime_error("Qwen logits require at least one row");
         }
@@ -2390,9 +2450,9 @@ struct QwenEngine::Impl {
         // not pay for a top-1 reduction it discards; greedy falls through to
         // the original code unchanged.
 #ifndef POCKET_BACKEND_ASCEND
-        if (sampling_enabled()) {
+        if (sampling_enabled() || per_row_params != nullptr) {
             return sample_tokens_for(local_logits, rows, local_vocab,
-                                     vocab_start, position_after);
+                                     vocab_start, position_after, per_row_params);
         }
 #endif
 
@@ -2504,8 +2564,10 @@ struct QwenEngine::Impl {
     }
 
     QwenVerifyBatch target_logits_for(const uint16_t* hidden, int rows,
-                                      int position_after) {
-        return top_tokens_for(hidden, rows, &final_norm, position_after);
+                                      int position_after,
+                                      const BatchSamplingParams* per_row_params = nullptr) {
+        return top_tokens_for(hidden, rows, &final_norm, position_after,
+                              per_row_params);
     }
 
     ForwardResult mtp_logits_for(const uint16_t* normalized_hidden,
@@ -3151,7 +3213,8 @@ struct QwenEngine::Impl {
     QwenVerifyBatch run_batched_decode(const std::vector<int>& tokens,
                                        const std::vector<int>& positions,
                                        const std::vector<int>& slot_ids,
-                                       int active_layers) {
+                                       int active_layers,
+                                       const BatchSamplingParams* per_row_params = nullptr) {
         const int rows = static_cast<int>(tokens.size());
         if (rows <= 0) {
             throw std::runtime_error("Qwen batched decode requires a row");
@@ -3265,7 +3328,7 @@ struct QwenEngine::Impl {
         // One LM head GEMM over all rows, which is the same amortization the
         // rest of the step gets. position_after is reported per row by the
         // caller, so the batch-wide value here is only the widest context.
-        return target_logits_for(hidden, rows, max_context_len);
+        return target_logits_for(hidden, rows, max_context_len, per_row_params);
 #endif
     }
 
@@ -3504,13 +3567,12 @@ Capabilities QwenEngine::caps() const {
     // batch_prefill honours its token budget on every configuration.
     c.chunked_prefill = true;
     c.max_slots = options_.max_batch_size;
-    // Sampling is an engine option here, not a per-row one: one temperature,
-    // top_p, top_k and seed are baked into the batch sampler at construction.
-    // Varying them per request would take a kernel change, not a plumbing one.
-    // Reporting the configured values lets a server accept a request that asks
-    // for exactly this and reject one that asks for anything else.
-    c.per_request_sampling = false;
-    c.per_request_top_k = false;
+    // Per-request sampling is supported: each BatchedRequest carries its own
+    // BatchSamplingParams and batch_decode_step extracts them before the
+    // sampler runs. Rows with matching params take the fast batched path;
+    // rows that differ are sampled one at a time (rows=1 per kernel call).
+    c.per_request_sampling = true;
+    c.per_request_top_k = true;
     c.fixed_temperature = options_.temperature;
     c.fixed_top_p = options_.top_p;
     c.fixed_top_k = options_.top_k;
@@ -3680,10 +3742,15 @@ BatchPrefillResult QwenEngine::batch_prefill(
 }
 
 std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
-    const std::vector<int>& tokens, const std::vector<int>& slot_ids) {
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+    const std::vector<BatchSamplingParams>* per_row_params) {
     if (tokens.size() != slot_ids.size()) {
         throw std::runtime_error(
             "QwenEngine::batch_decode_tokens: token and slot extents differ");
+    }
+    if (per_row_params != nullptr && per_row_params->size() != tokens.size()) {
+        throw std::runtime_error(
+            "QwenEngine::batch_decode_tokens: per_row_params extent differs from tokens");
     }
     const int rows = static_cast<int>(tokens.size());
     if (rows == 0) return {};
@@ -3718,8 +3785,10 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     }
     impl_->sync_block_table();
 
+    const BatchSamplingParams* row_params =
+        (per_row_params != nullptr) ? per_row_params->data() : nullptr;
     QwenVerifyBatch batch = impl_->run_batched_decode(
-        tokens, positions, slot_ids, active_layers_);
+        tokens, positions, slot_ids, active_layers_, row_params);
 
     std::vector<ForwardResult> results(static_cast<size_t>(rows));
     for (int row = 0; row < rows; ++row) {
@@ -3788,7 +3857,15 @@ BatchDecodeResult QwenEngine::batch_decode_step(
     // announces the batch before running it or the group deadlocks with rank 0
     // computing alone. No-op at world size 1.
     worker_command_batch_decode(tokens, slots);
-    std::vector<ForwardResult> forwards = batch_decode_tokens(tokens, slots);
+    // Collect per-request sampling params so the sampler can honour each
+    // request's own temperature/top_k/top_p rather than the engine default.
+    std::vector<BatchSamplingParams> row_params;
+    row_params.reserve(requests.size());
+    for (const BatchedRequest* req : requests) {
+        row_params.push_back(req->sampling);
+    }
+    std::vector<ForwardResult> forwards = batch_decode_tokens(tokens, slots,
+                                                              &row_params);
 
     for (size_t index = 0; index < requests.size(); ++index) {
         BatchedRequest* req = requests[index];
