@@ -215,12 +215,14 @@ void test_registry_dispatch() {
 
     std::string seen_ckpt;
     int seen_slots = 0;
+    int seen_prefill_chunk_tokens = 0;
     float seen_temperature = 0.0f;
     int seen_top_k = 0;
     pocket::register_engine("stub_arch", [&](const std::string& ckpt,
                                              const pocket::EngineOptions& options) {
         seen_ckpt = ckpt;
         seen_slots = options.max_batch_size;
+        seen_prefill_chunk_tokens = options.prefill_chunk_tokens;
         seen_temperature = options.temperature;
         seen_top_k = options.top_k;
         return std::unique_ptr<pocket::InferenceEngine>(
@@ -231,6 +233,7 @@ void test_registry_dispatch() {
 
     pocket::EngineOptions options;
     options.max_batch_size = 3;
+    options.prefill_chunk_tokens = 256;
     options.temperature = 0.75f;
     options.top_k = 17;
     std::unique_ptr<pocket::InferenceEngine> engine =
@@ -238,6 +241,8 @@ void test_registry_dispatch() {
     check(engine != nullptr, "create_engine builds the registered engine");
     check_eq(seen_ckpt, dir, "the factory receives the checkpoint path");
     check(seen_slots == 3, "the factory receives the caller's topology options");
+    check(seen_prefill_chunk_tokens == 256,
+          "the factory receives the prefill chunk option");
     check(seen_temperature == 0.75f && seen_top_k == 17,
           "the factory receives the caller's sampling options");
     check(engine->caps().max_slots == 3, "the built engine's caps reach the caller");

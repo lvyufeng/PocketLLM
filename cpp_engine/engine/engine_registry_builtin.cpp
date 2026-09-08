@@ -32,6 +32,9 @@ std::unique_ptr<InferenceEngine> make_qwen_engine(const std::string& ckpt_dir,
     qwen.device = options.device;
     qwen.nccl_id_path = options.nccl_id_path;
     qwen.max_batch_size = options.max_batch_size;
+    if (options.prefill_chunk_tokens > 0) {
+        qwen.prefill_chunk_tokens = options.prefill_chunk_tokens;
+    }
     qwen.kv_paged = options.kv_paged;
     qwen.kv_block_size = options.kv_block_size;
     qwen.kv_cache_bytes = options.kv_cache_bytes;

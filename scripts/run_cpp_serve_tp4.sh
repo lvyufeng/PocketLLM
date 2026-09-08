@@ -9,8 +9,30 @@ PORT="${PORT:-8000}"
 NCCL_ID="${NCCL_ID:-/tmp/pocketllm_cpp_serve_nccl.id}"
 MAX_CONTEXT="${MAX_CONTEXT:-8192}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-8}"
+PREFILL_TOKEN_BUDGET="${PREFILL_TOKEN_BUDGET:-4096}"
+PREFILL_CHUNK_TOKENS="${PREFILL_CHUNK_TOKENS:-0}"
+REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-900}"
 # 0 means the checkpoint's full depth for every registered architecture.
 SMOKE_LAYERS="${SMOKE_LAYERS:-0}"
+
+if [ "$PREFILL_TOKEN_BUDGET" -lt 0 ]; then
+    echo "PREFILL_TOKEN_BUDGET must not be negative" >&2
+    exit 2
+fi
+if [ "$PREFILL_CHUNK_TOKENS" -lt 0 ]; then
+    echo "PREFILL_CHUNK_TOKENS must not be negative" >&2
+    exit 2
+fi
+if [ "$REQUEST_TIMEOUT_SECONDS" -le 0 ]; then
+    echo "REQUEST_TIMEOUT_SECONDS must be positive" >&2
+    exit 2
+fi
+
+if [ "$PREFILL_CHUNK_TOKENS" -gt 0 ]; then
+    PREFILL_CHUNK_ARG="--prefill-chunk-tokens $PREFILL_CHUNK_TOKENS"
+else
+    PREFILL_CHUNK_ARG=""
+fi
 # Paging is ignored by an engine that does not support it. It is on here so a
 # Qwen server shares one block pool across the requested batch width instead of
 # reserving max_context separately for every slot.
@@ -25,7 +47,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 rm -f "$NCCL_ID"
 
-COMMON="--serve --ckpt $CKPT --tp-world 4 --nccl-id-path $NCCL_ID --smoke-layers $SMOKE_LAYERS --max-context $MAX_CONTEXT --max-batch-size $MAX_BATCH_SIZE --kv-block-size $KV_BLOCK_SIZE --python $PYTHON --sidecar $SIDECAR --port $PORT $EXTRA_ARGS"
+COMMON="--serve --ckpt $CKPT --tp-world 4 --nccl-id-path $NCCL_ID --smoke-layers $SMOKE_LAYERS --max-context $MAX_CONTEXT --max-batch-size $MAX_BATCH_SIZE --prefill-token-budget $PREFILL_TOKEN_BUDGET --request-timeout-seconds $REQUEST_TIMEOUT_SECONDS $PREFILL_CHUNK_ARG --kv-block-size $KV_BLOCK_SIZE --python $PYTHON --sidecar $SIDECAR --port $PORT $EXTRA_ARGS"
 if [ "$KV_PAGED" != "0" ]; then
     COMMON="$COMMON --kv-paged"
 fi

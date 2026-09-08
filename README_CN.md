@@ -14,7 +14,7 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 - **避免不必要的低 bit 展开：** 在支持的热路径中直接消费 FP4、FP8 E4M3、GGUF Q4/Q5/Q8、IQ1/IQ2/IQ3、Q2 等量化 block。
 - **消费级 GPU 并行：** 支持 PCIe 多卡上的 TP4/NCCL；对放不进显存的 checkpoint，支持 CPU/NUMA expert placement。
 - **Prefill/decode 分离：** 大 batch kernel 与单 token latency 路径独立调度、独立优化。
-- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径，以及 Qwen3.8 FP8 Safetensors 文本生成。
+- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径、Qwen3.8 FP8 Safetensors 文本生成，以及已验证的 Qwen OpenAI 兼容文本 server。
 - **检查和验证工具：** GGUF 架构/spec 报告、Safetensors audit、tensor shape 检查、数值 parity 测试和真实 checkpoint benchmark。
 
 ## 支持模型一览
@@ -37,7 +37,7 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 - 64-token prompt：prefill 138.61–138.69 tok/s，decode 36.82 tok/s。
 - 512-token prompt：prefill 416.48 tok/s，decode 35.87 tok/s。
 - 实测每 rank 约使用 8.0–8.6 GiB；本地 FP8 权重和 scale 常驻 GPU。
-- 四个 TP rank 的生成 token 序列一致。当前路径是 text-only，尚未接入 OpenAI server。
+- 四个 TP rank 的生成 token 序列一致。原生 OpenAI 兼容 server 已验证 text 请求；图像和视频输入仍不支持。
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -154,7 +154,18 @@ done
 wait
 ```
 
-正常运行时使用相同的 Qwen smoke 参数；rank 0 会输出 `prefill_tokens_per_s`、`decode_tokens_per_s`、resident weight bytes 和 GPU memory。Qwen OpenAI server adapter 尚未实现。
+正常运行时使用相同的 Qwen smoke 参数；rank 0 会输出 `prefill_tokens_per_s`、`decode_tokens_per_s`、resident weight bytes 和 GPU memory。可以使用真实 checkpoint 验证原生 Qwen 文本 server：
+
+```bash
+python scripts/verify_cpp_qwen_openai.py \\
+  --ckpt /path/to/Qwen3.8-27B-FP8 \\
+  --binary build/cpp_engine/pocketllm_engine \\
+  --python /path/to/python-with-transformers \\
+  --sidecar src/server/cpp_sidecar.py \\
+  --devices 0,1,2,3
+```
+
+该 harness 会检查 health、model discovery、非流式和流式 chat completion、固定 sampling 校验，以及并发 scheduler admission。
 
 对于单并发客户端，如果后续请求会追加或压缩上一次请求，使用长期存活的 TP4 token-ID worker。rank 0 读取 `<max_new_tokens> token0 token1 ...`，并输出 exact prefix 统计；追加请求复用 live state，分叉请求从 GPU snapshot 恢复：
 
@@ -189,7 +200,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - [x] MiniMax-M2.7 与 GLM-5.2 GGUF raw-block generation 路径。
 - [x] Qwen3.8-27B-FP8 C++ TP4 文本 runtime。
 - [ ] 在不破坏现有脚本的前提下，统一 C++ model dispatch 和 binary 命名。
-- [ ] Qwen OpenAI 兼容 serving adapter。
+- [x] Qwen OpenAI 兼容文本 serving adapter。
 - [ ] 在实测有收益时接入 CUDA Graph 和 persistent decode dispatch。
 - [ ] 增加更多模型 benchmark fixture 和自动化 regression dashboard。
 
@@ -198,7 +209,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - 性能高度依赖 GPU 型号、PCIe 拓扑、NUMA placement、驱动/runtime 版本和 checkpoint 变体。
 - PCIe 系统上的 GGUF expert staging 可能主导 decode；prefill TPS 高不代表 decode TPS 高。
 - DSpark 当前 C++ verify path 是 sequential，不应宣称为加速路径；multi-token verify 有独立的数值漂移策略。
-- Qwen runtime 当前只支持 text checkpoint 路径，视觉输入和 OpenAI 兼容 Qwen serving 尚未接入。
+- Qwen runtime 当前只支持 text checkpoint 路径，视觉输入和多模态 serving 尚未实现。
 - 部分实验优化在真实端到端测试出现回归后被保留为 opt-in 或关闭；具体见模型页和历史分析文档。
 
 ## License

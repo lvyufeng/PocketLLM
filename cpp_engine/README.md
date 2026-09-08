@@ -12,10 +12,10 @@ The executable is still named `pocketllm_engine` for compatibility with existing
 | --- | --- |
 | DeepSeek-V4 Safetensors FP4/FP8 | Persistent generation and OpenAI-compatible TP4 server |
 | DeepSeek-V4 GGUF Q2/IQ2/IQ1 | Inspect, low-bit kernels, TP4 generation/smoke paths |
-| Qwen3.8-27B-FP8 Safetensors | Config/tensor audit, GPU-resident TP4 text prefill/decode, timed greedy CLI |
+| Qwen3.8-27B-FP8 Safetensors | GPU-resident TP4 text runtime and native OpenAI-compatible text server |
 | Other GGUF architectures | Generic reader/inspection tools; generation may live in the Python raw-block runtime |
 
-Qwen vision execution and Qwen OpenAI serving are not implemented. Model metadata support should not be interpreted as full generation support.
+Qwen vision execution and multimodal serving are not implemented. The text-only Qwen path, including the native OpenAI-compatible server, is validated separately from vision support.
 
 ## Build
 

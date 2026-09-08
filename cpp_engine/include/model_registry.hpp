@@ -35,6 +35,9 @@ struct EngineOptions {
     // Requested concurrent slots. An engine that declares max_slots == 1 may
     // reject anything larger rather than pretend to batch.
     int max_batch_size = 1;
+    // Prompt tokens processed by one prefill call. 0 leaves each engine's
+    // documented default unchanged; engines without chunked prefill ignore it.
+    int prefill_chunk_tokens = 0;
     // Paged KV cache instead of a per-slot contiguous arena. Engines that cannot
     // page ignore this; ask caps() rather than assuming it took effect.
     bool kv_paged = false;

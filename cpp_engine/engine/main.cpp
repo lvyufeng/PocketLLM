@@ -82,6 +82,10 @@ struct Args {
     // engine declares, so leaving this at 8 costs nothing on an engine that
     // serves one session at a time.
     int max_batch_size = 8;
+    // Prompt tokens advanced per scheduler prefill iteration. 0 preserves the
+    // server default; the engine may clamp or ignore this according to caps().
+    int prefill_token_budget = 4096;
+    int request_timeout_seconds = 900;
     // Paged KV is what lets several requests share one pool instead of each
     // reserving max_context. Off by default so the serve path keeps the
     // contiguous arena's behaviour unless asked.
@@ -224,6 +228,10 @@ Args parse_args(int argc, char** argv) {
             args.host = argv[++i];
         } else if (arg == "--max-batch-size" && i + 1 < argc) {
             args.max_batch_size = std::stoi(argv[++i]);
+        } else if (arg == "--prefill-token-budget" && i + 1 < argc) {
+            args.prefill_token_budget = std::stoi(argv[++i]);
+        } else if (arg == "--request-timeout-seconds" && i + 1 < argc) {
+            args.request_timeout_seconds = std::stoi(argv[++i]);
         } else if (arg == "--kv-paged") {
             args.kv_paged = true;
         } else if (arg == "--kv-block-size" && i + 1 < argc) {
@@ -254,6 +262,12 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.max_batch_size <= 0) {
         throw std::runtime_error("--max-batch-size must be positive");
+    }
+    if (args.prefill_token_budget < 0) {
+        throw std::runtime_error("--prefill-token-budget must not be negative");
+    }
+    if (args.request_timeout_seconds <= 0) {
+        throw std::runtime_error("--request-timeout-seconds must be positive");
     }
     if (args.kv_block_size <= 0) {
         throw std::runtime_error("--kv-block-size must be positive");
@@ -437,6 +451,7 @@ int main(int argc, char** argv) {
                 args.smoke_layers_explicit ? args.smoke_layers : 0;
             engine_options.max_context = max_context;
             engine_options.max_batch_size = args.max_batch_size;
+            engine_options.prefill_chunk_tokens = args.prefill_chunk_tokens;
             engine_options.kv_paged = args.kv_paged;
             engine_options.kv_block_size = args.kv_block_size;
             engine_options.temperature = args.qwen_temperature;
@@ -468,6 +483,8 @@ int main(int argc, char** argv) {
             cfg.host = args.host;
             cfg.model_name = architecture.empty() ? std::string("pocketllm") : architecture;
             cfg.max_batch_size = args.max_batch_size;
+            cfg.prefill_token_budget = args.prefill_token_budget;
+            cfg.request_timeout_seconds = args.request_timeout_seconds;
             pocket::OpenAIServer server(*engine, tokenizer, sidecar, cfg);
             server.run();
             engine->shutdown_tp_workers();
