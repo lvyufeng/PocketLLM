@@ -4,7 +4,7 @@
 
 **Validated native C++/CUDA TP4 text runtime.** PocketLLM detects the nested Qwen3.5 text configuration, maps rank-local Safetensors weights, converts BF16 scales/non-FP8 tensors to FP16 for Turing where required, and keeps local FP8 weights resident on each GPU.
 
-The current integration supports text prompt/token-ID smoke and timed greedy generation through `pocketllm_engine`. It does not execute the checkpoint's vision tower and is not connected to the OpenAI-compatible server.
+The current integration supports text prompt/token-ID smoke, timed greedy generation, and native OpenAI-compatible text serving through `pocketllm_engine`. It does not execute the checkpoint's vision tower or accept image/video inputs.
 
 ## Model specification
 
@@ -422,7 +422,7 @@ build/cpp_engine/pocketllm_engine \
 ## Known limitations
 
 - Text-only: no image/video preprocessing or vision-tower execution.
-- CLI/smoke integration only: Qwen is explicitly rejected by the current DeepSeek-V4 OpenAI server path.
+- Text-only serving: the native OpenAI-compatible server is validated for Qwen text requests, while the checkpoint's vision tower and multimodal request formats are not implemented.
 - Greedy generation only in the current Qwen engine API.
 - The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
 - CUDA Graph and a decode megakernel remain future work; neither is included in the reported TPS.

@@ -6,7 +6,7 @@
 
 RTX 2080 Ti has no native FP4 tensor-core instruction. Nothing here executes Blackwell FP4 MMA. The NVFP4 weights are unpacked in registers to INT8 and consumed by DP4A and INT8 WMMA, which is why NVFP4 buys memory rather than speed on this hardware. Read the performance section before choosing this format.
 
-Like the FP8 page, this covers text prompt/token-ID smoke and timed greedy generation through `pocketllm_engine`. The vision tower is not executed and the OpenAI-compatible server is not wired up.
+Like the FP8 page, this covers text prompt/token-ID smoke and timed greedy generation through `pocketllm_engine`. The shared native server path is text-only; this page does not claim a separate NVFP4 serving benchmark, and the vision tower is not executed.
 
 ## Checkpoint specification
 
@@ -176,7 +176,7 @@ Measure on idle GPUs. Contention from unrelated jobs was repeatedly visible in t
 
 - **Slower than FP8 on SM75.** NVFP4 is a memory-footprint option here (0.73x per rank), not a throughput option. Choose it only when 4 GiB per rank matters more than roughly half the throughput.
 - No native FP4 tensor-core execution. All NVFP4 math is emulated through INT8 DP4A/WMMA after register-level nibble unpacking.
-- Text-only, CLI-only, greedy generation only — the same limits as the FP8 page. The vision tower is skipped, and Qwen is rejected by the OpenAI server path.
+- Text-only and greedy generation only. The shared native OpenAI-compatible text path exists, but this checkpoint has no separate serving benchmark; the vision tower is skipped.
 - The wide tile only engages at 128 rows and above. Decode and very narrow prefill chunks see none of the 2.7–2.8x prefill gain.
 - Validated at 512 and 8,192 on TP2 only. Longer contexts, other TP widths, and FP8 KV cache over NVFP4 weights are not measured here.
 - Layers 56–63 are FP8 in this checkpoint, so any claim about NVFP4 coverage must be read as a per-tensor, not a whole-model, property.

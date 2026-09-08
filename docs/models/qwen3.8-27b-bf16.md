@@ -125,7 +125,7 @@ Generation follows the FP8 page's four-rank NCCL procedure with this checkpoint 
 - BF16 weights are materialized as FP16 for RTX 2080 Ti. This is a precision-narrowing conversion at load time, not a lossless path, and it is specific to Turing. An accelerator with native BF16 must supply its own dtype policy rather than reusing `qwen_device_dtype`.
 - Resident BF16 weights are 12.8 GiB per rank at TP4, well above the FP8 and NVFP4 checkpoints. Long-context headroom on 22 GiB cards is correspondingly smaller.
 - Text-only: no image or video preprocessing, and the vision tower is never mapped or uploaded.
-- CLI only: Qwen remains rejected by the DeepSeek-V4 OpenAI server path.
+- Native OpenAI-compatible serving is not validated for this checkpoint because full-model CUDA generation is not validated yet.
 - The Ascend backend configures but does not link; no kernels exist yet.
 
 ## Evidence and related notes

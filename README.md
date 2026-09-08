@@ -14,7 +14,7 @@ The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validate
 - **Low-bit execution without unnecessary expansion:** FP4, FP8 E4M3, GGUF Q4/Q5/Q8, IQ1/IQ2/IQ3, and Q2 paths consume quantized blocks directly in the hot path where supported.
 - **Consumer-GPU parallelism:** TP4/NCCL execution on PCIe-connected GPUs, with CPU/NUMA expert placement for checkpoints that do not fit in device memory.
 - **Separate prefill and decode dispatch:** large-row kernels are optimized independently from single-token latency paths.
-- **Native C++/CUDA runtime:** the `cpp_engine/` path supports DeepSeek-V4 GGUF/Safetensors flows and Qwen3.8 FP8 Safetensors text generation.
+- **Native C++/CUDA runtime:** the `cpp_engine/` path supports DeepSeek-V4 GGUF/Safetensors flows, Qwen3.8 FP8 Safetensors text generation, and the validated Qwen OpenAI-compatible text server.
 - **Inspection and validation tools:** GGUF architecture/spec reports, Safetensors audits, tensor-shape checks, numerical parity tests, and real-checkpoint benchmarks.
 
 ## Supported models at a glance
@@ -24,7 +24,7 @@ The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validate
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **Validated text generation** | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime** | C++/CUDA TP4, GPU-resident FP8 | 416.48 tok/s prefill; 35.87 tok/s decode on a 512-token prompt |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 416.48 tok/s prefill; 35.87 tok/s decode on a 512-token prompt |
 
 The model pages separate architecture specifications from what PocketLLM currently implements. `inspect`, `smoke`, and a benchmark are not automatically equivalent to a production serving guarantee.
 
@@ -37,7 +37,7 @@ All figures in this section use real checkpoints on the same baseline system unl
 - 64-token prompt: 138.61–138.69 tok/s prefill, 36.82 tok/s decode.
 - 512-token prompt: 416.48 tok/s prefill, 35.87 tok/s decode.
 - Approximately 8.0–8.6 GiB used per rank in the measured runs; local FP8 weights and scales remain GPU-resident.
-- Token sequences were identical across all four TP ranks. The current path is text-only and is not wired to the OpenAI server.
+- Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -186,7 +186,18 @@ done
 wait
 ```
 
-For a normal run, use the same command-line options as the Qwen smoke entrypoint and let rank 0 report `prefill_tokens_per_s`, `decode_tokens_per_s`, resident weight bytes, and GPU memory. The Qwen OpenAI server adapter is not implemented yet.
+For a normal run, use the same command-line options as the Qwen smoke entrypoint and let rank 0 report `prefill_tokens_per_s`, `decode_tokens_per_s`, resident weight bytes, and GPU memory. The native Qwen text server can be verified against a real checkpoint with:
+
+```bash
+python scripts/verify_cpp_qwen_openai.py \\
+  --ckpt /path/to/Qwen3.8-27B-FP8 \\
+  --binary build/cpp_engine/pocketllm_engine \\
+  --python /path/to/python-with-transformers \\
+  --sidecar src/server/cpp_sidecar.py \\
+  --devices 0,1,2,3
+```
+
+The harness checks health, model discovery, non-streaming and streaming chat completions, fixed-sampling validation, and concurrent scheduler admission.
 
 External Qwen DSpark is available as an opt-in with `--qwen-dspark /path/to/Qwen3.8-27B-DSpark`; it cannot be combined with native MTP. The real five-layer drafter proposes seven tokens and verifies eight target rows at once. It remains default-off because measured gains are acceptance-dependent. See the [Qwen model page](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) for real 512/8K/32K results and the prefix/cold-parity command.
 
@@ -225,7 +236,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 - [x] MiniMax-M2.7 and GLM-5.2 GGUF raw-block generation paths.
 - [x] Qwen3.8-27B-FP8 C++ TP4 text runtime.
 - [ ] Generalize the C++ model dispatch and binary naming without breaking existing scripts.
-- [ ] Qwen OpenAI-compatible serving adapter.
+- [x] Qwen OpenAI-compatible text serving adapter.
 - [ ] CUDA Graph and persistent decode dispatch where measured beneficial.
 - [ ] More model-specific benchmark fixtures and automated regression dashboards.
 
@@ -235,7 +246,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 - GGUF expert staging can dominate decode on PCIe-only systems; a high prefill number does not imply high decode TPS.
 - DeepSeek-V4 DSpark's current C++ verify path is sequential and should not be presented as a speedup claim. Qwen DSpark is a separate external drafter with one eight-row target verification and model-specific parity/performance data.
 - Qwen DFlash2 wall-clock speedup is acceptance-dependent and prefill-capped: the synthetic fixtures accept the full eight-row block while GSM8K accepts 2.9–4.4, and shared prefill limits the 8,192-token case to 1.95x even with zero decode time. Upstream's 2.67–3.43x is a decode-latency ratio, not a full-request wall ratio.
-- The Qwen runtime currently supports the text checkpoint path only. Vision inputs and OpenAI-compatible Qwen serving are not wired in.
+- The Qwen runtime currently supports the text checkpoint path only. Vision inputs and multimodal serving are not implemented.
 - Some experimental optimizations are intentionally opt-in or disabled after real end-to-end regressions. See the model pages and historical notes for details.
 
 ## License
