@@ -91,10 +91,11 @@ struct Args {
     // server default; the engine may clamp or ignore this according to caps().
     int prefill_token_budget = 4096;
     int request_timeout_seconds = 900;
-    // Paged KV is what lets several requests share one pool instead of each
-    // reserving max_context. Off by default so the serve path keeps the
-    // contiguous arena's behaviour unless asked.
-    bool kv_paged = false;
+    // Paged KV lets requests share one block pool instead of each reserving
+    // max_context tokens upfront, so batch size scales with actual token use
+    // rather than the worst-case reservation. FP16 only; pass --no-kv-paged
+    // to fall back to the contiguous arena (required with non-FP16 caches).
+    bool kv_paged = true;
     int kv_block_size = 16;
     std::string python_bin = "python";
     std::string sidecar_script;
@@ -240,6 +241,8 @@ Args parse_args(int argc, char** argv) {
             args.request_timeout_seconds = std::stoi(argv[++i]);
         } else if (arg == "--kv-paged") {
             args.kv_paged = true;
+        } else if (arg == "--no-kv-paged") {
+            args.kv_paged = false;
         } else if (arg == "--kv-block-size" && i + 1 < argc) {
             args.kv_block_size = std::stoi(argv[++i]);
         } else if (arg == "--python" && i + 1 < argc) {
