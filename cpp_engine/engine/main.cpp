@@ -68,10 +68,15 @@ struct Args {
     bool qwen_mtp = false;
     int qwen_mtp_tokens = 1;
     // Greedy by default so existing results stay reproducible.
-    float qwen_temperature = 0.0f;
-    float qwen_top_p = 1.0f;
-    int qwen_top_k = 20;
-    unsigned long long qwen_seed = 0;
+    //
+    // Sampling is model-agnostic: nothing about a temperature is Qwen-specific,
+    // and these feed EngineOptions so any registered engine can be configured
+    // through the registry. The --qwen-* spellings predate the registry and stay
+    // accepted as aliases so existing benchmark commands keep working.
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 20;
+    unsigned long long seed = 0;
     bool qwen_mtp_adaptive = false;
     std::string qwen_dspark_checkpoint;
     std::string qwen_dflash2_checkpoint;
@@ -208,14 +213,15 @@ Args parse_args(int argc, char** argv) {
         } else if (arg == "--qwen-mtp-adaptive") {
             args.qwen_mtp = true;
             args.qwen_mtp_adaptive = true;
-        } else if (arg == "--qwen-temperature" && i + 1 < argc) {
-            args.qwen_temperature = std::stof(argv[++i]);
-        } else if (arg == "--qwen-top-p" && i + 1 < argc) {
-            args.qwen_top_p = std::stof(argv[++i]);
-        } else if (arg == "--qwen-top-k" && i + 1 < argc) {
-            args.qwen_top_k = std::stoi(argv[++i]);
-        } else if (arg == "--qwen-seed" && i + 1 < argc) {
-            args.qwen_seed = std::stoull(argv[++i]);
+        } else if ((arg == "--temperature" || arg == "--qwen-temperature") &&
+                   i + 1 < argc) {
+            args.temperature = std::stof(argv[++i]);
+        } else if ((arg == "--top-p" || arg == "--qwen-top-p") && i + 1 < argc) {
+            args.top_p = std::stof(argv[++i]);
+        } else if ((arg == "--top-k" || arg == "--qwen-top-k") && i + 1 < argc) {
+            args.top_k = std::stoi(argv[++i]);
+        } else if ((arg == "--seed" || arg == "--qwen-seed") && i + 1 < argc) {
+            args.seed = std::stoull(argv[++i]);
         } else if (arg == "--qwen-dspark" && i + 1 < argc) {
             args.qwen_dspark_checkpoint = argv[++i];
         } else if (arg == "--qwen-dflash2" && i + 1 < argc) {
@@ -454,10 +460,10 @@ int main(int argc, char** argv) {
             engine_options.prefill_chunk_tokens = args.prefill_chunk_tokens;
             engine_options.kv_paged = args.kv_paged;
             engine_options.kv_block_size = args.kv_block_size;
-            engine_options.temperature = args.qwen_temperature;
-            engine_options.top_p = args.qwen_top_p;
-            engine_options.top_k = args.qwen_top_k;
-            engine_options.seed = args.qwen_seed;
+            engine_options.temperature = args.temperature;
+            engine_options.top_p = args.top_p;
+            engine_options.top_k = args.top_k;
+            engine_options.seed = args.seed;
             std::unique_ptr<pocket::InferenceEngine> engine =
                 pocket::create_engine(args.ckpt, engine_options);
             std::cout << "server_architecture=" << architecture << "\n";
@@ -620,10 +626,10 @@ int main(int argc, char** argv) {
                     qwen_opts.dspark_checkpoint = args.qwen_dspark_checkpoint;
                     qwen_opts.dflash2_checkpoint = args.qwen_dflash2_checkpoint;
                     qwen_opts.nccl_id_path = args.nccl_id_path;
-                    qwen_opts.temperature = args.qwen_temperature;
-                    qwen_opts.top_p = args.qwen_top_p;
-                    qwen_opts.top_k = args.qwen_top_k;
-                    qwen_opts.sampling_seed = args.qwen_seed;
+                    qwen_opts.temperature = args.temperature;
+                    qwen_opts.top_p = args.top_p;
+                    qwen_opts.top_k = args.top_k;
+                    qwen_opts.sampling_seed = args.seed;
                     const int qwen_context = args.max_context > 0
                         ? args.max_context
                         : static_cast<int>(prompt_ids.size()) + std::max(1, args.max_new_tokens);
