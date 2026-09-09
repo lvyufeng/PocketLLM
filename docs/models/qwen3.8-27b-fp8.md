@@ -423,7 +423,7 @@ build/cpp_engine/pocketllm_engine \
 
 - Text-only: no image/video preprocessing or vision-tower execution.
 - Text-only serving: the native OpenAI-compatible server is validated for Qwen text requests, while the checkpoint's vision tower and multimodal request formats are not implemented.
-- Greedy generation only in the current Qwen engine API.
+- Stochastic sampling is available through `--temperature`, `--top-p`, and `--top-k`. The default remains greedy (temperature 0) so existing benchmarks stay reproducible. Per-request sampling overrides are exposed in the batched API and the OpenAI server.
 - The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
 - CUDA Graph and a decode megakernel remain future work; neither is included in the reported TPS.
 - Native MTP is opt-in. Parity-safe high-acceptance cases accelerate decode by 1.67x at 4K, 2.47x at 8K, and 3.21x at 32K; 65–71% acceptance gives only 1.18–1.37x on 512-token varied prompts. Persistent exact-prefix workloads are the intended use case; `--qwen-mtp-adaptive` starts at K=1 and limits but does not eliminate low-acceptance overhead.

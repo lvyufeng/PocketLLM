@@ -235,7 +235,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 - [x] DeepSeek-V4 FP4/FP8 and GGUF Q2/IQ2/IQ1 generation paths.
 - [x] MiniMax-M2.7 and GLM-5.2 GGUF raw-block generation paths.
 - [x] Qwen3.8-27B-FP8 C++ TP4 text runtime.
-- [ ] Generalize the C++ model dispatch and binary naming without breaking existing scripts.
+- [x] Generalize the C++ model dispatch and binary naming without breaking existing scripts.
 - [x] Qwen OpenAI-compatible text serving adapter.
 - [ ] CUDA Graph and persistent decode dispatch where measured beneficial.
 - [ ] More model-specific benchmark fixtures and automated regression dashboards.
