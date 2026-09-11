@@ -20,6 +20,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gpu_memory_sampler import GpuMemorySampler  # noqa: E402
+
 
 DEFAULT_TEXT = (
     "Decode context parallelism partitions the key-value history across devices "
@@ -381,6 +384,10 @@ def run_case(
     processes: list[tuple[int, subprocess.Popen[bytes]]] = []
     started = time.monotonic()
     statuses: dict[int, int] = {}
+    # Same instrument as the vLLM comparison bench: engine self-reporting cannot
+    # be compared against an external process's usage.
+    sampler = GpuMemorySampler(devices[:tp_world])
+    sampler.start()
     try:
         for rank in range(tp_world):
             log = (case_dir / f"rank{rank}.log").open("wb")
@@ -450,6 +457,7 @@ def run_case(
             except subprocess.TimeoutExpired:
                 process.kill()
                 statuses[rank] = process.wait(timeout=30)
+        gpu_memory = sampler.stop().report()
 
     ordered_statuses = [(rank, statuses[rank]) for rank in range(tp_world)]
     if any(status != 0 for _, status in ordered_statuses):
@@ -509,6 +517,9 @@ def run_case(
         "rank_gpu_memory_total_bytes": [
             item.get("gpu_memory_total_bytes") for item in rank_runtime
         ],
+        # Externally sampled peak, comparable with the vLLM run. The rank_*
+        # fields above are engine self-reports and are not.
+        "gpu_memory": gpu_memory,
         "rank_phase_summary": [phase_summary(items) for items in rank_phases],
         "phase_leaf_summary": phase_leaf_summary(rank_phases[0]),
         "phase_leaf_share_summary": phase_share_summary(
