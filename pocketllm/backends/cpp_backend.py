@@ -169,6 +169,14 @@ class CppBackend(BackendBase):
             self._native = load_native_module()
         else:
             self._native = None
+        if engine is None and args.tensor_parallel_size > 1:
+            nccl_id_path = str(args.backend_options.get("nccl_id_path", ""))
+            if not nccl_id_path:
+                nccl_id_path = os.environ.get("POCKETLLM_NCCL_ID_PATH", "")
+            if not nccl_id_path:
+                raise ConfigurationError(
+                    "C++ tensor-parallel backend requires nccl_id_path"
+                )
         self._tokenizer_error: str | None = None
         self._engine = engine if engine is not None else self._construct_engine()
         # A primitive lock may be released by a different worker thread.  This

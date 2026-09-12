@@ -96,6 +96,7 @@ class TensorParallelConfig:
     rendezvous_dir: str | os.PathLike[str] | None = None
     rank_flag: str = "--tensor-parallel-rank"
     forward_output: bool = True
+    child_ranks: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         command = tuple(str(item) for item in self.command)
@@ -104,6 +105,20 @@ class TensorParallelConfig:
             raise ConfigurationError("supervisor command must not be empty")
         if self.world_size < 2:
             raise ConfigurationError("supervisor world_size must be >= 2")
+        if self.child_ranks is not None:
+            try:
+                child_ranks = tuple(int(rank) for rank in self.child_ranks)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError("supervisor child_ranks must contain integers") from exc
+            object.__setattr__(self, "child_ranks", child_ranks)
+            if not child_ranks:
+                raise ConfigurationError("supervisor child_ranks must not be empty")
+            if len(set(child_ranks)) != len(child_ranks):
+                raise ConfigurationError("supervisor child_ranks must be unique")
+            if any(rank < 0 or rank >= self.world_size for rank in child_ranks):
+                raise ConfigurationError(
+                    "supervisor child_ranks must be within [0, world_size)"
+                )
         if self.startup_timeout <= 0:
             raise ConfigurationError("supervisor startup_timeout must be positive")
         if self.shutdown_timeout <= 0:
@@ -149,10 +164,13 @@ class RankProcess:
 class TensorParallelSupervisor:
     """Launch and supervise one local rank process per TP rank.
 
-    ``command`` is the common command prefix for every rank.  The supervisor
-    removes an existing ``rank_flag`` pair and appends the rank-specific value,
-    so callers can safely pass a command assembled from user arguments.  A
-    ``command_builder`` can be supplied when a backend needs generated
+    ``command`` is the common command prefix for every supervised rank.  The
+    supervisor removes an existing ``rank_flag`` pair and appends the
+    rank-specific value, so callers can safely pass a command assembled from
+    user arguments.  By default it supervises every rank in ``world_size``;
+    ``child_ranks`` lets a caller keep one or more ranks in its own process
+    while retaining the full distributed world size in every child environment.
+    A ``command_builder`` can be supplied when a backend needs generated
     rendezvous data in argv; it receives ``(rank, child_env)`` after the private
     rendezvous directory has been created.
     """
@@ -172,11 +190,21 @@ class TensorParallelSupervisor:
         rendezvous_dir: str | os.PathLike[str] | None = None,
         rank_flag: str = "--tensor-parallel-rank",
         forward_output: bool = True,
+        child_ranks: Sequence[int] | None = None,
         command_builder: Callable[[int, Mapping[str, str]], Sequence[str]] | None = None,
     ) -> None:
         if config is not None and any(
             value is not None
-            for value in (command, world_size, env, cwd, master_addr, master_port, rendezvous_dir)
+            for value in (
+                command,
+                world_size,
+                env,
+                cwd,
+                master_addr,
+                master_port,
+                rendezvous_dir,
+                child_ranks,
+            )
         ):
             raise TypeError("pass either TensorParallelConfig or supervisor keyword configuration")
         if config is None:
@@ -194,6 +222,7 @@ class TensorParallelSupervisor:
                 rendezvous_dir=rendezvous_dir,
                 rank_flag=rank_flag,
                 forward_output=forward_output,
+                child_ranks=None if child_ranks is None else tuple(child_ranks),
             )
         elif command_builder is not None:
             # A builder is an execution detail and cannot be represented by the
@@ -234,6 +263,14 @@ class TensorParallelSupervisor:
     @property
     def signal_received(self) -> int | None:
         return self._signal_received
+
+    def _child_ranks(self) -> tuple[int, ...]:
+        """Return the ranks this supervisor owns, in launch order."""
+        return (
+            tuple(range(self.config.world_size))
+            if self.config.child_ranks is None
+            else self.config.child_ranks
+        )
 
     def _base_env(self) -> dict[str, str]:
         result = dict(os.environ)
@@ -428,7 +465,7 @@ class TensorParallelSupervisor:
             try:
                 self._prepare_rendezvous()
                 self._prepare_master_port(self._base_env())
-                for rank in range(self.config.world_size):
+                for rank in self._child_ranks():
                     self._spawn(rank)
             except BaseException:
                 self.cleanup()

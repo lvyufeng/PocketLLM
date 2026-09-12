@@ -68,6 +68,26 @@ def _args(**overrides) -> EngineArgs:
     return EngineArgs(**base)
 
 
+def test_tp2_supervision_keeps_full_world_and_spawns_rank_one(supervised):
+    backend = factory.create_backend(_args(tensor_parallel_size=2))
+
+    assert len(supervised.instances) == 1
+    config = supervised.instances[0].config
+    assert config.world_size == 2
+    assert config.child_ranks == (1,)
+    assert backend.args.tensor_parallel_size == 2
+    assert backend.args.tensor_parallel_rank == 0
+    assert backend.seen_nccl_id_path == supervised.instances[0].nccl_id_path
+    assert "POCKETLLM_NCCL_ID_PATH" not in os.environ
+
+
+def test_worker_script_uses_supervisor_assigned_actual_rank():
+    script = factory._worker_script()
+
+    assert 'actual_rank = int(os.environ.get("TP_RANK", "0"))' in script
+    assert "actual_rank = supervisor_rank + 1" not in script
+
+
 def test_second_backend_still_spawns_workers(supervised):
     """The env var must not make the second backend think it is supervised.
 
