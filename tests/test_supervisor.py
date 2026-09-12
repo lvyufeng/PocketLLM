@@ -37,6 +37,20 @@ print(f"POCKETLLM_RANK_READY rank={rank}", flush=True)
 sys.exit(0)
 """
 
+_CHILD_READY_WITH_ENV = """
+import os
+rank = int(os.environ["RANK"])
+print(f"POCKETLLM_RANK_READY rank={rank}", flush=True)
+print(
+    f"TP_ENV world={os.environ['WORLD_SIZE']} tp_world={os.environ['TP_WORLD']} "
+    f"rank={os.environ['RANK']} tp_rank={os.environ['TP_RANK']}",
+    flush=True,
+)
+import time
+while True:
+    time.sleep(0.1)
+"""
+
 _CHILD_FAIL = """
 import os
 import sys
@@ -64,6 +78,38 @@ def test_supervisor_config_validation() -> None:
         TensorParallelConfig(command=("echo",), world_size=2, master_port=99999)
     with pytest.raises(ConfigurationError, match="rank_flag"):
         TensorParallelConfig(command=("echo",), world_size=2, rank_flag="")
+
+
+def test_supervisor_subset_rank_validation() -> None:
+    config = TensorParallelConfig(command=("echo",), world_size=2, child_ranks=(1,))
+    assert config.child_ranks == (1,)
+
+    with pytest.raises(ConfigurationError, match="child_ranks.*empty"):
+        TensorParallelConfig(command=("echo",), world_size=2, child_ranks=())
+    with pytest.raises(ConfigurationError, match="child_ranks.*unique"):
+        TensorParallelConfig(command=("echo",), world_size=2, child_ranks=(1, 1))
+    with pytest.raises(ConfigurationError, match="child_ranks.*within"):
+        TensorParallelConfig(command=("echo",), world_size=2, child_ranks=(2,))
+
+
+def test_supervisor_subset_rank_launch_keeps_full_world_size() -> None:
+    supervisor = TensorParallelSupervisor(
+        command=[sys.executable, "-c", _CHILD_READY_WITH_ENV],
+        world_size=2,
+        child_ranks=(1,),
+        startup_timeout=5.0,
+        shutdown_timeout=2.0,
+        forward_output=False,
+    )
+    supervisor.start()
+    try:
+        supervisor.wait_ready(timeout=5.0)
+        assert [record.rank for record in supervisor.processes] == [1]
+        assert supervisor.processes[0].ready
+        assert supervisor.processes[0].stdout[0] == "POCKETLLM_RANK_READY rank=1"
+        assert supervisor.processes[0].stdout[1] == "TP_ENV world=2 tp_world=2 rank=1 tp_rank=1"
+    finally:
+        supervisor.cleanup()
 
 
 def test_supervisor_requires_config_or_kwargs() -> None:

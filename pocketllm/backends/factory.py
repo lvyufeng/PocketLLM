@@ -137,7 +137,7 @@ def create_backend(args: EngineArgs, **injected: Any):
             # Auto-launch supervisor for multi-GPU setup
             from ..supervisor import TensorParallelSupervisor, TensorParallelConfig
 
-            # Build command for worker processes (rank 1, 2, 3, ...)
+            # Build command for worker processes (actual ranks 1, 2, 3, ...)
             worker_command = [
                 sys.executable,
                 "-c",
@@ -161,12 +161,14 @@ def create_backend(args: EngineArgs, **injected: Any):
                 "POCKETLLM_WORKER_ARGS": json.dumps(_worker_arg_overrides(args)),
             }
 
-            # Create supervisor configuration
-            # Supervisor will spawn workers for ranks 1, 2, 3
-            # (it starts from rank 0 in its own numbering, which we map to our rank 1)
+            # Create supervisor configuration. Rank 0 remains in this parent
+            # process, while the supervisor owns the remaining actual TP ranks.
+            # Keep the full world size in child environments so NCCL sees the
+            # same group as rank 0, including the TP2 case with one child.
             config = TensorParallelConfig(
                 command=tuple(worker_command),
-                world_size=args.tensor_parallel_size - 1,  # Spawn N-1 workers (ranks 1..N-1)
+                world_size=args.tensor_parallel_size,
+                child_ranks=tuple(range(1, args.tensor_parallel_size)),
                 env=worker_env,
             )
 
@@ -258,10 +260,10 @@ def _restore_env(name: str, previous: str | None) -> None:
 
 
 def _worker_script() -> str:
-    """Generate Python code for worker processes (ranks 1, 2, 3, ...).
+    """Generate Python code for worker processes (actual TP ranks 1, 2, ...).
 
-    The supervisor spawns world_size-1 processes with TP_RANK 0, 1, 2, ...
-    We map them to actual tensor-parallel ranks 1, 2, 3, ...
+    Rank 0 stays in the parent process. The supervisor assigns each child its
+    actual TP rank, so the worker environment already matches the NCCL group.
     """
     return """
 import os
@@ -269,11 +271,9 @@ import json
 from pocketllm import EngineArgs
 from pocketllm.backends.cpp_backend import CppBackend
 
-# Get configuration from environment
-# TP_RANK is set by supervisor (0, 1, 2, ... for world_size-1 workers)
-# Map to actual TP ranks 1, 2, 3, ... (rank 0 is the main process)
-supervisor_rank = int(os.environ.get("TP_RANK", "0"))
-actual_rank = supervisor_rank + 1
+# Get the actual rank assigned by the supervisor. Rank 0 belongs to the
+# parent process; child TP ranks start at 1.
+actual_rank = int(os.environ.get("TP_RANK", "0"))
 
 tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
 checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
