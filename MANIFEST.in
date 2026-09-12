@@ -1,0 +1,25 @@
+include README.md
+include README_CN.md
+include LICENSE
+include requirements.txt
+
+# Torch extension sources, needed for an sdist to rebuild ext_modules.
+recursive-include src/csrc *.cpp *.cu *.cuh *.h *.hpp
+
+# C++ engine sources, needed for an sdist to build the optional native module
+# under POCKETLLM_BUILD_CPP=1.
+include cpp_engine/CMakeLists.txt
+recursive-include cpp_engine/cmake *.cmake
+recursive-include cpp_engine/backends *.cpp *.cu *.cuh *.h *.hpp *.txt *.cmake
+recursive-include cpp_engine/core *.cpp *.h *.hpp
+recursive-include cpp_engine/engine *.cpp *.h *.hpp
+recursive-include cpp_engine/include *.h *.hpp
+recursive-include cpp_engine/python *.cpp
+recursive-include cpp_engine/third_party *.cpp *.h *.hpp
+
+# Build trees are environment-specific and are already git-ignored.
+prune cpp_engine/build
+prune cpp_engine/build-python
+prune cpp_engine/build-ascend
+prune cpp_engine/build-cuda
+prune build

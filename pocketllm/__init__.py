@@ -1,5 +1,7 @@
 """PocketLLM: one user-facing API over independent Torch and C++ backends."""
 
+__version__ = "0.1.0"
+
 from .api import (
     BackendCapabilities,
     BackendUnavailableError,
@@ -29,6 +31,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "__version__",
     "AsyncLLM",
     "BackendCapabilities",
     "BackendUnavailableError",

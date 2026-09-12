@@ -5,3 +5,5 @@ tqdm>=4.66
 setuptools>=68
 ninja>=1.11
 triton>=2.0
+# Build dependency for the optional native module (POCKETLLM_BUILD_CPP=1).
+pybind11>=2.12

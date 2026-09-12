@@ -1,0 +1,39 @@
+[build-system]
+# Torch is deliberately absent from this list. setup.py imports
+# torch.utils.cpp_extension at module level, and a Torch resolved fresh into an
+# isolated build environment does not necessarily match the CUDA toolkit the host
+# extensions are compiled against. Build with --no-build-isolation so the active
+# environment's Torch is the one that drives the extension build.
+requires = [
+    "setuptools>=68",
+    "wheel",
+    "pybind11>=2.12",
+    "cmake>=3.18",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocketllm"
+version = "0.1.0"
+description = "Inference engine for large language models on older accelerators"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "tqdm>=4.66",
+    "setuptools>=68",
+    "ninja>=1.11",
+    "triton>=2.0",
+]
+
+[project.scripts]
+pocketllm = "pocketllm.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lvyufeng/PocketLLM"
+
+# Packages are resolved in setup.py via find_packages() so the list cannot drift
+# from the tree the way a hand-maintained literal did.
