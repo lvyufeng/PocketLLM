@@ -26,6 +26,13 @@ struct SchedulerGenerationResult {
     std::string finish_reason;  // "stop" or "length"
     int prompt_tokens = 0;
     int completion_tokens = 0;
+    // Aggregate speculative work performed for this request. These remain zero
+    // for plain decoding and make row-local engine metadata visible after the
+    // temporary BatchedRequest is destroyed.
+    int proposed_drafts = 0;
+    int accepted_drafts = 0;
+    int speculative_steps = 0;
+    int rollback_steps = 0;
     double total_seconds = 0.0;
     double ttft_seconds = 0.0;  // Time to first token
     // Non-empty when the engine rejected or failed a forward. The old direct
@@ -72,6 +79,10 @@ struct SchedulerRequest {
     std::string error;
     int last_token = 0;
     std::vector<int> generated_tokens;
+    int proposed_drafts = 0;
+    int accepted_drafts = 0;
+    int speculative_steps = 0;
+    int rollback_steps = 0;
 
     // Timing
     std::chrono::steady_clock::time_point submit_time;

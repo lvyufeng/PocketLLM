@@ -177,15 +177,15 @@ QwenDSparkRuntime::QwenDSparkRuntime(const std::string&,
                                     const QwenDSparkWeightMap&,
                                     const QwenDeviceTensor&,
                                     QwenTargetHeadAdapter, int, int, int,
-                                    std::string, int) {
+                                    std::string, int, int) {
     unimplemented("Qwen DSpark drafter");
 }
 
 QwenDSparkRuntime::~QwenDSparkRuntime() = default;
 
-void QwenDSparkRuntime::reset() { unimplemented("Qwen DSpark drafter"); }
+void QwenDSparkRuntime::reset(int) { unimplemented("Qwen DSpark drafter"); }
 
-int QwenDSparkRuntime::committed_position() const {
+int QwenDSparkRuntime::committed_position(int) const {
     unimplemented("Qwen DSpark drafter");
 }
 
@@ -201,15 +201,15 @@ uint64_t QwenDSparkRuntime::activation_workspace_bytes() const {
     unimplemented("Qwen DSpark drafter");
 }
 
-void QwenDSparkRuntime::append_target_taps(const uint16_t*, int, int) {
+void QwenDSparkRuntime::append_target_taps(const uint16_t*, int, int, int) {
     unimplemented("Qwen DSpark drafter");
 }
 
-void QwenDSparkRuntime::crop_context(int) {
+void QwenDSparkRuntime::crop_context(int, int) {
     unimplemented("Qwen DSpark drafter");
 }
 
-QwenDSparkProposal QwenDSparkRuntime::propose(int) {
+QwenDSparkProposal QwenDSparkRuntime::propose(int, int) {
     unimplemented("Qwen DSpark drafter");
 }
 
@@ -220,15 +220,15 @@ QwenDFlash2Runtime::QwenDFlash2Runtime(const std::string&,
                                       const QwenDFlash2WeightMap&,
                                       const QwenDeviceTensor&,
                                       QwenTargetHeadAdapter, int, int, int,
-                                      std::string, int) {
+                                      std::string, int, int) {
     unimplemented("Qwen DFlash2 drafter");
 }
 
 QwenDFlash2Runtime::~QwenDFlash2Runtime() = default;
 
-void QwenDFlash2Runtime::reset() { unimplemented("Qwen DFlash2 drafter"); }
+void QwenDFlash2Runtime::reset(int) { unimplemented("Qwen DFlash2 drafter"); }
 
-int QwenDFlash2Runtime::committed_position() const {
+int QwenDFlash2Runtime::committed_position(int) const {
     unimplemented("Qwen DFlash2 drafter");
 }
 
@@ -249,24 +249,24 @@ void QwenDFlash2Runtime::set_debug_callback(QwenDFlash2DebugCallback) {
 }
 
 void QwenDFlash2Runtime::debug_load_target_taps(
-    const std::vector<uint16_t>&, int, int) {
-    unimplemented("Qwen DFlash2 drafter");
-}
-
-QwenDFlash2Proposal QwenDFlash2Runtime::debug_propose_from_host(
     const std::vector<uint16_t>&, int, int, int) {
     unimplemented("Qwen DFlash2 drafter");
 }
 
-void QwenDFlash2Runtime::append_target_taps(const uint16_t*, int, int) {
+QwenDFlash2Proposal QwenDFlash2Runtime::debug_propose_from_host(
+    const std::vector<uint16_t>&, int, int, int, int) {
     unimplemented("Qwen DFlash2 drafter");
 }
 
-void QwenDFlash2Runtime::crop_context(int) {
+void QwenDFlash2Runtime::append_target_taps(const uint16_t*, int, int, int) {
     unimplemented("Qwen DFlash2 drafter");
 }
 
-QwenDFlash2Proposal QwenDFlash2Runtime::propose(int) {
+void QwenDFlash2Runtime::crop_context(int, int) {
+    unimplemented("Qwen DFlash2 drafter");
+}
+
+QwenDFlash2Proposal QwenDFlash2Runtime::propose(int, int) {
     unimplemented("Qwen DFlash2 drafter");
 }
 

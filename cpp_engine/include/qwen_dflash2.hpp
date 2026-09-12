@@ -107,28 +107,30 @@ public:
                        const QwenDeviceTensor& target_embedding,
                        QwenTargetHeadAdapter target_head,
                        int tp_world, int tp_rank, int device,
-                       std::string nccl_id_path, int max_context);
+                       std::string nccl_id_path, int max_context,
+                       int max_slots = 1);
     ~QwenDFlash2Runtime();
 
     QwenDFlash2Runtime(const QwenDFlash2Runtime&) = delete;
     QwenDFlash2Runtime& operator=(const QwenDFlash2Runtime&) = delete;
 
-    void reset();
-    int committed_position() const;
+    void reset(int slot_id = 0);
+    int committed_position(int slot_id = 0) const;
     uint64_t resident_weight_bytes() const;
     uint64_t context_cache_bytes() const;
     uint64_t activation_workspace_bytes() const;
 
     void set_debug_callback(QwenDFlash2DebugCallback callback);
     void debug_load_target_taps(const std::vector<uint16_t>& target_taps,
-                                int rows, int position_offset);
+                                int rows, int position_offset,
+                                int slot_id = 0);
     QwenDFlash2Proposal debug_propose_from_host(
         const std::vector<uint16_t>& target_taps, int context_rows,
-        int position_offset, int anchor_token);
+        int position_offset, int anchor_token, int slot_id = 0);
     void append_target_taps(const uint16_t* target_taps, int rows,
-                            int position_offset);
-    void crop_context(int position);
-    QwenDFlash2Proposal propose(int anchor_token);
+                            int position_offset, int slot_id = 0);
+    void crop_context(int position, int slot_id = 0);
+    QwenDFlash2Proposal propose(int anchor_token, int slot_id = 0);
 
 private:
     struct Impl;

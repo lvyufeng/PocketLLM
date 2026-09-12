@@ -450,6 +450,9 @@ struct QwenEngine::Impl {
     QwenDeviceTensor mtp_norm;
     DeviceLayer mtp_layer;
     QwenDeviceTensor target_hidden_rows;
+    // MTP side-channel state is indexed by request slot. The activation tensors
+    // remain shared scratch because speculative rows are drafted serially per
+    // slot, while the committed seed hidden must survive interleaved requests.
     QwenDeviceTensor target_last_hidden;
     QwenDeviceTensor mtp_seed_hidden;
     QwenDeviceTensor mtp_embedding;
@@ -459,13 +462,13 @@ struct QwenEngine::Impl {
     QwenDeviceTensor mtp_fused;
     QwenDeviceTensor mtp_next_hidden;
     QwenDeviceTensor mtp_normalized_output;
-    int mtp_position = 0;
-    int mtp_seed_input_token = 0;
-    int mtp_next_token = 0;
-    float mtp_next_logit = 0.0f;
-    float mtp_next_checksum = 0.0f;
-    bool has_target_last_hidden = false;
-    bool mtp_seed_ready = false;
+    std::vector<int> mtp_position;
+    std::vector<int> mtp_seed_input_token;
+    std::vector<int> mtp_next_token;
+    std::vector<float> mtp_next_logit;
+    std::vector<float> mtp_next_checksum;
+    std::vector<bool> has_target_last_hidden;
+    std::vector<bool> mtp_seed_ready;
     std::vector<int> local_tokens;
     QwenDeviceTensor d_tokens;
     QwenDeviceTensor hidden_a;
@@ -585,8 +588,7 @@ struct QwenEngine::Impl {
     // non-batch code paths and telemetry still read position_.
     void set_slot_position(int slot_id, int position, int& engine_position) {
         engine_position = position;
-        if (batch_mode_enabled && slot_id >= 0 &&
-            slot_id < static_cast<int>(slot_positions.size())) {
+        if (slot_id >= 0 && slot_id < static_cast<int>(slot_positions.size())) {
             slot_positions[static_cast<size_t>(slot_id)] = position;
         }
     }
@@ -646,6 +648,12 @@ struct QwenEngine::Impl {
                      "Qwen block table upload");
     }
 
+    void trim_paged_slot(int slot_id, int tokens) {
+        if (!kv_paged()) return;
+        block_table->trim_capacity(slot_id, tokens);
+        sync_block_table();
+    }
+
     const int* block_table_data() const {
         return kv_paged()
             ? static_cast<const int*>(block_table_device.data) : nullptr;
@@ -673,17 +681,17 @@ struct QwenEngine::Impl {
         block_table->release(slot_id);
     }
 
-    // Tears down one slot's paged state as a unit: returns its blocks to the
-    // pool, uploads the table, and clears the reuse state that described KV no
-    // longer backed by those blocks. Rank 0's free_slot and the worker loop's
-    // FreeSlot command both call this, so a slot ends up in exactly the same
-    // state on every rank. A stale cached_prompt on a worker would otherwise let
-    // an exact-repeat prompt hit the previous request's logits while rank 0
-    // recomputes, silently desynchronizing the two.
+    // Tears down one slot's state as a unit. Paging additionally returns its
+    // blocks to the pool and uploads the table; contiguous storage only needs
+    // the state reset. Rank 0's free_slot and every worker's FreeSlot command
+    // call this, so a reused slot starts with no recurrent, predictor, or prefix
+    // state on any rank.
     void release_slot_paged_state(int slot_id, int& engine_position) {
-        if (!kv_paged()) return;
-        release_paged_slot(slot_id);
-        sync_block_table();
+        if (kv_paged()) {
+            release_paged_slot(slot_id);
+            sync_block_table();
+        }
+        zero_recurrent_state(slot_id);
         SlotPrefixState& prefix = prefix_for(slot_id);
         prefix.cached_prompt.clear();
         prefix.snapshots.clear();
@@ -805,6 +813,13 @@ struct QwenEngine::Impl {
         max_batch_size = options_.max_batch_size;
         batch_mode_enabled = (max_batch_size > 1);
         slot_positions.resize(max_batch_size, 0);  // Phase 3.4: per-slot positions
+        mtp_position.resize(static_cast<size_t>(max_batch_size), 0);
+        mtp_seed_input_token.resize(static_cast<size_t>(max_batch_size), 0);
+        mtp_next_token.resize(static_cast<size_t>(max_batch_size), 0);
+        mtp_next_logit.resize(static_cast<size_t>(max_batch_size), 0.0f);
+        mtp_next_checksum.resize(static_cast<size_t>(max_batch_size), 0.0f);
+        has_target_last_hidden.resize(static_cast<size_t>(max_batch_size), false);
+        mtp_seed_ready.resize(static_cast<size_t>(max_batch_size), false);
         // One prefix-reuse record per slot, sized with the KV arena.
         slot_prefix.resize(static_cast<size_t>(max_batch_size));
         // Phase 3.4: The KV arena is sized here, so the free list must be
@@ -1319,7 +1334,8 @@ struct QwenEngine::Impl {
             dspark = std::make_unique<QwenDSparkRuntime>(
                 options.dspark_checkpoint, *dspark_config, *dspark_weights,
                 embed, target_head, options.tp_world, options.tp_rank,
-                options.device, options.nccl_id_path, max_context);
+                options.device, options.nccl_id_path, max_context,
+                options.max_batch_size);
             dspark_enabled = true;
             uploaded_weight_bytes += dspark->resident_weight_bytes();
             cache_data_bytes += dspark->context_cache_bytes();
@@ -1348,7 +1364,8 @@ struct QwenEngine::Impl {
             dflash2 = std::make_unique<QwenDFlash2Runtime>(
                 options.dflash2_checkpoint, *dflash2_config, *dflash2_weights,
                 embed, target_head, options.tp_world, options.tp_rank,
-                options.device, options.nccl_id_path, max_context);
+                options.device, options.nccl_id_path, max_context,
+                options.max_batch_size);
             dflash2_enabled = true;
             uploaded_weight_bytes += dflash2->resident_weight_bytes();
             cache_data_bytes += dflash2->context_cache_bytes();
@@ -1407,9 +1424,10 @@ struct QwenEngine::Impl {
                 count_mtp_linear(*linear);
                 count_active_linear(linear->kind);
             }
-            const size_t mtp_cache_elements = static_cast<size_t>(max_context) *
-                local_kv_heads * head_dim;
+            const size_t mtp_cache_elements = static_cast<size_t>(max_batch_size) *
+                static_cast<size_t>(max_context) * local_kv_heads * head_dim;
             const std::vector<uint64_t> mtp_cache_shape = {
+                static_cast<uint64_t>(max_batch_size),
                 static_cast<uint64_t>(max_context),
                 static_cast<uint64_t>(local_kv_heads),
                 static_cast<uint64_t>(head_dim)};
@@ -1425,9 +1443,11 @@ struct QwenEngine::Impl {
                                   mtp_cache_shape, SafeDType::F8_E4M3);
                 allocate_elements(mtp_layer.full.v_cache, mtp_cache_elements,
                                   mtp_cache_shape, SafeDType::F8_E4M3);
-                const size_t scale_elements = static_cast<size_t>(max_context) *
-                    local_kv_heads * (head_dim / kKvScaleBlock);
+                const size_t scale_elements = static_cast<size_t>(max_batch_size) *
+                    static_cast<size_t>(max_context) * local_kv_heads *
+                    (head_dim / kKvScaleBlock);
                 const std::vector<uint64_t> scale_shape = {
+                    static_cast<uint64_t>(max_batch_size),
                     static_cast<uint64_t>(max_context),
                     static_cast<uint64_t>(local_kv_heads),
                     static_cast<uint64_t>(head_dim / kKvScaleBlock)};
@@ -1441,9 +1461,10 @@ struct QwenEngine::Impl {
                 // TurboQuantK8V4: one combined slot per token/head, sized
                 // from head_dim (196 bytes at 128, 388 at 256).
                 const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
-                const size_t slot_elements = static_cast<size_t>(max_context) *
-                    local_kv_heads * slot_bytes;
+                const size_t slot_elements = static_cast<size_t>(max_batch_size) *
+                    static_cast<size_t>(max_context) * local_kv_heads * slot_bytes;
                 const std::vector<uint64_t> slot_shape = {
+                    static_cast<uint64_t>(max_batch_size),
                     static_cast<uint64_t>(max_context),
                     static_cast<uint64_t>(local_kv_heads),
                     static_cast<uint64_t>(slot_bytes)};
@@ -1461,24 +1482,26 @@ struct QwenEngine::Impl {
         return false;
     }
 
-    // Phase 3.4: Clears one slot's recurrent state. The MTP and drafter fields
-    // below are still single-session, so slot != 0 only resets the arena rows
-    // it owns; see the shared-state limits in the Phase 3.4 notes.
+    // Clears one slot's recurrent and speculative state without disturbing any
+    // other request in the batch.
     void zero_recurrent_state(int slot_id = 0) {
+        if (slot_id < 0 || slot_id >= max_batch_size) {
+            throw std::runtime_error("Qwen recurrent state slot is out of range");
+        }
         for (DeviceLayer& layer : layers) {
             if (layer.linear.state.data == nullptr) continue;
             zero_slot_region(layer.linear.state, slot_id);
             zero_slot_region(layer.linear.conv_tail, slot_id);
         }
-        if (dspark_enabled) dspark->reset();
-        if (dflash2_enabled) dflash2->reset();
-        has_target_last_hidden = false;
-        mtp_seed_ready = false;
-        mtp_position = 0;
-        mtp_seed_input_token = 0;
-        mtp_next_token = 0;
-        mtp_next_logit = 0.0f;
-        mtp_next_checksum = 0.0f;
+        if (dspark_enabled) dspark->reset(slot_id);
+        if (dflash2_enabled) dflash2->reset(slot_id);
+        has_target_last_hidden[static_cast<size_t>(slot_id)] = false;
+        mtp_seed_ready[static_cast<size_t>(slot_id)] = false;
+        mtp_position[static_cast<size_t>(slot_id)] = 0;
+        mtp_seed_input_token[static_cast<size_t>(slot_id)] = 0;
+        mtp_next_token[static_cast<size_t>(slot_id)] = 0;
+        mtp_next_logit[static_cast<size_t>(slot_id)] = 0.0f;
+        mtp_next_checksum[static_cast<size_t>(slot_id)] = 0.0f;
     }
 
     void append_transaction_region(void* data, uint64_t bytes,
@@ -1501,30 +1524,87 @@ struct QwenEngine::Impl {
         packed_offset += bytes;
     }
 
-    void initialize_packed_transaction_state() {
-        if (!host_transaction_regions.empty()) return;
+    void set_transaction_slot(int slot_id) {
+        if (slot_id < 0 || slot_id >= max_batch_size) {
+            throw std::runtime_error("Qwen transaction slot is out of range");
+        }
+        size_t region_index = 0;
+        for (DeviceLayer& layer : layers) {
+            if (layer.linear.state.data == nullptr ||
+                layer.linear.state.nbytes == 0) {
+                continue;
+            }
+            if (region_index >= host_transaction_regions.size()) {
+                throw std::runtime_error("Qwen transaction descriptor mismatch");
+            }
+            host_transaction_regions[region_index++].device_address =
+                reinterpret_cast<uint64_t>(layer.linear.state.data) +
+                recurrent_slot_offset(layer.linear.state, slot_id);
+            if (layer.linear.conv_tail.data != nullptr &&
+                layer.linear.conv_tail.nbytes != 0) {
+                if (region_index >= host_transaction_regions.size()) {
+                    throw std::runtime_error(
+                        "Qwen transaction descriptor mismatch");
+                }
+                host_transaction_regions[region_index++].device_address =
+                    reinterpret_cast<uint64_t>(layer.linear.conv_tail.data) +
+                    recurrent_slot_offset(layer.linear.conv_tail, slot_id);
+            }
+        }
+        if (mtp_enabled) {
+            if (region_index >= host_transaction_regions.size()) {
+                throw std::runtime_error("Qwen MTP transaction descriptor mismatch");
+            }
+            host_transaction_regions[region_index++].device_address =
+                reinterpret_cast<uint64_t>(target_last_hidden.data) +
+                recurrent_slot_offset(target_last_hidden, slot_id);
+        }
+        if (region_index != host_transaction_regions.size()) {
+            throw std::runtime_error("Qwen transaction descriptor count mismatch");
+        }
+        check_device(memcpy_h2d(transaction_regions.data,
+                                host_transaction_regions.data(),
+                                host_transaction_regions.size() *
+                                    sizeof(QwenCopyRegion)),
+                     "Qwen transaction descriptor update");
+    }
+
+    void initialize_packed_transaction_state(int slot_id = 0) {
+        if (!host_transaction_regions.empty()) {
+            set_transaction_slot(slot_id);
+            return;
+        }
         uint64_t packed_bytes = 0;
         transaction_total_blocks = 0;
         host_transaction_regions.reserve(layers.size() * 2 +
                                          (mtp_enabled ? 1 : 0));
         for (DeviceLayer& layer : layers) {
-            if (layer.linear.state.data == nullptr) continue;
-            // Phase 3.4: MTP rollback is single-session, so the transaction
-            // covers slot 0's rows only rather than the whole arena.
-            append_transaction_region(layer.linear.state.data,
-                                      recurrent_slot_bytes(layer.linear.state),
-                                      packed_bytes);
-            append_transaction_region(layer.linear.conv_tail.data,
-                                      recurrent_slot_bytes(layer.linear.conv_tail),
-                                      packed_bytes);
+            if (layer.linear.state.data == nullptr ||
+                layer.linear.state.nbytes == 0) continue;
+            // Snapshot one slot's recurrent rows. The descriptor addresses are
+            // rebound before every transaction so slots can interleave without
+            // copying the entire recurrent arena.
+            append_transaction_region(
+                static_cast<uint8_t*>(layer.linear.state.data) +
+                    recurrent_slot_offset(layer.linear.state, slot_id),
+                recurrent_slot_bytes(layer.linear.state), packed_bytes);
+            if (layer.linear.conv_tail.data != nullptr &&
+                layer.linear.conv_tail.nbytes != 0) {
+                append_transaction_region(
+                    static_cast<uint8_t*>(layer.linear.conv_tail.data) +
+                        recurrent_slot_offset(layer.linear.conv_tail, slot_id),
+                    recurrent_slot_bytes(layer.linear.conv_tail), packed_bytes);
+            }
         }
         if (mtp_enabled) {
-            if (!has_target_last_hidden || target_last_hidden.data == nullptr) {
+            if (!has_target_last_hidden[static_cast<size_t>(slot_id)] ||
+                target_last_hidden.data == nullptr) {
                 throw std::runtime_error(
                     "Qwen MTP transaction requires the committed target hidden");
             }
             append_transaction_region(
-                target_last_hidden.data,
+                static_cast<uint8_t*>(target_last_hidden.data) +
+                    recurrent_slot_offset(target_last_hidden, slot_id),
                 static_cast<uint64_t>(config.hidden_size) * sizeof(uint16_t),
                 packed_bytes);
         }
@@ -1546,9 +1626,9 @@ struct QwenEngine::Impl {
     // Copies the recurrent half of the network to device-resident snapshots.
     // Only the 48 DeltaNet layers carry order-dependent state; full attention
     // is skipped because its KV cache is addressed by absolute position.
-    void prepare_transaction_state() {
+    void prepare_transaction_state(int slot_id) {
         PhaseScope scope(this, "transaction_snapshot");
-        initialize_packed_transaction_state();
+        initialize_packed_transaction_state(slot_id);
         require_launch(qwen_gather_copy_regions(
             static_cast<const QwenCopyRegion*>(transaction_regions.data),
             static_cast<int>(host_transaction_regions.size()),
@@ -1557,13 +1637,14 @@ struct QwenEngine::Impl {
             "Qwen packed transaction snapshot");
     }
 
-    void restore_transaction_state(int position) {
+    void restore_transaction_state(int position, int slot_id) {
         PhaseScope scope(this, "transaction_restore");
         if (host_transaction_regions.empty() ||
             transaction_regions.data == nullptr ||
             transaction_packed.data == nullptr) {
             throw std::runtime_error("Qwen transaction state is unavailable");
         }
+        set_transaction_slot(slot_id);
         require_launch(qwen_scatter_copy_regions(
             static_cast<const QwenCopyRegion*>(transaction_regions.data),
             static_cast<int>(host_transaction_regions.size()),
@@ -1571,12 +1652,12 @@ struct QwenEngine::Impl {
             transaction_total_blocks),
             "Qwen packed transaction restore");
         if (mtp_enabled) {
-            has_target_last_hidden = true;
-            mtp_seed_ready = false;
-            mtp_position = position;
+            has_target_last_hidden[static_cast<size_t>(slot_id)] = true;
+            mtp_seed_ready[static_cast<size_t>(slot_id)] = false;
+            mtp_position[static_cast<size_t>(slot_id)] = position;
         }
-        if (dspark_enabled) dspark->crop_context(position);
-        if (dflash2_enabled) dflash2->crop_context(position);
+        if (dspark_enabled) dspark->crop_context(position, slot_id);
+        if (dflash2_enabled) dflash2->crop_context(position, slot_id);
     }
 
     QwenRecurrentSnapshot capture_recurrent_state(
@@ -1607,15 +1688,19 @@ struct QwenEngine::Impl {
                      {tail_bytes / sizeof(uint16_t)}, SafeDType::F16);
         }
         if (mtp_enabled && position > 0) {
-            if (!has_target_last_hidden || target_last_hidden.data == nullptr) {
+            if (!has_target_last_hidden[static_cast<size_t>(slot_id)] ||
+                target_last_hidden.data == nullptr) {
                 throw std::runtime_error(
                     "Qwen MTP snapshot requires the committed target hidden");
             }
             const size_t hidden_elements = static_cast<size_t>(config.hidden_size);
             allocate_half(snapshot.target_hidden, hidden_elements,
                           {config.hidden_size});
-            check_device(memcpy_d2d(snapshot.target_hidden.data, target_last_hidden.data,
-                                    hidden_elements * sizeof(uint16_t)),
+            check_device(memcpy_d2d(
+                snapshot.target_hidden.data,
+                static_cast<const uint8_t*>(target_last_hidden.data) +
+                    recurrent_slot_offset(target_last_hidden, slot_id),
+                hidden_elements * sizeof(uint16_t)),
                          "Qwen target hidden snapshot copy");
         }
         size_t state_offset = 0;
@@ -1663,32 +1748,35 @@ struct QwenEngine::Impl {
                 throw std::runtime_error(
                     "Qwen MTP snapshot target hidden extent mismatch");
             }
-            allocate_half(target_last_hidden, config.hidden_size,
-                          {config.hidden_size});
-            check_device(memcpy_d2d(target_last_hidden.data, snapshot.target_hidden.data,
-                                    hidden_bytes),
-                         "Qwen target hidden snapshot restore");
-            has_target_last_hidden = true;
-            mtp_seed_ready = false;
-            mtp_position = snapshot.position;
+            allocate_half(target_last_hidden,
+                          static_cast<size_t>(max_batch_size) * config.hidden_size,
+                          {static_cast<uint64_t>(max_batch_size), config.hidden_size});
+            check_device(memcpy_d2d(
+                static_cast<uint8_t*>(target_last_hidden.data) +
+                    recurrent_slot_offset(target_last_hidden, slot_id),
+                snapshot.target_hidden.data, hidden_bytes),
+                "Qwen target hidden snapshot restore");
+            has_target_last_hidden[static_cast<size_t>(slot_id)] = true;
+            mtp_seed_ready[static_cast<size_t>(slot_id)] = false;
+            mtp_position[static_cast<size_t>(slot_id)] = snapshot.position;
         } else if (snapshot.position == 0) {
-            has_target_last_hidden = false;
-            mtp_seed_ready = false;
-            mtp_position = 0;
+            has_target_last_hidden[static_cast<size_t>(slot_id)] = false;
+            mtp_seed_ready[static_cast<size_t>(slot_id)] = false;
+            mtp_position[static_cast<size_t>(slot_id)] = 0;
         }
         if (dspark_enabled) {
             // DSpark K/V is position-indexed like target GQA. Cropping only moves
             // the logical committed boundary; replay overwrites the suffix.
-            if (snapshot.position <= dspark->committed_position()) {
-                dspark->crop_context(snapshot.position);
+            if (snapshot.position <= dspark->committed_position(slot_id)) {
+                dspark->crop_context(snapshot.position, slot_id);
             } else {
                 throw std::runtime_error(
                     "Qwen DSpark snapshot exceeds committed context");
             }
         }
         if (dflash2_enabled) {
-            if (snapshot.position <= dflash2->committed_position()) {
-                dflash2->crop_context(snapshot.position);
+            if (snapshot.position <= dflash2->committed_position(slot_id)) {
+                dflash2->crop_context(snapshot.position, slot_id);
             } else {
                 throw std::runtime_error(
                     "Qwen DFlash2 snapshot exceeds committed context");
@@ -2628,9 +2716,13 @@ struct QwenEngine::Impl {
     }
 
     ForwardResult mtp_forward_rows(const std::vector<int>& tokens,
-                                       const uint16_t* hidden, int position) {
+                                       const uint16_t* hidden, int position,
+                                       int slot_id = 0) {
         if (!mtp_enabled) {
             throw std::runtime_error("Qwen MTP rows requested while disabled");
+        }
+        if (slot_id < 0 || slot_id >= max_batch_size) {
+            throw std::runtime_error("Qwen MTP slot is out of range");
         }
         const int rows = static_cast<int>(tokens.size());
         if (hidden == nullptr || rows <= 0 || position < 0 ||
@@ -2675,7 +2767,7 @@ struct QwenEngine::Impl {
         allocate_half(mtp_next_hidden, hidden_elements, hidden_shape);
         decoder_layer_component.forward(
             *this, mtp_layer, mtp_fused.f16_data(),
-            mtp_next_hidden.f16_data(), rows, position, 0);  // slot_id=0 for MTP
+            mtp_next_hidden.f16_data(), rows, position, slot_id);
         allocate_half(mtp_normalized_output, hidden_elements, hidden_shape);
         rms_norm_component.forward(
             *this, mtp_norm, mtp_next_hidden.f16_data(),
@@ -2683,28 +2775,32 @@ struct QwenEngine::Impl {
         const uint16_t* last_hidden = mtp_normalized_output.f16_data() +
             static_cast<size_t>(rows - 1) * hidden_size;
         ForwardResult result = mtp_logits_for(last_hidden, position + rows);
-        allocate_half(mtp_seed_hidden, hidden_size, {config.hidden_size});
+        allocate_half(mtp_seed_hidden,
+                       static_cast<size_t>(max_batch_size) * hidden_size,
+                       {static_cast<uint64_t>(max_batch_size), config.hidden_size});
         // Recursive Qwen3.5 MTP consumes the prior predictor's returned hidden,
         // and that return is after mtp.norm in both vLLM and SGLang.
-        check_device(memcpy_d2d(mtp_seed_hidden.data, last_hidden,
-                                static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
-                     "Qwen MTP seed hidden copy");
-        mtp_position = position + rows;
-        mtp_seed_input_token = tokens.back();
-        mtp_next_token = result.top_token;
-        mtp_next_logit = result.top_logit;
-        mtp_next_checksum = result.checksum;
-        mtp_seed_ready = true;
+        check_device(memcpy_d2d(
+            static_cast<uint8_t*>(mtp_seed_hidden.data) +
+                recurrent_slot_offset(mtp_seed_hidden, slot_id),
+            last_hidden, static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
+            "Qwen MTP seed hidden copy");
+        mtp_position[static_cast<size_t>(slot_id)] = position + rows;
+        mtp_seed_input_token[static_cast<size_t>(slot_id)] = tokens.back();
+        mtp_next_token[static_cast<size_t>(slot_id)] = result.top_token;
+        mtp_next_logit[static_cast<size_t>(slot_id)] = result.top_logit;
+        mtp_next_checksum[static_cast<size_t>(slot_id)] = result.checksum;
+        mtp_seed_ready[static_cast<size_t>(slot_id)] = true;
         return result;
     }
 
     ForwardResult mtp_forward_row(int token, const uint16_t* hidden,
-                                      int position) {
-        return mtp_forward_rows({token}, hidden, position);
+                                      int position, int slot_id = 0) {
+        return mtp_forward_rows({token}, hidden, position, slot_id);
     }
 
     ForwardResult prime_target_mtp(const std::vector<int>& shifted_tokens,
-                                       int position) {
+                                       int position, int slot_id = 0) {
         const int rows = static_cast<int>(shifted_tokens.size());
         const int hidden_size = static_cast<int>(config.hidden_size);
         if (rows <= 0 || target_hidden_rows.data == nullptr ||
@@ -2714,44 +2810,56 @@ struct QwenEngine::Impl {
                 "Qwen MTP target prime requires matching target hidden rows");
         }
         return mtp_forward_rows(shifted_tokens, target_hidden_rows.f16_data(),
-                                position);
+                                position, slot_id);
     }
 
-    ForwardResult seed_mtp(int input_token) {
-        if (!has_target_last_hidden) {
+    ForwardResult seed_mtp(int input_token, int slot_id = 0) {
+        if (!has_target_last_hidden[static_cast<size_t>(slot_id)]) {
             throw std::runtime_error(
                 "Qwen MTP seed requires a committed target hidden");
         }
-        return mtp_forward_row(input_token, target_last_hidden.f16_data(),
-                               mtp_position - 1);
+        const uint16_t* seed = reinterpret_cast<const uint16_t*>(
+            static_cast<const uint8_t*>(target_last_hidden.data) +
+            recurrent_slot_offset(target_last_hidden, slot_id));
+        return mtp_forward_row(input_token, seed,
+                               mtp_position[static_cast<size_t>(slot_id)] - 1,
+                               slot_id);
     }
 
-    void rewrite_mtp_boundary(int input_token, int position) {
-        if (!has_target_last_hidden || position < 0 || position >= max_context) {
+    void rewrite_mtp_boundary(int input_token, int position, int slot_id = 0) {
+        if (!has_target_last_hidden[static_cast<size_t>(slot_id)] ||
+            position < 0 || position >= max_context) {
             throw std::runtime_error(
                 "Qwen MTP boundary rewrite requires a committed target hidden");
         }
-        (void)mtp_forward_row(input_token, target_last_hidden.f16_data(), position);
+        const uint16_t* seed = reinterpret_cast<const uint16_t*>(
+            static_cast<const uint8_t*>(target_last_hidden.data) +
+            recurrent_slot_offset(target_last_hidden, slot_id));
+        (void)mtp_forward_row(input_token, seed, position, slot_id);
     }
 
     std::vector<int> draft_tokens(int count, int input_token,
-                                  QwenMtpStats* stats) {
+                                  QwenMtpStats* stats, int slot_id = 0) {
         if (count <= 0) return {};
         const auto started = std::chrono::steady_clock::now();
         ForwardResult next;
-        if (mtp_seed_ready && mtp_seed_input_token == input_token) {
-            next.top_token = mtp_next_token;
-            next.top_logit = mtp_next_logit;
-            next.checksum = mtp_next_checksum;
+        const size_t slot = static_cast<size_t>(slot_id);
+        if (mtp_seed_ready[slot] && mtp_seed_input_token[slot] == input_token) {
+            next.top_token = mtp_next_token[slot];
+            next.top_logit = mtp_next_logit[slot];
+            next.checksum = mtp_next_checksum[slot];
         } else {
-            next = seed_mtp(input_token);
+            next = seed_mtp(input_token, slot_id);
         }
         std::vector<int> drafts;
         drafts.reserve(static_cast<size_t>(count));
         drafts.push_back(next.top_token);
         while (static_cast<int>(drafts.size()) < count) {
+            const uint16_t* seed = reinterpret_cast<const uint16_t*>(
+                static_cast<const uint8_t*>(mtp_seed_hidden.data) +
+                recurrent_slot_offset(mtp_seed_hidden, slot_id));
             next = mtp_forward_row(
-                drafts.back(), mtp_seed_hidden.f16_data(), mtp_position);
+                drafts.back(), seed, mtp_position[slot], slot_id);
             drafts.push_back(next.top_token);
         }
         if (stats != nullptr) {
@@ -2763,14 +2871,15 @@ struct QwenEngine::Impl {
     }
 
     ForwardResult dflash2_speculative_step(int input_token,
-                                               QwenMtpStats* stats) {
+                                               QwenMtpStats* stats,
+                                               int slot_id = 0) {
         if (!dflash2_enabled) {
             throw std::runtime_error("Qwen DFlash2 speculative step is disabled");
         }
-        const int committed_position = dflash2->committed_position();
-        prepare_transaction_state();
+        const int committed_position = dflash2->committed_position(slot_id);
+        prepare_transaction_state(slot_id);
         const auto draft_started = std::chrono::steady_clock::now();
-        const QwenDFlash2Proposal proposal = dflash2->propose(input_token);
+        const QwenDFlash2Proposal proposal = dflash2->propose(input_token, slot_id);
         // The 48 gated-delta layers recur sequentially across verify rows, so a
         // verify block costs close to linearly in its width. When acceptance runs
         // well below the full seven drafts the tail rows are paid for and then
@@ -2804,7 +2913,8 @@ struct QwenEngine::Impl {
         QwenVerifyBatch verify;
         const auto verify_started = std::chrono::steady_clock::now();
         (void)run_chunk(verify_inputs, committed_position,
-                        static_cast<int>(layers.size()), false, &verify);
+                        static_cast<int>(layers.size()), false, &verify,
+                        nullptr, slot_id);
         if (stats != nullptr) {
             stats->verify_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - verify_started).count();
@@ -2842,11 +2952,12 @@ struct QwenEngine::Impl {
                 stats->replay_tokens += static_cast<uint64_t>(correct + 1);
             }
             const auto replay_started = std::chrono::steady_clock::now();
-            restore_transaction_state(committed_position);
+            restore_transaction_state(committed_position, slot_id);
             std::vector<int> replay(verify_inputs.begin(),
                                     verify_inputs.begin() + correct + 1);
             (void)run_chunk(replay, committed_position,
-                            static_cast<int>(layers.size()), false);
+                            static_cast<int>(layers.size()), false, nullptr,
+                            nullptr, slot_id);
             if (stats != nullptr) {
                 stats->replay_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - replay_started).count();
@@ -2856,6 +2967,8 @@ struct QwenEngine::Impl {
         result.top_token = bonus;
         result.bonus_token = bonus;
         result.correct_drafts = correct;
+        result.proposed_drafts = static_cast<int>(draft_tokens_used.size());
+        result.rolled_back = correct != static_cast<int>(draft_tokens_used.size());
         result.accept_tokens.assign(draft_tokens_used.begin(),
                                     draft_tokens_used.begin() + correct);
         result.accept_logits.assign(verify.top_logits.begin(),
@@ -2867,22 +2980,23 @@ struct QwenEngine::Impl {
         result.logits = static_cast<int>(config.vocab_size);
         result.top_logit = bonus_logit;
         result.checksum = bonus_checksum;
-        result.position = dflash2->committed_position();
+        result.position = dflash2->committed_position(slot_id);
         return result;
     }
 
     ForwardResult dspark_speculative_step(int input_token,
-                                              QwenMtpStats* stats) {
+                                              QwenMtpStats* stats,
+                                              int slot_id = 0) {
         if (!dspark_enabled) {
             throw std::runtime_error("Qwen DSpark speculative step is disabled");
         }
-        const int committed_position = dspark->committed_position();
-        prepare_transaction_state();
+        const int committed_position = dspark->committed_position(slot_id);
+        prepare_transaction_state(slot_id);
         const auto draft_started = std::chrono::steady_clock::now();
         QwenDSparkProposal proposal;
         {
             RangeScope scope("qwen.dspark.draft");
-            proposal = dspark->propose(input_token);
+            proposal = dspark->propose(input_token, slot_id);
         }
         if (stats != nullptr) {
             stats->draft_seconds += std::chrono::duration<double>(
@@ -2916,7 +3030,8 @@ struct QwenEngine::Impl {
         {
             RangeScope scope("qwen.target.verify");
             (void)run_chunk(verify_inputs, committed_position,
-                            static_cast<int>(layers.size()), false, &verify);
+                            static_cast<int>(layers.size()), false, &verify,
+                            nullptr, slot_id);
         }
         if (stats != nullptr) {
             stats->verify_seconds += std::chrono::duration<double>(
@@ -2940,11 +3055,12 @@ struct QwenEngine::Impl {
                 stats->replay_tokens += static_cast<uint64_t>(correct + 1);
             }
             const auto replay_started = std::chrono::steady_clock::now();
-            restore_transaction_state(committed_position);
+            restore_transaction_state(committed_position, slot_id);
             std::vector<int> replay(verify_inputs.begin(),
                                     verify_inputs.begin() + correct + 1);
             (void)run_chunk(replay, committed_position,
-                            static_cast<int>(layers.size()), false);
+                            static_cast<int>(layers.size()), false, nullptr,
+                            nullptr, slot_id);
             if (stats != nullptr) {
                 stats->replay_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - replay_started).count();
@@ -2954,6 +3070,8 @@ struct QwenEngine::Impl {
         result.top_token = bonus;
         result.bonus_token = bonus;
         result.correct_drafts = correct;
+        result.proposed_drafts = static_cast<int>(proposal.tokens.size());
+        result.rolled_back = correct != static_cast<int>(proposal.tokens.size());
         result.accept_tokens.assign(proposal.tokens.begin(),
                                     proposal.tokens.begin() + correct);
         result.accept_logits.assign(verify.top_logits.begin(),
@@ -2965,19 +3083,22 @@ struct QwenEngine::Impl {
         result.logits = static_cast<int>(config.vocab_size);
         result.top_logit = bonus_logit;
         result.checksum = bonus_checksum;
-        result.position = dspark->committed_position();
+        result.position = dspark->committed_position(slot_id);
         return result;
     }
 
     ForwardResult speculative_step(int input_token, int draft_count,
-                                       QwenMtpStats* stats) {
+                                       QwenMtpStats* stats, int slot_id = 0) {
         if (!mtp_enabled || draft_count <= 0) {
-            return run_chunk({input_token}, mtp_position,
-                             static_cast<int>(layers.size()), true);
+            return run_chunk({input_token},
+                             mtp_position[static_cast<size_t>(slot_id)],
+                             static_cast<int>(layers.size()), true, nullptr,
+                             nullptr, slot_id);
         }
-        const int committed_position = mtp_position;
-        prepare_transaction_state();
-        const std::vector<int> drafts = draft_tokens(draft_count, input_token, stats);
+        const int committed_position = mtp_position[static_cast<size_t>(slot_id)];
+        prepare_transaction_state(slot_id);
+        const std::vector<int> drafts = draft_tokens(draft_count, input_token, stats,
+                                                     slot_id);
         std::vector<int> verify_inputs;
         verify_inputs.reserve(drafts.size() + 1);
         verify_inputs.push_back(input_token);
@@ -2985,7 +3106,8 @@ struct QwenEngine::Impl {
         QwenVerifyBatch verify;
         const auto verify_started = std::chrono::steady_clock::now();
         (void)run_chunk(verify_inputs, committed_position,
-                        static_cast<int>(layers.size()), false, &verify);
+                        static_cast<int>(layers.size()), false, &verify,
+                        nullptr, slot_id);
         if (stats != nullptr) {
             stats->verify_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - verify_started).count();
@@ -3011,11 +3133,12 @@ struct QwenEngine::Impl {
                 stats->replay_tokens += static_cast<uint64_t>(correct + 1);
             }
             const auto replay_started = std::chrono::steady_clock::now();
-            restore_transaction_state(committed_position);
+            restore_transaction_state(committed_position, slot_id);
             std::vector<int> replay(verify_inputs.begin(),
                                     verify_inputs.begin() + correct + 1);
             (void)run_chunk(replay, committed_position,
-                            static_cast<int>(layers.size()), false);
+                            static_cast<int>(layers.size()), false, nullptr,
+                            nullptr, slot_id);
             if (stats != nullptr) {
                 stats->replay_seconds += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - replay_started).count();
@@ -3025,7 +3148,7 @@ struct QwenEngine::Impl {
         // this fills the one row beyond the recursively proposed drafts; on
         // rejection it overwrites the stale speculative suffix after replay.
         const auto seed_started = std::chrono::steady_clock::now();
-        rewrite_mtp_boundary(bonus, committed_position + correct);
+        rewrite_mtp_boundary(bonus, committed_position + correct, slot_id);
         if (stats != nullptr) {
             stats->draft_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - seed_started).count();
@@ -3037,6 +3160,8 @@ struct QwenEngine::Impl {
         result.top_token = bonus;
         result.bonus_token = bonus;
         result.correct_drafts = correct;
+        result.proposed_drafts = draft_count;
+        result.rolled_back = !full_accept;
         result.accept_tokens.assign(drafts.begin(), drafts.begin() + correct);
         result.accept_logits.assign(verify.top_logits.begin(),
                                     verify.top_logits.begin() + correct);
@@ -3047,8 +3172,124 @@ struct QwenEngine::Impl {
         result.logits = static_cast<int>(config.vocab_size);
         result.top_logit = bonus_logit;
         result.checksum = bonus_checksum;
-        result.position = mtp_position;
+        result.position = mtp_position[static_cast<size_t>(slot_id)];
         return result;
+    }
+
+    std::vector<ForwardResult> batch_speculative_tokens(
+        const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+        const std::vector<int>& draft_counts, QwenMtpStats* stats) {
+        if (tokens.empty() || tokens.size() != slot_ids.size() ||
+            tokens.size() != draft_counts.size()) {
+            throw std::runtime_error(
+                "Qwen batched speculative row metadata has mismatched extents");
+        }
+        // Validate the complete batch before reserving any paged blocks or
+        // mutating recurrent state. A malformed later row must fail atomically
+        // with respect to the earlier rows.
+        for (size_t row = 0; row < tokens.size(); ++row) {
+            const int slot_id = slot_ids[row];
+            if (slot_id < 0 || slot_id >= max_batch_size) {
+                throw std::runtime_error(
+                    "Qwen batched speculative slot is out of range");
+            }
+            for (size_t earlier = 0; earlier < row; ++earlier) {
+                if (slot_ids[earlier] == slot_id) {
+                    throw std::runtime_error(
+                        "Qwen batched speculative slot appears twice in one batch");
+                }
+            }
+            const int draft_count = draft_counts[row];
+            if (draft_count < 0) {
+                throw std::runtime_error(
+                    "Qwen batched speculative draft count is negative");
+            }
+            if (draft_count > 0 && !options.mtp && !dspark_enabled &&
+                !dflash2_enabled) {
+                throw std::runtime_error(
+                    "Qwen batched speculative decode is disabled");
+            }
+            const int position = slot_position(
+                slot_id, slot_positions[static_cast<size_t>(slot_id)]);
+            const int proposal_width = draft_count > 0
+                ? (options.mtp
+                       ? draft_count
+                       : dspark_enabled
+                             ? dspark_config->block_size
+                             : dflash2_config->draft_tokens())
+                : 0;
+            if (position < 0 || position + 1 + proposal_width > max_context) {
+                throw std::runtime_error(
+                    "Qwen batched speculative context length exceeded");
+            }
+        }
+
+        std::vector<ForwardResult> results;
+        results.reserve(tokens.size());
+        for (size_t row = 0; row < tokens.size(); ++row) {
+            const int slot_id = slot_ids[row];
+            if (slot_id < 0 || slot_id >= max_batch_size) {
+                throw std::runtime_error(
+                    "Qwen batched speculative slot is out of range");
+            }
+            for (size_t earlier = 0; earlier < row; ++earlier) {
+                if (slot_ids[earlier] == slot_id) {
+                    throw std::runtime_error(
+                        "Qwen batched speculative slot appears twice in one batch");
+                }
+            }
+            const int draft_count = draft_counts[row];
+            if (draft_count < 0) {
+                throw std::runtime_error(
+                    "Qwen batched speculative draft count is negative");
+            }
+            if (draft_count > 0 && !options.mtp && !dspark_enabled &&
+                !dflash2_enabled) {
+                throw std::runtime_error(
+                    "Qwen batched speculative decode is disabled");
+            }
+            const int position = slot_position(
+                slot_id, slot_positions[static_cast<size_t>(slot_id)]);
+            const int proposal_width = draft_count > 0
+                ? (options.mtp
+                       ? draft_count
+                       : dspark_enabled
+                             ? dspark_config->block_size
+                             : dflash2_config->draft_tokens())
+                : 0;
+            if (position < 0 || position + 1 + proposal_width > max_context) {
+                throw std::runtime_error(
+                    "Qwen batched speculative context length exceeded");
+            }
+            reserve_paged_slot(slot_id, position + 1 + proposal_width);
+            sync_block_table();
+            ForwardResult forward;
+            if (draft_count <= 0) {
+                forward = run_chunk(
+                    {tokens[row]}, position, static_cast<int>(layers.size()),
+                    true, nullptr, nullptr, slot_id);
+            } else if (options.mtp) {
+                forward = speculative_step(
+                    tokens[row], draft_count, stats, slot_id);
+            } else if (dspark_enabled) {
+                forward = dspark_speculative_step(
+                    tokens[row], stats, slot_id);
+            } else if (dflash2_enabled) {
+                forward = dflash2_speculative_step(
+                    tokens[row], stats, slot_id);
+            } else {
+                throw std::runtime_error(
+                    "Qwen batched speculative decode is disabled");
+            }
+            if (forward.position <= position || forward.position > max_context) {
+                throw std::runtime_error(
+                    "Qwen batched speculative step returned an invalid position");
+            }
+            trim_paged_slot(slot_id, forward.position);
+            slot_positions[static_cast<size_t>(slot_id)] = forward.position;
+            results.push_back(std::move(forward));
+        }
+        return results;
     }
 
     uint64_t weights_vocab_start() const {
@@ -3151,32 +3392,32 @@ struct QwenEngine::Impl {
             if (dspark_tap_index != dspark_tap_count) {
                 throw std::runtime_error("Qwen DSpark target taps were not captured");
             }
-            if (dspark->committed_position() != position_offset) {
-                if (position_offset <= dspark->committed_position()) {
-                    dspark->crop_context(position_offset);
+            if (dspark->committed_position(slot_id) != position_offset) {
+                if (position_offset <= dspark->committed_position(slot_id)) {
+                    dspark->crop_context(position_offset, slot_id);
                 } else {
                     throw std::runtime_error(
                         "Qwen DSpark target context has a position gap");
                 }
             }
             dspark->append_target_taps(dspark_target_taps.f16_data(), rows,
-                                       position_offset);
+                                       position_offset, slot_id);
         }
         if (dflash2_tap_layers != nullptr) {
             if (dflash2_tap_index != dflash2_tap_count) {
                 throw std::runtime_error("Qwen DFlash2 target taps were not captured");
             }
             if (dflash2_enabled) {
-                if (dflash2->committed_position() != position_offset) {
-                    if (position_offset <= dflash2->committed_position()) {
-                        dflash2->crop_context(position_offset);
+                if (dflash2->committed_position(slot_id) != position_offset) {
+                    if (position_offset <= dflash2->committed_position(slot_id)) {
+                        dflash2->crop_context(position_offset, slot_id);
                     } else {
                         throw std::runtime_error(
                             "Qwen DFlash2 target context has a position gap");
                     }
                 }
                 dflash2->append_target_taps(dflash2_target_taps.f16_data(), rows,
-                                            position_offset);
+                                            position_offset, slot_id);
             } else if (dflash2_target_debug_callback) {
                 QwenDFlash2DebugTensor tensor;
                 tensor.name = "target_taps";
@@ -3196,21 +3437,26 @@ struct QwenEngine::Impl {
             rms_norm_component.forward(
                 *this, final_norm, hidden, target_hidden_rows.f16_data(), rows,
                 hidden_size);
-            allocate_half(target_last_hidden, hidden_size,
-                          {config.hidden_size});
-            check_device(memcpy_d2d(target_last_hidden.data,
-                                    target_hidden_rows.f16_data() + static_cast<size_t>(rows - 1) * hidden_size,
-                                    static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
-                         "Qwen target last hidden copy");
-            has_target_last_hidden = true;
-            mtp_seed_ready = false;
-            mtp_position = position_offset + rows;
+            allocate_half(target_last_hidden,
+                          static_cast<size_t>(max_batch_size) * hidden_size,
+                          {static_cast<uint64_t>(max_batch_size), config.hidden_size});
+            check_device(memcpy_d2d(
+                static_cast<uint8_t*>(target_last_hidden.data) +
+                    recurrent_slot_offset(target_last_hidden, slot_id),
+                target_hidden_rows.f16_data() +
+                    static_cast<size_t>(rows - 1) * hidden_size,
+                static_cast<size_t>(hidden_size) * sizeof(uint16_t)),
+                "Qwen target last hidden copy");
+            has_target_last_hidden[static_cast<size_t>(slot_id)] = true;
+            mtp_seed_ready[static_cast<size_t>(slot_id)] = false;
+            mtp_position[static_cast<size_t>(slot_id)] = position_offset + rows;
             if (mtp_shifted_tokens != nullptr) {
                 if (mtp_shifted_tokens->size() != token_ids.size()) {
                     throw std::runtime_error(
                         "Qwen MTP shifted-token extent does not match target rows");
                 }
-                (void)prime_target_mtp(*mtp_shifted_tokens, position_offset);
+                (void)prime_target_mtp(*mtp_shifted_tokens, position_offset,
+                                        slot_id);
             }
         }
         if (verify_batch != nullptr) {
@@ -3416,6 +3662,9 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
     if (options_.prefill_chunk_tokens <= 0) {
         throw std::runtime_error("Qwen prefill chunk size must be positive");
     }
+    if (options_.max_batch_size <= 0) {
+        throw std::runtime_error("Qwen max batch size must be positive");
+    }
     if (options_.attention_window < 0 || options_.attention_sink_tokens < 0) {
         throw std::runtime_error("Qwen attention window and sink must not be negative");
     }
@@ -3429,6 +3678,10 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
             "Qwen sparse attention currently requires an FP16 KV cache");
     }
     if (options_.kv_paged) {
+        if (options_.mtp) {
+            throw std::runtime_error(
+                "Qwen paged KV cache is not supported with native MTP");
+        }
         if (options_.kv_cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
             throw std::runtime_error(
                 "Qwen paged KV cache does not support int8_per_token_head");
@@ -3606,12 +3859,15 @@ Capabilities QwenEngine::caps() const {
     // batch_prefill honours its token budget on every configuration.
     c.chunked_prefill = true;
     c.max_slots = options_.max_batch_size;
-    // Per-request sampling is supported: each BatchedRequest carries its own
-    // BatchSamplingParams and batch_decode_step extracts them before the
-    // sampler runs. Rows with matching params take the fast batched path;
-    // rows that differ are sampled one at a time (rows=1 per kernel call).
-    c.per_request_sampling = true;
-    c.per_request_top_k = true;
+    // Plain batched decode applies each row's sampling parameters in a
+    // single-process engine. Under TP, all ranks must enter the same sampler
+    // collectives; the worker command therefore carries no sampling metadata,
+    // so rows must use the engine-wide values there.
+    const bool speculative = options_.mtp ||
+        !options_.dspark_checkpoint.empty() ||
+        !options_.dflash2_checkpoint.empty();
+    c.per_request_sampling = !speculative && options_.tp_world <= 1;
+    c.per_request_top_k = !speculative && options_.tp_world <= 1;
     c.fixed_temperature = options_.temperature;
     c.fixed_top_p = options_.top_p;
     c.fixed_top_k = options_.top_k;
@@ -3711,10 +3967,9 @@ void QwenEngine::free_slot(uint64_t request_id) {
     // capacity dynamic: the next request draws from a pool the finished one has
     // already given back, rather than inheriting a fixed reservation.
     //
-    // Under TP the workers hold their own copies of the block table, so they
-    // have to release the same slot too or their pools leak one row per freed
-    // slot and eventually run out. The command is a no-op unless a channel
-    // exists and paging is on, which keeps the contiguous path unchanged.
+    // Under TP the workers hold their own recurrent and cache state, so they
+    // have to clear the same slot too. Paging additionally requires releasing
+    // the worker's block-table row or its pool leaks one row per freed slot.
     impl_->release_slot_paged_state(slot_id, position_);
     worker_command_free_slot(slot_id);
 }
@@ -3736,12 +3991,22 @@ BatchPrefillResult QwenEngine::batch_prefill(
     result.total_tokens = 0;
 
     auto start = std::chrono::steady_clock::now();
-
-    for (BatchedRequest* req : requests) {
+    std::vector<int> seen_slots;
+    seen_slots.reserve(requests.size());
+    for (const BatchedRequest* req : requests) {
         if (!req || req->prompt_tokens.empty()) {
             throw std::runtime_error("QwenEngine::batch_prefill: invalid request");
         }
+        if (req->slot_id < 0 || req->slot_id >= impl_->max_batch_size ||
+            std::find(seen_slots.begin(), seen_slots.end(), req->slot_id) !=
+                seen_slots.end()) {
+            throw std::runtime_error(
+                "QwenEngine::batch_prefill: slots must be distinct and in range");
+        }
+        seen_slots.push_back(req->slot_id);
+    }
 
+    for (BatchedRequest* req : requests) {
         // Under TP the workers sit in run_worker_loop() waiting to be told which
         // collective to join; rank 0 must announce the op before running it, or
         // the group deadlocks with rank 0 computing alone.  No-op at world size 1.
@@ -3801,6 +4066,10 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     std::vector<int> positions(static_cast<size_t>(rows));
     for (int row = 0; row < rows; ++row) {
         const int slot = slot_ids[static_cast<size_t>(row)];
+        if (slot < 0 || slot >= impl_->max_batch_size) {
+            throw std::runtime_error(
+                "QwenEngine::batch_decode_tokens: slot is out of range");
+        }
         for (int earlier = 0; earlier < row; ++earlier) {
             if (slot_ids[static_cast<size_t>(earlier)] == slot) {
                 throw std::runtime_error(
@@ -3856,6 +4125,37 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     return results;
 }
 
+std::vector<ForwardResult> QwenEngine::batch_speculative_tokens(
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+    const std::vector<int>& draft_counts) {
+    if (tokens.size() != slot_ids.size() ||
+        tokens.size() != draft_counts.size()) {
+        throw std::runtime_error(
+            "QwenEngine::batch_speculative_tokens: row extents differ");
+    }
+    if (tokens.empty()) return {};
+    std::vector<ForwardResult> results = impl_->batch_speculative_tokens(
+        tokens, slot_ids, draft_counts, &mtp_stats_);
+    for (size_t index = 0; index < results.size(); ++index) {
+        const int slot = slot_ids[index];
+        impl_->set_slot_position(slot, results[index].position, position_);
+        if (options_.prefix_cache) {
+            Impl::SlotPrefixState& prefix = impl_->prefix_for(slot);
+            prefix.cached_prompt.push_back(tokens[index]);
+            prefix.cached_prompt.insert(prefix.cached_prompt.end(),
+                                        results[index].accept_tokens.begin(),
+                                        results[index].accept_tokens.end());
+            prefix.cached_result = results[index];
+            prefix.has_cached_result = true;
+            if (impl_->is_periodic_snapshot_position(results[index].position)) {
+                impl_->record_snapshot(results[index].position, &results[index],
+                                       true, slot);
+            }
+        }
+    }
+    return results;
+}
+
 bool QwenEngine::is_stop_token(const BatchSamplingParams& sampling,
                                int token) const {
     if (sampling.ignore_eos) return false;
@@ -3887,24 +4187,135 @@ BatchDecodeResult QwenEngine::batch_decode_step(
         if (!req) {
             throw std::runtime_error("QwenEngine::batch_decode_step: null request");
         }
+        if (req->slot_id < 0 || req->slot_id >= impl_->max_batch_size) {
+            throw std::runtime_error(
+                "QwenEngine::batch_decode_step: slot is out of range");
+        }
+        if (std::find(slots.begin(), slots.end(), req->slot_id) != slots.end()) {
+            throw std::runtime_error(
+                "QwenEngine::batch_decode_step: slot appears twice in one batch");
+        }
         tokens.push_back(req->last_token);
         slots.push_back(req->slot_id);
     }
+
+    const bool speculative = options_.mtp ||
+        !options_.dspark_checkpoint.empty() ||
+        !options_.dflash2_checkpoint.empty();
+    if (speculative) {
+        // The current speculative verifier is greedy: acceptance compares each
+        // draft with target argmax and the bonus is also an argmax. Do not
+        // silently ignore per-request sampling parameters until a sampled
+        // speculative verifier exists.
+        for (const BatchedRequest* req : requests) {
+            if (std::abs(req->sampling.temperature - options_.temperature) >
+                    1.0e-5f ||
+                std::abs(req->sampling.top_p - options_.top_p) > 1.0e-5f ||
+                req->sampling.top_k != options_.top_k ||
+                req->sampling.seed != options_.sampling_seed) {
+                throw std::runtime_error(
+                    "Qwen speculative batch decode does not support per-request "
+                    "sampling parameters");
+            }
+        }
+        std::vector<int> draft_counts;
+        draft_counts.reserve(requests.size());
+        for (const BatchedRequest* req : requests) {
+            const int remaining = req->sampling.max_new_tokens -
+                static_cast<int>(req->generated_tokens.size());
+            int count = 0;
+            if (remaining > 1) {
+                if (options_.mtp) {
+                    count = std::min(std::max(1, options_.mtp_speculative_tokens),
+                                     remaining - 1);
+                } else if (remaining >= 8) {
+                    // External Qwen drafters are trained for their fixed block;
+                    // use plain decode for the short tail rather than consuming
+                    // a block that would exceed the request's length cap.
+                    count = 1;
+                }
+            }
+            draft_counts.push_back(count);
+        }
+        worker_command_batch_speculative(tokens, slots, draft_counts);
+        std::vector<ForwardResult> forwards = batch_speculative_tokens(
+            tokens, slots, draft_counts);
+        for (size_t index = 0; index < requests.size(); ++index) {
+            BatchedRequest* req = requests[index];
+            ForwardResult& forward = forwards[index];
+            std::vector<int> emitted;
+            if (forward.proposed_drafts > 0) {
+                emitted = forward.accept_tokens;
+                emitted.push_back(forward.bonus_token);
+            } else {
+                emitted.push_back(forward.top_token);
+            }
+            bool stopped = false;
+            for (size_t token_index = 0; token_index < emitted.size();
+                 ++token_index) {
+                if (is_stop_token(req->sampling, emitted[token_index])) {
+                    emitted.resize(token_index + 1);
+                    stopped = true;
+                    break;
+                }
+            }
+            req->last_token = emitted.back();
+            req->last_result = forward;
+            req->seq_len += forward.proposed_drafts > 0
+                ? 1 + forward.correct_drafts : 1;
+            req->generated_tokens.insert(req->generated_tokens.end(),
+                                         emitted.begin(), emitted.end());
+            const bool capped = static_cast<int>(req->generated_tokens.size()) >=
+                                req->sampling.max_new_tokens;
+            req->finished = stopped || capped;
+            result.next_tokens.push_back(req->last_token);
+            result.finished.push_back(req->finished);
+            result.hit_stop_token.push_back(stopped);
+            result.emitted_tokens.push_back(std::move(emitted));
+            result.position_advances.push_back(
+                forward.proposed_drafts > 0 ? 1 + forward.correct_drafts : 1);
+            result.proposed_drafts.push_back(forward.proposed_drafts);
+            result.accepted_drafts.push_back(forward.correct_drafts);
+            result.used_speculative.push_back(forward.proposed_drafts > 0);
+            result.rolled_back.push_back(forward.rolled_back);
+        }
+        result.seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        return result;
+    }
+
+    // Collect per-request sampling params before announcing the operation. In a
+    // TP run, workers receive only the batch tokens and slots and therefore use
+    // the engine-wide sampler settings. Passing a non-null row-parameter pointer
+    // on rank 0 would take the sampling collective path while workers took the
+    // greedy top-1 path, leaving the ranks permanently out of step even when
+    // every request used the same greedy settings.
+    std::vector<BatchSamplingParams> row_params;
+    row_params.reserve(requests.size());
+    bool rows_differ_from_engine = false;
+    for (const BatchedRequest* req : requests) {
+        row_params.push_back(req->sampling);
+        rows_differ_from_engine |=
+            std::abs(req->sampling.temperature - options_.temperature) > 1.0e-5f ||
+            std::abs(req->sampling.top_p - options_.top_p) > 1.0e-5f ||
+            req->sampling.top_k != options_.top_k ||
+            req->sampling.seed != options_.sampling_seed;
+    }
+    if (options_.tp_world > 1 && rows_differ_from_engine) {
+        throw std::runtime_error(
+            "Qwen TP batched decode requires per-request sampling to match "
+            "the engine options");
+    }
+    const std::vector<BatchSamplingParams>* decode_params =
+        options_.tp_world > 1 ? nullptr : &row_params;
 
     // One forward for the whole batch. Under TP the workers sit in
     // run_worker_loop() waiting to be told which collective to join, so rank 0
     // announces the batch before running it or the group deadlocks with rank 0
     // computing alone. No-op at world size 1.
     worker_command_batch_decode(tokens, slots);
-    // Collect per-request sampling params so the sampler can honour each
-    // request's own temperature/top_k/top_p rather than the engine default.
-    std::vector<BatchSamplingParams> row_params;
-    row_params.reserve(requests.size());
-    for (const BatchedRequest* req : requests) {
-        row_params.push_back(req->sampling);
-    }
-    std::vector<ForwardResult> forwards = batch_decode_tokens(tokens, slots,
-                                                              &row_params);
+    std::vector<ForwardResult> forwards = batch_decode_tokens(
+        tokens, slots, decode_params);
 
     for (size_t index = 0; index < requests.size(); ++index) {
         BatchedRequest* req = requests[index];
@@ -4062,7 +4473,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         // new suffix so every predictor row observes target h[S-1] + new x[S].
         impl_->rewrite_mtp_boundary(
             token_ids[static_cast<size_t>(start_position)],
-            start_position - 1);
+            start_position - 1, slot_id);
     }
     ForwardResult result;
     // A budget both caps how far this call advances and shrinks the chunk, since
@@ -4121,7 +4532,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
                 result = impl_->run_chunk(chunk, offset, active_layers_, true,
                                           nullptr, nullptr, slot_id);
                 shifted.back() = result.top_token;
-                (void)impl_->prime_target_mtp(shifted, offset);
+                (void)impl_->prime_target_mtp(shifted, offset, slot_id);
             } else {
                 result = impl_->run_chunk(chunk, offset, active_layers_,
                                           snapshot_result, nullptr, &shifted, slot_id);
@@ -4426,6 +4837,28 @@ void QwenEngine::run_worker_loop() {
                 (void)batch_decode_tokens(batch_tokens, batch_slots);
                 break;
             }
+            case WorkerCommand::BatchSpeculativeStep: {
+                const int batch_rows = static_cast<int>(header[1]);
+                if (batch_rows <= 0 ||
+                    tokens.size() != static_cast<size_t>(batch_rows) * 3) {
+                    throw std::runtime_error(
+                        "run_worker_loop: malformed batched speculative payload");
+                }
+                std::vector<int> batch_tokens(static_cast<size_t>(batch_rows));
+                std::vector<int> batch_slots(static_cast<size_t>(batch_rows));
+                std::vector<int> draft_counts(static_cast<size_t>(batch_rows));
+                for (int row = 0; row < batch_rows; ++row) {
+                    batch_tokens[static_cast<size_t>(row)] =
+                        tokens[static_cast<size_t>(row) * 3];
+                    batch_slots[static_cast<size_t>(row)] =
+                        tokens[static_cast<size_t>(row) * 3 + 1];
+                    draft_counts[static_cast<size_t>(row)] =
+                        tokens[static_cast<size_t>(row) * 3 + 2];
+                }
+                (void)batch_speculative_tokens(
+                    batch_tokens, batch_slots, draft_counts);
+                break;
+            }
             case WorkerCommand::Reset:
                 reset();
                 break;
@@ -4521,6 +4954,45 @@ void QwenEngine::worker_command_batch_decode(
     impl_->cmd->send_to_workers(payload.data(), payload.size());
 }
 
+void QwenEngine::worker_command_batch_speculative(
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+    const std::vector<int>& draft_counts) {
+    if (options_.tp_world <= 1) return;
+    if (options_.tp_rank != 0) {
+        throw std::runtime_error(
+            "worker_command_batch_speculative: rank 0 only");
+    }
+    if (!impl_->cmd) {
+        throw std::runtime_error(
+            "worker_command_batch_speculative: command channel not initialized "
+            "(call warmup_tp first)");
+    }
+    if (tokens.size() != slot_ids.size() ||
+        tokens.size() != draft_counts.size()) {
+        throw std::runtime_error(
+            "worker_command_batch_speculative: row extents differ");
+    }
+    if (tokens.empty()) return;
+
+    const int32_t rows = static_cast<int32_t>(tokens.size());
+    int32_t header[4] = {
+        static_cast<int32_t>(WorkerCommand::BatchSpeculativeStep),
+        rows,
+        0,
+        rows * 3
+    };
+    impl_->cmd->send_to_workers(header, 4);
+
+    std::vector<int32_t> payload(static_cast<size_t>(rows) * 3);
+    for (int32_t row = 0; row < rows; ++row) {
+        const size_t offset = static_cast<size_t>(row) * 3;
+        payload[offset] = tokens[static_cast<size_t>(row)];
+        payload[offset + 1] = slot_ids[static_cast<size_t>(row)];
+        payload[offset + 2] = draft_counts[static_cast<size_t>(row)];
+    }
+    impl_->cmd->send_to_workers(payload.data(), payload.size());
+}
+
 void QwenEngine::worker_command_reset() {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
@@ -4564,11 +5036,8 @@ void QwenEngine::worker_command_free_slot(int32_t slot_id) {
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_free_slot: rank 0 only");
     }
-    // Contiguous arena: a slot already owns max_context implicitly, so there is
-    // no per-slot block state for a worker to release. A worker's position and
-    // prefix state are re-derived at the next prefill on that slot, so leaving
-    // the command unsent keeps the non-paged path byte-for-byte unchanged.
-    if (!impl_->kv_paged()) return;
+    // The command also clears recurrent, predictor, and prefix state for a
+    // contiguous slot; paging additionally returns its blocks to the pool.
     if (!impl_->cmd) {
         throw std::runtime_error("worker_command_free_slot: command channel not initialized (call warmup_tp first)");
     }

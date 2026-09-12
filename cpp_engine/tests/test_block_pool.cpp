@@ -124,6 +124,14 @@ void test_table_growth() {
     check(table.capacity_tokens(0) == 32, "the row is now two blocks");
     check(pool.free_blocks() == 14, "the boundary took one more block");
 
+    table.trim_capacity(0, 16);
+    check(table.capacity_tokens(0) == 16,
+          "trimming releases an unused trailing block");
+    check(pool.free_blocks() == 15, "trim returns the trailing block");
+    check(table.ensure_capacity(0, 17), "trimmed row can grow again");
+    check(table.capacity_tokens(0) == 32, "regrowth restores two blocks");
+    check(pool.free_blocks() == 14, "regrowth takes one block");
+
     table.release(0);
     check(table.capacity_tokens(0) == 0, "release empties the row");
     check(pool.free_blocks() == 16, "release returns every block");
