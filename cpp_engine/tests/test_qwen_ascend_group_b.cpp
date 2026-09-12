@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -181,6 +182,11 @@ ErrorStats half_error(const std::vector<uint16_t>& got,
     ErrorStats stats;
     for (size_t i = 0; i < want.size(); ++i) {
         const double actual = half_to_float(got[i]);
+        if (!std::isfinite(actual) || !std::isfinite(want[i])) {
+            stats.worst = std::numeric_limits<double>::infinity();
+            ++stats.mismatches;
+            continue;
+        }
         const double error = std::fabs(actual - want[i]);
         const double scale = std::max(std::fabs(want[i]), absolute);
         stats.worst = std::max(stats.worst, error / scale);
@@ -197,7 +203,13 @@ ErrorStats float_error(const std::vector<float>& got,
     }
     ErrorStats stats;
     for (size_t i = 0; i < want.size(); ++i) {
-        const double error = std::fabs(static_cast<double>(got[i]) - want[i]);
+        const double actual = static_cast<double>(got[i]);
+        if (!std::isfinite(actual) || !std::isfinite(want[i])) {
+            stats.worst = std::numeric_limits<double>::infinity();
+            ++stats.mismatches;
+            continue;
+        }
+        const double error = std::fabs(actual - want[i]);
         const double scale = std::max(std::fabs(want[i]), absolute);
         stats.worst = std::max(stats.worst, error / scale);
         if (error > absolute + relative * std::fabs(want[i])) ++stats.mismatches;
@@ -256,9 +268,23 @@ void expect_float_close(const std::vector<float>& got,
                         const std::vector<double>& want, double relative,
                         double absolute, const std::string& what) {
     const ErrorStats stats = float_error(got, want, relative, absolute);
+    std::string detail;
+    if (stats.mismatches != 0 && got.size() == want.size()) {
+        for (size_t i = 0; i < want.size(); ++i) {
+            const double actual = static_cast<double>(got[i]);
+            const double error = std::fabs(actual - want[i]);
+            if (!std::isfinite(actual) ||
+                error > absolute + relative * std::fabs(want[i])) {
+                detail = " first=" + std::to_string(i) +
+                         " got=" + std::to_string(actual) +
+                         " want=" + std::to_string(want[i]);
+                break;
+            }
+        }
+    }
     expect(stats.mismatches == 0,
            what + " mismatches=" + std::to_string(stats.mismatches) +
-               " worst_relative=" + std::to_string(stats.worst));
+               " worst_relative=" + std::to_string(stats.worst) + detail);
 }
 
 std::vector<double> normalize_reference(const std::vector<uint16_t>& source,
@@ -779,12 +805,10 @@ std::vector<double> attention_reference(const std::vector<uint16_t>& q,
     return output;
 }
 
-void test_gqa_decode(std::mt19937& rng) {
+void test_gqa_decode_case(std::mt19937& rng, int head_dim, int context_len) {
     const int q_heads = 6;
     const int kv_heads = 2;
-    const int head_dim = 32;
-    const int context_len = 5;
-    const int max_context = 9;
+    const int max_context = context_len + 4;
     const std::vector<uint16_t> q =
         random_halves(static_cast<size_t>(q_heads) * head_dim, rng, 0.45f);
     std::vector<uint16_t> k_cache = random_halves(
@@ -831,150 +855,39 @@ void test_gqa_decode(std::mt19937& rng) {
     }
     expect(bad_probability_rows == 0,
            "GQA decode score scratch holds probabilities" + score_detail);
+    std::vector<double> want_scores(scores.size());
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    for (int head = 0; head < q_heads; ++head) {
+        const int kv_head = head / (q_heads / kv_heads);
+        double maximum = -std::numeric_limits<double>::infinity();
+        for (int pos = 0; pos < context_len; ++pos) {
+            double score = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                score += static_cast<double>(half_to_float(q[head * head_dim + d])) *
+                         half_to_float(k_cache[(pos * kv_heads + kv_head) * head_dim + d]);
+            }
+            want_scores[head * context_len + pos] = score * scale;
+            maximum = std::max(maximum, score * scale);
+        }
+        double denominator = 0.0;
+        for (int pos = 0; pos < context_len; ++pos) {
+            double& value = want_scores[head * context_len + pos];
+            value = std::exp(value - maximum);
+            denominator += value;
+        }
+        for (int pos = 0; pos < context_len; ++pos) {
+            want_scores[head * context_len + pos] /= denominator;
+        }
+    }
+    expect_float_close(scores, want_scores, 5.0e-5, 2.0e-6,
+                       "GQA decode normalized probability values");
 }
 
-void test_gqa_decode_vectorized(std::mt19937& rng) {
-    // Exercise the tuned Qwen3.8-27B TP4 geometry and a partial 64-position
-    // tile. This must take the AscendC vectorized path rather than the scalar
-    // fallback used by the general-shape decode case above.
-    const int q_heads = 6;
-    const int kv_heads = 1;
-    const int head_dim = 256;
-    const int context_len = 65;
-    const int max_context = 80; // Also exercises the serialized scratch-row path.
-    const std::vector<uint16_t> q = random_halves(
-        static_cast<size_t>(q_heads) * head_dim, rng, 0.45f);
-    std::vector<uint16_t> k_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    std::vector<uint16_t> v_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    const size_t poison_start =
-        static_cast<size_t>(context_len) * kv_heads * head_dim;
-    std::fill(k_cache.begin() + poison_start, k_cache.end(),
-              float_to_half(40.0f));
-    std::fill(v_cache.begin() + poison_start, v_cache.end(),
-              float_to_half(-40.0f));
-
-    DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
-    DeviceBuffer<uint16_t> d_out(static_cast<size_t>(q_heads) * head_dim);
-    DeviceBuffer<float> d_scores(static_cast<size_t>(q_heads) * context_len);
-    expect(pocket::qwen_gqa_decode_attention_f16(
-               d_q.get(), d_k.get(), d_v.get(), d_out.get(), d_scores.get(),
-               q_heads, kv_heads, head_dim, context_len, max_context),
-           "vectorized GQA decode launch");
-    sync_or_throw("vectorized GQA decode");
-    expect_half_close(
-        d_out.download(),
-        attention_reference(q, k_cache, v_cache, 1, q_heads, kv_heads,
-                            head_dim, context_len - 1),
-        5.0e-3, 2.0e-3, "vectorized GQA decode output");
-
-    const std::vector<float> scores = d_scores.download();
-    int bad_probability_rows = 0;
-    for (int head = 0; head < q_heads; ++head) {
-        double sum = 0.0;
-        for (int pos = 0; pos < context_len; ++pos) {
-            const float value = scores[static_cast<size_t>(head) * context_len + pos];
-            if (!(value >= 0.0f) || !std::isfinite(value)) {
-                ++bad_probability_rows;
-            }
-            sum += value;
-        }
-        if (std::fabs(sum - 1.0) > 2.0e-4) ++bad_probability_rows;
-    }
-    expect(bad_probability_rows == 0,
-           "vectorized GQA decode scratch holds probabilities");
-
-    // Contexts divisible by five 64-position tiles use the context-split path:
-    // five partial softmax/value blocks per query head, followed by merge and
-    // scratch normalization. Keep this separate from the partial-tile check above
-    // so both dispatch branches remain covered by the hardware suite.
-    const int split_context_len = 640;
-    const int split_max_context = 656;
-    const std::vector<uint16_t> split_k_cache = random_halves(
-        static_cast<size_t>(split_max_context) * kv_heads * head_dim, rng, 0.5f);
-    const std::vector<uint16_t> split_v_cache = random_halves(
-        static_cast<size_t>(split_max_context) * kv_heads * head_dim, rng, 0.5f);
-    DeviceBuffer<uint16_t> split_k(split_k_cache), split_v(split_v_cache);
-    DeviceBuffer<uint16_t> split_out(static_cast<size_t>(q_heads) * head_dim);
-    DeviceBuffer<float> split_scores(
-        static_cast<size_t>(q_heads) * split_context_len);
-    expect(pocket::qwen_gqa_decode_attention_f16(
-               d_q.get(), split_k.get(), split_v.get(), split_out.get(),
-               split_scores.get(), q_heads, kv_heads, head_dim,
-               split_context_len, split_max_context),
-           "context-split GQA decode launch");
-    sync_or_throw("context-split GQA decode");
-    expect_half_close(
-        split_out.download(),
-        attention_reference(q, split_k_cache, split_v_cache, 1, q_heads,
-                            kv_heads, head_dim, split_context_len - 1),
-        5.0e-3, 2.0e-3, "context-split GQA decode output");
-    const std::vector<float> split_probability = split_scores.download();
-    int bad_split_probability_rows = 0;
-    for (int head = 0; head < q_heads; ++head) {
-        double sum = 0.0;
-        for (int pos = 0; pos < split_context_len; ++pos) {
-            const float value = split_probability[
-                static_cast<size_t>(head) * split_context_len + pos];
-            if (!(value >= 0.0f) || !std::isfinite(value)) {
-                ++bad_split_probability_rows;
-            }
-            sum += value;
-        }
-        if (std::fabs(sum - 1.0) > 2.0e-4) {
-            ++bad_split_probability_rows;
-        }
-    }
-    expect(bad_split_probability_rows == 0,
-           "context-split GQA scratch holds probabilities");
-
-    // From 30 whole 64-position tiles the dispatch switches to the KV-sharing
-    // geometry: one context range per AI core, every query head swept across the
-    // K/V tile already in UB. That path keeps raw scaled scores in scratch during
-    // the sweep and produces the probability plane in its own normalize stage, so
-    // both the output and the scratch contract need separate coverage here.
-    // Must clear the dispatch threshold in qwen_ascend_ops_launch.cpp, which is
-    // set by measured crossover rather than by the kernel's 30-tile minimum.
-    const int shared_context_len = 16384;
-    const int shared_max_context = 16400;
-    const std::vector<uint16_t> shared_k_cache = random_halves(
-        static_cast<size_t>(shared_max_context) * kv_heads * head_dim, rng, 0.5f);
-    const std::vector<uint16_t> shared_v_cache = random_halves(
-        static_cast<size_t>(shared_max_context) * kv_heads * head_dim, rng, 0.5f);
-    DeviceBuffer<uint16_t> shared_k(shared_k_cache), shared_v(shared_v_cache);
-    DeviceBuffer<uint16_t> shared_out(static_cast<size_t>(q_heads) * head_dim);
-    DeviceBuffer<float> shared_scores(
-        static_cast<size_t>(q_heads) * shared_context_len);
-    expect(pocket::qwen_gqa_decode_attention_f16(
-               d_q.get(), shared_k.get(), shared_v.get(), shared_out.get(),
-               shared_scores.get(), q_heads, kv_heads, head_dim,
-               shared_context_len, shared_max_context),
-           "KV-sharing GQA decode launch");
-    sync_or_throw("KV-sharing GQA decode");
-    expect_half_close(
-        shared_out.download(),
-        attention_reference(q, shared_k_cache, shared_v_cache, 1, q_heads,
-                            kv_heads, head_dim, shared_context_len - 1),
-        5.0e-3, 2.0e-3, "KV-sharing GQA decode output");
-    const std::vector<float> shared_probability = shared_scores.download();
-    int bad_shared_probability_rows = 0;
-    for (int head = 0; head < q_heads; ++head) {
-        double sum = 0.0;
-        for (int pos = 0; pos < shared_context_len; ++pos) {
-            const float value = shared_probability[
-                static_cast<size_t>(head) * shared_context_len + pos];
-            if (!(value >= 0.0f) || !std::isfinite(value)) {
-                ++bad_shared_probability_rows;
-            }
-            sum += value;
-        }
-        if (std::fabs(sum - 1.0) > 2.0e-4) {
-            ++bad_shared_probability_rows;
-        }
-    }
-    expect(bad_shared_probability_rows == 0,
-           "KV-sharing GQA scratch holds probabilities");
+void test_gqa_decode(std::mt19937& rng) {
+    test_gqa_decode_case(rng, 32, 5);
+    test_gqa_decode_case(rng, 256, 64);
+    test_gqa_decode_case(rng, 17, 65);
+    test_gqa_decode_case(rng, 64, 133);
 }
 
 void test_argmax(std::mt19937& rng) {
@@ -1061,48 +974,153 @@ void test_gqa_prefill(std::mt19937& rng) {
                       5.0e-3, 2.0e-3, "GQA prefill output");
 }
 
-void test_gqa_verify(std::mt19937& rng) {
-    const int rows = 4;
-    const int q_heads = 6;
-    const int kv_heads = 2;
-    const int head_dim = 32;
-    const int position_offset = 3;
-    const int max_context = 10;
-    const int splits = 5;
-    const std::vector<uint16_t> q = random_halves(
-        static_cast<size_t>(rows) * q_heads * head_dim, rng, 0.45f);
-    std::vector<uint16_t> k_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    std::vector<uint16_t> v_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    const size_t poison_start = static_cast<size_t>(position_offset + rows) *
-                                kv_heads * head_dim;
-    std::fill(k_cache.begin() + poison_start, k_cache.end(), float_to_half(40.0f));
-    std::fill(v_cache.begin() + poison_start, v_cache.end(), float_to_half(-40.0f));
-    DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
-    DeviceBuffer<uint16_t> d_out(static_cast<size_t>(rows) * q_heads * head_dim);
-    DeviceBuffer<float> d_partial(static_cast<size_t>(rows) * q_heads * splits *
-                                  (head_dim + 2));
-    expect(pocket::qwen_gqa_verify_attention_f16(
-               d_q.get(), d_k.get(), d_v.get(), d_out.get(), d_partial.get(),
-               rows, q_heads, kv_heads, head_dim, position_offset, max_context,
-               splits),
-           "GQA verify launch");
-    sync_or_throw("GQA verify");
-    expect_half_close(d_out.download(),
-                      attention_reference(q, k_cache, v_cache, rows, q_heads,
-                                          kv_heads, head_dim, position_offset),
-                      5.0e-3, 2.0e-3, "GQA verify output");
-    const std::vector<float> partial = d_partial.download();
-    int nonfinite = 0;
-    for (size_t group = 0;
-         group < static_cast<size_t>(rows) * q_heads * splits; ++group) {
-        const float maximum = partial[group * (head_dim + 2)];
-        const float denominator = partial[group * (head_dim + 2) + 1];
-        if (!std::isfinite(maximum) && denominator != 0.0f) ++nonfinite;
-        if (!std::isfinite(denominator) || denominator < 0.0f) ++nonfinite;
+std::vector<double> gqa_verify_partial_reference(
+    const std::vector<uint16_t>& q, const std::vector<uint16_t>& k_cache,
+    const std::vector<uint16_t>& v_cache, int rows, int q_heads, int kv_heads,
+    int head_dim, int position_offset, int splits) {
+    const int context_len = position_offset + rows;
+    const int positions_per_split = (context_len + splits - 1) / splits;
+    const int stride = head_dim + 2;
+    std::vector<double> out(static_cast<size_t>(rows) * q_heads * splits * stride,
+                            0.0);
+    const int repeat = q_heads / kv_heads;
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    for (int row = 0; row < rows; ++row) {
+        const int limit = position_offset + row + 1;
+        for (int head = 0; head < q_heads; ++head) {
+            const int kv_head = head / repeat;
+            const size_t q_base =
+                (static_cast<size_t>(row) * q_heads + head) * head_dim;
+            const size_t output_base =
+                (static_cast<size_t>(row) * q_heads + head) * splits * stride;
+            for (int split = 0; split < splits; ++split) {
+                const int begin = split * positions_per_split;
+                const int end = std::min(context_len, std::min(
+                    begin + positions_per_split, limit));
+                const size_t base = output_base + static_cast<size_t>(split) * stride;
+                if (begin >= end) {
+                    out[base] = -static_cast<double>(std::numeric_limits<float>::max());
+                    continue;
+                }
+                std::vector<double> probabilities(static_cast<size_t>(end - begin));
+                double maximum = -std::numeric_limits<double>::infinity();
+                for (int pos = begin; pos < end; ++pos) {
+                    const size_t cache_base =
+                        (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim;
+                    double score = 0.0;
+                    for (int d = 0; d < head_dim; ++d) {
+                        score += static_cast<double>(half_to_float(q[q_base + d])) *
+                                 half_to_float(k_cache[cache_base + d]);
+                    }
+                    probabilities[static_cast<size_t>(pos - begin)] = score * scale;
+                    maximum = std::max(maximum, score * scale);
+                }
+                out[base] = maximum;
+                double denominator = 0.0;
+                for (double& score : probabilities) {
+                    score = std::exp(score - maximum);
+                    denominator += score;
+                }
+                out[base + 1] = denominator;
+                for (int d = 0; d < head_dim; ++d) {
+                    double value = 0.0;
+                    for (int pos = begin; pos < end; ++pos) {
+                        const size_t cache_base =
+                            (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim;
+                        value += probabilities[static_cast<size_t>(pos - begin)] *
+                                 half_to_float(v_cache[cache_base + d]);
+                    }
+                    out[base + 2 + d] = value;
+                }
+            }
+        }
     }
-    expect(nonfinite == 0, "GQA verify fills valid split partials");
+    return out;
+}
+
+void test_gqa_verify(std::mt19937& rng) {
+    struct Shape {
+        int rows;
+        int q_heads;
+        int kv_heads;
+        int head_dim;
+        int position_offset;
+        int max_context;
+        int splits;
+        const char* name;
+    };
+    const Shape shapes[] = {
+        {4, 6, 2, 32, 3, 10, 5, "short"},
+        {2, 4, 2, 64, 131, 140, 3, "multi_tile"},
+        {3, 6, 2, 17, 65, 72, 2, "unaligned"},
+        {2, 2, 1, 17, 0, 8, 8, "empty_splits"},
+    };
+    for (const Shape& shape : shapes) {
+        const size_t q_count = static_cast<size_t>(shape.rows) * shape.q_heads *
+                               shape.head_dim;
+        const size_t kv_count = static_cast<size_t>(shape.max_context) *
+                                shape.kv_heads * shape.head_dim;
+        const size_t out_count = q_count;
+        const size_t partial_count = static_cast<size_t>(shape.rows) *
+            shape.q_heads * shape.splits * (shape.head_dim + 2);
+        const std::vector<uint16_t> q = random_halves(q_count, rng, 0.45f);
+        std::vector<uint16_t> k_cache = random_halves(kv_count, rng, 0.5f);
+        std::vector<uint16_t> v_cache = random_halves(kv_count, rng, 0.5f);
+        const size_t poison_start = static_cast<size_t>(shape.position_offset +
+                                                         shape.rows) *
+                                    shape.kv_heads * shape.head_dim;
+        std::fill(k_cache.begin() + poison_start, k_cache.end(),
+                  float_to_half(40.0f));
+        std::fill(v_cache.begin() + poison_start, v_cache.end(),
+                  float_to_half(-40.0f));
+        const std::vector<double> want_partial = gqa_verify_partial_reference(
+            q, k_cache, v_cache, shape.rows, shape.q_heads, shape.kv_heads,
+            shape.head_dim, shape.position_offset, shape.splits);
+        const std::vector<double> want_output = attention_reference(
+            q, k_cache, v_cache, shape.rows, shape.q_heads, shape.kv_heads,
+            shape.head_dim, shape.position_offset);
+        DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
+        DeviceBuffer<uint16_t> d_out(out_count + 16);
+        DeviceBuffer<float> d_partial(partial_count + 16);
+        std::vector<uint16_t> out_init(out_count + 16, float_to_half(9.0f));
+        std::vector<float> partial_init(partial_count + 16, 12345.0f);
+        d_out.upload(out_init);
+        d_partial.upload(partial_init);
+
+        for (int pass = 0; pass < 2; ++pass) {
+            expect(pocket::qwen_gqa_verify_attention_f16(
+                       d_q.get(), d_k.get(), d_v.get(), d_out.get() + 8,
+                       d_partial.get() + 8, shape.rows, shape.q_heads,
+                       shape.kv_heads, shape.head_dim, shape.position_offset,
+                       shape.max_context, shape.splits),
+                   std::string("GQA verify ") + shape.name + " launch");
+            sync_or_throw(std::string("GQA verify ") + shape.name);
+            const std::vector<uint16_t> got_out = d_out.download();
+            const std::vector<float> got_partial = d_partial.download();
+            std::vector<uint16_t> out_payload(got_out.begin() + 8,
+                                              got_out.begin() + 8 + out_count);
+            expect_half_close(out_payload, want_output, 5.0e-3, 2.0e-3,
+                              std::string("GQA verify ") + shape.name +
+                                  " output");
+            std::vector<float> partial_payload(got_partial.begin() + 8,
+                                                got_partial.begin() + 8 + partial_count);
+            expect_float_close(partial_payload, want_partial, 5.0e-4, 2.0e-4,
+                               std::string("GQA verify ") + shape.name +
+                                   " partials");
+            expect(std::equal(got_out.begin(), got_out.begin() + 8,
+                              out_init.begin()),
+                   std::string("GQA verify ") + shape.name + " output prefix guard");
+            expect(std::equal(got_out.begin() + 8 + out_count, got_out.end(),
+                              out_init.begin() + 8 + out_count),
+                   std::string("GQA verify ") + shape.name + " output suffix guard");
+            expect(std::equal(got_partial.begin(), got_partial.begin() + 8,
+                              partial_init.begin()),
+                   std::string("GQA verify ") + shape.name + " partial prefix guard");
+            expect(std::equal(got_partial.begin() + 8 + partial_count,
+                              got_partial.end(), partial_init.begin() + 8 + partial_count),
+                   std::string("GQA verify ") + shape.name + " partial suffix guard");
+        }
+    }
 }
 
 void test_argument_rejection() {
@@ -1140,6 +1158,10 @@ void test_argument_rejection() {
                half.get(), half.get(), half.get(), half.get(), real.get(), 3, 2,
                16, 2, 4),
            "GQA decode rejects a bad head ratio");
+    expect(!pocket::qwen_gqa_decode_attention_f16(
+               half.get(), half.get(), half.get(), half.get(), real.get(), 2, 1,
+               257, 2, 4),
+           "GQA decode rejects a head dimension above 256");
     expect(!pocket::qwen_gqa_prefill_attention_f16(
                half.get(), half.get(), half.get(), half.get(), 3, 2, 1, 16, 2,
                4),
@@ -1148,6 +1170,14 @@ void test_argument_rejection() {
                half.get(), half.get(), half.get(), half.get(), real.get(), 2, 2,
                1, 16, 1, 4, 0),
            "GQA verify rejects zero splits");
+    expect(!pocket::qwen_gqa_verify_attention_f16(
+               half.get(), half.get(), half.get(), half.get(), real.get(), 1, 2,
+               1, 16, 1, 4, 1),
+           "GQA verify rejects a single row");
+    expect(!pocket::qwen_gqa_verify_attention_f16(
+               half.get(), half.get(), half.get(), half.get(), real.get(), 2, 2,
+               1, 16, 1, 4, 257),
+           "GQA verify rejects more than 256 splits");
 }
 
 }  // namespace
@@ -1185,7 +1215,6 @@ int main(int argc, char** argv) {
         {"partial_rope", test_partial_rope},
         {"append_kv", test_append_kv},
         {"gqa_decode", test_gqa_decode},
-        {"gqa_decode_vectorized", test_gqa_decode_vectorized},
         {"gqa_prefill", test_gqa_prefill},
         {"gqa_verify", test_gqa_verify},
         {"argmax", test_argmax},

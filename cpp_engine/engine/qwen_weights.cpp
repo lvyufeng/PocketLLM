@@ -210,7 +210,18 @@ QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
     if (device.data == nullptr) {
         throw std::runtime_error("failed to allocate Qwen device tensor: " + ref.name);
     }
-    if (!memcpy_h2d_async(device.data, host.bytes.data(), device.nbytes, stream)) {
+#ifdef POCKET_BACKEND_ASCEND
+    // aclrtMemcpyAsync does not retain a pageable host buffer. `host` is a
+    // temporary materialization, so an asynchronous copy would let the vector
+    // be destroyed while the DMA engine is still reading it. The blocking ACL
+    // copy also restores the CUDA-shaped upload contract before the tensor is
+    // returned to the layer loader.
+    const bool copied = memcpy_h2d(device.data, host.bytes.data(), device.nbytes);
+#else
+    const bool copied = memcpy_h2d_async(device.data, host.bytes.data(),
+                                         device.nbytes, stream);
+#endif
+    if (!copied) {
         device_free(device.data);
         device.data = nullptr;
         device.nbytes = 0;

@@ -507,13 +507,17 @@ struct QwenEngine::Impl {
     bool sampling_rng_ready = false;
     std::vector<float> host_uniform_scratch;
     QwenWorkspace workspace;
-    // Separate NCCL stream. Every collective is bracketed by events on the
-    // default compute stream, so enabling this cannot expose a partially reduced
-    // tensor to the next layer. It is on by default because the sliced
-    // projection+all-reduce pipeline below needs it to hide any of the
-    // collective; `=0` restores the single-stream behaviour.
+    // Separate NCCL/HCCL stream. Every collective is bracketed by events on the
+    // default compute stream. CUDA keeps this enabled by default for overlap;
+    // Ascend stays on the default stream until the CANN event hand-off is proven
+    // deterministic on first-generation 910. Set QWEN_NCCL_COMM_STREAM=1 to
+    // explicitly opt into the separate HCCL stream for experiments.
+#ifdef POCKET_BACKEND_ASCEND
+    const bool use_nccl_comm_stream = qwen_env_enabled("QWEN_NCCL_COMM_STREAM");
+#else
     const bool use_nccl_comm_stream =
         qwen_env_enabled_default("QWEN_NCCL_COMM_STREAM");
+#endif
     void* nccl_comm_stream = nullptr;
     void* nccl_comm_ready = nullptr;
     void* nccl_comm_done = nullptr;
@@ -3495,6 +3499,10 @@ uint64_t QwenEngine::kv_cache_scale_bytes() const {
 
 QwenRuntimeTelemetry QwenEngine::runtime_telemetry() const {
     return impl_->telemetry;
+}
+
+void QwenEngine::report_phase_profile(const char* tag) const {
+    impl_->report_phase_profile(tag);
 }
 
 void QwenEngine::set_dflash2_debug_callback(
