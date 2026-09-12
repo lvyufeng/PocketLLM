@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -2860,7 +2861,7 @@ __global__ void append_kv_fp8_kernel(
     uint8_t* k_cache, uint8_t* v_cache,
     uint16_t* k_scale, uint16_t* v_scale,
     int seq_len, int kv_heads, int head_dim, int scale_block,
-    int start_pos, int max_context) {
+    int start_pos, int max_context, const int* block_table, int block_size) {
     const int block_index = static_cast<int>(blockIdx.x);
     const int blocks_per_head = head_dim / scale_block;
     const int token = block_index / (kv_heads * blocks_per_head);
@@ -2890,12 +2891,29 @@ __global__ void append_kv_fp8_kernel(
     const float ks = reduce_k[0] > 0.0f ? reduce_k[0] / 448.0f : 1.0f;
     const float vs = reduce_v[0] > 0.0f ? reduce_v[0] / 448.0f : 1.0f;
     const int destination_token = start_pos + token;
-    const size_t scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) * blocks_per_head + channel_block;
+    const size_t token_stride = static_cast<size_t>(kv_heads) * head_dim;
+    const size_t scale_stride = static_cast<size_t>(kv_heads) * blocks_per_head;
+    size_t scale_index;
+    size_t destination_base;
+    if (block_table != nullptr) {
+        const int physical_block = block_table[destination_token / block_size];
+        destination_base = (static_cast<size_t>(physical_block) * block_size +
+                           destination_token % block_size) * token_stride +
+                          static_cast<size_t>(head) * head_dim +
+                          static_cast<size_t>(channel_block) * scale_block;
+        scale_index = (static_cast<size_t>(physical_block) * block_size +
+                       destination_token % block_size) * scale_stride +
+                      static_cast<size_t>(head) * blocks_per_head + channel_block;
+    } else {
+        scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) *
+                      blocks_per_head + channel_block;
+        destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) *
+                           head_dim + static_cast<size_t>(channel_block) * scale_block;
+    }
     if (threadIdx.x == 0) {
         k_scale[scale_index] = float_to_half(ks);
         v_scale[scale_index] = float_to_half(vs);
     }
-    const size_t destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) * head_dim + channel_block * scale_block;
     for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
         k_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(k_rows[source_base + d]) / ks);
         v_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(v_rows[source_base + d]) / vs);
@@ -2907,7 +2925,8 @@ __global__ void append_kv_fp8_batched_kernel(
     uint8_t* k_cache, uint8_t* v_cache,
     uint16_t* k_scale, uint16_t* v_scale,
     const int* start_positions, const int* slot_ids, int rows, int kv_heads,
-    int head_dim, int scale_block, int max_context, size_t kv_slot_stride) {
+    int head_dim, int scale_block, int max_context, size_t kv_slot_stride,
+    const int* block_table, int block_size, int max_blocks_per_seq) {
     const int block_index = static_cast<int>(blockIdx.x);
     const int blocks_per_head = head_dim / scale_block;
     const int row = block_index / (kv_heads * blocks_per_head);
@@ -2920,10 +2939,12 @@ __global__ void append_kv_fp8_batched_kernel(
     // Each sequence owns a contiguous cache slot, which is not its batch index;
     // the scale array is strided by the same slot count over the block width.
     const int slot = slot_ids != nullptr ? slot_ids[row] : row;
-    k_cache += static_cast<size_t>(slot) * kv_slot_stride;
-    v_cache += static_cast<size_t>(slot) * kv_slot_stride;
-    k_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
-    v_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
+    if (block_table == nullptr) {
+        k_cache += static_cast<size_t>(slot) * kv_slot_stride;
+        v_cache += static_cast<size_t>(slot) * kv_slot_stride;
+        k_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
+        v_scale += static_cast<size_t>(slot) * (kv_slot_stride / scale_block);
+    }
     const int source_base = (row * kv_heads + head) * head_dim + channel_block * scale_block;
     float k_max = 0.0f;
     float v_max = 0.0f;
@@ -2945,12 +2966,31 @@ __global__ void append_kv_fp8_batched_kernel(
     }
     const float ks = reduce_k[0] > 0.0f ? reduce_k[0] / 448.0f : 1.0f;
     const float vs = reduce_v[0] > 0.0f ? reduce_v[0] / 448.0f : 1.0f;
-    const size_t scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) * blocks_per_head + channel_block;
+    const size_t token_stride = static_cast<size_t>(kv_heads) * head_dim;
+    const size_t scale_stride = static_cast<size_t>(kv_heads) * blocks_per_head;
+    size_t scale_index;
+    size_t destination_base;
+    if (block_table != nullptr) {
+        const int physical_block = block_table[
+            static_cast<size_t>(slot) * max_blocks_per_seq +
+            destination_token / block_size];
+        destination_base = (static_cast<size_t>(physical_block) * block_size +
+                           destination_token % block_size) * token_stride +
+                          static_cast<size_t>(head) * head_dim +
+                          static_cast<size_t>(channel_block) * scale_block;
+        scale_index = (static_cast<size_t>(physical_block) * block_size +
+                       destination_token % block_size) * scale_stride +
+                      static_cast<size_t>(head) * blocks_per_head + channel_block;
+    } else {
+        scale_index = (static_cast<size_t>(destination_token) * kv_heads + head) *
+                      blocks_per_head + channel_block;
+        destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) *
+                           head_dim + static_cast<size_t>(channel_block) * scale_block;
+    }
     if (threadIdx.x == 0) {
         k_scale[scale_index] = float_to_half(ks);
         v_scale[scale_index] = float_to_half(vs);
     }
-    const size_t destination_base = (static_cast<size_t>(destination_token) * kv_heads + head) * head_dim + channel_block * scale_block;
     for (int d = threadIdx.x; d < scale_block; d += blockDim.x) {
         k_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(k_rows[source_base + d]) / ks);
         v_cache[destination_base + d] = float_to_fp8_e4m3(half_to_float(v_rows[source_base + d]) / vs);
@@ -4432,7 +4472,7 @@ bool qwen_append_kv_cache_fp8_cuda(
     const int blocks = seq_len * kv_heads * (head_dim / scale_block);
     append_kv_fp8_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
         k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, seq_len,
-        kv_heads, head_dim, scale_block, start_pos, max_context);
+        kv_heads, head_dim, scale_block, start_pos, max_context, nullptr, 0);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4441,16 +4481,40 @@ bool qwen_append_kv_cache_fp8_batched_cuda(
     uint8_t* k_cache, uint8_t* v_cache, uint16_t* k_scale,
     uint16_t* v_scale, int rows, int kv_heads, int head_dim,
     int scale_block, const int* start_positions, const int* slot_ids,
-    int max_context, size_t kv_slot_stride, void* stream) {
+    int max_context, size_t kv_slot_stride, const int* block_table,
+    int block_size, int max_blocks_per_seq, void* stream) {
     if (!k_rows || !v_rows || !k_cache || !v_cache || !k_scale || !v_scale ||
         !start_positions || rows <= 0 || kv_heads <= 0 || head_dim <= 0 ||
         scale_block <= 0 || scale_block > 128 || head_dim % scale_block != 0 ||
-        max_context <= 0 || kv_slot_stride == 0) return false;
+        max_context <= 0) return false;
+    if (block_table != nullptr) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0) return false;
+    } else if (kv_slot_stride == 0) {
+        return false;
+    }
     const int blocks = rows * kv_heads * (head_dim / scale_block);
     append_kv_fp8_batched_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
         k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, start_positions,
         slot_ids, rows, kv_heads, head_dim, scale_block, max_context,
-        kv_slot_stride);
+        kv_slot_stride, block_table, block_size, max_blocks_per_seq);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_fp8_paged_cuda(
+    const uint16_t* k_rows, const uint16_t* v_rows,
+    uint8_t* k_cache, uint8_t* v_cache, uint16_t* k_scale,
+    uint16_t* v_scale, int seq_len, int kv_heads, int head_dim,
+    int scale_block, int start_pos, const int* block_table, int block_size,
+    void* stream) {
+    if (!k_rows || !k_cache || !v_rows || !v_cache || !k_scale || !v_scale ||
+        !block_table || seq_len <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        scale_block <= 0 || scale_block > 128 || head_dim % scale_block != 0 ||
+        start_pos < 0 || block_size <= 0) return false;
+    const int blocks = seq_len * kv_heads * (head_dim / scale_block);
+    append_kv_fp8_kernel<<<blocks, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        k_rows, v_rows, k_cache, v_cache, k_scale, v_scale, seq_len,
+        kv_heads, head_dim, scale_block, start_pos, INT_MAX, block_table,
+        block_size);
     return cudaGetLastError() == cudaSuccess;
 }
 

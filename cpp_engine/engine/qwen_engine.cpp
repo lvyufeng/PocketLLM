@@ -907,11 +907,20 @@ struct QwenEngine::Impl {
             }
             const size_t elements_per_token =
                 static_cast<size_t>(local_kv_heads) * head_dim;
-            // Bytes one block costs across every full-attention layer, K and V
-            // together. That is the unit the budget divides.
-            const size_t bytes_per_block = static_cast<size_t>(
-                options.kv_block_size) * elements_per_token * sizeof(uint16_t) *
-                2 * full_attention_layers;
+            size_t bytes_per_token = elements_per_token * sizeof(uint16_t) * 2;
+            size_t scale_bytes_per_token = 0;
+            if (options.kv_cache_dtype == QwenKvCacheDType::Fp8) {
+                bytes_per_token = elements_per_token * 2;
+                scale_bytes_per_token = static_cast<size_t>(local_kv_heads) *
+                    (head_dim / kKvScaleBlock) * sizeof(uint16_t) * 2;
+            } else if (options.kv_cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+                bytes_per_token = static_cast<size_t>(local_kv_heads) *
+                    qwen_turboquant_k8v4_slot_bytes(head_dim);
+            }
+            // Bytes one block costs across every full-attention layer, including
+            // quantized scale/metadata storage, which is the unit the budget divides.
+            const size_t bytes_per_block = static_cast<size_t>(options.kv_block_size) *
+                (bytes_per_token + scale_bytes_per_token) * full_attention_layers;
             if (full_attention_layers == 0 || bytes_per_block == 0) {
                 throw std::runtime_error(
                     "Qwen paged KV cache requires at least one full-attention "
@@ -923,7 +932,7 @@ struct QwenEngine::Impl {
             const uint64_t budget = options.kv_cache_bytes != 0
                 ? options.kv_cache_bytes
                 : static_cast<uint64_t>(options.max_batch_size) * max_context *
-                      elements_per_token * sizeof(uint16_t) * 2 *
+                      (bytes_per_token + scale_bytes_per_token) *
                       full_attention_layers;
             const int num_blocks = static_cast<int>(budget / bytes_per_block);
             // A slot must be able to reach max_context, or a long request would
@@ -1101,26 +1110,54 @@ struct QwenEngine::Impl {
                     static_cast<uint64_t>(head_dim)};
 
                 if (block_pool != nullptr) {
-                    // Paged: one arena of blocks shared by every slot. The
-                    // leading dimension is the block count, not the slot count,
-                    // which is the whole difference: a slot's extent is now what
-                    // it has been handed rather than what it reserved.
-                    // Construction rejects the quantized dtypes, so this branch
-                    // is FP16 by definition.
-                    const size_t paged_elements =
-                        static_cast<size_t>(block_pool->total_blocks()) *
-                        block_pool->block_size() * local_kv_heads * head_dim;
+                    const size_t physical_tokens = static_cast<size_t>(block_pool->total_blocks()) *
+                        block_pool->block_size();
                     const std::vector<uint64_t> paged_shape = {
                         static_cast<uint64_t>(block_pool->total_blocks()),
                         static_cast<uint64_t>(block_pool->block_size()),
                         static_cast<uint64_t>(local_kv_heads),
                         static_cast<uint64_t>(head_dim)};
-                    allocate_half(destination.full.k_cache, paged_elements,
-                                  paged_shape);
-                    allocate_half(destination.full.v_cache, paged_elements,
-                                  paged_shape);
-                    cache_data_bytes += destination.full.k_cache.nbytes +
-                                        destination.full.v_cache.nbytes;
+                    if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
+                        const size_t paged_elements = physical_tokens * local_kv_heads * head_dim;
+                        allocate_half(destination.full.k_cache, paged_elements, paged_shape);
+                        allocate_half(destination.full.v_cache, paged_elements, paged_shape);
+                        cache_data_bytes += destination.full.k_cache.nbytes +
+                                            destination.full.v_cache.nbytes;
+                    } else if (options.kv_cache_dtype == QwenKvCacheDType::Fp8) {
+                        const size_t paged_elements = physical_tokens * local_kv_heads * head_dim;
+                        const std::vector<uint64_t> scale_shape = {
+                            static_cast<uint64_t>(block_pool->total_blocks()),
+                            static_cast<uint64_t>(block_pool->block_size()),
+                            static_cast<uint64_t>(local_kv_heads),
+                            static_cast<uint64_t>(head_dim / kKvScaleBlock)};
+                        const size_t scale_elements = physical_tokens * local_kv_heads *
+                            (head_dim / kKvScaleBlock);
+                        allocate_elements(destination.full.k_cache, paged_elements,
+                                          paged_shape, SafeDType::F8_E4M3);
+                        allocate_elements(destination.full.v_cache, paged_elements,
+                                          paged_shape, SafeDType::F8_E4M3);
+                        allocate_half(destination.full.k_scale, scale_elements, scale_shape);
+                        allocate_half(destination.full.v_scale, scale_elements, scale_shape);
+                        cache_data_bytes += destination.full.k_cache.nbytes +
+                                            destination.full.v_cache.nbytes;
+                        cache_scale_bytes += destination.full.k_scale.nbytes +
+                                             destination.full.v_scale.nbytes;
+                    } else if (options.kv_cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+                        const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+                        const size_t packed_elements = physical_tokens * local_kv_heads * slot_bytes;
+                        const std::vector<uint64_t> packed_shape = {
+                            static_cast<uint64_t>(block_pool->total_blocks()),
+                            static_cast<uint64_t>(block_pool->block_size()),
+                            static_cast<uint64_t>(local_kv_heads),
+                            static_cast<uint64_t>(slot_bytes)};
+                        allocate_elements(destination.full.turboquant_cache, packed_elements,
+                                          packed_shape, SafeDType::I8);
+                        cache_data_bytes += destination.full.turboquant_cache.nbytes;
+                    } else {
+                        throw std::runtime_error(
+                            std::string("Qwen paged KV cache does not support ") +
+                            qwen_kv_cache_dtype_name(options.kv_cache_dtype));
+                    }
                 } else if (options.kv_cache_dtype == QwenKvCacheDType::Fp16) {
                     allocate_half(destination.full.k_cache, cache_elements, cache_shape);
                     allocate_half(destination.full.v_cache, cache_elements, cache_shape);
@@ -3237,12 +3274,12 @@ struct QwenEngine::Impl {
         throw std::runtime_error(
             "Qwen batched decode has no Ascend kernels yet");
 #else
-        // The batched append and attention kernels are FP16-cache only. A
-        // quantized cache would have the FP16 append write raw halves into
-        // packed codes, so it is refused rather than silently corrupted.
-        if (options.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+        if (options.kv_cache_dtype != QwenKvCacheDType::Fp16 &&
+            options.kv_cache_dtype != QwenKvCacheDType::Fp8 &&
+            options.kv_cache_dtype != QwenKvCacheDType::TurboQuantK8V4) {
             throw std::runtime_error(
-                "Qwen batched decode requires an FP16 KV cache");
+                std::string("Qwen batched decode does not support ") +
+                qwen_kv_cache_dtype_name(options.kv_cache_dtype));
         }
         std::vector<int> context_lens(static_cast<size_t>(rows));
         int max_context_len = 0;
@@ -3388,15 +3425,9 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
             "Qwen sparse attention currently requires an FP16 KV cache");
     }
     if (options_.kv_paged) {
-        // FP16 only. The quantized caches carry their own scale and packed-slot
-        // offset arithmetic, and paging them would mean reworking each one's
-        // addressing with no coverage from the batched path, which is FP16
-        // already. Refusing is what keeps the restriction visible instead of
-        // silently degrading to a contiguous cache.
-        if (options_.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+        if (options_.kv_cache_dtype == QwenKvCacheDType::Int8PerTokenHead) {
             throw std::runtime_error(
-                std::string("Qwen paged KV cache requires an FP16 cache; got ") +
-                qwen_kv_cache_dtype_name(options_.kv_cache_dtype));
+                "Qwen paged KV cache does not support int8_per_token_head");
         }
         if (options_.kv_block_size <= 0) {
             throw std::runtime_error(

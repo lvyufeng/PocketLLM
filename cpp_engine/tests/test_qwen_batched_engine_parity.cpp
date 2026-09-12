@@ -87,7 +87,7 @@ void test_batched_decode_parity(const std::string& dir,
     // Batched path: one forward for all sequences
     std::vector<int> batch_tokens(static_cast<size_t>(num_seqs));
     for (int seq = 0; seq < num_seqs; ++seq) {
-        batch_tokens[static_cast<size_t>(seq)] = (seq * 13 + 42) % 128;
+        batch_tokens[static_cast<size_t>(seq)] = (seq * 13 + 42) % 64;
     }
     const std::vector<pocket::ForwardResult> batched_results =
         engine.batch_decode_tokens(batch_tokens, slots);
@@ -133,7 +133,8 @@ int main() {
             "qwen_batched_engine_parity_fixture");
         require(write_fixture(dir), "could not create batched parity fixture");
         test_batched_decode_parity(dir, pocket::QwenKvCacheDType::Fp16);
-        // FP8 and TurboQuant batched decode are not yet implemented
+        test_batched_decode_parity(dir, pocket::QwenKvCacheDType::Fp8);
+        test_batched_decode_parity(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);
         std::cout << "[PASS] test_qwen_batched_engine_parity\n";
         return 0;
     } catch (const std::exception& ex) {

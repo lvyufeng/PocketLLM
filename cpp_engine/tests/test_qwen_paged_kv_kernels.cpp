@@ -34,6 +34,8 @@
 
 namespace {
 
+using namespace pocket;
+
 void check(cudaError_t error, const char* what) {
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " +
@@ -355,7 +357,145 @@ void test_paged_batched_append(const Geometry& geometry) {
 }
 
 // ============================================================================
-// Test 4: batched decode attention. The same K/V history and the same queries
+// Test 4: quantized paged append and dequantization. The logical dense result
+// must match a contiguous cache even when the target sequence uses a shuffled
+// row in a table interleaved with another sequence.
+// ============================================================================
+void test_paged_fp8_round_trip(const Geometry& geometry) {
+    const int context = 300;
+    const int block_size = geometry.block_size;
+    const int max_blocks = (context + block_size - 1) / block_size;
+    const int scale_channels =
+        (geometry.head_dim + 64 - 1) / 64;
+    const int scale_stride = geometry.kv_heads * scale_channels;
+    const std::vector<int32_t> image =
+        fragmented_table({context, context}, block_size, max_blocks, 51u);
+    const int blocks = total_blocks(image);
+    const size_t kv_elements = static_cast<size_t>(context) * geometry.kv_stride();
+    const size_t paged_elements = static_cast<size_t>(blocks) * block_size *
+                                  geometry.kv_stride();
+    const size_t paged_scales = static_cast<size_t>(blocks) * block_size *
+                                scale_stride;
+    const std::vector<uint16_t> k_host = random_half(kv_elements, 52u);
+    const std::vector<uint16_t> v_host = random_half(kv_elements, 53u);
+
+    DeviceBuffer<uint16_t> k_rows(kv_elements);
+    DeviceBuffer<uint16_t> v_rows(kv_elements);
+    DeviceBuffer<uint8_t> k_contiguous(kv_elements);
+    DeviceBuffer<uint8_t> v_contiguous(kv_elements);
+    DeviceBuffer<uint16_t> k_contiguous_scale(static_cast<size_t>(context) * scale_stride);
+    DeviceBuffer<uint16_t> v_contiguous_scale(static_cast<size_t>(context) * scale_stride);
+    DeviceBuffer<uint8_t> k_paged(paged_elements);
+    DeviceBuffer<uint8_t> v_paged(paged_elements);
+    DeviceBuffer<uint16_t> k_paged_scale(paged_scales);
+    DeviceBuffer<uint16_t> v_paged_scale(paged_scales);
+    DeviceBuffer<uint16_t> k_dense_contiguous(kv_elements);
+    DeviceBuffer<uint16_t> v_dense_contiguous(kv_elements);
+    DeviceBuffer<uint16_t> k_dense_paged(kv_elements);
+    DeviceBuffer<uint16_t> v_dense_paged(kv_elements);
+    DeviceBuffer<int32_t> table(image.size());
+    DeviceBuffer<int32_t> context_lens(1);
+    DeviceBuffer<int32_t> slots(1);
+    k_rows.upload(k_host);
+    v_rows.upload(v_host);
+    table.upload(image);
+    context_lens.upload({context});
+    slots.upload({0});
+
+    require(qwen_append_kv_cache_fp8_cuda(
+                k_rows.get(), v_rows.get(), k_contiguous.get(), v_contiguous.get(),
+                k_contiguous_scale.get(), v_contiguous_scale.get(), context,
+                geometry.kv_heads, geometry.head_dim, 64, 0, context),
+            "contiguous FP8 append launch");
+    require(qwen_append_kv_cache_fp8_paged_cuda(
+                k_rows.get(), v_rows.get(), k_paged.get(), v_paged.get(),
+                k_paged_scale.get(), v_paged_scale.get(), context,
+                geometry.kv_heads, geometry.head_dim, 64, 0,
+                table.get() + max_blocks, block_size),
+            "paged FP8 append launch");
+    require(qwen_fp8_dequant_kv_cache_batched_cuda(
+                k_contiguous.get(), v_contiguous.get(), k_contiguous_scale.get(),
+                v_contiguous_scale.get(), k_dense_contiguous.get(),
+                v_dense_contiguous.get(), context_lens.get(), slots.get(), 1,
+                context, geometry.kv_heads, geometry.head_dim, 64,
+                static_cast<size_t>(context) * geometry.kv_stride()),
+            "contiguous FP8 dequant launch");
+    require(qwen_fp8_dequant_kv_cache_batched_cuda(
+                k_paged.get(), v_paged.get(), k_paged_scale.get(),
+                v_paged_scale.get(), k_dense_paged.get(), v_dense_paged.get(),
+                context_lens.get(), slots.get(), 1, context, geometry.kv_heads,
+                geometry.head_dim, 64, 0, table.get() + max_blocks,
+                block_size, max_blocks),
+            "paged FP8 dequant launch");
+    check(cudaDeviceSynchronize(), "paged FP8 round-trip sync");
+    const std::vector<uint16_t> k_a = k_dense_contiguous.download();
+    const std::vector<uint16_t> v_a = v_dense_contiguous.download();
+    const std::vector<uint16_t> k_b = k_dense_paged.download();
+    const std::vector<uint16_t> v_b = v_dense_paged.download();
+    require(k_a == k_b && v_a == v_b,
+            "paged FP8 dequantization differs from contiguous result");
+    std::cout << "  paged FP8 append/dequant: " << context
+              << " tokens across an interleaved shuffled table PASS\n";
+}
+
+void test_paged_turboquant_round_trip(const Geometry& geometry) {
+    const int context = 300;
+    const int block_size = geometry.block_size;
+    const int max_blocks = (context + block_size - 1) / block_size;
+    const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(geometry.head_dim);
+    const std::vector<int32_t> image =
+        fragmented_table({context, context}, block_size, max_blocks, 61u);
+    const int blocks = total_blocks(image);
+    const size_t contiguous_bytes = static_cast<size_t>(context) *
+                                    geometry.kv_heads * slot_bytes;
+    const size_t paged_bytes = static_cast<size_t>(blocks) * block_size *
+                               geometry.kv_heads * slot_bytes;
+    const size_t kv_elements = static_cast<size_t>(context) * geometry.kv_stride();
+    const std::vector<uint16_t> k_host = random_half(kv_elements, 62u);
+    const std::vector<uint16_t> v_host = random_half(kv_elements, 63u);
+
+    DeviceBuffer<uint16_t> k_rows(kv_elements);
+    DeviceBuffer<uint16_t> v_rows(kv_elements);
+    DeviceBuffer<uint8_t> contiguous(contiguous_bytes);
+    DeviceBuffer<uint8_t> paged(paged_bytes);
+    DeviceBuffer<uint16_t> k_dense_contiguous(kv_elements);
+    DeviceBuffer<uint16_t> v_dense_contiguous(kv_elements);
+    DeviceBuffer<uint16_t> k_dense_paged(kv_elements);
+    DeviceBuffer<uint16_t> v_dense_paged(kv_elements);
+    DeviceBuffer<int32_t> table(image.size());
+    k_rows.upload(k_host);
+    v_rows.upload(v_host);
+    table.upload(image);
+
+    require(qwen_append_kv_cache_turboquant_k8v4_cuda(
+                k_rows.get(), v_rows.get(), contiguous.get(), context,
+                geometry.kv_heads, geometry.head_dim, 0, context),
+            "contiguous TurboQuant append launch");
+    require(qwen_append_kv_cache_turboquant_k8v4_paged_cuda(
+                k_rows.get(), v_rows.get(), paged.get(), context,
+                geometry.kv_heads, geometry.head_dim, 0,
+                table.get() + max_blocks, block_size),
+            "paged TurboQuant append launch");
+    require(qwen_turboquant_k8v4_dequant_kv_cuda(
+                contiguous.get(), k_dense_contiguous.get(),
+                v_dense_contiguous.get(), context, geometry.kv_heads,
+                geometry.head_dim, context),
+            "contiguous TurboQuant dequant launch");
+    require(qwen_turboquant_k8v4_dequant_kv_paged_cuda(
+                paged.get(), k_dense_paged.get(), v_dense_paged.get(), context,
+                geometry.kv_heads, geometry.head_dim, table.get() + max_blocks,
+                block_size),
+            "paged TurboQuant dequant launch");
+    check(cudaDeviceSynchronize(), "paged TurboQuant round-trip sync");
+    require(k_dense_contiguous.download() == k_dense_paged.download() &&
+                v_dense_contiguous.download() == v_dense_paged.download(),
+            "paged TurboQuant dequantization differs from contiguous result");
+    std::cout << "  paged TurboQuant append/dequant: " << context
+              << " tokens across an interleaved shuffled table PASS\n";
+}
+
+// ============================================================================
+// Test 6: batched decode attention. The same K/V history and the same queries
 // are laid out both ways, and the two launches must agree to the bit. This is
 // the load-bearing case: batched decode reads the blocks natively rather than
 // going through the gather.
@@ -512,6 +652,8 @@ int main() {
         test_paged_append(geometry);
         test_paged_gather(geometry);
         test_paged_batched_append(geometry);
+        test_paged_fp8_round_trip(geometry);
+        test_paged_turboquant_round_trip(geometry);
         test_paged_batched_decode(geometry, 0, 0, "dense");
         // Sparse attention keeps its own window and sink ranges; the block
         // translation has to hold for the positions those ranges actually visit.

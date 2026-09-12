@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <climits>
 #include <cstring>
 
 namespace pocket {
@@ -37,7 +38,8 @@ __global__ void append_kv_cache_turboquant_k8v4_kernel(
     const uint16_t* __restrict__ d_k_rows_fp16,
     const uint16_t* __restrict__ d_v_rows_fp16,
     uint8_t* __restrict__ d_combined_cache,
-    int seq_len, int kv_heads, int head_dim, int start_pos, int max_context) {
+    int seq_len, int kv_heads, int head_dim, int start_pos, int max_context,
+    const int* __restrict__ d_block_table, int block_size) {
 
     const int token = blockIdx.x;
     const int head = blockIdx.y;
@@ -51,8 +53,11 @@ __global__ void append_kv_cache_turboquant_k8v4_kernel(
 
     const size_t k_offset = (static_cast<size_t>(token) * kv_heads + head) * head_dim;
     const size_t v_offset = k_offset;
-    const size_t slot_offset =
-        (static_cast<size_t>(cache_pos) * kv_heads + head) * slot_bytes;
+    const size_t slot_offset = d_block_table != nullptr
+        ? (static_cast<size_t>(d_block_table[cache_pos / block_size]) * block_size +
+           cache_pos % block_size) * static_cast<size_t>(kv_heads) * slot_bytes +
+          static_cast<size_t>(head) * slot_bytes
+        : (static_cast<size_t>(cache_pos) * kv_heads + head) * slot_bytes;
 
     uint8_t* slot = d_combined_cache + slot_offset;
 
@@ -135,6 +140,84 @@ __global__ void append_kv_cache_turboquant_k8v4_kernel(
 }
 
 // Decode attention with TurboQuant K8V4 cache.
+__global__ void append_kv_cache_turboquant_k8v4_batched_kernel(
+    const uint16_t* __restrict__ d_k_rows_fp16,
+    const uint16_t* __restrict__ d_v_rows_fp16,
+    uint8_t* __restrict__ d_combined_cache,
+    const int* __restrict__ d_start_positions,
+    const int* __restrict__ d_slot_ids, int rows, int kv_heads, int head_dim,
+    int max_context, size_t slot_stride_bytes, const int* __restrict__ d_block_table,
+    int block_size, int max_blocks_per_seq) {
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    if (row >= rows || head >= kv_heads) return;
+    const int position = d_start_positions[row];
+    if (position < 0 || position >= max_context) return;
+    const int slot_id = d_slot_ids != nullptr ? d_slot_ids[row] : row;
+    const int slot_bytes = slot_bytes_for(head_dim);
+    size_t slot_offset;
+    if (d_block_table != nullptr) {
+        const int block = d_block_table[static_cast<size_t>(slot_id) * max_blocks_per_seq +
+                                        position / block_size];
+        slot_offset = (static_cast<size_t>(block) * block_size + position % block_size) *
+                      static_cast<size_t>(kv_heads) * slot_bytes +
+                      static_cast<size_t>(head) * slot_bytes;
+    } else {
+        slot_offset = static_cast<size_t>(slot_id) * slot_stride_bytes +
+                      (static_cast<size_t>(position) * kv_heads + head) * slot_bytes;
+    }
+    const size_t source = (static_cast<size_t>(row) * kv_heads + head) * head_dim;
+    uint8_t* slot = d_combined_cache + slot_offset;
+    float v_min = INFINITY;
+    float v_max = -INFINITY;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float value = __half2float(__ushort_as_half(d_v_rows_fp16[source + d]));
+        if (isfinite(value)) {
+            v_min = fminf(v_min, value);
+            v_max = fmaxf(v_max, value);
+        }
+    }
+    __shared__ float s_min[kStoreThreads];
+    __shared__ float s_max[kStoreThreads];
+    s_min[threadIdx.x] = v_min;
+    s_max[threadIdx.x] = v_max;
+    __syncthreads();
+    for (int stride = kStoreThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_min[threadIdx.x] = fminf(s_min[threadIdx.x], s_min[threadIdx.x + stride]);
+            s_max[threadIdx.x] = fmaxf(s_max[threadIdx.x], s_max[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    v_min = isfinite(s_min[0]) ? s_min[0] : 0.0f;
+    v_max = isfinite(s_max[0]) ? s_max[0] : 0.0f;
+    const __half min_h = __float2half(v_min);
+    v_min = __half2float(min_h);
+    float scale = fmaxf((v_max - v_min) / 15.0f, 1e-8f);
+    const __half scale_h = __float2half(scale);
+    scale = fmaxf(__half2float(scale_h), 1e-8f);
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float key = __half2float(__ushort_as_half(d_k_rows_fp16[source + d]));
+        slot[d] = __nv_cvt_float_to_fp8(key, __NV_SATFINITE, __NV_E5M2);
+    }
+    const int value_bytes = head_dim / 2;
+    for (int byte = threadIdx.x; byte < value_bytes; byte += blockDim.x) {
+        const int d = byte * 2;
+        const uint8_t low = quantize_value_nibble(
+            __half2float(__ushort_as_half(d_v_rows_fp16[source + d])), scale, v_min);
+        const uint8_t high = quantize_value_nibble(
+            __half2float(__ushort_as_half(d_v_rows_fp16[source + d + 1])), scale, v_min);
+        slot[head_dim + byte] = static_cast<uint8_t>(low | (high << 4));
+    }
+    if (threadIdx.x == 0) {
+        uint16_t scale_bits, min_bits;
+        std::memcpy(&scale_bits, &scale_h, 2);
+        std::memcpy(&min_bits, &min_h, 2);
+        std::memcpy(slot + head_dim + value_bytes, &scale_bits, 2);
+        std::memcpy(slot + head_dim + value_bytes + 2, &min_bits, 2);
+    }
+}
+
 __global__ void gqa_decode_attention_turboquant_k8v4_score_kernel(
     const uint16_t* __restrict__ d_q_fp16,
     const uint8_t* __restrict__ d_combined_cache,
@@ -232,14 +315,19 @@ __global__ void dequant_kv_turboquant_k8v4_kernel(
 // One block per query head. Masked-out positions already hold -inf, so they
 // contribute nothing and stay zero after normalization.
 __global__ void softmax_rows_f32_kernel(float* __restrict__ d_scores,
-                                        int row_stride, int valid_cols) {
+                                        int row_stride, int valid_cols,
+                                        const int* __restrict__ row_lengths,
+                                        int heads_per_row) {
     const int row = blockIdx.x;
     float* scores = d_scores + static_cast<size_t>(row) * row_stride;
+    const int sequence = heads_per_row > 0 ? row / heads_per_row : 0;
+    const int row_valid_cols = row_lengths != nullptr
+        ? row_lengths[sequence] : valid_cols;
 
     __shared__ float s_reduce[256];
 
     float local_max = -INFINITY;
-    for (int col = threadIdx.x; col < valid_cols; col += blockDim.x) {
+    for (int col = threadIdx.x; col < row_valid_cols; col += blockDim.x) {
         local_max = fmaxf(local_max, scores[col]);
     }
     s_reduce[threadIdx.x] = local_max;
@@ -255,7 +343,7 @@ __global__ void softmax_rows_f32_kernel(float* __restrict__ d_scores,
     __syncthreads();
 
     float local_sum = 0.0f;
-    for (int col = threadIdx.x; col < valid_cols; col += blockDim.x) {
+    for (int col = threadIdx.x; col < row_valid_cols; col += blockDim.x) {
         const float score = scores[col];
         const float weight = isfinite(score) ? __expf(score - row_max) : 0.0f;
         scores[col] = weight;
@@ -272,7 +360,7 @@ __global__ void softmax_rows_f32_kernel(float* __restrict__ d_scores,
     const float row_sum = s_reduce[0];
     const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
 
-    for (int col = threadIdx.x; col < valid_cols; col += blockDim.x) {
+    for (int col = threadIdx.x; col < row_valid_cols; col += blockDim.x) {
         scores[col] *= inv_sum;
     }
 }
@@ -466,7 +554,174 @@ __global__ void gqa_prefill_attention_turboquant_k8v4_kernel(
     d_out_rows_fp16[out_offset] = out_bits;
 }
 
+// Resolves one token's slot inside the combined cache. The contiguous arena
+// gives every sequence its own `slot_stride_bytes` region; the paged arena is
+// shared and the sequence's block-table row names the physical block that holds
+// each position, so only the addressing differs between the two layouts.
+__device__ __forceinline__ const uint8_t* turboquant_k8v4_slot_of(
+    const uint8_t* __restrict__ cache, int slot_id, int position, int kv_head,
+    int kv_heads, int slot_bytes, size_t slot_stride_bytes,
+    const int* __restrict__ block_table, int block_size,
+    int max_blocks_per_seq) {
+    if (block_table != nullptr) {
+        const int block = block_table[static_cast<size_t>(slot_id) * max_blocks_per_seq +
+                                      position / block_size];
+        return cache +
+               (static_cast<size_t>(block) * block_size + position % block_size) *
+                   static_cast<size_t>(kv_heads) * slot_bytes +
+               static_cast<size_t>(kv_head) * slot_bytes;
+    }
+    return cache + static_cast<size_t>(slot_id) * slot_stride_bytes +
+           (static_cast<size_t>(position) * kv_heads + kv_head) * slot_bytes;
+}
+
+__device__ __forceinline__ bool turboquant_k8v4_position_visible(
+    int position, int context_len, int attention_window,
+    int attention_sink_tokens) {
+    if (position >= context_len) return false;
+    if (attention_window <= 0) return true;
+    const int sink_end = attention_sink_tokens;
+    const int window_start = max(sink_end, context_len - attention_window);
+    return position < sink_end || position >= window_start;
+}
+
+// Batched score phase: one thread per (row, query head, position). Rows carry
+// their own context length, so a short row leaves padded columns at -inf while
+// its softmax and output phases consume only the logical history.
+__global__ void gqa_decode_attention_turboquant_k8v4_score_batched_kernel(
+    const uint16_t* __restrict__ d_q_fp16,
+    const uint8_t* __restrict__ d_combined_cache,
+    float* __restrict__ d_scores,
+    const int* __restrict__ d_context_lens,
+    const int* __restrict__ d_slot_ids, int rows, int max_context_len,
+    size_t slot_stride_bytes, int q_heads, int kv_heads, int head_dim,
+    int attention_window, int attention_sink_tokens, float q_scale,
+    const int* __restrict__ d_block_table, int block_size,
+    int max_blocks_per_seq) {
+
+    const int row = static_cast<int>(blockIdx.z);
+    const int head = static_cast<int>(blockIdx.x);
+    const int pos = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+    if (row >= rows || head >= q_heads || pos >= max_context_len) return;
+
+    const int context_len = d_context_lens[row];
+    const int slot_id = d_slot_ids != nullptr ? d_slot_ids[row] : row;
+    const int kv_head = head / (q_heads / kv_heads);
+
+    float score = -INFINITY;
+    if (turboquant_k8v4_position_visible(pos, context_len, attention_window,
+                                         attention_sink_tokens)) {
+        const uint16_t* q_row = d_q_fp16 +
+            (static_cast<size_t>(row) * q_heads + head) * head_dim;
+        const uint8_t* slot = turboquant_k8v4_slot_of(
+            d_combined_cache, slot_id, pos, kv_head, kv_heads,
+            slot_bytes_for(head_dim), slot_stride_bytes, d_block_table,
+            block_size, max_blocks_per_seq);
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = __half2float(__ushort_as_half(q_row[d]));
+            const __half key = __nv_cvt_fp8_to_halfraw(slot[d], __NV_E5M2);
+            dot += q * __half2float(key);
+        }
+        score = dot * q_scale;
+    }
+    d_scores[(static_cast<size_t>(row) * q_heads + head) * max_context_len + pos] =
+        score;
+}
+
+__global__ void gqa_decode_attention_turboquant_k8v4_output_batched_kernel(
+    const uint8_t* __restrict__ d_combined_cache,
+    const float* __restrict__ d_probs,
+    uint16_t* __restrict__ d_out_fp16,
+    const int* __restrict__ d_context_lens,
+    const int* __restrict__ d_slot_ids, int rows, int max_context_len,
+    size_t slot_stride_bytes, int q_heads, int kv_heads, int head_dim,
+    int attention_window, int attention_sink_tokens,
+    const int* __restrict__ d_block_table, int block_size,
+    int max_blocks_per_seq) {
+
+    const int row = static_cast<int>(blockIdx.z);
+    const int head = static_cast<int>(blockIdx.x);
+    const int dim = static_cast<int>(blockIdx.y * blockDim.x + threadIdx.x);
+    if (row >= rows || head >= q_heads || dim >= head_dim) return;
+
+    const int context_len = d_context_lens[row];
+    const int slot_id = d_slot_ids != nullptr ? d_slot_ids[row] : row;
+    const int kv_head = head / (q_heads / kv_heads);
+    const int value_bytes = head_dim / 2;
+    const int slot_bytes = slot_bytes_for(head_dim);
+    const float* head_probs = d_probs +
+        (static_cast<size_t>(row) * q_heads + head) * max_context_len;
+
+    float accum = 0.0f;
+    for (int pos = 0; pos < context_len; ++pos) {
+        if (!turboquant_k8v4_position_visible(pos, context_len, attention_window,
+                                              attention_sink_tokens)) {
+            continue;
+        }
+        const uint8_t* slot = turboquant_k8v4_slot_of(
+            d_combined_cache, slot_id, pos, kv_head, kv_heads, slot_bytes,
+            slot_stride_bytes, d_block_table, block_size, max_blocks_per_seq);
+        uint16_t scale_bits, min_bits;
+        std::memcpy(&scale_bits, slot + head_dim + value_bytes, 2);
+        std::memcpy(&min_bits, slot + head_dim + value_bytes + 2, 2);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const float minimum = __half2float(__ushort_as_half(min_bits));
+        const uint8_t packed = slot[head_dim + (dim >> 1)];
+        const uint8_t nibble = (dim & 1) ? (packed >> 4) : (packed & 0x0F);
+        accum += head_probs[pos] *
+                 dequantize_value_nibble(nibble, scale, minimum);
+    }
+
+    const size_t out_offset =
+        (static_cast<size_t>(row) * q_heads + head) * head_dim + dim;
+    __half out_h = __float2half(accum);
+    uint16_t out_bits;
+    std::memcpy(&out_bits, &out_h, 2);
+    d_out_fp16[out_offset] = out_bits;
+}
+
 }  // namespace
+
+bool qwen_append_kv_cache_turboquant_k8v4_batched_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_combined_cache, int rows, int kv_heads, int head_dim,
+    const int* d_start_positions, const int* d_slot_ids, int max_context,
+    size_t slot_stride_bytes, const int* d_block_table, int block_size,
+    int max_blocks_per_seq, void* stream) {
+    if (!d_k_rows_fp16 || !d_v_rows_fp16 || !d_combined_cache ||
+        !d_start_positions || rows <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > kMaxHeadDim || (head_dim % 2) != 0 || max_context <= 0) {
+        return false;
+    }
+    if (d_block_table != nullptr) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0) return false;
+    } else if (slot_stride_bytes == 0) {
+        return false;
+    }
+    append_kv_cache_turboquant_k8v4_batched_kernel<<<
+        dim3(static_cast<unsigned>(rows), static_cast<unsigned>(kv_heads)),
+        kStoreThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_k_rows_fp16, d_v_rows_fp16, d_combined_cache, d_start_positions,
+        d_slot_ids, rows, kv_heads, head_dim, max_context, slot_stride_bytes,
+        d_block_table, block_size, max_blocks_per_seq);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_append_kv_cache_turboquant_k8v4_paged_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_combined_cache, int seq_len, int kv_heads, int head_dim,
+    int start_pos, const int* d_block_table, int block_size, void* stream) {
+    if (!d_k_rows_fp16 || !d_v_rows_fp16 || !d_combined_cache || !d_block_table ||
+        seq_len <= 0 || kv_heads <= 0 || head_dim <= 0 || head_dim > kMaxHeadDim ||
+        (head_dim % 2) != 0 || start_pos < 0 || block_size <= 0) return false;
+    dim3 grid(seq_len, kv_heads);
+    append_kv_cache_turboquant_k8v4_kernel<<<grid, kStoreThreads, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        d_k_rows_fp16, d_v_rows_fp16, d_combined_cache, seq_len, kv_heads,
+        head_dim, start_pos, INT_MAX, d_block_table, block_size);
+    return cudaGetLastError() == cudaSuccess;
+}
 
 bool qwen_append_kv_cache_turboquant_k8v4_cuda(
     const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
@@ -490,8 +745,59 @@ bool qwen_append_kv_cache_turboquant_k8v4_cuda(
     append_kv_cache_turboquant_k8v4_kernel<<<grid, block, 0,
                                              static_cast<cudaStream_t>(stream)>>>(
         d_k_rows_fp16, d_v_rows_fp16, d_combined_cache, seq_len, kv_heads,
-        head_dim, start_pos, max_context);
+        head_dim, start_pos, max_context, nullptr, 0);
 
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gqa_decode_attention_turboquant_k8v4_batched_cuda(
+    const uint16_t* d_q_fp16, const uint8_t* d_combined_cache,
+    uint16_t* d_out_fp16, float* d_score_scratch, const int* d_context_lens,
+    const int* d_slot_ids, int rows, int max_context_len,
+    size_t slot_stride_bytes, int q_heads, int kv_heads, int head_dim,
+    int attention_window, int attention_sink_tokens, const int* d_block_table,
+    int block_size, int max_blocks_per_seq, void* stream) {
+    if (!d_q_fp16 || !d_combined_cache || !d_out_fp16 || !d_score_scratch ||
+        !d_context_lens || rows <= 0 || max_context_len <= 0 ||
+        q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        head_dim > kMaxHeadDim || (head_dim % 2) != 0 || kv_heads > q_heads ||
+        (q_heads % kv_heads) != 0 || attention_window < 0 ||
+        attention_sink_tokens < 0) return false;
+    if (d_block_table != nullptr) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0 ||
+            max_context_len > block_size * max_blocks_per_seq) return false;
+    } else if (slot_stride_bytes == 0) {
+        return false;
+    }
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const float q_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    const dim3 score_grid(static_cast<unsigned>(q_heads),
+                          static_cast<unsigned>((max_context_len + 127) / 128),
+                          static_cast<unsigned>(rows));
+    gqa_decode_attention_turboquant_k8v4_score_batched_kernel<<<
+        score_grid, 128, 0, s>>>(
+        d_q_fp16, d_combined_cache, d_score_scratch, d_context_lens,
+        d_slot_ids, rows, max_context_len, slot_stride_bytes, q_heads, kv_heads,
+        head_dim, attention_window, attention_sink_tokens, q_scale,
+        d_block_table, block_size, max_blocks_per_seq);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    // The score rows are padded to the longest context; all padding is -inf,
+    // allowing one uniform softmax launch while each output row still consumes
+    // only its own context length.
+    const int score_rows = rows * q_heads;
+    softmax_rows_f32_kernel<<<score_rows, 256, 0, s>>>(
+        d_score_scratch, max_context_len, max_context_len, d_context_lens,
+        q_heads);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const dim3 output_grid(static_cast<unsigned>(q_heads),
+                           static_cast<unsigned>((head_dim + 127) / 128),
+                           static_cast<unsigned>(rows));
+    gqa_decode_attention_turboquant_k8v4_output_batched_kernel<<<
+        output_grid, 128, 0, s>>>(
+        d_combined_cache, d_score_scratch, d_out_fp16, d_context_lens,
+        d_slot_ids, rows, max_context_len, slot_stride_bytes, q_heads, kv_heads,
+        head_dim, attention_window, attention_sink_tokens, d_block_table,
+        block_size, max_blocks_per_seq);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -515,12 +821,15 @@ bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
 
     // Score phase.
     {
-        dim3 grid(q_heads, (max_context + 127) / 128);
+        // The caller sizes scratch for the attended context, not the arena's
+        // maximum reservation. The cache itself is bounded by max_context, but
+        // scores only need one row of context_len entries.
+        dim3 grid(q_heads, (context_len + 127) / 128);
         dim3 block(128);
         gqa_decode_attention_turboquant_k8v4_score_kernel<<<grid, block, 0,
                                                             static_cast<cudaStream_t>(stream)>>>(
             d_q_fp16, d_combined_cache, d_score_scratch, q_heads, kv_heads,
-            head_dim, context_len, max_context, attention_window,
+            head_dim, context_len, context_len, attention_window,
             attention_sink_tokens, q_scale);
     }
 
@@ -530,7 +839,7 @@ bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
         dim3 block(256);
         softmax_rows_f32_kernel<<<grid, block, 0,
                                   static_cast<cudaStream_t>(stream)>>>(
-            d_score_scratch, max_context, context_len);
+            d_score_scratch, context_len, context_len, nullptr, 0);
     }
 
     // Output phase.
@@ -540,10 +849,56 @@ bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
         gqa_decode_attention_turboquant_k8v4_output_kernel<<<grid, block, 0,
                                                              static_cast<cudaStream_t>(stream)>>>(
             d_q_fp16, d_combined_cache, d_score_scratch, d_out_fp16, q_heads,
-            kv_heads, head_dim, context_len, max_context, attention_window,
+            kv_heads, head_dim, context_len, context_len, attention_window,
             attention_sink_tokens);
     }
 
+    return cudaGetLastError() == cudaSuccess;
+}
+
+__global__ void dequant_kv_turboquant_k8v4_paged_kernel(
+    const uint8_t* __restrict__ d_combined_cache,
+    uint16_t* __restrict__ d_k_dense_fp16,
+    uint16_t* __restrict__ d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, const int* __restrict__ block_table,
+    int block_size) {
+    const int pos = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    const int dim = threadIdx.x;
+    if (pos >= context_len || kv_head >= kv_heads || dim >= head_dim) return;
+    const int block = block_table[pos / block_size];
+    const int value_bytes = head_dim / 2;
+    const int slot_bytes = slot_bytes_for(head_dim);
+    const uint8_t* slot = d_combined_cache +
+        (static_cast<size_t>(block) * block_size + pos % block_size) *
+            static_cast<size_t>(kv_heads) * slot_bytes +
+        static_cast<size_t>(kv_head) * slot_bytes;
+    uint16_t scale_bits, min_bits;
+    std::memcpy(&scale_bits, slot + head_dim + value_bytes, 2);
+    std::memcpy(&min_bits, slot + head_dim + value_bytes + 2, 2);
+    const float scale = __half2float(__ushort_as_half(scale_bits));
+    const float minimum = __half2float(__ushort_as_half(min_bits));
+    const __half key = __nv_cvt_fp8_to_halfraw(slot[dim], __NV_E5M2);
+    const uint8_t packed = slot[head_dim + (dim >> 1)];
+    const uint8_t nibble = (dim & 1) ? packed >> 4 : packed & 0x0F;
+    const __half value = __float2half(dequantize_value_nibble(nibble, scale, minimum));
+    const size_t out = (static_cast<size_t>(pos) * kv_heads + kv_head) * head_dim + dim;
+    d_k_dense_fp16[out] = __half_as_ushort(key);
+    d_v_dense_fp16[out] = __half_as_ushort(value);
+}
+
+bool qwen_turboquant_k8v4_dequant_kv_paged_cuda(
+    const uint8_t* d_combined_cache, uint16_t* d_k_dense_fp16,
+    uint16_t* d_v_dense_fp16, int context_len, int kv_heads, int head_dim,
+    const int* d_block_table, int block_size, void* stream) {
+    if (!d_combined_cache || !d_k_dense_fp16 || !d_v_dense_fp16 || !d_block_table ||
+        context_len <= 0 || kv_heads <= 0 || head_dim <= 0 || head_dim > kMaxHeadDim ||
+        (head_dim % 2) != 0 || block_size <= 0) return false;
+    dequant_kv_turboquant_k8v4_paged_kernel<<<
+        dim3(static_cast<unsigned>(context_len), static_cast<unsigned>(kv_heads)),
+        head_dim, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_combined_cache, d_k_dense_fp16, d_v_dense_fp16, context_len, kv_heads,
+        head_dim, d_block_table, block_size);
     return cudaGetLastError() == cudaSuccess;
 }
 

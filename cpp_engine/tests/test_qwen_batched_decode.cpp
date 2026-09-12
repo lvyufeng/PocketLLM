@@ -618,6 +618,290 @@ bool test_conv_silu_batched() {
     return true;
 }
 
+// Quantized KV append must preserve the packed representation as well as the
+// attention result. Comparing decoded outputs alone can miss a bad scale offset
+// when two rows happen to have similar values.
+bool test_quantized_kv_batched(int head_dim) {
+    constexpr int kRows = 4;
+    constexpr int kKvHeads = 1;
+    constexpr int kQHeads = 6;
+    const int kHeadDim = head_dim;
+    constexpr int kMaxContext = 512;
+    constexpr int kSlots = 7;
+    const int positions[kRows] = {0, 17, 129, 511};
+    const int slots[kRows] = {1, 5, 2, 6};
+    const size_t row_elements = static_cast<size_t>(kKvHeads) * kHeadDim;
+    const size_t slot_stride = static_cast<size_t>(kMaxContext) * row_elements;
+    const size_t scale_stride = slot_stride / 64;
+    const size_t cache_bytes = static_cast<size_t>(kSlots) * slot_stride;
+    const size_t scale_bytes = static_cast<size_t>(kSlots) * scale_stride * sizeof(uint16_t);
+    std::mt19937 rng(246813);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<uint16_t> k_rows(static_cast<size_t>(kRows) * row_elements);
+    std::vector<uint16_t> v_rows(k_rows.size());
+    for (uint16_t& value : k_rows) value = to_half(dist(rng));
+    for (uint16_t& value : v_rows) value = to_half(dist(rng));
+
+    Buffer d_k_rows, d_v_rows, d_positions, d_slots;
+    Buffer fp8_k_seq, fp8_v_seq, fp8_k_batch, fp8_v_batch;
+    Buffer fp8_ks_seq, fp8_vs_seq, fp8_ks_batch, fp8_vs_batch;
+    if (!d_k_rows.allocate(k_rows.size() * sizeof(uint16_t)) ||
+        !d_v_rows.allocate(v_rows.size() * sizeof(uint16_t)) ||
+        !d_positions.allocate(kRows * sizeof(int)) ||
+        !d_slots.allocate(kRows * sizeof(int)) ||
+        !fp8_k_seq.allocate(cache_bytes) || !fp8_v_seq.allocate(cache_bytes) ||
+        !fp8_k_batch.allocate(cache_bytes) || !fp8_v_batch.allocate(cache_bytes) ||
+        !fp8_ks_seq.allocate(scale_bytes) || !fp8_vs_seq.allocate(scale_bytes) ||
+        !fp8_ks_batch.allocate(scale_bytes) || !fp8_vs_batch.allocate(scale_bytes)) {
+        device_ready = false;
+        return false;
+    }
+    if (!d_k_rows.upload(k_rows.data()) || !d_v_rows.upload(v_rows.data()) ||
+        !d_positions.upload(positions) || !d_slots.upload(slots) ||
+        !fp8_k_seq.clear() || !fp8_v_seq.clear() || !fp8_k_batch.clear() ||
+        !fp8_v_batch.clear() || !fp8_ks_seq.clear() || !fp8_vs_seq.clear() ||
+        !fp8_ks_batch.clear() || !fp8_vs_batch.clear()) {
+        device_ready = false;
+        return false;
+    }
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_append_kv_cache_fp8_cuda(
+                d_k_rows.as<uint16_t>() + static_cast<size_t>(row) * row_elements,
+                d_v_rows.as<uint16_t>() + static_cast<size_t>(row) * row_elements,
+                fp8_k_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_v_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_ks_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                fp8_vs_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                1, kKvHeads, kHeadDim, 64, positions[row], kMaxContext)) {
+            fail("FP8 sequential append launch failed");
+            return true;
+        }
+    }
+    if (!qwen_append_kv_cache_fp8_batched_cuda(
+            d_k_rows.as<uint16_t>(), d_v_rows.as<uint16_t>(),
+            fp8_k_batch.as<uint8_t>(), fp8_v_batch.as<uint8_t>(),
+            fp8_ks_batch.as<uint16_t>(), fp8_vs_batch.as<uint16_t>(), kRows,
+            kKvHeads, kHeadDim, 64, d_positions.as<int>(), d_slots.as<int>(),
+            kMaxContext, slot_stride)) {
+        fail("FP8 batched append launch failed");
+        return true;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP8 batched append sync failed");
+        return true;
+    }
+    std::vector<uint8_t> want_k(cache_bytes), got_k(cache_bytes), want_v(cache_bytes), got_v(cache_bytes);
+    std::vector<uint16_t> want_ks(static_cast<size_t>(kSlots) * scale_stride), got_ks(want_ks.size());
+    std::vector<uint16_t> want_vs(want_ks.size()), got_vs(want_ks.size());
+    if (!fp8_k_seq.download(want_k.data()) || !fp8_k_batch.download(got_k.data()) ||
+        !fp8_v_seq.download(want_v.data()) || !fp8_v_batch.download(got_v.data()) ||
+        !fp8_ks_seq.download(want_ks.data()) || !fp8_ks_batch.download(got_ks.data()) ||
+        !fp8_vs_seq.download(want_vs.data()) || !fp8_vs_batch.download(got_vs.data())) {
+        device_ready = false;
+        return false;
+    }
+    if (want_k != got_k || want_v != got_v || want_ks != got_ks || want_vs != got_vs) {
+        fail("FP8 batched append packed bytes or scales mismatch");
+        return true;
+    }
+    std::printf("  FP8 batched append rows=%d non-identity slots byte-exact\n", kRows);
+
+    // Give every slot a distinct, nonuniform history. Uniform codes and scales
+    // cannot expose a wrong slot, head, position, or scale offset in attention.
+    const size_t history_row_elements = static_cast<size_t>(kMaxContext) * row_elements;
+    std::vector<uint16_t> history_k(static_cast<size_t>(kRows) * history_row_elements);
+    std::vector<uint16_t> history_v(history_k.size());
+    for (int row = 0; row < kRows; ++row) {
+        for (size_t i = 0; i < history_row_elements; ++i) {
+            const size_t at = static_cast<size_t>(row) * history_row_elements + i;
+            history_k[at] = to_half(dist(rng) * (0.5f + row * 0.4f));
+            history_v[at] = to_half(dist(rng) * (0.7f + row * 0.6f));
+        }
+    }
+    Buffer d_history_k, d_history_v;
+    if (!d_history_k.allocate(history_k.size() * sizeof(uint16_t)) ||
+        !d_history_v.allocate(history_v.size() * sizeof(uint16_t)) ||
+        !d_history_k.upload(history_k.data()) || !d_history_v.upload(history_v.data())) {
+        device_ready = false;
+        return false;
+    }
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_append_kv_cache_fp8_cuda(
+                d_history_k.as<uint16_t>() + static_cast<size_t>(row) * history_row_elements,
+                d_history_v.as<uint16_t>() + static_cast<size_t>(row) * history_row_elements,
+                fp8_k_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_v_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_ks_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                fp8_vs_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                kMaxContext, kKvHeads, kHeadDim, 64, 0, kMaxContext)) {
+            fail("FP8 history append launch failed");
+            return true;
+        }
+    }
+    const int contexts[kRows] = {64, 127, 256, 511};
+    const size_t q_row = static_cast<size_t>(kQHeads) * kHeadDim;
+    std::vector<uint16_t> q_host(static_cast<size_t>(kRows) * q_row);
+    for (uint16_t& value : q_host) value = to_half(dist(rng));
+    Buffer d_q, d_contexts, out_seq, out_batch, score_seq, partial_batch;
+    if (!d_q.allocate(q_host.size() * sizeof(uint16_t)) ||
+        !d_contexts.allocate(kRows * sizeof(int)) ||
+        !out_seq.allocate(q_host.size() * sizeof(uint16_t)) ||
+        !out_batch.allocate(q_host.size() * sizeof(uint16_t)) ||
+        !score_seq.allocate(static_cast<size_t>(kQHeads) * contexts[kRows - 1] * sizeof(float)) ||
+        !partial_batch.allocate(static_cast<size_t>(kRows) * kQHeads *
+                                qwen_gqa_decode_batched_split_count(contexts[kRows - 1], kKvHeads) *
+                                (kHeadDim + 2) * sizeof(float))) {
+        device_ready = false;
+        return false;
+    }
+    if (!d_q.upload(q_host.data()) || !d_contexts.upload(contexts) ||
+        !out_seq.clear() || !out_batch.clear()) {
+        device_ready = false;
+        return false;
+    }
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_gqa_decode_attention_fp8_cuda(
+                d_q.as<uint16_t>() + static_cast<size_t>(row) * q_row,
+                fp8_k_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_v_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * slot_stride,
+                fp8_ks_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                fp8_vs_seq.as<uint16_t>() + static_cast<size_t>(slots[row]) * scale_stride,
+                out_seq.as<uint16_t>() + static_cast<size_t>(row) * q_row,
+                score_seq.as<float>(), kQHeads, kKvHeads, kHeadDim, 64,
+                contexts[row], kMaxContext)) {
+            fail("FP8 sequential attention launch failed");
+            return true;
+        }
+    }
+    if (!qwen_gqa_decode_attention_fp8_batched_cuda(
+            d_q.as<uint16_t>(), fp8_k_seq.as<uint8_t>(), fp8_v_seq.as<uint8_t>(),
+            fp8_ks_seq.as<uint16_t>(), fp8_vs_seq.as<uint16_t>(), out_batch.as<uint16_t>(),
+            partial_batch.as<float>(), d_contexts.as<int>(), d_slots.as<int>(), kRows,
+            contexts[kRows - 1], slot_stride, kQHeads, kKvHeads, kHeadDim, 64,
+            kMaxContext, 0, 0)) {
+        fail("FP8 batched attention launch failed");
+        return true;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail("FP8 batched attention sync failed");
+        return true;
+    }
+    std::vector<uint16_t> attention_want(q_host.size()), attention_got(q_host.size());
+    if (!out_seq.download(attention_want.data()) || !out_batch.download(attention_got.data())) {
+        device_ready = false;
+        return false;
+    }
+    const double fp8_worst = worst_difference(attention_want, attention_got);
+    if (fp8_worst > 1.0e-3) {
+        fail("FP8 batched attention worst=" + std::to_string(fp8_worst));
+    } else {
+        std::printf("  FP8 batched attention rows=%d head_dim=%d contexts=%d..%d worst=%.4g PASS\n",
+                    kRows, kHeadDim, contexts[0], contexts[kRows - 1], fp8_worst);
+    }
+    // TurboQuant uses a combined packed slot rather than separate K/V arrays.
+    // Check both the byte-exact store and the batched attention reader with the
+    // same fragmented logical slot assignment.
+    const int tq_slot_bytes = qwen_turboquant_k8v4_slot_bytes(kHeadDim);
+    const size_t tq_slot_stride = static_cast<size_t>(kMaxContext) * kKvHeads *
+        tq_slot_bytes;
+    const size_t tq_cache_bytes = static_cast<size_t>(kSlots) * tq_slot_stride;
+    Buffer tq_seq, tq_batch;
+    if (!tq_seq.allocate(tq_cache_bytes) || !tq_batch.allocate(tq_cache_bytes) ||
+        !tq_seq.clear() || !tq_batch.clear()) {
+        device_ready = false;
+        return false;
+    }
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_append_kv_cache_turboquant_k8v4_cuda(
+                d_k_rows.as<uint16_t>() + static_cast<size_t>(row) * row_elements,
+                d_v_rows.as<uint16_t>() + static_cast<size_t>(row) * row_elements,
+                tq_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * tq_slot_stride,
+                1, kKvHeads, kHeadDim, positions[row], kMaxContext)) {
+            fail("TurboQuant sequential append launch failed");
+            return true;
+        }
+    }
+    if (!qwen_append_kv_cache_turboquant_k8v4_batched_cuda(
+            d_k_rows.as<uint16_t>(), d_v_rows.as<uint16_t>(), tq_batch.as<uint8_t>(),
+            kRows, kKvHeads, kHeadDim, d_positions.as<int>(), d_slots.as<int>(),
+            kMaxContext, tq_slot_stride)) {
+        fail("TurboQuant batched append launch failed");
+        return true;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail("TurboQuant batched append sync failed");
+        return true;
+    }
+    std::vector<uint8_t> tq_want(tq_cache_bytes), tq_got(tq_cache_bytes);
+    if (!tq_seq.download(tq_want.data()) || !tq_batch.download(tq_got.data())) {
+        device_ready = false;
+        return false;
+    }
+    if (tq_want != tq_got) {
+        fail("TurboQuant batched append packed bytes mismatch");
+        return true;
+    }
+    std::printf("  TurboQuant batched append rows=%d non-identity slots byte-exact\n", kRows);
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_append_kv_cache_turboquant_k8v4_cuda(
+                d_history_k.as<uint16_t>() + static_cast<size_t>(row) * history_row_elements,
+                d_history_v.as<uint16_t>() + static_cast<size_t>(row) * history_row_elements,
+                tq_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * tq_slot_stride,
+                kMaxContext, kKvHeads, kHeadDim, 0, kMaxContext)) {
+            fail("TurboQuant history append launch failed");
+            return true;
+        }
+    }
+
+    const size_t tq_q_elements = q_host.size();
+    Buffer tq_out_seq, tq_out_batch, tq_scores_seq, tq_scores_batch;
+    if (!tq_out_seq.allocate(tq_q_elements * sizeof(uint16_t)) ||
+        !tq_out_batch.allocate(tq_q_elements * sizeof(uint16_t)) ||
+        !tq_scores_seq.allocate(static_cast<size_t>(kQHeads) * contexts[kRows - 1] * sizeof(float)) ||
+        !tq_scores_batch.allocate(static_cast<size_t>(kRows) * kQHeads *
+                                   contexts[kRows - 1] * sizeof(float)) ||
+        !tq_out_seq.clear() || !tq_out_batch.clear()) {
+        device_ready = false;
+        return false;
+    }
+    for (int row = 0; row < kRows; ++row) {
+        if (!qwen_gqa_decode_attention_turboquant_k8v4_cuda(
+                d_q.as<uint16_t>() + static_cast<size_t>(row) * q_row,
+                tq_seq.as<uint8_t>() + static_cast<size_t>(slots[row]) * tq_slot_stride,
+                tq_out_seq.as<uint16_t>() + static_cast<size_t>(row) * q_row,
+                tq_scores_seq.as<float>(), kQHeads, kKvHeads, kHeadDim,
+                contexts[row], kMaxContext, 0, 0)) {
+            fail("TurboQuant sequential attention launch failed");
+            return true;
+        }
+    }
+    if (!qwen_gqa_decode_attention_turboquant_k8v4_batched_cuda(
+            d_q.as<uint16_t>(), tq_seq.as<uint8_t>(), tq_out_batch.as<uint16_t>(),
+            tq_scores_batch.as<float>(), d_contexts.as<int>(), d_slots.as<int>(),
+            kRows, contexts[kRows - 1], tq_slot_stride, kQHeads, kKvHeads,
+            kHeadDim, 0, 0)) {
+        fail("TurboQuant batched attention launch failed");
+        return true;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        fail("TurboQuant batched attention sync failed");
+        return true;
+    }
+    if (!tq_out_seq.download(attention_want.data()) ||
+        !tq_out_batch.download(attention_got.data())) {
+        device_ready = false;
+        return false;
+    }
+    const double tq_worst = worst_difference(attention_want, attention_got);
+    if (tq_worst > 1.0e-3) {
+        fail("TurboQuant batched attention worst=" + std::to_string(tq_worst));
+    } else {
+        std::printf("  TurboQuant batched attention rows=%d head_dim=%d contexts=%d..%d worst=%.4g PASS\n",
+                    kRows, kHeadDim, contexts[0], contexts[kRows - 1], tq_worst);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -628,7 +912,8 @@ int main() {
     }
     const bool completed = test_rope_batched() && test_append_kv_batched() &&
         test_gqa_decode_batched() && test_gated_delta_step_batched() &&
-        test_conv_silu_batched();
+        test_conv_silu_batched() && test_quantized_kv_batched(128) &&
+        test_quantized_kv_batched(256);
     if (!completed && !device_ready) {
         std::printf("[SKIP] device allocation failed\n");
         return 0;

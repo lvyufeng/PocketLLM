@@ -1229,14 +1229,149 @@ __global__ void dequant_fp8_kv_cache_kernel(
         const uint8_t k_code = d_k_cache_fp8[cache_offset + ch];
         const float k_scale = scale_bits_to_float<kFp16Scale>(d_k_scale[scale_offset + scale_idx]);
         const float k_val = fp8_e4m3_to_float(k_code) * k_scale;
-        d_k_dense_fp16[dense_offset + ch] = __float2half_rn(k_val);
+        d_k_dense_fp16[dense_offset + ch] = __half_as_ushort(__float2half_rn(k_val));
 
         // Dequantize V
         const uint8_t v_code = d_v_cache_fp8[cache_offset + ch];
         const float v_scale = scale_bits_to_float<kFp16Scale>(d_v_scale[scale_offset + scale_idx]);
         const float v_val = fp8_e4m3_to_float(v_code) * v_scale;
-        d_v_dense_fp16[dense_offset + ch] = __float2half_rn(v_val);
+        d_v_dense_fp16[dense_offset + ch] = __half_as_ushort(__float2half_rn(v_val));
     }
+}
+
+__global__ void dequant_fp8_kv_cache_paged_kernel(
+    const uint8_t* __restrict__ d_k_cache_fp8,
+    const uint8_t* __restrict__ d_v_cache_fp8,
+    const uint16_t* __restrict__ d_k_scale,
+    const uint16_t* __restrict__ d_v_scale,
+    uint16_t* __restrict__ d_k_dense_fp16,
+    uint16_t* __restrict__ d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block,
+    const int* __restrict__ block_table, int block_size) {
+    const int position = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    if (position >= context_len || kv_head >= kv_heads) return;
+    const int physical_block = block_table[position / block_size];
+    const size_t cache_offset =
+        (static_cast<size_t>(physical_block) * block_size + position % block_size) *
+        static_cast<size_t>(kv_heads) * head_dim +
+        static_cast<size_t>(kv_head) * head_dim;
+    const size_t scale_offset =
+        (static_cast<size_t>(physical_block) * block_size + position % block_size) *
+        static_cast<size_t>(kv_heads) * (head_dim / scale_block) +
+        static_cast<size_t>(kv_head) * (head_dim / scale_block);
+    const size_t dense_offset =
+        (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+    for (int channel = threadIdx.x; channel < head_dim; channel += blockDim.x) {
+        const int scale_index = channel / scale_block;
+        const float k = fp8_e4m3_to_float(d_k_cache_fp8[cache_offset + channel]) *
+                        scale_bits_to_float<true>(d_k_scale[scale_offset + scale_index]);
+        const float v = fp8_e4m3_to_float(d_v_cache_fp8[cache_offset + channel]) *
+                        scale_bits_to_float<true>(d_v_scale[scale_offset + scale_index]);
+        d_k_dense_fp16[dense_offset + channel] = __half_as_ushort(__float2half_rn(k));
+        d_v_dense_fp16[dense_offset + channel] = __half_as_ushort(__float2half_rn(v));
+    }
+}
+
+bool qwen_fp8_dequant_kv_cache_paged_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block,
+    const int* d_block_table, int block_size, void* stream) {
+    if (!d_k_cache_fp8 || !d_v_cache_fp8 || !d_k_scale_fp16 || !d_v_scale_fp16 ||
+        !d_k_dense_fp16 || !d_v_dense_fp16 || !d_block_table || context_len <= 0 ||
+        kv_heads <= 0 || head_dim <= 0 || scale_block <= 0 ||
+        head_dim % scale_block != 0 || block_size <= 0) return false;
+    const dim3 grid(context_len, kv_heads);
+    dequant_fp8_kv_cache_paged_kernel<<<grid, 256, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+        d_k_cache_fp8, d_v_cache_fp8, d_k_scale_fp16, d_v_scale_fp16,
+        d_k_dense_fp16, d_v_dense_fp16, context_len, kv_heads, head_dim,
+        scale_block, d_block_table, block_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+template <bool kPaged>
+__global__ void dequant_fp8_kv_cache_batched_kernel(
+    const uint8_t* __restrict__ d_k_cache_fp8,
+    const uint8_t* __restrict__ d_v_cache_fp8,
+    const uint16_t* __restrict__ d_k_scale,
+    const uint16_t* __restrict__ d_v_scale,
+    uint16_t* __restrict__ d_k_dense_fp16,
+    uint16_t* __restrict__ d_v_dense_fp16,
+    const int* __restrict__ d_context_lens, const int* __restrict__ d_slot_ids,
+    int rows, int max_context_len, int kv_heads, int head_dim, int scale_block,
+    size_t kv_slot_stride, const int* __restrict__ d_block_table,
+    int block_size, int max_blocks_per_seq) {
+    const int row = blockIdx.z;
+    const int position = blockIdx.x;
+    const int kv_head = blockIdx.y;
+    if (row >= rows || position >= d_context_lens[row] ||
+        position >= max_context_len || kv_head >= kv_heads) return;
+    const int slot = d_slot_ids != nullptr ? d_slot_ids[row] : row;
+    size_t cache_offset;
+    size_t scale_offset;
+    if constexpr (kPaged) {
+        const int block = d_block_table[static_cast<size_t>(slot) * max_blocks_per_seq +
+                                        position / block_size];
+        cache_offset = (static_cast<size_t>(block) * block_size + position % block_size) *
+                       static_cast<size_t>(kv_heads) * head_dim +
+                       static_cast<size_t>(kv_head) * head_dim;
+        scale_offset = (static_cast<size_t>(block) * block_size + position % block_size) *
+                       static_cast<size_t>(kv_heads) * (head_dim / scale_block) +
+                       static_cast<size_t>(kv_head) * (head_dim / scale_block);
+    } else {
+        cache_offset = static_cast<size_t>(slot) * kv_slot_stride +
+                       (static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+        scale_offset = static_cast<size_t>(slot) * (kv_slot_stride / scale_block) +
+                       (static_cast<size_t>(position) * kv_heads + kv_head) *
+                           (head_dim / scale_block);
+    }
+    const size_t dense_offset =
+        (static_cast<size_t>(row) * max_context_len * kv_heads +
+         static_cast<size_t>(position) * kv_heads + kv_head) * head_dim;
+    for (int channel = threadIdx.x; channel < head_dim; channel += blockDim.x) {
+        const int scale_index = channel / scale_block;
+        const float k = fp8_e4m3_to_float(d_k_cache_fp8[cache_offset + channel]) *
+                        scale_bits_to_float<true>(d_k_scale[scale_offset + scale_index]);
+        const float v = fp8_e4m3_to_float(d_v_cache_fp8[cache_offset + channel]) *
+                        scale_bits_to_float<true>(d_v_scale[scale_offset + scale_index]);
+        d_k_dense_fp16[dense_offset + channel] = __half_as_ushort(__float2half_rn(k));
+        d_v_dense_fp16[dense_offset + channel] = __half_as_ushort(__float2half_rn(v));
+    }
+}
+
+bool qwen_fp8_dequant_kv_cache_batched_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    const int* d_context_lens, const int* d_slot_ids, int rows,
+    int max_context_len, int kv_heads, int head_dim, int scale_block,
+    size_t kv_slot_stride, const int* d_block_table, int block_size,
+    int max_blocks_per_seq, void* stream) {
+    if (!d_k_cache_fp8 || !d_v_cache_fp8 || !d_k_scale_fp16 || !d_v_scale_fp16 ||
+        !d_k_dense_fp16 || !d_v_dense_fp16 || !d_context_lens || rows <= 0 ||
+        max_context_len <= 0 || kv_heads <= 0 || head_dim <= 0 || scale_block <= 0 ||
+        head_dim % scale_block != 0) return false;
+    const bool paged = d_block_table != nullptr;
+    if (paged) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0) return false;
+    } else if (kv_slot_stride == 0) {
+        return false;
+    }
+    const dim3 grid(static_cast<unsigned>(max_context_len),
+                    static_cast<unsigned>(kv_heads), static_cast<unsigned>(rows));
+#define POCKET_LAUNCH_DEQUANT(PAGED) \
+    dequant_fp8_kv_cache_batched_kernel<PAGED><<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>( \
+        d_k_cache_fp8, d_v_cache_fp8, d_k_scale_fp16, d_v_scale_fp16, \
+        d_k_dense_fp16, d_v_dense_fp16, d_context_lens, d_slot_ids, rows, \
+        max_context_len, kv_heads, head_dim, scale_block, kv_slot_stride, \
+        d_block_table, block_size, max_blocks_per_seq)
+    if (paged) POCKET_LAUNCH_DEQUANT(true);
+    else POCKET_LAUNCH_DEQUANT(false);
+#undef POCKET_LAUNCH_DEQUANT
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool qwen_fp8_dequant_kv_cache_cuda(
