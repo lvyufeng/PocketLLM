@@ -2,6 +2,8 @@
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <type_traits>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -252,6 +254,23 @@ __device__ __forceinline__ float half_to_float(uint16_t bits) {
 
 __device__ __forceinline__ uint16_t float_to_half(float value) {
     return __half_as_ushort(__float2half_rn(value));
+}
+
+__device__ __forceinline__ float fp8_e4m3_to_float(uint8_t code) {
+    const uint32_t sign = static_cast<uint32_t>(code & 0x80u) << 24;
+    const uint32_t exponent = (code >> 3) & 0xfu;
+    const uint32_t mantissa = code & 0x7u;
+    uint32_t bits;
+    if (exponent != 0) {
+        bits = sign | ((exponent + 120u) << 23) | (mantissa << 20);
+    } else if (mantissa >= 4) {
+        bits = sign | (120u << 23) | ((mantissa - 4u) << 21);
+    } else if (mantissa >= 2) {
+        bits = sign | (119u << 23) | ((mantissa - 2u) << 22);
+    } else {
+        bits = sign | (mantissa == 0 ? 0u : (118u << 23));
+    }
+    return __uint_as_float(bits);
 }
 
 // Butterfly reduction: every lane ends with the full warp total, so a warp that
@@ -1644,11 +1663,12 @@ __global__ void gqa_prefill_tiled_f16_kernel(
 // contiguous per-slot reservation. It is a separate template parameter rather
 // than a runtime null check so the contiguous instantiation keeps its exact
 // register count and address arithmetic.
-template <int kHPG, bool kBatched = false, bool kPaged = false>
+template <int kHPG, bool kBatched = false, bool kPaged = false,
+          bool kFp8 = false>
 __global__ void gqa_decode_split_f16_kernel(
     const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ k_cache,
-    const uint16_t* __restrict__ v_cache,
+    const std::conditional_t<kFp8, uint8_t, uint16_t>* __restrict__ k_cache,
+    const std::conditional_t<kFp8, uint8_t, uint16_t>* __restrict__ v_cache,
     float* __restrict__ partial_output,
     int q_heads,
     int kv_heads,
@@ -1663,8 +1683,14 @@ __global__ void gqa_decode_split_f16_kernel(
     size_t kv_slot_stride = 0,
     const int* __restrict__ block_table = nullptr,
     int block_size = 0,
-    int max_blocks_per_seq = 0) {
+    int max_blocks_per_seq = 0,
+    // FP8 cache only: one FP16 scale per token, KV head and scale_block-wide
+    // channel group, laid out with the same geometry as the codes it rescales.
+    const uint16_t* __restrict__ k_scale = nullptr,
+    const uint16_t* __restrict__ v_scale = nullptr,
+    int scale_block = 0) {
     const int q_per_kv = q_heads / kv_heads;
+    const int scales_per_head = kFp8 ? head_dim / scale_block : 0;
     const int groups_per_kv = (q_per_kv + kHPG - 1) / kHPG;
     const int grouped = static_cast<int>(blockIdx.x) / splits;
     const int split = static_cast<int>(blockIdx.x) % splits;
@@ -1691,6 +1717,14 @@ __global__ void gqa_decode_split_f16_kernel(
                 static_cast<size_t>(slot_index) * kv_slot_stride;
             k_cache += slot;
             v_cache += slot;
+            if constexpr (kFp8) {
+                // The scale arena carries one entry per scale_block channels,
+                // so its per-slot stride is the code stride divided by that
+                // block width.
+                const size_t scale_slot = slot / scale_block;
+                k_scale += scale_slot;
+                v_scale += scale_slot;
+            }
         }
         q += static_cast<size_t>(row) * q_heads * head_dim;
         partial_output += static_cast<size_t>(row) * q_heads * splits *
@@ -1750,6 +1784,7 @@ __global__ void gqa_decode_split_f16_kernel(
     for (int logical = start; logical < end; ++logical) {
         const int position = ranges.position(logical);
         size_t kv_base;
+        size_t scale_base = 0;
         if constexpr (kPaged) {
             const int block_index = position / block_size;
             if (block_index != cached_block_index) {
@@ -1761,17 +1796,39 @@ __global__ void gqa_decode_split_f16_kernel(
             kv_base = cached_block_base +
                 static_cast<size_t>(position % block_size) * kv_stride +
                 static_cast<size_t>(kv_head) * head_dim;
+            if constexpr (kFp8) {
+                scale_base =
+                    (static_cast<size_t>(slot_blocks[block_index]) * block_size +
+                     position % block_size) * kv_heads * scales_per_head +
+                    static_cast<size_t>(kv_head) * scales_per_head;
+            }
         } else {
             kv_base = static_cast<size_t>(position) * kv_stride +
                 static_cast<size_t>(kv_head) * head_dim;
+            if constexpr (kFp8) {
+                scale_base = static_cast<size_t>(position) * kv_heads *
+                    scales_per_head + static_cast<size_t>(kv_head) * scales_per_head;
+            }
         }
         float key[kValuesPerThread];
         float value[kValuesPerThread];
 #pragma unroll
         for (int i = 0; i < kValuesPerThread; ++i) {
             const int d = tid + i * kThreads;
-            key[i] = d < head_dim ? half_to_float(k_cache[kv_base + d]) : 0.0f;
-            value[i] = d < head_dim ? half_to_float(v_cache[kv_base + d]) : 0.0f;
+            if (d < head_dim) {
+                if constexpr (kFp8) {
+                    key[i] = fp8_e4m3_to_float(k_cache[kv_base + d]) *
+                        half_to_float(k_scale[scale_base + d / scale_block]);
+                    value[i] = fp8_e4m3_to_float(v_cache[kv_base + d]) *
+                        half_to_float(v_scale[scale_base + d / scale_block]);
+                } else {
+                    key[i] = half_to_float(k_cache[kv_base + d]);
+                    value[i] = half_to_float(v_cache[kv_base + d]);
+                }
+            } else {
+                key[i] = 0.0f;
+                value[i] = 0.0f;
+            }
         }
         float dot[kHPG] = {};
 #pragma unroll
@@ -3215,6 +3272,82 @@ bool qwen_gqa_decode_attention_f16_batched_cuda(
     }
 #undef POCKET_LAUNCH_DECODE_SPLIT_BATCHED_WIDTH
 #undef POCKET_LAUNCH_DECODE_SPLIT_BATCHED
+    if (cudaGetLastError() != cudaSuccess) return false;
+    const dim3 merge_grid(static_cast<unsigned>(q_heads),
+                          static_cast<unsigned>(rows), 1);
+    gqa_decode_merge_f16_kernel<<<merge_grid, kThreads, 0, cuda_stream>>>(
+        partial_scratch, output, q_heads, head_dim, splits);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool qwen_gqa_decode_attention_fp8_batched_cuda(
+    const uint16_t* q, const uint8_t* k_cache, const uint8_t* v_cache,
+    const uint16_t* k_scale, const uint16_t* v_scale, uint16_t* output,
+    float* partial_scratch, const int* context_lens, const int* slot_ids,
+    int rows, int max_context_len, size_t kv_slot_stride, int q_heads,
+    int kv_heads, int head_dim, int scale_block, int max_context,
+    int attention_window, int sink_tokens, const int* block_table,
+    int block_size, int max_blocks_per_seq, void* stream) {
+    if (!q || !k_cache || !v_cache || !k_scale || !v_scale || !output ||
+        !partial_scratch || !context_lens || rows <= 0 || max_context_len <= 0 ||
+        attention_window < 0 || sink_tokens < 0 || scale_block <= 0 ||
+        head_dim % scale_block != 0 || !valid_shape(q_heads, kv_heads, head_dim)) {
+        return false;
+    }
+    const bool paged = block_table != nullptr;
+    if (paged) {
+        if (block_size <= 0 || max_blocks_per_seq <= 0 ||
+            max_context_len > block_size * max_blocks_per_seq) return false;
+    } else if (max_context_len > max_context || kv_slot_stride == 0) {
+        return false;
+    }
+    const SparseRanges ranges =
+        sparse_ranges(max_context_len, attention_window, sink_tokens);
+    const int attended = ranges.total();
+    const int splits = decode_split_count_for_variant(attended, false, 0, kv_heads);
+    if (splits <= 0 || splits > kDecodeSplitCeiling) return false;
+    const int positions_per_split = (attended + splits - 1) / splits;
+    const int group_heads = decode_group_width(q_heads / kv_heads);
+    const int groups_per_kv =
+        (q_heads / kv_heads + group_heads - 1) / group_heads;
+    const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const dim3 grid(static_cast<unsigned>(kv_heads * groups_per_kv * splits),
+                    static_cast<unsigned>(rows), 1);
+#define POCKET_LAUNCH_FP8_BATCHED(HPG, PAGED) \
+    gqa_decode_split_f16_kernel<HPG, true, PAGED, true> \
+        <<<grid, kThreads, 0, cuda_stream>>>( \
+        q, k_cache, v_cache, partial_scratch, q_heads, kv_heads, head_dim, \
+        max_context_len, splits, positions_per_split, attention_window, \
+        sink_tokens, context_lens, slot_ids, kv_slot_stride, block_table, \
+        block_size, max_blocks_per_seq, k_scale, v_scale, scale_block)
+    switch (group_heads) {
+        case 1:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(1, true);
+            else POCKET_LAUNCH_FP8_BATCHED(1, false);
+            break;
+        case 2:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(2, true);
+            else POCKET_LAUNCH_FP8_BATCHED(2, false);
+            break;
+        case 3:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(3, true);
+            else POCKET_LAUNCH_FP8_BATCHED(3, false);
+            break;
+        case 4:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(4, true);
+            else POCKET_LAUNCH_FP8_BATCHED(4, false);
+            break;
+        case 5:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(5, true);
+            else POCKET_LAUNCH_FP8_BATCHED(5, false);
+            break;
+        case 6:
+            if (paged) POCKET_LAUNCH_FP8_BATCHED(6, true);
+            else POCKET_LAUNCH_FP8_BATCHED(6, false);
+            break;
+        default: return false;
+    }
+#undef POCKET_LAUNCH_FP8_BATCHED
     if (cudaGetLastError() != cudaSuccess) return false;
     const dim3 merge_grid(static_cast<unsigned>(q_heads),
                           static_cast<unsigned>(rows), 1);

@@ -34,20 +34,22 @@ constexpr int kMaxContext = 8192;
 constexpr int kSlots = 8;
 constexpr int kBlockSize = 256;
 
-pocket::QwenEngineOptions base_options() {
+pocket::QwenEngineOptions base_options(
+    pocket::QwenKvCacheDType dtype = pocket::QwenKvCacheDType::Fp16) {
     pocket::QwenEngineOptions options;
     options.tp_world = 1;
     options.tp_rank = 0;
     options.device = 0;
     options.prefill_chunk_tokens = 1024;
-    options.kv_cache_dtype = pocket::QwenKvCacheDType::Fp16;
+    options.kv_cache_dtype = dtype;
     options.prefix_cache = false;
     options.max_batch_size = kSlots;
     return options;
 }
 
-pocket::QwenEngineOptions paged_options() {
-    pocket::QwenEngineOptions options = base_options();
+pocket::QwenEngineOptions paged_options(
+    pocket::QwenKvCacheDType dtype = pocket::QwenKvCacheDType::Fp16) {
+    pocket::QwenEngineOptions options = base_options(dtype);
     options.kv_paged = true;
     options.kv_block_size = kBlockSize;
     return options;
@@ -168,12 +170,66 @@ void test_batched_decode_parity(const std::string& dir) {
               << " steps at 4k-7.5k context: token-exact PASS\n";
 }
 
+void test_quantized_paged_parity(const std::string& dir,
+                                 pocket::QwenKvCacheDType dtype) {
+    const std::vector<int> prompt_lens = {63, 257, 513, 769};
+    const std::vector<int> slots = {1, 5, 2, 7};
+    const int steps = 4;
+    pocket::QwenEngine contiguous(dir, base_options(dtype), 2, kMaxContext);
+    contiguous.allocate_batch_slots(kSlots);
+    pocket::QwenEngine paged(dir, paged_options(dtype), 2, kMaxContext);
+    paged.allocate_batch_slots(kSlots);
+
+    for (size_t seq = 0; seq < prompt_lens.size(); ++seq) {
+        const std::vector<int> tokens =
+            prompt_for(static_cast<int>(seq), prompt_lens[seq]);
+        compare(contiguous.prefill(tokens, slots[seq]),
+                paged.prefill(tokens, slots[seq]),
+                std::string("quantized ") +
+                    pocket::qwen_kv_cache_dtype_name(dtype) +
+                    " prefill seq=" + std::to_string(seq));
+    }
+    for (int step = 0; step < steps; ++step) {
+        std::vector<int> tokens(slots.size());
+        for (size_t seq = 0; seq < slots.size(); ++seq) {
+            tokens[seq] = (static_cast<int>(seq) * 11 + step * 5 + 3) % 64;
+        }
+        const std::vector<pocket::ForwardResult> reference =
+            contiguous.batch_decode_tokens(tokens, slots);
+        const std::vector<pocket::ForwardResult> actual =
+            paged.batch_decode_tokens(tokens, slots);
+        require(reference.size() == actual.size(), "quantized batch count mismatch");
+        for (size_t seq = 0; seq < reference.size(); ++seq) {
+            compare(reference[seq], actual[seq],
+                    std::string("quantized ") +
+                        pocket::qwen_kv_cache_dtype_name(dtype) +
+                        " batch step=" + std::to_string(step) +
+                        " seq=" + std::to_string(seq));
+        }
+    }
+    std::cout << "  " << pocket::qwen_kv_cache_dtype_name(dtype)
+              << " paged/contiguous parity across block boundaries: PASS\n";
+}
+
 // ============================================================================
 // Blocks are returned and reused. A long request runs, finishes, and a second
 // request on a different slot then runs on the blocks the first gave back. If
 // free_slot did not release them, the pool here is too small for the
 // second request and reservation fails.
 // ============================================================================
+void test_paged_int8_rejected(const std::string& dir) {
+    bool threw = false;
+    try {
+        pocket::QwenEngine engine(
+            dir, paged_options(pocket::QwenKvCacheDType::Int8PerTokenHead),
+            2, kMaxContext);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    require(threw, "paged int8_per_token_head was accepted");
+    std::cout << "  unsupported paged int8 cache rejected explicitly: PASS\n";
+}
+
 void test_block_reuse(const std::string& dir) {
     pocket::QwenEngineOptions options = paged_options();
     // Room for roughly one max-context sequence, so the second request can only
@@ -225,18 +281,7 @@ void test_undersized_pool_rejected(const std::string& dir) {
     }
     require(threw, "undersized block pool was accepted");
 
-    // A quantized cache cannot be paged, and saying so beats silently running
-    // contiguous.
-    pocket::QwenEngineOptions fp8 = paged_options();
-    fp8.kv_cache_dtype = pocket::QwenKvCacheDType::Fp8;
-    threw = false;
-    try {
-        pocket::QwenEngine engine(dir, fp8, 2, kMaxContext);
-    } catch (const std::exception&) {
-        threw = true;
-    }
-    require(threw, "paged FP8 cache was accepted");
-    std::cout << "  undersized pool and paged-FP8 both rejected: PASS\n";
+    std::cout << "  undersized pool rejected before allocation: PASS\n";
 }
 
 }  // namespace
@@ -253,6 +298,9 @@ int main() {
                 "could not create paged parity fixture");
         test_prefill_decode_parity(dir);
         test_batched_decode_parity(dir);
+        test_quantized_paged_parity(dir, pocket::QwenKvCacheDType::Fp8);
+        test_quantized_paged_parity(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);
+        test_paged_int8_rejected(dir);
         test_block_reuse(dir);
         test_undersized_pool_rejected(dir);
         std::cout << "[PASS] test_qwen_paged_engine_parity\n";

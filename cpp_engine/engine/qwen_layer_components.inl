@@ -581,26 +581,70 @@ void GqaAttention::forward(
         kv_heads * head_dim;
 
     if (runtime.batch_rows != nullptr) {
-        // Each row appends its new K/V at its own position in its own slot.
-        // Under paging the slot stride is replaced by the block table, which
-        // the caller has already grown and uploaded for these positions.
-        require_launch(qwen_append_kv_cache_f16_batched_cuda(
-            k_norm.f16_data(), v.f16_data(),
-            layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
-            rows, kv_heads, head_dim, runtime.batch_rows->positions,
-            runtime.batch_rows->slot_ids, runtime.max_context, kv_slot_stride,
-            runtime.block_table_data(), runtime.paged_block_size(),
-            runtime.paged_blocks_per_seq()),
-            "append batched FP16 full KV cache");
+        if (cache_dtype == QwenKvCacheDType::Fp16) {
+            require_launch(qwen_append_kv_cache_f16_batched_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                rows, kv_heads, head_dim, runtime.batch_rows->positions,
+                runtime.batch_rows->slot_ids, runtime.max_context, kv_slot_stride,
+                runtime.block_table_data(), runtime.paged_block_size(),
+                runtime.paged_blocks_per_seq()),
+                "append batched FP16 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
+            const size_t slot_offset = static_cast<size_t>(runtime.max_context) *
+                kv_heads * head_dim;
+            require_launch(qwen_append_kv_cache_fp8_batched_cuda(
+                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
+                layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
+                layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
+                kKvScaleBlock, runtime.batch_rows->positions,
+                runtime.batch_rows->slot_ids, runtime.max_context, slot_offset,
+                runtime.block_table_data(), runtime.paged_block_size(),
+                runtime.paged_blocks_per_seq()),
+                "append batched FP8 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            const size_t slot_bytes = static_cast<size_t>(qwen_turboquant_k8v4_slot_bytes(head_dim));
+            const size_t slot_stride_bytes = static_cast<size_t>(runtime.max_context) *
+                kv_heads * slot_bytes;
+            require_launch(qwen_append_kv_cache_turboquant_k8v4_batched_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.turboquant_cache.byte_data(), rows, kv_heads, head_dim,
+                runtime.batch_rows->positions, runtime.batch_rows->slot_ids,
+                runtime.max_context, slot_stride_bytes, runtime.block_table_data(),
+                runtime.paged_block_size(), runtime.paged_blocks_per_seq()),
+                "append batched TurboQuant K8V4 full KV cache");
+        } else {
+            throw std::runtime_error(
+                std::string("Qwen batched decode does not support ") +
+                qwen_kv_cache_dtype_name(cache_dtype));
+        }
     } else if (runtime.kv_paged()) {
-        // Single-sequence paged append: consecutive positions of one
-        // sequence, scattered across the blocks its row names.
-        require_launch(qwen_append_kv_cache_f16_paged_cuda(
-            k_norm.f16_data(), v.f16_data(),
-            layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
-            rows, kv_heads, head_dim, position_offset,
-            runtime.block_table_row(slot_id), runtime.paged_block_size()),
-            "append paged FP16 full KV cache");
+        if (cache_dtype == QwenKvCacheDType::Fp16) {
+            require_launch(qwen_append_kv_cache_f16_paged_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                rows, kv_heads, head_dim, position_offset,
+                runtime.block_table_row(slot_id), runtime.paged_block_size()),
+                "append paged FP16 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
+            require_launch(qwen_append_kv_cache_fp8_paged_cuda(
+                k_norm.f16_data(), v.f16_data(), layer.full.k_cache.fp8_data(),
+                layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
+                layer.full.v_scale.f16_data(), rows, kv_heads, head_dim,
+                kKvScaleBlock, position_offset, runtime.block_table_row(slot_id),
+                runtime.paged_block_size()), "append paged FP8 full KV cache");
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            require_launch(qwen_append_kv_cache_turboquant_k8v4_paged_cuda(
+                k_norm.f16_data(), v.f16_data(),
+                layer.full.turboquant_cache.byte_data(), rows, kv_heads, head_dim,
+                position_offset, runtime.block_table_row(slot_id),
+                runtime.paged_block_size()),
+                "append paged TurboQuant K8V4 full KV cache");
+        } else {
+            throw std::runtime_error(
+                std::string("Qwen paged KV cache does not support ") +
+                qwen_kv_cache_dtype_name(cache_dtype));
+        }
     } else if (cache_dtype == QwenKvCacheDType::Fp8) {
         require_launch(qwen_append_kv_cache_fp8_cuda(
             k_norm.f16_data(), v.f16_data(),
@@ -657,6 +701,7 @@ void GqaAttention::forward(
         ? layer.full.k_cache.f16_data() + slot_offset : nullptr;
     const uint16_t* v_read = fp16_cache
         ? layer.full.v_cache.f16_data() + slot_offset : nullptr;
+    bool paged_quantized_dense = false;
     if (runtime.kv_paged() && runtime.batch_rows == nullptr) {
         const int context_length = position_offset + rows;
         const std::vector<uint64_t> dense_shape = {
@@ -670,16 +715,37 @@ void GqaAttention::forward(
         QwenDeviceTensor& v_dense =
             runtime.workspace_half(dense_elements, dense_shape);
         typename Runtime::PhaseScope sub(&runtime, "full.kv_gather");
-        require_launch(qwen_gather_kv_cache_f16_paged_cuda(
-            layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
-            k_dense.f16_data(), v_dense.f16_data(), context_length,
-            kv_heads, head_dim, runtime.block_table_row(slot_id),
-            runtime.paged_block_size()), "gather paged FP16 KV cache");
-        k_read = k_dense.f16_data();
-        v_read = v_dense.f16_data();
+        const int* table = runtime.block_table_row(slot_id);
+        if (cache_dtype == QwenKvCacheDType::Fp16) {
+            require_launch(qwen_gather_kv_cache_f16_paged_cuda(
+                layer.full.k_cache.f16_data(), layer.full.v_cache.f16_data(),
+                k_dense.f16_data(), v_dense.f16_data(), context_length,
+                kv_heads, head_dim, table, runtime.paged_block_size()),
+                "gather paged FP16 KV cache");
+            k_read = k_dense.f16_data();
+            v_read = v_dense.f16_data();
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
+            require_launch(qwen_fp8_dequant_kv_cache_paged_cuda(
+                layer.full.k_cache.fp8_data(), layer.full.v_cache.fp8_data(),
+                layer.full.k_scale.f16_data(), layer.full.v_scale.f16_data(),
+                k_dense.f16_data(), v_dense.f16_data(), context_length,
+                kv_heads, head_dim, kKvScaleBlock, table,
+                runtime.paged_block_size()), "dequant paged FP8 KV cache");
+            k_read = k_dense.f16_data();
+            v_read = v_dense.f16_data();
+            paged_quantized_dense = true;
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            require_launch(qwen_turboquant_k8v4_dequant_kv_paged_cuda(
+                layer.full.turboquant_cache.byte_data(), k_dense.f16_data(),
+                v_dense.f16_data(), context_length, kv_heads, head_dim, table,
+                runtime.paged_block_size()), "dequant paged TurboQuant KV cache");
+            k_read = k_dense.f16_data();
+            v_read = v_dense.f16_data();
+            paged_quantized_dense = true;
+        }
     }
 
-    if (runtime.batch_rows != nullptr) {
+    if (runtime.batch_rows != nullptr && cache_dtype == QwenKvCacheDType::Fp16) {
         // One launch for the whole batch. The split geometry comes from the
         // longest row, so the scratch is sized from that same query the
         // launcher uses; shorter rows leave their trailing splits empty.
@@ -703,6 +769,50 @@ void GqaAttention::forward(
             attention_window, sink_tokens, runtime.block_table_data(),
             runtime.paged_block_size(), runtime.paged_blocks_per_seq()),
             "batched decode FP16-cache GQA");
+    } else if (runtime.batch_rows != nullptr) {
+        const int context_len = runtime.batch_rows->max_context_len;
+        if (cache_dtype == QwenKvCacheDType::Fp8) {
+            const int splits = qwen_gqa_decode_batched_split_count(
+                context_len, kv_heads, attention_window, sink_tokens);
+            require_launch(splits > 0, "batched FP8 decode split geometry");
+            QwenDeviceTensor& partials = runtime.workspace_float(
+                static_cast<size_t>(rows) * q_heads * splits *
+                    static_cast<size_t>(head_dim + 2),
+                {static_cast<uint64_t>(rows), static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(splits),
+                 static_cast<uint64_t>(head_dim + 2)});
+            require_launch(qwen_gqa_decode_attention_fp8_batched_cuda(
+                q_norm.f16_data(), layer.full.k_cache.fp8_data(),
+                layer.full.v_cache.fp8_data(), layer.full.k_scale.f16_data(),
+                layer.full.v_scale.f16_data(), attention.f16_data(),
+                partials.f32_data(), runtime.batch_rows->context_lens,
+                runtime.batch_rows->slot_ids, rows, context_len, kv_slot_stride,
+                q_heads, kv_heads, head_dim, kKvScaleBlock, runtime.max_context,
+                attention_window, sink_tokens, runtime.block_table_data(),
+                runtime.paged_block_size(), runtime.paged_blocks_per_seq()),
+                "batched decode FP8-cache GQA");
+        } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+            const size_t score_elements = static_cast<size_t>(rows) * q_heads * context_len;
+            QwenDeviceTensor& scores = runtime.workspace_float(
+                score_elements, {static_cast<uint64_t>(rows),
+                                 static_cast<uint64_t>(q_heads),
+                                 static_cast<uint64_t>(context_len)});
+            const int slot_bytes = qwen_turboquant_k8v4_slot_bytes(head_dim);
+            const size_t slot_stride_bytes = static_cast<size_t>(runtime.max_context) *
+                kv_heads * slot_bytes;
+            require_launch(qwen_gqa_decode_attention_turboquant_k8v4_batched_cuda(
+                q_norm.f16_data(), layer.full.turboquant_cache.byte_data(),
+                attention.f16_data(), scores.f32_data(),
+                runtime.batch_rows->context_lens, runtime.batch_rows->slot_ids, rows,
+                context_len, slot_stride_bytes, q_heads, kv_heads, head_dim,
+                attention_window, sink_tokens, runtime.block_table_data(),
+                runtime.paged_block_size(), runtime.paged_blocks_per_seq()),
+                "batched decode TurboQuant K8V4 GQA");
+        } else {
+            throw std::runtime_error(
+                std::string("Qwen batched decode attention does not support ") +
+                qwen_kv_cache_dtype_name(cache_dtype));
+        }
     } else if (rows == 1) {
         const int context_length = position_offset + 1;
         const bool optimized_attention =
@@ -740,7 +850,13 @@ void GqaAttention::forward(
                                         static_cast<uint64_t>(head_dim + 2)}
                 : std::vector<uint64_t>{static_cast<uint64_t>(q_heads),
                                          static_cast<uint64_t>(context_length)});
-        if (cache_dtype == QwenKvCacheDType::Fp8) {
+        if (paged_quantized_dense) {
+            require_launch(qwen_gqa_decode_attention_f16(
+                q_norm.f16_data(), k_read, v_read, attention.f16_data(),
+                scores.f32_data(), q_heads, kv_heads, head_dim,
+                context_length, runtime.max_context),
+                "decode paged quantized KV via dense FP16 GQA");
+        } else if (cache_dtype == QwenKvCacheDType::Fp8) {
             require_launch(qwen_gqa_decode_attention_fp8_cuda(
                 q_norm.f16_data(),
                 layer.full.k_cache.fp8_data() + slot_offset,
@@ -792,7 +908,7 @@ void GqaAttention::forward(
                 scores.f32_data(), q_heads, kv_heads, head_dim,
                 context_length, runtime.max_context), "decode FP16-cache GQA");
         }
-    } else if (cache_dtype == QwenKvCacheDType::Fp8) {
+    } else if (cache_dtype == QwenKvCacheDType::Fp8 && !paged_quantized_dense) {
         const int context_length = position_offset + rows;
         // Dequantize the [0, context_length) range once into dense FP16
         // buffers, then call the tensor-core prefill kernel. O(ctx) dequant
@@ -866,7 +982,8 @@ void GqaAttention::forward(
                 position_offset, runtime.max_context),
                 "prefill INT8 via tensor-core exact");
         }
-    } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4) {
+    } else if (cache_dtype == QwenKvCacheDType::TurboQuantK8V4 &&
+               !paged_quantized_dense) {
         const int context_length = position_offset + rows;
         // Dequantize the [0, context_length) range once into dense FP16
         // buffers laid out like the FP16 cache, then call the tensor-core
@@ -902,6 +1019,21 @@ void GqaAttention::forward(
                 attention.f16_data(), rows, q_heads, kv_heads, head_dim,
                 position_offset, runtime.max_context),
                 "prefill TurboQuant via tensor-core exact");
+        }
+    } else if (paged_quantized_dense) {
+        // Paged quantized history was dequantized above into the same dense
+        // layout used by the established FP16 prefill kernels.
+        if (runtime.layer_config.gqa_optimized || attention_window > 0) {
+            require_launch(qwen_gqa_prefill_attention_f16_tiled_cuda(
+                q_norm.f16_data(), k_read, v_read, attention.f16_data(), rows,
+                q_heads, kv_heads, head_dim, position_offset, runtime.max_context,
+                attention_window, sink_tokens),
+                "prefill paged quantized via tensor-core tiled");
+        } else {
+            require_launch(qwen_gqa_prefill_attention_f16(
+                q_norm.f16_data(), k_read, v_read, attention.f16_data(), rows,
+                q_heads, kv_heads, head_dim, position_offset, runtime.max_context),
+                "prefill paged quantized via exact FP16 GQA");
         }
     } else if (cache_dtype == QwenKvCacheDType::Fp16 && rows <= 8 && attention_window == 0) {
         const int context_length = position_offset + rows;

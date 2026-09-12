@@ -880,7 +880,38 @@ bool qwen_append_kv_cache_fp8_batched_cuda(
     uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16, int rows,
     int kv_heads, int head_dim, int scale_block, const int* d_start_positions,
     const int* d_slot_ids, int max_context, size_t kv_slot_stride,
-    void* stream = nullptr);
+    const int* d_block_table = nullptr, int block_size = 0,
+    int max_blocks_per_seq = 0, void* stream = nullptr);
+bool qwen_append_kv_cache_fp8_paged_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_k_cache_fp8, uint8_t* d_v_cache_fp8,
+    uint16_t* d_k_scale_fp16, uint16_t* d_v_scale_fp16, int seq_len,
+    int kv_heads, int head_dim, int scale_block, int start_pos,
+    const int* d_block_table, int block_size, void* stream = nullptr);
+bool qwen_gqa_decode_attention_fp8_batched_cuda(
+    const uint16_t* d_q_fp16, const uint8_t* d_k_cache_fp8,
+    const uint8_t* d_v_cache_fp8, const uint16_t* d_k_scale_fp16,
+    const uint16_t* d_v_scale_fp16, uint16_t* d_out_fp16,
+    float* d_score_scratch, const int* d_context_lens,
+    const int* d_slot_ids, int rows, int max_context_len,
+    size_t kv_slot_stride, int q_heads, int kv_heads, int head_dim,
+    int scale_block, int max_context, int attention_window = 0,
+    int sink_tokens = 0, const int* d_block_table = nullptr,
+    int block_size = 0, int max_blocks_per_seq = 0, void* stream = nullptr);
+bool qwen_fp8_dequant_kv_cache_paged_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    int context_len, int kv_heads, int head_dim, int scale_block,
+    const int* d_block_table, int block_size, void* stream = nullptr);
+bool qwen_fp8_dequant_kv_cache_batched_cuda(
+    const uint8_t* d_k_cache_fp8, const uint8_t* d_v_cache_fp8,
+    const uint16_t* d_k_scale_fp16, const uint16_t* d_v_scale_fp16,
+    uint16_t* d_k_dense_fp16, uint16_t* d_v_dense_fp16,
+    const int* d_context_lens, const int* d_slot_ids, int rows,
+    int max_context_len, int kv_heads, int head_dim, int scale_block,
+    size_t kv_slot_stride, const int* d_block_table = nullptr,
+    int block_size = 0, int max_blocks_per_seq = 0, void* stream = nullptr);
 bool qwen_gqa_decode_attention_f16_cuda(
     const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
     const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
@@ -1059,12 +1090,34 @@ bool qwen_append_kv_cache_turboquant_k8v4_cuda(
     const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
     uint8_t* d_combined_cache, int seq_len, int kv_heads, int head_dim,
     int start_pos, int max_context, void* stream = nullptr);
+bool qwen_append_kv_cache_turboquant_k8v4_paged_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_combined_cache, int seq_len, int kv_heads, int head_dim,
+    int start_pos, const int* d_block_table, int block_size,
+    void* stream = nullptr);
+bool qwen_append_kv_cache_turboquant_k8v4_batched_cuda(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint8_t* d_combined_cache, int rows, int kv_heads, int head_dim,
+    const int* d_start_positions, const int* d_slot_ids, int max_context,
+    size_t slot_stride_bytes, const int* d_block_table = nullptr,
+    int block_size = 0, int max_blocks_per_seq = 0, void* stream = nullptr);
 
 bool qwen_gqa_decode_attention_turboquant_k8v4_cuda(
     const uint16_t* d_q_fp16, const uint8_t* d_combined_cache,
     uint16_t* d_out_fp16, float* d_score_scratch, int q_heads, int kv_heads,
     int head_dim, int context_len, int max_context, int attention_window,
     int attention_sink_tokens, void* stream = nullptr);
+bool qwen_gqa_decode_attention_turboquant_k8v4_batched_cuda(
+    const uint16_t* d_q_fp16, const uint8_t* d_combined_cache,
+    uint16_t* d_out_fp16, float* d_score_scratch, const int* d_context_lens,
+    const int* d_slot_ids, int rows, int max_context_len, size_t slot_stride_bytes,
+    int q_heads, int kv_heads, int head_dim, int attention_window,
+    int attention_sink_tokens, const int* d_block_table = nullptr,
+    int block_size = 0, int max_blocks_per_seq = 0, void* stream = nullptr);
+bool qwen_turboquant_k8v4_dequant_kv_paged_cuda(
+    const uint8_t* d_combined_cache, uint16_t* d_k_dense_fp16,
+    uint16_t* d_v_dense_fp16, int context_len, int kv_heads, int head_dim,
+    const int* d_block_table, int block_size, void* stream = nullptr);
 
 bool qwen_gqa_prefill_attention_turboquant_k8v4_cuda(
     const uint16_t* d_q_rows_fp16, const uint8_t* d_combined_cache,
