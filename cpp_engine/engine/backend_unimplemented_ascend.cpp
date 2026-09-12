@@ -135,6 +135,10 @@ const Tokenizer& PersistentEngine::tokenizer() const {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+const ForwardSmokeOptions& PersistentEngine::options() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 void PersistentEngine::run_worker_loop() {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }

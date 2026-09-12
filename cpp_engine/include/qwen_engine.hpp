@@ -234,6 +234,9 @@ public:
     uint64_t kv_cache_bytes() const;
     uint64_t kv_cache_scale_bytes() const;
     QwenRuntimeTelemetry runtime_telemetry() const;
+    // Emits optional host-side phase timings accumulated by the last forward.
+    // The implementation is a no-op unless QWEN_PHASE_PROFILE is enabled.
+    void report_phase_profile(const char* tag) const;
 
     const QwenPrefixCacheStats& prefix_cache_stats() const {
         return prefix_stats_;

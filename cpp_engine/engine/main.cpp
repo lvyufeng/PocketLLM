@@ -876,6 +876,10 @@ int main(int argc, char** argv) {
                                 next = qwen.decode_step(next.top_token);
                                 generated.push_back(next);
                             }
+                            // The one-shot CLI drives decode_step directly rather
+                            // than through QwenEngine::generate, so publish its
+                            // accumulated phase timings here as well.
+                            qwen.report_phase_profile("decode");
                         }
                         const auto t_decode1 = Clock::now();
                         for (size_t step = 0; step < generated.size(); ++step) {

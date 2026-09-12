@@ -88,8 +88,15 @@ public:
     __aicore__ inline void LoadKeyRow(const AscendC::LocalTensor<float>& dst,
                                       const AscendC::GlobalTensor<float>& src,
                                       uint32_t offset) {
+        // The row buffer is reused on the next token. MTE2->V only makes the
+        // current copy visible; the reverse hand-off prevents that next copy from
+        // overwriting a row that the previous Step still reads.
+        wait_compute_before_load();
         AscendC::DataCopy(dst, src[offset], kKeyDim);
         wait_load_before_compute();
+        // Step broadcasts individual q/k elements through the scalar unit as
+        // well as consuming the completed row through Vector.
+        wait_load_before_scalar();
     }
 
     // Pull an fp16 row and widen it. Used for v, and for q/k on the unnormalized
@@ -98,6 +105,10 @@ public:
                                        const AscendC::GlobalTensor<half>& src,
                                        uint32_t offset, uint32_t count) {
         AscendC::LocalTensor<half> staging = half_buf_.Get<half>();
+        // Cast reads staging on Vector. Do not refill it until that read has
+        // retired; the forward MTE2->V event alone does not provide this
+        // anti-dependency.
+        wait_compute_before_load();
         AscendC::DataCopy(staging, src[offset], count);
         wait_load_before_compute();
         AscendC::Cast(dst, staging, AscendC::RoundMode::CAST_NONE, count);
@@ -404,6 +415,10 @@ extern "C" __global__ __aicore__ void qwen_normalize_gated_delta_qk_kernel(
         // Q then K through the same buffers: the loads are independent but the
         // buffers are not, so each pass ends with its store drained.
         for (uint32_t which = 0; which < 2; ++which) {
+            // The previous Cast used this staging buffer as its Vector source.
+            // Fence that read before the next MTE2 transfer, including between
+            // the Q and K passes for one pair.
+            wait_compute_before_load();
             if (which == 0) {
                 AscendC::DataCopy(staging, q_gm[offset], kKeyDim);
             } else {

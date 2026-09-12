@@ -49,16 +49,6 @@
 #include "aclrtlaunch_qwen_gated_delta_step_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_kernel.h"
 #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_merge_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_normalize_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_split_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_normalize_raw_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_split_kv_shared_kernel.h"
-#include "aclrtlaunch_qwen_gqa_decode_attention_vectorized_kernel.h"
-// MMAD experimental kernels removed
-// #include "aclrtlaunch_qwen_gqa_decode_mmad_qk_score_kernel.h"
-// #include "aclrtlaunch_qwen_gqa_decode_mmad_softmax_v_kernel.h"
-// #include "aclrtlaunch_qwen_gqa_decode_softmax_v_from_scores_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_verify_attention_kernel.h"
 #include "aclrtlaunch_qwen_linear_attn_gates_kernel.h"
@@ -78,6 +68,7 @@ constexpr uint32_t kLaunchOk = 0;
 // wrong stride. The CUDA launchers reject the same values.
 constexpr int kRecurrentKeyDim = 128;
 constexpr int kRecurrentValueDim = 128;
+constexpr int kMaxAttentionHeadDim = 256;
 
 // Convolution tail capacity, matching kMaxKernel in the device code and kMaxTail
 // on the CUDA side.
@@ -130,7 +121,8 @@ uint32_t blocks_for(uint64_t work) {
 bool valid_attention(int q_heads, int kv_heads, int head_dim, int context_len,
                      int max_context) {
     return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 &&
-           head_dim > 0 && context_len > 0 && context_len <= max_context;
+           head_dim > 0 && head_dim <= kMaxAttentionHeadDim &&
+           context_len > 0 && context_len <= max_context;
 }
 
 // The softmax scale. Passed to the kernel as a float because aicore cannot cast
@@ -422,132 +414,6 @@ bool qwen_gqa_decode_attention_f16_ascend(
         return false;
     }
 
-    // Try vectorized path when geometry matches target (Qwen3.8-27B TP4):
-    // 6 query heads, 1 KV head, head_dim=256. The vectorized kernel uses
-    // UB-resident tiles to eliminate redundant scalar GM loads and exploits
-    // vector operations for QK dot products. Falls back to scalar path for
-    // non-standard configurations.
-    // This opt-out is a diagnostic knob only: it enables an apples-to-apples
-    // scalar-versus-vector benchmark at the tuned geometry without changing the
-    // neutral API or the production default.
-    const bool force_scalar = std::getenv("QWEN_ASCEND_FORCE_SCALAR_GQA") != nullptr;
-    const bool force_unsplit = std::getenv("QWEN_ASCEND_FORCE_UNSPLIT_GQA") != nullptr;
-    // Vectorized kernels temporarily disabled - using scalar fallback for all geometries
-    const bool use_vectorized = false;
-    // const bool use_vectorized = (q_heads == 6 && kv_heads == 1 && head_dim == 256 &&
-    //                              !force_scalar);
-
-    if (use_vectorized) {
-        // Two split geometries share the same partial-record plane, merge and
-        // normalize stages, and differ only in how the 30 first-generation AI
-        // cores are mapped onto the work.
-        //
-        // With kv_heads == 1 every query head reads the identical K/V bytes, so
-        // one block per (head, split) pair loads the cache q_heads times over.
-        // Removing that redundancy is what the KV-sharing geometry is for. Note
-        // it is not a bandwidth argument: a measured 30-core stream probe puts
-        // achievable read bandwidth near 1050 GB/s, and this operator reaches
-        // only 4-7% of it, so latency is set by Vector instruction count and
-        // pipe hand-offs. Sharing the tile still wins at long contexts because
-        // it also shares the per-tile widening and staging work. The preferred
-        // geometry therefore gives each core its own context range and sweeps
-        // every head across the K/V tile already in UB: the same total Vector
-        // work spread over the same 30 cores, but the cache is read once.
-        //
-        // The saving is not free: 30 context ranges mean 30 partial records per
-        // head to merge instead of 5, and a per-range prologue that reloads all
-        // six Q vectors. Those fixed costs are constant while the traffic saving
-        // grows with the context, so the geometry only pays off once each range
-        // is long enough to amortize them. Measured on one 910A at this geometry
-        // (ms/token, per-head vs KV-sharing):
-        //
-        //    4096   0.105   0.167
-        //    8192   0.184   0.217
-        //   16384   0.343   0.317
-        //   32768   0.658   0.540
-        //   65536   1.319   0.966
-        //
-        // Hence the 16K threshold rather than the 30-tile minimum the kernel
-        // itself needs. Below it the per-head mapping is still the faster one.
-        const bool shared_kv_split =
-            kv_heads == 1 && q_heads == 6 && head_dim == 256 &&
-            context_len >= 16384;
-        const int splits = shared_kv_split ? 30 : 5;
-        if ((context_len % 64) == 0 && context_len >= splits * 64) {
-            bool workspace_ok = true;
-            const size_t records =
-                static_cast<size_t>(q_heads) * static_cast<size_t>(splits);
-            const size_t record_stride = 8 + head_dim;
-            void* partial = ascend::WorkspacePool::acquire(
-                records * record_stride * sizeof(float), resolve(stream),
-                workspace_ok, ascend::WorkspacePool::Purpose::Intermediate);
-            if (workspace_ok && partial != nullptr) {
-                const aclrtStream s = resolve(stream);
-                const uint32_t launched = static_cast<uint32_t>(splits);
-                if (shared_kv_split) {
-                    if (aclrtlaunch_qwen_gqa_decode_attention_split_kv_shared_kernel(
-                            launched, s, gm(d_q_fp16), gm(d_k_cache_fp16),
-                            gm(d_v_cache_fp16), gm(d_score_scratch), partial,
-                            static_cast<uint32_t>(q_heads),
-                            static_cast<uint32_t>(kv_heads),
-                            static_cast<uint32_t>(head_dim),
-                            static_cast<uint32_t>(context_len),
-                            static_cast<uint32_t>(max_context),
-                            attention_scale(head_dim)) != kLaunchOk) {
-                        return false;
-                    }
-                } else if (aclrtlaunch_qwen_gqa_decode_attention_split_kernel(
-                               30u, s, gm(d_q_fp16), gm(d_k_cache_fp16),
-                               gm(d_v_cache_fp16), gm(d_score_scratch), partial,
-                               static_cast<uint32_t>(q_heads),
-                               static_cast<uint32_t>(kv_heads),
-                               static_cast<uint32_t>(head_dim),
-                               static_cast<uint32_t>(context_len),
-                               static_cast<uint32_t>(max_context),
-                               attention_scale(head_dim)) != kLaunchOk) {
-                    return false;
-                }
-                if (aclrtlaunch_qwen_gqa_decode_attention_merge_kernel(
-                        static_cast<uint32_t>(q_heads), s, gm(d_out_fp16),
-                        partial, static_cast<uint32_t>(q_heads),
-                        static_cast<uint32_t>(head_dim), launched) !=
-                    kLaunchOk) {
-                    return false;
-                }
-                // The shared kernel leaves raw scaled scores in scratch because
-                // it never needs a whole-plane Exp; the per-head kernel already
-                // left local exponentials there and only needs a rescale.
-                if (shared_kv_split) {
-                    return aclrtlaunch_qwen_gqa_decode_attention_normalize_raw_kernel(
-                               30u, s, gm(d_score_scratch), partial,
-                               static_cast<uint32_t>(q_heads),
-                               static_cast<uint32_t>(context_len),
-                               launched) == kLaunchOk;
-                }
-                return aclrtlaunch_qwen_gqa_decode_attention_normalize_kernel(
-                           30u, s, gm(d_score_scratch), partial,
-                           static_cast<uint32_t>(q_heads),
-                           static_cast<uint32_t>(context_len),
-                           launched) == kLaunchOk;
-            }
-        }
-
-        // The fallback keeps one complete block per query head. Rows whose
-        // length is not a multiple of eight floats would share a 32-byte cache
-        // line with the next head, so serialize that valid but irregular case.
-        const bool aligned_scratch_rows = (context_len % 8) == 0;
-        const uint32_t vector_blocks = aligned_scratch_rows
-            ? blocks_for(static_cast<uint64_t>(q_heads)) : 1u;
-        return aclrtlaunch_qwen_gqa_decode_attention_vectorized_kernel(
-                   vector_blocks, resolve(stream), gm(d_q_fp16),
-                   gm(d_k_cache_fp16), gm(d_v_cache_fp16), gm(d_out_fp16),
-                   gm(d_score_scratch), static_cast<uint32_t>(q_heads),
-                   static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(head_dim),
-                   static_cast<uint32_t>(context_len),
-                   static_cast<uint32_t>(max_context), attention_scale(head_dim)) ==
-               kLaunchOk;
-    }
-
     // The device baseline writes both output and score scratch with scalar GM
     // stores. Their neutral layouts need not be 32-byte aligned per head (the
     // score row is only `context_len` floats), and scalar stores from adjacent
@@ -600,9 +466,9 @@ bool qwen_gqa_verify_attention_f16_ascend(
     // out-of-bounds write rather than a wrong answer.
     if (d_q_rows_fp16 == nullptr || d_k_cache_fp16 == nullptr ||
         d_v_cache_fp16 == nullptr || d_out_rows_fp16 == nullptr ||
-        d_partial_scratch == nullptr || rows <= 0 || position_offset < 0 ||
-        position_offset + rows > max_context || splits <= 0 ||
-        splits > position_offset + rows ||
+        d_partial_scratch == nullptr || rows < 2 || rows > 8 || head_dim > 256 ||
+        position_offset < 0 || max_context < rows ||
+        position_offset > max_context - rows || splits <= 0 || splits > 256 ||
         !valid_attention(q_heads, kv_heads, head_dim, position_offset + rows,
                          max_context)) {
         return false;
