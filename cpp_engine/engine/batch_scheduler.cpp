@@ -455,6 +455,7 @@ bool BatchScheduler::run_decode_batch() {
                 batch_req->slot_id = req->slot_id;
                 batch_req->seq_len = req->seq_len;
                 batch_req->last_token = req->last_token;
+                batch_req->generated_tokens = req->generated_tokens;
                 batch_req->sampling = req->sampling;
 
                 decode_batch.push_back(batch_req);
@@ -482,43 +483,123 @@ bool BatchScheduler::run_decode_batch() {
                 " stop flags for " + std::to_string(decode_batch.size()) +
                 " requests");
         }
+        const bool has_row_metadata = !result.emitted_tokens.empty() ||
+            !result.position_advances.empty() ||
+            !result.proposed_drafts.empty() ||
+            !result.accepted_drafts.empty() ||
+            !result.used_speculative.empty() ||
+            !result.rolled_back.empty();
+        if (has_row_metadata &&
+            (result.emitted_tokens.size() != decode_batch.size() ||
+             result.position_advances.size() != decode_batch.size() ||
+             result.proposed_drafts.size() != decode_batch.size() ||
+             result.accepted_drafts.size() != decode_batch.size() ||
+             result.used_speculative.size() != decode_batch.size() ||
+             result.rolled_back.size() != decode_batch.size())) {
+            throw std::runtime_error(
+                "batch_decode_step returned malformed speculative row metadata");
+        }
 
-        // Update request states
+        // Update request states. A speculative row may emit several accepted
+        // drafts and one bonus token while consuming the same number of target
+        // KV positions, so the scheduler must not assume one token per call.
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             for (size_t i = 0; i < decode_batch.size(); ++i) {
                 auto* req = decode_requests[i];
-                if (i < result.next_tokens.size()) {
-                    req->last_token = result.next_tokens[i];
-                    req->generated_tokens.push_back(req->last_token);
-                    req->seq_len++;
+                if (i >= result.next_tokens.size()) continue;
+                std::vector<int> row_tokens = has_row_metadata
+                    ? result.emitted_tokens[i]
+                    : std::vector<int>{result.next_tokens[i]};
+                const int position_advance = has_row_metadata
+                    ? result.position_advances[i]
+                    : 1;
+                if (row_tokens.empty() || position_advance <= 0) {
+                    throw std::runtime_error(
+                        "batch_decode_step returned an empty speculative row");
+                }
+                // The engine normally applies this bound before launching a
+                // forward, but keep the generic scheduler safe for engines that
+                // return more output tokens than the request can accept. Target
+                // state may already have consumed the full reported advance; only
+                // the externally visible/generated suffix is truncated here.
+                const size_t remaining = req->generated_tokens.size() >=
+                        static_cast<size_t>(std::max(0, req->sampling.max_new_tokens))
+                    ? 0
+                    : static_cast<size_t>(req->sampling.max_new_tokens) -
+                          req->generated_tokens.size();
+                const bool row_truncated = row_tokens.size() > remaining;
+                if (row_truncated) row_tokens.resize(remaining);
+                if (row_tokens.empty()) {
+                    req->finished = true;
+                    req->seq_len += position_advance;
+                    if (has_row_metadata) {
+                        req->proposed_drafts += result.proposed_drafts[i];
+                        req->accepted_drafts += result.accepted_drafts[i];
+                        if (result.used_speculative[i]) ++req->speculative_steps;
+                        if (result.rolled_back[i]) ++req->rollback_steps;
+                    }
+                    continue;
+                }
 
-                    // Record TTFT for first decode token (if prefill didn't set it)
-                    if (req->first_token_time == std::chrono::steady_clock::time_point{} &&
-                        req->generated_tokens.size() == 1) {
-                        req->first_token_time = std::chrono::steady_clock::now();
+                bool stopped = false;
+                const bool row_stopped =
+                    !row_truncated && i < result.hit_stop_token.size() &&
+                    result.hit_stop_token[i];
+                for (size_t token_index = 0; token_index < row_tokens.size();
+                     ++token_index) {
+                    const int token = row_tokens[token_index];
+                    // A stop token is retained in the request sequence so the
+                    // request agrees with the engine's committed state, but no
+                    // token at or after it is streamed to the caller. The
+                    // row-level flag is authoritative for checkpoint EOS, which
+                    // the scheduler cannot identify without the model config.
+                    const bool token_stops =
+                        !req->sampling.ignore_eos &&
+                        !req->sampling.stop_token_ids.empty() &&
+                        std::find(req->sampling.stop_token_ids.begin(),
+                                  req->sampling.stop_token_ids.end(), token) !=
+                            req->sampling.stop_token_ids.end();
+                    req->generated_tokens.push_back(token);
+                    req->last_token = token;
+                    if (token_stops) {
+                        stopped = true;
+                        break;
                     }
+                    const bool checkpoint_stop_at_row_end =
+                        row_stopped && token_index + 1 == row_tokens.size();
+                    if (req->token_callback && !checkpoint_stop_at_row_end) {
+                        emitted.emplace_back(req, token);
+                    }
+                }
+                req->seq_len += position_advance;
+                if (has_row_metadata) {
+                    req->proposed_drafts += result.proposed_drafts[i];
+                    req->accepted_drafts += result.accepted_drafts[i];
+                    if (result.used_speculative[i]) ++req->speculative_steps;
+                    if (result.rolled_back[i]) ++req->rollback_steps;
+                }
 
-                    // Check if finished. A stop token remains in the scheduler's
-                    // sequence so it agrees with the engine's KV state, but it is
-                    // not delivered to a streaming caller.
-                    const bool stopped =
-                        i < result.hit_stop_token.size() && result.hit_stop_token[i];
-                    if (i < result.finished.size() && result.finished[i]) {
-                        req->finished = true;
-                    }
-                    if (stopped) {
-                        req->stopped_on_token = true;
-                    }
-                    if (req->token_callback && !stopped) {
-                        emitted.emplace_back(req, req->last_token);
-                    }
+                // The engine already applies checkpoint EOS when the request
+                // leaves stop_token_ids empty. In that case its row-level flag is
+                // authoritative; explicit per-request stop IDs are checked above
+                // so the streamed suffix can be truncated at the exact token.
+                if (i < result.finished.size() && result.finished[i]) {
+                    req->finished = true;
+                }
+                if (stopped || (i < result.hit_stop_token.size() &&
+                                result.hit_stop_token[i])) {
+                    req->finished = true;
+                    req->stopped_on_token = true;
+                }
 
-                    // Check max_new_tokens
-                    if (req->generated_tokens.size() >=
-                        static_cast<size_t>(req->sampling.max_new_tokens)) {
-                        req->finished = true;
-                    }
+                if (req->first_token_time == std::chrono::steady_clock::time_point{} &&
+                    !req->generated_tokens.empty()) {
+                    req->first_token_time = std::chrono::steady_clock::now();
+                }
+                if (req->generated_tokens.size() >=
+                    static_cast<size_t>(req->sampling.max_new_tokens)) {
+                    req->finished = true;
                 }
             }
         }
@@ -653,6 +734,10 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     }
     result.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
     result.completion_tokens = static_cast<int>(req->generated_tokens.size());
+    result.proposed_drafts = req->proposed_drafts;
+    result.accepted_drafts = req->accepted_drafts;
+    result.speculative_steps = req->speculative_steps;
+    result.rollback_steps = req->rollback_steps;
 
     // Calculate timings
     auto submit = req->submit_time;

@@ -112,11 +112,9 @@ struct QwenEngineOptions {
     // fixed-size blocks handed out as tokens arrive, so batch size scales with
     // what the requests actually hold.
     //
-    // FP16 only: batched decode already routes to the FP16 kernels before the
-    // dtype branches are reached, so paging FP16 covers all of batched decode
-    // while the quantized caches keep their validated scale and packed-slot
-    // arithmetic untouched. Construction rejects the other dtypes rather than
-    // silently falling back.
+    // CUDA FP16, FP8, and TurboQuant paging use their matching cache address
+    // arithmetic. Native MTP keeps a separate predictor cache and is rejected
+    // with paging until that cache has a page-table-aware allocation.
     bool kv_paged = false;
     // Tokens per block. 16 follows vLLM; at kv_heads * head_dim = 1024 FP16
     // elements that is 32 KiB of contiguity per block, so reads stay coalesced
@@ -338,6 +336,14 @@ public:
         const std::vector<int>& tokens, const std::vector<int>& slot_ids,
         const std::vector<BatchSamplingParams>* per_row_params = nullptr);
 
+    // One speculative transaction per row. The reference implementation is
+    // serialized because each drafter owns reusable activation scratch and the
+    // recurrent verifier must preserve order within each slot. It preserves
+    // slot isolation and TP ordering but does not claim cross-request speedup.
+    std::vector<ForwardResult> batch_speculative_tokens(
+        const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+        const std::vector<int>& draft_counts);
+
     // Check if batched API is supported (depends on build config)
     bool supports_batching() const;
 
@@ -356,9 +362,10 @@ public:
         Reset = 2,
         Shutdown = 3,
         BatchDecodeStep = 4,
-        // Releases one slot's paged blocks on every rank. Under the contiguous
-        // arena a slot owns max_context implicitly, so there is nothing to
-        // broadcast and this command is only sent when paging is on.
+        BatchSpeculativeStep = 6,
+        // Releases one slot's state on every rank. Paging additionally returns
+        // its blocks to the pool; contiguous storage still needs the recurrent,
+        // predictor, and prefix state reset.
         FreeSlot = 5,
     };
     // slot_id selects the KV cache slot the workers must use, so it has to match
@@ -371,6 +378,9 @@ public:
     // tokens and their slots travel together as one interleaved payload.
     void worker_command_batch_decode(const std::vector<int>& tokens,
                                      const std::vector<int>& slot_ids);
+    void worker_command_batch_speculative(
+        const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+        const std::vector<int>& draft_counts);
     void worker_command_reset();
     void worker_command_shutdown();
     void worker_command_free_slot(int32_t slot_id);

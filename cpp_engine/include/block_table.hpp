@@ -26,12 +26,17 @@ public:
     // Ensures `slot` is backed to at least `tokens` logical positions, taking
     // blocks from the pool as needed. Returns false without changing anything
     // when the pool cannot cover the growth, so the caller can leave the request
-    // waiting instead of failing it. Shrinking is not supported: a sequence only
-    // ever grows until it is released.
+    // waiting instead of failing it. Ordinary request growth is monotonic; the
+    // explicit trim_capacity() operation is used only after over-reserving a
+    // speculative step.
     bool ensure_capacity(int slot, int tokens);
 
     // Returns every block held by `slot` to the pool and clears the row.
     void release(int slot);
+
+    // Releases trailing blocks that are no longer needed for `tokens` logical
+    // positions. The logical position itself is not changed.
+    void trim_capacity(int slot, int tokens);
 
     void release_all();
 

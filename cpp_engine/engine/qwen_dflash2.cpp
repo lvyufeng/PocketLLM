@@ -494,10 +494,11 @@ struct QwenDFlash2Runtime::Impl {
     int device = 0;
     std::string nccl_id_path;
     int max_context = 0;
-    int committed = 0;
+    int max_slots = 1;
+    std::vector<int> committed;
+    std::vector<int> prepared_context;
     // Raw target taps can be appended while target prefill/verification runs;
     // projection and DFlash2 K/V preparation are flushed once before drafting.
-    int prepared_context = 0;
     uint64_t weight_bytes = 0;
     uint64_t cache_bytes = 0;
     std::vector<DeviceLayer> layers;
@@ -580,20 +581,22 @@ struct QwenDFlash2Runtime::Impl {
     Impl(const std::string& checkpoint_dir_, const QwenDFlash2Config& config_,
          const QwenDFlash2WeightMap& weights_, const QwenDeviceTensor& embedding,
          QwenTargetHeadAdapter target_head_, int world, int rank, int device_,
-         std::string id_path, int max_context_)
+         std::string id_path, int max_context_, int max_slots_)
         : checkpoint_dir(checkpoint_dir_), config(config_), weight_map(weights_),
           index(SafeTensorsIndex::from_single_file(checkpoint_dir_)),
           target_embedding(embedding), target_head(target_head_),
           tp_world(world), tp_rank(rank), device(device_),
           nccl_id_path(std::move(id_path)), max_context(max_context_),
-          profiler(device_, rank) {
-        if (device < 0 || max_context <= 0 ||
+          max_slots(max_slots_), profiler(device_, rank) {
+        if (device < 0 || max_context <= 0 || max_slots <= 0 ||
             target_embedding.device_dtype != SafeDType::F16 ||
             target_embedding.shape.size() != 2 ||
             target_embedding.shape[1] != static_cast<uint64_t>(config.hidden_size) ||
             !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DFlash2 runtime target tensors");
         }
+        committed.assign(static_cast<size_t>(max_slots), 0);
+        prepared_context.assign(static_cast<size_t>(max_slots), 0);
         check_device(device_set(device), "select Qwen DFlash2 device");
         grouped_attention = env_enabled("POCKETLLM_DFLASH2_GROUPED_ATTN");
         fused_swiglu = env_enabled("POCKETLLM_DFLASH2_FUSED_SWIGLU");
@@ -636,10 +639,17 @@ struct QwenDFlash2Runtime::Impl {
         successor = qwen_upload_tensor(index, weight_map.successor_codebook());
         selector_projection = qwen_upload_tensor(index, weight_map.selector_projection());
         weight_bytes = weight_map.local_device_bytes();
-        const size_t tap_elements = static_cast<size_t>(max_context) * config.hidden_size * config.target_layer_ids.size();
-        allocate_half(context_taps, tap_elements, {static_cast<uint64_t>(max_context), static_cast<uint64_t>(config.hidden_size * config.target_layer_ids.size())});
+        const size_t tap_elements = static_cast<size_t>(max_slots) *
+            static_cast<size_t>(max_context) * config.hidden_size *
+            config.target_layer_ids.size();
+        allocate_half(context_taps, tap_elements,
+                      {static_cast<uint64_t>(max_slots),
+                       static_cast<uint64_t>(max_context),
+                       static_cast<uint64_t>(config.hidden_size *
+                                             config.target_layer_ids.size())});
         layers.reserve(weight_map.layers().size());
-        const size_t context_elements = static_cast<size_t>(max_context) * local_kv_dim;
+        const size_t context_elements = static_cast<size_t>(max_slots) *
+            static_cast<size_t>(max_context) * local_kv_dim;
         for (const QwenDFlash2LayerWeights& source : weight_map.layers()) {
             DeviceLayer layer;
             layer.input_norm = qwen_upload_tensor(index, source.input_layernorm);
@@ -657,7 +667,11 @@ struct QwenDFlash2Runtime::Impl {
             layer.attention_conv.projection.weight = qwen_upload_tensor(index, source.attention_conv.kernel_projection.weight);
             layer.mlp_conv.base = qwen_upload_tensor(index, source.mlp_conv.base_kernel);
             layer.mlp_conv.projection.weight = qwen_upload_tensor(index, source.mlp_conv.kernel_projection.weight);
-            allocate_half(layer.context_k, context_elements, {static_cast<uint64_t>(max_context), static_cast<uint64_t>(local_kv_heads), static_cast<uint64_t>(config.head_dim)});
+            allocate_half(layer.context_k, context_elements,
+                          {static_cast<uint64_t>(max_slots),
+                           static_cast<uint64_t>(max_context),
+                           static_cast<uint64_t>(local_kv_heads),
+                           static_cast<uint64_t>(config.head_dim)});
             allocate_half(layer.context_v, context_elements, layer.context_k.shape);
             cache_bytes += layer.context_k.nbytes + layer.context_v.nbytes;
             layers.push_back(std::move(layer));
@@ -767,29 +781,53 @@ struct QwenDFlash2Runtime::Impl {
             columns), "DFlash2 projection");
     }
 
-    void append_target_taps(const uint16_t* taps, int rows, int position_offset) {
-        if (!taps || rows <= 0 || position_offset != committed || position_offset + rows > max_context) throw std::runtime_error("invalid Qwen DFlash2 target tap append");
+    int position_for(int slot_id) const {
+        if (slot_id < 0 || slot_id >= max_slots) {
+            throw std::runtime_error("Qwen DFlash2 slot is out of range");
+        }
+        return committed[static_cast<size_t>(slot_id)];
+    }
+
+    size_t tap_offset(int slot_id, int position) const {
+        const size_t width = static_cast<size_t>(config.hidden_size) *
+            config.target_layer_ids.size();
+        (void)position_for(slot_id);
+        return (static_cast<size_t>(slot_id) * max_context + position) * width;
+    }
+
+    size_t context_offset(int slot_id, int position, int kv_dim) const {
+        (void)position_for(slot_id);
+        return (static_cast<size_t>(slot_id) * max_context + position) *
+               static_cast<size_t>(kv_dim);
+    }
+
+    void append_target_taps(const uint16_t* taps, int rows, int position_offset,
+                            int slot_id) {
+        if (!taps || rows <= 0 || position_offset != position_for(slot_id) ||
+            position_offset + rows > max_context) throw std::runtime_error("invalid Qwen DFlash2 target tap append");
         const int width = config.hidden_size * static_cast<int>(config.target_layer_ids.size());
         const std::vector<uint64_t> tap_shape = {
             static_cast<uint64_t>(rows), static_cast<uint64_t>(width)};
         profiler.begin("context_append");
-        check_device(memcpy_d2d(context_taps.f16_data() + static_cast<size_t>(position_offset) * width,
+        check_device(memcpy_d2d(context_taps.f16_data() + tap_offset(slot_id, position_offset),
                                 taps, static_cast<size_t>(rows) * width * sizeof(uint16_t)), "append DFlash2 target taps");
         profiler.end();
         dump_half("target_taps", taps, tap_shape);
-        committed += rows;
+        committed[static_cast<size_t>(slot_id)] += rows;
     }
 
-    void prepare_context() {
-        if (prepared_context == committed) return;
-        if (prepared_context < 0 || prepared_context > committed) {
+    void prepare_context(int slot_id) {
+        const int committed_position = position_for(slot_id);
+        int& prepared = prepared_context[static_cast<size_t>(slot_id)];
+        if (prepared == committed_position) return;
+        if (prepared < 0 || prepared > committed_position) {
             throw std::runtime_error("invalid Qwen DFlash2 prepared context");
         }
-        const int position_offset = prepared_context;
-        const int rows = committed - prepared_context;
+        const int position_offset = prepared;
+        const int rows = committed_position - prepared;
         const int width = config.hidden_size * static_cast<int>(config.target_layer_ids.size());
         const uint16_t* taps = context_taps.f16_data() +
-            static_cast<size_t>(position_offset) * width;
+            tap_offset(slot_id, position_offset);
         const std::vector<uint64_t> tap_shape = {
             static_cast<uint64_t>(rows), static_cast<uint64_t>(width)};
         dump_half("context.pending_target_taps", taps, tap_shape);
@@ -824,21 +862,25 @@ struct QwenDFlash2Runtime::Impl {
             dump_half_sharded(prefix + "k_norm", knorm.f16_data(), knorm.shape);
             require_launch(qwen_dflash2_rope_k_rows_f16_cuda(knorm.f16_data(), rows, local_kv_heads, config.head_dim, position_offset, static_cast<float>(config.rope_theta)), "DFlash2 context K RoPE");
             dump_half_sharded(prefix + "k_rope", knorm.f16_data(), knorm.shape);
-            check_device(memcpy_d2d(layer.context_k.f16_data() + static_cast<size_t>(position_offset) * kv_dim,
+            const size_t cache_offset = context_offset(
+                slot_id, position_offset, kv_dim);
+            check_device(memcpy_d2d(layer.context_k.f16_data() + cache_offset,
                                     knorm.f16_data(), k.nbytes), "append DFlash2 context K");
-            check_device(memcpy_d2d(layer.context_v.f16_data() + static_cast<size_t>(position_offset) * kv_dim,
+            check_device(memcpy_d2d(layer.context_v.f16_data() + cache_offset,
                                     v.f16_data(), v.nbytes), "append DFlash2 context V");
         }
         profiler.end();
         profiler.flush("prepare_context");
-        prepared_context = committed;
+        prepared = committed_position;
     }
 
     // One denoising pass over the block. `host_tokens` supplies the row inputs:
     // row 0 is the committed anchor and the remaining rows are either mask tokens
     // (first pass) or the previous pass's drafts (refinement passes). The selected
     // path is left in `path` on the device.
-    void denoise_pass(int anchor_token, const std::vector<int>& host_tokens) {
+    void denoise_pass(int anchor_token, const std::vector<int>& host_tokens,
+                      int slot_id) {
+        const int committed_position = position_for(slot_id);
         const int rows = config.block_size;
         const int hidden = config.hidden_size;
         const int q_dim = local_q_dim;
@@ -928,7 +970,7 @@ struct QwenDFlash2Runtime::Impl {
             dump_half_sharded(prefix + "attention.k_norm", k.f16_data(), k.shape);
             require_launch(qwen_dflash2_rope_rows_f16_cuda(
                 q.f16_data(), k.f16_data(), rows, local_q_heads,
-                local_kv_heads, config.head_dim, committed,
+                local_kv_heads, config.head_dim, committed_position,
                 static_cast<float>(config.rope_theta)), "DFlash2 noise RoPE");
             profiler.end();
             dump_half_sharded(prefix + "attention.q_rope", q.f16_data(), q.shape);
@@ -938,16 +980,20 @@ struct QwenDFlash2Runtime::Impl {
             const bool grouped = use_grouped_attention();
             const bool attention_ok = grouped
                 ? qwen_dflash2_attention_grouped_f16_cuda(
-                    q.f16_data(), layer.context_k.f16_data(),
-                    layer.context_v.f16_data(), k.f16_data(), v.f16_data(),
+                    q.f16_data(), layer.context_k.f16_data() +
+                        context_offset(slot_id, 0, local_kv_dim),
+                    layer.context_v.f16_data() +
+                        context_offset(slot_id, 0, local_kv_dim), k.f16_data(), v.f16_data(),
                     attention.f16_data(), rows, local_q_heads,
-                    local_kv_heads, config.head_dim, committed,
+                    local_kv_heads, config.head_dim, committed_position,
                     max_context, config.sliding_window)
                 : qwen_dflash2_attention_f16_cuda(
-                    q.f16_data(), layer.context_k.f16_data(),
-                    layer.context_v.f16_data(), k.f16_data(), v.f16_data(),
+                    q.f16_data(), layer.context_k.f16_data() +
+                        context_offset(slot_id, 0, local_kv_dim),
+                    layer.context_v.f16_data() +
+                        context_offset(slot_id, 0, local_kv_dim), k.f16_data(), v.f16_data(),
                     attention.f16_data(), rows, local_q_heads,
-                    local_kv_heads, config.head_dim, committed,
+                    local_kv_heads, config.head_dim, committed_position,
                     max_context, config.sliding_window);
             require_launch(attention_ok, grouped
                 ? "DFlash2 grouped attention" : "DFlash2 attention");
@@ -1195,18 +1241,19 @@ struct QwenDFlash2Runtime::Impl {
         dump_i32("selector.path", static_cast<const int*>(path.data), path.shape);
     }
 
-    QwenDFlash2Proposal propose(int anchor_token) {
+    QwenDFlash2Proposal propose(int anchor_token, int slot_id) {
+        const int committed_position = position_for(slot_id);
         if (anchor_token < 0 || anchor_token >= config.vocab_size ||
-            committed >= max_context) {
+            committed_position >= max_context) {
             throw std::runtime_error("invalid Qwen DFlash2 proposal anchor");
         }
-        prepare_context();
+        prepare_context(slot_id);
         const int rows = config.block_size;
         const int draft_rows = rows - 1;
         std::vector<int> host_tokens(static_cast<size_t>(rows),
                                     config.mask_token_id);
         host_tokens[0] = anchor_token;
-        denoise_pass(anchor_token, host_tokens);
+        denoise_pass(anchor_token, host_tokens, slot_id);
         // Block diffusion denoises iteratively. The first pass conditions every
         // row on mask tokens, so late rows predict from an all-mask left context
         // and are the weakest drafts; feeding the pass's own tokens back in place
@@ -1224,7 +1271,7 @@ struct QwenDFlash2Runtime::Impl {
             }
             if (next == host_tokens) break;
             host_tokens = next;
-            denoise_pass(anchor_token, host_tokens);
+            denoise_pass(anchor_token, host_tokens, slot_id);
         }
         QwenDFlash2Proposal proposal;
         proposal.tokens.resize(static_cast<size_t>(draft_rows));
@@ -1262,23 +1309,28 @@ QwenDFlash2Runtime::QwenDFlash2Runtime(
     const QwenDFlash2WeightMap& weights,
     const QwenDeviceTensor& target_embedding,
     QwenTargetHeadAdapter target_head, int tp_world, int tp_rank, int device,
-    std::string nccl_id_path, int max_context)
+    std::string nccl_id_path, int max_context, int max_slots)
     : impl_(std::make_unique<Impl>(
           checkpoint_dir, config, weights, target_embedding, target_head,
-          tp_world, tp_rank, device, std::move(nccl_id_path), max_context)) {}
+          tp_world, tp_rank, device, std::move(nccl_id_path), max_context,
+          max_slots)) {}
 
 QwenDFlash2Runtime::~QwenDFlash2Runtime() = default;
-void QwenDFlash2Runtime::reset() {
-    impl_->committed = 0;
-    impl_->prepared_context = 0;
+void QwenDFlash2Runtime::reset(int slot_id) {
+    (void)impl_->position_for(slot_id);
+    impl_->committed[static_cast<size_t>(slot_id)] = 0;
+    impl_->prepared_context[static_cast<size_t>(slot_id)] = 0;
 }
-int QwenDFlash2Runtime::committed_position() const { return impl_->committed; }
+int QwenDFlash2Runtime::committed_position(int slot_id) const {
+    return impl_->position_for(slot_id);
+}
 void QwenDFlash2Runtime::set_debug_callback(
     QwenDFlash2DebugCallback callback) {
     impl_->debug_callback = std::move(callback);
 }
 void QwenDFlash2Runtime::debug_load_target_taps(
-    const std::vector<uint16_t>& taps, int rows, int position_offset) {
+    const std::vector<uint16_t>& taps, int rows, int position_offset,
+    int slot_id) {
     const size_t width = static_cast<size_t>(impl_->config.hidden_size) *
         impl_->config.target_layer_ids.size();
     if (rows <= 0 || position_offset < 0 ||
@@ -1290,31 +1342,40 @@ void QwenDFlash2Runtime::debug_load_target_taps(
                   {static_cast<uint64_t>(rows), static_cast<uint64_t>(width)});
     check_device(memcpy_h2d(device_taps.data, taps.data(), taps.size() * sizeof(uint16_t)),
                  "upload host Qwen DFlash2 target taps");
-    impl_->append_target_taps(device_taps.f16_data(), rows, position_offset);
+    impl_->append_target_taps(device_taps.f16_data(), rows, position_offset,
+                              slot_id);
 }
 QwenDFlash2Proposal QwenDFlash2Runtime::debug_propose_from_host(
     const std::vector<uint16_t>& taps, int context_rows, int position_offset,
-    int anchor_token) {
-    if (impl_->committed != position_offset) {
-        if (position_offset <= impl_->committed) {
-            impl_->committed = position_offset;
-            impl_->prepared_context = std::min(impl_->prepared_context, position_offset);
+    int anchor_token, int slot_id) {
+    const int committed_position = impl_->position_for(slot_id);
+    if (committed_position != position_offset) {
+        if (position_offset <= committed_position) {
+            impl_->committed[static_cast<size_t>(slot_id)] = position_offset;
+            impl_->prepared_context[static_cast<size_t>(slot_id)] = std::min(
+                impl_->prepared_context[static_cast<size_t>(slot_id)], position_offset);
         } else {
             throw std::runtime_error("host Qwen DFlash2 fixture has a context gap");
         }
     }
-    debug_load_target_taps(taps, context_rows, position_offset);
-    return impl_->propose(anchor_token);
+    debug_load_target_taps(taps, context_rows, position_offset, slot_id);
+    return impl_->propose(anchor_token, slot_id);
 }
 uint64_t QwenDFlash2Runtime::resident_weight_bytes() const { return impl_->weight_bytes; }
 uint64_t QwenDFlash2Runtime::context_cache_bytes() const { return impl_->cache_bytes; }
 uint64_t QwenDFlash2Runtime::activation_workspace_bytes() const { return impl_->activation_workspace_bytes(); }
-void QwenDFlash2Runtime::append_target_taps(const uint16_t* taps, int rows, int position_offset) { impl_->append_target_taps(taps, rows, position_offset); }
-void QwenDFlash2Runtime::crop_context(int position) {
-    if (position < 0 || position > impl_->committed) throw std::runtime_error("invalid Qwen DFlash2 context crop");
-    impl_->committed = position;
-    impl_->prepared_context = std::min(impl_->prepared_context, position);
+void QwenDFlash2Runtime::append_target_taps(const uint16_t* taps, int rows,
+                                            int position_offset, int slot_id) {
+    impl_->append_target_taps(taps, rows, position_offset, slot_id);
 }
-QwenDFlash2Proposal QwenDFlash2Runtime::propose(int anchor_token) { return impl_->propose(anchor_token); }
+void QwenDFlash2Runtime::crop_context(int position, int slot_id) {
+    if (position < 0 || position > impl_->position_for(slot_id)) throw std::runtime_error("invalid Qwen DFlash2 context crop");
+    impl_->committed[static_cast<size_t>(slot_id)] = position;
+    impl_->prepared_context[static_cast<size_t>(slot_id)] = std::min(
+        impl_->prepared_context[static_cast<size_t>(slot_id)], position);
+}
+QwenDFlash2Proposal QwenDFlash2Runtime::propose(int anchor_token, int slot_id) {
+    return impl_->propose(anchor_token, slot_id);
+}
 
 }  // namespace pocket
