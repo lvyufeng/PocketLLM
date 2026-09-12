@@ -145,7 +145,22 @@ Prefer typed `EngineArgs` and explicit CLI options. `EngineArgs.from_env()` exis
 
 ## Native C++ Python module
 
-The native bridge is optional and does not affect CPU-only imports:
+The native bridge is optional and does not affect CPU-only imports. You can build it as part of
+`pip install` (recommended) or manually via CMake.
+
+### Via pip install
+
+```bash
+POCKETLLM_BUILD_CPP=1 pip install --no-build-isolation .
+```
+
+The `--no-build-isolation` flag ensures the active environment's Torch is the one that drives the
+Torch extension build. Without `POCKETLLM_BUILD_CPP=1`, the install skips the native module and
+produces only the Torch runtime.
+
+The native module installs top-level (`import pocketllm_cpp`), so no manual copy is needed.
+
+### Manual CMake build
 
 ```bash
 cmake -S cpp_engine -B cpp_engine/build-python \

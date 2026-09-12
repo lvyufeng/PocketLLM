@@ -63,10 +63,27 @@ The runtime is intentionally model-specific. DeepSeek-V4 uses MLA/indexing and r
 
 ## Quick start
 
-### Build the Python extensions
+### Install the Python package
 
 ```bash
 python -m pip install -r requirements.txt
+python -m pip install --no-build-isolation .
+```
+
+This installs the `pocketllm` package and the `pocketllm` CLI. `--no-build-isolation` keeps the
+build using the active environment's Torch, which must match the CUDA toolkit the extensions
+compile against.
+
+To also build the optional native C++ engine module (`pocketllm_cpp`), which the
+`backend="cpp"` path needs:
+
+```bash
+POCKETLLM_BUILD_CPP=1 python -m pip install --no-build-isolation .
+```
+
+Building the Torch extensions in place, without installing, still works:
+
+```bash
 python setup.py build_ext
 ```
 
