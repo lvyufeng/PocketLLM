@@ -17,14 +17,25 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace pocket {
 
 namespace {
+
+std::string make_request_id() {
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    static std::uniform_int_distribution<uint64_t> dist;
+    std::ostringstream os;
+    os << "req_" << std::hex << dist(gen);
+    return os.str();
+}
 
 std::string json_escape(const std::string& s) {
     std::string out;
@@ -156,14 +167,6 @@ std::pair<std::string, std::string> split_utf8_complete(const std::string& s) {
     return { s, "" };
 }
 
-std::string make_request_id() {
-    using clock = std::chrono::steady_clock;
-    auto t = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
-    std::ostringstream os;
-    os << "chatcmpl-cpp-" << std::hex << t;
-    return os.str();
-}
-
 std::string render_choice_message(const std::string& content, const std::string& reasoning, const std::string& tool_calls_json) {
     std::ostringstream os;
     os << "{\"role\":\"assistant\"";
@@ -248,6 +251,15 @@ struct OpenAIServer::Impl {
     const int think_end_id;
     EngineMetrics metrics;
 
+    // Request tracking for cancellation API
+    struct TrackedRequest {
+        uint64_t scheduler_id;
+        std::string client_id;
+        std::chrono::steady_clock::time_point start_time;
+    };
+    std::mutex tracked_requests_mutex_;
+    std::unordered_map<std::string, TrackedRequest> tracked_requests_;
+
     Impl(InferenceEngine& e, const Tokenizer& t, PythonSidecar& s, const OpenAIServerConfig& c)
         : engine(e), tok(t), sidecar(s), cfg(c),
           sched(&e, c.max_batch_size > 0 ? c.max_batch_size : 1),
@@ -289,6 +301,33 @@ struct OpenAIServer::Impl {
             stats.free_blocks, stats.cache_pinned_blocks, cache_stats);
 
         res.set_content(body, "text/plain; version=0.0.4");
+    }
+
+    void handle_cancel_request(const httplib::Request& req, httplib::Response& res) {
+        const std::string request_id = req.path_params.at("id");
+
+        uint64_t scheduler_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            auto it = tracked_requests_.find(request_id);
+            if (it == tracked_requests_.end()) {
+                res.status = 404;
+                std::ostringstream os;
+                os << "{\"error\":{\"message\":\"Request not found or already completed\","
+                   << "\"type\":\"invalid_request_error\"}}";
+                res.set_content(os.str(), "application/json");
+                return;
+            }
+            scheduler_id = it->second.scheduler_id;
+        }
+
+        const bool cancelled = sched.cancel_request(scheduler_id);
+
+        std::ostringstream os;
+        os << "{\"id\":\"" << json_escape(request_id) << "\""
+           << ",\"object\":\"request.cancel\""
+           << ",\"cancelled\":" << (cancelled ? "true" : "false") << "}";
+        res.set_content(os.str(), "application/json");
     }
 
     // Rejects a request that names sampling this engine cannot vary per row
@@ -348,7 +387,8 @@ struct OpenAIServer::Impl {
     bool encode_request(const std::string& body, const JsonObject& obj,
                         EncodeReply& out, std::string& thinking_mode_out,
                         int& max_tokens_out, bool& stream_out,
-                        BatchSamplingParams& sp_out, std::string& err_out) {
+                        BatchSamplingParams& sp_out, std::string& request_id_out,
+                        std::string& err_out) {
         if (!check_sampling_supported(obj, err_out)) return false;
 
         EncodeRequest enc;
@@ -363,6 +403,12 @@ struct OpenAIServer::Impl {
         max_tokens_out = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
         if (max_tokens_out <= 0) max_tokens_out = cfg.default_max_tokens;
         stream_out = get_bool(obj, "stream", false);
+
+        // Extract optional request_id from client, or generate one
+        request_id_out = get_string(obj, "request_id", "");
+        if (request_id_out.empty()) {
+            request_id_out = make_request_id();
+        }
 
         // An engine that fixes its own sampling ignores these; check_sampling_
         // supported has already established the request agrees with them, so
@@ -415,8 +461,9 @@ struct OpenAIServer::Impl {
         int max_tokens = 0;
         bool stream = false;
         BatchSamplingParams sp;
+        std::string client_id;
         std::string err;
-        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, err)) {
+        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, err)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
@@ -438,9 +485,9 @@ struct OpenAIServer::Impl {
         }
 
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, thinking_mode, request_start);
+            handle_stream(req, res, enc_reply, sp, thinking_mode, client_id, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, thinking_mode, request_start);
+            handle_nonstream(res, enc_reply, sp, thinking_mode, client_id, request_start);
         }
     }
 
@@ -456,6 +503,7 @@ struct OpenAIServer::Impl {
 
     void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
                           const BatchSamplingParams& sp, const std::string& thinking_mode,
+                          const std::string& client_id,
                           std::chrono::steady_clock::time_point request_start) {
         std::chrono::steady_clock::time_point ttft_time;
         bool ttft_recorded = false;
@@ -472,6 +520,12 @@ struct OpenAIServer::Impl {
             return;
         }
 
+        // Track request for cancellation API
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
+        }
+
         int unused_token = 0;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(cfg.request_timeout_seconds);
@@ -484,6 +538,13 @@ struct OpenAIServer::Impl {
             // requests are not duplicated into poll_result(), abandoning this
             // HTTP response leaves no completed-result map entry behind.
             sched.cancel_request(request_id);
+
+            // Cleanup tracking
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
             emit_error(res, 504, "generation timed out");
             return;
         }
@@ -496,6 +557,12 @@ struct OpenAIServer::Impl {
         {
             std::lock_guard<std::mutex> lk(completion->m);
             out = completion->result;
+        }
+
+        // Cleanup tracking
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_.erase(client_id);
         }
 
         const auto request_end = std::chrono::steady_clock::now();
@@ -518,7 +585,7 @@ struct OpenAIServer::Impl {
         std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
 
         std::ostringstream os;
-        os << "{\"id\":\"" << make_request_id() << "\""
+        os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"chat.completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
@@ -532,14 +599,13 @@ struct OpenAIServer::Impl {
 
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
-                       const std::string& thinking_mode,
+                       const std::string& thinking_mode, const std::string& client_id,
                        std::chrono::steady_clock::time_point request_start) {
-        const std::string id = make_request_id();
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, id, created, thinking_mode, request_start]
+            [this, enc, sp, client_id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             std::chrono::steady_clock::time_point ttft_time;
@@ -548,7 +614,7 @@ struct OpenAIServer::Impl {
             auto send_chunk = [&](const std::string& delta, const char* field,
                                   const char* finish_reason = nullptr) {
                 std::ostringstream os;
-                os << "{\"id\":\"" << id << "\",\"object\":\"chat.completion.chunk\""
+                os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
                    << ",\"choices\":[{\"index\":0,\"delta\":{";
                 if (!delta.empty()) {
@@ -576,7 +642,7 @@ struct OpenAIServer::Impl {
             // First chunk: role marker.
             {
                 std::ostringstream os;
-                os << "{\"id\":\"" << id << "\",\"object\":\"chat.completion.chunk\""
+                os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
                    << ",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}";
                 std::string line = "data: " + os.str() + "\n\n";
@@ -598,6 +664,12 @@ struct OpenAIServer::Impl {
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
+            }
+
+            // Track request for cancellation API
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
             }
 
             // Sliding-window prefix used to compute deltas + UTF-8 boundary buffer.
@@ -692,6 +764,12 @@ struct OpenAIServer::Impl {
             const bool success = !timed_out && generation_error.empty();
             metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
 
+            // Cleanup tracking
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
             if (timed_out) send_error("generation timed out");
             if (!generation_error.empty()) {
                 send_error(generation_error);
@@ -717,6 +795,10 @@ struct OpenAIServer::Impl {
         svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) { handle_metrics(res); });
         svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
             try { handle_chat_completions(req, res); }
+            catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
+        });
+        svr.Delete("/v1/requests/:id", [this](const httplib::Request& req, httplib::Response& res) {
+            try { handle_cancel_request(req, res); }
             catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
         });
         std::cerr << "[server] listening on " << cfg.host << ":" << cfg.port << "\n";
