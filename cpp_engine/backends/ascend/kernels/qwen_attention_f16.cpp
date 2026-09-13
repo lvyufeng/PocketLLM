@@ -550,7 +550,7 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_kernel(
 // simple enough to validate on first-generation 910.
 namespace {
 
-constexpr uint32_t kVectorPositionTile = 16;
+constexpr uint32_t kVectorPositionTile = 32;
 constexpr uint32_t kVectorHeadCapacity = 256;
 
 struct VectorAttentionBuffers {
