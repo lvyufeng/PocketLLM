@@ -805,9 +805,9 @@ std::vector<double> attention_reference(const std::vector<uint16_t>& q,
     return output;
 }
 
-void test_gqa_decode_case(std::mt19937& rng, int head_dim, int context_len) {
+void test_gqa_decode_case(std::mt19937& rng, int head_dim, int context_len,
+                          int kv_heads = 2) {
     const int q_heads = 6;
-    const int kv_heads = 2;
     const int max_context = context_len + 4;
     const std::vector<uint16_t> q =
         random_halves(static_cast<size_t>(q_heads) * head_dim, rng, 0.45f);
@@ -888,6 +888,7 @@ void test_gqa_decode(std::mt19937& rng) {
     test_gqa_decode_case(rng, 256, 64);
     test_gqa_decode_case(rng, 17, 65);
     test_gqa_decode_case(rng, 64, 133);
+    test_gqa_decode_case(rng, 256, 64, 1);
 }
 
 void test_argmax(std::mt19937& rng) {
@@ -945,33 +946,53 @@ void test_argmax(std::mt19937& rng) {
 }
 
 void test_gqa_prefill(std::mt19937& rng) {
-    const int rows = 3;
-    const int q_heads = 6;
-    const int kv_heads = 2;
-    const int head_dim = 32;
-    const int position_offset = 2;
-    const int max_context = 9;
-    const std::vector<uint16_t> q = random_halves(
-        static_cast<size_t>(rows) * q_heads * head_dim, rng, 0.45f);
-    std::vector<uint16_t> k_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    std::vector<uint16_t> v_cache = random_halves(
-        static_cast<size_t>(max_context) * kv_heads * head_dim, rng, 0.5f);
-    const size_t poison_start = static_cast<size_t>(position_offset + rows) *
-                                kv_heads * head_dim;
-    std::fill(k_cache.begin() + poison_start, k_cache.end(), float_to_half(40.0f));
-    std::fill(v_cache.begin() + poison_start, v_cache.end(), float_to_half(-40.0f));
-    DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
-    DeviceBuffer<uint16_t> d_out(static_cast<size_t>(rows) * q_heads * head_dim);
-    expect(pocket::qwen_gqa_prefill_attention_f16(
-               d_q.get(), d_k.get(), d_v.get(), d_out.get(), rows, q_heads,
-               kv_heads, head_dim, position_offset, max_context),
-           "GQA prefill launch");
-    sync_or_throw("GQA prefill");
-    expect_half_close(d_out.download(),
-                      attention_reference(q, k_cache, v_cache, rows, q_heads,
-                                          kv_heads, head_dim, position_offset),
-                      5.0e-3, 2.0e-3, "GQA prefill output");
+    struct Shape {
+        int rows;
+        int q_heads;
+        int kv_heads;
+        int head_dim;
+        int position_offset;
+        int max_context;
+        const char* name;
+    };
+    const Shape shapes[] = {
+        {3, 6, 2, 32, 2, 9, "general"},
+        {3, 6, 1, 256, 2, 9, "vector_aligned"},
+    };
+    for (const Shape& shape : shapes) {
+        const std::vector<uint16_t> q = random_halves(
+            static_cast<size_t>(shape.rows) * shape.q_heads * shape.head_dim,
+            rng, 0.45f);
+        std::vector<uint16_t> k_cache = random_halves(
+            static_cast<size_t>(shape.max_context) * shape.kv_heads * shape.head_dim,
+            rng, 0.5f);
+        std::vector<uint16_t> v_cache = random_halves(
+            static_cast<size_t>(shape.max_context) * shape.kv_heads * shape.head_dim,
+            rng, 0.5f);
+        const size_t poison_start = static_cast<size_t>(shape.position_offset +
+                                                         shape.rows) *
+                                    shape.kv_heads * shape.head_dim;
+        std::fill(k_cache.begin() + poison_start, k_cache.end(),
+                  float_to_half(40.0f));
+        std::fill(v_cache.begin() + poison_start, v_cache.end(),
+                  float_to_half(-40.0f));
+        DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
+        DeviceBuffer<uint16_t> d_out(static_cast<size_t>(shape.rows) *
+                                     shape.q_heads * shape.head_dim);
+        expect(pocket::qwen_gqa_prefill_attention_f16(
+                   d_q.get(), d_k.get(), d_v.get(), d_out.get(), shape.rows,
+                   shape.q_heads, shape.kv_heads, shape.head_dim,
+                   shape.position_offset, shape.max_context),
+               std::string("GQA prefill ") + shape.name + " launch");
+        sync_or_throw(std::string("GQA prefill ") + shape.name);
+        expect_half_close(
+            d_out.download(),
+            attention_reference(q, k_cache, v_cache, shape.rows, shape.q_heads,
+                                shape.kv_heads, shape.head_dim,
+                                shape.position_offset),
+            5.0e-3, 2.0e-3,
+            std::string("GQA prefill ") + shape.name + " output");
+    }
 }
 
 std::vector<double> gqa_verify_partial_reference(
@@ -1054,6 +1075,7 @@ void test_gqa_verify(std::mt19937& rng) {
         {2, 4, 2, 64, 131, 140, 3, "multi_tile"},
         {3, 6, 2, 17, 65, 72, 2, "unaligned"},
         {2, 2, 1, 17, 0, 8, 8, "empty_splits"},
+        {4, 6, 1, 256, 3, 10, 5, "vector_aligned"},
     };
     for (const Shape& shape : shapes) {
         const size_t q_count = static_cast<size_t>(shape.rows) * shape.q_heads *
@@ -1086,38 +1108,39 @@ void test_gqa_verify(std::mt19937& rng) {
         std::vector<float> partial_init(partial_count + 16, 12345.0f);
         d_out.upload(out_init);
         d_partial.upload(partial_init);
+        const size_t guard = std::string(shape.name) == "vector_aligned" ? 0 : 8;
 
         for (int pass = 0; pass < 2; ++pass) {
             expect(pocket::qwen_gqa_verify_attention_f16(
-                       d_q.get(), d_k.get(), d_v.get(), d_out.get() + 8,
-                       d_partial.get() + 8, shape.rows, shape.q_heads,
+                       d_q.get(), d_k.get(), d_v.get(), d_out.get() + guard,
+                       d_partial.get() + guard, shape.rows, shape.q_heads,
                        shape.kv_heads, shape.head_dim, shape.position_offset,
                        shape.max_context, shape.splits),
                    std::string("GQA verify ") + shape.name + " launch");
             sync_or_throw(std::string("GQA verify ") + shape.name);
             const std::vector<uint16_t> got_out = d_out.download();
             const std::vector<float> got_partial = d_partial.download();
-            std::vector<uint16_t> out_payload(got_out.begin() + 8,
-                                              got_out.begin() + 8 + out_count);
+            std::vector<uint16_t> out_payload(got_out.begin() + guard,
+                                              got_out.begin() + guard + out_count);
             expect_half_close(out_payload, want_output, 5.0e-3, 2.0e-3,
                               std::string("GQA verify ") + shape.name +
                                   " output");
-            std::vector<float> partial_payload(got_partial.begin() + 8,
-                                                got_partial.begin() + 8 + partial_count);
+            std::vector<float> partial_payload(got_partial.begin() + guard,
+                                                got_partial.begin() + guard + partial_count);
             expect_float_close(partial_payload, want_partial, 5.0e-4, 2.0e-4,
                                std::string("GQA verify ") + shape.name +
                                    " partials");
-            expect(std::equal(got_out.begin(), got_out.begin() + 8,
+            expect(std::equal(got_out.begin(), got_out.begin() + guard,
                               out_init.begin()),
                    std::string("GQA verify ") + shape.name + " output prefix guard");
-            expect(std::equal(got_out.begin() + 8 + out_count, got_out.end(),
-                              out_init.begin() + 8 + out_count),
+            expect(std::equal(got_out.begin() + guard + out_count, got_out.end(),
+                              out_init.begin() + guard + out_count),
                    std::string("GQA verify ") + shape.name + " output suffix guard");
-            expect(std::equal(got_partial.begin(), got_partial.begin() + 8,
+            expect(std::equal(got_partial.begin(), got_partial.begin() + guard,
                               partial_init.begin()),
                    std::string("GQA verify ") + shape.name + " partial prefix guard");
-            expect(std::equal(got_partial.begin() + 8 + partial_count,
-                              got_partial.end(), partial_init.begin() + 8 + partial_count),
+            expect(std::equal(got_partial.begin() + guard + partial_count,
+                              got_partial.end(), partial_init.begin() + guard + partial_count),
                    std::string("GQA verify ") + shape.name + " partial suffix guard");
         }
     }

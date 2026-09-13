@@ -1,10 +1,9 @@
 // First-generation Ascend 910 full-attention kernels.
 //
-// Decode and verify keep Q and probability tiles in UB. Exp runs on Vector;
-// QK and weighted-V accumulation still use the scalar path. Reusing probabilities
-// across value dimensions removes the O(head_dim^2 * context) recomputation that
-// dominated the correctness baseline. Cache padding, causal limits, and split
-// ownership remain explicit.
+// Scalar kernels below are retained as correctness fallbacks for irregular layouts.
+// The aligned Qwen path also has UB+Vector decode, prefill, and verify kernels that
+// load FP16 K/V tiles once, cast them to FP32, and avoid scalar GM inner loops.
+// Cache padding, causal limits, and split ownership remain explicit.
 
 #include "qwen_ascend_kernel_common.hpp"
 
@@ -542,5 +541,449 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_kernel(
         for (uint32_t d = 0; d < head_dim; ++d) {
             set_half(out_gm, q_offset + d, merged_tile.GetValue(d) * inverse);
         }
+    }
+}
+
+// Vectorized full-attention helpers. The scalar kernels above remain the neutral
+// fallback for irregular layouts. This path is deliberately tile-sequential: it
+// removes scalar GM traffic first, while keeping UB ownership and pipe ordering
+// simple enough to validate on first-generation 910.
+namespace {
+
+constexpr uint32_t kVectorPositionTile = 16;
+constexpr uint32_t kVectorHeadCapacity = 256;
+
+struct VectorAttentionBuffers {
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> q_half_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> row_half_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> q_float_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> row_float_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> product_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> accum_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> merged_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> score_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> exp_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> output_half_buf;
+
+    __aicore__ VectorAttentionBuffers() {
+        pipe.InitBuffer(q_half_buf, kVectorHeadCapacity * sizeof(half));
+        pipe.InitBuffer(row_half_buf,
+                        kVectorPositionTile * kVectorHeadCapacity * sizeof(half));
+        pipe.InitBuffer(q_float_buf, kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(row_float_buf,
+                        kVectorPositionTile * kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(product_buf, kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(accum_buf, kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(merged_buf, kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(score_buf, kVectorPositionTile * sizeof(float));
+        pipe.InitBuffer(exp_buf, kAlignFloat * sizeof(float));
+        pipe.InitBuffer(output_half_buf, kVectorHeadCapacity * sizeof(half));
+    }
+
+    __aicore__ AscendC::LocalTensor<half> q_half() {
+        return q_half_buf.Get<half>();
+    }
+    __aicore__ AscendC::LocalTensor<half> row_half() {
+        return row_half_buf.Get<half>();
+    }
+    __aicore__ AscendC::LocalTensor<float> q_float() {
+        return q_float_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> row_float() {
+        return row_float_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> product() {
+        return product_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> accum() {
+        return accum_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> merged() {
+        return merged_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> scores() {
+        return score_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> exp_work() {
+        return exp_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<half> output_half() {
+        return output_half_buf.Get<half>();
+    }
+};
+
+__aicore__ inline void load_vector_row(
+    const AscendC::GlobalTensor<half>& source,
+    AscendC::LocalTensor<half> half_tile,
+    AscendC::LocalTensor<float> float_tile,
+    uint32_t offset, uint32_t count) {
+    wait_scalar_before_load();
+    load_half_exact(half_tile, source, offset, count);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(float_tile, half_tile, AscendC::RoundMode::CAST_NONE, count);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+__aicore__ inline float vector_dot(
+    const AscendC::LocalTensor<float>& query,
+    const AscendC::LocalTensor<float>& key,
+    const AscendC::LocalTensor<float>& product,
+    uint32_t head_dim) {
+    AscendC::Mul(product, query, key, head_dim);
+    return fold_sum(product, head_dim);
+}
+
+__aicore__ inline float vector_score(
+    const AscendC::LocalTensor<float>& query,
+    const AscendC::LocalTensor<float>& key,
+    const AscendC::LocalTensor<float>& product,
+    const AscendC::LocalTensor<float>& scores,
+    uint32_t index, uint32_t head_dim, float scale) {
+    wait_scalar_before_compute();
+    const float value = vector_dot(query, key, product, head_dim) * scale;
+    scores.SetValue(index, value);
+    return value;
+}
+
+__aicore__ inline float vector_score_tile(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& cache,
+    uint32_t cache_base, uint32_t kv_heads, uint32_t head_dim,
+    const AscendC::LocalTensor<float>& query,
+    uint32_t count, float scale) {
+    AscendC::LocalTensor<float> scores = buffers.scores();
+    AscendC::LocalTensor<half> row_half = buffers.row_half();
+    AscendC::LocalTensor<float> row_float = buffers.row_float();
+    AscendC::LocalTensor<float> product = buffers.product();
+    load_vector_row(cache, row_half, row_float, cache_base,
+                    count * head_dim);
+    float maximum = -3.402823466e+38F;
+    for (uint32_t i = 0; i < count; ++i) {
+        const float score = vector_score(
+            query, row_float[i * head_dim], product, scores, i, head_dim, scale);
+        if (score > maximum) maximum = score;
+    }
+    (void)kv_heads;
+    return maximum;
+}
+
+__aicore__ inline float vector_max_pass(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& cache,
+    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t begin, uint32_t end,
+    const AscendC::LocalTensor<float>& query, float scale) {
+    float maximum = -3.402823466e+38F;
+    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
+        const uint32_t count = min_u32(kVectorPositionTile, end - start);
+            const uint32_t cache_base = (start * kv_heads + kv_head) * head_dim;
+        const float tile_max = vector_score_tile(
+            buffers, cache, cache_base, kv_heads, head_dim, query, count, scale);
+        if (tile_max > maximum) maximum = tile_max;
+    }
+    return maximum;
+}
+
+__aicore__ inline float vector_value_pass(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& key_cache,
+    const AscendC::GlobalTensor<half>& value_cache,
+    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t begin, uint32_t end,
+    const AscendC::LocalTensor<float>& query, float scale, float maximum) {
+    AscendC::LocalTensor<float> accum = buffers.accum();
+    AscendC::LocalTensor<float> scores = buffers.scores();
+    AscendC::LocalTensor<float> row_float = buffers.row_float();
+    AscendC::LocalTensor<half> row_half = buffers.row_half();
+    AscendC::LocalTensor<float> product = buffers.product();
+    for (uint32_t d = 0; d < head_dim; ++d) accum.SetValue(d, 0.0f);
+    wait_scalar_before_compute();
+    AscendC::PipeBarrier<PIPE_V>();
+
+    float denominator = 0.0f;
+    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
+        const uint32_t count = min_u32(kVectorPositionTile, end - start);
+        const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
+        load_vector_row(key_cache, row_half, row_float, key_base,
+                        count * head_dim);
+        for (uint32_t i = 0; i < count; ++i) {
+            wait_scalar_before_compute();
+            const float score = vector_dot(
+                query, row_float[i * head_dim], product, head_dim) * scale;
+            scores.SetValue(i, score - maximum);
+        }
+        for (uint32_t i = count; i < kVectorPositionTile; ++i) {
+            scores.SetValue(i, -3.402823466e+38F);
+        }
+        wait_scalar_before_compute();
+        AscendC::Exp(scores, scores, kVectorPositionTile);
+        wait_compute_before_scalar();
+        for (uint32_t i = 0; i < count; ++i) denominator += scores.GetValue(i);
+
+        const uint32_t value_base = (start * kv_heads + kv_head) * head_dim;
+        load_vector_row(value_cache, row_half, row_float, value_base,
+                        count * head_dim);
+        for (uint32_t i = 0; i < count; ++i) {
+            const float probability = scores.GetValue(i);
+            wait_scalar_before_compute();
+            AscendC::Muls(product, row_float[i * head_dim], probability,
+                           head_dim);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(accum, accum, product, head_dim);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+    wait_compute_before_scalar();
+    return denominator;
+}
+
+__aicore__ inline void vector_publish_probabilities(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& key_cache,
+    AscendC::GlobalTensor<float>& score_output,
+    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t begin, uint32_t end,
+    const AscendC::LocalTensor<float>& query, float scale, float maximum,
+    float inverse, uint32_t score_output_base) {
+    AscendC::LocalTensor<float> scores = buffers.scores();
+    AscendC::LocalTensor<half> row_half = buffers.row_half();
+    AscendC::LocalTensor<float> row_float = buffers.row_float();
+    AscendC::LocalTensor<float> product = buffers.product();
+    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
+        const uint32_t count = min_u32(kVectorPositionTile, end - start);
+        const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
+        load_vector_row(key_cache, row_half, row_float, key_base,
+                        count * head_dim);
+        for (uint32_t i = 0; i < count; ++i) {
+            wait_scalar_before_compute();
+            const float score = vector_dot(
+                query, row_float[i * head_dim], product, head_dim) * scale;
+            scores.SetValue(i, score - maximum);
+        }
+        for (uint32_t i = count; i < kVectorPositionTile; ++i) {
+            scores.SetValue(i, -3.402823466e+38F);
+        }
+        wait_scalar_before_compute();
+        AscendC::Exp(scores, scores, kVectorPositionTile);
+        wait_compute_before_scalar();
+        for (uint32_t i = 0; i < count; ++i) {
+            score_output.SetValue(score_output_base + start + i,
+                                  scores.GetValue(i) * inverse);
+        }
+    }
+}
+
+__aicore__ inline void store_vector_values(
+    VectorAttentionBuffers& buffers, AscendC::LocalTensor<float> values,
+    AscendC::GlobalTensor<half>& output, uint32_t output_base,
+    uint32_t head_dim, float inverse) {
+    AscendC::LocalTensor<half> output_half = buffers.output_half();
+    wait_scalar_before_compute();
+    AscendC::Muls(values, values, inverse, head_dim);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(output_half, values, AscendC::RoundMode::CAST_NONE, head_dim);
+    AscendC::PipeBarrier<PIPE_V>();
+    store_half_exact(output, output_base, output_half, head_dim);
+}
+
+__aicore__ inline void store_vector_output(
+    VectorAttentionBuffers& buffers, AscendC::GlobalTensor<half>& output,
+    uint32_t output_base, uint32_t head_dim, float inverse) {
+    store_vector_values(buffers, buffers.accum(), output, output_base, head_dim,
+                        inverse);
+}
+
+}  // namespace
+
+// Fast decode for aligned layouts. The public contract is identical to the scalar
+// entry point; only the implementation's tile ownership changes.
+extern "C" __global__ __aicore__ void qwen_gqa_decode_attention_vector_kernel(
+    GM_ADDR q, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR out,
+    GM_ADDR score_scratch, uint32_t q_heads, uint32_t kv_heads,
+    uint32_t head_dim, uint32_t context_len, uint32_t max_context, float scale,
+    uint32_t works_per_block) {
+    VectorAttentionBuffers buffers;
+    AscendC::GlobalTensor<half> q_gm;
+    AscendC::GlobalTensor<half> k_gm;
+    AscendC::GlobalTensor<half> v_gm;
+    AscendC::GlobalTensor<half> out_gm;
+    AscendC::GlobalTensor<float> score_gm;
+    q_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(q), q_heads * head_dim);
+    k_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k_cache),
+                         max_context * kv_heads * head_dim);
+    v_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v_cache),
+                         max_context * kv_heads * head_dim);
+    out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(out), q_heads * head_dim);
+    score_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(score_scratch),
+                             q_heads * context_len);
+
+    AscendC::LocalTensor<half> q_half = buffers.q_half();
+    AscendC::LocalTensor<float> q_float = buffers.q_float();
+    const uint32_t repeat = q_heads / kv_heads;
+    for (uint32_t group = AscendC::GetBlockIdx() * works_per_block;
+         group < q_heads;
+         group += AscendC::GetBlockNum() * works_per_block) {
+        const uint32_t group_end = min_u32(q_heads, group + works_per_block);
+        for (uint32_t head = group; head < group_end; ++head) {
+            const uint32_t kv_head = head / repeat;
+            const uint32_t q_base = head * head_dim;
+            load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
+            const float maximum = vector_max_pass(
+                buffers, k_gm, kv_head, kv_heads, head_dim, 0, context_len,
+                q_float, scale);
+            const float denominator = vector_value_pass(
+                buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, 0, context_len,
+                q_float, scale, maximum);
+            const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+            vector_publish_probabilities(
+                buffers, k_gm, score_gm, kv_head, kv_heads, head_dim, 0,
+                context_len, q_float, scale, maximum, inverse,
+                head * context_len);
+            store_vector_output(buffers, out_gm, q_base, head_dim, inverse);
+        }
+        wait_store_before_load();
+    }
+}
+
+// Fast causal prefill. Each block owns one row/head output and never reads beyond
+// that row's causal limit.
+extern "C" __global__ __aicore__ void qwen_gqa_prefill_attention_vector_kernel(
+    GM_ADDR q_rows, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR out_rows,
+    uint32_t seq_len, uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t position_offset, uint32_t max_context, float scale,
+    uint32_t works_per_block) {
+    VectorAttentionBuffers buffers;
+    AscendC::GlobalTensor<half> q_gm;
+    AscendC::GlobalTensor<half> k_gm;
+    AscendC::GlobalTensor<half> v_gm;
+    AscendC::GlobalTensor<half> out_gm;
+    q_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(q_rows),
+                         seq_len * q_heads * head_dim);
+    k_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k_cache),
+                         max_context * kv_heads * head_dim);
+    v_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v_cache),
+                         max_context * kv_heads * head_dim);
+    out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(out_rows),
+                           seq_len * q_heads * head_dim);
+    AscendC::LocalTensor<half> q_half = buffers.q_half();
+    AscendC::LocalTensor<float> q_float = buffers.q_float();
+    const uint32_t total = seq_len * q_heads;
+    const uint32_t repeat = q_heads / kv_heads;
+    for (uint32_t group = AscendC::GetBlockIdx() * works_per_block;
+         group < total;
+         group += AscendC::GetBlockNum() * works_per_block) {
+        const uint32_t group_end = min_u32(total, group + works_per_block);
+        for (uint32_t work = group; work < group_end; ++work) {
+            const uint32_t row = work / q_heads;
+            const uint32_t head = work % q_heads;
+            const uint32_t kv_head = head / repeat;
+            const uint32_t q_base = work * head_dim;
+            const uint32_t limit = position_offset + row + 1;
+            load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
+            const float maximum = vector_max_pass(
+                buffers, k_gm, kv_head, kv_heads, head_dim, 0, limit,
+                q_float, scale);
+            const float denominator = vector_value_pass(
+                buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, 0, limit,
+                q_float, scale, maximum);
+            const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+            store_vector_output(buffers, out_gm, q_base, head_dim, inverse);
+        }
+        wait_store_before_load();
+    }
+}
+
+// Fast verify. Partial records are emitted in groups whose total record span is
+// cache-line aligned, so no two blocks write the same GM cache line.
+extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_vector_kernel(
+    GM_ADDR q_rows, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR out_rows,
+    GM_ADDR partial_scratch, uint32_t rows, uint32_t q_heads, uint32_t kv_heads,
+    uint32_t head_dim, uint32_t position_offset, uint32_t max_context,
+    uint32_t splits, float scale, uint32_t works_per_block) {
+    VectorAttentionBuffers buffers;
+    AscendC::GlobalTensor<half> q_gm;
+    AscendC::GlobalTensor<half> k_gm;
+    AscendC::GlobalTensor<half> v_gm;
+    AscendC::GlobalTensor<half> out_gm;
+    AscendC::GlobalTensor<float> partial;
+    q_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(q_rows),
+                         rows * q_heads * head_dim);
+    k_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k_cache),
+                         max_context * kv_heads * head_dim);
+    v_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v_cache),
+                         max_context * kv_heads * head_dim);
+    out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(out_rows),
+                           rows * q_heads * head_dim);
+    partial.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(partial_scratch),
+                            rows * q_heads * splits * (head_dim + 2));
+    AscendC::LocalTensor<half> q_half = buffers.q_half();
+    AscendC::LocalTensor<float> q_float = buffers.q_float();
+    AscendC::LocalTensor<float> merged = buffers.merged();
+    AscendC::LocalTensor<float> exp_work = buffers.exp_work();
+    const uint32_t total = rows * q_heads;
+    const uint32_t repeat = q_heads / kv_heads;
+    const uint32_t context_len = position_offset + rows;
+    const uint32_t positions_per_split =
+        (context_len + splits - 1) / splits;
+    const uint32_t stride = head_dim + 2;
+    for (uint32_t group = AscendC::GetBlockIdx() * works_per_block;
+         group < total; group += AscendC::GetBlockNum() * works_per_block) {
+        const uint32_t group_end = min_u32(total, group + works_per_block);
+        for (uint32_t work = group; work < group_end; ++work) {
+            const uint32_t row = work / q_heads;
+            const uint32_t head = work % q_heads;
+            const uint32_t kv_head = head / repeat;
+            const uint32_t q_base = work * head_dim;
+            const uint32_t context_limit = position_offset + row + 1;
+            const uint32_t output_base = work * splits * stride;
+            load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
+            for (uint32_t d = 0; d < head_dim; ++d) merged.SetValue(d, 0.0f);
+            float global_max = -3.402823466e+38F;
+            float global_denominator = 0.0f;
+            for (uint32_t split = 0; split < splits; ++split) {
+                const uint32_t begin = split * positions_per_split;
+                const uint32_t end = min_u32(
+                    context_len, min_u32(begin + positions_per_split, context_limit));
+                const uint32_t base = output_base + split * stride;
+                float maximum = -3.402823466e+38F;
+                if (begin < end) {
+                    maximum = vector_max_pass(
+                        buffers, k_gm, kv_head, kv_heads, head_dim, begin, end,
+                        q_float, scale);
+                }
+                partial.SetValue(base, maximum);
+                if (begin >= end) {
+                    partial.SetValue(base + 1, 0.0f);
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        partial.SetValue(base + 2 + d, 0.0f);
+                    }
+                    continue;
+                }
+                const float denominator = vector_value_pass(
+                    buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, begin, end,
+                    q_float, scale, maximum);
+                partial.SetValue(base + 1, denominator);
+                AscendC::LocalTensor<float> values = buffers.accum();
+                const float next_max = maximum > global_max ? maximum : global_max;
+                const float old_weight = global_denominator > 0.0f
+                    ? scalar_exp(exp_work, global_max - next_max) : 0.0f;
+                const float split_weight = scalar_exp(exp_work, maximum - next_max);
+                global_denominator = global_denominator * old_weight +
+                                     denominator * split_weight;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const float updated = merged.GetValue(d) * old_weight +
+                                          values.GetValue(d) * split_weight;
+                    merged.SetValue(d, updated);
+                    partial.SetValue(base + 2 + d, values.GetValue(d));
+                }
+                global_max = next_max;
+            }
+            const float inverse = global_denominator > 0.0f
+                ? 1.0f / global_denominator : 0.0f;
+            store_vector_values(buffers, merged, out_gm, q_base, head_dim,
+                                inverse);
+        }
+        wait_store_before_load();
     }
 }
