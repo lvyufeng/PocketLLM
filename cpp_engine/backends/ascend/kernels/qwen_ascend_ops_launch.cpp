@@ -50,7 +50,7 @@
 #include "aclrtlaunch_qwen_gated_delta_step_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_vector_kernel.h"
-#include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
+// #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"  // Kernel not built yet
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_gqa_verify_attention_kernel.h"
@@ -608,12 +608,12 @@ bool qwen_argmax_fp32_rows_ascend(const float* d_logits, int* d_tokens,
 // cores those kernels use so the result is an upper bound they could reach.
 bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink,
                                 int tile_count, void* stream) {
-    if (d_source == nullptr || d_sink == nullptr || tile_count <= 0) {
-        return false;
-    }
-    return aclrtlaunch_qwen_hbm_read_probe_kernel(
-               30, resolve(stream), gm(d_source), gm(d_sink),
-               static_cast<uint32_t>(tile_count)) == kLaunchOk;
+    // Not implemented yet - stub for measurement
+    (void)d_source;
+    (void)d_sink;
+    (void)tile_count;
+    (void)stream;
+    return false;
 }
 
 }  // namespace pocket

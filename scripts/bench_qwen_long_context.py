@@ -44,6 +44,13 @@ def parse_args() -> argparse.Namespace:
         help="built C++ engine executable",
     )
     parser.add_argument(
+        "--backend",
+        choices=("cuda", "ascend"),
+        default="cuda",
+        help="device backend: cuda uses CUDA_VISIBLE_DEVICES masking, "
+             "ascend passes physical --device to each rank",
+    )
+    parser.add_argument(
         "--lengths",
         default="512,4096,8192,32768,65536",
         help="comma-separated prompt lengths",
@@ -335,6 +342,10 @@ def environment_metadata() -> dict[str, str]:
         "QWEN_RMSNORM_VECTOR",
         "QWEN_FUSE_QKVZ_DECODE",
         "QWEN_FUSE_FULL_QKV_DECODE",
+        "QWEN_FUSE_AB_PROJECTION",
+        "QWEN_GATED_DELTA_PRENORMALIZE",
+        "ASCEND_TOOLKIT_HOME",
+        "ASCEND_AICPU_PATH",
     )
     return {name: os.environ[name] for name in names if name in os.environ}
 
@@ -370,6 +381,7 @@ def run_case(
     qwen_top_k: int,
     qwen_seed: int,
     env_overrides: dict[str, str],
+    backend: str,
 ) -> dict[str, Any]:
     token_path = work_dir / f"tokens_{length}.txt"
     tokens = make_token_fixture(ckpt, token_path, length, tokenizer_python)
@@ -384,10 +396,12 @@ def run_case(
     processes: list[tuple[int, subprocess.Popen[bytes]]] = []
     started = time.monotonic()
     statuses: dict[int, int] = {}
-    # Same instrument as the vLLM comparison bench: engine self-reporting cannot
-    # be compared against an external process's usage.
-    sampler = GpuMemorySampler(devices[:tp_world])
-    sampler.start()
+    # CUDA: engine self-reporting cannot be compared against an external sampler.
+    # Ascend: ACL memory queries are authoritative; no external sampler needed.
+    sampler = None
+    if backend == "cuda":
+        sampler = GpuMemorySampler(devices[:tp_world])
+        sampler.start()
     try:
         for rank in range(tp_world):
             log = (case_dir / f"rank{rank}.log").open("wb")
@@ -400,7 +414,7 @@ def run_case(
                 "--tp-rank",
                 str(rank),
                 "--device",
-                "0",
+                str(devices[rank]) if backend == "ascend" else "0",
                 "--nccl-id-path",
                 str(id_path),
                 "--token-ids-file",
@@ -429,7 +443,8 @@ def run_case(
             ]
             env = os.environ.copy()
             env.update(env_overrides)
-            env["CUDA_VISIBLE_DEVICES"] = str(devices[rank])
+            if backend == "cuda":
+                env["CUDA_VISIBLE_DEVICES"] = str(devices[rank])
             processes.append((rank, subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)))
             log.close()
         while len(statuses) < len(processes):
@@ -457,7 +472,7 @@ def run_case(
             except subprocess.TimeoutExpired:
                 process.kill()
                 statuses[rank] = process.wait(timeout=30)
-        gpu_memory = sampler.stop().report()
+        gpu_memory = sampler.stop().report() if sampler else {}
 
     ordered_statuses = [(rank, statuses[rank]) for rank in range(tp_world)]
     if any(status != 0 for _, status in ordered_statuses):
@@ -480,7 +495,7 @@ def run_case(
         "--ckpt", str(ckpt),
         "--tp-world", str(tp_world),
         "--tp-rank", "<rank>",
-        "--device", "0",
+        "--device", "<device>" if backend == "ascend" else "0",
         "--nccl-id-path", str(id_path),
         "--token-ids-file", str(token_path),
         "--generate-token", "123",
@@ -517,8 +532,8 @@ def run_case(
         "rank_gpu_memory_total_bytes": [
             item.get("gpu_memory_total_bytes") for item in rank_runtime
         ],
-        # Externally sampled peak, comparable with the vLLM run. The rank_*
-        # fields above are engine self-reports and are not.
+        # Externally sampled peak for CUDA (comparable with vLLM); empty for Ascend.
+        # Engine self-reports above are ACL queries on Ascend, nvidia-smi on CUDA.
         "gpu_memory": gpu_memory,
         "rank_phase_summary": [phase_summary(items) for items in rank_phases],
         "phase_leaf_summary": phase_leaf_summary(rank_phases[0]),
@@ -562,7 +577,9 @@ def run_case(
     )
     result["environment"] = {
         **result["environment"],
-        "benchmark_cuda_visible_devices": ",".join(str(device) for device in devices),
+        "benchmark_backend": backend,
+        "benchmark_cuda_visible_devices": ",".join(str(device) for device in devices) if backend == "cuda" else "N/A",
+        "benchmark_devices": ",".join(str(device) for device in devices),
         "benchmark_binary": str(binary),
         "benchmark_checkpoint": str(ckpt),
         "benchmark_prefill_chunk_tokens": str(prefill_chunk_tokens),
@@ -583,6 +600,12 @@ def main() -> int:
     binary = Path(args.binary).resolve()
     ckpt = Path(args.ckpt).resolve()
     work_dir = Path(args.work_dir).resolve()
+    backend = args.backend
+    if backend == "ascend" and "ASCEND_TOOLKIT_HOME" not in os.environ:
+        raise SystemExit(
+            "Ascend backend requires ASCEND_TOOLKIT_HOME. "
+            "Source scripts/ascend_env.sh before running."
+        )
     if not binary.is_file():
         raise SystemExit(f"binary not found: {binary}")
     if not ckpt.is_dir():
@@ -676,6 +699,7 @@ def main() -> int:
                     args.qwen_top_k,
                     args.qwen_seed,
                     env_overrides,
+                    backend,
                 )
             )
             result_path.write_text(

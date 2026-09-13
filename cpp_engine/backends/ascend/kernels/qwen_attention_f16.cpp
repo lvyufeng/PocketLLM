@@ -685,6 +685,89 @@ __aicore__ inline float vector_max_pass(
     return maximum;
 }
 
+__aicore__ inline void vector_online_softmax_pass(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& key_cache,
+    const AscendC::GlobalTensor<half>& value_cache,
+    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t begin, uint32_t end,
+    const AscendC::LocalTensor<float>& query, float scale,
+    const AscendC::LocalTensor<float>& exp_work,
+    float& out_maximum, float& out_denominator) {
+    AscendC::LocalTensor<float> accum = buffers.accum();
+    AscendC::LocalTensor<float> scores = buffers.scores();
+    AscendC::LocalTensor<float> row_float = buffers.row_float();
+    AscendC::LocalTensor<half> row_half = buffers.row_half();
+    AscendC::LocalTensor<float> product = buffers.product();
+
+    // Initialize online softmax state
+    float m = -3.402823466e+38F;  // running maximum
+    float d = 0.0f;                // running denominator
+    for (uint32_t dim = 0; dim < head_dim; ++dim) accum.SetValue(dim, 0.0f);
+    wait_scalar_before_compute();
+    AscendC::PipeBarrier<PIPE_V>();
+
+    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
+        const uint32_t count = min_u32(kVectorPositionTile, end - start);
+
+        // Load K cache tile and compute QK^T scores (only once!)
+        const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
+        load_vector_row(key_cache, row_half, row_float, key_base, count * head_dim);
+
+        float tile_max = -3.402823466e+38F;
+        for (uint32_t i = 0; i < count; ++i) {
+            wait_scalar_before_compute();
+            const float score = vector_dot(
+                query, row_float[i * head_dim], product, head_dim) * scale;
+            scores.SetValue(i, score);
+            if (score > tile_max) tile_max = score;
+        }
+
+        // Update running maximum and rescale previous accumulator
+        const float m_new = (tile_max > m) ? tile_max : m;
+        const float correction = scalar_exp(exp_work, m - m_new);
+        if (m_new != m) {
+            d *= correction;
+            wait_scalar_before_compute();
+            AscendC::Muls(accum, accum, correction, head_dim);
+            AscendC::PipeBarrier<PIPE_V>();
+            m = m_new;
+        }
+
+        // Compute exp(scores - m_new) and update denominator
+        for (uint32_t i = 0; i < count; ++i) {
+            scores.SetValue(i, scores.GetValue(i) - m_new);
+        }
+        for (uint32_t i = count; i < kVectorPositionTile; ++i) {
+            scores.SetValue(i, -3.402823466e+38F);
+        }
+        wait_scalar_before_compute();
+        AscendC::Exp(scores, scores, kVectorPositionTile);
+        wait_compute_before_scalar();
+
+        for (uint32_t i = 0; i < count; ++i) {
+            d += scores.GetValue(i);
+        }
+
+        // Load V cache tile and accumulate weighted values
+        const uint32_t value_base = (start * kv_heads + kv_head) * head_dim;
+        load_vector_row(value_cache, row_half, row_float, value_base, count * head_dim);
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const float probability = scores.GetValue(i);
+            wait_scalar_before_compute();
+            AscendC::Muls(product, row_float[i * head_dim], probability, head_dim);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(accum, accum, product, head_dim);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    wait_compute_before_scalar();
+    out_maximum = m;
+    out_denominator = d;
+}
+
 __aicore__ inline float vector_value_pass(
     VectorAttentionBuffers& buffers,
     const AscendC::GlobalTensor<half>& key_cache,
@@ -829,12 +912,10 @@ extern "C" __global__ __aicore__ void qwen_gqa_decode_attention_vector_kernel(
             const uint32_t kv_head = head / repeat;
             const uint32_t q_base = head * head_dim;
             load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
-            const float maximum = vector_max_pass(
-                buffers, k_gm, kv_head, kv_heads, head_dim, 0, context_len,
-                q_float, scale);
-            const float denominator = vector_value_pass(
+            float maximum, denominator;
+            vector_online_softmax_pass(
                 buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, 0, context_len,
-                q_float, scale, maximum);
+                q_float, scale, buffers.exp_work(), maximum, denominator);
             const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
             vector_publish_probabilities(
                 buffers, k_gm, score_gm, kv_head, kv_heads, head_dim, 0,
@@ -881,12 +962,10 @@ extern "C" __global__ __aicore__ void qwen_gqa_prefill_attention_vector_kernel(
             const uint32_t q_base = work * head_dim;
             const uint32_t limit = position_offset + row + 1;
             load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
-            const float maximum = vector_max_pass(
-                buffers, k_gm, kv_head, kv_heads, head_dim, 0, limit,
-                q_float, scale);
-            const float denominator = vector_value_pass(
+            float maximum, denominator;
+            vector_online_softmax_pass(
                 buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, 0, limit,
-                q_float, scale, maximum);
+                q_float, scale, buffers.exp_work(), maximum, denominator);
             const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
             store_vector_output(buffers, out_gm, q_base, head_dim, inverse);
         }
@@ -946,11 +1025,14 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_vector_kernel(
                 const uint32_t end = min_u32(
                     context_len, min_u32(begin + positions_per_split, context_limit));
                 const uint32_t base = output_base + split * stride;
-                float maximum = -3.402823466e+38F;
+                float maximum, denominator;
                 if (begin < end) {
-                    maximum = vector_max_pass(
-                        buffers, k_gm, kv_head, kv_heads, head_dim, begin, end,
-                        q_float, scale);
+                    vector_online_softmax_pass(
+                        buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, begin, end,
+                        q_float, scale, buffers.exp_work(), maximum, denominator);
+                } else {
+                    maximum = -3.402823466e+38F;
+                    denominator = 0.0f;
                 }
                 partial.SetValue(base, maximum);
                 if (begin >= end) {
@@ -960,9 +1042,6 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_vector_kernel(
                     }
                     continue;
                 }
-                const float denominator = vector_value_pass(
-                    buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, begin, end,
-                    q_float, scale, maximum);
                 partial.SetValue(base + 1, denominator);
                 AscendC::LocalTensor<float> values = buffers.accum();
                 const float next_max = maximum > global_max ? maximum : global_max;

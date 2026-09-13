@@ -216,15 +216,18 @@ else()
 
     # aclnn operator libraries. libnnopbase carries aclCreateTensor and the
     # aclOpExecutor type, so linking libopapi alone leaves those undefined even
-    # though the aclnn* entry points themselves resolve.
+    # though the aclnn* entry points themselves resolve. libnnopbase depends on
+    # libprofapi for MsprofRegisterCallback, so that must be linked explicitly.
     find_library(ASCEND_OPAPI_LIBRARY NAMES opapi
         PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
     find_library(ASCEND_NNOPBASE_LIBRARY NAMES nnopbase
         PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
-    if(NOT ASCEND_OPAPI_LIBRARY OR NOT ASCEND_NNOPBASE_LIBRARY)
+    find_library(ASCEND_PROFAPI_LIBRARY NAMES profapi
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    if(NOT ASCEND_OPAPI_LIBRARY OR NOT ASCEND_NNOPBASE_LIBRARY OR NOT ASCEND_PROFAPI_LIBRARY)
         message(FATAL_ERROR
-            "libopapi / libnnopbase not found under ${ASCEND_ARCH_DIR}/lib64; "
-            "the aclnn operator implementations need both")
+            "libopapi / libnnopbase / libprofapi not found under ${ASCEND_ARCH_DIR}/lib64; "
+            "the aclnn operator implementations need all three")
     endif()
 
     # HCCL. Every init entry point in hccl_comm.h is declared
@@ -233,9 +236,19 @@ else()
     # libhccl as fatal rather than letting POCKET_HAVE_TP_COMM silently stay off.
     find_library(ASCEND_HCCL_LIBRARY NAMES hccl
         PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    find_library(ASCEND_DLOG_LIBRARY NAMES unified_dlog
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
+    find_library(ASCEND_CSEC_LIBRARY NAMES c_sec
+        PATHS "${ASCEND_ARCH_DIR}/lib64" NO_DEFAULT_PATH)
     if(ASCEND_HCCL_LIBRARY)
         set(POCKET_HAVE_TP_COMM ON)
         message(STATUS "HCCL found: ${ASCEND_HCCL_LIBRARY}")
+        if(NOT ASCEND_DLOG_LIBRARY)
+            message(FATAL_ERROR "libunified_dlog not found; HCCL requires it")
+        endif()
+        if(NOT ASCEND_CSEC_LIBRARY)
+            message(FATAL_ERROR "libc_sec not found; HCCL and nnopbase require it")
+        endif()
     else()
         message(STATUS "libhccl not found; tensor parallelism disabled on Ascend")
     endif()
@@ -245,7 +258,9 @@ else()
     list(APPEND POCKET_BACKEND_LIBS
         "${ASCEND_ACL_LIBRARY}"
         "${ASCEND_OPAPI_LIBRARY}"
-        "${ASCEND_NNOPBASE_LIBRARY}")
+        "${ASCEND_PROFAPI_LIBRARY}"
+        "${ASCEND_NNOPBASE_LIBRARY}"
+        "${ASCEND_CSEC_LIBRARY}")
     list(APPEND POCKET_BACKEND_DEFINES POCKET_BACKEND_ASCEND=1)
 
     # Stands in for POCKET_CUDA_ONLY_ENGINE_SOURCES, which is not built here.
@@ -266,33 +281,37 @@ else()
         backends/ascend/kernels/qwen_attention_f16.cpp
         backends/ascend/kernels/qwen_argmax_f32.cpp
     )
-    # ascendc.cmake reads these three variables by name out of the enclosing
-    # scope and fails unhelpfully if any is unset, so set them here rather than
-    # making every caller pass -D flags.
-    set(SOC_VERSION "${ASCEND_SOC_VERSION}")
-    set(RUN_MODE "npu")
-    set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
-    # The nested ExternalProject builds spawned by ascendc.cmake use GCC 12's
-    # compiler driver but need to find GCC 11's C++ headers (the ones installed
-    # on this system). Pass them via ASCENDC_COMPILE_OPTIONS which ascendc.cmake
-    # appends to every nested compile command.
-    set(ASCENDC_COMPILE_OPTIONS "-isystem;/usr/include/c++/11;-isystem;/usr/include/aarch64-linux-gnu/c++/11")
-    include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
-    ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
+    # Use precompiled kernel library if it exists to bypass AscendC compilation
+    # issues (missing <cstdint> in CANN environment). The precompiled library
+    # and generated headers are kept in build-ascend/.
+    set(PRECOMPILED_KERNEL_LIB "${CMAKE_BINARY_DIR}/lib/libpocket_ascend_kernels.a")
+    set(PRECOMPILED_KERNEL_HEADERS "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
 
-    # ascendc_library() emits one aclrtlaunch_<kernel>.h per
-    # `extern "C" __global__ __aicore__` entry point into
-    # ${CMAKE_BINARY_DIR}/include/<target>. The launcher below is the only file
-    # that includes them, but the directory has to be on the include path of
-    # whatever compiles it, which is pocket_cpp_core.
-    list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
-    list(APPEND POCKET_ASCEND_KERNEL_INCLUDES
-        "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
-    list(APPEND POCKET_ASCEND_KERNEL_LIBS pocket_ascend_kernels)
+    if(EXISTS "${PRECOMPILED_KERNEL_LIB}" AND EXISTS "${PRECOMPILED_KERNEL_HEADERS}")
+        message(STATUS "Using precompiled AscendC kernels: ${PRECOMPILED_KERNEL_LIB}")
+        add_library(pocket_ascend_kernels STATIC IMPORTED)
+        set_target_properties(pocket_ascend_kernels PROPERTIES
+            IMPORTED_LOCATION "${PRECOMPILED_KERNEL_LIB}")
+        list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
+        list(APPEND POCKET_ASCEND_KERNEL_INCLUDES "${PRECOMPILED_KERNEL_HEADERS}")
+        list(APPEND POCKET_ASCEND_KERNEL_LIBS pocket_ascend_kernels)
+    else()
+        # Fallback: build kernels from source using ascendc.cmake
+        set(SOC_VERSION "${ASCEND_SOC_VERSION}")
+        set(RUN_MODE "npu")
+        set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
+        set(ASCENDC_COMPILE_OPTIONS "-isystem;/usr/include/c++/11;-isystem;/usr/include/aarch64-linux-gnu/c++/11")
+        include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
+        ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
+        list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
+        list(APPEND POCKET_ASCEND_KERNEL_INCLUDES
+            "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
+        list(APPEND POCKET_ASCEND_KERNEL_LIBS pocket_ascend_kernels)
+    endif()
 
     if(POCKET_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
-        list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}")
+        list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}" "${ASCEND_DLOG_LIBRARY}")
         list(APPEND POCKET_BACKEND_DEFINES POCKET_HAVE_TP_COMM=1)
     endif()
 
@@ -385,6 +404,17 @@ add_custom_target(check_layering
 
 add_executable(pocketllm_engine engine/main.cpp)
 target_link_libraries(pocketllm_engine PRIVATE pocket_cpp_core)
+# Ascend: CANN libraries have deep transitive dependencies (libnnopbase.so
+# needs libprofapi.so, which needs libmmpa.so, etc.). Rather than enumerating
+# them all, add the entire lib64 directory to the linker's library search path
+# and disable --as-needed so all referenced symbols are resolved.
+if(POCKET_BACKEND STREQUAL "ascend")
+    target_link_options(pocketllm_engine PRIVATE
+        "-Wl,--no-as-needed"
+        "-Wl,-rpath,${ASCEND_ARCH_DIR}/lib64"
+        "-L${ASCEND_ARCH_DIR}/lib64")
+    target_link_libraries(pocketllm_engine PRIVATE mmpa runtime)
+endif()
 
 if(POCKET_BUILD_PYTHON)
     find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
