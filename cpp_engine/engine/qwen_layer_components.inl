@@ -525,17 +525,37 @@ void GqaAttention::forward(
 
     if (rows == 1) {
         const int context_length = position_offset + 1;
-        QwenDeviceTensor& scores = runtime.workspace_float(
-            static_cast<size_t>(q_heads) * context_length,
-            {static_cast<uint64_t>(q_heads),
-             static_cast<uint64_t>(context_length)});
-        require_launch(qwen_gqa_decode_attention_f16(
-            q_norm.f16_data(),
-            layer.full.k_cache.f16_data() + slot_offset,
-            layer.full.v_cache.f16_data() + slot_offset,
-            attention.f16_data(),
-            scores.f32_data(), q_heads, kv_heads, head_dim,
-            context_length, runtime.max_context), "decode FP16-cache GQA");
+        // Use FlashDecoding for long context (>= 4096 tokens)
+        if (context_length >= 4096) {
+            const int num_partitions = std::min(
+                30, (context_length + 255) / 256);
+            QwenDeviceTensor& partials = runtime.workspace_float(
+                static_cast<size_t>(q_heads) * num_partitions * (head_dim + 2),
+                {static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(num_partitions),
+                 static_cast<uint64_t>(head_dim + 2)});
+            typename Runtime::PhaseScope sub(&runtime, "full.attn_kernel");
+            require_launch(qwen_gqa_decode_attention_flashdec_f16(
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(),
+                partials.f32_data(), q_heads, kv_heads, head_dim,
+                context_length, runtime.max_context, num_partitions),
+                "decode FlashDecoding FP16-cache GQA");
+        } else {
+            QwenDeviceTensor& scores = runtime.workspace_float(
+                static_cast<size_t>(q_heads) * context_length,
+                {static_cast<uint64_t>(q_heads),
+                 static_cast<uint64_t>(context_length)});
+            require_launch(qwen_gqa_decode_attention_f16(
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(),
+                scores.f32_data(), q_heads, kv_heads, head_dim,
+                context_length, runtime.max_context), "decode FP16-cache GQA");
+        }
     } else if (rows <= 8) {
         const int context_length = position_offset + rows;
         // Same split geometry the CUDA verify path uses, so a verify block
