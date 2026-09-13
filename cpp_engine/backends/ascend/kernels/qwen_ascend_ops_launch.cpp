@@ -50,6 +50,8 @@
 #include "aclrtlaunch_qwen_gated_delta_step_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_vector_kernel.h"
+#include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_partial_kernel.h"
+#include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_reduce_kernel.h"
 // #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"  // Kernel not built yet
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
@@ -484,6 +486,48 @@ bool qwen_gqa_decode_attention_f16_ascend(
                static_cast<uint32_t>(context_len),
                static_cast<uint32_t>(max_context), attention_scale(head_dim)) ==
            kLaunchOk;
+}
+
+bool qwen_gqa_decode_attention_flashdec_f16_ascend(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_partials_scratch, int q_heads, int kv_heads, int head_dim,
+    int context_len, int max_context, int num_partitions, void* stream) {
+    if (d_q_fp16 == nullptr || d_k_cache_fp16 == nullptr ||
+        d_v_cache_fp16 == nullptr || d_out_fp16 == nullptr ||
+        d_partials_scratch == nullptr || num_partitions <= 0 ||
+        !valid_attention(q_heads, kv_heads, head_dim, context_len,
+                         max_context)) {
+        return false;
+    }
+
+    if (!vector_attention_geometry(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16,
+                                   d_out_fp16, q_heads, kv_heads, head_dim)) {
+        return false;
+    }
+
+    // Launch partial computation kernel (one block per partition)
+    const int partial_result = aclrtlaunch_qwen_gqa_decode_attention_flashdec_partial_kernel(
+        static_cast<uint32_t>(num_partitions), resolve(stream),
+        gm(d_q_fp16), gm(d_k_cache_fp16), gm(d_v_cache_fp16),
+        gm(d_partials_scratch),
+        static_cast<uint32_t>(q_heads), static_cast<uint32_t>(kv_heads),
+        static_cast<uint32_t>(head_dim), static_cast<uint32_t>(context_len),
+        static_cast<uint32_t>(max_context), attention_scale(head_dim),
+        static_cast<uint32_t>(num_partitions));
+
+    if (partial_result != kLaunchOk) {
+        return false;
+    }
+
+    // Launch reduction kernel (single block)
+    const int reduce_result = aclrtlaunch_qwen_gqa_decode_attention_flashdec_reduce_kernel(
+        1u, resolve(stream),
+        gm(d_partials_scratch), gm(d_out_fp16),
+        static_cast<uint32_t>(q_heads), static_cast<uint32_t>(head_dim),
+        static_cast<uint32_t>(num_partitions));
+
+    return reduce_result == kLaunchOk;
 }
 
 bool qwen_gqa_prefill_attention_f16_ascend(
