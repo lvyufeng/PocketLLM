@@ -45,6 +45,9 @@ struct EngineOptions {
     // Paged pool budget in bytes on this rank; 0 derives it from what the
     // contiguous arena would have reserved.
     uint64_t kv_cache_bytes = 0;
+    // Cross-request prefix-cache budget in bytes. Engines without a prefix cache
+    // ignore this; Qwen derives a bounded default when it is zero.
+    uint64_t prefix_cache_bytes = 0;
     // Sampling, for engines that fix it at construction rather than reading it
     // off each request. Nothing about a temperature is model-specific, and an
     // engine reporting caps().per_request_sampling == false has no other way to

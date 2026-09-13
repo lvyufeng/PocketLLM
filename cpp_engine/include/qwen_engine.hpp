@@ -126,6 +126,10 @@ struct QwenEngineOptions {
     // paging alone memory-neutral and lets the block count be raised
     // deliberately.
     uint64_t kv_cache_bytes = 0;
+    // Upper bound for the cross-request prefix cache, including retained KV
+    // blocks and recurrent snapshots. 0 derives a bounded default from the
+    // paged KV pool (30 percent of the pool bytes).
+    uint64_t prefix_cache_bytes = 0;
 };
 
 // Accounting for one native-MTP or external-DSpark generate call.
@@ -197,6 +201,14 @@ struct QwenPrefixCacheStats {
     uint64_t snapshot_bytes = 0;
     int hits = 0;
     int misses = 0;
+    // Cross-request paged-cache telemetry. These counters are cumulative until
+    // clear_prefix_cache(), while the fields above describe the last prefill.
+    int global_hits = 0;
+    int global_misses = 0;
+    int global_cached_blocks = 0;
+    int global_evictions = 0;
+    uint64_t global_cache_bytes = 0;
+    uint64_t global_cache_budget_bytes = 0;
 };
 
 // Independent Qwen3.5 hybrid dense runtime. Checkpoint BF16 tensors are
@@ -302,6 +314,8 @@ public:
     // are 0.
     int kv_free_blocks() const override;
     int kv_total_blocks() const override;
+    int kv_cache_pinned_blocks() const override;
+    int kv_evict_cache_blocks(int count) override;
 
     // Blocks a sequence of `tokens` logical positions needs in total. This is
     // the unit admission has to reason in: a request's cost is set by the blocks

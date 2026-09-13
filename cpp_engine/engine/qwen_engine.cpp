@@ -338,6 +338,96 @@ struct QwenVerifyBatch {
     int position_after = 0;
 };
 
+uint64_t qwen_xxhash64(const void* input, size_t length, uint64_t seed) {
+    constexpr uint64_t kPrime1 = 11400714785074694791ULL;
+    constexpr uint64_t kPrime2 = 14029467366897019727ULL;
+    constexpr uint64_t kPrime3 = 1609587929392839161ULL;
+    constexpr uint64_t kPrime4 = 9650029242287828579ULL;
+    constexpr uint64_t kPrime5 = 2870177450012600261ULL;
+
+    auto read64 = [](const uint8_t* p) {
+        uint64_t value;
+        std::memcpy(&value, p, sizeof(value));
+        return value;
+    };
+    auto read32 = [](const uint8_t* p) {
+        uint32_t value;
+        std::memcpy(&value, p, sizeof(value));
+        return value;
+    };
+    auto round = [=](uint64_t accumulator, uint64_t value) {
+        accumulator += value * kPrime2;
+        accumulator = (accumulator << 31) | (accumulator >> 33);
+        return accumulator * kPrime1;
+    };
+
+    const uint8_t* cursor = static_cast<const uint8_t*>(input);
+    const uint8_t* end = cursor + length;
+    uint64_t hash;
+    if (length >= 32) {
+        uint64_t v1 = seed + kPrime1 + kPrime2;
+        uint64_t v2 = seed + kPrime2;
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - kPrime1;
+        const uint8_t* limit = end - 32;
+        while (cursor <= limit) {
+            v1 = round(v1, read64(cursor)); cursor += 8;
+            v2 = round(v2, read64(cursor)); cursor += 8;
+            v3 = round(v3, read64(cursor)); cursor += 8;
+            v4 = round(v4, read64(cursor)); cursor += 8;
+        }
+        hash = ((v1 << 1) | (v1 >> 63)) +
+               ((v2 << 7) | (v2 >> 57)) +
+               ((v3 << 12) | (v3 >> 52)) +
+               ((v4 << 18) | (v4 >> 46));
+        auto merge = [&](uint64_t accumulator, uint64_t value) {
+            value *= kPrime2;
+            value = (value << 31) | (value >> 33);
+            value *= kPrime1;
+            accumulator ^= value;
+            accumulator = accumulator * kPrime1 + kPrime4;
+            return accumulator;
+        };
+        hash = merge(hash, v1);
+        hash = merge(hash, v2);
+        hash = merge(hash, v3);
+        hash = merge(hash, v4);
+    } else {
+        hash = seed + kPrime5;
+    }
+    hash += static_cast<uint64_t>(length);
+    while (cursor + 8 <= end) {
+        uint64_t value = read64(cursor) * kPrime2;
+        value = ((value << 31) | (value >> 33)) * kPrime1;
+        hash ^= value;
+        hash = ((hash << 27) | (hash >> 37)) * kPrime1 + kPrime4;
+        cursor += 8;
+    }
+    if (cursor + 4 <= end) {
+        hash ^= static_cast<uint64_t>(read32(cursor)) * kPrime1;
+        hash = ((hash << 23) | (hash >> 41)) * kPrime2 + kPrime3;
+        cursor += 4;
+    }
+    while (cursor < end) {
+        hash ^= static_cast<uint64_t>(*cursor++) * kPrime5;
+        hash = ((hash << 11) | (hash >> 53)) * kPrime1;
+    }
+    hash ^= hash >> 33;
+    hash *= kPrime2;
+    hash ^= hash >> 29;
+    hash *= kPrime3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+uint64_t qwen_prefix_hash(uint64_t seed, uint64_t parent, int block_index,
+                          const int* tokens, size_t count) {
+    const uint64_t metadata[2] = {
+        parent, static_cast<uint64_t>(static_cast<uint32_t>(block_index))};
+    uint64_t hash = qwen_xxhash64(metadata, sizeof(metadata), seed);
+    return qwen_xxhash64(tokens, count * sizeof(int), hash);
+}
+
 struct QwenWorkspace {
     std::vector<QwenDeviceTensor> slots;
     size_t cursor = 0;
@@ -564,6 +654,237 @@ struct QwenEngine::Impl {
     // statistic and carry no per-sequence correctness meaning.
     int prefix_hits = 0;
     int prefix_misses = 0;
+
+    // Cross-request cache entries are keyed by cumulative prompt hash. Each
+    // entry owns one pool reference; active slot rows own their references
+    // independently, so evicting an entry never invalidates a live request.
+    struct GlobalPrefixEntry {
+        uint64_t hash = 0;
+        int block_index = 0;
+        std::vector<int> tokens;
+        int block_id = BlockPool::kInvalidBlock;
+        QwenRecurrentSnapshot snapshot;
+        bool has_snapshot = false;
+        uint64_t lru = 0;
+        uint64_t bytes = 0;
+    };
+    std::unordered_map<uint64_t, GlobalPrefixEntry> global_prefix_cache;
+    uint64_t global_prefix_clock = 0;
+    uint64_t global_prefix_bytes = 0;
+    uint64_t global_prefix_budget_bytes = 0;
+    uint64_t global_prefix_block_bytes = 0;
+    uint64_t global_prefix_hash_seed = 0;
+    int global_prefix_hits = 0;
+    int global_prefix_misses = 0;
+    int global_prefix_evictions = 0;
+
+    bool global_prefix_enabled() const {
+        return options.prefix_cache && block_pool != nullptr &&
+               options.mtp == false && options.dspark_checkpoint.empty() &&
+               options.dflash2_checkpoint.empty();
+    }
+
+    void update_global_prefix_stats(QwenPrefixCacheStats& stats) const {
+        stats.global_hits = global_prefix_hits;
+        stats.global_misses = global_prefix_misses;
+        stats.global_cached_blocks = static_cast<int>(global_prefix_cache.size());
+        stats.global_evictions = global_prefix_evictions;
+        stats.global_cache_bytes = global_prefix_bytes;
+        stats.global_cache_budget_bytes = global_prefix_budget_bytes;
+    }
+
+    void clear_global_prefix_cache() {
+        if (block_pool != nullptr) {
+            for (const auto& item : global_prefix_cache) {
+                const int block = item.second.block_id;
+                if (block != BlockPool::kInvalidBlock &&
+                    block_pool->refcount(block) > 0) {
+                    block_pool->free({block});
+                }
+            }
+        }
+        global_prefix_cache.clear();
+        global_prefix_bytes = 0;
+    }
+
+    int evict_global_prefix_blocks(int count) {
+        if (count <= 0 || block_pool == nullptr) return 0;
+        int evicted = 0;
+        while (evicted < count) {
+            auto victim = global_prefix_cache.end();
+            for (auto it = global_prefix_cache.begin();
+                 it != global_prefix_cache.end(); ++it) {
+                if (block_pool->refcount(it->second.block_id) != 1) continue;
+                if (victim == global_prefix_cache.end() ||
+                    it->second.lru < victim->second.lru) {
+                    victim = it;
+                }
+            }
+            if (victim == global_prefix_cache.end()) break;
+            const int block = victim->second.block_id;
+            const uint64_t bytes = victim->second.bytes;
+            global_prefix_cache.erase(victim);
+            block_pool->free({block});
+            global_prefix_bytes -= bytes;
+            ++global_prefix_evictions;
+            ++evicted;
+        }
+        return evicted;
+    }
+
+    bool evict_global_prefix_until(uint64_t additional_bytes) {
+        if (additional_bytes > global_prefix_budget_bytes) return false;
+        while (global_prefix_bytes + additional_bytes > global_prefix_budget_bytes) {
+            auto victim = global_prefix_cache.end();
+            for (auto it = global_prefix_cache.begin();
+                 it != global_prefix_cache.end(); ++it) {
+                if (block_pool->refcount(it->second.block_id) != 1) continue;
+                if (victim == global_prefix_cache.end() ||
+                    it->second.lru < victim->second.lru) {
+                    victim = it;
+                }
+            }
+            if (victim == global_prefix_cache.end()) return false;
+            const int block = victim->second.block_id;
+            const uint64_t bytes = victim->second.bytes;
+            global_prefix_cache.erase(victim);
+            block_pool->free({block});
+            global_prefix_bytes -= bytes;
+            ++global_prefix_evictions;
+        }
+        return true;
+    }
+
+    struct GlobalPrefixMatch {
+        int position = 0;
+        ForwardResult result;
+        bool has_result = false;
+    };
+
+    std::optional<GlobalPrefixMatch> try_global_prefix(
+        const std::vector<int>& token_ids, int slot_id) {
+        if (!global_prefix_enabled() || token_ids.empty() ||
+            !block_table->row(slot_id).empty() ||
+            slot_position(slot_id, 0) != 0) {
+            return std::nullopt;
+        }
+        const int block_size = block_pool->block_size();
+        const int complete_blocks = static_cast<int>(token_ids.size()) / block_size;
+        if (complete_blocks <= 0) {
+            ++global_prefix_misses;
+            return std::nullopt;
+        }
+
+        std::vector<int> matched_blocks;
+        matched_blocks.reserve(static_cast<size_t>(complete_blocks));
+        const GlobalPrefixEntry* best = nullptr;
+        int best_blocks = 0;
+        uint64_t parent = 0;
+        for (int block_index = 0; block_index < complete_blocks; ++block_index) {
+            const int begin = block_index * block_size;
+            const int end = begin + block_size;
+            const uint64_t hash = qwen_prefix_hash(
+                global_prefix_hash_seed, parent, block_index,
+                token_ids.data() + begin, static_cast<size_t>(block_size));
+            auto it = global_prefix_cache.find(hash);
+            if (it == global_prefix_cache.end() ||
+                it->second.block_index != block_index ||
+                it->second.tokens != std::vector<int>(
+                    token_ids.begin() + begin, token_ids.begin() + end)) {
+                break;
+            }
+            it->second.lru = ++global_prefix_clock;
+            matched_blocks.push_back(it->second.block_id);
+            if (it->second.has_snapshot) {
+                best = &it->second;
+                best_blocks = block_index + 1;
+            }
+            parent = hash;
+        }
+        if (best == nullptr || best_blocks <= 0 ||
+            (best_blocks * block_size == static_cast<int>(token_ids.size()) &&
+             !best->snapshot.has_result)) {
+            ++global_prefix_misses;
+            return std::nullopt;
+        }
+        matched_blocks.resize(static_cast<size_t>(best_blocks));
+        block_table->attach(slot_id, matched_blocks);
+        sync_block_table();
+        restore_recurrent_state(best->snapshot, true, slot_id);
+        ++global_prefix_hits;
+        GlobalPrefixMatch match;
+        match.position = best_blocks * block_size;
+        match.has_result = best->snapshot.has_result;
+        if (match.has_result) match.result = best->snapshot.result;
+        return match;
+    }
+
+    void publish_global_prefix(const std::vector<int>& token_ids, int upto,
+                               int slot_id, const ForwardResult* result,
+                               bool complete) {
+        if (!global_prefix_enabled() || upto <= 0) return;
+        const int block_size = block_pool->block_size();
+        const int block_count = upto / block_size;
+        if (block_count <= 0 || block_table->row(slot_id).size() <
+                                    static_cast<size_t>(block_count)) {
+            return;
+        }
+        const std::vector<int>& row = block_table->row(slot_id);
+        uint64_t parent = 0;
+        for (int block_index = 0; block_index < block_count; ++block_index) {
+            const int begin = block_index * block_size;
+            const int end = begin + block_size;
+            const uint64_t hash = qwen_prefix_hash(
+                global_prefix_hash_seed, parent, block_index,
+                token_ids.data() + begin, static_cast<size_t>(block_size));
+            auto existing = global_prefix_cache.find(hash);
+            if (existing != global_prefix_cache.end()) {
+                if (existing->second.block_index != block_index ||
+                    existing->second.tokens != std::vector<int>(
+                        token_ids.begin() + begin, token_ids.begin() + end)) {
+                    break;
+                }
+                existing->second.lru = ++global_prefix_clock;
+                // Only the final complete prompt boundary has a result. A
+                // prior entry may have been published by a partial prefill.
+                if (end == upto && !existing->second.has_snapshot) {
+                    QwenRecurrentSnapshot snapshot = capture_recurrent_state(
+                        upto, complete ? result : nullptr, true, slot_id);
+                    const uint64_t extra = snapshot.bytes();
+                    if (evict_global_prefix_until(extra)) {
+                        existing->second.snapshot = std::move(snapshot);
+                        existing->second.has_snapshot = true;
+                        existing->second.bytes += extra;
+                        global_prefix_bytes += extra;
+                    }
+                }
+                parent = hash;
+                continue;
+            }
+
+            GlobalPrefixEntry entry;
+            entry.hash = hash;
+            entry.block_index = block_index;
+            entry.tokens.assign(token_ids.begin() + begin, token_ids.begin() + end);
+            entry.block_id = row[static_cast<size_t>(block_index)];
+            entry.lru = ++global_prefix_clock;
+            entry.bytes = global_prefix_block_bytes;
+            // Capture the recurrent state at every published complete
+            // boundary. Only the final prompt boundary carries reusable logits;
+            // an interior boundary is still enough to resume the suffix.
+            if (end == upto) {
+                entry.snapshot = capture_recurrent_state(
+                    upto, complete ? result : nullptr, true, slot_id);
+                entry.has_snapshot = true;
+                entry.bytes += entry.snapshot.bytes();
+            }
+            if (!evict_global_prefix_until(entry.bytes)) break;
+            block_pool->retain(entry.block_id);
+            global_prefix_bytes += entry.bytes;
+            global_prefix_cache.emplace(hash, std::move(entry));
+            parent = hash;
+        }
+    }
 
     SlotPrefixState& prefix_for(int slot_id) {
         if (slot_id < 0 || slot_id >= static_cast<int>(slot_prefix.size())) {
@@ -792,6 +1113,9 @@ struct QwenEngine::Impl {
             // keep destruction safe if construction or a caller failed midway.
             stream_synchronize(nccl_comm_stream);
         }
+        // Drop cache-owned block references before the pool itself is destroyed.
+        // Snapshot tensors then release through their normal RAII destructor.
+        clear_global_prefix_cache();
         for (void* event : comm_slice_ready) {
             if (event != nullptr) event_destroy(event);
         }
@@ -822,6 +1146,14 @@ struct QwenEngine::Impl {
         mtp_seed_ready.resize(static_cast<size_t>(max_batch_size), false);
         // One prefix-reuse record per slot, sized with the KV arena.
         slot_prefix.resize(static_cast<size_t>(max_batch_size));
+        const uint64_t hash_scope[5] = {
+            static_cast<uint64_t>(config.hidden_size),
+            static_cast<uint64_t>(config.vocab_size),
+            static_cast<uint64_t>(config.num_hidden_layers),
+            static_cast<uint64_t>(options.kv_cache_dtype),
+            static_cast<uint64_t>(options.kv_block_size)};
+        global_prefix_hash_seed = qwen_xxhash64(
+            hash_scope, sizeof(hash_scope), 0x9e3779b185ebca87ULL);
         // Phase 3.4: The KV arena is sized here, so the free list must be
         // seeded here as well. Seeding it only from allocate_batch_slots()
         // left the batch API unreachable: that function throws once
@@ -969,6 +1301,12 @@ struct QwenEngine::Impl {
             }
             block_pool = std::make_unique<BlockPool>(
                 num_blocks, options.kv_block_size);
+            global_prefix_block_bytes = bytes_per_block;
+            const uint64_t pool_bytes =
+                static_cast<uint64_t>(num_blocks) * bytes_per_block;
+            global_prefix_budget_bytes = options.prefix_cache_bytes != 0
+                ? std::min(options.prefix_cache_bytes, pool_bytes)
+                : pool_bytes * 3 / 10;
             block_table = std::make_unique<BlockTable>(
                 block_pool.get(), options.max_batch_size, max_context);
             const size_t image_elements =
@@ -3820,6 +4158,7 @@ void QwenEngine::reset() {
 void QwenEngine::clear_prefix_cache() {
     position_ = 0;
     prefix_stats_ = QwenPrefixCacheStats{};
+    impl_->clear_global_prefix_cache();
     // Every slot's reuse state, not just slot 0's: a stale entry on any slot
     // would survive the clear and be matched by the next request there.
     for (Impl::SlotPrefixState& slot : impl_->slot_prefix) {
@@ -3831,6 +4170,9 @@ void QwenEngine::clear_prefix_cache() {
     std::fill(impl_->slot_positions.begin(), impl_->slot_positions.end(), 0);
     impl_->prefix_hits = 0;
     impl_->prefix_misses = 0;
+    impl_->global_prefix_hits = 0;
+    impl_->global_prefix_misses = 0;
+    impl_->global_prefix_evictions = 0;
     for (int slot = 0; slot < impl_->max_batch_size; ++slot) {
         impl_->zero_recurrent_state(slot);
     }
@@ -3926,6 +4268,16 @@ int QwenEngine::kv_free_blocks() const {
 
 int QwenEngine::kv_total_blocks() const {
     return impl_->kv_paged() ? impl_->block_pool->total_blocks() : 0;
+}
+
+int QwenEngine::kv_cache_pinned_blocks() const {
+    return impl_->global_prefix_enabled()
+        ? static_cast<int>(impl_->global_prefix_cache.size()) : 0;
+}
+
+int QwenEngine::kv_evict_cache_blocks(int count) {
+    return impl_->global_prefix_enabled()
+        ? impl_->evict_global_prefix_blocks(count) : 0;
 }
 
 int QwenEngine::kv_blocks_for_tokens(int tokens) const {
@@ -4376,16 +4728,37 @@ PartialPrefillResult QwenEngine::prefill_bounded(
     prefix_stats_.prompt_tokens = static_cast<int>(token_ids.size());
     impl_->phase_seconds.clear();
     impl_->phase_calls.clear();
-    // Prefix reuse is scoped to this slot.  Each slot keeps its own cached
-    // prompt, snapshot ring and cached result, so a batch can reuse on every
-    // slot independently; sharing one copy would let a prompt match against
-    // another sequence's tokens and resume from its recurrent state.
+    // Every slot keeps its own mutable prompt and snapshot ring. The global
+    // cache is consulted only when this slot is fresh; its attached blocks and
+    // restored recurrent state then become the slot-local live prefix.
     Impl::SlotPrefixState& prefix = impl_->prefix_for(slot_id);
     const int slot_position = impl_->slot_position(slot_id, position_);
-    const bool can_reuse = options_.prefix_cache &&
+    int start_position = 0;
+    bool global_reused = false;
+    if (options_.prefix_cache && prefix.cached_prompt.empty() &&
+        slot_position == 0) {
+        const std::optional<Impl::GlobalPrefixMatch> global_match =
+            impl_->try_global_prefix(token_ids, slot_id);
+        if (global_match.has_value()) {
+            start_position = global_match->position;
+            // The attach/restore path materializes the destination at the
+            // matched boundary, so the per-slot position must advance before
+            // an exact hit returns or a later decode/append would write at 0.
+            impl_->set_slot_position(slot_id, start_position, position_);
+            global_reused = true;
+            prefix.cached_prompt.assign(
+                token_ids.begin(),
+                token_ids.begin() + static_cast<ptrdiff_t>(start_position));
+            prefix.has_cached_result = global_match->has_result &&
+                start_position == static_cast<int>(token_ids.size());
+            if (prefix.has_cached_result) prefix.cached_result = global_match->result;
+        }
+    }
+
+    bool can_reuse = !global_reused && options_.prefix_cache &&
         !prefix.cached_prompt.empty() && slot_position ==
             static_cast<int>(prefix.cached_prompt.size());
-    size_t common = 0;
+    size_t common = global_reused ? static_cast<size_t>(start_position) : 0;
     if (can_reuse) {
         const size_t limit = std::min(token_ids.size(), prefix.cached_prompt.size());
         while (common < limit && token_ids[common] == prefix.cached_prompt[common]) {
@@ -4395,21 +4768,46 @@ PartialPrefillResult QwenEngine::prefill_bounded(
     prefix_stats_.matched_tokens = static_cast<int>(common);
 
     // Exact repeat: the cached final logits are already the requested result.
-    if (can_reuse && common == token_ids.size() &&
+    if ((global_reused || can_reuse) && common == token_ids.size() &&
         token_ids.size() == prefix.cached_prompt.size() && prefix.has_cached_result) {
-        ++impl_->prefix_hits;
+        if (!global_reused) ++impl_->prefix_hits;
         prefix_stats_.hits = impl_->prefix_hits;
         prefix_stats_.misses = impl_->prefix_misses;
         prefix_stats_.reused_tokens = static_cast<int>(token_ids.size());
-        prefix_stats_.resume_source = "live";
+        prefix_stats_.resume_source = global_reused ? "global" : "live";
         prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
         prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
+        impl_->update_global_prefix_stats(prefix_stats_);
         return {prefix.cached_result, static_cast<int>(token_ids.size()), true};
     }
 
-    int start_position = 0;
+    // A paged row that is being branched or replaced may contain blocks pinned
+    // by the global cache. Recomputing into that row would overwrite data still
+    // visible to other requests. Drop the whole row and recompute from zero;
+    // complete-block global reuse above remains the fast path, while this avoids
+    // a partial-block device copy-on-write implementation in the prefill path.
+    if (impl_->global_prefix_enabled() && !global_reused &&
+        !prefix.cached_prompt.empty() &&
+        (!can_reuse || common != prefix.cached_prompt.size())) {
+        impl_->release_paged_slot(slot_id);
+        impl_->sync_block_table();
+        impl_->zero_recurrent_state(slot_id);
+        prefix.cached_prompt.clear();
+        prefix.snapshots.clear();
+        prefix.cached_result = ForwardResult{};
+        prefix.has_cached_result = false;
+        start_position = 0;
+        common = 0;
+        can_reuse = false;
+        prefix_stats_.matched_tokens = 0;
+    }
+
     const QwenRecurrentSnapshot* resume_snapshot = nullptr;
-    if (can_reuse && common == prefix.cached_prompt.size() &&
+    if (global_reused) {
+        prefix_stats_.resume_source = "global";
+        // The recurrent state and complete blocks were attached above. The
+        // unmatched suffix starts exactly at the restored boundary.
+    } else if (can_reuse && common == prefix.cached_prompt.size() &&
         common <= token_ids.size()) {
         // The current recurrent state is exactly the state after the common
         // prefix. This is the hot path for monotonically growing prompts.
@@ -4438,6 +4836,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
             ++impl_->prefix_hits;
             prefix_stats_.hits = impl_->prefix_hits;
             prefix_stats_.misses = impl_->prefix_misses;
+            impl_->update_global_prefix_stats(prefix_stats_);
             return {prefix.cached_result, static_cast<int>(common), true};
         }
         if (resume_snapshot != nullptr &&
@@ -4544,6 +4943,14 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         if (periodic_snapshot || end == target_position) {
             impl_->record_snapshot(end, &result, periodic_snapshot, slot_id);
         }
+        // Publish complete physical blocks as soon as their recurrent boundary
+        // exists. This allows another request to share a system prompt that is
+        // only a prefix of the current prompt, provided the chunk boundary is
+        // aligned with the block size.
+        if (impl_->kv_paged() && end % impl_->paged_block_size() == 0) {
+            impl_->publish_global_prefix(
+                token_ids, end, slot_id, &result, end == target_position);
+        }
 
         offset = end;
     }
@@ -4572,12 +4979,15 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         prefix.cached_prompt.clear();
         prefix.has_cached_result = false;
     }
+    impl_->publish_global_prefix(token_ids, budget_limit, slot_id,
+                                 &result, complete);
     prefix_stats_.reused_tokens = start_position;
     prefix_stats_.computed_tokens = budget_limit - start_position;
     prefix_stats_.snapshots = impl_->snapshot_count(slot_id);
     prefix_stats_.snapshot_bytes = impl_->snapshot_bytes();
     prefix_stats_.hits = impl_->prefix_hits;
     prefix_stats_.misses = impl_->prefix_misses;
+    impl_->update_global_prefix_stats(prefix_stats_);
     impl_->report_phase_profile("prefill");
     return {result, budget_limit, complete};
 }

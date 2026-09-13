@@ -168,6 +168,7 @@ public:
         int reserved_blocks = 0;
         int total_blocks = 0;
         int free_blocks = 0;
+        int cache_pinned_blocks = 0;
     };
     Stats get_stats() const;
 
