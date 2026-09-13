@@ -28,6 +28,46 @@ enum class QwenKvCacheDType {
 const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype);
 QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value);
 
+// Forward declarations to avoid circular dependency with qwen_layer_components.hpp
+namespace qwen_components {
+    enum class NvFp4Mode : int;
+    enum class OptionalSwitch : int;
+}
+
+// Kernel tuning options for advanced users. Most users never touch these; they
+// control low-level execution paths and optimization strategies. All fields have
+// sensible defaults derived from hardware detection and benchmarking.
+struct QwenKernelOptions {
+    // NVFP4 quantization
+    qwen_components::NvFp4Mode nvfp4_mode = static_cast<qwen_components::NvFp4Mode>(0);  // Auto
+    bool nvfp4_wide_n64 = true;
+    int nvfp4_wide_n64_min_rows = 128;
+    bool nvfp4_fused_swiglu = false;
+    bool nvfp4_shared_q8_swiglu = true;
+
+    // GQA (full attention)
+    bool gqa_optimized = true;
+    bool gqa_verify_cublas_qk = false;
+    qwen_components::OptionalSwitch gqa_verify_split = static_cast<qwen_components::OptionalSwitch>(0);  // Auto
+    int gqa_verify_splits = 0;
+
+    // Kernel fusion flags
+    bool verify_small_fp16_cublas = true;
+    bool gated_delta_flashqla = true;
+    bool fuse_qkvz_decode = false;
+    bool fuse_ab_projection = true;
+    bool gated_delta_prenormalize = true;
+    bool gated_delta_shared_state = false;
+    bool fuse_full_qkv_decode = false;
+    bool fuse_attention_residual_norm = true;
+
+    // Communication overlap
+    int comm_overlap_slices = 4;
+
+    // Load from environment variables (backward compatibility)
+    void load_from_env();
+};
+
 struct QwenEngineOptions {
     int tp_world = 1;
     int tp_rank = 0;
@@ -126,6 +166,13 @@ struct QwenEngineOptions {
     // paging alone memory-neutral and lets the block count be raised
     // deliberately.
     uint64_t kv_cache_bytes = 0;
+    // Upper bound for the cross-request prefix cache, including retained KV
+    // blocks and recurrent snapshots. 0 derives a bounded default from the
+    // paged KV pool (30 percent of the pool bytes).
+    uint64_t prefix_cache_bytes = 0;
+
+    // Kernel tuning options (advanced users only)
+    QwenKernelOptions kernel;
 };
 
 // Accounting for one native-MTP or external-DSpark generate call.
@@ -197,6 +244,14 @@ struct QwenPrefixCacheStats {
     uint64_t snapshot_bytes = 0;
     int hits = 0;
     int misses = 0;
+    // Cross-request paged-cache telemetry. These counters are cumulative until
+    // clear_prefix_cache(), while the fields above describe the last prefill.
+    int global_hits = 0;
+    int global_misses = 0;
+    int global_cached_blocks = 0;
+    int global_evictions = 0;
+    uint64_t global_cache_bytes = 0;
+    uint64_t global_cache_budget_bytes = 0;
 };
 
 // Independent Qwen3.5 hybrid dense runtime. Checkpoint BF16 tensors are
@@ -302,6 +357,8 @@ public:
     // are 0.
     int kv_free_blocks() const override;
     int kv_total_blocks() const override;
+    int kv_cache_pinned_blocks() const override;
+    int kv_evict_cache_blocks(int count) override;
 
     // Blocks a sequence of `tokens` logical positions needs in total. This is
     // the unit admission has to reason in: a request's cost is set by the blocks

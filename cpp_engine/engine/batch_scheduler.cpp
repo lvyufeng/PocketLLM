@@ -189,6 +189,7 @@ BatchScheduler::Stats BatchScheduler::get_stats() const {
     stats.reserved_blocks = reserved_blocks_;
     stats.total_blocks = engine_->kv_total_blocks();
     stats.free_blocks = engine_->kv_free_blocks();
+    stats.cache_pinned_blocks = engine_->kv_cache_pinned_blocks();
 
     return stats;
 }
@@ -267,13 +268,28 @@ void BatchScheduler::admit_requests() {
         if (caps_.paged_kv) {
             const int needed =
                 worst_case_blocks(*waiting_queue_.front());
-            // Checked against the pool total minus what admitted requests may
-            // still grow into, not against free_blocks. The engine takes blocks
-            // as tokens arrive, so free_blocks counts a running request's future
-            // decode blocks as available; admitting against it would overcommit
-            // and exhaust the pool inside a decode forward, which has nowhere to
-            // put the K/V it must write and no way to back out.
-            if (needed > engine_->kv_total_blocks() - reserved_blocks_) {
+            // Checked against capacity not owned by the global prefix cache or
+            // by admitted requests, rather than against free_blocks. The engine
+            // takes blocks as tokens arrive, so free_blocks counts a running
+            // request's future decode blocks as available; admitting against it
+            // would overcommit and exhaust the pool inside a decode forward,
+            // which has nowhere to put the K/V it must write and no way to back
+            // out.
+            int available = engine_->kv_total_blocks() -
+                engine_->kv_cache_pinned_blocks() - reserved_blocks_;
+            if (needed > available) {
+                // Prefix entries are a performance cache, not a correctness
+                // requirement. Reclaim unreferenced entries before holding a
+                // request at the queue head; active slots remain protected by
+                // their additional block references.
+                const int deficit = needed - std::max(0, available);
+                if (deficit > 0) {
+                    engine_->kv_evict_cache_blocks(deficit);
+                    available = engine_->kv_total_blocks() -
+                        engine_->kv_cache_pinned_blocks() - reserved_blocks_;
+                }
+            }
+            if (needed > available) {
                 // Head-of-line blocking is deliberate: taking a later, smaller
                 // request first would starve long prompts indefinitely under a
                 // steady stream of short ones. The request waits for blocks its

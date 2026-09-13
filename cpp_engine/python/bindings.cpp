@@ -9,19 +9,60 @@
 #include "qwen_engine.hpp"
 #include "qwen_weights.hpp"
 #include "batch_scheduler.hpp"
+#include "inference_engine.hpp"
 #include "device_runtime.hpp"
 #include "model_registry.hpp"
+#include "qwen_layer_components.hpp"
 
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <iostream>
+#include <memory>
 #include <utility>
 
 namespace py = pybind11;
 using namespace pocket;
+using namespace pocket::qwen_components;
 
 namespace {
+
+// Owns a Python callable that is handed to the scheduler, which stores it on a
+// request and releases it from its own background thread once the request
+// retires. A bare py::function would decref there without the GIL, so the
+// callable is held behind a shared_ptr whose deleter reacquires it. Copying the
+// holder only bumps the shared_ptr count, so the scheduler is free to copy the
+// enclosing std::function without holding a GIL of its own.
+class GilSafeCallable {
+public:
+    explicit GilSafeCallable(py::function fn)
+        : fn_(new py::function(std::move(fn)), GilDeleter{}) {}
+
+    // Runs on the scheduler thread with no GIL held. Exceptions are reported
+    // and swallowed: letting one escape would cross the scheduler's thread and
+    // take down every other live request with it.
+    template <typename... Args>
+    void call(const char* what, Args&&... args) const {
+        py::gil_scoped_acquire acquire;
+        try {
+            (*fn_)(std::forward<Args>(args)...);
+        } catch (const py::error_already_set& e) {
+            std::cerr << "[BatchScheduler] " << what << " callback error: "
+                      << e.what() << std::endl;
+        }
+    }
+
+private:
+    struct GilDeleter {
+        void operator()(py::function* fn) const {
+            py::gil_scoped_acquire acquire;
+            delete fn;
+        }
+    };
+
+    std::shared_ptr<py::function> fn_;
+};
 
 py::dict forward_result_dict(const ForwardResult& result) {
     py::dict out;
@@ -75,6 +116,12 @@ py::dict prefix_stats_dict(const QwenPrefixCacheStats& stats) {
     out["snapshot_bytes"] = stats.snapshot_bytes;
     out["hits"] = stats.hits;
     out["misses"] = stats.misses;
+    out["global_hits"] = stats.global_hits;
+    out["global_misses"] = stats.global_misses;
+    out["global_cached_blocks"] = stats.global_cached_blocks;
+    out["global_evictions"] = stats.global_evictions;
+    out["global_cache_bytes"] = stats.global_cache_bytes;
+    out["global_cache_budget_bytes"] = stats.global_cache_budget_bytes;
     return out;
 }
 
@@ -207,11 +254,46 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .value("Int8PerTokenHead", QwenKvCacheDType::Int8PerTokenHead)
         .export_values();
 
+    py::enum_<NvFp4Mode>(module, "NvFp4Mode")
+        .value("Auto", NvFp4Mode::Auto)
+        .value("Dp4a", NvFp4Mode::Dp4a)
+        .value("Wmma", NvFp4Mode::Wmma)
+        .value("Reference", NvFp4Mode::Reference)
+        .export_values();
+
+    py::enum_<OptionalSwitch>(module, "OptionalSwitch")
+        .value("Auto", OptionalSwitch::Auto)
+        .value("Disabled", OptionalSwitch::Disabled)
+        .value("Enabled", OptionalSwitch::Enabled)
+        .export_values();
+
     module.def("qwen_kv_cache_dtype_name", [](QwenKvCacheDType dtype) {
         return std::string(qwen_kv_cache_dtype_name(dtype));
     });
     module.def("parse_qwen_kv_cache_dtype", &parse_qwen_kv_cache_dtype);
     module.def("is_qwen3_5_checkpoint", &is_qwen3_5_checkpoint);
+
+    py::class_<QwenKernelOptions>(module, "QwenKernelOptions")
+        .def(py::init<>())
+        .def_readwrite("nvfp4_mode", &QwenKernelOptions::nvfp4_mode)
+        .def_readwrite("nvfp4_wide_n64", &QwenKernelOptions::nvfp4_wide_n64)
+        .def_readwrite("nvfp4_wide_n64_min_rows", &QwenKernelOptions::nvfp4_wide_n64_min_rows)
+        .def_readwrite("nvfp4_fused_swiglu", &QwenKernelOptions::nvfp4_fused_swiglu)
+        .def_readwrite("nvfp4_shared_q8_swiglu", &QwenKernelOptions::nvfp4_shared_q8_swiglu)
+        .def_readwrite("gqa_optimized", &QwenKernelOptions::gqa_optimized)
+        .def_readwrite("gqa_verify_cublas_qk", &QwenKernelOptions::gqa_verify_cublas_qk)
+        .def_readwrite("gqa_verify_split", &QwenKernelOptions::gqa_verify_split)
+        .def_readwrite("gqa_verify_splits", &QwenKernelOptions::gqa_verify_splits)
+        .def_readwrite("verify_small_fp16_cublas", &QwenKernelOptions::verify_small_fp16_cublas)
+        .def_readwrite("gated_delta_flashqla", &QwenKernelOptions::gated_delta_flashqla)
+        .def_readwrite("fuse_qkvz_decode", &QwenKernelOptions::fuse_qkvz_decode)
+        .def_readwrite("fuse_ab_projection", &QwenKernelOptions::fuse_ab_projection)
+        .def_readwrite("gated_delta_prenormalize", &QwenKernelOptions::gated_delta_prenormalize)
+        .def_readwrite("gated_delta_shared_state", &QwenKernelOptions::gated_delta_shared_state)
+        .def_readwrite("fuse_full_qkv_decode", &QwenKernelOptions::fuse_full_qkv_decode)
+        .def_readwrite("fuse_attention_residual_norm", &QwenKernelOptions::fuse_attention_residual_norm)
+        .def_readwrite("comm_overlap_slices", &QwenKernelOptions::comm_overlap_slices)
+        .def("load_from_env", &QwenKernelOptions::load_from_env);
 
     py::class_<QwenEngineOptions>(module, "QwenEngineOptions")
         .def(py::init<>())
@@ -238,7 +320,9 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("sampling_seed", &QwenEngineOptions::sampling_seed)
         .def_readwrite("kv_paged", &QwenEngineOptions::kv_paged)
         .def_readwrite("kv_block_size", &QwenEngineOptions::kv_block_size)
-        .def_readwrite("kv_cache_bytes", &QwenEngineOptions::kv_cache_bytes);
+        .def_readwrite("kv_cache_bytes", &QwenEngineOptions::kv_cache_bytes)
+        .def_readwrite("prefix_cache_bytes", &QwenEngineOptions::prefix_cache_bytes)
+        .def_readwrite("kernel", &QwenEngineOptions::kernel);
 
     py::class_<ForwardResult>(module, "QwenForwardResult")
         .def(py::init<>())
@@ -290,6 +374,12 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("snapshot_bytes", &QwenPrefixCacheStats::snapshot_bytes)
         .def_readwrite("hits", &QwenPrefixCacheStats::hits)
         .def_readwrite("misses", &QwenPrefixCacheStats::misses)
+        .def_readwrite("global_hits", &QwenPrefixCacheStats::global_hits)
+        .def_readwrite("global_misses", &QwenPrefixCacheStats::global_misses)
+        .def_readwrite("global_cached_blocks", &QwenPrefixCacheStats::global_cached_blocks)
+        .def_readwrite("global_evictions", &QwenPrefixCacheStats::global_evictions)
+        .def_readwrite("global_cache_bytes", &QwenPrefixCacheStats::global_cache_bytes)
+        .def_readwrite("global_cache_budget_bytes", &QwenPrefixCacheStats::global_cache_budget_bytes)
         .def("as_dict", &prefix_stats_dict);
 
     py::class_<QwenEngine>(module, "QwenEngine")
@@ -347,6 +437,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_property_readonly("kv_paged", &QwenEngine::kv_paged)
         .def_property_readonly("kv_free_blocks", &QwenEngine::kv_free_blocks)
         .def_property_readonly("kv_total_blocks", &QwenEngine::kv_total_blocks)
+        .def_property_readonly("kv_cache_pinned_blocks", &QwenEngine::kv_cache_pinned_blocks)
         .def_property_readonly("config", [](const QwenEngine& engine) {
             return qwen_config_dict(engine.config());
         })
@@ -425,6 +516,26 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("worker_command_speculative_decode", &PersistentEngine::worker_command_speculative_decode)
         .def("worker_command_prime_draft_kv", &PersistentEngine::worker_command_prime_draft_kv);
 
+    // Capabilities struct for engine introspection
+    py::class_<Capabilities>(module, "Capabilities")
+        .def(py::init<>())
+        .def_readonly("paged_kv", &Capabilities::paged_kv)
+        .def_readonly("continuous_batching", &Capabilities::continuous_batching)
+        .def_readonly("chunked_prefill", &Capabilities::chunked_prefill)
+        .def_readonly("max_slots", &Capabilities::max_slots)
+        .def_readonly("per_request_sampling", &Capabilities::per_request_sampling)
+        .def_readonly("per_request_top_k", &Capabilities::per_request_top_k)
+        .def_readonly("fixed_temperature", &Capabilities::fixed_temperature)
+        .def_readonly("fixed_top_p", &Capabilities::fixed_top_p)
+        .def_readonly("fixed_top_k", &Capabilities::fixed_top_k)
+        .def_readonly("fixed_seed", &Capabilities::fixed_seed)
+        .def("__repr__", [](const Capabilities& c) {
+            return "<Capabilities max_slots=" + std::to_string(c.max_slots) +
+                   " continuous_batching=" + (c.continuous_batching ? "True" : "False") +
+                   " chunked_prefill=" + (c.chunked_prefill ? "True" : "False") +
+                   " paged_kv=" + (c.paged_kv ? "True" : "False") + ">";
+        });
+
     // BatchScheduler bindings (Phase 3.4)
     py::class_<BatchSamplingParams>(module, "QwenBatchSamplingParams")
         .def(py::init<>())
@@ -460,32 +571,62 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("running_requests", &BatchScheduler::Stats::running_requests)
         .def_readwrite("completed_requests", &BatchScheduler::Stats::completed_requests)
         .def_readwrite("cancelled_requests", &BatchScheduler::Stats::cancelled_requests)
-        .def_readwrite("free_slots", &BatchScheduler::Stats::free_slots);
+        .def_readwrite("free_slots", &BatchScheduler::Stats::free_slots)
+        .def_readwrite("cache_pinned_blocks", &BatchScheduler::Stats::cache_pinned_blocks);
 
     py::class_<BatchScheduler>(module, "QwenBatchScheduler")
         .def(py::init<QwenEngine*, int>(),
              py::arg("engine"), py::arg("max_batch_size"))
-        .def("submit_request", [](BatchScheduler& scheduler,
-                                   const std::vector<int>& prompt_tokens,
-                                   const BatchSamplingParams& sampling,
-                                   py::object callback) {
-            // Convert Python callback to C++ std::function
-            std::function<void(const SchedulerGenerationResult&)> cpp_callback;
-            if (!callback.is_none()) {
-                cpp_callback = [callback](const SchedulerGenerationResult& result) {
-                    py::gil_scoped_acquire acquire;
-                    try {
-                        callback(result);
-                    } catch (const py::error_already_set& e) {
-                        // Re-raise Python exceptions
-                        throw;
-                    }
-                };
-            }
+        .def("submit_request",
+             [](BatchScheduler& scheduler,
+                const std::vector<int>& prompt_tokens,
+                const BatchSamplingParams& sampling,
+                py::object callback,
+                py::object on_token) -> uint64_t {
 
-            py::gil_scoped_release release;
-            return scheduler.submit_request(prompt_tokens, sampling, cpp_callback);
-        }, py::arg("prompt_tokens"), py::arg("sampling"), py::arg("callback") = py::none())
+                 std::function<void(const SchedulerGenerationResult&)> cpp_callback;
+                 if (!callback.is_none()) {
+                     GilSafeCallable fn(py::cast<py::function>(callback));
+                     cpp_callback = [fn](const SchedulerGenerationResult& result) {
+                         fn.call("completion", result);
+                     };
+                 }
+
+                 TokenCallback cpp_token_callback;
+                 if (!on_token.is_none()) {
+                     GilSafeCallable fn(py::cast<py::function>(on_token));
+                     cpp_token_callback = [fn](uint64_t request_id, int token) {
+                         fn.call("token", request_id, token);
+                     };
+                 }
+
+                 // Moved, not copied: copying a std::function that owns a
+                 // py::function touches the Python refcount, and the GIL is
+                 // released below. Moving is a pointer swap, so it is safe.
+                 py::gil_scoped_release release;
+                 return scheduler.submit_request(prompt_tokens, sampling,
+                                                std::move(cpp_callback),
+                                                std::move(cpp_token_callback));
+             },
+             py::arg("prompt_tokens"),
+             py::arg("sampling"),
+             py::arg("callback") = py::none(),
+             py::arg("on_token") = py::none(),
+             R"doc(Submit a generation request.
+
+             Args:
+                 prompt_tokens: Input token IDs
+                 sampling: Sampling parameters (temperature, top_p, etc.)
+                 callback: Optional completion callback (called from scheduler thread)
+                 on_token: Optional per-token callback (called from scheduler thread)
+
+             Returns:
+                 request_id (> 0 on success, 0 on failure)
+
+             Note:
+                 Callbacks run from the scheduler's background thread and MUST NOT BLOCK.
+                 Blocking callbacks will stall all running requests.
+             )doc")
         .def("cancel_request", [](BatchScheduler& scheduler, uint64_t request_id) {
             py::gil_scoped_release release;
             return scheduler.cancel_request(request_id);
@@ -510,7 +651,23 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("stop", [](BatchScheduler& scheduler) {
             py::gil_scoped_release release;
             scheduler.stop();
-        });
+        })
+        .def("engine_caps", &BatchScheduler::engine_caps,
+             py::return_value_policy::reference_internal,
+             "Query engine capabilities (max_slots, continuous_batching, etc.)")
+        .def("max_batch_size", &BatchScheduler::max_batch_size,
+             "Get effective batch size (may be clamped to max_slots)")
+        .def("set_prefill_token_budget", &BatchScheduler::set_prefill_token_budget,
+             py::arg("tokens"),
+             R"doc(Set prefill token budget per schedule iteration.
+
+             Smaller values let decode interleave sooner at some cost to prefill
+             throughput. 0 disables chunking (run each prompt to completion).
+
+             Ignored if engine does not declare chunked_prefill capability.
+             )doc")
+        .def("prefill_token_budget", &BatchScheduler::prefill_token_budget,
+             "Get current prefill token budget");
 
     module.attr("backend") = device_backend_name();
 }

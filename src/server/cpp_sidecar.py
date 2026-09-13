@@ -17,6 +17,9 @@ Protocol (one JSON object per stdin/stdout line):
            "context": [...] (optional), "drop_thinking": true}
   reply   {"ok": true, "prompt_text": "...", "token_ids": [...]}
 
+  request {"op": "tokenize", "prompt": "..."}
+  reply   {"ok": true, "token_ids": [...]}
+
   request {"op": "parse", "text": "...", "thinking_mode": "chat"|"thinking"}
   reply   {"ok": true, "content": "...", "reasoning": "...", "tool_calls": [...]}
 
@@ -210,6 +213,16 @@ def _handle_encode(templater, req: dict[str, Any]) -> None:
     _emit({"ok": True, "prompt_text": prompt_text, "token_ids": token_ids})
 
 
+def _handle_tokenize(tokenizer, req: dict[str, Any]) -> None:
+    """Tokenize raw text without applying chat template."""
+    prompt = req.get("prompt", "")
+    if not isinstance(prompt, str):
+        _err("prompt must be a string")
+        return
+    token_ids = list(tokenizer.encode(prompt, add_special_tokens=True))
+    _emit({"ok": True, "token_ids": token_ids})
+
+
 def _handle_parse(templater, req: dict[str, Any]) -> None:
     parsed = templater.parse(req.get("text", ""), req.get("thinking_mode", "chat"))
     _emit({"ok": True, **parsed})
@@ -255,6 +268,8 @@ def main() -> int:
         try:
             if op == "encode":
                 _handle_encode(templater, req)
+            elif op == "tokenize":
+                _handle_tokenize(tokenizer, req)
             elif op == "parse":
                 _handle_parse(templater, req)
             elif op == "ping":

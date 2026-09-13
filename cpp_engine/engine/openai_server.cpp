@@ -1,7 +1,9 @@
 #include "openai_server.hpp"
 
 #include "batch_scheduler.hpp"
+#include "metrics.hpp"
 #include "json_lite.hpp"
+#include "qwen_engine.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include "httplib.h"
@@ -15,14 +17,25 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace pocket {
 
 namespace {
+
+std::string make_request_id() {
+    static std::random_device rd;
+    static std::mt19937_64 gen(rd());
+    static std::uniform_int_distribution<uint64_t> dist;
+    std::ostringstream os;
+    os << "req_" << std::hex << dist(gen);
+    return os.str();
+}
 
 std::string json_escape(const std::string& s) {
     std::string out;
@@ -154,14 +167,6 @@ std::pair<std::string, std::string> split_utf8_complete(const std::string& s) {
     return { s, "" };
 }
 
-std::string make_request_id() {
-    using clock = std::chrono::steady_clock;
-    auto t = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now().time_since_epoch()).count();
-    std::ostringstream os;
-    os << "chatcmpl-cpp-" << std::hex << t;
-    return os.str();
-}
-
 std::string render_choice_message(const std::string& content, const std::string& reasoning, const std::string& tool_calls_json) {
     std::ostringstream os;
     os << "{\"role\":\"assistant\"";
@@ -244,6 +249,16 @@ struct OpenAIServer::Impl {
     // Token id for "</think>", or -1 when the vocabulary has none. Looked up
     // once; the streaming path needs it per token.
     const int think_end_id;
+    EngineMetrics metrics;
+
+    // Request tracking for cancellation API
+    struct TrackedRequest {
+        uint64_t scheduler_id;
+        std::string client_id;
+        std::chrono::steady_clock::time_point start_time;
+    };
+    std::mutex tracked_requests_mutex_;
+    std::unordered_map<std::string, TrackedRequest> tracked_requests_;
 
     Impl(InferenceEngine& e, const Tokenizer& t, PythonSidecar& s, const OpenAIServerConfig& c)
         : engine(e), tok(t), sidecar(s), cfg(c),
@@ -261,10 +276,67 @@ struct OpenAIServer::Impl {
         res.set_content("{\"status\":\"ok\"}", "application/json");
     }
 
+    void handle_ready(httplib::Response& res) {
+        // The engine is initialized if we reach this point (constructor passed).
+        // Return 200 to signal readiness for serving requests.
+        res.set_content("{\"ready\":true}", "application/json");
+    }
+
+    void handle_alive(httplib::Response& res) {
+        res.set_content("{\"alive\":true}", "application/json");
+    }
+
     void handle_models(httplib::Response& res) {
         std::ostringstream os;
         os << "{\"object\":\"list\",\"data\":[{\"id\":\"" << json_escape(cfg.model_name)
            << "\",\"object\":\"model\",\"owned_by\":\"local\"}]}";
+        res.set_content(os.str(), "application/json");
+    }
+
+    void handle_metrics(httplib::Response& res) {
+        const auto stats = sched.get_stats();
+
+        // Try to get Qwen-specific prefix cache stats
+        const QwenPrefixCacheStats* cache_stats = nullptr;
+        QwenPrefixCacheStats qwen_stats;
+        QwenEngine* qwen = dynamic_cast<QwenEngine*>(&engine);
+        if (qwen) {
+            qwen_stats = qwen->prefix_cache_stats();
+            cache_stats = &qwen_stats;
+        }
+
+        const std::string body = metrics.serialize_prometheus(
+            stats.waiting_requests, stats.running_requests,
+            stats.free_slots, stats.reserved_blocks, stats.total_blocks,
+            stats.free_blocks, stats.cache_pinned_blocks, cache_stats);
+
+        res.set_content(body, "text/plain; version=0.0.4");
+    }
+
+    void handle_cancel_request(const httplib::Request& req, httplib::Response& res) {
+        const std::string request_id = req.path_params.at("id");
+
+        uint64_t scheduler_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            auto it = tracked_requests_.find(request_id);
+            if (it == tracked_requests_.end()) {
+                res.status = 404;
+                std::ostringstream os;
+                os << "{\"error\":{\"message\":\"Request not found or already completed\","
+                   << "\"type\":\"invalid_request_error\"}}";
+                res.set_content(os.str(), "application/json");
+                return;
+            }
+            scheduler_id = it->second.scheduler_id;
+        }
+
+        const bool cancelled = sched.cancel_request(scheduler_id);
+
+        std::ostringstream os;
+        os << "{\"id\":\"" << json_escape(request_id) << "\""
+           << ",\"object\":\"request.cancel\""
+           << ",\"cancelled\":" << (cancelled ? "true" : "false") << "}";
         res.set_content(os.str(), "application/json");
     }
 
@@ -325,7 +397,8 @@ struct OpenAIServer::Impl {
     bool encode_request(const std::string& body, const JsonObject& obj,
                         EncodeReply& out, std::string& thinking_mode_out,
                         int& max_tokens_out, bool& stream_out,
-                        BatchSamplingParams& sp_out, std::string& err_out) {
+                        BatchSamplingParams& sp_out, std::string& request_id_out,
+                        std::string& err_out) {
         if (!check_sampling_supported(obj, err_out)) return false;
 
         EncodeRequest enc;
@@ -340,6 +413,12 @@ struct OpenAIServer::Impl {
         max_tokens_out = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
         if (max_tokens_out <= 0) max_tokens_out = cfg.default_max_tokens;
         stream_out = get_bool(obj, "stream", false);
+
+        // Extract optional request_id from client, or generate one
+        request_id_out = get_string(obj, "request_id", "");
+        if (request_id_out.empty()) {
+            request_id_out = make_request_id();
+        }
 
         // An engine that fixes its own sampling ignores these; check_sampling_
         // supported has already established the request agrees with them, so
@@ -371,13 +450,18 @@ struct OpenAIServer::Impl {
     }
 
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+        const auto request_start = std::chrono::steady_clock::now();
+        metrics.record_request_start();
+
         const std::string& body = req.body;
         JsonValue jv;
         try { jv = parse_json(body); } catch (const std::exception& ex) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, std::string("invalid JSON: ") + ex.what());
             return;
         }
         if (!jv.is_object()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, "request body must be JSON object");
             return;
         }
@@ -387,8 +471,10 @@ struct OpenAIServer::Impl {
         int max_tokens = 0;
         bool stream = false;
         BatchSamplingParams sp;
+        std::string client_id;
         std::string err;
-        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, err)) {
+        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
         }
@@ -403,14 +489,126 @@ struct OpenAIServer::Impl {
         // by what the engine declared. Serialising here would give a paged
         // batched engine the throughput of a single-session one.
         if (static_cast<int>(enc_reply.token_ids.size()) + max_tokens > engine.max_context()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, "prompt + max_tokens exceeds max_context");
             return;
         }
 
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, thinking_mode);
+            handle_stream(req, res, enc_reply, sp, thinking_mode, client_id, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, thinking_mode);
+            handle_nonstream(res, enc_reply, sp, thinking_mode, client_id, request_start);
+        }
+    }
+
+    void handle_completions(const httplib::Request& req, httplib::Response& res) {
+        const auto request_start = std::chrono::steady_clock::now();
+        metrics.record_request_start();
+
+        const std::string& body = req.body;
+        JsonValue jv;
+        try { jv = parse_json(body); } catch (const std::exception& ex) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, std::string("invalid JSON: ") + ex.what());
+            return;
+        }
+        if (!jv.is_object()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "request body must be JSON object");
+            return;
+        }
+        const auto& obj = jv.object();
+
+        // Extract prompt (string or array of strings)
+        std::string prompt_str;
+        const JsonValue* prompt_val = object_get(obj, "prompt");
+        if (prompt_val == nullptr) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "missing required field: prompt");
+            return;
+        }
+        if (prompt_val->is_string()) {
+            prompt_str = prompt_val->string();
+        } else if (prompt_val->is_array()) {
+            const auto& arr = prompt_val->array();
+            if (arr.empty()) {
+                metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+                emit_error(res, 400, "prompt array must not be empty");
+                return;
+            }
+            // Only handle single-prompt case for now (n=1)
+            if (!arr[0].is_string()) {
+                metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+                emit_error(res, 400, "prompt array must contain strings");
+                return;
+            }
+            prompt_str = arr[0].string();
+        } else {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "prompt must be string or array of strings");
+            return;
+        }
+
+        // Tokenize without chat template
+        TokenizeRequest tok_req;
+        tok_req.prompt = prompt_str;
+        TokenizeReply tok_reply = sidecar.tokenize(tok_req);
+        if (!tok_reply.ok) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "tokenization failed: " + tok_reply.err);
+            return;
+        }
+        if (tok_reply.token_ids.empty()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "tokenization produced no tokens");
+            return;
+        }
+
+        // Extract generation parameters
+        std::string err;
+        if (!check_sampling_supported(obj, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
+        }
+
+        int max_tokens = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
+        if (max_tokens <= 0) max_tokens = cfg.default_max_tokens;
+        bool stream = get_bool(obj, "stream", false);
+
+        std::string client_id = get_string(obj, "request_id", "");
+        if (client_id.empty()) {
+            client_id = make_request_id();
+        }
+
+        BatchSamplingParams sp;
+        sp.temperature = static_cast<float>(get_number(obj, "temperature", 1.0));
+        sp.top_p = static_cast<float>(get_number(obj, "top_p", 1.0));
+        sp.top_k = static_cast<int>(get_number(obj, "top_k", 20));
+        sp.seed = static_cast<unsigned long long>(get_number(obj, "seed", 0));
+        sp.max_new_tokens = max_tokens;
+
+        if (static_cast<int>(tok_reply.token_ids.size()) + max_tokens > engine.max_context()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, "prompt + max_tokens exceeds max_context");
+            return;
+        }
+
+        if (cfg.log_requests) {
+            std::cerr << "[server] /v1/completions prompt_tokens=" << tok_reply.token_ids.size()
+                      << " max_tokens=" << max_tokens << " stream=" << (stream ? 1 : 0) << "\n";
+        }
+
+        // Reuse the same generation logic, but use "text_completion" format
+        EncodeReply enc_reply;
+        enc_reply.ok = true;
+        enc_reply.token_ids = std::move(tok_reply.token_ids);
+        enc_reply.prompt_text = prompt_str;
+
+        if (stream) {
+            handle_completions_stream(enc_reply, sp, client_id, request_start, res);
+        } else {
+            handle_completions_nonstream(enc_reply, sp, client_id, request_start, res);
         }
     }
 
@@ -424,30 +622,51 @@ struct OpenAIServer::Impl {
         return std::vector<int>(tokens.begin(), tokens.end() - 1);
     }
 
-    void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
-                          const BatchSamplingParams& sp, const std::string& thinking_mode) {
+    void handle_completions_nonstream(const EncodeReply& enc,
+                                      const BatchSamplingParams& sp,
+                                      const std::string& client_id,
+                                      std::chrono::steady_clock::time_point request_start,
+                                      httplib::Response& res) {
+        std::chrono::steady_clock::time_point ttft_time;
+        bool ttft_recorded = false;
+
         auto completion = std::make_shared<TokenStream>();
         const uint64_t request_id = sched.submit_request(
             enc.token_ids, sp,
             [completion](const SchedulerGenerationResult& r) { completion->finish(r); });
         if (request_id == 0) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
             return;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
+        }
+
         int unused_token = 0;
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(cfg.request_timeout_seconds);
         if (completion->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
-            // The callback owns `completion`, so it remains valid until the
-            // scheduler observes the cancellation. Because callback-mode
-            // requests are not duplicated into poll_result(), abandoning this
-            // HTTP response leaves no completed-result map entry behind.
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
             sched.cancel_request(request_id);
+
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
             emit_error(res, 504, "generation timed out");
             return;
+        }
+        if (!ttft_recorded) {
+            ttft_time = std::chrono::steady_clock::now();
+            ttft_recorded = true;
         }
 
         SchedulerGenerationResult out;
@@ -456,12 +675,262 @@ struct OpenAIServer::Impl {
             out = completion->result;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_.erase(client_id);
+        }
+
+        const auto request_end = std::chrono::steady_clock::now();
+        const double duration = std::chrono::duration<double>(request_end - request_start).count();
+        const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
+
         if (!out.error.empty()) {
+            metrics.record_request_end(false, duration, ttft, enc.token_ids.size(), 0);
             emit_error(res, 500, out.error);
             return;
         }
 
         const std::vector<int> generated = strip_stop_token(out.generated_tokens, out.finish_reason);
+        metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
+
+        const std::string text = tok.decode_tokens(generated);
+
+        std::ostringstream os;
+        os << "{\"id\":\"" << json_escape(client_id) << "\""
+           << ",\"object\":\"text_completion\""
+           << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
+           << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
+           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << out.finish_reason << "\""
+           << ",\"text\":\"" << json_escape(text) << "\"}]"
+           << ",\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
+           << ",\"completion_tokens\":" << generated.size()
+           << ",\"total_tokens\":" << (enc.token_ids.size() + generated.size()) << "}}";
+        res.set_content(os.str(), "application/json");
+    }
+
+    void handle_completions_stream(const EncodeReply& enc,
+                                   const BatchSamplingParams& sp,
+                                   const std::string& client_id,
+                                   std::chrono::steady_clock::time_point request_start,
+                                   httplib::Response& res) {
+        const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream",
+            [this, enc, sp, client_id, created, request_start]
+            (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
+
+            std::chrono::steady_clock::time_point ttft_time;
+            bool ttft_recorded = false;
+
+            auto send_chunk = [&](const std::string& text, const char* finish_reason = nullptr) {
+                std::ostringstream os;
+                os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"text_completion\""
+                   << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
+                   << ",\"choices\":[{\"index\":0,\"text\":\"" << json_escape(text) << "\"";
+                if (finish_reason != nullptr) {
+                    os << ",\"finish_reason\":\"" << finish_reason << "\"";
+                } else {
+                    os << ",\"finish_reason\":null";
+                }
+                os << "}]}";
+                std::string line = "data: " + os.str() + "\n\n";
+                sink.write(line.data(), line.size());
+            };
+
+            auto send_error = [&](const std::string& message) {
+                std::ostringstream os;
+                os << "{\"error\":{\"message\":\"" << json_escape(message)
+                   << "\",\"type\":\"server_error\"}}";
+                std::string line = "data: " + os.str() + "\n\n";
+                sink.write(line.data(), line.size());
+            };
+
+            auto stream = std::make_shared<TokenStream>();
+            const uint64_t request_id = sched.submit_request(
+                enc.token_ids, sp,
+                [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
+                [stream](uint64_t, int token) { stream->push(token); });
+            if (request_id == 0) {
+                const auto request_end = std::chrono::steady_clock::now();
+                const double duration = std::chrono::duration<double>(request_end - request_start).count();
+                metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
+                send_error("request rejected: its worst-case KV footprint exceeds "
+                           "the whole block pool, so it could never be admitted");
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
+            }
+
+            std::vector<int> generated;
+            size_t sent_offset = 0;
+
+            auto emit_delta = [&]() {
+                const std::string full = tok.decode_tokens(generated);
+                if (full.size() <= sent_offset) return;
+                std::string candidate = full.substr(sent_offset);
+                auto [complete, leftover] = split_utf8_complete(candidate);
+                if (!complete.empty()) {
+                    sent_offset += complete.size();
+                    send_chunk(complete);
+                }
+            };
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(cfg.request_timeout_seconds);
+            bool timed_out = false;
+            int token_count = 0;
+            while (true) {
+                int token = 0;
+                const TokenStream::Next next = stream->next(&token, deadline);
+                if (next == TokenStream::Next::Token) {
+                    if (!ttft_recorded) {
+                        ttft_time = std::chrono::steady_clock::now();
+                        ttft_recorded = true;
+                    }
+                    generated.push_back(token);
+                    emit_delta();
+                    ++token_count;
+                    continue;
+                }
+                if (next == TokenStream::Next::Timeout) {
+                    timed_out = true;
+                    sched.cancel_request(request_id);
+                }
+                break;
+            }
+
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
+
+            std::string finish_reason = "length";
+            std::string generation_error;
+            if (timed_out) {
+                finish_reason = "timeout";
+            } else {
+                std::lock_guard<std::mutex> lk(stream->m);
+                finish_reason = stream->result.finish_reason;
+                generation_error = stream->result.error;
+            }
+
+            {
+                const std::string full = tok.decode_tokens(generated);
+                if (full.size() > sent_offset) {
+                    std::string tail = full.substr(sent_offset);
+                    sent_offset += tail.size();
+                    send_chunk(tail);
+                }
+            }
+
+            const bool success = !timed_out && generation_error.empty();
+            metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
+
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
+            if (timed_out) send_error("generation timed out");
+            if (!generation_error.empty()) {
+                send_error(generation_error);
+                const std::string done = "data: [DONE]\n\n";
+                sink.write(done.data(), done.size());
+                sink.done();
+                return true;
+            }
+
+            send_chunk("", finish_reason.c_str());
+            const std::string done = "data: [DONE]\n\n";
+            sink.write(done.data(), done.size());
+            sink.done();
+            return true;
+        });
+    }
+
+    void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
+                          const BatchSamplingParams& sp, const std::string& thinking_mode,
+                          const std::string& client_id,
+                          std::chrono::steady_clock::time_point request_start) {
+        std::chrono::steady_clock::time_point ttft_time;
+        bool ttft_recorded = false;
+
+        auto completion = std::make_shared<TokenStream>();
+        const uint64_t request_id = sched.submit_request(
+            enc.token_ids, sp,
+            [completion](const SchedulerGenerationResult& r) { completion->finish(r); });
+        if (request_id == 0) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 503,
+                       "request rejected: its worst-case KV footprint exceeds the "
+                       "whole block pool, so it could never be admitted");
+            return;
+        }
+
+        // Track request for cancellation API
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
+        }
+
+        int unused_token = 0;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(cfg.request_timeout_seconds);
+        if (completion->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
+            // The callback owns `completion`, so it remains valid until the
+            // scheduler observes the cancellation. Because callback-mode
+            // requests are not duplicated into poll_result(), abandoning this
+            // HTTP response leaves no completed-result map entry behind.
+            sched.cancel_request(request_id);
+
+            // Cleanup tracking
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
+            emit_error(res, 504, "generation timed out");
+            return;
+        }
+        if (!ttft_recorded) {
+            ttft_time = std::chrono::steady_clock::now();
+            ttft_recorded = true;
+        }
+
+        SchedulerGenerationResult out;
+        {
+            std::lock_guard<std::mutex> lk(completion->m);
+            out = completion->result;
+        }
+
+        // Cleanup tracking
+        {
+            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+            tracked_requests_.erase(client_id);
+        }
+
+        const auto request_end = std::chrono::steady_clock::now();
+        const double duration = std::chrono::duration<double>(request_end - request_start).count();
+        const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
+
+        if (!out.error.empty()) {
+            metrics.record_request_end(false, duration, ttft, enc.token_ids.size(), 0);
+            emit_error(res, 500, out.error);
+            return;
+        }
+
+        const std::vector<int> generated = strip_stop_token(out.generated_tokens, out.finish_reason);
+        metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
+
         const std::string text = tok.decode_tokens(generated);
         const ParsedMessage parsed = sidecar.parse(text, thinking_mode);
         std::string content = parsed.ok ? parsed.content : text;
@@ -469,7 +938,7 @@ struct OpenAIServer::Impl {
         std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
 
         std::ostringstream os;
-        os << "{\"id\":\"" << make_request_id() << "\""
+        os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"chat.completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
@@ -483,19 +952,22 @@ struct OpenAIServer::Impl {
 
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
-                       const std::string& thinking_mode) {
-        const std::string id = make_request_id();
+                       const std::string& thinking_mode, const std::string& client_id,
+                       std::chrono::steady_clock::time_point request_start) {
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, id, created, thinking_mode]
+            [this, enc, sp, client_id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
+
+            std::chrono::steady_clock::time_point ttft_time;
+            bool ttft_recorded = false;
 
             auto send_chunk = [&](const std::string& delta, const char* field,
                                   const char* finish_reason = nullptr) {
                 std::ostringstream os;
-                os << "{\"id\":\"" << id << "\",\"object\":\"chat.completion.chunk\""
+                os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
                    << ",\"choices\":[{\"index\":0,\"delta\":{";
                 if (!delta.empty()) {
@@ -523,7 +995,7 @@ struct OpenAIServer::Impl {
             // First chunk: role marker.
             {
                 std::ostringstream os;
-                os << "{\"id\":\"" << id << "\",\"object\":\"chat.completion.chunk\""
+                os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
                    << ",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}";
                 std::string line = "data: " + os.str() + "\n\n";
@@ -536,12 +1008,21 @@ struct OpenAIServer::Impl {
                 [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
                 [stream](uint64_t, int token) { stream->push(token); });
             if (request_id == 0) {
+                const auto request_end = std::chrono::steady_clock::now();
+                const double duration = std::chrono::duration<double>(request_end - request_start).count();
+                metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
                 send_error("request rejected: its worst-case KV footprint exceeds "
                            "the whole block pool, so it could never be admitted");
                 const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());
                 sink.done();
                 return true;
+            }
+
+            // Track request for cancellation API
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
             }
 
             // Sliding-window prefix used to compute deltas + UTF-8 boundary buffer.
@@ -584,11 +1065,17 @@ struct OpenAIServer::Impl {
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(cfg.request_timeout_seconds);
             bool timed_out = false;
+            int token_count = 0;
             while (true) {
                 int token = 0;
                 const TokenStream::Next next = stream->next(&token, deadline);
                 if (next == TokenStream::Next::Token) {
+                    if (!ttft_recorded) {
+                        ttft_time = std::chrono::steady_clock::now();
+                        ttft_recorded = true;
+                    }
                     accept(token);
+                    ++token_count;
                     continue;
                 }
                 if (next == TokenStream::Next::Timeout) {
@@ -597,6 +1084,10 @@ struct OpenAIServer::Impl {
                 }
                 break;
             }
+
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
             std::string finish_reason = "length";
             std::string generation_error;
@@ -623,6 +1114,15 @@ struct OpenAIServer::Impl {
                 }
             }
 
+            const bool success = !timed_out && generation_error.empty();
+            metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
+
+            // Cleanup tracking
+            {
+                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+                tracked_requests_.erase(client_id);
+            }
+
             if (timed_out) send_error("generation timed out");
             if (!generation_error.empty()) {
                 send_error(generation_error);
@@ -644,9 +1144,20 @@ struct OpenAIServer::Impl {
     void run() {
         running = true;
         svr.Get("/health", [this](const httplib::Request&, httplib::Response& res) { handle_health(res); });
+        svr.Get("/ready", [this](const httplib::Request&, httplib::Response& res) { handle_ready(res); });
+        svr.Get("/alive", [this](const httplib::Request&, httplib::Response& res) { handle_alive(res); });
         svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) { handle_models(res); });
+        svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) { handle_metrics(res); });
         svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
             try { handle_chat_completions(req, res); }
+            catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
+        });
+        svr.Post("/v1/completions", [this](const httplib::Request& req, httplib::Response& res) {
+            try { handle_completions(req, res); }
+            catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
+        });
+        svr.Delete("/v1/requests/:id", [this](const httplib::Request& req, httplib::Response& res) {
+            try { handle_cancel_request(req, res); }
             catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
         });
         std::cerr << "[server] listening on " << cfg.host << ":" << cfg.port << "\n";

@@ -1,5 +1,6 @@
 #include "block_table.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -26,6 +27,36 @@ BlockTable::BlockTable(BlockPool* pool, int max_slots,
     image_.assign(static_cast<size_t>(max_slots) *
                       static_cast<size_t>(max_blocks_per_seq_),
                   BlockPool::kInvalidBlock);
+}
+
+void BlockTable::attach(int slot, const std::vector<int>& block_ids) {
+    validate_slot(slot);
+    std::vector<int>& row = rows_[static_cast<size_t>(slot)];
+    if (!row.empty()) {
+        throw std::runtime_error(
+            "BlockTable::attach: destination slot already owns blocks");
+    }
+    if (block_ids.size() > static_cast<size_t>(max_blocks_per_seq_)) {
+        throw std::runtime_error(
+            "BlockTable::attach: block row exceeds max_context");
+    }
+    // Validate every id before retaining any of them, so a bad cache entry
+    // cannot leave a partially attached row behind.
+    for (size_t index = 0; index < block_ids.size(); ++index) {
+        const int block = block_ids[index];
+        if (block == BlockPool::kInvalidBlock) {
+            throw std::runtime_error("BlockTable::attach: invalid block id");
+        }
+        for (size_t earlier = 0; earlier < index; ++earlier) {
+            if (block_ids[earlier] == block) {
+                throw std::runtime_error("BlockTable::attach: duplicate block id");
+            }
+        }
+        (void)pool_->refcount(block);
+    }
+    for (const int block : block_ids) pool_->retain(block);
+    row = block_ids;
+    if (!row.empty()) dirty_ = true;
 }
 
 bool BlockTable::ensure_capacity(int slot, int tokens) {
