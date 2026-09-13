@@ -28,6 +28,46 @@ enum class QwenKvCacheDType {
 const char* qwen_kv_cache_dtype_name(QwenKvCacheDType dtype);
 QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value);
 
+// Forward declarations to avoid circular dependency with qwen_layer_components.hpp
+namespace qwen_components {
+    enum class NvFp4Mode : int;
+    enum class OptionalSwitch : int;
+}
+
+// Kernel tuning options for advanced users. Most users never touch these; they
+// control low-level execution paths and optimization strategies. All fields have
+// sensible defaults derived from hardware detection and benchmarking.
+struct QwenKernelOptions {
+    // NVFP4 quantization
+    qwen_components::NvFp4Mode nvfp4_mode = static_cast<qwen_components::NvFp4Mode>(0);  // Auto
+    bool nvfp4_wide_n64 = true;
+    int nvfp4_wide_n64_min_rows = 128;
+    bool nvfp4_fused_swiglu = false;
+    bool nvfp4_shared_q8_swiglu = true;
+
+    // GQA (full attention)
+    bool gqa_optimized = true;
+    bool gqa_verify_cublas_qk = false;
+    qwen_components::OptionalSwitch gqa_verify_split = static_cast<qwen_components::OptionalSwitch>(0);  // Auto
+    int gqa_verify_splits = 0;
+
+    // Kernel fusion flags
+    bool verify_small_fp16_cublas = true;
+    bool gated_delta_flashqla = true;
+    bool fuse_qkvz_decode = false;
+    bool fuse_ab_projection = true;
+    bool gated_delta_prenormalize = true;
+    bool gated_delta_shared_state = false;
+    bool fuse_full_qkv_decode = false;
+    bool fuse_attention_residual_norm = true;
+
+    // Communication overlap
+    int comm_overlap_slices = 4;
+
+    // Load from environment variables (backward compatibility)
+    void load_from_env();
+};
+
 struct QwenEngineOptions {
     int tp_world = 1;
     int tp_rank = 0;
@@ -130,6 +170,9 @@ struct QwenEngineOptions {
     // blocks and recurrent snapshots. 0 derives a bounded default from the
     // paged KV pool (30 percent of the pool bytes).
     uint64_t prefix_cache_bytes = 0;
+
+    // Kernel tuning options (advanced users only)
+    QwenKernelOptions kernel;
 };
 
 // Accounting for one native-MTP or external-DSpark generate call.
