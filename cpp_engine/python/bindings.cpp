@@ -31,7 +31,9 @@ py::dict forward_result_dict(const ForwardResult& result) {
     out["logits"] = result.logits;
     out["top_token"] = result.top_token;
     out["correct_drafts"] = result.correct_drafts;
+    out["proposed_drafts"] = result.proposed_drafts;
     out["bonus_token"] = result.bonus_token;
+    out["rolled_back"] = result.rolled_back;
     out["accept_tokens"] = result.accept_tokens;
     out["accept_logits"] = result.accept_logits;
     out["accept_checksums"] = result.accept_checksums;
@@ -246,7 +248,9 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("logits", &ForwardResult::logits)
         .def_readwrite("top_token", &ForwardResult::top_token)
         .def_readwrite("correct_drafts", &ForwardResult::correct_drafts)
+        .def_readwrite("proposed_drafts", &ForwardResult::proposed_drafts)
         .def_readwrite("bonus_token", &ForwardResult::bonus_token)
+        .def_readwrite("rolled_back", &ForwardResult::rolled_back)
         .def_readwrite("accept_tokens", &ForwardResult::accept_tokens)
         .def_readwrite("accept_logits", &ForwardResult::accept_logits)
         .def_readwrite("accept_checksums", &ForwardResult::accept_checksums)
@@ -442,6 +446,10 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("finish_reason", &SchedulerGenerationResult::finish_reason)
         .def_readwrite("prompt_tokens", &SchedulerGenerationResult::prompt_tokens)
         .def_readwrite("completion_tokens", &SchedulerGenerationResult::completion_tokens)
+        .def_readwrite("proposed_drafts", &SchedulerGenerationResult::proposed_drafts)
+        .def_readwrite("accepted_drafts", &SchedulerGenerationResult::accepted_drafts)
+        .def_readwrite("speculative_steps", &SchedulerGenerationResult::speculative_steps)
+        .def_readwrite("rollback_steps", &SchedulerGenerationResult::rollback_steps)
         .def_readwrite("total_seconds", &SchedulerGenerationResult::total_seconds)
         .def_readwrite("ttft_seconds", &SchedulerGenerationResult::ttft_seconds)
         .def_readwrite("error", &SchedulerGenerationResult::error);

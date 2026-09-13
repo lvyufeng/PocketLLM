@@ -84,14 +84,15 @@ public:
                       const QwenDeviceTensor& target_embedding,
                       QwenTargetHeadAdapter target_head,
                       int tp_world, int tp_rank, int device,
-                      std::string nccl_id_path, int max_context);
+                      std::string nccl_id_path, int max_context,
+                      int max_slots = 1);
     ~QwenDSparkRuntime();
 
     QwenDSparkRuntime(const QwenDSparkRuntime&) = delete;
     QwenDSparkRuntime& operator=(const QwenDSparkRuntime&) = delete;
 
-    void reset();
-    int committed_position() const;
+    void reset(int slot_id = 0);
+    int committed_position(int slot_id = 0) const;
     uint64_t resident_weight_bytes() const;
     uint64_t context_cache_bytes() const;
     uint64_t activation_workspace_bytes() const;
@@ -99,9 +100,9 @@ public:
     // target_taps is [rows, target_layer_ids.size() * hidden_size], containing
     // raw target post-layer hidden states in target_layer_ids order.
     void append_target_taps(const uint16_t* target_taps, int rows,
-                            int position_offset);
-    void crop_context(int position);
-    QwenDSparkProposal propose(int anchor_token);
+                            int position_offset, int slot_id = 0);
+    void crop_context(int position, int slot_id = 0);
+    QwenDSparkProposal propose(int anchor_token, int slot_id = 0);
 
 private:
     struct Impl;

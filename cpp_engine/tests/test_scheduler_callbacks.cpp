@@ -101,10 +101,24 @@ public:
         pocket::BatchDecodeResult out;
         for (pocket::BatchedRequest* req : requests) {
             const int token = req->last_token + 1;
-            const bool stopped = is_stop(req->sampling, token);
-            out.next_tokens.push_back(token);
-            out.finished.push_back(stopped);
-            out.hit_stop_token.push_back(stopped);
+            if (emit_multi_token) {
+                // Deliberately overproduce one token so the scheduler must apply
+                // the request's remaining output budget to a multi-token row.
+                out.next_tokens.push_back(token + 1);
+                out.finished.push_back(false);
+                out.hit_stop_token.push_back(false);
+                out.emitted_tokens.push_back({token, token + 1});
+                out.position_advances.push_back(2);
+                out.proposed_drafts.push_back(2);
+                out.accepted_drafts.push_back(1);
+                out.used_speculative.push_back(true);
+                out.rolled_back.push_back(true);
+            } else {
+                const bool stopped = is_stop(req->sampling, token);
+                out.next_tokens.push_back(token);
+                out.finished.push_back(stopped);
+                out.hit_stop_token.push_back(stopped);
+            }
         }
         return out;
     }
@@ -113,6 +127,7 @@ public:
     std::atomic<int> decode_calls{0};
     bool fail_prefill = false;
     bool fail_decode = false;
+    bool emit_multi_token = false;
 
 private:
     std::vector<uint64_t> slots_;
@@ -225,6 +240,36 @@ void test_poll_result_without_callback() {
     scheduler.stop();
 }
 
+void test_multi_token_row_respects_budget_and_reports_stats() {
+    std::cout << "multi-token rows respect the remaining budget and report telemetry\n";
+    CountingEngine engine;
+    engine.emit_multi_token = true;
+    pocket::BatchScheduler scheduler(&engine, 1);
+
+    pocket::BatchSamplingParams sampling;
+    sampling.max_new_tokens = 2;
+    CallbackState state;
+    const uint64_t id = submit_with_callbacks(scheduler, sampling, state);
+
+    check(id != 0, "multi-token request is accepted");
+    check(wait_done(state), "multi-token request completes");
+    check(state.result.generated_tokens == std::vector<int>({10, 11}),
+          "scheduler truncates emitted row at max_new_tokens");
+    check(state.tokens == std::vector<int>({10, 11}),
+          "truncated row streams only visible tokens");
+    check(state.result.proposed_drafts == 2,
+          "proposed draft telemetry is retained");
+    check(state.result.accepted_drafts == 1,
+          "accepted draft telemetry is retained");
+    check(state.result.speculative_steps == 1,
+          "speculative step telemetry is retained");
+    check(state.result.rollback_steps == 1,
+          "rollback telemetry is retained");
+    check(state.result.finish_reason == "length",
+          "truncated multi-token row finishes by length");
+    scheduler.stop();
+}
+
 void test_engine_failure_is_terminal() {
     std::cout << "engine failures complete the request instead of retrying forever\n";
     CountingEngine engine;
@@ -255,6 +300,7 @@ int main() {
     test_prefill_token_counts_toward_limit();
     test_stop_token_is_not_streamed();
     test_poll_result_without_callback();
+    test_multi_token_row_respects_budget_and_reports_stats();
     test_engine_failure_is_terminal();
 
     if (failures != 0) {

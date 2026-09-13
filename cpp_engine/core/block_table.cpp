@@ -64,6 +64,21 @@ void BlockTable::release(int slot) {
     dirty_ = true;
 }
 
+void BlockTable::trim_capacity(int slot, int tokens) {
+    validate_slot(slot);
+    if (tokens < 0 || tokens > max_context_) {
+        throw std::runtime_error(
+            "BlockTable::trim_capacity: tokens out of range");
+    }
+    std::vector<int>& row = rows_[static_cast<size_t>(slot)];
+    const int needed = pool_->blocks_for_tokens(tokens);
+    if (needed >= static_cast<int>(row.size())) return;
+    std::vector<int> trailing(row.begin() + needed, row.end());
+    pool_->free(trailing);
+    row.resize(static_cast<size_t>(needed));
+    dirty_ = true;
+}
+
 void BlockTable::release_all() {
     for (int slot = 0; slot < max_slots_; ++slot) release(slot);
 }

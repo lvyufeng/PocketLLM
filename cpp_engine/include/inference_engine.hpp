@@ -59,7 +59,9 @@ struct ForwardResult {
     int top_token = 0;
     // Filled by native MTP speculative steps; plain forwards leave these zero.
     int correct_drafts = 0;
+    int proposed_drafts = 0;
     int bonus_token = 0;
+    bool rolled_back = false;
     std::vector<int> accept_tokens;
     std::vector<float> accept_logits;
     std::vector<float> accept_checksums;
@@ -126,6 +128,20 @@ struct BatchDecodeResult {
     // to `next_tokens`. Callers need the distinction to report finish_reason,
     // which cannot be recovered from `finished` alone.
     std::vector<bool> hit_stop_token;
+    // Tokens produced by one row in this iteration. Plain decoding has one
+    // entry, while speculative decoding has the accepted draft suffix followed
+    // by the target bonus token. Keeping this separate from next_tokens lets
+    // the scheduler advance each request by its actual accepted length.
+    std::vector<std::vector<int>> emitted_tokens;
+    // Number of target KV positions consumed by each row. This can differ from
+    // one when a speculative block accepts multiple drafts.
+    std::vector<int> position_advances;
+    // Draft accounting parallel to the rows. These fields are zero for plain
+    // decode and are intentionally row-local so telemetry cannot cross slots.
+    std::vector<int> proposed_drafts;
+    std::vector<int> accepted_drafts;
+    std::vector<bool> used_speculative;
+    std::vector<bool> rolled_back;
     double seconds = 0.0;
 };
 
@@ -195,8 +211,10 @@ public:
     virtual BatchPrefillResult batch_prefill(
         const std::vector<BatchedRequest*>& requests, int token_budget) = 0;
 
-    // Advance every request one token. Requests may sit at different positions
-    // but must occupy distinct slots.
+    // Advance every request by one or more output tokens. Plain rows consume one
+    // target position; speculative rows report their accepted span through the
+    // returned row metadata. Requests may sit at different positions but must
+    // occupy distinct slots.
     virtual BatchDecodeResult batch_decode_step(
         const std::vector<BatchedRequest*>& requests) = 0;
 

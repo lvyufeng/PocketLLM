@@ -554,6 +554,63 @@ void exercise_cache_lifecycle(const std::string& dir,
 
 // Phase 3.4: Verify that independent prompts in different slots produce
 // different results, proving the recurrent state and KV cache are isolated.
+void exercise_batch_speculative_mtp(const std::string& dir) {
+    pocket::QwenEngineOptions options;
+    options.tp_world = 1;
+    options.tp_rank = 0;
+    options.device = 0;
+    options.prefill_chunk_tokens = 8;
+    options.prefix_cache = false;
+    options.mtp = true;
+    options.mtp_speculative_tokens = 2;
+    options.max_batch_size = 2;
+
+    pocket::QwenEngine engine(dir, options, 2, 16);
+    pocket::BatchedRequest first;
+    first.request_id = 1;
+    first.slot_id = 0;
+    first.prompt_tokens = {1, 2, 3};
+    first.sampling.max_new_tokens = 8;
+    pocket::BatchedRequest second;
+    second.request_id = 2;
+    second.slot_id = 1;
+    second.prompt_tokens = {4, 5};
+    second.sampling.max_new_tokens = 8;
+
+    const std::vector<pocket::BatchedRequest*> requests = {&first, &second};
+    const pocket::BatchPrefillResult prefill = engine.batch_prefill(requests, 0);
+    require(prefill.results.size() == 2 && prefill.incomplete.size() == 2,
+            "batched MTP prefill rows");
+    require(!prefill.incomplete[0] && !prefill.incomplete[1],
+            "batched MTP prefill completion");
+    first.last_token = prefill.results[0].top_token;
+    second.last_token = prefill.results[1].top_token;
+    first.seq_len = prefill.results[0].position;
+    second.seq_len = prefill.results[1].position;
+
+    pocket::BatchDecodeResult decoded = engine.batch_decode_step(requests);
+    require(decoded.next_tokens.size() == 2 && decoded.finished.size() == 2,
+            "batched MTP decode rows");
+    require(decoded.emitted_tokens.size() == 2 &&
+                decoded.position_advances.size() == 2,
+            "batched MTP row metadata");
+    for (size_t row = 0; row < 2; ++row) {
+        require(!decoded.emitted_tokens[row].empty(),
+                "batched MTP emitted tokens");
+        require(decoded.position_advances[row] >= 1,
+                "batched MTP position advance");
+        require(decoded.used_speculative[row], "batched MTP speculative marker");
+    }
+
+    // Drive both slots again. This catches stale slot-0 MTP hidden state and
+    // verifies that each row's position advances independently.
+    decoded = engine.batch_decode_step(requests);
+    require(decoded.next_tokens.size() == 2 &&
+                decoded.position_advances[0] >= 1 &&
+                decoded.position_advances[1] >= 1,
+            "batched MTP second decode");
+}
+
 void exercise_batch_isolation(const std::string& dir,
                                pocket::QwenKvCacheDType cache_dtype) {
     pocket::QwenEngineOptions options;
@@ -613,6 +670,7 @@ int main() {
         exercise_mtp_prefix_cache(dir, pocket::QwenKvCacheDType::Fp16);
         exercise_mtp_prefix_cache(dir, pocket::QwenKvCacheDType::Fp8);
         exercise_mtp_prefix_cache(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);
+        exercise_batch_speculative_mtp(dir);
         exercise_batch_isolation(dir, pocket::QwenKvCacheDType::Fp16);
         exercise_batch_isolation(dir, pocket::QwenKvCacheDType::Fp8);
         exercise_batch_isolation(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);

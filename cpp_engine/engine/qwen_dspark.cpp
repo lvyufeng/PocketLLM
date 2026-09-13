@@ -431,7 +431,8 @@ struct QwenDSparkRuntime::Impl {
     int device = 0;
     std::string nccl_id_path;
     int max_context = 0;
-    int committed = 0;
+    int max_slots = 1;
+    std::vector<int> committed;
     uint64_t weight_bytes = 0;
     uint64_t cache_bytes = 0;
 
@@ -469,20 +470,22 @@ struct QwenDSparkRuntime::Impl {
          const QwenDSparkWeightMap& weights_,
          const QwenDeviceTensor& target_embedding_,
          QwenTargetHeadAdapter target_head_, int tp_world_, int tp_rank_,
-         int device_, std::string nccl_id_path_, int max_context_)
+         int device_, std::string nccl_id_path_, int max_context_, int max_slots_)
         : checkpoint_dir(checkpoint_dir_), config(config_), weight_map(weights_),
           index(SafeTensorsIndex::from_single_file(checkpoint_dir_)),
           target_embedding(target_embedding_), target_head(target_head_),
           tp_world(tp_world_), tp_rank(tp_rank_), device(device_),
-          nccl_id_path(std::move(nccl_id_path_)), max_context(max_context_) {
+          nccl_id_path(std::move(nccl_id_path_)), max_context(max_context_),
+          max_slots(max_slots_) {
         if (tp_world <= 0 || tp_rank < 0 || tp_rank >= tp_world ||
-            device < 0 || max_context <= 0 ||
+            device < 0 || max_context <= 0 || max_slots <= 0 ||
             target_embedding.device_dtype != SafeDType::F16 ||
             target_embedding.shape.size() != 2 ||
             target_embedding.shape[1] != static_cast<uint64_t>(config.hidden_size) ||
             !target_head.valid() || target_head.hidden_size != config.hidden_size) {
             throw std::runtime_error("invalid Qwen DSpark runtime target tensors");
         }
+        committed.assign(static_cast<size_t>(max_slots), 0);
         check_device(device_set(device), "select Qwen DSpark device");
         projector = qwen_upload_tensor(index, weight_map.projector());
         hidden_norm = qwen_upload_tensor(index, weight_map.hidden_norm());
@@ -503,11 +506,11 @@ struct QwenDSparkRuntime::Impl {
 
         const int kv_heads = config.num_key_value_heads;
         const int head_dim = config.head_dim;
-        const size_t context_elements = static_cast<size_t>(max_context) *
-            kv_heads * head_dim;
+        const size_t context_elements = static_cast<size_t>(max_slots) *
+            static_cast<size_t>(max_context) * kv_heads * head_dim;
         const std::vector<uint64_t> context_shape = {
-            static_cast<uint64_t>(max_context), static_cast<uint64_t>(kv_heads),
-            static_cast<uint64_t>(head_dim)};
+            static_cast<uint64_t>(max_slots), static_cast<uint64_t>(max_context),
+            static_cast<uint64_t>(kv_heads), static_cast<uint64_t>(head_dim)};
         layers.reserve(weight_map.layers().size());
         for (const QwenDSparkLayerWeights& source : weight_map.layers()) {
             DSparkDeviceLayer layer;
@@ -600,10 +603,24 @@ struct QwenDSparkRuntime::Impl {
             "full YaRN RoPE");
     }
 
+    int position_for(int slot_id) const {
+        if (slot_id < 0 || slot_id >= max_slots) {
+            throw std::runtime_error("Qwen DSpark slot is out of range");
+        }
+        return committed[static_cast<size_t>(slot_id)];
+    }
+
+    size_t context_slot_offset(int slot_id, int kv_dim) const {
+        (void)position_for(slot_id);
+        return static_cast<size_t>(slot_id) * static_cast<size_t>(max_context) *
+               static_cast<size_t>(kv_dim);
+    }
+
     void append_target_taps(const uint16_t* target_taps, int rows,
-                            int position_offset) {
+                            int position_offset, int slot_id) {
         if (target_taps == nullptr || rows <= 0 || position_offset < 0 ||
-            position_offset != committed || position_offset + rows > max_context) {
+            position_offset != position_for(slot_id) ||
+            position_offset + rows > max_context) {
             throw std::runtime_error("invalid Qwen DSpark target tap append");
         }
         const int hidden = config.hidden_size;
@@ -631,7 +648,8 @@ struct QwenDSparkRuntime::Impl {
             head_norm(layer.k_norm, block_k.f16_data(), normalized.f16_data(),
                       rows, kv_heads);
             apply_rope(normalized.f16_data(), rows, kv_heads, position_offset);
-            const size_t offset = static_cast<size_t>(position_offset) * kv_dim;
+            const size_t offset = context_slot_offset(slot_id, kv_dim) +
+                static_cast<size_t>(position_offset) * kv_dim;
             check_device(memcpy_d2d(
                 layer.context_k.f16_data() + offset, normalized.f16_data(),
                 kv_elements * sizeof(uint16_t)),
@@ -641,7 +659,7 @@ struct QwenDSparkRuntime::Impl {
                 kv_elements * sizeof(uint16_t)),
                 "append Qwen DSpark context V");
         }
-        committed += rows;
+        committed[static_cast<size_t>(slot_id)] += rows;
     }
 
     std::pair<int, float> global_top1(float* local_logits, int local_vocab) {
@@ -686,9 +704,10 @@ struct QwenDSparkRuntime::Impl {
             confidence.capacity;
     }
 
-    QwenDSparkProposal propose(int anchor_token) {
+    QwenDSparkProposal propose(int anchor_token, int slot_id) {
+        const int committed_position = position_for(slot_id);
         if (anchor_token < 0 || anchor_token >= config.vocab_size ||
-            committed >= max_context) {
+            committed_position >= max_context) {
             throw std::runtime_error("invalid Qwen DSpark proposal anchor");
         }
         const int rows = config.block_size;
@@ -735,15 +754,17 @@ struct QwenDSparkRuntime::Impl {
             projection(layer.v, normalized.f16_data(), block_v.f16_data(), rows);
             allocate_half(attention, static_cast<size_t>(rows) * q_dim, q.shape);
             head_norm(layer.q_norm, q.f16_data(), attention.f16_data(), rows, q_heads);
-            apply_rope(attention.f16_data(), rows, q_heads, committed);
+            apply_rope(attention.f16_data(), rows, q_heads, committed_position);
             head_norm(layer.k_norm, block_k.f16_data(), normalized.f16_data(),
                       rows, kv_heads);
-            apply_rope(normalized.f16_data(), rows, kv_heads, committed);
+            apply_rope(normalized.f16_data(), rows, kv_heads, committed_position);
+            const size_t context_offset = context_slot_offset(
+                slot_id, kv_dim);
             require_launch(qwen_dspark_dual_source_gqa_f16_cuda(
-                attention.f16_data(), layer.context_k.f16_data(),
-                layer.context_v.f16_data(), normalized.f16_data(),
+                attention.f16_data(), layer.context_k.f16_data() + context_offset,
+                layer.context_v.f16_data() + context_offset, normalized.f16_data(),
                 block_v.f16_data(), q.f16_data(), rows, q_heads, kv_heads,
-                config.head_dim, committed, max_context),
+                config.head_dim, committed_position, max_context),
                 "dual-source GQA");
             projection(layer.out, q.f16_data(), output, rows);
             require_launch(qwen_add_inplace_f16(
@@ -839,16 +860,22 @@ QwenDSparkRuntime::QwenDSparkRuntime(
     const QwenDSparkWeightMap& weights,
     const QwenDeviceTensor& target_embedding,
     QwenTargetHeadAdapter target_head, int tp_world, int tp_rank, int device,
-    std::string nccl_id_path, int max_context)
+    std::string nccl_id_path, int max_context, int max_slots)
     : impl_(std::make_unique<Impl>(
           checkpoint_dir, config, weights, target_embedding, target_head,
-          tp_world, tp_rank, device, std::move(nccl_id_path), max_context)) {}
+          tp_world, tp_rank, device, std::move(nccl_id_path), max_context,
+          max_slots)) {}
 
 QwenDSparkRuntime::~QwenDSparkRuntime() = default;
 
-void QwenDSparkRuntime::reset() { impl_->committed = 0; }
+void QwenDSparkRuntime::reset(int slot_id) {
+    (void)impl_->position_for(slot_id);
+    impl_->committed[static_cast<size_t>(slot_id)] = 0;
+}
 
-int QwenDSparkRuntime::committed_position() const { return impl_->committed; }
+int QwenDSparkRuntime::committed_position(int slot_id) const {
+    return impl_->position_for(slot_id);
+}
 
 uint64_t QwenDSparkRuntime::resident_weight_bytes() const {
     return impl_->weight_bytes;
@@ -863,19 +890,19 @@ uint64_t QwenDSparkRuntime::activation_workspace_bytes() const {
 }
 
 void QwenDSparkRuntime::append_target_taps(
-    const uint16_t* target_taps, int rows, int position_offset) {
-    impl_->append_target_taps(target_taps, rows, position_offset);
+    const uint16_t* target_taps, int rows, int position_offset, int slot_id) {
+    impl_->append_target_taps(target_taps, rows, position_offset, slot_id);
 }
 
-void QwenDSparkRuntime::crop_context(int position) {
-    if (position < 0 || position > impl_->committed) {
+void QwenDSparkRuntime::crop_context(int position, int slot_id) {
+    if (position < 0 || position > impl_->position_for(slot_id)) {
         throw std::runtime_error("invalid Qwen DSpark context crop");
     }
-    impl_->committed = position;
+    impl_->committed[static_cast<size_t>(slot_id)] = position;
 }
 
-QwenDSparkProposal QwenDSparkRuntime::propose(int anchor_token) {
-    return impl_->propose(anchor_token);
+QwenDSparkProposal QwenDSparkRuntime::propose(int anchor_token, int slot_id) {
+    return impl_->propose(anchor_token, slot_id);
 }
 
 std::vector<float> qwen_dspark_yarn_inv_freqs(
