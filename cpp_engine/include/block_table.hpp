@@ -31,6 +31,12 @@ public:
     // speculative step.
     bool ensure_capacity(int slot, int tokens);
 
+    // Attaches existing physical blocks to an empty slot row. Each attached
+    // block gains one reference for the destination slot. This is used by
+    // cross-request prefix reuse; callers must attach only complete, immutable
+    // prefix blocks.
+    void attach(int slot, const std::vector<int>& block_ids);
+
     // Returns every block held by `slot` to the pool and clears the row.
     void release(int slot);
 

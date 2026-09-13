@@ -38,6 +38,7 @@ std::unique_ptr<InferenceEngine> make_qwen_engine(const std::string& ckpt_dir,
     qwen.kv_paged = options.kv_paged;
     qwen.kv_block_size = options.kv_block_size;
     qwen.kv_cache_bytes = options.kv_cache_bytes;
+    qwen.prefix_cache_bytes = options.prefix_cache_bytes;
     // Fixed at construction here, which is why EngineOptions carries it:
     // QwenEngine reports caps().per_request_sampling == false, so this is the
     // only place its temperature can be set.

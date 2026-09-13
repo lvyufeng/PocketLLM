@@ -137,6 +137,26 @@ void test_table_growth() {
     check(pool.free_blocks() == 16, "release returns every block");
 }
 
+void test_table_shared_rows() {
+    pocket::BlockPool pool(4, 8);
+    pocket::BlockTable table(&pool, 2, 32);
+    check(table.ensure_capacity(0, 16), "source row takes two blocks");
+    const std::vector<int> source = table.row(0);
+    table.attach(1, source);
+    check(table.row(1) == source, "attached row preserves physical order");
+    check(pool.refcount(source[0]) == 2 && pool.refcount(source[1]) == 2,
+          "attached row retains every block");
+    check(table.dirty(), "attaching a row marks the image dirty");
+    table.release(0);
+    check(pool.refcount(source[0]) == 1 && pool.refcount(source[1]) == 1,
+          "source release leaves the shared row alive");
+    check(pool.free_blocks() == 2, "shared blocks are not returned early");
+    table.release(1);
+    check(pool.free_blocks() == 4, "last shared row release returns blocks");
+    check(throws([&] { table.attach(1, {pocket::BlockPool::kInvalidBlock}); }),
+          "attaching an invalid block throws");
+}
+
 void test_table_translation() {
     pocket::BlockPool pool(8, 4);
     pocket::BlockTable table(&pool, 2, 32);
@@ -260,6 +280,7 @@ int main() {
     test_pool_basics();
     test_pool_exhaustion();
     test_pool_refcounts();
+    test_table_shared_rows();
     test_table_growth();
     test_table_translation();
     test_table_fragmentation();

@@ -197,6 +197,15 @@ public:
     virtual int kv_free_blocks() const = 0;
     virtual int kv_total_blocks() const = 0;
 
+    // Physical blocks retained by a global prefix cache. They are not on the
+    // pool free list and must be excluded from scheduler admission capacity.
+    // Engines without a global cache report zero.
+    virtual int kv_cache_pinned_blocks() const { return 0; }
+
+    // Reclaims up to `count` unreferenced global-cache blocks under admission
+    // pressure. Returns the number actually evicted.
+    virtual int kv_evict_cache_blocks(int count) { return 0; }
+
     // Blocks a sequence of `tokens` logical positions needs in total. This is
     // the unit admission reasons in: a request's cost is set by the blocks its
     // context will span, not by the single slot it occupies.

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -97,6 +98,8 @@ struct Args {
     // to fall back to the contiguous arena (required with non-FP16 caches).
     bool kv_paged = true;
     int kv_block_size = 16;
+    // 0 derives the Qwen prefix-cache budget from the paged KV pool.
+    uint64_t prefix_cache_bytes = 0;
     std::string python_bin = "python";
     std::string sidecar_script;
 };
@@ -245,6 +248,9 @@ Args parse_args(int argc, char** argv) {
             args.kv_paged = false;
         } else if (arg == "--kv-block-size" && i + 1 < argc) {
             args.kv_block_size = std::stoi(argv[++i]);
+        } else if ((arg == "--prefix-cache-bytes" ||
+                    arg == "--qwen-prefix-cache-bytes") && i + 1 < argc) {
+            args.prefix_cache_bytes = std::stoull(argv[++i]);
         } else if (arg == "--python" && i + 1 < argc) {
             args.python_bin = argv[++i];
         } else if (arg == "--sidecar" && i + 1 < argc) {
@@ -463,6 +469,7 @@ int main(int argc, char** argv) {
             engine_options.prefill_chunk_tokens = args.prefill_chunk_tokens;
             engine_options.kv_paged = args.kv_paged;
             engine_options.kv_block_size = args.kv_block_size;
+            engine_options.prefix_cache_bytes = args.prefix_cache_bytes;
             engine_options.temperature = args.temperature;
             engine_options.top_p = args.top_p;
             engine_options.top_k = args.top_k;
@@ -615,6 +622,7 @@ int main(int argc, char** argv) {
                     qwen_opts.kv_cache_dtype = pocket::parse_qwen_kv_cache_dtype(args.kv_cache_dtype);
                     qwen_opts.attention_window = args.qwen_attention_window;
                     qwen_opts.attention_sink_tokens = args.qwen_attention_sink_tokens;
+                    qwen_opts.prefix_cache_bytes = args.prefix_cache_bytes;
                     // Prefix snapshots are useful only while this engine stays
                     // alive across requests. Keep one-shot runs free of their
                     // extra device allocations; --qwen-no-prefix-cache still
@@ -819,6 +827,12 @@ int main(int argc, char** argv) {
                                           << " prefix_resume_source=" << stats.resume_source
                                           << " prefix_snapshots=" << stats.snapshots
                                           << " prefix_snapshot_bytes=" << stats.snapshot_bytes
+                                          << " prefix_global_hits=" << stats.global_hits
+                                          << " prefix_global_misses=" << stats.global_misses
+                                          << " prefix_global_blocks=" << stats.global_cached_blocks
+                                          << " prefix_global_bytes=" << stats.global_cache_bytes
+                                          << " prefix_global_budget_bytes=" << stats.global_cache_budget_bytes
+                                          << " prefix_global_evictions=" << stats.global_evictions
                                           << " mtp=" << (qwen.options().mtp ? 1 : 0)
                                           << " dspark=" << (!qwen.options().dspark_checkpoint.empty() ? 1 : 0)
                                           << " dflash2=" << (!qwen.options().dflash2_checkpoint.empty() ? 1 : 0)

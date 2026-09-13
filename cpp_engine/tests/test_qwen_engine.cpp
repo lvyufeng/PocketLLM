@@ -394,6 +394,113 @@ void exercise_prefix_cache(const std::string& dir,
             "wide chunk prefill must match cold prefill");
 }
 
+void exercise_cross_request_prefix_cache(const std::string& dir) {
+    pocket::QwenEngineOptions options;
+    options.tp_world = 1;
+    options.device = 0;
+    options.max_batch_size = 2;
+    options.kv_paged = true;
+    options.kv_block_size = 16;
+    options.kv_cache_bytes = 1u << 20;
+    // One complete fixture block plus one recurrent snapshot fits, forcing the
+    // next distinct prefix to exercise LRU eviction.
+    options.prefix_cache_bytes = 350000;
+    options.prefill_chunk_tokens = 16;
+    options.state_snapshot_interval_tokens = 16;
+    options.max_state_snapshots = 4;
+
+    pocket::QwenEngine engine(dir, options, 2, 32);
+    const std::vector<int> prompt = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    const std::vector<int> different_prompt = {
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17};
+    const int source = engine.allocate_slot(101);
+    const int destination = engine.allocate_slot(102);
+    require(source >= 0 && destination >= 0 && source != destination,
+            "cross-request slots allocated");
+
+    const pocket::ForwardResult source_result = engine.prefill(prompt, source);
+    require(engine.prefix_cache_stats().global_cached_blocks == 1,
+            "complete prompt block published globally");
+    const pocket::ForwardResult shared_result = engine.prefill(prompt, destination);
+    const pocket::QwenPrefixCacheStats shared = engine.prefix_cache_stats();
+    require(shared.resume_source == "global" && shared.reused_tokens == 16 &&
+                shared.computed_tokens == 0 && shared.global_hits == 1,
+            "independent slot reuses global prefix");
+    require(shared_result.top_token == source_result.top_token &&
+                shared_result.top_logit == source_result.top_logit &&
+                shared_result.checksum == source_result.checksum,
+            "global prefix result matches source slot");
+
+    // A branch in the source slot must not overwrite the block still used by
+    // the destination slot. The cache budget prevents replacing the active
+    // shared entry, so the later repeat also checks that its bytes stayed intact.
+    (void)engine.prefill(different_prompt, source);
+    const pocket::ForwardResult destination_after_branch =
+        engine.prefill(prompt, destination);
+    const pocket::QwenPrefixCacheStats branch_repeat =
+        engine.prefix_cache_stats();
+    require(branch_repeat.resume_source == "live" &&
+                branch_repeat.reused_tokens == 16 &&
+                branch_repeat.computed_tokens == 0 &&
+                destination_after_branch.top_token == source_result.top_token &&
+                destination_after_branch.checksum == source_result.checksum,
+            "branching one shared slot preserves the other slot's position and result");
+
+    engine.free_slot(101);
+    engine.free_slot(102);
+    const int reused_slot = engine.allocate_slot(103);
+    require(reused_slot >= 0, "slot can be reused after shared requests finish");
+    const pocket::ForwardResult retained_result = engine.prefill(prompt, reused_slot);
+    const pocket::QwenPrefixCacheStats retained = engine.prefix_cache_stats();
+    require(retained.resume_source == "global" && retained.reused_tokens == 16 &&
+                retained.computed_tokens == 0 && retained.global_hits == 2,
+            "cache survives all source slot releases");
+    require(retained_result.top_token == source_result.top_token,
+            "retained global prefix preserves token parity");
+    engine.free_slot(103);
+
+    const int eviction_slot = engine.allocate_slot(104);
+    require(eviction_slot >= 0, "slot available for LRU probe");
+    (void)engine.prefill(different_prompt, eviction_slot);
+    const pocket::QwenPrefixCacheStats evicted = engine.prefix_cache_stats();
+    require(evicted.global_evictions >= 1 && evicted.global_cached_blocks == 1,
+            "a distinct prefix evicts the least-recently-used cache block");
+    engine.free_slot(104);
+
+    pocket::QwenEngineOptions partial_options = options;
+    partial_options.prefix_cache_bytes = 700000;
+    pocket::QwenEngine partial_engine(dir, partial_options, 2, 32);
+    const std::vector<int> long_prompt = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35};
+    const std::vector<int> branched_prompt = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55};
+    const int partial_source = partial_engine.allocate_slot(201);
+    const int partial_destination = partial_engine.allocate_slot(202);
+    require(partial_source >= 0 && partial_destination >= 0,
+            "partial-prefix slots allocated");
+    (void)partial_engine.prefill(long_prompt, partial_source);
+    const pocket::ForwardResult partial_result =
+        partial_engine.prefill(branched_prompt, partial_destination);
+    const pocket::QwenPrefixCacheStats partial = partial_engine.prefix_cache_stats();
+    require(partial.resume_source == "global" && partial.reused_tokens == 16 &&
+                partial.computed_tokens == 16 && partial.global_hits == 1,
+            "aligned shared system prompt reuses only its complete block");
+    pocket::QwenEngineOptions partial_cold_options = partial_options;
+    partial_cold_options.prefix_cache = false;
+    pocket::QwenEngine partial_cold(dir, partial_cold_options, 2, 32);
+    const pocket::ForwardResult partial_expected =
+        partial_cold.prefill(branched_prompt);
+    require(partial_result.top_token == partial_expected.top_token &&
+                partial_result.top_logit == partial_expected.top_logit &&
+                partial_result.checksum == partial_expected.checksum,
+            "shared system-prompt suffix matches cold prefill");
+    partial_engine.free_slot(201);
+    partial_engine.free_slot(202);
+}
+
 void exercise_mtp(const std::string& dir,
                   pocket::QwenKvCacheDType cache_dtype) {
     pocket::QwenEngineOptions plain_options;
@@ -664,6 +771,7 @@ int main() {
         exercise_prefix_cache(dir, pocket::QwenKvCacheDType::Fp16);
         exercise_prefix_cache(dir, pocket::QwenKvCacheDType::Fp8);
         exercise_prefix_cache(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);
+        exercise_cross_request_prefix_cache(dir);
         exercise_mtp(dir, pocket::QwenKvCacheDType::Fp16);
         exercise_mtp(dir, pocket::QwenKvCacheDType::Fp8);
         exercise_mtp(dir, pocket::QwenKvCacheDType::TurboQuantK8V4);

@@ -192,10 +192,18 @@ void test_completion_releases_blocks(const std::string& dir) {
     require(stats.reserved_blocks == 0,
             "reservation should return to zero once idle, got " +
                 std::to_string(stats.reserved_blocks));
-    require(stats.free_blocks == stats.total_blocks,
-            "every block should be back in the pool: " +
-                std::to_string(stats.free_blocks) + " of " +
+    require(stats.free_blocks + stats.cache_pinned_blocks == stats.total_blocks,
+            "every block should be either free or cache-owned: " +
+                std::to_string(stats.free_blocks) + " free + " +
+                std::to_string(stats.cache_pinned_blocks) + " cached of " +
                 std::to_string(stats.total_blocks));
+    // Cache ownership is deliberate after completion. A full flush must return
+    // those retained references as well.
+    engine.clear_prefix_cache();
+    stats = scheduler.get_stats();
+    require(stats.free_blocks == stats.total_blocks &&
+                stats.cache_pinned_blocks == 0,
+            "clear_prefix_cache returns retained blocks to the pool");
 
     scheduler.stop();
     std::cout << "  completion releases blocks and admits the waiting request: "
@@ -299,10 +307,16 @@ void test_cancellation_releases_blocks(const std::string& dir) {
     require(stats.reserved_blocks == 0,
             "reservation should return to zero after cancel and completion, got " +
                 std::to_string(stats.reserved_blocks));
-    require(stats.free_blocks == stats.total_blocks,
-            "every block should be back in the pool: " +
-                std::to_string(stats.free_blocks) + " of " +
+    require(stats.free_blocks + stats.cache_pinned_blocks == stats.total_blocks,
+            "every block should be either free or cache-owned: " +
+                std::to_string(stats.free_blocks) + " free + " +
+                std::to_string(stats.cache_pinned_blocks) + " cached of " +
                 std::to_string(stats.total_blocks));
+    engine.clear_prefix_cache();
+    stats = scheduler.get_stats();
+    require(stats.free_blocks == stats.total_blocks &&
+                stats.cache_pinned_blocks == 0,
+            "clear_prefix_cache returns retained blocks to the pool");
 
     scheduler.stop();
     std::cout << "  cancellation releases blocks: PASS" << std::endl;

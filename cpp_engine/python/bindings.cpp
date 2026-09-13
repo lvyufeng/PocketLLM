@@ -75,6 +75,12 @@ py::dict prefix_stats_dict(const QwenPrefixCacheStats& stats) {
     out["snapshot_bytes"] = stats.snapshot_bytes;
     out["hits"] = stats.hits;
     out["misses"] = stats.misses;
+    out["global_hits"] = stats.global_hits;
+    out["global_misses"] = stats.global_misses;
+    out["global_cached_blocks"] = stats.global_cached_blocks;
+    out["global_evictions"] = stats.global_evictions;
+    out["global_cache_bytes"] = stats.global_cache_bytes;
+    out["global_cache_budget_bytes"] = stats.global_cache_budget_bytes;
     return out;
 }
 
@@ -238,7 +244,8 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("sampling_seed", &QwenEngineOptions::sampling_seed)
         .def_readwrite("kv_paged", &QwenEngineOptions::kv_paged)
         .def_readwrite("kv_block_size", &QwenEngineOptions::kv_block_size)
-        .def_readwrite("kv_cache_bytes", &QwenEngineOptions::kv_cache_bytes);
+        .def_readwrite("kv_cache_bytes", &QwenEngineOptions::kv_cache_bytes)
+        .def_readwrite("prefix_cache_bytes", &QwenEngineOptions::prefix_cache_bytes);
 
     py::class_<ForwardResult>(module, "QwenForwardResult")
         .def(py::init<>())
@@ -290,6 +297,12 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("snapshot_bytes", &QwenPrefixCacheStats::snapshot_bytes)
         .def_readwrite("hits", &QwenPrefixCacheStats::hits)
         .def_readwrite("misses", &QwenPrefixCacheStats::misses)
+        .def_readwrite("global_hits", &QwenPrefixCacheStats::global_hits)
+        .def_readwrite("global_misses", &QwenPrefixCacheStats::global_misses)
+        .def_readwrite("global_cached_blocks", &QwenPrefixCacheStats::global_cached_blocks)
+        .def_readwrite("global_evictions", &QwenPrefixCacheStats::global_evictions)
+        .def_readwrite("global_cache_bytes", &QwenPrefixCacheStats::global_cache_bytes)
+        .def_readwrite("global_cache_budget_bytes", &QwenPrefixCacheStats::global_cache_budget_bytes)
         .def("as_dict", &prefix_stats_dict);
 
     py::class_<QwenEngine>(module, "QwenEngine")
@@ -347,6 +360,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_property_readonly("kv_paged", &QwenEngine::kv_paged)
         .def_property_readonly("kv_free_blocks", &QwenEngine::kv_free_blocks)
         .def_property_readonly("kv_total_blocks", &QwenEngine::kv_total_blocks)
+        .def_property_readonly("kv_cache_pinned_blocks", &QwenEngine::kv_cache_pinned_blocks)
         .def_property_readonly("config", [](const QwenEngine& engine) {
             return qwen_config_dict(engine.config());
         })
@@ -460,7 +474,8 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("running_requests", &BatchScheduler::Stats::running_requests)
         .def_readwrite("completed_requests", &BatchScheduler::Stats::completed_requests)
         .def_readwrite("cancelled_requests", &BatchScheduler::Stats::cancelled_requests)
-        .def_readwrite("free_slots", &BatchScheduler::Stats::free_slots);
+        .def_readwrite("free_slots", &BatchScheduler::Stats::free_slots)
+        .def_readwrite("cache_pinned_blocks", &BatchScheduler::Stats::cache_pinned_blocks);
 
     py::class_<BatchScheduler>(module, "QwenBatchScheduler")
         .def(py::init<QwenEngine*, int>(),
