@@ -1055,7 +1055,7 @@ struct QwenEngine::Impl {
             destination.down = upload_linear(index, source.mlp.down_proj);
             // Fuse gate and up projections for MLP (similar to linear-attention a/b).
             // Reduces MatMul calls from 2 to 1 per layer, saving 64 calls per token.
-            if (config.fuse_ab_projection) {
+            if (layer_config.fuse_ab_projection) {
                 destination.gate_up = fuse_linear_rows(destination.gate, destination.up);
             }
             if (source.linear_attention.in_proj_qkv.weight.found) {
