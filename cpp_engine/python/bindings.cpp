@@ -9,6 +9,7 @@
 #include "qwen_engine.hpp"
 #include "qwen_weights.hpp"
 #include "batch_scheduler.hpp"
+#include "inference_engine.hpp"
 #include "device_runtime.hpp"
 #include "model_registry.hpp"
 #include "qwen_layer_components.hpp"
@@ -17,6 +18,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <iostream>
+#include <memory>
 #include <utility>
 
 namespace py = pybind11;
@@ -24,6 +27,42 @@ using namespace pocket;
 using namespace pocket::qwen_components;
 
 namespace {
+
+// Owns a Python callable that is handed to the scheduler, which stores it on a
+// request and releases it from its own background thread once the request
+// retires. A bare py::function would decref there without the GIL, so the
+// callable is held behind a shared_ptr whose deleter reacquires it. Copying the
+// holder only bumps the shared_ptr count, so the scheduler is free to copy the
+// enclosing std::function without holding a GIL of its own.
+class GilSafeCallable {
+public:
+    explicit GilSafeCallable(py::function fn)
+        : fn_(new py::function(std::move(fn)), GilDeleter{}) {}
+
+    // Runs on the scheduler thread with no GIL held. Exceptions are reported
+    // and swallowed: letting one escape would cross the scheduler's thread and
+    // take down every other live request with it.
+    template <typename... Args>
+    void call(const char* what, Args&&... args) const {
+        py::gil_scoped_acquire acquire;
+        try {
+            (*fn_)(std::forward<Args>(args)...);
+        } catch (const py::error_already_set& e) {
+            std::cerr << "[BatchScheduler] " << what << " callback error: "
+                      << e.what() << std::endl;
+        }
+    }
+
+private:
+    struct GilDeleter {
+        void operator()(py::function* fn) const {
+            py::gil_scoped_acquire acquire;
+            delete fn;
+        }
+    };
+
+    std::shared_ptr<py::function> fn_;
+};
 
 py::dict forward_result_dict(const ForwardResult& result) {
     py::dict out;
@@ -477,6 +516,26 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("worker_command_speculative_decode", &PersistentEngine::worker_command_speculative_decode)
         .def("worker_command_prime_draft_kv", &PersistentEngine::worker_command_prime_draft_kv);
 
+    // Capabilities struct for engine introspection
+    py::class_<Capabilities>(module, "Capabilities")
+        .def(py::init<>())
+        .def_readonly("paged_kv", &Capabilities::paged_kv)
+        .def_readonly("continuous_batching", &Capabilities::continuous_batching)
+        .def_readonly("chunked_prefill", &Capabilities::chunked_prefill)
+        .def_readonly("max_slots", &Capabilities::max_slots)
+        .def_readonly("per_request_sampling", &Capabilities::per_request_sampling)
+        .def_readonly("per_request_top_k", &Capabilities::per_request_top_k)
+        .def_readonly("fixed_temperature", &Capabilities::fixed_temperature)
+        .def_readonly("fixed_top_p", &Capabilities::fixed_top_p)
+        .def_readonly("fixed_top_k", &Capabilities::fixed_top_k)
+        .def_readonly("fixed_seed", &Capabilities::fixed_seed)
+        .def("__repr__", [](const Capabilities& c) {
+            return "<Capabilities max_slots=" + std::to_string(c.max_slots) +
+                   " continuous_batching=" + (c.continuous_batching ? "True" : "False") +
+                   " chunked_prefill=" + (c.chunked_prefill ? "True" : "False") +
+                   " paged_kv=" + (c.paged_kv ? "True" : "False") + ">";
+        });
+
     // BatchScheduler bindings (Phase 3.4)
     py::class_<BatchSamplingParams>(module, "QwenBatchSamplingParams")
         .def(py::init<>())
@@ -518,27 +577,56 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
     py::class_<BatchScheduler>(module, "QwenBatchScheduler")
         .def(py::init<QwenEngine*, int>(),
              py::arg("engine"), py::arg("max_batch_size"))
-        .def("submit_request", [](BatchScheduler& scheduler,
-                                   const std::vector<int>& prompt_tokens,
-                                   const BatchSamplingParams& sampling,
-                                   py::object callback) {
-            // Convert Python callback to C++ std::function
-            std::function<void(const SchedulerGenerationResult&)> cpp_callback;
-            if (!callback.is_none()) {
-                cpp_callback = [callback](const SchedulerGenerationResult& result) {
-                    py::gil_scoped_acquire acquire;
-                    try {
-                        callback(result);
-                    } catch (const py::error_already_set& e) {
-                        // Re-raise Python exceptions
-                        throw;
-                    }
-                };
-            }
+        .def("submit_request",
+             [](BatchScheduler& scheduler,
+                const std::vector<int>& prompt_tokens,
+                const BatchSamplingParams& sampling,
+                py::object callback,
+                py::object on_token) -> uint64_t {
 
-            py::gil_scoped_release release;
-            return scheduler.submit_request(prompt_tokens, sampling, cpp_callback);
-        }, py::arg("prompt_tokens"), py::arg("sampling"), py::arg("callback") = py::none())
+                 std::function<void(const SchedulerGenerationResult&)> cpp_callback;
+                 if (!callback.is_none()) {
+                     GilSafeCallable fn(py::cast<py::function>(callback));
+                     cpp_callback = [fn](const SchedulerGenerationResult& result) {
+                         fn.call("completion", result);
+                     };
+                 }
+
+                 TokenCallback cpp_token_callback;
+                 if (!on_token.is_none()) {
+                     GilSafeCallable fn(py::cast<py::function>(on_token));
+                     cpp_token_callback = [fn](uint64_t request_id, int token) {
+                         fn.call("token", request_id, token);
+                     };
+                 }
+
+                 // Moved, not copied: copying a std::function that owns a
+                 // py::function touches the Python refcount, and the GIL is
+                 // released below. Moving is a pointer swap, so it is safe.
+                 py::gil_scoped_release release;
+                 return scheduler.submit_request(prompt_tokens, sampling,
+                                                std::move(cpp_callback),
+                                                std::move(cpp_token_callback));
+             },
+             py::arg("prompt_tokens"),
+             py::arg("sampling"),
+             py::arg("callback") = py::none(),
+             py::arg("on_token") = py::none(),
+             R"doc(Submit a generation request.
+
+             Args:
+                 prompt_tokens: Input token IDs
+                 sampling: Sampling parameters (temperature, top_p, etc.)
+                 callback: Optional completion callback (called from scheduler thread)
+                 on_token: Optional per-token callback (called from scheduler thread)
+
+             Returns:
+                 request_id (> 0 on success, 0 on failure)
+
+             Note:
+                 Callbacks run from the scheduler's background thread and MUST NOT BLOCK.
+                 Blocking callbacks will stall all running requests.
+             )doc")
         .def("cancel_request", [](BatchScheduler& scheduler, uint64_t request_id) {
             py::gil_scoped_release release;
             return scheduler.cancel_request(request_id);
@@ -563,7 +651,23 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("stop", [](BatchScheduler& scheduler) {
             py::gil_scoped_release release;
             scheduler.stop();
-        });
+        })
+        .def("engine_caps", &BatchScheduler::engine_caps,
+             py::return_value_policy::reference_internal,
+             "Query engine capabilities (max_slots, continuous_batching, etc.)")
+        .def("max_batch_size", &BatchScheduler::max_batch_size,
+             "Get effective batch size (may be clamped to max_slots)")
+        .def("set_prefill_token_budget", &BatchScheduler::set_prefill_token_budget,
+             py::arg("tokens"),
+             R"doc(Set prefill token budget per schedule iteration.
+
+             Smaller values let decode interleave sooner at some cost to prefill
+             throughput. 0 disables chunking (run each prompt to completion).
+
+             Ignored if engine does not declare chunked_prefill capability.
+             )doc")
+        .def("prefill_token_budget", &BatchScheduler::prefill_token_budget,
+             "Get current prefill token budget");
 
     module.attr("backend") = device_backend_name();
 }

@@ -398,6 +398,9 @@ if(POCKET_BUILD_PYTHON)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
         ${CMAKE_CURRENT_SOURCE_DIR}/backends/api
+        # qwen_layer_components.hpp declares the kernel-policy enums the module
+        # exposes, and lives beside the engine sources rather than in include/.
+        ${CMAKE_CURRENT_SOURCE_DIR}/engine
     )
     if(POCKET_BACKEND_INCLUDES)
         target_include_directories(pocketllm_cpp PRIVATE ${POCKET_BACKEND_INCLUDES})
