@@ -16,10 +16,20 @@ struct EncodeRequest {
     bool drop_thinking = true;
 };
 
+struct TokenizeRequest {
+    std::string prompt;              // Raw text to tokenize
+};
+
 struct EncodeReply {
     bool ok = false;
     std::string err;
     std::string prompt_text;
+    std::vector<int> token_ids;
+};
+
+struct TokenizeReply {
+    bool ok = false;
+    std::string err;
     std::vector<int> token_ids;
 };
 
@@ -49,6 +59,7 @@ public:
     int eos_token_id() const { return eos_token_id_; }
 
     EncodeReply encode(const EncodeRequest& req);
+    TokenizeReply tokenize(const TokenizeRequest& req);
     ParsedMessage parse(const std::string& text, const std::string& thinking_mode);
 
 private:

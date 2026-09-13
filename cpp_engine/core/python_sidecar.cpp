@@ -231,6 +231,38 @@ EncodeReply PythonSidecar::encode(const EncodeRequest& req) {
     return reply;
 }
 
+TokenizeReply PythonSidecar::tokenize(const TokenizeRequest& req) {
+    TokenizeReply reply;
+    std::ostringstream os;
+    os << "{\"op\":\"tokenize\",\"prompt\":\"" << json_escape(req.prompt) << "\"}\n";
+
+    std::string resp = send_request(os.str());
+    JsonValue v;
+    try { v = parse_json(resp); } catch (const std::exception& ex) {
+        reply.err = std::string("parse_json failed: ") + ex.what() + " raw=" + resp;
+        return reply;
+    }
+    if (!v.is_object()) { reply.err = "tokenize response not object: " + resp; return reply; }
+    const auto& obj = v.object();
+    const JsonValue* ok = object_get(obj, "ok");
+    if (ok == nullptr || !ok->is_bool() || !ok->boolean()) {
+        const JsonValue* err = object_get(obj, "err");
+        reply.err = err != nullptr && err->is_string() ? err->string() : resp;
+        return reply;
+    }
+    const JsonValue* ids = object_get(obj, "token_ids");
+    if (ids != nullptr && ids->is_array()) {
+        const auto& arr = ids->array();
+        reply.token_ids.reserve(arr.size());
+        for (const auto& item : arr) {
+            if (!item.is_number()) { reply.err = "token_ids item not number"; return reply; }
+            reply.token_ids.push_back(static_cast<int>(item.number()));
+        }
+    }
+    reply.ok = true;
+    return reply;
+}
+
 ParsedMessage PythonSidecar::parse(const std::string& text, const std::string& thinking_mode) {
     ParsedMessage parsed;
     std::ostringstream os;
