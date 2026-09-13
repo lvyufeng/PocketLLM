@@ -179,6 +179,67 @@ PYTHONPATH=cpp_engine/build-python/python python -c \
 
 The module exposes token-oriented `QwenEngine` and low-level `PersistentEngine` value types. Device-touching calls (prefill, decode, generate, verify, warmup, reset) release the Python GIL; cheap accessors and construction do not. It intentionally does not expose CUDA/ACL handles or Torch tensors.
 
+### Scheduler-backed async requests
+
+`QwenBatchScheduler` wraps an engine in the same continuous-batching scheduler the native
+OpenAI server uses, so Python can submit concurrent requests and stream tokens without going
+through HTTP.
+
+```python
+import threading
+import pocketllm_cpp
+
+engine = pocketllm_cpp.QwenEngine(checkpoint, pocketllm_cpp.QwenEngineOptions())
+scheduler = pocketllm_cpp.QwenBatchScheduler(engine, max_batch_size=4)
+
+sampling = pocketllm_cpp.QwenBatchSamplingParams()
+sampling.max_new_tokens = 64
+
+done = threading.Event()
+
+def on_token(request_id, token):
+    print(token, flush=True)
+
+def on_complete(result):
+    print(result.finish_reason)
+    done.set()
+
+request_id = scheduler.submit_request(
+    prompt_tokens, sampling, callback=on_complete, on_token=on_token)
+done.wait()
+scheduler.stop()
+```
+
+Omit both callbacks to poll instead; `poll_result` returns `None` on timeout:
+
+```python
+request_id = scheduler.submit_request(prompt_tokens, sampling)
+result = scheduler.poll_result(request_id, timeout_ms=30000)
+```
+
+Both callbacks run on the scheduler's background thread, so they **must not block** — time
+spent there delays every other running request. Push the token onto a queue and return. An
+exception raised inside a callback is reported on stderr and swallowed rather than being allowed
+to cross the thread boundary and terminate unrelated requests.
+
+`engine_caps()` reports what the engine actually supports, which is what a caller should branch on
+rather than assuming:
+
+```python
+caps = scheduler.engine_caps()
+caps.max_slots, caps.continuous_batching, caps.chunked_prefill, caps.paged_kv
+caps.per_request_sampling, caps.per_request_top_k
+```
+
+`max_batch_size()` returns the effective batch size, which may be lower than requested because it
+is clamped to `caps.max_slots`. `set_prefill_token_budget(tokens)` controls how much prefill runs
+per schedule iteration: smaller values let decode interleave sooner at some cost to prefill
+throughput, and `0` disables chunking so each prompt runs to completion in one call. It has no
+effect on engines that do not declare `chunked_prefill`.
+
+The engine must outlive the scheduler; the scheduler holds a non-owning pointer, matching the C++
+ownership model. Call `stop()` for a deterministic shutdown rather than relying on collection order.
+
 ## Backend selection
 
 `backend="auto"` picks the C++ adapter only when the native module is importable and the checkpoint
