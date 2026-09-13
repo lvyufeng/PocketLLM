@@ -1066,3 +1066,130 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_vector_kernel(
         wait_store_before_load();
     }
 }
+
+// FlashDecoding: Multi-core parallel decode attention
+// Each AI Core processes a partition of the KV cache, computing partial results.
+// This kernel writes (max, denominator, output) partials to GM for later reduction.
+extern "C" __global__ __aicore__ void qwen_gqa_decode_attention_flashdec_partial_kernel(
+    GM_ADDR q, GM_ADDR k_cache, GM_ADDR v_cache, GM_ADDR partials_out,
+    uint32_t q_heads, uint32_t kv_heads, uint32_t head_dim,
+    uint32_t context_len, uint32_t max_context, float scale,
+    uint32_t num_partitions) {
+    VectorAttentionBuffers buffers;
+    AscendC::GlobalTensor<half> q_gm;
+    AscendC::GlobalTensor<half> k_gm;
+    AscendC::GlobalTensor<half> v_gm;
+    AscendC::GlobalTensor<float> partials_gm;
+
+    q_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(q), q_heads * head_dim);
+    k_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(k_cache),
+                         max_context * kv_heads * head_dim);
+    v_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(v_cache),
+                         max_context * kv_heads * head_dim);
+    // partials layout: [q_heads, num_partitions, 2 + head_dim]
+    // Each partition stores: [max, denominator, output[head_dim]]
+    const uint32_t partial_stride = 2 + head_dim;
+    partials_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(partials_out),
+                                q_heads * num_partitions * partial_stride);
+
+    AscendC::LocalTensor<half> q_half = buffers.q_half();
+    AscendC::LocalTensor<float> q_float = buffers.q_float();
+
+    const uint32_t partition_id = AscendC::GetBlockIdx();
+    const uint32_t repeat = q_heads / kv_heads;
+
+    // Calculate this partition's position range
+    const uint32_t positions_per_partition = (context_len + num_partitions - 1) / num_partitions;
+    const uint32_t begin = partition_id * positions_per_partition;
+    const uint32_t end = min_u32(context_len, begin + positions_per_partition);
+
+    for (uint32_t head = 0; head < q_heads; ++head) {
+        const uint32_t kv_head = head / repeat;
+        const uint32_t q_base = head * head_dim;
+
+        load_vector_row(q_gm, q_half, q_float, q_base, head_dim);
+
+        float maximum, denominator;
+        if (begin < end) {
+            vector_online_softmax_pass(
+                buffers, k_gm, v_gm, kv_head, kv_heads, head_dim, begin, end,
+                q_float, scale, buffers.exp_work(), maximum, denominator);
+        } else {
+            // Empty partition
+            maximum = -3.402823466e+38F;
+            denominator = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                buffers.accum().SetValue(d, 0.0f);
+            }
+        }
+
+        // Write partial results to GM
+        const uint32_t partial_base = (head * num_partitions + partition_id) * partial_stride;
+        partials_gm.SetValue(partial_base, maximum);
+        partials_gm.SetValue(partial_base + 1, denominator);
+
+        AscendC::LocalTensor<float> output = buffers.accum();
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            partials_gm.SetValue(partial_base + 2 + d, output.GetValue(d));
+        }
+    }
+}
+
+// FlashDecoding reduction kernel: Combines partial results from all partitions
+extern "C" __global__ __aicore__ void qwen_gqa_decode_attention_flashdec_reduce_kernel(
+    GM_ADDR partials_in, GM_ADDR out,
+    uint32_t q_heads, uint32_t head_dim, uint32_t num_partitions) {
+    VectorAttentionBuffers buffers;
+    AscendC::GlobalTensor<float> partials_gm;
+    AscendC::GlobalTensor<half> out_gm;
+
+    const uint32_t partial_stride = 2 + head_dim;
+    partials_gm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(partials_in),
+                                q_heads * num_partitions * partial_stride);
+    out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(out), q_heads * head_dim);
+
+    AscendC::LocalTensor<float> merged = buffers.accum();
+    AscendC::LocalTensor<float> exp_work = buffers.exp_work();
+
+    for (uint32_t head = 0; head < q_heads; ++head) {
+        float global_max = -3.402823466e+38F;
+        float global_denominator = 0.0f;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            merged.SetValue(d, 0.0f);
+        }
+
+        // Combine partials with exp rescaling
+        for (uint32_t p = 0; p < num_partitions; ++p) {
+            const uint32_t base = (head * num_partitions + p) * partial_stride;
+            const float partial_max = partials_gm.GetValue(base);
+            const float partial_denom = partials_gm.GetValue(base + 1);
+
+            if (partial_denom == 0.0f) continue; // Empty partition
+
+            const float next_max = partial_max > global_max ? partial_max : global_max;
+            const float old_weight = global_denominator > 0.0f
+                ? scalar_exp(exp_work, global_max - next_max) : 0.0f;
+            const float new_weight = scalar_exp(exp_work, partial_max - next_max);
+
+            global_denominator = global_denominator * old_weight +
+                                 partial_denom * new_weight;
+
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const float partial_val = partials_gm.GetValue(base + 2 + d);
+                const float updated = merged.GetValue(d) * old_weight +
+                                      partial_val * new_weight;
+                merged.SetValue(d, updated);
+            }
+
+            global_max = next_max;
+        }
+
+        // Normalize and write output
+        const float inverse = global_denominator > 0.0f ? 1.0f / global_denominator : 0.0f;
+        const uint32_t out_base = head * head_dim;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            out_gm.SetValue(out_base + d, static_cast<half>(merged.GetValue(d) * inverse));
+        }
+    }
+}
+

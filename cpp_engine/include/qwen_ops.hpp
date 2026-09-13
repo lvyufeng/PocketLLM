@@ -197,6 +197,14 @@ inline bool qwen_gqa_prefill_attention_f16(const uint16_t* d_q_rows_fp16, const 
 #endif
 }
 
+inline bool qwen_gqa_decode_attention_flashdec_f16(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_partials_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int num_partitions, void* stream = nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_gqa_decode_attention_flashdec_f16_ascend(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
+#else
+    return qwen_gqa_decode_attention_flashdec_f16_cuda(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
+#endif
+}
+
 inline bool qwen_gqa_verify_attention_f16(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, float* d_partial_scratch, int rows, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, int splits, void* stream = nullptr) {
 #ifdef POCKET_BACKEND_ASCEND
     return qwen_gqa_verify_attention_f16_ascend(d_q_rows_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_rows_fp16, d_partial_scratch, rows, q_heads, kv_heads, head_dim, position_offset, max_context, splits, stream);
