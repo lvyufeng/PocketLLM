@@ -54,12 +54,11 @@ double time_case(int rows, int position_offset, int max_context, int iters,
     // The production default enables hpg6 when the variable is unset. Make the
     // baseline explicit so this benchmark cannot compare hpg6 against itself.
     setenv("POCKETLLM_QWEN_GQA_LONG_TILE", mode == Mode::Base ? "0" : "1", 1);
-    unsetenv("POCKETLLM_QWEN_GQA_FLASH_TILE");
-    unsetenv("POCKETLLM_QWEN_GQA_MMA_TILE");
-    if (mode == Mode::Flash) setenv("POCKETLLM_QWEN_GQA_FLASH_TILE", "1", 1);
+    // Set to "0" instead of unsetting - unset means enabled in the dispatcher.
+    setenv("POCKETLLM_QWEN_GQA_FLASH_TILE", mode == Mode::Flash ? "1" : "0", 1);
     // The MMA dispatch is checked before flash and long, so this one variable
     // selects it regardless of the others.
-    if (mode == Mode::Mma) setenv("POCKETLLM_QWEN_GQA_MMA_TILE", "1", 1);
+    setenv("POCKETLLM_QWEN_GQA_MMA_TILE", mode == Mode::Mma ? "1" : "0", 1);
     std::vector<uint16_t> host_q(q_elements);
     std::vector<uint16_t> host_kv(kv_elements, 0);
     for (uint16_t& value : host_q) {
