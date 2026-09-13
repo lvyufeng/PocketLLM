@@ -36,6 +36,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -48,9 +49,12 @@
 #include "aclrtlaunch_qwen_gated_delta_sequence_normalized_kernel.h"
 #include "aclrtlaunch_qwen_gated_delta_step_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_kernel.h"
+#include "aclrtlaunch_qwen_gqa_decode_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
+#include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_gqa_verify_attention_kernel.h"
+#include "aclrtlaunch_qwen_gqa_verify_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_linear_attn_gates_kernel.h"
 #include "aclrtlaunch_qwen_normalize_gated_delta_qk_kernel.h"
 #include "aclrtlaunch_qwen_partial_rope_rows_kernel.h"
@@ -69,6 +73,8 @@ constexpr uint32_t kLaunchOk = 0;
 constexpr int kRecurrentKeyDim = 128;
 constexpr int kRecurrentValueDim = 128;
 constexpr int kMaxAttentionHeadDim = 256;
+constexpr uint32_t kAttentionAlignmentBytes = 32;
+constexpr uint32_t kAttentionAlignmentHalfs = 16;
 
 // Convolution tail capacity, matching kMaxKernel in the device code and kMaxTail
 // on the CUDA side.
@@ -123,6 +129,42 @@ bool valid_attention(int q_heads, int kv_heads, int head_dim, int context_len,
     return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 &&
            head_dim > 0 && head_dim <= kMaxAttentionHeadDim &&
            context_len > 0 && context_len <= max_context;
+}
+
+// The first vector path is intentionally limited to contiguous KV rows. The real
+// Qwen TP4 full-attention shape is kv_heads=1; other valid neutral shapes stay on
+// the scalar kernel until a strided UB loader is separately validated. The fast
+// path is enabled by default after hardware validation; set the switch to 0 for
+// an apples-to-apples scalar baseline.
+bool vector_gqa_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("QWEN_ASCEND_GQA_VECTOR");
+        return value == nullptr || value[0] != '0' || value[1] != '\0';
+    }();
+    return enabled;
+}
+
+bool vector_attention_geometry(const void* q, const void* k, const void* v,
+                               const void* out, int q_heads, int kv_heads,
+                               int head_dim) {
+    const auto aligned = [](const void* pointer) {
+        return pointer != nullptr &&
+               (reinterpret_cast<uintptr_t>(pointer) & (kAttentionAlignmentBytes - 1)) == 0;
+    };
+    return vector_gqa_enabled() && q_heads > 0 && kv_heads == 1 &&
+           head_dim > 0 && head_dim <= kMaxAttentionHeadDim &&
+           head_dim % static_cast<int>(kAttentionAlignmentHalfs) == 0 && aligned(q) &&
+           aligned(k) && aligned(v) && aligned(out);
+}
+
+// Return the smallest group count that makes `group * elements` an integral
+// number of alignment units. This keeps adjacent block-owned records on distinct
+// 32-byte GM cache lines.
+uint32_t aligned_work_group(uint32_t elements, uint32_t alignment) {
+    for (uint32_t group = 1; group <= alignment; ++group) {
+        if ((group * elements) % alignment == 0) return group;
+    }
+    return alignment;
 }
 
 // The softmax scale. Passed to the kernel as a float because aicore cannot cast
@@ -414,12 +456,26 @@ bool qwen_gqa_decode_attention_f16_ascend(
         return false;
     }
 
-    // The device baseline writes both output and score scratch with scalar GM
-    // stores. Their neutral layouts need not be 32-byte aligned per head (the
-    // score row is only `context_len` floats), and scalar stores from adjacent
-    // blocks can then lose one another in a shared GM cache line. Use one block
-    // for this correctness-first implementation; the whole head loop remains
-    // grid-stride-ready for a future block-owned, aligned fast path.
+    if (vector_attention_geometry(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16,
+                                  d_out_fp16, q_heads, kv_heads, head_dim) &&
+        (reinterpret_cast<uintptr_t>(d_score_scratch) & (kAttentionAlignmentBytes - 1)) == 0) {
+        const uint32_t works_per_block = aligned_work_group(
+            static_cast<uint32_t>(context_len), 8);
+        const uint32_t blocks =
+            (static_cast<uint32_t>(q_heads) + works_per_block - 1) /
+            works_per_block;
+        return aclrtlaunch_qwen_gqa_decode_attention_vector_kernel(
+                   blocks, resolve(stream), gm(d_q_fp16), gm(d_k_cache_fp16),
+                   gm(d_v_cache_fp16), gm(d_out_fp16), gm(d_score_scratch),
+                   static_cast<uint32_t>(q_heads), static_cast<uint32_t>(kv_heads),
+                   static_cast<uint32_t>(head_dim),
+                   static_cast<uint32_t>(context_len),
+                   static_cast<uint32_t>(max_context), attention_scale(head_dim),
+                   works_per_block) == kLaunchOk;
+    }
+
+    // The scalar baseline remains the safe path for unaligned and strided KV
+    // geometries. Its single block also protects irregular scratch records.
     return aclrtlaunch_qwen_gqa_decode_attention_kernel(
                1u, resolve(stream), gm(d_q_fp16), gm(d_k_cache_fp16),
                gm(d_v_cache_fp16), gm(d_out_fp16), gm(d_score_scratch),
@@ -444,6 +500,22 @@ bool qwen_gqa_prefill_attention_f16_ascend(
         return false;
     }
     const uint64_t work = static_cast<uint64_t>(seq_len) * q_heads;
+    if (vector_attention_geometry(d_q_rows_fp16, d_k_cache_fp16, d_v_cache_fp16,
+                                  d_out_rows_fp16, q_heads, kv_heads, head_dim)) {
+        const uint32_t works_per_block = aligned_work_group(
+            static_cast<uint32_t>(head_dim), 16);
+        const uint32_t blocks =
+            (static_cast<uint32_t>(work) + works_per_block - 1) /
+            works_per_block;
+        return aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel(
+                   blocks, resolve(stream), gm(d_q_rows_fp16),
+                   gm(d_k_cache_fp16), gm(d_v_cache_fp16), gm(d_out_rows_fp16),
+                   static_cast<uint32_t>(seq_len), static_cast<uint32_t>(q_heads),
+                   static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(head_dim),
+                   static_cast<uint32_t>(position_offset),
+                   static_cast<uint32_t>(max_context), attention_scale(head_dim),
+                   works_per_block) == kLaunchOk;
+    }
     return aclrtlaunch_qwen_gqa_prefill_attention_kernel(
                blocks_for(work), resolve(stream), gm(d_q_rows_fp16),
                gm(d_k_cache_fp16), gm(d_v_cache_fp16), gm(d_out_rows_fp16),
@@ -473,9 +545,27 @@ bool qwen_gqa_verify_attention_f16_ascend(
                          max_context)) {
         return false;
     }
-    // Partial records are also scalar-written and a record is not necessarily an
-    // integral number of 32-byte cache lines (`splits * (head_dim + 2)` floats).
-    // Serialize ownership until the kernel has a block-owned aligned store path.
+    if (vector_attention_geometry(d_q_rows_fp16, d_k_cache_fp16, d_v_cache_fp16,
+                                  d_out_rows_fp16, q_heads, kv_heads, head_dim) &&
+        (reinterpret_cast<uintptr_t>(d_partial_scratch) & (kAttentionAlignmentBytes - 1)) == 0) {
+        const uint32_t record_elements =
+            static_cast<uint32_t>(splits * (head_dim + 2));
+        const uint32_t works_per_block = aligned_work_group(record_elements, 8);
+        const uint32_t total = static_cast<uint32_t>(rows * q_heads);
+        const uint32_t blocks = (total + works_per_block - 1) / works_per_block;
+        return aclrtlaunch_qwen_gqa_verify_attention_vector_kernel(
+                   blocks, resolve(stream), gm(d_q_rows_fp16),
+                   gm(d_k_cache_fp16), gm(d_v_cache_fp16), gm(d_out_rows_fp16),
+                   gm(d_partial_scratch), static_cast<uint32_t>(rows),
+                   static_cast<uint32_t>(q_heads), static_cast<uint32_t>(kv_heads),
+                   static_cast<uint32_t>(head_dim),
+                   static_cast<uint32_t>(position_offset),
+                   static_cast<uint32_t>(max_context), static_cast<uint32_t>(splits),
+                   attention_scale(head_dim), works_per_block) == kLaunchOk;
+    }
+
+    // Irregular records remain serialized so adjacent blocks cannot race in a
+    // shared 32-byte GM cache line.
     return aclrtlaunch_qwen_gqa_verify_attention_kernel(
                1u, resolve(stream), gm(d_q_rows_fp16), gm(d_k_cache_fp16),
                gm(d_v_cache_fp16), gm(d_out_rows_fp16), gm(d_partial_scratch),
