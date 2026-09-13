@@ -48,6 +48,7 @@ set(POCKET_CORE_SOURCES
     core/sampler.cpp
     core/cmd_channel.cpp
     core/python_sidecar.cpp
+    core/metrics.cpp
     third_party/httplib.cpp
 )
 
@@ -310,6 +311,7 @@ add_library(pocket_core STATIC ${POCKET_CORE_SOURCES})
 set_target_properties(pocket_core PROPERTIES POSITION_INDEPENDENT_CODE ${POCKET_STATIC_PIC})
 target_include_directories(pocket_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
@@ -342,6 +344,7 @@ target_link_libraries(pocket_cpp_core PUBLIC pocket_core pocket_runtime)
 
 target_include_directories(pocket_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 if(POCKET_BACKEND_INCLUDES)
