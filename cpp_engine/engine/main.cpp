@@ -424,6 +424,9 @@ void print_safe_tensor(const pocket::SafeTensorInfo& info, const std::string& sh
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Force line buffering so redirected stdout shows progress immediately
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IOLBF, 0);
     const auto process_started = std::chrono::steady_clock::now();
     try {
         Args args = parse_args(argc, argv);
@@ -873,7 +876,16 @@ int main(int argc, char** argv) {
                             t_decode0 = t_prefill1;
                             generated.push_back(next);
                             for (int step = 1; step < args.max_new_tokens; ++step) {
+                                auto step_start = Clock::now();
                                 next = qwen.decode_step(next.top_token);
+                                auto step_end = Clock::now();
+                                double step_ms = std::chrono::duration<double, std::milli>(
+                                    step_end - step_start).count();
+                                if (args.tp_rank == 0) {
+                                    std::cout << "decode_step=" << step
+                                              << " ms=" << step_ms << "\n";
+                                    std::cout.flush();
+                                }
                                 generated.push_back(next);
                             }
                             // The one-shot CLI drives decode_step directly rather

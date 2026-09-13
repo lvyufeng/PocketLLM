@@ -67,6 +67,8 @@ struct DeviceLayer {
     DeviceLinear gate;
     DeviceLinear up;
     DeviceLinear down;
+    // Row-concat of gate and up; empty when the two cannot be fused.
+    DeviceLinear gate_up;
 };
 
 enum class NvFp4Mode {

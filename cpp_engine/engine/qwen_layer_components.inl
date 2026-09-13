@@ -1213,15 +1213,32 @@ void FusedGateUpSwiGLU::forward(
     Runtime& runtime, DeviceLayer& layer, const uint16_t* input,
     Workspace& workspace, int rows, int hidden_size) const {
 #ifdef POCKET_BACKEND_ASCEND
-    runtime.linear_component.forward(
-        runtime, layer.gate, input, workspace.gate->f16_data(), rows,
-        "mlp.gate");
-    runtime.linear_component.forward(
-        runtime, layer.up, input, workspace.up->f16_data(), rows, "mlp.up");
-    require_launch(qwen_silu_mul_rows_f16(
-        workspace.gate->f16_data(), workspace.up->f16_data(),
-        workspace.output->f16_data(), rows,
-        static_cast<int>(layer.gate.logical_shape[0])), "FP16 SwiGLU");
+    // Use fused gate_up projection when available (reduces MatMul calls from 2 to 1).
+    if (layer.gate_up.weight.data != nullptr) {
+        const int gate_rows = static_cast<int>(layer.gate.logical_shape[0]);
+        const int total_rows = gate_rows * 2;
+        QwenDeviceTensor& fused_output = runtime.workspace_half(
+            static_cast<size_t>(rows) * total_rows,
+            {static_cast<uint64_t>(rows), static_cast<uint64_t>(total_rows)});
+        runtime.linear_component.forward(
+            runtime, layer.gate_up, input, fused_output.f16_data(), rows,
+            "mlp.gate_up");
+        // Split the output: first half is gate, second half is up.
+        require_launch(qwen_silu_mul_rows_f16(
+            fused_output.f16_data(),
+            fused_output.f16_data() + rows * gate_rows,
+            workspace.output->f16_data(), rows, gate_rows), "FP16 SwiGLU");
+    } else {
+        runtime.linear_component.forward(
+            runtime, layer.gate, input, workspace.gate->f16_data(), rows,
+            "mlp.gate");
+        runtime.linear_component.forward(
+            runtime, layer.up, input, workspace.up->f16_data(), rows, "mlp.up");
+        require_launch(qwen_silu_mul_rows_f16(
+            workspace.gate->f16_data(), workspace.up->f16_data(),
+            workspace.output->f16_data(), rows,
+            static_cast<int>(layer.gate.logical_shape[0])), "FP16 SwiGLU");
+    }
 #else
     if (workspace.fused_decode) {
         typename Runtime::PhaseScope scope(&runtime, "swiglu.d");
