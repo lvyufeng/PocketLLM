@@ -1,7 +1,9 @@
 #include "openai_server.hpp"
 
 #include "batch_scheduler.hpp"
+#include "metrics.hpp"
 #include "json_lite.hpp"
+#include "qwen_engine.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include "httplib.h"
@@ -244,6 +246,7 @@ struct OpenAIServer::Impl {
     // Token id for "</think>", or -1 when the vocabulary has none. Looked up
     // once; the streaming path needs it per token.
     const int think_end_id;
+    EngineMetrics metrics;
 
     Impl(InferenceEngine& e, const Tokenizer& t, PythonSidecar& s, const OpenAIServerConfig& c)
         : engine(e), tok(t), sidecar(s), cfg(c),
@@ -266,6 +269,26 @@ struct OpenAIServer::Impl {
         os << "{\"object\":\"list\",\"data\":[{\"id\":\"" << json_escape(cfg.model_name)
            << "\",\"object\":\"model\",\"owned_by\":\"local\"}]}";
         res.set_content(os.str(), "application/json");
+    }
+
+    void handle_metrics(httplib::Response& res) {
+        const auto stats = sched.get_stats();
+
+        // Try to get Qwen-specific prefix cache stats
+        const QwenPrefixCacheStats* cache_stats = nullptr;
+        QwenPrefixCacheStats qwen_stats;
+        QwenEngine* qwen = dynamic_cast<QwenEngine*>(&engine);
+        if (qwen) {
+            qwen_stats = qwen->prefix_cache_stats();
+            cache_stats = &qwen_stats;
+        }
+
+        const std::string body = metrics.serialize_prometheus(
+            stats.waiting_requests, stats.running_requests,
+            stats.free_slots, stats.reserved_blocks, stats.total_blocks,
+            stats.free_blocks, stats.cache_pinned_blocks, cache_stats);
+
+        res.set_content(body, "text/plain; version=0.0.4");
     }
 
     // Rejects a request that names sampling this engine cannot vary per row
@@ -371,13 +394,18 @@ struct OpenAIServer::Impl {
     }
 
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+        const auto request_start = std::chrono::steady_clock::now();
+        metrics.record_request_start();
+
         const std::string& body = req.body;
         JsonValue jv;
         try { jv = parse_json(body); } catch (const std::exception& ex) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, std::string("invalid JSON: ") + ex.what());
             return;
         }
         if (!jv.is_object()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, "request body must be JSON object");
             return;
         }
@@ -389,6 +417,7 @@ struct OpenAIServer::Impl {
         BatchSamplingParams sp;
         std::string err;
         if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
         }
@@ -403,14 +432,15 @@ struct OpenAIServer::Impl {
         // by what the engine declared. Serialising here would give a paged
         // batched engine the throughput of a single-session one.
         if (static_cast<int>(enc_reply.token_ids.size()) + max_tokens > engine.max_context()) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, "prompt + max_tokens exceeds max_context");
             return;
         }
 
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, thinking_mode);
+            handle_stream(req, res, enc_reply, sp, thinking_mode, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, thinking_mode);
+            handle_nonstream(res, enc_reply, sp, thinking_mode, request_start);
         }
     }
 
@@ -425,12 +455,17 @@ struct OpenAIServer::Impl {
     }
 
     void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
-                          const BatchSamplingParams& sp, const std::string& thinking_mode) {
+                          const BatchSamplingParams& sp, const std::string& thinking_mode,
+                          std::chrono::steady_clock::time_point request_start) {
+        std::chrono::steady_clock::time_point ttft_time;
+        bool ttft_recorded = false;
+
         auto completion = std::make_shared<TokenStream>();
         const uint64_t request_id = sched.submit_request(
             enc.token_ids, sp,
             [completion](const SchedulerGenerationResult& r) { completion->finish(r); });
         if (request_id == 0) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
@@ -441,6 +476,9 @@ struct OpenAIServer::Impl {
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::seconds(cfg.request_timeout_seconds);
         if (completion->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
             // The callback owns `completion`, so it remains valid until the
             // scheduler observes the cancellation. Because callback-mode
             // requests are not duplicated into poll_result(), abandoning this
@@ -449,6 +487,10 @@ struct OpenAIServer::Impl {
             emit_error(res, 504, "generation timed out");
             return;
         }
+        if (!ttft_recorded) {
+            ttft_time = std::chrono::steady_clock::now();
+            ttft_recorded = true;
+        }
 
         SchedulerGenerationResult out;
         {
@@ -456,12 +498,19 @@ struct OpenAIServer::Impl {
             out = completion->result;
         }
 
+        const auto request_end = std::chrono::steady_clock::now();
+        const double duration = std::chrono::duration<double>(request_end - request_start).count();
+        const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
+
         if (!out.error.empty()) {
+            metrics.record_request_end(false, duration, ttft, enc.token_ids.size(), 0);
             emit_error(res, 500, out.error);
             return;
         }
 
         const std::vector<int> generated = strip_stop_token(out.generated_tokens, out.finish_reason);
+        metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
+
         const std::string text = tok.decode_tokens(generated);
         const ParsedMessage parsed = sidecar.parse(text, thinking_mode);
         std::string content = parsed.ok ? parsed.content : text;
@@ -483,14 +532,18 @@ struct OpenAIServer::Impl {
 
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
-                       const std::string& thinking_mode) {
+                       const std::string& thinking_mode,
+                       std::chrono::steady_clock::time_point request_start) {
         const std::string id = make_request_id();
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, id, created, thinking_mode]
+            [this, enc, sp, id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
+
+            std::chrono::steady_clock::time_point ttft_time;
+            bool ttft_recorded = false;
 
             auto send_chunk = [&](const std::string& delta, const char* field,
                                   const char* finish_reason = nullptr) {
@@ -536,6 +589,9 @@ struct OpenAIServer::Impl {
                 [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
                 [stream](uint64_t, int token) { stream->push(token); });
             if (request_id == 0) {
+                const auto request_end = std::chrono::steady_clock::now();
+                const double duration = std::chrono::duration<double>(request_end - request_start).count();
+                metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
                 send_error("request rejected: its worst-case KV footprint exceeds "
                            "the whole block pool, so it could never be admitted");
                 const std::string done = "data: [DONE]\n\n";
@@ -584,11 +640,17 @@ struct OpenAIServer::Impl {
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(cfg.request_timeout_seconds);
             bool timed_out = false;
+            int token_count = 0;
             while (true) {
                 int token = 0;
                 const TokenStream::Next next = stream->next(&token, deadline);
                 if (next == TokenStream::Next::Token) {
+                    if (!ttft_recorded) {
+                        ttft_time = std::chrono::steady_clock::now();
+                        ttft_recorded = true;
+                    }
                     accept(token);
+                    ++token_count;
                     continue;
                 }
                 if (next == TokenStream::Next::Timeout) {
@@ -597,6 +659,10 @@ struct OpenAIServer::Impl {
                 }
                 break;
             }
+
+            const auto request_end = std::chrono::steady_clock::now();
+            const double duration = std::chrono::duration<double>(request_end - request_start).count();
+            const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
             std::string finish_reason = "length";
             std::string generation_error;
@@ -623,6 +689,9 @@ struct OpenAIServer::Impl {
                 }
             }
 
+            const bool success = !timed_out && generation_error.empty();
+            metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
+
             if (timed_out) send_error("generation timed out");
             if (!generation_error.empty()) {
                 send_error(generation_error);
@@ -645,6 +714,7 @@ struct OpenAIServer::Impl {
         running = true;
         svr.Get("/health", [this](const httplib::Request&, httplib::Response& res) { handle_health(res); });
         svr.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) { handle_models(res); });
+        svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) { handle_metrics(res); });
         svr.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
             try { handle_chat_completions(req, res); }
             catch (const std::exception& ex) { emit_error(res, 500, ex.what()); }
