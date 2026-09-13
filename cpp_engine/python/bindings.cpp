@@ -11,6 +11,7 @@
 #include "batch_scheduler.hpp"
 #include "device_runtime.hpp"
 #include "model_registry.hpp"
+#include "qwen_layer_components.hpp"
 
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
@@ -20,6 +21,7 @@
 
 namespace py = pybind11;
 using namespace pocket;
+using namespace pocket::qwen_components;
 
 namespace {
 
@@ -213,11 +215,46 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .value("Int8PerTokenHead", QwenKvCacheDType::Int8PerTokenHead)
         .export_values();
 
+    py::enum_<NvFp4Mode>(module, "NvFp4Mode")
+        .value("Auto", NvFp4Mode::Auto)
+        .value("Dp4a", NvFp4Mode::Dp4a)
+        .value("Wmma", NvFp4Mode::Wmma)
+        .value("Reference", NvFp4Mode::Reference)
+        .export_values();
+
+    py::enum_<OptionalSwitch>(module, "OptionalSwitch")
+        .value("Auto", OptionalSwitch::Auto)
+        .value("Disabled", OptionalSwitch::Disabled)
+        .value("Enabled", OptionalSwitch::Enabled)
+        .export_values();
+
     module.def("qwen_kv_cache_dtype_name", [](QwenKvCacheDType dtype) {
         return std::string(qwen_kv_cache_dtype_name(dtype));
     });
     module.def("parse_qwen_kv_cache_dtype", &parse_qwen_kv_cache_dtype);
     module.def("is_qwen3_5_checkpoint", &is_qwen3_5_checkpoint);
+
+    py::class_<QwenKernelOptions>(module, "QwenKernelOptions")
+        .def(py::init<>())
+        .def_readwrite("nvfp4_mode", &QwenKernelOptions::nvfp4_mode)
+        .def_readwrite("nvfp4_wide_n64", &QwenKernelOptions::nvfp4_wide_n64)
+        .def_readwrite("nvfp4_wide_n64_min_rows", &QwenKernelOptions::nvfp4_wide_n64_min_rows)
+        .def_readwrite("nvfp4_fused_swiglu", &QwenKernelOptions::nvfp4_fused_swiglu)
+        .def_readwrite("nvfp4_shared_q8_swiglu", &QwenKernelOptions::nvfp4_shared_q8_swiglu)
+        .def_readwrite("gqa_optimized", &QwenKernelOptions::gqa_optimized)
+        .def_readwrite("gqa_verify_cublas_qk", &QwenKernelOptions::gqa_verify_cublas_qk)
+        .def_readwrite("gqa_verify_split", &QwenKernelOptions::gqa_verify_split)
+        .def_readwrite("gqa_verify_splits", &QwenKernelOptions::gqa_verify_splits)
+        .def_readwrite("verify_small_fp16_cublas", &QwenKernelOptions::verify_small_fp16_cublas)
+        .def_readwrite("gated_delta_flashqla", &QwenKernelOptions::gated_delta_flashqla)
+        .def_readwrite("fuse_qkvz_decode", &QwenKernelOptions::fuse_qkvz_decode)
+        .def_readwrite("fuse_ab_projection", &QwenKernelOptions::fuse_ab_projection)
+        .def_readwrite("gated_delta_prenormalize", &QwenKernelOptions::gated_delta_prenormalize)
+        .def_readwrite("gated_delta_shared_state", &QwenKernelOptions::gated_delta_shared_state)
+        .def_readwrite("fuse_full_qkv_decode", &QwenKernelOptions::fuse_full_qkv_decode)
+        .def_readwrite("fuse_attention_residual_norm", &QwenKernelOptions::fuse_attention_residual_norm)
+        .def_readwrite("comm_overlap_slices", &QwenKernelOptions::comm_overlap_slices)
+        .def("load_from_env", &QwenKernelOptions::load_from_env);
 
     py::class_<QwenEngineOptions>(module, "QwenEngineOptions")
         .def(py::init<>())
@@ -245,7 +282,8 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("kv_paged", &QwenEngineOptions::kv_paged)
         .def_readwrite("kv_block_size", &QwenEngineOptions::kv_block_size)
         .def_readwrite("kv_cache_bytes", &QwenEngineOptions::kv_cache_bytes)
-        .def_readwrite("prefix_cache_bytes", &QwenEngineOptions::prefix_cache_bytes);
+        .def_readwrite("prefix_cache_bytes", &QwenEngineOptions::prefix_cache_bytes)
+        .def_readwrite("kernel", &QwenEngineOptions::kernel);
 
     py::class_<ForwardResult>(module, "QwenForwardResult")
         .def(py::init<>())

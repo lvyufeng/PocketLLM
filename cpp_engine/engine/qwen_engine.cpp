@@ -103,43 +103,74 @@ OptionalSwitch qwen_optional_switch(const char* name) {
                                   : OptionalSwitch::Disabled;
 }
 
-LayerExecutionConfig read_layer_execution_config() {
+}  // namespace
+
+}  // namespace pocket
+
+namespace pocket {
+
+namespace {
+
+void load_kernel_options_from_env(QwenKernelOptions& opts) {
+    opts.nvfp4_mode = qwen_nvfp4_mode();
+    opts.nvfp4_wide_n64 = qwen_env_enabled_default("POCKETLLM_QWEN_NVFP4_WIDE_N64");
+    opts.nvfp4_wide_n64_min_rows = qwen_env_int("POCKETLLM_QWEN_NVFP4_WIDE_N64_MIN_ROWS", 128);
+
+    const char* fused_nvfp4 = std::getenv("POCKETLLM_QWEN_NVFP4_FUSED_SWIGLU");
+    opts.nvfp4_fused_swiglu = fused_nvfp4 != nullptr && std::strcmp(fused_nvfp4, "1") == 0;
+
+    const char* shared_nvfp4 = std::getenv("POCKETLLM_QWEN_NVFP4_SHARED_Q8_SWIGLU");
+    opts.nvfp4_shared_q8_swiglu = shared_nvfp4 == nullptr || std::strcmp(shared_nvfp4, "0") != 0;
+
+    opts.gqa_optimized = qwen_env_enabled_default("POCKETLLM_QWEN_GQA_OPTIMIZED");
+    opts.gqa_verify_cublas_qk = qwen_env_enabled("QWEN_GQA_VERIFY_CUBLAS_QK");
+    opts.gqa_verify_split = qwen_optional_switch("QWEN_GQA_VERIFY_SPLIT");
+    opts.gqa_verify_splits = qwen_env_int("QWEN_GQA_VERIFY_SPLITS", 0);
+
+    opts.verify_small_fp16_cublas = qwen_env_enabled_default("QWEN_VERIFY_SMALL_FP16_CUBLAS");
+    opts.gated_delta_flashqla = qwen_env_enabled_default("QWEN_GATED_DELTA_FLASHQLA_SM75");
+    opts.fuse_qkvz_decode = qwen_env_enabled("QWEN_FUSE_QKVZ_DECODE");
+    opts.fuse_ab_projection = qwen_env_enabled_default("QWEN_FUSE_AB_PROJECTION");
+    opts.gated_delta_prenormalize = qwen_env_enabled_default("QWEN_GATED_DELTA_PRENORMALIZE");
+    opts.gated_delta_shared_state = qwen_env_enabled("QWEN_GATED_DELTA_SHARED_STATE");
+    opts.fuse_full_qkv_decode = qwen_env_enabled("QWEN_FUSE_FULL_QKV_DECODE");
+    opts.fuse_attention_residual_norm = qwen_env_enabled_default("QWEN_FUSE_ATTN_RESID_NORM");
+    opts.comm_overlap_slices = qwen_env_int("QWEN_COMM_OVERLAP_SLICES", 4);
+}
+
+}  // namespace
+
+}  // namespace pocket
+
+namespace pocket {
+
+void QwenKernelOptions::load_from_env() {
+    load_kernel_options_from_env(*this);
+}
+
+namespace {
+
+// Convert QwenKernelOptions to internal LayerExecutionConfig
+LayerExecutionConfig kernel_options_to_layer_config(const QwenKernelOptions& opts) {
     LayerExecutionConfig config;
-    config.nvfp4_mode = qwen_nvfp4_mode();
-    config.nvfp4_wide_n64 =
-        qwen_env_enabled_default("POCKETLLM_QWEN_NVFP4_WIDE_N64");
-    config.nvfp4_wide_n64_min_rows = qwen_env_int(
-        "POCKETLLM_QWEN_NVFP4_WIDE_N64_MIN_ROWS", 128);
-    const char* fused_nvfp4 =
-        std::getenv("POCKETLLM_QWEN_NVFP4_FUSED_SWIGLU");
-    config.nvfp4_fused_swiglu = fused_nvfp4 != nullptr &&
-        std::strcmp(fused_nvfp4, "1") == 0;
-    const char* shared_nvfp4 =
-        std::getenv("POCKETLLM_QWEN_NVFP4_SHARED_Q8_SWIGLU");
-    config.nvfp4_shared_q8_swiglu = shared_nvfp4 == nullptr ||
-        std::strcmp(shared_nvfp4, "0") != 0;
-    config.verify_small_fp16_cublas =
-        qwen_env_enabled_default("QWEN_VERIFY_SMALL_FP16_CUBLAS");
-    config.gated_delta_flashqla =
-        qwen_env_enabled_default("QWEN_GATED_DELTA_FLASHQLA_SM75");
-    config.fuse_qkvz_decode = qwen_env_enabled("QWEN_FUSE_QKVZ_DECODE");
-    config.fuse_ab_projection =
-        qwen_env_enabled_default("QWEN_FUSE_AB_PROJECTION");
-    config.gated_delta_prenormalize =
-        qwen_env_enabled_default("QWEN_GATED_DELTA_PRENORMALIZE");
-    config.gated_delta_shared_state =
-        qwen_env_enabled("QWEN_GATED_DELTA_SHARED_STATE");
-    config.fuse_full_qkv_decode =
-        qwen_env_enabled("QWEN_FUSE_FULL_QKV_DECODE");
-    config.gqa_optimized =
-        qwen_env_enabled_default("POCKETLLM_QWEN_GQA_OPTIMIZED");
-    config.gqa_verify_cublas_qk =
-        qwen_env_enabled("QWEN_GQA_VERIFY_CUBLAS_QK");
-    config.gqa_verify_split = qwen_optional_switch("QWEN_GQA_VERIFY_SPLIT");
-    config.gqa_verify_splits = qwen_env_int("QWEN_GQA_VERIFY_SPLITS", 0);
-    config.fuse_attention_residual_norm =
-        qwen_env_enabled_default("QWEN_FUSE_ATTN_RESID_NORM");
-    config.comm_overlap_slices = qwen_env_int("QWEN_COMM_OVERLAP_SLICES", 4);
+    config.nvfp4_mode = opts.nvfp4_mode;
+    config.nvfp4_wide_n64 = opts.nvfp4_wide_n64;
+    config.nvfp4_wide_n64_min_rows = opts.nvfp4_wide_n64_min_rows;
+    config.nvfp4_fused_swiglu = opts.nvfp4_fused_swiglu;
+    config.nvfp4_shared_q8_swiglu = opts.nvfp4_shared_q8_swiglu;
+    config.gqa_optimized = opts.gqa_optimized;
+    config.gqa_verify_cublas_qk = opts.gqa_verify_cublas_qk;
+    config.gqa_verify_split = opts.gqa_verify_split;
+    config.gqa_verify_splits = opts.gqa_verify_splits;
+    config.verify_small_fp16_cublas = opts.verify_small_fp16_cublas;
+    config.gated_delta_flashqla = opts.gated_delta_flashqla;
+    config.fuse_qkvz_decode = opts.fuse_qkvz_decode;
+    config.fuse_ab_projection = opts.fuse_ab_projection;
+    config.gated_delta_prenormalize = opts.gated_delta_prenormalize;
+    config.gated_delta_shared_state = opts.gated_delta_shared_state;
+    config.fuse_full_qkv_decode = opts.fuse_full_qkv_decode;
+    config.fuse_attention_residual_norm = opts.fuse_attention_residual_norm;
+    config.comm_overlap_slices = opts.comm_overlap_slices;
     return config;
 }
 
@@ -1131,7 +1162,7 @@ struct QwenEngine::Impl {
          const QwenWeightMap& map, const QwenEngineOptions& options_,
          int max_context_, int active_layers)
         : index(index_), config(config_), options(options_),
-          layer_config(read_layer_execution_config()),
+          layer_config(kernel_options_to_layer_config(options_.kernel)),
           max_context(max_context_) {
         // Phase 3.2: Initialize max_batch_size from options
         max_batch_size = options_.max_batch_size;
