@@ -57,7 +57,10 @@ PersistentEngineAdapter::~PersistentEngineAdapter() = default;
 Capabilities PersistentEngineAdapter::caps() const {
     Capabilities c;
     c.paged_kv = false;
-    c.continuous_batching = (max_slots_ > 1);
+    // FIXME: Current batch_decode_step() is sequential, not batched.
+    // Report false until true batched forward is implemented.
+    // Infrastructure supports max_slots_ slots, but no performance benefit yet.
+    c.continuous_batching = false;
     c.chunked_prefill = false;
     c.max_slots = max_slots_;
     // One request at a time, so "per row" is trivially satisfiable: each
