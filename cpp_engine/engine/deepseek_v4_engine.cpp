@@ -10922,6 +10922,51 @@ int PersistentEngine::decode_step(int last_token, int position, const SamplingPa
     return token;
 }
 
+std::vector<int> PersistentEngine::batch_decode_step(
+    const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+
+    if (requests.empty()) {
+        throw std::runtime_error("batch_decode_step: empty requests");
+    }
+    if (requests.size() > 8) {
+        throw std::runtime_error("batch_decode_step: at most 8 requests are supported");
+    }
+
+    // Validate all requests use distinct slots
+    std::vector<bool> slot_used(static_cast<size_t>(s.max_slots), false);
+    for (const auto& req : requests) {
+        if (req.slot_id < 0 || req.slot_id >= s.max_slots) {
+            throw std::runtime_error("batch_decode_step: slot_id out of range");
+        }
+        if (slot_used[static_cast<size_t>(req.slot_id)]) {
+            throw std::runtime_error("batch_decode_step: duplicate slot_id in batch");
+        }
+        slot_used[static_cast<size_t>(req.slot_id)] = true;
+    }
+
+    // For now, use sequential decode as a safe implementation
+    // TODO: Implement true batched forward using continuation_batch_impl
+    std::vector<int> result_tokens;
+    result_tokens.reserve(requests.size());
+
+    for (const auto& req : requests) {
+        auto& slot = s.slots[static_cast<size_t>(req.slot_id)];
+        maybe_reseed(req.sampling.seed, slot.rng_seed, slot.rng);
+
+        worker_command_decode(req.last_token, req.position);
+        (void)run_safetensors_token_forward_impl(ctx, req.last_token, s.layer_count,
+                                                 req.position, req.slot_id);
+        const int token = select_token_for_slot(ctx, s.opts, req.sampling, slot.rng, req.slot_id);
+        slot.position = req.position + 1;
+        result_tokens.push_back(token);
+    }
+
+    return result_tokens;
+}
+
 // Verify a block of draft tokens: forward each one and report what the target
 // model would have sampled at that position. The caller compares these against
 // the draft to find the accepted prefix.

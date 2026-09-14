@@ -203,7 +203,10 @@ BatchDecodeResult PersistentEngineAdapter::batch_decode_step(
 
     const auto started = std::chrono::steady_clock::now();
 
-    // Phase 1: Sequential decode for now (TODO: implement true batched decode)
+    // Build batch request array
+    std::vector<PersistentBatchRequest> batch_requests;
+    batch_requests.reserve(requests.size());
+
     for (BatchedRequest* req : requests) {
         if (req == nullptr) {
             throw std::invalid_argument(
@@ -216,12 +219,23 @@ BatchDecodeResult PersistentEngineAdapter::batch_decode_step(
                 "PersistentEngineAdapter::batch_decode_step: request not allocated to a slot");
         }
 
-        const SamplingParams sp = to_persistent_sampling(req->sampling);
-        const int position = positions_[static_cast<size_t>(slot_id)];
-        // position is where `last_token` itself sits, which is the position
-        // decode_step wants -- not the position being produced.
-        engine_->worker_command_decode(req->last_token, position);
-        const int token = engine_->decode_step(req->last_token, position, sp, slot_id);
+        PersistentBatchRequest batch_req;
+        batch_req.last_token = req->last_token;
+        batch_req.position = positions_[static_cast<size_t>(slot_id)];
+        batch_req.slot_id = slot_id;
+        batch_req.sampling = to_persistent_sampling(req->sampling);
+        batch_requests.push_back(batch_req);
+    }
+
+    // Single batched forward (currently sequential, will be optimized)
+    std::vector<int> tokens = engine_->batch_decode_step(batch_requests);
+
+    // Update per-request state
+    for (size_t i = 0; i < requests.size(); ++i) {
+        BatchedRequest* req = requests[i];
+        const int token = tokens[i];
+        const int slot_id = batch_requests[i].slot_id;
+
         positions_[static_cast<size_t>(slot_id)]++;
 
         const bool stopped = is_stop_token(req->sampling, token);
