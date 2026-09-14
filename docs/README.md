@@ -11,6 +11,11 @@ This directory contains model-specific support notes, reproducible benchmark def
   namespace, build targets, executable, and every `DSV4_*` environment variable
 - [PyPI release guide](PYPI_RELEASE.md) — the single source of truth for cutting a release
 
+## Platform notes
+
+- [Ascend SoC generations](ascend_soc_generations.md) — why `910B` with no trailing digit is first
+  generation, and how to resolve the generation you are actually on
+
 ## Model guides
 
 - [Model support matrix](models/README.md)
