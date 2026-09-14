@@ -1,5 +1,9 @@
 # PocketLLM
 
+[![PyPI version](https://badge.fury.io/py/pocketllm.svg)](https://pypi.org/project/pocketllm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+
 [中文](README_CN.md) | English
 
 PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running large language models on consumer multi-GPU systems. It combines model-specific kernels, low-bit formats, tensor/expert parallelism, CPU/GPU placement, and reproducible single-request benchmarks.
@@ -7,6 +11,116 @@ PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running la
 The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, and Qwen3.8-27B-FP8. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
 
 > **Status:** research and engineering software. The numbers below are measurements from specific checkpoints and hardware configurations, not general performance guarantees.
+
+## Installation
+
+### Quick install (PyTorch backend only)
+
+```bash
+pip install pocketllm
+```
+
+This installs the `pocketllm` Python package and CLI with PyTorch-based kernels. CUDA extensions will be compiled during installation if a CUDA toolkit is detected.
+
+**Requirements:**
+- Python >= 3.10
+- PyTorch >= 2.0
+- CUDA toolkit 11.8+ (optional, for GPU acceleration)
+- 16GB+ system RAM (for compilation)
+
+### Full install (with C++ engine)
+
+For the native C++/CUDA engine (required for `backend="cpp"`):
+
+```bash
+# Install dependencies first
+pip install pybind11 cmake
+
+# Build with C++ engine support
+POCKETLLM_BUILD_CPP=1 pip install pocketllm --no-build-isolation
+```
+
+**Additional requirements for C++ engine:**
+- CMake >= 3.18
+- pybind11 >= 2.12
+- NCCL (for tensor parallelism with TP > 1)
+- C++17 compiler (gcc 9+, clang 10+, or MSVC 2019+)
+
+### Development install
+
+```bash
+git clone https://github.com/lvyufeng/PocketLLM.git
+cd PocketLLM
+pip install -e . --no-build-isolation
+```
+
+## Quick Start
+
+### Python API
+
+```python
+from pocketllm import LLM
+
+# Initialize with automatic backend selection
+llm = LLM(
+    model="/path/to/checkpoint",
+    backend="auto",  # or "torch", "cpp"
+    tensor_parallel_size=1
+)
+
+# Generate text
+result = llm.generate("What is artificial intelligence?")
+print(result.text)
+
+# Stream tokens
+for token in llm.stream("Explain quantum computing"):
+    print(token.text, end="", flush=True)
+```
+
+### OpenAI-Compatible Server
+
+```bash
+# Start server on default port 8000
+pocketllm serve \
+    --model /path/to/checkpoint \
+    --backend auto \
+    --tensor-parallel-size 4
+
+# Test with curl
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "pocketllm",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+### Tensor Parallel Inference (Multi-GPU)
+
+```bash
+# 4-GPU setup (TP4)
+pocketllm serve \
+    --model /path/to/qwen-27b-fp8 \
+    --backend cpp \
+    --tensor-parallel-size 4 \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+## When to use PocketLLM
+
+**PocketLLM excels at:**
+- ✅ Single-request low-latency inference on consumer GPUs (RTX 2080 Ti, 3090, 4090)
+- ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4)
+- ✅ TP4 inference without NVLink (PCIe-only multi-GPU systems)
+- ✅ Research and experimentation with model-specific kernel optimization
+
+**Consider alternatives like vLLM or SGLang if you need:**
+- ❌ High-throughput serving with dynamic batching (PocketLLM batching is sequential)
+- ❌ Broad model support (PocketLLM focuses on 4 models with deep optimization)
+- ❌ Production features (advanced scheduling, monitoring, multi-LoRA)
+- ❌ Multimodal inputs (images/video are not yet supported)
 
 ## What PocketLLM provides
 
