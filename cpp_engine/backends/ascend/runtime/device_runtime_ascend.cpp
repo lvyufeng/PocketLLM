@@ -295,9 +295,12 @@ void* event_create(bool with_timing) {
     if (!acl_initialize()) return nullptr;
     aclrtEvent event = nullptr;
     // ACL_EVENT_SYNC is the ordering-only event and is the cheaper one; timing
-    // needs ACL_EVENT_TIME_LINE, which the hot path never asks for.
+    // needs ACL_EVENT_TIME_LINE, which the hot path never asks for. The Ex
+    // constructor is required for events that are recorded repeatedly while a
+    // previous stream wait may still be queued (the TP communication path reuses
+    // its ready/done events for every collective).
     const uint32_t flag = with_timing ? ACL_EVENT_TIME_LINE : ACL_EVENT_SYNC;
-    if (aclrtCreateEventWithFlag(&event, flag) != ACL_SUCCESS) return nullptr;
+    if (aclrtCreateEventExWithFlag(&event, flag) != ACL_SUCCESS) return nullptr;
     return static_cast<void*>(event);
 }
 
