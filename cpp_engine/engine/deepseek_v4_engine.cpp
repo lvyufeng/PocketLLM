@@ -10536,7 +10536,7 @@ struct PersistentEngine::State {
         int position = 0;
         std::mt19937 rng{0xDEEDBEEFu};
         uint64_t rng_seed = 0;
-        std::vector<int> verify_dspark_hidden_slots;
+        std::vector<float> verify_dspark_hidden_slots;
         std::vector<float> pending_batch_dspark_hidden;
         int pending_batch_rows = 0;
     };
