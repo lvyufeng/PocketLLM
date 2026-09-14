@@ -173,9 +173,12 @@ source /tmp/test-pocketllm/bin/activate
 python -m pip install --upgrade pip
 python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
 
+# Pin the exact version under test. Unpinned, both indexes are searched and pip
+# takes the highest version it can see, so this can quietly install a different
+# release than the one just uploaded -- see Troubleshooting.
 pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
-    pocketllm --no-build-isolation
+    "pocketllm==0.x.x" --no-build-isolation
 
 cd /tmp   # otherwise the checkout shadows the installed package; see step 4
 python -c "import pocketllm; print(pocketllm.__version__, pocketllm.__file__)"
@@ -187,6 +190,12 @@ deactivate
 
 This is the step that catches an sdist that is missing files it needs to compile — the archive
 resolves, downloads and installs, and the failure is at build time.
+
+The version is pinned for a reason. `--extra-index-url` does not scope the requirement to Test PyPI:
+pip searches both indexes and takes the highest version it can see, so a listing that does not
+mention the version just uploaded resolves to whatever production PyPI has instead, without a word.
+Pinning turns that into `No matching distribution found`, which is a failure you can act on. See
+Troubleshooting for the way this actually happens.
 
 ### Step 4: Production PyPI
 
@@ -278,6 +287,31 @@ python -m pip install ninja cmake pybind11
 A venv created with `--system-site-packages` hides both of these failures, because it inherits the
 base interpreter's `setuptools` and toolchain. That makes it useless for this check: it will report
 success for an artifact the documented procedure cannot install.
+
+### The install verification builds an older release than the one just uploaded
+
+The step fails somewhere that has nothing to do with this release — CMake configuration, a source
+file no target names — or installs successfully and then reports the previous version.
+
+pip caches the simple-index page. If `https://test.pypi.org/simple/pocketllm/` was fetched before
+this release was uploaded, pip reuses that listing; it has no link for the new version, so the
+resolver falls back to the version production PyPI is offering. The published index is correct — only
+the cached copy is old. It is visible without installing anything:
+
+```bash
+pip index versions pocketllm --index-url https://test.pypi.org/simple/
+```
+
+If that stops at the previous release while `https://test.pypi.org/pypi/pocketllm/<version>/json`
+answers for the new one, this is what happened. Passing a fresh cache directory forces a real fetch:
+
+```bash
+pip index versions pocketllm --cache-dir /tmp/pipcache --index-url https://test.pypi.org/simple/
+```
+
+The version pin in step 3 is what keeps this from being silent: with it, a listing that does not
+carry the release under test fails with `No matching distribution found` rather than installing
+something else. Add `--no-cache-dir` to the install command to bypass the cache as well.
 
 ### `ModuleNotFoundError: No module named 'torch'` during the build
 
