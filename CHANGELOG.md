@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from Test PyPI on a runner without a CUDA toolkit, which cannot compile it, and the failure was
   suppressed by a trailing `|| echo`. It is replaced by a verification of the metadata Test PyPI is
   actually serving, which fails on the 0.1.0 artifact for exactly the license defect above.
+- **A default install from the sdist failed at CMake configuration.** `cpp_engine/CMakeLists.txt`
+  declared an executable for every file under `tools/` and `tests/`, which `MANIFEST.in` does not
+  ship, so an install reported 110 "Cannot find source file" errors and the native engine never
+  built. This is the default install path: `POCKETLLM_BUILD_CPP` is on by default, and it failed with
+  a complete toolchain rather than a missing one. The development targets are now behind
+  `POCKET_BUILD_DEV_TARGETS`, defaulting to whether `tools/` and `tests/` are present, so a working
+  copy keeps building them and an unpacked sdist does not declare them. Regression tests are in
+  `tests/test_sdist_native_sources.py`.
+
+  This one was found by the release's own install verification, not by a user report — 0.1.0 shipped
+  with it as well.
 
 ### Changed
 
