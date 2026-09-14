@@ -76,6 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pocketllm` from the source tree and reported the version the tree has rather than the one that was
   installed — the check whose job is to prove the artifact installs could not fail for that reason.
   The local install step also verifies the native module now, which only the Test PyPI step did.
+- The install steps prepare the virtualenv they run in. `--no-build-isolation` tells pip not to
+  provision `[build-system].requires`, so the environment has to already have what the build imports,
+  and a venv that has just been created has none of it. Run on a genuinely fresh one, the step that
+  proves the artifact installs failed at metadata generation with `invalid command 'bdist_wheel'` —
+  `python -m venv` bootstraps the interpreter's bundled setuptools, older than the version that ships
+  the command — and then, once that was fixed, at the native-engine preflight, for `cmake`,
+  `pybind11` and `ninja`. It now installs those first. The guide also records that a venv created
+  with `--system-site-packages` cannot be used for this check, because it inherits the base
+  interpreter's toolchain and reports success for the procedure that does not work.
 - The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
 - The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
   CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
