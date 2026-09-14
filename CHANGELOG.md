@@ -41,6 +41,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   This one was found by the release's own install verification, not by a user report — 0.1.0 shipped
   with it as well.
+- **The native C++ engine did not compile in any CUDA configuration.** `cpp_engine/include/qwen_ops.hpp`
+  declared a `qwen_gqa_decode_attention_flashdec_f16` that forwarded to
+  `qwen_gqa_decode_attention_flashdec_f16_cuda`, a kernel that was never declared or defined; the
+  operator exists only on Ascend. The header's operators are `inline`, so every translation unit that
+  includes it compiles the whole body, including the arm it never takes — four of them failed on the
+  name. A second, unrelated break sat in `cpp_engine/engine/deepseek_v4_engine.cpp`, which called the
+  four-parameter `run_safetensors_continuation_batch_impl` with five arguments, a signature its two
+  sibling entry points gained in the multi-slot batching change and it did not. The CUDA arm of the
+  flashdec operator now refuses with an explanation instead of naming a kernel that does not exist,
+  and the call matches the declaration again. Neither defect was reachable by any check the project
+  ran: no workflow compiles the native engine, and `python -m build --sdist` does not run
+  `build_ext`. `POCKETLLM_BUILD_CPP=1` therefore failed for every user of 0.1.0, by one route or the
+  other — at CMake configuration from the sdist, or here from a checkout.
+- **The sdist omitted two files that its own sources `#include`.** `MANIFEST.in` listed the
+  extensions to ship per subtree and neither `*.inl` nor `*.inc` was among them, so
+  `cpp_engine/engine/qwen_layer_components.inl` (included by `qwen_engine.cpp`) and
+  `cpp_engine/backends/cuda/kernels/iq1_grid.inc` (included by `iq1_ops.cu`) were absent from the
+  archive. Unlike the missing `tools/` and `tests/` sources above, nothing named these files as a
+  CMake target source, so configuration succeeded and the compile failed. Both extensions are now
+  shipped from every `cpp_engine/` subtree, and `tests/test_sdist_native_sources.py` reads the quoted
+  `#include` directives out of the files the archive ships and fails if any of them names a file it
+  does not carry.
 
 ### Changed
 
@@ -50,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The publish workflow installs Torch from the CPU index within the version range `pyproject.toml`
   declares, rather than an unconstrained latest.
 - The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
+- The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
+  CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
+  feature, and the defect above is the other half of the same confusion.
 
 ## [0.1.0] - 2026-09-14
 
@@ -77,7 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Health check endpoints (`/ready`, `/alive`, `/health`)
 - Token streaming callbacks for async generation
 - Speculative decoding (DSpark, DFlash2, MTP)
-- FlashDecoding for long-context decode (2.68× speedup)
+- FlashDecoding for long-context decode on Ascend (2.68× decode speedup, Ascend 910A, TP4, 4096-token
+  context). There is no separate CUDA FlashDecoding entry point; the CUDA path reaches split-partial
+  decode through the fused `qwen_gqa_decode_attention_f16_fused_cuda` kernel instead.
 - Prefix caching
 - Chunked prefill
 
