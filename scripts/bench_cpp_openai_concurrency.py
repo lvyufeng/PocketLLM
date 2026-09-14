@@ -407,6 +407,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         model = models["data"][0]["id"]
         record["model"] = model
 
+        # Discarded passes over the measured ladder. The engine's own first
+        # request is not free (kernel module load, allocator growth, and for
+        # TP4 the NCCL communicator's first collective), and it lands on the
+        # count=1 case that the report reads as "single-request latency".
+        # Measuring without this charges that cost to one concurrency level and
+        # makes the remaining levels look faster by comparison.
+        if args.warmup_rounds > 0:
+            warmups: list[dict[str, Any]] = []
+            for _ in range(args.warmup_rounds):
+                for n in [1] + list(args.concurrency):
+                    warm = run_concurrent(group, model, n, args.short_prompt_words, args.max_tokens)
+                    warmups.append({"count": n, "wall_seconds": warm["wall_seconds"]})
+            record["warmup"] = warmups
+
         single = run_concurrent(group, model, 1, args.short_prompt_words, args.max_tokens)
         concurrency = [run_concurrent(group, model, n, args.short_prompt_words, args.max_tokens) for n in args.concurrency]
         interleave = run_interleave(group, model, args.max_tokens)
@@ -443,6 +457,8 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--short-prompt-words", type=int, default=128)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[2, 4, 8])
+    parser.add_argument("--warmup-rounds", type=int, default=1,
+                        help="discarded passes over the measured ladder before measuring (0 disables)")
     parser.add_argument("--startup-timeout", type=float, default=900.0)
     parser.add_argument("--log-dir")
     parser.add_argument("--json-out")
