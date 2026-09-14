@@ -4527,6 +4527,27 @@ BatchPrefillResult QwenEngine::batch_prefill(
         seen_slots.push_back(req->slot_id);
     }
 
+    // Collect per-request sampling params before announcing the operation. In a
+    // TP run the workers receive only the prompt tokens, the slot and the token
+    // budget, so they sample with the engine-wide settings. Handing
+    // `&req->sampling` to prefill_bounded on rank 0 would put rank 0 on the
+    // sampled top-k collective while the workers took the greedy top-1 one, and
+    // the two AllGathers disagree on their count: the group blocks inside the
+    // first request, before a single token is emitted. Rank 0 uses the
+    // engine-wide settings too. The numeric fields of a request are already
+    // either rejected by the HTTP layer or deliberately ignored when the engine
+    // fixes its own sampling, but a token constraint is not harmless in the same
+    // way -- dropping it would emit unconstrained text where the client asked
+    // for JSON, so it is refused instead.
+    if (options_.tp_world > 1) {
+        for (const BatchedRequest* req : requests) {
+            if (req->sampling.constraint != nullptr) {
+                throw std::runtime_error(
+                    "Qwen TP prefill does not support token constraints");
+            }
+        }
+    }
+
     for (BatchedRequest* req : requests) {
         // Under TP the workers sit in run_worker_loop() waiting to be told which
         // collective to join; rank 0 must announce the op before running it, or
@@ -4537,9 +4558,11 @@ BatchPrefillResult QwenEngine::batch_prefill(
         worker_command_prefill(req->prompt_tokens, req->slot_id, token_budget);
 
         // Phase 3.3: Use req->slot_id to isolate KV cache
+        const BatchSamplingParams* row_sampling =
+            options_.tp_world > 1 ? nullptr : &req->sampling;
         PartialPrefillResult step =
             prefill_bounded(req->prompt_tokens, req->slot_id,
-                            std::max(0, token_budget), &req->sampling);
+                            std::max(0, token_budget), row_sampling);
 
         result.total_tokens += step.consumed_tokens - req->seq_len;
         req->seq_len = step.consumed_tokens;
