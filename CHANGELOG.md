@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `No matching distribution found`, and the guide's Troubleshooting section records the symptom and
   the command that identifies it.
 - The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
+- The post-release step extracts this version's changelog section for the GitHub release. It passed
+  `CHANGELOG.md` to `gh release create --notes-file`, which publishes the whole file — the v0.1.1
+  notes would have been 216 lines, the 0.1.0 feature list and performance table included.
 - The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
   CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
   feature, and the defect above is the other half of the same confusion.
