@@ -17,6 +17,10 @@ The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validate
 ### Quick install (full capabilities)
 
 ```bash
+# Install the build prerequisites first; the build imports them from the
+# environment rather than fetching them. See the note below.
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+
 pip install pocketllm --no-build-isolation
 ```
 
@@ -24,32 +28,36 @@ This installs PocketLLM with both PyTorch and C++ engine backends. The build pro
 
 **Requirements:**
 - Python >= 3.10
-- PyTorch >= 2.0 (install first: `pip install torch`)
+- PyTorch >= 2.0, < 2.7 (install first: `pip install "torch>=2.0,<2.7"`)
 - CUDA toolkit 11.8+ (for GPU acceleration)
-- CMake >= 3.18
-- pybind11 >= 2.10
+- CMake >= 3.18, pybind11 >= 2.10, Ninja >= 1.11
+- `setuptools >= 68` and `wheel`
 - NCCL (for tensor parallelism with TP > 1)
 - 16GB+ system RAM (for compilation)
 
-**Note:** `--no-build-isolation` is required so the build uses your environment's PyTorch, which must match your CUDA toolkit version.
+**Note:** `--no-build-isolation` is required so the build uses your environment's PyTorch, which must match your CUDA toolkit version. It also means pip will not fetch the build prerequisites listed above: they have to be in the environment before you run the install. A freshly created virtualenv has none of them — `python -m venv` bootstraps the interpreter's bundled `setuptools`, which on Python 3.10 is older than the version that provides the `bdist_wheel` command, and on Python 3.12+ installs no setuptools at all — so the install can fail at metadata generation with `invalid command 'bdist_wheel'`, and then at the native-engine build for a missing `pybind11` or `cmake`. The first command above installs all of them.
 
 ### PyTorch-only install (skip C++ engine)
 
 If you only need the PyTorch backend or lack the C++ build dependencies:
 
 ```bash
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel
 POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
 ```
 
-This skips the C++ engine build but still compiles PyTorch CUDA extensions.
+This skips the C++ engine build but still compiles PyTorch CUDA extensions, so it still needs `torch` and a `setuptools` new enough to build a wheel.
 
 ### Development install
 
 ```bash
 git clone https://github.com/lvyufeng/PocketLLM.git
 cd PocketLLM
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
 pip install -e . --no-build-isolation
 ```
+
+The same prerequisites apply: an editable install builds the extensions too.
 
 ## Quick Start
 
