@@ -4,6 +4,7 @@
 #include "metrics.hpp"
 #include "json_lite.hpp"
 #include "qwen_engine.hpp"
+#include "token_constraint.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include "httplib.h"
@@ -394,12 +395,66 @@ struct OpenAIServer::Impl {
         return true;
     }
 
+    bool parse_response_format(const JsonObject& obj,
+                               std::shared_ptr<TokenConstraint>& constraint_out,
+                               std::string& err_out) const {
+        constraint_out.reset();
+        const JsonValue* response_format = object_get(obj, "response_format");
+        if (response_format == nullptr) return true;
+        if (!sched.engine_caps().structured_outputs) {
+            err_out = "this engine does not support structured outputs (response_format)";
+            return false;
+        }
+        if (!response_format->is_object()) {
+            err_out = "response_format must be an object";
+            return false;
+        }
+        const JsonObject& format = response_format->object();
+        const JsonValue* type_value = object_get(format, "type");
+        if (type_value == nullptr || !type_value->is_string()) {
+            err_out = "response_format requires a string type";
+            return false;
+        }
+        const std::string& type = type_value->string();
+        try {
+            if (type == "text") {
+                return true;
+            }
+            if (type == "json_object") {
+                constraint_out = make_json_object_constraint(tok);
+                return true;
+            }
+            if (type == "json_schema") {
+                const JsonValue* json_schema = object_get(format, "json_schema");
+                if (json_schema == nullptr || !json_schema->is_object()) {
+                    err_out = "json_schema response_format requires a json_schema object";
+                    return false;
+                }
+                const JsonValue* schema = object_get(json_schema->object(), "schema");
+                if (schema == nullptr || !schema->is_object()) {
+                    err_out = "json_schema response_format requires an object schema";
+                    return false;
+                }
+                constraint_out = make_json_schema_constraint(tok, *schema);
+                return true;
+            }
+        } catch (const std::exception& e) {
+            err_out = std::string("invalid response_format: ") + e.what();
+            return false;
+        }
+        err_out = "response_format type must be 'text', 'json_object', or 'json_schema'";
+        return false;
+    }
+
     bool encode_request(const std::string& body, const JsonObject& obj,
                         EncodeReply& out, std::string& thinking_mode_out,
                         int& max_tokens_out, bool& stream_out,
                         BatchSamplingParams& sp_out, std::string& request_id_out,
+                        std::shared_ptr<TokenConstraint>& constraint_out,
                         std::string& err_out) {
         if (!check_sampling_supported(obj, err_out)) return false;
+
+        if (!parse_response_format(obj, constraint_out, err_out)) return false;
 
         EncodeRequest enc;
         enc.messages_json = extract_messages_json(body);
@@ -472,8 +527,9 @@ struct OpenAIServer::Impl {
         bool stream = false;
         BatchSamplingParams sp;
         std::string client_id;
+        std::shared_ptr<TokenConstraint> constraint;
         std::string err;
-        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, err)) {
+        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, constraint, err)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
@@ -495,9 +551,9 @@ struct OpenAIServer::Impl {
         }
 
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, thinking_mode, client_id, request_start);
+            handle_stream(req, res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, thinking_mode, client_id, request_start);
+            handle_nonstream(res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
         }
     }
 
@@ -571,6 +627,12 @@ struct OpenAIServer::Impl {
             emit_error(res, 400, err);
             return;
         }
+        std::shared_ptr<TokenConstraint> constraint;
+        if (!parse_response_format(obj, constraint, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
+        }
 
         int max_tokens = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
         if (max_tokens <= 0) max_tokens = cfg.default_max_tokens;
@@ -606,34 +668,43 @@ struct OpenAIServer::Impl {
         enc_reply.prompt_text = prompt_str;
 
         if (stream) {
-            handle_completions_stream(enc_reply, sp, client_id, request_start, res);
+            handle_completions_stream(enc_reply, sp, constraint, client_id, request_start, res);
         } else {
-            handle_completions_nonstream(enc_reply, sp, client_id, request_start, res);
+            handle_completions_nonstream(enc_reply, sp, constraint, client_id, request_start, res);
         }
     }
 
     // A stop token is the last token of a sequence and is still counted and
     // stored by the engine, which needs it to keep the KV cache consistent with
     // what it returns. It is not part of the answer, so drop it before
-    // detokenizing and before reporting completion_tokens.
-    static std::vector<int> strip_stop_token(const std::vector<int>& tokens,
-                                             const std::string& finish_reason) {
-        if (finish_reason != "stop" || tokens.empty()) return tokens;
+    // detokenizing and before reporting completion_tokens. A structured-output
+    // terminal token is also reported as "stop", but it is part of the JSON and
+    // must be preserved.
+    static std::vector<int> strip_stop_token(
+        const std::vector<int>& tokens, const std::string& finish_reason,
+        bool preserve_terminal_token = false) {
+        if (preserve_terminal_token || finish_reason != "stop" || tokens.empty()) {
+            return tokens;
+        }
         return std::vector<int>(tokens.begin(), tokens.end() - 1);
     }
 
-    void handle_completions_nonstream(const EncodeReply& enc,
-                                      const BatchSamplingParams& sp,
-                                      const std::string& client_id,
-                                      std::chrono::steady_clock::time_point request_start,
-                                      httplib::Response& res) {
+    void handle_completions_nonstream(
+        const EncodeReply& enc, const BatchSamplingParams& sp,
+        const std::shared_ptr<TokenConstraint>& constraint,
+        const std::string& client_id,
+        std::chrono::steady_clock::time_point request_start,
+        httplib::Response& res) {
         std::chrono::steady_clock::time_point ttft_time;
         bool ttft_recorded = false;
 
         auto completion = std::make_shared<TokenStream>();
+        BatchSamplingParams sp_with_constraint = sp;
+        sp_with_constraint.constraint = constraint.get();
         const uint64_t request_id = sched.submit_request(
-            enc.token_ids, sp,
-            [completion](const SchedulerGenerationResult& r) { completion->finish(r); });
+            enc.token_ids, sp_with_constraint,
+            [completion](const SchedulerGenerationResult& r) { completion->finish(r); },
+            nullptr, constraint);
         if (request_id == 0) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
@@ -690,7 +761,8 @@ struct OpenAIServer::Impl {
             return;
         }
 
-        const std::vector<int> generated = strip_stop_token(out.generated_tokens, out.finish_reason);
+        const std::vector<int> generated = strip_stop_token(
+            out.generated_tokens, out.finish_reason, out.constraint_completed);
         metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
 
         const std::string text = tok.decode_tokens(generated);
@@ -708,16 +780,17 @@ struct OpenAIServer::Impl {
         res.set_content(os.str(), "application/json");
     }
 
-    void handle_completions_stream(const EncodeReply& enc,
-                                   const BatchSamplingParams& sp,
-                                   const std::string& client_id,
-                                   std::chrono::steady_clock::time_point request_start,
-                                   httplib::Response& res) {
+    void handle_completions_stream(
+        const EncodeReply& enc, const BatchSamplingParams& sp,
+        const std::shared_ptr<TokenConstraint>& constraint,
+        const std::string& client_id,
+        std::chrono::steady_clock::time_point request_start,
+        httplib::Response& res) {
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, client_id, created, request_start]
+            [this, enc, sp, constraint, client_id, created, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             std::chrono::steady_clock::time_point ttft_time;
@@ -747,10 +820,12 @@ struct OpenAIServer::Impl {
             };
 
             auto stream = std::make_shared<TokenStream>();
+            BatchSamplingParams sp_with_constraint = sp;
+            sp_with_constraint.constraint = constraint.get();
             const uint64_t request_id = sched.submit_request(
-                enc.token_ids, sp,
+                enc.token_ids, sp_with_constraint,
                 [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
-                [stream](uint64_t, int token) { stream->push(token); });
+                [stream](uint64_t, int token) { stream->push(token); }, constraint);
             if (request_id == 0) {
                 const auto request_end = std::chrono::steady_clock::now();
                 const double duration = std::chrono::duration<double>(request_end - request_start).count();
@@ -855,16 +930,24 @@ struct OpenAIServer::Impl {
     }
 
     void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
-                          const BatchSamplingParams& sp, const std::string& thinking_mode,
+                          const BatchSamplingParams& sp,
+                          const std::shared_ptr<TokenConstraint>& constraint,
+                          const std::string& thinking_mode,
                           const std::string& client_id,
                           std::chrono::steady_clock::time_point request_start) {
         std::chrono::steady_clock::time_point ttft_time;
         bool ttft_recorded = false;
 
         auto completion = std::make_shared<TokenStream>();
+
+        // Create a copy of sampling params to attach the constraint pointer
+        BatchSamplingParams sp_with_constraint = sp;
+        sp_with_constraint.constraint = constraint.get();
+
         const uint64_t request_id = sched.submit_request(
-            enc.token_ids, sp,
-            [completion](const SchedulerGenerationResult& r) { completion->finish(r); });
+            enc.token_ids, sp_with_constraint,
+            [completion](const SchedulerGenerationResult& r) { completion->finish(r); },
+            nullptr, constraint);
         if (request_id == 0) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
@@ -928,7 +1011,8 @@ struct OpenAIServer::Impl {
             return;
         }
 
-        const std::vector<int> generated = strip_stop_token(out.generated_tokens, out.finish_reason);
+        const std::vector<int> generated = strip_stop_token(
+            out.generated_tokens, out.finish_reason, out.constraint_completed);
         metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
 
         const std::string text = tok.decode_tokens(generated);
@@ -952,13 +1036,14 @@ struct OpenAIServer::Impl {
 
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
+                       const std::shared_ptr<TokenConstraint>& constraint,
                        const std::string& thinking_mode, const std::string& client_id,
                        std::chrono::steady_clock::time_point request_start) {
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, client_id, created, thinking_mode, request_start]
+            [this, enc, sp, constraint, client_id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             std::chrono::steady_clock::time_point ttft_time;
@@ -1003,10 +1088,15 @@ struct OpenAIServer::Impl {
             }
 
             auto stream = std::make_shared<TokenStream>();
+
+            // Create a copy of sampling params to attach the constraint pointer
+            BatchSamplingParams sp_with_constraint = sp;
+            sp_with_constraint.constraint = constraint.get();
+
             const uint64_t request_id = sched.submit_request(
-                enc.token_ids, sp,
+                enc.token_ids, sp_with_constraint,
                 [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
-                [stream](uint64_t, int token) { stream->push(token); });
+                [stream](uint64_t, int token) { stream->push(token); }, constraint);
             if (request_id == 0) {
                 const auto request_end = std::chrono::steady_clock::now();
                 const double duration = std::chrono::duration<double>(request_end - request_start).count();

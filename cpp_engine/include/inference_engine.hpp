@@ -48,6 +48,10 @@ struct Capabilities {
     float fixed_top_p = 1.0f;
     int fixed_top_k = 0;
     unsigned long long fixed_seed = 0;
+    // Engine supports structured outputs via TokenConstraint (json_object, json_schema).
+    // When false, the server refuses requests with response_format rather than
+    // returning unconstrained text.
+    bool structured_outputs = false;
 };
 
 // One forward pass over one sequence.
@@ -70,6 +74,8 @@ struct ForwardResult {
     int position = 0;
 };
 
+class TokenConstraint;
+
 // Sampling parameters for one batched request.
 struct BatchSamplingParams {
     float temperature = 0.0f;
@@ -83,6 +89,9 @@ struct BatchSamplingParams {
     // is what benchmarks want so their token counts stay fixed.
     std::vector<int> stop_token_ids;
     bool ignore_eos = false;
+    // Optional token-level constraint (e.g., JSON grammar). Non-owning pointer;
+    // the scheduler owns the constraint lifetime via shared_ptr in SchedulerRequest.
+    TokenConstraint* constraint = nullptr;
 };
 
 // Per-request state for batched continuous execution.
