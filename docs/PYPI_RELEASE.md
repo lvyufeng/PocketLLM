@@ -55,9 +55,11 @@ git pull origin master
 - [ ] Bump the version in **both** `pyproject.toml` and `pocketllm/__init__.py`
 - [ ] Update `CHANGELOG.md` with the release notes
 - [ ] Update `README.md` if the release changes installation or requirements
-- [ ] Run the tests: `python -m pytest tests/test_install_smoke.py tests/test_native_build_preflight.py`
+- [ ] Run the tests: `python -m pytest tests/test_install_smoke.py tests/test_native_build_preflight.py tests/test_sdist_native_sources.py`
+      `test_sdist_native_sources.py` is the one that guards the packaging step rather than the code: it checks that every source `cpp_engine/CMakeLists.txt` declares is in the sdist.
 - [ ] Confirm the two version strings agree:
-      `python -c "import pocketllm, tomllib, pathlib; print(pocketllm.__version__, tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])"`
+      `python -c "import re, pathlib, pocketllm; print(pocketllm.__version__, re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))"`
+      The regular expression is not stylistic: `tomllib` is 3.11+, while this package supports 3.10, so a checklist step that imports it cannot be run on the oldest supported interpreter. The publish workflow reads the version the same way.
 - [ ] Commit all changes: `git commit -m "Release v0.x.x"`
 - [ ] Create the tag: `git tag v0.x.x`
 
