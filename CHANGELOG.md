@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any compilation starts, and the failure names each missing tool, how to install it, and the
   `POCKETLLM_BUILD_CPP=0` route for a PyTorch-only install. Regression tests are in
   `tests/test_native_build_preflight.py`.
+- **The install commands in `README.md` could not be followed in a fresh virtualenv.**
+  `pip install pocketllm --no-build-isolation` does not fetch the build requirements, and the
+  requirements list named neither `setuptools` nor `wheel` nor said that anything had to be present
+  before pip ran. A user in a new virtualenv got `invalid command 'bdist_wheel'` out of metadata
+  generation — `python -m venv` bootstraps the interpreter's bundled setuptools, and on 3.12+
+  installs none — and then the missing-prerequisite failure above, with nothing to say which list was
+  short. All three install commands now install the prerequisites first, and the README's
+  `--no-build-isolation` note names both messages.
 - **The publish workflow's production upload could never run.** `publish-pypi.yml` gated the step on
   `github.event.inputs.publish_production` without declaring an `inputs` block, so the expression was
   always null and the only way to reach production PyPI from Actions was to edit the file. The
