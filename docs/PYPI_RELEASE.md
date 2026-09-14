@@ -101,6 +101,12 @@ rm -rf /tmp/test-pocketllm
 python -m venv /tmp/test-pocketllm
 source /tmp/test-pocketllm/bin/activate
 
+# --no-build-isolation tells pip not to provision [build-system].requires, so the
+# venv has to already have what the build imports. A new venv has none of these,
+# and the two ways that shows up are under Troubleshooting.
+python -m pip install --upgrade pip
+python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+
 pip install dist/pocketllm-0.x.x.tar.gz --no-build-isolation
 
 cd /tmp
@@ -162,7 +168,11 @@ rm -rf /tmp/test-pocketllm
 python -m venv /tmp/test-pocketllm
 source /tmp/test-pocketllm/bin/activate
 
-pip install "torch>=2.0,<2.7"  # Test PyPI does not carry it; range as declared in pyproject.toml
+# Test PyPI does not carry Torch; range as declared in pyproject.toml. These are
+# the build imports as well -- see step 4 for why the venv needs them first.
+python -m pip install --upgrade pip
+python -m pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+
 pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
     pocketllm --no-build-isolation
@@ -236,6 +246,38 @@ installation verification stays a local step.
    Skipping this makes the next release indistinguishable from the one just published.
 
 ## Troubleshooting
+
+### The install verification stops at `invalid command 'bdist_wheel'`
+
+The venv is too bare for `--no-build-isolation`, which is the expected state of a venv that has just
+been created. `python -m venv` bootstraps `pip` and `setuptools` from the interpreter's bundled
+`ensurepip`; on Python 3.10 with pip 22.3.1 that is setuptools 65.5.0, which predates the version
+that ships `bdist_wheel` as a built-in command — before setuptools 70.1 the command comes from the
+separate `wheel` distribution, which a venv does not install. Nothing is built before this fails.
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install "setuptools>=68" wheel
+```
+
+`pyproject.toml` declares both in `[build-system].requires` and `setuptools>=68` in
+`[project].dependencies`, but pip builds the wheel before installing the project's runtime
+dependencies, so those declarations cannot supply the build that needs them.
+
+### The install verification stops at "pybind11 is not importable"
+
+Same cause, one step later: `cmake`, `pybind11` and `ninja` are also build imports, and the venv has
+none of them. The message comes from this package's own preflight, which is reporting the venv's
+toolchain rather than anything about the archive — it is not a sign that the artifact is broken.
+Install them and retry:
+
+```bash
+python -m pip install ninja cmake pybind11
+```
+
+A venv created with `--system-site-packages` hides both of these failures, because it inherits the
+base interpreter's `setuptools` and toolchain. That makes it useless for this check: it will report
+success for an artifact the documented procedure cannot install.
 
 ### `ModuleNotFoundError: No module named 'torch'` during the build
 
