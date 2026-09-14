@@ -1,6 +1,6 @@
 """PocketLLM: one user-facing API over independent Torch and C++ backends."""
 
-__version__ = "0.1.1"
+__version__ = "0.1.2.dev0"
 
 from .api import (
     BackendCapabilities,
