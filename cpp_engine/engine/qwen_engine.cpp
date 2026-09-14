@@ -682,12 +682,8 @@ struct QwenEngine::Impl {
     // Ascend stays on the default stream until the CANN event hand-off is proven
     // deterministic on first-generation 910. Set QWEN_NCCL_COMM_STREAM=1 to
     // explicitly opt into the separate HCCL stream for experiments.
-#ifdef POCKET_BACKEND_ASCEND
-    const bool use_nccl_comm_stream = qwen_env_enabled("QWEN_NCCL_COMM_STREAM");
-#else
     const bool use_nccl_comm_stream =
         qwen_env_enabled_default("QWEN_NCCL_COMM_STREAM");
-#endif
     void* nccl_comm_stream = nullptr;
     void* nccl_comm_ready = nullptr;
     void* nccl_comm_done = nullptr;
@@ -1178,10 +1174,13 @@ struct QwenEngine::Impl {
     }
 
     void end_nccl_collective() {
-        check_device(event_record(nccl_comm_done, nccl_comm_stream),
-                     "Qwen record NCCL done event");
-        check_device(stream_wait_event(nullptr, nccl_comm_done),
-                     "Qwen compute stream wait");
+        // CANN 9.0 on first-generation Ascend can return from a default-stream
+        // wait before an HCCL operation has made its in-place output visible to
+        // subsequent aclnn work. Synchronize the communication stream explicitly
+        // at this boundary; the producer side still uses the ready event and avoids
+        // draining the compute stream before every collective.
+        check_device(stream_synchronize(nccl_comm_stream),
+                     "Qwen synchronize NCCL stream");
     }
 
     ~Impl() {
