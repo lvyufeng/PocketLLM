@@ -1,5 +1,11 @@
 # PocketLLM
 
+Multi-backend inference engine for DeepSeek-V4, MiniMax, GLM, and Qwen checkpoints. One repository,
+two engines: a device-agnostic core shared by both, and a per-vendor kernel layer.
+
+`docs/README.md` indexes the documentation — model support status, benchmarking rules, and the
+release procedure are documented there.
+
 ## Language convention
 
 **All Markdown documents and code comments in this project must be written in English**, unless a
@@ -10,200 +16,137 @@ rather than mixing languages inside one file.
 
 This applies to commit messages, code comments, docstrings, and all `.md` files.
 
-## Ascend chip naming convention
+## Repository layout
 
-**This is the most error-prone detail in this project. Read this section before making any judgement
-about which hardware generation you are on.**
+| Path | What it is |
+|---|---|
+| `cpp_engine/` | C++ engine. `core/` is device-agnostic, `engine/` is the layer model, and `backends/{api,cuda,ascend}/` holds the vendor code. Build and run instructions: `cpp_engine/README.md`. |
+| `src/` | Python/PyTorch implementation and kernel library. |
+| `pocketllm/` | The installed package: CLI, HTTP server, supervisor. Imports `pocketllm_cpp` when the native engine was built. |
+| `tests/` | pytest suite — see **Testing** below. |
+| `docs/` | Model guides, benchmark definitions, release procedure. |
 
-For the Ascend 910 series, the product name and the SoC generation are not the same thing. The name
-shown by `npu-smi info` is misleading.
+Two invariants the layout exists to protect:
 
-### The rule
+- **Kernels stay behind the C ABI.** `cpp_engine/include/cuda_ops.hpp` declares 93 ops, 91 of which
+  take `void* stream`, and it includes no CUDA headers at all. `cpp_engine/engine/` likewise
+  includes no CUDA headers and contains **zero `<<<` launches** — all 359 of them are under
+  `backends/`. Adding a vendor-specific type to an op signature breaks the other vendor's build.
+- **Backend selection happens at build time.** Per-hardware tuning is not traded away for
+  portability, so do not "unify" a 2080 Ti or 910B specific kernel in the name of sharing code.
 
-**`910B` with no trailing digit belongs to the same generation as 910A (first generation).
-`910B1` / `910B2` / `910B3` / `910B4` with a trailing digit are 910B (second generation).**
+Quantized kernel dispatch on the Python side goes through `src/kernels/ops.py`
+(`_auto_impl` / `_resolve_impl`), with paired `*_torch` / `*_triton` implementations behind it.
 
-The only reliable discriminator is `Short_SoC_version` in the CANN `platform_config` files, not the
-product name:
+## Hardware and toolchain
 
-| platform_config | `Short_SoC_version` | Generation | AI Core | L2 | Cube freq |
-|---|---|---|---|---|---|
-| `Ascend910A` | **`Ascend910`** | 1st | 32 | 32 MB | 1000 MHz |
-| `Ascend910B` | **`Ascend910`** | **1st** | 30 | 32 MB | 900 MHz |
-| `Ascend910ProA` | **`Ascend910`** | 1st | 32 | 32 MB | 1100 MHz |
-| `Ascend910ProB` | **`Ascend910`** | 1st | - | 32 MB | - |
-| `Ascend910PremiumA` | **`Ascend910`** | 1st | - | 32 MB | - |
-| `Ascend910B1` | **`Ascend910B`** | 2nd | 24 | 192 MB | 1850 MHz |
-| `Ascend910B2` | **`Ascend910B`** | 2nd | 24 | 192 MB | 1800 MHz |
-| `Ascend910B3` | **`Ascend910B`** | 2nd | 20 | 192 MB | 1800 MHz |
-| `Ascend910B4` | **`Ascend910B`** | 2nd | 20 | 96 MB | 1500 MHz |
+Two development machines, one per backend. **Determine which one you are on before concluding
+anything about what can be built, run, or measured.** A command that is correct on one is usually
+wrong on the other — most visibly, the CUDA path does not exist on the Ascend machine at all.
 
-Platform config location (varies with the CANN install path):
+### x86_64 CUDA machine — 4 x RTX 2080 Ti
 
-```
-$ASCEND_TOOLKIT_HOME/aarch64-linux/data/platform_config/*.ini
-```
+- **GPUs**: 4 x RTX 2080 Ti, 22528 MiB each, compute capability **7.5 (Turing / sm_75)**.
+  `cpp_engine` defaults to `CMAKE_CUDA_ARCHITECTURES=75`; do not drop sm_75-specific paths.
+- **Topology**: `GPU0-GPU1` are PHB (PCIe, same NUMA node); **`GPU2-GPU3` are NV2 (NVLink)**; every
+  cross-pair is SYS. NVLink-sensitive work and fair TP2 comparisons must run on physical GPUs
+  **2 and 3**.
+- **CPU / RAM**: 2 x Xeon E5-2696 v4, 22 cores each (88 hardware threads), 2 NUMA nodes, ~1 TiB RAM.
+  GPUs 0-1 sit on NUMA node 0, GPUs 2-3 on node 1.
+- **OS / Python**: Ubuntu 22.04.5, x86_64, kernel 5.15. Python 3.10.10 (conda).
+- **Compilers**: gcc 11.4.0, cmake 3.26.3 (conda's, first on `PATH`).
+- **CUDA**: `nvcc` on `PATH` is **13.0** (`/usr/local/cuda` → 13.0) while `CUDA_HOME` points at
+  **`/usr/local/cuda-12.4`**; 11.8, 12.4 and 13.0 are all installed.
+  - **Trap**: a pip-installed torch is built against CUDA 12.4, and `torch.utils.cpp_extension`
+    hard-fails on the mismatch (`The detected CUDA version (13.0) mismatches the version that was
+    used to compile PyTorch (12.4)`). Keep `CUDA_HOME` on a 12.x toolkit, and do not put
+    `/usr/local/cuda-13.0/bin` ahead on `PATH` when building an extension against that torch.
+- **No NPU here**: no `/dev/davinci*` and no CANN. `cpp_engine/build_ascend/` is a synced artifact
+  tree; its presence tells you nothing about this host.
 
-### Why this matters
+### aarch64 Ascend machine — 8 x Ascend 910B
 
-Kernel tuning strategies cannot be shared across the two generations:
+These facts are recorded from that machine, not measured on the x86_64 host, so **none of them can
+be verified from here** — treat them as claims to re-check in place.
 
-- **L2 differs by 6x** (32 MB vs 192 MB), which drives weight/KV L2 residency strategy and block sizes
-- **Cube frequency differs by ~2x**, which shifts the compute/memory balance point and therefore the tiling
-- **Only the 2nd generation has `cube_vector_combine=split`**, where Cube and Vector are independent
-  units that can be pipelined in parallel. The 1st generation cannot do this.
-
-So AscendC kernels must branch on `Short_SoC_version` with separate implementations, not merely
-retuned parameters. This mirrors the principle on the CUDA side of not giving up 2080 Ti (sm_75)
-specific optimizations.
-
-### Do not detect it this way
-
-```bash
-npu-smi info | grep 910B      # WRONG: "910B" without a digit is actually 1st generation
-```
-
-Read `Short_SoC_version` instead, or resolve the exact model via `npu-smi` and look it up in the
-table above.
-
-## Hardware and toolchain (current dev machine)
-
-- **NPU**: 8 x Ascend `910B` (i.e. **1st generation**, `Short_SoC_version=Ascend910`), 32 GB HBM per
-  card, `/dev/davinci0-7`
-- **CANN**: 9.0.0, `ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.0.0`
-- **Driver**: 25.5.2 (`ascendhal 7.35.23`)
-- **OS**: Ubuntu 22.04.5, aarch64, kernel 5.15
-- **Compilers**: gcc 11.4.0, cmake 3.22.1
-- **No CUDA toolchain** on this machine (no `nvcc` / `nvidia-smi`). CUDA / 2080 Ti builds and
-  regression runs must happen on a different machine.
-- `/etc/hccn.conf` exists but is empty. Multi-card HCCL over RDMA needs it configured first.
-  Intra-server SDMA (die-to-die) does not depend on it; the actual topology still needs to be
-  measured.
+- **NPU**: 8 x Ascend `910B` with no trailing digit, i.e. **1st generation**
+  (`Short_SoC_version=Ascend910`); 32 GB HBM per card, `/dev/davinci0-7`. See **Ascend chip naming
+  convention** below before trusting that name.
+- **CANN**: 9.0.0, `ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.0.0`. Driver 25.5.2
+  (`ascendhal 7.35.23`).
+- **OS**: Ubuntu 22.04.5, aarch64, kernel 5.15. Compilers: gcc 11.4.0.
+- **No CUDA toolchain**, so CUDA builds and 2080 Ti regression runs cannot happen there.
+- **Build**: `source scripts/ascend_env.sh` first — CANN's own `set_env.sh` is required, not just
+  `LD_LIBRARY_PATH`, because an ACL binary launched without it does not fail but *hangs* before
+  `aclInit` returns. Then `scripts/build_ascend.sh`.
+- `/etc/hccn.conf` exists but is empty: multi-card **HCCL over RDMA** needs it configured first.
+  Intra-server SDMA does not depend on it.
 
 ## Network access
 
-Port 443 on `github.com` is **blocked by SNI filtering** (DNS resolves fine, the TLS handshake
-hangs). The same IP returns HTTP 200 when the SNI is `api.github.com` but times out with SNI
-`github.com`, so switching IPs or omitting SNI does not help.
+- **`origin` is HTTPS**: `https://github.com/lvyufeng/PocketLLM.git`, with `gh` authenticated as
+  `lvyufeng`. There is no SSH remote, no `~/.ssh/config` entry for `github.com`, and no deploy key;
+  `ssh -T git@github.com` is refused on port 22. Use HTTPS.
+- `github.com` over 443 works (checked 2026-09-14). The SNI-filtering workaround documented here
+  previously no longer applies.
+- `api.github.com` is reachable but **intermittently times out**. `gh` commands — `gh pr list
+  --json` in particular — may need a retry.
+- PyPI and Test PyPI are reachable over HTTPS. `docs/PYPI_RELEASE.md` documents the release flow and
+  where the credentials live.
 
-`git` is configured to bypass this via SSH over port 443:
+## Ascend chip naming convention
 
-```
-# ~/.ssh/config
-Host github.com
-    HostName ssh.github.com
-    Port 443
-```
+**`910B` with no trailing digit is first generation; `910B1`–`910B4` are second generation.** The
+name `npu-smi info` prints is not the SoC generation, so read `Short_SoC_version` from
+`$ASCEND_TOOLKIT_HOME/<arch>-linux/data/platform_config/*.ini` before making any judgement about
+which hardware you are on. The two generations need **separate AscendC kernel implementations, not
+retuned parameters**.
 
-- `origin` uses SSH: `git@github.com:lvyufeng/PocketLLM.git`
-- Authentication uses a repository-level **deploy key** (write-enabled), `~/.ssh/id_ed25519_github`
-- `api.github.com` is reachable but flaky; `gh` commands may need a retry
-- Read-only fetches can also use the mirror prefix `https://ghfast.top/https://github.com/...`
-  (the mirror does not support push)
-
-The repository was renamed from `deepseek-v4-2080ti` to `PocketLLM`.
-
-## Architecture
-
-Two largely independent engines with almost no cross-dependency:
-
-- `cpp_engine/` — C++/CUDA engine (~52k lines). Kernels already sit behind a vendor-neutral C ABI
-  (`include/cuda_ops.hpp` and friends: 91 of 93 declarations take `void* stream`, and the headers
-  pull in no CUDA headers). The engine layer contains **zero `<<<` kernel launches**, and 13 of the
-  22 files under `src/` have no CUDA references at all.
-- `src/` — PyTorch implementation (~44k lines). `src/kernels/ops.py` already has an
-  `_auto_impl` / `_resolve_impl` dispatch seam with paired `*_torch` / `*_triton` implementations.
-
-The multi-backend refactor uses a **single repository with layered separation** rather than splitting
-repos: a device-agnostic core is shared (GGUF parsing, tokenizer, HTTP server, scheduling skeleton),
-while each vendor owns its own kernel implementations so that per-hardware optimization is never
-compromised. Backend selection happens at build time.
+Full table, platform_config layout, and the CMake variable that consumes it:
+[docs/ascend_soc_generations.md](docs/ascend_soc_generations.md).
 
 ## Git workflow
 
-**All development work must follow the feature branch workflow with pull requests.**
+**Never commit directly to `master`.** Every change goes on a branch and through a pull request.
 
-### Branch naming conventions
+Branch prefixes:
 
-- `feature/<description>` — New features (e.g., `feature/cpp-engine-batch-scheduler`)
-- `fix/<description>` — Bug fixes (e.g., `fix/decode-eos-handling`)
-- `refactor/<description>` — Code refactoring (e.g., `refactor/unified-api-phase1`)
-- `docs/<description>` — Documentation updates (e.g., `docs/phase3-completion-summary`)
-- `perf/<description>` — Performance optimizations (e.g., `perf/gqa-tensor-core`)
+- `feature/<description>` — new features (e.g. `feature/cpp-engine-batch-scheduler`)
+- `fix/<description>` — bug fixes (e.g. `fix/decode-eos-handling`)
+- `refactor/<description>` — refactoring (e.g. `refactor/unified-api-phase1`)
+- `docs/<description>` — documentation (e.g. `docs/phase3-completion-summary`)
+- `perf/<description>` — performance work (e.g. `perf/gqa-tensor-core`)
 
-### Development process
+Pull requests: a title under 72 characters, a body covering the summary, implementation details and
+testing status, and **one concern per PR** — break large features into several. Every PR body must
+end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 
-1. **Never commit directly to `master`**. Always create a feature branch:
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
+Commits: a one-line summary under 72 characters, a blank line, then the explanation starting on line
+3. Every commit message must end with
+`Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`.
 
-2. **Make commits with clear messages**:
-   ```bash
-   git add <files>
-   git commit -m "Brief description
-   
-   Detailed explanation of what changed and why.
-   Include any relevant context, benchmarks, or references.
-   
-   Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
-   ```
+Merged branches are **not** reliably deleted on `origin`, so delete yours yourself, locally and
+remotely.
 
-3. **Push the branch to remote**:
-   ```bash
-   git push -u origin feature/your-feature-name
-   ```
+**Emergency hotfixes** may go directly to `master` for critical production issues only: a clear
+commit message explaining the emergency, an immediate follow-up PR, and a post-mortem if it was
+severe. This should be well under 1% of commits.
 
-4. **Create a pull request using `gh` CLI**:
-   ```bash
-   gh pr create --title "Brief PR title" \
-                --body "Detailed description" \
-                --base master
-   ```
-   
-   The PR description should include:
-   - Summary of changes
-   - Implementation details
-   - Testing status
-   - Performance impact (if applicable)
-   - Checklist of completed/pending items
+## Testing
 
-5. **After PR is merged**, the feature branch will be automatically deleted by GitHub.
-   Update your local repository:
-   ```bash
-   git checkout master
-   git pull origin master
-   git branch -d feature/your-feature-name  # Delete local branch
-   ```
+The suite is `tests/`, alongside `bench_*` and `profile_*` scripts that pytest does not collect.
+There is no `conftest.py` and no pytest configuration; modules import from the repository root, so
+**run pytest from the repository root**:
 
-### PR requirements
-
-- PR title should be concise and descriptive (< 72 characters)
-- PR body must include a summary, implementation notes, and testing status
-- All PRs must end with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
-- Large features should be broken into multiple smaller PRs when possible
-- Each PR should be focused on a single concern (no "kitchen sink" PRs)
-
-### Commit message format
-
-```
-Brief one-line summary (< 72 chars)
-
-Detailed explanation starting on line 3. Include:
-- What changed and why
-- Any relevant context or background
-- Performance impact if applicable
-- Related issues or PRs
-
-Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+```bash
+python -m pytest tests/ -q
 ```
 
-### Emergency hotfixes
-
-For critical production issues only, a hotfix may be committed directly to `master` with:
-1. Clear commit message explaining the emergency
-2. Immediate follow-up PR for review and documentation
-3. Post-mortem analysis if the issue was severe
-
-This should be extremely rare (< 1% of commits).
-
+- `tests/test_gguf_q2_precision.py` fails at **collection**: it still imports `src.gguf.reader`,
+  which moved to `src/loader/gguf/reader.py`. A bare `python -m pytest tests/` aborts on it, so add
+  `--continue-on-collection-errors` to run the rest. Porting or deleting that module is the better
+  fix.
+- Modules that need a GPU, a real checkpoint, or a built `pocketllm_cpp` skip themselves via
+  `pytest.importorskip`. A skip is not a pass.
+- **CI runs no tests.** `.github/workflows/publish-pypi.yml` is the only workflow, and it only
+  builds and uploads a release.
