@@ -60,6 +60,7 @@ git pull origin master
 - [ ] Confirm the two version strings agree:
       `python -c "import re, pathlib, pocketllm; print(pocketllm.__version__, re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))"`
       The regular expression is not stylistic: `tomllib` is 3.11+, while this package supports 3.10, so a checklist step that imports it cannot be run on the oldest supported interpreter. The publish workflow reads the version the same way.
+      This one does belong in the checkout — it compares the two version strings the source declares, and both sides come from the tree. The install steps below are the ones that must not run here.
 - [ ] Commit all changes: `git commit -m "Release v0.x.x"`
 - [ ] Create the tag: `git tag v0.x.x`
 
@@ -95,16 +96,27 @@ Checking dist/pocketllm-0.x.x.tar.gz: PASSED
 ### 4. Install the built sdist locally
 
 ```bash
+REPO=$PWD                      # run this from the repository root
+rm -rf /tmp/test-pocketllm
 python -m venv /tmp/test-pocketllm
 source /tmp/test-pocketllm/bin/activate
 
 pip install dist/pocketllm-0.x.x.tar.gz --no-build-isolation
 
-python -c "import pocketllm; print(pocketllm.__version__)"
-python tests/test_install_smoke.py
+cd /tmp
+python -c "import pocketllm; print(pocketllm.__version__, pocketllm.__file__)"
+python -c "import pocketllm_cpp; print('C++ engine: OK', pocketllm_cpp.__file__)"
+python "$REPO/tests/test_install_smoke.py"
 
 deactivate
 ```
+
+`cd /tmp` is not incidental. `python -c` puts the working directory on `sys.path`, so run from the
+checkout the first line imports `pocketllm/` from the source tree and prints the version the tree
+has — which is what the release is bumping, so it agrees with the artifact by construction and proves
+nothing. Both lines print the module path for the same reason: it has to be under the virtualenv.
+The smoke test is run by path rather than by name, which puts the test's own directory, not the
+checkout, on `sys.path`.
 
 This is the only step that proves the artifact installs. It compiles CUDA extensions and the native
 C++ engine, so it needs a machine with a CUDA toolkit — a CI runner without one cannot do it.
@@ -145,20 +157,26 @@ the "Verify the published metadata" step of the publish workflow.
 ### Step 3: Install from Test PyPI
 
 ```bash
+REPO=$PWD                      # run this from the repository root
+rm -rf /tmp/test-pocketllm
 python -m venv /tmp/test-pocketllm
 source /tmp/test-pocketllm/bin/activate
 
-pip install torch                      # Test PyPI does not carry it
+pip install "torch>=2.0,<2.7"  # Test PyPI does not carry it; range as declared in pyproject.toml
 pip install --index-url https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple/ \
     pocketllm --no-build-isolation
 
-python -c "import pocketllm; print(pocketllm.__version__)"
-python -c "import pocketllm_cpp; print('C++ engine: OK')"
-python tests/test_install_smoke.py
+cd /tmp   # otherwise the checkout shadows the installed package; see step 4
+python -c "import pocketllm; print(pocketllm.__version__, pocketllm.__file__)"
+python -c "import pocketllm_cpp; print('C++ engine: OK', pocketllm_cpp.__file__)"
+python "$REPO/tests/test_install_smoke.py"
 
 deactivate
 ```
+
+This is the step that catches an sdist that is missing files it needs to compile — the archive
+resolves, downloads and installs, and the failure is at build time.
 
 ### Step 4: Production PyPI
 
