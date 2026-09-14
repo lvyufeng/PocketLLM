@@ -118,29 +118,62 @@ Despite `ASCENDC_COMPILE_OPTIONS` being set to include `/usr/include/c++/11`, th
 - Cube operates on 16×16 tiles in C0 fractal format
 - `Short_SoC_version=Ascend910` (not `Ascend910B`)
 
+## Completed Work (2026-09-14)
+
+### ✅ Phase 1: Tile Size Optimization - COMPLETE
+
+**Changes made**:
+- Increased `kVectorPositionTile` from 16→64 in `qwen_attention_f16.cpp:556`
+- Fixed AscendC compilation toolchain issues:
+  - Used `-I` flags instead of `-isystem` (bisheng doesn't handle the latter properly)
+  - Passed flags to both device and host compilation stages via `-forward-options-to-host-compiler`
+  - Updated `CMakeLists.txt` lines 300-311
+
+**Results**:
+- ✅ All tests pass: `test_qwen_ascend_ops` (47 checks), `test_qwen_ascend_group_b` (149 checks)
+- ✅ Binary built successfully: `pocketllm_engine` (1.7M)
+- Expected speedup: 1.3-1.5× on 4K prefill (reduces 256 iterations → 64)
+
+**Committed**: Branch `perf/attention-tile-optimization`, commit `586f41a`
+
+### 🚧 Phase 2: aclnnBatchMatMul Integration - IN PROGRESS
+
+**Status**: Prototype implementation created in `qwen_attention_batched.cpp`
+
+**What works**:
+- ✅ QK^T matmul using `aclnnBatchMatMul` (uses Cube unit)
+- ✅ P·V matmul using `aclnnBatchMatMul` (uses Cube unit)
+- ✅ GQA head group reshaping logic
+
+**Blockers**:
+- ❌ Causal masking: Need custom AscendC kernel or efficient use of `aclnnMaskedFill`
+- ❌ Attention scaling: Need `aclnnMuls` integration for 1/sqrt(head_dim)
+- ❌ Softmax: Need `aclnnSoftmax` with proper dimension handling
+
+**Why this matters**: The two BatchMatMul calls will use the Cube (matrix) unit instead of Vector scalar loops, potentially delivering 2-3× speedup on the matmul portions alone.
+
+**Complexity**: Medium - requires additional kernel for causal masking, or significant tensor manipulation overhead to construct mask tensors per batch.
+
 ## Next Steps
 
-1. **Fix AscendC compilation toolchain**
-   - Debug why `-isystem /usr/include/c++/11` isn't working
-   - Or use precompiled kernel workflow if source builds are not supported
+1. **Benchmark Phase 1 optimization**
+   - Run with `QWEN_PHASE_PROFILE=1` to measure actual speedup
+   - Compare 4K prefill time: current ~18.4s → expected ~12-14s
+   - Validate the 4× loop reduction actually delivers performance gains
 
-2. **Test tile size optimization** (Phase 1)
-   - Rebuild with `kVectorPositionTile=64`
-   - Benchmark 4K prefill with `QWEN_PHASE_PROFILE=1`
-   - Expect ~18.4s → ~12-14s
+2. **Complete Phase 2 causal masking** (if Phase 1 shows promise)
+   - Option A: Write small AscendC kernel for causal mask + scale + softmax
+   - Option B: Use `aclnnMaskedFill` with precomputed mask tensor
+   - Option C: Accept that Phase 2 complexity may not be worth it
 
 3. **Profile decode FlashDecoding reduce**
    - Currently ~68ms/token (see PR #184 description)
    - May be next bottleneck after prefill
 
-4. **Investigate aclnnBatchMatMul path** (Phase 2)
-   - Prototype full attention with batched matmul
-   - Measure vs. tile-optimized Vector kernel
-   - Decide if complexity is worth it
-
-5. **Long-term: Custom Cube kernel** (Phase 3)
+4. **Long-term: Custom Cube kernel** (Phase 3)
    - Only pursue if Phase 2 shows Cube delivers significant wins
-   - Requires CANN SDK documentation on C0 layout
+   - Requires CANN SDK documentation on C0 fractal layout
+   - Expected 3-5× total speedup if done correctly
 
 ## Files Modified
 
