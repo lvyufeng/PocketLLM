@@ -451,6 +451,30 @@ if(POCKET_BUILD_PYTHON)
     message(STATUS "POCKET_BUILD_PYTHON=ON: building pocketllm_cpp")
 endif()
 
+# Everything below is development-only: the inspection tools and the per-kernel
+# test and benchmark binaries. Nothing an install builds links them, and the
+# sdist ships neither tools/ nor tests/ -- MANIFEST.in includes only what building
+# the library needs. Declaring these targets unconditionally therefore made
+# configuration fail on 110 source files that are not in the archive, which broke
+# `pip install` from the sdist at the CMake step, after the Torch extensions had
+# already spent minutes compiling.
+#
+# The default follows the tree rather than being a constant, because neither
+# constant is right: ON fails an sdist install, OFF silently drops the developer
+# tests from a git checkout. A missing directory is the signal that this is an
+# unpacked artifact rather than a working copy.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    set(POCKET_DEV_TARGETS_DEFAULT ON)
+else()
+    set(POCKET_DEV_TARGETS_DEFAULT OFF)
+endif()
+
+option(POCKET_BUILD_DEV_TARGETS
+       "Build the development tools and the test/benchmark binaries"
+       ${POCKET_DEV_TARGETS_DEFAULT})
+
+if(POCKET_BUILD_DEV_TARGETS)
+
 add_executable(inspect_gguf tools/inspect_gguf.cpp)
 target_link_libraries(inspect_gguf PRIVATE pocket_cpp_core)
 set_target_properties(inspect_gguf PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tools)
@@ -913,3 +937,5 @@ set_target_properties(bench_qwen_gqa_verify PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_executable(bench_qwen_dflash2_topk tests/bench_qwen_dflash2_topk.cpp)
 target_link_libraries(bench_qwen_dflash2_topk PRIVATE pocket_cpp_core)
 set_target_properties(bench_qwen_dflash2_topk PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+endif()  # POCKET_BUILD_DEV_TARGETS

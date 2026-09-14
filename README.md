@@ -228,6 +228,14 @@ cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
 does not yet link, because the ACL runtime, AscendC kernels and HCCL collectives
 under `cpp_engine/backends/ascend/` are not implemented.
 
+`POCKET_BUILD_DEV_TARGETS` controls the inspection tools and the per-kernel test
+and benchmark binaries — everything `cpp_engine/tools/` and `cpp_engine/tests/`
+hold. It defaults to whether those directories are present, so a working copy
+configures them and an unpacked sdist does not: an install builds the libraries,
+the `pocketllm_engine` executable and the optional Python module, and nothing an
+install builds needs a test binary. Pass `-DPOCKET_BUILD_DEV_TARGETS=OFF` to
+configure a checkout for a library-only build.
+
 The source tree is layered so that a second backend can reuse everything that is
 not vendor-specific:
 
