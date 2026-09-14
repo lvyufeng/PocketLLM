@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pocketllm"
-version = "0.1.1"
+version = "0.1.2.dev0"
 description = "Inference engine for large language models on consumer GPUs with deep optimization for older hardware"
 readme = "README.md"
 requires-python = ">=3.10"
