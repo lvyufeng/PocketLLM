@@ -11034,8 +11034,12 @@ std::vector<int> PersistentEngine::batch_verify_step(
     worker_command_batch_verify(draft_tokens, start_position);
     ContinuationBatchResult result;
     try {
+        // Unlike the token-forward and prompt-prefill implementations, this one
+        // takes no request_slot: every per-slot buffer it reads goes through a
+        // helper that defaults to slot 0, which is the slot speculative decoding
+        // is pinned to above.
         result = run_safetensors_continuation_batch_impl(
-            ctx, draft_tokens, s.layer_count, start_position, 0);
+            ctx, draft_tokens, s.layer_count, start_position);
     } catch (...) {
         // Workers abort their own journal from the command-loop catch. A zero-row
         // finalize is still sent so a worker that completed before rank 0 failed
