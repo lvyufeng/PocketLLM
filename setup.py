@@ -26,10 +26,11 @@ CPP_ENGINE_DIR = ROOT / "cpp_engine"
 def _build_native_requested() -> bool:
     """Whether to build the optional pybind11 module for the C++ engine.
 
-    Off by default: the native build needs pybind11, a CUDA toolkit and NCCL, and
-    takes minutes. A host that only wants the Torch runtimes must still install.
+    On by default for v0.1.0: users should get the full C++ engine capability.
+    Can be disabled with POCKETLLM_BUILD_CPP=0 for PyTorch-only installation.
     """
-    return os.environ.get("POCKETLLM_BUILD_CPP", "").strip().lower() in {"1", "true", "yes", "on"}
+    env_value = os.environ.get("POCKETLLM_BUILD_CPP", "1").strip().lower()
+    return env_value not in {"0", "false", "no", "off"}
 
 
 def _python_cmake_hints() -> list[str]:

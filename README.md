@@ -14,37 +14,34 @@ The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validate
 
 ## Installation
 
-### Quick install (PyTorch backend only)
+### Quick install (full capabilities)
 
 ```bash
-pip install pocketllm
+pip install pocketllm --no-build-isolation
 ```
 
-This installs the `pocketllm` Python package and CLI with PyTorch-based kernels. CUDA extensions will be compiled during installation if a CUDA toolkit is detected.
+This installs PocketLLM with both PyTorch and C++ engine backends. The build process compiles CUDA extensions and the native C++ engine, which takes 5-15 minutes.
 
 **Requirements:**
 - Python >= 3.10
-- PyTorch >= 2.0
-- CUDA toolkit 11.8+ (optional, for GPU acceleration)
+- PyTorch >= 2.0 (install first: `pip install torch`)
+- CUDA toolkit 11.8+ (for GPU acceleration)
+- CMake >= 3.18
+- pybind11 >= 2.10
+- NCCL (for tensor parallelism with TP > 1)
 - 16GB+ system RAM (for compilation)
 
-### Full install (with C++ engine)
+**Note:** `--no-build-isolation` is required so the build uses your environment's PyTorch, which must match your CUDA toolkit version.
 
-For the native C++/CUDA engine (required for `backend="cpp"`):
+### PyTorch-only install (skip C++ engine)
+
+If you only need the PyTorch backend or lack the C++ build dependencies:
 
 ```bash
-# Install dependencies first
-pip install pybind11 cmake
-
-# Build with C++ engine support
-POCKETLLM_BUILD_CPP=1 pip install pocketllm --no-build-isolation
+POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
 ```
 
-**Additional requirements for C++ engine:**
-- CMake >= 3.18
-- pybind11 >= 2.12
-- NCCL (for tensor parallelism with TP > 1)
-- C++17 compiler (gcc 9+, clang 10+, or MSVC 2019+)
+This skips the C++ engine build but still compiles PyTorch CUDA extensions.
 
 ### Development install
 

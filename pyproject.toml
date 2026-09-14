@@ -54,12 +54,14 @@ dependencies = [
     "tqdm>=4.66",
     "setuptools>=68",
     "ninja>=1.11",
+    "pybind11>=2.10",
+    "cmake>=3.18",
 ]
 
 [project.optional-dependencies]
 triton = ["triton>=2.0"]
-cpp = ["pybind11>=2.10", "cmake>=3.18"]
-all = ["pocketllm[triton,cpp]"]
+minimal = []  # PyTorch-only, no C++ engine (set POCKETLLM_BUILD_CPP=0)
+all = ["pocketllm[triton]"]
 
 [project.scripts]
 pocketllm = "pocketllm.cli:main"

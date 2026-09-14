@@ -87,12 +87,25 @@ All measurements on 4×NVIDIA RTX 2080 Ti (22 GiB, PCIe Gen3, no NVLink), TP4 wh
 
 ### Dependencies
 - Python >= 3.10
-- PyTorch >= 2.0
+- PyTorch >= 2.0, < 2.7
 - Transformers >= 4.40
 - Safetensors >= 0.4
-- Optional: CUDA toolkit 11.8+ (for CUDA extensions)
-- Optional: NCCL (for TP > 1)
-- Optional: pybind11, cmake (for C++ engine)
+- CMake >= 3.18
+- pybind11 >= 2.10
+- CUDA toolkit 11.8+ (for CUDA extensions)
+- NCCL (for TP > 1)
+
+### Installation
+```bash
+pip install pocketllm --no-build-isolation
+```
+
+By default, PocketLLM builds both PyTorch CUDA extensions and the native C++ engine, providing full capabilities out of the box. The build takes 5-15 minutes and requires CUDA toolkit, CMake, and pybind11.
+
+For PyTorch-only installation (skip C++ engine):
+```bash
+POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
+```
 
 ### License
 - Changed from PolyForm Noncommercial 1.0.0 to MIT License

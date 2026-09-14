@@ -147,12 +147,19 @@ python -m build --sdist --no-isolation
 
 ### C++ engine build fails
 
-**User needs:**
-- CMake >= 3.18
-- pybind11 >= 2.10
-- NCCL (for TP > 1)
+**Common causes:**
+- Missing CMake: `pip install cmake` or `apt install cmake`
+- Missing pybind11: `pip install pybind11`
+- Missing NCCL: Install from NVIDIA or your package manager
 
-Install with: `POCKETLLM_BUILD_CPP=1 pip install pocketllm --no-build-isolation`
+**If C++ engine is not needed:**
+```bash
+POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
+```
+
+### Build takes too long
+
+The full build (CUDA extensions + C++ engine) takes 5-15 minutes. This is normal for the first installation. Subsequent upgrades reuse cached builds when possible.
 
 ## Version Numbering
 
