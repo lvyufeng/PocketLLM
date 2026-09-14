@@ -5,7 +5,42 @@ All notable changes to PocketLLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2024-09-14
+## [0.1.1] - 2026-09-14
+
+### Fixed
+
+- **The PyPI project page contradicted the package metadata.** `pyproject.toml` declared the MIT
+  license, while the rendered long description — which is `README.md`, published verbatim as the
+  project page — still presented PocketLLM as PolyForm Noncommercial 1.0.0 and stated that
+  commercial use required separate written permission. The 0.1.0 page therefore read as
+  non-commercial-only while its classifier and license field said MIT. `twine check` does not
+  compare the description against the declared license, so it passed. `README.md` and
+  `README_CN.md` now both state MIT.
+- **Installation failed only after compiling for several minutes when the native build toolchain was
+  missing.** `setup.py` checked for `cmake` and `pybind11` inside `build_native_module()`, which runs
+  after the Torch CUDA extensions have already compiled. The prerequisites are now checked before
+  any compilation starts, and the failure names each missing tool, how to install it, and the
+  `POCKETLLM_BUILD_CPP=0` route for a PyTorch-only install. Regression tests are in
+  `tests/test_native_build_preflight.py`.
+- **The publish workflow's production upload could never run.** `publish-pypi.yml` gated the step on
+  `github.event.inputs.publish_production` without declaring an `inputs` block, so the expression was
+  always null and the only way to reach production PyPI from Actions was to edit the file. The
+  workflow now declares a `publish_production` choice input, defaulting to `no`.
+- **The publish workflow's Test PyPI install check could never pass either.** It installed the sdist
+  from Test PyPI on a runner without a CUDA toolkit, which cannot compile it, and the failure was
+  suppressed by a trailing `|| echo`. It is replaced by a verification of the metadata Test PyPI is
+  actually serving, which fails on the 0.1.0 artifact for exactly the license defect above.
+
+### Changed
+
+- Release documentation consolidated into `docs/PYPI_RELEASE.md`, now linked from the documentation
+  index. `docs/RELEASE_CHECKLIST.md` and the untracked `PYPI_UPLOAD_GUIDE.md` were duplicates that
+  had drifted from it, including a stale statement of the pre-MIT license, and are removed.
+- The publish workflow installs Torch from the CPU index within the version range `pyproject.toml`
+  declares, rather than an unconstrained latest.
+- The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
+
+## [0.1.0] - 2026-09-14
 
 ### Added
 
@@ -110,4 +145,5 @@ POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
 ### License
 - Changed from PolyForm Noncommercial 1.0.0 to MIT License
 
+[0.1.1]: https://github.com/lvyufeng/PocketLLM/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lvyufeng/PocketLLM/releases/tag/v0.1.0
