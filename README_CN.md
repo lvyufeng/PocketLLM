@@ -214,9 +214,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 ## License
 
-PocketLLM 代码使用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
-
-个人使用、学术研究、教育、非商业 benchmark 和非商业部署属于允许用途。商业使用需要版权持有者单独书面许可。
+PocketLLM 采用 [MIT License](LICENSE) 发布。你可以自由使用、修改和分发本代码，包括商业用途，只需保留版权声明和许可声明。
 
 模型权重、tokenizer、CUDA、PyTorch、GGUF 资源和其他第三方组件分别受其自身许可证约束。PocketLLM 代码许可证不授予任何第三方模型资产的额外权利。
 
