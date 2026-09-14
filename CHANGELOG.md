@@ -93,6 +93,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pybind11` and `ninja`. It now installs those first. The guide also records that a venv created
   with `--system-site-packages` cannot be used for this check, because it inherits the base
   interpreter's toolchain and reports success for the procedure that does not work.
+- The Test PyPI install step names the version it installs. Run unpinned, it installed the
+  *production* 0.1.0 sdist while verifying 0.1.1, and then failed inside that sdist's CMake
+  configuration — the defect above — because pip had cached Test PyPI's index page from before the
+  upload: the listing it searched carried no link for the new version, so resolution fell back to
+  the version the other index offered. Pinning turns a silent install of the wrong artifact into
+  `No matching distribution found`, and the guide's Troubleshooting section records the symptom and
+  the command that identifies it.
 - The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
 - The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
   CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
