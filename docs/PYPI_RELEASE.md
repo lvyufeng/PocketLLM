@@ -232,17 +232,35 @@ installation verification stays a local step.
 
 ## Post-release
 
+Do this only after the artifact is on production PyPI. The GitHub release links to a version that
+must already exist, and it cannot be created from a commit that is not on `master` — if the release
+was prepared on a branch, merged first and pull `master` so the tag has somewhere to land.
+
 1. **Push the tag and create the GitHub release**
 
    ```bash
    git push origin master
    git push origin v0.x.x
 
-   gh release create v0.x.x \
-       --title "PocketLLM v0.x.x" \
-       --notes-file CHANGELOG.md \
-       dist/pocketllm-0.x.x.tar.gz
+   # Release notes are this version's changelog section, not the whole file. Passing
+   # CHANGELOG.md directly publishes every previous release's notes as well; see
+   # Troubleshooting.
+   VERSION=0.x.x
+   awk -v hdr="## [$VERSION]" '
+       index($0, hdr) == 1 { found = 1 }
+       found && /^## \[/ && index($0, hdr) != 1 { exit }
+       found
+   ' CHANGELOG.md > /tmp/notes-$VERSION.md
+
+   gh release create v$VERSION \
+       --title "PocketLLM v$VERSION" \
+       --notes-file /tmp/notes-$VERSION.md \
+       dist/pocketllm-$VERSION.tar.gz
    ```
+
+   The comparison is on the bracketed header rather than a regular expression on purpose: an
+   unescaped `[0.x.x]` is a character class, and `index` on `## [0.1.1]` also declines to match a
+   `## [0.1.10]` header.
 
 2. **Bump the version for development**
 
@@ -312,6 +330,16 @@ pip index versions pocketllm --cache-dir /tmp/pipcache --index-url https://test.
 The version pin in step 3 is what keeps this from being silent: with it, a listing that does not
 carry the release under test fails with `No matching distribution found` rather than installing
 something else. Add `--no-cache-dir` to the install command to bypass the cache as well.
+
+### The GitHub release notes contain the whole changelog
+
+`gh release create --notes-file CHANGELOG.md` publishes the entire file. The v0.1.1 release notes
+built that way would be 216 lines: the 0.1.1 section, then the 0.1.0 section with its feature list
+and performance table, then the link definitions. A reader looking for what changed in this release
+has to find it.
+
+Pass the extracted section instead, as the post-release step does. The same applies to
+`--notes "$(cat CHANGELOG.md)"`.
 
 ### `ModuleNotFoundError: No module named 'torch'` during the build
 

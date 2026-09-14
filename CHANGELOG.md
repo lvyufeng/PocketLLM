@@ -5,7 +5,110 @@ All notable changes to PocketLLM will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2024-09-14
+## [0.1.1] - 2026-09-14
+
+### Fixed
+
+- **The PyPI project page contradicted the package metadata.** `pyproject.toml` declared the MIT
+  license, while the rendered long description — which is `README.md`, published verbatim as the
+  project page — still presented PocketLLM as PolyForm Noncommercial 1.0.0 and stated that
+  commercial use required separate written permission. The 0.1.0 page therefore read as
+  non-commercial-only while its classifier and license field said MIT. `twine check` does not
+  compare the description against the declared license, so it passed. `README.md` and
+  `README_CN.md` now both state MIT.
+- **Installation failed only after compiling for several minutes when the native build toolchain was
+  missing.** `setup.py` checked for `cmake` and `pybind11` inside `build_native_module()`, which runs
+  after the Torch CUDA extensions have already compiled. The prerequisites are now checked before
+  any compilation starts, and the failure names each missing tool, how to install it, and the
+  `POCKETLLM_BUILD_CPP=0` route for a PyTorch-only install. Regression tests are in
+  `tests/test_native_build_preflight.py`.
+- **The install commands in `README.md` could not be followed in a fresh virtualenv.**
+  `pip install pocketllm --no-build-isolation` does not fetch the build requirements, and the
+  requirements list named neither `setuptools` nor `wheel` nor said that anything had to be present
+  before pip ran. A user in a new virtualenv got `invalid command 'bdist_wheel'` out of metadata
+  generation — `python -m venv` bootstraps the interpreter's bundled setuptools, and on 3.12+
+  installs none — and then the missing-prerequisite failure above, with nothing to say which list was
+  short. All three install commands now install the prerequisites first, and the README's
+  `--no-build-isolation` note names both messages.
+- **The publish workflow's production upload could never run.** `publish-pypi.yml` gated the step on
+  `github.event.inputs.publish_production` without declaring an `inputs` block, so the expression was
+  always null and the only way to reach production PyPI from Actions was to edit the file. The
+  workflow now declares a `publish_production` choice input, defaulting to `no`.
+- **The publish workflow's Test PyPI install check could never pass either.** It installed the sdist
+  from Test PyPI on a runner without a CUDA toolkit, which cannot compile it, and the failure was
+  suppressed by a trailing `|| echo`. It is replaced by a verification of the metadata Test PyPI is
+  actually serving, which fails on the 0.1.0 artifact for exactly the license defect above.
+- **A default install from the sdist failed at CMake configuration.** `cpp_engine/CMakeLists.txt`
+  declared an executable for every file under `tools/` and `tests/`, which `MANIFEST.in` does not
+  ship, so an install reported 110 "Cannot find source file" errors and the native engine never
+  built. This is the default install path: `POCKETLLM_BUILD_CPP` is on by default, and it failed with
+  a complete toolchain rather than a missing one. The development targets are now behind
+  `POCKET_BUILD_DEV_TARGETS`, defaulting to whether `tools/` and `tests/` are present, so a working
+  copy keeps building them and an unpacked sdist does not declare them. Regression tests are in
+  `tests/test_sdist_native_sources.py`.
+
+  This one was found by the release's own install verification, not by a user report — 0.1.0 shipped
+  with it as well.
+- **The native C++ engine did not compile in any CUDA configuration.** `cpp_engine/include/qwen_ops.hpp`
+  declared a `qwen_gqa_decode_attention_flashdec_f16` that forwarded to
+  `qwen_gqa_decode_attention_flashdec_f16_cuda`, a kernel that was never declared or defined; the
+  operator exists only on Ascend. The header's operators are `inline`, so every translation unit that
+  includes it compiles the whole body, including the arm it never takes — four of them failed on the
+  name. A second, unrelated break sat in `cpp_engine/engine/deepseek_v4_engine.cpp`, which called the
+  four-parameter `run_safetensors_continuation_batch_impl` with five arguments, a signature its two
+  sibling entry points gained in the multi-slot batching change and it did not. The CUDA arm of the
+  flashdec operator now refuses with an explanation instead of naming a kernel that does not exist,
+  and the call matches the declaration again. Neither defect was reachable by any check the project
+  ran: no workflow compiles the native engine, and `python -m build --sdist` does not run
+  `build_ext`. `POCKETLLM_BUILD_CPP=1` therefore failed for every user of 0.1.0, by one route or the
+  other — at CMake configuration from the sdist, or here from a checkout.
+- **The sdist omitted two files that its own sources `#include`.** `MANIFEST.in` listed the
+  extensions to ship per subtree and neither `*.inl` nor `*.inc` was among them, so
+  `cpp_engine/engine/qwen_layer_components.inl` (included by `qwen_engine.cpp`) and
+  `cpp_engine/backends/cuda/kernels/iq1_grid.inc` (included by `iq1_ops.cu`) were absent from the
+  archive. Unlike the missing `tools/` and `tests/` sources above, nothing named these files as a
+  CMake target source, so configuration succeeded and the compile failed. Both extensions are now
+  shipped from every `cpp_engine/` subtree, and `tests/test_sdist_native_sources.py` reads the quoted
+  `#include` directives out of the files the archive ships and fails if any of them names a file it
+  does not carry.
+
+### Changed
+
+- Release documentation consolidated into `docs/PYPI_RELEASE.md`, now linked from the documentation
+  index. `docs/RELEASE_CHECKLIST.md` and the untracked `PYPI_UPLOAD_GUIDE.md` were duplicates that
+  had drifted from it, including a stale statement of the pre-MIT license, and are removed.
+- The publish workflow installs Torch from the CPU index within the version range `pyproject.toml`
+  declares, rather than an unconstrained latest.
+- The install verification steps run from outside the checkout and print the module path they loaded.
+  `python -c` puts the working directory on `sys.path`, so from the repository root they imported
+  `pocketllm` from the source tree and reported the version the tree has rather than the one that was
+  installed — the check whose job is to prove the artifact installs could not fail for that reason.
+  The local install step also verifies the native module now, which only the Test PyPI step did.
+- The install steps prepare the virtualenv they run in. `--no-build-isolation` tells pip not to
+  provision `[build-system].requires`, so the environment has to already have what the build imports,
+  and a venv that has just been created has none of it. Run on a genuinely fresh one, the step that
+  proves the artifact installs failed at metadata generation with `invalid command 'bdist_wheel'` —
+  `python -m venv` bootstraps the interpreter's bundled setuptools, older than the version that ships
+  the command — and then, once that was fixed, at the native-engine preflight, for `cmake`,
+  `pybind11` and `ninja`. It now installs those first. The guide also records that a venv created
+  with `--system-site-packages` cannot be used for this check, because it inherits the base
+  interpreter's toolchain and reports success for the procedure that does not work.
+- The Test PyPI install step names the version it installs. Run unpinned, it installed the
+  *production* 0.1.0 sdist while verifying 0.1.1, and then failed inside that sdist's CMake
+  configuration — the defect above — because pip had cached Test PyPI's index page from before the
+  upload: the listing it searched carried no link for the new version, so resolution fell back to
+  the version the other index offered. Pinning turns a silent install of the wrong artifact into
+  `No matching distribution found`, and the guide's Troubleshooting section records the symptom and
+  the command that identifies it.
+- The `[0.1.0]` entry's date is corrected from 2024-09-14 to 2026-09-14.
+- The post-release step extracts this version's changelog section for the GitHub release. It passed
+  `CHANGELOG.md` to `gh release create --notes-file`, which publishes the whole file — the v0.1.1
+  notes would have been 216 lines, the 0.1.0 feature list and performance table included.
+- The `[0.1.0]` entry's FlashDecoding bullet now says what it is: an Ascend 910A measurement, with no
+  CUDA implementation of a separate entry point behind it. As written it read as a shipped CUDA
+  feature, and the defect above is the other half of the same confusion.
+
+## [0.1.0] - 2026-09-14
 
 ### Added
 
@@ -31,7 +134,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Health check endpoints (`/ready`, `/alive`, `/health`)
 - Token streaming callbacks for async generation
 - Speculative decoding (DSpark, DFlash2, MTP)
-- FlashDecoding for long-context decode (2.68× speedup)
+- FlashDecoding for long-context decode on Ascend (2.68× decode speedup, Ascend 910A, TP4, 4096-token
+  context). There is no separate CUDA FlashDecoding entry point; the CUDA path reaches split-partial
+  decode through the fused `qwen_gqa_decode_attention_f16_fused_cuda` kernel instead.
 - Prefix caching
 - Chunked prefill
 
@@ -110,4 +215,5 @@ POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
 ### License
 - Changed from PolyForm Noncommercial 1.0.0 to MIT License
 
+[0.1.1]: https://github.com/lvyufeng/PocketLLM/releases/tag/v0.1.1
 [0.1.0]: https://github.com/lvyufeng/PocketLLM/releases/tag/v0.1.0
