@@ -550,7 +550,10 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_kernel(
 // simple enough to validate on first-generation 910.
 namespace {
 
-constexpr uint32_t kVectorPositionTile = 16;
+// Position tile size: larger tiles reduce outer loop iterations and improve
+// memory access patterns. 16→64 reduces prefill loop count by 4x.
+// UB capacity on 910A allows 64 positions × 128 head_dim = 8KB per tile.
+constexpr uint32_t kVectorPositionTile = 64;
 constexpr uint32_t kVectorHeadCapacity = 256;
 
 struct VectorAttentionBuffers {

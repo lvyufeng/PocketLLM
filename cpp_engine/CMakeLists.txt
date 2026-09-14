@@ -300,9 +300,15 @@ else()
         set(SOC_VERSION "${ASCEND_SOC_VERSION}")
         set(RUN_MODE "npu")
         set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
-        set(ASCENDC_COMPILE_OPTIONS "-isystem;/usr/include/c++/11;-isystem;/usr/include/aarch64-linux-gnu/c++/11")
         include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
         ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
+        # Pass C++ standard library paths to both device and host compilation stages
+        ascendc_compile_options(pocket_ascend_kernels PRIVATE
+            -I/usr/include/c++/11
+            -I/usr/include/aarch64-linux-gnu/c++/11
+            -forward-options-to-host-compiler
+            -I/usr/include/c++/11
+            -I/usr/include/aarch64-linux-gnu/c++/11)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
         list(APPEND POCKET_ASCEND_KERNEL_INCLUDES
             "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
