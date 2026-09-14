@@ -1,197 +1,274 @@
 # PyPI Release Guide
 
-This document describes how to release PocketLLM to PyPI.
+This is the single source of truth for releasing PocketLLM to PyPI. Any other release note that
+disagrees with this file is out of date.
 
 ## Prerequisites
 
-1. **PyPI account and API token**
-   - Create account at https://pypi.org/account/register/
-   - Generate API token at https://pypi.org/manage/account/token/
-   - Store token in `~/.pypirc`:
-     ```ini
-     [pypi]
-     username = __token__
-     password = pypi-AgE...your-token-here
-     ```
+### 1. PyPI account and API tokens
 
-2. **Install build tools**
-   ```bash
-   pip install --upgrade build twine
-   ```
+Production and Test PyPI are separate services with separate accounts:
 
-3. **Clean working directory**
-   ```bash
-   git status  # Should be clean
-   git pull origin master
-   ```
+- Production: https://pypi.org/account/register/ and https://pypi.org/manage/account/token/
+- Test: https://test.pypi.org/account/register/ and https://test.pypi.org/manage/account/token/
 
-## Pre-release Checklist
+Create a token for each. The first publish for a project has to use an account-scoped token, because
+a project-scoped token cannot be created until the project exists.
 
-- [ ] Update version in `pocketllm/__init__.py` and `pyproject.toml`
-- [ ] Update `CHANGELOG.md` with release notes
-- [ ] Run tests: `python -m pytest tests/test_install_smoke.py`
-- [ ] Update README.md if needed
-- [ ] Commit all changes: `git commit -m "Prepare v0.x.x release"`
-- [ ] Create git tag: `git tag v0.x.x`
+### 2. `~/.pypirc`
 
-## Build the Distribution
+```ini
+[distutils]
+index-servers =
+    pypi
+    testpypi
+
+[pypi]
+username = __token__
+password = pypi-AgE...your-production-token-here
+
+[testpypi]
+repository = https://test.pypi.org/legacy/
+username = __token__
+password = pypi-AgE...your-test-token-here
+```
+
+```bash
+chmod 600 ~/.pypirc
+```
+
+### 3. Build tools
+
+```bash
+pip install --upgrade build twine
+```
+
+### 4. Clean working directory
+
+```bash
+git status            # should be clean apart from the release commit itself
+git pull origin master
+```
+
+## Pre-release checklist
+
+- [ ] Bump the version in **both** `pyproject.toml` and `pocketllm/__init__.py`
+- [ ] Update `CHANGELOG.md` with the release notes
+- [ ] Update `README.md` if the release changes installation or requirements
+- [ ] Run the tests: `python -m pytest tests/test_install_smoke.py tests/test_native_build_preflight.py`
+- [ ] Confirm the two version strings agree:
+      `python -c "import pocketllm, tomllib, pathlib; print(pocketllm.__version__, tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])"`
+- [ ] Commit all changes: `git commit -m "Release v0.x.x"`
+- [ ] Create the tag: `git tag v0.x.x`
+
+## Build the distribution
 
 ### 1. Clean previous builds
+
 ```bash
 rm -rf dist/ build/ *.egg-info pocketllm.egg-info
 ```
 
-### 2. Build source distribution
+### 2. Build the source distribution
+
 ```bash
 python -m build --sdist --no-isolation
 ```
 
-**Important:** Use `--no-isolation` because:
+**`--no-isolation` is required:**
 - `setup.py` needs the active environment's PyTorch
 - CUDA extensions must compile against the host's CUDA toolkit
-- An isolated build environment may have version mismatches
+- An isolated build environment resolves a Torch that may not match that toolkit
 
-### 3. Verify the package
+### 3. Check the package
+
 ```bash
 twine check dist/*
 ```
 
-Expected output:
 ```
-Checking dist/pocketllm-0.1.0.tar.gz: PASSED
+Checking dist/pocketllm-0.x.x.tar.gz: PASSED
 ```
 
-### 4. Test installation locally (optional but recommended)
+### 4. Install the built sdist locally
+
 ```bash
-# Create a fresh virtual environment
 python -m venv /tmp/test-pocketllm
 source /tmp/test-pocketllm/bin/activate
 
-# Install from the built package
-pip install dist/pocketllm-0.1.0.tar.gz --no-build-isolation
+pip install dist/pocketllm-0.x.x.tar.gz --no-build-isolation
 
-# Run smoke test
 python -c "import pocketllm; print(pocketllm.__version__)"
+python tests/test_install_smoke.py
 
 deactivate
 ```
 
-## Upload to PyPI
+This is the only step that proves the artifact installs. It compiles CUDA extensions and the native
+C++ engine, so it needs a machine with a CUDA toolkit — a CI runner without one cannot do it.
 
-### Test PyPI (recommended first)
+## Upload
 
-1. Register at https://test.pypi.org/ (separate from production PyPI)
+### Step 1: Test PyPI
 
-2. Upload to Test PyPI:
-   ```bash
-   twine upload --repository testpypi dist/*
-   ```
+Uploading here is always the first upload of a release, without exception.
 
-3. Test installation from Test PyPI:
-   ```bash
-   pip install --index-url https://test.pypi.org/simple/ \
-       --extra-index-url https://pypi.org/simple/ \
-       pocketllm
-   ```
+```bash
+twine upload --repository testpypi dist/*
+```
 
-### Production PyPI
+### Step 2: Verify what Test PyPI actually serves
 
-**⚠️ Warning: Once uploaded to PyPI, a version cannot be deleted or re-uploaded.**
+Do not stop at a successful upload. The 0.1.0 release uploaded cleanly, passed `twine check`, and
+still shipped a distribution whose metadata claimed MIT while its rendered description said PolyForm
+Noncommercial — because the description is `README.md`, and `twine check` does not read it.
 
-1. Upload to production PyPI:
-   ```bash
-   twine upload dist/*
-   ```
+Query the index for the metadata it is serving:
 
-2. Verify at https://pypi.org/project/pocketllm/
+```bash
+python - <<'PY'
+import json, urllib.request
+version = "0.x.x"  # the version just uploaded
+with urllib.request.urlopen(f"https://test.pypi.org/pypi/pocketllm/{version}/json") as r:
+    info = json.load(r)["info"]
+print("version:   ", info["version"])
+print("license:   ", info["license"])
+print("rendered description mentions PolyForm:", "PolyForm" in (info.get("description") or ""))
+PY
+```
 
-3. Push git tags:
-   ```bash
-   git push origin master
-   git push origin v0.x.x
-   ```
+Expected: the version just uploaded, `license: MIT`, and `False`. The same check runs automatically as
+the "Verify the published metadata" step of the publish workflow.
+
+### Step 3: Install from Test PyPI
+
+```bash
+python -m venv /tmp/test-pocketllm
+source /tmp/test-pocketllm/bin/activate
+
+pip install torch                      # Test PyPI does not carry it
+pip install --index-url https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ \
+    pocketllm --no-build-isolation
+
+python -c "import pocketllm; print(pocketllm.__version__)"
+python -c "import pocketllm_cpp; print('C++ engine: OK')"
+python tests/test_install_smoke.py
+
+deactivate
+```
+
+### Step 4: Production PyPI
+
+**Once uploaded, a version cannot be deleted or replaced.** A mistake there is recoverable only by
+yanking the release and publishing the next patch version.
+
+```bash
+twine upload dist/*
+```
+
+Verify at https://pypi.org/project/pocketllm/ and re-run the metadata query above against
+`https://pypi.org/pypi/pocketllm/0.x.x/json`.
+
+## Automated publishing (GitHub Actions)
+
+`.github/workflows/publish-pypi.yml` runs the same sequence on a runner: build the sdist,
+`twine check`, upload to Test PyPI, verify the metadata Test PyPI serves, and only then optionally
+upload to production.
+
+It is `workflow_dispatch`-only and the production upload is gated on the `publish_production` input,
+which defaults to `no`. Leave it at `no` for a release candidate, inspect the verification step, and
+re-run with `yes` once the metadata is known good.
+
+Repository secrets the workflow needs:
+
+| Secret | Purpose |
+| --- | --- |
+| `TEST_PYPI_API_TOKEN` | Upload to Test PyPI |
+| `PYPI_API_TOKEN` | Upload to production PyPI |
+
+Until both exist the workflow fails at its upload step. The workflow cannot install-test the
+artifact: GitHub-hosted runners have no CUDA toolkit, and the sdist compiles CUDA extensions, so
+installation verification stays a local step.
 
 ## Post-release
 
-1. **Create GitHub release**
+1. **Push the tag and create the GitHub release**
+
    ```bash
+   git push origin master
+   git push origin v0.x.x
+
    gh release create v0.x.x \
        --title "PocketLLM v0.x.x" \
        --notes-file CHANGELOG.md \
        dist/pocketllm-0.x.x.tar.gz
    ```
 
-2. **Announce the release**
-   - Update project README badges
-   - Post on relevant forums/communities if appropriate
+2. **Bump the version for development**
 
-3. **Bump version for development**
-   - Update version to next dev version (e.g., `0.2.0.dev0`)
-   - Commit: `git commit -m "Bump version to 0.2.0.dev0"`
+   Set the next development version in `pyproject.toml` and `pocketllm/__init__.py`, then commit:
+
+   ```bash
+   git commit -m "Bump version to 0.x.y.dev0"
+   ```
+
+   Skipping this makes the next release indistinguishable from the one just published.
 
 ## Troubleshooting
 
-### Build fails with "ModuleNotFoundError: No module named 'torch'"
+### `ModuleNotFoundError: No module named 'torch'` during the build
 
-**Solution:** Use `--no-build-isolation`:
+Use `--no-build-isolation`:
+
 ```bash
 python -m build --sdist --no-isolation
 ```
 
 ### CUDA extension compilation fails during `pip install`
 
-**User should:**
-1. Check CUDA toolkit is installed: `nvcc --version`
+1. Check the toolkit: `nvcc --version`
 2. Install PyTorch first: `pip install torch`
-3. Install with: `pip install pocketllm --no-build-isolation`
+3. Install with `pip install pocketllm --no-build-isolation`
 
-### C++ engine build fails
+### Native C++ engine build fails
 
-**Common causes:**
-- Missing CMake: `pip install cmake` or `apt install cmake`
-- Missing pybind11: `pip install pybind11`
-- Missing NCCL: Install from NVIDIA or your package manager
+The build stops deliberately rather than continuing without `pocketllm_cpp`, because a silently
+missing native module lets `backend="auto"` fall back to Torch kernels with no error to explain the
+change in behaviour. The failure message names the missing prerequisite.
 
-**If C++ engine is not needed:**
+To install the PyTorch backend only:
+
 ```bash
 POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
 ```
 
 ### Build takes too long
 
-The full build (CUDA extensions + C++ engine) takes 5-15 minutes. This is normal for the first installation. Subsequent upgrades reuse cached builds when possible.
+The full build (CUDA extensions plus C++ engine) takes 5-15 minutes on a first install. Subsequent
+installs reuse cached builds where possible.
 
-## Version Numbering
+## Version numbering
 
 PocketLLM follows [Semantic Versioning](https://semver.org/):
 
-- **Major** (x.0.0): Breaking API changes
-- **Minor** (0.x.0): New features, backward compatible
-- **Patch** (0.0.x): Bug fixes, backward compatible
+- **Major** (`x.0.0`): breaking API changes
+- **Minor** (`0.x.0`): new features, backward compatible
+- **Patch** (`0.0.x`): bug fixes, backward compatible
 
-For pre-releases:
-- **Alpha**: `0.1.0a1` (early testing)
-- **Beta**: `0.1.0b1` (feature complete, testing)
-- **RC**: `0.1.0rc1` (release candidate)
-- **Dev**: `0.1.0.dev0` (development version)
+Pre-releases: `0.1.0a1` (alpha), `0.1.0b1` (beta), `0.1.0rc1` (release candidate), `0.1.0.dev0`
+(development).
 
-## Current Release Status
+## Known limitations of the published artifacts
 
-**Version:** 0.1.0  
-**Status:** Ready for first PyPI release  
-**License:** MIT  
-**Python:** 3.10, 3.11, 3.12  
-**Platforms:** Linux (CUDA), Linux (CPU-only)
-
-## Notes
-
-- **No pre-built wheels yet**: Users must compile extensions during installation
-- **CUDA versions**: Extensions compile against user's CUDA toolkit (11.8, 12.1, 12.4 tested)
-- **C++ engine**: Optional, requires `POCKETLLM_BUILD_CPP=1`
-- **Platform support**: Linux only (Ubuntu 22.04 tested, others should work)
-- **Windows/macOS**: Not tested, may need adjustments
+- **No pre-built wheels.** Users compile extensions during installation, so they need a CUDA toolkit
+  and 5-15 minutes.
+- **CUDA versions.** Extensions compile against the user's toolkit. 11.8, 12.1, and 12.4 are
+  exercised; anything else is untested.
+- **Platform.** Linux only (Ubuntu 22.04 tested). Windows and macOS are untested.
 
 Future improvements:
-- [ ] Add `cibuildwheel` for pre-compiled wheels (multiple CUDA versions × Python versions)
-- [ ] Add Windows support
-- [ ] Add macOS CPU-only support
+
+- [ ] `cibuildwheel` for pre-built wheels (CUDA version × Python version matrix)
+- [ ] Windows support
+- [ ] macOS CPU-only support
