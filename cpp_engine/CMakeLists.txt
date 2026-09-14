@@ -33,6 +33,8 @@ set(POCKET_STATIC_PIC ${POCKET_BUILD_PYTHON})
 # unchanged; see check_layering below, which enforces it.
 set(POCKET_CORE_SOURCES
     core/json_lite.cpp
+    core/json_constraint.cpp
+    core/token_constraint.cpp
     core/gguf_reader.cpp
     core/safetensors_reader.cpp
     core/safetensors_model.cpp
@@ -725,6 +727,14 @@ set_target_properties(test_qwen_dflash2_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_executable(test_sampler_ops tests/test_sampler_ops.cpp)
 target_link_libraries(test_sampler_ops PRIVATE pocket_cpp_core)
 set_target_properties(test_sampler_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_json_constraint tests/test_json_constraint.cpp)
+target_link_libraries(test_json_constraint PRIVATE pocket_core)
+set_target_properties(test_json_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_token_constraint tests/test_token_constraint.cpp)
+target_link_libraries(test_token_constraint PRIVATE pocket_core)
+set_target_properties(test_token_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE pocket_cpp_core)

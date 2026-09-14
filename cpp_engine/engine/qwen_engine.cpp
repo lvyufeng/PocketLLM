@@ -15,6 +15,7 @@
 #include "sampler_ops.hpp"
 #include "qwen_target_head.hpp"
 #include "tp_comm.hpp"
+#include "token_constraint.hpp"
 
 
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1095,7 +1097,18 @@ struct QwenEngine::Impl {
         prefix.snapshots.clear();
         prefix.cached_result = ForwardResult{};
         prefix.has_cached_result = false;
-        set_slot_position(slot_id, 0, engine_position);
+        // In multi-slot mode another live request may own the engine-wide
+        // position_ telemetry value. Reset the slot-local position without
+        // overwriting that value; single-session mode still updates it as
+        // before because it is the slot's authoritative position there.
+        if (batch_mode_enabled) {
+            if (slot_id >= 0 &&
+                slot_id < static_cast<int>(slot_positions.size())) {
+                slot_positions[static_cast<size_t>(slot_id)] = 0;
+            }
+        } else {
+            set_slot_position(slot_id, 0, engine_position);
+        }
     }
 
     // Phase 3.4: Element offsets into the per-slot recurrent state arenas. Both
@@ -2784,6 +2797,12 @@ struct QwenEngine::Impl {
                     options.temperature = p.temperature;
                     options.top_p = p.top_p;
                     options.top_k = p.top_k > 0 ? p.top_k : saved_top_k;
+                    // Normalize the row before the recursive one-row call. In
+                    // particular, top_k <= 0 means the engine default; passing
+                    // the unnormalized value back would recurse forever because
+                    // the call would keep seeing a row/default mismatch.
+                    BatchSamplingParams row_sampling = p;
+                    row_sampling.top_k = options.top_k;
                     // Build a 1-row view into the logit buffer for this row.
                     // The logit layout is [rows, local_vocab] contiguous, so
                     // row i starts at offset i * local_vocab floats.
@@ -2794,7 +2813,8 @@ struct QwenEngine::Impl {
                     row_logits.nbytes = static_cast<size_t>(local_vocab) * sizeof(float);
                     row_logits.shape = {1, static_cast<uint64_t>(local_vocab)};
                     QwenVerifyBatch row_result = sample_tokens_for(
-                        row_logits, 1, local_vocab, vocab_start, position_after);
+                        row_logits, 1, local_vocab, vocab_start, position_after,
+                        &row_sampling);
                     combined.top_tokens[static_cast<size_t>(row)] = row_result.top_tokens[0];
                     combined.top_logits[static_cast<size_t>(row)] = row_result.top_logits[0];
                     combined.local_logits[static_cast<size_t>(row)] = row_result.local_logits[0];
@@ -2824,6 +2844,46 @@ struct QwenEngine::Impl {
         check_device(memcpy_h2d(sample_uniforms.data, uniforms,
                                 static_cast<size_t>(rows) * sizeof(float)),
                      "Qwen sampling uniform upload");
+
+        // Apply token constraints (structured outputs) by masking logits on host.
+        // For each constrained row: D2H logits, set rejected tokens to -inf, H2D back.
+        // Under TP each rank masks its own vocab shard identically (mask is a function
+        // of global token id), so no new collective is needed. This is a host-side
+        // implementation; a device bitmask kernel would be faster but requires backend
+        // work on both CUDA and Ascend.
+        if (per_row_params != nullptr) {
+            std::vector<float> host_logits(local_vocab);
+            std::unique_ptr<bool[]> mask(new bool[static_cast<size_t>(local_vocab)]);
+            for (int row = 0; row < rows; ++row) {
+                const BatchSamplingParams& p = per_row_params[row];
+                if (p.constraint == nullptr) continue;
+
+                // Copy this row's logits to host
+                const size_t row_offset = static_cast<size_t>(row) * local_vocab;
+                const void* row_logits_device = static_cast<const uint8_t*>(local_logits.data) +
+                    row_offset * sizeof(float);
+                check_device(memcpy_d2h(host_logits.data(), row_logits_device,
+                                        local_vocab * sizeof(float)),
+                             "Qwen constraint logits D2H");
+
+                // Fill mask for this vocab shard
+                p.constraint->fill_mask(mask.get(), vocab_start, vocab_start + local_vocab);
+
+                // Mask rejected tokens to -inf
+                for (int i = 0; i < local_vocab; ++i) {
+                    if (!mask[i]) {
+                        host_logits[i] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+
+                // Copy masked logits back to device
+                check_device(memcpy_h2d(static_cast<uint8_t*>(local_logits.data) +
+                                        row_offset * sizeof(float),
+                                        host_logits.data(),
+                                        local_vocab * sizeof(float)),
+                             "Qwen constraint logits H2D");
+            }
+        }
 
         QwenVerifyBatch result;
         result.top_tokens.resize(static_cast<size_t>(rows));
@@ -3717,12 +3777,11 @@ struct QwenEngine::Impl {
                config.vocab_size / options.tp_world;
     }
 
-    ForwardResult run_chunk(const std::vector<int>& token_ids,
-                                int position_offset, int active_layers,
-                                bool compute_logits,
-                                QwenVerifyBatch* verify_batch = nullptr,
-                                const std::vector<int>* mtp_shifted_tokens = nullptr,
-                                int slot_id = 0) {
+    ForwardResult run_chunk(
+        const std::vector<int>& token_ids, int position_offset, int active_layers,
+        bool compute_logits, QwenVerifyBatch* verify_batch = nullptr,
+        const std::vector<int>* mtp_shifted_tokens = nullptr, int slot_id = 0,
+        const BatchSamplingParams* sampling = nullptr) {
         if (token_ids.empty()) {
             throw std::runtime_error("Qwen forward requires at least one token");
         }
@@ -3892,6 +3951,20 @@ struct QwenEngine::Impl {
                 result.top_token = verify_batch->top_tokens.back();
                 result.top_logit = verify_batch->top_logits.back();
                 result.checksum = verify_batch->local_logits.back();
+                result.position = position_offset + rows;
+                return result;
+            }
+            if (sampling != nullptr) {
+                QwenVerifyBatch sampled = top_tokens_for(
+                    hidden + static_cast<size_t>(rows - 1) * hidden_size, 1,
+                    &final_norm, position_offset + rows, sampling);
+                ForwardResult result;
+                result.layers = active_layers;
+                result.dim = hidden_size;
+                result.logits = static_cast<int>(config.vocab_size);
+                result.top_token = sampled.top_tokens[0];
+                result.top_logit = sampled.top_logits[0];
+                result.checksum = sampled.local_logits[0];
                 result.position = position_offset + rows;
                 return result;
             }
@@ -4299,6 +4372,14 @@ Capabilities QwenEngine::caps() const {
     c.fixed_top_p = options_.top_p;
     c.fixed_top_k = options_.top_k;
     c.fixed_seed = options_.sampling_seed;
+    // Structured outputs are applied in the CUDA device-sampling path below.
+    // Ascend currently uses the argmax path and therefore reports this capability
+    // as unavailable rather than silently returning unconstrained text.
+#ifdef POCKET_BACKEND_ASCEND
+    c.structured_outputs = false;
+#else
+    c.structured_outputs = c.per_request_sampling;
+#endif
     return c;
 }
 
@@ -4373,7 +4454,11 @@ int QwenEngine::kv_blocks_for_tokens(int tokens) const {
 
 int QwenEngine::allocate_slot(uint64_t request_id) {
     if (!impl_->batch_mode_enabled) {
-        // Single session mode: always use slot 0
+        // Single-session mode still records ownership: the scheduler may admit a
+        // new request only after the previous one is freed, and that boundary
+        // must clear recurrent/KV/prefix state before slot 0 is reused.
+        if (!impl_->request_to_slot.empty()) return -1;
+        impl_->request_to_slot[request_id] = 0;
         return 0;
     }
 
@@ -4388,21 +4473,21 @@ int QwenEngine::allocate_slot(uint64_t request_id) {
 }
 
 void QwenEngine::free_slot(uint64_t request_id) {
-    if (!impl_->batch_mode_enabled) {
-        return;  // Single session mode: nothing to free
-    }
-
     auto it = impl_->request_to_slot.find(request_id);
     if (it == impl_->request_to_slot.end()) {
         return;  // Request not found
     }
 
-    int slot_id = it->second;
+    const int slot_id = it->second;
     impl_->request_to_slot.erase(it);
-    impl_->free_slots.push_back(slot_id);
+    if (impl_->batch_mode_enabled) {
+        impl_->free_slots.push_back(slot_id);
+    }
     // Returning the slot returns its blocks. Under paging this is what makes
     // capacity dynamic: the next request draws from a pool the finished one has
-    // already given back, rather than inheriting a fixed reservation.
+    // already given back, rather than inheriting a fixed reservation. In
+    // single-session mode this also establishes a request boundary, so stale
+    // generated tokens cannot become a cached prefix for the next request.
     //
     // Under TP the workers hold their own recurrent and cache state, so they
     // have to clear the same slot too. Paging additionally requires releasing
@@ -4455,7 +4540,7 @@ BatchPrefillResult QwenEngine::batch_prefill(
         // Phase 3.3: Use req->slot_id to isolate KV cache
         PartialPrefillResult step =
             prefill_bounded(req->prompt_tokens, req->slot_id,
-                            std::max(0, token_budget));
+                            std::max(0, token_budget), &req->sampling);
 
         result.total_tokens += step.consumed_tokens - req->seq_len;
         req->seq_len = step.consumed_tokens;
@@ -4552,10 +4637,15 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
         if (options_.prefix_cache) {
             Impl::SlotPrefixState& prefix = impl_->prefix_for(slot);
             prefix.cached_prompt.push_back(tokens[index]);
+            const bool constrained = per_row_params != nullptr &&
+                (*per_row_params)[index].constraint != nullptr;
             prefix.cached_result = forward;
-            prefix.has_cached_result = true;
+            // Masked logits are valid for the active constrained request but
+            // must not become the exact-repeat result for an unconstrained one.
+            prefix.has_cached_result = !constrained;
             if (impl_->is_periodic_snapshot_position(position_after)) {
-                impl_->record_snapshot(position_after, &forward, true, slot);
+                impl_->record_snapshot(
+                    position_after, constrained ? nullptr : &forward, true, slot);
             }
         }
     }
@@ -4654,6 +4744,11 @@ BatchDecodeResult QwenEngine::batch_decode_step(
                     "Qwen speculative batch decode does not support per-request "
                     "sampling parameters");
             }
+            if (req->sampling.constraint != nullptr) {
+                throw std::runtime_error(
+                    "Qwen speculative batch decode does not support per-request "
+                    "token constraints");
+            }
         }
         std::vector<int> draft_counts;
         draft_counts.reserve(requests.size());
@@ -4737,11 +4832,14 @@ BatchDecodeResult QwenEngine::batch_decode_step(
             std::abs(req->sampling.top_p - options_.top_p) > 1.0e-5f ||
             req->sampling.top_k != options_.top_k ||
             req->sampling.seed != options_.sampling_seed;
+        if (req->sampling.constraint != nullptr) {
+            rows_differ_from_engine = true;
+        }
     }
     if (options_.tp_world > 1 && rows_differ_from_engine) {
         throw std::runtime_error(
             "Qwen TP batched decode requires per-request sampling to match "
-            "the engine options");
+            "the engine options (constraints are not supported under TP)");
     }
     const std::vector<BatchSamplingParams>* decode_params =
         options_.tp_world > 1 ? nullptr : &row_params;
@@ -4794,7 +4892,8 @@ PartialPrefillResult QwenEngine::prefill_partial(
 }
 
 PartialPrefillResult QwenEngine::prefill_bounded(
-    const std::vector<int>& token_ids, int slot_id, int max_tokens) {
+    const std::vector<int>& token_ids, int slot_id, int max_tokens,
+    const BatchSamplingParams* sampling) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
@@ -4817,10 +4916,11 @@ PartialPrefillResult QwenEngine::prefill_bounded(
     // cache is consulted only when this slot is fresh; its attached blocks and
     // restored recurrent state then become the slot-local live prefix.
     Impl::SlotPrefixState& prefix = impl_->prefix_for(slot_id);
+    const bool constrained = sampling != nullptr && sampling->constraint != nullptr;
     const int slot_position = impl_->slot_position(slot_id, position_);
     int start_position = 0;
     bool global_reused = false;
-    if (options_.prefix_cache && prefix.cached_prompt.empty() &&
+    if (!constrained && options_.prefix_cache && prefix.cached_prompt.empty() &&
         slot_position == 0) {
         const std::optional<Impl::GlobalPrefixMatch> global_match =
             impl_->try_global_prefix(token_ids, slot_id);
@@ -4840,6 +4940,11 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         }
     }
 
+    // A constraint must not reuse cached final logits, but the prompt KV and
+    // recurrent state remain valid when the new prompt strictly extends the
+    // materialized prefix. That safe prefix reuse matters for chunked prefill;
+    // only an exact constrained repeat is forced through a fresh final-token
+    // computation.
     bool can_reuse = !global_reused && options_.prefix_cache &&
         !prefix.cached_prompt.empty() && slot_position ==
             static_cast<int>(prefix.cached_prompt.size());
@@ -4850,11 +4955,27 @@ PartialPrefillResult QwenEngine::prefill_bounded(
             ++common;
         }
     }
+
+    if (constrained) {
+        // A strict cached-prefix extension can resume safely. Every other
+        // existing single-slot state may belong to a previous request (or may
+        // already contain generated tokens), so clear it before recomputing.
+        const bool safe_prefix_resume = can_reuse &&
+            common == prefix.cached_prompt.size() && common < token_ids.size();
+        if (!safe_prefix_resume &&
+            (slot_position != 0 || !prefix.cached_prompt.empty())) {
+            impl_->release_slot_paged_state(slot_id, position_);
+            start_position = 0;
+            common = 0;
+            can_reuse = false;
+        }
+    }
     prefix_stats_.matched_tokens = static_cast<int>(common);
 
     // Exact repeat: the cached final logits are already the requested result.
-    if ((global_reused || can_reuse) && common == token_ids.size() &&
-        token_ids.size() == prefix.cached_prompt.size() && prefix.has_cached_result) {
+    if (!constrained && (global_reused || can_reuse) &&
+        common == token_ids.size() && token_ids.size() == prefix.cached_prompt.size() &&
+        prefix.has_cached_result) {
         if (!global_reused) ++impl_->prefix_hits;
         prefix_stats_.hits = impl_->prefix_hits;
         prefix_stats_.misses = impl_->prefix_misses;
@@ -4871,7 +4992,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
     // visible to other requests. Drop the whole row and recompute from zero;
     // complete-block global reuse above remains the fast path, while this avoids
     // a partial-block device copy-on-write implementation in the prefill path.
-    if (impl_->global_prefix_enabled() && !global_reused &&
+    if (!constrained && impl_->global_prefix_enabled() && !global_reused &&
         !prefix.cached_prompt.empty() &&
         (!can_reuse || common != prefix.cached_prompt.size())) {
         impl_->release_paged_slot(slot_id);
@@ -4899,7 +5020,7 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         start_position = static_cast<int>(common);
         prefix_stats_.resume_source = "live";
         ++impl_->prefix_hits;
-    } else if (options_.prefix_cache && common > 0) {
+    } else if (!constrained && options_.prefix_cache && common > 0) {
         // For a branch or a shorter prompt, restore the deepest safe snapshot.
         // A request-boundary snapshot also carries the final-token result, so
         // an exact shorter-prefix request can finish without recomputation.
@@ -5014,19 +5135,25 @@ PartialPrefillResult QwenEngine::prefill_bounded(
                 // The last shifted input is the target token predicted by this
                 // final prompt row, so obtain its logits before priming MTP.
                 result = impl_->run_chunk(chunk, offset, active_layers_, true,
-                                          nullptr, nullptr, slot_id);
+                                          nullptr, nullptr, slot_id, sampling);
                 shifted.back() = result.top_token;
                 (void)impl_->prime_target_mtp(shifted, offset, slot_id);
             } else {
                 result = impl_->run_chunk(chunk, offset, active_layers_,
-                                          snapshot_result, nullptr, &shifted, slot_id);
+                                          snapshot_result, nullptr, &shifted, slot_id,
+                                          sampling);
             }
         } else {
             result = impl_->run_chunk(chunk, offset, active_layers_,
-                                      snapshot_result, nullptr, nullptr, slot_id);
+                                      snapshot_result, nullptr, nullptr, slot_id,
+                                      sampling);
         }
         if (periodic_snapshot || end == target_position) {
-            impl_->record_snapshot(end, &result, periodic_snapshot, slot_id);
+            // A constrained sampler changes only the returned token, not the
+            // recurrent/KV state. Do not cache its masked logits as a reusable
+            // unconstrained prompt result.
+            impl_->record_snapshot(
+                end, constrained ? nullptr : &result, periodic_snapshot, slot_id);
         }
         // Publish complete physical blocks as soon as their recurrent boundary
         // exists. This allows another request to share a system prompt that is
@@ -5034,7 +5161,9 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         // aligned with the block size.
         if (impl_->kv_paged() && end % impl_->paged_block_size() == 0) {
             impl_->publish_global_prefix(
-                token_ids, end, slot_id, &result, end == target_position);
+                token_ids, end, slot_id,
+                constrained ? nullptr : &result,
+                constrained ? false : end == target_position);
         }
 
         offset = end;
@@ -5059,13 +5188,17 @@ PartialPrefillResult QwenEngine::prefill_bounded(
         prefix.cached_result = result;
         // Interior logits predict the next prompt token, not the prompt's
         // continuation, so they must not satisfy a later exact-repeat hit.
-        prefix.has_cached_result = complete;
+        // A constrained result is sampled from a masked vocabulary and cannot
+        // be reused as the unconstrained next token for another request.
+        prefix.has_cached_result = complete && !constrained;
     } else {
         prefix.cached_prompt.clear();
         prefix.has_cached_result = false;
     }
-    impl_->publish_global_prefix(token_ids, budget_limit, slot_id,
-                                 &result, complete);
+    impl_->publish_global_prefix(
+        token_ids, budget_limit, slot_id,
+        constrained ? nullptr : &result,
+        constrained ? false : complete);
     prefix_stats_.reused_tokens = start_position;
     prefix_stats_.computed_tokens = budget_limit - start_position;
     prefix_stats_.snapshots = impl_->snapshot_count(slot_id);

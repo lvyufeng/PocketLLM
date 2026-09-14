@@ -1,5 +1,6 @@
 #include "batch_scheduler.hpp"
 #include "device_runtime.hpp"
+#include "token_constraint.hpp"
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -88,7 +89,8 @@ uint64_t BatchScheduler::submit_request(
     const std::vector<int>& prompt_tokens,
     const BatchSamplingParams& sampling,
     std::function<void(const SchedulerGenerationResult&)> callback,
-    TokenCallback on_token) {
+    TokenCallback on_token,
+    std::shared_ptr<TokenConstraint> constraint) {
 
     if (prompt_tokens.empty()) {
         return 0;  // Invalid request
@@ -100,6 +102,10 @@ uint64_t BatchScheduler::submit_request(
     req->request_id = request_id;
     req->prompt_tokens = prompt_tokens;
     req->sampling = sampling;
+    req->constraint = std::move(constraint);
+    // The scheduler owns the constraint for the entire request lifetime. Ignore
+    // any non-owning pointer copied in from a caller without an owner.
+    req->sampling.constraint = req->constraint ? req->constraint.get() : nullptr;
     req->callback = std::move(callback);
     req->token_callback = std::move(on_token);
     req->submit_time = std::chrono::steady_clock::now();
@@ -401,6 +407,23 @@ bool BatchScheduler::run_prefill_batch() {
                 req->last_token = result.results[i].top_token;
                 req->generated_tokens.push_back(req->last_token);
                 req->seq_len = req->prefilled_tokens;
+
+                // Apply token constraint if present
+                if (req->constraint) {
+                    if (!req->constraint->accept_token(req->last_token)) {
+                        req->error = "constraint violation";
+                        req->finished = true;
+                        continue;
+                    }
+                    if (req->constraint->is_complete()) {
+                        // The terminal grammar token is a real output token. Keep
+                        // it in the stream and distinguish grammar completion from
+                        // an ordinary stop token, which is intentionally hidden.
+                        req->finished = true;
+                        req->constraint_completed = true;
+                    }
+                }
+
                 // batch_prefill flags a prompt whose very first predicted token
                 // is a stop token; such a request must never reach the decode
                 // batch or be exposed to a streaming caller.
@@ -417,7 +440,8 @@ bool BatchScheduler::run_prefill_batch() {
                     static_cast<size_t>(req->sampling.max_new_tokens)) {
                     req->finished = true;
                 }
-                if (req->token_callback && !stopped) {
+                if (req->token_callback && req->error.empty() &&
+                    (!stopped || req->constraint_completed)) {
                     emitted.emplace_back(req, req->last_token);
                 }
 
@@ -578,6 +602,29 @@ bool BatchScheduler::run_decode_batch() {
                             req->sampling.stop_token_ids.end();
                     req->generated_tokens.push_back(token);
                     req->last_token = token;
+
+                    // Apply token constraint if present
+                    if (req->constraint) {
+                        if (!req->constraint->accept_token(token)) {
+                            req->error = "constraint violation";
+                            req->finished = true;
+                            stopped = true;
+                            break;
+                        }
+                        if (req->constraint->is_complete()) {
+                            // Emit the closing grammar token before ending the
+                            // request. It is not a regular stop token: clients
+                            // need the final `}`/`]` in both streaming and
+                            // non-streaming responses.
+                            req->finished = true;
+                            req->constraint_completed = true;
+                            if (req->token_callback) {
+                                emitted.emplace_back(req, token);
+                            }
+                            break;
+                        }
+                    }
+
                     if (token_stops) {
                         stopped = true;
                         break;
@@ -603,8 +650,9 @@ bool BatchScheduler::run_decode_batch() {
                 if (i < result.finished.size() && result.finished[i]) {
                     req->finished = true;
                 }
-                if (stopped || (i < result.hit_stop_token.size() &&
-                                result.hit_stop_token[i])) {
+                if (!req->constraint_completed &&
+                    (stopped || (i < result.hit_stop_token.size() &&
+                                 result.hit_stop_token[i]))) {
                     req->finished = true;
                     req->stopped_on_token = true;
                 }
@@ -737,6 +785,7 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     SchedulerGenerationResult result;
     result.request_id = req->request_id;
     result.generated_tokens = req->generated_tokens;
+    result.constraint_completed = req->constraint_completed;
     // Previously `finished ? "length" : "stop"`, which was backwards: `finished`
     // was only ever set by the length cap, so a normal completion reported
     // "length" and "stop" was reachable only via cancellation.
@@ -746,7 +795,9 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     } else if (req->cancelled) {
         result.finish_reason = "cancelled";
     } else {
-        result.finish_reason = req->stopped_on_token ? "stop" : "length";
+        result.finish_reason =
+            (req->constraint_completed || req->stopped_on_token)
+                ? "stop" : "length";
     }
     result.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
     result.completion_tokens = static_cast<int>(req->generated_tokens.size());

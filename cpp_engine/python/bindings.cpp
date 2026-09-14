@@ -555,6 +555,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("request_id", &SchedulerGenerationResult::request_id)
         .def_readwrite("generated_tokens", &SchedulerGenerationResult::generated_tokens)
         .def_readwrite("finish_reason", &SchedulerGenerationResult::finish_reason)
+        .def_readwrite("constraint_completed", &SchedulerGenerationResult::constraint_completed)
         .def_readwrite("prompt_tokens", &SchedulerGenerationResult::prompt_tokens)
         .def_readwrite("completion_tokens", &SchedulerGenerationResult::completion_tokens)
         .def_readwrite("proposed_drafts", &SchedulerGenerationResult::proposed_drafts)
