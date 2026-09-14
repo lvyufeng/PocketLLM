@@ -9,6 +9,7 @@ This directory contains model-specific support notes, reproducible benchmark def
 - [C++/CUDA engine notes](../cpp_engine/README.md)
 - [Migration: `dsv4` → `pocket`](migration/dsv4-to-pocket-rename.md) — breaking rename of the
   namespace, build targets, executable, and every `DSV4_*` environment variable
+- [PyPI release guide](PYPI_RELEASE.md) — the single source of truth for cutting a release
 
 ## Model guides
 
