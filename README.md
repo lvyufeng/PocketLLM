@@ -379,9 +379,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 ## License
 
-PocketLLM code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-
-Permitted uses include personal use, academic research, education, non-commercial benchmarking, and non-commercial deployment. Commercial use requires separate written permission from the copyright holder.
+PocketLLM is released under the [MIT License](LICENSE). You are free to use, modify, and distribute the code, including for commercial purposes, provided the copyright notice and permission notice are retained.
 
 Model weights, tokenizer files, CUDA, PyTorch, GGUF assets, and other third-party components are governed by their respective licenses. PocketLLM's code license does not grant additional rights to third-party model assets.
 
