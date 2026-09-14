@@ -189,11 +189,26 @@ inline bool qwen_hbm_read_probe(const uint16_t* d_source, uint16_t* d_sink, int 
 #endif
 }
 
+// Split the context across partitions, compute per-partition partial softmax
+// outputs, then reduce them. Ascend implements it as its own kernel pair.
+//
+// CUDA has no equivalent entry point and does not need one: the split-partial
+// decode for long contexts already lives in
+// qwen_gqa_decode_attention_f16_fused_cuda, which the engine selects by itself,
+// and that kernel derives its split count from qwen_gqa_decode_split_count()
+// rather than from the num_partitions threaded through here. The two geometries
+// are not interchangeable -- the caller sizes d_partials_scratch as
+// q_heads * num_partitions * (head_dim + 2), which is smaller than what the CUDA
+// kernel sizes for itself -- so this refuses instead of forwarding to a
+// different partition count. The only call site is Ascend-only.
 inline bool qwen_gqa_decode_attention_flashdec_f16(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_partials_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int num_partitions, void* stream = nullptr) {
 #ifdef POCKET_BACKEND_ASCEND
     return qwen_gqa_decode_attention_flashdec_f16_ascend(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
 #else
-    return qwen_gqa_decode_attention_flashdec_f16_cuda(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
+    (void)d_q_fp16; (void)d_k_cache_fp16; (void)d_v_cache_fp16; (void)d_out_fp16;
+    (void)d_partials_scratch; (void)q_heads; (void)kv_heads; (void)head_dim;
+    (void)context_len; (void)max_context; (void)num_partitions; (void)stream;
+    return false;
 #endif
 }
 

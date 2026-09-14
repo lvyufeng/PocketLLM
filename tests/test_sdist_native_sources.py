@@ -1,4 +1,4 @@
-"""The sdist must be able to configure CMake.
+"""The sdist must be able to configure CMake, and then compile what it configured.
 
 Installing from PyPI builds the native engine out of the sdist, so every source
 path `cpp_engine/CMakeLists.txt` names must be inside the archive that
@@ -13,6 +13,12 @@ tree holds `tools/` and `tests/`: a git checkout keeps building the developer
 tools and tests, an unpacked sdist does not declare them at all. These tests pin
 both halves of that -- the guarded targets are allowed to be unshipped but must
 exist, and everything outside the guard must be shipped.
+
+Naming sources in a target is not the only way the build reads a file. Scanning the
+CMake sources misses anything pulled in by `#include`, which is how
+`qwen_layer_components.inl` and `iq1_grid.inc` were left out of the archive: the
+sdist configured without complaint and then failed to compile. That half is checked
+separately, against the directives themselves.
 
 `MANIFEST.in` is checked rather than the built archive because that is the input
 the release actually controls; the archive itself is verified by the install step
@@ -44,6 +50,31 @@ KNOWN_DIRECTIVES = {"include", "recursive-include", "prune", "exclude", "global-
 
 TARGET_RE = re.compile(r"^\s*(add_executable|add_library|pybind11_add_module)\(([^)]*)\)", re.MULTILINE)
 SOURCE_SUFFIXES = (".cpp", ".cu", ".cuh", ".cc", ".h", ".hpp")
+
+# Files the compiler reads but that no CMake target names as a source: `.inl` and
+# `.inc` are pulled in by a `#include` instead. They were the second half of the
+# same packaging defect -- `qwen_engine.cpp` includes `qwen_layer_components.inl`
+# and `iq1_ops.cu` includes `iq1_grid.inc`, and MANIFEST.in shipped neither, so the
+# sdist configured cleanly and then failed to compile. `_sources()` cannot see
+# them, so `test_manifest_ships_what_the_engine_sources_include` reads the
+# directives out of the files that do reach the archive.
+QUOTED_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"', re.MULTILINE)
+COMPILED_SUFFIXES = SOURCE_SUFFIXES + (".inl", ".inc")
+
+# Include directories the native targets add that live inside the repository.
+# POCKET_BACKEND_INCLUDES adds only directories outside cpp_engine/ (NCCL, CANN),
+# so a quoted include that resolves inside the tree resolves through one of these
+# or through the includer's own directory. One that resolves nowhere is an
+# external or compiler-generated header -- the AscendC `aclrtlaunch_*.h` family
+# and `kernel_operator.h` -- and is not this test's business.
+IN_REPO_INCLUDE_DIRS = ("include", "core", "third_party", "engine", "backends/api")
+
+# Floors that fail the file rather than pass it silently if a regex above stops
+# matching. The shipped tree currently holds 108 such sources with 214 quoted
+# include directives between them, 196 of which resolve inside the repository;
+# both floors sit comfortably below that and well above zero.
+MIN_INCLUDES_SCANNED = 150
+MIN_INCLUDES_RESOLVED = 130
 
 # The only unguarded targets with a literal source file. Every other target takes a
 # `${..._SOURCES}` variable, so these two are what catches the parser drifting out
@@ -144,6 +175,93 @@ def _shipped(path: str) -> bool:
         if any(fnmatch.fnmatch(name, pattern) for pattern in patterns):
             return True
     return False
+
+
+def _engine_files() -> list[Path]:
+    """Every file under cpp_engine/ that is not part of a build tree."""
+    return [
+        path
+        for path in sorted((ROOT / "cpp_engine").rglob("*"))
+        if path.is_file() and not any(part.startswith("build") for part in path.parts)
+    ]
+
+
+def _resolve_include(includer: Path, name: str) -> list[str]:
+    """Shipped-candidate paths a quoted `#include` could name, as sdist paths.
+
+    Returns every repository file the compiler could reach for `name` -- the
+    includer's own directory first, then the include directories the native
+    targets add -- so an ambiguous name is compared on all its candidates rather
+    than on whichever the filesystem happened to yield. Empty means the header is
+    external or generated, which is not a packaging question.
+    """
+    bases = [includer.parent] + [
+        ROOT / "cpp_engine" / directory for directory in IN_REPO_INCLUDE_DIRS
+    ]
+    found = []
+    for base in bases:
+        candidate = (base / name).resolve()
+        if candidate.is_file() and candidate.is_relative_to(ROOT):
+            shipped = candidate.relative_to(ROOT).as_posix()
+            if shipped not in found:
+                found.append(shipped)
+    return found
+
+
+def test_manifest_ships_what_the_engine_sources_include() -> None:
+    """A shipped source that #includes a file the archive lacks does not compile.
+
+    This is the check the CMake-source test cannot make: `qwen_layer_components.inl`
+    and `iq1_grid.inc` belong to no target, so nothing declared them and the sdist
+    shipped neither. Scanned over the shipped files only, because those are what an
+    install compiles.
+    """
+    includers = [
+        path for path in _engine_files() if path.suffix in COMPILED_SUFFIXES
+    ]
+    shipped = {
+        path.relative_to(ROOT).as_posix(): path
+        for path in includers
+        if _shipped(path.relative_to(ROOT).as_posix())
+    }
+    assert len(shipped) >= 100, f"only {len(shipped)} shipped sources found to scan"
+
+    scanned = 0
+    resolved = 0
+    unresolved: set[str] = set()
+    missing: list[str] = []
+    for relative, path in sorted(shipped.items()):
+        for name in QUOTED_INCLUDE.findall(path.read_text(errors="replace")):
+            scanned += 1
+            candidates = _resolve_include(path, name)
+            if not candidates:
+                unresolved.add(name)
+                continue
+            resolved += 1
+            for candidate in candidates:
+                if candidate not in shipped:
+                    missing.append(f"{relative} -> {candidate}")
+
+    assert scanned >= MIN_INCLUDES_SCANNED, (
+        f"only {scanned} quoted includes found across {len(shipped)} shipped sources; the scanner "
+        "has probably drifted and is no longer testing anything"
+    )
+    assert resolved >= MIN_INCLUDES_RESOLVED, (
+        f"only {resolved} of {scanned} quoted includes resolved inside the repository; the include "
+        "directory list no longer matches what the native targets add"
+    )
+    assert not missing, (
+        f"{len(missing)} quoted include(s) resolve to a file MANIFEST.in does not ship, so the "
+        "sdist installs and then fails to compile:\n  "
+        + "\n  ".join(sorted(set(missing)))
+        + "\nAdd the extension to the recursive-include lines in MANIFEST.in."
+    )
+    # Not an assertion about which headers may be external -- just a floor, so a
+    # resolution regression that makes everything "unresolved" is visible.
+    assert len(unresolved) < scanned // 4, (
+        f"{len(unresolved)} of {scanned} quoted includes resolved nowhere: "
+        + ", ".join(sorted(unresolved)[:10])
+    )
 
 
 def test_the_guard_exists() -> None:

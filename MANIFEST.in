@@ -7,15 +7,19 @@ include requirements.txt
 recursive-include src/csrc *.cpp *.cu *.cuh *.h *.hpp
 
 # C++ engine sources, needed for an sdist to build the optional native module
-# under POCKETLLM_BUILD_CPP=1.
+# under POCKETLLM_BUILD_CPP=1. The extension list is the same for every subtree
+# on purpose: which directory happens to hold a .inl or a .inc today is not a
+# property worth re-deriving here, and a pattern that is too broad ships nothing
+# extra while a pattern that is too narrow ships a tree that cannot compile.
 include cpp_engine/CMakeLists.txt
+include cpp_engine/README.md
 recursive-include cpp_engine/cmake *.cmake
-recursive-include cpp_engine/backends *.cpp *.cu *.cuh *.h *.hpp *.txt *.cmake
-recursive-include cpp_engine/core *.cpp *.h *.hpp
-recursive-include cpp_engine/engine *.cpp *.h *.hpp
-recursive-include cpp_engine/include *.h *.hpp
-recursive-include cpp_engine/python *.cpp
-recursive-include cpp_engine/third_party *.cpp *.h *.hpp
+recursive-include cpp_engine/backends *.cpp *.cu *.cuh *.h *.hpp *.inl *.inc *.txt *.cmake
+recursive-include cpp_engine/core *.cpp *.h *.hpp *.inl *.inc
+recursive-include cpp_engine/engine *.cpp *.h *.hpp *.inl *.inc
+recursive-include cpp_engine/include *.h *.hpp *.inl *.inc
+recursive-include cpp_engine/python *.cpp *.inl *.inc
+recursive-include cpp_engine/third_party *.cpp *.h *.hpp *.inl *.inc
 
 # Build trees are environment-specific and are already git-ignored.
 prune cpp_engine/build
