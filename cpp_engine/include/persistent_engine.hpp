@@ -18,6 +18,15 @@ struct SamplingParams {
     uint64_t seed = 0;
 };
 
+// One independent row for a multiplexed decode step. Rows must use distinct
+// slots, but their positions may differ because requests progress independently.
+struct PersistentBatchRequest {
+    int last_token = 0;
+    int position = 0;
+    int slot_id = -1;
+    SamplingParams sampling;
+};
+
 // Persistent inference engine that owns SafeForwardContext (weights, resident
 // device caches, NCCL handle, FP4 host pinned buffers) for the full lifetime
 // of a server process. Lets multiple requests reuse all heavy resident state.
@@ -28,24 +37,46 @@ public:
     PersistentEngine(const std::string& ckpt_dir,
                      const ForwardSmokeOptions& opts,
                      int layer_count,
-                     int max_context);
+                     int max_context,
+                     int max_slots = 1);
     ~PersistentEngine();
 
     PersistentEngine(const PersistentEngine&) = delete;
     PersistentEngine& operator=(const PersistentEngine&) = delete;
 
-    // Clear KV / indexer caches and reset internal position counter. Cheap.
+    // Clear every request slot and reset all request-local state. This is kept
+    // for callers that own the engine directly; multiplexed callers should use
+    // reset_slot() so active requests are not disturbed.
     void reset_session();
+
+    // Clear one request slot, including its KV, recurrent compressor and
+    // request-local sampling state. Other active slots are left untouched.
+    void reset_slot(int slot_id);
+    void claim_slot(int slot_id, uint64_t request_id);
+
+    int max_slots() const;
 
     // Run prefill on token_ids (which must include the prompt's last token).
     // Returns the sampled token id for the next position (rank 0 valid; on
     // worker ranks the return value is the rank-local argmax, which the
-    // server should discard).
+    // server should discard). The overload with an explicit slot is the
+    // multiplexed entry point; the legacy overload uses slot 0.
     int prefill(const std::vector<int>& token_ids, const SamplingParams& sp);
+    int prefill(const std::vector<int>& token_ids, const SamplingParams& sp,
+                int slot_id);
 
     // Run one decode step using `last_token` as the input embedding at
     // position `position`. Returns the sampled next token (rank 0 valid).
+    // The overload with an explicit slot is the multiplexed entry point.
     int decode_step(int last_token, int position, const SamplingParams& sp);
+    int decode_step(int last_token, int position, const SamplingParams& sp,
+                    int slot_id);
+
+    // Run independent request rows through one batched continuation forward.
+    // Sampling and RNG state remain row-local. This is the true multi-slot
+    // decode path used by PersistentEngineAdapter.
+    std::vector<int> batch_decode_step(
+        const std::vector<PersistentBatchRequest>& requests);
 
     // Speculative-decode verify: forward `draft_tokens` starting at
     // `start_position` and return what the target model samples at each one, so
@@ -189,9 +220,12 @@ public:
         PrimeDraftKV = 7,
         BatchVerify = 8,
         FinalizeBatchVerify = 9,
+        BatchDecode = 10,
     };
     void worker_command_prefill(const std::vector<int>& token_ids);
     void worker_command_decode(int32_t last_token, int32_t position);
+    void worker_command_batch_decode(
+        const std::vector<PersistentBatchRequest>& requests);
     void worker_command_reset();
     void worker_command_shutdown();
     void worker_command_verify(const std::vector<int>& block, int32_t start_position);
