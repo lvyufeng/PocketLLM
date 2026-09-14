@@ -7,7 +7,7 @@
 requires = [
     "setuptools>=68",
     "wheel",
-    "pybind11>=2.12",
+    "pybind11>=2.10",
     "cmake>=3.18",
 ]
 build-backend = "setuptools.build_meta"
@@ -15,25 +15,63 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pocketllm"
 version = "0.1.0"
-description = "Inference engine for large language models on older accelerators"
+description = "Inference engine for large language models on consumer GPUs with deep optimization for older hardware"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = { text = "MIT" }
+authors = [
+    { name = "lvyufeng" }
+]
+keywords = [
+    "llm",
+    "inference",
+    "cuda",
+    "gguf",
+    "quantization",
+    "deepseek",
+    "qwen",
+    "fp4",
+    "fp8",
+    "tensor-parallel"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
-    "torch>=2.0",
+    "torch>=2.0,<2.7",
     "transformers>=4.40",
     "safetensors>=0.4",
     "tqdm>=4.66",
     "setuptools>=68",
     "ninja>=1.11",
-    "triton>=2.0",
+    "pybind11>=2.10",
+    "cmake>=3.18",
 ]
+
+[project.optional-dependencies]
+triton = ["triton>=2.0"]
+minimal = []  # PyTorch-only, no C++ engine (set POCKETLLM_BUILD_CPP=0)
+all = ["pocketllm[triton]"]
 
 [project.scripts]
 pocketllm = "pocketllm.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/lvyufeng/PocketLLM"
+Documentation = "https://github.com/lvyufeng/PocketLLM/tree/master/docs"
+Repository = "https://github.com/lvyufeng/PocketLLM"
+Issues = "https://github.com/lvyufeng/PocketLLM/issues"
+Changelog = "https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md"
 
 # Packages are resolved in setup.py via find_packages() so the list cannot drift
 # from the tree the way a hand-maintained literal did.
