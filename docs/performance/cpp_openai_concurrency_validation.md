@@ -20,7 +20,10 @@ The validated path is:
 The following remain outside this acceptance result:
 
 - TP2 automatic supervision (tracked in #159)
-- DeepSeek-V4/PersistentEngine multi-slot execution
+- DeepSeek-V4/PersistentEngine multi-slot execution. Its serial baseline on
+  DeepSeek-V4-Flash-0731 is recorded in
+  [deepseek_v4_serial_baseline.md](deepseek_v4_serial_baseline.md); the
+  multi-slot execution itself is still open.
 - MTP, DSpark, and DFlash2 batched decode
 - Ascend batched decode
 - FP8/TurboQuant batched KV decode

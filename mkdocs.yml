@@ -128,6 +128,7 @@ nav:
       - Qwen KV cache at 65K: performance/qwen_kv_cache_65k_tg512.md
       - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
       - Ascend 910A attention: performance/ascend_attention_optimization.md
+      - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
   - Architecture:
       - Overview: architecture/index.md
       - Backend unification design: architecture/backend_unification_design.md
