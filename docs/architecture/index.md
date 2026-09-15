@@ -1,0 +1,26 @@
+# Architecture
+
+How PocketLLM is put together, and how it compares to the serving stacks it is
+usually measured against. Two things are worth knowing before reading:
+
+- The three design documents — [Backend unification design](backend_unification_design.md),
+  [PocketLLM refactor analysis](pocketllm_refactor_analysis_2026_09.md) and the
+  [cpp_engine multi-backend plan](cpp_engine_multi_backend_plan.md) — are three
+  drafts of the same proposal at different points in time. Where they disagree,
+  the newest one wins; none of them describes work that is fully complete.
+- [cpp_engine vs vLLM/SGLang](vllm_sglang_comparison.md) is a pre-Phase-1 baseline.
+  For the current comparison read
+  [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md).
+
+| Document | What it covers |
+| --- | --- |
+| [Backend unification design](backend_unification_design.md) | The original proposal for one engine over swappable device backends. |
+| [cpp_engine multi-backend refactor plan](cpp_engine_multi_backend_plan.md) | The refactor plan that followed it: `core/` / `engine/` / `backends/` layering without giving up per-hardware kernels. |
+| [PocketLLM refactor analysis (2026-09)](pocketllm_refactor_analysis_2026_09.md) | A vLLM/SGLang comparison that motivates the dual-backend design, against master `e59d5d3`. *(Chinese)* |
+| [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) | What is worth building for 2080 Ti (SM75) and Ascend 910A, and what is not. *(Chinese)* |
+| [PocketLLM vs vLLM vs SGLang architecture analysis](vllm_sglang_architecture_analysis.md) | The current comparison: scheduling, paged KV, batching, and serving surface. *(Chinese)* |
+| [cpp_engine vs vLLM/SGLang comparison](vllm_sglang_comparison.md) | The earlier comparison, retained as the pre-Phase-1 baseline. |
+
+The invariants these designs exist to protect are stated in the repository's
+`CLAUDE.md`: kernels stay behind the C ABI, and backend selection happens at
+configure time rather than in shared code.

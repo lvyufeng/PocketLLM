@@ -3,6 +3,7 @@
 [![PyPI version](https://badge.fury.io/py/pocketllm.svg)](https://pypi.org/project/pocketllm/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-lvyufeng.github.io%2FPocketLLM-blue.svg)](https://lvyufeng.github.io/PocketLLM/)
 
 [中文](README_CN.md) | English
 
@@ -368,7 +369,12 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 ## Documentation
 
+The documentation is published at **<https://lvyufeng.github.io/PocketLLM/>**, built from the
+`docs/` tree in this repository. It has full-text search, per-topic navigation, and the same
+content as the files below.
+
 - [Documentation index](docs/README.md)
+- [Getting started](docs/getting-started.md)
 - [Model support matrix](docs/models/README.md)
 - [Benchmarking and reporting rules](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)

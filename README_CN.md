@@ -188,7 +188,11 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 ## 文档
 
+文档站点已发布在 **<https://lvyufeng.github.io/PocketLLM/>**，由本仓库的 `docs/` 目录构建，
+支持全文搜索和分主题导航，内容与下面的文件一致。
+
 - [文档总览](docs/README.md)
+- [快速开始](docs/getting-started.md)
 - [模型支持矩阵](docs/models/README.md)
 - [Benchmark 口径](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)

@@ -24,7 +24,7 @@ This applies to commit messages, code comments, docstrings, and all `.md` files.
 | `src/` | Python/PyTorch implementation and kernel library. |
 | `pocketllm/` | The installed package: CLI, HTTP server, supervisor. Imports `pocketllm_cpp` when the native engine was built. |
 | `tests/` | pytest suite — see **Testing** below. |
-| `docs/` | Model guides, benchmark definitions, release procedure. |
+| `docs/` | Model guides, benchmark definitions, release procedure. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>. |
 
 Two invariants the layout exists to protect:
 
@@ -148,5 +148,6 @@ python -m pytest tests/ -q
   fix.
 - Modules that need a GPU, a real checkpoint, or a built `pocketllm_cpp` skip themselves via
   `pytest.importorskip`. A skip is not a pass.
-- **CI runs no tests.** `.github/workflows/publish-pypi.yml` is the only workflow, and it only
-  builds and uploads a release.
+- **CI runs no tests.** `.github/workflows/publish-pypi.yml` builds and uploads a release, and
+  `.github/workflows/pages.yml` builds the documentation site with `mkdocs build --strict`. No
+  workflow runs the pytest suite.
