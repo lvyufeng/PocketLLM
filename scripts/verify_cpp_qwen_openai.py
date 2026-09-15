@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import importlib
 import json
 import math
 import os
@@ -1004,6 +1005,335 @@ def validate_tool_calls(base_url: str, model_name: str, timeout: float) -> None:
     )
 
 
+def weather_result(arguments: dict[str, Any]) -> str:
+    """A stand-in tool result, in the shape a client puts in a `role: "tool"` message.
+
+    It echoes the arguments the model asked with so the final answer can be
+    compared against the call that produced it.
+    """
+    return json.dumps(
+        {
+            "city": arguments.get("city", "Paris"),
+            "days": arguments.get("days", 3),
+            "forecast": "sunny, 21C daytime, 11C overnight",
+        },
+        ensure_ascii=False,
+    )
+
+
+def validate_multi_turn_tool_calls(base_url: str, model_name: str, timeout: float) -> None:
+    """Drives a complete round trip: call, tool result, final answer.
+
+    This is what #155's acceptance ("a LangChain agent can call a function and
+    return") actually exercises, and what the single-turn check above cannot see:
+    the assistant message goes back with the `content: null` and `tool_calls` the
+    server itself produced, followed by a `role: "tool"` reply keyed by that call's
+    id, so the chat template has to render history it did not author.
+
+    The phrasings are tried in order because the second turn's output belongs to
+    the model, not the server, and a single miss would otherwise read as a server
+    defect rather than as a model that answered obliquely.
+    """
+    attempts = (
+        "What is the weather in Paris for the next 3 days? Use the get_weather tool.",
+        "Call get_weather with city=Paris and days=3, then tell me the forecast.",
+        "Use the tool named get_weather for Paris, 3 days out, and summarize it.",
+    )
+    missed: list[str] = []
+
+    for prompt in attempts:
+        first = http_request(
+            base_url,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [WEATHER_TOOL],
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+            },
+            timeout=timeout,
+        )
+        require(
+            first.status == 200,
+            f"the first tool turn was not served: HTTP {first.status}: {first.text}",
+        )
+        first_body = first.json()
+        require(first_body.get("model") == model_name, "wrong model on the first tool turn")
+        first_choice = first_body["choices"][0]
+        calls = first_choice["message"].get("tool_calls")
+        if not calls:
+            missed.append(
+                f"{prompt!r} -> no call on the first turn: "
+                f"finish_reason={first_choice.get('finish_reason')!r} "
+                f"content={first_choice['message'].get('content', '')!r}"
+            )
+            continue
+        require(len(calls) == 1, f"the first tool turn returned {len(calls)} calls, expected one")
+        call = calls[0]
+        identifier = call.get("id")
+        require(
+            isinstance(identifier, str) and identifier,
+            "the first tool turn returned a call with no id to key the result on",
+        )
+        arguments = tool_call_arguments(call, "the first tool turn")
+
+        # Replayed exactly as a client holds it: no field dropped, no field added.
+        messages = [
+            {"role": "user", "content": prompt},
+            first_choice["message"],
+            {"role": "tool", "tool_call_id": identifier, "content": weather_result(arguments)},
+        ]
+        second = http_request(
+            base_url,
+            "/v1/chat/completions",
+            {
+                "messages": messages,
+                "tools": [WEATHER_TOOL],
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+            },
+            timeout=timeout,
+        )
+        require(
+            second.status == 200,
+            f"the second tool turn was not served: HTTP {second.status}: {second.text}",
+        )
+        second_body = second.json()
+        require(second_body.get("model") == model_name, "wrong model on the second tool turn")
+        second_choice = second_body["choices"][0]
+        second_message = second_choice["message"]
+        content = second_message.get("content") or ""
+        if second_message.get("tool_calls") or not content:
+            missed.append(
+                f"{prompt!r} -> no final answer on the second turn: "
+                f"finish_reason={second_choice.get('finish_reason')!r} "
+                f"tool_calls={second_message.get('tool_calls')!r} content={content!r}"
+            )
+            continue
+
+        # The result came back, so the completion is an ordinary answer: it ends on
+        # a stop and carries none of the call syntax the parser is supposed to lift
+        # out of the text.
+        require(
+            second_choice.get("finish_reason") == "stop",
+            f"a final answer finished with {second_choice.get('finish_reason')!r}",
+        )
+        require(
+            "<tool_call>" not in content and "</tool_call>" not in content,
+            f"the call syntax leaked into the final answer: {content!r}",
+        )
+        print(
+            f"[PASS] multi-turn tool calls: {identifier} replayed with its result, "
+            f"answered with {len(content)} characters of content"
+        )
+        return
+
+    raise AssertionError(
+        "no attempt completed a two-turn tool round trip; the replay of the "
+        "assistant message or its rendering into the template is at fault, not "
+        "the request.\n" + "\n".join(missed)
+    )
+
+
+# --- Published clients --------------------------------------------------------
+#
+# #155's acceptance criterion is "an OpenAI SDK client works unmodified", so the
+# checks below drive the same server through the real published clients instead of
+# through urllib. They are optional by design -- the script stays runnable on a
+# host that has neither -- but a client that did not run is reported as `[NOT RUN]`
+# and is not counted as a pass. `--require-tool-clients` promotes any not-run entry
+# to a failure, which is how a run record asserts the check actually happened.
+TOOL_CLIENT_RESULTS: dict[str, str] = {}
+
+
+def record_not_run(client: str, reason: str) -> None:
+    TOOL_CLIENT_RESULTS[client] = f"not run: {reason}"
+
+
+def import_client(client: str, modules: tuple[str, ...], install: str) -> list[Any] | None:
+    """Imports a client library, or records that the check could not run.
+
+    A missing package is deliberately neither a pass nor a failure: the caller
+    returns without asserting anything, and the result is visible in the summary.
+    """
+    try:
+        return [importlib.import_module(name) for name in modules]
+    except ImportError as exc:
+        print(f"[NOT RUN] {client}: {exc} (pip install {install})")
+        record_not_run(client, str(exc))
+        return None
+
+
+def enforce_tool_clients(required: bool) -> None:
+    """Turns `[NOT RUN]` into a failure when the caller asked for the full set."""
+    if not required:
+        return
+    skipped = sorted(client for client, status in TOOL_CLIENT_RESULTS.items() if status != "ran")
+    require(
+        not skipped,
+        "--require-tool-clients was set but these client checks did not run: "
+        + ", ".join(skipped),
+    )
+
+
+def validate_openai_sdk_tool_call(base_url: str, model_name: str, timeout: float) -> None:
+    """Drives a whole tool round trip through the real `openai` Python client.
+
+    The request is built the way the SDK's own documentation builds it: the
+    assistant message is handed back as the SDK's own object, the tool result is a
+    plain `role: "tool"` dict, and nothing goes through `extra_body`. That is what
+    "works unmodified" means, so a bypass here would test nothing.
+    """
+    imported = import_client("openai SDK", ("openai",), "openai")
+    if imported is None:
+        return
+    (openai,) = imported
+
+    client = openai.OpenAI(base_url=f"{base_url}/v1", api_key="dummy", timeout=timeout, max_retries=0)
+    models = client.models.list()
+    require(models.data, "the SDK's models.list() returned no models")
+    require(
+        models.data[0].id == model_name,
+        f"the SDK's models.list() reported {models.data[0].id!r}, expected {model_name!r}",
+    )
+
+    prompt = "What is the weather in Paris for the next 3 days? Use the get_weather tool."
+    first = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        tools=[WEATHER_TOOL],
+        max_tokens=128,
+        temperature=0.0,
+    )
+    require(first.model == model_name, "wrong model on the SDK's first turn")
+    message = first.choices[0].message
+    require(
+        message.tool_calls,
+        f"the SDK's first turn carried no tool call: content={message.content!r} "
+        f"finish_reason={first.choices[0].finish_reason!r}",
+    )
+    call = message.tool_calls[0]
+    require(
+        call.type == "function",
+        f"the SDK parsed the call as {call.type!r}, not as a function call",
+    )
+    require(
+        call.function.name == WEATHER_TOOL["function"]["name"],
+        f"the SDK parsed tool {call.function.name!r}",
+    )
+    require(
+        isinstance(call.function.arguments, str),
+        f"the SDK handed back arguments that are not a JSON string: {call.function.arguments!r}",
+    )
+    try:
+        arguments = json.loads(call.function.arguments)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"the SDK's arguments are not JSON: {call.function.arguments!r}"
+        ) from exc
+    require(isinstance(arguments, dict), "the SDK's arguments are not an object")
+
+    second = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "user", "content": prompt},
+            message,
+            {"role": "tool", "tool_call_id": call.id, "content": weather_result(arguments)},
+        ],
+        tools=[WEATHER_TOOL],
+        max_tokens=128,
+        temperature=0.0,
+    )
+    final = second.choices[0]
+    content = final.message.content or ""
+    require(
+        not final.message.tool_calls and content,
+        "the SDK got no final answer after the tool result: "
+        f"tool_calls={final.message.tool_calls!r} content={content!r}",
+    )
+    require(
+        final.finish_reason == "stop",
+        f"the SDK's final answer finished with {final.finish_reason!r}",
+    )
+    TOOL_CLIENT_RESULTS["openai SDK"] = "ran"
+    print(
+        f"[PASS] openai SDK {openai.__version__}: models.list(), tool call {call.id}, "
+        f"and a {len(content)}-character final answer"
+    )
+
+
+def validate_langchain_tool_call(base_url: str, model_name: str, timeout: float) -> None:
+    """Drives the round trip through `langchain_openai.ChatOpenAI` and `bind_tools`.
+
+    LangChain is the client #155 names by name, and it parses the call itself: the
+    arguments arrive as a dict in `AIMessage.tool_calls` rather than as a JSON
+    string, so this also checks that a real framework reading our response needs no
+    post-processing of its own.
+    """
+    imported = import_client(
+        "langchain",
+        ("langchain_openai", "langchain_core.tools", "langchain_core.messages"),
+        "langchain-openai",
+    )
+    if imported is None:
+        return
+    langchain_openai, tools_module, messages_module = imported
+
+    @tools_module.tool
+    def get_weather(city: str, days: int) -> str:
+        """Look up the weather forecast for a city."""
+        return weather_result({"city": city, "days": days})
+
+    llm = langchain_openai.ChatOpenAI(
+        model=model_name,
+        base_url=f"{base_url}/v1",
+        api_key="dummy",
+        temperature=0.0,
+        max_tokens=128,
+        timeout=timeout,
+        max_retries=0,
+    )
+    bound = llm.bind_tools([get_weather])
+
+    prompt = "What is the weather in Paris for the next 3 days? Use the get_weather tool."
+    first = bound.invoke([messages_module.HumanMessage(prompt)])
+    require(
+        first.tool_calls,
+        f"LangChain's first turn carried no tool call: content={first.content!r}",
+    )
+    call = first.tool_calls[0]
+    require(call["name"] == "get_weather", f"LangChain parsed tool {call['name']!r}")
+    require(
+        isinstance(call.get("args"), dict) and call["args"],
+        f"LangChain did not parse the arguments into a dict: {call.get('args')!r}",
+    )
+    require(call.get("id"), "LangChain's parsed call has no id to key the result on")
+
+    final = bound.invoke(
+        [
+            messages_module.HumanMessage(prompt),
+            first,
+            messages_module.ToolMessage(
+                content=weather_result(call["args"]), tool_call_id=call["id"]
+            ),
+        ]
+    )
+    require(
+        not final.tool_calls and final.content,
+        "LangChain got no final answer after the tool result: "
+        f"tool_calls={final.tool_calls!r} content={final.content!r}",
+    )
+    TOOL_CLIENT_RESULTS["langchain"] = "ran"
+    print(
+        f"[PASS] langchain {langchain_openai.__version__}: bind_tools -> ToolMessage -> "
+        f"a {len(final.content)}-character final answer"
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
     binary = pathlib.Path(args.binary).resolve()
@@ -1122,6 +1452,20 @@ def run(args: argparse.Namespace) -> int:
 
         validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
+        validate_multi_turn_tool_calls(
+            base_url, model_name, timeout=args.request_timeout_seconds + 30
+        )
+
+        validate_openai_sdk_tool_call(
+            base_url, model_name, timeout=args.request_timeout_seconds + 30
+        )
+
+        validate_langchain_tool_call(
+            base_url, model_name, timeout=args.request_timeout_seconds + 30
+        )
+
+        enforce_tool_clients(args.require_tool_clients)
+
         incompatible = http_request(
             base_url,
             "/v1/chat/completions",
@@ -1158,9 +1502,13 @@ def run(args: argparse.Namespace) -> int:
             f"prefill budget {args.prefill_token_budget}" in logs,
             "rank-0 log did not report the configured prefill budget",
         )
+        clients = ", ".join(
+            f"{client}={status}" for client, status in sorted(TOOL_CLIENT_RESULTS.items())
+        )
         print(
             f"[PASS] native Qwen OpenAI serving: tp={tp_world} model={model_name} "
-            f"log_dir={log_dir} concurrent_requests={len(concurrent_results)}"
+            f"log_dir={log_dir} concurrent_requests={len(concurrent_results)} "
+            f"tool_clients=[{clients}]"
         )
         return 0
     except Exception:
@@ -1196,6 +1544,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--startup-timeout", type=float, default=600.0)
     parser.add_argument("--log-dir", default=None, help="Keep rank logs in this directory")
+    parser.add_argument(
+        "--require-tool-clients",
+        action="store_true",
+        help=(
+            "Fail rather than report [NOT RUN] when the openai or langchain package "
+            "is missing, so a run record can assert the client checks executed"
+        ),
+    )
     return parser
 
 
