@@ -19,7 +19,8 @@ This applies to commit messages, code comments, docstrings, and all `.md` files.
 ## Documentation layout
 
 **New documents go into the existing topic directory. Do not add a file at the top level of
-`docs/`.** Only `docs/README.md` lives there.
+`docs/`.** The top level holds the two site entry points and nothing else — `docs/README.md`, which
+indexes the directories, and `docs/getting-started.md`, which the `mkdocs.yml` nav pins at that path.
 
 | Directory | What belongs in it |
 |---|---|
