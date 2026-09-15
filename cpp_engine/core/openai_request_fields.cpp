@@ -125,15 +125,28 @@ RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint en
 
     RequestFieldCheck check;
 
-    // How many completions come back. Every response emitter in the server
-    // writes a single-element `choices` array with a hardcoded index 0, so a
-    // request for more gets one and no indication that the rest are missing.
+    // How many completions come back. The server submits one scheduler request
+    // per choice, so any count the caller names is produced -- but a request for
+    // choices beyond kMaxChoices would put that many requests in the queue,
+    // which is a way to make one request cost the server an unbounded amount of
+    // memory, so the ceiling is refused rather than quietly honoured.
     const JsonValue* value = object_get(body, "n");
-    if (!is_default_number(value, 1.0)) {
-        return refuse("n", *value,
-                      "\"choices\" always holds exactly one entry and its index "
-                      "is always 0.",
-                      "Remove \"n\", or set it to 1 and read the single choice.");
+    if (!absent_or_null(value)) {
+        if (!value->is_number() || value->number() != std::floor(value->number())) {
+            return refuse("n", *value,
+                          "the number of choices is a whole number and this "
+                          "value is not one.",
+                          "Send \"n\" as an integer, or omit it for one choice.");
+        }
+        if (value->number() < 1.0 || value->number() > static_cast<double>(kMaxChoices)) {
+            std::ostringstream os;
+            os << "this server generates one request per choice and accepts at "
+               << "most " << kMaxChoices << " choices in a single request.";
+            return refuse("n", *value, os.str(),
+                          "Lower \"n\" to " + std::to_string(kMaxChoices) +
+                              " or less; a client that needs more can send the "
+                              "request again.");
+        }
     }
 
     // Client stop sequences are implemented -- matched over the decoded text,
@@ -281,6 +294,20 @@ RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint en
     // over nothing, which is the opposite failure from the one this function
     // exists to prevent.
     return check;
+}
+
+int requested_choices(const JsonObject& body) {
+    const JsonValue* value = object_get(body, "n");
+    if (value == nullptr || !value->is_number()) return 1;
+    const double requested = value->number();
+    // The same test the audit applies, so a caller that audited first gets its
+    // own value back and a caller that did not gets a request that generates one
+    // choice rather than a truncated count.
+    if (requested != std::floor(requested) || requested < 1.0 ||
+        requested > static_cast<double>(kMaxChoices)) {
+        return 1;
+    }
+    return static_cast<int>(requested);
 }
 
 int effective_max_tokens(const JsonObject& body, int fallback) {

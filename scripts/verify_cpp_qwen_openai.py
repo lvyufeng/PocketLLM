@@ -197,11 +197,13 @@ def chat_payload(text: str, max_tokens: int, *, stream: bool = False) -> dict[st
 # were at its default. Every case here is refused before tokenization, so the
 # whole check costs no generation.
 #
-# `stop` is implemented, so it is here only at a value of the wrong shape: a
-# number is not a stop sequence, and accepting it would leave a request that
-# never stops looking configured.
+# `n` and `stop` are implemented, so they are here only at a value that cannot be
+# served: a count below one or past the server's ceiling is not a number of
+# choices, a number is not a stop sequence, and accepting either would leave a
+# request that looks configured and is not.
 REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
-    ("n", 3),
+    ("n", 0),
+    ("n", 129),
     ("stop", 5),
     ("logprobs", True),
     ("top_logprobs", 5),
@@ -443,6 +445,135 @@ def validate_stop_sequences(base_url: str, model_name: str, timeout: float) -> N
     print("[PASS] stop sequences: the answer is cut at the first matching sequence")
 
 
+def choice_breakdown(
+    result: HttpResult, chat: bool, stream: bool
+) -> tuple[dict[int, str], dict[int, str], dict[str, Any] | None]:
+    """Per-choice text and finish reason, plus the usage block when there is one.
+
+    Unlike answer_and_finish this reads *every* entry of `choices`, which is what
+    a multi-choice response is made of, and keys the result by the index the
+    server reported rather than by position.
+    """
+    texts: dict[int, str] = {}
+    finishes: dict[int, str] = {}
+    if not stream:
+        body = result.json()
+        for choice in body["choices"]:
+            index = choice["index"]
+            texts[index] = choice["message"]["content"] if chat else choice["text"]
+            finishes[index] = choice["finish_reason"]
+        usage = body.get("usage")
+        return texts, finishes, usage if isinstance(usage, dict) else None
+    for event in sse_events(result):
+        for choice in event["choices"]:
+            index = choice["index"]
+            delta = choice.get("delta") or {}
+            piece = delta.get("content", "") if chat else choice.get("text", "")
+            texts[index] = texts.get(index, "") + piece
+            if choice.get("finish_reason") is not None:
+                finishes[index] = choice["finish_reason"]
+    return texts, finishes, None
+
+
+def validate_n_choices(base_url: str, model_name: str, timeout: float) -> None:
+    """Checks that "n" really produces n choices on both endpoints.
+
+    The acceptance engine samples greedily at engine-wide values, which is the
+    one configuration where n > 1 is served rather than refused, and that is what
+    makes the expected answer knowable: every choice has to repeat the greedy
+    answer a plain n = 1 request gives. Three choices that each match a separate
+    reference generation is the difference between three real generations and
+    one response with its index relabelled, and it is why the usage block is
+    checked against a number derived from the reference rather than a constant.
+    """
+    prompt = "List the numbers from 1 to 20, separated by commas."
+    max_tokens = 24
+    n = 3
+    indices = list(range(n))
+
+    for chat in (True, False):
+        endpoint = "/v1/chat/completions" if chat else "/v1/completions"
+        greedy: dict[str, Any] = (
+            chat_payload(prompt, max_tokens)
+            if chat
+            else {
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+            }
+        )
+
+        reference = http_request(base_url, endpoint, greedy, timeout=timeout)
+        reference_body = reference.json()
+        reference_text, reference_finish = answer_and_finish(reference, chat, False, model_name)
+        reference_usage = reference_body["usage"]
+        require(len(reference_text) >= 8, f"reference answer is too short: {reference_text!r}")
+
+        for stream in (False, True):
+            label = f"{'chat' if chat else 'completions'} {'stream' if stream else 'non-stream'} n={n}"
+            result = http_request(
+                base_url, endpoint, {**greedy, "n": n, "stream": stream}, timeout=timeout
+            )
+            require(result.status == 200, f"{label} failed: HTTP {result.status}: {result.text}")
+            texts, finishes, usage = choice_breakdown(result, chat, stream)
+            require(
+                sorted(texts) == indices,
+                f"{label} returned choices {sorted(texts)}, expected {n} indexed 0..{n - 1}",
+            )
+            for index in indices:
+                require(
+                    texts[index] == reference_text,
+                    f"{label} choice {index} returned {texts[index]!r}, expected the greedy "
+                    f"answer {reference_text!r}",
+                )
+                require(
+                    finishes.get(index) == reference_finish,
+                    f"{label} choice {index} reported finish_reason {finishes.get(index)!r}, "
+                    f"expected {reference_finish!r}",
+                )
+            if usage is None:
+                continue
+            # OpenAI counts the prompt once and the completion as the sum over
+            # choices, which for n greedy copies of the same answer is n times
+            # the single-choice count.
+            require(
+                usage.get("prompt_tokens") == reference_usage["prompt_tokens"],
+                f"{label} counted {usage.get('prompt_tokens')} prompt tokens, expected the "
+                f"reference's {reference_usage['prompt_tokens']} counted once",
+            )
+            expected_completion = reference_usage["completion_tokens"] * n
+            require(
+                usage.get("completion_tokens") == expected_completion,
+                f"{label} reported {usage.get('completion_tokens')} completion tokens, "
+                f"expected {n} x {reference_usage['completion_tokens']}",
+            )
+            require(
+                usage.get("total_tokens")
+                == usage.get("prompt_tokens") + usage.get("completion_tokens"),
+                f"{label} usage total does not equal prompt plus completion",
+            )
+
+    # A count the server cannot serve is refused before generation, naming the
+    # field, on both endpoints.
+    for endpoint, extra in (
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "inspected"}]}),
+        ("/v1/completions", {"prompt": "inspected"}),
+    ):
+        for value in (0, 129, 2.5):
+            result = http_request(
+                base_url, endpoint, {**extra, "max_tokens": 1, "n": value}, timeout=timeout
+            )
+            error = refusal_error(result, f"{endpoint} n={value!r}")
+            require(error.get("param") == "n", f"n={value!r} refusal named {error.get('param')!r}")
+
+    print(
+        f"[PASS] n choices: {n} indexed choices on both endpoints, greedy text and "
+        "summed usage"
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
     binary = pathlib.Path(args.binary).resolve()
@@ -554,6 +685,8 @@ def run(args: argparse.Namespace) -> int:
         validate_request_field_refusals(base_url, model_name, timeout=10.0)
 
         validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+
+        validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         incompatible = http_request(
             base_url,

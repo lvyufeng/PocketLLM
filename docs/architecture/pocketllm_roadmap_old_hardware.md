@@ -82,7 +82,8 @@
 - ✅ Streaming (SSE) 已支持
 - ❌ 缺失 tools/function calling
 - ❌ 缺失 logprobs
-- ❌ 缺失 multiple choices (n>1)
+- ✅ multiple choices (n>1) 已实现（2026-09-15）：native C++ server 为每个 choice 提交一个独立的
+  scheduler 请求，逐 choice 的 seed / grammar / KV，流式响应交错输出；上限 128
 - ❌ 缺失 JSON mode / structured output
 
 **为什么重要（老硬件视角）**：

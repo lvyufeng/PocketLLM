@@ -100,15 +100,43 @@ void test_accepts_defaults() {
     CHECK(audit_completions(R"({"best_of":null,"echo":null,"suffix":null})").ok);
 }
 
-void test_rejects_n() {
-    REFUSED(audit_chat(R"({"n":3})"), "n");
-    REFUSED(audit_chat(R"({"n":0})"), "n");
-    REFUSED(audit_chat(R"({"n":"3"})"), "n");
-    REFUSED(audit_completions(R"({"n":2})"), "n");
+// `n` moved from refused to implemented: the server runs one scheduler request
+// per choice and answers with one entry per choice, so what is left to refuse is
+// a count it cannot serve -- zero, a fraction, a non-number, or a count past the
+// request ceiling.
+void test_choices() {
     CHECK(audit_chat(R"({"n":1})").ok);
+    CHECK(audit_chat(R"({"n":2})").ok);
+    CHECK(audit_chat(R"({"n":3})").ok);
+    CHECK(audit_chat(R"({"n":128})").ok);
+    // A count written as a float is still a whole number, and SDKs send it that
+    // way when the field came from a float-typed variable.
+    CHECK(audit_chat(R"({"n":2.0})").ok);
+    CHECK(audit_chat(R"({"n":null})").ok);
+    CHECK(audit_completions(R"({"n":2})").ok);
 
-    // The refusal has to say how many were asked for.
-    CHECK(audit_chat(R"({"n":3})").requested == "3");
+    REFUSED(audit_chat(R"({"n":0})"), "n");
+    REFUSED(audit_chat(R"({"n":-1})"), "n");
+    REFUSED(audit_chat(R"({"n":1.5})"), "n");
+    REFUSED(audit_chat(R"({"n":"3"})"), "n");
+    REFUSED(audit_chat(R"({"n":true})"), "n");
+    REFUSED(audit_completions(R"({"n":129})"), "n");
+
+    // The refusal has to say how many were asked for, and to name the ceiling it
+    // applies rather than leaving the caller to find it.
+    CHECK(audit_chat(R"({"n":999})").requested == "999");
+    CHECK(audit_chat(R"({"n":999})").message.find(std::to_string(kMaxChoices)) !=
+          std::string::npos);
+
+    CHECK(requested_choices(object_of(R"({"n":3})")) == 3);
+    CHECK(requested_choices(object_of(R"({"n":1})")) == 1);
+    CHECK(requested_choices(object_of("{}")) == 1);
+    // A body the audit would have refused generates one choice rather than a
+    // truncated count.
+    CHECK(requested_choices(object_of(R"({"n":2.5})")) == 1);
+    CHECK(requested_choices(object_of(R"({"n":0})")) == 1);
+    CHECK(requested_choices(object_of(R"({"n":999})")) == 1);
+    CHECK(requested_choices(object_of(R"({"n":"3"})")) == 1);
 }
 
 // `stop` moved from refused to implemented, so what is left to refuse is a
@@ -246,7 +274,7 @@ void test_effective_max_tokens() {
 
 int main() {
     test_accepts_defaults();
-    test_rejects_n();
+    test_choices();
     test_rejects_stop();
     test_rejects_logprobs();
     test_rejects_penalties();
