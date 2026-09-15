@@ -505,9 +505,13 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
             py::gil_scoped_release release;
             engine.run_worker_loop();
         })
-        .def("worker_command_prefill", &PersistentEngine::worker_command_prefill)
-        .def("worker_command_decode", &PersistentEngine::worker_command_decode)
+        .def("worker_command_prefill", &PersistentEngine::worker_command_prefill,
+             py::arg("token_ids"), py::arg("slot_id") = 0)
+        .def("worker_command_decode", &PersistentEngine::worker_command_decode,
+             py::arg("last_token"), py::arg("position"), py::arg("slot_id") = 0)
         .def("worker_command_reset", &PersistentEngine::worker_command_reset)
+        .def("worker_command_reset_slot", &PersistentEngine::worker_command_reset_slot,
+             py::arg("slot_id"))
         .def("worker_command_shutdown", &PersistentEngine::worker_command_shutdown)
         .def("worker_command_verify", &PersistentEngine::worker_command_verify)
         .def("worker_command_batch_verify", &PersistentEngine::worker_command_batch_verify)

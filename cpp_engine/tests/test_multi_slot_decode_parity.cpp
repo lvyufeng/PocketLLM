@@ -30,31 +30,34 @@
 //   5. TP parity             -- deliberately NOT token equality across world
 //      sizes. Splitting the same projection across ranks changes the order its
 //      terms are summed in, so the logits move, and near a tie the argmax moves
-//      with them. Measured on this checkpoint (4 layers, 8 steps, prompt_len 6):
-//      tp1, tp2 and tp4 each reproduce themselves run to run, and each pair
-//      disagrees from token 1 or 2. The disagreement is a deterministic function
-//      of the world size, so it is a property of the path rather than a flake.
-//      What the test pins is therefore: the same protocol run at one world size
-//      repeats, and across world sizes a divergence passes only when each run
-//      still ranks the other's token somewhere in its own top-k. The margins are
-//      printed rather than thresholded, and they are not small -- at the one
-//      divergence measured, tp1 put its pick 2.12 logits above tp4's and tp4 put
-//      its own 1.01 above tp1's, which is a wider gap than an accumulation-order
-//      difference usually produces. Reading that as "a near tie, therefore fine"
-//      would be a guess; the test reports it as a ranked disagreement and the
-//      numbers are in the log for whoever looks next.
+//      with them. What the test pins is therefore: the same protocol run at one
+//      world size repeats, and across world sizes a divergence passes only when
+//      each run still ranks the other's token somewhere in its own top-k. The
+//      margins are printed rather than thresholded, because a threshold written
+//      here would be a guess about a checkpoint the test cannot see.
+//
+//      On this checkpoint (4 layers, 8 steps, prompt_len 6) the two world sizes
+//      now agree token for token, and that is a fix rather than a tightened
+//      assertion. The same protocol used to diverge at token 1: measured at tp1
+//      putting its pick 2.120203 logits above tp4's, and tp4 putting its own
+//      1.007359 above tp1's -- a wider gap than an accumulation-order difference
+//      produces, over a chain whose first token already differed. It was the
+//      route-index defect described below. The membership criterion stays
+//      because the general argument for it has not changed; it is a net now
+//      rather than a live discriminator, and the numbers above are what it
+//      caught.
 //
 //      The reference is the first decode of a freshly built engine, recorded
 //      before any other case, and it is recorded a second time on the same slot
-//      through reset_session(). Those two agree at tp_world 1, where the
-//      agreement is asserted because slot reuse depends on it. At tp_world 4
-//      they do not: the second recording diverges from the first, reproducibly,
-//      in both processes tried. That is a real finding about the TP path rather
-//      than a flake -- each recording repeats across runs, so the difference
-//      tracks how many decodes the process has already done -- and it is
-//      reported rather than asserted, because asserting a defect this test
-//      cannot fix would leave it permanently red. --compare reads the first
-//      recording, so both world sizes are compared under the same protocol.
+//      through reset_session(). Those two agree at every world size, and the
+//      agreement is asserted because slot reuse depends on it. At tp_world > 1
+//      it is also what caught the reset being rank-local: reset_session() clears
+//      the calling process, so on its own it left every worker holding the
+//      previous request's KV and compressor accumulators, and the second
+//      recording diverged from the first -- reproducibly, in both processes
+//      tried, because the difference tracked how many decodes the process had
+//      already done. That was a defect in the protocol, not a property of the
+//      path: reset_every_rank() sends ::Reset as well, and the repeat holds.
 //   6. batched decode        -- the real batched forward against the per-request
 //      loop, under POCKETLLM_CPP_BATCHED_DECODE. The two are not the same
 //      arithmetic (a two-row GEMM picks different tiles than two one-row GEMMs),
@@ -66,15 +69,39 @@
 //      one identical chain, which is what keeps the default path bit-for-bit the
 //      engine that existed before batching.
 //
-// Multi-slot schedules are deliberately NOT driven at tp_world > 1, and the test
-// says so rather than reporting a green result it did not earn:
-// WorkerCommand::Prefill and ::DecodeStep carry no slot id on the command
-// channel, so worker ranks would fill slot 0 for every row while rank 0 filled
-// the row's own slot. ::BatchDecode now does carry one, but a decode-only fix
-// does not help while the prefill that filled the ring carries none: row 1's
-// worker-side attention would read slot 0's ring. So cases 1-4 and 6 stay
-// tp_world 1 only, and closing the prefill half of that protocol gap is what
-// would make case 6 meaningful at tp_world > 1.
+// Multi-slot schedules run at every world size. That was not always true: the
+// worker commands were rank-incomplete in several places, and each gap showed up
+// as the same symptom -- slot 0's chain moving when its neighbour changed.
+// WorkerCommand::Prefill carried no slot id, so worker ranks filled slot 0 for
+// every row while rank 0 filled the row's own slot. ::DecodeStep had the same gap
+// on the serial branch, where one row is driven per call and a slot-1 row was
+// therefore decoded by every worker against slot 0's ring. Both are what cases
+// 1-3 measure, because only tp_world > 1 can show either one.
+//
+// Two more of the same kind are closed now. A slot handed back for reuse was
+// cleared on rank 0 only, there being no ::ResetSlot command to broadcast it
+// (case 5's self-repeat is what caught that). And ::BatchDecode left every worker
+// to re-read POCKETLLM_CPP_BATCHED_DECODE for itself, so a worker whose
+// environment disagreed with rank 0 ran the per-request loop while rank 0 ran the
+// batched forward: the two then issue a different number of collectives per
+// layer, and the mismatch stalls the first all-reduce in the forward instead of
+// failing loudly. Rank 0 alone reads the switch now and the command carries the
+// decision, which is what lets case 6 arm it from inside the test process at
+// tp_world > 1.
+//
+// The last one is not on the command channel at all, and it is the one case 5
+// used to measure. The serial decode MoE built its route-index buffer out of the
+// routes this rank owns and handed it to kernels that read the route weights
+// unfiltered, so a weight landed on whichever expert the compacted slot happened
+// to name, and the tail past the compacted count re-ran whatever the previous
+// token had left in the arena. A rank owning none of the gate's picks -- routine
+// at tp_world 4 with 64 experts per rank, impossible at 1 -- fed the kernels an
+// empty buffer and contributed zeros for the whole MoE output. The buffer now
+// keeps the gate's own route order, with unowned routes marked and the kernels'
+// range guards turning them into zeros, and that is what took the cross-world
+// chain from "diverges at token 1" to identical.
+//
+// So the whole file runs at both world sizes; nothing here is tp_world 1 only.
 //
 //   test_multi_slot_decode_parity <ckpt_dir> [layers=4] [steps=8] [prompt_len=6]
 //                                 [tp_world=1] [tp_rank=0] [nccl_id_path]
@@ -204,10 +231,26 @@ struct Row {
 };
 
 void prefill_row(PersistentEngine& engine, Row& row, const SamplingParams& sp) {
-    engine.worker_command_prefill(row.prompt);
+    engine.worker_command_prefill(row.prompt, row.slot);
     row.last_token = engine.prefill(row.prompt, sp, row.slot);
     row.position = static_cast<int>(row.prompt.size());
     row.chain.clear();
+}
+
+// Clear request state on every rank. reset_session() and reset_slot() touch the
+// calling process only, and every rank holds the same caches: at tp_world > 1 a
+// local-only reset leaves the workers with the previous case's KV and compressor
+// accumulators, which then all-reduce into the next case's logits. Every reset in
+// this file goes through one of these two, so the test drives the same protocol a
+// server does rather than a rank-0-only approximation of it.
+void reset_every_rank(PersistentEngine& engine) {
+    engine.worker_command_reset();
+    engine.reset_session();
+}
+
+void reset_slot_every_rank(PersistentEngine& engine, int slot_id) {
+    engine.worker_command_reset_slot(slot_id);
+    engine.reset_slot(slot_id);
 }
 
 // Advance every row by `steps` greedy tokens. With `grouped`, all rows go into
@@ -271,7 +314,7 @@ PairChains run_pair(PersistentEngine& engine,
                     int steps,
                     bool grouped,
                     const SamplingParams& sp) {
-    engine.reset_session();
+    reset_every_rank(engine);
     Row row0(0, first);
     Row row1(1, second);
     prefill_row(engine, row0, sp);
@@ -300,7 +343,7 @@ std::vector<std::vector<int>> pick_distinct_prompts(PersistentEngine& engine,
     for (int base : kCandidateBases) {
         if (static_cast<int>(picked.size()) >= count) break;
         std::vector<int> candidate = make_prompt(prompt_len, base);
-        engine.reset_session();
+        reset_every_rank(engine);
         Row row(0, candidate);
         prefill_row(engine, row, sp);
         decode_steps(engine, {&row}, 1, true, sp);
@@ -479,7 +522,7 @@ void test_slot_reuse(PersistentEngine& engine,
     const std::vector<int>& c = prompts[2];
 
     auto run_reuse = [&](const std::vector<int>& first) {
-        engine.reset_session();
+        reset_every_rank(engine);
         Row row0(0, first);
         Row row1(1, b);
         prefill_row(engine, row0, sp);
@@ -488,7 +531,7 @@ void test_slot_reuse(PersistentEngine& engine,
         decode_steps(engine, rows, steps, true, sp);
 
         // Hand slot 0 to a new request without disturbing slot 1.
-        engine.reset_slot(0);
+        reset_slot_every_rank(engine, 0);
         Row reused(0, c);
         prefill_row(engine, reused, sp);
         std::vector<Row*> next{&reused, &row1};
@@ -578,22 +621,25 @@ std::vector<int> run_solo(PersistentEngineAdapter& adapter,
 // issued straight after submit would race admission and would silently test the
 // same path twice. Re-entering the scheduler from a token callback is an
 // explicit contract (batch_scheduler.hpp:57).
-void test_cancellation(PersistentEngine& engine,
-                       const std::vector<std::vector<int>>& prompts,
-                       int steps,
-                       const SamplingParams& sp) {
-    (void)sp;
-    std::cout << "\n=== 4. cancellation through BatchScheduler ===\n";
-    PersistentEngineAdapter adapter(engine);
+//
+// The two sub-cases live in a helper rather than in their driver so that a build
+// in which caps() does report batching can drive them next to the serial ones and
+// assert the same solo chains. A cancel is about one request, not about the
+// width, which is the point: a neighbour appearing or disappearing, in another
+// slot or in a shared batched step, must not move either chain.
+// The engine's batched-decode switch, spelled once. Case 4 unsets it and case 6
+// arms it per arm.
+constexpr const char* kBatchDecodeSwitch = "POCKETLLM_CPP_BATCHED_DECODE";
 
-    const BatchSamplingParams sampling = greedy_batch_sampling(steps);
-    const std::vector<int> solo_a = run_solo(adapter, prompts[0], steps);
-    const std::vector<int> solo_b = run_solo(adapter, prompts[1], steps);
-    std::cout << "  solo A=" << join(solo_a) << "\n";
-    std::cout << "  solo B=" << join(solo_b) << "\n";
-
+void test_cancellation_arm(PersistentEngineAdapter& adapter,
+                           const std::vector<std::vector<int>>& prompts,
+                           int steps,
+                           const BatchSamplingParams& sampling,
+                           const std::vector<int>& solo_a,
+                           const std::vector<int>& solo_b,
+                           const std::string& tag) {
     {
-        std::cout << "  -- 4a: cancel the running request --\n";
+        std::cout << "  -- " << tag << "a: cancel the running request --\n";
         BatchScheduler scheduler(&adapter, 8);
         std::cout << "     scheduler width " << scheduler.max_batch_size()
                   << ", engine max_slots " << scheduler.engine_caps().max_slots
@@ -613,42 +659,46 @@ void test_cancellation(PersistentEngine& engine,
                 bool expected = false;
                 if (!fired.compare_exchange_strong(expected, true)) return;
                 // A is running and has emitted a token, so the scheduler has
-                // admitted it; B cannot be admitted until A gives up its slot.
+                // admitted it. Whether B waits for A's slot or is handed one of
+                // its own is the arm difference; the cancel below is about A
+                // either way.
                 second_id.store(scheduler.submit_request(prompts[1], sampling));
                 scheduler.cancel_request(request_id);
             });
-        check(first_id != 0, "4a: scheduler rejected the first submit");
+        check(first_id != 0, tag + "a: scheduler rejected the first submit");
 
         SchedulerGenerationResult cancelled;
         if (scheduler.poll_result(first_id, &cancelled, kPollTimeoutMs)) {
             check(cancelled.finish_reason == "cancelled",
-                  "4a: cancelled request finish_reason was " + cancelled.finish_reason);
+                  tag + "a: cancelled request finish_reason was " +
+                      cancelled.finish_reason);
             check(cancelled.completion_tokens < steps,
-                  "4a: the cancelled request ran to its length cap instead of "
-                  "stopping early (generated " +
+                  tag + "a: the cancelled request ran to its length cap instead "
+                        "of stopping early (generated " +
                       std::to_string(cancelled.completion_tokens) + " of " +
                       std::to_string(steps) + ")");
         } else {
-            check(false, "4a: the cancelled request produced no poll result");
+            check(false, tag + "a: the cancelled request produced no poll result");
         }
 
         const uint64_t b_id = second_id.load();
-        check(b_id != 0, "4a: the token callback did not submit the second request");
+        check(b_id != 0,
+              tag + "a: the token callback did not submit the second request");
         SchedulerGenerationResult queued;
         check(scheduler.poll_result(b_id, &queued, kPollTimeoutMs),
-              "4a: the request admitted into the freed slot never finished");
-        check(queued.error.empty(), "4a: survivor reported: " + queued.error);
+              tag + "a: the neighbour of a cancelled request never finished");
+        check(queued.error.empty(), tag + "a: survivor reported: " + queued.error);
         check(queued.generated_tokens == solo_b,
-              "4a: the request admitted into a cancelled request's slot did not "
-              "reproduce its solo run");
+              tag + "a: the neighbour of a cancelled request did not reproduce "
+                    "its solo run");
         if (queued.generated_tokens != solo_b) {
-            report_mismatch("4a freed slot", solo_b, queued.generated_tokens);
+            report_mismatch(tag + "a neighbour", solo_b, queued.generated_tokens);
         }
         scheduler.stop();
     }
 
     {
-        std::cout << "  -- 4b: cancel the queued request --\n";
+        std::cout << "  -- " << tag << "b: cancel the queued request --\n";
         BatchScheduler scheduler(&adapter, 8);
 
         std::atomic<bool> fired{false};
@@ -662,19 +712,20 @@ void test_cancellation(PersistentEngine& engine,
                 second_id.store(id);
                 scheduler.cancel_request(id);
             });
-        check(first_id != 0, "4b: scheduler rejected the first submit");
+        check(first_id != 0, tag + "b: scheduler rejected the first submit");
 
         SchedulerGenerationResult survivor;
         check(scheduler.poll_result(first_id, &survivor, kPollTimeoutMs),
-              "4b: the survivor never finished");
-        check(survivor.error.empty(), "4b: survivor reported: " + survivor.error);
+              tag + "b: the survivor never finished");
+        check(survivor.error.empty(), tag + "b: survivor reported: " + survivor.error);
         check(survivor.generated_tokens == solo_a,
-              "4b: the survivor's chain changed when its neighbour was cancelled");
+              tag + "b: the survivor's chain changed when its neighbour was "
+                    "cancelled");
         if (survivor.generated_tokens != solo_a) {
-            report_mismatch("4b survivor", solo_a, survivor.generated_tokens);
+            report_mismatch(tag + "b survivor", solo_a, survivor.generated_tokens);
         }
         check(static_cast<int>(survivor.generated_tokens.size()) == steps,
-              "4b: the survivor stopped short");
+              tag + "b: the survivor stopped short");
 
         // Pinned behaviour, not a preference: a request cancelled before
         // admission is dropped inside admit_requests and never reaches
@@ -682,15 +733,37 @@ void test_cancellation(PersistentEngine& engine,
         // changes this -- a streaming server in particular -- is a visible API
         // change and should be an explicit decision.
         const uint64_t b_id = second_id.load();
-        check(b_id != 0, "4b: the token callback did not submit the second request");
+        check(b_id != 0,
+              tag + "b: the token callback did not submit the second request");
         SchedulerGenerationResult cancelled;
         check(!scheduler.poll_result(b_id, &cancelled, 2000),
-              "4b: a request cancelled before admission now produces a result; "
-              "the silent-drop path changed");
+              tag + "b: a request cancelled before admission now produces a "
+                    "result; the silent-drop path changed");
         check(scheduler.get_stats().cancelled_requests >= 1,
-              "4b: the cancelled request was not counted in stats");
+              tag + "b: the cancelled request was not counted in stats");
         scheduler.stop();
     }
+}
+
+// Case 4's driver. The solo chains are computed once and shared with the helper:
+// they are the invariant both sub-cases are measured against.
+void test_cancellation(PersistentEngine& engine,
+                       const std::vector<std::vector<int>>& prompts,
+                       int steps,
+                       const SamplingParams& sp) {
+    (void)sp;
+    std::cout << "\n=== 4. cancellation through BatchScheduler ===\n";
+    PersistentEngineAdapter adapter(engine);
+
+    const BatchSamplingParams sampling = greedy_batch_sampling(steps);
+    const std::vector<int> solo_a = run_solo(adapter, prompts[0], steps);
+    const std::vector<int> solo_b = run_solo(adapter, prompts[1], steps);
+    std::cout << "  solo A=" << join(solo_a) << "\n";
+    std::cout << "  solo B=" << join(solo_b) << "\n";
+
+    unsetenv(kBatchDecodeSwitch);
+    test_cancellation_arm(adapter, prompts, steps, sampling, solo_a, solo_b,
+                          "4");
 }
 
 // Case 5: the single-slot reference chain, with the top-k behind every token, so
@@ -701,7 +774,7 @@ std::vector<std::vector<Step>> record_tp_reference(
     const std::vector<std::vector<int>>& prompts,
     int steps,
     const SamplingParams& sp) {
-    engine.reset_session();
+    reset_every_rank(engine);
     Row row(0, prompts[0]);
     prefill_row(engine, row, sp);
     std::vector<Step> chain;
@@ -812,7 +885,7 @@ PairRun run_pair_recorded(PersistentEngine& engine,
                           const std::vector<int>& second,
                           int steps,
                           const SamplingParams& sp) {
-    engine.reset_session();
+    reset_every_rank(engine);
     Row row0(0, first);
     Row row1(1, second);
     prefill_row(engine, row0, sp);
@@ -919,7 +992,7 @@ void test_batched_decode(PersistentEngine& engine,
                          const SamplingParams& sp) {
     std::cout << "\n=== 6. batched decode forward vs the per-request loop ===\n";
 
-    const char* const kSwitch = "POCKETLLM_CPP_BATCHED_DECODE";
+    const char* const kSwitch = kBatchDecodeSwitch;
     const std::string saved = [kSwitch] {
         const char* value = std::getenv(kSwitch);
         return value == nullptr ? std::string() : std::string(value);
@@ -1138,16 +1211,16 @@ int main(int argc, char** argv) {
         setenv("POCKETLLM_CPP_TOPK_DIAG", "8", 1);
     }
 
-    // Cases 1-4 are the pre-batching contract and are only meaningful on the
+    // Cases 1-3 are the pre-batching contract and are only meaningful on the
     // serial path, so the test owns the switch rather than inheriting it from the
-    // shell: it clears it here, and case 6 sets both values itself. A stale
-    // export in the environment would otherwise turn a clean checkout into four
-    // confusing failures.
-    if (const char* batched = std::getenv("POCKETLLM_CPP_BATCHED_DECODE");
+    // shell: it clears it here, and cases 4 and 6 arm both values themselves. A
+    // stale export in the environment would otherwise turn a clean checkout into
+    // three confusing failures.
+    if (const char* batched = std::getenv(kBatchDecodeSwitch);
         batched != nullptr && *batched != '\0') {
-        std::cout << "  note: ignoring an inherited POCKETLLM_CPP_BATCHED_DECODE="
-                  << batched << "; case 6 arms the switch itself\n";
-        unsetenv("POCKETLLM_CPP_BATCHED_DECODE");
+        std::cout << "  note: ignoring an inherited " << kBatchDecodeSwitch << "="
+                  << batched << "; cases 4 and 6 arm the switch themselves\n";
+        unsetenv(kBatchDecodeSwitch);
     }
 
     if (device_backend() != DeviceBackend::Cuda) {
@@ -1201,61 +1274,42 @@ int main(int argc, char** argv) {
                             tokens_of(repeated[0]));
         }
 
-        if (opts.tp_world > 1) {
-            note("multi-slot cases are skipped at tp_world > 1: WorkerCommand "
-                 "carries no slot id, so worker ranks would fill slot 0 for "
-                 "every row while rank 0 filled the row's own slot");
-            // Measured, and pinned by the header: at tp_world 4 the second
-            // recording differs from the first. Each recording is reproducible
-            // across processes, so the difference tracks how far into the
-            // process it is, not run-to-run noise -- and a test cannot fix that.
-            // Asserting it here would leave the test permanently red; asserting
-            // the opposite would be a lie. Report it, with the two chains, so
-            // the number is in the log rather than in someone's memory.
-            if (!self_repeat) {
-                note("case 5: reset_session() did not restore the state the "
-                     "reference depends on at tp_world=" +
-                     std::to_string(opts.tp_world) +
-                     "; the second recording of the same prompt on the same slot "
-                     "diverges from the first (see above). The first recording is "
-                     "the one --compare reads");
-            }
-        } else {
-            const std::vector<std::vector<int>> prompts =
-                pick_distinct_prompts(engine, prompt_len, 3, sp);
-            if (static_cast<int>(prompts.size()) < 3) {
-                std::cerr << "[FAIL] the checkpoint did not yield three prompts "
-                             "with distinct greedy continuations (" << prompts.size()
-                          << " found); this fixture cannot test slot isolation\n";
-                return 1;
-            }
-            // The recorded reference has to be the same row driven the same way
-            // at both world sizes, or --compare reports a difference that is
-            // really a fixture mismatch. pick_distinct_prompts accepts the first
-            // candidate unconditionally, so this holds; assert it rather than
-            // rely on it.
-            check(prompts[0] == reference_prompt,
-                  "fixture drift: the first picked prompt is not the base-16 one "
-                  "the tp_world > 1 arm records");
-
-            test_neighbour_independence(engine, prompts, steps, sp);
-            test_drive_order(engine, prompts, steps, sp);
-            test_slot_reuse(engine, prompts, steps, sp);
-            test_cancellation(engine, prompts, steps, sp);
-            // Last, because it is the only case that arms
-            // POCKETLLM_CPP_BATCHED_DECODE: the cases above must have run on the
-            // default path, and it restores the variable on the way out.
-            test_batched_decode(engine, prompts, steps, sp);
-
-            // Where the repeat does hold it is a contract, not a curiosity: the
-            // slot-reuse case above depends on it.
-            check(self_repeat,
-                  "case 5: reset_session() at tp_world=" +
-                      std::to_string(opts.tp_world) +
-                      " does not restore the state the reference depends on, so "
-                      "the second recording of the same prompt on the same slot "
-                      "differs from the first");
+        const std::vector<std::vector<int>> prompts =
+            pick_distinct_prompts(engine, prompt_len, 3, sp);
+        if (static_cast<int>(prompts.size()) < 3) {
+            std::cerr << "[FAIL] the checkpoint did not yield three prompts "
+                         "with distinct greedy continuations (" << prompts.size()
+                      << " found); this fixture cannot test slot isolation\n";
+            return 1;
         }
+        // The recorded reference has to be the same row driven the same way at
+        // both world sizes, or --compare reports a difference that is really a
+        // fixture mismatch. pick_distinct_prompts accepts the first candidate
+        // unconditionally, so this holds; assert it rather than rely on it.
+        check(prompts[0] == reference_prompt,
+              "fixture drift: the first picked prompt is not the base-16 one "
+              "the tp_world > 1 arm records");
+
+        test_neighbour_independence(engine, prompts, steps, sp);
+        test_drive_order(engine, prompts, steps, sp);
+        test_slot_reuse(engine, prompts, steps, sp);
+        test_cancellation(engine, prompts, steps, sp);
+        // Last, because it is the only case that arms
+        // POCKETLLM_CPP_BATCHED_DECODE: the cases above must have run on the
+        // default path, and it restores the variable on the way out.
+        test_batched_decode(engine, prompts, steps, sp);
+
+        // The repeat is a contract, not a curiosity: the slot-reuse case above
+        // depends on it, and at tp_world > 1 it is what caught reset_session()
+        // being rank-local. It holds at every world size now that
+        // reset_every_rank() broadcasts ::Reset, so assert it everywhere rather
+        // than reporting it where it used to fail.
+        check(self_repeat,
+              "case 5: reset_session() at tp_world=" +
+                  std::to_string(opts.tp_world) +
+                  " does not restore the state the reference depends on, so "
+                  "the second recording of the same prompt on the same slot "
+                  "differs from the first");
         reference = pristine;
 
         engine.worker_command_shutdown();

@@ -4366,7 +4366,12 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                         static_cast<size_t>(compressed_slot) * dims.head_dim;
                     ctx.continuation_journal.record(pooled,
                         static_cast<size_t>(dims.head_dim) * sizeof(float), row);
-                    if (!compressor_pool_cuda(comp_state->kv, comp_state->score,
+                    // Pool from this row's ring, not the cache base: the base
+                    // pointer is slot 0, so a slot-1 row would pool another
+                    // request's accumulator and publish it as its own compressed
+                    // KV. The update above already writes the row's ring; this
+                    // has to read the same one.
+                    if (!compressor_pool_cuda(state_kv, state_score,
                                               pooled, comp_ratio, dims.head_dim,
                                               comp_state_cols, comp_overlap) ||
                         !rmsnorm_bf16_gamma_cuda(pooled, comp_cache->norm, pooled,
@@ -5050,18 +5055,24 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
         const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
         const int expert_start = ctx.options.tp_rank * experts_per_rank;
         const int expert_end = ctx.options.tp_world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
-        std::vector<int64_t> route_indices;
         std::vector<Fp4View> active_w1;
         std::vector<Fp4View> active_w2;
         std::vector<Fp4View> active_w3;
-        route_indices.reserve(routed.size());
         active_w1.reserve(routed.size());
         active_w2.reserve(routed.size());
         active_w3.reserve(routed.size());
         std::vector<int> active_local_ids;
-        for (const RoutedExpert& route : routed) {
+        std::vector<size_t> active_route_positions;
+        // The decode MoE kernels read d_route_weights[route] for every route they
+        // are launched over and skip the experts that are not on this rank, so the
+        // index buffer has to stay in the gate's route order -- the weights are not
+        // filtered with it. Compacting the indices alone (as this used to do) moved
+        // every weight onto the wrong expert and re-ran whatever local expert the
+        // gate had left in the tail past the filtered count.
+        for (size_t ri = 0; ri < routed.size(); ++ri) {
+            const RoutedExpert& route = routed[ri];
             if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
-            route_indices.push_back(route.id);
+            active_route_positions.push_back(ri);
             active_local_ids.push_back(route.id - expert_start);
             active_w1.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight"));
             active_w2.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight"));
@@ -5079,7 +5090,14 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
             sample.s3_bytes = active_w3.front().s->nbytes;
             active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, use_sparse_arena ? sparse_slots_per_layer : experts_per_rank, sample, use_sparse_arena);
             if (moe_stage_event_recorded) check_device(stream_wait_event(moe_copy_stream, moe_stage_event), "wait prior moe stage event");
-            std::vector<int64_t> route_indices_kernel = route_indices;
+            // Sparse-slot indices address arena slots rather than expert ids, so a
+            // route this rank does not own holds no valid slot and is marked
+            // invalid instead of keeping the raw gate id, which would name a slot
+            // holding a different expert.
+            std::vector<int64_t> route_indices_kernel =
+                use_sparse_arena
+                    ? std::vector<int64_t>(selected_route_ids.size(), static_cast<int64_t>(-1))
+                    : selected_route_ids;
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
                 const int local = active_local_ids[ri];
                 int slot = local;
@@ -5088,7 +5106,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
                     bool already_staged = false;
                     slot = ctx.acquire_sparse_slot(*active_arena, local, already_staged);
                     need_stage = !already_staged;
-                    route_indices_kernel[ri] = static_cast<int64_t>(expert_start + slot);
+                    route_indices_kernel[active_route_positions[ri]] = static_cast<int64_t>(expert_start + slot);
                 } else {
                     need_stage = active_arena->staged_local.insert(local).second;
                 }
@@ -11024,12 +11042,9 @@ int PersistentEngine::decode_step(int last_token, int position, const SamplingPa
     return token;
 }
 
-std::vector<int> PersistentEngine::batch_decode_step(
-    const std::vector<PersistentBatchRequest>& requests) {
-    auto& s = *state_;
-    auto& ctx = *s.ctx;
-    ctx.options = s.opts;
-
+void PersistentEngine::validate_batch_decode_requests(
+    const std::vector<PersistentBatchRequest>& requests) const {
+    const auto& s = *state_;
     if (requests.empty()) {
         throw std::runtime_error("batch_decode_step: empty requests");
     }
@@ -11048,10 +11063,23 @@ std::vector<int> PersistentEngine::batch_decode_step(
         }
         slot_used[static_cast<size_t>(req.slot_id)] = true;
     }
+}
+
+std::vector<int> PersistentEngine::batch_decode_step(
+    const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+
+    validate_batch_decode_requests(requests);
 
     // Serial by default: one forward per request. It is the reference the
     // batched path has to match, and the only option while the batched forward
     // is still being validated against it.
+    //
+    // This switch is read here and nowhere else. Its value leaves rank 0 as one
+    // ::DecodeStep per row (serial) or one ::BatchDecode for the whole batch
+    // (batched), and that command is what a worker obeys.
     const bool batched = env_int_or_default("POCKETLLM_CPP_BATCHED_DECODE", 0) != 0 &&
                          requests.size() > 1;
 
@@ -11063,7 +11091,7 @@ std::vector<int> PersistentEngine::batch_decode_step(
             auto& slot = s.slots[static_cast<size_t>(req.slot_id)];
             maybe_reseed(req.sampling.seed, slot.rng_seed, slot.rng);
 
-            worker_command_decode(req.last_token, req.position);
+            worker_command_decode(req.last_token, req.position, req.slot_id);
             (void)run_safetensors_token_forward_impl(ctx, req.last_token, s.layer_count,
                                                      req.position, req.slot_id);
             const int token = select_token_for_slot(ctx, s.opts, req.sampling, slot.rng, req.slot_id);
@@ -11072,6 +11100,16 @@ std::vector<int> PersistentEngine::batch_decode_step(
         }
         return result_tokens;
     }
+
+    return batch_decode_step_batched(requests);
+}
+
+std::vector<int> PersistentEngine::batch_decode_step_batched(
+    const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+    validate_batch_decode_requests(requests);
 
     // Batched: one row per request, each at its own position and in its own
     // request slot, so N independent requests advance in a single forward. A
@@ -11495,12 +11533,13 @@ constexpr int kCmdHeaderInts = 4;
 
 }  // namespace
 
-void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids) {
+void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids,
+                                              int32_t slot_id) {
     auto& s = *state_;
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
-        0,
+        slot_id,
         0,
         static_cast<int32_t>(token_ids.size())
     };
@@ -11511,14 +11550,17 @@ void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids)
     }
 }
 
-void PersistentEngine::worker_command_decode(int32_t last_token, int32_t position) {
+void PersistentEngine::worker_command_decode(int32_t last_token, int32_t position,
+                                             int32_t slot_id) {
     auto& s = *state_;
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    // header[3] carries the slot rather than the token count: DecodeStep has no
+    // payload, so this field is free and the drain above never reads it.
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::DecodeStep),
         last_token,
         position,
-        0
+        slot_id
     };
     s.cmd->send_to_workers(header, kCmdHeaderInts);
 }
@@ -11557,6 +11599,17 @@ void PersistentEngine::worker_command_reset() {
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Reset), 0, 0, 0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
+void PersistentEngine::worker_command_reset_slot(int32_t slot_id) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    // ResetSlot has no payload, so header[1] carries the slot -- the same field
+    // DecodeStep uses for the last token.
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::ResetSlot), slot_id, 0, 0
     };
     s.cmd->send_to_workers(header, kCmdHeaderInts);
 }
@@ -11690,10 +11743,12 @@ void PersistentEngine::run_worker_loop() {
         try {
             if (cmd == WorkerCommand::Reset) {
                 reset_session();
+            } else if (cmd == WorkerCommand::ResetSlot) {
+                reset_slot(header[1]);
             } else if (cmd == WorkerCommand::Prefill) {
-                (void)prefill(prefill_tokens, sp);
+                (void)prefill(prefill_tokens, sp, header[1]);
             } else if (cmd == WorkerCommand::DecodeStep) {
-                (void)decode_step(header[1], header[2], sp);
+                (void)decode_step(header[1], header[2], sp, header[3]);
             } else if (cmd == WorkerCommand::Verify) {
                 (void)verify_step(verify_block, header[1], sp);
             } else if (cmd == WorkerCommand::BatchVerify) {
@@ -11712,7 +11767,7 @@ void PersistentEngine::run_worker_loop() {
                     batch[i].position = batch_decode_payload[i * 3 + 1];
                     batch[i].slot_id = batch_decode_payload[i * 3 + 2];
                 }
-                (void)batch_decode_step(batch);
+                (void)batch_decode_step_batched(batch);
             } else if (cmd == WorkerCommand::FinalizeBatchVerify) {
                 if (!s.ctx->continuation_journal.pending ||
                     header[1] < 0 || header[1] > s.pending_batch_rows) {
