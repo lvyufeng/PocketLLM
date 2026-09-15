@@ -1,6 +1,11 @@
 import json
 
-from src.server.cpp_sidecar import ChatTemplateTemplater, detect_architecture
+from src.server.cpp_sidecar import (
+    ChatTemplateTemplater,
+    DeepSeekV4Templater,
+    build_templater,
+    detect_architecture,
+)
 
 
 class RecordingTokenizer:
@@ -116,3 +121,79 @@ def test_generic_sidecar_splits_reasoning_into_protocol_field():
         "reasoning_content": "",
         "tool_calls": [],
     }
+
+
+QWEN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+        },
+    },
+}
+
+QWEN_CALL = (
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n"
+    "<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_qwen_templater_reports_tool_calls_and_clears_the_content():
+    templater = build_templater("qwen3_5", RecordingTokenizer())
+
+    parsed = templater.parse(QWEN_CALL, "chat", [QWEN_TOOL])
+
+    assert parsed["content"] == ""
+    assert parsed["reasoning_content"] == ""
+    assert len(parsed["tool_calls"]) == 1
+    call = parsed["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "get_weather"
+    # The schema is what makes "3" an integer rather than the string the XML
+    # spelling alone would be.
+    assert json.loads(call["function"]["arguments"]) == {"city": "Paris", "days": 3}
+
+
+def test_a_call_after_the_think_block_is_read_from_the_content():
+    templater = build_templater("qwen3_5", RecordingTokenizer())
+
+    parsed = templater.parse(f"weighing it up</think>{QWEN_CALL}", "thinking", [QWEN_TOOL])
+
+    assert parsed["reasoning_content"] == "weighing it up"
+    assert parsed["content"] == ""
+    assert parsed["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+def test_an_architecture_with_no_known_syntax_leaves_the_call_in_the_content():
+    """No parser is registered, so the XML is what the client sees.  Inventing a
+    parse for a syntax nobody has read would be worse than showing the text."""
+    templater = build_templater("llama", RecordingTokenizer())
+
+    parsed = templater.parse(QWEN_CALL, "chat", [QWEN_TOOL])
+
+    assert parsed["tool_calls"] == []
+    assert parsed["content"] == QWEN_CALL
+
+
+def test_a_truncated_call_is_left_in_the_content_rather_than_half_reported():
+    templater = build_templater("qwen3_5", RecordingTokenizer())
+    truncated = QWEN_CALL.split("</parameter>")[0]
+
+    parsed = templater.parse(truncated, "chat", [QWEN_TOOL])
+
+    assert parsed["tool_calls"] == []
+    assert parsed["content"] == truncated
+
+
+def test_build_templater_selects_a_templater_per_architecture():
+    # The registry reports the architecture name; only qwen3_5 has a call syntax
+    # this repository has read, and only deepseek_v4 has its own templater class.
+    assert isinstance(
+        build_templater("qwen3_5", RecordingTokenizer()), ChatTemplateTemplater
+    )
+    assert isinstance(build_templater("llama", RecordingTokenizer()), ChatTemplateTemplater)
+    assert isinstance(
+        build_templater("deepseek_v4", RecordingTokenizer()), DeepSeekV4Templater
+    )

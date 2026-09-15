@@ -767,7 +767,7 @@ struct OpenAIServer::Impl {
                           client_id, request_start);
         } else {
             handle_nonstream(res, enc_reply, sp, constraints, stops, thinking_mode,
-                             client_id, logprobs, request_start);
+                             client_id, logprobs, enc_reply.tools_json, request_start);
         }
     }
 
@@ -1538,6 +1538,7 @@ struct OpenAIServer::Impl {
                           const std::string& thinking_mode,
                           const std::string& client_id,
                           const LogprobsSpec& logprobs,
+                          const std::string& tools_json,
                           std::chrono::steady_clock::time_point request_start) {
         std::vector<ChoiceRun> runs;
         if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
@@ -1567,13 +1568,21 @@ struct OpenAIServer::Impl {
             // Truncated before the sidecar sees them: the parser splits the text
             // into content / reasoning / tool calls, and a stop sequence that
             // lands inside a tool call would otherwise be parsed as part of one.
-            const ParsedMessage parsed = sidecar.parse(texts[i].text, thinking_mode);
+            const ParsedMessage parsed = sidecar.parse(texts[i].text, thinking_mode, tools_json);
             const std::string content = parsed.ok ? parsed.content : texts[i].text;
             const std::string reasoning = parsed.ok ? parsed.reasoning : std::string();
             const std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
+            // A turn that ends in a tool call is reported as one, whatever the
+            // engine's own reason was. A client that branches on "tool_calls" to
+            // decide whether to run something and send the result back would,
+            // under "stop", read the call as the final answer and stop there. The
+            // parse is all-or-nothing, so a reported call is a complete one and
+            // the assistant turn really did end at it.
+            const std::string finish_reason =
+                tool_calls_json != "[]" ? std::string("tool_calls") : texts[i].finish_reason;
             if (i > 0) os << ",";
             os << "{\"index\":" << texts[i].index
-               << ",\"finish_reason\":\"" << texts[i].finish_reason << "\""
+               << ",\"finish_reason\":\"" << finish_reason << "\""
                << ",\"message\":"
                << render_choice_message(content, reasoning, tool_calls_json);
             // Beside the message rather than inside it: the ranking describes the

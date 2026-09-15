@@ -163,7 +163,7 @@ than trusted.
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
 | `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
-| `tools` | chat | Tool definitions reach the chat template. The model still chooses; see `tool_choice` below. |
+| `tools` | chat | Tool definitions reach the chat template, and a call the model writes back is reported in the assistant message's `tool_calls` rather than left in the text; see [Tool calls](#tool-calls). |
 | `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
 | `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. |
 | `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. |
@@ -276,6 +276,40 @@ Four things are worth knowing before relying on the field:
   case for speculative decoding (its verify step ranks no tokens) and for the Ascend backend. The
   limit on alternatives is this server's — 20 per position, above OpenAI's documented range — and a
   request past it is a 400 naming the ceiling.
+
+#### Tool calls
+
+`tools` is forwarded to the checkpoint's own chat template, and a call the model writes back is
+reported in the assistant message's `tool_calls` array instead of being left in the text. The array
+uses the OpenAI shape — an `id`, `type` set to `"function"`, and `function.name` with
+`function.arguments` as a JSON string — and `finish_reason` is `"tool_calls"`, which is what a client
+branching on the field expects to see before it runs the call and sends the result back in a
+`tool`-role message.
+
+Five things are worth knowing before relying on the field:
+
+- **The schema is what types the arguments.** Qwen's template writes a call as XML —
+  `<tool_call><function=NAME><parameter=ARG>VALUE</parameter></function></tool_call>` — and that shape
+  records no type of its own: `<parameter=days>3</parameter>` is one character more than
+  `<parameter=days>two</parameter>`. Each value is therefore read back against the type the request's
+  own `parameters.properties` declares, so an argument declared `integer` arrives as the number `3`
+  and one whose declared type is missing, unknown, or not parseable from the text arrives as the
+  characters that were written. A request with no `tools` at all leaves every argument a string,
+  because nothing in the text can settle whether `01234` meant a number.
+- **Parsing is all-or-nothing.** A completion whose call was truncated at the token budget, is
+  malformed, or has prose between two calls yields **no** `tool_calls`, and the text stays in
+  `content` exactly as generated. A half-read call whose arguments look complete is worse than one
+  whose syntax the caller can see.
+- **Only a call syntax this server has read is parsed.** That is Qwen's template (`qwen3_5`,
+  including the `qwen3_5_text` spelling) and DeepSeek-V4's own encoder, which already parsed its
+  DSML calls. Any other architecture keeps the older behaviour and leaves the call in `content`;
+  inventing a parse for a syntax nobody has read would drop or corrupt calls silently.
+- **Streaming is not supported.** A streamed response carries the call syntax as content, exactly as
+  it did before, and reports the engine's own `finish_reason`. Ask for a non-streaming response when
+  you want `tool_calls`.
+- **The selection policy is not applied.** `tool_choice` other than `"auto"` and
+  `parallel_tool_calls: false` are 400s, listed below: the model still decides whether to call
+  anything and how many calls to make.
 
 ### Refused with HTTP 400
 

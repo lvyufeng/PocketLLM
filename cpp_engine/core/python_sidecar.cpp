@@ -45,6 +45,25 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
+// The sidecar uses newline-delimited JSON on stdin, so raw newlines and tabs
+// inside an embedded `messages` or `tools` array would break the line framing.
+// Inside a JSON string a raw newline is illegal anyway, so collapsing
+// whitespace that sits outside string literals is always safe.
+std::string flatten(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_str = false;
+    bool esc = false;
+    for (char c : s) {
+        if (esc) { out.push_back(c); esc = false; continue; }
+        if (c == '\\' && in_str) { out.push_back(c); esc = true; continue; }
+        if (c == '"') { in_str = !in_str; out.push_back(c); continue; }
+        if (!in_str && (c == '\n' || c == '\r' || c == '\t')) { out.push_back(' '); continue; }
+        out.push_back(c);
+    }
+    return out;
+}
+
 std::string read_line(int fd) {
     std::string out;
     char ch = 0;
@@ -168,24 +187,7 @@ std::string PythonSidecar::send_request(const std::string& json_line) {
 
 EncodeReply PythonSidecar::encode(const EncodeRequest& req) {
     EncodeReply reply;
-    // Sidecar uses newline-delimited JSON on stdin. Raw newlines/tabs inside
-    // our embedded `messages` / `tools` arrays would break the line framing,
-    // so flatten any whitespace outside of JSON string literals. Inside JSON
-    // strings, raw newlines are illegal, so this is always safe.
-    auto flatten = [](const std::string& s) {
-        std::string out;
-        out.reserve(s.size());
-        bool in_str = false;
-        bool esc = false;
-        for (char c : s) {
-            if (esc) { out.push_back(c); esc = false; continue; }
-            if (c == '\\' && in_str) { out.push_back(c); esc = true; continue; }
-            if (c == '"') { in_str = !in_str; out.push_back(c); continue; }
-            if (!in_str && (c == '\n' || c == '\r' || c == '\t')) { out.push_back(' '); continue; }
-            out.push_back(c);
-        }
-        return out;
-    };
+    reply.tools_json = req.tools_json;
     const std::string messages_inline = req.messages_json.empty() ? std::string("[]") : flatten(req.messages_json);
     const std::string tools_inline = req.tools_json.empty() ? std::string() : flatten(req.tools_json);
     std::ostringstream os;
@@ -263,11 +265,18 @@ TokenizeReply PythonSidecar::tokenize(const TokenizeRequest& req) {
     return reply;
 }
 
-ParsedMessage PythonSidecar::parse(const std::string& text, const std::string& thinking_mode) {
+ParsedMessage PythonSidecar::parse(const std::string& text, const std::string& thinking_mode,
+                                 const std::string& tools_json) {
     ParsedMessage parsed;
     std::ostringstream os;
     os << "{\"op\":\"parse\",\"text\":\"" << json_escape(text)
-       << "\",\"thinking_mode\":\"" << json_escape(thinking_mode) << "\"}\n";
+       << "\",\"thinking_mode\":\"" << json_escape(thinking_mode) << "\"";
+    if (!tools_json.empty()) {
+        // Same reason as encode(): a raw newline inside the embedded array would
+        // break the line framing of the protocol.
+        os << ",\"tools\":" << flatten(tools_json);
+    }
+    os << "}\n";
     std::string resp = send_request(os.str());
     JsonValue v;
     try { v = parse_json(resp); } catch (const std::exception& ex) {
