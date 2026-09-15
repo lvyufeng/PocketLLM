@@ -7,7 +7,15 @@ from pathlib import Path
 
 from setuptools import find_namespace_packages, setup
 from setuptools import Extension
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Defer torch import until needed, so sdist builds without torch installed
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    BuildExtension = None
+    CUDAExtension = None
 
 ROOT = Path(__file__).resolve().parent
 CSRC = ROOT / "src" / "csrc"
@@ -18,10 +26,58 @@ CPP_ENGINE_DIR = ROOT / "cpp_engine"
 def _build_native_requested() -> bool:
     """Whether to build the optional pybind11 module for the C++ engine.
 
-    Off by default: the native build needs pybind11, a CUDA toolkit and NCCL, and
-    takes minutes. A host that only wants the Torch runtimes must still install.
+    On by default for v0.1.0: users should get the full C++ engine capability.
+    Can be disabled with POCKETLLM_BUILD_CPP=0 for PyTorch-only installation.
     """
-    return os.environ.get("POCKETLLM_BUILD_CPP", "").strip().lower() in {"1", "true", "yes", "on"}
+    env_value = os.environ.get("POCKETLLM_BUILD_CPP", "1").strip().lower()
+    return env_value not in {"0", "false", "no", "off"}
+
+
+def _missing_native_build_prerequisites() -> list[str]:
+    """One message per prerequisite the native C++ engine build is missing.
+
+    Each entry names the missing tool and what to do about it, so the caller can
+    tell "no cmake installed" apart from "pybind11 not importable".
+    """
+    missing = []
+
+    if shutil.which("cmake") is None:
+        missing.append("cmake not found on PATH (PocketLLM requires CMake >= 3.18)")
+
+    try:
+        import pybind11  # noqa: F401
+    except ImportError:
+        missing.append("pybind11 is not importable (install it with: pip install pybind11)")
+
+    return missing
+
+
+def _native_build_error(missing: list[str]) -> str:
+    """Fail-fast message for a native build that cannot start."""
+    return (
+        "POCKETLLM_BUILD_CPP is enabled, but the native C++ engine cannot be built:\n"
+        + "\n".join(f"  - {item}" for item in missing)
+        + "\n\n"
+        "Install the missing prerequisites above and retry, or install the PyTorch backend\n"
+        "on its own:\n\n"
+        "    POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation\n\n"
+        "That skips the C++ engine entirely and still builds the PyTorch CUDA extensions.\n"
+        'The install stops here rather than continuing without the native module, because a\n'
+        'silently missing pocketllm_cpp would let backend="auto" fall back to Torch and hand\n'
+        "the caller different kernels than requested, with no error to explain it."
+    )
+
+
+def _require_native_build_prerequisites() -> None:
+    """Raise if anything the native module needs is missing.
+
+    Called before the Torch CUDA extensions compile. Those take minutes, so
+    reporting a missing cmake afterwards means the user waits through a full
+    compile only to learn the build was never going to succeed.
+    """
+    missing = _missing_native_build_prerequisites()
+    if missing:
+        raise RuntimeError(_native_build_error(missing))
 
 
 def _python_cmake_hints() -> list[str]:
@@ -70,13 +126,22 @@ def _nccl_cmake_hints() -> list[str]:
 
 class BuildExtensions(BuildExtension):
     def run(self):
+        if not TORCH_AVAILABLE:
+            print("WARNING: PyTorch not available, skipping CUDA extension build")
+            return
+        build_native = _build_native_requested()
+        if build_native:
+            # Checked here, not only in build_native_module(): the CUDA extensions
+            # below compile for minutes, and a missing cmake should not be reported
+            # after that wait.
+            _require_native_build_prerequisites()
         super().run()
         EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
         for ext in self.extensions:
             built_path = Path(self.get_ext_fullpath(ext.name)).resolve()
             if built_path.exists():
                 shutil.copy2(built_path, EXTENSIONS_DIR / built_path.name)
-        if _build_native_requested():
+        if build_native:
             self.build_native_module()
 
     def build_native_module(self):
@@ -85,19 +150,14 @@ class BuildExtensions(BuildExtension):
         Any failure here is fatal. A silently missing native module is worse than a
         failed install: ``backend="auto"`` would quietly fall back to Torch, and the
         caller who asked for the C++ engine would get different kernels than
-        requested with no error to explain it.
+        requested with no error to explain it. ``_native_build_error`` carries that
+        rationale in the message the user actually sees.
         """
-        try:
-            import pybind11
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise RuntimeError(
-                "POCKETLLM_BUILD_CPP=1 requires pybind11 (pip install pybind11)"
-            ) from exc
+        _require_native_build_prerequisites()
+        # Guaranteed importable: the preflight above fails the build otherwise.
+        import pybind11
 
         cmake = shutil.which("cmake")
-        if cmake is None:  # pragma: no cover - environment dependent
-            raise RuntimeError("POCKETLLM_BUILD_CPP=1 requires cmake on PATH")
-
         backend = os.environ.get("POCKETLLM_BACKEND", "cuda")
         build_dir = Path(self.build_temp).resolve() / "cpp_engine"
         build_dir.mkdir(parents=True, exist_ok=True)
@@ -135,18 +195,12 @@ class BuildExtensions(BuildExtension):
             shutil.copy2(module, EXTENSIONS_DIR / module.name)
 
 
-setup(
-    # Resolved from the tree rather than hand-listed; the previous literal had
-    # drifted, omitting src.components.gguf, src.models.glm_dsa and
-    # src.models.qwen4_exp while naming two directories that are not packages.
-    # find_namespace_packages picks up src.components and src.loader.mappings,
-    # which are real namespace packages actively imported but have no __init__.py.
-    packages=find_namespace_packages(
-        include=["pocketllm", "pocketllm.*", "src", "src.*"],
-        # src.csrc holds only C++/CUDA sources; src.gguf and src.moe are stale empty dirs.
-        exclude=["src.csrc", "src.csrc.*", "src.gguf", "src.moe"],
-    ),
-    ext_modules=[
+# Build extension list conditionally
+ext_modules = []
+cmdclass = {}
+
+if TORCH_AVAILABLE:
+    ext_modules = [
         CUDAExtension(
             name="cuda_kernel",
             sources=[
@@ -182,6 +236,20 @@ setup(
                 "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
             },
         ),
-    ],
-    cmdclass={"build_ext": BuildExtensions},
+    ]
+    cmdclass = {"build_ext": BuildExtensions}
+
+setup(
+    # Resolved from the tree rather than hand-listed; the previous literal had
+    # drifted, omitting src.components.gguf, src.models.glm_dsa and
+    # src.models.qwen4_exp while naming two directories that are not packages.
+    # find_namespace_packages picks up src.components and src.loader.mappings,
+    # which are real namespace packages actively imported but have no __init__.py.
+    packages=find_namespace_packages(
+        include=["pocketllm", "pocketllm.*", "src", "src.*"],
+        # src.csrc holds only C++/CUDA sources; src.gguf and src.moe are stale empty dirs.
+        exclude=["src.csrc", "src.csrc.*", "src.gguf", "src.moe"],
+    ),
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
 )

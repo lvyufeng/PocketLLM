@@ -294,10 +294,10 @@ python3 -c "import sys; \
 
 ## 📝 Documentation Updates Needed
 
-- [ ] Update `docs/pocketllm_api.md` with batching examples
+- [ ] Update `docs/guides/pocketllm_api.md` with batching examples
 - [ ] Update `README.md` performance section
 - [ ] Add `docs/cpp_engine_batch_scheduler.md` design doc
-- [ ] Update `docs/backend_unification_design.md` with Phase 3.4 completion
+- [ ] Update `docs/architecture/backend_unification_design.md` with Phase 3.4 completion
 
 ---
 

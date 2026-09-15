@@ -24,20 +24,26 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8；GGUF Q2/IQ2/IQ1 | **已验证 generation** | PyTorch 异构、C++/CUDA、GGUF TP4 | C++ FP4：32K–64K prefill 约 401 tok/s；decode 约 3.7 tok/s |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **已验证 TP4 generation** | Raw-block CUDA、GGUF TP4 | Full-model 256-token prefill 约 104.9–107 tok/s；43-layer decode benchmark 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **已验证文本生成** | Raw-block CUDA、GGUF TP4 | prefill 约 0.79 tok/s；decode 约 0.66 tok/s |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime** | C++/CUDA TP4、GPU-resident FP8 | 512-token prompt：prefill 416.48 tok/s；decode 35.87 tok/s |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime** | C++/CUDA TP4、GPU-resident FP8 | 512-token prompt：prefill 864.54 tok/s、decode 43.22 tok/s（生成 128 token） |
 
 模型页面会把“模型架构规格”和“PocketLLM 当前实际实现能力”分开。`inspect`、`smoke` 和 benchmark 也不自动等于 production serving 保证。
 
 ## 性能摘要
 
-本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/benchmarking.md)。
+本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/guides/benchmarking.md)。
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
-- 64-token prompt：prefill 138.61–138.69 tok/s，decode 36.82 tok/s。
-- 512-token prompt：prefill 416.48 tok/s，decode 35.87 tok/s。
-- 实测每 rank 约使用 8.0–8.6 GiB；本地 FP8 权重和 scale 常驻 GPU。
-- 四个 TP rank 的生成 token 序列一致。原生 OpenAI 兼容 server 已验证 text 请求；图像和视频输入仍不支持。
+master `cfad866` 上按引擎默认值做的一轮串行 sweep，每次生成 128 token：
+
+- 64-token prompt：prefill 115.91 tok/s（0.55 s），decode 45.05 tok/s。
+- 512-token prompt：prefill 864.54 tok/s（0.59 s），decode 43.22 tok/s。
+- 8,192-token prompt：prefill 1,818.65 tok/s（4.50 s），decode 43.99 tok/s。
+- 65,536-token prompt：prefill 1,453.51 tok/s（45.09 s），decode 39.11 tok/s。
+
+每 rank 的引擎计数为 6.86 GiB 常驻 FP8 权重与 scale，加上 65,536 token 时的 1.00 GiB KV 数据和 1.01 GiB chunk workspace；`nvidia-smi` 在此之上还要多出 3.4–3.5 GiB（CUDA context、cuBLAS workspace、NCCL buffer），且该差值不随 prompt 长度变化。四个 TP rank 的生成 token 序列一致。原生 OpenAI 兼容 server 已验证 text 请求；图像和视频输入仍不支持。
+
+64 和 512 token 两行的 prefill 反映的是短 prompt 延迟而非稳态吞吐：两者都在 0.55–0.59 s 内完成，因为该规模下固定进程开销占主导。4,096 token 以上，prefill 到 32,768 的边际吞吐为 1,670 tok/s，之后再为 1,285 tok/s。
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -182,16 +188,20 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 ## 文档
 
+文档站点已发布在 **<https://lvyufeng.github.io/PocketLLM/>**，由本仓库的 `docs/` 目录构建，
+支持全文搜索和分主题导航，内容与下面的文件一致。
+
 - [文档总览](docs/README.md)
+- [快速开始](docs/getting-started.md)
 - [模型支持矩阵](docs/models/README.md)
-- [Benchmark 口径](docs/benchmarking.md)
+- [Benchmark 口径](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
-- [DSpark speculative decoding](docs/dspark.md)
-- [FlashMemory 1M context](docs/FLASHMEMORY_1M_CONTEXT.md)
-- [MiniMax decode bottleneck 分析](docs/minimax_decode_bottleneck_analysis.md)
+- [DSpark speculative decoding](docs/performance/dspark.md)
+- [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
+- [MiniMax decode bottleneck 分析](docs/performance/minimax_decode_bottleneck_analysis.md)
 - [历史 2080 Ti 报告](docs/reports/dsv4_2080ti_report.pdf)
 
 ## Roadmap
@@ -214,9 +224,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 ## License
 
-PocketLLM 代码使用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
-
-个人使用、学术研究、教育、非商业 benchmark 和非商业部署属于允许用途。商业使用需要版权持有者单独书面许可。
+PocketLLM 采用 [MIT License](LICENSE) 发布。你可以自由使用、修改和分发本代码，包括商业用途，只需保留版权声明和许可声明。
 
 模型权重、tokenizer、CUDA、PyTorch、GGUF 资源和其他第三方组件分别受其自身许可证约束。PocketLLM 代码许可证不授予任何第三方模型资产的额外权利。
 

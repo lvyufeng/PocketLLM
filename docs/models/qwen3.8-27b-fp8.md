@@ -43,11 +43,11 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 - 48-layer Gated DeltaNet sequence/recurrent kernels with persistent state and convolution tails.
 - 16-layer GQA prefill and KV-cache decode with local K/V heads.
 - FP16 activation storage with FP32 local accumulation/state where required; no prompt-length FP32 activation expansion.
-- Chunked prefill (default 512 tokens) that retains only recurrent state, convolution tails, and full-attention KV cache between chunks.
+- Chunked prefill (default 8,192 tokens, `--prefill-chunk-tokens`) that retains only recurrent state, convolution tails, and full-attention KV cache between chunks.
 - Exact single-request prefix reuse: the position-indexed GQA KV cache and the DeltaNet recurrent state are retained across sequential `prefill()` calls. Appended prompts execute only their uncached suffix; diverging or compressed prompts restore a device-resident recurrent snapshot at the longest safe common prefix.
 - FP16 KV cache by default, plus explicit opt-in FP8 E4M3 cache with per-token/KV-head FP16 scales over 64-channel blocks.
 - Decode-only fused FP8 gate/up projection plus SwiGLU.
-- Opt-in exact FP16 GQA kernels: tiled prefill and split-context fused decode with compact online-softmax partials. Enable with `POCKETLLM_QWEN_GQA_OPTIMIZED=1`; the default remains the reference full-attention path.
+- Exact FP16 GQA kernels, on by default: tiled prefill and split-context fused decode with compact online-softmax partials. On SM75 the split/merge decode path is dispatched from context 4,096 onward, and the reference score/value decode below that, where it is faster. `POCKETLLM_QWEN_GQA_OPTIMIZED=0` restores the reference path.
 - Opt-in FP16 sink-plus-sliding-window attention through `--qwen-attention-window N` and optional `--qwen-attention-sink-tokens N`. This changes full-attention semantics and is not part of exact parity or default performance claims; FP8 cache is intentionally rejected for this mode.
 - TP4 NCCL reductions and global greedy top-1 selection.
 - Opt-in native one-layer MTP loading and greedy speculative generation through `--qwen-mtp-tokens K`. The MTP layer reuses the target embedding/LM head, recursively proposes drafts, and verifies `[current_token, draft_1, ..., draft_K]` in one multi-row target forward. Partial rejection restores DeltaNet state/convolution tails and replays only the committed input prefix. MTP remains disabled by default.
@@ -55,30 +55,54 @@ The root config also contains a vision tower, but PocketLLM deliberately dispatc
 
 ## Validated performance
 
-Hardware: 4×RTX 2080 Ti 22 GiB, TP4, single request, real Qwen3.8-27B-FP8 checkpoint and prompts.
+Hardware: 4×RTX 2080 Ti 22 GiB, TP4 (GPU 0–3), single request, real Qwen3.8-27B-FP8 checkpoint and
+deterministic real-tokenizer prompts. One serial sweep of the engine defaults — complete 64 layers,
+`prefill_chunk_tokens=8192`, FP16 KV cache, greedy sampling, 128 generated tokens — on master
+`cfad866` (2026-09-15). Run record: `.tmp/qwen_fp8_page_20260915/`.
 
-| Prompt | Generated tokens | Prefill | Decode | GPU used/rank |
-| ---: | ---: | ---: | ---: | ---: |
-| 64 tokens | 24 | 138.61–138.69 tok/s | 36.82 tok/s | ~8.04–8.46 GiB |
-| 512 tokens | 24 | 416.48 tok/s | 35.87 tok/s | ~8.18–8.60 GiB |
+| Prompt | Prefill | Decode | KV data/rank | Peak activation workspace | Rank parity |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 64 | 115.91 tok/s (0.55 s) | 45.05 tok/s | 3.0 MiB | 7.9 MiB | PASS |
+| 512 | 864.54 tok/s (0.59 s) | 43.22 tok/s | 10.0 MiB | 63.0 MiB | PASS |
+| 4,096 | 1,729.05 tok/s (2.37 s) | 43.82 tok/s | 66.0 MiB | 504.2 MiB | PASS |
+| 8,192 | 1,818.65 tok/s (4.50 s) | 43.99 tok/s | 130.0 MiB | 1,008.4 MiB | PASS |
+| 32,768 | 1,673.79 tok/s (19.58 s) | 41.77 tok/s | 514.0 MiB | 1,008.4 MiB | PASS |
+| 65,536 | 1,453.51 tok/s (45.09 s) | 39.11 tok/s | 1,026.0 MiB | 1,008.4 MiB | PASS |
 
-Additional repeat runs on the 512-token fixture measured approximately 411.8–416.4 tok/s prefill and 35.66–35.85 tok/s decode.
+Decode holds near 44 tok/s out to 8,192 tokens and reaches 39.11 tok/s at 65,536. Prefill peaks at
+8,192 tokens and is still at 80% of that peak at 65,536.
+
+Read the table with the two reporting rules from `../guides/benchmarking.md`:
+
+- **Prefill and decode are reported separately**; neither is a wall-clock figure, and the prefill
+  seconds above exclude model load and process startup.
+- **Decode throughput is only comparable between runs that generate the same number of tokens.**
+  These runs generate 128, so the timed decode window excludes the first token (produced by prefill)
+  and is long enough to average out per-step overhead. Any measurement generating four or 24 tokens
+  is not comparable to this table's decode column, including the earlier figures on this page.
+
+Prefill is close to linear in prompt length above 4,096 tokens: the 4,096→32,768 segment runs at a
+marginal 1,670 tok/s (a 600 µs/token slope) and the 32,768→65,536 segment at 1,285 tok/s, the
+difference being the growing quadratic attention term. **The 64- and 512-token rows measure
+short-prompt latency, not steady-state throughput**: both complete in 0.55–0.59 s because a fixed
+per-process cost dominates at that size.
+
+Per rank, 6.86 GiB of resident weights and 0.71 MiB of scales are fixed; only the KV data and the
+activation workspace grow with context, which is why the memory curve is nearly flat. The activation
+workspace is the peak capacity of the reusable chunk workspace and does not grow with prompt length
+past one chunk.
+
+Earlier revisions of this section published 416.48, 453.08 and 295.46 tok/s for a 512-token fixture
+in three different places. All three predate the GQA tensor-core prefill and cuBLAS FP8 prefill
+defaults, and the long-context tables used 512-token prefill chunks; this sweep supersedes them.
 
 ### Current memory-safe FP16-activation kernels
 
 The current reference runtime now uses FP16-input, FP32-accumulation FP8 projection kernels without expanding prompt activations or weights. The prefill path uses a 128-token x 64-output N64 tile when alignment and batch size permit; decode uses vectorized single-row FP8 matvec, while the original scalar kernel remains the fallback. Two-row and four-row decode variants remain explicit experiments because their register pressure reduced end-to-end decode throughput. These kernels preserve the default exact full-attention semantics and FP16 KV cache.
 
-A clean serial TP4 run on the same real checkpoint and 512-token fixture measured `453.08 tok/s` prefill and `36.95 tok/s` decode with 24 generated tokens. A prior repeat measured `456.78 / 37.12 tok/s`; both runs produced identical rank-local greedy sequences and `rank_token_parity=PASS`. The resident weight and scale bytes remained `7,367,270,656` and `742,400` per rank, and peak GPU memory was `8,497,528,832` bytes on the highest rank.
-
-The same executable was then run serially over longer prompts with four generated tokens, complete 64-layer execution, 512-token chunks, and FP16 KV cache:
-
-| Prompt | Prefill | Decode | Activation workspace | KV data | Highest rank memory | Rank parity |
-| ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 4,096 | 386.16 tok/s | 29.82 tok/s | 61.00 MiB | 64.1 MiB | 8.02 GiB | PASS |
-| 8,192 | 293.60 tok/s | 24.58 tok/s | 61.00 MiB | 128.1 MiB | 8.09 GiB | PASS |
-| 32,768 | 113.92 tok/s | 11.05 tok/s | 61.00 MiB | 512.1 MiB | 8.47 GiB | PASS |
-| 65,536 | 65.21 tok/s | 6.60 tok/s | 61.00 MiB | 1,024.1 MiB | 8.97 GiB | PASS |
-| 131,072 | 35.19 tok/s | 3.65 tok/s | 62.50 MiB | 2,048.1 MiB | 9.97 GiB | PASS |
+These kernels are the default projection path. Their end-to-end result is the sweep in **Validated
+performance** above, and the resident weight and scale bytes they report are `7,367,270,656` and
+`742,400` per rank.
 
 The direct FP16-activation FP8 projection gate covers aligned and padded strides, masked rows, tail K tiles, vectorized-versus-scalar decode dispatch, and the wide prefill tile. It reports decode max absolute error `1.459e-2` against the FP32 host reference, with vectorized-versus-scalar output difference `0`; the 4-row experimental path differs by at most `3.906e-3`. The focused FP8 online operator suite and full TP4 rank parity checks also pass.
 
@@ -291,7 +315,7 @@ Native MTP was also exercised through this same long-lived protocol with adaptiv
 
 This validates the intended single-concurrency cache behavior and shows a wall win on all four requests, but it also confirms that the 1.5x requirement remains acceptance-dependent: only the 100%-acceptance request clears 1.5x decode and wall throughput. Appends reuse the target recurrent/KV state and the MTP shifted boundary; compression restores a target-hidden snapshot and rewrites the MTP boundary before priming the new suffix. The persistent harness reports wall, prefill, and decode timing separately; prefill includes MTP predictor priming when enabled.
 
-The same harness was then run from a 32,768-token cold prompt with 512-token appends and a 4,096-token compression boundary:
+The same harness was then run from a 32,768-token cold prompt with 512-token appends and a 4,096-token compression boundary. The run predates the current kernel defaults, so its absolute prefill figures are superseded by **Validated performance**; request 1 is that run's own cold baseline, so the reuse comparison holds within the table:
 
 | Request | Prompt | Reused | Computed | Resume | Request prefill TPS | Snapshot bytes/rank |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
@@ -302,24 +326,37 @@ The same harness was then run from a 32,768-token cold prompt with 512-token app
 
 Request 1 matches the cold 32K prefill baseline. The two appends each execute only the 513 uncached tokens, and the compressed request recomputes only its 512-token suffix after restoring the 4,096-token snapshot. Snapshot memory shrinks when a shorter prompt invalidates later rollback points.
 
-### Long-context TP4 baseline
+### KV cache dtype and the 262,144-token boundary
 
-The following recent serial runs use the real checkpoint, deterministic natural-language tokenizer IDs, four generated tokens, complete 64-layer execution, 512-token prefill chunks, and greedy-token parity across all four ranks. Decode TPS excludes the first generated token, which is produced by prefill. The activation workspace is the peak capacity of the reusable chunk workspace, not a prompt-length buffer.
+FP16 KV cache is the default and the precision/performance baseline. FP8 E4M3 cache is an explicit
+opt-in over 64-channel blocks that halves KV data per rank — 2,048 MiB instead of 4,096 MiB at the
+262,140-token boundary — and is not the faster configuration at any length. The quantized-cache
+comparison has its own document: [`../performance/qwen_kv_cache_65k_tg512.md`](../performance/qwen_kv_cache_65k_tg512.md)
+measures FP16, FP8, TurboQuant K8V4 and INT8 per-token-head at 65,536 tokens with 512 generated
+tokens and finds that dequant-once gives the quantized formats **prefill parity** with FP16 (within
+0.3%) while decode falls to 0.124x (FP8), 0.370x (TurboQuant K8V4) and 0.052x (INT8 per-token-head).
+Earlier revisions of this page said FP8 cache reduced prefill throughput as well; that measurement
+predates dequant-once and is corrected here. The two cache dtypes also agree token for token: the
+131,072-token FP16 and FP8 runs generated the same 128 tokens. FP16 greedy output is itself stable
+across builds — ten runs of the 32,768-token case spanning five revisions and six runs of the
+65,536-token case all produced the same sequence.
 
-| Cache | Prompt | Prefill | Decode | Activation workspace | KV data / scales | Highest rank memory | Rank parity |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| FP16 | 32,768 | 99.32 tok/s | 10.39 tok/s | 63.97 MB | 512.0 / 0 MB | 8.47 GiB | PASS |
-| FP8 | 32,768 | 81.58 tok/s | 4.44 tok/s | 63.97 MB | 256.0 / 8.00 MB | 8.22 GiB | PASS |
-| FP16 | 65,536 | 60.42 tok/s | 6.48 tok/s | 63.97 MB | 1,024.0 / 0 MB | 8.97 GiB | PASS |
-| FP8 | 65,536 | 47.91 tok/s | 2.41 tok/s | 63.97 MB | 512.0 / 16.00 MB | 8.48 GiB | PASS |
-| FP16 | 131,072 | 33.80 tok/s | 3.58 tok/s | 62.50 MB | 2,048.0 / 0 MB | 9.97 GiB | PASS |
-| FP8 | 131,072 | 26.03 tok/s | 1.25 tok/s | 62.50 MB | 1,024.0 / 32.00 MB | 9.01 GiB | PASS |
-| FP16 | 262,140 | 17.88 tok/s | 1.92 tok/s | 65.50 MB | 4,096.0 / 0 MB | 11.91 GiB | PASS |
-| FP8 | 262,140 | 13.29 tok/s | 0.64 tok/s | 65.50 MB | 2,048.0 / 64.0 MB | 9.97 GiB | PASS |
+Chunked prefill is what makes the boundary reachable. It removes the previous prompt-length FP32
+activation allocation, so the longest prompt the model accepts — 262,140 tokens, four positions short
+of `max_context=262144` — completes without OOM inside the 22 GiB/rank budget: 787.32 tok/s prefill
+over 332.95 s, 4,096 MiB of KV data and no scale bytes per rank, a 15.24 GiB highest-rank
+`nvidia-smi` peak, TP-rank parity, and `[321, 5979, 13914, 13]` as the four generated tokens. Of that
+peak, 11.85 GiB is the engine's own accounting and the remaining 3.4 GiB is the same fixed
+per-process overhead seen at every other prompt length.
 
-The 32K, 64K, and 128K FP16/FP8 runs produced identical four-token sequences for each cache-dtype pair. The FP16 and FP8 262,140-token boundary runs both generated `[321, 5979, 13914, 13]` with `max_context=262144`, completed without OOM, and preserved TP-rank token parity. FP8 cache is retained as an explicit memory-saving option, not the default: on this RTX 2080 Ti setup, online cache dequantization materially reduces prefill and decode throughput. At the 262K boundary it halves KV data from 4,096 MiB to 2,048 MiB and reduces the highest observed rank memory from 11.91 GiB to 9.97 GiB, while prefill falls from 17.88 to 13.29 tok/s and decode from 1.92 to 0.64 tok/s. FP16 KV cache remains the precision/performance baseline.
-
-These measurements establish that chunked prefill removes the previous prompt-length FP32 activation allocation and that a 262,140-token prompt plus four generated positions completes within the 22 GiB/rank budget with either FP16 or FP8 KV cache. The FP8 boundary run took approximately 19,729.6 seconds wall time with the complete 64-layer runtime.
+The boundary case carries no decode column, and cannot: `max_context` has to cover the prompt plus
+the generated positions, and the model is limited to 262,144 of them, so 262,140 prompt tokens leave
+exactly four. `--max-new-tokens 128` is refused at this length — all four ranks report `Qwen max
+context exceeds model configuration`, with either cache dtype — so read the row as a
+prefill-and-memory result only. An earlier revision of this page published 1.92 tok/s (FP16) and
+0.64 tok/s (FP8) decode for it; those figures came from generations too short to measure decode and
+are retracted. Decode is measured at 64, 512, 4,096, 8,192, 32,768 and 65,536 tokens in
+**Validated performance**.
 
 ### Decode Context Parallelism feasibility on four GPUs
 
@@ -327,7 +364,7 @@ These measurements establish that chunked prefill removes the previous prompt-le
 
 Keeping four GPUs constrains the proposed topology to TP2xDCP2. For a context length `C`, the per-GPU full-attention decode work is unchanged: TP4 performs `6` local Q heads over `C` positions, while TP2xDCP2 performs `12` local Q heads over `C/2` positions. Both equal `6C` head-position evaluations per device; the DCP topology then adds two DCP all-reduces per full-attention layer and doubles the local TP2 weights.
 
-This was tested with a deliberately favorable upper bound: plain TP2 at half the TP4 context length, without the two DCP collectives or cache compaction. It was already slower and used substantially more memory:
+This was tested with a deliberately favorable upper bound: plain TP2 at half the TP4 context length, without the two DCP collectives or cache compaction. It was already slower and used substantially more memory. Both columns come from the same run, so the comparison stands, but the TP4 decode column was measured with 512-token prefill chunks on the kernels of the time and is superseded by **Validated performance**:
 
 | TP4 context / result | TP2 half-context, no DCP communication | Result |
 | --- | --- | --- |
@@ -384,29 +421,20 @@ For reproducible serial long-context TP4 measurements:
 
 ```bash
 python scripts/bench_qwen_long_context.py \
+  --binary cpp_engine/build/pocketllm_engine \
   --ckpt /path/to/Qwen3.8-27B-FP8 \
   --tp-world 4 --devices 0,1,2,3 \
-  --lengths 512,4096,8192,32768,65536 \
-  --max-new-tokens 4 \
-  --prefill-chunk-tokens 512 \
+  --lengths 64,512,4096,8192,32768,65536 \
+  --max-new-tokens 128 \
+  --prefill-chunk-tokens 8192 \
   --kv-cache-dtype fp16 \
   --layers 0 \
   --tokenizer-python /path/to/deepseek/bin/python
 ```
 
-The harness persists one log per rank, records rank-local timing and memory fields, checks greedy-token parity across TP ranks, and writes `results.json` after every successful context length. FP16-versus-FP8 cache parity is a separate comparison of the generated sequences from two serial runs.
+This is the command behind **Validated performance**, including its generated-token budget and prefill chunk size; changing either makes the output incomparable to that table. The harness persists one log per rank, records rank-local timing and memory fields, checks greedy-token parity across TP ranks, and writes `results.json` after every successful context length. FP16-versus-FP8 cache parity is a separate comparison of the generated sequences from two serial runs.
 
-For the exact optimized FP16 GQA path, set `POCKETLLM_QWEN_GQA_OPTIMIZED=1` around the engine command or benchmark process. It keeps full attention and uses a tiled prefill kernel. The engine uses compact split-context fused decode partials from context 16,384 onward on SM75; shorter contexts retain the reference score/value decode path because it is faster there. A clean TP4 run with 24 generated tokens measured the following opt-in results, with token parity at every length:
-
-| Prompt | Reference prefill / decode | Optimized prefill / decode |
-| ---: | ---: | ---: |
-| 512 | 295.46 / 31.06 tok/s | 294.84 / 30.98 tok/s |
-| 4,096 | 259.69 / 25.96 tok/s | 282.47 / 25.72 tok/s |
-| 8,192 | 211.02 / 21.19 tok/s | 253.70 / 21.01 tok/s |
-| 16,384 | 154.58 / 15.58 tok/s | 208.24 / 17.57 tok/s |
-| 32,768 | 97.75 / 10.66 tok/s | 159.52 / 17.36 tok/s |
-
-The 4,096 and 8,192 optimized rows use the tiled prefill but reference decode dispatch; the 16,384 row is the fused-decode crossover validation, and the 32,768 row shows the long-context gain. The direct CUDA gate covers causal offsets through 333 tokens, head dimensions 64/256, contexts 4,096/8,192/32,768, and a 262,144-token compact-partial boundary check. The optimized path preserves the default token sequence in the clean TP4 runs.
+The exact FP16 GQA path is on by default and is what those measurements exercise: it keeps full attention, uses a tiled prefill kernel, and uses compact split-context fused decode partials from context 4,096 onward on SM75 while shorter contexts retain the reference score/value decode path because it is faster there. On an earlier build, when the path was still opt-in behind `POCKETLLM_QWEN_GQA_OPTIMIZED=1`, it improved a 24-generated-token 32,768-token run from 97.75 to 159.52 tok/s prefill and from 10.66 to 17.36 tok/s decode, with token parity at every length. Those absolute values are superseded by **Validated performance**; the gate itself is unchanged: the direct CUDA test covers causal offsets through 333 tokens, head dimensions 64/256, contexts 4,096/8,192/32,768, and a 262,144-token compact-partial boundary check.
 
 Sparse experiments require an explicit `--qwen-attention-window N` and may add `--qwen-attention-sink-tokens N`; `N=0` is exact full attention. The sparse kernel attends to the leading sink prefix plus the newest window positions without changing KV-cache storage. This is an experimental semantic change, not an exact full-attention optimization claim. Window values that cover the complete context are directly checked against exact output; long-context quality and throughput are not reported here until measured on clean GPUs.
 
@@ -424,7 +452,7 @@ build/cpp_engine/pocketllm_engine \
 - Text-only: no image/video preprocessing or vision-tower execution.
 - Text-only serving: the native OpenAI-compatible server is validated for Qwen text requests, while the checkpoint's vision tower and multimodal request formats are not implemented.
 - Stochastic sampling is available through `--temperature`, `--top-p`, and `--top-k`. The default remains greedy (temperature 0) so existing benchmarks stay reproducible. Per-request sampling overrides are exposed in the batched API and the OpenAI server.
-- The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. This boundary is validated with both the default FP16 KV cache and the explicit FP8 cache mode; FP8 uses less memory but is slower on this RTX 2080 Ti setup.
+- The model limit is 262,144 positions; with four generated tokens, the longest valid benchmark prompt is 262,140 tokens. That boundary is a prefill-and-memory result, not a throughput one — the position limit leaves no room for a decode measurement there. FP8 KV cache halves the boundary's KV footprint per rank by construction but is slower everywhere it has been measured; see [`../performance/qwen_kv_cache_65k_tg512.md`](../performance/qwen_kv_cache_65k_tg512.md).
 - CUDA Graph and a decode megakernel remain future work; neither is included in the reported TPS.
 - Native MTP is opt-in. Parity-safe high-acceptance cases accelerate decode by 1.67x at 4K, 2.47x at 8K, and 3.21x at 32K; 65–71% acceptance gives only 1.18–1.37x on 512-token varied prompts. Persistent exact-prefix workloads are the intended use case; `--qwen-mtp-adaptive` starts at K=1 and limits but does not eliminate low-acceptance overhead.
 - External Qwen DSpark is opt-in and always uses its fixed seven-draft/eight-row transaction. It accelerates high-draft-match decode by 1.61–1.92x in measured 512/8K/32K cases, while a bare greedy stress prompt achieved only 31/182 draft matches and regressed to about 17.4 tok/s. This draft-match ratio excludes bonus tokens and is not comparable to the model card's bonus-inclusive `spec_accept_length=3.39` sampled-workload mean. Confidence is telemetry only; no unvalidated threshold is used to gate transactions.
@@ -454,4 +482,4 @@ build/cpp_engine/pocketllm_engine \
 - `scripts/bench_qwen_dspark.py`
 - `scripts/bench_qwen_dspark_prefix_cache.py`
 - [Qwen3.8-27B-NVFP4](qwen3.8-27b-nvfp4.md) for the mixed NVFP4/FP8 checkpoint on the same text runtime
-- [Benchmark reporting rules](../benchmarking.md)
+- [Benchmark reporting rules](../guides/benchmarking.md)

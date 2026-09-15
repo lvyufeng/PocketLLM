@@ -61,8 +61,9 @@ std::unique_ptr<InferenceEngine> make_deepseek_v4_engine(
     opts.device = options.device;
     opts.nccl_id_path = options.nccl_id_path;
     const int layers = options.layer_count > 0 ? options.layer_count : kDeepSeekV4Layers;
+    const int max_slots = std::max(1, options.max_batch_size);
     return std::make_unique<PersistentEngineAdapter>(ckpt_dir, opts, layers,
-                                                     options.max_context);
+                                                     options.max_context, max_slots);
 }
 
 }  // namespace

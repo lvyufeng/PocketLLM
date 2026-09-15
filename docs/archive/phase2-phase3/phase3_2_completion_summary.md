@@ -330,9 +330,9 @@ def test_2slot_isolation():
 
 ## 🔗 相关文档
 
-- **实施计划**: `docs/phase3_2_implementation_plan.md`
-- **Phase 3.1 总结**: `docs/phase3_1_completion_summary.md`
-- **总体架构**: `docs/cpp_engine_batching_phase3_1.md`
+- **实施计划**: `docs/archive/phase2-phase3/phase3_2_implementation_plan.md`
+- **Phase 3.1 总结**: `docs/archive/phase2-phase3/phase3_1_completion_summary.md`
+- **总体架构**: `docs/archive/phase2-phase3/cpp_engine_batching_phase3_1.md`
 
 ---
 

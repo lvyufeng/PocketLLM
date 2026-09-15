@@ -983,8 +983,23 @@ struct DeviceCompressorCache {
 struct DeviceCompressorState {
     float* kv = nullptr;
     float* score = nullptr;
+    // `slots` is the compressor's ring width for one sequence. The device
+    // allocation contains this ring for every request slot.
     int slots = 0;
     int cols = 0;
+    int request_slots = 1;
+
+    size_t request_stride() const {
+        return static_cast<size_t>(slots) * static_cast<size_t>(cols);
+    }
+
+    float* kv_for_request(int request_slot) const {
+        return kv + static_cast<size_t>(request_slot) * request_stride();
+    }
+
+    float* score_for_request(int request_slot) const {
+        return score + static_cast<size_t>(request_slot) * request_stride();
+    }
 };
 
 // Host snapshot retained for the sequential speculative fallback. Streaming
@@ -1162,6 +1177,7 @@ struct DeviceContinuationWorkspace {
     int route_count = 0;
     int index_q_dim = 0;
     int index_head_dim = 0;
+    int32_t* positions = nullptr;
     int* token_ids = nullptr;
     float* x = nullptr;
     float* h4 = nullptr;
@@ -1211,7 +1227,8 @@ struct DeviceContinuationWorkspace {
         device_free(attn_out); device_free(compressor_input_bf16); device_free(compressor_input_rounded);
         device_free(compressor_kv); device_free(compressor_score); device_free(indexer_comp_kv);
         device_free(indexer_comp_score); device_free(index_q); device_free(index_scores);
-        device_free(kv_row_starts); device_free(kv_indices); device_free(ffn_x); device_free(ffn_norm);
+        device_free(positions); device_free(kv_row_starts); device_free(kv_indices);
+        device_free(ffn_x); device_free(ffn_norm);
         device_free(shared_gate); device_free(shared_up); device_free(shared_hidden); device_free(shared_out);
         device_free(moe); device_free(route_indices); device_free(route_weights); device_free(final_x);
         device_free(final_norm); device_free(logits); device_free(dspark_hidden);
@@ -1266,6 +1283,7 @@ struct DeviceContinuationWorkspace {
         alloc_f(&indexer_comp_score, r * index_head_dim * 2, "device_malloc continuation indexer comp score");
         if (index_q_dim > 0) alloc_f(&index_q, r * index_q_dim, "device_malloc continuation index q");
         alloc_f(&index_scores, static_cast<size_t>(max_indices + index_q_dim), "device_malloc continuation index scores");
+        check_device(device_malloc_into(positions, r * sizeof(int32_t)), "device_malloc continuation positions");
         check_device(device_malloc_into(kv_row_starts, (r + 1) * sizeof(int32_t)), "device_malloc continuation row starts");
         check_device(device_malloc_into(kv_indices, r * max_kv_indices * sizeof(int32_t)), "device_malloc continuation kv indices");
         alloc_f(&ffn_x, r * dim, "device_malloc continuation ffn x");
@@ -1590,9 +1608,21 @@ struct DeviceGateCache {
     int hash_topk = 0;
 };
 
+struct ForwardSlotState {
+    std::vector<float> last_local_logits;
+    int last_head_rows = 0;
+    int last_local_head_start = 0;
+    std::vector<int> last_topk_tokens;
+    std::vector<float> last_topk_logits;
+    std::vector<float> dspark_hidden;
+    int dspark_hidden_positions = 0;
+};
+
 struct SafeForwardContext {
-    explicit SafeForwardContext(const std::string& dir)
-        : ckpt_dir(check_safetensors_path(dir)),
+    explicit SafeForwardContext(const std::string& dir, int requested_slots = 1)
+        : max_slots(std::max(1, requested_slots)),
+          slot_states(static_cast<size_t>(std::max(1, requested_slots))),
+          ckpt_dir(check_safetensors_path(dir)),
           index(dir),
           config(ModelConfig::from_hf_config(dir)),
           embed_shard(index.shard_path(require_shard_name(index, "embed.weight"))),
@@ -1605,6 +1635,22 @@ struct SafeForwardContext {
         hc_head_fn = require_tensor(hc_head_shard, "hc_head_fn");
         hc_head_scale = require_tensor(hc_head_shard, "hc_head_scale");
         hc_head_base = require_tensor(hc_head_shard, "hc_head_base");
+    }
+
+    ForwardSlotState& slot_state_for(int slot_id) {
+        if (slot_id < 0 || slot_id >= max_slots) {
+            throw std::runtime_error("invalid DeepSeek request slot " +
+                                     std::to_string(slot_id));
+        }
+        return slot_states[static_cast<size_t>(slot_id)];
+    }
+
+    const ForwardSlotState& slot_state_for(int slot_id) const {
+        if (slot_id < 0 || slot_id >= max_slots) {
+            throw std::runtime_error("invalid DeepSeek request slot " +
+                                     std::to_string(slot_id));
+        }
+        return slot_states[static_cast<size_t>(slot_id)];
     }
 
     ~SafeForwardContext() {
@@ -2415,10 +2461,13 @@ struct SafeForwardContext {
         DeviceCompressorState state;
         state.slots = slots;
         state.cols = cols;
-        check_device(device_malloc_into(state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc compressor kv state");
-        check_device(device_malloc_into(state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc compressor score state");
-        check_device(device_memset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero compressor kv state");
-        std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
+        state.request_slots = max_slots;
+        const size_t elements = static_cast<size_t>(state.request_slots) *
+            state.request_stride();
+        check_device(device_malloc_into(state.kv, elements * sizeof(float)), "device_malloc compressor kv state");
+        check_device(device_malloc_into(state.score, elements * sizeof(float)), "device_malloc compressor score state");
+        check_device(device_memset(state.kv, 0, elements * sizeof(float)), "zero compressor kv state");
+        std::vector<float> init(elements, -INFINITY);
         check_device(memcpy_h2d(state.score, init.data(), init.size() * sizeof(float)), "init compressor score state");
         auto inserted = compressor_device_state.emplace(layer_id, state);
         return inserted.first->second;
@@ -2430,10 +2479,13 @@ struct SafeForwardContext {
         DeviceCompressorState state;
         state.slots = slots;
         state.cols = cols;
-        check_device(device_malloc_into(state.kv, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc indexer compressor kv state");
-        check_device(device_malloc_into(state.score, static_cast<size_t>(slots) * cols * sizeof(float)), "device_malloc indexer compressor score state");
-        check_device(device_memset(state.kv, 0, static_cast<size_t>(slots) * cols * sizeof(float)), "zero indexer compressor kv state");
-        std::vector<float> init(static_cast<size_t>(slots) * cols, -INFINITY);
+        state.request_slots = max_slots;
+        const size_t elements = static_cast<size_t>(state.request_slots) *
+            state.request_stride();
+        check_device(device_malloc_into(state.kv, elements * sizeof(float)), "device_malloc indexer compressor kv state");
+        check_device(device_malloc_into(state.score, elements * sizeof(float)), "device_malloc indexer compressor score state");
+        check_device(device_memset(state.kv, 0, elements * sizeof(float)), "zero indexer compressor kv state");
+        std::vector<float> init(elements, -INFINITY);
         check_device(memcpy_h2d(state.score, init.data(), init.size() * sizeof(float)), "init indexer compressor score state");
         auto inserted = indexer_compressor_device_state.emplace(layer_id, state);
         return inserted.first->second;
@@ -2447,14 +2499,34 @@ struct SafeForwardContext {
     // and only flushed/pooled at block boundaries ((position+1) % ratio == 0).
     // When a request ends mid-block, a partial accumulation lingers in kv/score
     // and the next request resumes from it, contaminating compressed-KV output.
-    // reset_session() must call this to restore the initial state.
+    // Reset the streaming compressor running state (kv accumulator -> 0, score
+    // -> -INF) for every request slot. The state is an incremental accumulator,
+    // so clearing only the visible KV ring is not sufficient when a request ends
+    // in the middle of a compression block.
     void reset_streaming_compressor_states() {
         auto reset_one = [](DeviceCompressorState& s) {
             if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) return;
-            const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
+            const size_t n = static_cast<size_t>(s.request_slots) * s.request_stride();
             check_device(device_memset(s.kv, 0, n * sizeof(float)), "reset compressor kv state");
             std::vector<float> init(n, -INFINITY);
             check_device(memcpy_h2d(s.score, init.data(), n * sizeof(float)), "reset compressor score state");
+        };
+        for (auto& [_, s] : compressor_device_state) reset_one(s);
+        for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
+    }
+
+    void reset_streaming_compressor_state_slot(int request_slot) {
+        if (request_slot < 0 || request_slot >= max_slots) {
+            throw std::runtime_error("invalid compressor request slot");
+        }
+        auto reset_one = [&](DeviceCompressorState& s) {
+            if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) return;
+            const size_t n = s.request_stride();
+            check_device(device_memset(s.kv_for_request(request_slot), 0,
+                                        n * sizeof(float)), "reset compressor slot state");
+            std::vector<float> init(n, -INFINITY);
+            check_device(memcpy_h2d(s.score_for_request(request_slot), init.data(),
+                                    n * sizeof(float)), "reset compressor slot score");
         };
         for (auto& [_, s] : compressor_device_state) reset_one(s);
         for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
@@ -2500,24 +2572,88 @@ struct SafeForwardContext {
         return window + compressed;
     }
 
-    float* kv_cache_for_layer(int layer_id, int head_dim) {
+    size_t kv_cache_stride_elements(int layer_id, int head_dim) const {
+        return static_cast<size_t>(kv_cache_capacity_for_layer(layer_id)) *
+               static_cast<size_t>(head_dim);
+    }
+
+    float* kv_cache_storage_for_layer(int layer_id, int head_dim) {
         auto it = kv_cache.find(layer_id);
         if (it != kv_cache.end()) return it->second;
         float* ptr = nullptr;
-        const int capacity = kv_cache_capacity_for_layer(layer_id);
-        check_device(device_malloc_into(ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "device_malloc kv cache");
+        const size_t stride = kv_cache_stride_elements(layer_id, head_dim);
+        check_device(device_malloc_into(
+            ptr, static_cast<size_t>(max_slots) * stride * sizeof(float)),
+            "device_malloc multi-slot kv cache");
+        check_device(device_memset(
+            ptr, 0, static_cast<size_t>(max_slots) * stride * sizeof(float)),
+            "zero multi-slot kv cache");
         kv_cache[layer_id] = ptr;
         return ptr;
     }
 
-    float* indexer_kv_cache_for_layer(int layer_id, int head_dim) {
+    float* kv_cache_for_layer(int layer_id, int head_dim, int request_slot = 0) {
+        if (request_slot < 0 || request_slot >= max_slots) {
+            throw std::runtime_error("invalid KV request slot");
+        }
+        return kv_cache_storage_for_layer(layer_id, head_dim) +
+               static_cast<size_t>(request_slot) *
+                   kv_cache_stride_elements(layer_id, head_dim);
+    }
+
+    size_t indexer_kv_cache_stride_elements(int head_dim) const {
+        const int capacity = std::max(1, (kv_cache_tokens + 3) / 4);
+        return static_cast<size_t>(capacity) * static_cast<size_t>(head_dim);
+    }
+
+    float* indexer_kv_cache_storage_for_layer(int layer_id, int head_dim) {
         auto it = indexer_kv_cache.find(layer_id);
         if (it != indexer_kv_cache.end()) return it->second;
-        const int capacity = std::max(1, (kv_cache_tokens + 3) / 4);
         float* ptr = nullptr;
-        check_device(device_malloc_into(ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "device_malloc indexer kv cache");
+        const size_t stride = indexer_kv_cache_stride_elements(head_dim);
+        check_device(device_malloc_into(
+            ptr, static_cast<size_t>(max_slots) * stride * sizeof(float)),
+            "device_malloc multi-slot indexer kv cache");
+        check_device(device_memset(
+            ptr, 0, static_cast<size_t>(max_slots) * stride * sizeof(float)),
+            "zero multi-slot indexer kv cache");
         indexer_kv_cache[layer_id] = ptr;
         return ptr;
+    }
+
+    float* indexer_kv_cache_for_layer(int layer_id, int head_dim,
+                                      int request_slot = 0) {
+        if (request_slot < 0 || request_slot >= max_slots) {
+            throw std::runtime_error("invalid indexer KV request slot");
+        }
+        return indexer_kv_cache_storage_for_layer(layer_id, head_dim) +
+               static_cast<size_t>(request_slot) *
+                   indexer_kv_cache_stride_elements(head_dim);
+    }
+
+    void reset_slot_caches(int request_slot) {
+        if (request_slot < 0 || request_slot >= max_slots) {
+            throw std::runtime_error("invalid cache request slot");
+        }
+        for (const auto& [layer_id, ptr] : kv_cache) {
+            if (ptr == nullptr) continue;
+            const int head_dim = static_cast<int>(config.head_dim);
+            check_device(device_memset(
+                ptr + static_cast<size_t>(request_slot) *
+                         kv_cache_stride_elements(layer_id, head_dim),
+                0, kv_cache_stride_elements(layer_id, head_dim) * sizeof(float)),
+                "reset KV request slot");
+        }
+        const int index_head_dim = static_cast<int>(config.index_head_dim);
+        for (const auto& [_, ptr] : indexer_kv_cache) {
+            if (ptr == nullptr) continue;
+            check_device(device_memset(
+                ptr + static_cast<size_t>(request_slot) *
+                         indexer_kv_cache_stride_elements(index_head_dim),
+                0, indexer_kv_cache_stride_elements(index_head_dim) * sizeof(float)),
+                "reset indexer KV request slot");
+        }
+        reset_streaming_compressor_state_slot(request_slot);
     }
 
     const float* rope_inv_freqs_for(int layer_id, bool use_compress, int rope_dim, float theta) {
@@ -2561,6 +2697,8 @@ struct SafeForwardContext {
     }
 
 
+    int max_slots = 1;
+    std::vector<ForwardSlotState> slot_states;
     std::string ckpt_dir;
     SafeTensorsIndex index;
     ModelConfig config;
@@ -2637,8 +2775,12 @@ struct SafeForwardContext {
 
 }  // namespace
 
-ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position);
-ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count);
+ForwardSmokeResult run_safetensors_token_forward_impl(
+    SafeForwardContext& ctx, int token, int layer_count, int position,
+    int request_slot = 0);
+ForwardSmokeResult run_safetensors_prompt_prefill_impl(
+    SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count,
+    int request_slot = 0);
 
 struct ContinuationBatchResult {
     int rows = 0;
@@ -2754,9 +2896,12 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(con
     return run_safetensors_generate_tokens_timed_with_options(ckpt_dir, seed_tokens, layer_count, max_new_tokens, options).tokens;
 }
 
-ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count) {
+ForwardSmokeResult run_safetensors_prompt_prefill_impl(
+    SafeForwardContext& ctx, const std::vector<int>& tokens, int layer_count,
+    int request_slot) {
     if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
+    (void)ctx.slot_state_for(request_slot);
     SafeTensorsIndex& index = ctx.index;
     ModelConfig& config = ctx.config;
     if (layer_count <= 0) layer_count = 1;
@@ -3087,7 +3232,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
         if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
         attn_dims.d_inv_freqs = ctx.rope_inv_freqs_for(li, layer_compress_ratio != 0, attn_dims.rope_dim, attn_dims.rope_theta);
-        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
+        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim, request_slot) : nullptr;
 
         if (prefill_moe_prefetch_enabled && prefill_moe_copy_stream_enabled && li > 0 && !prev_layer_active_locals.empty()) {
             const int prefetched = stage_experts_for_layer(li, prev_layer_active_locals, prefill_moe_copy_stream);
@@ -3545,19 +3690,20 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             top_token = local_head_start + i;
         }
     }
-    ctx.last_local_logits = std::move(logits);
-    ctx.last_head_rows = head_rows;
-    ctx.last_local_head_start = local_head_start;
+    ForwardSlotState& slot_out = ctx.slot_state_for(request_slot);
+    slot_out.last_local_logits = std::move(logits);
+    slot_out.last_head_rows = head_rows;
+    slot_out.last_local_head_start = local_head_start;
 
     if (dspark_capture_slot >= 0) {
-        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride);
-        check_device(memcpy_d2h(ctx.dspark_hidden.data(), d_dspark_hidden,
-                                ctx.dspark_hidden.size() * sizeof(float)),
+        slot_out.dspark_hidden.resize(static_cast<size_t>(dspark_capture_rows) * dspark_hidden_stride);
+        check_device(memcpy_d2h(slot_out.dspark_hidden.data(), d_dspark_hidden,
+                                slot_out.dspark_hidden.size() * sizeof(float)),
                      "copy prefill dspark hidden");
-        ctx.dspark_hidden_positions = dspark_capture_rows;
+        slot_out.dspark_hidden_positions = dspark_capture_rows;
     } else {
-        ctx.dspark_hidden.clear();
-        ctx.dspark_hidden_positions = 0;
+        slot_out.dspark_hidden.clear();
+        slot_out.dspark_hidden_positions = 0;
     }
 
     device_free(d_token_ids); device_free(d_embed_matrix); device_free(d_x_rows); device_free(d_h4_rows); device_free(d_h4_next_rows); device_free(d_h4_bf16_rows); device_free(d_hc_post_rows); device_free(d_hc_comb_rows); device_free(d_attn_out_rows); device_free(d_ffn_gamma); device_free(d_ffn_norm_rows);
@@ -4279,8 +4425,11 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     return result;
 }
 
-ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {
+ForwardSmokeResult run_safetensors_token_forward_impl(
+    SafeForwardContext& ctx, int token, int layer_count, int position,
+    int request_slot) {
     if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
+    (void)ctx.slot_state_for(request_slot);
     SafeTensorsIndex& index = ctx.index;
     ModelConfig& config = ctx.config;
     if (layer_count <= 0) layer_count = 1;
@@ -4509,7 +4658,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         const std::string prefix = "layers." + std::to_string(li) + ".";
         attn_dims.layer_id = li;
         attn_dims.cache_write_slot = position % attn_dims.window_size;
-        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
+        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim, request_slot) : nullptr;
         uint64_t layer_compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
         attn_dims.rope_theta = static_cast<float>(layer_compress_ratio == 0 ? config.rope_theta : config.compress_rope_theta);
         if (attn_dims.rope_theta <= 0.0f) throw std::runtime_error("invalid layer rope_theta");
@@ -4567,13 +4716,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             const int offset = position % ratio;
             const float* ape = comp_cache.ape + static_cast<size_t>(offset) * comp_cols;
             DeviceCompressorState& comp_state = ctx.compressor_state_for_layer(li, slots, state_cols);
+            float* comp_state_kv = comp_state.kv_for_request(request_slot);
+            float* comp_state_score = comp_state.score_for_request(request_slot);
             const int write_slot = overlap ? ratio + offset : offset;
-            if (!compressor_update_state_cuda(d_compressor_kv, d_compressor_score, ape, comp_state.kv, comp_state.score, offset, write_slot, state_cols)) throw std::runtime_error("compressor state update launch failed");
+            if (!compressor_update_state_cuda(d_compressor_kv, d_compressor_score, ape, comp_state_kv, comp_state_score, offset, write_slot, state_cols)) throw std::runtime_error("compressor state update launch failed");
             if ((position + 1) % ratio == 0) {
                 const int compressed_slot = attn_dims.window_size + position / ratio;
                 if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
                     float* d_pooled_slot = d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim;
-                    if (!compressor_pool_cuda(comp_state.kv, comp_state.score, d_pooled_slot, ratio, attn_dims.head_dim, state_cols, overlap)) throw std::runtime_error("compressor pool launch failed");
+                    if (!compressor_pool_cuda(comp_state_kv, comp_state_score, d_pooled_slot, ratio, attn_dims.head_dim, state_cols, overlap)) throw std::runtime_error("compressor pool launch failed");
                     if (!rmsnorm_bf16_gamma_cuda(d_pooled_slot, comp_cache.norm, d_pooled_slot, attn_dims.head_dim, 1e-6f)) throw std::runtime_error("compressed kv norm launch failed");
                     const float comp_rope_theta = static_cast<float>(config.compress_rope_theta == 0 ? 160000 : config.compress_rope_theta);
                     const float* comp_freqs = ctx.rope_inv_freqs_for(li, true, attn_dims.rope_dim, comp_rope_theta);
@@ -4586,7 +4737,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                         print_summary("layer=" + std::to_string(li) + ".compressed_kv", pooled_slot);
                     }
                 }
-                if (overlap && !compressor_shift_overlap_state_cuda(comp_state.kv, comp_state.score, ratio, state_cols)) throw std::runtime_error("compressor state shift launch failed");
+                if (overlap && !compressor_shift_overlap_state_cuda(comp_state_kv, comp_state_score, ratio, state_cols)) throw std::runtime_error("compressor state shift launch failed");
             }
             route_comp_ms += elapsed_ms(route_stage_t, Clock::now());
         }
@@ -4615,12 +4766,15 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 const int offset = position % 4;
                 const float* ape = idx_comp_cache.ape + static_cast<size_t>(offset) * idx_cols;
                 DeviceCompressorState& idx_state = ctx.indexer_compressor_state_for_layer(li, idx_slots, idx_state_cols);
+                float* idx_state_kv = idx_state.kv_for_request(request_slot);
+                float* idx_state_score = idx_state.score_for_request(request_slot);
                 const int idx_write_slot = idx_overlap ? 4 + offset : offset;
-                if (!compressor_update_state_cuda(d_indexer_comp_kv, d_indexer_comp_score, ape, idx_state.kv, idx_state.score, offset, idx_write_slot, idx_state_cols)) throw std::runtime_error("indexer compressor state update launch failed");
+                if (!compressor_update_state_cuda(d_indexer_comp_kv, d_indexer_comp_score, ape, idx_state_kv, idx_state_score, offset, idx_write_slot, idx_state_cols)) throw std::runtime_error("indexer compressor state update launch failed");
                 if ((position + 1) % 4 == 0) {
-                    float* d_idx_cache = ctx.indexer_kv_cache_for_layer(li, idx_head_dim);
+                    float* d_idx_cache = ctx.indexer_kv_cache_for_layer(
+                        li, idx_head_dim, request_slot);
                     float* d_idx_slot = d_idx_cache + static_cast<size_t>(position / 4) * idx_head_dim;
-                    if (!compressor_pool_cuda(idx_state.kv, idx_state.score, d_idx_slot, 4, idx_head_dim, idx_state_cols, idx_overlap)) throw std::runtime_error("indexer compressor pool launch failed");
+                    if (!compressor_pool_cuda(idx_state_kv, idx_state_score, d_idx_slot, 4, idx_head_dim, idx_state_cols, idx_overlap)) throw std::runtime_error("indexer compressor pool launch failed");
                     if (!rmsnorm_bf16_gamma_cuda(d_idx_slot, idx_comp_cache.norm, d_idx_slot, idx_head_dim, 1e-6f)) throw std::runtime_error("indexer compressed kv norm launch failed");
                     const float comp_rope_theta = static_cast<float>(config.compress_rope_theta == 0 ? 160000 : config.compress_rope_theta);
                     const float* comp_freqs = ctx.rope_inv_freqs_for(li, true, attn_dims.rope_dim, comp_rope_theta);
@@ -4633,7 +4787,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                                                 static_cast<size_t>(idx_head_dim) * sizeof(float)), "copy indexer compressed kv debug");
                         print_summary("layer=" + std::to_string(li) + ".indexer_compressed_kv", idx_slot);
                     }
-                    if (idx_overlap && !compressor_shift_overlap_state_cuda(idx_state.kv, idx_state.score, 4, idx_state_cols)) throw std::runtime_error("indexer compressor state shift launch failed");
+                    if (idx_overlap && !compressor_shift_overlap_state_cuda(idx_state_kv, idx_state_score, 4, idx_state_cols)) throw std::runtime_error("indexer compressor state shift launch failed");
                 }
                 route_indexer_comp_ms += elapsed_ms(route_stage_t, Clock::now());
                 route_stage_t = Clock::now();
@@ -4654,7 +4808,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 const int keep = std::min<int>(compressed_ready, std::max<uint64_t>(1, config.index_topk));
                 if (!indexer_select_topk_cuda(
                         d_index_q,
-                        ctx.indexer_kv_cache_for_layer(li, idx_head_dim),
+                        ctx.indexer_kv_cache_for_layer(li, idx_head_dim, request_slot),
                         idx_cache.weights_proj,
                         d_x,
                         d_index_scores,
@@ -5071,20 +5225,21 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             top_token = local_head_start + i;
         }
     }
-    ctx.last_local_logits = std::move(logits);
-    ctx.last_head_rows = head_rows;
-    ctx.last_local_head_start = local_head_start;
+    ForwardSlotState& slot_out = ctx.slot_state_for(request_slot);
+    slot_out.last_local_logits = std::move(logits);
+    slot_out.last_head_rows = head_rows;
+    slot_out.last_local_head_start = local_head_start;
     if (!std::isfinite(checksum) || !std::isfinite(top_logit)) throw std::runtime_error("non-finite smoke logits");
 
     if (dspark_capture_slot >= 0) {
-        ctx.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
-        check_device(memcpy_d2h(ctx.dspark_hidden.data(), d_dspark_hidden,
-                                ctx.dspark_hidden.size() * sizeof(float)),
+        slot_out.dspark_hidden.resize(static_cast<size_t>(dspark_hidden_stride));
+        check_device(memcpy_d2h(slot_out.dspark_hidden.data(), d_dspark_hidden,
+                                slot_out.dspark_hidden.size() * sizeof(float)),
                      "copy dspark hidden");
-        ctx.dspark_hidden_positions = 1;
+        slot_out.dspark_hidden_positions = 1;
     } else {
-        ctx.dspark_hidden.clear();
-        ctx.dspark_hidden_positions = 0;
+        slot_out.dspark_hidden.clear();
+        slot_out.dspark_hidden_positions = 0;
     }
 
     device_free(d_embed);
@@ -10375,12 +10530,28 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 }
 
 struct PersistentEngine::State {
+    struct SlotState {
+        bool active = false;
+        uint64_t request_id = 0;
+        int position = 0;
+        std::mt19937 rng{0xDEEDBEEFu};
+        uint64_t rng_seed = 0;
+        std::vector<float> verify_dspark_hidden_slots;
+        std::vector<float> pending_batch_dspark_hidden;
+        int pending_batch_rows = 0;
+    };
+
     std::unique_ptr<SafeForwardContext> ctx;
     Tokenizer tokenizer;
     ForwardSmokeOptions opts;
     int layer_count = 0;
     int max_context = 0;
+    int max_slots = 1;
     int eos_token_id = 1;
+    std::vector<SlotState> slots;
+    // Legacy slot-0 speculative buffers remain separate because the public
+    // speculative API is still single-session. Ordinary scheduler decode uses
+    // the per-slot buffers above and never touches these fields.
     std::mt19937 rng{0xDEEDBEEFu};
     uint64_t rng_seed = 0;
     std::unique_ptr<CmdChannel> cmd;
@@ -10396,12 +10567,15 @@ struct PersistentEngine::State {
     float* d_dspark_main_hidden = nullptr;
     int dspark_hidden_stride = 0;
 
-    State(const std::string& ckpt_dir, const ForwardSmokeOptions& options, int lc, int mc)
-        : ctx(std::make_unique<SafeForwardContext>(ckpt_dir)),
+    State(const std::string& ckpt_dir, const ForwardSmokeOptions& options,
+          int lc, int mc, int ms)
+        : ctx(std::make_unique<SafeForwardContext>(ckpt_dir, ms)),
           tokenizer(ckpt_dir),
           opts(options),
           layer_count(lc),
-          max_context(mc) {
+          max_context(mc),
+          max_slots(std::max(1, ms)),
+          slots(static_cast<size_t>(std::max(1, ms))) {
         if (const char* env = std::getenv("POCKETLLM_CPP_EOS_TOKEN_ID")) {
             try { eos_token_id = std::stoi(env); } catch (...) {}
         }
@@ -10415,8 +10589,10 @@ struct PersistentEngine::State {
 PersistentEngine::PersistentEngine(const std::string& ckpt_dir,
                                    const ForwardSmokeOptions& opts,
                                    int layer_count,
-                                   int max_context)
-    : state_(std::make_unique<State>(ckpt_dir, opts, layer_count, max_context)) {
+                                   int max_context,
+                                   int max_slots)
+    : state_(std::make_unique<State>(ckpt_dir, opts, layer_count,
+                                     max_context, std::max(1, max_slots))) {
     if (max_context <= 0) throw std::runtime_error("PersistentEngine: max_context must be > 0");
     if (layer_count <= 0) throw std::runtime_error("PersistentEngine: layer_count must be > 0");
     auto& ctx = *state_->ctx;
@@ -10431,21 +10607,70 @@ PersistentEngine::PersistentEngine(const std::string& ckpt_dir,
 PersistentEngine::~PersistentEngine() = default;
 
 void PersistentEngine::reset_session() {
-    // Sliding-window KV and indexer KV caches are pre-allocated to max_context
-    // and prefill overwrites positions 0..N-1, so for N < window a new request
-    // fully replaces the previous one with no carryover. The streaming
-    // compressor running state is different: it is an incremental accumulator
-    // (offset = position % ratio, flushed only at block boundaries), so a
-    // request that ends mid-block leaves a partial accumulation that the next
-    // request would resume from. Explicitly restore it to the initial state.
     auto& ctx = *state_->ctx;
     ctx.continuation_journal.abort_noexcept();
     state_->pending_batch_dspark_hidden.clear();
     state_->pending_batch_rows = 0;
     state_->verify_dspark_hidden.clear();
+    for (auto& slot : state_->slots) {
+        slot.active = false;
+        slot.request_id = 0;
+        slot.position = 0;
+        slot.rng.seed(0xDEEDBEEFu);
+        slot.rng_seed = 0;
+        slot.verify_dspark_hidden_slots.clear();
+        slot.pending_batch_dspark_hidden.clear();
+        slot.pending_batch_rows = 0;
+    }
     ctx.reset_streaming_compressor_states();
-    // Sync to drain any in-flight stream work from the previous request.
+    for (int slot = 0; slot < state_->max_slots; ++slot) {
+        auto& slot_state = ctx.slot_state_for(slot);
+        slot_state.last_local_logits.clear();
+        slot_state.last_topk_tokens.clear();
+        slot_state.last_topk_logits.clear();
+        slot_state.dspark_hidden.clear();
+        slot_state.dspark_hidden_positions = 0;
+    }
     device_synchronize();
+}
+
+void PersistentEngine::reset_slot(int slot_id) {
+    auto& s = *state_;
+    if (slot_id < 0 || slot_id >= s.max_slots) {
+        throw std::runtime_error("PersistentEngine::reset_slot invalid slot");
+    }
+    auto& slot = s.slots[static_cast<size_t>(slot_id)];
+    slot.active = false;
+    slot.request_id = 0;
+    slot.position = 0;
+    slot.rng.seed(0xDEEDBEEFu);
+    slot.rng_seed = 0;
+    slot.verify_dspark_hidden_slots.clear();
+    slot.pending_batch_dspark_hidden.clear();
+    slot.pending_batch_rows = 0;
+    s.ctx->slot_state_for(slot_id).last_local_logits.clear();
+    s.ctx->slot_state_for(slot_id).last_topk_tokens.clear();
+    s.ctx->slot_state_for(slot_id).last_topk_logits.clear();
+    s.ctx->slot_state_for(slot_id).dspark_hidden.clear();
+    s.ctx->slot_state_for(slot_id).dspark_hidden_positions = 0;
+    s.ctx->continuation_journal.abort_noexcept();
+    s.ctx->reset_slot_caches(slot_id);
+    device_synchronize();
+}
+
+int PersistentEngine::max_slots() const { return state_->max_slots; }
+
+void PersistentEngine::claim_slot(int slot_id, uint64_t request_id) {
+    auto& s = *state_;
+    if (slot_id < 0 || slot_id >= s.max_slots || request_id == 0) {
+        throw std::runtime_error("PersistentEngine::claim_slot invalid slot or request");
+    }
+    auto& slot = s.slots[static_cast<size_t>(slot_id)];
+    if (slot.active) {
+        throw std::runtime_error("PersistentEngine::claim_slot slot is already active");
+    }
+    slot.active = true;
+    slot.request_id = request_id;
 }
 
 namespace {
@@ -10459,28 +10684,32 @@ namespace {
 // Record the k largest logits of an already-assembled vocabulary slice.
 // Diagnostic only, gated by POCKETLLM_CPP_TOPK_DIAG; k is small so a partial
 // selection sort is cheaper than sorting the whole vocabulary.
-void record_topk_diag(SafeForwardContext& ctx, const float* values, int count,
+void record_topk_diag(ForwardSlotState& slot, const float* values, int count,
                       int base_token, int k) {
-    ctx.last_topk_tokens.clear();
-    ctx.last_topk_logits.clear();
+    slot.last_topk_tokens.clear();
+    slot.last_topk_logits.clear();
     if (k <= 0 || count <= 0) return;
     k = std::min(k, count);
     std::vector<int> order(static_cast<size_t>(count));
     for (int i = 0; i < count; ++i) order[static_cast<size_t>(i)] = i;
     std::partial_sort(order.begin(), order.begin() + k, order.end(),
                       [&](int a, int b) { return values[a] > values[b]; });
-    ctx.last_topk_tokens.reserve(static_cast<size_t>(k));
-    ctx.last_topk_logits.reserve(static_cast<size_t>(k));
+    slot.last_topk_tokens.reserve(static_cast<size_t>(k));
+    slot.last_topk_logits.reserve(static_cast<size_t>(k));
     for (int i = 0; i < k; ++i) {
         const int idx = order[static_cast<size_t>(i)];
-        ctx.last_topk_tokens.push_back(base_token + idx);
-        ctx.last_topk_logits.push_back(values[idx]);
+        slot.last_topk_tokens.push_back(base_token + idx);
+        slot.last_topk_logits.push_back(values[idx]);
     }
 }
 
-int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
-                 const SamplingParams& sp, std::mt19937& rng) {
-    const int local = static_cast<int>(ctx.last_local_logits.size());
+int select_token_for_slot(SafeForwardContext& ctx,
+                          const ForwardSmokeOptions& opts,
+                          const SamplingParams& sp,
+                          std::mt19937& rng,
+                          int slot_id) {
+    ForwardSlotState& slot = ctx.slot_state_for(slot_id);
+    const int local = static_cast<int>(slot.last_local_logits.size());
     if (local <= 0) throw std::runtime_error("select_token: empty local logits");
     const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
     const int topk_diag = env_int_or_default("POCKETLLM_CPP_TOPK_DIAG", 0);
@@ -10491,14 +10720,14 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
         if (opts.tp_rank == 0) all.resize(static_cast<size_t>(opts.tp_world) * static_cast<size_t>(local));
         tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
                                    opts.nccl_id_path.c_str(),
-                                   ctx.last_local_logits.data(), local,
+                                   slot.last_local_logits.data(), local,
                                    opts.tp_rank == 0 ? all.data() : nullptr, 0);
         int32_t token_buf[1] = {0};
         if (opts.tp_rank == 0) {
             const int vocab = static_cast<int>(all.size());
             // The gather is rank-major and the shards are contiguous vocabulary
             // ranges, so index i in `all` is token id i.
-            if (topk_diag > 0) record_topk_diag(ctx, all.data(), vocab, 0, topk_diag);
+            if (topk_diag > 0) record_topk_diag(slot, all.data(), vocab, 0, topk_diag);
             if (greedy) {
                 int best = 0;
                 float best_v = all[0];
@@ -10516,21 +10745,27 @@ int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
     }
 #endif
     if (topk_diag > 0) {
-        record_topk_diag(ctx, ctx.last_local_logits.data(), local,
-                         ctx.last_local_head_start, topk_diag);
+        record_topk_diag(slot, slot.last_local_logits.data(), local,
+                         slot.last_local_head_start, topk_diag);
     }
     if (greedy) {
-        int best = ctx.last_local_head_start;
+        int best = slot.last_local_head_start;
         float best_v = -INFINITY;
         for (int i = 0; i < local; ++i) {
-            if (ctx.last_local_logits[i] > best_v) {
-                best_v = ctx.last_local_logits[i];
-                best = ctx.last_local_head_start + i;
+            if (slot.last_local_logits[i] > best_v) {
+                best_v = slot.last_local_logits[i];
+                best = slot.last_local_head_start + i;
             }
         }
         return best;
     }
-    return sample_token_top_p(ctx.last_local_logits.data(), local, sp.temperature, sp.top_p, rng);
+    return sample_token_top_p(slot.last_local_logits.data(), local,
+                              sp.temperature, sp.top_p, rng);
+}
+
+int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
+                 const SamplingParams& sp, std::mt19937& rng) {
+    return select_token_for_slot(ctx, opts, sp, rng, 0);
 }
 
 // Publish the last committed continuation row as "the hidden of the most
@@ -10640,18 +10875,28 @@ void maybe_reseed(uint64_t seed, uint64_t& current_seed, std::mt19937& rng) {
 }  // namespace
 
 int PersistentEngine::prefill(const std::vector<int>& token_ids, const SamplingParams& sp) {
+    return prefill(token_ids, sp, 0);
+}
+
+int PersistentEngine::prefill(const std::vector<int>& token_ids, const SamplingParams& sp, int slot_id) {
     if (token_ids.empty()) throw std::runtime_error("PersistentEngine::prefill empty");
     auto& s = *state_;
+    if (slot_id < 0 || slot_id >= s.max_slots) {
+        throw std::runtime_error("PersistentEngine::prefill invalid slot");
+    }
+    auto& slot = s.slots[static_cast<size_t>(slot_id)];
     auto& ctx = *s.ctx;
     ctx.options = s.opts;
-    maybe_reseed(sp.seed, s.rng_seed, s.rng);
-    (void)run_safetensors_prompt_prefill_impl(ctx, token_ids, s.layer_count);
-    if (s.dspark && !ctx.dspark_hidden.empty()) {
-        const int rows = ctx.dspark_hidden_positions;
-        prime_dspark_kv(ctx.dspark_hidden, rows,
+    maybe_reseed(sp.seed, slot.rng_seed, slot.rng);
+    (void)run_safetensors_prompt_prefill_impl(ctx, token_ids, s.layer_count, slot_id);
+    auto& slot_state = ctx.slot_state_for(slot_id);
+    if (s.dspark && !slot_state.dspark_hidden.empty()) {
+        const int rows = slot_state.dspark_hidden_positions;
+        prime_dspark_kv(slot_state.dspark_hidden, rows,
                         static_cast<int>(token_ids.size()) - rows);
     }
-    const int token = select_token(ctx, s.opts, sp, s.rng);
+    const int token = select_token_for_slot(ctx, s.opts, sp, slot.rng, slot_id);
+    slot.position = static_cast<int>(token_ids.size());
     if (env_int_or_default("POCKETLLM_CPP_DECODE_SPARSE_ARENA", 0) > 0) {
         ctx.release_active_arenas_with_suffix(":d");
     }
@@ -10659,12 +10904,67 @@ int PersistentEngine::prefill(const std::vector<int>& token_ids, const SamplingP
 }
 
 int PersistentEngine::decode_step(int last_token, int position, const SamplingParams& sp) {
+    return decode_step(last_token, position, sp, 0);
+}
+
+int PersistentEngine::decode_step(int last_token, int position, const SamplingParams& sp, int slot_id) {
+    auto& s = *state_;
+    if (slot_id < 0 || slot_id >= s.max_slots) {
+        throw std::runtime_error("PersistentEngine::decode_step invalid slot");
+    }
+    auto& slot = s.slots[static_cast<size_t>(slot_id)];
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+    maybe_reseed(sp.seed, slot.rng_seed, slot.rng);
+    (void)run_safetensors_token_forward_impl(ctx, last_token, s.layer_count, position, slot_id);
+    const int token = select_token_for_slot(ctx, s.opts, sp, slot.rng, slot_id);
+    slot.position = position + 1;
+    return token;
+}
+
+std::vector<int> PersistentEngine::batch_decode_step(
+    const std::vector<PersistentBatchRequest>& requests) {
     auto& s = *state_;
     auto& ctx = *s.ctx;
     ctx.options = s.opts;
-    maybe_reseed(sp.seed, s.rng_seed, s.rng);
-    (void)run_safetensors_token_forward_impl(ctx, last_token, s.layer_count, position);
-    return select_token(ctx, s.opts, sp, s.rng);
+
+    if (requests.empty()) {
+        throw std::runtime_error("batch_decode_step: empty requests");
+    }
+    if (requests.size() > 8) {
+        throw std::runtime_error("batch_decode_step: at most 8 requests are supported");
+    }
+
+    // Validate all requests use distinct slots
+    std::vector<bool> slot_used(static_cast<size_t>(s.max_slots), false);
+    for (const auto& req : requests) {
+        if (req.slot_id < 0 || req.slot_id >= s.max_slots) {
+            throw std::runtime_error("batch_decode_step: slot_id out of range");
+        }
+        if (slot_used[static_cast<size_t>(req.slot_id)]) {
+            throw std::runtime_error("batch_decode_step: duplicate slot_id in batch");
+        }
+        slot_used[static_cast<size_t>(req.slot_id)] = true;
+    }
+
+    // For now, use sequential decode as a safe implementation
+    // TODO: Implement true batched forward using continuation_batch_impl
+    std::vector<int> result_tokens;
+    result_tokens.reserve(requests.size());
+
+    for (const auto& req : requests) {
+        auto& slot = s.slots[static_cast<size_t>(req.slot_id)];
+        maybe_reseed(req.sampling.seed, slot.rng_seed, slot.rng);
+
+        worker_command_decode(req.last_token, req.position);
+        (void)run_safetensors_token_forward_impl(ctx, req.last_token, s.layer_count,
+                                                 req.position, req.slot_id);
+        const int token = select_token_for_slot(ctx, s.opts, req.sampling, slot.rng, req.slot_id);
+        slot.position = req.position + 1;
+        result_tokens.push_back(token);
+    }
+
+    return result_tokens;
 }
 
 // Verify a block of draft tokens: forward each one and report what the target
@@ -10676,16 +10976,17 @@ int PersistentEngine::decode_step(int last_token, int position, const SamplingPa
 // two are not numerically equivalent here: GEMMs pick tiles and reduction
 // orders by shape, so a batched verify disagrees with plain decode by ~4e-3 at
 // the first projection, which amplifies to O(1) at the head and costs real
-// accept rate (see docs/dspark.md). Sequential keeps verify bit-comparable with
+// accept rate (see docs/performance/dspark.md). Sequential keeps verify bit-comparable with
 // decode; batching it is a separate optimization that has to be measured
 // against that drift, not assumed free.
 std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tokens,
                                                int start_position,
                                                const SamplingParams& sp) {
     auto& s = *state_;
+    auto& slot = s.slots[0];  // Spec stays on slot 0
     auto& ctx = *s.ctx;
     ctx.options = s.opts;
-    maybe_reseed(sp.seed, s.rng_seed, s.rng);
+    maybe_reseed(sp.seed, slot.rng_seed, slot.rng);
 
     if (draft_tokens.empty()) throw std::runtime_error("verify_step: empty draft_tokens");
 
@@ -10694,16 +10995,18 @@ std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tok
 
     std::vector<int> next_tokens;
     next_tokens.reserve(draft_tokens.size());
-    s.verify_dspark_hidden.clear();
+    slot.verify_dspark_hidden_slots.clear();
     for (size_t i = 0; i < draft_tokens.size(); ++i) {
         const int position = start_position + static_cast<int>(i);
-        (void)run_safetensors_token_forward_impl(ctx, draft_tokens[i], s.layer_count, position);
-        next_tokens.push_back(select_token(ctx, s.opts, sp, s.rng));
+        (void)run_safetensors_token_forward_impl(ctx, draft_tokens[i], s.layer_count, position, 0);
+        next_tokens.push_back(select_token_for_slot(ctx, s.opts, sp, slot.rng, 0));
         // Keep every draft position's hidden, not just the last: the accepted
         // prefix is only known after the comparison below, and the next draft
         // round has to start from whichever position it ends at.
-        s.verify_dspark_hidden.insert(s.verify_dspark_hidden.end(),
-                                      ctx.dspark_hidden.begin(), ctx.dspark_hidden.end());
+        auto& slot_state = ctx.slot_state_for(0);
+        slot.verify_dspark_hidden_slots.insert(slot.verify_dspark_hidden_slots.end(),
+                                               slot_state.dspark_hidden.begin(),
+                                               slot_state.dspark_hidden.end());
     }
     return next_tokens;
 }
@@ -10713,9 +11016,10 @@ std::vector<int> PersistentEngine::batch_verify_step(
     int start_position,
     const SamplingParams& sp) {
     auto& s = *state_;
+    auto& slot = s.slots[0];  // Spec stays on slot 0
     auto& ctx = *s.ctx;
     ctx.options = s.opts;
-    maybe_reseed(sp.seed, s.rng_seed, s.rng);
+    maybe_reseed(sp.seed, slot.rng_seed, slot.rng);
 
     if (draft_tokens.empty()) {
         throw std::runtime_error("batch_verify_step: empty draft_tokens");
@@ -10730,6 +11034,10 @@ std::vector<int> PersistentEngine::batch_verify_step(
     worker_command_batch_verify(draft_tokens, start_position);
     ContinuationBatchResult result;
     try {
+        // Unlike the token-forward and prompt-prefill implementations, this one
+        // takes no request_slot: every per-slot buffer it reads goes through a
+        // helper that defaults to slot 0, which is the slot speculative decoding
+        // is pinned to above.
         result = run_safetensors_continuation_batch_impl(
             ctx, draft_tokens, s.layer_count, start_position);
     } catch (...) {
@@ -10741,13 +11049,13 @@ std::vector<int> PersistentEngine::batch_verify_step(
     }
     std::vector<int> next_tokens;
     try {
-        next_tokens = select_continuation_tokens(result, s.opts, sp, s.rng);
-        s.pending_batch_dspark_hidden = std::move(result.dspark_hidden);
-        s.pending_batch_rows = result.rows;
+        next_tokens = select_continuation_tokens(result, s.opts, sp, slot.rng);
+        slot.pending_batch_dspark_hidden = std::move(result.dspark_hidden);
+        slot.pending_batch_rows = result.rows;
     } catch (...) {
         ctx.continuation_journal.abort_noexcept();
-        s.pending_batch_dspark_hidden.clear();
-        s.pending_batch_rows = 0;
+        slot.pending_batch_dspark_hidden.clear();
+        slot.pending_batch_rows = 0;
         worker_command_finalize_batch_verify(0);
         throw;
     }
@@ -10765,21 +11073,21 @@ std::vector<int> PersistentEngine::batch_verify_step(
     worker_command_finalize_batch_verify(committed_rows);
     try {
         ctx.continuation_journal.finalize(committed_rows);
-        const size_t stride = s.pending_batch_rows > 0
-            ? s.pending_batch_dspark_hidden.size() /
-                  static_cast<size_t>(s.pending_batch_rows)
+        const size_t stride = slot.pending_batch_rows > 0
+            ? slot.pending_batch_dspark_hidden.size() /
+                  static_cast<size_t>(slot.pending_batch_rows)
             : 0;
-        s.verify_dspark_hidden.assign(
-            s.pending_batch_dspark_hidden.begin(),
-            s.pending_batch_dspark_hidden.begin() +
+        slot.verify_dspark_hidden_slots.assign(
+            slot.pending_batch_dspark_hidden.begin(),
+            slot.pending_batch_dspark_hidden.begin() +
                 static_cast<size_t>(committed_rows) * stride);
-        s.pending_batch_dspark_hidden.clear();
-        s.pending_batch_rows = 0;
-        publish_continuation_seed_hidden(ctx, s.verify_dspark_hidden,
+        slot.pending_batch_dspark_hidden.clear();
+        slot.pending_batch_rows = 0;
+        publish_continuation_seed_hidden(ctx, slot.verify_dspark_hidden_slots,
                                          committed_rows);
     } catch (...) {
-        s.pending_batch_dspark_hidden.clear();
-        s.pending_batch_rows = 0;
+        slot.pending_batch_dspark_hidden.clear();
+        slot.pending_batch_rows = 0;
         throw;
     }
     return next_tokens;
@@ -10788,6 +11096,7 @@ std::vector<int> PersistentEngine::batch_verify_step(
 std::vector<int> PersistentEngine::speculative_step(int committed_token, int position,
                                        const SamplingParams& sp) {
     auto& s = *state_;
+    auto& slot = s.slots[0];  // Spec stays on slot 0
     auto& ctx = *s.ctx;
     if (!dspark_loaded()) {
         throw std::runtime_error("speculative_step: DSpark not loaded (call load_dspark first)");
@@ -10826,8 +11135,8 @@ std::vector<int> PersistentEngine::speculative_step(int committed_token, int pos
         std::vector<int> generated(next_tokens.begin(),
                                    next_tokens.begin() + committed_rows);
         worker_command_prime_draft_kv(committed_rows, position);
-        if (!s.verify_dspark_hidden.empty()) {
-            prime_dspark_kv(s.verify_dspark_hidden, committed_rows, position);
+        if (!slot.verify_dspark_hidden_slots.empty()) {
+            prime_dspark_kv(slot.verify_dspark_hidden_slots, committed_rows, position);
         }
         return generated;
     }
@@ -10849,14 +11158,16 @@ std::vector<int> PersistentEngine::speculative_step(int committed_token, int pos
     // sends are a few hundred bytes against a full model forward.
     std::vector<int> generated;
     generated.reserve(draft.tokens.size());
-    s.verify_dspark_hidden.clear();
+    slot.verify_dspark_hidden_slots.clear();
     for (size_t i = 0; i < draft.tokens.size(); ++i) {
         const int pos_i = position + static_cast<int>(i);
         worker_command_speculative_decode(draft.tokens[i], pos_i, i == 0);
-        if (i == 0) s.verify_dspark_hidden.clear();
-        const int next = decode_step(draft.tokens[i], pos_i, sp);
-        s.verify_dspark_hidden.insert(s.verify_dspark_hidden.end(),
-                                      ctx.dspark_hidden.begin(), ctx.dspark_hidden.end());
+        if (i == 0) slot.verify_dspark_hidden_slots.clear();
+        const int next = decode_step(draft.tokens[i], pos_i, sp, 0);
+        auto& slot_state = ctx.slot_state_for(0);
+        slot.verify_dspark_hidden_slots.insert(slot.verify_dspark_hidden_slots.end(),
+                                               slot_state.dspark_hidden.begin(),
+                                               slot_state.dspark_hidden.end());
         generated.push_back(next);
         // draft.tokens[i + 1] is what the draft guessed the model would say
         // here. If it guessed wrong, `next` is the bonus token and the round
@@ -10869,8 +11180,8 @@ std::vector<int> PersistentEngine::speculative_step(int committed_token, int pos
     // was committed.
     const int n_rows = static_cast<int>(generated.size());
     worker_command_prime_draft_kv(n_rows, position);
-    if (!s.verify_dspark_hidden.empty()) {
-        prime_dspark_kv(s.verify_dspark_hidden, n_rows, position);
+    if (!slot.verify_dspark_hidden_slots.empty()) {
+        prime_dspark_kv(slot.verify_dspark_hidden_slots, n_rows, position);
     }
 
     // generated[j] is what the model sampled after consuming draft.tokens[j],
@@ -10888,9 +11199,11 @@ void PersistentEngine::set_dspark_capture_layers(const std::vector<int>& layers,
     }
     s.ctx->dspark_capture_layers = layers;
     s.ctx->dspark_capture_window = std::max(1, prefill_window);
-    s.ctx->dspark_hidden.clear();
-    s.ctx->dspark_hidden_positions = 0;
-    s.verify_dspark_hidden.clear();
+    // Clear slot 0's dspark state
+    auto& slot_state = s.ctx->slot_state_for(0);
+    slot_state.dspark_hidden.clear();
+    slot_state.dspark_hidden_positions = 0;
+    s.slots[0].verify_dspark_hidden_slots.clear();
 }
 
 const std::vector<int>& PersistentEngine::dspark_capture_layers() const {
@@ -10898,23 +11211,23 @@ const std::vector<int>& PersistentEngine::dspark_capture_layers() const {
 }
 
 const std::vector<float>& PersistentEngine::last_dspark_hidden() const {
-    return state_->ctx->dspark_hidden;
+    return state_->ctx->slot_state_for(0).dspark_hidden;
 }
 
 int PersistentEngine::last_dspark_hidden_positions() const {
-    return state_->ctx->dspark_hidden_positions;
+    return state_->ctx->slot_state_for(0).dspark_hidden_positions;
 }
 
 const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
-    return state_->verify_dspark_hidden;
+    return state_->slots[0].verify_dspark_hidden_slots;
 }
 
 const std::vector<int>& PersistentEngine::last_topk_tokens() const {
-    return state_->ctx->last_topk_tokens;
+    return state_->ctx->slot_state_for(0).last_topk_tokens;
 }
 
 const std::vector<float>& PersistentEngine::last_topk_logits() const {
-    return state_->ctx->last_topk_logits;
+    return state_->ctx->slot_state_for(0).last_topk_logits;
 }
 
 void PersistentEngine::load_dspark(const std::string& ckpt_dir) {

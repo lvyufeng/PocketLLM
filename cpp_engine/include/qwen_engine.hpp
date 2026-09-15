@@ -468,8 +468,9 @@ private:
     // Shared body behind prefill() and prefill_partial(). `max_tokens` of 0
     // means unbounded, which is what makes the full-prompt path byte-for-byte
     // the same work it was before the bounded entry point existed.
-    PartialPrefillResult prefill_bounded(const std::vector<int>& token_ids,
-                                             int slot_id, int max_tokens);
+    PartialPrefillResult prefill_bounded(
+        const std::vector<int>& token_ids, int slot_id, int max_tokens,
+        const BatchSamplingParams* sampling = nullptr);
 
     // Whether `token` ends generation under these params: the request's own
     // stop_token_ids when set, otherwise the checkpoint's eos ids.

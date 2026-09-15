@@ -23,7 +23,11 @@ namespace pocket {
 struct SchedulerGenerationResult {
     uint64_t request_id = 0;
     std::vector<int> generated_tokens;
-    std::string finish_reason;  // "stop" or "length"
+    std::string finish_reason;  // "stop", "length", "cancelled", or "error"
+    // True when the final emitted token completed a TokenConstraint. Structured
+    // output uses the same public "stop" finish reason, but this flag prevents
+    // callers from treating that grammar token as an ordinary stop id.
+    bool constraint_completed = false;
     int prompt_tokens = 0;
     int completion_tokens = 0;
     // Aggregate speculative work performed for this request. These remain zero
@@ -54,11 +58,16 @@ struct SchedulerGenerationResult {
 // it is called with no scheduler lock held -- but still counts as time spent.
 using TokenCallback = std::function<void(uint64_t request_id, int token)>;
 
+// Forward declaration
+class TokenConstraint;
+
 // Internal request wrapper with scheduling metadata
 struct SchedulerRequest {
     uint64_t request_id = 0;
     std::vector<int> prompt_tokens;
     BatchSamplingParams sampling;
+    // Owned token constraint; sampling.constraint points at this.
+    std::shared_ptr<TokenConstraint> constraint;
     int slot_id = -1;
     int seq_len = 0;  // Tokens processed (prompt + generated)
     // Prompt tokens prefilled so far. Chunked prefill advances this a bounded
@@ -71,6 +80,10 @@ struct SchedulerRequest {
     // Whether generation ended on a stop token rather than on max_new_tokens.
     // `finished` is true for both, so it cannot distinguish them on its own.
     bool stopped_on_token = false;
+    // Whether the terminal emitted token completed the structured-output
+    // constraint. This is deliberately separate from stopped_on_token: a JSON
+    // closing brace is output, not a stop token that should be stripped.
+    bool constraint_completed = false;
     // Cancelled before finishing. Recorded here because the cancelled set is
     // erased before results are reported.
     bool cancelled = false;
@@ -125,7 +138,8 @@ public:
         const std::vector<int>& prompt_tokens,
         const BatchSamplingParams& sampling,
         std::function<void(const SchedulerGenerationResult&)> callback = nullptr,
-        TokenCallback on_token = nullptr);
+        TokenCallback on_token = nullptr,
+        std::shared_ptr<TokenConstraint> constraint = nullptr);
 
     // Cancel a pending or running request
     // Returns true if the request was found and marked for cancellation

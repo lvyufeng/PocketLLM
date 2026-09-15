@@ -1,6 +1,6 @@
 // Does the DSpark draft produce the same tokens at TP=1 and TP=4?
 //
-// The end-to-end accept rate is 0 (docs/dspark.md), and the sub-path parity
+// The end-to-end accept rate is 0 (docs/performance/dspark.md), and the sub-path parity
 // tests all run at TP=1 from injected inputs, so two suspects are still open:
 // the composition (stage 0 -> blocks -> head) and the TP sharding of the draft
 // itself. This test settles the second one, which is the cheaper half: the

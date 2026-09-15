@@ -15,7 +15,7 @@ mirrors that file's math rather than inventing its own.
 One round drafts `dspark_block_size` tokens from a single committed token, then
 the main model verifies all of them in one forward. Verify cost grows with the
 draft length, so drafting tokens that will be rejected is a net loss -- see
-`DSparkGate` for the truncation rule and `docs/dspark.md` for the measurements.
+`DSparkGate` for the truncation rule and `docs/performance/dspark.md` for the measurements.
 """
 from __future__ import annotations
 

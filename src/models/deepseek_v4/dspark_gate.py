@@ -42,7 +42,7 @@ about what comes next (small margin), the draft will be poor and speculation
 will lose even before verify cost. Controlled by
 DEEPSEEK_DSPARK_GATE_MARGIN_THRESHOLD (default 0.0 = disabled, set >0 to enable).
 
-See docs/dspark.md for the full measurement tables.
+See docs/performance/dspark.md for the full measurement tables.
 """
 from __future__ import annotations
 

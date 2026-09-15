@@ -106,4 +106,4 @@ PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
 - `tests/test_encoding_glm_dsa.py`
 - `tests/test_glm_dsa_iq2xs_iq3xxs_dp4a.py`
 - `tests/test_glm_dsa_tp_routed.py`
-- [Benchmark reporting rules](../benchmarking.md)
+- [Benchmark reporting rules](../guides/benchmarking.md)

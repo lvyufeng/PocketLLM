@@ -1,5 +1,10 @@
 # PocketLLM
 
+[![PyPI version](https://badge.fury.io/py/pocketllm.svg)](https://pypi.org/project/pocketllm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-lvyufeng.github.io%2FPocketLLM-blue.svg)](https://lvyufeng.github.io/PocketLLM/)
+
 [中文](README_CN.md) | English
 
 PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running large language models on consumer multi-GPU systems. It combines model-specific kernels, low-bit formats, tensor/expert parallelism, CPU/GPU placement, and reproducible single-request benchmarks.
@@ -7,6 +12,121 @@ PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running la
 The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, and Qwen3.8-27B-FP8. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
 
 > **Status:** research and engineering software. The numbers below are measurements from specific checkpoints and hardware configurations, not general performance guarantees.
+
+## Installation
+
+### Quick install (full capabilities)
+
+```bash
+# Install the build prerequisites first; the build imports them from the
+# environment rather than fetching them. See the note below.
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+
+pip install pocketllm --no-build-isolation
+```
+
+This installs PocketLLM with both PyTorch and C++ engine backends. The build process compiles CUDA extensions and the native C++ engine, which takes 5-15 minutes.
+
+**Requirements:**
+- Python >= 3.10
+- PyTorch >= 2.0, < 2.7 (install first: `pip install "torch>=2.0,<2.7"`)
+- CUDA toolkit 11.8+ (for GPU acceleration)
+- CMake >= 3.18, pybind11 >= 2.10, Ninja >= 1.11
+- `setuptools >= 68` and `wheel`
+- NCCL (for tensor parallelism with TP > 1)
+- 16GB+ system RAM (for compilation)
+
+**Note:** `--no-build-isolation` is required so the build uses your environment's PyTorch, which must match your CUDA toolkit version. It also means pip will not fetch the build prerequisites listed above: they have to be in the environment before you run the install. A freshly created virtualenv has none of them — `python -m venv` bootstraps the interpreter's bundled `setuptools`, which on Python 3.10 is older than the version that provides the `bdist_wheel` command, and on Python 3.12+ installs no setuptools at all — so the install can fail at metadata generation with `invalid command 'bdist_wheel'`, and then at the native-engine build for a missing `pybind11` or `cmake`. The first command above installs all of them.
+
+### PyTorch-only install (skip C++ engine)
+
+If you only need the PyTorch backend or lack the C++ build dependencies:
+
+```bash
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel
+POCKETLLM_BUILD_CPP=0 pip install pocketllm --no-build-isolation
+```
+
+This skips the C++ engine build but still compiles PyTorch CUDA extensions, so it still needs `torch` and a `setuptools` new enough to build a wheel.
+
+### Development install
+
+```bash
+git clone https://github.com/lvyufeng/PocketLLM.git
+cd PocketLLM
+pip install "torch>=2.0,<2.7" "setuptools>=68" wheel ninja cmake pybind11
+pip install -e . --no-build-isolation
+```
+
+The same prerequisites apply: an editable install builds the extensions too.
+
+## Quick Start
+
+### Python API
+
+```python
+from pocketllm import LLM
+
+# Initialize with automatic backend selection
+llm = LLM(
+    model="/path/to/checkpoint",
+    backend="auto",  # or "torch", "cpp"
+    tensor_parallel_size=1
+)
+
+# Generate text
+result = llm.generate("What is artificial intelligence?")
+print(result.text)
+
+# Stream tokens
+for token in llm.stream("Explain quantum computing"):
+    print(token.text, end="", flush=True)
+```
+
+### OpenAI-Compatible Server
+
+```bash
+# Start server on default port 8000
+pocketllm serve \
+    --model /path/to/checkpoint \
+    --backend auto \
+    --tensor-parallel-size 4
+
+# Test with curl
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "pocketllm",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+### Tensor Parallel Inference (Multi-GPU)
+
+```bash
+# 4-GPU setup (TP4)
+pocketllm serve \
+    --model /path/to/qwen-27b-fp8 \
+    --backend cpp \
+    --tensor-parallel-size 4 \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+## When to use PocketLLM
+
+**PocketLLM excels at:**
+- ✅ Single-request low-latency inference on consumer GPUs (RTX 2080 Ti, 3090, 4090)
+- ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4)
+- ✅ TP4 inference without NVLink (PCIe-only multi-GPU systems)
+- ✅ Research and experimentation with model-specific kernel optimization
+
+**Consider alternatives like vLLM or SGLang if you need:**
+- ❌ High-throughput serving with dynamic batching (PocketLLM batching is sequential)
+- ❌ Broad model support (PocketLLM focuses on 4 models with deep optimization)
+- ❌ Production features (advanced scheduling, monitoring, multi-LoRA)
+- ❌ Multimodal inputs (images/video are not yet supported)
 
 ## What PocketLLM provides
 
@@ -24,20 +144,26 @@ The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validate
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **Validated text generation** | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 416.48 tok/s prefill; 35.87 tok/s decode on a 512-token prompt |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
 
 The model pages separate architecture specifications from what PocketLLM currently implements. `inspect`, `smoke`, and a benchmark are not automatically equivalent to a production serving guarantee.
 
 ## Performance highlights
 
-All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/benchmarking.md) before comparing results.
+All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/guides/benchmarking.md) before comparing results.
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
-- 64-token prompt: 138.61–138.69 tok/s prefill, 36.82 tok/s decode.
-- 512-token prompt: 416.48 tok/s prefill, 35.87 tok/s decode.
-- Approximately 8.0–8.6 GiB used per rank in the measured runs; local FP8 weights and scales remain GPU-resident.
-- Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
+One serial sweep of the engine defaults on master `cfad866`, with 128 generated tokens per run:
+
+- 64-token prompt: 115.91 tok/s prefill (0.55 s), 45.05 tok/s decode.
+- 512-token prompt: 864.54 tok/s prefill (0.59 s), 43.22 tok/s decode.
+- 8,192-token prompt: 1,818.65 tok/s prefill (4.50 s), 43.99 tok/s decode.
+- 65,536-token prompt: 1,453.51 tok/s prefill (45.09 s), 39.11 tok/s decode.
+
+Per rank the engine accounts for 6.86 GiB of resident FP8 weights and scales, plus 1.00 GiB of KV data and 1.01 GiB of chunk workspace at 65,536 tokens; `nvidia-smi` peaks a further 3.4–3.5 GiB in CUDA context, cuBLAS workspaces and NCCL buffers, which is constant across prompt lengths. Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
+
+The prefill figures for the 64- and 512-token prompts measure short-prompt latency, not steady-state throughput: both complete in 0.55–0.59 s because a fixed per-process cost dominates at that size. Above 4,096 tokens prefill runs at a marginal 1,670 tok/s up to 32,768 and 1,285 tok/s beyond it.
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -116,6 +242,14 @@ cmake -S cpp_engine -B build/cpp_engine -DPOCKET_BACKEND=cuda
 `POCKET_BACKEND=ascend` reserves the layout for Ascend NPUs. It configures but
 does not yet link, because the ACL runtime, AscendC kernels and HCCL collectives
 under `cpp_engine/backends/ascend/` are not implemented.
+
+`POCKET_BUILD_DEV_TARGETS` controls the inspection tools and the per-kernel test
+and benchmark binaries — everything `cpp_engine/tools/` and `cpp_engine/tests/`
+hold. It defaults to whether those directories are present, so a working copy
+configures them and an unpacked sdist does not: an install builds the libraries,
+the `pocketllm_engine` executable and the optional Python module, and nothing an
+install builds needs a test binary. Pass `-DPOCKET_BUILD_DEV_TARGETS=OFF` to
+configure a checkout for a library-only build.
 
 The source tree is layered so that a second backend can reuse everything that is
 not vendor-specific:
@@ -235,16 +369,21 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 ## Documentation
 
+The documentation is published at **<https://lvyufeng.github.io/PocketLLM/>**, built from the
+`docs/` tree in this repository. It has full-text search, per-topic navigation, and the same
+content as the files below.
+
 - [Documentation index](docs/README.md)
+- [Getting started](docs/getting-started.md)
 - [Model support matrix](docs/models/README.md)
-- [Benchmarking and reporting rules](docs/benchmarking.md)
+- [Benchmarking and reporting rules](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
-- [DSpark speculative decoding](docs/dspark.md)
-- [FlashMemory 1M context](docs/FLASHMEMORY_1M_CONTEXT.md)
-- [MiniMax decode bottleneck analysis](docs/minimax_decode_bottleneck_analysis.md)
+- [DSpark speculative decoding](docs/performance/dspark.md)
+- [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
+- [MiniMax decode bottleneck analysis](docs/performance/minimax_decode_bottleneck_analysis.md)
 - [Historical 2080 Ti report](docs/reports/dsv4_2080ti_report.pdf)
 
 ## Roadmap
@@ -268,9 +407,7 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 ## License
 
-PocketLLM code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
-
-Permitted uses include personal use, academic research, education, non-commercial benchmarking, and non-commercial deployment. Commercial use requires separate written permission from the copyright holder.
+PocketLLM is released under the [MIT License](LICENSE). You are free to use, modify, and distribute the code, including for commercial purposes, provided the copyright notice and permission notice are retained.
 
 Model weights, tokenizer files, CUDA, PyTorch, GGUF assets, and other third-party components are governed by their respective licenses. PocketLLM's code license does not grant additional rights to third-party model assets.
 

@@ -8,8 +8,8 @@
 ### 1. 架构设计和规划 ✅
 
 **完成文档**:
-- `docs/cpp_engine_batching_phase3_1.md` - 完整的实施计划
-- `docs/vllm_sglang_comparison.md` - 与 vLLM/SGLang 的对比分析
+- `docs/archive/phase2-phase3/cpp_engine_batching_phase3_1.md` - 完整的实施计划
+- `docs/architecture/vllm_sglang_comparison.md` - 与 vLLM/SGLang 的对比分析
 
 **设计亮点**:
 - 向后兼容：默认单 session 模式，零性能开销
@@ -281,8 +281,8 @@ std::vector<int> free_slots;
 
 ## 参考
 
-- **实施文档**: `docs/cpp_engine_batching_phase3_1.md`
-- **架构对比**: `docs/vllm_sglang_comparison.md`
+- **实施文档**: `docs/archive/phase2-phase3/cpp_engine_batching_phase3_1.md`
+- **架构对比**: `docs/architecture/vllm_sglang_comparison.md`
 - **性能基线**: TP2 8K: 1434 tok/s prefill, 30.9 tok/s decode
 - **内存预算**: 22 GB/rank (2080 Ti)
 - **目标硬件**: 4×2080 Ti, TP2/TP4

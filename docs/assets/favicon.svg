@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="PocketLLM">
+  <rect width="64" height="64" rx="14" fill="#3f51b5"/>
+  <path fill="#fff" d="M22 46V18h11.5c6.4 0 10.5 3.6 10.5 9.4 0 5.9-4.1 9.5-10.5 9.5H29V46z"/>
+  <path fill="#3f51b5" d="M29 31.4h4.1c2.6 0 4.2-1.6 4.2-4s-1.6-4-4.2-4H29z"/>
+</svg>

@@ -1,0 +1,112 @@
+name: Publish to PyPI
+
+# Manual trigger only. PyPI versions are immutable, so the production upload stays
+# behind an explicit input rather than running on tags.
+on:
+  workflow_dispatch:
+    inputs:
+      publish_production:
+        description: >-
+          Upload to Production PyPI. Leave as "no" until the published metadata check
+          below has been reviewed - a version number can never be reused.
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
+        default: 'no'
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+        # The CPU index keeps this to ~200MB instead of a full CUDA wheel. The version
+        # range mirrors the one pyproject.toml declares for the package itself, so the
+        # build does not run against a Torch the project does not claim to support.
+        pip install "torch>=2.0,<2.7" --index-url https://download.pytorch.org/whl/cpu
+
+    - name: Build package
+      # sdist only, matching the manual flow in docs/guides/pypi_release.md. Pre-built
+      # wheels are a separate decision: they either ship without the C++ engine or
+      # need a CUDA runner plus an explicit arch matrix.
+      run: python -m build --sdist --no-isolation
+
+    - name: Check package
+      run: twine check dist/*
+
+    - name: Read the expected version
+      id: version
+      run: |
+        version=$(python -c "import re,pathlib; print(re.search(r'^version = \"(.+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))")
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Publish to Test PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+      run: twine upload --repository testpypi dist/* --verbose
+
+    - name: Wait for Test PyPI to process
+      run: sleep 60
+
+    - name: Verify the published metadata
+      # Verifies what Test PyPI actually serves, not the local tree. This is the
+      # check that catches the 0.1.0 class of bug: the artifact claimed MIT in its
+      # classifier while its rendered description still said PolyForm Noncommercial.
+      #
+      # A real `pip install` cannot be verified here. The sdist compiles CUDA
+      # extensions, which needs a CUDA toolkit that GitHub-hosted runners do not
+      # have, so installation is verified locally per docs/guides/pypi_release.md.
+      env:
+        EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        python - <<'PY'
+        import json
+        import os
+        import urllib.request
+
+        version = os.environ["EXPECTED_VERSION"]
+        url = f"https://test.pypi.org/pypi/pocketllm/{version}/json"
+        with urllib.request.urlopen(url) as response:
+            info = json.load(response)["info"]
+
+        problems = []
+
+        if info["version"] != version:
+            problems.append(f"version is {info['version']}, expected {version}")
+
+        if info.get("license") != "MIT":
+            problems.append(f"license is {info.get('license')!r}, expected 'MIT'")
+
+        classifiers = info.get("classifiers") or []
+        if "License :: OSI Approved :: MIT License" not in classifiers:
+            problems.append("the MIT license classifier is missing")
+
+        description = info.get("description") or ""
+        for stale in ("PolyForm", "Noncommercial"):
+            if stale in description:
+                problems.append(f"the rendered description still mentions {stale}")
+
+        if problems:
+            raise SystemExit("published metadata is wrong:\n  - " + "\n  - ".join(problems))
+
+        print(f"Test PyPI serves {version}: MIT license, description consistent")
+        PY
+
+    - name: Publish to Production PyPI
+      if: inputs.publish_production == 'yes'
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: twine upload dist/* --verbose

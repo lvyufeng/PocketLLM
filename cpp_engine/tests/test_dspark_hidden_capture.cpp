@@ -284,7 +284,7 @@ void part_b(const std::string& ckpt_dir, int layer_count) {
     // --- B5: prefill captures the last prompt position ---
     // Prefill the prompt minus its last token, then decode that token: the
     // forward now ends at the same position the full prefill ended at. The
-    // batched and per-token paths drift (docs/dspark.md), so this is a loose
+    // batched and per-token paths drift (docs/performance/dspark.md), so this is a loose
     // bound -- what makes it a real check is the wrong-position comparison
     // printed beside it, which is O(1) rather than O(1e-2).
     std::vector<int> head(prompt.begin(), prompt.end() - 1);

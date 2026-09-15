@@ -45,7 +45,7 @@ python scripts/bench_qwen_long_context.py \
 | int8_per_token_head | 56.32 | 1163.6 | 487.87 | 1.05 | 520 | 1.002 | 0.052 |
 
 `decode_token_count` is 511 in every case (the first token belongs to prefill, per
-`docs/benchmarking.md`). TQ4NC is absent because it has no CUDA kernel and is not wired
+`docs/guides/benchmarking.md`). TQ4NC is absent because it has no CUDA kernel and is not wired
 into attention, so it cannot run.
 
 ## Reading of the results

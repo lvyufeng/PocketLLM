@@ -129,7 +129,7 @@ This made per-instance configuration and discoverability difficult.
 
 Backend-specific tuning remains in `backend_options`. `EngineArgs.from_env()` is a compatibility
 bridge; runtime variables are named `POCKETLLM_*` (renamed from `DSV4_*` — see
-[the migration note](migration/dsv4-to-pocket-rename.md)), while `QWEN_*` and related names are
+[the migration note](../migration/dsv4-to-pocket-rename.md)), while `QWEN_*` and related names are
 unchanged. Explicit API and CLI values take precedence over this bridge.
 
 **Remaining gap:** not every model-specific tuning switch has a portable typed field, by design.

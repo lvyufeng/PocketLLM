@@ -95,11 +95,11 @@ The isolated benchmark is useful for kernel A/B work, but model-level TPS should
 
 ## Evidence and related notes
 
-- [MiniMax decode bottleneck analysis](../minimax_decode_bottleneck_analysis.md)
+- [MiniMax decode bottleneck analysis](../performance/minimax_decode_bottleneck_analysis.md)
 - `src/models/minimax_m2/spec.py`
 - `src/models/minimax_m2/architecture.py`
 - `tests/test_minimax_m2_spec.py`
 - `tests/test_encoding_minimax_m2.py`
 - `tests/test_q4k_q5k_mma.py`
 - `tests/test_minimax_iq2xxs_w2_dp4a.py`
-- [Benchmark reporting rules](../benchmarking.md)
+- [Benchmark reporting rules](../guides/benchmarking.md)

@@ -1,0 +1,206 @@
+# Documentation site for PocketLLM, published to GitHub Pages by
+# .github/workflows/pages.yml.
+#
+# `docs_dir` points at the `docs/` tree the repository already had, so publishing
+# the site moves no files: the same markdown is the GitHub directory index and the
+# site source. `docs/README.md` is the site home — MkDocs treats a README.md as the
+# index page of its directory, and if both index.md and README.md existed here the
+# README would be ignored instead.
+site_name: PocketLLM
+site_url: https://lvyufeng.github.io/PocketLLM/
+site_description: >-
+  Inference engine for large language models on consumer GPUs with deep
+  optimization for older hardware
+site_author: lvyufeng
+copyright: MIT licensed. Model weights and third-party components keep their own licenses.
+
+repo_url: https://github.com/lvyufeng/PocketLLM
+repo_name: lvyufeng/PocketLLM
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+use_directory_urls: true
+
+theme:
+  name: material
+  language: en
+  favicon: assets/favicon.svg
+  # Only overrides/main.html lives here, and it does nothing except fill
+  # `{% block announce %}`. Material's own main.html is four lines that just
+  # extend base.html, so overriding it drops no other block.
+  custom_dir: overrides
+
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+  features:
+    - announce.dismiss
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/lvyufeng/PocketLLM
+      name: PocketLLM on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/pocketllm/
+      name: pocketllm on PyPI
+
+plugins:
+  # Chinese search is broken without this block, and silently so: Material's Python
+  # side segments CJK with jieba and joins the pieces with U+200B, while the built-in
+  # separator "[\s\-]+" does not match U+200B. 363 of the 765 search entries are
+  # CJK-bearing, and every one of them is unreachable by its own words.
+  #
+  # The separator below is the one Material itself ships in
+  # templates/partials/languages/zh.html. It is written with backslash-u escapes
+  # rather than the literal characters so that a zero-width space stays visible in
+  # review; Python's `re` and the worker's `new RegExp` both accept the escapes.
+  #
+  # Listing "zh" is also what makes the search worker importScripts lunr.zh.min.js,
+  # lunr.multi.min.js and lunr.stemmer.support.min.js. Material already ships all
+  # three under assets/javascripts/lunr/min/, so this adds no dependency.
+  #
+  # Measured against the built index with Material's own lunr: ten single-term CJK
+  # queries went from 0 hits each to 8-66, while benchmark and prefill were unchanged.
+  # A multi-word Chinese query still needs a space between words: Material splits
+  # queries on whitespace only, never with jieba. That is upstream behaviour for the
+  # zh locale, not something this file can change.
+  #
+  # Declaring `plugins:` at all means this list is the whole list. A plugin added
+  # later has to be listed here, or it will not run.
+  - search:
+      lang:
+        - en
+        - zh
+      separator: '[\s\u200b\u3000\-、。，．？！；]+'
+
+nav:
+  - Home: README.md
+  - Getting started: getting-started.md
+  - Model guides:
+      - Support matrix: models/README.md
+      - DeepSeek-V4: models/deepseek-v4.md
+      - DeepSeek-V4 GGUF Q2 on one GPU: models/deepseek-v4-gguf-q2-single-gpu.md
+      - MiniMax-M2.7: models/minimax-m2.7.md
+      - GLM-5.2: models/glm-5.2.md
+      - Qwen3.8-27B-FP8: models/qwen3.8-27b-fp8.md
+      - Qwen3.8-27B-NVFP4: models/qwen3.8-27b-nvfp4.md
+      - Qwen3.8-27B-BF16: models/qwen3.8-27b-bf16.md
+  - Guides:
+      - Overview: guides/index.md
+      - Benchmarking and reporting: guides/benchmarking.md
+      - Native engine API: guides/pocketllm_api.md
+      - PyPI release: guides/pypi_release.md
+      - Ascend SoC generations: guides/ascend_soc_generations.md
+  - Performance:
+      - Overview: performance/index.md
+      - DSpark speculative decoding: performance/dspark.md
+      - FlashMemory 1M context: performance/flashmemory_1m_context.md
+      - MiniMax decode bottleneck: performance/minimax_decode_bottleneck_analysis.md
+      - Qwen4-Exp expert placement: performance/qwen4_exp_performance.md
+      - Qwen KV cache at 65K: performance/qwen_kv_cache_65k_tg512.md
+      - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
+  - Architecture:
+      - Overview: architecture/index.md
+      - Backend unification design: architecture/backend_unification_design.md
+      - C++ engine multi-backend plan: architecture/cpp_engine_multi_backend_plan.md
+      - Refactor analysis (2026-09): architecture/pocketllm_refactor_analysis_2026_09.md
+      - Roadmap for old hardware: architecture/pocketllm_roadmap_old_hardware.md
+      - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
+      - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
+  - Migration:
+      - The dsv4 to pocket rename: migration/dsv4-to-pocket-rename.md
+  - Archive (Phase 2/3):
+      - Overview: archive/phase2-phase3/index.md
+      - Phase 2 validation results: archive/phase2-phase3/phase2_validation_results.md
+      - Backend auto-TP design: archive/phase2-phase3/cpp_backend_auto_tp.md
+      - Phase 3.1 batching design: archive/phase2-phase3/cpp_engine_batching_phase3_1.md
+      - Phase 3.1 progress report: archive/phase2-phase3/phase3_1_progress_report.md
+      - Phase 3.1 completion summary: archive/phase2-phase3/phase3_1_completion_summary.md
+      - Phase 3.2 implementation plan: archive/phase2-phase3/phase3_2_implementation_plan.md
+      - Phase 3.2 completion summary: archive/phase2-phase3/phase3_2_completion_summary.md
+      - Phase 3.3 implementation plan: archive/phase2-phase3/phase3_3_implementation_plan.md
+      - Phase 3.3 completion summary: archive/phase2-phase3/phase3_3_completion_summary.md
+      - Phase 3.4 completion summary: archive/phase2-phase3/phase3_4_completion_summary.md
+      - Phase 3.5 auto-TP results: archive/phase2-phase3/phase3_5_auto_tp_results.md
+      - Phase 3.5 benchmark guide: archive/phase2-phase3/phase3_5_benchmark_guide.md
+      - Phase 3.5 performance report: archive/phase2-phase3/phase3_5_performance_report.md
+      - Phase 3.5 validation results: archive/phase2-phase3/phase3_5_validation_results.md
+  - Changelog: https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md
+
+# The build is the link checker: `mkdocs build --strict` runs in CI and promotes
+# every warning below to a failure. Anything omitted from `nav` also fails, so no
+# document can be reachable only by guessing its filename.
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: warn
+  links:
+    not_found: warn
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  # Chinese headings appear in a dozen of these documents, so slugify has to keep
+  # non-ASCII instead of stripping it the way the Markdown default does.
+  - toc:
+      permalink: true
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.betterem
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tilde
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+watch:
+  - docs
+  - mkdocs.yml

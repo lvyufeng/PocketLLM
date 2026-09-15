@@ -9,10 +9,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
-**/build-ascend/
-**/build-ascend-*/
-**/build-cuda/
-**/build-python/
+# Build trees under cpp_engine. `scripts/build_ascend.sh` and the documented cmake
+# invocations use the hyphenated names, but hand-run cmake commands have produced
+# underscore variants (build_cuda, build_ascend) that a hyphen-only pattern misses.
+**/build[-_]*/
 **/develop-eggs/
 **/dist/
 **/downloads/
@@ -236,8 +236,6 @@ compile_commands.json
 
 # VSCode
 .vscode
-
-1
 
 # Autoenv
 .env.leave

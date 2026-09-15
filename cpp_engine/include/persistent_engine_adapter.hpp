@@ -11,18 +11,12 @@ namespace pocket {
 
 // Presents the DeepSeek-V4 PersistentEngine through the InferenceEngine surface.
 //
-// PersistentEngine is a single mutable session: one KV cache, one position
-// counter the caller maintains (see persistent_engine.hpp), no slots, no block
-// pool, no bounded prefill. None of that is a defect to be papered over here --
-// porting it onto paged KV and slots is a separate effort -- so this adapter does
-// not pretend. It declares `paged_kv = false`, `continuous_batching = false`,
-// `chunked_prefill = false`, `max_slots = 1`, and the scheduler reads that
-// declaration instead of inferring capability from an accounting field that
-// happens to read zero.
-//
-// What the adapter does supply is the position bookkeeping the batched API hides
-// and PersistentEngine requires: `decode_step` takes the absolute position of the
-// token it is fed, which every existing caller has had to track by hand.
+// PersistentEngine owns a fixed set of contiguous request slots. KV and
+// recurrent state are allocated once, and every scheduler row carries its slot
+// id into the model forward. The cache is not paged, but independent rows can
+// decode together through PersistentEngine's batched continuation path. Prefill
+// remains a safe per-request operation; the scheduler may admit several prompts
+// and the adapter fills their slots without resetting active requests.
 //
 // TP is handled the way QwenEngine's batched entry points handle it: each forward
 // announces itself on the worker command channel first, so a scheduler driving
@@ -35,7 +29,8 @@ public:
     PersistentEngineAdapter(const std::string& ckpt_dir,
                             const ForwardSmokeOptions& opts,
                             int layer_count,
-                            int max_context);
+                            int max_context,
+                            int max_slots = 1);
 
     // Borrowing form, for a caller that already owns a PersistentEngine and
     // still needs its non-batched entry points (speculative decoding, the TP
@@ -57,8 +52,8 @@ public:
     int max_context() const override;
     int device() const override;
 
-    // Rejects anything above one slot rather than accepting it and overwriting
-    // one request's KV cache with another's.
+    // Allocates the fixed slot count selected at construction. The scheduler's
+    // requested width is clamped by the capability negotiation before this call.
     void allocate_batch_slots(int max_batch_size) override;
     int allocate_slot(uint64_t request_id) override;
     void free_slot(uint64_t request_id) override;
@@ -70,15 +65,14 @@ public:
     int kv_total_blocks() const override;
     int kv_blocks_for_tokens(int tokens) const override;
 
-    // Single-request degradations. Both reject a batch wider than one row: the
-    // adapter declared max_slots == 1, so a wider call is a scheduler that
-    // ignored the declaration, and failing loudly beats silently interleaving two
-    // sequences through one KV cache.
-    //
-    // `token_budget` is ignored, as caps().chunked_prefill == false announces:
-    // the prompt runs to completion in one call.
+    // Prefill each newly admitted prompt into its own slot. The full prompt
+    // kernel remains the tuned single-sequence path; no active slot is reset
+    // while another request is being filled.
     BatchPrefillResult batch_prefill(const std::vector<BatchedRequest*>& requests,
                                      int token_budget) override;
+
+    // Decode all active rows in one continuation batch. Rows may have different
+    // absolute positions but must have distinct slots.
     BatchDecodeResult batch_decode_step(
         const std::vector<BatchedRequest*>& requests) override;
 
@@ -91,15 +85,15 @@ public:
 
 private:
     bool is_stop_token(const BatchSamplingParams& sampling, int token) const;
+    int find_slot(uint64_t request_id) const;
 
     std::unique_ptr<PersistentEngine> owned_;
     PersistentEngine* engine_ = nullptr;
-    // The one slot, and whose it is. -1 means free.
-    bool slot_taken_ = false;
-    uint64_t slot_request_id_ = 0;
-    // Absolute position of `last_token` for the request holding the slot. Prefill
-    // of n tokens leaves this at n, which is where the token it sampled sits.
-    int position_ = 0;
+    int max_slots_ = 1;
+    int allocated_slots_ = 1;
+    std::vector<bool> slot_taken_;
+    std::vector<uint64_t> slot_request_ids_;
+    std::vector<int> positions_;
 };
 
 }  // namespace pocket
