@@ -161,6 +161,7 @@ than trusted.
 | `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. |
 | `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
+| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
 | `tools` | chat | Tool definitions reach the chat template. The model still chooses; see `tool_choice` below. |
 | `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
@@ -192,16 +193,43 @@ Three details are worth knowing before relying on the field:
   scheduler ends a request on token ids, and a client sequence is not one, so the request runs to its
   budget and only the text handed back is cut.
 
+#### Choices
+
+`n` is the number of completions one request asks for, and the server serves it by running the
+request `n` times: each choice is its own scheduler request, with its own seed derived from the
+request's `seed` and — when `response_format` asks for one — its own grammar. The response carries
+one entry per choice with `index` running 0..`n`-1, and a streaming response **interleaves** the
+choices rather than sending one after another, so a client watching four choices sees all four
+advance together. `usage` is counted the way OpenAI counts it: `prompt_tokens` once for the request,
+`completion_tokens` the sum over the choices.
+
+Three consequences are worth knowing:
+
+- **Under greedy decoding every choice is the same text.** With `temperature` at 0 the seed is not
+  read, so `n=3` returns the greedy answer three times. That is what a greedy request for three
+  choices asks for; a caller who wants three different answers has to sample. The corresponding
+  refusal is on the other side: an engine that fixes its sampling distribution engine-wide while the
+  request asks for stochastic sampling cannot vary a choice at all, so `n>1` there is a 400 — three
+  identical texts would otherwise be handed back as three independent samples.
+- **`n` is refused above 128**, and refused for a fraction, a non-number, or a count below 1. The
+  ceiling is this server's, not OpenAI's: one choice is one scheduler request, so the field is what
+  bounds how much of the queue a single client can occupy.
+- **The timeout is the request's, not the choice's.** A group of choices gets the one budget a
+  single-choice request would have had, so a request wide enough that some of its choices wait
+  behind the batch comes back with fewer entries than `n`. That is a 200 with a short `choices`
+  array — the choices that did arrive are real answers — and not a failure. A response with no
+  entries at all is a 500, or a 504 when the deadline was the reason. Cancelling the request cancels
+  every choice.
+
 ### Refused with HTTP 400
 
 Each of these is refused only at a value that would change the output. The same field at the value
-naming what the server already does — `n=1`, `logprobs=false`, penalties of zero, an empty `stop`
-list, an empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented
-defaults explicitly is not punished for it.
+naming what the server already does — `logprobs=false`, penalties of zero, an empty `stop` list, an
+empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented defaults
+explicitly is not punished for it.
 
 | Field | Endpoints | Refused when | What this server does instead |
 | --- | --- | --- | --- |
-| `n` | both | not 1 | `choices` always holds exactly one entry, with index 0. |
 | `stop` | both | the value is not a string and not a list of strings | Nothing is matched, so a well-formed `stop` is refused on shape alone rather than half-applied. Empty strings match nothing and are accepted, which is what makes an empty `stop` list — or the empty entries some clients pad it with — harmless. |
 | `logprobs` | chat | anything but `false` | No `logprobs` object is returned on any choice. |
 | `logprobs` | completions | any value | It is a count there, where even `0` asks for the sampled token's logprob, so no value is inert. |
@@ -219,7 +247,7 @@ The refusal uses the OpenAI error shape with `type` set to `invalid_request_erro
 to the offending field, so a client can act on it without parsing the prose:
 
 ```json
-{"error":{"message":"\"n\" = 3 is not supported by this server: \"choices\" always holds exactly one entry and its index is always 0. Remove \"n\", or set it to 1 and read the single choice.","type":"invalid_request_error","param":"n","code":null}}
+{"error":{"message":"\"stop\" = 5 is not supported by this server: a stop sequence is a string, or a list of strings, and this value is neither. Send \"stop\" as a string or an array of strings.","type":"invalid_request_error","param":"stop","code":null}}
 ```
 
 ### Accepted and inert

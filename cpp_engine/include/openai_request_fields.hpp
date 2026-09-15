@@ -14,6 +14,14 @@ enum class OpenAiEndpoint {
     Completions,
 };
 
+// The largest "n" this server accepts. A request for n choices is served as n
+// scheduler requests, one per choice, so the field is bounded by a fixed server
+// limit rather than by anything the engine declares: the limit exists so that a
+// single request cannot fill the scheduler's waiting queue with choices that
+// will not be reached before the request times out, and it is chosen high
+// enough that no ordinary client reaches it.
+inline constexpr int kMaxChoices = 128;
+
 // Outcome of auditing a request body against what this server actually does.
 struct RequestFieldCheck {
     bool ok = true;
@@ -47,6 +55,12 @@ struct RequestFieldCheck {
 // a client sending false is asking for a limit this server does not enforce, so
 // that value is refused. See docs/guides/pocketllm_api.md for the table.
 RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint endpoint);
+
+// The number of choices a body asks for: "n" when it is a whole number in
+// [1, kMaxChoices], and 1 otherwise -- which is what check_request_fields has
+// already established, so a caller that audited first gets the caller's value
+// and a caller that did not gets a request that generates one choice.
+int requested_choices(const JsonObject& body);
 
 // The effective generation budget: OpenAI deprecated max_tokens in favour of
 // max_completion_tokens and gives the latter precedence when both are present.
