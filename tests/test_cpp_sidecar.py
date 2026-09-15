@@ -81,6 +81,46 @@ def test_generic_sidecar_uses_checkpoint_chat_template_for_ids_and_text():
     assert tokenizer.calls[1][1]["tokenize"] is False
 
 
+def test_generic_sidecar_decodes_replayed_tool_arguments_for_the_template():
+    """A replayed assistant message has to reach the template as an object.
+
+    Qwen's chat template walks `tool_call.function.arguments` with `|items`,
+    while OpenAI specifies the same field as a JSON string.  A second turn
+    replays the assistant message the server just returned, so passing the
+    request through verbatim raises "Can only get item pairs from a mapping"
+    before the model is ever reached.
+    """
+    tokenizer = RecordingTokenizer()
+    messages = [
+        {"role": "user", "content": "weather in Paris?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_" + "0" * 24,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "Paris", "days": 3}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_" + "0" * 24, "content": "{}"},
+    ]
+    tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+    ChatTemplateTemplater(tokenizer).encode({"messages": messages, "tools": tools})
+
+    assert len(tokenizer.calls) == 2
+    for seen_messages, _ in tokenizer.calls:
+        assert seen_messages[1]["tool_calls"][0]["function"]["arguments"] == {
+            "city": "Paris",
+            "days": 3,
+        }
+        assert seen_messages[2] == messages[2]
+    # The request is not the template's to rewrite.
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"city": "Paris", "days": 3}'
+
+
 def test_generic_sidecar_falls_back_when_template_has_no_thinking_argument():
     tokenizer = NoThinkingArgumentTokenizer()
     prompt, token_ids = ChatTemplateTemplater(tokenizer).encode(

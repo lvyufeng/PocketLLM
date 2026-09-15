@@ -17,7 +17,7 @@ from .chat import (
     tool_choice_instruction,
     tool_names,
 )
-from .prompt import encode_chat_prompt
+from .prompt import encode_chat_prompt, template_messages
 from .requests import build_chat_request, build_completion_request
 
 __all__ = [
@@ -31,6 +31,7 @@ __all__ = [
     "prepare_messages",
     "render_fallback_prompt",
     "stop_strings",
+    "template_messages",
     "thinking_config",
     "tool_choice_instruction",
     "tool_names",

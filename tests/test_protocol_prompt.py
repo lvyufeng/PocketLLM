@@ -77,6 +77,42 @@ def test_template_encoding_passes_tools_and_does_not_mutate_arguments():
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
 
 
+def test_template_messages_is_public_and_leaves_undecodable_arguments_alone():
+    """The conversion is shared with the sidecar, and it is all-or-nothing.
+
+    A call whose arguments are not a JSON object stays exactly as it arrived, so
+    the template sees what the request said rather than a half-converted value.
+    """
+    from pocketllm.protocol import template_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_0", "type": "function",
+                 "function": {"name": "weather", "arguments": '{"city":"Paris"}'}},
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "weather", "arguments": "{not json"}},
+                {"id": "call_2", "type": "function",
+                 "function": {"name": "weather", "arguments": "[1, 2]"}},
+            ],
+        },
+        {"role": "user", "content": "Weather?"},
+    ]
+
+    copied = template_messages(messages)
+
+    arguments = [call["function"]["arguments"] for call in copied[0]["tool_calls"]]
+    assert arguments == [{"city": "Paris"}, "{not json", "[1, 2]"]
+    # The caller's messages keep the OpenAI wire shape.
+    assert [call["function"]["arguments"] for call in messages[0]["tool_calls"]] == [
+        '{"city":"Paris"}',
+        "{not json",
+        "[1, 2]",
+    ]
+
+
 def test_public_reasoning_aliases_map_to_template_vocabulary():
     for public, expected in (("minimal", "low"), ("low", "low"), ("medium", "medium"), ("max", "xhigh"), (None, "xhigh")):
         tokenizer = TemplateTokenizer()
