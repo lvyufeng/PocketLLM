@@ -245,6 +245,21 @@ public:
     // batched call at world size > 1. No-op at world size 1.
     virtual void warmup_tp() {}
 
+    // Run one short forward through every device operator the prefill and
+    // decode paths use, so the one-time cost of building an aclnn executor and
+    // loading an AscendC kernel binary lands in startup rather than inside
+    // whichever request arrives first. Ignores its own slot state. No-op by
+    // default, and a no-op after the first call.
+    //
+    // `workers_in_loop` says where the other ranks are. When they are parked in
+    // run_worker_loop() only rank 0 may call this, and it has to drive them over
+    // the command channel exactly as a real request would, because they follow
+    // the same collective sequence. When every rank runs the same program (the
+    // SPMD harnesses), each one warms up locally and nothing is sent -- and then
+    // the engine does not need to be rank 0.
+    virtual void warmup_kernels(bool workers_in_loop) { (void)workers_in_loop; }
+    void warmup_kernels() { warmup_kernels(false); }
+
     // Entry point for ranks other than 0: block on the command channel and
     // serve whatever rank 0 announces until it sends shutdown. Returns only
     // once the group is torn down.

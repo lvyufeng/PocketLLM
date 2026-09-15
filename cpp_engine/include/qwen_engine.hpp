@@ -310,6 +310,23 @@ public:
     // Drops every cached prefix so the next prefill recomputes from zero.
     void clear_prefix_cache();
     void warmup_tp() override;
+    // Runs one short forward through every device operator the prefill and
+    // decode paths use, so the aclnn executor construction and AscendC kernel
+    // binary load land in startup instead of inside whichever request arrives
+    // first. Measured at ~1.0s per process on this machine, independent of both
+    // prompt length and layer count.
+    //
+    // `workers_in_loop` says where the other ranks are. When they are parked in
+    // run_worker_loop() they have to be driven over the command channel exactly
+    // as a real request drives them, and only rank 0 may call this. When every
+    // rank runs the same program (the SPMD harnesses) each one warms up locally
+    // and nothing is sent.
+    //
+    // Leaves the engine as it found it: the warmup's slot state is dropped
+    // before returning, so position 0 and an empty prefix cache are what the
+    // first real request sees. No-op after the first call, and at max_context
+    // below two tokens.
+    void warmup_kernels(bool workers_in_loop) override;
     ForwardResult prefill(const std::vector<int>& token_ids, int slot_id = 0);
     // Prefill that consumes at most `max_tokens` prompt tokens and returns,
     // leaving the rest for a later call. This is what lets a scheduler keep a
@@ -465,6 +482,7 @@ private:
     QwenWeightMap weights_;
     int active_layers_ = 0;
     int max_context_ = 0;
+    bool kernels_warmed_ = false;
     int position_ = 0;
     uint64_t resident_weight_bytes_ = 0;
     uint64_t resident_scale_bytes_ = 0;

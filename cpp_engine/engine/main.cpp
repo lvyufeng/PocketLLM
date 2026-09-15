@@ -488,6 +488,10 @@ int main(int argc, char** argv) {
                 engine->run_worker_loop();
                 return 0;
             }
+            // Rank 0 only, and only once the workers are parked: the warmup
+            // forward has to be announced over the command channel so the other
+            // ranks take the same collectives.
+            engine->warmup_kernels(true);
             const std::string sidecar_script = args.sidecar_script.empty()
                 ? std::string("src/server/cpp_sidecar.py")
                 : args.sidecar_script;
@@ -867,6 +871,10 @@ int main(int argc, char** argv) {
                     }
                     if (args.generate_token) {
                         qwen.warmup_tp();
+                        // Every rank runs this program, so the warmup forward is
+                        // SPMD too: each one warms up locally and no command
+                        // channel traffic is needed to keep them together.
+                        qwen.warmup_kernels(false);
                         using Clock = std::chrono::steady_clock;
                         const auto t_total0 = Clock::now();
                         const auto t_prefill0 = Clock::now();

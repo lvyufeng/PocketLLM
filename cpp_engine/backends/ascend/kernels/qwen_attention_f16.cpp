@@ -550,9 +550,12 @@ extern "C" __global__ __aicore__ void qwen_gqa_verify_attention_kernel(
 // simple enough to validate on first-generation 910.
 namespace {
 
-// Position tile size: larger tiles reduce outer loop iterations and improve
-// memory access patterns. 16→64 reduces prefill loop count by 4x.
-// UB capacity on 910A allows 64 positions × 128 head_dim = 8KB per tile.
+// Position tile size. Every buffer sized by this is a [tile, head_dim] fp32 (or
+// fp16 staging) plane, so the cost is tile × head_dim × 10 bytes across the row and
+// query-replica planes. At the 256-wide head dimension this model uses a 32-position
+// tile costs ~80 KB of the 256 KB UB budget, which leaves room for the smaller
+// per-row scratch and keeps the tile inside UB for any head_dim up to
+// kVectorHeadCapacity.
 constexpr uint32_t kVectorPositionTile = 64;
 constexpr uint32_t kVectorHeadCapacity = 256;
 
@@ -562,6 +565,7 @@ struct VectorAttentionBuffers {
     AscendC::TBuf<AscendC::TPosition::VECCALC> row_half_buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> q_float_buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> row_float_buf;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> q_rep_buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> product_buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> accum_buf;
     AscendC::TBuf<AscendC::TPosition::VECCALC> merged_buf;
@@ -575,6 +579,8 @@ struct VectorAttentionBuffers {
                         kVectorPositionTile * kVectorHeadCapacity * sizeof(half));
         pipe.InitBuffer(q_float_buf, kVectorHeadCapacity * sizeof(float));
         pipe.InitBuffer(row_float_buf,
+                        kVectorPositionTile * kVectorHeadCapacity * sizeof(float));
+        pipe.InitBuffer(q_rep_buf,
                         kVectorPositionTile * kVectorHeadCapacity * sizeof(float));
         pipe.InitBuffer(product_buf, kVectorHeadCapacity * sizeof(float));
         pipe.InitBuffer(accum_buf, kVectorHeadCapacity * sizeof(float));
@@ -595,6 +601,9 @@ struct VectorAttentionBuffers {
     }
     __aicore__ AscendC::LocalTensor<float> row_float() {
         return row_float_buf.Get<float>();
+    }
+    __aicore__ AscendC::LocalTensor<float> q_rep() {
+        return q_rep_buf.Get<float>();
     }
     __aicore__ AscendC::LocalTensor<float> product() {
         return product_buf.Get<float>();
@@ -626,6 +635,107 @@ __aicore__ inline void load_vector_row(
     AscendC::PipeBarrier<PIPE_V>();
     AscendC::Cast(float_tile, half_tile, AscendC::RoundMode::CAST_NONE, count);
     AscendC::PipeBarrier<PIPE_V>();
+}
+
+// Replicate the query row `rows` times.
+//
+// A repeat-strided Mul cannot express the per-row wrap a query rep needs (the
+// source stride would have to reset every head_dim lanes), and the Cube broadcast
+// primitive Brcb is an unsupported stub on first-generation dav_c100. So the
+// replication is one broadcast per row. It is built once per query row and reused
+// by every key tile, which amortizes the `rows` issues over the whole context.
+__aicore__ inline void broadcast_query_rows(
+    const AscendC::LocalTensor<float>& destination,
+    const AscendC::LocalTensor<float>& query,
+    uint32_t rows, uint32_t head_dim) {
+    for (uint32_t i = 0; i < rows; ++i) {
+        AscendC::Muls(destination[i * head_dim], query, 1.0f, head_dim);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+}
+
+// Row-sum a [rows, head_dim] fp32 tile, leaving sum i in scores[i].
+//
+// This is the replacement for one fold_sum per (query, key) pair. The halving fold
+// is the same, but a single level now covers every row of the tile before the next
+// level starts, so a tile costs `log2(head_dim/kAlignFloat)` barriers and
+// `rows` × that many vector issues — no per-key scalar round trip. That round trip
+// is what dominated this kernel: the per-score wait_scalar_before_compute /
+// wait_compute_before_scalar pair drains the vector pipe on every key position.
+//
+// rows must be at least 1 and head_dim a multiple of kAlignFloat. Destroys `work`.
+__aicore__ inline void fold_tile_rows(
+    const AscendC::LocalTensor<float>& work,
+    const AscendC::LocalTensor<float>& scores,
+    uint32_t rows, uint32_t head_dim) {
+    if (head_dim < kAlignFloat) {
+        wait_compute_before_scalar();
+        for (uint32_t i = 0; i < rows; ++i) {
+            float sum = 0.0f;
+            for (uint32_t j = 0; j < head_dim; ++j) {
+                sum += work.GetValue(i * head_dim + j);
+            }
+            scores.SetValue(i, sum);
+        }
+        return;
+    }
+    // Fold every row's level before moving to the next one: the rows are disjoint
+    // spans of the tile, so one barrier per level is enough and the issue stream
+    // stays dense instead of paying a barrier per (row, level) pair.
+    //
+    // Each level is a repeat-strided Add that folds all `rows` rows in a single
+    // issue. One instruction per (row, level) is what makes this fold expensive:
+    // at 64 rows and 8 levels that is 512 issues of mostly address and mask setup
+    // per tile. Repeat strides are counted in 32-byte blocks, so one row of
+    // `head_dim` floats spans exactly head_dim/kAlignFloat blocks, which is the
+    // per-repeat stride for both source and destination. A single fp32 repeat
+    // covers at most kRepeatLanes, so a half wider than that needs several issues.
+    constexpr uint32_t kRepeatLanes = 64;
+    const uint32_t row_blocks = head_dim / kAlignFloat;
+    const AscendC::BinaryRepeatParams row_major{
+        1, 1, 1, static_cast<uint8_t>(row_blocks),
+        static_cast<uint8_t>(row_blocks), static_cast<uint8_t>(row_blocks)};
+    for (uint32_t half = head_dim / 2; half >= kAlignFloat; half /= 2) {
+        for (uint32_t offset = 0; offset < half; offset += kRepeatLanes) {
+            const uint32_t lanes = min_u32(kRepeatLanes, half - offset);
+            AscendC::Add(work[offset], work[offset], work[half + offset],
+                         lanes, static_cast<uint8_t>(rows), row_major);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    // The halving stops one step short of a single lane: the vector unit works in
+    // kAlignFloat-wide lanes, so `kAlignFloat` partial sums survive per row and the
+    // last fold has to happen on the scalar unit. Reading lane 0 alone would return
+    // 1/kAlignFloat of the dot product — this is the same tail fold_sum performs.
+    wait_compute_before_scalar();
+    for (uint32_t i = 0; i < rows; ++i) {
+        float sum = 0.0f;
+        for (uint32_t lane = 0; lane < kAlignFloat && lane < head_dim; ++lane) {
+            sum += work.GetValue(i * head_dim + lane);
+        }
+        scores.SetValue(i, sum);
+    }
+}
+
+// Load `count` key rows and produce their dot products with the broadcast query.
+// `query_rep` must already hold count copies of the query row.
+//
+// The tile is scored in place in the fp32 row buffer: the raw keys have no use
+// after the elementwise product, and the tile is far wider than the single-row
+// `product` scratch, which stays reserved for the value accumulation.
+__aicore__ inline void qk_tile_scores(
+    VectorAttentionBuffers& buffers,
+    const AscendC::GlobalTensor<half>& key_cache, uint32_t cache_base,
+    uint32_t head_dim, const AscendC::LocalTensor<float>& query_rep,
+    uint32_t count) {
+    AscendC::LocalTensor<half> row_half = buffers.row_half();
+    AscendC::LocalTensor<float> row_float = buffers.row_float();
+    AscendC::LocalTensor<float> scores = buffers.scores();
+    load_vector_row(key_cache, row_half, row_float, cache_base,
+                    count * head_dim);
+    AscendC::Mul(row_float, row_float, query_rep, count * head_dim);
+    AscendC::PipeBarrier<PIPE_V>();
+    fold_tile_rows(row_float, scores, count, head_dim);
 }
 
 __aicore__ inline float vector_dot(
@@ -702,6 +812,7 @@ __aicore__ inline void vector_online_softmax_pass(
     AscendC::LocalTensor<float> row_float = buffers.row_float();
     AscendC::LocalTensor<half> row_half = buffers.row_half();
     AscendC::LocalTensor<float> product = buffers.product();
+    AscendC::LocalTensor<float> query_rep = buffers.q_rep();
 
     // Initialize online softmax state
     float m = -3.402823466e+38F;  // running maximum
@@ -710,18 +821,21 @@ __aicore__ inline void vector_online_softmax_pass(
     wait_scalar_before_compute();
     AscendC::PipeBarrier<PIPE_V>();
 
+    broadcast_query_rows(query_rep, query, kVectorPositionTile, head_dim);
+    wait_scalar_before_compute();
+
     for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
         const uint32_t count = min_u32(kVectorPositionTile, end - start);
 
-        // Load K cache tile and compute QK^T scores (only once!)
+        // Load the whole key tile and score it in one batched pass. This leaves
+        // the scalar unit synchronized with the fold, so the raw scores below are
+        // read without a per-position flag round trip.
         const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(key_cache, row_half, row_float, key_base, count * head_dim);
+        qk_tile_scores(buffers, key_cache, key_base, head_dim, query_rep, count);
 
         float tile_max = -3.402823466e+38F;
         for (uint32_t i = 0; i < count; ++i) {
-            wait_scalar_before_compute();
-            const float score = vector_dot(
-                query, row_float[i * head_dim], product, head_dim) * scale;
+            const float score = scores.GetValue(i) * scale;
             scores.SetValue(i, score);
             if (score > tile_max) tile_max = score;
         }
@@ -738,30 +852,36 @@ __aicore__ inline void vector_online_softmax_pass(
         }
 
         // Compute exp(scores - m_new) and update denominator
-        for (uint32_t i = 0; i < count; ++i) {
-            scores.SetValue(i, scores.GetValue(i) - m_new);
-        }
         for (uint32_t i = count; i < kVectorPositionTile; ++i) {
             scores.SetValue(i, -3.402823466e+38F);
         }
         wait_scalar_before_compute();
+        AscendC::Adds(scores, scores, -m_new, count);
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Exp(scores, scores, kVectorPositionTile);
         wait_compute_before_scalar();
 
+        float tile_sum = 0.0f;
         for (uint32_t i = 0; i < count; ++i) {
-            d += scores.GetValue(i);
+            tile_sum += scores.GetValue(i);
         }
+        d += tile_sum;
+        if (tile_sum <= 0.0f) continue;
 
-        // Load V cache tile and accumulate weighted values
+        // Load V cache tile and accumulate weighted values. The scalar reads of
+        // `scores` for the weights below happen in the same pass as the ones for
+        // the denominator, so the tile needs a single S->V hand-off.
+        //
+        // Axpy folds the scale-and-accumulate pair into one issue per key: the
+        // separate Muls + Add needed a barrier between them to keep `product` from
+        // overwriting itself, and that barrier drains the vector pipe once per key.
         const uint32_t value_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(value_cache, row_half, row_float, value_base, count * head_dim);
-
+        load_vector_row(value_cache, row_half, row_float, value_base,
+                        count * head_dim);
+        wait_scalar_before_compute();
         for (uint32_t i = 0; i < count; ++i) {
             const float probability = scores.GetValue(i);
-            wait_scalar_before_compute();
-            AscendC::Muls(product, row_float[i * head_dim], probability, head_dim);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(accum, accum, product, head_dim);
+            AscendC::Axpy(accum, row_float[i * head_dim], probability, head_dim);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
@@ -833,19 +953,15 @@ __aicore__ inline void vector_publish_probabilities(
     const AscendC::LocalTensor<float>& query, float scale, float maximum,
     float inverse, uint32_t score_output_base) {
     AscendC::LocalTensor<float> scores = buffers.scores();
-    AscendC::LocalTensor<half> row_half = buffers.row_half();
-    AscendC::LocalTensor<float> row_float = buffers.row_float();
-    AscendC::LocalTensor<float> product = buffers.product();
+    AscendC::LocalTensor<float> query_rep = buffers.q_rep();
+    broadcast_query_rows(query_rep, query, kVectorPositionTile, head_dim);
+    wait_scalar_before_compute();
     for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
         const uint32_t count = min_u32(kVectorPositionTile, end - start);
         const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(key_cache, row_half, row_float, key_base,
-                        count * head_dim);
+        qk_tile_scores(buffers, key_cache, key_base, head_dim, query_rep, count);
         for (uint32_t i = 0; i < count; ++i) {
-            wait_scalar_before_compute();
-            const float score = vector_dot(
-                query, row_float[i * head_dim], product, head_dim) * scale;
-            scores.SetValue(i, score - maximum);
+            scores.SetValue(i, scores.GetValue(i) * scale - maximum);
         }
         for (uint32_t i = count; i < kVectorPositionTile; ++i) {
             scores.SetValue(i, -3.402823466e+38F);

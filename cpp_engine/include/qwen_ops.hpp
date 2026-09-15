@@ -176,6 +176,18 @@ inline bool qwen_gqa_decode_attention_f16(const uint16_t* d_q_fp16, const uint16
 #endif
 }
 
+// Whether qwen_gqa_decode_attention_f16 above will run on the Cube unit for this
+// shape. Only Ascend has a Cube path; everywhere else the answer is false and the
+// caller's split-context kernel stays in charge.
+inline bool qwen_gqa_decode_attention_cube_available(int q_heads, int kv_heads, int head_dim, int context_len, int max_context) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_gqa_decode_attention_cube_available_ascend(q_heads, kv_heads, head_dim, context_len, max_context);
+#else
+    (void)q_heads; (void)kv_heads; (void)head_dim; (void)context_len; (void)max_context;
+    return false;
+#endif
+}
+
 // Streams tile_count 64x256 FP16 tiles out of HBM and does one op per element.
 // This is a measurement tool, not part of any model path: it establishes the
 // achievable read bandwidth that the bandwidth-bound decode attention kernels are
@@ -194,6 +206,21 @@ inline bool qwen_gqa_decode_attention_flashdec_f16(const uint16_t* d_q_fp16, con
     return qwen_gqa_decode_attention_flashdec_f16_ascend(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
 #else
     return qwen_gqa_decode_attention_flashdec_f16_cuda(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, d_partials_scratch, q_heads, kv_heads, head_dim, context_len, max_context, num_partitions, stream);
+#endif
+}
+
+// Cube decode attention with the context split across AI cores. Ascend only: the
+// CUDA backend reaches its parallel decode through the FlashDecoding entry above,
+// and this returns false there rather than aliasing it, so a caller that wants a
+// specific kernel can tell the two apart.
+inline bool qwen_gqa_decode_attention_cube_split_f16(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int partitions, void* stream = nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_gqa_decode_attention_cube_split_f16_ascend(d_q_fp16, d_k_cache_fp16, d_v_cache_fp16, d_out_fp16, q_heads, kv_heads, head_dim, context_len, max_context, partitions, stream);
+#else
+    (void)d_q_fp16; (void)d_k_cache_fp16; (void)d_v_cache_fp16; (void)d_out_fp16;
+    (void)q_heads; (void)kv_heads; (void)head_dim; (void)context_len;
+    (void)max_context; (void)partitions; (void)stream;
+    return false;
 #endif
 }
 

@@ -2377,6 +2377,21 @@ struct QwenEngine::Impl {
     std::map<std::string, double> phase_seconds;
     std::map<std::string, uint64_t> phase_calls;
 
+    // Host-side attribution, the counterpart to phase_profile. phase_profile
+    // brackets every scope with a device synchronize, which serializes the
+    // pipeline and therefore answers "how much device work is here" at the cost of
+    // hiding every overlap. host_profile measures the same scopes without any
+    // synchronization, so it answers a different question: how long the issuing
+    // thread spends inside the scope. When the two disagree by an order of
+    // magnitude on a phase that does little device work, that phase is launch cost
+    // rather than kernel cost, and the fix is fewer or cheaper host calls.
+    //
+    // Only one of the two can be on: their timings mean different things and a run
+    // that silently mixed them would attribute a sync to the wrong side.
+    bool host_profile = !phase_profile && qwen_env_enabled("QWEN_HOST_PROFILE");
+    std::map<std::string, double> host_phase_seconds;
+    std::map<std::string, uint64_t> host_phase_calls;
+
     class PhaseScope {
     public:
         PhaseScope(Impl* owner, std::string name) : owner_(owner), name_(std::move(name)) {
@@ -2391,6 +2406,8 @@ struct QwenEngine::Impl {
             if (owner_->phase_profile) {
                 device_synchronize();
                 started_ = std::chrono::steady_clock::now();
+            } else if (owner_->host_profile) {
+                started_ = std::chrono::steady_clock::now();
             }
         }
         ~PhaseScope() {
@@ -2399,6 +2416,10 @@ struct QwenEngine::Impl {
                 owner_->phase_seconds[name_] += std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - started_).count();
                 ++owner_->phase_calls[name_];
+            } else if (owner_->host_profile) {
+                owner_->host_phase_seconds[name_] += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - started_).count();
+                ++owner_->host_phase_calls[name_];
             }
             if (range_pushed_) device_range_pop();
         }
@@ -2427,6 +2448,22 @@ struct QwenEngine::Impl {
                          qwen_env_enabled("QWEN_NVTX_PROFILE");
 
     void report_phase_profile(const char* tag) const {
+        if (host_profile) {
+            double total = 0.0;
+            for (const auto& entry : host_phase_seconds) total += entry.second;
+            for (const auto& entry : host_phase_seconds) {
+                std::cout << "qwen_phase tag=" << tag << " rank="
+                          << options.tp_rank << " host=1 phase=" << entry.first
+                          << " seconds=" << entry.second
+                          << " calls=" << host_phase_calls.at(entry.first)
+                          << " share=" << (total > 0.0 ? entry.second / total : 0.0)
+                          << "\n";
+            }
+            std::cout << "qwen_phase tag=" << tag << " rank=" << options.tp_rank
+                      << " host=1 phase=TOTAL seconds=" << total << "\n";
+            std::cout.flush();
+            return;
+        }
         if (!phase_profile) return;
         double total = 0.0;
         for (const auto& entry : phase_seconds) total += entry.second;
@@ -4233,6 +4270,61 @@ void QwenEngine::warmup_tp() {
     zero_tensor(scratch);
     impl_->all_reduce_half(scratch.f16_data(), 1, "scratch");
     check_device(device_synchronize(), "Qwen TP warmup synchronization");
+}
+
+void QwenEngine::warmup_kernels(bool workers_in_loop) {
+    if (kernels_warmed_) return;
+    // Only rank 0 drives a group; a worker reaches this function through
+    // run_worker_loop(), which would consume the commands this call sends.
+    if (workers_in_loop && options_.tp_rank != 0) return;
+    // The warmup is a real forward and the reset below throws away every slot's
+    // cached prompt, so it is only safe on an idle engine. Callers run it at
+    // startup, before any request exists.
+    if (!impl_->request_to_slot.empty()) return;
+    // Two slots are needed: a prompt to prefill, then at least one position left
+    // for the decode step. Below that the engine is unusable anyway.
+    if (max_context_ < 2 || impl_->max_batch_size < 1) return;
+    kernels_warmed_ = true;
+
+    std::optional<Impl::RangeScope> range;
+    if (impl_->range_profile) range.emplace("qwen.warmup_kernels");
+
+    // Eight rows rather than one: a single-row prompt takes the decode-shaped
+    // branch of the attention kernels, which is a different kernel set from the
+    // one the first real prompt reaches, so a one-token warmup would leave the
+    // prefill kernels to be loaded by that first request. Eight covers both
+    // paths and costs the same fixed per-process term.
+    const int warm_rows = std::min(8, max_context_ - 1);
+    const std::vector<int> tokens(static_cast<size_t>(warm_rows), 1);
+
+    try {
+        // The parked workers have to be driven exactly as a real request drives
+        // them, position for position, or the next collective finds them at a
+        // different step and the group hangs.
+        if (workers_in_loop) worker_command_reset();
+        reset();
+        if (workers_in_loop) worker_command_prefill(tokens, 0);
+        (void)prefill(tokens, 0);
+        if (workers_in_loop) worker_command_decode(tokens.back(), 0);
+        (void)decode_step(tokens.back(), 0);
+        // Put the engine back exactly where reset() left it. Warmup tokens in
+        // the KV cache would otherwise be visible to the first real request as
+        // a prefix it did not ask for.
+        if (workers_in_loop) worker_command_reset();
+        reset();
+    } catch (...) {
+        // A throw here means rank 0 has left the sequence the workers are still
+        // following, so nothing can resume them. Send the shutdown so they exit
+        // run_worker_loop() and the process can report the failure instead of
+        // blocking forever on the next collective.
+        if (workers_in_loop && impl_->cmd) {
+            try {
+                worker_command_shutdown();
+            } catch (...) {
+            }
+        }
+        throw;
+    }
 }
 
 void QwenEngine::reset() {

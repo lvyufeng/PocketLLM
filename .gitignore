@@ -10,6 +10,7 @@ __pycache__/
 .Python
 **/build/
 **/build-ascend/
+**/build-ascend-*/
 **/build-cuda/
 **/build-python/
 **/develop-eggs/
