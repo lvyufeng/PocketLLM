@@ -183,8 +183,10 @@ named:
   gated-delta matrix work (two 128x128 reductions and a rank-1 update currently done as 128-wide
   vector ops, with `broadcast_rows` the documented hot spot), the norms, and the transposes;
 - 129 TP all-reduce calls per decode token (64 `ar.mlp` + 48 `ar.lin.out` + 16 `ar.full.out` +
-  1 `ar.hidden_a`) at ~540 us each, serialised by the per-call `stream_synchronize` inside
-  `end_nccl_collective`, which is roughly 70 ms of the 108 ms step.
+  1 `ar.hidden_a`) at the measured 0.3923 ms per call — flat in payload, so per-call and not
+  per-byte — serialised by the per-call `stream_synchronize` inside `end_nccl_collective`. That is
+  **50.6 ms** of the 108.6 ms step. (An earlier revision of this page put the same calls at ~540 us
+  each and the total at ~70 ms; the 0.3923 ms figure in the table above is the measured one.)
 
 **100 TPS is not reachable on this part at fp16.** It needs <= 10 ms/token; the perfect-streaming
 bound at TP8 is 21 ms with zero collective cost, which would already require 673 GB/s per card.

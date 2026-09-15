@@ -57,10 +57,10 @@ That gives:
 100 TPS at TP8 would need 673 GB/s per card with zero collective cost. Two separate deficits sit on
 top of the bound, and neither is small:
 
-1. **129 TP all-reduce calls per decode token**, ~540 us each, serialised by the per-call
-   `stream_synchronize` in `end_nccl_collective` — roughly 70 ms of the 108 ms step. The collective
-   floor is flat in payload size up to 640 KB (0.3923 ms at 10 KB, 0.3989 ms at 640 KB against a
-   0.0183 ms device-op floor), so this is latency, and the fix is fewer collectives.
+1. **129 TP all-reduce calls per decode token**, serialised by the per-call `stream_synchronize` in
+   `end_nccl_collective` — **50.6 ms** of the 108.6 ms step at the measured 0.3923 ms per call. The
+   collective floor is flat in payload size up to 640 KB (0.3923 ms at 10 KB, 0.3989 ms at 640 KB
+   against a 0.0183 ms device-op floor), so this is latency, and the fix is fewer collectives.
 2. **The per-layer cost is ~2.4x the pure weight-streaming cost** (13.45 GB / 108.6 ms = 124 GB/s
    effective vs the ~320 GB/s ceiling). The excess is layer work that moves no weights: the
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
@@ -70,9 +70,10 @@ top of the bound, and neither is small:
 
 **Ranked next steps:**
 
-1. **Merge the per-layer collectives.** 129 calls at ~0.5 ms is the largest single identified cost in
-   the decode step and needs no new hardware capability. Removing it should land decode at the
-   streaming bound of roughly 20-23 TPS at TP4.
+1. **Merge the per-layer collectives.** 129 calls at 0.39 ms is the largest single identified cost in
+   the decode step and needs no new hardware capability. Subtracting it wholesale leaves 58.0 ms =
+   **17.2 TPS** at TP4, so the 20-23 TPS streaming bound above is only reached if the collective
+   latency also overlaps layer work — which is the case the comm-stream path is already making.
 2. **Move the gated-delta matrix work onto the Cube.** Same argument as the attention kernel: it is a
    matrix operation running on the vector unit.
 3. **Weight quantization (int8, then int4).** This is the only route to 100 TPS. int8 halves the
@@ -97,3 +98,7 @@ listed so they are not picked up again:
 - "FlashDecoding reduce to <20 ms gives 3.4x decode" — FlashDecoding is 5224 us in decode attention
   and loses to both Cube paths; it is a fallback for shapes the Cube path refuses.
 - The week-by-week schedule with per-week TPS targets.
+- "129 TP all-reduce calls per decode token at ~540 us each, roughly 70 ms of the 108 ms step" — the
+  calls are real but the price is not. The same page's own collective table measures 0.3923 ms per
+  call, flat from 10 KB to 640 KB, which puts the total at **50.6 ms**. The ~540 us figure has no
+  measurement behind it.
