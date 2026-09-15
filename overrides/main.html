@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{#
+  Material renders `{% block announce %}` through its own `md-banner` markup, and
+  only when the block is non-empty, so a blank override is the same as having none.
+
+  The link points at the pinned old-hardware roadmap rather than at a release, so
+  the banner does not go stale between releases. `theme.features` carries
+  `announce.dismiss`, which is Material's own close button — it remembers the
+  dismissal in localStorage and needs no script of ours.
+#}
+{% block announce %}
+  <p>Running on 2080&nbsp;Ti-class hardware? The
+  <a href="https://github.com/lvyufeng/PocketLLM/issues/151">old-hardware roadmap</a>
+  is the ordered work queue.</p>
+{% endblock %}

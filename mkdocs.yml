@@ -25,6 +25,10 @@ theme:
   name: material
   language: en
   favicon: assets/favicon.svg
+  # Only overrides/main.html lives here, and it does nothing except fill
+  # `{% block announce %}`. Material's own main.html is four lines that just
+  # extend base.html, so overriding it drops no other block.
+  custom_dir: overrides
 
   palette:
     - media: "(prefers-color-scheme: light)"
@@ -43,6 +47,7 @@ theme:
         name: Switch to light mode
 
   features:
+    - announce.dismiss
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.sections
