@@ -111,18 +111,28 @@ void test_rejects_n() {
     CHECK(audit_chat(R"({"n":3})").requested == "3");
 }
 
+// `stop` moved from refused to implemented, so what is left to refuse is a
+// value of the wrong shape: a number, a nested array, or a list with a non-string
+// entry. Every well-formed value -- including the empty ones -- is accepted,
+// because a sequence that is present is now actually matched against the text.
 void test_rejects_stop() {
-    REFUSED(audit_chat(R"({"stop":"\n\n"})"), "stop");
-    REFUSED(audit_chat(R"({"stop":["USER:"]})"), "stop");
-    REFUSED(audit_chat(R"({"stop":["","END"]})"), "stop");
-    REFUSED(audit_chat(R"({"stop":5})"), "stop");
+    CHECK(audit_chat(R"({"stop":"\n\n"})").ok);
+    CHECK(audit_chat(R"({"stop":["USER:"]})").ok);
+    CHECK(audit_chat(R"({"stop":["a","b"]})").ok);
     CHECK(audit_chat(R"({"stop":""})").ok);
     CHECK(audit_chat(R"({"stop":[]})").ok);
     CHECK(audit_chat(R"({"stop":["",""]})").ok);
 
-    // A short list of strings renders its entries, so the caller can see which
-    // sequence was refused without re-reading the request it just sent.
-    CHECK(audit_chat(R"({"stop":["a","b"]})").requested == "[\"a\", \"b\"]");
+    REFUSED(audit_chat(R"({"stop":5})"), "stop");
+    REFUSED(audit_chat(R"({"stop":true})"), "stop");
+    REFUSED(audit_chat(R"({"stop":{"a":1}})"), "stop");
+    REFUSED(audit_chat(R"({"stop":["a",5]})"), "stop");
+    REFUSED(audit_chat(R"({"stop":[["a"]]})"), "stop");
+    REFUSED(audit_completions(R"({"stop":5})"), "stop");
+
+    // The refusal names the field and shows what arrived, so a caller sending a
+    // number sees which value was rejected rather than only which field.
+    CHECK(audit_chat(R"({"stop":5})").requested == "5");
 }
 
 void test_rejects_logprobs() {

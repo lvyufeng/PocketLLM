@@ -4,12 +4,14 @@
 #include "metrics.hpp"
 #include "json_lite.hpp"
 #include "openai_request_fields.hpp"
+#include "openai_stop_strings.hpp"
 #include "qwen_engine.hpp"
 #include "token_constraint.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include "httplib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -586,10 +588,16 @@ struct OpenAIServer::Impl {
             return;
         }
 
+        // Parsed once per request: every emitter below applies the same list to
+        // the text it is about to hand over.
+        const std::vector<std::string> stops = parse_stop_sequences(obj);
+
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
+            handle_stream(req, res, enc_reply, sp, constraint, stops, thinking_mode,
+                          client_id, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
+            handle_nonstream(res, enc_reply, sp, constraint, stops, thinking_mode,
+                             client_id, request_start);
         }
     }
 
@@ -706,10 +714,16 @@ struct OpenAIServer::Impl {
         enc_reply.token_ids = std::move(tok_reply.token_ids);
         enc_reply.prompt_text = prompt_str;
 
+        // Parsed once per request: every emitter below applies the same list to
+        // the text it is about to hand over.
+        const std::vector<std::string> stops = parse_stop_sequences(obj);
+
         if (stream) {
-            handle_completions_stream(enc_reply, sp, constraint, client_id, request_start, res);
+            handle_completions_stream(enc_reply, sp, constraint, stops, client_id,
+                                      request_start, res);
         } else {
-            handle_completions_nonstream(enc_reply, sp, constraint, client_id, request_start, res);
+            handle_completions_nonstream(enc_reply, sp, constraint, stops, client_id,
+                                         request_start, res);
         }
     }
 
@@ -731,6 +745,7 @@ struct OpenAIServer::Impl {
     void handle_completions_nonstream(
         const EncodeReply& enc, const BatchSamplingParams& sp,
         const std::shared_ptr<TokenConstraint>& constraint,
+        const std::vector<std::string>& stops,
         const std::string& client_id,
         std::chrono::steady_clock::time_point request_start,
         httplib::Response& res) {
@@ -804,14 +819,23 @@ struct OpenAIServer::Impl {
             out.generated_tokens, out.finish_reason, out.constraint_completed);
         metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
 
-        const std::string text = tok.decode_tokens(generated);
+        // A client stop sequence ends the answer at its first byte. Matching
+        // runs on the decoded text rather than on token ids because a sequence
+        // is not one token; see openai_stop_strings.hpp.
+        const std::string decoded = tok.decode_tokens(generated);
+        const StopScan scan = scan_stop_strings(decoded, stops);
+        const std::string text = decoded.substr(0, scan.final_length);
+        // The engine still ran to max_tokens -- the scheduler has no way to see
+        // a text-level sequence -- but the completion the client reads ends at
+        // the sequence, which is what "stop" means to a caller.
+        const std::string finish_reason = scan.matched ? "stop" : out.finish_reason;
 
         std::ostringstream os;
         os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"text_completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << out.finish_reason << "\""
+           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << finish_reason << "\""
            << ",\"text\":\"" << json_escape(text) << "\"}]"
            << ",\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
            << ",\"completion_tokens\":" << generated.size()
@@ -822,6 +846,7 @@ struct OpenAIServer::Impl {
     void handle_completions_stream(
         const EncodeReply& enc, const BatchSamplingParams& sp,
         const std::shared_ptr<TokenConstraint>& constraint,
+        const std::vector<std::string>& stops,
         const std::string& client_id,
         std::chrono::steady_clock::time_point request_start,
         httplib::Response& res) {
@@ -829,7 +854,7 @@ struct OpenAIServer::Impl {
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, constraint, client_id, created, request_start]
+            [this, enc, sp, constraint, stops, client_id, created, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             std::chrono::steady_clock::time_point ttft_time;
@@ -884,11 +909,20 @@ struct OpenAIServer::Impl {
 
             std::vector<int> generated;
             size_t sent_offset = 0;
+            bool stop_matched = false;
 
             auto emit_delta = [&]() {
                 const std::string full = tok.decode_tokens(generated);
-                if (full.size() <= sent_offset) return;
-                std::string candidate = full.substr(sent_offset);
+                // Deliverable-now: everything before a matched sequence, or
+                // everything except a trailing partial sequence, which the next
+                // token may complete. Text already sent cannot be taken back, so
+                // the half-formed sequence is held rather than streamed and
+                // retracted.
+                const StopScan scan = scan_stop_strings(full, stops);
+                if (scan.matched) stop_matched = true;
+                if (scan.safe_length <= sent_offset) return;
+                std::string candidate =
+                    full.substr(sent_offset, scan.safe_length - sent_offset);
                 auto [complete, leftover] = split_utf8_complete(candidate);
                 if (!complete.empty()) {
                     sent_offset += complete.size();
@@ -936,12 +970,22 @@ struct OpenAIServer::Impl {
 
             {
                 const std::string full = tok.decode_tokens(generated);
-                if (full.size() > sent_offset) {
-                    std::string tail = full.substr(sent_offset);
+                // Generation has ended, so a trailing partial sequence can no
+                // longer complete: those bytes are part of the answer and are
+                // flushed rather than withheld. A match still truncates.
+                const StopScan scan = scan_stop_strings(full, stops);
+                if (scan.matched) stop_matched = true;
+                const std::size_t deliverable = std::max(scan.final_length, sent_offset);
+                if (deliverable > sent_offset) {
+                    std::string tail = full.substr(sent_offset, deliverable - sent_offset);
                     sent_offset += tail.size();
                     send_chunk(tail);
                 }
             }
+
+            // The scheduler saw no stop token, so it reports "length" even when
+            // the answer it produced was cut short at a client sequence.
+            if (stop_matched && finish_reason != "timeout") finish_reason = "stop";
 
             const bool success = !timed_out && generation_error.empty();
             metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
@@ -971,6 +1015,7 @@ struct OpenAIServer::Impl {
     void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
                           const BatchSamplingParams& sp,
                           const std::shared_ptr<TokenConstraint>& constraint,
+                          const std::vector<std::string>& stops,
                           const std::string& thinking_mode,
                           const std::string& client_id,
                           std::chrono::steady_clock::time_point request_start) {
@@ -1054,18 +1099,27 @@ struct OpenAIServer::Impl {
             out.generated_tokens, out.finish_reason, out.constraint_completed);
         metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
 
-        const std::string text = tok.decode_tokens(generated);
+        // Truncated before the sidecar sees it: the parser splits the text into
+        // content / reasoning / tool calls, and a stop sequence that lands
+        // inside a tool call would otherwise be parsed as part of one.
+        const std::string decoded = tok.decode_tokens(generated);
+        const StopScan scan = scan_stop_strings(decoded, stops);
+        const std::string text = decoded.substr(0, scan.final_length);
         const ParsedMessage parsed = sidecar.parse(text, thinking_mode);
         std::string content = parsed.ok ? parsed.content : text;
         std::string reasoning = parsed.ok ? parsed.reasoning : std::string();
         std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
+        // The engine still ran to max_tokens -- the scheduler has no way to see
+        // a text-level sequence -- but the completion the client reads ends at
+        // the sequence, which is what "stop" means to a caller.
+        const std::string finish_reason = scan.matched ? "stop" : out.finish_reason;
 
         std::ostringstream os;
         os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"chat.completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << out.finish_reason << "\""
+           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << finish_reason << "\""
            << ",\"message\":" << render_choice_message(content, reasoning, tool_calls_json) << "}]"
            << ",\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
            << ",\"completion_tokens\":" << generated.size()
@@ -1076,13 +1130,14 @@ struct OpenAIServer::Impl {
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
                        const std::shared_ptr<TokenConstraint>& constraint,
+                       const std::vector<std::string>& stops,
                        const std::string& thinking_mode, const std::string& client_id,
                        std::chrono::steady_clock::time_point request_start) {
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, constraint, client_id, created, thinking_mode, request_start]
+            [this, enc, sp, constraint, stops, client_id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             std::chrono::steady_clock::time_point ttft_time;
@@ -1164,11 +1219,26 @@ struct OpenAIServer::Impl {
             // text keeps each stream's UTF-8 decoding self-contained and cannot be
             // fooled by a model that writes the literal characters.
             bool in_reasoning = (thinking_mode == "thinking");
+            bool stop_matched = false;
 
             auto emit_delta = [&]() {
                 const std::string full = tok.decode_tokens(generated);
-                if (full.size() <= sent_offset) return;
-                std::string candidate = full.substr(sent_offset);
+                // Stop sequences apply to the answer only. The reasoning block
+                // is a separate field that ends on a token id, and truncating it
+                // mid-block would drop the answer that follows.
+                std::size_t deliverable = full.size();
+                if (!in_reasoning) {
+                    // Deliverable-now: everything before a matched sequence, or
+                    // everything except a trailing partial sequence, which the
+                    // next token may complete. Text already sent cannot be taken
+                    // back, so the half-formed sequence is held rather than
+                    // streamed and retracted.
+                    const StopScan scan = scan_stop_strings(full, stops);
+                    if (scan.matched) stop_matched = true;
+                    deliverable = scan.safe_length;
+                }
+                if (deliverable <= sent_offset) return;
+                std::string candidate = full.substr(sent_offset, deliverable - sent_offset);
                 auto [complete, leftover] = split_utf8_complete(candidate);
                 if (!complete.empty()) {
                     sent_offset += complete.size();
@@ -1236,12 +1306,25 @@ struct OpenAIServer::Impl {
             // valid UTF-8, so this is usually empty.
             {
                 const std::string full = tok.decode_tokens(generated);
-                if (full.size() > sent_offset) {
-                    std::string tail = full.substr(sent_offset);
+                std::size_t deliverable = full.size();
+                if (!in_reasoning) {
+                    // Generation has ended, so a trailing partial sequence can
+                    // no longer complete: those bytes are part of the answer and
+                    // are flushed rather than withheld. A match still truncates.
+                    const StopScan scan = scan_stop_strings(full, stops);
+                    if (scan.matched) stop_matched = true;
+                    deliverable = std::max(scan.final_length, sent_offset);
+                }
+                if (deliverable > sent_offset) {
+                    std::string tail = full.substr(sent_offset, deliverable - sent_offset);
                     sent_offset += tail.size();
                     send_chunk(tail, in_reasoning ? "reasoning_content" : "content");
                 }
             }
+
+            // The scheduler saw no stop token, so it reports "length" even when
+            // the answer it produced was cut short at a client sequence.
+            if (stop_matched && finish_reason != "timeout") finish_reason = "stop";
 
             const bool success = !timed_out && generation_error.empty();
             metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);

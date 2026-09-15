@@ -163,7 +163,34 @@ than trusted.
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
 | `tools` | chat | Tool definitions reach the chat template. The model still chooses; see `tool_choice` below. |
+| `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
 | `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. |
+
+#### Stop sequences
+
+`stop` is matched against the **decoded text**, not against token ids. A stop string is not one
+token — `"USER:"` is three in most vocabularies — and a sequence can begin inside one token and end
+inside the next, so the only place it exists as a unit is the text the caller reads anyway. Matching
+is applied to the cumulative text as it is produced, which gives the field the same meaning on a
+non-streaming response and on a stream. The earliest occurrence of any sequence in the list ends the
+completion, the sequence itself is not part of the answer, and `finish_reason` is reported as
+`"stop"`.
+
+Three details are worth knowing before relying on the field:
+
+- **A partial sequence is withheld while streaming.** If the text so far ends in a run of characters
+  that is the beginning of a stop sequence, those bytes are held rather than sent, because the next
+  token may complete the sequence and text already written to the socket cannot be taken back. Once
+  generation ends the same bytes can no longer complete anything, so they are flushed as part of the
+  answer. Nothing is withheld when the trailing characters cannot begin a sequence, which is the
+  usual case — the hold is bounded by the longest sequence, not by the length of the text.
+- **On chat, `stop` applies to the answer and not to `reasoning_content`.** The reasoning block is a
+  separate field that ends on a token id, and a sequence that appeared inside it would otherwise
+  truncate the answer that follows.
+- **`usage.completion_tokens` counts the tokens the engine generated**, which can exceed the number
+  of tokens in the returned text when a sequence truncated it. The engine is not stopped early: the
+  scheduler ends a request on token ids, and a client sequence is not one, so the request runs to its
+  budget and only the text handed back is cut.
 
 ### Refused with HTTP 400
 
@@ -175,7 +202,7 @@ defaults explicitly is not punished for it.
 | Field | Endpoints | Refused when | What this server does instead |
 | --- | --- | --- | --- |
 | `n` | both | not 1 | `choices` always holds exactly one entry, with index 0. |
-| `stop` | both | the string or list is not empty | A completion ends only at the budget or the checkpoint's end-of-sequence token; no sequence is matched against the generated text, so it runs past a requested stop string. |
+| `stop` | both | the value is not a string and not a list of strings | Nothing is matched, so a well-formed `stop` is refused on shape alone rather than half-applied. Empty strings match nothing and are accepted, which is what makes an empty `stop` list — or the empty entries some clients pad it with — harmless. |
 | `logprobs` | chat | anything but `false` | No `logprobs` object is returned on any choice. |
 | `logprobs` | completions | any value | It is a count there, where even `0` asks for the sampled token's logprob, so no value is inert. |
 | `top_logprobs` | both | not 0 | There are no per-token logprobs to rank alternatives within. |
