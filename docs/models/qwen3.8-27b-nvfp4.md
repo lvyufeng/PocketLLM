@@ -193,4 +193,4 @@ Measure on idle GPUs. Contention from unrelated jobs was repeatedly visible in t
 - `scripts/bench_qwen_long_context.py`
 - [Qwen3.8-27B-FP8](qwen3.8-27b-fp8.md) for the shared text runtime
 - [DeepSeek-V4](deepseek-v4.md) for the FP4 INT8 kernels this borrowed scheduling from
-- [Benchmark reporting rules](../benchmarking.md)
+- [Benchmark reporting rules](../guides/benchmarking.md)

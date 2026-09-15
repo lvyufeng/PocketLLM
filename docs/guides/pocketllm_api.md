@@ -141,7 +141,7 @@ The unified server provides:
 
 ## Configuration precedence
 
-Prefer typed `EngineArgs` and explicit CLI options. `EngineArgs.from_env()` exists as a compatibility bridge for legacy deployments. Runtime tuning variables are named `POCKETLLM_*` (renamed from `DSV4_*`, a breaking change — see [the migration note](migration/dsv4-to-pocket-rename.md)); `QWEN_*` and related names are unchanged. Backend-specific tuning belongs in `backend_options` and must not be assumed portable between CUDA and Ascend.
+Prefer typed `EngineArgs` and explicit CLI options. `EngineArgs.from_env()` exists as a compatibility bridge for legacy deployments. Runtime tuning variables are named `POCKETLLM_*` (renamed from `DSV4_*`, a breaking change — see [the migration note](../migration/dsv4-to-pocket-rename.md)); `QWEN_*` and related names are unchanged. Backend-specific tuning belongs in `backend_options` and must not be assumed portable between CUDA and Ascend.
 
 ## Native C++ Python module
 

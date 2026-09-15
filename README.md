@@ -149,7 +149,7 @@ The model pages separate architecture specifications from what PocketLLM current
 
 ## Performance highlights
 
-All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/benchmarking.md) before comparing results.
+All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/guides/benchmarking.md) before comparing results.
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
@@ -364,14 +364,14 @@ The benchmark starts ranks 1–3 as command workers and keeps rank 0 alive for a
 
 - [Documentation index](docs/README.md)
 - [Model support matrix](docs/models/README.md)
-- [Benchmarking and reporting rules](docs/benchmarking.md)
+- [Benchmarking and reporting rules](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
-- [DSpark speculative decoding](docs/dspark.md)
-- [FlashMemory 1M context](docs/FLASHMEMORY_1M_CONTEXT.md)
-- [MiniMax decode bottleneck analysis](docs/minimax_decode_bottleneck_analysis.md)
+- [DSpark speculative decoding](docs/performance/dspark.md)
+- [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
+- [MiniMax decode bottleneck analysis](docs/performance/minimax_decode_bottleneck_analysis.md)
 - [Historical 2080 Ti report](docs/reports/dsv4_2080ti_report.pdf)
 
 ## Roadmap

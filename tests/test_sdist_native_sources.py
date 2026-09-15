@@ -22,7 +22,7 @@ separately, against the directives themselves.
 
 `MANIFEST.in` is checked rather than the built archive because that is the input
 the release actually controls; the archive itself is verified by the install step
-in `docs/PYPI_RELEASE.md`.
+in `docs/guides/pypi_release.md`.
 """
 
 from __future__ import annotations

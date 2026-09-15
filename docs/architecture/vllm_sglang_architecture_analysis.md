@@ -522,5 +522,5 @@ PocketLLM 侧的实际构成（来自引擎自身计数器，65536 场景）:
 
 - vLLM 源码: /mnt/data1/vLLM-2080Ti-Definitive-v015
 - SGLang 论文: "Efficiently Programming Large Language Models using SGLang"
-- PocketLLM 文档: docs/vllm_sglang_comparison.md
+- PocketLLM 文档: docs/architecture/vllm_sglang_comparison.md
 - 性能内存记录: MEMORY.md (qwen_*, cpp_engine_*)

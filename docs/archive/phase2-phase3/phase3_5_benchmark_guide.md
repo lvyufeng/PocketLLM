@@ -163,7 +163,7 @@ diff phase3.5_results/concurrent_throughput_*.txt
 
 After Phase 3.5 validation passes:
 
-1. **Document results** in `docs/phase3.5_performance_report.md`
+1. **Document results** in `docs/archive/phase2-phase3/phase3_5_performance_report.md`
 2. **Update README.md** with actual benchmark numbers
 3. **Create Phase 3.5 completion PR**
 

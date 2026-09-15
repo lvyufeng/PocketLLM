@@ -13,7 +13,7 @@ how many the gate chose to submit.
 Requires the small-batch FP4 MoE kernel (DEEPSEEK_GPU_MOE_MULTI_TOKEN_FP4=1) to
 be worth running at all: without it a multi-token verify falls into the prefill
 grouped MoE path and costs ~3.3s instead of ~850ms, which puts speculation at
-0.37x plain decode. See docs/dspark.md.
+0.37x plain decode. See docs/performance/dspark.md.
 """
 from __future__ import annotations
 
@@ -211,7 +211,7 @@ class DSparkLoop:
         # Commit the accepted prefix plus the main model's own next token. In
         # exact arithmetic the bonus token makes this equivalent to plain greedy
         # decode; measured on TP=4 FP4 it is not, because the multi-token verify
-        # forward is not even run-to-run reproducible (docs/dspark.md,
+        # forward is not even run-to-run reproducible (docs/performance/dspark.md,
         # "Output determinism"). That divergence is a property of the batched
         # attention path, not of this loop or of gating.
         out = torch.cat([self._committed, draft_ids[:, :n_ok]], dim=1)

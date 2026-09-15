@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vLLM-side counterpart of the native-server HTTP concurrency acceptance test.
 
-`docs/cpp_openai_concurrency_validation.md` records PocketLLM's concurrent
+`docs/performance/cpp_openai_concurrency_validation.md` records PocketLLM's concurrent
 throughput (1.43x/2.64x/2.93x wall speedup at 2/4/8 requests), but every number
 in it is PocketLLM-only: the repository has never measured vLLM under
 concurrency, so "PocketLLM multiplexes requests" and "PocketLLM multiplexes

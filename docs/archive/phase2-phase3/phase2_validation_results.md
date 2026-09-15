@@ -171,6 +171,6 @@ FlashMemory + KV_SWAP 组合机制在 GGUF Q2 TP4 环境下工作正常：
 
 ---
 
-**文档**: 完整配置指南见 `docs/FLASHMEMORY_1M_CONTEXT.md`  
+**文档**: 完整配置指南见 `docs/performance/flashmemory_1m_context.md`  
 **PR**: #33 (feature/flashmemory-kv-swap-phase2)  
 **验证环境**: GGUF Q2 TP4, 4×2080Ti 22GB

@@ -300,7 +300,7 @@ qwen_append_kv_cache_f16(
 
 ## 参考
 
-- **架构文档**: `docs/vllm_sglang_comparison.md`
+- **架构文档**: `docs/architecture/vllm_sglang_comparison.md`
 - **性能基线**: `qwen_tp2_64k_final_gap.md` (TP2 8K: 1434/30.9 tok/s)
 - **内存预算**: 22 GB/rank (TP2/TP4)
 - **现有 KV cache**: `qwen_engine.cpp:775-833`

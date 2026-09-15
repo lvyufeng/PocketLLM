@@ -74,7 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Release documentation consolidated into `docs/PYPI_RELEASE.md`, now linked from the documentation
+- Release documentation consolidated into `docs/guides/pypi_release.md`, now linked from the documentation
   index. `docs/RELEASE_CHECKLIST.md` and the untracked `PYPI_UPLOAD_GUIDE.md` were duplicates that
   had drifted from it, including a stale statement of the pre-MIT license, and are removed.
 - The publish workflow installs Torch from the CPU index within the version range `pyproject.toml`
