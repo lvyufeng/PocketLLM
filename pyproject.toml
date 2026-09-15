@@ -68,7 +68,7 @@ pocketllm = "pocketllm.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/lvyufeng/PocketLLM"
-Documentation = "https://github.com/lvyufeng/PocketLLM/tree/master/docs"
+Documentation = "https://lvyufeng.github.io/PocketLLM/"
 Repository = "https://github.com/lvyufeng/PocketLLM"
 Issues = "https://github.com/lvyufeng/PocketLLM/issues"
 Changelog = "https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md"
