@@ -3,6 +3,7 @@
 #include "batch_scheduler.hpp"
 #include "metrics.hpp"
 #include "json_lite.hpp"
+#include "openai_request_fields.hpp"
 #include "qwen_engine.hpp"
 #include "token_constraint.hpp"
 
@@ -465,8 +466,10 @@ struct OpenAIServer::Impl {
         enc.add_generation_prompt = get_bool(obj, "add_generation_prompt", true);
         enc.drop_thinking = get_bool(obj, "drop_thinking", true);
 
-        max_tokens_out = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
-        if (max_tokens_out <= 0) max_tokens_out = cfg.default_max_tokens;
+        // "max_completion_tokens" wins over the deprecated "max_tokens" when a
+        // request carries both, which is OpenAI's rule; reading only
+        // "max_tokens" silently handed such a request the server default.
+        max_tokens_out = effective_max_tokens(obj, cfg.default_max_tokens);
         stream_out = get_bool(obj, "stream", false);
 
         // Extract optional request_id from client, or generate one
@@ -504,6 +507,38 @@ struct OpenAIServer::Impl {
         res.set_content(os.str(), "application/json");
     }
 
+    // 400 in the OpenAI error shape, with `param` naming the field the caller
+    // has to change so a client can act on it without parsing the prose. That
+    // field is the difference between this and the generic shape emit_error
+    // writes, and it is what makes a refusal machine-readable.
+    void emit_request_error(httplib::Response& res, const std::string& msg,
+                            const std::string& param) {
+        std::ostringstream os;
+        os << "{\"error\":{\"message\":\"" << json_escape(msg)
+           << "\",\"type\":\"invalid_request_error\"";
+        if (!param.empty()) {
+            os << ",\"param\":\"" << json_escape(param) << "\"";
+        }
+        os << ",\"code\":null}}";
+        res.status = 400;
+        res.set_content(os.str(), "application/json");
+    }
+
+    // Audits the body against the request fields this server implements and, on
+    // refusal, writes the 400 itself. Returns whether the handler should carry
+    // on. Called before any generation work -- and before the sidecar is asked
+    // to tokenize or encode -- so a request that cannot be honoured costs
+    // nothing and is refused for the field it named rather than for whatever
+    // the engine would have failed on later.
+    bool audit_request_fields(httplib::Response& res, const JsonObject& obj,
+                              OpenAiEndpoint endpoint) {
+        const RequestFieldCheck check = check_request_fields(obj, endpoint);
+        if (check.ok) return true;
+        metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+        emit_request_error(res, check.message, check.field);
+        return false;
+    }
+
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
         const auto request_start = std::chrono::steady_clock::now();
         metrics.record_request_start();
@@ -521,6 +556,7 @@ struct OpenAIServer::Impl {
             return;
         }
         const auto& obj = jv.object();
+        if (!audit_request_fields(res, obj, OpenAiEndpoint::ChatCompletions)) return;
         EncodeReply enc_reply;
         std::string thinking_mode;
         int max_tokens = 0;
@@ -605,6 +641,8 @@ struct OpenAIServer::Impl {
             return;
         }
 
+        if (!audit_request_fields(res, obj, OpenAiEndpoint::Completions)) return;
+
         // Tokenize without chat template
         TokenizeRequest tok_req;
         tok_req.prompt = prompt_str;
@@ -634,8 +672,9 @@ struct OpenAIServer::Impl {
             return;
         }
 
-        int max_tokens = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
-        if (max_tokens <= 0) max_tokens = cfg.default_max_tokens;
+        // Same precedence rule as /v1/chat/completions: "max_completion_tokens"
+        // wins over the deprecated "max_tokens" when both are present.
+        int max_tokens = effective_max_tokens(obj, cfg.default_max_tokens);
         bool stream = get_bool(obj, "stream", false);
 
         std::string client_id = get_string(obj, "request_id", "");

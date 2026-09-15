@@ -139,6 +139,73 @@ The unified server provides:
 
 `/ready` returns HTTP 503 while model loading is incomplete. `/metrics` uses dependency-free Prometheus text exposition and can later be wrapped by a richer exporter.
 
+That list is the whole HTTP surface. **`/v1/embeddings` is deliberately unsupported** — PocketLLM
+serves the checkpoint's text-generation path, and nothing in either plane computes a pooled
+embedding, so there is no head to return, no `/v1/moderations`, `/v1/audio`, or `/v1/images` either.
+An unregistered path answers 404 rather than accepting a request it would have to reinterpret.
+Callers that need embeddings should run an embedding model; adding a pooling head to this engine is
+a separate project from serving generation.
+
+## Request fields
+
+A request field is accepted only when the server acts on it. Every documented OpenAI request field
+therefore falls into one of three groups, and a field in the second group has to be removed rather
+than trusted.
+
+### Implemented
+
+| Field | Endpoints | Behaviour |
+| --- | --- | --- |
+| `messages` | chat | The conversation, rendered by the checkpoint's own chat template (see [Request normalization](#request-normalization)). |
+| `prompt` | completions | Tokenized and prefilled unchanged. |
+| `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. |
+| `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
+| `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
+| `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
+| `tools` | chat | Tool definitions reach the chat template. The model still chooses; see `tool_choice` below. |
+| `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. |
+
+### Refused with HTTP 400
+
+Each of these is refused only at a value that would change the output. The same field at the value
+naming what the server already does — `n=1`, `logprobs=false`, penalties of zero, an empty `stop`
+list, an empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented
+defaults explicitly is not punished for it.
+
+| Field | Endpoints | Refused when | What this server does instead |
+| --- | --- | --- | --- |
+| `n` | both | not 1 | `choices` always holds exactly one entry, with index 0. |
+| `stop` | both | the string or list is not empty | A completion ends only at the budget or the checkpoint's end-of-sequence token; no sequence is matched against the generated text, so it runs past a requested stop string. |
+| `logprobs` | chat | anything but `false` | No `logprobs` object is returned on any choice. |
+| `logprobs` | completions | any value | It is a count there, where even `0` asks for the sampled token's logprob, so no value is inert. |
+| `top_logprobs` | both | not 0 | There are no per-token logprobs to rank alternatives within. |
+| `frequency_penalty`, `presence_penalty` | both | non-zero | The sampler has no repetition or presence term, so the request is generated as if the penalty were 0. |
+| `logit_bias` | both | the object is not empty | No per-token bias is applied, so biased tokens are sampled at their unmodified probability. |
+| `best_of` | completions | not 1 | One candidate is generated per request; there is no second candidate to compare it against. |
+| `suffix` | completions | non-empty | The completion is returned on its own, with no suffix appended. |
+| `echo` | completions | `true` | `text` holds only the generated continuation, never the prompt. |
+| `tool_choice` | chat | anything but `"auto"` | Tool definitions reach the chat template, but the model is not constrained to call a tool, skip them, or call one function, so the policy has no effect. |
+| `parallel_tool_calls` | chat | `false` | The number of tool calls the model emits is not limited. |
+| `stream_options.include_usage` | both | `true` on a streaming request | A stream is delta chunks followed by `[DONE]`, and none of them carries `usage`. A non-streaming response already reports usage, so the option is satisfied there and accepted. |
+
+The refusal uses the OpenAI error shape with `type` set to `invalid_request_error` and `param` set
+to the offending field, so a client can act on it without parsing the prose:
+
+```json
+{"error":{"message":"\"n\" = 3 is not supported by this server: \"choices\" always holds exactly one entry and its index is always 0. Remove \"n\", or set it to 1 and read the single choice.","type":"invalid_request_error","param":"n","code":null}}
+```
+
+### Accepted and inert
+
+These cannot change the generated text, so they are accepted and ignored rather than refused:
+`user`, `store`, `metadata`, `service_tier`, and `model`. The server serves exactly one model and
+echoes its configured name back, so a `model` naming something else is not a routing request it can
+honour — but rejecting it would break clients over nothing.
+
+`parallel_tool_calls` is the exception that shows the rule is applied per value rather than per
+field: `true` is inert and accepted, while `false` asks for a limit that is not enforced and is
+refused with the rest of the table above.
+
 ## Configuration precedence
 
 Prefer typed `EngineArgs` and explicit CLI options. `EngineArgs.from_env()` exists as a compatibility bridge for legacy deployments. Runtime tuning variables are named `POCKETLLM_*` (renamed from `DSV4_*`, a breaking change — see [the migration note](../migration/dsv4-to-pocket-rename.md)); `QWEN_*` and related names are unchanged. Backend-specific tuning belongs in `backend_options` and must not be assumed portable between CUDA and Ascend.
