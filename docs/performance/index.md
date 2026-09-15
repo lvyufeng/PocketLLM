@@ -15,6 +15,7 @@ different generation length — a `TG4` measurement says nothing about `TG512`.
 | [CPU offload and prefetch: the measured ceiling](cpu_offload_profile.md) | Layer-granularity offload measured rather than planned: the H2D and overlap ceilings, the storage rate behind them, and why #156's decode and prefetch targets are unreachable on this host. |
 | [Qwen quantized KV cache at 65K (TG512)](qwen_kv_cache_65k_tg512.md) | The authoritative quantized-KV table at 65K/TG512, including corrections to two earlier throughput claims. |
 | [Native C++ OpenAI concurrency validation](cpp_openai_concurrency_validation.md) | The end-to-end HTTP acceptance test and the vLLM head-to-head that followed it. |
+| [Native C++ OpenAI tool-calling acceptance](cpp_openai_tool_acceptance.md) | Tool calling driven through a second turn, the `openai` SDK and `langchain-openai`, and the sidecar templating defect the first real two-turn request exposed. |
 | [Ascend 910A attention and its measured ceilings](ascend_attention_optimization.md) | The Cube (`Mmad`) GQA attention operator, the three-way decode dispatch, the prefill phase table, and the bandwidth, all-reduce and `aclrtMemcpy` limits every remaining target has to clear. |
 | [DeepSeek-V4 PersistentEngine serial baseline](deepseek_v4_serial_baseline.md) | The serial prefill/decode baseline for the native engine on DeepSeek-V4-Flash-0731, the environment ablation behind it, and why `--max-batch-size 8` currently changes nothing. |
 

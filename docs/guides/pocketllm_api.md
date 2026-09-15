@@ -286,6 +286,12 @@ uses the OpenAI shape — an `id`, `type` set to `"function"`, and `function.nam
 branching on the field expects to see before it runs the call and sends the result back in a
 `tool`-role message.
 
+That round trip is the one the acceptance test drives: the assistant message the server returned is
+replayed verbatim alongside a `role: "tool"` result keyed on its `id`, and the answer comes back as an
+ordinary `stop`. Both turns were checked through the `openai` and `langchain-openai` clients as well as
+over bare HTTP — the [tool-calling acceptance record](../performance/cpp_openai_tool_acceptance.md)
+has the request and response shapes.
+
 Five things are worth knowing before relying on the field:
 
 - **The schema is what types the arguments.** Qwen's template writes a call as XML —
