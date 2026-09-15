@@ -143,7 +143,7 @@ pocketllm serve \
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **Validated text generation** | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 416.48 tok/s prefill; 35.87 tok/s decode on a 512-token prompt |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
 
 The model pages separate architecture specifications from what PocketLLM currently implements. `inspect`, `smoke`, and a benchmark are not automatically equivalent to a production serving guarantee.
 
@@ -153,10 +153,16 @@ All figures in this section use real checkpoints on the same baseline system unl
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
-- 64-token prompt: 138.61–138.69 tok/s prefill, 36.82 tok/s decode.
-- 512-token prompt: 416.48 tok/s prefill, 35.87 tok/s decode.
-- Approximately 8.0–8.6 GiB used per rank in the measured runs; local FP8 weights and scales remain GPU-resident.
-- Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
+One serial sweep of the engine defaults on master `cfad866`, with 128 generated tokens per run:
+
+- 64-token prompt: 115.91 tok/s prefill (0.55 s), 45.05 tok/s decode.
+- 512-token prompt: 864.54 tok/s prefill (0.59 s), 43.22 tok/s decode.
+- 8,192-token prompt: 1,818.65 tok/s prefill (4.50 s), 43.99 tok/s decode.
+- 65,536-token prompt: 1,453.51 tok/s prefill (45.09 s), 39.11 tok/s decode.
+
+Per rank the engine accounts for 6.86 GiB of resident FP8 weights and scales, plus 1.00 GiB of KV data and 1.01 GiB of chunk workspace at 65,536 tokens; `nvidia-smi` peaks a further 3.4–3.5 GiB in CUDA context, cuBLAS workspaces and NCCL buffers, which is constant across prompt lengths. Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
+
+The prefill figures for the 64- and 512-token prompts measure short-prompt latency, not steady-state throughput: both complete in 0.55–0.59 s because a fixed per-process cost dominates at that size. Above 4,096 tokens prefill runs at a marginal 1,670 tok/s up to 32,768 and 1,285 tok/s beyond it.
 
 ### DeepSeek-V4 C++ FP4 runtime
 

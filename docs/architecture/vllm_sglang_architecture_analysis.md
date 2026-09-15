@@ -371,7 +371,7 @@ if (options_.kv_paged) {
 
 **限制**：
 - ❌ 模型支持少（仅 Qwen/DeepSeek-V3/MiniMax）
-- ❌ 生态不成熟（无 LoRA/多模态/结构化输出）
+- ❌ 生态不成熟（无 LoRA、无多模态；结构化输出仅部分支持，见第 6 节）
 - ⚠️ Continuous batching 路径已存在（批处理 forward + waiting 队列 + 准入预算），但并发
   吞吐未实测，且与投机解码/量化 KV 互斥
 - ❌ 社区规模小
@@ -443,6 +443,18 @@ PocketLLM 侧的实际构成（来自引擎自身计数器，65536 场景）:
 
 权重是固定项，随 context 增长的只有 KV 与 activation workspace。4096 场景下 KV 仅
 66 MiB、workspace 504 MiB，这解释了显存曲线为何几乎是平的。
+
+**PocketLLM 这一列在当前 master 上会更高，读表时须知。** 上表取自 2026-09-11 的实测
+（rev `d57584a`，运行记录 `.tmp/ab3_pocket_20260911_071901/`）。当前 master（`cfad866`）在
+相同配置（TG=128、chunk 8192、FP16 KV）下，引擎自身计数逐字节一致——65536 场景仍是权重
+6.86 GiB + KV 1.00 GiB + workspace 1.01 GiB——但 `nvidia-smi` 峰值高 2.75 GiB：引擎之外每进程
+固定多占用 3.46 GiB 而不是 0.71 GiB（CUDA context、cuBLAS workspace、NCCL buffer 一类），且该
+差值不随 context 变化。因此当前 master 在 65536 上峰值是 12.31 GiB，比值 0.62× 而非 0.483×。
+**结论不变**：差异来自默认显存策略而不是效率倍数。这 2.75 GiB 由哪次提交引入尚未定位。
+
+同一原因使 decode 列也有小幅漂移：当前 master 重跑同一 sweep，prefill 与上表相差 0.4% 以内，
+decode 则低 2–4%（8192 场景 43.99 vs 45.44 tok/s）。模型页的
+[Validated performance](../models/qwen3.8-27b-fp8.md) 以当前 master 为准。
 
 ### 怎么解读这组数字
 
