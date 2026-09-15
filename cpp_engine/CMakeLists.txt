@@ -773,6 +773,18 @@ add_executable(bench_qwen_ascend_decode_ops tests/bench_qwen_ascend_decode_ops.c
 target_link_libraries(bench_qwen_ascend_decode_ops PRIVATE pocket_cpp_core)
 set_target_properties(bench_qwen_ascend_decode_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# The gated-delta recurrence is the largest single op in a prefill layer, and the
+# full-model profile only ever reports it as one lump behind a 44 s weight load.
+# This runs the launcher at the production shape so the kernel can be tuned
+# without the model.
+add_executable(bench_qwen_ascend_gated_delta tests/bench_qwen_ascend_gated_delta.cpp)
+target_link_libraries(bench_qwen_ascend_gated_delta PRIVATE pocket_cpp_core)
+# It reports against the same geometry the kernel and launcher use, so it reads
+# that header rather than keeping a third copy of the value-axis split.
+target_include_directories(bench_qwen_ascend_gated_delta PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/ascend/kernels)
+set_target_properties(bench_qwen_ascend_gated_delta PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 # Decode profiles on this backend put most of a token inside the TP all-reduce
 # scopes, so the collective's own latency has to be separated from the per-call
 # synchronization the comm-stream path performs. Depends on the HCCL backend.

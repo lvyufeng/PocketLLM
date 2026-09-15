@@ -33,6 +33,7 @@
 #include "aclnn_common.hpp"
 
 #include "qwen_ascend_ops.hpp"
+#include "qwen_gated_delta_geometry.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -91,7 +92,11 @@ constexpr int kMaxConvKernel = 8;
 // First-generation 910 has 30 AI cores. Every kernel here is a grid-stride loop
 // over independent work items, so more blocks than cores would only add launch
 // overhead; fewer than the work available would leave cores idle.
-constexpr uint32_t kMaxBlocks = 30;
+//
+// Defined in the gated-delta geometry header because the value-axis split there
+// is the one place a kernel's item count and the launcher's grid size are two
+// derivations of the same number, and a mismatch would be silent.
+constexpr uint32_t kMaxBlocks = pocket::gated_delta::kMaxBlocks;
 
 // Query the AI core count once per device and fall back to the known
 // first-generation value. Reading it rather than hard-coding it means a run on
@@ -619,7 +624,9 @@ bool qwen_gated_delta_sequence_f16_ascend(
         return false;
     }
     return aclrtlaunch_qwen_gated_delta_sequence_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(static_cast<uint64_t>(heads) *
+                              pocket::gated_delta::kSlices),
+               resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
@@ -639,7 +646,9 @@ bool qwen_gated_delta_sequence_normalized_f16_ascend(
         return false;
     }
     return aclrtlaunch_qwen_gated_delta_sequence_normalized_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(static_cast<uint64_t>(heads) *
+                              pocket::gated_delta::kSlices),
+               resolve(stream),
                gm(d_state), gm(d_q_normalized), gm(d_k_normalized),
                gm(d_v_fp16), gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
@@ -676,7 +685,9 @@ bool qwen_gated_delta_step_f16_ascend(
         return false;
     }
     return aclrtlaunch_qwen_gated_delta_step_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(static_cast<uint64_t>(heads) *
+                              pocket::gated_delta::kSlices),
+               resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(heads), static_cast<uint32_t>(key_heads),

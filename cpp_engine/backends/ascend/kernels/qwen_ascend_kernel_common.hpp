@@ -246,6 +246,20 @@ __aicore__ inline AscendC::DataCopyParams window_params(uint32_t rows,
     return params;
 }
 
+// The same window in the other direction. DataCopyParams names `srcStride` after
+// the source operand whatever way the copy runs, so a GM-bound store has to move
+// the window pitch to `dstStride` -- copying window_params verbatim into a store
+// silently writes every block at the same place.
+template <typename T>
+__aicore__ inline AscendC::DataCopyParams store_window_params(uint32_t rows,
+                                                              uint32_t width,
+                                                              uint32_t stride) {
+    AscendC::DataCopyParams params = window_params<T>(rows, width, stride);
+    params.srcStride = 0;
+    params.dstStride = static_cast<uint16_t>((stride - width) * sizeof(T) / kBlockBytes);
+    return params;
+}
+
 }  // namespace pocket
 
 #endif  // POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
