@@ -91,6 +91,12 @@ int PersistentEngineAdapter::allocate_slot(uint64_t request_id) {
             slot_taken_[static_cast<size_t>(slot_id)] = true;
             slot_request_ids_[static_cast<size_t>(slot_id)] = request_id;
             positions_[static_cast<size_t>(slot_id)] = 0;
+            // Both halves are needed and neither implies the other: the local
+            // call clears this rank's caches, the command clears every worker's.
+            // A slot reused without the command keeps the finished request's KV
+            // and compressor accumulators on the worker ranks, and the next
+            // request admitted to that slot reads them through the all-reduce.
+            engine_->worker_command_reset_slot(slot_id);
             engine_->reset_slot(slot_id);
             engine_->claim_slot(slot_id, request_id);
             return slot_id;
@@ -168,7 +174,7 @@ BatchPrefillResult PersistentEngineAdapter::batch_prefill(
         }
 
         const SamplingParams sp = to_persistent_sampling(req->sampling);
-        engine_->worker_command_prefill(req->prompt_tokens);
+        engine_->worker_command_prefill(req->prompt_tokens, slot_id);
         const int token = engine_->prefill(req->prompt_tokens, sp, slot_id);
 
         const int prompt_tokens = static_cast<int>(req->prompt_tokens.size());
