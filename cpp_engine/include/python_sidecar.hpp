@@ -25,6 +25,9 @@ struct EncodeReply {
     std::string err;
     std::string prompt_text;
     std::vector<int> token_ids;
+    // Echoed back from the request so the handler can hand the parser the same
+    // array the chat template was given, without reading the body a second time.
+    std::string tools_json;
 };
 
 struct TokenizeReply {
@@ -60,7 +63,12 @@ public:
 
     EncodeReply encode(const EncodeRequest& req);
     TokenizeReply tokenize(const TokenizeRequest& req);
-    ParsedMessage parse(const std::string& text, const std::string& thinking_mode);
+    // `tools_json` is the same array the request carried, or empty.  It reaches
+    // the parser because the tool-call syntaxes that carry no type information
+    // of their own (Qwen's XML) can only be read back against the schema the
+    // caller declared; a template whose syntax is self-describing ignores it.
+    ParsedMessage parse(const std::string& text, const std::string& thinking_mode,
+                        const std::string& tools_json = std::string());
 
 private:
     std::string send_request(const std::string& json_line);

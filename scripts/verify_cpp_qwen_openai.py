@@ -214,6 +214,8 @@ REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
     ("presence_penalty", -1.0),
     ("logit_bias", {"100": -100}),
     ("tool_choice", "required"),
+    ("tool_choice", "none"),
+    ("tool_choice", {"type": "function", "function": {"name": "get_weather"}}),
     ("parallel_tool_calls", False),
 )
 
@@ -857,6 +859,151 @@ def validate_logprobs(base_url: str, model_name: str, timeout: float) -> None:
     print("[PASS] logprobs: per-token probabilities that agree with the tokens generated")
 
 
+# The tool the tool-call check offers. `city` and `days` are described as
+# required and `days` is an integer on purpose: the XML the chat template emits
+# marks no type of its own, so the only way "3" comes back as the number 3 rather
+# than the string "3" is if the schema reached the parser.
+WEATHER_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Look up the weather forecast for a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "The city to look up."},
+                "days": {"type": "integer", "description": "How many days ahead."},
+            },
+            "required": ["city", "days"],
+        },
+    },
+}
+
+
+def tool_call_arguments(tool_call: dict[str, Any], label: str) -> dict[str, Any]:
+    function = tool_call.get("function")
+    require(isinstance(function, dict), f"{label} has no function object")
+    require(
+        isinstance(function.get("arguments"), str),
+        f"{label} arguments are not a JSON string: {function.get('arguments')!r}",
+    )
+    try:
+        arguments = json.loads(function["arguments"])
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"{label} arguments are not JSON: {function['arguments']!r}") from exc
+    require(isinstance(arguments, dict), f"{label} arguments are not an object")
+    return arguments
+
+
+def validate_tool_calls(base_url: str, model_name: str, timeout: float) -> None:
+    """Checks that a tool call comes back as a tool call and not as prose.
+
+    The offered tool is the one the prompt asks for by name, so a model that can
+    follow the template at all emits the call; the phrasings are tried in order
+    because this is the one part of the surface whose output the server does not
+    control, and a single miss would otherwise read as a parser bug.
+    """
+    attempts = (
+        "What is the weather in Paris for the next 3 days? Use the get_weather tool.",
+        "Call get_weather with city=Paris and days=3.",
+        "Use the tool named get_weather for Paris, 3 days out.",
+    )
+    declared = {WEATHER_TOOL["function"]["name"]}
+    properties = WEATHER_TOOL["function"]["parameters"]["properties"]
+    missed: list[str] = []
+
+    for prompt in attempts:
+        result = http_request(
+            base_url,
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "tools": [WEATHER_TOOL],
+                "max_tokens": 128,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+            },
+            timeout=timeout,
+        )
+        require(
+            result.status == 200,
+            f"a request carrying tools was not served: HTTP {result.status}: {result.text}",
+        )
+        body = result.json()
+        require(body.get("model") == model_name, "wrong model on the tool-call response")
+        choice = body["choices"][0]
+        message = choice["message"]
+        calls = message.get("tool_calls")
+        if calls is None:
+            # No call this time: the call syntax, if any, has to be in the content
+            # and the completion has to be a normal one. Retried below.
+            missed.append(
+                f"{prompt!r} -> finish_reason={choice.get('finish_reason')!r} "
+                f"content={message.get('content', '')!r}"
+            )
+            continue
+
+        require(isinstance(calls, list) and calls, "tool_calls is present but empty")
+        require(
+            choice.get("finish_reason") == "tool_calls",
+            "a response carrying tool calls finished with "
+            f"{choice.get('finish_reason')!r}",
+        )
+        # The call was moved out of the text, so nothing of its own syntax is left
+        # behind for a client to trip over.
+        require(
+            "<tool_call>" not in message.get("content", "")
+            and "</tool_call>" not in message.get("content", ""),
+            f"the call syntax is still in the content: {message.get('content')!r}",
+        )
+
+        for index, call in enumerate(calls):
+            label = f"tool call {index}"
+            require(call.get("type") == "function", f"{label} is not a function call")
+            identifier = call.get("id")
+            require(
+                isinstance(identifier, str)
+                and len(identifier) == 29
+                and identifier.startswith("call_")
+                and all(c in "0123456789abcdef" for c in identifier[5:]),
+                f"{label} has a malformed id: {identifier!r}",
+            )
+            name = call["function"].get("name")
+            require(name in declared, f"{label} calls {name!r}, which was not offered")
+            arguments = tool_call_arguments(call, label)
+            # Nothing the model was not offered: a typed schema has no room for an
+            # argument the tool does not declare.
+            unknown = set(arguments) - set(properties)
+            require(not unknown, f"{label} invented arguments: {sorted(unknown)}")
+
+        # The declared types are what make the arguments usable without the caller
+        # reparsing text, so at least one declared parameter has to come back with
+        # the type the schema gave it -- a string here, an integer there.
+        arguments = tool_call_arguments(calls[0], "the first tool call")
+        require(arguments, "the tool call carried no arguments at all")
+        for key, value in arguments.items():
+            declared_type = properties[key]["type"]
+            if declared_type == "string":
+                require(isinstance(value, str), f"{key} came back as {value!r}, not a string")
+            elif declared_type == "integer":
+                require(
+                    isinstance(value, int) and not isinstance(value, bool),
+                    f"{key} came back as {value!r}, not an integer",
+                )
+        print(
+            f"[PASS] tool calls: {len(calls)} call(s) parsed out of the completion "
+            f"with arguments {json.dumps(arguments, ensure_ascii=False)}"
+        )
+        return
+
+    raise AssertionError(
+        "no attempt produced a tool call from a model asked to use one; the parser "
+        "or the checkpoint's template is at fault, not the request.\n"
+        + "\n".join(missed)
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
     binary = pathlib.Path(args.binary).resolve()
@@ -972,6 +1119,8 @@ def run(args: argparse.Namespace) -> int:
         validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+
+        validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         incompatible = http_request(
             base_url,
