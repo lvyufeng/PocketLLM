@@ -348,7 +348,7 @@ python scripts/verify_cpp_qwen_openai.py \\
   --devices 0,1,2,3
 ```
 
-The harness checks health, model discovery, non-streaming and streaming chat and text completions, fixed-sampling validation, request-field refusals, stop-sequence truncation, and concurrent scheduler admission.
+The harness checks health, model discovery, non-streaming and streaming chat and text completions, fixed-sampling validation, request-field refusals, stop-sequence truncation, multiple choices, per-token log probabilities, and concurrent scheduler admission.
 
 External Qwen DSpark is available as an opt-in with `--qwen-dspark /path/to/Qwen3.8-27B-DSpark`; it cannot be combined with native MTP. The real five-layer drafter proposes seven tokens and verifies eight target rows at once. It remains default-off because measured gains are acceptance-dependent. See the [Qwen model page](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) for real 512/8K/32K results and the prefix/cold-parity command.
 

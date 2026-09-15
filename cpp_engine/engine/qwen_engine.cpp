@@ -415,6 +415,11 @@ struct QwenVerifyBatch {
     std::vector<float> top_logits;
     std::vector<float> local_logits;
     int position_after = 0;
+    // Per-row log probabilities, parallel to `top_tokens` and empty when no row
+    // asked for a ranking. `sample_tokens_for` fills these; every other producer
+    // of a QwenVerifyBatch leaves the vector empty, which is what tells the
+    // decode path that this step has nothing to report.
+    std::vector<TokenLogprob> logprobs;
 };
 
 uint64_t qwen_xxhash64(const void* input, size_t length, uint64_t seed) {
@@ -673,6 +678,13 @@ struct QwenEngine::Impl {
     QwenDeviceTensor sample_merged_logit;
     QwenDeviceTensor sample_uniforms;
     QwenDeviceTensor sample_rng_states;
+    // Ranking scratch for a logprobs request: the row maximum, the full-vocab
+    // softmax denominator, and the ranked alternatives the sampler returns. Only
+    // allocated by a request that asks for a ranking.
+    QwenDeviceTensor sample_rank_token;
+    QwenDeviceTensor sample_rank_logit;
+    QwenDeviceTensor sample_max_logit;
+    QwenDeviceTensor sample_sumexp;
     // Host RNG. Seeding this identically on every rank and broadcasting the
     // drawn uniforms is what makes a TP group agree on the sampled token.
     std::mt19937_64 sampling_rng;
@@ -2795,13 +2807,88 @@ struct QwenEngine::Impl {
     // Rows that share the engine defaults are batched together exactly as before.
     // A null pointer means every row uses the engine's global options.
     //
+    // `logprobs_n` is how wide a ranking this step produces, 0 for none. It is a
+    // property of the step rather than of a row because the ranking kernels take
+    // one width for the whole batch, and under TP it must be identical on every
+    // rank: each rank enters the same collectives, so a rank that ranked a
+    // different width would not be in step with the others. Callers therefore
+    // pass the widest ranking any row in the step asked for and narrow it per
+    // row afterwards.
+    //
     // The Ascend build has no device sampler yet, so the whole routine is
     // compiled out and the constructor rejects a nonzero temperature up front.
 #ifndef POCKET_BACKEND_ASCEND
+    // Reads back the ranking `sample_tokens_for` just produced and turns it into
+    // log probabilities.
+    //
+    // A log probability here is log P(t) = z_t - max - log(sumexp), where `max`
+    // is the row's largest raw logit and `sumexp` sums exp(z - max) over the
+    // whole vocabulary. Both are raw logits, so nothing about the request's
+    // temperature or top-p appears in the result: those narrow which tokens
+    // could be drawn, not how likely the model considered them afterwards.
+    //
+    // `sampled_logits` is the raw logit of the token that was actually drawn,
+    // which is not necessarily among the ranked entries -- a request is free to
+    // ask for fewer alternatives than the sampler kept.
+    std::vector<TokenLogprob> collect_ranking(int rows, int logprobs_n,
+                                              const std::vector<float>& sampled_logits) {
+        std::vector<TokenLogprob> out;
+        if (logprobs_n <= 0 || rows <= 0) return out;
+        const size_t ranking = static_cast<size_t>(rows) *
+                               static_cast<size_t>(logprobs_n);
+        std::vector<float> host_max(static_cast<size_t>(rows));
+        std::vector<float> host_sumexp(static_cast<size_t>(rows));
+        std::vector<int> host_tokens(ranking);
+        std::vector<float> host_logits(ranking);
+        check_device(memcpy_d2h(host_max.data(), sample_max_logit.data,
+                                static_cast<size_t>(rows) * sizeof(float)),
+                     "Qwen logprob row maximum copy");
+        check_device(memcpy_d2h(host_sumexp.data(), sample_sumexp.data,
+                                static_cast<size_t>(rows) * sizeof(float)),
+                     "Qwen logprob denominator copy");
+        check_device(memcpy_d2h(host_tokens.data(), sample_rank_token.data,
+                                ranking * sizeof(int)),
+                     "Qwen logprob candidate token copy");
+        check_device(memcpy_d2h(host_logits.data(), sample_rank_logit.data,
+                                ranking * sizeof(float)),
+                     "Qwen logprob candidate logit copy");
+
+        out.resize(static_cast<size_t>(rows));
+        for (int row = 0; row < rows; ++row) {
+            const size_t index = static_cast<size_t>(row);
+            const float max_logit = host_max[index];
+            const float sumexp = host_sumexp[index];
+            // A row that reduced to nothing has no distribution to report.
+            // Leaving it absent is what the server needs to tell a position it
+            // cannot describe from one whose probability is genuinely 0.
+            if (!(sumexp > 0.0f) || !std::isfinite(sumexp) ||
+                !std::isfinite(max_logit)) {
+                continue;
+            }
+            const float log_denom = std::log(sumexp);
+            TokenLogprob& entry = out[index];
+            entry.present = true;
+            entry.logprob = sampled_logits[index] - max_logit - log_denom;
+            const size_t base = index * static_cast<size_t>(logprobs_n);
+            for (int i = 0; i < logprobs_n; ++i) {
+                const int token = host_tokens[base + static_cast<size_t>(i)];
+                // -1 is the kernels' padding for a row that kept fewer
+                // candidates than the ranking is wide.
+                if (token < 0) break;
+                entry.top_tokens.push_back(token);
+                entry.top_logprobs.push_back(
+                    host_logits[base + static_cast<size_t>(i)] - max_logit -
+                    log_denom);
+            }
+        }
+        return out;
+    }
+
     QwenVerifyBatch sample_tokens_for(QwenDeviceTensor& local_logits, int rows,
                                       int local_vocab, int vocab_start,
                                       int position_after,
-                                      const BatchSamplingParams* per_row_params = nullptr) {
+                                      const BatchSamplingParams* per_row_params = nullptr,
+                                      int logprobs_n = 0) {
         // When per-row params differ from the engine defaults, sample each row
         // independently. This is correct but O(rows) in kernel launches; for
         // homogeneous batches (all greedy, or all same temperature) the fast
@@ -2823,6 +2910,11 @@ struct QwenEngine::Impl {
                 combined.top_logits.resize(static_cast<size_t>(rows));
                 combined.local_logits.resize(static_cast<size_t>(rows));
                 combined.position_after = position_after;
+                // A row list only exists to hold a ranking, so an absent one
+                // stays absent rather than becoming `rows` empty entries.
+                if (logprobs_n > 0) {
+                    combined.logprobs.resize(static_cast<size_t>(rows));
+                }
                 // Temporarily override the engine options for each row and
                 // invoke the standard sampler on a 1-row slice.
                 const float saved_temp = options.temperature;
@@ -2850,10 +2942,14 @@ struct QwenEngine::Impl {
                     row_logits.shape = {1, static_cast<uint64_t>(local_vocab)};
                     QwenVerifyBatch row_result = sample_tokens_for(
                         row_logits, 1, local_vocab, vocab_start, position_after,
-                        &row_sampling);
+                        &row_sampling, logprobs_n);
                     combined.top_tokens[static_cast<size_t>(row)] = row_result.top_tokens[0];
                     combined.top_logits[static_cast<size_t>(row)] = row_result.top_logits[0];
                     combined.local_logits[static_cast<size_t>(row)] = row_result.local_logits[0];
+                    if (logprobs_n > 0 && !row_result.logprobs.empty()) {
+                        combined.logprobs[static_cast<size_t>(row)] =
+                            std::move(row_result.logprobs[0]);
+                    }
                 }
                 options.temperature = saved_temp;
                 options.top_p = saved_top_p;
@@ -2866,6 +2962,15 @@ struct QwenEngine::Impl {
         if (top_k <= 0 || top_k > max_top_k) top_k = max_top_k;
         if (top_k > local_vocab) top_k = local_vocab;
 
+        // A ranking is the head of the same list the draw comes from, so a width
+        // past that list's capacity would only ever be padding. The kernels set
+        // a hard ceiling of their own on top of that.
+        if (logprobs_n > top_k) logprobs_n = top_k;
+        if (logprobs_n > max_top_k) logprobs_n = max_top_k;
+        if (logprobs_n < 0) logprobs_n = 0;
+        const size_t ranking = static_cast<size_t>(rows) *
+                               static_cast<size_t>(logprobs_n);
+
         allocate(sample_rng_states,
                  static_cast<size_t>(rows) * sampler_rng_state_size(),
                  {static_cast<uint64_t>(rows)}, SafeDType::I8);
@@ -2875,6 +2980,26 @@ struct QwenEngine::Impl {
                  {static_cast<uint64_t>(rows)}, SafeDType::I64);
         allocate_float(argmax_logit, static_cast<size_t>(rows),
                        {static_cast<uint64_t>(rows)});
+
+        // Ranking outputs, allocated only for a step that asked for one. They
+        // exist as `nullptr` arguments otherwise, which is how the kernels are
+        // told to skip the work.
+        float* rank_max = nullptr;
+        int* rank_tokens = nullptr;
+        float* rank_logits = nullptr;
+        if (logprobs_n > 0) {
+            allocate_float(sample_max_logit, static_cast<size_t>(rows),
+                           {static_cast<uint64_t>(rows)});
+            allocate_float(sample_sumexp, static_cast<size_t>(rows),
+                           {static_cast<uint64_t>(rows)});
+            allocate(sample_rank_token, ranking * sizeof(int),
+                     {static_cast<uint64_t>(ranking)}, SafeDType::I64);
+            allocate_float(sample_rank_logit, ranking,
+                           {static_cast<uint64_t>(ranking)});
+            rank_max = sample_max_logit.f32_data();
+            rank_tokens = static_cast<int*>(sample_rank_token.data);
+            rank_logits = sample_rank_logit.f32_data();
+        }
 
         const float* uniforms = host_uniforms_for(rows);
         check_device(memcpy_h2d(sample_uniforms.data, uniforms,
@@ -2967,8 +3092,30 @@ struct QwenEngine::Impl {
                 rows, top_k, options.temperature,
                 options.top_p, top_k,
                 static_cast<DeviceRngState*>(sample_rng_states.data),
-                sample_uniforms.f32_data(), nullptr),
+                sample_uniforms.f32_data(), nullptr,
+                rank_max, rank_tokens, rank_logits, logprobs_n),
                 "Qwen sampling from merged candidates");
+
+            // The denominator is a sum over the whole vocabulary, and this rank
+            // holds one shard of it, so the ranks have to add their partial sums
+            // together. Splitting it this way is what keeps the result exact:
+            // normalizing over the merged candidate list instead would divide by
+            // whatever mass the top-k truncation dropped and inflate every
+            // reported probability.
+            //
+            // Every rank runs this under the same `logprobs_n`, which is why
+            // that width travels in the worker command rather than being rederived
+            // per rank -- a rank that skipped the collective would hang the group.
+            if (logprobs_n > 0) {
+                require_launch(vocab_logsumexp_rows(
+                    local_logits.f32_data(), sample_max_logit.f32_data(),
+                    sample_sumexp.f32_data(), rows, local_vocab, nullptr),
+                    "Qwen logprob denominator");
+                tp_all_reduce_sum_float_inplace(
+                    options.tp_world, options.tp_rank, options.device,
+                    options.nccl_id_path.c_str(), sample_sumexp.f32_data(),
+                    rows, nullptr);
+            }
         } else
 #endif
         {
@@ -2984,8 +3131,19 @@ struct QwenEngine::Impl {
                 rows, local_vocab, vocab_start, options.temperature,
                 options.top_p, top_k,
                 static_cast<DeviceRngState*>(sample_rng_states.data),
-                sample_uniforms.f32_data(), nullptr),
+                sample_uniforms.f32_data(), nullptr,
+                rank_max, rank_tokens, rank_logits, logprobs_n),
                 "Qwen sampling single shard");
+
+            // A single shard already holds the whole vocabulary, so the row's
+            // maximum the ranking reported is the max this sum needs and no
+            // cross-rank reduction follows.
+            if (logprobs_n > 0) {
+                require_launch(vocab_logsumexp_rows(
+                    local_logits.f32_data(), sample_max_logit.f32_data(),
+                    sample_sumexp.f32_data(), rows, local_vocab, nullptr),
+                    "Qwen logprob denominator");
+            }
         }
 
         check_device(memcpy_d2h(result.top_tokens.data(), argmax_token.data,
@@ -2995,6 +3153,7 @@ struct QwenEngine::Impl {
                                 static_cast<size_t>(rows) * sizeof(float)),
                      "Qwen sampled logit copy");
         result.local_logits = result.top_logits;
+        result.logprobs = collect_ranking(rows, logprobs_n, result.top_logits);
         return result;
     }
 #endif
@@ -3002,7 +3161,8 @@ struct QwenEngine::Impl {
     QwenVerifyBatch top_tokens_for(const uint16_t* hidden, int rows,
                                    const QwenDeviceTensor* output_norm,
                                    int position_after,
-                                   const BatchSamplingParams* per_row_params = nullptr) {
+                                   const BatchSamplingParams* per_row_params = nullptr,
+                                   int logprobs_n = 0) {
         if (rows <= 0) {
             throw std::runtime_error("Qwen logits require at least one row");
         }
@@ -3094,10 +3254,15 @@ struct QwenEngine::Impl {
         // Sampled path. Kept ahead of the argmax launch so a sampled run does
         // not pay for a top-1 reduction it discards; greedy falls through to
         // the original code unchanged.
+        //
+        // A ranking request joins it even at temperature 0: the greedy reduction
+        // below reports one token and no distribution, while the sampler's
+        // greedy branch reports the same token plus the list it came from.
 #ifndef POCKET_BACKEND_ASCEND
-        if (sampling_enabled() || per_row_params != nullptr) {
+        if (sampling_enabled() || per_row_params != nullptr || logprobs_n > 0) {
             return sample_tokens_for(local_logits, rows, local_vocab,
-                                     vocab_start, position_after, per_row_params);
+                                     vocab_start, position_after, per_row_params,
+                                     logprobs_n);
         }
 #endif
 
@@ -3210,9 +3375,10 @@ struct QwenEngine::Impl {
 
     QwenVerifyBatch target_logits_for(const uint16_t* hidden, int rows,
                                       int position_after,
-                                      const BatchSamplingParams* per_row_params = nullptr) {
+                                      const BatchSamplingParams* per_row_params = nullptr,
+                                      int logprobs_n = 0) {
         return top_tokens_for(hidden, rows, &final_norm, position_after,
-                              per_row_params);
+                              per_row_params, logprobs_n);
     }
 
     ForwardResult mtp_logits_for(const uint16_t* normalized_hidden,
@@ -3817,7 +3983,7 @@ struct QwenEngine::Impl {
         const std::vector<int>& token_ids, int position_offset, int active_layers,
         bool compute_logits, QwenVerifyBatch* verify_batch = nullptr,
         const std::vector<int>* mtp_shifted_tokens = nullptr, int slot_id = 0,
-        const BatchSamplingParams* sampling = nullptr) {
+        const BatchSamplingParams* sampling = nullptr, int logprobs_n = 0) {
         if (token_ids.empty()) {
             throw std::runtime_error("Qwen forward requires at least one token");
         }
@@ -3978,8 +4144,24 @@ struct QwenEngine::Impl {
             *verify_batch = target_logits_for(
                 hidden, rows, position_offset + rows);
         }
+        // A per-row parameter block carries its own ranking width, so the two
+        // sources are folded together rather than one shadowing the other: under
+        // TP there is no parameter block, and under single-process prefill there
+        // is no separate width to pass.
+        const int ranking = std::max(
+            logprobs_n, sampling != nullptr ? sampling->logprobs_n : 0);
         if (compute_logits) {
             if (verify_batch != nullptr) {
+                // A verify pass emits several tokens at once and reports one
+                // ranking for the whole block, which cannot describe the
+                // per-token positions a client asked about. The configurations
+                // that reach here report caps().logprobs as false, so the server
+                // refuses such a request rather than letting this drop it.
+                if (ranking > 0) {
+                    throw std::runtime_error(
+                        "Qwen speculative verify does not report log "
+                        "probabilities");
+                }
                 ForwardResult result;
                 result.layers = active_layers;
                 result.dim = hidden_size;
@@ -3990,10 +4172,10 @@ struct QwenEngine::Impl {
                 result.position = position_offset + rows;
                 return result;
             }
-            if (sampling != nullptr) {
+            if (sampling != nullptr || ranking > 0) {
                 QwenVerifyBatch sampled = top_tokens_for(
                     hidden + static_cast<size_t>(rows - 1) * hidden_size, 1,
-                    &final_norm, position_offset + rows, sampling);
+                    &final_norm, position_offset + rows, sampling, ranking);
                 ForwardResult result;
                 result.layers = active_layers;
                 result.dim = hidden_size;
@@ -4002,6 +4184,9 @@ struct QwenEngine::Impl {
                 result.top_logit = sampled.top_logits[0];
                 result.checksum = sampled.local_logits[0];
                 result.position = position_offset + rows;
+                if (!sampled.logprobs.empty()) {
+                    result.logprob = sampled.logprobs[0];
+                }
                 return result;
             }
             return logits_for(
@@ -4030,7 +4215,8 @@ struct QwenEngine::Impl {
                                        const std::vector<int>& positions,
                                        const std::vector<int>& slot_ids,
                                        int active_layers,
-                                       const BatchSamplingParams* per_row_params = nullptr) {
+                                       const BatchSamplingParams* per_row_params = nullptr,
+                                       int logprobs_n = 0) {
         const int rows = static_cast<int>(tokens.size());
         if (rows <= 0) {
             throw std::runtime_error("Qwen batched decode requires a row");
@@ -4144,13 +4330,16 @@ struct QwenEngine::Impl {
         // One LM head GEMM over all rows, which is the same amortization the
         // rest of the step gets. position_after is reported per row by the
         // caller, so the batch-wide value here is only the widest context.
-        return target_logits_for(hidden, rows, max_context_len, per_row_params);
+        return target_logits_for(hidden, rows, max_context_len, per_row_params,
+                                 logprobs_n);
 #endif
     }
 
     uint64_t activation_capacity_bytes() const {
         return hidden_a.capacity + hidden_b.capacity + d_tokens.capacity +
                argmax_token.capacity + argmax_logit.capacity +
+               sample_rank_token.capacity + sample_rank_logit.capacity +
+               sample_max_logit.capacity + sample_sumexp.capacity +
                target_hidden_rows.capacity + target_last_hidden.capacity +
                mtp_seed_hidden.capacity + mtp_embedding.capacity +
                mtp_normalized_embedding.capacity +
@@ -4471,6 +4660,19 @@ Capabilities QwenEngine::caps() const {
 #else
     c.structured_outputs = c.per_request_sampling;
 #endif
+    // Ranking a position does not depend on per-request sampling: the values
+    // come from the raw logits, and the width travels in the worker command, so
+    // a TP group reports the same capability as a single process. Three things
+    // do rule it out. The Ascend build has no device sampler, so there is
+    // nothing to rank with. A speculative step emits several tokens at once and
+    // reports one ranking for the whole block, which cannot describe the
+    // per-token positions a client asked about. And the DeepSeek-V4 engine
+    // declares its own answer, so it is deliberately not carried over there.
+#ifdef POCKET_BACKEND_ASCEND
+    c.logprobs = false;
+#else
+    c.logprobs = !speculative;
+#endif
     return c;
 }
 
@@ -4640,21 +4842,35 @@ BatchPrefillResult QwenEngine::batch_prefill(
         }
     }
 
+    // How wide a ranking the prompt's last position has to produce: the widest
+    // any request in this call asked for. Like batched decode, this is a
+    // step-wide width rather than a per-row one, because the ranks reduce the
+    // log-probability denominator together and a rank that ranked a different
+    // width would not be in step with the others.
+    int logprobs_n = 0;
+    for (const BatchedRequest* req : requests) {
+        if (req->sampling.logprobs_n > logprobs_n) {
+            logprobs_n = req->sampling.logprobs_n;
+        }
+    }
+
     for (BatchedRequest* req : requests) {
         // Under TP the workers sit in run_worker_loop() waiting to be told which
         // collective to join; rank 0 must announce the op before running it, or
         // the group deadlocks with rank 0 computing alone.  No-op at world size 1.
         // The budget goes across too: the workers run the same bounded loop, so
         // every rank has to stop at the same token or the next collective pairs
-        // mismatched shapes.
-        worker_command_prefill(req->prompt_tokens, req->slot_id, token_budget);
+        // mismatched shapes. The ranking width goes with it for the same reason.
+        worker_command_prefill(req->prompt_tokens, req->slot_id, token_budget,
+                               logprobs_n);
 
         // Phase 3.3: Use req->slot_id to isolate KV cache
         const BatchSamplingParams* row_sampling =
             options_.tp_world > 1 ? nullptr : &req->sampling;
         PartialPrefillResult step =
             prefill_bounded(req->prompt_tokens, req->slot_id,
-                            std::max(0, token_budget), row_sampling);
+                            std::max(0, token_budget), row_sampling,
+                            logprobs_n);
 
         result.total_tokens += step.consumed_tokens - req->seq_len;
         req->seq_len = step.consumed_tokens;
@@ -4683,7 +4899,8 @@ BatchPrefillResult QwenEngine::batch_prefill(
 
 std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     const std::vector<int>& tokens, const std::vector<int>& slot_ids,
-    const std::vector<BatchSamplingParams>* per_row_params) {
+    const std::vector<BatchSamplingParams>* per_row_params,
+    int logprobs_n) {
     if (tokens.size() != slot_ids.size()) {
         throw std::runtime_error(
             "QwenEngine::batch_decode_tokens: token and slot extents differ");
@@ -4732,7 +4949,7 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
     const BatchSamplingParams* row_params =
         (per_row_params != nullptr) ? per_row_params->data() : nullptr;
     QwenVerifyBatch batch = impl_->run_batched_decode(
-        tokens, positions, slot_ids, active_layers_, row_params);
+        tokens, positions, slot_ids, active_layers_, row_params, logprobs_n);
 
     std::vector<ForwardResult> results(static_cast<size_t>(rows));
     for (int row = 0; row < rows; ++row) {
@@ -4747,6 +4964,14 @@ std::vector<ForwardResult> QwenEngine::batch_decode_tokens(
         forward.top_logit = batch.top_logits[index];
         forward.checksum = batch.local_logits[index];
         forward.position = position_after;
+        // The step produced one ranking as wide as the widest row asked for, and
+        // this call has no way to know which row asked for how much: under TP
+        // there is no per-row parameter array at all. Each row therefore carries
+        // the step-wide ranking here and `batch_decode_step`, which does hold the
+        // requests, narrows it to the width that row asked for.
+        if (index < batch.logprobs.size()) {
+            forward.logprob = batch.logprobs[index];
+        }
         impl_->set_slot_position(slot, position_after, position_);
         if (options_.prefix_cache) {
             Impl::SlotPrefixState& prefix = impl_->prefix_for(slot);
@@ -4939,8 +5164,20 @@ BatchDecodeResult QwenEngine::batch_decode_step(
     std::vector<BatchSamplingParams> row_params;
     row_params.reserve(requests.size());
     bool rows_differ_from_engine = false;
+    // How wide a ranking this step has to produce: the widest any row asked for.
+    // Deliberately not part of `rows_differ_from_engine` below. That flag exists
+    // to catch a row whose sampling would make rank 0 and the workers sample
+    // differently -- temperature, top_p, top_k and seed all change which token
+    // comes out, and under TP the wire carries no per-row parameters at all, so
+    // a per-row value is structurally impossible there. A ranking width changes
+    // nothing about the draw, and every rank recomputes the same engine-wide
+    // value, so it cannot put the workers out of step.
+    int logprobs_n = 0;
     for (const BatchedRequest* req : requests) {
         row_params.push_back(req->sampling);
+        if (req->sampling.logprobs_n > logprobs_n) {
+            logprobs_n = req->sampling.logprobs_n;
+        }
         rows_differ_from_engine |=
             std::abs(req->sampling.temperature - options_.temperature) > 1.0e-5f ||
             std::abs(req->sampling.top_p - options_.top_p) > 1.0e-5f ||
@@ -4962,9 +5199,9 @@ BatchDecodeResult QwenEngine::batch_decode_step(
     // run_worker_loop() waiting to be told which collective to join, so rank 0
     // announces the batch before running it or the group deadlocks with rank 0
     // computing alone. No-op at world size 1.
-    worker_command_batch_decode(tokens, slots);
+    worker_command_batch_decode(tokens, slots, logprobs_n);
     std::vector<ForwardResult> forwards = batch_decode_tokens(
-        tokens, slots, decode_params);
+        tokens, slots, decode_params, logprobs_n);
 
     for (size_t index = 0; index < requests.size(); ++index) {
         BatchedRequest* req = requests[index];
@@ -4986,6 +5223,23 @@ BatchDecodeResult QwenEngine::batch_decode_step(
         result.next_tokens.push_back(forward.top_token);
         result.finished.push_back(req->finished);
         result.hit_stop_token.push_back(stopped);
+        // Parallel to next_tokens, so every row needs an entry even when it
+        // asked for none. The step ranked every row as wide as the widest row
+        // wanted, so a row that asked for fewer alternatives drops the tail
+        // here. It can also come back narrower than it asked for: the sampler's
+        // candidate list is capped by the engine's top_k, and a width past that
+        // list would only ever be padding.
+        TokenLogprob ranked = forward.logprob;
+        const int wanted = req->sampling.logprobs_n;
+        if (wanted > 0 && ranked.present) {
+            if (static_cast<int>(ranked.top_tokens.size()) > wanted) {
+                ranked.top_tokens.resize(static_cast<size_t>(wanted));
+                ranked.top_logprobs.resize(static_cast<size_t>(wanted));
+            }
+        } else {
+            ranked = TokenLogprob();
+        }
+        result.logprobs.push_back(std::move(ranked));
     }
 
     auto end = std::chrono::steady_clock::now();
@@ -5007,7 +5261,7 @@ PartialPrefillResult QwenEngine::prefill_partial(
 
 PartialPrefillResult QwenEngine::prefill_bounded(
     const std::vector<int>& token_ids, int slot_id, int max_tokens,
-    const BatchSamplingParams* sampling) {
+    const BatchSamplingParams* sampling, int logprobs_n) {
     std::optional<Impl::RangeScope> range;
     if (impl_->range_profile) range.emplace("qwen.prefill");
     if (token_ids.empty()) {
@@ -5249,18 +5503,19 @@ PartialPrefillResult QwenEngine::prefill_bounded(
                 // The last shifted input is the target token predicted by this
                 // final prompt row, so obtain its logits before priming MTP.
                 result = impl_->run_chunk(chunk, offset, active_layers_, true,
-                                          nullptr, nullptr, slot_id, sampling);
+                                          nullptr, nullptr, slot_id, sampling,
+                                          logprobs_n);
                 shifted.back() = result.top_token;
                 (void)impl_->prime_target_mtp(shifted, offset, slot_id);
             } else {
                 result = impl_->run_chunk(chunk, offset, active_layers_,
                                           snapshot_result, nullptr, &shifted, slot_id,
-                                          sampling);
+                                          sampling, logprobs_n);
             }
         } else {
             result = impl_->run_chunk(chunk, offset, active_layers_,
                                       snapshot_result, nullptr, nullptr, slot_id,
-                                      sampling);
+                                      sampling, logprobs_n);
         }
         if (periodic_snapshot || end == target_position) {
             // A constrained sampler changes only the returned token, not the
@@ -5526,8 +5781,12 @@ void QwenEngine::run_worker_loop() {
     }
 
     while (true) {
-        int32_t header[4] = {0, 0, 0, 0};
-        impl_->cmd->recv_from_root(header, 4);
+        // Five fields, not four: header[4] is how wide a ranking this step
+        // produces, 0 for a command that ranks nothing. It has to travel
+        // because the log-probability denominator is reduced across the ranks,
+        // so every rank must rank the same width or the group diverges.
+        int32_t header[5] = {0, 0, 0, 0, 0};
+        impl_->cmd->recv_from_root(header, 5);
 
         const auto cmd = static_cast<WorkerCommand>(header[0]);
         if (cmd == WorkerCommand::Shutdown) return;
@@ -5553,8 +5812,11 @@ void QwenEngine::run_worker_loop() {
         switch (cmd) {
             case WorkerCommand::Prefill:
                 // header[1] is the token budget rank 0 applied; 0 is unbounded.
-                (void)prefill_bounded(tokens, slot_id,
-                                      std::max(0, static_cast<int>(header[1])));
+                // header[4] is the ranking width, which the prompt's last
+                // position needs so this rank joins the denominator reduction.
+                (void)prefill_bounded(
+                    tokens, slot_id, std::max(0, static_cast<int>(header[1])),
+                    nullptr, std::max(0, static_cast<int>(header[4])));
                 break;
             case WorkerCommand::DecodeStep:
                 (void)decode_step(header[1], slot_id);
@@ -5576,7 +5838,11 @@ void QwenEngine::run_worker_loop() {
                     batch_slots[static_cast<size_t>(row)] =
                         tokens[static_cast<size_t>(row) * 2 + 1];
                 }
-                (void)batch_decode_tokens(batch_tokens, batch_slots);
+                // header[4] is this step's ranking width. A worker that skipped
+                // the ranking would skip the cross-rank denominator reduction
+                // with it and hang the group.
+                (void)batch_decode_tokens(batch_tokens, batch_slots, nullptr,
+                                          std::max(0, static_cast<int>(header[4])));
                 break;
             }
             case WorkerCommand::BatchSpeculativeStep: {
@@ -5618,7 +5884,8 @@ void QwenEngine::run_worker_loop() {
 }
 
 void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids,
-                                        int32_t slot_id, int32_t token_budget) {
+                                        int32_t slot_id, int32_t token_budget,
+                                        int32_t logprobs_n) {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_prefill: rank 0 only");
@@ -5631,13 +5898,19 @@ void QwenEngine::worker_command_prefill(const std::vector<int>& token_ids,
     // command before bounded prefill existed. Every rank must apply the same
     // bound: a worker that ran the whole prompt while rank 0 stopped at a chunk
     // would arrive at the next collective with a different row count.
-    int32_t header[4] = {
+    //
+    // header[4] carries the step's ranking width. The first four fields were
+    // already spoken for here, so the header grew a field rather than overloading
+    // one; the worker loop reads the same five from every command, and the ones
+    // that do not use it send zero.
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
         token_budget,
         slot_id,
-        static_cast<int32_t>(token_ids.size())
+        static_cast<int32_t>(token_ids.size()),
+        logprobs_n
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 
     if (!token_ids.empty()) {
         std::vector<int32_t> payload(token_ids.begin(), token_ids.end());
@@ -5654,17 +5927,19 @@ void QwenEngine::worker_command_decode(int32_t last_token, int32_t slot_id) {
         throw std::runtime_error("worker_command_decode: command channel not initialized (call warmup_tp first)");
     }
 
-    int32_t header[4] = {
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::DecodeStep),
         last_token,
         slot_id,
+        0,
         0
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 }
 
 void QwenEngine::worker_command_batch_decode(
-    const std::vector<int>& tokens, const std::vector<int>& slot_ids) {
+    const std::vector<int>& tokens, const std::vector<int>& slot_ids,
+    int logprobs_n) {
     if (options_.tp_world <= 1) return;
     if (options_.tp_rank != 0) {
         throw std::runtime_error("worker_command_batch_decode: rank 0 only");
@@ -5679,13 +5954,18 @@ void QwenEngine::worker_command_batch_decode(
     if (tokens.empty()) return;
 
     const int32_t rows = static_cast<int32_t>(tokens.size());
-    int32_t header[4] = {
+    // header[2] is unused by this command -- the interleaved payload carries the
+    // per-row slots. header[4] is the step's ranking width, which the workers
+    // need because the denominator is reduced across ranks: a worker that ranked
+    // nothing would not join the collective.
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::BatchDecodeStep),
         rows,
         0,
-        rows * 2
+        rows * 2,
+        logprobs_n
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 
     std::vector<int32_t> payload(static_cast<size_t>(rows) * 2);
     for (int32_t row = 0; row < rows; ++row) {
@@ -5717,13 +5997,14 @@ void QwenEngine::worker_command_batch_speculative(
     if (tokens.empty()) return;
 
     const int32_t rows = static_cast<int32_t>(tokens.size());
-    int32_t header[4] = {
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::BatchSpeculativeStep),
         rows,
         0,
-        rows * 3
+        rows * 3,
+        0
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 
     std::vector<int32_t> payload(static_cast<size_t>(rows) * 3);
     for (int32_t row = 0; row < rows; ++row) {
@@ -5744,13 +6025,14 @@ void QwenEngine::worker_command_reset() {
         throw std::runtime_error("worker_command_reset: command channel not initialized (call warmup_tp first)");
     }
 
-    int32_t header[4] = {
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::Reset),
+        0,
         0,
         0,
         0
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 }
 
 void QwenEngine::worker_command_shutdown() {
@@ -5762,13 +6044,14 @@ void QwenEngine::worker_command_shutdown() {
         throw std::runtime_error("worker_command_shutdown: command channel not initialized (call warmup_tp first)");
     }
 
-    int32_t header[4] = {
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::Shutdown),
+        0,
         0,
         0,
         0
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 }
 
 void QwenEngine::worker_command_free_slot(int32_t slot_id) {
@@ -5784,13 +6067,14 @@ void QwenEngine::worker_command_free_slot(int32_t slot_id) {
         throw std::runtime_error("worker_command_free_slot: command channel not initialized (call warmup_tp first)");
     }
 
-    int32_t header[4] = {
+    int32_t header[5] = {
         static_cast<int32_t>(WorkerCommand::FreeSlot),
         0,
         slot_id,
+        0,
         0
     };
-    impl_->cmd->send_to_workers(header, 4);
+    impl_->cmd->send_to_workers(header, 5);
 }
 
 }  // namespace pocket

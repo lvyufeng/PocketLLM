@@ -163,21 +163,76 @@ void test_rejects_stop() {
     CHECK(audit_chat(R"({"stop":5})").requested == "5");
 }
 
-void test_rejects_logprobs() {
-    REFUSED(audit_chat(R"({"logprobs":true})"), "logprobs");
-    REFUSED(audit_chat(R"({"logprobs":1})"), "logprobs");
+// `logprobs` and `top_logprobs` moved from refused to implemented, so what is
+// left to refuse is a value this server cannot act on. The two endpoints spell
+// the same request differently -- chat takes a boolean plus a count in
+// "top_logprobs", /v1/completions takes one count in "logprobs" -- so each value
+// is checked against the endpoint that defines it.
+void test_logprobs_shape() {
     CHECK(audit_chat(R"({"logprobs":false})").ok);
+    CHECK(audit_chat(R"({"logprobs":true})").ok);
+    CHECK(audit_chat(R"({"logprobs":true,"top_logprobs":5})").ok);
+    CHECK(audit_chat(R"({"logprobs":true,"top_logprobs":0})").ok);
+    // A count is the other endpoint's spelling of the field, so it is not a
+    // boolean here.
+    REFUSED(audit_chat(R"({"logprobs":1})"), "logprobs");
+    REFUSED(audit_chat(R"({"logprobs":"true"})"), "logprobs");
+    REFUSED(audit_chat(R"({"logprobs":[]})"), "logprobs");
 
     // /v1/completions takes a count, where 0 already asks for the sampled
-    // token's logprob, so nothing about the field is inert there.
-    REFUSED(audit_completions(R"({"logprobs":0})"), "logprobs");
-    REFUSED(audit_completions(R"({"logprobs":5})"), "logprobs");
+    // token's own logprob, so every value in range asks for something.
+    CHECK(audit_completions(R"({"logprobs":0})").ok);
+    CHECK(audit_completions(R"({"logprobs":5})").ok);
+    CHECK(audit_completions(R"({"logprobs":20})").ok);
     CHECK(audit_completions(R"({"logprobs":null})").ok);
+    REFUSED(audit_completions(R"({"logprobs":-1})"), "logprobs");
+    // 2.5 is a count that is not a count; the message has to say so rather than
+    // report it as out of range.
+    REFUSED(audit_completions(R"({"logprobs":2.5})"), "logprobs");
+    REFUSED(audit_completions(R"({"logprobs":true})"), "logprobs");
+    REFUSED(audit_completions(R"({"logprobs":21})"), "logprobs");
+    REFUSED(audit_completions(R"({"logprobs":"5"})"), "logprobs");
 
+    // "top_logprobs" is a chat field, and on its own it is inert only at 0.
+    REFUSED(audit_completions(R"({"top_logprobs":5})"), "top_logprobs");
+    CHECK(audit_completions(R"({"top_logprobs":null})").ok);
     REFUSED(audit_chat(R"({"top_logprobs":5})"), "top_logprobs");
     REFUSED(audit_chat(R"({"top_logprobs":-1})"), "top_logprobs");
     REFUSED(audit_chat(R"({"top_logprobs":"5"})"), "top_logprobs");
+    REFUSED(audit_chat(R"({"logprobs":false,"top_logprobs":5})"), "top_logprobs");
     CHECK(audit_chat(R"({"top_logprobs":0})").ok);
+    CHECK(audit_chat(R"({"logprobs":false,"top_logprobs":0})").ok);
+
+    // The ceiling is named in the message rather than left for the caller to
+    // find, on both endpoints' spellings of it.
+    CHECK(audit_chat(R"({"logprobs":true,"top_logprobs":64})")
+              .message.find(std::to_string(kMaxLogprobAlternatives)) !=
+          std::string::npos);
+    CHECK(audit_completions(R"({"logprobs":64})")
+              .message.find(std::to_string(kMaxLogprobAlternatives)) !=
+          std::string::npos);
+}
+
+// A streamed chunk carries the text of its token and no ranking beside it, so a
+// request that asks for log probabilities on the streaming path is refused
+// rather than answered with a stream indistinguishable from one whose request
+// asked for none.
+void test_rejects_streamed_logprobs() {
+    REFUSED(audit_chat(R"({"stream":true,"logprobs":true})"), "logprobs");
+    REFUSED(audit_chat(R"({"stream":true,"logprobs":true,"top_logprobs":3})"),
+            "logprobs");
+    REFUSED(audit_completions(R"({"stream":true,"logprobs":5})"), "logprobs");
+    // 0 asks for the sampled token's own probability here, so it is not the
+    // "off" value the way false is on chat.
+    REFUSED(audit_completions(R"({"stream":true,"logprobs":0})"), "logprobs");
+
+    CHECK(audit_chat(R"({"stream":true,"logprobs":false})").ok);
+    CHECK(audit_chat(R"({"stream":true})").ok);
+    CHECK(audit_completions(R"({"stream":true})").ok);
+    CHECK(audit_completions(R"({"stream":true,"logprobs":null})").ok);
+    // The refusal is about the pair, not about either field.
+    CHECK(audit_chat(R"({"logprobs":true})").ok);
+    CHECK(audit_completions(R"({"logprobs":5})").ok);
 }
 
 void test_rejects_penalties() {
@@ -276,7 +331,8 @@ int main() {
     test_accepts_defaults();
     test_choices();
     test_rejects_stop();
-    test_rejects_logprobs();
+    test_logprobs_shape();
+    test_rejects_streamed_logprobs();
     test_rejects_penalties();
     test_rejects_logit_bias();
     test_rejects_best_of();

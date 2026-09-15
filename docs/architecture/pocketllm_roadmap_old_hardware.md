@@ -81,7 +81,9 @@
 - ✅ `/v1/chat/completions` 基础功能可用
 - ✅ Streaming (SSE) 已支持
 - ❌ 缺失 tools/function calling
-- ❌ 缺失 logprobs
+- ✅ logprobs 已实现（2026-09-15）：sampler 在 decode 时对整份词表做 log-softmax，逐位置返回
+  采样 token 自身的 logprob 与 top-N 候选（chat 用 `top_logprobs`，`/v1/completions` 用
+  `logprobs` 计数）；流式请求拒绝，投机解码与 Ascend 后端声明为不支持
 - ✅ multiple choices (n>1) 已实现（2026-09-15）：native C++ server 为每个 choice 提交一个独立的
   scheduler 请求，逐 choice 的 seed / grammar / KV，流式响应交错输出；上限 128
 - ❌ 缺失 JSON mode / structured output
@@ -94,7 +96,9 @@
 
 **设计要点**：
 - **Tools/function calling**: 在 Python 控制平面实现（调度器触发函数调用，返回 tool_calls）
-- **Logprobs**: 在 C++ decode 时记录 top-k logits，通过 sampling 结果返回
+- **Logprobs**: ~~在 C++ decode 时记录 top-k logits~~ 已实现：不记录 top-k，而是对整份词表算
+  log-softmax（`vocab_logsumexp_rows` + 逐行采样 kernel），因此概率是真实归一化概率；代价是
+  每个 decode step 多一次全词表归约，只在请求要求时开启
 - **Multiple choices (n>1)**: 在调度器中为同一 prompt 创建 n 个独立 slot，并行采样
 - **JSON mode**: 简化版可以用 post-filter（生成后校验），完整版需要 FSM token filtering
 
@@ -354,7 +358,7 @@
 1. ✅ **Continuous Batching**: 实现动态调度器，默认 `max_num_seqs=4`
 2. ✅ **Prefix Caching**: Block hash + 全局共享
 3. ✅ **KV Quantization + Paged**: 修复冲突，INT8 KV 默认开启
-4. ✅ **OpenAI API**: Tools/logprobs/n>1
+4. ✅ **OpenAI API**: logprobs / n>1 / stop 序列（tools 仍缺失，见 1.3）
 5. ✅ **CPU Offload**: 前 N 层 GPU + 后 M 层 CPU + prefetch 流水线
 
 **验收标准**：

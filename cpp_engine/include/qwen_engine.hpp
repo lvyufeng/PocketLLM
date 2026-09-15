@@ -409,9 +409,18 @@ public:
     // themselves so a batch is announced exactly once.
     // per_row_params, when non-null, carries one entry per token and overrides
     // the engine's global temperature/top_k/top_p for that row's sample step.
+    //
+    // `logprobs_n` is how many alternatives to rank at each position this step,
+    // 0 for none. It is one width for the whole step rather than one per row
+    // because the ranking kernels take a single width and, under TP, because
+    // every rank has to enter the same denominator reduction -- a rank that
+    // ranked a different width would not be in step with the others. A step with
+    // rows asking for different widths passes the widest and each row's entry in
+    // the returned ForwardResult is narrowed back to its own count.
     std::vector<ForwardResult> batch_decode_tokens(
         const std::vector<int>& tokens, const std::vector<int>& slot_ids,
-        const std::vector<BatchSamplingParams>* per_row_params = nullptr);
+        const std::vector<BatchSamplingParams>* per_row_params = nullptr,
+        int logprobs_n = 0);
 
     // One speculative transaction per row. The reference implementation is
     // serialized because each drafter owns reusable activation scratch and the
@@ -448,13 +457,27 @@ public:
     // slot_id selects the KV cache slot the workers must use, so it has to match
     // the slot rank 0 computes into.  It defaults to 0 for the single-session
     // path, where only slot 0 ever exists.
+    //
+    // `logprobs_n` reaches the workers because the denominator a log probability
+    // divides by is a sum over the whole vocabulary, and each rank holds one
+    // shard of it. The ranks reduce their partial sums together, so a worker
+    // that ranked nothing would not join the collective and would hang the
+    // group.
     void worker_command_prefill(const std::vector<int>& token_ids,
-                                int32_t slot_id = 0, int32_t token_budget = 0);
+                                int32_t slot_id = 0, int32_t token_budget = 0,
+                                int32_t logprobs_n = 0);
     void worker_command_decode(int32_t last_token, int32_t slot_id = 0);
     // A batched step's slots do not fit the single slot_id header field, so the
     // tokens and their slots travel together as one interleaved payload.
+    //
+    // `logprobs_n` rides in the header's free field rather than in the payload
+    // because it is the same for every row. The workers need it because they
+    // join the same cross-rank denominator reduction as rank 0, and a worker
+    // that ranked a different width would either hang the collective or come
+    // back with a denominator over the wrong set of rows.
     void worker_command_batch_decode(const std::vector<int>& tokens,
-                                     const std::vector<int>& slot_ids);
+                                     const std::vector<int>& slot_ids,
+                                     int logprobs_n = 0);
     void worker_command_batch_speculative(
         const std::vector<int>& tokens, const std::vector<int>& slot_ids,
         const std::vector<int>& draft_counts);
@@ -468,9 +491,15 @@ private:
     // Shared body behind prefill() and prefill_partial(). `max_tokens` of 0
     // means unbounded, which is what makes the full-prompt path byte-for-byte
     // the same work it was before the bounded entry point existed.
+    //
+    // `logprobs_n` is how wide a ranking to produce for the prompt's last
+    // position, 0 for none. It is separate from `sampling` because under TP
+    // there is no per-row sampling pointer to carry it: the ranks sample with
+    // the engine-wide settings, but a ranking request still has to reach all of
+    // them, since the denominator is reduced across the group.
     PartialPrefillResult prefill_bounded(
         const std::vector<int>& token_ids, int slot_id, int max_tokens,
-        const BatchSamplingParams* sampling = nullptr);
+        const BatchSamplingParams* sampling = nullptr, int logprobs_n = 0);
 
     // Whether `token` ends generation under these params: the request's own
     // stop_token_ids when set, otherwise the checkpoint's eos ids.
