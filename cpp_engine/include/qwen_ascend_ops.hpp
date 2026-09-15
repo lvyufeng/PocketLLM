@@ -59,15 +59,55 @@ bool qwen_gather_copy_regions_ascend(const QwenCopyRegion* d_regions, int region
 
 bool qwen_gqa_decode_attention_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_score_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, void* stream);
 
+// True when a decode call of this shape will be served by the Cube path inside
+// qwen_gqa_decode_attention_f16_ascend rather than by the vector kernel. The
+// engine uses it to decide whether splitting the context across cores is worth
+// its reduction pass; the CUDA backend has no such path and always answers false.
+bool qwen_gqa_decode_attention_cube_available_ascend(int q_heads, int kv_heads, int head_dim, int context_len, int max_context);
+
 // FlashDecoding: Multi-core parallel decode attention for long context
 // d_partials_scratch: workspace for partial results, size = q_heads * num_partitions * (2 + head_dim) * sizeof(float)
 bool qwen_gqa_decode_attention_flashdec_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_partials_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int num_partitions, void* stream);
+
+// The Cube decode kernel with the context split across cores. Allocates its own
+// scratch internally, so unlike the FlashDecoding entry above the caller passes no
+// workspace and the two are not interchangeable.
+//
+// `partitions <= 0` selects the widest split the context allows, which is one
+// partition per 512-column chunk capped at the core count. Returns false when the
+// context is shorter than two chunks, when the rank holds more than one KV head,
+// or when the shape falls outside the Cube path -- the caller's signal to use the
+// single-core Cube entry instead.
+bool qwen_gqa_decode_attention_cube_split_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int partitions, void* stream);
 
 bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink, int tile_count, void* stream);
 
 bool qwen_gqa_prefill_attention_f16_ascend(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, int seq_len, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, void* stream);
 
 bool qwen_gqa_verify_attention_f16_ascend(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, float* d_partial_scratch, int rows, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, int splits, void* stream);
+
+// Transpose a [rows, cols] fp16 matrix into a [cols, rows] one. Both extents must
+// be multiples of 16. The Cube path needs this for V: O = P * V contracts along
+// the column axis of both operands, and the cache stores V as [position, head_dim]
+// while the Cube wants [head_dim, position].
+bool qwen_transpose_f16_ascend(const uint16_t* d_src, uint16_t* d_dst, int rows, int cols, void* stream);
+
+// The same transpose with explicit pitches, for the Cube attention path.
+//
+// `src_rows` source rows out of a source whose row stride is `src_pitch` are
+// transposed into a destination of `cols` rows whose row stride is `dst_pitch`;
+// the destination columns past `src_rows` are written as zero. `rows` is the
+// destination column extent and must be at least `src_rows`.
+//
+// The extra extents are not cosmetic. The attention kernel reads V in whole
+// 16-position chunks and has no partial case, so `rows` is the query extent
+// rounded up to a chunk boundary while `src_rows` is the query extent itself; the
+// zero fill is what makes reading the padding safe, because those columns meet
+// probabilities that masking has already zeroed. `src_pitch` is the KV cache's
+// head stride, so one call transposes one head out of an interleaved cache.
+bool qwen_transpose_f16_padded_ascend(const uint16_t* d_src, uint16_t* d_dst, int rows,
+                                      int cols, int src_rows, int src_pitch, int dst_pitch,
+                                      void* stream);
 
 bool qwen_linear_attn_gates_f16_ascend(const uint16_t* d_a_fp16, const uint16_t* d_b_fp16, const uint16_t* d_a_log_fp16, const uint16_t* d_dt_bias_fp16, uint16_t* d_g_fp16, uint16_t* d_beta_fp16, int rows, int heads, void* stream);
 

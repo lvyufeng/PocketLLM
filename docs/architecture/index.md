@@ -20,6 +20,7 @@ usually measured against. Two things are worth knowing before reading:
 | [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) | What is worth building for 2080 Ti (SM75) and Ascend 910A, and what is not. *(Chinese)* |
 | [PocketLLM vs vLLM vs SGLang architecture analysis](vllm_sglang_architecture_analysis.md) | The current comparison: scheduling, paged KV, batching, and serving surface. *(Chinese)* |
 | [cpp_engine vs vLLM/SGLang comparison](vllm_sglang_comparison.md) | The earlier comparison, retained as the pre-Phase-1 baseline. |
+| [Ascend 910A performance roadmap](ascend_performance_roadmap.md) | Where the prefill and decode targets actually stand after measurement, and the ranked next steps — including why the decode target needs quantization rather than tuning. |
 
 The invariants these designs exist to protect are stated in the repository's
 `CLAUDE.md`: kernels stay behind the C ABI, and backend selection happens at

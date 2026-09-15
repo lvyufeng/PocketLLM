@@ -525,8 +525,33 @@ void GqaAttention::forward(
 
     if (rows == 1) {
         const int context_length = position_offset + 1;
-        // Use FlashDecoding for long context (>= 4096 tokens)
-        if (context_length >= 4096) {
+        const bool cube_ready = qwen_gqa_decode_attention_cube_available(
+            q_heads, kv_heads, head_dim, context_length, runtime.max_context);
+        // Three decode kernels, and which one wins is settled by measurement, not
+        // by core count:
+        //
+        //   Cube, context-split  the Cube kernel with the chunk axis spread over the
+        //                        cores and a merge pass. Measured at a 4097-token
+        //                        context: 257 us against 1225 us for the single-core
+        //                        Cube kernel and 5224 us for FlashDecoding.
+        //   Cube, single core    the same kernel unsplit. Wins below two chunks,
+        //                        where there is nothing to split, and it is the only
+        //                        option when the shape is not one it can express.
+        //   FlashDecoding        the vector kernel split across cores. It loses to
+        //                        both Cube paths by 3-6x on this machine -- its
+        //                        partial and reduce kernels drive their per-head
+        //                        state through scalar GetValue/SetValue loops -- and
+        //                        is kept only for shapes the Cube path refuses.
+        if (cube_ready && context_length > 512) {
+            typename Runtime::PhaseScope sub(&runtime, "full.attn_kernel");
+            require_launch(qwen_gqa_decode_attention_cube_split_f16(
+                q_norm.f16_data(),
+                layer.full.k_cache.f16_data() + slot_offset,
+                layer.full.v_cache.f16_data() + slot_offset,
+                attention.f16_data(), q_heads, kv_heads, head_dim,
+                context_length, runtime.max_context, 0),
+                "decode FP16-cache GQA with a split context");
+        } else if (context_length >= 4096 && !cube_ready) {
             const int num_partitions = std::min(
                 30, (context_length + 255) / 256);
             QwenDeviceTensor& partials = runtime.workspace_float(
@@ -548,6 +573,7 @@ void GqaAttention::forward(
                 static_cast<size_t>(q_heads) * context_length,
                 {static_cast<uint64_t>(q_heads),
                  static_cast<uint64_t>(context_length)});
+            typename Runtime::PhaseScope sub(&runtime, "full.attn_kernel");
             require_launch(qwen_gqa_decode_attention_f16(
                 q_norm.f16_data(),
                 layer.full.k_cache.f16_data() + slot_offset,
@@ -582,6 +608,7 @@ void GqaAttention::forward(
             position_offset, runtime.max_context, verify_splits),
             "verify split FP16-cache GQA");
     } else {
+        typename Runtime::PhaseScope sub(&runtime, "full.attn_kernel");
         require_launch(qwen_gqa_prefill_attention_f16(
             q_norm.f16_data(),
             layer.full.k_cache.f16_data() + slot_offset,

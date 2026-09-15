@@ -282,14 +282,28 @@ else()
         backends/ascend/kernels/qwen_linear_f16.cpp
         backends/ascend/kernels/qwen_attention_f16.cpp
         backends/ascend/kernels/qwen_argmax_f32.cpp
+        backends/ascend/kernels/qwen_cube_gemm_probe.cpp
+        backends/ascend/kernels/qwen_cube_transpose_probe.cpp
+        backends/ascend/kernels/qwen_transpose_f16.cpp
+        backends/ascend/kernels/qwen_attention_cube_f16.cpp
     )
-    # Use precompiled kernel library if it exists to bypass AscendC compilation
-    # issues (missing <cstdint> in CANN environment). The precompiled library
-    # and generated headers are kept in build-ascend/.
+    # Optional escape hatch: reuse a previously built kernel archive instead of
+    # recompiling AscendC. It is opt-in because the artifacts land at the same
+    # paths the source build produces, so probing for their existence silently
+    # ignores kernel source edits — a stale archive then looks like a failed
+    # optimization at run time.
+    option(POCKET_ASCEND_USE_PRECOMPILED_KERNELS
+        "Link a prebuilt libpocket_ascend_kernels.a instead of compiling the kernels"
+        OFF)
     set(PRECOMPILED_KERNEL_LIB "${CMAKE_BINARY_DIR}/lib/libpocket_ascend_kernels.a")
     set(PRECOMPILED_KERNEL_HEADERS "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
 
-    if(EXISTS "${PRECOMPILED_KERNEL_LIB}" AND EXISTS "${PRECOMPILED_KERNEL_HEADERS}")
+    if(POCKET_ASCEND_USE_PRECOMPILED_KERNELS)
+        if(NOT EXISTS "${PRECOMPILED_KERNEL_LIB}" OR NOT EXISTS "${PRECOMPILED_KERNEL_HEADERS}")
+            message(FATAL_ERROR
+                "POCKET_ASCEND_USE_PRECOMPILED_KERNELS is ON but "
+                "${PRECOMPILED_KERNEL_LIB} or ${PRECOMPILED_KERNEL_HEADERS} is missing")
+        endif()
         message(STATUS "Using precompiled AscendC kernels: ${PRECOMPILED_KERNEL_LIB}")
         add_library(pocket_ascend_kernels STATIC IMPORTED)
         set_target_properties(pocket_ascend_kernels PROPERTIES
@@ -298,13 +312,19 @@ else()
         list(APPEND POCKET_ASCEND_KERNEL_INCLUDES "${PRECOMPILED_KERNEL_HEADERS}")
         list(APPEND POCKET_ASCEND_KERNEL_LIBS pocket_ascend_kernels)
     else()
-        # Fallback: build kernels from source using ascendc.cmake
+        # Build kernels from source using ascendc.cmake
         set(SOC_VERSION "${ASCEND_SOC_VERSION}")
         set(RUN_MODE "npu")
         set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_TOOLKIT_HOME}")
-        set(ASCENDC_COMPILE_OPTIONS "-isystem;/usr/include/c++/11;-isystem;/usr/include/aarch64-linux-gnu/c++/11")
         include(${ASCEND_TOOLKIT_HOME}/compiler/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
         ascendc_library(pocket_ascend_kernels STATIC ${POCKET_ASCEND_KERNEL_SOURCES})
+        # Pass C++ standard library paths to both device and host compilation stages
+        ascendc_compile_options(pocket_ascend_kernels PRIVATE
+            -I/usr/include/c++/11
+            -I/usr/include/aarch64-linux-gnu/c++/11
+            -forward-options-to-host-compiler
+            -I/usr/include/c++/11
+            -I/usr/include/aarch64-linux-gnu/c++/11)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/kernels/qwen_ascend_ops_launch.cpp)
         list(APPEND POCKET_ASCEND_KERNEL_INCLUDES
             "${CMAKE_BINARY_DIR}/include/pocket_ascend_kernels")
@@ -392,6 +412,20 @@ else()
     # reachable unsupported paths still reject their formats at runtime.
     target_compile_options(pocket_cpp_core PRIVATE -ffunction-sections -fdata-sections)
     target_link_options(pocket_cpp_core INTERFACE -Wl,--gc-sections)
+endif()
+if(POCKET_BACKEND STREQUAL "ascend")
+    # The generated kernel wrapper calls MsprofRegisterCallback, which lives in
+    # libprofapi. That library is on the link line via POCKET_BACKEND_LIBS, but it
+    # appears before the kernel archive, so the default --as-needed drops it and
+    # only the kernel archive's undefined symbol fails the link. Disable
+    # --as-needed for consumers and add the whole CANN lib64 to the search path
+    # rather than enumerating the transitive closure (libprofapi needs libmmpa,
+    # which needs libruntime, ...).
+    target_link_options(pocket_cpp_core INTERFACE
+        "-Wl,--no-as-needed"
+        "-Wl,-rpath,${ASCEND_ARCH_DIR}/lib64"
+        "-L${ASCEND_ARCH_DIR}/lib64")
+    target_link_libraries(pocket_cpp_core INTERFACE mmpa runtime)
 endif()
 
 # Fail the build if a vendor SDK leaks into the shared layers. This is the
@@ -707,6 +741,53 @@ set_target_properties(test_tp_comm_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 add_executable(test_qwen_ascend_ops tests/test_qwen_ascend_ops.cpp)
 target_link_libraries(test_qwen_ascend_ops PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_ascend_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(bench_qwen_ascend_attention tests/bench_qwen_ascend_attention.cpp)
+target_link_libraries(bench_qwen_ascend_attention PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Per-shape GEMM timing. The full-model profile only reports whole attention
+# layers, which hides whether the Cube-bound projections or the layout around
+# them is what costs the prefill its time.
+add_executable(bench_qwen_ascend_gemm tests/bench_qwen_ascend_gemm.cpp)
+target_link_libraries(bench_qwen_ascend_gemm PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Validates the Cube path -- L1 fractal staging plus AscendC::Gemm -- against a
+# CPU reference before any attention kernel is built on top of it.
+add_executable(test_qwen_ascend_cube_gemm tests/test_qwen_ascend_cube_gemm.cpp)
+target_link_libraries(test_qwen_ascend_cube_gemm PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ascend_cube_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Compares the Cube prefill attention against the vector one it replaces, and both
+# against a double-precision host reference. Two kernels agreeing is weaker
+# evidence than either matching the definition, so the host reference runs too.
+add_executable(test_qwen_ascend_cube_attention tests/test_qwen_ascend_cube_attention.cpp)
+target_link_libraries(test_qwen_ascend_cube_attention PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ascend_cube_attention PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Splits per-op decode cost into host and device halves at the real TP4 shard
+# shapes. Decode is not bandwidth bound on this backend, so which half dominates
+# decides what to optimize; the profile counters alone cannot separate them.
+add_executable(bench_qwen_ascend_decode_ops tests/bench_qwen_ascend_decode_ops.cpp)
+target_link_libraries(bench_qwen_ascend_decode_ops PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_decode_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Decode profiles on this backend put most of a token inside the TP all-reduce
+# scopes, so the collective's own latency has to be separated from the per-call
+# synchronization the comm-stream path performs. Depends on the HCCL backend.
+if(POCKET_HAVE_TP_COMM AND POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_allreduce tests/bench_qwen_ascend_allreduce.cpp)
+    target_link_libraries(bench_qwen_ascend_allreduce PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
+# The decode target is a question about a physical limit: one decode step re-reads
+# every resident weight, so it is worth knowing what this part's memory actually
+# sustains rather than inferring it from a GEMV that may simply be inefficient.
+add_executable(bench_qwen_ascend_bandwidth tests/bench_qwen_ascend_bandwidth.cpp)
+target_link_libraries(bench_qwen_ascend_bandwidth PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_bandwidth PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # The twelve operators with no aclnn equivalent, i.e. the hand-written AscendC
 # kernels. Same neutral-name discipline as test_qwen_ascend_ops; it is a separate

@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -124,16 +125,30 @@ std::unique_ptr<CmdChannel> CmdChannel::create(int tp_world, int tp_rank,
             cc->impl_->peer_fds[their_rank - 1] = cfd;
         }
     } else {
-        // Worker: rank 0 may not have bound yet (we are launched concurrently
-        // via mpirun/torchrun-equivalent). Retry connect for up to ~10s.
+        // Worker: rank 0 binds only after it has finished reading its part of
+        // the checkpoint, so the wait has to cover the load skew between ranks,
+        // not assume a simultaneous launch.
+        //
+        // The budget used to be a fixed 200 attempts x 50ms = 10s. On the 55GB
+        // Qwen3.8-27B checkpoint the fastest and slowest rank finish loading
+        // about 10s apart, so the rendezvous sat exactly on the boundary and
+        // failed on roughly half of all runs -- reported as a connection error
+        // that looks nothing like a slow loader. Reuse the budget the HCCL
+        // root-info wait uses (same env var, same default) so one knob bounds
+        // both rendezvous.
+        int attempts = 6000;  // 10 minutes at 100ms, matching the HCCL wait
+        if (const char* env = std::getenv("POCKETLLM_CPP_NCCL_ID_WAIT_ATTEMPTS")) {
+            const int parsed = std::atoi(env);
+            if (parsed > 0) attempts = parsed;
+        }
         int fd = -1;
-        for (int attempt = 0; attempt < 200; ++attempt) {
+        for (int attempt = 0; attempt < attempts; ++attempt) {
             fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
             if (fd < 0) throw std::runtime_error(std::string("CmdChannel: socket() failed: ") + std::strerror(errno));
             if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
             ::close(fd);
             fd = -1;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         if (fd < 0) {
             throw std::runtime_error("CmdChannel: connect failed after retries: " + path);

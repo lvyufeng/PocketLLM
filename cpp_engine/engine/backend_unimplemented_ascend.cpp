@@ -105,7 +105,7 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(
 struct PersistentEngine::State {};
 
 PersistentEngine::PersistentEngine(const std::string&,
-                                   const ForwardSmokeOptions&, int, int) {
+                                   const ForwardSmokeOptions&, int, int, int) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
@@ -115,11 +115,42 @@ void PersistentEngine::reset_session() {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+// The multiplexed entry points are declared in the header unconditionally, so
+// every one of them needs a definition here even though nothing on this backend
+// calls them: a declared-but-undefined member is fine until the linker sees a
+// reference, and persistent_engine_adapter.cpp -- which is built on both
+// backends -- does reference them.
+void PersistentEngine::reset_slot(int) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::claim_slot(int, uint64_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+int PersistentEngine::max_slots() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 int PersistentEngine::prefill(const std::vector<int>&, const SamplingParams&) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+int PersistentEngine::prefill(const std::vector<int>&, const SamplingParams&,
+                              int) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 int PersistentEngine::decode_step(int, int, const SamplingParams&) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+int PersistentEngine::decode_step(int, int, const SamplingParams&, int) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+std::vector<int> PersistentEngine::batch_decode_step(
+    const std::vector<PersistentBatchRequest>&) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
@@ -152,6 +183,11 @@ void PersistentEngine::worker_command_prefill(const std::vector<int>&) {
 }
 
 void PersistentEngine::worker_command_decode(int32_t, int32_t) {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_batch_decode(
+    const std::vector<PersistentBatchRequest>&) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
