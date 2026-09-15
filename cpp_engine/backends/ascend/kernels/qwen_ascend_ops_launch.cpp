@@ -269,6 +269,14 @@ bool cube_prefill_attention(const uint16_t* d_q_rows_fp16,
     const uint32_t score_stride = (limit + kCubeChunk - 1) / kCubeChunk * kCubeChunk;
     const uint32_t head = static_cast<uint32_t>(head_dim);
     if (score_stride == 0 || score_stride > kCubeMaxScoreStride) return false;
+    // One KV head. A work item stacks a whole head group as the tile's rows, and
+    // the prefill entry reads those rows from Q and writes them to the output as
+    // one uniformly strided run -- which they are only when the group is the whole
+    // head axis. With more KV heads the group boundary sits inside the tile and no
+    // single pitch describes it, so the shape belongs to the vector kernel. The
+    // decode-partitioned entry below has no such restriction: it stacks one
+    // position, which is contiguous for any kv_heads.
+    if (kv_heads != 1) return false;
 
     uint32_t rows_per_tile = 1;
     while (rows_per_tile * 2 * repeat <= kCubeMaxStackedRows) rows_per_tile *= 2;
