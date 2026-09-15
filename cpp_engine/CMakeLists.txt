@@ -981,6 +981,10 @@ add_executable(test_batch_scheduler tests/test_batch_scheduler.cpp)
 target_link_libraries(test_batch_scheduler PRIVATE pocket_cpp_core)
 set_target_properties(test_batch_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+add_executable(test_multi_slot_decode_parity tests/test_multi_slot_decode_parity.cpp)
+target_link_libraries(test_multi_slot_decode_parity PRIVATE pocket_cpp_core)
+set_target_properties(test_multi_slot_decode_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_model_registry tests/test_model_registry.cpp)
 target_link_libraries(test_model_registry PRIVATE pocket_cpp_core)
 set_target_properties(test_model_registry PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
