@@ -47,6 +47,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from src.encoding import qwen_tool_calls  # noqa: E402  (needs _REPO_ROOT on sys.path)
+from pocketllm.protocol import template_messages  # noqa: E402  (needs _REPO_ROOT on sys.path)
 
 
 def _configure_stdio() -> None:
@@ -195,6 +196,11 @@ class ChatTemplateTemplater:
         tools = tools if isinstance(tools, list) and tools else None
         add_generation_prompt = bool(req.get("add_generation_prompt", True))
         thinking_mode = req.get("thinking_mode", "chat")
+        # A replayed assistant message carries its `tool_calls[].function.arguments`
+        # as the JSON string OpenAI specifies, while Qwen's template iterates them
+        # as an object (`arguments|items`).  The template gets the converted copy;
+        # the caller's list is left as it was received.
+        messages = template_messages(messages)
         # Tokenize through the template rather than re-encoding the rendered
         # text: a template that emits a BOS would otherwise get a second one
         # from encode().
