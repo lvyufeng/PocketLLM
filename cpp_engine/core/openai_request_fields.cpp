@@ -6,6 +6,8 @@
 #include <sstream>
 #include <string>
 
+#include "openai_stop_strings.hpp"
+
 namespace pocket {
 
 namespace {
@@ -134,32 +136,16 @@ RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint en
                       "Remove \"n\", or set it to 1 and read the single choice.");
     }
 
-    // Client stop sequences. The engine can end a request on stop token ids,
-    // but nothing here tokenizes the strings into them, and a stop string is
-    // not one token -- matching it needs tail matching over the decoded text.
+    // Client stop sequences are implemented -- matched over the decoded text,
+    // see openai_stop_strings.hpp -- so only a value of the wrong *shape* is a
+    // refusal here. Accepting a number or a nested array would turn a client
+    // mistake into a request that silently never stops.
     value = object_get(body, "stop");
-    if (!absent_or_null(value)) {
-        bool inert = false;
-        if (value->is_string()) {
-            inert = value->string().empty();
-        } else if (value->is_array()) {
-            inert = true;
-            for (const JsonValue& item : value->array()) {
-                if (!item.is_string() || !item.string().empty()) {
-                    inert = false;
-                    break;
-                }
-            }
-        }
-        if (!inert) {
-            return refuse("stop", *value,
-                          "a completion ends only at \"max_tokens\" or the "
-                          "checkpoint's end-of-sequence token, and no requested "
-                          "sequence is matched against the generated text, so "
-                          "the text runs past it.",
-                          "Remove \"stop\" and apply the sequences to the "
-                          "returned text yourself.");
-        }
+    if (!absent_or_null(value) && !is_stop_shape(*value)) {
+        return refuse("stop", *value,
+                      "a stop sequence is a string, or a list of strings, and "
+                      "this value is neither.",
+                      "Send \"stop\" as a string or an array of strings.");
     }
 
     // Per-token log probabilities.

@@ -35,10 +35,10 @@ struct RequestFieldCheck {
 // explicitly are not punished for it.
 //
 // The alternative was the behaviour this replaces: `n=3` returning one choice
-// and `stop=["\n\n"]` returning text that runs past it, both with a 200 and no
-// indication that anything was dropped. That is the same failure mode as a
-// capability flag that reports batching it does not do -- the request looks
-// configured and the output is something else.
+// and `logprobs=true` returning no logprobs, both with a 200 and no indication
+// that anything was dropped. That is the same failure mode as a capability flag
+// that reports batching it does not do -- the request looks configured and the
+// output is something else.
 //
 // Fields that cannot change the generated text -- `user`, `store`, `metadata`,
 // `service_tier`, `model` -- are accepted and inert on purpose; rejecting them

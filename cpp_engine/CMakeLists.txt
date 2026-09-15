@@ -36,6 +36,7 @@ set(POCKET_CORE_SOURCES
     core/json_constraint.cpp
     core/token_constraint.cpp
     core/openai_request_fields.cpp
+    core/openai_stop_strings.cpp
     core/gguf_reader.cpp
     core/safetensors_reader.cpp
     core/safetensors_model.cpp
@@ -847,6 +848,12 @@ set_target_properties(test_token_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY 
 add_executable(test_openai_request_fields tests/test_openai_request_fields.cpp)
 target_link_libraries(test_openai_request_fields PRIVATE pocket_core)
 set_target_properties(test_openai_request_fields PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Stop-sequence matching is pure string work over decoded text, so it is
+# testable the same way and without a server to stream through.
+add_executable(test_openai_stop_strings tests/test_openai_stop_strings.cpp)
+target_link_libraries(test_openai_stop_strings PRIVATE pocket_core)
+set_target_properties(test_openai_stop_strings PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE pocket_cpp_core)

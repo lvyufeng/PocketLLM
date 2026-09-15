@@ -196,9 +196,13 @@ def chat_payload(text: str, max_tokens: int, *, stream: bool = False) -> dict[st
 # the output, so a caller is never handed a response generated as if the field
 # were at its default. Every case here is refused before tokenization, so the
 # whole check costs no generation.
+#
+# `stop` is implemented, so it is here only at a value of the wrong shape: a
+# number is not a stop sequence, and accepting it would leave a request that
+# never stops looking configured.
 REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
     ("n", 3),
-    ("stop", ["\n\n"]),
+    ("stop", 5),
     ("logprobs", True),
     ("top_logprobs", 5),
     ("frequency_penalty", 1.5),
@@ -299,6 +303,144 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
     )
 
     print("[PASS] request field refusals: all undocumented fields rejected with a named param")
+
+
+def sse_events(result: HttpResult) -> list[dict[str, Any]]:
+    """The JSON events of an SSE response, `[DONE]` excluded."""
+    require(result.status == 200, f"stream request failed: HTTP {result.status}: {result.text}")
+    events: list[dict[str, Any]] = []
+    saw_done = False
+    for line in result.text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:]
+        if payload == "[DONE]":
+            saw_done = True
+            continue
+        events.append(json.loads(payload))
+    require(saw_done, "stream did not terminate with [DONE]")
+    return events
+
+
+def answer_and_finish(
+    result: HttpResult, chat: bool, stream: bool, expected_model: str
+) -> tuple[str, str]:
+    """The answer text and finish reason of a response, in any of its four shapes."""
+    require(result.status == 200, f"request failed: HTTP {result.status}: {result.text}")
+    if not stream:
+        body = result.json()
+        require(body.get("model") == expected_model, "wrong non-stream model")
+        choice = body["choices"][0]
+        text = choice["message"]["content"] if chat else choice["text"]
+        return text, choice["finish_reason"]
+    text = ""
+    finish_reason = ""
+    for event in sse_events(result):
+        require(event.get("model") == expected_model, "wrong stream model")
+        choice = event["choices"][0]
+        # The two endpoints do not share a chunk shape. A chat chunk wraps the
+        # incremental text in `delta`; a completions chunk carries `text` on the
+        # choice itself, which is what OpenAI's own /v1/completions stream does.
+        delta = choice.get("delta") or {}
+        text += delta.get("content", "") if chat else choice.get("text", "")
+        if choice.get("finish_reason") is not None:
+            finish_reason = choice["finish_reason"]
+    return text, finish_reason
+
+
+def validate_stop_sequences(base_url: str, model_name: str, timeout: float) -> None:
+    """Checks that a client stop sequence really truncates the answer.
+
+    The sequence is lifted out of a first, unconstrained answer to the same
+    greedy request, so the model has every reason to produce it again and the
+    expected truncation is derived from the reference rather than guessed. The
+    server cuts at the *first* occurrence, which is what `str.index` reports.
+    """
+    prompt = "List the numbers from 1 to 40, separated by commas."
+    max_tokens = 64
+    unmatched = "<|not-a-stop-sequence|>"
+
+    for chat in (True, False):
+        endpoint = "/v1/chat/completions" if chat else "/v1/completions"
+        base: dict[str, Any] = (
+            chat_payload(prompt, max_tokens)
+            if chat
+            else {
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 20,
+            }
+        )
+
+        reference, _ = answer_and_finish(
+            http_request(base_url, endpoint, base, timeout=timeout), chat, False, model_name
+        )
+        require(
+            len(reference) >= 16,
+            f"reference answer is too short to truncate: {reference!r}",
+        )
+        middle = len(reference) // 2
+        sequence = reference[middle : middle + 4]
+        expected = reference[: reference.index(sequence)]
+        require(expected != "", f"stop sequence chosen at the start of the answer: {sequence!r}")
+
+        for stream in (False, True):
+            mode = "stream" if stream else "non-stream"
+            label = f"{'chat' if chat else 'completions'} {mode}"
+
+            # The documented spellings: a list of sequences, and the bare string
+            # that means a list of one.
+            spellings: tuple[tuple[str, Any], ...] = (
+                ("stop", [sequence]),
+                ("stop", [unmatched, sequence]),
+            )
+            if not stream:
+                spellings += (("stop", sequence),)
+
+            for field, value in spellings:
+                result = http_request(
+                    base_url, endpoint, {**base, "stream": stream, field: value}, timeout=timeout
+                )
+                text, finish_reason = answer_and_finish(result, chat, stream, model_name)
+                require(
+                    text == expected,
+                    f"{label} {field}={value!r} returned {text!r}, expected the answer cut "
+                    f"before {sequence!r}: {expected!r}",
+                )
+                require(sequence not in text, f"{label} leaked the stop sequence into the answer")
+                require(
+                    finish_reason == "stop",
+                    f"{label} {field}={value!r} reported finish_reason {finish_reason!r}",
+                )
+
+            # A sequence that never occurs must not truncate anything. On a
+            # stream this is also the regression check for the holdback: the
+            # scan withholds a trailing partial sequence, and it must give every
+            # byte back rather than dropping one.
+            result = http_request(
+                base_url, endpoint, {**base, "stream": stream, "stop": [unmatched]}, timeout=timeout
+            )
+            text, _ = answer_and_finish(result, chat, stream, model_name)
+            require(
+                text == reference,
+                f"{label} with an unmatched stop sequence returned {text!r}, expected {reference!r}",
+            )
+
+            # An empty list is what an SDK sends when nothing is configured, and
+            # the empty strings some clients pad it with must not match at
+            # position 0 and truncate the answer to nothing.
+            result = http_request(
+                base_url, endpoint, {**base, "stream": stream, "stop": []}, timeout=timeout
+            )
+            text, _ = answer_and_finish(result, chat, stream, model_name)
+            require(
+                text == reference,
+                f"{label} with an empty stop list returned {text!r}, expected {reference!r}",
+            )
+
+    print("[PASS] stop sequences: the answer is cut at the first matching sequence")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -410,6 +552,8 @@ def run(args: argparse.Namespace) -> int:
         validate_stream(stream, model_name)
 
         validate_request_field_refusals(base_url, model_name, timeout=10.0)
+
+        validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         incompatible = http_request(
             base_url,
