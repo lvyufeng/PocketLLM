@@ -12,6 +12,7 @@ on:
     branches: [master]
     paths:
       - 'docs/**'
+      - 'overrides/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - '.github/workflows/pages.yml'
