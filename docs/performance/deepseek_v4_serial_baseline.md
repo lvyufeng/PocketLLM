@@ -7,10 +7,15 @@ neither can be judged — nor can the effect of any later batching change be
 measured — without a recorded baseline for this engine on this checkpoint. This
 page is that baseline.
 
-It is also the control for the batching question. The same harness is run in
-`--mode batch` with `--max-batch-size 8`, and the result is what the clamps
-described [below](#why-batch-mode-is-throughput-neutral-here) predict: identical
-throughput, because the scheduler never actually runs two requests at once.
+It is also the control for the batching question, and that question has two
+answers on this page because the code changed between them. The first batch arm
+was run before a real batched forward existed, and it came back
+indistinguishable from serial because the scheduler clamped every batch to width
+1 — that is [why the first batch arm was throughput-neutral](#why-the-first-batch-arm-was-throughput-neutral). The second
+was run after the batched forward landed (#239, #241) and after `caps()` was
+changed to report it, and it does move: 1.62x wall time at eight concurrent
+requests, with the single-request phase split unchanged. That is
+[batch mode after the batched forward](#batch-mode-after-the-batched-forward).
 
 Read [Benchmarking and reporting rules](../guides/benchmarking.md) before
 comparing these numbers with anything else. Prefill and decode are reported
@@ -31,9 +36,12 @@ The measured path is:
 
 The following are outside this result:
 
-- **Multi-slot execution.** The engine declares up to 8 slots but runs at width 1;
-  see [the clamps](#why-batch-mode-is-throughput-neutral-here). Nothing on this
-  page demonstrates two requests executing in one forward pass.
+- **Multi-slot execution.** The engine declared up to 8 slots but ran at width 1;
+  see [the clamps](#why-the-first-batch-arm-was-throughput-neutral). Nothing in
+  the baseline tables above demonstrates two requests executing in one forward
+  pass. That changed afterwards, and
+  [the second batch arm](#batch-mode-after-the-batched-forward) does run at width
+  8 — a later measurement on later code, not part of this baseline's result.
 - **Token parity against a reference implementation.** No PyTorch or GGUF
   reference run was made for this baseline, so no parity claim is available here.
   The harnesses check that each response is well-formed, reaches its token
@@ -294,7 +302,13 @@ so the measurement behind it is worth stating:
 forward, with the GPU column above as the resource that actually constrains the
 slot count.
 
-## Why batch mode is throughput-neutral here
+## Why the first batch arm was throughput-neutral
+
+**Every measurement in this section is from commit `1536681`.** It is kept because
+it is the explanation for the batch rows of the tables above, which were taken
+there. It is no longer the behaviour of the code: `caps()` now asks the engine,
+and the [arm below](#batch-mode-after-the-batched-forward) runs at width 8. Read
+it as the record of why the 2026-09-14 batch column was a control.
 
 `--max-batch-size 8` does reach the engine —
 `engine_registry_builtin.cpp` wires it into `max_slots`, and the batch arm's log
@@ -306,19 +320,20 @@ int allowed = caps_.continuous_batching ? caps_.max_slots : 1;
 ```
 
 and `PersistentEngineAdapter::caps()`
-(`persistent_engine_adapter.cpp`) hardcodes `continuous_batching = false`. So
+(`persistent_engine_adapter.cpp`) hardcoded `continuous_batching = false`. So
 every batch arm logged:
 
 ```
 [server] batch width 1 (engine declares max_slots=8, continuous_batching=no), prefill budget 0
 ```
 
-There is a second clamp in the same file, `if (!caps_.chunked_prefill)
+There was a second clamp in the same file, `if (!caps_.chunked_prefill)
 prefill_token_budget_ = 0;`, which is why `--prefill-token-budget 4096` also had
-no effect: the same `false` zeroes the budget. Both clamps come from one
-capability flag.
+no effect: the same `false` zeroed the budget. Both clamps came from one
+capability flag, and only the first of them was about batching: `chunked_prefill`
+still reports false, which is why the budget is still zero in the arm below.
 
-The reason the flag is `false` is visible in the implementation rather than the
+The reason the flag was `false` is visible in the implementation rather than the
 scheduler. `PersistentEngine::batch_decode_step`
 (`deepseek_v4_engine.cpp`) validates that there are no more than 8 requests with
 unique slots and then decodes them in a `for` loop, one `worker_command_decode`
@@ -333,6 +348,114 @@ need those to become per-row, which is the actual work item behind #163.
 So the honest reading of the batch column is not "batching is neutral" but
 "batching is not yet switched on, and these numbers are the width-1 control the
 real implementation will be measured against."
+
+## Batch mode after the batched forward
+
+Three commits separate this arm from the one above. #239 gave
+`PersistentEngine::batch_decode_step` a real row-batched forward behind
+`POCKETLLM_CPP_BATCHED_DECODE` (default off, serial kept as the reference), #241
+scoped that forward's decode state to its own slot and its own rank, and the third
+is the one recorded on this page: `PersistentEngineAdapter::caps()` now reports
+`continuous_batching = max_slots > 1 && engine_->batched_decode_enabled()` instead
+of the hardcoded `false` fixed earlier in the file, which is what makes the switch
+visible from outside the engine. `BatchScheduler` clamps on that flag, so the arm
+runs at width 8 instead of being silently reduced to 1.
+
+The startup line is the evidence that it did:
+
+```
+# switch unset, --max-batch-size 8
+[server] batch width 1 (engine declares max_slots=8, continuous_batching=no), prefill budget 0
+# POCKETLLM_CPP_BATCHED_DECODE=1, --max-batch-size 8
+[server] batch width 8 (engine declares max_slots=8, continuous_batching=yes), prefill budget 0
+```
+
+The prefill budget is still zero in both arms. It is zeroed by `chunked_prefill`,
+which is a separate capability — this engine has no block allocator to resume an
+unfinished prompt against — and it is deliberately not part of the change.
+
+Method: commit `ccb339d` plus the `caps()` change recorded here, the tuned
+environment, the same two harnesses as above, one server process per
+configuration, run one after another. The batch arm is the same command with
+`POCKETLLM_CPP_BATCHED_DECODE=1` exported; the harnesses copy the parent
+environment into the ranks they start, so nothing else differs.
+
+### Whole request
+
+| Arm | Single request | n=2 | n=4 | n=8 | Interleave, short latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| serial, mbs=1 | 8.656 s / 3.697 tok/s | 17.734 s / 3.609 | 34.760 s / 3.682 | 69.495 s / 3.684 | 19.660 s |
+| batched, mbs=8 | 8.978 s / 3.564 tok/s | 16.581 s / 3.860 | 27.624 s / 4.634 | 42.927 s / 5.964 | 18.538 s |
+| batched / serial | 0.96x | 1.07x | 1.26x | **1.62x** | 1.06x |
+
+Rates are output tokens per second over the whole request; the ladder columns are
+per-request-multiplied aggregate rates, as in the serial table above.
+
+- **The ladder is no longer flat.** Serial holds 3.609 → 3.682 → 3.684 across
+  n=2/4/8, which is the serialization recorded above; the batch arm rises 3.860 →
+  4.634 → 5.964, a 1.62x wall-time improvement at n=8. Requests in that arm are
+  genuinely running in the same forward pass.
+- **The serial row reproduces the baseline table**, which is the check that
+  nothing on this branch moved the width-1 path: 3.697 against the baseline's
+  3.686 at a single request, 3.684 against 3.770 at n=8, and a single-request
+  wall of 8.656 s against 8.682 s.
+- **The gain is an amortization, not free parallelism.** At n=8 the batch arm
+  spends 42.927 s on 32 decode steps, 1.342 s per step for the whole batch; one
+  row alone spends 8.656 s, 0.271 s per step. Eight rows therefore cost 4.96
+  single-row steps, an effective width of 1.62 — the same number as the speedup,
+  as it must be. Rows share the step but do not disappear inside it.
+- **Prefill is still one request at a time** (`batch_prefill` loops over the
+  requests it is handed), so the wall-time speedup understates the decode gain.
+  If the 8 short prefills cost the same 2.716 s each that the phase table
+  measures, the n=8 arm spends ~21.7 s in prefill and decodes 256 tokens in
+  ~21.2 s against serial's 8 x 8.656 - 21.7 = ~47.6 s, which would put the
+  decode-only gain near 2.2x. That is an estimate built on a prefill cost
+  measured one request at a time, not a second measurement, and it is written
+  here as an estimate.
+- **The queue changes shape before it gets shorter.** At n=8 the serial arm's
+  average latency is 39.113 s with a worst case of 69.490 s; the batch arm's is
+  42.830 s with a worst case of 42.925 s. Every row in a batch finishes with the
+  batch, so a request that would have been near the front of the queue now waits
+  for its slowest neighbour — a lower ceiling, a higher floor. Whether that is an
+  improvement depends on which end of the distribution the caller cares about.
+
+### Single request, phase split
+
+| Arm | Prompt | ptok | Prefill | Prefill tok/s | ctok | Decode tok/s | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| serial | short | 120 | 2.716 s | 44.2 (44.0–44.4) | 32 | **5.370** (5.314–5.423) | 8.489 s |
+| serial | long | 1446 | 5.163 s | 280.1 (279.8–282.0) | 32 | **4.685** (4.442–4.872) | 11.780 s |
+| batched | short | 120 | 2.739 s | 43.8 (43.4–44.8) | 32 | **5.422** (5.199–5.450) | 8.482 s |
+| batched | long | 1446 | 5.113 s | 282.8 (281.2–283.9) | 32 | **4.988** (4.796–5.099) | 11.173 s |
+
+Median of three samples after one discarded warmup round, ranges in parentheses,
+decode rates are floors.
+
+This is the acceptance criterion that had to survive, and it does: **turning the
+batched forward on does not cost single-request latency.** The four pairs overlap
+on every field. The one gap worth naming is long-prompt decode, 4.685 → 4.988, or
++6.5%, and 6.5% is smaller than the 7.5% spread recorded above between two
+identical serial runs of this command, so it is not a result. A single-row batch
+takes the serial branch of the switch in any case: `batch_decode_step` falls back
+to its per-request reference loop at `requests.size() == 1`.
+
+### Peak memory
+
+Each row is one server process in a run of its own, sampling
+`nvidia-smi --query-gpu=index,memory.used` every two seconds from before the
+model load to after the last response. The comparison is at the concurrency
+ladder, because that is where eight rows are in flight at once and therefore
+where width changes what is resident.
+
+| Arm | Scheduler width | Peak GPU per rank | `Shmem` |
+| --- | ---: | ---: | ---: |
+| serial, mbs=1 | 1 | 15.90 GiB | 137.1 GiB |
+| batched, mbs=8 | 8 | **17.52 GiB** | 137.1 GiB |
+
+Four and a half GiB of the 22 GiB card remain at the highest configuration
+measured here, and the host figure does not move. Widening the scheduler from 1
+to 8 costs about 1.6 GiB per rank, which is the eight slots' KV and the
+row-batched decode workspace being live together rather than one at a time.
 
 ## Environment ablation
 
@@ -437,20 +560,33 @@ What this establishes:
    environment and 3.430–3.686 in the tuned one; split by phase, the tuned
    environment decodes at 5.248 and 4.868 tok/s at 120 and 1446 prompt tokens
    and prefills the long prompt at 281.4 tok/s. Its 44.5 tok/s at 120 prompt
-   tokens is a fixed-cost measurement rather than a rate.
+   tokens is a fixed-cost measurement rather than a rate. It re-measures today at
+   3.697 tok/s whole-request, 5.370 and 4.685 tok/s of decode, and 280.1 tok/s of
+   long-prompt prefill.
 2. **The default environment is not the baseline to beat.** It decodes 1.5x
    slower. Any change to the decode path has to be measured against the tuned
    environment, not against an unset shell.
-3. **Batching is not on.** `--max-batch-size 8` reaches the engine and is clamped
-   to width 1 by `caps().continuous_batching`, which also silently zeroes the
-   prefill token budget. The batch arm's numbers are a control, not a result.
-4. **Single-request latency is the binding constraint**, and it is preserved
-   trivially at present because concurrency is serialized: throughput is flat
-   across the 2/4/8 ladder and every increase in load shows up as added latency.
-   That is the property #163 has to keep while removing the serialization.
+3. **Batching is on, behind a switch.** The 2026-09-14 batch arm was clamped to
+   width 1 by a hardcoded `caps().continuous_batching`; that is fixed, and with
+   `POCKETLLM_CPP_BATCHED_DECODE=1` the scheduler admits eight requests and runs
+   them in one batched forward, for 1.62x wall time at n=8 (3.684 → 5.964 output
+   tok/s aggregate). The switch is off by default, so an unset environment still
+   gets the serial reference path.
+4. **Single-request latency is unchanged by batching**, which is the criterion
+   that had to hold: the phase split overlaps across the whole table and the
+   whole-request difference is 3.7%, inside this host's run-to-run spread. What
+   does change at saturation is the shape of the queue — a lower worst case and a
+   higher average, because a row now finishes with its batch.
+5. **The gain is bounded by amortization.** Eight rows cost 4.96 single-row steps
+   of work, so the effective width is 1.62, not 8. Nothing here shows a batched
+   forward that scales with the number of rows; it shows one whose step cost grows
+   with them and is worth paying from about n=4 upward.
 
-What remains open on #163 is unchanged by this page: slot-isolation,
-cancellation, slot-reuse and TP-parity tests; whether `caps()` may report
-multi-slot only once a real batched forward exists; and the per-row position
-plumbing in `run_safetensors_continuation_batch_impl` that a real batched decode
-requires.
+What this does **not** claim: paged KV, chunked prefill, or a prefill token
+budget. `caps()` still reports `chunked_prefill = false` and `paged_kv = false`,
+so `--prefill-token-budget` remains a no-op on this engine and prefills stay one
+request at a time — which is also why the decode-only gain is larger than the
+wall-time one. Slot isolation, slot reuse, cancellation, and TP parity across
+both arms of the switch are covered by
+`cpp_engine/tests/test_multi_slot_decode_parity.cpp`, which runs at `tp_world` 1
+and 4 and whose tp4 and tp1 chains are token-identical over eight steps.
