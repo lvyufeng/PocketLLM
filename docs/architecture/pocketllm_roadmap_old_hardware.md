@@ -171,6 +171,38 @@
 - 910A 跑 70B Q2: 前 24 层 GPU（~15GB）+ 后 56 层 CPU
   - HBM2 带宽更高，decode ~8-10 tok/s
 
+**现状**（2026-09-15 实测，PR #253）：
+
+上面两段收益预估是规划值，没有一条在本机量过。完整测量与复现命令见
+[CPU offload 与 prefetch 的实测天花板](../performance/cpu_offload_profile.md)，
+逐条对照如下：
+
+- ✅ **prefill 侧的算术成立**：TP1 下 512 行 chunk 搬 12.28 GiB，完美流水时 439 tok/s，
+  与上面「~200 tok/s（受 H2D 带宽限制）」同一量级。
+- ❌ **decode ≥ 5 tok/s 被带宽而不是实现质量否决**：5 tok/s 意味着每 token 200 ms，
+  也就是实测 10.53 GiB/s 下 2.11 GiB 的可搬运量。一个 70B FP4 层是 0.42 GiB，
+  所以最多只放得下 4 层；上面「前 16 层 GPU + 后 64 层 CPU」每 token 要搬 27.1 GiB，
+  实测 0.39 tok/s，差 13×。本机 checkpoint 上实测的 offload 上限是 0.025–0.29 tok/s
+  （Flash-Next TP4）与 0.83 tok/s（70B FP4 TP1）。
+- ❌ **prefetch 隐藏 > 80% 在原理上不可达**：可隐藏比例的上限就是 `compute / copy`。
+  GLM-5.2 MoE block decode 实测 1.18 ms 计算对 540 ms 拷贝（0.09%），70B dense 层是
+  3.58 ms 对 39.8 ms（6.67%）；全部测量里最好的一档是 512 行 prefill 的 28.04%，
+  而那正是本节没有针对性优化的阶段。要隐藏 80% 的传输，需要 `compute >= 0.8 × copy`。
+- ⚠️ **前提只部分成立**：70B FP4 在 TP2（16.93 GiB/rank）和 TP4（8.47 GiB/rank）
+  下零 offload 即可放下，所以只有 TP1 真的需要本方案。本机没有 70B FP4 checkpoint，
+  这一条是公开几何数据而不是实测。
+- ⚠️ **权重必须常驻主机内存**：本机所有 checkpoint 挂载点都是机械盘
+  （冷读 0.096 / 0.194 / 0.209 GiB/s，对 pinned H2D 实测平台 10.53 GiB/s），
+  不能依赖 mmap 缺页换入——`/mnt/data2` 在规划时按 SSD 对待，实际不是。
+- ❌ **本方案尚未实现**：全仓库 grep `gpu_layers|gpu-layers|n_gpu_layers`
+  只匹配到上面那个测量页和它的脚本，两者都只是在说明这个 flag 没有实现。
+
+结论：按各 checkpoint 的真实几何与实测带宽算出的 offload ceiling 是 **0.025–0.29 tok/s**
+（跨 checkpoint），低于仓库已经交付的 expert 粒度路径在本机的实测值——GLM-5.2 走
+expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/glm-5.2.md)）。
+而唯一真正受益的 70B FP4 TP1 配置在本机没有 checkpoint，无法端到端验证。
+**是否仍然实现 `--gpu-layers`，由这条测量结论决定**（见 #156）。
+
 ---
 
 ### 2.2 Aggressive Quantization（FP4/Q2/Q3）
@@ -342,7 +374,7 @@
 | **Continuous Batching** | P0 | 中 | ⭐⭐⭐⭐⭐ | 吞吐量 2-4×，必需 |
 | **Prefix Caching** | P0 | 中 | ⭐⭐⭐⭐⭐ | 多轮对话必需 |
 | **KV Quant + Paged** | P1 | 高 | ⭐⭐⭐⭐⭐ | 显存省 50-62% |
-| **CPU Offload + Prefetch** | P1 | 高 | ⭐⭐⭐⭐ | 70B 可跑 |
+| **CPU Offload + Prefetch** | P1 | 高 | ⭐⭐ | 70B 可跑——但 TP2/TP4 零 offload 即可，TP1 上限实测 0.83 tok/s（见 2.1） |
 | **OpenAI API 完整** | P1 | 低-中 | ⭐⭐⭐ | 生态兼容 |
 | **Hybrid Quantization** | P1 | 中 | ⭐⭐⭐⭐ | 速度 vs 显存平衡 |
 | **FlashAttention-1 (SM75)** | P2 | 中 | ⭐⭐⭐ | Batch prefill |
@@ -359,12 +391,15 @@
 2. ✅ **Prefix Caching**: Block hash + 全局共享
 3. ✅ **KV Quantization + Paged**: 修复冲突，INT8 KV 默认开启
 4. ✅ **OpenAI API**: logprobs / n>1 / stop 序列（tools 仍缺失，见 1.3）
-5. ✅ **CPU Offload**: 前 N 层 GPU + 后 M 层 CPU + prefetch 流水线
+5. ❌ **CPU Offload**: 前 N 层 GPU + 后 M 层 CPU + prefetch 流水线——**尚未实现**。
+   这一行原先标 ✅ 属于规划标记；2026-09-15 的实测否证了它的 decode 与 prefetch
+   目标（见 2.1），是否实现待定
 
 **验收标准**：
 - 4 并发请求下，吞吐量 ≥ 单请求的 3×
 - 多轮对话第 2 轮起，prefill 时间 <100ms（前缀全命中）
-- 70B FP4 在 2080Ti 上可跑，decode ≥5 tok/s
+- 70B FP4 在 2080Ti 上可跑，decode ≥5 tok/s——**前半句成立但不需要本方案**（TP2/TP4
+  零 offload 即可放下），**后半句被实测否证**（TP1 上限 0.83 tok/s，见 2.1）
 
 ### Phase 5: 生态与性能（2-3 个月）
 1. ✅ **Qwen-VL**: 支持 Qwen2-VL-7B
@@ -395,7 +430,9 @@
 **PocketLLM 的核心竞争力（针对老硬件）**：
 
 1. **极致量化**: FP4/Q2 让 2080Ti 跑 70B
-2. **CPU Offloading**: vLLM/SGLang 都不支持
+2. **CPU Offloading**: vLLM/SGLang 都不支持——但 2026-09-15 的实测（见 2.1）表明，
+   在 2080Ti 上让 70B 装得下的是量化而不是逐层 offload：TP2/TP4 零 offload 即可，
+   而 TP1 的实测上限是 0.83 tok/s
 3. **多后端**: Ascend 910A 是独家优势
 4. **Qwen 推测解码**: MTP/DSpark/DFlash2 比通用 draft model 更高效
 5. **单请求延迟优化**: vLLM 为吞吐优化，PocketLLM 为个人/边缘场景优化
@@ -421,7 +458,7 @@
 **必做（P0-P1）**：
 - Continuous Batching + Prefix Caching（吞吐量和多轮对话）
 - KV Quantization + Paged（显存优化）
-- CPU Offloading（70B 可跑）
+- CPU Offloading（让 70B 在 TP1 可跑；TP2/TP4 不需要，见 2.1）
 - OpenAI API 完整（生态兼容）
 
 **选做（P2）**：
