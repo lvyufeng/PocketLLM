@@ -35,6 +35,7 @@ set(POCKET_CORE_SOURCES
     core/json_lite.cpp
     core/json_constraint.cpp
     core/token_constraint.cpp
+    core/openai_request_fields.cpp
     core/gguf_reader.cpp
     core/safetensors_reader.cpp
     core/safetensors_model.cpp
@@ -840,6 +841,12 @@ set_target_properties(test_json_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_token_constraint tests/test_token_constraint.cpp)
 target_link_libraries(test_token_constraint PRIVATE pocket_core)
 set_target_properties(test_token_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The request-field audit is pure JSON and string work, so it is testable without
+# a checkpoint, a device, or a running server.
+add_executable(test_openai_request_fields tests/test_openai_request_fields.cpp)
+target_link_libraries(test_openai_request_fields PRIVATE pocket_core)
+set_target_properties(test_openai_request_fields PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE pocket_cpp_core)

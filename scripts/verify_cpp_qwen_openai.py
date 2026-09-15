@@ -191,6 +191,116 @@ def chat_payload(text: str, max_tokens: int, *, stream: bool = False) -> dict[st
     }
 
 
+# Request fields the server does not implement. The audit refuses each one with a
+# 400 naming the field in OpenAI's `param` slot when the value would have changed
+# the output, so a caller is never handed a response generated as if the field
+# were at its default. Every case here is refused before tokenization, so the
+# whole check costs no generation.
+REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("n", 3),
+    ("stop", ["\n\n"]),
+    ("logprobs", True),
+    ("top_logprobs", 5),
+    ("frequency_penalty", 1.5),
+    ("presence_penalty", -1.0),
+    ("logit_bias", {"100": -100}),
+    ("tool_choice", "required"),
+    ("parallel_tool_calls", False),
+)
+
+# The same fields at the value that names what the server already does. These
+# must be accepted: an SDK that sends the documented default explicitly is not
+# asking for anything.
+ACCEPTED_CHAT_DEFAULTS: tuple[tuple[str, Any], ...] = (
+    ("n", 1),
+    ("stop", []),
+    ("logprobs", False),
+    ("top_logprobs", 0),
+    ("frequency_penalty", 0),
+    ("presence_penalty", 0),
+    ("logit_bias", {}),
+    ("tool_choice", "auto"),
+    ("parallel_tool_calls", True),
+)
+
+
+def refusal_error(result: HttpResult, label: str) -> dict[str, Any]:
+    """Asserts the 400 carries the OpenAI error shape with a populated `param`."""
+    require(result.status == 400, f"{label} was not refused: HTTP {result.status}: {result.text}")
+    error = result.json().get("error")
+    require(isinstance(error, dict), f"{label} refusal is not in the OpenAI error shape")
+    require(error.get("type") == "invalid_request_error", f"{label} refusal has the wrong type")
+    require(error.get("message"), f"{label} refusal has no message")
+    return error
+
+
+def validate_request_field_refusals(base_url: str, model_name: str, timeout: float) -> None:
+    """Checks the request-field contract on both OpenAI endpoints."""
+    messages = [{"role": "user", "content": "This request is inspected, not generated."}]
+    base = {"messages": messages, "max_tokens": 1}
+
+    for field, value in REFUSED_CHAT_FIELDS:
+        result = http_request(
+            base_url, "/v1/chat/completions", {**base, field: value}, timeout=timeout
+        )
+        error = refusal_error(result, f"chat {field}={value!r}")
+        require(
+            error.get("param") == field,
+            f"{field} refusal named {error.get('param')!r} instead of {field!r}",
+        )
+
+    for field, value in ACCEPTED_CHAT_DEFAULTS:
+        result = http_request(
+            base_url, "/v1/chat/completions", {**base, field: value}, timeout=timeout
+        )
+        require(
+            result.status == 200,
+            f"chat {field}={value!r} should be accepted, got HTTP {result.status}: {result.text}",
+        )
+
+    streaming = http_request(
+        base_url,
+        "/v1/chat/completions",
+        {**base, "stream": True, "stream_options": {"include_usage": True}},
+        timeout=timeout,
+    )
+    error = refusal_error(streaming, "chat stream_options.include_usage")
+    require(
+        error.get("param") == "stream_options.include_usage",
+        f"include_usage refusal named {error.get('param')!r}",
+    )
+
+    # Fields that only exist on /v1/completions are refused there, and ignored as
+    # unknown parameters on chat rather than being read as something else.
+    for field, value in (("echo", True), ("best_of", 2), ("suffix", " END")):
+        result = http_request(
+            base_url,
+            "/v1/completions",
+            {"prompt": "This prompt is inspected, not generated.", "max_tokens": 1, field: value},
+            timeout=timeout,
+        )
+        error = refusal_error(result, f"completions {field}={value!r}")
+        require(error.get("param") == field, f"{field} refusal named {error.get('param')!r}")
+
+    # "max_completion_tokens" supersedes the deprecated "max_tokens": a request
+    # carrying 32 and 1 must generate one token, not 32.
+    precedence = http_request(
+        base_url,
+        "/v1/chat/completions",
+        {"messages": messages, "max_tokens": 32, "max_completion_tokens": 1,
+         "temperature": 0.0},
+        timeout=timeout,
+    )
+    body = validate_nonstream(precedence, model_name)
+    require(
+        body["usage"]["completion_tokens"] == 1,
+        "max_completion_tokens did not take precedence over max_tokens: "
+        f"{body['usage']['completion_tokens']} tokens generated",
+    )
+
+    print("[PASS] request field refusals: all undocumented fields rejected with a named param")
+
+
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
     binary = pathlib.Path(args.binary).resolve()
@@ -298,6 +408,8 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.request_timeout_seconds + 30,
         )
         validate_stream(stream, model_name)
+
+        validate_request_field_refusals(base_url, model_name, timeout=10.0)
 
         incompatible = http_request(
             base_url,
