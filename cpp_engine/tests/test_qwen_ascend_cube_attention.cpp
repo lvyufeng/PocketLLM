@@ -54,10 +54,22 @@ uint16_t float_to_half(float f) {
         return static_cast<uint16_t>(sign | half);
     }
     if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    // The exponent field is not optional. Without it every value in (-1, 1) --
+    // which is the whole of the uniform range this file generates -- packs to a
+    // denormal near 2^-24, the attention output lands three orders of magnitude
+    // below the tolerance below, and every comparison here passes on zeros.
     uint32_t half = mantissa >> 13;
     const uint32_t remainder = mantissa & 0x1fffu;
     if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) ++half;
-    return static_cast<uint16_t>(sign | half);
+    // Rounding up out of the mantissa carries into the exponent, and past the top
+    // of it to infinity. Both are reachable: the largest float below 1.0 has an
+    // all-ones mantissa.
+    if (half == 1024u) {
+        half = 0;
+        if (exponent + 1 >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+        return static_cast<uint16_t>(sign | static_cast<uint32_t>(exponent + 1) << 10);
+    }
+    return static_cast<uint16_t>(sign | static_cast<uint32_t>(exponent) << 10 | half);
 }
 
 float half_to_float(uint16_t h) {
