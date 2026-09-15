@@ -10783,6 +10783,12 @@ void PersistentEngine::reset_slot(int slot_id) {
 
 int PersistentEngine::max_slots() const { return state_->max_slots; }
 
+bool PersistentEngine::batched_decode_enabled() const {
+    // The same switch batch_decode_step() reads. Asked through the accessor so
+    // the capability report and the code path can never disagree about it.
+    return env_int_or_default("POCKETLLM_CPP_BATCHED_DECODE", 0) != 0;
+}
+
 void PersistentEngine::claim_slot(int slot_id, uint64_t request_id) {
     auto& s = *state_;
     if (slot_id < 0 || slot_id >= s.max_slots || request_id == 0) {

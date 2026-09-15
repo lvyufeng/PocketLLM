@@ -132,6 +132,10 @@ int PersistentEngine::max_slots() const {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+bool PersistentEngine::batched_decode_enabled() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 int PersistentEngine::prefill(const std::vector<int>&, const SamplingParams&) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }

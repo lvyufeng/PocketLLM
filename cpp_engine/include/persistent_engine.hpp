@@ -56,6 +56,15 @@ public:
 
     int max_slots() const;
 
+    // Whether multi-row batches actually run as one batched forward. False means
+    // batch_decode_step() falls back to its per-request reference loop however
+    // many rows it is handed, so there is no concurrent execution to report and
+    // a caller asking for a wider batch would only lengthen every request's
+    // latency without changing throughput. Capability reporting has to ask:
+    // claiming slots the engine will not run in parallel is what made
+    // --max-batch-size a no-op that still looked configured.
+    bool batched_decode_enabled() const;
+
     // Run prefill on token_ids (which must include the prompt's last token).
     // Returns the sampled token id for the next position (rank 0 valid; on
     // worker ranks the return value is the rank-local argmax, which the

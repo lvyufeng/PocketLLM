@@ -490,6 +490,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         })
         .def("dspark_loaded", &PersistentEngine::dspark_loaded)
         .def("eos_id", &PersistentEngine::eos_id)
+        .def("batched_decode_enabled", &PersistentEngine::batched_decode_enabled)
         .def("max_context", &PersistentEngine::max_context)
         .def("layer_count", &PersistentEngine::layer_count)
         .def_property_readonly("last_dspark_hidden", &PersistentEngine::last_dspark_hidden)

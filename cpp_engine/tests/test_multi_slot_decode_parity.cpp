@@ -24,9 +24,12 @@
 //   3. slot reuse            -- reset_slot() while a neighbour is live must
 //      leave no residue: C in a slot that held A must match C in a slot that
 //      held D, and the live neighbour must be untouched by the reset.
-//   4. cancellation          -- through BatchScheduler: the survivor must match
-//      a solo run, the cancelled request must report "cancelled", and the slot
-//      it releases must be usable again.
+//   4. cancellation          -- through BatchScheduler, in both arms of the
+//      batched-decode switch: the survivor must match a solo run, the cancelled
+//      request must report "cancelled", and the slot it releases must be usable
+//      again. The switch is the variable the scheduler clamps its width on, so
+//      the two arms put the cancel on a queued request and on one running
+//      beside its neighbour.
 //   5. TP parity             -- deliberately NOT token equality across world
 //      sizes. Splitting the same projection across ranks changes the order its
 //      terms are summed in, so the logits move, and near a tie the argmax moves
@@ -614,21 +617,23 @@ std::vector<int> run_solo(PersistentEngineAdapter& adapter,
 //   * cancelling a request that is still *waiting* drops it at admission.
 //
 // Which of the two a cancel hits depends on whether the request got admitted
-// yet, and the scheduler clamps to width 1 here because caps() reports
-// continuous_batching == false. Both sub-cases therefore fire the cancel from
-// the running request's first token callback, where the running request is
-// provably running and the second request is provably still queued -- a cancel
-// issued straight after submit would race admission and would silently test the
-// same path twice. Re-entering the scheduler from a token callback is an
-// explicit contract (batch_scheduler.hpp:57).
+// yet, and the two arms differ exactly there: with the batched forward off the
+// scheduler clamps to width 1 and the second request waits for the first one's
+// slot, while with it on both are admitted and the cancel lands on a request
+// sharing a batched step with its neighbour. Both sub-cases therefore fire the
+// cancel from the running request's first token callback, where the running
+// request is provably running and the second request is provably either queued
+// or admitted -- a cancel issued straight after submit would race admission and
+// would silently test the same path twice. Re-entering the scheduler from a
+// token callback is an explicit contract (batch_scheduler.hpp:57).
 //
-// The two sub-cases live in a helper rather than in their driver so that a build
-// in which caps() does report batching can drive them next to the serial ones and
-// assert the same solo chains. A cancel is about one request, not about the
-// width, which is the point: a neighbour appearing or disappearing, in another
-// slot or in a shared batched step, must not move either chain.
-// The engine's batched-decode switch, spelled once. Case 4 unsets it and case 6
-// arms it per arm.
+// The two sub-cases live in a helper rather than in their driver so that both
+// arms can drive them and assert the same solo chains. A cancel is about one
+// request, not about the width, which is the point: a neighbour appearing or
+// disappearing, in another slot or in a shared batched step, must not move
+// either chain.
+//
+// The engine's batched-decode switch, spelled once. Cases 4 and 6 arm it.
 constexpr const char* kBatchDecodeSwitch = "POCKETLLM_CPP_BATCHED_DECODE";
 
 void test_cancellation_arm(PersistentEngineAdapter& adapter,
@@ -745,8 +750,9 @@ void test_cancellation_arm(PersistentEngineAdapter& adapter,
     }
 }
 
-// Case 4's driver. The solo chains are computed once and shared with the helper:
-// they are the invariant both sub-cases are measured against.
+// Case 4's driver. The solo chains are computed once and shared with both arms:
+// they are the invariant each arm is measured against, and computing them once
+// keeps the two arms from differing in anything but the switch.
 void test_cancellation(PersistentEngine& engine,
                        const std::vector<std::vector<int>>& prompts,
                        int steps,
@@ -761,9 +767,28 @@ void test_cancellation(PersistentEngine& engine,
     std::cout << "  solo A=" << join(solo_a) << "\n";
     std::cout << "  solo B=" << join(solo_b) << "\n";
 
+    struct Arm {
+        const char* tag;
+        const char* value;
+    };
+    const Arm arms[] = {
+        {"4(serial)", nullptr},
+        {"4(batched)", "1"},
+    };
+    for (const Arm& arm : arms) {
+        if (arm.value == nullptr) {
+            unsetenv(kBatchDecodeSwitch);
+        } else {
+            setenv(kBatchDecodeSwitch, arm.value, 1);
+        }
+        std::cout << "  == arm " << arm.tag << ", " << kBatchDecodeSwitch << "="
+                  << (arm.value == nullptr ? "<unset>" : arm.value) << " ==\n";
+        test_cancellation_arm(adapter, prompts, steps, sampling, solo_a, solo_b,
+                              arm.tag);
+    }
+    // Case 5 records the reference chain next, and it has to be the default
+    // engine's chain: leave the switch as this test found it.
     unsetenv(kBatchDecodeSwitch);
-    test_cancellation_arm(adapter, prompts, steps, sampling, solo_a, solo_b,
-                          "4");
 }
 
 // Case 5: the single-slot reference chain, with the top-k behind every token, so

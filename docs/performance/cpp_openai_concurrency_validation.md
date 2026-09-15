@@ -20,10 +20,15 @@ The validated path is:
 The following remain outside this acceptance result:
 
 - TP2 automatic supervision (tracked in #159)
-- DeepSeek-V4/PersistentEngine multi-slot execution. Its serial baseline on
-  DeepSeek-V4-Flash-0731 is recorded in
-  [deepseek_v4_serial_baseline.md](deepseek_v4_serial_baseline.md); the
-  multi-slot execution itself is still open.
+- DeepSeek-V4/PersistentEngine multi-slot execution is not part of this
+  acceptance result. Its serial baseline on DeepSeek-V4-Flash-0731 is recorded in
+  [deepseek_v4_serial_baseline.md](deepseek_v4_serial_baseline.md), which also
+  carries the later serial-vs-batch measurement taken after that engine's row
+  batched forward landed (#239, #241): with `POCKETLLM_CPP_BATCHED_DECODE=1` it
+  now reaches width 8 and is 1.62x faster on wall time at eight concurrent
+  requests, and it is unchanged at one. That engine is still outside this page's
+  scope — it has no paged KV and no chunked prefill, so its prefill token budget
+  stays zero — and none of this page's Qwen numbers apply to it.
 - MTP, DSpark, and DFlash2 batched decode
 - Ascend batched decode
 - FP8/TurboQuant batched KV decode
