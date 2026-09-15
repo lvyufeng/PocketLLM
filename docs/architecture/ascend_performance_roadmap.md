@@ -4,8 +4,8 @@ Qwen3.8-27B, 4 x Ascend 910A first generation (`Short_SoC_version=Ascend910`, 30
 FP16 only, no BF16), TP=4, CANN 9.0.0.
 
 Measured status and the ranked next steps. All figures and their commands are in
-[`ascend_attention_optimization.md`](ascend_attention_optimization.md); this document only draws
-conclusions from them.
+[`performance/ascend_attention_optimization.md`](../performance/ascend_attention_optimization.md); this
+document only draws conclusions from them.
 
 ## Targets and current standing
 
