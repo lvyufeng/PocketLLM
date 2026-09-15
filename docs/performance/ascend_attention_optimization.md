@@ -79,28 +79,41 @@ fallback.
 
 ## 4. Measured prefill attribution
 
-`QWEN_HOST_PROFILE=1`, 64 layers, 512-token prompt, `--resident-bench`. The profile emits three
-blocks (kernel warmup, the real prefill, decode) and the per-phase cost is the difference between
-block 0 and block 1. Prefill wall for the differenced pair: **1.6742 s**.
+`QWEN_HOST_PROFILE=1`, 64 layers, 512-token prompt, `--resident-bench`. The profile emits four
+blocks: `tag=prefill` (startup kernel warmup), `tag=warmup_decode` (a boundary
+`QwenEngine::warmup_kernels` now emits so the warmup pass cannot be mistaken for the measured one),
+`tag=prefill` again for the real prompt, and `tag=decode`. The real-prefill block reports `calls=64`
+uniformly on the layer sub-scopes; without that boundary a contaminated run reported 128.
 
-| phase | seconds | calls | us/call | share |
-|---|---|---|---|---|
-| `STACK.r` (whole decoder layer) | 1.1031 | 64 | 17236 | **65.9%** |
-| `full_attention` | 0.1646 | 32 | 5144 | 9.8% |
-| `STACK.d` | 0.0967 | 64 | 1512 | 5.8% |
-| `top1_allreduce` | 0.0814 | 2 | 40688 | 4.9% |
-| `tp_all_reduce` | 0.0779 | 130 | 599 | 4.6% |
-| every `pr.*` / `pd.*` projection | ~0.050 | — | — | ~3% |
+An earlier version of this section carried a three-block table and concluded that `STACK.r` at
+17.2 ms/layer was "an unattributed black box". **That conclusion is superseded.** The layer was
+instrumented, and the black box is not compute — it is the TP all-reduce:
+
+| component | seconds | share of prefill wall |
+|---|---|---|
+| 129 TP all-reduce calls (2 per layer + 1 hidden) | 0.5072 | **87%** |
+| everything else inside the 64-layer stack | 0.0577 | 10% |
+| `top1_allreduce` (1 call) | 0.0111 | 2% |
+
+`STACK.r` measures 0.548 s of the 0.584 s prefill wall, and 0.491 s of that is the collectives it
+contains. Every other operation in the layer — norms, transposes, gated-delta, swiglu, and all the
+projection GEMMs — sums to **0.90 ms per layer**. The full per-phase table, the pre-fix comparison
+and the collective's measured fixed/byte cost split are in
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
 
 Two conclusions this settles:
 
-- **All projection GEMMs together are ~3% of prefill.** The prefill gap is not in the matmuls, so
-  further GEMM tuning cannot close it.
-- **`STACK.r` at 17.2 ms/layer is 66% of prefill and is still an unattributed black box.** It wraps
-  `decoder_layer_component.forward(...)` as a single scope, so it absorbs the layer's norms, transposes,
-  gated-delta work and elementwise passes without naming any of them. Instrumenting inside it is the
-  next measurement, and it is a prerequisite for any further prefill work — attributing this to
-  "attention" would be wrong, since `full_attention` is measured separately and is 9.8%.
+- **All projection GEMMs together are ~1% of a 512-token prefill.** The prefill gap is not in the
+  matmuls, so further GEMM tuning cannot close it.
+- **Prefill is collective-bound, and the fix is fewer calls.** The all-reduce is a measured ~1.6 ms
+  of host-side issue plus a byte term, so the lever is the number of calls per layer, not their
+  payload or their enqueue mechanism. `full_attention` remains 9.8% and is measured separately.
+
+The same profile at a 4096-token prompt gives 84% for the collectives (84 vs 87 is inside the noise
+of two different passes), so this is the shape of a 64-layer TP4 pass rather than a property of
+short prompts. At 4096 rows `full_attention` grows to 9.3% and a single `top1_allreduce` call costs
+0.243 s, 7.5% of that prefill — measured, and not yet explained. See
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
 
 ## 5. Measured throughput
 
@@ -109,10 +122,17 @@ All runs: four ranks, `--smoke-forward --resident-bench`, `tp-world 4`, 64 layer
 | configuration | prompt | new | prefill TPS | decode TPS |
 |---|---|---|---|---|
 | before startup kernel warmup | 512 | 128 | 234.3 | 9.38 |
-| after startup kernel warmup | 512 | 128 | **428.1** | 9.21 |
-| after startup kernel warmup | 4096 | 32 | **1265.3** | 9.55 |
+| after startup kernel warmup | 512 | 128 | 428.1 | 9.21 |
+| after startup kernel warmup | 4096 | 32 | 1265.3 | 9.55 |
+| after the row-count slice rule | 512 | 128 | **878.8** | 8.73 |
+| after the row-count slice rule | 1024 | 8 | 1134.5 | 8.96 |
+| after the row-count slice rule | 2048 | 8 | 1238.3 | 9.11 |
+| after the row-count slice rule | 4096 | 32 | 1261.6 | 8.91 |
 | 64-layer reference, Cube split decode | 512 | 5 | 435.6 | 9.23 |
 | 4096 prefill, prior to this branch | 4096 | 1-16 | 287-325 | 3.20 |
+
+The slice rule is worth 2.05x at 512 tokens and is neutral at 4096; see
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
 
 The startup-warmup fix (`QwenEngine::warmup_kernels`) brackets exactly one full forward pass with
 8-row prefill and one decode step. It is worth 512/128: 2.185 s -> 1.196 s (**1.83x** prefill) and
@@ -183,20 +203,26 @@ named:
   gated-delta matrix work (two 128x128 reductions and a rank-1 update currently done as 128-wide
   vector ops, with `broadcast_rows` the documented hot spot), the norms, and the transposes;
 - 129 TP all-reduce calls per decode token (64 `ar.mlp` + 48 `ar.lin.out` + 16 `ar.full.out` +
-  1 `ar.hidden_a`) at ~540 us each, serialised by the per-call `stream_synchronize` inside
-  `end_nccl_collective`, which is roughly 70 ms of the 108 ms step.
+  1 `ar.hidden_a`) at ~540 us each, roughly 60% of the step. A previous version of this document
+  blamed the per-call `stream_synchronize` inside `end_nccl_collective` for ~70 ms of it; **that
+  attribution is wrong.** In `bench_qwen_ascend_allreduce` the per-call figure is flat in message
+  size (0.404 ms of pure host enqueue at 10 KB, 0.412 ms at 640 KB), and the probe line shows
+  enqueueing an event pair costs 0.011 ms against 0.382 ms for one bare collective. The cost is
+  host-side issue of the collective itself, paid once per call regardless of payload, so the fix is
+  fewer collectives and not a cheaper fence around each one.
 
 **100 TPS is not reachable on this part at fp16.** It needs <= 10 ms/token; the perfect-streaming
 bound at TP8 is 21 ms with zero collective cost, which would already require 673 GB/s per card.
 Reaching the target requires weight quantization — int8 for 2x, int4 for 4x — plus removing the
-per-step collective serialisation. Note also that 8 cards is the practical maximum here:
+per-step collectives. Note also that 8 cards is the practical maximum here:
 `HcclCommInitAll` is unusable on this stack and one process per rank is required.
 
 ## 7. What this rules out
 
-- **More GEMM tuning for prefill.** Projections are ~3% of prefill.
-- **Blaming prefill on attention.** `full_attention` is 9.8% at 512 tokens and is measured separately
-  from `STACK.r`; attributing the 66% to it would point the next optimisation at the wrong unit.
+- **More GEMM tuning for prefill.** Projections are ~1% of a 512-token prefill.
+- **Blaming prefill on attention.** `full_attention` is 0.054 s of the 0.584 s wall at 512 tokens and
+  is measured separately from the collectives; the 87% is the TP all-reduce, and pointing the next
+  optimisation at the attention kernels would miss it.
 - **A faster collective.** The HCCL floor is flat in payload size up to 640 KB.
 - **`aclrtMemcpy`-based bandwidth work.** 8.7 GB/s.
 - **Reading a short-layer smoke run as decode throughput.** See the layer scaling table.

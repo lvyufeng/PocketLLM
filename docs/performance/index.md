@@ -15,6 +15,7 @@ different generation length — a `TG4` measurement says nothing about `TG512`.
 | [Qwen quantized KV cache at 65K (TG512)](qwen_kv_cache_65k_tg512.md) | The authoritative quantized-KV table at 65K/TG512, including corrections to two earlier throughput claims. |
 | [Native C++ OpenAI concurrency validation](cpp_openai_concurrency_validation.md) | The end-to-end HTTP acceptance test and the vLLM head-to-head that followed it. |
 | [Ascend 910A attention and its measured ceilings](ascend_attention_optimization.md) | The Cube (`Mmad`) GQA attention operator, the three-way decode dispatch, the prefill phase table, and the bandwidth, all-reduce and `aclrtMemcpy` limits every remaining target has to clear. |
+| [Ascend 910A TP collective overlap](ascend_tp_collective_overlap.md) | Why the overlapped all-reduce must slice by row count rather than a constant, the crossover sweep, and the profiles showing prefill is 84-87% collectives at both 512 and 4096 tokens. |
 
 The currently authoritative per-model numbers live in the
 [model guides](../models/README.md); pages under

@@ -11,32 +11,50 @@ document only draws conclusions from them.
 
 | | target | measured now | gap |
 |---|---|---|---|
-| Prefill | >= 2000 TPS | 1265 TPS (4096-token prompt) | 1.6x |
+| Prefill | >= 2000 TPS | 1261.6 TPS (4096-token prompt), 878.8 TPS (512-token prompt) | 1.6x |
 | Decode | >= 100 TPS | 9.2 TPS (TP4, 64 layers) | 10.9x |
 
 Decode is not 1.6x away and is not a tuning problem. See "Decode" below.
 
-## Prefill: 1.6x is available, but not where it was assumed
+## Prefill: the wall is the collectives, not the math
 
 An earlier version of this document attributed 84% of prefill to attention and planned a 10.9x
-speedup on that basis. **That attribution was wrong and has been retracted.** The measured split at a
-512-token prompt is:
+speedup on that basis. **That attribution was wrong and has been retracted.** A second version
+correctly blamed the projections' share and then stopped at `STACK.r`, the whole decoder layer, as an
+"unattributed black box". **That is now measured too, and the answer is not compute:**
 
-- `STACK.r`, the whole decoder layer, **65.9%** — and it is still an unattributed black box
-- `full_attention`, measured separately, 9.8%
-- all projection GEMMs together, ~3%
+| component, 512-token prompt | share of prefill wall |
+|---|---|
+| 129 TP all-reduce calls (2 per layer + 1 hidden) | **87%** |
+| every other operation in the 64-layer stack | 10% |
+| `top1_allreduce`, 1 call | 2% |
 
-The projection GEMMs being 3% is the load-bearing fact: prefill cannot be fixed by making matmuls
-faster, and the single-card GEMM measurement (74-115 TFLOPS at batch 4096) says the target needs only
-24-38% of what the hardware already delivers. The missing 1.6x is inside `STACK.r`.
+At a 4096-token prompt the same profile gives 84% for 513 collectives, so this is the shape of a
+64-layer TP4 pass rather than a property of short prompts. Attention is 9.8% at 512 tokens and 9.3%
+at 4096; all projection GEMMs together are ~1% at 512 and ~0.3% at 4096.
+
+The consequence is that prefill cannot be fixed by making matmuls faster, and the single-card GEMM
+measurement (74-115 TFLOPS at batch 4096) is not the binding constraint. The lever is the number of
+times the layer stops at a collective.
+
+**Done:**
+
+- Branch `perf/ascend-overlap-slice-by-rows`: the overlapped all-reduce now slices by row count
+  instead of a constant 4 (`comm_overlap_slices_for_rows`), worth **2.05x at a 512-token prompt**
+  (428.1 -> 878.8 TPS) and neutral at 4096. See
+  [`performance/ascend_tp_collective_overlap.md`](../performance/ascend_tp_collective_overlap.md).
 
 **Next step, in order:**
 
-1. **Instrument inside `decoder_layer_component.forward`.** `STACK.r` wraps the whole layer as one
-   scope, so the norms, transposes, gated-delta work and elementwise passes are all merged into one
-   17.2 ms/layer figure. Nothing further can be aimed until this is broken down. This is the only
-   step that is currently unblocked and worth doing first.
-2. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1265 TPS figure is a
+1. **Cut the collective count per layer.** Two per layer — one `mlp.down` reduce in every layer and
+   one attention-output reduce — at ~3.8 ms each against a layer whose every other operation
+   together costs 0.90 ms. Removing one of the two per layer takes 0.245 s off the 0.584 s wall at
+   512 tokens. This is the same change decode needs, and it is the only identified prefill lever
+   that is worth more than a few percent.
+2. **Explain `top1_allreduce`.** A single call costs 0.243 s at 4096 tokens (7.5% of that prefill)
+   against 0.011 s for the same scope in the decode block of the same run. It is measured and not
+   yet explained; a 20x phase difference on one call is worth an afternoon.
+3. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1261 TPS figure is a
    4096-token prefill, where the per-token cost is dominated by the layer GEMMs. Shorter prompts pay
    the same fixed per-step costs over fewer tokens, so a single 2000 TPS target across prompt lengths
    may need to be restated per length rather than pursued as one number.
@@ -57,10 +75,20 @@ That gives:
 100 TPS at TP8 would need 673 GB/s per card with zero collective cost. Two separate deficits sit on
 top of the bound, and neither is small:
 
-1. **129 TP all-reduce calls per decode token**, ~540 us each, serialised by the per-call
-   `stream_synchronize` in `end_nccl_collective` — roughly 70 ms of the 108 ms step. The collective
-   floor is flat in payload size up to 640 KB (0.3923 ms at 10 KB, 0.3989 ms at 640 KB against a
-   0.0183 ms device-op floor), so this is latency, and the fix is fewer collectives.
+1. **129 TP all-reduce calls per decode token, at ~0.40 ms each** — roughly 52 ms of the ~104 ms
+   step, and confirmed by the post-fix host profile of a 4096-context token: the 129 calls measure
+   0.068 s of the 0.114 s step, **60%**. A previous version of this document blamed the per-call
+   `stream_synchronize` in
+   `end_nccl_collective` for ~70 ms of it. **That attribution is wrong.** In
+   `bench_qwen_ascend_allreduce` the per-call figure is flat in message size (0.404 ms of pure
+   host enqueue at 10 KB, 0.412 ms at 640 KB) and the synchronized round trip is not slower than the
+   unsynchronized one (0.388 vs 0.456 ms at 10 KB — the "sync" variant is measured inside the loop
+   and the "comm" variant pays an extra per-iteration synchronize, so the difference is the
+   measurement, not the fence). The probe line settles it: enqueueing an event pair costs 0.011 ms,
+   enqueueing one bare collective costs 0.382 ms. The cost is host-side issue of the collective
+   itself, it is paid once per call regardless of payload, and neither `HcclCommConfig`'s
+   `hcclOpExpansionMode` (swept 0/1/2/3, all within noise) nor `HCCL_OP_EXPANSION_MODE=AIV` moves
+   it. The fix is fewer collectives, not a cheaper fence around each one.
 2. **The per-layer cost is ~2.4x the pure weight-streaming cost** (13.45 GB / 108.6 ms = 124 GB/s
    effective vs the ~320 GB/s ceiling). The excess is layer work that moves no weights: the
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
@@ -88,7 +116,9 @@ The following were estimates presented as a plan and are not supported by measur
 listed so they are not picked up again:
 
 - "attention is 84% of prefill" — measured at 9.8% at 512 tokens, and the phase is separately
-  instrumented from the 65.9% `STACK.r` black box.
+  instrumented from the decoder layer. The layer itself turned out to be 87% TP all-reduce, so the
+  error was not in measuring attention but in never opening the scope that contained everything
+  else.
 - Multiplicative projections of phase gains ("Phase 1 x Phase 2 = ~720 TPS") — the phases are not
   independent and the base attribution was wrong.
 - "Cube is ~2x faster than Vector at matmul, so expect 3-5x" — the measured decode attention result is

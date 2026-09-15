@@ -2387,8 +2387,10 @@ struct QwenEngine::Impl {
     // Opt-in prefill phase attribution. Each scope synchronises the device, so it
     // is only ever enabled for profiling runs; the default path adds no sync.
     bool phase_profile = qwen_env_enabled("QWEN_PHASE_PROFILE");
-    std::map<std::string, double> phase_seconds;
-    std::map<std::string, uint64_t> phase_calls;
+    // Mutable because report_phase_profile() is const on the public engine yet
+    // consumes what it reports: see the reset at the end of that function.
+    mutable std::map<std::string, double> phase_seconds;
+    mutable std::map<std::string, uint64_t> phase_calls;
 
     // Host-side attribution, the counterpart to phase_profile. phase_profile
     // brackets every scope with a device synchronize, which serializes the
@@ -2402,8 +2404,8 @@ struct QwenEngine::Impl {
     // Only one of the two can be on: their timings mean different things and a run
     // that silently mixed them would attribute a sync to the wrong side.
     bool host_profile = !phase_profile && qwen_env_enabled("QWEN_HOST_PROFILE");
-    std::map<std::string, double> host_phase_seconds;
-    std::map<std::string, uint64_t> host_phase_calls;
+    mutable std::map<std::string, double> host_phase_seconds;
+    mutable std::map<std::string, uint64_t> host_phase_calls;
 
     class PhaseScope {
     public:
@@ -2460,6 +2462,12 @@ struct QwenEngine::Impl {
     bool range_profile = qwen_env_enabled("QWEN_RANGE_PROFILE") ||
                          qwen_env_enabled("QWEN_NVTX_PROFILE");
 
+    // Consumes what it reports. The counters are cumulative and several call
+    // sites dump them -- prefill, then once per decode step under
+    // --resident-bench -- so without the reset every dump after the first
+    // contains the earlier windows folded in, and a decode line looks like it
+    // costs what decode plus prefill cost. Each dump is therefore the window
+    // since the previous dump, not since process start.
     void report_phase_profile(const char* tag) const {
         if (host_profile) {
             double total = 0.0;
@@ -2475,6 +2483,8 @@ struct QwenEngine::Impl {
             std::cout << "qwen_phase tag=" << tag << " rank=" << options.tp_rank
                       << " host=1 phase=TOTAL seconds=" << total << "\n";
             std::cout.flush();
+            host_phase_seconds.clear();
+            host_phase_calls.clear();
             return;
         }
         if (!phase_profile) return;
@@ -2491,25 +2501,76 @@ struct QwenEngine::Impl {
         std::cout << "qwen_phase tag=" << tag << " rank=" << options.tp_rank
                   << " phase=TOTAL seconds=" << total << "\n";
         std::cout.flush();
+        phase_seconds.clear();
+        phase_calls.clear();
     }
 
     // Number of row slices used by the overlapped projection+all-reduce path.
     // 0 or 1 disables slicing entirely and keeps the serial behaviour.
     //
-    // Four slices is the default. Measured serially on the real 64-layer TP4
-    // checkpoint with the wider q64 attention tile in place, comm stream on, and
-    // both the mlp.down and lin.out sites overlapped:
+    // Four is the *ceiling*, not the count: comm_overlap_slices_for_rows()
+    // scales it down with the row count, because slicing is a trade that only
+    // pays at large row counts (see the measurement there). Measured on the real
+    // 64-layer TP4 checkpoint with the wider q64 attention tile in place, comm
+    // stream on, and both the mlp.down and lin.out sites overlapped:
     //
     //   context   serial    slices=4   slices=8   prefill
     //    65536    1275.7     1325.8     1304.1     1.04x
     //
-    // Eight slices is worse than four: the extra launches cost more than the
-    // finer-grained overlap recovers. Phase profiling attributes the win to
+    // Eight slices is worse than four at 65K: the extra launches cost more than
+    // the finer-grained overlap recovers. Phase profiling attributes the win to
     // tp_all_reduce dropping 14.64 -> 2.88 s across the whole 65K prefill.
     // The collective is bytes-bound at ~8.8 GB/s of ring bandwidth per rank, so
     // it cannot be made faster, only hidden. Set 0 or 1 to disable.
     int comm_overlap_slices() const {
         return layer_config.comm_overlap_slices;
+    }
+
+    // Below this many rows per slice the split is not worth making.
+    //
+    // Slicing does not reduce the bytes a site sends or the number of collectives
+    // it needs -- `slices` slices send the same total bytes through `slices`
+    // calls -- so it only trades the collective's *fixed* per-call cost for
+    // overlap of its byte cost against the GEMM. Splitting one call into four
+    // therefore pays the fixed term four times, which is a loss until the byte
+    // term is large enough that overlapping it recovers more than the three
+    // extra fixed terms cost.
+    //
+    // That crossover is measurable. The 384 extra collectives a 4-slice pass
+    // issues at 512 rows cost 0.612 s of prefill, i.e. 1.6 ms each on top of the
+    // 3.8 ms the serial call already cost -- so at 512 rows the fixed term is
+    // 1.6 ms against a 2.2 ms byte term and the trade is a 2x loss. 1024 rows
+    // per slice is where the two terms swap over.
+    static constexpr int kMinRowsPerOverlapSlice = 1024;
+
+    // Slice count for a specific row count, up to the configured ceiling.
+    //
+    // One collective per site becomes `slices` of them, so the split buys
+    // overlap with additional fixed-cost calls, and the count has to follow the
+    // row count rather than being a constant. Measured at TP4 on 64 layers with
+    // 8 new tokens (three runs per point at 512 rows, spread under 2.5%):
+    //
+    //   rows   serial(prefill TPS)   slices=2   slices=4
+    //    512        875.8               --        431.4   slicing loses 2.03x
+    //   1024       1138.8             1140.1      862.4   2 is a wash, 4 loses
+    //   2048       1195.1             1238.6     1185.8   2 wins 3.6%
+    //   4096       1205.2               --       1265.2   4 wins 5.0%
+    //
+    // The rule below reproduces every one of those optima from the row count
+    // alone; the values it picks are in docs/performance/ascend_tp_collective_overlap.md.
+    // At 512 rows the unsliced serial path is what a constant 4 was costing: 431
+    // TPS against 876, because a sliced 64-layer pass issues 512 collectives
+    // where the serial path issues 128. Decode, which takes the serial path at
+    // every setting, moved 3% across the whole scan and bounds the drift.
+    int comm_overlap_slices_for_rows(int rows) const {
+        const int configured = comm_overlap_slices();
+        if (configured <= 1) return 1;
+        int slices = 1;
+        while (slices * 2 <= configured &&
+               rows >= slices * 2 * kMinRowsPerOverlapSlice) {
+            slices *= 2;
+        }
+        return slices;
     }
 
     // Pipelined projection and all-reduce.
@@ -2537,7 +2598,7 @@ struct QwenEngine::Impl {
     bool projection_all_reduce_overlapped(
             const DeviceLinear& linear, const uint16_t* input, uint16_t* output,
             int rows, int hidden, const char* proj_site, const char* ar_site) {
-        const int slices = comm_overlap_slices();
+        const int slices = comm_overlap_slices_for_rows(rows);
         if (options.tp_world == 1 || slices <= 1 || rows < slices * 2) {
             return false;
         }
@@ -2572,11 +2633,16 @@ struct QwenEngine::Impl {
                     "Qwen overlapped all-reduce wait");
                 pending = false;
             }
-            // Deliberately no PhaseScope around the collective. PhaseScope calls
-            // device_synchronize() on entry and exit, which would drain the
-            // comm stream and serialize exactly the pipeline being built, so a
-            // profiled run would report a slowdown caused by the profiler. The
-            // enclosing per-layer scopes still attribute the exposed cost.
+            // A PhaseScope around the collective is only meaningful under host
+            // profiling, which reads a clock and nothing else. Under
+            // QWEN_PHASE_PROFILE the scope would call device_synchronize() on
+            // entry and exit and serialize exactly the pipeline being built, so
+            // the scope is created only when it cannot do that. .ov marks the
+            // overlapped-path collective, the counterpart to the serial ar.<site>.
+            std::optional<PhaseScope> ar_scope;
+            if (host_profile) {
+                ar_scope.emplace(this, std::string("ar.") + ar_site + ".ov");
+            }
             check_device(event_record(comm_slice_ready[index], nullptr),
                          "Qwen overlapped ready event");
             check_device(stream_wait_event(
@@ -4341,7 +4407,13 @@ void QwenEngine::warmup_tp() {
     QwenDeviceTensor scratch;
     allocate_half(scratch, 1, {1});
     zero_tensor(scratch);
-    impl_->all_reduce_half(scratch.f16_data(), 1, "scratch");
+    // Labelled for what it is, not for the buffer it uses. This is the first
+    // collective through a fresh communicator and pays the connection setup --
+    // measured at ~9.7 s on this machine -- so it is the one all-reduce whose
+    // cost must not be read as steady-state. Under a name like "scratch" it
+    // landed in the same bucket as any future one-element reduce and made the
+    // first prefill dump look like it had a ~10 s layer in it.
+    impl_->all_reduce_half(scratch.f16_data(), 1, "tp_warmup");
     check_device(device_synchronize(), "Qwen TP warmup synchronization");
 }
 
@@ -4380,6 +4452,14 @@ void QwenEngine::warmup_kernels(bool workers_in_loop) {
         (void)prefill(tokens, 0);
         if (workers_in_loop) worker_command_decode(tokens.back(), 0);
         (void)decode_step(tokens.back(), 0);
+        // Close the profiling window here. The warmup runs a whole prefill and
+        // then a whole decode step, and prefill() dumps its own window on the way
+        // out -- so without this boundary the next dump, which is the real
+        // prompt's, still has the warmup's single-row layer pass folded into every
+        // layer sub-scope. Per-call averages then mix a 512-row layer with a
+        // one-row one, which is exactly the quantity the sub-scopes exist to
+        // separate. A no-op unless one of the profiling switches is on.
+        impl_->report_phase_profile("warmup_decode");
         // Put the engine back exactly where reset() left it. Warmup tokens in
         // the KV cache would otherwise be visible to the first real request as
         // a prefix it did not ask for.

@@ -182,17 +182,68 @@ int main(int argc, char** argv) {
                                                   id_path.c_str(), buffer, count,
                                                   comm_stream);
         }
+        // Host time only, taken before the drain below. Each HcclAllReduce is
+        // asynchronous on this backend, so this separates "the host cannot issue
+        // collectives fast enough" from "the device takes this long to run one",
+        // which are fixed by entirely different changes.
+        const double host_ms = (now_ms() - started) / iters;
         pocket::stream_synchronize(comm_stream);
         pocket::device_synchronize();
         const double nosync_ms = (now_ms() - started) / iters;
 
         std::printf(
             "allreduce rank=%d bytes=%-9zu sync=%8.4f ms  comm=%8.4f ms  "
-            "comm-nosync=%8.4f ms  gbps(sync)=%6.1f\n",
-            rank, bytes, sync_ms, comm_ms, nosync_ms,
+            "comm-nosync=%8.4f ms  host-enqueue=%8.4f ms  gbps(sync)=%6.1f\n",
+            rank, bytes, sync_ms, comm_ms, nosync_ms, host_ms,
             bytes * 8.0 * (world - 1) / (sync_ms * 1e-3) / 1e9);
         std::fflush(stdout);
         pocket::device_free(buffer);
+    }
+
+    // The production path issues a collective through an event pair: record on
+    // the compute stream, wait on the communication stream, reduce. If the pair
+    // alone costs what the whole sequence costs, then the per-call figure is a
+    // property of the event bracketing rather than of HCCL, and the two are fixed
+    // in different places. Run last, so the communicator is already warm and the
+    // ~9.7 s first-collective setup cannot land in a timed region.
+    {
+        const int probe_iters = 200;
+        uint16_t* dummy = nullptr;
+        if (pocket::device_malloc_into(dummy, 5120 * sizeof(uint16_t))) {
+            for (int i = 0; i < 5; ++i) {
+                pocket::tp_all_reduce_sum_f16_inplace(world, rank, device,
+                                                     id_path.c_str(), dummy,
+                                                     5120, nullptr);
+            }
+            pocket::device_synchronize();
+            for (int rep = 0; rep < 2; ++rep) {
+                double started = now_ms();
+                for (int i = 0; i < probe_iters; ++i) {
+                    pocket::event_record(ready, nullptr);
+                    pocket::stream_wait_event(comm_stream, ready);
+                }
+                const double pair_ms = (now_ms() - started) / probe_iters;
+                pocket::stream_synchronize(comm_stream);
+                pocket::device_synchronize();
+
+                started = now_ms();
+                for (int i = 0; i < probe_iters; ++i) {
+                    pocket::tp_all_reduce_sum_f16_inplace(world, rank, device,
+                                                          id_path.c_str(), dummy,
+                                                          5120, comm_stream);
+                }
+                const double bare_ms = (now_ms() - started) / probe_iters;
+                pocket::stream_synchronize(comm_stream);
+                pocket::device_synchronize();
+
+                std::printf(
+                    "ar_probe rank=%d event-pair-enqueue=%8.4f ms  "
+                    "ar-bare-enqueue=%8.4f ms\n",
+                    rank, pair_ms, bare_ms);
+                std::fflush(stdout);
+            }
+            pocket::device_free(dummy);
+        }
     }
 
     pocket::event_destroy(ready);
