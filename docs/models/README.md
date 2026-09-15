@@ -23,7 +23,7 @@ PocketLLM uses model-specific runtimes rather than treating every checkpoint as 
 
 ## Shared baseline
 
-The headline results use 4×RTX 2080 Ti 22 GiB unless the model page says otherwise. Model TPS numbers are not directly comparable unless their checkpoint, prompt, runtime, warm state, and measurement convention match. See [Benchmarking](../benchmarking.md).
+The headline results use 4×RTX 2080 Ti 22 GiB unless the model page says otherwise. Model TPS numbers are not directly comparable unless their checkpoint, prompt, runtime, warm state, and measurement convention match. See [Benchmarking](../guides/benchmarking.md).
 
 ## Adding or updating a model page
 

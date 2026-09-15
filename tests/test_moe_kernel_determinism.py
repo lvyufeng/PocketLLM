@@ -1,7 +1,7 @@
 """Are the FP4 MoE kernels run-to-run reproducible?
 
 Speculative decoding measured a real defect: DSpark always-k produced different
-tokens from itself on the same prompt with the same weights (docs/dspark.md,
+tokens from itself on the same prompt with the same weights (docs/performance/dspark.md,
 "Output determinism"). That is distinct from batch-vs-sequential drift, which is
 expected -- N-token and 1-token forwards reduce in different orders, so their
 logits differ and an argmax near a tie can flip. Nondeterminism is not expected
@@ -111,7 +111,7 @@ def test_multi_token_moe_is_bitwise_reproducible(tokens):
 
     This is the property DSpark needs and the one measured to fail end to end.
     A failure here localizes it to the MoE kernel; a pass sends the search to
-    the attention path, which docs/dspark.md already implicates.
+    the attention path, which docs/performance/dspark.md already implicates.
     """
     args = _multi_args(tokens)
     first = _run_multi(args)

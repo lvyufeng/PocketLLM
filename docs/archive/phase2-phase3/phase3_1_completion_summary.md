@@ -263,9 +263,9 @@ docs/
 
 ## 📚 参考文档
 
-- **实施计划**：`docs/cpp_engine_batching_phase3_1.md`
-- **架构对比**：`docs/vllm_sglang_comparison.md`
-- **进度跟踪**：`docs/phase3_1_progress_report.md`
+- **实施计划**：`docs/archive/phase2-phase3/cpp_engine_batching_phase3_1.md`
+- **架构对比**：`docs/architecture/vllm_sglang_comparison.md`
+- **进度跟踪**：`docs/archive/phase2-phase3/phase3_1_progress_report.md`
 - **性能基线**：`qwen_tp2_64k_final_gap.md`
 
 ---

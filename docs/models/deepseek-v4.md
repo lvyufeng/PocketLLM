@@ -123,9 +123,9 @@ PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
 
 ## Evidence and related notes
 
-- [DSpark speculative decoding](../dspark.md)
-- [FlashMemory 1M context](../FLASHMEMORY_1M_CONTEXT.md)
-- [Phase 2 validation](../PHASE2_VALIDATION_RESULTS.md)
+- [DSpark speculative decoding](../performance/dspark.md)
+- [FlashMemory 1M context](../performance/flashmemory_1m_context.md)
+- [Phase 2 validation](../archive/phase2-phase3/phase2_validation_results.md)
 - [GGUF Q2 single-GPU history](deepseek-v4-gguf-q2-single-gpu.md)
 - [Historical 4×RTX 2080 Ti report](../reports/dsv4_2080ti_report.pdf)
-- [Benchmark reporting rules](../benchmarking.md)
+- [Benchmark reporting rules](../guides/benchmarking.md)

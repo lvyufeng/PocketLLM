@@ -10976,7 +10976,7 @@ std::vector<int> PersistentEngine::batch_decode_step(
 // two are not numerically equivalent here: GEMMs pick tiles and reduction
 // orders by shape, so a batched verify disagrees with plain decode by ~4e-3 at
 // the first projection, which amplifies to O(1) at the head and costs real
-// accept rate (see docs/dspark.md). Sequential keeps verify bit-comparable with
+// accept rate (see docs/performance/dspark.md). Sequential keeps verify bit-comparable with
 // decode; batching it is a separate optimization that has to be measured
 // against that drift, not assumed free.
 std::vector<int> PersistentEngine::verify_step(const std::vector<int>& draft_tokens,

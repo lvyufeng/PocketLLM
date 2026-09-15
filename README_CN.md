@@ -30,7 +30,7 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 
 ## 性能摘要
 
-本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/benchmarking.md)。
+本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/guides/benchmarking.md)。
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
@@ -184,14 +184,14 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 - [文档总览](docs/README.md)
 - [模型支持矩阵](docs/models/README.md)
-- [Benchmark 口径](docs/benchmarking.md)
+- [Benchmark 口径](docs/guides/benchmarking.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
-- [DSpark speculative decoding](docs/dspark.md)
-- [FlashMemory 1M context](docs/FLASHMEMORY_1M_CONTEXT.md)
-- [MiniMax decode bottleneck 分析](docs/minimax_decode_bottleneck_analysis.md)
+- [DSpark speculative decoding](docs/performance/dspark.md)
+- [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
+- [MiniMax decode bottleneck 分析](docs/performance/minimax_decode_bottleneck_analysis.md)
 - [历史 2080 Ti 报告](docs/reports/dsv4_2080ti_report.pdf)
 
 ## Roadmap

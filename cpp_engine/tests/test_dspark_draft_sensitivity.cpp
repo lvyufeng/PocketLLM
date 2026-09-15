@@ -1,7 +1,7 @@
 // Does the DSpark draft actually respond to its inputs?
 //
 // The end-to-end accept rate is 0 for the real seed and equally 0 for a zeroed
-// one (docs/dspark.md), which an accept rate alone cannot explain: it is what
+// one (docs/performance/dspark.md), which an accept rate alone cannot explain: it is what
 // you would see both if the draft is merely bad and if the seed never reaches
 // it. This test asks the sharper question directly -- perturb one input at a
 // time and count how many drafted tokens change.

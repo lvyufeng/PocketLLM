@@ -161,7 +161,7 @@ python scripts/bench_single_request_latency.py /path/to/checkpoint
 python scripts/bench_concurrent_throughput.py /path/to/checkpoint
 ```
 
-See `docs/phase3.5_benchmark_guide.md` for detailed instructions.
+See `docs/archive/phase2-phase3/phase3_5_benchmark_guide.md` for detailed instructions.
 
 ---
 

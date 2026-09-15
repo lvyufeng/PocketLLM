@@ -91,7 +91,7 @@ be verified from here** — treat them as claims to re-check in place.
   previously no longer applies.
 - `api.github.com` is reachable but **intermittently times out**. `gh` commands — `gh pr list
   --json` in particular — may need a retry.
-- PyPI and Test PyPI are reachable over HTTPS. `docs/PYPI_RELEASE.md` documents the release flow and
+- PyPI and Test PyPI are reachable over HTTPS. `docs/guides/pypi_release.md` documents the release flow and
   where the credentials live.
 
 ## Ascend chip naming convention
@@ -103,7 +103,7 @@ which hardware you are on. The two generations need **separate AscendC kernel im
 retuned parameters**.
 
 Full table, platform_config layout, and the CMake variable that consumes it:
-[docs/ascend_soc_generations.md](docs/ascend_soc_generations.md).
+[docs/guides/ascend_soc_generations.md](docs/guides/ascend_soc_generations.md).
 
 ## Git workflow
 

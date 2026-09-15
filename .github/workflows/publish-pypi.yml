@@ -37,7 +37,7 @@ jobs:
         pip install "torch>=2.0,<2.7" --index-url https://download.pytorch.org/whl/cpu
 
     - name: Build package
-      # sdist only, matching the manual flow in docs/PYPI_RELEASE.md. Pre-built
+      # sdist only, matching the manual flow in docs/guides/pypi_release.md. Pre-built
       # wheels are a separate decision: they either ship without the C++ engine or
       # need a CUDA runner plus an explicit arch matrix.
       run: python -m build --sdist --no-isolation
@@ -67,7 +67,7 @@ jobs:
       #
       # A real `pip install` cannot be verified here. The sdist compiles CUDA
       # extensions, which needs a CUDA toolkit that GitHub-hosted runners do not
-      # have, so installation is verified locally per docs/PYPI_RELEASE.md.
+      # have, so installation is verified locally per docs/guides/pypi_release.md.
       env:
         EXPECTED_VERSION: ${{ steps.version.outputs.version }}
       run: |

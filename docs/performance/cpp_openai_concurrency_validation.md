@@ -25,7 +25,7 @@ The following remain outside this acceptance result:
 - Ascend batched decode
 - FP8/TurboQuant batched KV decode
 - SGLang: not installed and not measured. The SGLang comparison in
-  [vllm_sglang_architecture_analysis.md](vllm_sglang_architecture_analysis.md) is
+  [vllm_sglang_architecture_analysis.md](../architecture/vllm_sglang_architecture_analysis.md) is
   an architecture-level reading of its scheduler and cache, not a benchmark.
 
 ## Reproduction

@@ -1,6 +1,6 @@
 # PocketLLM C++/CUDA engine
 
-[Project home](../README.md) · [Model guides](../docs/models/README.md) · [Benchmarking](../docs/benchmarking.md)
+[Project home](../README.md) · [Model guides](../docs/models/README.md) · [Benchmarking](../docs/guides/benchmarking.md)
 
 `cpp_engine/` is PocketLLM's native C++/CUDA runtime and model-inspection layer. It currently contains performance-oriented DeepSeek-V4 paths, a validated Qwen3.8-27B-FP8 TP4 text runtime, GGUF/Safetensors readers, NCCL helpers, and model-specific CUDA tests.
 
@@ -77,7 +77,7 @@ CMake builds focused CUDA/numerical tests under `build/cpp_engine/tests/`, inclu
 - DSpark draft/verify parity and scheduling tests;
 - `bench_qwen_fp8_kernels` and `bench_dspark_decode` microbenchmarks.
 
-A kernel microbenchmark is not a model TPS result. End-to-end numbers must follow the repository's [benchmark reporting rules](../docs/benchmarking.md).
+A kernel microbenchmark is not a model TPS result. End-to-end numbers must follow the repository's [benchmark reporting rules](../docs/guides/benchmarking.md).
 
 ## Naming
 
