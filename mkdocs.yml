@@ -67,6 +67,35 @@ extra:
       link: https://pypi.org/project/pocketllm/
       name: pocketllm on PyPI
 
+plugins:
+  # Chinese search is broken without this block, and silently so: Material's Python
+  # side segments CJK with jieba and joins the pieces with U+200B, while the built-in
+  # separator "[\s\-]+" does not match U+200B. 363 of the 765 search entries are
+  # CJK-bearing, and every one of them is unreachable by its own words.
+  #
+  # The separator below is the one Material itself ships in
+  # templates/partials/languages/zh.html. It is written with backslash-u escapes
+  # rather than the literal characters so that a zero-width space stays visible in
+  # review; Python's `re` and the worker's `new RegExp` both accept the escapes.
+  #
+  # Listing "zh" is also what makes the search worker importScripts lunr.zh.min.js,
+  # lunr.multi.min.js and lunr.stemmer.support.min.js. Material already ships all
+  # three under assets/javascripts/lunr/min/, so this adds no dependency.
+  #
+  # Measured against the built index with Material's own lunr: ten single-term CJK
+  # queries went from 0 hits each to 8-66, while benchmark and prefill were unchanged.
+  # A multi-word Chinese query still needs a space between words: Material splits
+  # queries on whitespace only, never with jieba. That is upstream behaviour for the
+  # zh locale, not something this file can change.
+  #
+  # Declaring `plugins:` at all means this list is the whole list. A plugin added
+  # later has to be listed here, or it will not run.
+  - search:
+      lang:
+        - en
+        - zh
+      separator: '[\s\u200b\u3000\-、。，．？！；]+'
+
 nav:
   - Home: README.md
   - Getting started: getting-started.md
