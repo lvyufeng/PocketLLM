@@ -65,6 +65,13 @@ bool qwen_gqa_decode_attention_f16_ascend(const uint16_t* d_q_fp16, const uint16
 // its reduction pass; the CUDA backend has no such path and always answers false.
 bool qwen_gqa_decode_attention_cube_available_ascend(int q_heads, int kv_heads, int head_dim, int context_len, int max_context);
 
+// True when a prefill call of this shape will be served by the Cube path inside
+// qwen_gqa_prefill_attention_f16_ascend. The neutral prefill entry falls through to
+// the vector kernel on its own, so nothing in the engine has to ask; this exists for
+// callers that need to attribute a result to a kernel, since the fall-through leaves
+// no trace in the output. The CUDA backend has no such path and answers false.
+bool qwen_gqa_prefill_attention_cube_available_ascend(int q_heads, int kv_heads, int head_dim, int seq_len, int position_offset, int max_context);
+
 // FlashDecoding: Multi-core parallel decode attention for long context
 // d_partials_scratch: workspace for partial results, size = q_heads * num_partitions * (2 + head_dim) * sizeof(float)
 bool qwen_gqa_decode_attention_flashdec_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_partials_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int num_partitions, void* stream);

@@ -152,6 +152,33 @@ __aicore__ inline void load_half_exact(const AscendC::LocalTensor<half>& dst,
     }
 }
 
+// Row-strided fp16 tile load: `rows` rows of `row_len` halfs whose starts sit
+// `row_stride` apart in GM, packed contiguously in the destination.
+//
+// This is what a grouped-query KV cache needs whenever there is more than one KV
+// head. One head's rows are `head_dim` wide but the next position's row for the
+// same head is a whole `kv_heads * head_dim` away, so a contiguous copy of
+// `rows * head_dim` halfs pulls in the other heads' keys instead.
+//
+// DataCopyParams expresses exactly that shape, and its block length and strides
+// are counted in 32-byte units, so both the row and the gap have to be whole
+// units. The launcher's geometry check makes head_dim a multiple of 16 halfs, and
+// the gap is a whole number of rows, so both are.
+__aicore__ inline void load_half_strided(const AscendC::LocalTensor<half>& dst,
+                                         const AscendC::GlobalTensor<half>& src,
+                                         uint32_t offset, uint32_t rows,
+                                         uint32_t row_len, uint32_t row_stride) {
+    AscendC::DataCopyParams params;
+    params.blockCount = static_cast<uint16_t>(rows);
+    params.blockLen = static_cast<uint16_t>(row_len * sizeof(half) / 32);
+    params.srcStride =
+        static_cast<uint16_t>((row_stride - row_len) * sizeof(half) / 32);
+    params.dstStride = 0;
+    AscendC::DataCopy(dst, src[offset], params);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+}
+
 __aicore__ inline void store_half_exact(AscendC::GlobalTensor<half>& dst,
                                         uint32_t offset,
                                         const AscendC::LocalTensor<half>& src,

@@ -139,11 +139,12 @@ bool valid_attention(int q_heads, int kv_heads, int head_dim, int context_len,
            context_len > 0 && context_len <= max_context;
 }
 
-// The first vector path is intentionally limited to contiguous KV rows. The real
-// Qwen TP4 full-attention shape is kv_heads=1; other valid neutral shapes stay on
-// the scalar kernel until a strided UB loader is separately validated. The fast
-// path is enabled by default after hardware validation; set the switch to 0 for
-// an apples-to-apples scalar baseline.
+// The fast vector path scores a whole key tile per issue, which needs the cache
+// rows of one KV head to be addressable as a block. They are `head_dim` wide with
+// the other heads' rows in between whenever there is more than one KV head, so the
+// kernel's tile loader switches to a block-strided copy for those shapes; see
+// load_vector_rows. The switch below is only the scalar baseline control: set it
+// to 0 for an apples-to-apples comparison against the per-element kernel.
 bool vector_gqa_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("QWEN_ASCEND_GQA_VECTOR");
@@ -159,8 +160,11 @@ bool vector_attention_geometry(const void* q, const void* k, const void* v,
         return pointer != nullptr &&
                (reinterpret_cast<uintptr_t>(pointer) & (kAttentionAlignmentBytes - 1)) == 0;
     };
-    return vector_gqa_enabled() && q_heads > 0 && kv_heads == 1 &&
-           head_dim > 0 && head_dim <= kMaxAttentionHeadDim &&
+    // head_dim a multiple of 16 halfs is what keeps both the contiguous and the
+    // strided tile load on 32-byte block boundaries.
+    return vector_gqa_enabled() && q_heads > 0 && kv_heads > 0 &&
+           q_heads % kv_heads == 0 && head_dim > 0 &&
+           head_dim <= kMaxAttentionHeadDim &&
            head_dim % static_cast<int>(kAttentionAlignmentHalfs) == 0 && aligned(q) &&
            aligned(k) && aligned(v) && aligned(out);
 }
@@ -217,8 +221,20 @@ bool cube_gqa_enabled() {
 // The Cube path's preconditions that depend only on the shape. Split out from
 // cube_attention_geometry because the engine-side availability query has no
 // pointers to check, only a shape.
+//
+// One KV head per rank is part of the shape, not a tuning choice. A work item
+// covers a whole query head group stacked as rows, and both the Q read and the
+// output store treat it as one uniformly strided run -- which it is only when the
+// group is the whole head axis. With more KV heads the group boundary falls inside
+// the tile and no single pitch describes it, so those shapes take the vector
+// kernel, whose tile loader skips the interleaved heads.
+//
+// Stated here rather than only in cube_prefill_attention because this is the one
+// place the dispatcher and the engine-side availability query both read; when the
+// two disagreed, the dispatcher tried a launch the entry refused and the shape
+// silently ran on the vector kernel wearing the Cube path's name.
 bool cube_attention_shape_ok(int q_heads, int kv_heads, int head_dim) {
-    return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 && head_dim > 0 &&
+    return q_heads > 0 && kv_heads == 1 && q_heads % kv_heads == 0 && head_dim > 0 &&
            head_dim <= kMaxAttentionHeadDim &&
            head_dim % static_cast<int>(kAttentionAlignmentHalfs) == 0;
 }
@@ -269,14 +285,10 @@ bool cube_prefill_attention(const uint16_t* d_q_rows_fp16,
     const uint32_t score_stride = (limit + kCubeChunk - 1) / kCubeChunk * kCubeChunk;
     const uint32_t head = static_cast<uint32_t>(head_dim);
     if (score_stride == 0 || score_stride > kCubeMaxScoreStride) return false;
-    // One KV head. A work item stacks a whole head group as the tile's rows, and
-    // the prefill entry reads those rows from Q and writes them to the output as
-    // one uniformly strided run -- which they are only when the group is the whole
-    // head axis. With more KV heads the group boundary sits inside the tile and no
-    // single pitch describes it, so the shape belongs to the vector kernel. The
-    // decode-partitioned entry below has no such restriction: it stacks one
-    // position, which is contiguous for any kv_heads.
-    if (kv_heads != 1) return false;
+    // The single-KV-head precondition is cube_attention_shape_ok's; it is not
+    // repeated here. The device entry carries it as well, so a caller that reaches
+    // the kernel without passing through the shape check still cannot launch a
+    // geometry the tile staging cannot express.
 
     uint32_t rows_per_tile = 1;
     while (rows_per_tile * 2 * repeat <= kCubeMaxStackedRows) rows_per_tile *= 2;
@@ -796,10 +808,31 @@ bool qwen_gqa_decode_attention_cube_available_ascend(int q_heads, int kv_heads,
                                                      int max_context) {
     if (!cube_gqa_enabled()) return false;
     if (!cube_attention_shape_ok(q_heads, kv_heads, head_dim)) return false;
-    if (kv_heads != 1) return false;
     if (context_len <= 0 || context_len > max_context) return false;
     const uint32_t score_stride =
         (static_cast<uint32_t>(context_len) + kCubeChunk - 1) / kCubeChunk * kCubeChunk;
+    return score_stride != 0 && score_stride <= kCubeMaxScoreStride;
+}
+
+// The prefill counterpart. The engine's dispatch needs no query here -- the
+// neutral entry falls through to the vector kernel on its own -- but the numeric
+// test does: the fall-through is invisible from outside, so a run that reports a
+// Cube column has no way to tell whether the Cube kernel or the vector kernel
+// produced it, and at a grouped shape it is always the latter. Asking the same
+// predicate the dispatcher asks is the only answer that cannot drift from it.
+bool qwen_gqa_prefill_attention_cube_available_ascend(int q_heads, int kv_heads,
+                                                      int head_dim, int seq_len,
+                                                      int position_offset,
+                                                      int max_context) {
+    if (!cube_gqa_enabled()) return false;
+    if (!cube_attention_shape_ok(q_heads, kv_heads, head_dim)) return false;
+    if (seq_len <= 0 || position_offset < 0 ||
+        position_offset + seq_len > max_context) {
+        return false;
+    }
+    const uint32_t score_stride =
+        (static_cast<uint32_t>(position_offset + seq_len) + kCubeChunk - 1) /
+        kCubeChunk * kCubeChunk;
     return score_stride != 0 && score_stride <= kCubeMaxScoreStride;
 }
 
