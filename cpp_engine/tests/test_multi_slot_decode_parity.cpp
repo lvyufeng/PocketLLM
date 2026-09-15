@@ -55,13 +55,26 @@
 //      reported rather than asserted, because asserting a defect this test
 //      cannot fix would leave it permanently red. --compare reads the first
 //      recording, so both world sizes are compared under the same protocol.
+//   6. batched decode        -- the real batched forward against the per-request
+//      loop, under POCKETLLM_CPP_BATCHED_DECODE. The two are not the same
+//      arithmetic (a two-row GEMM picks different tiles than two one-row GEMMs),
+//      so this case reuses case 5's membership criterion rather than asserting
+//      equality: per row, the batched arm must reproduce the serial chain or
+//      diverge only at a step where each arm still ranks the other's token in its
+//      own top-k. The env-var contract is pinned from the other side in the same
+//      case -- unset, "0" and "0 again after a batched arm" all have to produce
+//      one identical chain, which is what keeps the default path bit-for-bit the
+//      engine that existed before batching.
 //
 // Multi-slot schedules are deliberately NOT driven at tp_world > 1, and the test
 // says so rather than reporting a green result it did not earn:
 // WorkerCommand::Prefill and ::DecodeStep carry no slot id on the command
 // channel, so worker ranks would fill slot 0 for every row while rank 0 filled
-// the row's own slot. Closing that protocol gap belongs to the batched-decode
-// work, and a test cannot paper over it.
+// the row's own slot. ::BatchDecode now does carry one, but a decode-only fix
+// does not help while the prefill that filled the ring carries none: row 1's
+// worker-side attention would read slot 0's ring. So cases 1-4 and 6 stay
+// tp_world 1 only, and closing the prefill half of that protocol gap is what
+// would make case 6 meaningful at tp_world > 1.
 //
 //   test_multi_slot_decode_parity <ckpt_dir> [layers=4] [steps=8] [prompt_len=6]
 //                                 [tp_world=1] [tp_rank=0] [nccl_id_path]
@@ -95,6 +108,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace pocket;
@@ -784,6 +798,224 @@ bool both_runs_rank_the_other_token(const Step& a, const Step& b,
     return true;
 }
 
+// Case 6: two rows through batch_decode_step(), recording each row's token
+// together with the top-k of the slot that row used. `batched_steps` is read
+// around the drive so the caller can tell which forward the arm actually ran --
+// a silently-serial arm would otherwise look like a passing one.
+struct PairRun {
+    std::vector<std::vector<Step>> chains;
+    int64_t batched_steps = 0;
+};
+
+PairRun run_pair_recorded(PersistentEngine& engine,
+                          const std::vector<int>& first,
+                          const std::vector<int>& second,
+                          int steps,
+                          const SamplingParams& sp) {
+    engine.reset_session();
+    Row row0(0, first);
+    Row row1(1, second);
+    prefill_row(engine, row0, sp);
+    prefill_row(engine, row1, sp);
+    std::vector<Row*> rows{&row0, &row1};
+
+    PairRun out;
+    out.chains.resize(rows.size());
+    const int64_t before = engine.batched_decode_steps();
+    for (int step = 0; step < steps; ++step) {
+        std::vector<PersistentBatchRequest> batch;
+        batch.reserve(rows.size());
+        for (const Row* row : rows) {
+            PersistentBatchRequest req;
+            req.last_token = row->last_token;
+            req.position = row->position;
+            req.slot_id = row->slot;
+            req.sampling = sp;
+            batch.push_back(req);
+        }
+        const std::vector<int> tokens = engine.batch_decode_step(batch);
+        check(tokens.size() == rows.size(),
+              "case 6: batch_decode_step returned " + std::to_string(tokens.size()) +
+                  " row(s) for " + std::to_string(rows.size()) + " requests");
+        if (tokens.size() != rows.size()) break;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            Step recorded;
+            recorded.token = tokens[i];
+            // Per row, on the row's own slot: this is the plumbing the batched
+            // arm needs so that N rows in one forward are still N readable
+            // recordings rather than one overwritten by the last row.
+            recorded.topk_tokens = engine.last_topk_tokens(rows[i]->slot);
+            recorded.topk_logits = engine.last_topk_logits(rows[i]->slot);
+            if (!recorded.topk_tokens.empty()) {
+                check(recorded.topk_tokens.front() == recorded.token,
+                      "case 6 step " + std::to_string(step) + " row " +
+                          std::to_string(i) + " (slot " +
+                          std::to_string(rows[i]->slot) +
+                          "): the top-k diagnostic ranks token " +
+                          std::to_string(recorded.topk_tokens.front()) +
+                          " first but the run chose " +
+                          std::to_string(recorded.token) +
+                          "; the row diagnostics are landing on the wrong slot");
+            }
+            out.chains[i].push_back(std::move(recorded));
+            rows[i]->last_token = tokens[i];
+            rows[i]->position += 1;
+            rows[i]->chain.push_back(tokens[i]);
+        }
+    }
+    out.batched_steps = engine.batched_decode_steps() - before;
+    if (rows.size() == 2 && row0.chain == row1.chain) {
+        note("case 6: the two rows produced the same chain; a leak between them "
+             "would be invisible in this pair");
+    }
+    return out;
+}
+
+// Compare a serial chain against a batched one. They are comparable only up to
+// the first difference -- past it the two runs were fed different contexts -- so
+// the first difference is judged once, by the same membership criterion case 5
+// applies across world sizes, and reported with its margins.
+void compare_arms(const std::string& label,
+                  const std::vector<Step>& serial,
+                  const std::vector<Step>& batched) {
+    size_t step = 0;
+    while (step < serial.size() && step < batched.size() &&
+           serial[step].token == batched[step].token) {
+        ++step;
+    }
+    if (step == serial.size() && step == batched.size()) {
+        std::cout << "  " << label << ": serial and batched agree on all " << step
+                  << " token(s)\n";
+        return;
+    }
+    std::string detail;
+    const bool ranked =
+        both_runs_rank_the_other_token(serial[step], batched[step], &detail);
+    check(ranked, label + ": the serial and batched arms chose different tokens at "
+                  "step " + std::to_string(step) + " (" +
+                  std::to_string(serial[step].token) + " vs " +
+                  std::to_string(batched[step].token) + ") and " + detail);
+    if (ranked) {
+        std::cout << "  " << label << ": agree for " << step
+                  << " token(s), then diverge at step " << step << " -- " << detail
+                  << "\n";
+    }
+}
+
+// Case 6. Four arms over the identical schedule, so the only variable is the
+// fork inside batch_decode_step():
+//
+//   unset     -- the default, and the baseline every later arm is read against
+//   "0"       -- has to reproduce `unset` token for token. The switch is written
+//                so that anything but a non-zero value stays serial; this arm is
+//                what keeps that promise from drifting into "any value enables it".
+//   "1"       -- the batched forward, compared to `unset` by margin
+//   unset #2  -- has to reproduce `unset` exactly. A batched arm that left the
+//                journal or the row-keyed workspace mid-transaction would show up
+//                here and nowhere else.
+void test_batched_decode(PersistentEngine& engine,
+                         const std::vector<std::vector<int>>& prompts,
+                         int steps,
+                         const SamplingParams& sp) {
+    std::cout << "\n=== 6. batched decode forward vs the per-request loop ===\n";
+
+    const char* const kSwitch = "POCKETLLM_CPP_BATCHED_DECODE";
+    const std::string saved = [kSwitch] {
+        const char* value = std::getenv(kSwitch);
+        return value == nullptr ? std::string() : std::string(value);
+    }();
+    struct EnvRestore {
+        std::string name;
+        std::string value;
+        ~EnvRestore() {
+            if (value.empty()) {
+                unsetenv(name.c_str());
+            } else {
+                setenv(name.c_str(), value.c_str(), 1);
+            }
+        }
+    } restore{kSwitch, saved};
+
+    // Equal-length rows sit at the same positions, so the only thing the batched
+    // arm has to get right is which ring each row reads and publishes.
+    // Unequal-length rows sit at different positions, which is what a server
+    // serving two requests looks like and what any forward that ropes every row
+    // from one scalar start_position gets wrong.
+    std::vector<int> shorter = prompts[2];
+    if (shorter.size() > 3) shorter.resize(shorter.size() - 2);
+    const std::pair<std::vector<int>, std::vector<int>> pairs[] = {
+        {prompts[0], prompts[1]},
+        {prompts[0], shorter},
+    };
+    const char* const pair_names[] = {"equal-length rows", "unequal-length rows"};
+
+    for (size_t i = 0; i < sizeof(pairs) / sizeof(pairs[0]); ++i) {
+        const std::vector<int>& first = pairs[i].first;
+        const std::vector<int>& second = pairs[i].second;
+        const std::string tag = std::string("case 6 (") + pair_names[i] + ")";
+        std::cout << "  -- " << pair_names[i] << " --\n";
+
+        unsetenv(kSwitch);
+        const PairRun baseline = run_pair_recorded(engine, first, second, steps, sp);
+        check(baseline.batched_steps == 0,
+              tag + ": an unset variable ran the batched forward " +
+                  std::to_string(baseline.batched_steps) + " time(s)");
+
+        setenv(kSwitch, "0", 1);
+        const PairRun off = run_pair_recorded(engine, first, second, steps, sp);
+        check(off.batched_steps == 0,
+              tag + ": POCKETLLM_CPP_BATCHED_DECODE=0 ran the batched forward " +
+                  std::to_string(off.batched_steps) + " time(s)");
+
+        setenv(kSwitch, "1", 1);
+        const PairRun on = run_pair_recorded(engine, first, second, steps, sp);
+        check(on.batched_steps == steps,
+              tag + ": the batched arm took the batched forward " +
+                  std::to_string(on.batched_steps) + " time(s) for " +
+                  std::to_string(steps) +
+                  " step(s), so this arm did not run the path it claims to test");
+
+        unsetenv(kSwitch);
+        const PairRun after = run_pair_recorded(engine, first, second, steps, sp);
+        check(after.batched_steps == 0,
+              tag + ": the post-batched serial arm ran the batched forward " +
+                  std::to_string(after.batched_steps) + " time(s)");
+
+        for (size_t row = 0; row < baseline.chains.size(); ++row) {
+            const std::string label =
+                tag + " row " + std::to_string(row) + " (slot " +
+                std::to_string(row) + ")";
+            const std::vector<int> base_tokens = tokens_of(baseline.chains[row]);
+
+            // Bit-for-bit, not "close": this compares two runs of the same
+            // serial path, so a difference here is the switch leaking or the
+            // path having moved.
+            const std::vector<int> off_tokens = tokens_of(off.chains[row]);
+            check(off_tokens == base_tokens,
+                  label + ": an explicit POCKETLLM_CPP_BATCHED_DECODE=0 does not "
+                          "reproduce an unset variable");
+            if (off_tokens != base_tokens) {
+                report_mismatch(label + " unset vs \"0\"", base_tokens, off_tokens);
+            }
+
+            const std::vector<int> after_tokens = tokens_of(after.chains[row]);
+            check(after_tokens == base_tokens,
+                  label + ": a serial run after a batched one does not reproduce "
+                          "the serial baseline, so the batched arm left state behind");
+            if (after_tokens != base_tokens) {
+                report_mismatch(label + " baseline vs after-batched", base_tokens,
+                                after_tokens);
+            }
+
+            compare_arms(label + " serial vs batched", baseline.chains[row],
+                         on.chains[row]);
+        }
+        check(tokens_of(baseline.chains[0]) != tokens_of(baseline.chains[1]),
+              tag + ": both rows produced identical chains, so this fixture "
+                    "cannot show a row reading its neighbour's cache");
+    }
+}
+
 int compare_files(const std::string& a_path, const std::string& b_path) {
     std::vector<std::vector<Step>> a;
     std::vector<std::vector<Step>> b;
@@ -906,6 +1138,18 @@ int main(int argc, char** argv) {
         setenv("POCKETLLM_CPP_TOPK_DIAG", "8", 1);
     }
 
+    // Cases 1-4 are the pre-batching contract and are only meaningful on the
+    // serial path, so the test owns the switch rather than inheriting it from the
+    // shell: it clears it here, and case 6 sets both values itself. A stale
+    // export in the environment would otherwise turn a clean checkout into four
+    // confusing failures.
+    if (const char* batched = std::getenv("POCKETLLM_CPP_BATCHED_DECODE");
+        batched != nullptr && *batched != '\0') {
+        std::cout << "  note: ignoring an inherited POCKETLLM_CPP_BATCHED_DECODE="
+                  << batched << "; case 6 arms the switch itself\n";
+        unsetenv("POCKETLLM_CPP_BATCHED_DECODE");
+    }
+
     if (device_backend() != DeviceBackend::Cuda) {
         std::cerr << "SKIP: PersistentEngine requires the CUDA backend\n";
         return 0;
@@ -998,6 +1242,10 @@ int main(int argc, char** argv) {
             test_drive_order(engine, prompts, steps, sp);
             test_slot_reuse(engine, prompts, steps, sp);
             test_cancellation(engine, prompts, steps, sp);
+            // Last, because it is the only case that arms
+            // POCKETLLM_CPP_BATCHED_DECODE: the cases above must have run on the
+            // default path, and it restores the variable on the way out.
+            test_batched_decode(engine, prompts, steps, sp);
 
             // Where the repeat does hold it is a contract, not a curiosity: the
             // slot-reuse case above depends on it.

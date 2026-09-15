@@ -918,9 +918,13 @@ bool indexed_cached_attention_rows_cuda(
 // address d_batch_kv[-index - 2]. Keeping current rows separate prevents a later
 // row in a wrapping block from overwriting history still visible to an earlier
 // row. -1 remains an invalid/padding index.
+// `d_row_kv_offset`, when non-null, holds one element offset per row into
+// `d_kv_cache`: rows that belong to different requests index different KV rings.
+// Pass nullptr when every row shares one ring.
 bool indexed_cached_attention_rows_batch_kv_cuda(
     const float* d_q,
     const float* d_kv_cache,
+    const int* d_row_kv_offset,
     const float* d_batch_kv,
     const int32_t* d_row_starts,
     const int32_t* d_indices,
@@ -1035,6 +1039,22 @@ bool head_rmsnorm_rope_freqs_rows_cuda(
     int head_dim,
     int rope_dim,
     int start_position,
+    bool inverse,
+    float eps,
+    void* stream = nullptr);
+
+// Same as above, except each row's absolute position is read from d_positions[row]
+// instead of being start_position + row. Use this whenever the rows in one launch
+// do not form a contiguous position run -- i.e. whenever they belong to different
+// requests.
+bool head_rmsnorm_rope_freqs_rows_positions_cuda(
+    float* d_x,
+    const float* d_inv_freqs,
+    const int* d_positions,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
     bool inverse,
     float eps,
     void* stream = nullptr);

@@ -189,9 +189,15 @@ public:
     // descending logit order. Only populated when POCKETLLM_CPP_TOPK_DIAG > 0, and
     // only on rank 0 at TP > 1 (the only rank holding the whole vocabulary).
     // Read-only diagnostic: it reuses the selection's existing gather and does
-    // not add a collective or change the sampled token.
-    const std::vector<int>& last_topk_tokens() const;
-    const std::vector<float>& last_topk_logits() const;
+    // not add a collective or change the sampled token. The slot argument selects
+    // which request's recording to read; a batched decode writes one per row.
+    const std::vector<int>& last_topk_tokens(int slot_id = 0) const;
+    const std::vector<float>& last_topk_logits(int slot_id = 0) const;
+
+    // How many batch_decode_step() calls ran the batched forward instead of the
+    // per-request loop. Diagnostic: a test needs it to prove that the
+    // POCKETLLM_CPP_BATCHED_DECODE arm it ran was not silently the serial one.
+    int64_t batched_decode_steps() const;
 
     int eos_id() const;
     int max_context() const;
