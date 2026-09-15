@@ -22,6 +22,16 @@ enum class OpenAiEndpoint {
 // enough that no ordinary client reaches it.
 inline constexpr int kMaxChoices = 128;
 
+// The largest number of ranked alternatives per position this server accepts,
+// from either endpoint's spelling of it -- `top_logprobs` on chat, `logprobs` on
+// /v1/completions. Like kMaxChoices this is a fixed server limit rather than
+// something the engine declares: each alternative is ranked for every generated
+// position, so the count bounds a per-token cost, and it is set above the
+// documented OpenAI range (20 on chat, 5 on completions) so that no ordinary
+// client reaches it. The sampler retains 64 candidates, so a request inside this
+// limit is always served in full rather than truncated.
+inline constexpr int kMaxLogprobAlternatives = 20;
+
 // Outcome of auditing a request body against what this server actually does.
 struct RequestFieldCheck {
     bool ok = true;
@@ -41,6 +51,14 @@ struct RequestFieldCheck {
 // value names what this server does anyway -- n=1, logprobs=false, penalties of
 // zero, an empty stop list -- is accepted, so clients that send the defaults
 // explicitly are not punished for it.
+//
+// A field this server does implement is audited for shape and range rather than
+// refused, and holds its place here because the endpoint difference is part of
+// the same audit: `logprobs` is a boolean on chat and a count on /v1/completions,
+// and `top_logprobs` exists only on the first. Asking for log probabilities on a
+// streaming request is refused for the same reason -- the chunks this server
+// streams carry no ranking, so the answer would look like one whose request asked
+// for none.
 //
 // The alternative was the behaviour this replaces: `n=3` returning one choice
 // and `logprobs=true` returning no logprobs, both with a 200 and no indication

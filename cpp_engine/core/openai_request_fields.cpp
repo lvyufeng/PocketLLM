@@ -26,6 +26,14 @@ bool is_default_bool(const JsonValue* value, bool expected) {
            (value->is_bool() && value->boolean() == expected);
 }
 
+// A count field, as opposed to a measure: 2 is one, 2.5 is not. Folding this into
+// the range checks below would report 2.5 as out of range, which points the
+// caller at the wrong half of the mistake.
+bool is_whole_number(const JsonValue* value) {
+    return !absent_or_null(value) && value->is_number() &&
+           value->number() == std::floor(value->number());
+}
+
 std::string quote(const std::string& s) {
     std::string out = "\"";
     for (char c : s) {
@@ -123,6 +131,13 @@ RequestFieldCheck refuse(const std::string& field, const JsonValue& requested,
 RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint endpoint) {
     const bool chat = endpoint == OpenAiEndpoint::ChatCompletions;
 
+    // Read here rather than where "stream_options" needs it, because whether the
+    // response is streamed decides whether asking for log probabilities can be
+    // served at all, and that question is settled with the logprobs block below.
+    const JsonValue* stream_value = object_get(body, "stream");
+    const bool streaming = stream_value != nullptr && stream_value->is_bool() &&
+                           stream_value->boolean();
+
     RequestFieldCheck check;
 
     // How many completions come back. The server submits one scheduler request
@@ -161,29 +176,102 @@ RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint en
                       "Send \"stop\" as a string or an array of strings.");
     }
 
-    // Per-token log probabilities.
-    value = object_get(body, "logprobs");
-    if (!absent_or_null(value)) {
-        // Chat takes a boolean, and false -- the default -- asks for nothing.
-        // /v1/completions takes a count, where even 0 asks for the sampled
-        // token's logprob, so no value is inert on that endpoint.
-        const bool inert = chat && value->is_bool() && !value->boolean();
-        if (!inert) {
-            return refuse("logprobs", *value,
-                          "no \"logprobs\" object is returned on any choice.",
-                          chat ? "Remove \"logprobs\", or set it to false."
-                               : "Remove \"logprobs\".");
+    // Per-token log probabilities. Both fields are implemented, so what is left
+    // to refuse is a value this server cannot act on.
+    //
+    // The two endpoints spell the same request differently and the difference is
+    // not cosmetic: chat takes `logprobs` as a boolean and puts the number of
+    // ranked alternatives in `top_logprobs`, while /v1/completions takes one
+    // count in `logprobs` where even 0 includes the sampled token's own
+    // probability. A boolean is meaningless on the second and a count on the
+    // first, so each is checked against the endpoint that defines it.
+    const JsonValue* logprobs_value = object_get(body, "logprobs");
+    const JsonValue* top_logprobs_value = object_get(body, "top_logprobs");
+    if (chat) {
+        if (!absent_or_null(logprobs_value) && !logprobs_value->is_bool()) {
+            return refuse("logprobs", *logprobs_value,
+                          "the chat endpoint takes a boolean: true asks for the "
+                          "sampled token's own log probability, plus any "
+                          "alternatives named in \"top_logprobs\".",
+                          "Send \"logprobs\" as true or false, or omit it.");
+        }
+    } else if (!absent_or_null(logprobs_value)) {
+        // The count is what bounds the work: every alternative is ranked per
+        // generated position, so an unbounded count would ask the sampler for a
+        // ranking wider than it keeps and the response for a list longer than a
+        // caller can use.
+        if (!is_whole_number(logprobs_value) || logprobs_value->number() < 0.0 ||
+            logprobs_value->number() > static_cast<double>(kMaxLogprobAlternatives)) {
+            std::ostringstream os;
+            os << "the number of alternatives to rank per position is a whole "
+               << "number from 0 to " << kMaxLogprobAlternatives << ".";
+            return refuse("logprobs", *logprobs_value, os.str(),
+                          "Lower \"logprobs\" to " +
+                              std::to_string(kMaxLogprobAlternatives) +
+                              " or less; 0 reports the sampled token's own "
+                              "probability and no alternatives.");
         }
     }
-    // A count of alternatives to rank per position. Only 0 -- the default -- asks
-    // for nothing; a negative count is outside the documented range rather than a
-    // larger default, so it is refused along with everything above zero.
-    value = object_get(body, "top_logprobs");
-    if (!absent_or_null(value) && !(value->is_number() && value->number() == 0.0)) {
-        return refuse("top_logprobs", *value,
-                      "there are no per-token logprobs, so there is no set of "
-                      "alternatives to rank.",
-                      "Remove \"top_logprobs\".");
+    if (chat && !absent_or_null(top_logprobs_value)) {
+        if (!is_whole_number(top_logprobs_value) ||
+            top_logprobs_value->number() < 0.0 ||
+            top_logprobs_value->number() >
+                static_cast<double>(kMaxLogprobAlternatives)) {
+            std::ostringstream os;
+            os << "the number of alternatives to rank per position is a whole "
+               << "number from 0 to " << kMaxLogprobAlternatives << ".";
+            return refuse("top_logprobs", *top_logprobs_value, os.str(),
+                          "Lower \"top_logprobs\" to " +
+                              std::to_string(kMaxLogprobAlternatives) +
+                              " or less; 0 reports the sampled token's own "
+                              "probability and no alternatives.");
+        }
+        // Alternatives exist only for a request that asked for log
+        // probabilities, so naming a count is a request for something this one
+        // never turns on -- and answering it with no "logprobs" object at all
+        // reads as a server that ignored the field. A count of 0 asks for no
+        // alternatives, which is what this request produces anyway, so it is
+        // inert on its own and accepted.
+        if (top_logprobs_value->number() > 0.0 &&
+            !(logprobs_value != nullptr && logprobs_value->is_bool() &&
+              logprobs_value->boolean())) {
+            return refuse("top_logprobs", *top_logprobs_value,
+                          "alternatives are reported only for a request that "
+                          "asks for log probabilities, and this one's "
+                          "\"logprobs\" is absent or false.",
+                          "Set \"logprobs\" to true, or remove \"top_logprobs\".");
+        }
+    } else if (!chat && !absent_or_null(top_logprobs_value)) {
+        return refuse("top_logprobs", *top_logprobs_value,
+                      "the completions endpoint names the number of "
+                      "alternatives in \"logprobs\" itself.",
+                      "Put the count in \"logprobs\" and remove "
+                      "\"top_logprobs\".");
+    }
+
+    // Log probabilities are reported on a non-streaming response only. A chunk
+    // carries the text of the token it delivers, so a ranking for that token
+    // would have to travel beside it -- a different wire shape from the one this
+    // server streams. Answering anyway would produce a stream that is
+    // indistinguishable from one whose request asked for no ranking at all,
+    // which is the failure this whole function exists to prevent.
+    //
+    // What counts as asking differs by endpoint: false is off on chat, while
+    // /v1/completions spells the same thing as the count 0, where 0 is already a
+    // real request for the sampled token's own probability. The block above
+    // validated both spellings, so this reads them rather than re-deriving them.
+    if (streaming) {
+        const bool asked = chat
+            ? (logprobs_value != nullptr && logprobs_value->is_bool() &&
+               logprobs_value->boolean())
+            : is_whole_number(logprobs_value);
+        if (asked) {
+            return refuse("logprobs", *logprobs_value,
+                          "log probabilities are reported on a non-streaming "
+                          "response, and a streamed chunk carries the text of "
+                          "its token with no ranking beside it.",
+                          "Remove \"stream\", or remove \"logprobs\".");
+        }
     }
 
     // Repetition controls. The sampler has neither term, so a request naming
@@ -217,9 +305,6 @@ RequestFieldCheck check_request_fields(const JsonObject& body, OpenAiEndpoint en
     // response: a non-streaming completion already carries "usage", which is
     // the whole thing the option asks for, so only a streaming request is
     // actually losing anything.
-    const JsonValue* stream_value = object_get(body, "stream");
-    const bool streaming = stream_value != nullptr && stream_value->is_bool() &&
-                           stream_value->boolean();
     value = object_get(body, "stream_options");
     if (streaming && value != nullptr && value->is_object()) {
         const JsonValue* include_usage = object_get(value->object(), "include_usage");

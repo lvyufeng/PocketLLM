@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -555,15 +556,64 @@ struct OpenAIServer::Impl {
         return false;
     }
 
+    // What one request asked for in the way of per-token log probabilities,
+    // reduced to the two numbers the engine and the response need.
+    //
+    // `width` is what the engine ranks with, and it is 0 only when the client
+    // asked for nothing: a client that wants the sampled token's own probability
+    // and no alternatives still wants one number per position, so its width is 1
+    // even though `alternatives` is 0. Those two differ exactly in that case,
+    // which is why they are kept apart -- the width is the sampler's argument and
+    // the count is how much of the ranking is written out.
+    struct LogprobsSpec {
+        int width = 0;
+        int alternatives = 0;
+        bool asked() const { return width > 0; }
+    };
+
+    // Reads the two fields that ask for log probabilities into that pair. The
+    // audit has already established the shape is one this server accepts, for the
+    // endpoint the request came in on, so what is left is combining the fields
+    // and confirming the engine can produce a ranking at all.
+    bool parse_logprobs(const JsonObject& obj, OpenAiEndpoint endpoint,
+                        LogprobsSpec& out, std::string& err_out) const {
+        const bool chat = endpoint == OpenAiEndpoint::ChatCompletions;
+        const JsonValue* value = object_get(obj, "logprobs");
+        int alternatives = 0;
+        if (chat) {
+            if (value == nullptr || !value->is_bool() || !value->boolean()) return true;
+            const JsonValue* top = object_get(obj, "top_logprobs");
+            if (top != nullptr && top->is_number()) {
+                alternatives = static_cast<int>(top->number());
+            }
+        } else {
+            if (value == nullptr || !value->is_number()) return true;
+            alternatives = static_cast<int>(value->number());
+        }
+        if (!sched.engine_caps().logprobs) {
+            err_out = "this engine does not report per-token log probabilities "
+                      "(\"logprobs\"). Omit the field, or run an engine "
+                      "configuration that ranks them.";
+            return false;
+        }
+        out.width = std::max(alternatives, 1);
+        out.alternatives = alternatives;
+        return true;
+    }
+
     bool encode_request(const std::string& body, const JsonObject& obj,
                         EncodeReply& out, std::string& thinking_mode_out,
                         int& max_tokens_out, bool& stream_out,
                         BatchSamplingParams& sp_out, std::string& request_id_out,
                         std::shared_ptr<TokenConstraint>& constraint_out,
-                        std::string& err_out) {
+                        LogprobsSpec& logprobs_out, std::string& err_out) {
         if (!check_sampling_supported(obj, err_out)) return false;
 
         if (!parse_response_format(obj, constraint_out, err_out)) return false;
+
+        if (!parse_logprobs(obj, OpenAiEndpoint::ChatCompletions, logprobs_out, err_out)) {
+            return false;
+        }
 
         EncodeRequest enc;
         enc.messages_json = extract_messages_json(body);
@@ -594,6 +644,7 @@ struct OpenAIServer::Impl {
         sp_out.top_k = static_cast<int>(get_number(obj, "top_k", 20));
         sp_out.seed = static_cast<unsigned long long>(get_number(obj, "seed", 0));
         sp_out.max_new_tokens = max_tokens_out;
+        sp_out.logprobs_n = logprobs_out.width;
 
         out = sidecar.encode(enc);
         if (!out.ok) {
@@ -672,8 +723,9 @@ struct OpenAIServer::Impl {
         BatchSamplingParams sp;
         std::string client_id;
         std::shared_ptr<TokenConstraint> constraint;
+        LogprobsSpec logprobs;
         std::string err;
-        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, constraint, err)) {
+        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, constraint, logprobs, err)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
@@ -715,7 +767,7 @@ struct OpenAIServer::Impl {
                           client_id, request_start);
         } else {
             handle_nonstream(res, enc_reply, sp, constraints, stops, thinking_mode,
-                             client_id, request_start);
+                             client_id, logprobs, request_start);
         }
     }
 
@@ -815,6 +867,18 @@ struct OpenAIServer::Impl {
         sp.seed = static_cast<unsigned long long>(get_number(obj, "seed", 0));
         sp.max_new_tokens = max_tokens;
 
+        // This endpoint names the count in "logprobs" itself, where even 0 asks
+        // for the sampled token's own probability; the chat handler's spelling of
+        // the same request is a boolean plus "top_logprobs", so the two go
+        // through different readers.
+        LogprobsSpec logprobs;
+        if (!parse_logprobs(obj, OpenAiEndpoint::Completions, logprobs, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
+        }
+        sp.logprobs_n = logprobs.width;
+
         if (static_cast<int>(tok_reply.token_ids.size()) + max_tokens > engine.max_context()) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, "prompt + max_tokens exceeds max_context");
@@ -851,7 +915,7 @@ struct OpenAIServer::Impl {
                                       request_start, res);
         } else {
             handle_completions_nonstream(enc_reply, sp, constraints, stops, client_id,
-                                         request_start, res);
+                                         logprobs, request_start, res);
         }
     }
 
@@ -885,6 +949,10 @@ struct OpenAIServer::Impl {
         std::string finish_reason;
         std::string text;
         std::size_t completion_tokens = 0;
+        // The choice's OpenAI "logprobs" object, serialized at the point the text
+        // was cut so the two cover the same positions, or empty when the request
+        // asked for none.
+        std::string logprobs_json;
     };
 
     // One grammar per choice.
@@ -984,6 +1052,105 @@ struct OpenAIServer::Impl {
         tracked_requests_.erase(client_id);
     }
 
+    // Whether the engine reported a ranking for every position it was asked
+    // about. A ranking that arrives short would leave the response's "content"
+    // array describing fewer positions than the text covers, and a caller reading
+    // a probability per token has no way to notice the two drifted apart -- so
+    // the choice is failed instead of reported with less than was asked for.
+    //
+    // The comparison is against the tokens the engine generated, before the stop
+    // token is stripped: the ranking is parallel to that vector, not to the text.
+    static bool ranking_complete(const SchedulerGenerationResult& out,
+                                 const LogprobsSpec& spec) {
+        if (!spec.asked()) return true;
+        if (out.logprobs.size() != out.generated_tokens.size()) return false;
+        for (const TokenLogprob& entry : out.logprobs) {
+            if (!entry.present) return false;
+        }
+        return true;
+    }
+
+    // Renders the OpenAI "logprobs" object for one choice, or an empty string when
+    // the client asked for none.
+    //
+    // The shape is the one the Python server produces, so a caller cannot tell
+    // which engine answered: a "content" array with one entry per token, each
+    // carrying the token's text, its log probability, the UTF-8 bytes of that
+    // text, and -- only when the request named a count -- that position's ranked
+    // alternatives. The bytes are there because the text alone does not say where
+    // a token begins and ends: a caller reassembling an answer from token
+    // boundaries needs them, and a piece whose text decodes to nothing (a special
+    // token, say) is invisible without them.
+    //
+    // `tokens` and `rankings` are parallel, and `rankings` also covers tokens the
+    // text below does not: the ranking is produced for everything the engine
+    // generated, while `text_bytes` is where the caller's own stop sequence ended
+    // the answer, possibly inside a token. Walking the surfaces until they reach
+    // that byte is what cuts the two to the same positions -- a probability
+    // reported for text the caller never received describes a position it cannot
+    // line up against anything.
+    std::string render_logprobs(const std::vector<int>& tokens,
+                                const std::vector<TokenLogprob>& rankings,
+                                std::size_t text_bytes,
+                                const LogprobsSpec& spec) const {
+        if (!spec.asked()) return std::string();
+
+        std::size_t kept = 0;
+        std::size_t covered = 0;
+        std::vector<std::string> surfaces;
+        surfaces.reserve(tokens.size());
+        while (kept < tokens.size() && kept < rankings.size()) {
+            const std::string surface = tok.decode_tokens({tokens[kept]});
+            if (covered + surface.size() > text_bytes) break;
+            covered += surface.size();
+            surfaces.push_back(surface);
+            ++kept;
+        }
+
+        std::ostringstream os;
+        os << std::setprecision(9);
+        os << "{\"content\":[";
+        for (std::size_t i = 0; i < kept; ++i) {
+            if (i > 0) os << ",";
+            os << "{\"token\":\"" << json_escape(surfaces[i]) << "\""
+               << ",\"logprob\":" << rankings[i].logprob
+               << ",\"bytes\":[";
+            append_utf8_bytes(os, surfaces[i]);
+            os << "]";
+            if (spec.alternatives > 0 && !rankings[i].top_tokens.empty()) {
+                const std::size_t count = std::min(
+                    rankings[i].top_tokens.size(),
+                    static_cast<std::size_t>(spec.alternatives));
+                os << ",\"top_logprobs\":[";
+                for (std::size_t c = 0; c < count; ++c) {
+                    const std::string candidate =
+                        tok.decode_tokens({rankings[i].top_tokens[c]});
+                    if (c > 0) os << ",";
+                    os << "{\"token\":\"" << json_escape(candidate) << "\""
+                       << ",\"logprob\":" << rankings[i].top_logprobs[c]
+                       << ",\"bytes\":[";
+                    append_utf8_bytes(os, candidate);
+                    os << "]}";
+                }
+                os << "]";
+            }
+            os << "}";
+        }
+        os << "]}";
+        return os.str();
+    }
+
+    // The UTF-8 bytes of a token's text, as the numbers a JSON array of bytes
+    // holds. Taken from the decoded string rather than from the token's id: what
+    // a caller needs to reassemble is the bytes it was handed, and for a token
+    // whose text is a partial character those are not derivable from the id.
+    static void append_utf8_bytes(std::ostringstream& os, const std::string& text) {
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            if (i > 0) os << ",";
+            os << static_cast<int>(static_cast<unsigned char>(text[i]));
+        }
+    }
+
     // Waits for every choice, records the request's metrics, and reduces the
     // outcomes to the answers that arrived. The two non-streaming emitters do the
     // same thing up to how one answer is rendered, which is how much of it is
@@ -997,6 +1164,7 @@ struct OpenAIServer::Impl {
                         const std::vector<std::string>& stops,
                         const std::vector<int>& prompt_tokens,
                         const std::string& client_id,
+                        const LogprobsSpec& logprobs,
                         std::chrono::steady_clock::time_point request_start,
                         std::vector<ChoiceText>& texts_out,
                         std::size_t& completion_tokens_out) {
@@ -1036,6 +1204,15 @@ struct OpenAIServer::Impl {
                 if (first_error.empty()) first_error = out.error;
                 continue;
             }
+            if (!ranking_complete(out, logprobs)) {
+                // Treated like any other engine failure rather than answered with
+                // an array shorter than the text: see ranking_complete.
+                if (first_error.empty()) {
+                    first_error = "the engine returned no log probabilities for a "
+                                  "position it was asked to rank";
+                }
+                continue;
+            }
 
             const std::vector<int> generated = strip_stop_token(
                 out.generated_tokens, out.finish_reason, out.constraint_completed);
@@ -1053,6 +1230,11 @@ struct OpenAIServer::Impl {
             text.text = decoded.substr(0, scan.final_length);
             text.finish_reason = scan.matched ? "stop" : out.finish_reason;
             text.completion_tokens = generated.size();
+            // Rendered against the same two cuts the text just took -- the stop
+            // token the engine appended and the client stop sequence -- so the
+            // array and the text describe the same positions.
+            text.logprobs_json =
+                render_logprobs(generated, out.logprobs, scan.final_length, logprobs);
             completion_tokens_out += generated.size();
             texts_out.push_back(std::move(text));
         }
@@ -1105,6 +1287,7 @@ struct OpenAIServer::Impl {
         const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
         const std::vector<std::string>& stops,
         const std::string& client_id,
+        const LogprobsSpec& logprobs,
         std::chrono::steady_clock::time_point request_start,
         httplib::Response& res) {
         std::vector<ChoiceRun> runs;
@@ -1120,7 +1303,8 @@ struct OpenAIServer::Impl {
         std::vector<ChoiceText> texts;
         std::size_t completion_tokens = 0;
         const bool answered = finish_choices(res, runs, stops, enc.token_ids, client_id,
-                                             request_start, texts, completion_tokens);
+                                             logprobs, request_start, texts,
+                                             completion_tokens);
         untrack_request(client_id);
         if (!answered) return;
 
@@ -1134,7 +1318,11 @@ struct OpenAIServer::Impl {
             if (i > 0) os << ",";
             os << "{\"index\":" << texts[i].index
                << ",\"finish_reason\":\"" << texts[i].finish_reason << "\""
-               << ",\"text\":\"" << json_escape(texts[i].text) << "\"}";
+               << ",\"text\":\"" << json_escape(texts[i].text) << "\"";
+            if (!texts[i].logprobs_json.empty()) {
+                os << ",\"logprobs\":" << texts[i].logprobs_json;
+            }
+            os << "}";
         }
         os << "],\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
            << ",\"completion_tokens\":" << completion_tokens
@@ -1349,6 +1537,7 @@ struct OpenAIServer::Impl {
                           const std::vector<std::string>& stops,
                           const std::string& thinking_mode,
                           const std::string& client_id,
+                          const LogprobsSpec& logprobs,
                           std::chrono::steady_clock::time_point request_start) {
         std::vector<ChoiceRun> runs;
         if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
@@ -1363,7 +1552,8 @@ struct OpenAIServer::Impl {
         std::vector<ChoiceText> texts;
         std::size_t completion_tokens = 0;
         const bool answered = finish_choices(res, runs, stops, enc.token_ids, client_id,
-                                             request_start, texts, completion_tokens);
+                                             logprobs, request_start, texts,
+                                             completion_tokens);
         untrack_request(client_id);
         if (!answered) return;
 
@@ -1385,7 +1575,15 @@ struct OpenAIServer::Impl {
             os << "{\"index\":" << texts[i].index
                << ",\"finish_reason\":\"" << texts[i].finish_reason << "\""
                << ",\"message\":"
-               << render_choice_message(content, reasoning, tool_calls_json) << "}";
+               << render_choice_message(content, reasoning, tool_calls_json);
+            // Beside the message rather than inside it: the ranking describes the
+            // token stream, which the sidecar has by now split into content,
+            // reasoning and tool calls, so a client that wants it per field has
+            // to do that split itself.
+            if (!texts[i].logprobs_json.empty()) {
+                os << ",\"logprobs\":" << texts[i].logprobs_json;
+            }
+            os << "}";
         }
         os << "],\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
            << ",\"completion_tokens\":" << completion_tokens

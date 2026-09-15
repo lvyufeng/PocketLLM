@@ -165,6 +165,8 @@ than trusted.
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
 | `tools` | chat | Tool definitions reach the chat template. The model still chooses; see `tool_choice` below. |
 | `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
+| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. |
+| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. |
 | `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. |
 
 #### Stop sequences
@@ -221,19 +223,76 @@ Three consequences are worth knowing:
   entries at all is a 500, or a 504 when the deadline was the reason. Cancelling the request cancels
   every choice.
 
+#### Log probabilities
+
+`logprobs` reports the probability the model assigned to each token it generated, and — when a count
+of alternatives is given — the probabilities it assigned to the tokens it did *not* generate. The
+two endpoints spell the same request differently, and this server follows each spelling rather than
+picking one: on chat `logprobs` is a **boolean** and the number of alternatives lives in
+`top_logprobs`, while on `/v1/completions` `logprobs` is the **count** itself. They are not
+interchangeable, and the difference is not cosmetic — on chat `logprobs=false` means "not asked for",
+while on completions `logprobs=0` is a real request for the sampled token's own probability with no
+alternatives. A count sent to chat, or a boolean sent to completions, is a 400.
+
+The answer is an array of one object per generated token, in order, under the choice's `logprobs`
+key:
+
+```json
+{"logprobs":{"content":[
+  {"token":"1","logprob":-0.0001234,"bytes":[49],"top_logprobs":[
+    {"token":"1","logprob":-0.0001234,"bytes":[49]},
+    {"token":"2","logprob":-9.21,"bytes":[50]}
+  ]}
+]}}
+```
+
+- **`token` is the surface text of one token**, not a word: `bytes` holds its UTF-8 encoding, which
+  is how a caller reassembles text that a multi-byte character was split across. A token holding one
+  piece of a multi-byte character is not valid UTF-8 on its own, so a client that wants the exact
+  bytes should read `bytes` rather than re-encoding `token` — concatenating the `bytes` arrays in
+  order reproduces the answer.
+- **`logprob` is a natural log**, so it is always ≤ 0 and `exp(logprob)` is the probability.
+- **`top_logprobs` ranks the model's own distribution, not the sampler's candidate set.** It is
+  computed from the same raw logits the sampler draws from but over the whole vocabulary and before
+  `temperature`, `top_k` or `top_p` touch it, so the numbers are comparable across positions and
+  across requests. Ranking only the sampler's top-k candidates would inflate every probability by
+  whatever mass the truncation dropped. Under `temperature` 0 the generated token is the argmax and
+  is therefore the first entry, with the same `logprob` reported twice; when the request samples, the
+  generated token is somewhere inside the requested alternatives rather than necessarily first.
+
+Four things are worth knowing before relying on the field:
+
+- **The array covers the text, not the token budget.** A stop token or a client `stop` sequence cuts
+  the answer, and the array is cut with it — a position the caller never received is not reported.
+  `usage.completion_tokens` still counts the tokens the engine generated, so it can exceed the number
+  of entries in `content`.
+- **On chat the array sits beside `message`, not inside it.** The sidecar splits the token stream
+  into `content`, `reasoning_content` and `tool_calls`, so a client that wants a probability per
+  field has to do that split itself — the ranking describes the stream the model produced.
+- **Streaming is not supported**, because a chunk carries the text of its token with no ranking
+  beside it. `{"stream":true,"logprobs":...}` is a 400 rather than a stream that looks the same as
+  one whose request asked for no ranking at all.
+- **The engine has to declare it.** `logprobs` is refused when the capability is off, which is the
+  case for speculative decoding (its verify step ranks no tokens) and for the Ascend backend. The
+  limit on alternatives is this server's — 20 per position, above OpenAI's documented range — and a
+  request past it is a 400 naming the ceiling.
+
 ### Refused with HTTP 400
 
 Each of these is refused only at a value that would change the output. The same field at the value
-naming what the server already does — `logprobs=false`, penalties of zero, an empty `stop` list, an
-empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented defaults
-explicitly is not punished for it.
+naming what the server already does — `logprobs=false` on chat, penalties of zero, an empty `stop`
+list, an empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented
+defaults explicitly is not punished for it. The two entries for a field this server *does* implement
+are shape checks on the endpoint that defines the value, not refusals of the feature.
 
 | Field | Endpoints | Refused when | What this server does instead |
 | --- | --- | --- | --- |
 | `stop` | both | the value is not a string and not a list of strings | Nothing is matched, so a well-formed `stop` is refused on shape alone rather than half-applied. Empty strings match nothing and are accepted, which is what makes an empty `stop` list — or the empty entries some clients pad it with — harmless. |
-| `logprobs` | chat | anything but `false` | No `logprobs` object is returned on any choice. |
-| `logprobs` | completions | any value | It is a count there, where even `0` asks for the sampled token's logprob, so no value is inert. |
-| `top_logprobs` | both | not 0 | There are no per-token logprobs to rank alternatives within. |
+| `logprobs` | chat | not a boolean | A count is the other endpoint's spelling of the field; see [Log probabilities](#log-probabilities). |
+| `logprobs` | completions | not a whole number in 0..20 | It is the number of alternatives to rank per position, above this server's ceiling of 20. |
+| `top_logprobs` | completions | any value but `null` | The completions endpoint names the count in `logprobs` itself. |
+| `top_logprobs` | chat | not a whole number in 0..20, or positive while `logprobs` is absent or `false` | There is no ranking to take alternatives from unless the request asked for log probabilities. |
+| `logprobs` | both | asked for on a streaming request | A streamed chunk carries the text of its token with no ranking beside it. |
 | `frequency_penalty`, `presence_penalty` | both | non-zero | The sampler has no repetition or presence term, so the request is generated as if the penalty were 0. |
 | `logit_bias` | both | the object is not empty | No per-token bias is applied, so biased tokens are sampled at their unmodified probability. |
 | `best_of` | completions | not 1 | One candidate is generated per request; there is no second candidate to compare it against. |

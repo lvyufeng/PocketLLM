@@ -40,11 +40,45 @@ __device__ inline void insert_sorted(Candidate* list, int& len, int cap,
     list[pos] = item;
 }
 
+// Writes the head of a row's candidate list for a caller that wants log
+// probabilities. Both sampling paths below reach this with the full sorted list
+// in hand -- the greedy one has run the same top-k reduction the sampled one
+// draws from -- so a request that asks for a ranking gets the real distribution
+// whichever path its temperature sends it down.
+//
+// `len` is the number of live entries; the tail up to `top_n` is padded with
+// token -1 and logit -inf, the same convention `local_topk_candidates_kernel`
+// uses, so a consumer can filter on the token rather than carry a count.
+__device__ inline void write_ranking(const Candidate* merged, int len,
+                                     int vocab_start, float* out_max_logit,
+                                     int* out_top_tokens, float* out_top_logits,
+                                     int top_n, int row) {
+    // An empty list has no maximum. That only happens when the caller handed
+    // this kernel nothing to rank, which the TP path reports as -inf rather
+    // than as a zero that would read back as a perfectly likely token.
+    if (out_max_logit != nullptr) {
+        out_max_logit[row] = (len > 0) ? merged[0].logit : -INFINITY;
+    }
+    if (out_top_tokens == nullptr || out_top_logits == nullptr) return;
+    for (int i = 0; i < top_n; ++i) {
+        const size_t slot = static_cast<size_t>(row) * top_n + i;
+        if (i < len) {
+            out_top_tokens[slot] = merged[i].index + vocab_start;
+            out_top_logits[slot] = merged[i].logit;
+        } else {
+            out_top_tokens[slot] = -1;
+            out_top_logits[slot] = -INFINITY;
+        }
+    }
+}
+
 __global__ void sample_top_k_top_p_kernel(
     const float* __restrict__ logits, int* __restrict__ out_tokens,
     float* __restrict__ out_logits, int rows, int vocab, int vocab_start,
     float temperature, float top_p, int top_k, curandState* rng_states,
-    const float* __restrict__ uniforms) {
+    const float* __restrict__ uniforms, float* __restrict__ out_max_logit,
+    int* __restrict__ out_top_tokens, float* __restrict__ out_top_logits,
+    int top_n) {
 
     const int row = blockIdx.x;
     if (row >= rows) return;
@@ -80,6 +114,8 @@ __global__ void sample_top_k_top_p_kernel(
 
     // Greedy path: temperature 0 means argmax, which the top-k list already has.
     if (temperature <= 1e-5f || merged_len <= 1) {
+        write_ranking(merged, merged_len, vocab_start, out_max_logit,
+                      out_top_tokens, out_top_logits, top_n, row);
         out_tokens[row] = merged[0].index + vocab_start;
         out_logits[row] = merged[0].logit;
         return;
@@ -131,6 +167,49 @@ __global__ void sample_top_k_top_p_kernel(
 
     out_tokens[row] = merged[chosen].index + vocab_start;
     out_logits[row] = merged[chosen].logit;
+    write_ranking(merged, merged_len, vocab_start, out_max_logit,
+                  out_top_tokens, out_top_logits, top_n, row);
+}
+
+// One block per row, striding the whole vocabulary. This reads a row's logits a
+// second time, which is a few megabytes against the gigabytes a decode step
+// already moves, and it only runs for a request that asked for log
+// probabilities. Doing it here rather than inside the sampler is what makes the
+// reported value a true log-softmax: the sampler's candidate list is top-k
+// truncated, so summing over it would inflate every probability by however much
+// mass the truncation dropped.
+//
+// A masked-out logit is -inf and contributes exp(-inf) = 0, so a constrained
+// row normalizes over exactly the tokens the sampler was allowed to draw.
+constexpr int kSumExpThreads = 256;
+
+__global__ void vocab_logsumexp_kernel(
+    const float* __restrict__ logits, const float* __restrict__ max_logits,
+    float* __restrict__ out_sumexp, int rows, int vocab) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+
+    const float max_logit = max_logits[row];
+    const float* row_logits = logits + static_cast<size_t>(row) * vocab;
+
+    // Accurate exp, not __expf: this sum is a number the client reads back, and
+    // it is computed once per generated token, so there is nothing to buy with
+    // the approximate one.
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < vocab; i += kSumExpThreads) {
+        local += expf(row_logits[i] - max_logit);
+    }
+
+    __shared__ float scratch[kSumExpThreads];
+    scratch[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = kSumExpThreads / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out_sumexp[row] = scratch[0];
 }
 
 // Stage 1 of the TP path: reduce a sharded row to its local top-k and write the
@@ -219,7 +298,9 @@ __global__ void sample_from_candidates_kernel(
     const int* __restrict__ cand_tokens, const float* __restrict__ cand_logits,
     int* __restrict__ out_tokens, float* __restrict__ out_logits, int rows,
     int cand_stride, float temperature, float top_p, int top_k,
-    curandState* rng_states, const float* __restrict__ uniforms) {
+    curandState* rng_states, const float* __restrict__ uniforms,
+    float* __restrict__ out_max_logit, int* __restrict__ out_top_tokens,
+    float* __restrict__ out_top_logits, int top_n) {
 
     const int row = blockIdx.x;
     if (row != blockIdx.x || threadIdx.x != 0) return;
@@ -244,12 +325,19 @@ __global__ void sample_from_candidates_kernel(
         insert_sorted(list, len, k, Candidate{lgs[i], toks[i]});
     }
     if (len == 0) {
+        write_ranking(list, 0, 0, out_max_logit, out_top_tokens, out_top_logits,
+                      top_n, row);
         out_tokens[row] = 0;
         out_logits[row] = 0.0f;
         return;
     }
 
     if (temperature <= 1e-5f || len == 1) {
+        // Same greedy ranking as the unsharded kernel: the merged list is the
+        // list a draw would have come from, so its head is the distribution's
+        // most likely token whichever branch commits it.
+        write_ranking(list, len, 0, out_max_logit, out_top_tokens, out_top_logits,
+                      top_n, row);
         out_tokens[row] = list[0].index;
         out_logits[row] = list[0].logit;
         return;
@@ -290,6 +378,8 @@ __global__ void sample_from_candidates_kernel(
     }
     out_tokens[row] = list[chosen].index;
     out_logits[row] = list[chosen].logit;
+    write_ranking(list, len, 0, out_max_logit, out_top_tokens, out_top_logits,
+                  top_n, row);
 }
 
 __global__ void init_curand_kernel(curandState* states, int count,
@@ -315,16 +405,33 @@ bool init_rng_states(DeviceRngState* states, int count,
 bool sample_top_k_top_p_rows(
     const float* logits, int* out_tokens, float* out_logits, int rows,
     int vocab, int vocab_start, float temperature, float top_p, int top_k,
-    DeviceRngState* rng_states, const float* uniforms, void* stream) {
+    DeviceRngState* rng_states, const float* uniforms, void* stream,
+    float* out_max_logit, int* out_top_tokens, float* out_top_logits,
+    int top_n) {
     if (logits == nullptr || out_tokens == nullptr || out_logits == nullptr) {
         return false;
     }
     if (rows <= 0 || vocab <= 0) return false;
     if (uniforms == nullptr && rng_states == nullptr) return false;
+    if (top_n < 0 || top_n > kMaxTopK) return false;
     sample_top_k_top_p_kernel<<<rows, kBlockThreads, 0,
                                static_cast<cudaStream_t>(stream)>>>(
         logits, out_tokens, out_logits, rows, vocab, vocab_start, temperature,
-        top_p, top_k, reinterpret_cast<curandState*>(rng_states), uniforms);
+        top_p, top_k, reinterpret_cast<curandState*>(rng_states), uniforms,
+        out_max_logit, out_top_tokens, out_top_logits, top_n);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool vocab_logsumexp_rows(
+    const float* logits, const float* max_logits, float* out_sumexp, int rows,
+    int vocab, void* stream) {
+    if (logits == nullptr || max_logits == nullptr || out_sumexp == nullptr) {
+        return false;
+    }
+    if (rows <= 0 || vocab <= 0) return false;
+    vocab_logsumexp_kernel<<<rows, kSumExpThreads, 0,
+                             static_cast<cudaStream_t>(stream)>>>(
+        logits, max_logits, out_sumexp, rows, vocab);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -365,18 +472,20 @@ bool sample_from_candidates(
     const int* cand_tokens, const float* cand_logits, int* out_tokens,
     float* out_logits, int rows, int cand_stride, float temperature,
     float top_p, int top_k, DeviceRngState* rng_states, const float* uniforms,
-    void* stream) {
+    void* stream, float* out_max_logit, int* out_top_tokens,
+    float* out_top_logits, int top_n) {
     if (cand_tokens == nullptr || cand_logits == nullptr ||
         out_tokens == nullptr || out_logits == nullptr) {
         return false;
     }
     if (rows <= 0 || cand_stride <= 0) return false;
     if (uniforms == nullptr && rng_states == nullptr) return false;
+    if (top_n < 0 || top_n > kMaxTopK) return false;
     sample_from_candidates_kernel<<<rows, 1, 0,
                                     static_cast<cudaStream_t>(stream)>>>(
         cand_tokens, cand_logits, out_tokens, out_logits, rows, cand_stride,
         temperature, top_p, top_k, reinterpret_cast<curandState*>(rng_states),
-        uniforms);
+        uniforms, out_max_logit, out_top_tokens, out_top_logits, top_n);
     return cudaGetLastError() == cudaSuccess;
 }
 

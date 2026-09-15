@@ -161,8 +161,8 @@ Remaining protocol work includes:
 - completion-specific streaming chunk schemas;
 - complete tool-call and reasoning/thinking normalization across both adapters;
 - structured outputs and grammar-constrained decoding;
-- multiple choices (`n`) on the native C++ path;
-- logprobs and stop-string behavior on every backend;
+- logprobs on every backend — implemented on the native C++ path, but only where the
+  engine declares it, which excludes speculative decoding and the Ascend backend;
 - embeddings and multimodal request endpoints.
 
 Unsupported native controls raise typed errors rather than being silently ignored.
@@ -196,7 +196,7 @@ Compared with mature vLLM/SGLang deployments, PocketLLM still lacks a common imp
 - embeddings;
 - LoRA adapter loading and multiplexing;
 - structured/grammar-constrained outputs;
-- complete multi-choice and logprob semantics;
+- logprob semantics on backends that do not declare them;
 - a common continuous-batching scheduler.
 
 These are capability-gated follow-up features, not reasons to merge vendor kernels or KV layouts.

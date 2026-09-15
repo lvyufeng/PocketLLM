@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -205,8 +206,10 @@ REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
     ("n", 0),
     ("n", 129),
     ("stop", 5),
-    ("logprobs", True),
+    ("logprobs", 1),
+    ("logprobs", "true"),
     ("top_logprobs", 5),
+    ("top_logprobs", "5"),
     ("frequency_penalty", 1.5),
     ("presence_penalty", -1.0),
     ("logit_bias", {"100": -100}),
@@ -217,6 +220,10 @@ REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
 # The same fields at the value that names what the server already does. These
 # must be accepted: an SDK that sends the documented default explicitly is not
 # asking for anything.
+#
+# `logprobs = true` and a non-zero `top_logprobs` are accepted too, but they are
+# checked by validate_logprobs instead of here: accepting them is only half the
+# contract, and the other half is that the response actually carries a ranking.
 ACCEPTED_CHAT_DEFAULTS: tuple[tuple[str, Any], ...] = (
     ("n", 1),
     ("stop", []),
@@ -227,6 +234,20 @@ ACCEPTED_CHAT_DEFAULTS: tuple[tuple[str, Any], ...] = (
     ("logit_bias", {}),
     ("tool_choice", "auto"),
     ("parallel_tool_calls", True),
+)
+
+# /v1/completions spells the same fields differently: "logprobs" is a count, where
+# even 0 asks for the sampled token's own probability, and "top_logprobs" does not
+# exist. A boolean is the chat spelling of the field and a count past the server's
+# ceiling is a request it cannot serve.
+REFUSED_COMPLETIONS_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("logprobs", True),
+    ("logprobs", -1),
+    ("logprobs", 2.5),
+    ("logprobs", 21),
+    ("best_of", 2),
+    ("echo", True),
+    ("suffix", " END"),
 )
 
 
@@ -276,9 +297,9 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
         f"include_usage refusal named {error.get('param')!r}",
     )
 
-    # Fields that only exist on /v1/completions are refused there, and ignored as
-    # unknown parameters on chat rather than being read as something else.
-    for field, value in (("echo", True), ("best_of", 2), ("suffix", " END")):
+    # Fields that only exist on /v1/completions, plus that endpoint's spelling of
+    # the log-probability fields, are refused there.
+    for field, value in REFUSED_COMPLETIONS_FIELDS:
         result = http_request(
             base_url,
             "/v1/completions",
@@ -287,6 +308,45 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
         )
         error = refusal_error(result, f"completions {field}={value!r}")
         require(error.get("param") == field, f"{field} refusal named {error.get('param')!r}")
+
+    # A streamed chunk carries the text of its token and no ranking beside it, so
+    # asking for log probabilities on the streaming path is refused rather than
+    # answered with a stream that looks the same as one that asked for none. On
+    # /v1/completions 0 is a real request for the sampled token's probability, so
+    # only chat has an inert spelling of the field here.
+    for path, payload in (
+        ("/v1/chat/completions", {**base, "logprobs": True}),
+        ("/v1/chat/completions", {**base, "logprobs": True, "top_logprobs": 3}),
+        (
+            "/v1/completions",
+            {"prompt": "This prompt is inspected, not generated.", "max_tokens": 1, "logprobs": 5},
+        ),
+        (
+            "/v1/completions",
+            {"prompt": "This prompt is inspected, not generated.", "max_tokens": 1, "logprobs": 0},
+        ),
+    ):
+        result = http_request(base_url, path, {**payload, "stream": True}, timeout=timeout)
+        error = refusal_error(result, f"{path} stream with logprobs")
+        require(
+            error.get("param") == "logprobs",
+            f"streaming logprobs refusal named {error.get('param')!r}",
+        )
+        require(
+            "stream" in error.get("message", ""),
+            f"streaming logprobs refusal does not mention streaming: {error.get('message')!r}",
+        )
+
+    for path, payload in (
+        ("/v1/chat/completions", {**base, "logprobs": False}),
+        ("/v1/completions", {"prompt": "x", "max_tokens": 1}),
+    ):
+        result = http_request(base_url, path, {**payload, "stream": True}, timeout=timeout)
+        require(
+            result.status == 200,
+            f"{path} stream without logprobs should be accepted, "
+            f"got HTTP {result.status}: {result.text}",
+        )
 
     # "max_completion_tokens" supersedes the deprecated "max_tokens": a request
     # carrying 32 and 1 must generate one token, not 32.
@@ -574,6 +634,229 @@ def validate_n_choices(base_url: str, model_name: str, timeout: float) -> None:
     )
 
 
+def logprob_content(result: HttpResult, label: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The per-token entries of a response's only choice, shape-checked.
+
+    Returns the "content" array and the choice it came from. Every invariant that
+    does not need two requests is checked here, so the callers below only have to
+    compare positions against something.
+    """
+    require(result.status == 200, f"{label} failed: HTTP {result.status}: {result.text}")
+    body = result.json()
+    choices = body.get("choices")
+    require(isinstance(choices, list) and len(choices) == 1, f"{label} has {len(choices or [])} choices")
+    choice = choices[0]
+    logprobs = choice.get("logprobs")
+    require(isinstance(logprobs, dict), f"{label} returned no logprobs object: {choice}")
+    content = logprobs.get("content")
+    require(
+        isinstance(content, list) and content,
+        f"{label} reported no per-token log probabilities: {logprobs}",
+    )
+    for position, entry in enumerate(content):
+        where = f"{label} position {position}"
+        require(isinstance(entry, dict), f"{where} is not an object")
+        token = entry.get("token")
+        require(isinstance(token, str), f"{where} has no token string")
+        value = entry.get("logprob")
+        require(
+            isinstance(value, (int, float)) and math.isfinite(value) and value <= 0.0,
+            f"{where} reported logprob {value!r}, which is not a log probability",
+        )
+        raw = entry.get("bytes")
+        require(
+            isinstance(raw, list) and raw and all(isinstance(b, int) and 0 <= b <= 255 for b in raw),
+            f"{where} bytes is not a non-empty list of octets: {raw!r}",
+        )
+        # The generated text is ASCII here, so no token is a partial UTF-8
+        # sequence and the byte array must be exactly the token's encoding.
+        require(
+            bytes(raw) == token.encode("utf-8"),
+            f"{where} bytes {raw!r} do not encode its token {token!r}",
+        )
+        alternatives = entry.get("top_logprobs")
+        if alternatives is None:
+            continue
+        require(isinstance(alternatives, list), f"{where} top_logprobs is not a list")
+        previous = 0.0
+        for rank, candidate in enumerate(alternatives):
+            spot = f"{where} alternative {rank}"
+            require(isinstance(candidate, dict), f"{spot} is not an object")
+            require(isinstance(candidate.get("token"), str), f"{spot} has no token string")
+            logged = candidate.get("logprob")
+            require(
+                isinstance(logged, (int, float)) and math.isfinite(logged) and logged <= 0.0,
+                f"{spot} reported logprob {logged!r}, which is not a log probability",
+            )
+            require(
+                rank == 0 or logged <= previous,
+                f"{spot} is ranked above the one before it ({logged!r} > {previous!r})",
+            )
+            previous = logged
+            require(
+                bytes(candidate.get("bytes") or []) == candidate["token"].encode("utf-8"),
+                f"{spot} bytes do not encode its token {candidate['token']!r}",
+            )
+    return content, choice
+
+
+def validate_logprobs(base_url: str, model_name: str, timeout: float) -> None:
+    """Checks that log probabilities are reported and describe the same run.
+
+    The engine ranks the model's own next-token distribution from the raw logits,
+    so the strongest check available without those logits is self-consistency:
+    the ranking at a position must agree with the token the engine generated
+    there, the alternatives must be ordered, and the array must cover the text
+    the caller was handed. The text is read from /v1/completions, where it is the
+    decoded token stream and nothing else -- on chat the sidecar has already split
+    reasoning out of it, so a token count no longer lines up with `content`.
+    """
+    prompt = "List the numbers from 1 to 20, separated by commas."
+    max_tokens = 24
+    greedy = {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0.0, "top_p": 1.0, "top_k": 20}
+
+    reference = http_request(base_url, "/v1/completions", greedy, timeout=timeout)
+    reference_text, reference_finish = answer_and_finish(reference, False, False, model_name)
+    require(len(reference_text) >= 8, f"reference answer is too short: {reference_text!r}")
+
+    alternatives_wanted = 3
+    result = http_request(
+        base_url, "/v1/completions", {**greedy, "logprobs": alternatives_wanted}, timeout=timeout
+    )
+    content, choice = logprob_content(result, f"completions logprobs={alternatives_wanted}")
+    body = result.json()
+    text = choice["text"]
+
+    # Asking for a ranking must not change what is generated: the same greedy
+    # request has to return the same tokens with and without it.
+    require(
+        text == reference_text,
+        f"the ranked answer {text!r} differs from the unranked one {reference_text!r}",
+    )
+    require(
+        choice["finish_reason"] == reference_finish,
+        f"the ranked answer finished with {choice['finish_reason']!r}, "
+        f"the unranked one with {reference_finish!r}",
+    )
+
+    # The array is per token of the answer, in order, and rejoins into it.
+    require(
+        "".join(entry["token"] for entry in content) == text,
+        f"the ranked tokens do not rejoin into the text {text!r}",
+    )
+    require(
+        len(content) <= body["usage"]["completion_tokens"],
+        f"{len(content)} ranked positions for {body['usage']['completion_tokens']} tokens",
+    )
+
+    for position, entry in enumerate(content):
+        candidates = entry.get("top_logprobs")
+        require(
+            isinstance(candidates, list) and len(candidates) == alternatives_wanted,
+            f"position {position} reported {len(candidates or [])} alternatives, "
+            f"expected {alternatives_wanted}",
+        )
+        # Greedy decoding takes the argmax of the distribution the sampler draws
+        # from, and the ranking is that same distribution from the raw logits, so
+        # the top alternative must be the token that was generated -- with the
+        # probability reported twice, once beside the token and once in the
+        # ranking. This is what ties the ranking to the run instead of letting a
+        # plausible-looking distribution be reported for tokens it did not
+        # produce.
+        require(
+            candidates[0]["token"] == entry["token"],
+            f"position {position} generated {entry['token']!r} but ranked "
+            f"{candidates[0]['token']!r} first",
+        )
+        require(
+            candidates[0]["logprob"] == entry["logprob"],
+            f"position {position} reported {entry['logprob']!r} for the sampled token "
+            f"and {candidates[0]['logprob']!r} for the same token in the ranking",
+        )
+
+    # A count of 0 asks for the sampled token's own probability and no
+    # alternatives, which is not the same as asking for nothing.
+    bare = http_request(base_url, "/v1/completions", {**greedy, "logprobs": 0}, timeout=timeout)
+    bare_content, bare_choice = logprob_content(bare, "completions logprobs=0")
+    require(bare_choice["text"] == text, "logprobs=0 changed the generated text")
+    require(
+        "".join(entry["token"] for entry in bare_content) == text,
+        "the logprobs=0 array does not rejoin into the text",
+    )
+    require(
+        all("top_logprobs" not in entry for entry in bare_content),
+        "logprobs=0 reported alternatives",
+    )
+
+    # Chat spells the same request as a boolean plus a count, and the count is
+    # the only thing that decides whether alternatives are reported. The ranked
+    # tokens are not compared against the text here: the sidecar splits a chat
+    # completion into reasoning and content, so the token stream is no longer the
+    # answer string. What still holds is per position -- the top alternative is
+    # the token generated there -- and that is what is checked.
+    for top_logprobs, expected in ((4, 4), (0, 0)):
+        chat = http_request(
+            base_url,
+            "/v1/chat/completions",
+            {**chat_payload(prompt, max_tokens), "logprobs": True, "top_logprobs": top_logprobs},
+            timeout=timeout,
+        )
+        label = f"chat logprobs=true top_logprobs={top_logprobs}"
+        chat_content, _ = logprob_content(chat, label)
+        for position, entry in enumerate(chat_content):
+            candidates = entry.get("top_logprobs")
+            if expected == 0:
+                require(
+                    not candidates,
+                    f"{label} reported {len(candidates or [])} alternatives at position "
+                    f"{position}",
+                )
+                continue
+            require(
+                isinstance(candidates, list) and len(candidates) == expected,
+                f"{label} position {position} reported {len(candidates or [])} "
+                f"alternatives, expected {expected}",
+            )
+            require(
+                candidates[0]["token"] == entry["token"],
+                f"{label} position {position} ranked {candidates[0]['token']!r} above "
+                f"the generated {entry['token']!r}",
+            )
+
+    # A client stop sequence ends the answer inside the token stream, and the
+    # ranking has to end with it: reporting a probability for a position the
+    # caller never received would put the array out of step with the text.
+    middle = len(text) // 2
+    sequence = text[middle : middle + 4]
+    expected_text = text[: text.index(sequence)]
+    require(expected_text != "", f"stop sequence chosen at the start of the answer: {sequence!r}")
+    stopped = http_request(
+        base_url, "/v1/completions", {**greedy, "logprobs": 2, "stop": [sequence]}, timeout=timeout
+    )
+    stopped_content, stopped_choice = logprob_content(stopped, "completions logprobs=2 with stop")
+    require(
+        stopped_choice["text"] == expected_text,
+        f"the stopped answer {stopped_choice['text']!r} is not {expected_text!r}",
+    )
+    # The cut can land inside a token, so the array ends at the last position that
+    # fits entirely before it rather than exactly on it. Both halves of that are
+    # checked: nothing past the cut is reported, and the array does not stop early
+    # -- the shortfall is less than one token of the run being ranked.
+    covered = "".join(entry["token"] for entry in stopped_content)
+    require(
+        expected_text.startswith(covered),
+        f"the ranking covers {covered!r}, which runs past the stopped text {expected_text!r}",
+    )
+    longest = max(len(entry["token"]) for entry in content)
+    require(
+        len(expected_text) - len(covered) < longest,
+        f"the ranking stops {len(expected_text) - len(covered)} characters before the "
+        f"stopped text {expected_text!r}, further than one token",
+    )
+
+    print("[PASS] logprobs: per-token probabilities that agree with the tokens generated")
+
+
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
     binary = pathlib.Path(args.binary).resolve()
@@ -687,6 +970,8 @@ def run(args: argparse.Namespace) -> int:
         validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+
+        validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         incompatible = http_request(
             base_url,

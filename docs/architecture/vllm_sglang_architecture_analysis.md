@@ -510,8 +510,8 @@ decode 则低 2–4%（8192 场景 43.99 vs 45.44 tok/s）。模型页的
    - 目标：batch_size=4 下保持单请求延迟不回归
 2. **补全 OpenAI API 语义**:
    - Tools/function calling
-   - Logprobs
-   - Multiple choices (n>1)
+   - ~~Logprobs~~ ✅（2026-09-15）
+   - ~~Multiple choices (n>1)~~ ✅（2026-09-15）
 3. **Prefix caching**:
    - 实现 block hash 和跨请求共享
    - 优先支持多轮对话场景
