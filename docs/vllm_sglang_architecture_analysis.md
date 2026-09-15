@@ -323,8 +323,11 @@ if (options_.kv_paged) {
 - ❌ 当前不支持（文档明确标注 text-only）
 
 **结构化输出**：
-- ❌ 当前不支持 JSON schema/grammar-constrained decoding
-- Python 控制平面有 `StructuredOutputManager` 占位，但未实现
+- 部分支持（native C++ engine，PR #183）
+- JSON mode 与 JSON Schema 约束已实现（`cpp_engine/core/json_constraint.cpp` + `token_constraint.cpp`，HTTP `response_format` 解析）
+- ❌ 不支持 grammar / regex（GBNF）约束
+- ❌ TP > 1 下不可用：请求级 token 约束在张量并行路径被显式拒绝
+- Python 控制平面仍无 `StructuredOutputManager`，结构化输出只走 C++ engine
 
 ---
 
