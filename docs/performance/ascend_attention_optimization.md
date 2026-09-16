@@ -79,41 +79,45 @@ fallback.
 
 ## 4. Measured prefill attribution
 
-`QWEN_HOST_PROFILE=1`, 64 layers, 512-token prompt, `--resident-bench`. The profile emits four
-blocks: `tag=prefill` (startup kernel warmup), `tag=warmup_decode` (a boundary
-`QwenEngine::warmup_kernels` now emits so the warmup pass cannot be mistaken for the measured one),
-`tag=prefill` again for the real prompt, and `tag=decode`. The real-prefill block reports `calls=64`
-uniformly on the layer sub-scopes; without that boundary a contaminated run reported 128.
+`QWEN_PHASE_PROFILE=1 QWEN_COMM_OVERLAP_SLICES=1`, 64 layers, four ranks, `--resident-bench`. The
+phase profile synchronises the device on entry and exit of every scope, so each `seconds=` is device
+time for that scope rather than host wall-clock, and the serial slice count keeps a collective from
+hiding behind the GEMM it would otherwise overlap. A run emits four profile blocks and reuses the
+`tag=prefill` label for two of them — one a decode-shaped warmup pass whose scope times do not move
+with the prompt length; the timed block is the one whose `STACK.r` matches the reported
+`prefill_seconds`. See
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md#8-reproducing) for the
+block-identification trap.
 
 An earlier version of this section carried a three-block table and concluded that `STACK.r` at
-17.2 ms/layer was "an unattributed black box". **That conclusion is superseded.** The layer was
-instrumented, and the black box is not compute — it is the TP all-reduce:
+17.2 ms/layer was "an unattributed black box". **That conclusion is superseded twice.** The layer was
+instrumented, and that instrumentation then charged the collectives far more than they cost. The
+corrected attribution, device-synced at three prompt lengths, is:
 
-| component | seconds | share of prefill wall |
-|---|---|---|
-| 129 TP all-reduce calls (2 per layer + 1 hidden) | 0.5072 | **87%** |
-| everything else inside the 64-layer stack | 0.0577 | 10% |
-| `top1_allreduce` (1 call) | 0.0111 | 2% |
+| component | 1105 tokens | 2223 tokens | 4433 tokens |
+|---|---|---|---|
+| `STACK.r` (whole 64-layer stack) | 1.2229 | 2.1187 | 3.9142 |
+| **`gated_delta`** (48 calls) | **0.5493 (44.9%)** | **1.1005 (51.9%)** | **2.2009 (56.2%)** |
+| 129 TP all-reduce calls | 0.3026 (24.7%) | 0.3479 (16.4%) | 0.4961 (12.7%) |
+| all 384 projection GEMMs | 0.1623 (13.3%) | 0.3243 (15.3%) | 0.5471 (14.0%) |
+| `full_attention` (16 calls) | 0.1359 (11.1%) | 0.2331 (11.0%) | 0.4722 (12.1%) |
 
-`STACK.r` measures 0.548 s of the 0.584 s prefill wall, and 0.491 s of that is the collectives it
-contains. Every other operation in the layer — norms, transposes, gated-delta, swiglu, and all the
-projection GEMMs — sums to **0.90 ms per layer**. The full per-phase table, the pre-fix comparison
-and the collective's measured fixed/byte cost split are in
-[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
+Three conclusions this settles:
 
-Two conclusions this settles:
+- **The linear-attention recurrence is the prefill bottleneck at long prompts, not the collectives.**
+  `gated_delta` is 10.35 us per token per head per layer, exactly linear in length (496.9 / 495.1 /
+  496.5 us per token across a 4x span), and it is 62% vector-instruction issue rather than state
+  bandwidth: ablating its `broadcast_rows` and `Axpy` loops out of the kernel moves the end-to-end
+  prefill 1128 -> 1734 TPS. Its shapes are Cube shapes, so the fix is a Cube step.
+- **The collectives fall as a share while the recurrence rises.** 24.7% at 1105 tokens to 12.7% at
+  4433. Their fixed per-call term is 1.85 ms from the device-synced fit in section 5.3, so the lever
+  is the number of calls per layer, not their payload — but it is no longer the lever that reaches
+  2000 TPS.
+- **`full_attention` is a steady 11-12%** and is profiled separately.
 
-- **All projection GEMMs together are ~1% of a 512-token prefill.** The prefill gap is not in the
-  matmuls, so further GEMM tuning cannot close it.
-- **Prefill is collective-bound, and the fix is fewer calls.** The all-reduce is a measured ~1.6 ms
-  of host-side issue plus a byte term, so the lever is the number of calls per layer, not their
-  payload or their enqueue mechanism. `full_attention` remains 9.8% and is measured separately.
-
-The same profile at a 4096-token prompt gives 84% for the collectives (84 vs 87 is inside the noise
-of two different passes), so this is the shape of a 64-layer TP4 pass rather than a property of
-short prompts. At 4096 rows `full_attention` grows to 9.3% and a single `top1_allreduce` call costs
-0.243 s, 7.5% of that prefill — measured, and not yet explained. See
-[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
+The full per-phase tables, the ablation, the collective's measured fixed/byte split and the reason
+the earlier profile over-charged `ar.*` are in
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md) section 5.
 
 ## 5. Measured throughput
 
@@ -203,13 +207,14 @@ named:
   gated-delta matrix work (two 128x128 reductions and a rank-1 update currently done as 128-wide
   vector ops, with `broadcast_rows` the documented hot spot), the norms, and the transposes;
 - 129 TP all-reduce calls per decode token (64 `ar.mlp` + 48 `ar.lin.out` + 16 `ar.full.out` +
-  1 `ar.hidden_a`) at ~540 us each, roughly 60% of the step. A previous version of this document
-  blamed the per-call `stream_synchronize` inside `end_nccl_collective` for ~70 ms of it; **that
-  attribution is wrong.** In `bench_qwen_ascend_allreduce` the per-call figure is flat in message
-  size (0.404 ms of pure host enqueue at 10 KB, 0.412 ms at 640 KB), and the probe line shows
-  enqueueing an event pair costs 0.011 ms against 0.382 ms for one bare collective. The cost is
-  host-side issue of the collective itself, paid once per call regardless of payload, so the fix is
-  fewer collectives and not a cheaper fence around each one.
+  1 `ar.hidden_a`). The per-call figure is measured flat in payload size — **0.3923 ms at 10 KB,
+  0.3989 ms at 640 KB** — so the 129 calls total **50.6 ms, 47% of the 108.6 ms step**. A previous
+  version of this document blamed the per-call `stream_synchronize` inside `end_nccl_collective`
+  for ~70 ms of it, at ~540 us per call; **both of those figures are wrong and neither is measured
+  anywhere on this stack.** The probe line settles it: enqueueing an event pair costs 0.011 ms
+  against 0.382 ms for one bare collective. The cost is host-side issue of the collective itself,
+  paid once per call regardless of payload, so the fix is fewer collectives and not a cheaper fence
+  around each one.
 
 **100 TPS is not reachable on this part at fp16.** It needs <= 10 ms/token; the perfect-streaming
 bound at TP8 is 21 ms with zero collective cost, which would already require 673 GB/s per card.
@@ -219,10 +224,13 @@ per-step collectives. Note also that 8 cards is the practical maximum here:
 
 ## 7. What this rules out
 
-- **More GEMM tuning for prefill.** Projections are ~1% of a 512-token prefill.
-- **Blaming prefill on attention.** `full_attention` is 0.054 s of the 0.584 s wall at 512 tokens and
-  is measured separately from the collectives; the 87% is the TP all-reduce, and pointing the next
-  optimisation at the attention kernels would miss it.
+- **More GEMM tuning for prefill.** All 384 projection GEMMs together are 13-15% of the stack at
+  every length from 1105 to 4433 tokens, against a linear-attention recurrence that is 45-56%.
+- **Blaming prefill on attention.** `full_attention` is a steady 11-12% and is measured separately
+  from the collectives.
+- **Reading the prefill wall as collective-bound.** The 87% this section used to assert came from
+  nested host-wall spans; device-synced, the collectives are 12.7% of the stack at 4433 tokens and
+  their share *falls* as the prompt grows. Section 4 has the replacement table.
 - **A faster collective.** The HCCL floor is flat in payload size up to 640 KB.
 - **`aclrtMemcpy`-based bandwidth work.** 8.7 GB/s.
 - **Reading a short-layer smoke run as decode throughput.** See the layer scaling table.

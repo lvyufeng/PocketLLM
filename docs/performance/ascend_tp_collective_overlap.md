@@ -29,9 +29,11 @@ overlapping it recovers more than those three fixed terms cost.
 
 Both terms can be priced from the measurements below. At 512 rows the 4-slice pass issues 384 more
 collectives than the serial pass and costs **0.612 s more prefill** (1.196 s against 0.584 s), i.e.
-1.60 ms per extra collective. The serial pass's 128 collectives cost 0.491 s, i.e. 3.83 ms each
-(section 6). So the fixed term is **~1.6 ms** and the byte term **~2.2 ms** at 512 rows — the 4-slice
-split pays 4x1.6 ms of fixed cost to overlap 2.2 ms of bytes, which is why it loses by 2x.
+1.60 ms per extra collective. The serial pass's 128 collectives cost 0.491 s, i.e. 3.83 ms each. So
+the fixed term is **~1.6 ms** and the byte term **~2.2 ms** at 512 rows — the 4-slice split pays
+4x1.6 ms of fixed cost to overlap 2.2 ms of bytes, which is why it loses by 2x. Section 5.3 prices
+the same fixed term at 1.85 ms from a device-synced profile three prompt lengths long, so the number
+the crossover turns on is measured twice by unrelated routes.
 
 The byte term grows 8x from 512 to 4096 rows; the fixed term does not. That is the whole crossover.
 
@@ -107,106 +109,129 @@ within the drift the decode column bounds.
 picks 4 slices and is unchanged, which is the intended behaviour of a rule that only ever moves the
 short-prompt end.
 
-## 5. Measured: prefill is collective-bound at both prompt lengths
+## 5. Measured: what the prefill wall is made of
 
-`QWEN_HOST_PROFILE=1`, 512-token prompt, 64 layers, TP4, post-fix build (so the rule selects the
-serial path). The profile emits four blocks — kernel warmup, the added `warmup_decode` boundary, the
-real prefill, decode — and the real-prefill block's own figures are below. `TOTAL` is the sum of
-every scope and so double-counts nested ones; the wall for the same run was
-`prefill_seconds=0.584436` / `prefill_tokens_per_s=876.058`.
+Sections 3 and 4 pin the slice count from the outside, by throughput. They say nothing about what
+the wall that remains is made of, and the first answer this document gave — that the collectives are
+84-87% of it — does not survive a device-synced profile. The corrected attribution and the evidence
+that replaces it are below.
 
-| phase | seconds | calls | us/call |
+### 5.1 Why the earlier profile could not answer this
+
+The first version of this section used `QWEN_HOST_PROFILE=1`. Its spans are host wall-clock and
+**nest**: an outer scope absorbs everything its children spend, so `ar.lin.out` charged to the
+collective whatever ran between two collective issues. `TOTAL` is the sum of every scope including
+the nested ones, so it came out above the wall it was measuring — 2.77 s of scopes against a 1.25 s
+wall in the runs below, 8.41 s against 3.95 s at the longest one. The short-prompt table that
+resulted also names `layer.attn` and `layer.mlp_down`, scopes that no longer exist anywhere in
+`cpp_engine/`; it is not reproducible on the current tree.
+
+`QWEN_PHASE_PROFILE=1` instead has every `PhaseScope` synchronise the device on entry and exit, so
+each `seconds=` is device time for that scope and a GEMM cannot hide behind a collective wait. Run
+with `QWEN_COMM_OVERLAP_SLICES=1`, i.e. the serial path, so that nothing overlaps at all.
+
+### 5.2 The attribution
+
+TP4, four ranks, `QWEN_PHASE_PROFILE=1 QWEN_COMM_OVERLAP_SLICES=1`, rank 0, one report block per run
+identifiable by its `STACK.r`. `STACK.r` is the whole 64-layer decoder stack as one scope and it
+lands within 2% of the reported `prefill_seconds` at every length, so it is the denominator the rest
+of the column is read against.
+
+| prompt tokens | 1105 | 2223 | 4433 |
 |---|---|---|---|
-| `STACK.r` (whole 64-layer stack) | 0.54849 | 64 | 8570 |
-| `ar.lin.out` | 0.324624 | 48 | 6763 |
-| `ar.mlp` | 0.132871 | 64 | 2076 |
-| `ar.full.out` | 0.0332871 | 16 | 2080 |
-| `ar.hidden_a` | 0.0165539 | 1 | 16554 |
-| `tp_all_reduce` (inner measure of the same calls) | 0.507209 | 129 | 3932 |
-| `top1_allreduce` | 0.0111021 | 1 | 11102 |
-| `layer.attn` | 0.400903 | 64 | 6264 |
-| `layer.mlp_down` | 0.133831 | 64 | 2091 |
-| `full_attention` | 0.053958 | 16 | 3372 |
-| every `pr.*` / `pd.*` projection | <= 0.006359 each | — | — |
+| wall (`prefill_seconds`) | 1.2501 | 2.1490 | 3.9484 |
+| `STACK.r` | 1.2229 | 2.1187 | 3.9142 |
+| prefill TPS | 883.9 | 1034.5 | 1122.7 |
+| **`gated_delta`** (48 calls) | **0.5493 (44.9%)** | **1.1005 (51.9%)** | **2.2009 (56.2%)** |
+| `full_attention` (16) | 0.1359 (11.1%) | 0.2331 (11.0%) | 0.4722 (12.1%) |
+| projections, all 384 GEMMs | 0.1623 (13.3%) | 0.3243 (15.3%) | 0.5471 (14.0%) |
+| `tp_all_reduce` (129 collectives) | 0.3026 (24.7%) | 0.3479 (16.4%) | 0.4961 (12.7%) |
+| `attn_resid_norm` + `add` + `norm` | 0.0312 (2.6%) | 0.0507 (2.4%) | 0.0693 (1.8%) |
 
-Read against the wall this is a sharper statement than the one it replaces:
+- **The linear-attention recurrence is the largest term and it is the one that grows.** `gated_delta`
+  goes 44.9% → 56.2% of the stack across a 4x length increase, and its absolute cost is exactly
+  linear: 0.5493 / 1.1005 / 2.2009 s for 1105 / 2223 / 4433 tokens is 496.9 / 495.1 / 496.5 us per
+  token, a spread of 0.4%. It is 10.35 us per token per head per layer, over 48 layers.
+- **The collectives are a falling share, not the wall.** 129 calls — one `mlp.down` in each of the 64
+  layers, one output reduce in each of the 48 gated-delta layers (`lin.out`) and each of the 16 full
+  attention layers (`full.out`), plus one hidden-state reduce — cost 24.7% of the stack at 1105
+  tokens and 12.7% at 4433.
+- **The projections are not the story either.** All 384 of them together are 14% at every length.
+- The shares sum to 96% of `STACK.r`; the remainder is the small per-layer scopes (`swiglu`,
+  `resid_copy` and friends) that the table does not list.
 
-- `ar.lin.out + ar.mlp + ar.full.out = 0.4908 s`, and `ar.hidden_a` adds the 1 collective the stack
-  does not contain, so **0.5072 s of the 0.584 s prefill wall is the 129 TP all-reduce calls** —
-  87%.
-- `STACK.r` is 0.548 s total, of which 0.491 s is those collectives, so **all of the layer's other
-  work — norms, transposes, gated-delta, swiglu, all the projections — is 0.058 s, 0.90 ms per
-  layer**.
-- The 129 calls are 2 per layer — one `mlp.down` reduce in every layer and one attention-output
-  reduce, which is `lin.out` in the 48 gated-delta layers and `full.out` in the 16 full attention
-  layers — plus one hidden-state reduce.
+### 5.3 The collective priced from the same runs
 
-The same profile on the pre-fix build confirms the mechanism from the other side: `STACK.r` 1.10998 s
-with the three `ar.<site>.ov` scopes summing to 1.0336 s over 512 calls (256 + 192 + 64, i.e. the
-layer sites times 4 slices), and the layer's non-collective work at 0.076 s. The collectives
-themselves cost 1.0336 s sliced against 0.4908 s serial for the same bytes.
+Dividing `tp_all_reduce` by its 129 calls against the rows each call carries (`rows * 5120`
+fp16 elements):
 
-That is also the largest remaining prefill lever, and it is the same one decode needs. There are 2
-collectives per layer at ~3.8 ms each at this row count, against a layer whose every other
-operation together costs 0.90 ms; removing one of the two per layer would take 0.245 s off the
-0.584 s wall. No projection tuning at this prompt length comes close.
-
-### The same attribution at 4096 rows
-
-The short-prompt result could have been an artefact of the serial path: at 4096 rows the rule
-selects 4 slices, the byte term is 8x larger, and three of every four collectives are overlapped by
-the next slice's GEMM, so the collective share should fall. It does not. Same profile,
-4096-token prompt, 2 new tokens, no override (so `comm_overlap_slices_for_rows(4096)` picks 4):
-
-| phase | seconds | calls | us/call |
+| rows | us/call | payload | MB/call |
 |---|---|---|---|
-| `ar.mlp.ov` | 2.17062 | 256 | 8479 |
-| `ar.lin.out.ov` | 0.400025 | 192 | 2083 |
-| `ar.full.out.ov` | 0.135582 | 64 | 2119 |
-| `ar.hidden_a` | 0.0163618 | 1 | 16362 |
-| `STACK.r` (whole 64-layer stack) | 2.9734 | 64 | 46460 |
-| `full_attention` | 0.299992 | 16 | 18750 |
-| `layer.attn` | 0.773072 | 64 | 12079 |
-| `pr.mlp.down` (the GEMMs the collectives overlap) | 0.00835505 | 256 | 33 |
-| `pr.lin.out` | 0.00642037 | 192 | 33 |
-| every other `pr.*` / `pd.*` projection | <= 0.005759 each | — | — |
-| `top1_allreduce` | 0.242522 | 1 | 242522 |
-| wall | 3.24111 | — | 1263.77 TPS |
+| 1105 | 2346 | 11.32 MB | 11.32 |
+| 2223 | 2697 | 22.76 MB | 22.76 |
+| 4433 | 3845 | 45.39 MB | 45.39 |
 
-- The `*.ov` scopes sum to **2.706 s over 512 calls**, and `ar.hidden_a` is the 513th, so
-  **2.723 s of the 3.241 s wall — 84% — is still TP all-reduce**, at 8x the row count and with the
-  4-way split in place. Slicing does what it was supposed to (the projections it overlaps are
-  measured at 33 us per slice, 0.0084 s for all 256 of them) and the collective still owns the wall.
-- `STACK.r` at 2.973 s against 2.706 s of collectives leaves **0.267 s, 4.2 ms per layer**, for
-  everything else in the layer. That is up from 0.90 ms at 512 rows because the GEMM work is real
-  at this length — but it is still 8% of the wall.
-- `top1_allreduce` is a single call and costs **0.243 s, 7.5% of this prefill**, against 0.011 s for
-  the same scope in the decode block of the same run. It is measured, not explained: the scope is
-  the only one that grows 20x between the two phases, and this profile cannot yet say why. It is
-  the second-largest single item in the prefill wall and is recorded here as open.
-- `full_attention` is 0.300 s (9.3%) — at 4096 rows attention has become a real term, unlike at 512,
-  which is why it is profiled separately from the collectives rather than folded into them.
+A two-point fit on the ends gives a **fixed term of 1.85 ms per call** and a **marginal 22.7 GB/s**;
+that predicts the middle point at 2849 us against 2697 us measured, 5% off. The fixed term agrees
+with the ~1.6 ms section 2 derived from the slice sweep by a completely different route, which is the
+useful part: the number that decides the slice count is the same number that decides the ceiling.
 
-The two profiles say the same thing at both ends of the range: a 64-layer TP4 pass issues 129
-collectives at 512 rows and 513 at 4096 rows, and either way they are 84-87% of the prefill wall.
-More slices move cost between the fixed and byte terms; they do not reduce the number of times the
-layer has to stop at a collective.
+### 5.4 Where the recurrence's 2.2 s goes
+
+The kernel's per-token work is one `Muls` over the 64 KiB state, two `broadcast_rows` calls (a
+`Duplicate` per key row — 256 of them), a `Mul`, two `fold_rows` folds, the delta chain, and a
+128-iteration `Axpy` loop for the rank-1 update. Reading that gives a cost model but not a
+measurement, so each group was ablated out of `qwen_gated_delta_f16.cpp` and the scope re-timed:
+build, run at 4433 tokens, restore.
+
+| variant | `gated_delta` | delta | wall | prefill TPS |
+|---|---|---|---|---|
+| as shipped | 2.2023 | — | 3.929 | 1128 |
+| `broadcast_rows` ablated (256 `Duplicate`/token) | 1.4105 | −0.792 (−36.0%) | 3.137 | 1413 |
+| rank-1 update ablated (128 `Axpy`/token) | 1.6252 | −0.577 (−26.2%) | 3.373 | 1314 |
+| both ablated | 0.8424 | −1.360 (−61.8%) | 2.557 | 1734 |
+
+The two deltas sum to 1.369 s against 1.360 s measured with both gone — additive to 0.7%, so the
+groups are independent. **62% of the recurrence is the issue cost of 384 per-row vector
+instructions, not the state bandwidth**: the ablation rewrites only one of three kernels in a 64-layer
+pass and moves the end-to-end prefill 1128 → 1734 TPS.
+
+The shapes are the reason. `broadcast_rows` builds `work[i][j] = k[i]` so that
+`fold_rows(k * S)` can compute `k^T S` — a 1x128 by 128x128 matvec written as a broadcast, a multiply
+and a seven-step fold. The rank-1 update, `S += k (x) delta`, is a 128x1 by 1x128 outer product
+written as 128 `Axpy`. Both are Cube shapes, and neither uses Cube. `Brcb` is an unsupported stub on
+first-generation `dav_c100`, so the scalar `Duplicate` loop is deliberate rather than an oversight —
+but it costs 36% of the prefill wall at this length.
+
+### 5.5 What this costs the 2000 TPS target
+
+2000 TPS at 4433 prompt tokens is a 2.217 s wall. The recurrence is 2.202 s of the 3.948 s measured,
+so **it has to come down to 0.47 s — 4.7x — before any other term matters**, even holding everything
+else fixed. Cutting it to 0.9 s, which is what turning the two ablated groups into Cube ops has to
+plausibly achieve, gives a 2.6 s wall or about 1700 TPS, and the remaining gap is then the
+collectives' 1.85 ms fixed term at 129 calls (0.24 s) plus the state passes that survive.
 
 ## 6. What this rules out
 
 - **More slices.** Four is already past the optimum at every row count below 4096 and the ceiling is
-  only reachable because of it; the failure mode at short prompts is not subtle. The 4096-row
-  profile above is the stronger form of the same point: with the 4-way split applied and half a
-  thousand collectives in the pass, they are still 84% of the wall.
+  only reachable because of it; the failure mode at short prompts is not subtle.
+- **Reading the prefill wall as collective-bound.** This was this document's original conclusion, at
+  84-87%, and it is withdrawn: it came from nested host-wall spans charged to `ar.*` scopes that also
+  contained the work between collective issues. Device-synced, the collectives are 12.7% of the stack
+  at 4433 tokens against the recurrence's 56.2%, and their share falls as the prompt grows while the
+  recurrence's rises. Cutting a collective is still worth doing — 0.24 s of the 3.95 s wall is pure
+  fixed per-call cost — but it is not the lever that reaches 2000 TPS.
 - **A cheaper collective.** The fixed term is host-side issue of the collective itself, measured flat
   in payload size in `bench_qwen_ascend_allreduce` (0.404 ms at 10 KB, 0.412 ms at 640 KB, against a
   0.011 ms device event pair), and `hcclOpExpansionMode` 0/1/2/3 leaves it unmoved. Slicing hides the
-  byte term; it cannot make the fixed term smaller.
-- **Tuning the projections to fix prefill.** Every projection GEMM is 0.0064 s or less at a 512-token
-  prompt and 0.0084 s or less at 4096; the collectives over the same layers are 0.49 s and 2.71 s
-  respectively.
-- **Reading the short-prompt result as a short-prompt problem.** The collective share is 87% at 512
-  rows and 84% at 4096, so this is the shape of the pass, not of the prompt.
+  byte term; it cannot make the fixed term smaller. Section 5.3 prices the same fixed term at 1.85 ms
+  from inside the engine, which is 4.5x the standalone probe — the difference is not explained and is
+  recorded here as open.
+- **Tuning the projections to fix prefill.** Every projection GEMM together is 0.162 s at 1105 rows
+  and 0.547 s at 4433, against a recurrence of 0.549 s and 2.201 s.
+- **Reading the short-prompt result as a short-prompt problem.** The collective share is highest at
+  short prompts (24.7% at 1105 rows) and lowest at long ones (12.7% at 4433); the wall is a shape of
+  the pass, not of the prompt, but the term that owns it changes with length.
 
 ## 7. Files
 
@@ -216,6 +241,8 @@ layer has to stop at a collective.
 - `cpp_engine/engine/qwen_layer_components.hpp` and `include/qwen_engine.hpp` — the
   `comm_overlap_slices` config field and its default.
 - `cpp_engine/tests/bench_qwen_ascend_allreduce.cpp` — the per-call cost in section 6.
+- `cpp_engine/backends/ascend/kernels/qwen_gated_delta_f16.cpp` — the recurrence kernel section 5.4
+  ablates, and `qwen_ascend_kernel_common.hpp` for `broadcast_rows` / `fold_rows`.
 
 ## 8. Reproducing
 
@@ -236,7 +263,17 @@ QWEN_COMM_OVERLAP_SLICES=4 ./cpp_engine/build-ascend/pocketllm_engine \
 
 `QWEN_COMM_OVERLAP_SLICES` pins the slice count for the sweep; omit it to measure the rule. The
 `prefill_seconds` / `prefill_tokens_per_s` / `decode_seconds` / `decode_tokens_per_s` line on rank 0
-is the result. For the section 5 tables add `QWEN_HOST_PROFILE=1`; the profile then prints one
-`qwen_phase tag=...` block per measurement boundary and resets between them. The 4096-row profile is
-the same command with `--max-new-tokens 2` and a 4096-token id file; two new tokens rather than 32
-keeps the decode block short, and the prefill block is unaffected by the generation length.
+is the result.
+
+For the section 5 tables use `scripts/run_qwen_ascend_tp4.sh`, which is simpler to drive and takes
+the prompt as text: `QWEN_PHASE_PROFILE=1 QWEN_COMM_OVERLAP_SLICES=1 ./scripts/run_qwen_ascend_tp4.sh
+"<prompt>" 4`. The profile then prints one `qwen_phase tag=...` block per measurement boundary and
+resets between them. **The tag does not identify a block**: a run emits several `tag=prefill` blocks,
+one of them a decode-shaped pass whose scope times do not move with the prompt length at all. The
+timed prefill is the block whose `STACK.r` matches the run's `prefill_seconds`, and the sections
+above are all read from that block. Take `rank=0` and one block; a flat grep by tag mixes blocks and
+produces a table that does not correspond to any single pass.
+
+`QWEN_HOST_PROFILE=1` remains useful for the overlapped path, where a device-synced scope would
+serialise the pipeline it is measuring, but its spans nest and its `TOTAL` overcounts — do not read
+an `ar.*` figure from it as the collective's cost.

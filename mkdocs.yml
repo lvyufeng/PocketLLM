@@ -133,7 +133,8 @@ nav:
       - Ascend 910A attention: performance/ascend_attention_optimization.md
       - Ascend 910A TP collective overlap: performance/ascend_tp_collective_overlap.md
       - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
-      - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md  - Architecture:
+      - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
+  - Architecture:
       - Overview: architecture/index.md
       - Backend unification design: architecture/backend_unification_design.md
       - C++ engine multi-backend plan: architecture/cpp_engine_multi_backend_plan.md

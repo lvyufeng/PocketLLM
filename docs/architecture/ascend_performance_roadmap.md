@@ -16,26 +16,32 @@ document only draws conclusions from them.
 
 Decode is not 1.6x away and is not a tuning problem. See "Decode" below.
 
-## Prefill: the wall is the collectives, not the math
+## Prefill: the wall is the linear-attention recurrence
 
-An earlier version of this document attributed 84% of prefill to attention and planned a 10.9x
-speedup on that basis. **That attribution was wrong and has been retracted.** A second version
-correctly blamed the projections' share and then stopped at `STACK.r`, the whole decoder layer, as an
-"unattributed black box". **That is now measured too, and the answer is not compute:**
+Two earlier versions of this document got this wrong in different ways, and both retractions matter.
+The first attributed 84% of prefill to attention. The second replaced it with the collectives at
+84-87%, on the strength of a host-wall profile whose spans nest — an outer `ar.*` scope absorbed
+everything that ran between two collective issues, and `TOTAL` came out above the wall it was
+measuring (2.77 s of scopes against a 1.25 s wall). **A device-synced profile at three prompt lengths
+gives a third answer**, and it is the first one the collectives do not own:
 
-| component, 512-token prompt | share of prefill wall |
-|---|---|
-| 129 TP all-reduce calls (2 per layer + 1 hidden) | **87%** |
-| every other operation in the 64-layer stack | 10% |
-| `top1_allreduce`, 1 call | 2% |
+| share of `STACK.r` | 1105 tokens | 2223 tokens | 4433 tokens |
+|---|---|---|---|
+| **`gated_delta`** (48 calls) | **44.9%** | **51.9%** | **56.2%** |
+| 129 TP all-reduce calls | 24.7% | 16.4% | 12.7% |
+| all 384 projection GEMMs | 13.3% | 15.3% | 14.0% |
+| `full_attention` (16 calls) | 11.1% | 11.0% | 12.1% |
 
-At a 4096-token prompt the same profile gives 84% for 513 collectives, so this is the shape of a
-64-layer TP4 pass rather than a property of short prompts. Attention is 9.8% at 512 tokens and 9.3%
-at 4096; all projection GEMMs together are ~1% at 512 and ~0.3% at 4096.
+The recurrence is 10.35 us per token per head per layer and is **exactly linear in sequence length**
+(496.9 / 495.1 / 496.5 us per token across a 4x span), so it is not a fallback path and it does not
+amortise. An ablation of the kernel shows what the time is: removing its `broadcast_rows` calls and
+its 128-iteration rank-1 `Axpy` loop — both Cube-shaped arithmetic expressed as per-row vector
+instructions — moves the end-to-end 4433-token prefill from **1128 to 1734 TPS**, so **62% of the
+recurrence's 2.2 s is vector-instruction issue cost, not state bandwidth.** Both groups are
+independent, to 0.7%.
 
-The consequence is that prefill cannot be fixed by making matmuls faster, and the single-card GEMM
-measurement (74-115 TFLOPS at batch 4096) is not the binding constraint. The lever is the number of
-times the layer stops at a collective.
+The consequence is that prefill cannot be fixed by making the collectives fewer, and the projections
+are not the binding constraint either at 13-15%. The lever is one kernel.
 
 **Done:**
 
@@ -43,21 +49,32 @@ times the layer stops at a collective.
   instead of a constant 4 (`comm_overlap_slices_for_rows`), worth **2.05x at a 512-token prompt**
   (428.1 -> 878.8 TPS) and neutral at 4096. See
   [`performance/ascend_tp_collective_overlap.md`](../performance/ascend_tp_collective_overlap.md).
+  That document's section 5 also carries the corrected attribution above and the ablation.
 
 **Next step, in order:**
 
-1. **Cut the collective count per layer.** Two per layer — one `mlp.down` reduce in every layer and
-   one attention-output reduce — at ~3.8 ms each against a layer whose every other operation
-   together costs 0.90 ms. Removing one of the two per layer takes 0.245 s off the 0.584 s wall at
-   512 tokens. This is the same change decode needs, and it is the only identified prefill lever
-   that is worth more than a few percent.
-2. **Explain `top1_allreduce`.** A single call costs 0.243 s at 4096 tokens (7.5% of that prefill)
+1. **Move the gated-delta recurrence onto the Cube.** It is 2.20 s of the 3.95 s wall at 4433 tokens
+   and 62% of it is issue cost of per-row vector instructions whose shapes are matrix shapes: the
+   `broadcast_rows` / `fold_rows` pair computes `k^T S` as a broadcast, a multiply and a seven-step
+   fold, and the rank-1 update `S += k (x) delta` is 128 `Axpy` calls. `Brcb` is an unsupported stub
+   on first-generation `dav_c100`, so the scalar `Duplicate` loop is deliberate — but it is 36% of the
+   wall at that length. This is the only identified prefill lever worth more than a few percent.
+2. **Cut the collective count per layer.** Two per layer — one `mlp.down` reduce in every layer and
+   one attention-output reduce — at a measured ~1.85 ms of fixed host-side issue each. At 129 calls
+   that is 0.24 s of the 3.95 s wall at 4433 tokens, and it is the same change decode needs. Worth
+   doing, but it no longer reaches the target on its own.
+3. **Explain `top1_allreduce`.** A single call costs 0.243 s at 4096 tokens (7.5% of that prefill)
    against 0.011 s for the same scope in the decode block of the same run. It is measured and not
    yet explained; a 20x phase difference on one call is worth an afternoon.
-3. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1261 TPS figure is a
+4. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1261 TPS figure is a
    4096-token prefill, where the per-token cost is dominated by the layer GEMMs. Shorter prompts pay
    the same fixed per-step costs over fewer tokens, so a single 2000 TPS target across prompt lengths
    may need to be restated per length rather than pursued as one number.
+
+At 4433 tokens, 2000 TPS is a 2.217 s wall. The recurrence is 2.202 s of the 3.948 s measured, so it
+has to fall 4.7x before any other term matters; turning the two ablated groups into Cube ops gives a
+2.6 s wall or about 1700 TPS, and the remainder is then the collectives' fixed term plus the state
+passes that survive.
 
 ## Decode: quantization is required, not optional
 
@@ -94,7 +111,8 @@ top of the bound, and neither is small:
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
    128-wide vector ops, with `broadcast_rows` the documented hot spot — plus the norms and
    transposes. Those are Cube work being done on the vector unit, and unlike attention this one is
-   worth 128x128 scale arithmetic.
+   worth 128x128 scale arithmetic. The prefill ablation prices the same two groups at **62% of the
+   recurrence's device time** (see "Prefill" above), so the estimate is no longer a cost model.
 
 **Ranked next steps:**
 
@@ -116,9 +134,11 @@ The following were estimates presented as a plan and are not supported by measur
 listed so they are not picked up again:
 
 - "attention is 84% of prefill" — measured at 9.8% at 512 tokens, and the phase is separately
-  instrumented from the decoder layer. The layer itself turned out to be 87% TP all-reduce, so the
-  error was not in measuring attention but in never opening the scope that contained everything
-  else.
+  instrumented from the decoder layer.
+- "the collectives are 84-87% of prefill" — the replacement for the line above, and wrong for the
+  same reason in the other direction: the spans it was read from nest, so an `ar.*` scope was
+  charged whatever ran between two collective issues. Device-synced, the collectives are 12.7% of
+  the decoder stack at 4433 tokens against the linear-attention recurrence's 56.2%.
 - Multiplicative projections of phase gains ("Phase 1 x Phase 2 = ~720 TPS") — the phases are not
   independent and the base attribution was wrong.
 - "Cube is ~2x faster than Vector at matmul, so expect 3-5x" — the measured decode attention result is

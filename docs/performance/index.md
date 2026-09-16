@@ -17,9 +17,10 @@ different generation length — a `TG4` measurement says nothing about `TG512`.
 | [Native C++ OpenAI concurrency validation](cpp_openai_concurrency_validation.md) | The end-to-end HTTP acceptance test and the vLLM head-to-head that followed it. |
 | [Native C++ OpenAI tool-calling acceptance](cpp_openai_tool_acceptance.md) | Tool calling driven through a second turn, the `openai` SDK and `langchain-openai`, and the sidecar templating defect the first real two-turn request exposed. |
 | [Ascend 910A attention and its measured ceilings](ascend_attention_optimization.md) | The Cube (`Mmad`) GQA attention operator, the three-way decode dispatch, the prefill phase table, and the bandwidth, all-reduce and `aclrtMemcpy` limits every remaining target has to clear. |
-| [Ascend 910A TP collective overlap](ascend_tp_collective_overlap.md) | Why the overlapped all-reduce must slice by row count rather than a constant, the crossover sweep, and the profiles showing prefill is 84-87% collectives at both 512 and 4096 tokens. |
+| [Ascend 910A TP collective overlap](ascend_tp_collective_overlap.md) | Why the overlapped all-reduce must slice by row count rather than a constant, the crossover sweep, and a device-synced profile at three prompt lengths showing the linear-attention recurrence is 45-56% of the stack against the collectives' 13-25%. |
 | [DeepSeek-V4 PersistentEngine serial baseline](deepseek_v4_serial_baseline.md) | The serial prefill/decode baseline for the native engine on DeepSeek-V4-Flash-0731, the environment ablation behind it, and why `--max-batch-size 8` currently changes nothing. |
 | [Auditing the DeepSeek-V4.1-Flash shards while the checkpoint is arriving](deepseek_v4_1_shard_audit.md) | A header audit that distinguishes a missing shard from a wrong one: 44.0% of a 48-shard checkpoint readable as it downloads, the 8 checks that are still undecided and the shards each waits on, and the tensor shapes and per-layer counts the landed shards assert. |
+
 The currently authoritative per-model numbers live in the
 [model guides](../models/README.md); pages under
 [Archive](../archive/phase2-phase3/index.md) are historical records whose numbers
