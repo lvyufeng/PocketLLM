@@ -4,12 +4,13 @@ The released V4.1-Flash weights now load into `src/models/deepseek_v4_1` and dec
 this machine. This page is the measured cost of doing it, phase by phase, and the arithmetic that
 says which of those phases the four RTX 2080 Ti can and cannot move.
 
-**Nothing in the forward used a GPU.** The forward is entirely host code over a memory-mapped
-checkpoint, so the four cards are idle throughout and every number below is a CPU, RAM and disk
-number. That is the point: it establishes what the host half costs before any device work, and it is
-the first measurement of this checkpoint anywhere in this repository. The one exception is the last
-section, which times PCIe to a card — the single question about this plan that cannot be answered
-without touching one.
+**The forward timed here is entirely host code over a memory-mapped checkpoint**, so for everything
+below the four cards are idle and every number is a CPU, RAM and disk number. That is the point: it
+establishes what the host half costs, and it is the first measurement of this checkpoint anywhere in
+this repository. Two things here touch a card at all — the PCIe rows of the carrier table, and the
+`/tmp/probe_token_cost.py` line that measures the same prompt through the device path — and the
+device path itself has its own page,
+[deepseek_v4_1_flash_device_experts.md](deepseek_v4_1_flash_device_experts.md).
 
 ## Run record
 
@@ -19,9 +20,9 @@ without touching one.
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB (SMR disk, `/dev/sda`) |
 | Runtime | PyTorch resident, `src/models/deepseek_v4_1`, no native engine, no CUDA tensors |
 | Commit | `688d803` on `feature/v41-backbone-runtime` |
-| GPUs | 4 x RTX 2080 Ti, 22528 MiB each — **idle**; TP/EP world size 1 CPU rank, plus one card timed for PCIe in the last section |
+| GPUs | 4 x RTX 2080 Ti, 22528 MiB each — **idle** for every host number below; EP world size 1 on the host path, one card timed for PCIe in the carrier table, and the device page's world 1 and 4 |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM, 930 GiB available |
-| Software | Python 3.10.10, torch 2.9.1+cu128, `deepseek` conda env |
+| Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env |
 | Prompt | `The capital of France is` (5 tokens), and one token at position 0 for the phase table |
 | Warm/cold | Both reported; the phase table gives three consecutive forwards of the same token |
 
@@ -29,13 +30,16 @@ Scripts: `/tmp/probe_where.py` (phase timing), `/tmp/probe_footprint.py` (what t
 `/tmp/probe_engram_cost.py` (the Engram gather), `/tmp/probe_accept.py` (correctness),
 `/tmp/probe_expand_vs_read.py` and `/tmp/probe_dequant_floor.py` (the read/expansion split and the
 expansion's headroom), `/tmp/probe_top5_label.py` (which prefix length each quoted top-5 belongs to),
-and `/tmp/probe_h2d.py` (the PCIe and card-side arithmetic in the last section
-— the only one of them that wants a GPU). They are throwaway probes rather than checked-in
+`/tmp/probe_capture.py` (the routing and the miss rate against the 16-slot window),
+`/tmp/probe_token_cost.py` (the per-step table that replaced the page's miss arithmetic, on the host
+path and on the device one) and `/tmp/probe_h2d.py` (the PCIe and card-side arithmetic in the carrier
+table — the only one of them that wants a GPU). They are throwaway probes rather than checked-in
 benchmarks; the numbers they produced are what this page records. The commit above is the code the
 phase table, the byte census and the Engram numbers ran against; this page itself, the comment
 corrections it prompted, and the checked-in generation path land in later commits, and the two
 generated-token runs in the next section were made with
-`src/models/deepseek_v4_1/generate.py` on top of `c9694b3`.
+`src/models/deepseek_v4_1/generate.py` on top of `c9694b3`. The per-step table under them and the
+corrected carrier rows were measured after that, on the same branch.
 
 ## What is in the 475 GiB
 
@@ -126,17 +130,18 @@ Three consecutive forwards of the same token at position 0, in one process:
 | per-layer overhead and `embed`, unattributed | 0.24 s | 0.19 s | 0.14 s |
 | **total** | **27.23 s** | **2.23 s** | **1.00 s** |
 
-The cold column is every routed expert of the token — 8 per layer, all 320 — expanded to bf16 for the
-first time: 5.60 GiB read and 21.09 GiB written out. The third column is the *same* forward a third
-time, and by then all 320 of those experts are in the 16-slot window, so its 0.44 s of MoE is
-arithmetic over cached bf16 with no expansion in it at all. **The third column is a repeat cost, not a
-decode cost**, and the difference between the two is the whole of the next section.
+The cold column is every routed expert of the token — 6 per layer, all 240 — expanded to bf16 for the
+first time: 4.20 GiB read and 15.82 GiB written out. The third column is the *same* forward a third
+time, and by then the layer's 16-slot window holds all six of the experts that token routes to, so its
+0.44 s of MoE is arithmetic over cached bf16 with no expansion in it at all. **The third column is a
+repeat cost, not a decode cost**, and the difference between the two is the whole of the next section.
 
 The 16-expert FIFO window in `CheckpointRoutedExperts` turns out to be nearly worthless and is
-measured rather than assumed: a token routes to 8 of a layer's 384 experts, and **6 of those 8 are
-misses at every layer, every token, warm**. It saves 25% of the expert expansions for 42 GiB of host
-RAM across the backbone. `DEFAULT_EXPERT_CACHE = 16` bounds a correctness path; it is not a cache
-policy.
+measured rather than assumed: a token routes to 6 of a layer's 384 experts, and against a window that
+holds the last 16, **about half of them miss — 2.67, 3.30, 2.92 and 3.02 misses per layer over the
+four decode steps of `/tmp/probe_capture.py`, 6 distinct experts per layer in every one of them**. It
+saves about half of a step's expert expansions for 42 GiB of host RAM across the backbone.
+`DEFAULT_EXPERT_CACHE = 16` bounds a correctness path; it is not a cache policy.
 
 ### What a generated token costs, and of what
 
@@ -148,9 +153,13 @@ prompt, two runs in separate processes:
 | 1 | 4 | 169.5 s | 42.37 s | `The capital of France is Paris. The E` |
 | 2 | 4 | 124.6 s | 31.15 s | `The capital of France is Paris. The E` |
 
-**30 to 40 seconds per generated token**, against the 1.00 s the repeated-forward column reports. The
-gap is exactly the expansion a repeated forward does not have to do. Splitting one miss into its two
-halves, over a layer whose pages are already resident:
+The same command run three more times, once in the device page's session, gives a wider sample —
+`168.0 s for 6`, `142.0 s for 4` and a second `142.0 s for 4`, so the whole-request per-token figure
+is **28 to 42 seconds** over the five runs. A *step* whose expert pages are warm is the floor of that
+range and it is measured separately, at **15.3 s** (below). Call a generated token **15 to 42
+seconds** on this host, then, against the 1.00 s the repeated-forward column reports. The spread is the
+page cache and the gap to the repeated forward is exactly the expansion a repeated forward does not
+have to do. Splitting one miss into its two halves, over a layer whose pages are already resident:
 
 | Step of one miss | Per projection tensor |
 | --- | ---: |
@@ -159,8 +168,30 @@ halves, over a layer whose pages are already resident:
 | read + expand + cast (`weight(..., dtype=bf16)`) | 40.7 ms |
 
 **The read is 0.3% of a miss and the expansion is 99.7% of it.** One expert is three of those tensors,
-so 0.122 s per expert: **39.1 s** for a token's 320 experts, **29.3 s** for the 240 that a warm step
-still misses — which is what the measured 31 s is made of.
+so 0.122 s per expert: a token's **240** experts are **29.3 s** when a step misses every one of them,
+and that is what the 31 s of run 2 is made of. A warm step misses fewer, and the number is measured
+rather than assumed — `/tmp/probe_token_cost.py`, one run, per step:
+
+| Step | Wall | MoE | other | misses of 240 | s per miss |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 (5-token prefill) | 84.14 s | 82.41 s | 1.72 s | **759 of 1,200** | 0.1086 |
+| 1 | 14.98 s | 13.59 s | 1.40 s | 107 | 0.1270 |
+| 2 | 16.72 s | 15.85 s | 0.86 s | 132 | 0.1201 |
+| 3 | 14.43 s | 14.08 s | 0.35 s | 117 | 0.1204 |
+| 4 | 15.01 s | 14.22 s | 0.79 s | 121 | 0.1175 |
+
+The prefill routes 5 tokens × 6 experts × 40 layers = **1,200** rows and misses **759** of them; a
+decode step routes 240 and misses **107–132**, a mean of **119**. The per-miss cost is
+**0.1175–0.1270 s**, which is the 0.122 s above and not something near it, so the decomposition holds
+and the miss count is what was wrong: a warm decode step is **15.3 s** wall, **14.4 s** of it MoE and
+**0.9 s** everything else — 119 misses × 0.122 s = 14.5 s of the 14.4 s.
+
+**The miss *count* is the routing's and the miss *cost* is the page cache's.** 119 is what the
+6-experts-against-a-16-slot window gives at any speed; this probe's steps are the fastest the page
+has recorded because it ran behind probes that had already read the same expert rows, so its reads
+were page-cache hits. The two `generate.py` runs above were slower and the two of them differ by 11 s
+per token from each other in the same conditions, so what separates 15 s from 31 s and 42 s is how
+much of the 4.20 GiB of expert pages was resident, not anything in the loop.
 
 The expansion is not a bandwidth floor. The same probe times the bf16 cast of the already-expanded
 matrix — the cheapest operation that writes the same 45 MiB — at **1.28 ms**, so the expansion runs at
@@ -176,13 +207,19 @@ prefilled, at temperature 0, through the host-offload path:
 
 ```text
 The capital of France is  ->  ' Paris.<｜end▁of▁sentence｜>\n\n\n\n\n'
-expert misses per layer: min 26 max 52 total 1648
 engram rows gathered:    {1: 456, 14: 456}
 ```
 
 Those 456 gathers per table are 24 rows for each of the 19 positions that probe forwards in one
 process — a profile forward, four prefill/stepwise comparisons and the thirteen-step decode — not
 456 for the prompt on its own.
+
+That block used to carry a third line, `expert misses per layer: min 26 max 52 total 1648`, and it
+is gone because it was wrong: the probe stepped one token at a time at **8** experts per layer where
+the checkpoint activates **6**, and its `1648` over 19 forwards reconciles with neither count. The
+measured replacement is the table above — **119 of 240** expert rows missed at a decode step and
+**759 of 1,200** at a five-token prefill, both from `/tmp/probe_token_cost.py`, which counts what
+the class actually did rather than what a constant in a probe said it would.
 
 The distribution at the end of a prefill is coherent rather than flat, and `/tmp/probe_top5_label.py`
 pins which prefix each one belongs to, because the prompt is five tokens and not four:
@@ -212,10 +249,10 @@ right, not that the logits match the reference's.
 
 ## The wall, and what the cards can do about it
 
-A decode step routes to 8 experts per layer, so it must move
+A decode step routes to 6 experts per layer, so it must move
 
 ```text
-8 experts x 40 layers x 17.9 MiB of packed fp4 and its scales  =  5.60 GiB of expert bytes per token
+6 experts x 40 layers x 17.9 MiB of packed fp4 and its scales  =  4.20 GiB of expert bytes per token
 ```
 
 and all 384 experts of all 40 layers are **268.95 GiB**, against 88 GiB of VRAM on the four cards
@@ -224,50 +261,52 @@ combined. The experts cannot be resident on the cards. Everything else in the mo
 checkpoint, and it fits at 19.1% of a card per rank.
 
 So the floor is set by the expansion, not by the bytes and not by FLOPS. Every carrier that could
-bring the 5.60 GiB to a consumer is now measured rather than estimated:
+bring the 4.20 GiB to a consumer is now measured rather than estimated:
 
 | Carrier | Rate on this host | Floor per token |
 | --- | ---: | ---: |
-| host CPU today: read free, expand 240–320 experts | 0.122 s per expert measured | **29–39 s** (the two runs above) |
-| PCIe Gen3 x16, packed fp4 as stored, pinned | 8.29 GiB/s measured | 0.68 s |
-| PCIe Gen3 x16, expanded to bf16 first, pinned | 10.19 GiB/s measured | 2.07 s |
-| the SMR disk behind both | 271 MiB/s | 21 s |
+| host CPU today: read free, expand a step's missed experts | 0.122 s per expert measured | **14.5–29 s** (119 misses warm, 240 cold) |
+| PCIe Gen3 x16, packed fp4 as stored, pinned | 8.29 GiB/s measured | 0.51 s |
+| PCIe Gen3 x16, expanded to bf16 first, pinned | 10.19 GiB/s measured | 1.55 s |
+| the SMR disk behind both | 271 MiB/s | 16 s |
 
-These are `/tmp/probe_h2d.py` on `cuda:2`, over the real 1,920-tensor token load and not a synthetic
+These are `/tmp/probe_h2d.py` on `cuda:2`, over the real 1,440-tensor token load and not a synthetic
 buffer. The raw slot sustains 6.4 GiB/s pageable and 10.6 GiB/s pinned on a 512 MiB buffer; the token
-load reaches 5.70 and 8.29 GiB/s of that — 11% and 22% below the slot — so 1,920 separate copies cost
-a fifth and not a factor. The `I8` packing costs nothing on the wire: the 5.60 GiB that crosses is the
+load reaches 5.70 and 8.29 GiB/s of that — 11% and 22% below the slot — so 1,440 separate copies cost
+a fifth and not a factor. The `I8` packing costs nothing on the wire: the 4.20 GiB that crosses is the
 bytes as stored. The bf16 row is the one that decides whether a device-side expert cache is worth
-building on the dequant path that already exists, and it costs 3.0x the time: 5.60 GiB of packed fp4
-becomes 21.09 GiB of bf16, which is also why its rate is the higher of the two.
+building on the dequant path that already exists, and it costs 3.0x the time: 4.20 GiB of packed fp4
+becomes 15.82 GiB of bf16, which is also why its rate is the higher of the two.
 
 The first row is the one that surprised this page, and the one that decides the rest of it: the bytes
 are already in host RAM, and reading them is 0.3% of what a miss costs. The other 99.7% is arithmetic
 — the fp4 code turned into a bf16 number at 304 Mparam/s, where the cheapest op of the same output
 size runs at 9,223 Mparam/s. Every other row here is a hardware rate; that one is an implementation
-cost, and it is what the host's 30 s per token is made of.
+cost, and it is what the host's token time is made of.
 
 **The cards' arithmetic is not the problem, and neither is the transfer out to them.** The same probe
-times the batched MoE for one layer — 8 experts through all three projections — at 1,564 µs, which is
-**62.6 ms** for the 40 layers of a token, against the **29–39 s** the host spends on the same 40
-layers. The card is two to three orders of magnitude the cheaper place to do the multiplication, and
-it stays the cheaper place after being handed the operands: 0.68 s of pinned PCIe plus 62.6 ms of
-arithmetic is **0.74 s per token** if the two do not overlap and 0.68 s if they do, against the 1.00 s
-the host needs merely to *repeat* a forward it has already cached.
+times an isolated batched MoE for one layer — 8 experts through all three projections — at 1,564 µs,
+and the device path is what a real token pays for the same work: **0.27 s** for all 40 layers' four
+call sets, D2H partials and host sum included, measured, against the **14.5–29 s** the host spends on
+the same 40 layers. The card is two orders of magnitude the cheaper place to do the multiplication,
+and it stays the cheaper place after being handed the operands. The whole device step — staging the
+packed rows, four links, four kernels a layer, and the dense tree still on the host — measures
+**1.23–1.42 s**, against the 1.00 s the host needs merely to *repeat* a forward it has already cached
+and the 15 to 42 s it needs for a real one.
 
 That reverses the reading this page first drew from the carrier table. It took the repeated forward's
 0.44 s of MoE as the host-RAM carrier's floor and set it against 0.68 s of PCIe, and concluded that
 the bytes were the wall. The fair comparison is against what a real step costs, and a real step
-expands 240 fresh experts: **the bytes are not the wall, the expansion is.** The four cards are the
-fastest way measured to pay it.
+expands 119 experts warm and 240 cold: **the bytes are not the wall, the expansion is.** The four
+cards are the fastest way measured to pay it.
 
 What does not change is the constraint underneath: 268.95 GiB of experts against 88 GiB of VRAM, so
-every token still moves 5.60 GiB. A device-side expert cache holding whole layers resident fails on
+every token still moves 4.20 GiB. A device-side expert cache holding whole layers resident fails on
 arithmetic rather than on engineering — one layer is 25.3 GiB expanded, so all 88 GiB of VRAM holds
 three of the forty and the remaining 37 layers would still pay the 0.68 s. Only a format that makes a
 layer small enough to sit on a card removes the per-token transfer.
 
-The host path's own 30 s is left where it is, and the measurement says where the room is: an
+The host path's own 15 to 42 s is left where it is, and the measurement says where the room is: an
 expansion running at 30.4x the cheapest op of the same output size is a kernel problem, not a
 bandwidth one, so a host that kept the experts on the CPU has that much in front of it without
 touching PCIe at all.
@@ -283,7 +322,7 @@ touching PCIe at all.
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_expand_vs_read.py
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_dequant_floor.py
 
-# a generated token, which is the number the expansion actually sets: ~60 s to load, then 30-40 s
+# a generated token, which is the number the expansion actually sets: ~60 s to load, then 15-42 s
 # per token
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python -m src.models.deepseek_v4_1.generate \
   --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" --max-new-tokens 4
@@ -300,8 +339,15 @@ touching PCIe at all.
 # the Engram gather, cold, warm, and out of the copy
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_engram_cost.py
 
+# the per-step routes, misses and wall clock that replaced this page's miss arithmetic, and the same
+# prompt through the device path with `--expert-device cuda --expert-world 4`
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_token_cost.py --max-new-tokens 6
+
+# the routing and the miss rate on their own, one layer at a time
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_capture.py
+
 # the PCIe rows of the carrier table and the card's MoE arithmetic -- the only probe here that
-# wants a GPU, and the only one that reads 21 GiB instead of 5.6
+# wants a GPU, and the only one that reads 21 GiB instead of 4.2
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_h2d.py
 ```
 
@@ -311,4 +357,6 @@ page-cache state it finds the checkpoint in; run it twice for a warm H2D column.
 probes want the opposite: they warm the pages on purpose, so that what they time is the arithmetic
 and not the disk. `probe_top5_label.py` pays the ~60 s load again for five prefixes at one forward
 each, which is worth it once — the prefix a quoted distribution belongs to is not recoverable from
-the numbers.
+the numbers. `probe_token_cost.py` is the one whose page-cache state has to be read off the run: its
+per-miss column is a property of the class and its wall clock is a property of what is resident, and
+the two are reported side by side for that reason.
