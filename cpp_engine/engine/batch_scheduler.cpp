@@ -406,6 +406,19 @@ bool BatchScheduler::run_prefill_batch() {
                 req->prefill_complete = true;
                 req->last_token = result.results[i].top_token;
                 req->generated_tokens.push_back(req->last_token);
+                // The token sampled from the prompt is generation token number
+                // one, so it carries the first log-probability entry. Recorded
+                // here rather than at the streaming callback below for the same
+                // reason the token is: an entry appended later than its token
+                // would be indexed against the wrong position.
+                //
+                // `prefill_bounded` ranks the prompt's last position exactly
+                // once, and only a complete row's ranking is a prediction for
+                // the token being appended; an incomplete row returned the last
+                // chunk's interior logits and has already been skipped above.
+                if (req->sampling.logprobs_n > 0) {
+                    req->logprobs.push_back(result.results[i].logprob);
+                }
                 req->seq_len = req->prefilled_tokens;
 
                 // Apply token constraint if present
@@ -603,6 +616,20 @@ bool BatchScheduler::run_decode_batch() {
                     req->generated_tokens.push_back(token);
                     req->last_token = token;
 
+                    // Log probabilities are accumulated in lockstep with the
+                    // tokens, and only for a request that asked for them: the
+                    // engine reports one ranking per row and describes the row's
+                    // *first* emitted token, so a row that emitted several
+                    // (speculative) leaves the rest without an entry rather than
+                    // attaching the first token's ranking to a later one.
+                    // Requests that asked for none keep this vector empty.
+                    if (req->sampling.logprobs_n > 0) {
+                        req->logprobs.push_back(
+                            token_index == 0 && i < result.logprobs.size()
+                                ? result.logprobs[i]
+                                : TokenLogprob());
+                    }
+
                     // Apply token constraint if present
                     if (req->constraint) {
                         if (!req->constraint->accept_token(token)) {
@@ -785,6 +812,7 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     SchedulerGenerationResult result;
     result.request_id = req->request_id;
     result.generated_tokens = req->generated_tokens;
+    result.logprobs = req->logprobs;
     result.constraint_completed = req->constraint_completed;
     // Previously `finished ? "length" : "stop"`, which was backwards: `finished`
     // was only ever set by the length cap, so a normal completion reported

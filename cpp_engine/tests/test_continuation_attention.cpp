@@ -155,7 +155,7 @@ void run_batch_kv_case() {
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     if (!pocket::indexed_cached_attention_rows_batch_kv_cuda(
-            d_q.ptr, d_live.ptr, d_batch_kv.ptr, d_starts.ptr, d_indices.ptr,
+            d_q.ptr, d_live.ptr, nullptr, d_batch_kv.ptr, d_starts.ptr, d_indices.ptr,
             d_sink.ptr, d_batch.ptr, rows, heads, head_dim, max_count, scale)) {
         throw std::runtime_error("batch-local continuation attention launch failed");
     }
@@ -179,7 +179,7 @@ void run_batch_kv_case() {
     const std::vector<float> first = batch;
     for (int iter = 0; iter < 3; ++iter) {
         if (!pocket::indexed_cached_attention_rows_batch_kv_cuda(
-                d_q.ptr, d_live.ptr, d_batch_kv.ptr, d_starts.ptr, d_indices.ptr,
+                d_q.ptr, d_live.ptr, nullptr, d_batch_kv.ptr, d_starts.ptr, d_indices.ptr,
                 d_sink.ptr, d_batch.ptr, rows, heads, head_dim, max_count, scale)) {
             throw std::runtime_error("repeated batch-local attention launch failed");
         }

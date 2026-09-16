@@ -35,6 +35,8 @@ set(POCKET_CORE_SOURCES
     core/json_lite.cpp
     core/json_constraint.cpp
     core/token_constraint.cpp
+    core/openai_request_fields.cpp
+    core/openai_stop_strings.cpp
     core/gguf_reader.cpp
     core/safetensors_reader.cpp
     core/safetensors_model.cpp
@@ -841,6 +843,18 @@ add_executable(test_token_constraint tests/test_token_constraint.cpp)
 target_link_libraries(test_token_constraint PRIVATE pocket_core)
 set_target_properties(test_token_constraint PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# The request-field audit is pure JSON and string work, so it is testable without
+# a checkpoint, a device, or a running server.
+add_executable(test_openai_request_fields tests/test_openai_request_fields.cpp)
+target_link_libraries(test_openai_request_fields PRIVATE pocket_core)
+set_target_properties(test_openai_request_fields PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# Stop-sequence matching is pure string work over decoded text, so it is
+# testable the same way and without a server to stream through.
+add_executable(test_openai_stop_strings tests/test_openai_stop_strings.cpp)
+target_link_libraries(test_openai_stop_strings PRIVATE pocket_core)
+set_target_properties(test_openai_stop_strings PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_qwen_fp8_online tests/test_qwen_fp8_online.cpp)
 target_link_libraries(test_qwen_fp8_online PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_fp8_online PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
@@ -980,6 +994,10 @@ set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_batch_scheduler tests/test_batch_scheduler.cpp)
 target_link_libraries(test_batch_scheduler PRIVATE pocket_cpp_core)
 set_target_properties(test_batch_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_multi_slot_decode_parity tests/test_multi_slot_decode_parity.cpp)
+target_link_libraries(test_multi_slot_decode_parity PRIVATE pocket_cpp_core)
+set_target_properties(test_multi_slot_decode_parity PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_model_registry tests/test_model_registry.cpp)
 target_link_libraries(test_model_registry PRIVATE pocket_cpp_core)

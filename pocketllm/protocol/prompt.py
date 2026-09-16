@@ -31,13 +31,16 @@ def _template_reasoning_effort(value: Any) -> str:
     return _TEMPLATE_REASONING_EFFORTS.get(value, "xhigh")
 
 
-def _template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def template_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Copy messages and make OpenAI tool arguments template-compatible.
 
     OpenAI carries function arguments as a JSON string.  Qwen's bundled
     template iterates over ``tool_call.function.arguments`` as an object, so
     only the private copy passed to the template converts valid JSON objects
     back to dictionaries.  The normalized request metadata is never mutated.
+
+    Any control plane that hands a request's ``messages`` straight to a
+    checkpoint's ``apply_chat_template`` has to run them through this first.
     """
     copied = copy.deepcopy([dict(message) for message in messages])
     for message in copied:
@@ -119,9 +122,9 @@ def _encode_with_template(
         # A custom template is model code from the checkpoint; keep all public
         # request metadata private from accidental in-place mutations.
         kwargs["tools"] = copy.deepcopy(tools)
-    template_messages = _template_messages(messages)
+    rendered_messages = template_messages(messages)
     try:
-        encoded = apply_chat_template(template_messages, **kwargs)
+        encoded = apply_chat_template(rendered_messages, **kwargs)
     except TypeError:
         # Tokenizers with a valid template but an older or custom method may not
         # accept optional model-specific controls.  Preserve the core template
@@ -151,7 +154,7 @@ def _encode_with_template(
         supported.discard("messages")
         compatible_kwargs = {name: value for name, value in kwargs.items() if name in supported}
         try:
-            encoded = apply_chat_template(template_messages, **compatible_kwargs)
+            encoded = apply_chat_template(rendered_messages, **compatible_kwargs)
         except TypeError:
             return None
     return _token_ids(encoded, tokenizer)

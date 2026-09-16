@@ -20,7 +20,8 @@ Protocol (one JSON object per stdin/stdout line):
   request {"op": "tokenize", "prompt": "..."}
   reply   {"ok": true, "token_ids": [...]}
 
-  request {"op": "parse", "text": "...", "thinking_mode": "chat"|"thinking"}
+  request {"op": "parse", "text": "...", "thinking_mode": "chat"|"thinking",
+           "tools": [...] (optional, the same definitions the request carried)}
   reply   {"ok": true, "content": "...", "reasoning": "...", "tool_calls": [...]}
 
   request {"op": "ping"}
@@ -44,6 +45,9 @@ import os
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+from src.encoding import qwen_tool_calls  # noqa: E402  (needs _REPO_ROOT on sys.path)
+from pocketllm.protocol import template_messages  # noqa: E402  (needs _REPO_ROOT on sys.path)
 
 
 def _configure_stdio() -> None:
@@ -132,7 +136,9 @@ class DeepSeekV4Templater:
         )
         return prompt_text, list(self._tokenizer.encode(prompt_text))
 
-    def parse(self, text: str, thinking_mode: str) -> dict[str, Any]:
+    def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
+        # `tools` is accepted and unused here: DSML marks every parameter as a
+        # string or not inside the syntax itself, so the schema adds nothing.
         # parse_message_from_completion_text requires the EOS token to be
         # present.  The C++ engine emits raw decoded text without re-inserting
         # the EOS string (it stops on the EOS token id), so append it if missing.
@@ -141,19 +147,31 @@ class DeepSeekV4Templater:
         return self._parse(text, thinking_mode)
 
 
+# Which tool-call syntax each architecture emits, by the name the C++ model
+# registry reports.  An architecture absent from this table returns no tool calls
+# and leaves the call syntax in the content, which is what the generic templater
+# did for every model before this table existed: inventing a parse for a model
+# whose syntax has not been read would drop or corrupt calls silently.
+_TOOL_CALL_PARSERS = {
+    # Qwen's own chat template, the one every Qwen3.5 checkpoint ships.
+    "qwen3_5": qwen_tool_calls.parse,
+}
+
+
 class ChatTemplateTemplater:
     """The checkpoint's own HF chat template, for models with no bespoke encoder.
 
     Deliberately narrower than the DeepSeek path.  ``reasoning_effort``,
-    ``context`` and ``drop_thinking`` have no equivalent in a stock chat
-    template and are ignored, and tool *calls* in the completion are left in the
-    content rather than parsed: their syntax is per-model, and returning an empty
-    tool_calls list keeps them visible instead of inventing a parse that would
-    silently drop them.
+    ``context`` and ``drop_thinking`` have no equivalent in a stock chat template
+    and are ignored.  Tool calls are parsed only for an architecture whose
+    emitted syntax is known (see ``_TOOL_CALL_PARSERS``); anywhere else they are
+    left in the content, which keeps them visible instead of inventing a parse
+    that would silently drop them.
     """
 
-    def __init__(self, tokenizer) -> None:
+    def __init__(self, tokenizer, tool_call_parser=None) -> None:
         self._tokenizer = tokenizer
+        self._tool_call_parser = tool_call_parser
 
     def _apply(self, messages, tools, add_generation_prompt, thinking_mode, tokenize):
         kwargs: dict[str, Any] = {
@@ -178,6 +196,11 @@ class ChatTemplateTemplater:
         tools = tools if isinstance(tools, list) and tools else None
         add_generation_prompt = bool(req.get("add_generation_prompt", True))
         thinking_mode = req.get("thinking_mode", "chat")
+        # A replayed assistant message carries its `tool_calls[].function.arguments`
+        # as the JSON string OpenAI specifies, while Qwen's template iterates them
+        # as an object (`arguments|items`).  The template gets the converted copy;
+        # the caller's list is left as it was received.
+        messages = template_messages(messages)
         # Tokenize through the template rather than re-encoding the rendered
         # text: a template that emits a BOS would otherwise get a second one
         # from encode().
@@ -185,7 +208,7 @@ class ChatTemplateTemplater:
         prompt_text = self._apply(messages, tools, add_generation_prompt, thinking_mode, False)
         return str(prompt_text), [int(t) for t in token_ids]
 
-    def parse(self, text: str, thinking_mode: str) -> dict[str, Any]:
+    def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
         reasoning = ""
         content = text
         marker = "</think>"
@@ -199,13 +222,22 @@ class ChatTemplateTemplater:
             # Generation stopped before closing the block; all of it is reasoning.
             reasoning = text.removeprefix("<think>")
             content = ""
-        return {"content": content, "reasoning_content": reasoning, "tool_calls": []}
+        tool_calls: list[dict[str, Any]] = []
+        if self._tool_call_parser is not None:
+            # None means the completion carries no call this parser can read in
+            # full, so the text stands as it was written.  That is the same
+            # answer as "this model's calls are not parsed", and it is the one
+            # that cannot show a client a truncated call.
+            parsed = self._tool_call_parser(content, tools)
+            if parsed is not None:
+                content, tool_calls = parsed
+        return {"content": content, "reasoning_content": reasoning, "tool_calls": tool_calls}
 
 
 def build_templater(architecture: str, tokenizer):
     if architecture == "deepseek_v4":
         return DeepSeekV4Templater(tokenizer)
-    return ChatTemplateTemplater(tokenizer)
+    return ChatTemplateTemplater(tokenizer, _TOOL_CALL_PARSERS.get(architecture))
 
 
 def _handle_encode(templater, req: dict[str, Any]) -> None:
@@ -224,7 +256,9 @@ def _handle_tokenize(tokenizer, req: dict[str, Any]) -> None:
 
 
 def _handle_parse(templater, req: dict[str, Any]) -> None:
-    parsed = templater.parse(req.get("text", ""), req.get("thinking_mode", "chat"))
+    parsed = templater.parse(
+        req.get("text", ""), req.get("thinking_mode", "chat"), req.get("tools")
+    )
     _emit({"ok": True, **parsed})
 
 

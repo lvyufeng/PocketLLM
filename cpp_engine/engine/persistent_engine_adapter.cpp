@@ -57,15 +57,23 @@ PersistentEngineAdapter::~PersistentEngineAdapter() = default;
 Capabilities PersistentEngineAdapter::caps() const {
     Capabilities c;
     c.paged_kv = false;
-    // FIXME: Current batch_decode_step() is sequential, not batched.
-    // Report false until true batched forward is implemented.
-    // Infrastructure supports max_slots_ slots, but no performance benefit yet.
-    c.continuous_batching = false;
+    // The engine owns slots and can run rows at different positions in their own
+    // caches at once, but only when the batched forward is switched on: with it
+    // off, batch_decode_step() runs its per-request reference loop however wide
+    // the batch is, so handing it a second row would only make both requests
+    // slower. Reporting that honestly is what the scheduler clamps on, and it
+    // matters in both directions -- a hardcoded false silently discarded
+    // --max-batch-size, and a hardcoded true would advertise concurrency the
+    // engine does not deliver.
+    c.continuous_batching = max_slots_ > 1 && engine_->batched_decode_enabled();
+    // Chunked prefill is a separate question from decode batching and stays off:
+    // it decides whether a prefill token budget means anything, and this engine
+    // reports no paged KV (kv_paged() is false, every kv_*_blocks() is 0), so
+    // there is no block allocator to resume an unfinished prompt against.
     c.chunked_prefill = false;
     c.max_slots = max_slots_;
-    // One request at a time, so "per row" is trivially satisfiable: each
-    // request's temperature/top_p/seed go straight onto the SamplingParams for
-    // its own forward.
+    // Rows are sampled independently -- batch_decode_step() runs one selection
+    // per row against that row's own sampling params and slot RNG.
     c.per_request_sampling = true;
     c.per_request_top_k = false;
     c.fixed_top_k = 0;
@@ -91,6 +99,12 @@ int PersistentEngineAdapter::allocate_slot(uint64_t request_id) {
             slot_taken_[static_cast<size_t>(slot_id)] = true;
             slot_request_ids_[static_cast<size_t>(slot_id)] = request_id;
             positions_[static_cast<size_t>(slot_id)] = 0;
+            // Both halves are needed and neither implies the other: the local
+            // call clears this rank's caches, the command clears every worker's.
+            // A slot reused without the command keeps the finished request's KV
+            // and compressor accumulators on the worker ranks, and the next
+            // request admitted to that slot reads them through the all-reduce.
+            engine_->worker_command_reset_slot(slot_id);
             engine_->reset_slot(slot_id);
             engine_->claim_slot(slot_id, request_id);
             return slot_id;
@@ -168,7 +182,7 @@ BatchPrefillResult PersistentEngineAdapter::batch_prefill(
         }
 
         const SamplingParams sp = to_persistent_sampling(req->sampling);
-        engine_->worker_command_prefill(req->prompt_tokens);
+        engine_->worker_command_prefill(req->prompt_tokens, slot_id);
         const int token = engine_->prefill(req->prompt_tokens, sp, slot_id);
 
         const int prompt_tokens = static_cast<int>(req->prompt_tokens.size());
