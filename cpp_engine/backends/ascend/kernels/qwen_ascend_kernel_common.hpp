@@ -190,7 +190,9 @@ __aicore__ inline float fold_sum(const AscendC::LocalTensor<float>& work,
 }
 
 // acc[:] += weights[i] * state[i, :], summed over a contiguous [rows, width] fp32
-// tile. The caller zeroes `acc`; `rows` must fit the 128-wide float tile.
+// tile. `acc` holds `groups` accumulators of `width` floats laid out
+// contiguously; the sum of all of them comes back in the first. The caller sizes
+// the buffer and does not zero it.
 //
 // This is a weighted reduction down the row axis, and the point of writing it this
 // way is that the weight is a *scalar operand of the instruction*, which this part
@@ -206,16 +208,35 @@ __aicore__ inline float fold_sum(const AscendC::LocalTensor<float>& work,
 // instruction, byte and barrier fixed, moved it 0.09%. So the cost tracks issues,
 // not bytes and not the scalar reads, and the fix is fewer issues.
 //
+// Rows are handed to the accumulators round-robin. With one accumulator the whole
+// loop is a chain of `rows` dependent read-modify-writes and the vector pipe has
+// nothing to overlap; with `groups` of them the dependences are `groups` apart.
+// Which of those two things the phase is paying for -- a chain of latencies or a
+// count of issues -- is what the width ablation left open, since both scale with
+// the row count and the arms only varied the row count.
+//
 // The accumulation order is also the more defensible one: this sums sequentially
 // down the key axis, which is what the CUDA kernel and the tests' double-precision
 // host reference both do, where the fold was a tree with a different rounding.
 __aicore__ inline void accumulate_weighted_rows(const AscendC::LocalTensor<float>& acc,
                                                 const AscendC::LocalTensor<float>& weights,
                                                 const AscendC::LocalTensor<float>& state,
-                                                uint32_t rows, uint32_t width) {
-    for (uint32_t i = 0; i < rows; ++i) {
-        AscendC::Axpy(acc, state[i * width], weights.GetValue(i), width);
+                                                uint32_t rows, uint32_t width,
+                                                uint32_t groups) {
+    for (uint32_t g = 0; g < groups; ++g) {
+        AscendC::Duplicate(acc[g * width], 0.0f, width);
     }
+    AscendC::PipeBarrier<PIPE_V>();
+    uint32_t g = 0;
+    for (uint32_t i = 0; i < rows; ++i) {
+        AscendC::Axpy(acc[g * width], state[i * width], weights.GetValue(i), width);
+        if (++g == groups) g = 0;
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    for (uint32_t g = 1; g < groups; ++g) {
+        AscendC::Add(acc, acc, acc[g * width], width);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 // exp() of a single scalar. There is no scalar exp on this part, so this runs the
@@ -233,18 +254,38 @@ __aicore__ inline float scalar_exp(const AscendC::LocalTensor<float>& work,
 
 // Copy a [rows, width] column window out of a [rows, stride] GM tile.
 //
+// DataCopyParams describes the source and the destination in the same two stride
+// fields, so the load and the store of the same window are *not* the same params:
+// whichever side is GM carries the gap, and the rows of the UB side are always
+// packed. Writing the load's params into the store costs nothing at compile time
+// and writes a contiguous block over the neighbouring windows, so the direction is
+// part of the name rather than a comment.
+//
 // DataCopyParams counts in 32-byte blocks, so this needs width*sizeof(T) and
 // (stride-width)*sizeof(T) to both be block multiples. Callers validate that on
 // the host rather than silently truncating here.
 template <typename T>
-__aicore__ inline AscendC::DataCopyParams window_params(uint32_t rows,
-                                                        uint32_t width,
-                                                        uint32_t stride) {
+__aicore__ inline AscendC::DataCopyParams window_load_params(uint32_t rows,
+                                                             uint32_t width,
+                                                             uint32_t stride) {
     AscendC::DataCopyParams params;
     params.blockCount = static_cast<uint16_t>(rows);
     params.blockLen = static_cast<uint16_t>(width * sizeof(T) / kBlockBytes);
     params.srcStride = static_cast<uint16_t>((stride - width) * sizeof(T) / kBlockBytes);
     params.dstStride = 0;
+    return params;
+}
+
+// The mirror of window_load_params: UB rows are packed, GM rows are `stride` apart.
+template <typename T>
+__aicore__ inline AscendC::DataCopyParams window_store_params(uint32_t rows,
+                                                              uint32_t width,
+                                                              uint32_t stride) {
+    AscendC::DataCopyParams params;
+    params.blockCount = static_cast<uint16_t>(rows);
+    params.blockLen = static_cast<uint16_t>(width * sizeof(T) / kBlockBytes);
+    params.srcStride = 0;
+    params.dstStride = static_cast<uint16_t>((stride - width) * sizeof(T) / kBlockBytes);
     return params;
 }
 
