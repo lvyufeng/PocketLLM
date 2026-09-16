@@ -575,6 +575,22 @@ std::vector<uint16_t> expected_tail(const std::vector<uint16_t>& old_tail,
     return out;
 }
 
+// The Ascend upload stores the convolution weight tap-major so the kernel can load
+// one tap's row over the channels as a single contiguous run. Every reference below
+// reads the checkpoint's channel-major layout, so a test that builds its own weight
+// has to transpose it the same way before handing it to the op.
+std::vector<uint16_t> transpose_conv_weight(const std::vector<uint16_t>& weight,
+                                            int channels, int kernel) {
+    std::vector<uint16_t> out(weight.size());
+    for (int channel = 0; channel < channels; ++channel) {
+        for (int tap = 0; tap < kernel; ++tap) {
+            out[static_cast<size_t>(tap) * channels + channel] =
+                weight[static_cast<size_t>(channel) * kernel + tap];
+        }
+    }
+    return out;
+}
+
 void test_causal_conv(std::mt19937& rng) {
     const int seq_len = 5;
     const int channels = 517;
@@ -586,7 +602,8 @@ void test_causal_conv(std::mt19937& rng) {
         random_halves(static_cast<size_t>(channels) * kernel, rng, 0.35f);
     const std::vector<uint16_t> tail =
         random_halves(static_cast<size_t>(tail_len) * channels, rng, 0.4f);
-    DeviceBuffer<uint16_t> d_x(x), d_weight(weight), d_tail(tail);
+    DeviceBuffer<uint16_t> d_x(x), d_tail(tail);
+    DeviceBuffer<uint16_t> d_weight(transpose_conv_weight(weight, channels, kernel));
     DeviceBuffer<uint16_t> d_y(static_cast<size_t>(seq_len) * channels);
     expect(pocket::qwen_causal_depthwise_conv_silu_f16(
                d_x.get(), d_weight.get(), d_tail.get(), d_y.get(), seq_len,

@@ -47,6 +47,11 @@ struct Args {
     int device = -1;
     std::string nccl_id_path;
     bool generate_token = false;
+    // Runs the continuous-batching decode path instead of the single-row one:
+    // every rank prefills `max_batch_size` sequences into distinct slots and then
+    // decodes them together. The measured quantity is aggregate tokens per
+    // second over the whole batch, which is what batching exists to raise.
+    bool batch_decode = false;
     bool resident_bench = false;
     bool qwen_audit = false;
     bool qwen_audit_strict = false;
@@ -165,6 +170,10 @@ Args parse_args(int argc, char** argv) {
             args.smoke_forward = true;
             args.generate_token = true;
             args.resident_bench = true;
+        } else if (arg == "--batch-decode") {
+            args.smoke_forward = true;
+            args.generate_token = true;
+            args.batch_decode = true;
         } else if (arg == "--prompt" && i + 1 < argc) {
             args.smoke_forward = true;
             args.prompt = argv[++i];
@@ -623,6 +632,15 @@ int main(int argc, char** argv) {
                     qwen_opts.tp_world = args.tp_world;
                     qwen_opts.tp_rank = args.tp_rank;
                     qwen_opts.device = args.device >= 0 ? args.device : args.tp_rank;
+                    if (args.batch_decode) {
+                        // Batch mode sizes the KV arena at construction, so the
+                        // row count has to reach the options rather than only the
+                        // CLI. The contiguous arena is what the batched per-row
+                        // operators address by slot stride; the paged one has no
+                        // such stride and is rejected on the Ascend path.
+                        qwen_opts.max_batch_size = args.max_batch_size;
+                        qwen_opts.kv_paged = false;
+                    }
                     if (args.prefill_chunk_tokens > 0) {
                         qwen_opts.prefill_chunk_tokens = args.prefill_chunk_tokens;
                     }
@@ -867,6 +885,343 @@ int main(int argc, char** argv) {
                             throw;
                         }
                         shutdown_workers();
+                        return 0;
+                    }
+                    if (args.batch_decode) {
+                        // Every rank runs this program, so the batched forwards
+                        // are SPMD exactly like the single-row ones above: nothing
+                        // has to be announced over a command channel.
+                        qwen.warmup_tp();
+                        qwen.warmup_kernels(false);
+                        using BatchClock = std::chrono::steady_clock;
+                        const auto batch_seconds = [](auto begin, auto end) {
+                            return std::chrono::duration<double>(end - begin).count();
+                        };
+                        // The arena is sized by --max-batch-size, and a step
+                        // carries one row per arena slot.
+                        const int rows = args.max_batch_size;
+                        const int steps = std::max(1, args.max_new_tokens);
+                        // One prompt per row, rotated so no two rows decode the
+                        // same sequence. A shared prompt would make the rows
+                        // interchangeable, and a slot mix-up between two rows
+                        // then cancels out of any comparison between them.
+                        std::vector<std::vector<int>> prompts(static_cast<size_t>(rows));
+                        for (int row = 0; row < rows; ++row) {
+                            std::vector<int>& prompt = prompts[static_cast<size_t>(row)];
+                            prompt.resize(prompt_ids.size());
+                            for (size_t i = 0; i < prompt_ids.size(); ++i) {
+                                prompt[i] = prompt_ids[
+                                    (i + static_cast<size_t>(row)) % prompt_ids.size()];
+                            }
+                        }
+                        // Row i of a step owns slot i for the whole run. The slot
+                        // is what carries a row's KV cache and its recurrent
+                        // state, so a slot mix-up between two rows is the failure
+                        // mode this driver is arranged to expose.
+                        std::vector<int> slots(static_cast<size_t>(rows));
+                        for (int row = 0; row < rows; ++row) {
+                            slots[static_cast<size_t>(row)] = row;
+                        }
+                        std::vector<int> first_tokens(static_cast<size_t>(rows), 0);
+                        const auto prefill_rows = [&]() {
+                            for (int row = 0; row < rows; ++row) {
+                                const pocket::ForwardResult result =
+                                    qwen.prefill(prompts[static_cast<size_t>(row)],
+                                                 slots[static_cast<size_t>(row)]);
+                                first_tokens[static_cast<size_t>(row)] = result.top_token;
+                            }
+                        };
+
+                        // Reference run first: the same rows through the
+                        // single-row path, one at a time, from the same starting
+                        // state. Both are greedy over the same weights on the
+                        // same device, so a disagreement is a batching bug and
+                        // not a tolerance question -- which is the whole reason
+                        // this comparison is exact equality rather than a norm.
+                        int verify_steps = 3;
+                        {
+                            const char* verify_env = std::getenv("POCKET_BATCH_VERIFY");
+                            if (verify_env != nullptr && *verify_env != '\0') {
+                                verify_steps = std::atoi(verify_env);
+                            }
+                            verify_steps = std::max(0, std::min(verify_steps, steps));
+                        }
+                        // Repeats of the reference (1) and of the batched pass (2).
+                        // Default 2: the numbers they produce are what make
+                        // `verify_mismatches` readable at all.
+                        int repeat_passes = 2;
+                        {
+                            const char* repeat_env = std::getenv("POCKET_BATCH_REPEAT");
+                            if (repeat_env != nullptr && *repeat_env != '\0') {
+                                repeat_passes = std::atoi(repeat_env);
+                            }
+                        }
+                        // The reference and the batch each prefill the same rows
+                        // from a reset engine, so the two must agree token for
+                        // token. Keeping the first run's seeds lets the comparison
+                        // below distinguish "the batched step disagrees with the
+                        // single-row step" from "the two prefills disagree", which
+                        // no downstream number can tell apart.
+                        std::vector<int> reference_seed(static_cast<size_t>(rows), -1);
+                        std::vector<std::vector<int>> reference(static_cast<size_t>(rows));
+                        // The token is a lossy summary of the step's logits, and
+                        // on a truncated `--smoke-layers` model the logit vector
+                        // is close to uniform, so a greedy argmax there is
+                        // hypersensitive to fp16 accumulation order. Keeping the
+                        // checksum and the top logit alongside the token is what
+                        // separates "the batched operators disagree by a rounding
+                        // step" from "the batched operators are wired wrong".
+                        std::vector<std::vector<double>> reference_checksum(
+                            static_cast<size_t>(rows));
+                        std::vector<std::vector<double>> reference_logit(
+                            static_cast<size_t>(rows));
+                        if (verify_steps > 0) {
+                            prefill_rows();
+                            reference_seed = first_tokens;
+                            std::vector<int> tokens = first_tokens;
+                            for (int step = 0; step < verify_steps; ++step) {
+                                for (int row = 0; row < rows; ++row) {
+                                    const pocket::ForwardResult result = qwen.decode_step(
+                                        tokens[static_cast<size_t>(row)],
+                                        slots[static_cast<size_t>(row)]);
+                                    reference[static_cast<size_t>(row)].push_back(
+                                        result.top_token);
+                                    reference_checksum[static_cast<size_t>(row)].push_back(
+                                        result.checksum);
+                                    reference_logit[static_cast<size_t>(row)].push_back(
+                                        result.top_logit);
+                                    std::cout << "ref_step=" << step << " row=" << row
+                                              << " token=" << result.top_token
+                                              << " checksum=" << result.checksum
+                                              << " logit=" << result.top_logit
+                                              << " position=" << result.position
+                                              << "\n";
+                                    tokens[static_cast<size_t>(row)] = result.top_token;
+                                }
+                            }
+                        }
+                        // The same reference, run a second time from a reset
+                        // engine with nothing else changed. This is the control
+                        // the comparison below has to be read against: this part
+                        // does not reproduce its own decode logits bit for bit,
+                        // and the residual is large enough to move a greedy
+                        // argmax when the output distribution is near uniform.
+                        // Without the control, that platform noise and a real
+                        // batching defect produce the same `verify_mismatches`
+                        // count and there is no way to tell them apart.
+                        //
+                        // Counted the way the batched comparison counts: one per
+                        // row, not one per (row, step), because that comparison
+                        // stops scoring a row after its first divergence.
+                        int repeat_mismatches = -1;
+                        double repeat_logit_abs_matched = 0.0;
+                        if (repeat_passes > 0 && verify_steps > 0) {
+                            qwen.reset();
+                            prefill_rows();
+                            std::vector<int> repeat_tokens = first_tokens;
+                            std::vector<char> repeat_matching(static_cast<size_t>(rows), 1);
+                            repeat_mismatches = 0;
+                            for (int step = 0; step < verify_steps; ++step) {
+                                for (int row = 0; row < rows; ++row) {
+                                    const size_t r = static_cast<size_t>(row);
+                                    const pocket::ForwardResult result =
+                                        qwen.decode_step(repeat_tokens[r], slots[r]);
+                                    if (result.top_token ==
+                                        reference[r][static_cast<size_t>(step)]) {
+                                        repeat_logit_abs_matched = std::max(
+                                            repeat_logit_abs_matched,
+                                            std::fabs(result.top_logit -
+                                                      reference_logit[r]
+                                                                     [static_cast<size_t>(
+                                                                         step)]));
+                                    }
+                                    if (repeat_matching[r] &&
+                                        result.top_token !=
+                                            reference[r][static_cast<size_t>(step)]) {
+                                        repeat_matching[r] = 0;
+                                        ++repeat_mismatches;
+                                    }
+                                    repeat_tokens[r] = result.top_token;
+                                }
+                            }
+                        }
+                        qwen.reset();
+                        prefill_rows();
+                        {
+                            std::cout << "batch_decode_seed=";
+                            for (int row = 0; row < rows; ++row) {
+                                if (row) std::cout << ',';
+                                std::cout << first_tokens[static_cast<size_t>(row)];
+                            }
+                            std::cout << " reference_seed=";
+                            int seed_mismatches = 0;
+                            for (int row = 0; row < rows; ++row) {
+                                if (row) std::cout << ',';
+                                std::cout << reference_seed[static_cast<size_t>(row)];
+                                if (reference_seed[static_cast<size_t>(row)] !=
+                                    first_tokens[static_cast<size_t>(row)]) {
+                                    ++seed_mismatches;
+                                }
+                            }
+                            std::cout << " reference=";
+                            for (int row = 0; row < rows; ++row) {
+                                if (row) std::cout << ',';
+                                std::cout << (reference[static_cast<size_t>(row)].empty()
+                                                  ? -1
+                                                  : reference[static_cast<size_t>(row)][0]);
+                            }
+                            std::cout << " seed_mismatches=" << seed_mismatches << "\n";
+                        }
+
+                        std::vector<int> tokens = first_tokens;
+                        std::vector<char> matching(static_cast<size_t>(rows), 1);
+                        // The batched pass's own output, kept so a second batched
+                        // pass can be compared against it. That comparison is the
+                        // one this driver gates on: it holds the arithmetic fixed
+                        // and varies only the run, so it measures reproducibility
+                        // without the M=1-versus-M=16 difference the single-row
+                        // reference brings in.
+                        std::vector<std::vector<int>> batch_reference(
+                            static_cast<size_t>(rows));
+                        int mismatches = 0;
+                        int compared = 0;
+                        double worst_checksum_rel = 0.0;
+                        double worst_logit_abs = 0.0;
+                        // The same delta restricted to pairs that agreed on the
+                        // winner. `worst_logit_abs` mixes in pairs that chose
+                        // different tokens, where the two numbers belong to
+                        // different vocabulary entries and their difference says
+                        // nothing; this one is the only direct measure of how far
+                        // the batched arithmetic sits from the single-row
+                        // arithmetic on identical outputs.
+                        double worst_logit_abs_matched = 0.0;
+                        int matched = 0;
+                        const auto decode_started = BatchClock::now();
+                        for (int step = 0; step < steps; ++step) {
+                            const std::vector<pocket::ForwardResult> results =
+                                qwen.batch_decode_tokens(tokens, slots);
+                            if (static_cast<int>(results.size()) != rows) {
+                                throw std::runtime_error(
+                                    "batched decode returned the wrong row count");
+                            }
+                            for (int row = 0; row < rows; ++row) {
+                                const size_t r = static_cast<size_t>(row);
+                                const pocket::ForwardResult& batched = results[r];
+                                if (step < verify_steps) {
+                                    ++compared;
+                                    const double ref_checksum =
+                                        reference_checksum[r][static_cast<size_t>(step)];
+                                    const double ref_logit =
+                                        reference_logit[r][static_cast<size_t>(step)];
+                                    const double scale =
+                                        std::max(1e-6, std::fabs(ref_checksum));
+                                    worst_checksum_rel = std::max(
+                                        worst_checksum_rel,
+                                        std::fabs(batched.checksum - ref_checksum) / scale);
+                                    worst_logit_abs = std::max(
+                                        worst_logit_abs,
+                                        std::fabs(batched.top_logit - ref_logit));
+                                    if (batched.top_token ==
+                                        reference[r][static_cast<size_t>(step)]) {
+                                        ++matched;
+                                        worst_logit_abs_matched = std::max(
+                                            worst_logit_abs_matched,
+                                            std::fabs(batched.top_logit - ref_logit));
+                                    }
+                                    batch_reference[r].push_back(batched.top_token);
+                                }
+                                // Divergence is reported once per row: after the
+                                // first disagreement the two runs are no longer
+                                // decoding the same sequence and every later step
+                                // would differ for a reason that is not a bug.
+                                if (step < verify_steps &&
+                                    matching[r] &&
+                                    batched.top_token !=
+                                        reference[r][static_cast<size_t>(step)]) {
+                                    matching[r] = 0;
+                                    ++mismatches;
+                                    std::cout
+                                        << "batch_decode_mismatch=1 row=" << row
+                                        << " step=" << step
+                                        << " single=" << reference[r][static_cast<size_t>(step)]
+                                        << " batched=" << batched.top_token
+                                        << " position=" << batched.position
+                                        << " single_checksum="
+                                        << reference_checksum[r][static_cast<size_t>(step)]
+                                        << " batched_checksum=" << batched.checksum
+                                        << " single_logit="
+                                        << reference_logit[r][static_cast<size_t>(step)]
+                                        << " batched_logit=" << batched.top_logit
+                                        << "\n";
+                                }
+                                tokens[r] = batched.top_token;
+                            }
+                        }
+                        // The clock is read here, before the reproducibility
+                        // pass below: that pass re-prefills and re-decodes the
+                        // whole grid, so leaving it inside the window would
+                        // roughly double `decode_seconds` and report half the
+                        // real throughput.
+                        const double decode_seconds =
+                            batch_seconds(decode_started, BatchClock::now());
+                        // Second batched pass, outside the timed region. Same
+                        // rows, same slots, same shapes, a fresh sequence of
+                        // launches: everything except the run is held fixed, so
+                        // this is the reproducibility the batched path owes its
+                        // callers. `repeat_mismatches` above is the same control
+                        // for the single-row reference, and the two are what make
+                        // `verify_mismatches` -- the only number that can see a
+                        // wiring error -- readable.
+                        int batch_repeat_mismatches = -1;
+                        if (repeat_passes >= 2 && verify_steps > 0) {
+                            qwen.reset();
+                            prefill_rows();
+                            std::vector<int> sweep_tokens = first_tokens;
+                            std::vector<char> sweep_matching(static_cast<size_t>(rows), 1);
+                            batch_repeat_mismatches = 0;
+                            for (int step = 0; step < verify_steps; ++step) {
+                                const std::vector<pocket::ForwardResult> results =
+                                    qwen.batch_decode_tokens(sweep_tokens, slots);
+                                for (int row = 0; row < rows; ++row) {
+                                    const size_t r = static_cast<size_t>(row);
+                                    if (sweep_matching[r] &&
+                                        results[r].top_token !=
+                                            batch_reference[r][static_cast<size_t>(step)]) {
+                                        sweep_matching[r] = 0;
+                                        ++batch_repeat_mismatches;
+                                    }
+                                    sweep_tokens[r] = results[r].top_token;
+                                }
+                            }
+                        }
+                        const int decoded = rows * steps;
+                        std::cout << "batch_decode=1 rows=" << rows
+                                  << " steps=" << steps
+                                  << " decode_seconds=" << decode_seconds
+                                  << " decode_tokens_per_s="
+                                  << (decode_seconds > 0.0 ? decoded / decode_seconds : 0.0)
+                                  << " step_ms="
+                                  << (decode_seconds > 0.0
+                                          ? decode_seconds * 1000.0 / steps : 0.0)
+                                  << " verify_steps=" << verify_steps
+                                  << " verify_mismatches=" << mismatches
+                                  << " verify_compared=" << compared
+                                  << " repeat_mismatches=" << repeat_mismatches
+                                  << " batch_repeat_mismatches="
+                                  << batch_repeat_mismatches
+                                  << " repeat_logit_abs_matched="
+                                  << repeat_logit_abs_matched
+                                  << " verify_agreed=" << matched
+                                  << " verify_logit_abs_matched="
+                                  << worst_logit_abs_matched
+                                  << " worst_checksum_rel=" << worst_checksum_rel
+                                  << " worst_logit_abs=" << worst_logit_abs
+                                  << " resident_weight_bytes="
+                                  << qwen.resident_weight_bytes()
+                                  << " kv_cache_bytes=" << qwen.kv_cache_bytes()
+                                  << " max_context=" << qwen.max_context()
+                                  << "\n";
+                        std::cout.flush();
                         return 0;
                     }
                     if (args.generate_token) {

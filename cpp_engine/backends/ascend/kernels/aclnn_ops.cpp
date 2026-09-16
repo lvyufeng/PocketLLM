@@ -223,6 +223,102 @@ bool qwen_fp16_matmul_rows_f16_ascend(const uint16_t* d_x_fp16,
                        cols, x_stride, y_stride, weight_stride, stream);
 }
 
+// y = x @ W^T, issued as W @ x^T so the weight is the A operand.
+//
+// `matmul_rows` above puts the weight on B, where it has to be described by a
+// transposed view -- shape [cols, rows] with strides {1, weight_stride}. The view
+// is legal and aclnn accepts it, but B's fractal is indexed by the contracted
+// axis, so the unit either materializes the transpose or reads the weight
+// sixteen elements at a time with the row pitch as the stride. Measured on the
+// TP4 MLP shard: 168 us for the 44.6 MB weight, 265 GB/s against the 1152 GB/s
+// the plain MTE2 stream reaches.
+//
+// Swapping the operands moves the weight to A, whose fractal is indexed by the
+// uncontracted axis and therefore reads the row-major layout sequentially. The
+// transposed view does not disappear, it moves to `x`: [cols, batch] with
+// strides {1, x_stride}. One row of activations is a rounding error next to the
+// weight, so the cost of a strided operand stops mattering.
+bool qwen_fp16_gemv_f16_ascend(const uint16_t* d_x_fp16,
+                               const uint16_t* d_w_fp16, uint16_t* d_y_fp16,
+                               int batch, int rows, int cols, int x_stride,
+                               int y_stride, void* stream) {
+    if (d_x_fp16 == nullptr || d_w_fp16 == nullptr || d_y_fp16 == nullptr) {
+        return false;
+    }
+    if (batch <= 0 || rows <= 0 || cols <= 0) return false;
+    if (x_stride < cols || y_stride < rows) return false;
+
+    TensorBag bag;
+    aclTensor* w = bag.add(d_w_fp16, {rows, cols}, ACL_FLOAT16);
+    aclTensor* xt = bag.add_strided(d_x_fp16, {cols, batch},
+                                    {1, static_cast<int64_t>(x_stride)},
+                                    ACL_FLOAT16);
+    aclTensor* out = bag.add_strided(d_y_fp16, {rows, batch},
+                                     {1, static_cast<int64_t>(y_stride)},
+                                     ACL_FLOAT16);
+    if (w == nullptr || xt == nullptr || out == nullptr) return false;
+
+    const aclrtStream s = resolve(stream);
+    return invoke(
+        [&](uint64_t* bytes, aclOpExecutor** executor) {
+            return aclnnMatmulGetWorkspaceSize(w, xt, out, 1, bytes, executor);
+        },
+        [&](void* workspace, uint64_t bytes, aclOpExecutor* executor) {
+            return aclnnMatmul(workspace, bytes, executor, s);
+        },
+        s);
+}
+
+// The same product as `matmul_rows`, with the weight physically stored the other
+// way round.
+//
+// `matmul_rows` keeps the weight row-major as [output_rows, columns] and describes
+// it to aclnn as the transposed view [columns, output_rows] with stride
+// {1, weight_stride}. The view is legal and aclnn accepts it, but it is not dense:
+// the B operand of a Cube matmul is read fractal by fractal, and a fractal's
+// contiguous 16-element run is along N -- which in that layout is the axis with
+// stride weight_stride. So every fractal the unit wants is a sixteen-way gather
+// instead of a 32-byte burst.
+//
+// This variant passes B as a dense [columns, output_rows] tensor, which is the
+// layout the ND2NZ loader is shaped for. The weight is read-only and the transpose
+// is paid once at upload, so if it measures faster this is free at decode time.
+//
+// Callers must not pass the same buffer as `d_w_kn_fp16` that `matmul_rows` reads:
+// the two layouts are different arrangements of the same 13 GB.
+bool qwen_fp16_matmul_weight_transposed_f16_ascend(
+    const uint16_t* d_x_fp16, const uint16_t* d_w_kn_fp16, uint16_t* d_y_fp16,
+    int batch, int rows, int cols, int x_stride, int y_stride, void* stream) {
+    if (d_x_fp16 == nullptr || d_w_kn_fp16 == nullptr || d_y_fp16 == nullptr) {
+        return false;
+    }
+    if (batch <= 0 || rows <= 0 || cols <= 0) return false;
+    if (x_stride < cols || y_stride < rows) return false;
+
+    const int64_t b = batch;
+    const int64_t r = rows;
+    const int64_t c = cols;
+    TensorBag bag;
+    aclTensor* a = bag.add_strided(d_x_fp16, {b, c},
+                                   {static_cast<int64_t>(x_stride), 1},
+                                   ACL_FLOAT16);
+    aclTensor* w = bag.add(d_w_kn_fp16, {c, r}, ACL_FLOAT16);
+    aclTensor* out = bag.add_strided(d_y_fp16, {b, r},
+                                     {static_cast<int64_t>(y_stride), 1},
+                                     ACL_FLOAT16);
+    if (a == nullptr || w == nullptr || out == nullptr) return false;
+
+    const aclrtStream s = resolve(stream);
+    return invoke(
+        [&](uint64_t* bytes, aclOpExecutor** executor) {
+            return aclnnMatmulGetWorkspaceSize(a, w, out, 1, bytes, executor);
+        },
+        [&](void* workspace, uint64_t bytes, aclOpExecutor* executor) {
+            return aclnnMatmul(workspace, bytes, executor, s);
+        },
+        s);
+}
+
 bool qwen_fp16_matmul_rows_f16_f32_ascend(const uint16_t* d_x_fp16,
                                           const uint16_t* d_w_fp16, float* d_y,
                                           int batch, int rows, int cols,

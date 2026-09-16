@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace pocket {
 namespace {
@@ -657,7 +658,14 @@ struct QwenEngine::Impl {
         // Context length after the new token is appended: positions[i] + 1.
         const int* context_lens = nullptr;
         // Host mirrors. The launchers need the widest context to size the split
-        // geometry and the scratch, and that is a host-side decision.
+        // geometry and the scratch, and that is a host-side decision. The
+        // Ascend backend has no per-row decode kernels at all: its batched
+        // entry points dispatch one single-row launch per row, so every piece
+        // of per-row metadata has to be readable from the host, not just from
+        // the device arrays above.
+        const int* host_slot_ids = nullptr;
+        const int* host_positions = nullptr;
+        const int* host_context_lens = nullptr;
         int rows = 0;
         int max_context_len = 0;
     };
@@ -2633,6 +2641,23 @@ struct QwenEngine::Impl {
 #endif
     }
 
+    // All-reduce a [rows, row_elements] plane in one collective per call.
+    //
+    // A collective is not decomposable: the accumulator order inside a ring
+    // depends on how the buffer is chunked, so reducing one row at a time does
+    // not reproduce the reduction of the whole plane bit for bit, and neither
+    // reproduces the single-row call it used to be compared against. Slicing per
+    // row was an attempt to restore that exact order; it costs `rows` times the
+    // collective *latency*, which is what the small-collective measurements show
+    // is all that matters here (world=4: 10 KB 0.412 ms against 80 KB 0.452 ms).
+    // Four rows therefore paid 1.7 ms where 0.45 ms does the same work, on every
+    // one of the 129 collective sites in a step. The token-parity gate is what
+    // decides whether the wider call is acceptable.
+    void all_reduce_half_rows(uint16_t* values, int rows, int row_elements,
+                              const char* site = "other") {
+        all_reduce_half(values, rows * row_elements, site);
+    }
+
     void count_active_linear(QwenLinearKind kind) {
         switch (kind) {
             case QwenLinearKind::DenseF16:
@@ -4050,8 +4075,29 @@ struct QwenEngine::Impl {
                 "decoding");
         }
 #ifdef POCKET_BACKEND_ASCEND
-        throw std::runtime_error(
-            "Qwen batched decode has no Ascend kernels yet");
+        // The Ascend backend allocates a contiguous, unpaged KV arena, and the
+        // engine constructor already rejects every cache dtype but FP16, so
+        // this path is the FP16 one by construction. It is checked rather than
+        // assumed because the batched Ascend entry points address a slot by a
+        // constant element stride: a paged arena would need the block-table
+        // translation they do not do, and the attention kernels ignore a
+        // sliding window and attention sinks, which would silently widen the
+        // context instead of erroring.
+        if (options.kv_cache_dtype != QwenKvCacheDType::Fp16) {
+            throw std::runtime_error(
+                std::string("Qwen batched decode does not support ") +
+                qwen_kv_cache_dtype_name(options.kv_cache_dtype));
+        }
+        if (options.kv_paged) {
+            throw std::runtime_error(
+                "Qwen batched decode does not support a paged KV cache on the "
+                "Ascend backend");
+        }
+        if (options.attention_window > 0 || options.attention_sink_tokens > 0) {
+            throw std::runtime_error(
+                "Qwen batched decode does not support a sliding attention "
+                "window or attention sinks on the Ascend backend");
+        }
 #else
         if (options.kv_cache_dtype != QwenKvCacheDType::Fp16 &&
             options.kv_cache_dtype != QwenKvCacheDType::Fp8 &&
@@ -4060,6 +4106,11 @@ struct QwenEngine::Impl {
                 std::string("Qwen batched decode does not support ") +
                 qwen_kv_cache_dtype_name(options.kv_cache_dtype));
         }
+#endif
+        // Everything below is backend-neutral: the metadata upload, the
+        // embedding gather, the per-row all-reduce, the layer loop and the LM
+        // head all run unchanged on both backends. Only the per-row operators
+        // inside a layer are backend-specific, and they are selected there.
         std::vector<int> context_lens(static_cast<size_t>(rows));
         int max_context_len = 0;
         for (int row = 0; row < rows; ++row) {
@@ -4096,6 +4147,12 @@ struct QwenEngine::Impl {
         metadata.positions = static_cast<const int*>(batch_positions.data);
         metadata.slot_ids = static_cast<const int*>(batch_slot_ids.data);
         metadata.context_lens = static_cast<const int*>(batch_context_lens.data);
+        // `positions`, `slot_ids` and `context_lens` are the vectors this
+        // function was called with and outlive the forward, so the host mirrors
+        // point straight at them rather than at a second copy.
+        metadata.host_positions = positions.data();
+        metadata.host_slot_ids = slot_ids.data();
+        metadata.host_context_lens = context_lens.data();
         metadata.rows = rows;
         metadata.max_context_len = max_context_len;
 
@@ -4117,7 +4174,7 @@ struct QwenEngine::Impl {
             static_cast<int>(weights_vocab_start()),
             static_cast<int>(embed.shape[0])),
             "Qwen batched decode embedding lookup");
-        all_reduce_half(hidden_a.f16_data(), rows * hidden_size, "hidden_a");
+        all_reduce_half_rows(hidden_a.f16_data(), rows, hidden_size, "hidden_a");
 
         uint16_t* hidden = hidden_a.f16_data();
         uint16_t* output = hidden_b.f16_data();
@@ -4145,7 +4202,6 @@ struct QwenEngine::Impl {
         // rest of the step gets. position_after is reported per row by the
         // caller, so the batch-wide value here is only the widest context.
         return target_logits_for(hidden, rows, max_context_len, per_row_params);
-#endif
     }
 
     uint64_t activation_capacity_bytes() const {

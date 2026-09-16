@@ -12,6 +12,7 @@
 //     turns that into an exception naming the operator.
 //   - Shapes are row-major and identical to the CUDA declarations.
 
+#include <cstddef>
 #include <cstdint>
 
 // QwenCopyRegion and kQwenCopyRegionBlockBytes are part of the shared operator
@@ -31,7 +32,33 @@ bool qwen_argmax_fp32_rows_ascend(const float* d_logits, int* d_tokens, float* d
 
 bool qwen_append_kv_cache_f16_ascend(const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16, uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, int seq_len, int kv_heads, int head_dim, int start_pos, int max_context, void* stream);
 
+// ---------------------------------------------------------------------------
+// Batched decode: one token for each of `rows` independent sequences.
+//
+// This is not the single-row operator called `rows` times with consecutive
+// positions. Each row carries its own position, its own KV slot and its own
+// recurrent state, so none of the batched variants below share the row-wise
+// `position_offset` / `slot_id` convention the single-row entry points use.
+// The per-row metadata has to be read on the host for that reason: unlike the
+// CUDA kernels, whose per-row work is a device thread, these Ascend entries
+// are host loops over the existing single-row launchers, and the launch
+// arguments are host scalars. That is deliberate for a first cut -- the whole
+// point of batching is to amortize the weight stream in the large GEMMs, which
+// the linear component already batches, and the five operators on this list
+// are ones the row scan showed to be nearly row-independent in cost.
+//
+// Every `host_*` argument is a host array of `rows` int32, matching the device
+// copy of the same name in BatchRows.
+// ---------------------------------------------------------------------------
+
+bool qwen_append_kv_cache_f16_batched_ascend(const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16, uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16, const int* host_positions, const int* host_slot_ids, int rows, int kv_heads, int head_dim, int max_context, size_t kv_slot_stride_elements, void* stream);
+
 bool qwen_causal_depthwise_conv_silu_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16, uint16_t* d_tail_fp16, uint16_t* d_y_fp16, int seq_len, int channels, int kernel, bool update_tail, void* stream);
+
+// The convolution history lives in the slot's own tail, so the pointer passed
+// here is the arena base and each row resolves its own slice with
+// slot_ids[row] * slot_stride_elements.
+bool qwen_causal_depthwise_conv_silu_f16_batched_ascend(const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16, uint16_t* d_tail_fp16, uint16_t* d_y_fp16, const int* host_slot_ids, int rows, int channels, int kernel, size_t slot_stride_elements, void* stream);
 
 bool qwen_concat_rows_f16_ascend(const uint16_t* d_left, const uint16_t* d_right, uint16_t* d_out, int rows, int cols, void* stream);
 
@@ -40,6 +67,29 @@ bool qwen_copy_rows_strided_f16_ascend(const uint16_t* d_source_fp16, int source
 bool qwen_embedding_fp16_gather_f16_ascend(const uint16_t* d_table_fp16, const int* d_tokens, uint16_t* d_out_fp16, int count, int cols, int row_start, int row_count, void* stream);
 
 bool qwen_fp16_matmul_rows_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_w_fp16, uint16_t* d_y_fp16, int batch, int rows, int cols, int x_stride, int y_stride, int weight_stride, void* stream);
+
+// The same product with the operands swapped: y = x @ W^T, computed as
+// W @ x^T so that the weight is the Cube's A operand instead of its B.
+//
+// Which operand the weight lands on decides what the Cube has to do to read it.
+// B is indexed by its contracted axis in the fractal the unit wants, which for a
+// row-major [rows, cols] weight means sixteen-way strided reads; A is indexed the
+// other way, so the same memory is a straight sequential stream. The transposed
+// view the helper needs then falls on `x`, which is one row of activations
+// instead of the whole weight.
+//
+// `x` stays [batch, cols] row-major with pitch `x_stride` and `y` [batch, rows]
+// with pitch `y_stride`, so call sites are unchanged.
+bool qwen_fp16_gemv_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_w_fp16, uint16_t* d_y_fp16, int batch, int rows, int cols, int x_stride, int y_stride, void* stream);
+
+// The same product with the weight stored transposed, as a dense [columns, rows]
+// row-major matrix rather than as a strided view of the [rows, columns] layout.
+//
+// The two are the same arithmetic over the same bytes; they differ only in the
+// order those bytes sit in memory, and therefore in whether the Cube's fractal
+// loader can read B in 32-byte bursts or has to gather it. A weight is read-only,
+// so if this wins the transpose is paid once at upload and never at decode time.
+bool qwen_fp16_matmul_weight_transposed_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_w_kn_fp16, uint16_t* d_y_fp16, int batch, int rows, int cols, int x_stride, int y_stride, void* stream);
 
 bool qwen_fp16_matmul_rows_f16_f32_ascend(const uint16_t* d_x_fp16, const uint16_t* d_w_fp16, float* d_y, int batch, int rows, int cols, int x_stride, int y_stride, int weight_stride, void* stream);
 
@@ -53,11 +103,22 @@ bool qwen_gated_delta_sequence_normalized_shared_f16_ascend(float* d_state, cons
 
 bool qwen_gated_delta_step_f16_ascend(float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16, const uint16_t* d_v_fp16, const uint16_t* d_g_fp16, const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, int heads, int key_heads, int key_dim, int value_dim, float q_scale, void* stream);
 
+// One recurrent step for each row against that row's own [key_dim, value_dim]
+// state slice. As with the convolution tail, `d_state` is the arena base.
+bool qwen_gated_delta_step_batched_f16_ascend(float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16, const uint16_t* d_v_fp16, const uint16_t* d_g_fp16, const uint16_t* d_beta_fp16, uint16_t* d_out_fp16, const int* host_slot_ids, int rows, int heads, int key_heads, int key_dim, int value_dim, float q_scale, size_t slot_stride_elements, void* stream);
+
 bool qwen_gated_rmsnorm_fp16_gamma_rows_f16_ascend(const uint16_t* d_x_fp16, const uint16_t* d_gamma_fp16, const uint16_t* d_gate_fp16, uint16_t* d_y_fp16, int rows, int cols, float eps, void* stream);
 
 bool qwen_gather_copy_regions_ascend(const QwenCopyRegion* d_regions, int region_count, uint8_t* d_packed, uint64_t total_blocks, void* stream);
 
 bool qwen_gqa_decode_attention_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_score_scratch, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, void* stream);
+
+// `d_score_scratch` is one row's worth per row, carved up by each row's own
+// context length; `scratch_row_stride` is that per-row stride in floats, so a
+// caller who sizes the workspace from the widest row in the batch can pass the
+// same number for every row. The cache pointers are arena bases, offset per row
+// by slot_ids[row] * kv_slot_stride_elements.
+bool qwen_gqa_decode_attention_f16_batched_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, float* d_score_scratch, int scratch_row_stride, const int* host_context_lens, const int* host_slot_ids, int rows, int q_heads, int kv_heads, int head_dim, int max_context, size_t kv_slot_stride_elements, void* stream);
 
 // True when a decode call of this shape will be served by the Cube path inside
 // qwen_gqa_decode_attention_f16_ascend rather than by the vector kernel. The
@@ -121,6 +182,11 @@ bool qwen_linear_attn_gates_f16_ascend(const uint16_t* d_a_fp16, const uint16_t*
 bool qwen_normalize_gated_delta_qk_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_fp16, float* d_q_normalized, float* d_k_normalized, int rows, int key_heads, int key_dim, void* stream);
 
 bool qwen_partial_rope_rows_f16_ascend(uint16_t* d_q_fp16, uint16_t* d_k_fp16, int start_position, int rows, int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim, void* stream);
+
+// `start_position` is the one argument the single-row entry cannot express for
+// a batch: each row is a different sequence at a different position, so the
+// rotation angle is per row rather than position_offset + row.
+bool qwen_partial_rope_rows_f16_batched_ascend(uint16_t* d_q_fp16, uint16_t* d_k_fp16, const int* host_positions, int rows, int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim, void* stream);
 
 bool qwen_residual_add_rmsnorm_fp16_gamma_rows_f16_ascend(const uint16_t* d_hidden_fp16, const uint16_t* d_delta_fp16, const uint16_t* d_gamma_fp16, uint16_t* d_residual_fp16, uint16_t* d_normalized_fp16, int rows, int cols, float eps, void* stream);
 

@@ -216,19 +216,28 @@ void GatedDeltaNetAttention::forward(
             runtime, layer.linear.qkv, hidden, packed.f16_data(), rows,
             "lin.qkv");
     }
-#ifndef POCKET_BACKEND_ASCEND
     if (runtime.batch_rows != nullptr) {
         // One token per sequence against that sequence's own tail. The
-        // pointer is the arena base here, not this slot's rows, because the
-        // kernel resolves the slot per row.
+        // pointer is the arena base here, not this slot's rows: the CUDA
+        // kernel resolves the slot per row on the device, and the Ascend
+        // wrapper resolves the same slot per row on the host, from the same
+        // metadata.
+#ifdef POCKET_BACKEND_ASCEND
+        require_launch(qwen_causal_depthwise_conv_silu_f16_batched_ascend(
+            packed.f16_data(), layer.linear.conv.f16_data(),
+            layer.linear.conv_tail.f16_data(), convolved.f16_data(),
+            runtime.batch_rows->host_slot_ids, rows, packed_dim, kernel,
+            runtime.slot_stride_elements(layer.linear.conv_tail), nullptr),
+            "FP16 batched linear causal convolution");
+#else
         require_launch(qwen_causal_depthwise_conv_silu_f16_batched_cuda(
             packed.f16_data(), layer.linear.conv.f16_data(),
             layer.linear.conv_tail.f16_data(), convolved.f16_data(),
             runtime.batch_rows->slot_ids, rows, packed_dim, kernel,
             runtime.slot_stride_elements(layer.linear.conv_tail)),
             "FP16 batched linear causal convolution");
-    } else
 #endif
+    } else
     require_launch(qwen_causal_depthwise_conv_silu_f16(
         packed.f16_data(), layer.linear.conv.f16_data(),
         conv_tail, convolved.f16_data(), rows,
@@ -265,8 +274,17 @@ void GatedDeltaNetAttention::forward(
     std::optional<typename Runtime::PhaseScope> delta_scope;
     delta_scope.emplace(&runtime, "gated_delta");
     bool sequenced = false;
-#ifndef POCKET_BACKEND_ASCEND
     if (runtime.batch_rows != nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+        sequenced = qwen_gated_delta_step_batched_f16_ascend(
+            layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
+            v.f16_data(), gates.f16_data(), beta.f16_data(),
+            core.f16_data(), runtime.batch_rows->host_slot_ids, rows,
+            value_heads, key_heads,
+            static_cast<int>(runtime.config.linear_attention.key_head_dim),
+            static_cast<int>(runtime.config.linear_attention.value_head_dim),
+            q_scale, runtime.slot_stride_elements(layer.linear.state), nullptr);
+#else
         sequenced = qwen_gated_delta_step_batched_f16_cuda(
             layer.linear.state.f32_data(), q.f16_data(), k.f16_data(),
             v.f16_data(), gates.f16_data(), beta.f16_data(),
@@ -275,8 +293,11 @@ void GatedDeltaNetAttention::forward(
             static_cast<int>(runtime.config.linear_attention.key_head_dim),
             static_cast<int>(runtime.config.linear_attention.value_head_dim),
             q_scale, runtime.slot_stride_elements(layer.linear.state));
+#endif
         require_launch(sequenced, "FP16 batched linear recurrent state");
-    } else if (flashqla) {
+    }
+#ifndef POCKET_BACKEND_ASCEND
+    else if (flashqla) {
         // FlashQLA SM75 subgroup-sharded kernel. Still a serial recurrence,
         // but sharding the [128, 128] state over 16-lane subgroups replaces
         // the baseline's 128-element per-thread register vector: 1.85x on the
@@ -295,9 +316,9 @@ void GatedDeltaNetAttention::forward(
                 static_cast<int>(runtime.config.linear_attention.key_head_dim),
                 static_cast<int>(runtime.config.linear_attention.value_head_dim),
                 q_scale);
-    } else
+    }
 #endif
-    if (rows >= 5 && key_heads < value_heads &&
+    else if (rows >= 5 && key_heads < value_heads &&
         runtime.layer_config.gated_delta_prenormalize) {
         QwenDeviceTensor& q_normalized = runtime.workspace_float(
             key_elements, {static_cast<uint64_t>(rows),
@@ -372,7 +393,7 @@ void GatedDeltaNetAttention::forward(
         runtime.linear_component.forward(
             runtime, layer.linear.out, normalized.f16_data(), output, rows,
             "lin.out");
-        runtime.all_reduce_half(output, rows * hidden_size, "lin.out");
+        runtime.all_reduce_half_rows(output, rows, hidden_size, "lin.out");
     }
     (void)position_offset;
 }
@@ -487,17 +508,27 @@ void GqaAttention::forward(
     runtime.rms_norm_component.forward(
         runtime, layer.full.k_norm, k.f16_data(), k_norm.f16_data(),
         rows * kv_heads, head_dim);
-#ifndef POCKET_BACKEND_ASCEND
     if (runtime.batch_rows != nullptr) {
         // Each row is a different sequence at its own position, so the
         // rotation angle is per row rather than position_offset + row.
+#ifdef POCKET_BACKEND_ASCEND
+        // Same kernel as the single-row entry, with a cos/sin table built from
+        // the batch's positions instead of from one start position, so this is
+        // still one launch for the whole batch.
+        require_launch(qwen_partial_rope_rows_f16_batched_ascend(
+            q_norm.f16_data(), k_norm.f16_data(),
+            runtime.batch_rows->host_positions, rows,
+            static_cast<int>(runtime.config.partial_rotary_dim()),
+            static_cast<float>(runtime.config.rope_theta), q_heads, kv_heads,
+            head_dim, nullptr), "FP16 batched partial RoPE");
+#else
         require_launch(qwen_partial_rope_rows_f16_batched_cuda(
             q_norm.f16_data(), k_norm.f16_data(), runtime.batch_rows->positions,
             rows, static_cast<int>(runtime.config.partial_rotary_dim()),
             static_cast<float>(runtime.config.rope_theta), q_heads, kv_heads,
             head_dim), "FP16 batched partial RoPE");
-    } else
 #endif
+    } else
     require_launch(qwen_partial_rope_rows_f16(
         q_norm.f16_data(), k_norm.f16_data(), position_offset, rows,
         static_cast<int>(runtime.config.partial_rotary_dim()),
@@ -515,15 +546,54 @@ void GqaAttention::forward(
 
     // Phase 3.3: Use slot_id parameter instead of global current_slot_id
     const size_t slot_offset = runtime.kv_slot_offset_elements(slot_id, kv_heads, head_dim);
+    // Distance between slots in the contiguous, unpaged KV arena this backend
+    // allocates. It is the same quantity the CUDA path computes for its own
+    // batched append and attention, and both batched entry points below walk it
+    // once per row on the host.
+    const size_t kv_slot_stride =
+        static_cast<size_t>(runtime.max_context) * kv_heads * head_dim;
 
-    require_launch(qwen_append_kv_cache_f16(
-        k_norm.f16_data(), v.f16_data(),
-        layer.full.k_cache.f16_data() + slot_offset,
-        layer.full.v_cache.f16_data() + slot_offset,
-        rows, kv_heads, head_dim,
-        position_offset, runtime.max_context), "append FP16 full KV cache");
+    if (runtime.batch_rows != nullptr) {
+        // Every row is a different sequence: its own slot, its own position,
+        // its own context length.
+        require_launch(qwen_append_kv_cache_f16_batched_ascend(
+            k_norm.f16_data(), v.f16_data(), layer.full.k_cache.f16_data(),
+            layer.full.v_cache.f16_data(), runtime.batch_rows->host_positions,
+            runtime.batch_rows->host_slot_ids, rows, kv_heads, head_dim,
+            runtime.max_context, kv_slot_stride, nullptr),
+            "append batched FP16 full KV cache");
+    } else {
+        require_launch(qwen_append_kv_cache_f16(
+            k_norm.f16_data(), v.f16_data(),
+            layer.full.k_cache.f16_data() + slot_offset,
+            layer.full.v_cache.f16_data() + slot_offset,
+            rows, kv_heads, head_dim,
+            position_offset, runtime.max_context), "append FP16 full KV cache");
+    }
 
-    if (rows == 1) {
+    if (runtime.batch_rows != nullptr) {
+        // Scratch sized from the widest row, so one allocation covers the whole
+        // batch and a row's own context length decides how much of its slice is
+        // written. The context-split geometries the single-row path uses do not
+        // apply here: splitting one row's context across the cores while the
+        // other rows wait is a loss at these batch sizes, and no kernel takes
+        // several rows from several slots yet.
+        const int scratch_row_stride =
+            q_heads * runtime.batch_rows->max_context_len;
+        QwenDeviceTensor& scores = runtime.workspace_float(
+            static_cast<size_t>(rows) * static_cast<size_t>(scratch_row_stride),
+            {static_cast<uint64_t>(rows),
+             static_cast<uint64_t>(scratch_row_stride)});
+        typename Runtime::PhaseScope sub(&runtime, "full.attn_kernel");
+        require_launch(qwen_gqa_decode_attention_f16_batched_ascend(
+            q_norm.f16_data(), layer.full.k_cache.f16_data(),
+            layer.full.v_cache.f16_data(), attention.f16_data(),
+            scores.f32_data(), scratch_row_stride,
+            runtime.batch_rows->host_context_lens,
+            runtime.batch_rows->host_slot_ids, rows, q_heads, kv_heads, head_dim,
+            runtime.max_context, kv_slot_stride, nullptr),
+            "batched decode FP16-cache GQA");
+    } else if (rows == 1) {
         const int context_length = position_offset + 1;
         const bool cube_ready = qwen_gqa_decode_attention_cube_available(
             q_heads, kv_heads, head_dim, context_length, runtime.max_context);
@@ -1199,8 +1269,8 @@ void GqaAttention::forward(
                 runtime, layer.full.out, merged.f16_data(), output, rows,
                 "full.out");
         }
-        runtime.all_reduce_half(
-            output, rows * static_cast<int>(runtime.config.hidden_size),
+        runtime.all_reduce_half_rows(
+            output, rows, static_cast<int>(runtime.config.hidden_size),
             "full.out");
     }
 }
@@ -1270,10 +1340,20 @@ void FusedGateUpSwiGLU::forward(
         runtime.linear_component.forward(
             runtime, layer.gate_up, input, fused_output.f16_data(), rows,
             "mlp.gate_up");
-        // Split the output: first half is gate, second half is up.
+        // `gate_up` is a row-concatenation of the gate and up weights, so output
+        // column c of row r is gate column c for c < gate_rows and up column
+        // c - gate_rows beyond that. The result is therefore [rows, 2*gate_rows]
+        // *interleaved per row*, not two contiguous row blocks, and the two
+        // halves have to be separated with a per-row split. Reading the second
+        // operand as `fused_output + rows * gate_rows` happens to line up only
+        // when rows == 1: at rows > 1 it feeds each row another row's gate
+        // plane, which is wrong for prefill and for batched decode alike.
+        require_launch(qwen_split_rows_pair_f16(
+                         fused_output.f16_data(), workspace.gate->f16_data(),
+                         workspace.up->f16_data(), rows, gate_rows),
+                     "FP16 MLP gate/up split");
         require_launch(qwen_silu_mul_rows_f16(
-            fused_output.f16_data(),
-            fused_output.f16_data() + rows * gate_rows,
+            workspace.gate->f16_data(), workspace.up->f16_data(),
             workspace.output->f16_data(), rows, gate_rows), "FP16 SwiGLU");
     } else {
         runtime.linear_component.forward(
@@ -1397,7 +1477,7 @@ void DecoderLayer::forward(Runtime& runtime, DeviceLayer& layer,
         runtime.linear_component.forward(
             runtime, layer.down, swiglu.output->f16_data(), mlp.f16_data(),
             rows, "mlp.down");
-        runtime.all_reduce_half(mlp.f16_data(), rows * hidden_size, "mlp");
+        runtime.all_reduce_half_rows(mlp.f16_data(), rows, hidden_size, "mlp");
     }
     runtime.add(output, mlp.f16_data(), rows * hidden_size);
 }
