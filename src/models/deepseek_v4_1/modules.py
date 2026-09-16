@@ -128,7 +128,7 @@ class ResidentRoutedExperts(RoutedExperts, nn.Module):
     """Every routed expert of one layer held on one device.
 
     Correct and convenient, and not what the released checkpoint needs: 384 experts is 16.9 MiB of
-    packed fp4 each, plus 1.1 MiB of scales, which is 6.3 GiB of codes per layer and 25.3 GiB once
+    packed fp4 each, plus 1.1 MiB of scales, which is 6.7 GiB of codes per layer and 12.7 GiB once
     every one of them is expanded to bf16, so a 40-layer model cannot hold them. This exists for the
     small configs the tests build and for a future device-side expert cache; the checkpoint path is
     `CheckpointRoutedExperts` in `loader.py`.

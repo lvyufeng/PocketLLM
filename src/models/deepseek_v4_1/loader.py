@@ -38,7 +38,7 @@ never has to decide any of them:
   `norm` and `head` -- and `checkpoint_weights` casts each into its parameter's own dtype rather than
   special-casing any of them.
 * **Neither Engram table belongs anywhere but host RAM, and gathering from the shards is not an
-  option either.** They are 91.56 and 91.55 GiB of rows, and a forward touches one row per hash
+  option either.** They are 91.55 and 91.56 GiB of rows, and a forward touches one row per hash
   column -- 24 per position, per table -- so `CheckpointEngramTable` either copies the table into RAM
   (189.1 GiB of codes and scales for both) or gathers each row out of the mapping. The gather is what
   decides it, and it is a page-cache question rather than a bandwidth one: measured on a quiet disk,
@@ -51,9 +51,10 @@ never has to decide any of them:
   float8 `index_select`: `view[rows]` raises `NotImplementedError: "index_cpu" not implemented for
   'Float8_e4m3fn'` and the E8M0 scales raise it too.
 * **The three DSpark draft layers, the vision tower and the aligner are simply not asked for.**
-  `Backbone` is the text backbone, so 95,161 of the checkpoint's 96,085 tensors are left where they
-  are, and 92,160 of those are the expert projections. `LoadReport.unloaded_groups` counts them
-  rather than passing over them in silence.
+  `Backbone` is the text backbone, so 94,831 of the checkpoint's 96,085 tensors are left where they
+  are, and 92,160 of those are the expert projections. `LoadReport.unloaded_groups` counts 95,161
+  rather than 94,831 because it tallies a quantized name as the one tensor it is named by and not as
+  the two it reads; either way it counts them rather than passing over them in silence.
 
 `checkpoint_weights` raises on a parameter it could not fill. That is deliberate: every module in the
 tree is built out of `torch.empty`, so a parameter the checkpoint does not name stays uninitialized
@@ -103,9 +104,9 @@ FP8_WEIGHT = "F8_E4M3"
 FP4_PACKED_WEIGHT = "I8"
 
 # Dequantized experts one layer keeps on the host. The released layer is 384
-# experts of 16.9 MiB packed fp4 each -- 67.5 MiB each once expanded to bf16, so
-# 25.3 GiB for the whole layer -- and the correctness path re-reads and re-expands
-# on a miss. 16 experts is 1.03 GiB per layer and 41 GiB across the backbone, which
+# experts of 16.9 MiB packed fp4 each -- 33.8 MiB each once expanded to bf16, so
+# 12.7 GiB for the whole layer -- and the correctness path re-reads and re-expands
+# on a miss. 16 experts is 0.53 GiB per layer and 21 GiB across the backbone, which
 # bounds the cache without pretending to be the serving design: a device-side
 # expert cache fed by fp4 kernels is what a measured run needs, and it replaces
 # this, not tunes it.
@@ -357,12 +358,12 @@ class CheckpointRoutedExperts(RoutedExperts):
     expansion can recover, and the cache below is what makes the cost per miss bearable.
 
     It barely does. A token routes to 8 of the layer's 384 experts, so a 16-expert window returns
-    about 2 of them: measured, 6 misses per layer per token, warm. That is 25% saved for the 41 GiB
+    about 2 of them: measured, 6 misses per layer per token, warm. That is 25% saved for the 21 GiB
     the window costs across the backbone, and it puts the whole model's token time on the disk --
     the first token costs 27.2 s because all 240 of its experts are cold, against 1.0 s once the
     previous token's working set is in the page cache. This class is a correctness path, and the
     number that says so is that its ffn is 0.44 s of that second: 240 fresh experts is 4.2 GiB read
-    and 15.8 GiB expanded per token, on a host whose RAM holds all 269 GiB of them in their packed
+    and 7.9 GiB expanded per token, on a host whose RAM holds all 269 GiB of them in their packed
     form. A device-side cache is what replaces it, not a larger `cache_size`.
     """
 
@@ -432,7 +433,7 @@ class CheckpointRoutedExperts(RoutedExperts):
 class CheckpointEngramTable(EngramTable):
     """One Engram layer's n-gram table, either left in the shards or copied into host RAM.
 
-    The two tables are 91.56 and 91.55 GiB of rows, and a forward touches one row per hash column --
+    The two tables are 91.55 and 91.56 GiB of rows, and a forward touches one row per hash column --
     24 per position, two tables -- so the question is not whether the table fits but what a gather
     costs. Out of the mapping it is one seek per row, and on the shingled disk this checkpoint lives
     on that is expensive enough to decide how the model is served: measured 21 to 49 ms for a row
