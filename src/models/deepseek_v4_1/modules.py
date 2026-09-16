@@ -597,6 +597,7 @@ class Backbone(nn.Module):
         device = canonical_device(device)
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         max_seq_len = cfg.max_position_embeddings if max_seq_len is None else max_seq_len
+        self.device = device
         self.max_seq_len = max_seq_len
         self.hc_mult = cfg.hc_mult
         self.norm_eps = cfg.norm_eps
@@ -637,6 +638,15 @@ class Backbone(nn.Module):
         """
         if any(block.engram is not None for block in self.layers) and hash_ids is None:
             raise ValueError("this model has Engram layers, so `hash_ids` is required")
+        # The tree is built where it runs, so a caller's token ids land on the card here rather than
+        # one module at a time -- `EngramHashIds` already moves its own input the same way, which is
+        # why a device forward used to get as far as this line and no further. Host is a no-op:
+        # `Tensor.to` returns self when the device already matches, so the host path is the one it
+        # always was.
+        if self.device is not None:
+            input_ids = input_ids.to(self.device)
+            if image_mask is not None:
+                image_mask = image_mask.to(self.device)
         # image tokens take no part in an n-gram and get no engram contribution; text-only needs no mask
         engram_mask = None if image_mask is None else ~image_mask
 

@@ -132,9 +132,15 @@ than separate opinions:
   cost against the **7.3 ms** the same row's staging costs. It needs one more generation of the
   activation, the weights and the partials, and it changes the shape of the row loop rather than any
   of its parts, so it is a follow-on with its own measurement.
-* **The dense tree stays on the host.** It is 16.79 GiB, it works, and moving it is worth 0.4-0.6
-  s/token on its own; doing both at once would put two independent sources of divergence inside one
-  debugging session.
+* **The dense tree's own quarter is now on the card beside this class, and the split moved.** With
+  the tree on the host this class was the whole step's smaller half; with the tree cut across the
+  four cards (TP4, `src/cli/generate_v41.py`) the activation arrives on a card rather than from the
+  host, so the input copy is a device-to-device one and the partial goes back to the card the `MoE`
+  wants it on. Measured that way at 8 tokens of decode, **722-747 ms per step, 409-444 of it in this
+  class and 303-313 in the tree** -- against the recorded 1060-1140 ms per step with the tree on the
+  host, so the move took 620 ms of dense tree down to 310 and left the staging as the larger half.
+  This is also why the class no longer raises when a rank holds none of a row's routes: under a deal
+  that rank's share is zero and it has to stay in the all-reduce to say so.
 """
 
 from __future__ import annotations
@@ -542,12 +548,29 @@ class DeviceRoutedExperts(RoutedExperts):
         so 3.42x of the 3.60x is the ordering and not the transfers.
         """
         scratch = self._row_scratch(x_row)
-        scratch["x"].copy_(x_row)
-        # One gather for the row, in card order, so card `c`'s weights are a contiguous slice.
+        # The activation goes to every card, and with the dense tree on a card it is already on one:
+        # then it is a device-to-device copy of the same 10 KiB with no pageable D2H in between, and
+        # a pageable copy is synchronous -- which is the one cost the issue-then-drain ordering below
+        # exists to keep off the per-row path.
+        source = scratch["x"]
+        if x_row.is_cuda:
+            source = x_row.reshape(1, -1)
+        else:
+            scratch["x"].copy_(x_row)
+        # One gather for the row, in card order, so card `c`'s weights are a contiguous slice. The
+        # permutation follows the weights to whichever device the gate produced them on.
         perm = torch.tensor(
-            [slot for members in cards for _, slot in members], dtype=torch.int64
+            [slot for members in cards for _, slot in members],
+            dtype=torch.int64,
+            device=weights_row.device,
         )
-        scratch["w"].copy_(weights_row.reshape(-1).index_select(0, perm))
+        # `perm` is the routes *this process* holds, which under a deal is fewer than `topk` -- the
+        # else of them are a sibling rank's arena rows and its share of the sum. `scratch["w"]` is
+        # sized for `topk` because that is the widest a row's own routes can be, so the copy takes a
+        # view of it rather than the whole buffer.
+        scratch["w"].narrow(0, 0, perm.numel()).copy_(
+            weights_row.reshape(-1).index_select(0, perm)
+        )
 
         issued: list[int] = []
         offset = 0
@@ -560,7 +583,7 @@ class DeviceRoutedExperts(RoutedExperts):
             # only its own arena, so four independent chains is what the hardware is.
             torch.cuda.current_stream(device).wait_stream(_copy_stream(device))
             with torch.cuda.device(device):
-                scratch["x_device"][card].copy_(scratch["x"], non_blocking=True)
+                scratch["x_device"][card].copy_(source, non_blocking=True)
                 scratch["w_device"][card].narrow(0, 0, k).copy_(
                     scratch["w"].narrow(0, offset, k), non_blocking=True
                 )
@@ -587,7 +610,14 @@ class DeviceRoutedExperts(RoutedExperts):
             y = scratch["y"][card] if y is None else y + scratch["y"][card]
 
         if y is None:
-            raise RuntimeError(f"layer {self.layer_id} routed a row to no expert at all")
+            # Under a deal a rank can hold none of a row's routes -- `topk` below `world`, or a
+            # routing that landed every one of them on a sibling. That rank's share of the sum is
+            # zero, and returning it is what keeps it in the all-reduce the `MoE` is about to run;
+            # raising here would take the process group down over an answer that is not an error.
+            # Without a deal there is no sibling to hold the routes, so nobody routed is a real one.
+            if not self.partial:
+                raise RuntimeError(f"layer {self.layer_id} routed a row to no expert at all")
+            return torch.zeros(self.dim, dtype=torch.float32)
         # A tensor of its own and not the view of a reused buffer: the caller assigns this into its
         # own `[n, dim]` today, and one that kept the result would otherwise watch the next row
         # overwrite it.
@@ -612,7 +642,13 @@ class DeviceRoutedExperts(RoutedExperts):
         y = torch.empty((n, dim), dtype=torch.float32)
         for row in range(n):
             y[row] = self._forward_row(x[row], weights[row], indices[row])
-        return y
+        # The result belongs where the activation came from. With the tree on a card this is the
+        # half of the layer that follows: the `MoE` above adds the shared expert's output and hands
+        # the sum to the all-reduce, and a CPU tensor would make that line a cross-device add. The
+        # sum itself is still the host's -- each card's copy is drained into pinned memory and added
+        # there, which is what `_launch` measures -- so this is one H2D of `[n, dim]` per layer and
+        # not a fourth card in the reduction.
+        return y if x.device.type == "cpu" else y.to(x.device)
 
     def _forward_row(
         self, x_row: torch.Tensor, weights_row: torch.Tensor, indices_row: torch.Tensor
