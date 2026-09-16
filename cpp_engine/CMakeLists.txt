@@ -785,6 +785,27 @@ if(POCKET_HAVE_TP_COMM AND POCKET_BACKEND STREQUAL "ascend")
     set_target_properties(bench_qwen_ascend_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()
 
+# That measurement leaves replacing HcclAllReduce as the only remaining lever, so
+# the ACL primitives such a replacement would be built from are priced separately:
+# peer access, cross-device copies, the batch copy entry point and the notify pair.
+# Uses raw AscendCL beyond the device runtime, so it is Ascend-only.
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_peer_copy tests/bench_qwen_ascend_peer_copy.cpp)
+    target_link_libraries(bench_qwen_ascend_peer_copy PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_peer_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
+# That probe prices the primitives in a single process, where a peer's address is an
+# ordinary pointer, but the engine runs one process per TP rank. Whether a
+# hand-written collective is buildable at all therefore turns on
+# aclrtIpcMemGetExportKey / aclrtIpcMemImportByKey working across processes here,
+# which is what this one measures.
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_ipc_exchange tests/bench_qwen_ascend_ipc_exchange.cpp)
+    target_link_libraries(bench_qwen_ascend_ipc_exchange PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_ipc_exchange PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
 # The decode target is a question about a physical limit: one decode step re-reads
 # every resident weight, so it is worth knowing what this part's memory actually
 # sustains rather than inferring it from a GEMV that may simply be inefficient.
