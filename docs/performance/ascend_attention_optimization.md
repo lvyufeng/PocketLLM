@@ -57,6 +57,43 @@ Two entries exist because the call shapes genuinely differ: `causal != 0` for pr
 sequence positions with individual causal limits) and `causal == 0` for decode (a single position, so
 the tile is the whole query head group and every row shares one limit).
 
+### 2.1 The tile pitch: two wrong strides, and why no test saw them
+
+As first committed, the prefill entry read Q and wrote O with the *position* pitch
+(`q_heads * head_dim`) where the tile's own row pitch (`head_dim`) belongs. One work item stacks a
+whole head group at one position — `q_base = (row0 * q_heads + kv_head * repeat) * head_dim` — so
+its rows are adjacent in GM, and `q_heads * head_dim` is the distance to the *next position*:
+
+- `Nd2NzParams::srcDValue = q_pitch` read rows 1..`repeat-1` of Q from five positions further along
+  than intended (row 0 is correct, since `0 * q_pitch == 0`);
+- `Nz2NdParamsFull::dstDStride = q_pitch` sent tile row `s` to GM offset `s * q_heads * head_dim`, so
+  only `ceil(rows / q_heads)` of `rows` rows landed inside the output buffer and the remainder ran
+  past the end of the allocation.
+
+At TP4 (`q_heads=6`, `kv_heads=1`, `head_dim=256`) that is five of six head rows wrong on both the
+read and the write. Both are now `head_dim`, and the kernel refuses `kv_heads != 1`, which is the
+condition under which a single pitch describes both the group and the output (see the note above).
+
+Both tests that should have caught it shared a defect of their own: each had a `float_to_half` that
+never packed the exponent. Every value in the uniform range these files generate is in `(-1, 1)`, so
+every input became a denormal near `2^-24`, every output landed three orders of magnitude below the
+`4e-3` tolerance, and the comparison passed on zeros. `test_qwen_ascend_cube_attention` reported `ok`
+for a kernel writing five of six heads into the wrong memory. With the exponent packed, the same test
+immediately reported `cube max_abs=6.4e-01 bad=91458/98304 head-rows diverging=383/384`, and the
+repeat probe — which compares the Cube path against the vector path on the same input — reported row
+0 identical and every later row different, which is the signature of a per-position pitch error.
+
+After both fixes `test_qwen_ascend_cube_attention` reports `ok` at every length from 16 to 2048 and at
+decode contexts 512/1024/4096, with Cube `max_abs` `3.1e-04`..`3.5e-04` against a double reference. A
+throwaway probe (a seeded destination rather than a cleared one, so an unwritten element is visible)
+confirmed independently that every output row is now fully written, that no head rows diverge, and
+that the Cube path differs from the vector path by one fp16 ulp (`2.44e-04`); it is not kept in the
+tree.
+
+**Throughput is unchanged**, which is the expected result: the defect put the same bytes on the wire,
+just at the wrong addresses. 512/128 prefill moved 428.1 -> 415.8 TPS and 4096/32 moved 1265.3 ->
+1262.8 TPS (decode 9.21 -> 8.83 and 9.55 -> 8.82), all inside run-to-run spread.
+
 ## 3. Measured decode attention
 
 Same machine, 4097-token context, `bench_qwen_ascend_attention`. Three kernels are dispatchable and
