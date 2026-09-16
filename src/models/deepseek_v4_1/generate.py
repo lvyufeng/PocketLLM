@@ -6,10 +6,15 @@ call, then one call per new token, decoding greedily by default.
 
 The loop is small on purpose, because the cost is not in it. Every token is a full forward over the
 host-offload expert path, so a decode step re-reads and re-expands the experts its layer routes to;
-on this machine that is **30 to 40 s per generated token**, and 99.7% of it is the fp4-to-bf16
-expansion of the 240-odd experts the step misses rather than any read. There is no batching, no
-speculative decoding and no device path here -- see
-`docs/performance/deepseek_v4_1_flash_host_run.md` for what a token costs and why.
+on this machine that is **15 to 42 s per generated token**, and 99.7% of it is the fp4-to-bf16
+expansion of the 240-odd experts the step misses rather than any read. There is no batching and no
+speculative decoding here.
+
+`--expert-device cuda --expert-world 4` is the one lever this loop does expose: it hands the routed
+experts to all four cards instead of the host, one `RoutedExperts` swap in `load_backbone` and no
+change to the loop. The cards consume the checkpoint's packed fp4 directly, so the expansion above
+does not happen at all -- see `device_experts.py` and
+`docs/performance/deepseek_v4_1_flash_host_run.md` for what remains.
 
 Command line:
 
@@ -19,6 +24,7 @@ Command line:
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -26,6 +32,12 @@ from typing import Callable, Sequence
 import torch
 
 __all__ = ["Generation", "generate", "main"]
+
+# The environment spellings of the two device-path flags, so that the machine remembers the
+# configuration and the command stays a command. Everything about the choice is still the host path
+# until one of them is set.
+EXPERT_DEVICE_ENV = "DEEPSEEK_V41_EXPERT_DEVICE"
+EXPERT_WORLD_ENV = "DEEPSEEK_V41_EXPERT_WORLD"
 
 
 @dataclass
@@ -158,6 +170,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                              "them from the shards; roughly 750 s of reading, once")
     parser.add_argument("--expert-cache", type=int, default=None,
                         help="dequantized experts one layer keeps on the host")
+    parser.add_argument("--expert-device", default=os.environ.get(EXPERT_DEVICE_ENV), metavar="DEVICE",
+                        help="put the routed experts on DEVICE (e.g. cuda) across --expert-world "
+                             "cards instead of the host, which never expands fp4 to bf16; falls "
+                             "back to the host path if the build does not work. "
+                             f"Default: ${EXPERT_DEVICE_ENV} if set")
+    parser.add_argument("--expert-world", type=int, default=None,
+                        help="cards to split the routed experts over. Default: "
+                             f"${EXPERT_WORLD_ENV} if set, else 1")
     parser.add_argument("--quiet", action="store_true", help="suppress the progress and timing lines")
     args = parser.parse_args(argv)
 
@@ -182,9 +202,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         hasher=hasher,
         resident_engram=args.resident_engram,
         expert_cache=DEFAULT_EXPERT_CACHE if args.expert_cache is None else args.expert_cache,
+        expert_device=args.expert_device,
+        expert_world=(
+            int(os.environ.get(EXPERT_WORLD_ENV, "1")) if args.expert_world is None
+            else args.expert_world
+        ),
         progress=say,
     )
     say(f"loaded in {time.perf_counter() - started:.1f} s")
+    if args.expert_device is not None:
+        # Not `front.model.routed`: `load_backbone` unpacks that dict into the layers, so what a
+        # forward reaches is `layer.ffn.routed`, and `DeviceRoutedExperts` is deliberately not an
+        # `nn.Module` -- `modules()` would not surface it either. The line reports what the run
+        # actually built, because "it fell back to the host" is the failure this flag has, and the
+        # world is read off the objects rather than off the flag for the same reason.
+        held = [layer.ffn.routed for layer in front.model.layers]
+        kinds = sorted({type(r).__name__ for r in held})
+        world = getattr(held[0], "world", None)
+        where = "" if world is None else f", world {world}"
+        say(f"routed experts: {', '.join(kinds)} on {len(held)} layers{where}")
 
     prompt_ids = tokenizer(args.prompt)["input_ids"]
     say(f"prompt {len(prompt_ids)} tokens: {tokenizer.convert_ids_to_tokens(prompt_ids)}")

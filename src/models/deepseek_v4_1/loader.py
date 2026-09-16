@@ -72,6 +72,7 @@ import torch
 from src.encoding.engram import EngramLayout, NgramHasher, build_compressed_token_map
 from src.loader.safetensors import SAFETENSORS_DTYPES, MmapSafetensors
 from src.models.deepseek_v4_1.config import V41TextConfig
+from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
 from src.models.deepseek_v4_1.kernels import dequant_fp4_weight, dequant_fp8_weight
 from src.models.deepseek_v4_1.modules import (
     LINEAR_DTYPE,
@@ -357,16 +358,18 @@ class CheckpointRoutedExperts(RoutedExperts):
     fp32: the released fp4 is four bits of mantissa, so bf16's eight are already more than the
     expansion can recover, and the cache below is what makes the cost per miss bearable.
 
-    It barely does. A token routes to 8 of the layer's 384 experts, so a 16-expert window returns
-    about 2 of them: measured, 6 misses per layer per token, warm. That is 25% saved for the 42 GiB
-    the window costs across the backbone, and it puts the whole model's token time on the expansion
-    rather than on the disk -- one miss is 0.3% mapping read and 99.7% the arithmetic that turns fp4
-    codes into fp32 and then bf16, at 0.122 s per expert, so a step that misses 240 of them costs
-    about 29 s against 1.0 s for a forward whose experts are already expanded and 27.2 s for a first,
-    entirely cold one. 240 fresh
-    experts is 4.2 GiB read and 15.8 GiB expanded per token, on a host whose RAM holds all 269 GiB of
-    them in their packed form and hands them over for free; what the host cannot do cheaply is turn
-    them into numbers. A device-side cache is what replaces it, not a larger `cache_size`.
+    It barely does. A token routes to 6 of the layer's 384 experts, so a 16-expert window returns
+    about half of them: measured over four decode steps, 119 of 240 expert rows missed, warm, and
+    759 of 1,200 at a five-token prefill (`/tmp/probe_token_cost.py`). That is half a step's
+    expansions saved for the 42 GiB the window costs across the backbone, and it puts the whole
+    model's token time on the expansion rather than on the disk -- one miss is 0.3% mapping read and
+    99.7% the arithmetic that turns fp4 codes into fp32 and then bf16, at 0.122 s per expert, so a
+    step that misses all 240 of a token's experts costs about 29 s and the 119 a warm step misses
+    about 14.5 s, against 1.0 s for a forward whose experts are already expanded and 27.2 s for a
+    first, entirely cold one. 240 fresh experts is 4.2 GiB read and 15.8 GiB expanded per token, on
+    a host whose RAM holds all 269 GiB of them in their packed form and hands them over for free;
+    what the host cannot do cheaply is turn them into numbers. A device-side cache is what replaces
+    it, not a larger `cache_size`.
     """
 
     def __init__(
@@ -687,6 +690,8 @@ def load_backbone(
     hasher: NgramHasher | None = None,
     tokenizer_dir: str | None = None,
     expert_cache: int = DEFAULT_EXPERT_CACHE,
+    expert_device: str | None = None,
+    expert_world: int = 1,
     progress: Callable[[str], None] | None = None,
 ) -> LoadedBackbone:
     """Build the V4.1 text backbone and fill it from `checkpoint`.
@@ -697,11 +702,19 @@ def load_backbone(
     `CheckpointEngramTable` for why gathering them from the shards is not an option here.
 
     The forward that follows is the host-offload correctness path, and it is measured now rather than
-    assumed: a generated token costs 30 to 40 s, of which the attention stack is 0.37 s, and the rest
-    is the routed experts -- 320 of them expanded on a first, cold forward, 240 on a warm step, at
-    0.122 s each. The cost is the expansion and not the bytes: 0.3% of a miss is reading the mapping
-    and 99.7% is turning fp4 codes into fp32 and then bf16. `CheckpointRoutedExperts` is that
-    subject, and this function's is only the dense half.
+    assumed: a generated token costs 15 to 42 s, of which the attention stack is 0.37 s, and the rest
+    is the routed experts -- 240 of them per token at the checkpoint's 6 per layer, at 0.122 s each
+    on a miss. The cost is the expansion and not the bytes: 0.3% of a miss is reading the mapping and
+    99.7% is turning fp4 codes into fp32 and then bf16. `CheckpointRoutedExperts` is that subject,
+    and this function's is only the dense half.
+
+    `expert_device` moves the routed experts off the host and onto `expert_world` cards
+    (`DeviceRoutedExperts`), which consumes the packed fp4 in the kernel and so never pays the
+    expansion this function's paragraph above is about. It is opt-in and it is allowed to fail: an
+    unloadable extension, a card that is not there, or a checkpoint whose expert is laid out the
+    other way round all land back on `CheckpointRoutedExperts` with one line on `progress`, because a
+    slow correct run is worth more than a fast wrong one. The host path is unchanged and is still
+    what an unset `expert_device` gives.
     """
     if hasher is not None:
         layout = hasher.layout
@@ -712,18 +725,47 @@ def load_backbone(
 
     max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     n_layers = config.n_layers if config.n_layers is not None else len(config.compress_ratios)
-    routed = {
-        layer_id: CheckpointRoutedExperts(
+
+    def on_device(layer_id: int, n_experts: int) -> RoutedExperts | None:
+        """A card-resident layer if the caller asked for one and the build works, else `None`."""
+        if expert_device is None:
+            return None
+        # `--expert-device cuda:1 --expert-world 4` is cards 1 through 4, not `cuda:1:0`: the flag
+        # names where the split starts and the world says how wide it is.
+        base = torch.device(expert_device)
+        first = base.index if base.index is not None else 0
+        try:
+            return DeviceRoutedExperts(
+                checkpoint,
+                layer_id,
+                n_experts=n_experts,
+                dim=config.dim,
+                inter_dim=config.moe_inter_dim,
+                topk=_moe_shape(config, layer_id)[1],
+                swiglu_limit=config.swiglu_limit or 0.0,
+                world=expert_world,
+                devices=[torch.device(base.type, first + c) for c in range(expert_world)],
+            )
+        except (RuntimeError, ValueError) as error:
+            if progress is not None:
+                progress(
+                    f"layer {layer_id}: not putting the experts on {expert_device}, "
+                    f"{type(error).__name__}: {error}"
+                )
+            return None
+
+    routed = {}
+    for layer_id in range(n_layers):
+        n_experts = _moe_shape(config, layer_id)[0]
+        routed[layer_id] = on_device(layer_id, n_experts) or CheckpointRoutedExperts(
             checkpoint,
             layer_id,
-            n_experts=_moe_shape(config, layer_id)[0],
+            n_experts=n_experts,
             dim=config.dim,
             inter_dim=config.moe_inter_dim,
             swiglu_limit=config.swiglu_limit or 0.0,
             cache_size=expert_cache,
         )
-        for layer_id in range(n_layers)
-    }
     tables = (
         {
             layer_id: CheckpointEngramTable(
