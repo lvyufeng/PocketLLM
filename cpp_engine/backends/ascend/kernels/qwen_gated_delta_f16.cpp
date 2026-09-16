@@ -12,76 +12,132 @@
 //
 // Why this maps onto the vector unit the way it does:
 //
-//   - One head per core iteration, not one value column per core. A head's state is
-//     128*128 FP32 = 64 KiB, which fits UB (256 KiB) alongside the row buffers, so
-//     the whole recurrence runs out of UB with two GM touches per head: load the
-//     state once, store it once. Splitting a head across cores would mean either
-//     re-reading the state per token or a cross-core reduction for kv_mem, and this
-//     part has no separate vector cores to win that back.
+//   - A head's state is 128*128 FP32 = 64 KiB, which fits UB (256 KiB) alongside
+//     the row buffers, so the whole recurrence runs out of UB with two GM touches
+//     per unit: load the state once, store it once.
 //   - `k^T S` and `q^T S` are reductions down the key axis, i.e. across rows of the
-//     state tile. Broadcasting the key scalar over a value-wide row and folding rows
-//     pairwise keeps every instruction a full-width vadd/vmul. The alternative,
-//     one dot product per value column, is 128 narrow reductions.
-//   - The rank-1 update is `Axpy` per key row: S[i,:] += delta * k[i], which is
-//     exactly dst = src*scalar + dst.
+//     state tile. Both are written as one `Axpy` per key row accumulating into a
+//     value-wide row, with the key element as the instruction's scalar operand, so
+//     nothing has to splat it across a row first. The alternative, one dot product
+//     per value column, is 128 narrow reductions.
+//   - The rank-1 update is the same instruction again: `Axpy` per key row,
+//     S[i,:] += delta * k[i], which is exactly dst = src*scalar + dst.
 //
-// Numerical order differs from the CUDA kernel: CUDA accumulates kv_mem as a scalar
-// sequential sum down the key axis, this folds pairwise in a tree. Both are FP32,
-// neither is "the" reference, so the tests compare against a double-precision host
-// reference with a tolerance that covers both.
+// So each of the three passes over the state tile costs 128 issues and no more.
+// Writing `k^T S` as broadcast-multiply-fold instead costs 2*rows + log2(rows)
+// issues -- 264 rather than 128 -- and this part turns out to charge for issues
+// rather than for bytes, so the accumulation form is the cheaper one by roughly
+// the ratio of those two numbers.
+//
+// Work is spread over `heads * value_split` units, not over heads: see the comment
+// on kMaxValueSplit for why the value axis and only the value axis can be cut, and
+// what the cut is worth. Which split to run is a launch argument taken from the
+// head count, because whether it pays depends on the head count -- but the width it
+// implies stays a compile-time constant, for the reason recorded there.
+//
+// The accumulation order is also the more defensible one: it sums sequentially
+// down the key axis, which is what the CUDA kernel and the tests' double-precision
+// host reference both do, where the fold was a tree with a different rounding.
 //
 // The state is fp32 and stays fp32 the whole way through; only q/k/v/out are fp16.
 
 #include "qwen_ascend_kernel_common.hpp"
+#include "qwen_gated_delta_geometry.hpp"
 
 namespace {
 
 using namespace pocket;
 
-// Qwen3.5's linear-attention head geometry. Both are 128, and the host rejects
-// anything else, so they are compile-time constants: the state tile size, the
-// number of Axpy rows and the fold depth all depend on them.
-constexpr uint32_t kKeyDim = 128;
-constexpr uint32_t kValueDim = 128;
-constexpr uint32_t kStateElems = kKeyDim * kValueDim;
+// The head geometry and the value split live in a header the launcher and the
+// benchmark read too, because the kernel's item count and the launcher's grid size
+// are two derivations of the same number: see qwen_gated_delta_geometry.hpp.
+using pocket::gated_delta::kKeyDim;
+using pocket::gated_delta::kMaxValueSplit;
+using pocket::gated_delta::kStateElems;
+using pocket::gated_delta::kValueDim;
 
-// Rows are folded pairwise, so the fold works on a power-of-two row count. 128 is
-// already one.
-constexpr uint32_t kFoldRows = kKeyDim;
+// Accumulators the two `k^T S` / `q^T S` reductions are spread over. Rows go to
+// them round-robin, so this is also the distance between two instructions that
+// depend on each other.
+//
+// 1, and not by omission. Spreading the rows was tried at 2, 4 and 8 groups, on
+// the theory that one accumulator makes the whole loop a chain of `rows` dependent
+// read-modify-writes that the vector pipe cannot overlap. Every group count was
+// slower than one -- 41.6, 42.4, 44.7, 44.7 ms/layer for 1, 2, 4, 8 -- and the
+// degradation is monotone in the group count, which is the signature of paying for
+// the extra zeroing Duplicates and partial adds and getting nothing back. So the
+// loop is not waiting on the dependence; it is simply issuing instructions at a
+// fixed cost each, and the way to make it faster is to issue fewer of them.
+constexpr uint32_t kAccGroups = 1;
 
-// One head's working set in UB:
+// Which split to run is a runtime decision and why is argued on kMaxValueSplit in
+// the geometry header. What belongs here is how the kernel takes it.
+//
+// By an `if` on a template parameter, rather than by carrying the width in a
+// variable, and that is not a stylistic choice. The width is the repeat count of
+// every instruction in the step, and a runtime variable stopped the vector
+// intrinsics from constant-folding theirs: 41.3 -> 45.4 ms/layer on the full-width
+// arm and 36.0 -> 44.4 on the split one, both measurably worse than the slower of
+// the two compile-time arms. Both specializations are instantiated and the untaken
+// one is dead-code eliminated, so the dispatch costs nothing.
+static_assert(kMaxValueSplit >= 1 &&
+                  (kMaxValueSplit & (kMaxValueSplit - 1)) == 0,
+              "value split must be a power of two so the width stays aligned");
+static_assert(kValueDim % kMaxValueSplit == 0,
+              "value split must divide the value dimension");
+
+// One value range of one head's state in UB. The buffers are always allocated at
+// the full value width so that either split fits:
 //   state      64 KiB   [kKeyDim, kValueDim] fp32
-//   scratch    64 KiB   broadcast/fold workspace, same shape
-//   rows        3 KiB   q, k (fp32, kKeyDim) and v, out, kv_mem, delta (fp32, kValueDim)
+//   scratch    64 KiB   split workspace, same shape
+//   rows        3 KiB   q, k (fp32, kKeyDim) and v, out (fp32, kValueDim)
 //   halves      1 KiB   fp16 staging for v and out
-// which leaves better than half of UB free.
+// which leaves better than half of UB free. A split leaves the spare columns dead
+// rather than resizing the buffers, which costs UB that is not scarce and keeps the
+// split out of the buffer arithmetic.
+template <uint32_t kValueSplit>
 class GatedDeltaHead {
 public:
+    static constexpr uint32_t kValueWidth = kValueDim / kValueSplit;
+
     __aicore__ inline void Init(AscendC::TPipe& pipe) {
-        pipe.InitBuffer(state_buf_, kStateElems * sizeof(float));
-        pipe.InitBuffer(scratch_buf_, kStateElems * sizeof(float));
+        pipe.InitBuffer(state_buf_, kKeyDim * kValueDim * sizeof(float));
+        pipe.InitBuffer(scratch_buf_, kKeyDim * kValueDim * sizeof(float));
         pipe.InitBuffer(q_buf_, kKeyDim * sizeof(float));
         pipe.InitBuffer(k_buf_, kKeyDim * sizeof(float));
         pipe.InitBuffer(v_buf_, kValueDim * sizeof(float));
-        pipe.InitBuffer(acc_buf_, kValueDim * sizeof(float));
+        pipe.InitBuffer(acc_buf_, kAccGroups * kValueDim * sizeof(float));
         pipe.InitBuffer(half_buf_, kValueDim * sizeof(half));
         pipe.InitBuffer(aux_buf_, kAlignFloat * sizeof(float));
     }
 
-    // Load S for this head. State layout is [heads, key_dim, value_dim], so a head's
-    // slice is contiguous.
+    // Load S for this head and value range. State layout is
+    // [heads, key_dim, value_dim], so the range is a column window of the head's
+    // slice: contiguous inside each row, `kValueDim` apart between rows.
     __aicore__ inline void LoadState(const AscendC::GlobalTensor<float>& state,
-                                     uint32_t head) {
+                                     uint32_t head, uint32_t half) {
         AscendC::LocalTensor<float> st = state_buf_.Get<float>();
-        AscendC::DataCopy(st, state[head * kStateElems], kStateElems);
+        const uint32_t base = head * kKeyDim * kValueDim + half * kValueWidth;
+        if (kValueSplit == 1) {
+            AscendC::DataCopy(st, state[base], kKeyDim * kValueWidth);
+        } else {
+            AscendC::DataCopy(st, state[base],
+                              window_load_params<float>(kKeyDim, kValueWidth, kValueDim));
+        }
         wait_load_before_compute();
     }
 
     __aicore__ inline void StoreState(const AscendC::GlobalTensor<float>& state,
-                                      uint32_t head) {
+                                      uint32_t head, uint32_t half) {
         AscendC::LocalTensor<float> st = state_buf_.Get<float>();
+        const uint32_t base = head * kKeyDim * kValueDim + half * kValueWidth;
         wait_compute_before_store();
-        AscendC::DataCopy(state[head * kStateElems], st, kStateElems);
+        if (kValueSplit == 1) {
+            AscendC::DataCopy(state[base], st, kKeyDim * kValueWidth);
+        } else {
+            AscendC::DataCopy(state[base], st,
+                              window_store_params<float>(kKeyDim, kValueWidth, kValueDim));
+        }
     }
 
     // Pull an fp32 key or query row straight out of a normalized GM buffer.
@@ -141,40 +197,36 @@ public:
         AscendC::LocalTensor<float> acc = acc_buf_.Get<float>();
 
         // S *= decay
-        AscendC::Muls(st, st, decay, kStateElems);
+        AscendC::Muls(st, st, decay, kKeyDim * kValueWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // kv_mem = k^T S, as a row-wise fold of S scaled by broadcast k.
-        broadcast_rows(work, k, kKeyDim, kValueDim);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(work, work, st, kStateElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        fold_rows(work, kFoldRows, kValueDim);
-        AscendC::PipeBarrier<PIPE_V>();
+        // kv_mem = k^T S. One issue per key row, accumulated into `acc`; the old
+        // form broadcast k across the state, multiplied elementwise and folded the
+        // rows, which is 2*rows + log2(rows) issues for the same sum.
+        accumulate_weighted_rows(acc, k, st, kKeyDim, kValueWidth, kAccGroups);
 
-        // delta = (v - kv_mem) * beta, held in acc.
-        AscendC::Muls(acc, work, -1.0f, kValueDim);
+        // delta = (v - kv_mem) * beta, held in work.
+        AscendC::Muls(work, acc, -1.0f, kValueWidth);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add(acc, acc, v, kValueDim);
+        AscendC::Add(work, work, v, kValueWidth);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(acc, acc, beta, kValueDim);
+        AscendC::Muls(work, work, beta, kValueWidth);
         AscendC::PipeBarrier<PIPE_V>();
 
         // S += k delta^T, one Axpy per key row. Distinct dst rows, so the only
-        // barrier needed is the one before the next read of S.
+        // barrier needed is the one before the next read of S. The row count is the
+        // key dimension and a split does not touch it, which is why this loop costs
+        // the same either way and bounds what a split can buy.
         for (uint32_t i = 0; i < kKeyDim; ++i) {
-            AscendC::Axpy(st[i * kValueDim], acc, k.GetValue(i), kValueDim);
+            AscendC::Axpy(st[i * kValueWidth], work, k.GetValue(i), kValueWidth);
         }
         AscendC::PipeBarrier<PIPE_V>();
 
-        // out = q^T S * q_scale, same fold as kv_mem.
-        broadcast_rows(work, q, kKeyDim, kValueDim);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(work, work, st, kStateElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        fold_rows(work, kFoldRows, kValueDim);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(v, work, q_scale, kValueDim);
+        // out = q^T S * q_scale. Same accumulation over the updated state, and it
+        // reuses `acc`: delta was already formed out of it above and the barrier
+        // after the rank-1 update is what orders this read of S behind that write.
+        accumulate_weighted_rows(acc, q, st, kKeyDim, kValueWidth, kAccGroups);
+        AscendC::Muls(v, acc, q_scale, kValueWidth);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -209,8 +261,9 @@ private:
 // of stride `heads`, so reading them as a scalar per token beats staging a tile.
 // decay = exp(g), and exp is vector-only on this part, so it goes through an 8-lane
 // tile once per token.
+template <uint32_t kValueSplit>
 struct Gates {
-    __aicore__ inline void Read(GatedDeltaHead& head,
+    __aicore__ inline void Read(GatedDeltaHead<kValueSplit>& head,
                                 const AscendC::GlobalTensor<half>& g,
                                 const AscendC::GlobalTensor<half>& beta,
                                 uint32_t index) {
@@ -223,19 +276,20 @@ struct Gates {
     float beta_value;
 };
 
-}  // namespace
-
 // Whole-sequence recurrence over pre-normalized fp32 q/k.
 //
-// One head per core iteration, round-robin over the 30 cores. Heads are independent,
-// so there is no cross-core communication at all; tokens inside a head are strictly
-// sequential, which is what forces the loop to live on one core.
-extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_normalized_kernel(
+// One head, or one value range of a head, per core iteration, round-robin over the
+// 30 cores. Units are independent, so there is no cross-core communication at all;
+// tokens inside a unit are strictly sequential, which is what forces the loop to
+// live on one core.
+template <uint32_t kValueSplit>
+__aicore__ inline void sequence_normalized_body(
     GM_ADDR state, GM_ADDR q_normalized, GM_ADDR k_normalized, GM_ADDR v,
     GM_ADDR g, GM_ADDR beta, GM_ADDR out, uint32_t rows, uint32_t heads,
     uint32_t key_heads, float q_scale) {
+    constexpr uint32_t width = kValueDim / kValueSplit;
     AscendC::TPipe pipe;
-    GatedDeltaHead worker;
+    GatedDeltaHead<kValueSplit> worker;
     worker.Init(pipe);
 
     AscendC::GlobalTensor<float> state_gm;
@@ -255,27 +309,39 @@ extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_normalized_kerne
 
     const uint32_t repeat = heads / key_heads;
     const uint32_t key_stride = key_heads * kKeyDim;
+    const uint32_t units = heads * kValueSplit;
 
-    for (uint32_t head = AscendC::GetBlockIdx(); head < heads;
-         head += AscendC::GetBlockNum()) {
+    for (uint32_t unit = AscendC::GetBlockIdx(); unit < units;
+         unit += AscendC::GetBlockNum()) {
+        const uint32_t head = unit / kValueSplit;
+        const uint32_t half = unit % kValueSplit;
         const uint32_t key_head = head / repeat;
-        worker.LoadState(state_gm, head);
+        worker.LoadState(state_gm, head, half);
         for (uint32_t token = 0; token < rows; ++token) {
             const uint32_t key_offset = token * key_stride + key_head * kKeyDim;
-            const uint32_t value_offset = (token * heads + head) * kValueDim;
+            const uint32_t value_offset =
+                (token * heads + head) * kValueDim + half * width;
             AscendC::LocalTensor<float> q = worker.Query();
             AscendC::LocalTensor<float> k = worker.Key();
             AscendC::LocalTensor<float> v = worker.Value();
             worker.LoadKeyRow(q, q_gm, key_offset);
             worker.LoadKeyRow(k, k_gm, key_offset);
-            worker.LoadHalfRow(v, v_gm, value_offset, kValueDim);
-            Gates gates;
+            worker.LoadHalfRow(v, v_gm, value_offset, width);
+            Gates<kValueSplit> gates;
             gates.Read(worker, g_gm, beta_gm, token * heads + head);
             worker.Step(q, k, v, gates.decay, gates.beta_value, q_scale);
-            worker.StoreHalfRow(out_gm, v, value_offset, kValueDim);
+            worker.StoreHalfRow(out_gm, v, value_offset, width);
         }
-        worker.StoreState(state_gm, head);
+        worker.StoreState(state_gm, head, half);
     }
+}
+
+// Clamp a caller's split to one this kernel implements. The two specializations are
+// both instantiated and the untaken branch is dead-code eliminated. Clamping rather
+// than trusting the launcher keeps a host bug from launching a grid that covers only
+// part of the state.
+__aicore__ inline uint32_t clamp_split(uint32_t value_split) {
+    return value_split >= kMaxValueSplit ? kMaxValueSplit : 1;
 }
 
 // Whole-sequence recurrence over raw fp16 q/k, normalizing each row on the fly.
@@ -283,12 +349,14 @@ extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_normalized_kerne
 // Same kernel as above with the normalization folded in. It exists because the
 // engine's default path (and every rows == 1 decode step) takes this entry point
 // without a separate normalization pass.
-extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_kernel(
+template <uint32_t kValueSplit>
+__aicore__ inline void sequence_body(
     GM_ADDR state, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta,
     GM_ADDR out, uint32_t rows, uint32_t heads, uint32_t key_heads,
     float q_scale) {
+    constexpr uint32_t width = kValueDim / kValueSplit;
     AscendC::TPipe pipe;
-    GatedDeltaHead worker;
+    GatedDeltaHead<kValueSplit> worker;
     worker.Init(pipe);
 
     AscendC::GlobalTensor<float> state_gm;
@@ -308,14 +376,18 @@ extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_kernel(
 
     const uint32_t repeat = heads / key_heads;
     const uint32_t key_stride = key_heads * kKeyDim;
+    const uint32_t units = heads * kValueSplit;
 
-    for (uint32_t head = AscendC::GetBlockIdx(); head < heads;
-         head += AscendC::GetBlockNum()) {
+    for (uint32_t unit = AscendC::GetBlockIdx(); unit < units;
+         unit += AscendC::GetBlockNum()) {
+        const uint32_t head = unit / kValueSplit;
+        const uint32_t half = unit % kValueSplit;
         const uint32_t key_head = head / repeat;
-        worker.LoadState(state_gm, head);
+        worker.LoadState(state_gm, head, half);
         for (uint32_t token = 0; token < rows; ++token) {
             const uint32_t key_offset = token * key_stride + key_head * kKeyDim;
-            const uint32_t value_offset = (token * heads + head) * kValueDim;
+            const uint32_t value_offset =
+                (token * heads + head) * kValueDim + half * width;
             AscendC::LocalTensor<float> q = worker.Query();
             AscendC::LocalTensor<float> k = worker.Key();
             AscendC::LocalTensor<float> v = worker.Value();
@@ -323,23 +395,60 @@ extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_kernel(
             worker.NormalizeRow(q);
             worker.LoadHalfRow(k, k_gm, key_offset, kKeyDim);
             worker.NormalizeRow(k);
-            worker.LoadHalfRow(v, v_gm, value_offset, kValueDim);
-            Gates gates;
+            worker.LoadHalfRow(v, v_gm, value_offset, width);
+            Gates<kValueSplit> gates;
             gates.Read(worker, g_gm, beta_gm, token * heads + head);
             worker.Step(q, k, v, gates.decay, gates.beta_value, q_scale);
-            worker.StoreHalfRow(out_gm, v, value_offset, kValueDim);
+            worker.StoreHalfRow(out_gm, v, value_offset, width);
         }
-        worker.StoreState(state_gm, head);
+        worker.StoreState(state_gm, head, half);
+    }
+}
+
+}  // namespace
+
+// The entry points. Each one is a thin `if` over the two value splits, so the body
+// it dispatches to is a compile-time specialization and the untaken one is dropped
+// before codegen. `extern "C"` and outside the anonymous namespace, because the
+// launch stub resolves these by name.
+
+extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_kernel(
+    GM_ADDR state, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta,
+    GM_ADDR out, uint32_t rows, uint32_t heads, uint32_t key_heads,
+    float q_scale, uint32_t value_split) {
+    if (clamp_split(value_split) >= kMaxValueSplit) {
+        sequence_body<kMaxValueSplit>(state, q, k, v, g, beta, out, rows, heads,
+                                      key_heads, q_scale);
+    } else {
+        sequence_body<1>(state, q, k, v, g, beta, out, rows, heads, key_heads,
+                         q_scale);
+    }
+}
+
+extern "C" __global__ __aicore__ void qwen_gated_delta_sequence_normalized_kernel(
+    GM_ADDR state, GM_ADDR q_normalized, GM_ADDR k_normalized, GM_ADDR v,
+    GM_ADDR g, GM_ADDR beta, GM_ADDR out, uint32_t rows, uint32_t heads,
+    uint32_t key_heads, float q_scale, uint32_t value_split) {
+    if (clamp_split(value_split) >= kMaxValueSplit) {
+        sequence_normalized_body<kMaxValueSplit>(state, q_normalized, k_normalized,
+                                                 v, g, beta, out, rows, heads,
+                                                 key_heads, q_scale);
+    } else {
+        sequence_normalized_body<1>(state, q_normalized, k_normalized, v, g, beta,
+                                    out, rows, heads, key_heads, q_scale);
     }
 }
 
 // Single-token step. The gate, q, k and v buffers hold exactly one row, so the
 // indexing loses its token term; the recurrence itself is identical.
-extern "C" __global__ __aicore__ void qwen_gated_delta_step_kernel(
-    GM_ADDR state, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta,
-    GM_ADDR out, uint32_t heads, uint32_t key_heads, float q_scale) {
+template <uint32_t kValueSplit>
+__aicore__ inline void step_body(GM_ADDR state, GM_ADDR q, GM_ADDR k, GM_ADDR v,
+                                 GM_ADDR g, GM_ADDR beta, GM_ADDR out,
+                                 uint32_t heads, uint32_t key_heads,
+                                 float q_scale) {
+    constexpr uint32_t width = kValueDim / kValueSplit;
     AscendC::TPipe pipe;
-    GatedDeltaHead worker;
+    GatedDeltaHead<kValueSplit> worker;
     worker.Init(pipe);
 
     AscendC::GlobalTensor<float> state_gm;
@@ -358,24 +467,39 @@ extern "C" __global__ __aicore__ void qwen_gated_delta_step_kernel(
     out_gm.SetGlobalBuffer(reinterpret_cast<__gm__ half*>(out), heads * kValueDim);
 
     const uint32_t repeat = heads / key_heads;
+    const uint32_t units = heads * kValueSplit;
 
-    for (uint32_t head = AscendC::GetBlockIdx(); head < heads;
-         head += AscendC::GetBlockNum()) {
+    for (uint32_t unit = AscendC::GetBlockIdx(); unit < units;
+         unit += AscendC::GetBlockNum()) {
+        const uint32_t head = unit / kValueSplit;
+        const uint32_t half = unit % kValueSplit;
         const uint32_t key_head = head / repeat;
         AscendC::LocalTensor<float> q = worker.Query();
         AscendC::LocalTensor<float> k = worker.Key();
         AscendC::LocalTensor<float> v = worker.Value();
-        worker.LoadState(state_gm, head);
+        worker.LoadState(state_gm, head, half);
         worker.LoadHalfRow(q, q_gm, key_head * kKeyDim, kKeyDim);
         worker.NormalizeRow(q);
         worker.LoadHalfRow(k, k_gm, key_head * kKeyDim, kKeyDim);
         worker.NormalizeRow(k);
-        worker.LoadHalfRow(v, v_gm, head * kValueDim, kValueDim);
-        Gates gates;
+        worker.LoadHalfRow(v, v_gm, head * kValueDim + half * width, width);
+        Gates<kValueSplit> gates;
         gates.Read(worker, g_gm, beta_gm, head);
         worker.Step(q, k, v, gates.decay, gates.beta_value, q_scale);
-        worker.StoreHalfRow(out_gm, v, head * kValueDim, kValueDim);
-        worker.StoreState(state_gm, head);
+        worker.StoreHalfRow(out_gm, v, head * kValueDim + half * width, width);
+        worker.StoreState(state_gm, head, half);
+    }
+}
+
+extern "C" __global__ __aicore__ void qwen_gated_delta_step_kernel(
+    GM_ADDR state, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR g, GM_ADDR beta,
+    GM_ADDR out, uint32_t heads, uint32_t key_heads, float q_scale,
+    uint32_t value_split) {
+    if (clamp_split(value_split) >= kMaxValueSplit) {
+        step_body<kMaxValueSplit>(state, q, k, v, g, beta, out, heads, key_heads,
+                                  q_scale);
+    } else {
+        step_body<1>(state, q, k, v, g, beta, out, heads, key_heads, q_scale);
     }
 }
 

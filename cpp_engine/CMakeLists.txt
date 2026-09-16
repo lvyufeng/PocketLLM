@@ -979,6 +979,12 @@ add_executable(bench_qwen_delta_f16 tests/bench_qwen_delta_f16.cpp)
 target_link_libraries(bench_qwen_delta_f16 PRIVATE pocket_cpp_core)
 set_target_properties(bench_qwen_delta_f16 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_delta tests/bench_qwen_ascend_delta.cpp)
+    target_link_libraries(bench_qwen_ascend_delta PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_delta PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
 add_executable(test_qwen_gdn_flashqla tests/test_qwen_gdn_flashqla.cpp)
 target_link_libraries(test_qwen_gdn_flashqla PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_gdn_flashqla PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

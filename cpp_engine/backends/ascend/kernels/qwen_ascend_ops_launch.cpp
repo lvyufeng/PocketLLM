@@ -33,6 +33,7 @@
 #include "aclnn_common.hpp"
 
 #include "qwen_ascend_ops.hpp"
+#include "qwen_gated_delta_geometry.hpp"
 
 // Grid width and tile size, shared with the device kernel so the divisor the
 // kernel partitions on and the block count launched here cannot drift apart.
@@ -82,8 +83,9 @@ constexpr uint32_t kLaunchOk = 0;
 // The recurrence kernels hard-code a [128, 128] state tile, so the host has to
 // reject any other head geometry rather than launch a kernel that would read the
 // wrong stride. The CUDA launchers reject the same values.
-constexpr int kRecurrentKeyDim = 128;
-constexpr int kRecurrentValueDim = 128;
+constexpr int kRecurrentKeyDim = pocket::gated_delta::kKeyDim;
+constexpr int kRecurrentValueDim = pocket::gated_delta::kValueDim;
+
 constexpr int kMaxAttentionHeadDim = 256;
 constexpr uint32_t kAttentionAlignmentBytes = 32;
 constexpr uint32_t kAttentionAlignmentHalfs = 16;
@@ -95,7 +97,11 @@ constexpr int kMaxConvKernel = 8;
 // First-generation 910 has 30 AI cores. Every kernel here is a grid-stride loop
 // over independent work items, so more blocks than cores would only add launch
 // overhead; fewer than the work available would leave cores idle.
-constexpr uint32_t kMaxBlocks = 30;
+//
+// Defined in the gated-delta geometry header because the value-axis split there is
+// the one place a kernel's item count and the launcher's grid size are two
+// derivations of the same number, and a mismatch between them would be silent.
+constexpr uint32_t kMaxBlocks = pocket::gated_delta::kMaxBlocks;
 
 // Query the AI core count once per device and fall back to the known
 // first-generation value. Reading it rather than hard-coding it means a run on
@@ -132,6 +138,15 @@ uint32_t blocks_for(uint64_t work) {
     if (work == 0) return 1;
     if (work < static_cast<uint64_t>(cores)) return static_cast<uint32_t>(work);
     return cores;
+}
+
+// The unit of work in the recurrence kernels is one head times one value range, not
+// one head: the state is separable down the value axis, so a split multiplies the
+// number of independent items. The rule that picks the split, and the argument for
+// it, live in the geometry header next to the constant the kernel derives its own
+// item count from.
+uint64_t recurrent_units(uint64_t heads, uint32_t split) {
+    return heads * static_cast<uint64_t>(split);
 }
 
 // Shared attention preconditions, mirroring valid_attention() in the CUDA
@@ -693,12 +708,15 @@ bool qwen_gated_delta_sequence_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_sequence_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
-               static_cast<uint32_t>(key_heads), q_scale) == kLaunchOk;
+               static_cast<uint32_t>(key_heads), q_scale,
+               split) == kLaunchOk;
 }
 
 bool qwen_gated_delta_sequence_normalized_f16_ascend(
@@ -713,12 +731,15 @@ bool qwen_gated_delta_sequence_normalized_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_sequence_normalized_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_normalized), gm(d_k_normalized),
                gm(d_v_fp16), gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
-               static_cast<uint32_t>(key_heads), q_scale) == kLaunchOk;
+               static_cast<uint32_t>(key_heads), q_scale,
+               split) == kLaunchOk;
 }
 
 // The CUDA `_shared` variant shards one head's state across a block so several
@@ -750,12 +771,14 @@ bool qwen_gated_delta_step_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_step_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(heads), static_cast<uint32_t>(key_heads),
-               q_scale) == kLaunchOk;
+               q_scale, split) == kLaunchOk;
 }
 
 bool qwen_gated_delta_step_batched_f16_ascend(
