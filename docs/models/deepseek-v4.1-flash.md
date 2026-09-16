@@ -2,15 +2,16 @@
 
 ## Runtime status
 
-**Inspect only: the config parses and a 37-check safetensors-header audit is validated on the host; no V4.1 execution path exists in this repository.**
+**Inspect only: the config parses, a 37-check safetensors-header audit is validated on the host, and the Engram hash front end that addresses the two 189 GiB tables is reproduced and tested; no V4.1 execution path exists in this repository.**
 
-Nothing in this page generates tokens. The repository has no V4.1 code: `engram`, `kv_source_layers`, `candidate_source_layer` and `bias_vl` do not appear anywhere under `cpp_engine/`, `src/`, `pocketllm/`, `tests/` or `docs/` except in this page and the audit script it documents. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
+Nothing in this page generates tokens. The repository has no V4.1 layer code: `kv_source_layers`, `candidate_source_layer` and `bias_vl` do not appear anywhere under `cpp_engine/`, `src/`, `pocketllm/`, `tests/` or `docs/` except in this page and the files it documents. `engram` does appear — `src/encoding/engram.py` reproduces the reference's tokenizer-side front end — but that is address arithmetic over a tokenizer, not a layer of the model. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
 
-What *was* validated is a fact list read out of the checkpoint's own metadata:
+What *was* validated is a set of facts read out of the checkpoint's own metadata, plus an Engram front end that needs only the config and a tokenizer:
 
 - `scripts/audit_dsv41_headers.py` parses the V4.1 config and runs 37 checks over the safetensors headers.
 - The audit ran against the first 3,000,001 bytes of each of the 48 published shards — roughly 144 MB in total. **No weight payload was downloaded or read.**
-- Upshot: 96,085 tensors, 510,286,023,000 B (475.24 GiB), a fully consistent tensor inventory, and a checkpoint-specific configuration that differs from the validated V4-Flash config in the ways listed below.
+- `src/encoding/engram.py` re-derives the Engram bucket layout and hashes token n-grams onto it. The primes it draws add up to the declared `engram_num_embeddings` exactly, so the 189.13 GiB of Engram tables are addressable rather than merely counted.
+- Upshot: 96,085 tensors, 510,286,023,000 B (475.24 GiB), a fully consistent tensor inventory, an Engram layout that closes to the row, and a checkpoint-specific configuration that differs from the validated V4-Flash config in the ways listed below.
 
 Generation, TPS and numerical parity are unmeasured and are not claimed. See [Known limitations](#known-limitations).
 
@@ -110,11 +111,30 @@ Two Engram tables dominate the checkpoint. `layers.1.engram.embed.weight` is F8_
 
 ## Implemented execution path
 
-**There is no V4.1 execution path.** What exists is a host-only audit, plus a V4-Flash runtime that the layer-level comparison below suggests is a partial starting point.
+**There is no V4.1 execution path.** What exists is a host-only audit, an Engram front end that needs no checkpoint at all, and a V4-Flash runtime that the layer-level comparison below suggests is a partial starting point.
 
 ### The audit script
 
 `scripts/audit_dsv41_headers.py` is pure standard library — `argparse`, `json`, `os`, `re`, `struct`, `sys`, `collections` — so it runs under any interpreter with no `torch`, `safetensors` or `numpy`. It reads the 8-byte little-endian header length at the start of each shard, parses the header JSON, and validates the declared `dtype`/`shape`/`data_offsets` against the config. It never reads a payload, which is why it works identically on complete shards and on 3 MB header prefixes.
+
+### The Engram hash front end
+
+`src/encoding/engram.py` is the consumer the 189.13 GiB of tables were missing, and it needs neither the checkpoint nor a download. Nothing in the checkpoint names a row: the row ids are computed at inference time from the tokenizer, so the tables are unusable without this arithmetic. The module implements, in pure Python:
+
+- `build_compressed_token_map(tokenizer)` — the normalizer chain the reference builds (`NFKC` → `NFD` → strip accents → lowercase → collapse whitespace runs → map a lone space to a `U+E000` sentinel → strip → restore the sentinel), the `"�"` raw-decode fallback for ids the normalizer destroys, and first-seen interning. It returns the per-token-id lookup and the number of distinct keys. Note the sentinel: without it a token that normalizes to nothing and a token that normalizes to `" "` would fold together.
+- `EngramLayout.from_config(config)` — takes primes in ascending order starting just above `engram_vocab_size`, hands them out across Engram layers without reuse, and derives the flattened bucket list and its offsets. `verify()` re-derives the row count and compares it against `engram_num_embeddings`, and also checks that the buckets tile the table with no gap and no overlap.
+- `compute_hash_multipliers(...)` — the reference's `numpy.random.default_rng(10007 * layer_id)` stream, one multiplier per lookback position, forced odd. The bound divides by the **compressed** vocabulary, so a wrong `engram_compressed_vocab_size` silently rehashes both tables while the weights stay put. `NgramHasher` refuses to construct when the map size disagrees with the config, which is where the reference's `assert` lives.
+- `NgramHasher.hash_ids(...)` — the 2-gram/3-gram/4-gram rolling XOR over the masked lookback window, `mod` each bucket, plus that bucket's offset. Dead tokens are sticky: once a position's window crosses a masked token every longer n-gram is padded, not just the one that reached it. The cache carries the lookback across chunk boundaries so a prefill/decode split yields the same ids as a single call.
+
+`is_prime` is a deterministic Miller-Rabin over the first twelve prime bases instead of the reference's `sympy.isprime`, because `sympy` is not a dependency of this repository. numpy is imported lazily inside `compute_hash_multipliers` for the same reason. The module also exposes a CLI:
+
+```bash
+python -m src.encoding.engram \
+  --config /path/to/inference_config.json \
+  --tokenizer /path/to/tokenizer_dir     # optional
+```
+
+It prints, per Engram layer, the derived row count against the declared one and the difference, the GiB the two readings imply, the multipliers, the pad id's compressed id, and a sample of hash ids checked to be inside the table, then exits non-zero if anything disagrees. With `--tokenizer` it additionally rebuilds the compressed map and fails when its size does not match `engram_compressed_vocab_size`.
 
 ### What the V4-Flash runtime already provides
 
@@ -126,7 +146,7 @@ The deltas a V4.1 path would actually have to add:
 | --- | --- |
 | Shared CSA2 compression | `attn.compressor.*` on 4 layers instead of 41, plus new `kv_source_layers` / `index_source_layers` / `Full`/`Reindex`/`Reuse` mode logic |
 | Hierarchical sparse indexer | New `indexer.wk` + `indexer.k_norm` (absent in V4-Flash) and `candidate_source_layer` / `candidate_topk_blocks` / `candidate_block_size` |
-| Engram | 189.13 GiB of n-gram hash tables, a 99,092-entry compressed vocabulary, and the `engram_compressed_vocab_size` assertion in the reference `inference_engram.py` |
+| Engram | 189.13 GiB of n-gram hash tables and a 99,092-entry compressed vocabulary. The tokenizer-side front end is `src/encoding/engram.py`; the GPU consumer of the rows is not written |
 | Vision | 259 `vision.*` tensors, a 4-tensor aligner, and `ffn.gate.bias_vl` — a vision-conditioned routing bias present on all 43 V4.1 layers and absent from V4-Flash |
 | Hash-routing removal | V4-Flash has `layers.{0,1,2}.ffn.gate.tid2eid`; V4.1 has no `tid2eid` tensor and no `n_hash_layers` key |
 | Hyper-connection head removal | V4-Flash has top-level `hc_head_{fn,base,scale}`; V4.1 has none, and the last MTP stage has none either |
@@ -162,7 +182,7 @@ The audit's 37 checks currently pass on the real headers. They are grouped as fo
 
 Two facts from this section deserve emphasis because they were derived rather than read off:
 
-The Engram row counts are *derived*, and the derivation is exact to the row. The reference draws primes in order starting just above `engram_vocab_size` (16,000,000), hands them out across both layers without reuse, taking `(max_ngram_size − 1) × n_heads = 3 × 8 = 24` primes per layer, and `NgramHashState` builds its bucket offsets as a running sum over the layer's *flattened* prime list. The largest id a layer can produce is therefore `sum(primes) − 1` and the table needs exactly `sum(primes)` rows. Both layers match `engram_num_embeddings` with a difference of zero: the declared `[384006168, 384016682]` equals the derived values.
+The Engram row counts are *derived*, and the derivation is exact to the row. The reference draws primes in order starting just above `engram_vocab_size` (16,000,000), hands them out across both layers without reuse, taking `(max_ngram_size − 1) × n_heads = 3 × 8 = 24` primes per layer, and `NgramHashState` builds its bucket offsets as a running sum over the layer's *flattened* prime list. The largest id a layer can produce is therefore `sum(primes) − 1` and the table needs exactly `sum(primes)` rows. Both layers match `engram_num_embeddings` with a difference of zero: the declared `[384006168, 384016682]` equals the derived values. That derivation is no longer only a claim on this page: `EngramLayout.from_config` reproduces it, `verify()` returns no problems, and `python -m src.encoding.engram --config …` prints a difference of 0 for both layers and exits 0. Layer 1's 24 primes run from 16,000,057 to 16,000,463 and layer 14's from 16,000,477 to 16,000,889; all 48 are distinct and all sit above `engram_vocab_size`, which is why one shared prime stream can serve both tables without overlap.
 
 The CSA2 modes are derived from tensor presence, not from a config field. Diffing the three shard shapes against each other gives an exact per-mode tensor delta: a Reuse layer carries nothing extra; a Reindex layer adds `indexer.wq_b.weight`, `indexer.wq_b.scale` and `indexer.weights_proj.weight`; a Full layer adds those three plus `compressor.wkv.weight`, `compressor.norm.weight`, `compressor.wgate.weight`, `indexer.wk.weight` and `indexer.k_norm.weight`. So Full = owns `indexer.wk`, Reindex = owns `indexer.wq_b` only, Reuse = neither, which partitions the backbone as Full `[2, 8, 14, 20]`, Reindex `[24, 28, 32, 36]`, Reuse the other 32 layers.
 
@@ -171,6 +191,10 @@ The CSA2 modes are derived from tensor presence, not from a config field. Diffin
 Negative controls were run to confirm the checks are live rather than vacuous: perturbing a config key the audit does not consume leaves the result at 37/37 with exit 0, while setting `engram_n_heads = 7` drops it to 36/37 with exit 1, reporting `declared=[384006168, 384016682] derived=[336004849, 336012883]`.
 
 The audit establishes nothing about numerics. No tensor value has been read, so no claim about quantization error, activation range or output parity is available.
+
+The Engram front end is held to a different and stronger standard than the rest of this page, because it is executable. `tests/test_encoding_engram.py` pins the eight multipliers, both row counts and each layer's prime range as literals, so a change that would silently rehash 189 GiB fails the suite instead of passing quietly; it also asserts the negative direction (a tampered `engram_num_embeddings` is reported, not accepted) and checks `is_prime` against `sympy.isprime` across both bucket windows plus its edge cases, skipping rather than passing where `sympy` is absent. Separately, `NgramHasher.hash_ids` was compared position-for-position against the released reference's `NgramHashState.forward` on the host — plain sequences, masked sequences, a prefill-then-decode split across the cache, and a batch of two — and the outputs agree exactly. That comparison needs the unpacked reference under `/tmp` and the reference's `torch`, so it is a host run rather than a committed test, and it was made with the compressed map stubbed to an identity map over 99,092 entries; it validates the hashing arithmetic, not the tokenizer normalization feeding it.
+
+Two limits on the Engram result remain, and neither is a formality. First, the compressed vocabulary was reproduced against the **V4-Flash** tokenizer that is on this host, not V4.1's: `len(tokenizer)` is 129,280 and the map collapses to exactly 99,092 distinct keys with the ids filling `[0, 99092)` with no gaps, matching `engram_compressed_vocab_size` — but that `tokenizer.json` is 6,367,146 bytes against V4.1's 6,367,257, and it lacks the `<｜deepseek_image｜>` and `<｜System｜>` tokens V4.1's prompt format requires. A 111-byte difference is not obviously enough to change a count that folds 129,280 ids into 99,092 keys, and the two added tokens would collapse onto existing keys if they normalize the same way, but this is strong evidence rather than a self-contained proof. Second, no row has been read out of either table: the row count and the id range are consistent with each other, and nothing here confirms that the FP8 payload at a given row is the embedding the reference would fetch.
 
 ## Reproduction
 
@@ -198,12 +222,49 @@ Shard files are detected either by a `.safetensors` suffix or by their first 8 b
 
 To confirm the checks are live, make a copy of the config with `engram_n_heads` changed to 7 and expect 36/37 with exit 1.
 
+The Engram front end needs only the config, and optionally a tokenizer directory; neither the checkpoint nor any of the header prefixes above are required:
+
+```bash
+python -m src.encoding.engram --config /path/to/inference_config.json
+```
+
+On this host that prints:
+
+```
+Engram layers [1, 14] | 24 hash columns per position
+  layer   1: 24 buckets, primes 16000057..16000463, rows derived 384006168 vs declared 384006168 -> ok
+            embedding rows [384006168 x 256] = 91.55 GiB at one byte per element, plus 2.86 GiB of row scales
+  layer  14: 24 buckets, primes 16000477..16000889, rows derived 384016682 vs declared 384016682 -> ok
+            embedding rows [384016682 x 256] = 91.56 GiB at one byte per element, plus 2.86 GiB of row scales
+  [ok] the primes add up to the declared row counts
+
+tokenizer /mnt/data3/DeepSeek-V4-Flash-0731: 129280 tokens -> 99092 compressed ids
+  [ok] matches engram_compressed_vocab_size (99092)
+  pad id 2 -> compressed 2
+  layer 1 multipliers: [76632096046245, 4839876093313, 35959672319349, 73987337458391]
+  layer 14 multipliers: [67716810739261, 51510806800915, 30921347202721, 82619226485591]
+  layer 1: 192 ids from 8 tokens, min 3395123 max 382971602 of 384006168 rows -> all in range
+  layer 14: 192 ids from 8 tokens, min 2266587 max 383166700 of 384016682 rows -> all in range
+
+[PASS] Engram layout verification
+```
+
+Exit code 0. Both row counts are `ok` — the difference is zero for each layer — and the sampled ids land inside the tables. `--tokenizer` is optional: without it the second block is replaced by `[SKIP] compressed token map: pass --tokenizer to check it against the config`, and the layout checks still run. Passing a tokenizer whose map does not come out at 99,092 fails instead of skipping, because every hash multiplier derives from that size. `--json out.json` writes the same report machine-readably; note that it writes the report *and* the tokenizer leg's findings even when a check fails, so a caller can diff a failure rather than re-run it.
+
+The same two directions are covered by the test suite, which needs no checkpoint either:
+
+```bash
+python -m pytest tests/test_encoding_engram.py -q
+```
+
+Expect 21 tests collected with nothing failing. `numpy` is not a declared dependency of this repository, so on a host without it the tests that draw the multipliers skip instead of failing, as do the `sympy` and tokenizer legs without their packages; a skip is not a pass, and the layout tests that need neither still run. Checked both ways: 21 passed with `numpy`, 8 passed and 13 skipped with it blocked.
+
 ## Known limitations
 
-- **No generation of any kind.** No tokenizer is exercised, no embedding is loaded, and no forward pass exists for this architecture.
+- **No generation of any kind.** No embedding is loaded and no forward pass exists for this architecture. The one tokenizer that has been exercised is the V4-Flash tokenizer, and only to rebuild the Engram compressed vocabulary — not to tokenize a prompt, and not to check that V4.1's own tokenizer would produce the same map.
 - **No local checkpoint.** Only 48 header prefixes were downloaded; the 475.24 GiB of weights is not on this host, and it does not fit on the four 22 GiB cards available here.
 - **The audit validates metadata consistency, not correctness.** It proves the config and the tensor inventory agree with each other. A checkpoint could satisfy all 37 checks and still be unusable, and a wrong value that is *consistently* wrong in both the config and the shapes would pass.
-- **Engram cannot be exercised.** `inference_engram.py` asserts `vocab_size == args.engram_compressed_vocab_size` as a binary gate, and the 99,092-entry compressed token map is built from the n-gram tokenizer rather than from the checkpoint. Until that map exists in this repository, the 189.13 GiB of Engram tables have no consumer.
+- **Engram is addressable but not consumed.** The compressed token map, the prime-derived bucket layout and the n-gram hasher now exist in `src/encoding/engram.py`, and the two layers reproduce their declared row counts exactly, so the 189.13 GiB of tables can be indexed. What is still missing is everything downstream: no row has been read, no embedding lookup has been written, no gate or value projection has been run, and the compressed map was verified against the V4-Flash tokenizer rather than V4.1's (see [Correctness and precision](#correctness-and-precision)).
 - **The vision path is unvalidated in both directions.** The 263 vision and aligner tensors are accounted for and their shapes match the config, but no image has been processed and no projector has been run.
 - **No reference comparison is possible on this host.** The released stack needs `torch>=2.10.0` and `tilelang==0.1.8`; neither is available in the `deepseek` environment.
 - **The prompt format changed and is unimplemented here.** DSML tags gain a leading space (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`), reasoning effort becomes a numeric budget in 1–100 rendered only under `thinking_mode="thinking"` at index 0, and mid-conversation `<｜System｜>` messages are supported. None of that is wired into this repository's chat templates.
@@ -212,6 +273,8 @@ To confirm the checks are live, make a copy of the config with `engram_n_heads` 
 ## Evidence and related notes
 
 - `scripts/audit_dsv41_headers.py` — the host-only header audit and config parser
+- `src/encoding/engram.py` — the Engram compressed token map, bucket layout, hash multipliers and n-gram hasher, plus a `--config`/`--tokenizer` CLI
+- `tests/test_encoding_engram.py` — 21 tests pinning the primes, multipliers and row counts, with the tokenizer and `sympy` legs skipping when unavailable
 - `configs/config.json` — the validated V4-Flash config used as the delta baseline
 - [DeepSeek-V4-Flash](deepseek-v4.md) — the validated runtime whose layer structure the V4.1 backbone reuses
 - [Benchmark reporting rules](../guides/benchmarking.md) — required before any V4.1 number is quoted
