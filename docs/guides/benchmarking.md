@@ -73,3 +73,11 @@ These constraints are part of the result. Moving to a newer GPU, NVLink system, 
 5. Report regressions and disabled experiments alongside wins.
 6. Keep model architecture specifications separate from runtime support status.
 7. Link the test, script, commit, or analysis note that produced each non-trivial number.
+8. Establish run-to-run stability before comparing generated tokens across configurations. Repeated
+   runs of one identical binary can disagree with each other, and then the comparison measures the
+   spread rather than the change. On the Ascend backend with TP all-reduce active, four runs of two
+   binaries over a 4966-token prompt produced three distinct greedy step-0 tokens and top logits
+   spanning 10.42-10.94 — well above fp16 rounding ([measurement](../performance/ascend_gated_delta_slice.md#the-generated-tokens-are-not-a-usable-ab-signal-here)).
+   Numerical A/B comparisons against a host reference inside one process are not affected by this,
+   and neither are repeated timings of a kernel; it is specifically generated-token comparison that
+   needs the stability established first.
