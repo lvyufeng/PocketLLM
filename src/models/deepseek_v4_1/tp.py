@@ -14,10 +14,11 @@ rank owns, what it replicates, and where the three all-reduces go.
   heads holds exactly groups `2r` and `2r+1` whole, and `wo_a` needs **no** collective.
 * `wo_b` is row-parallel: one `all_reduce` of `[1, 5120]` per layer.
 * the shared expert splits the same way -- `w1`/`w3` by intermediate, `w2` row-parallel -- and it is
-  the one half the ffn's all-reduce completes *today*, because no routed store deals the experts out
-  yet: all four ranks hold the same 384 and compute the same routed sum, so reducing `routed + shared`
-  would multiply that sum by the world. When `DeviceRoutedExperts` learns a rank (Phase 2.4) the
-  routed partial joins the shared one on **one** message, and `MoE.forward` and this line change
+  the one half the ffn's all-reduce completes *when the routed store is whole*: with no rank dealt
+  out, every process holds the same 384 experts and computes the same routed sum, so reducing
+  `routed + shared` would multiply that sum by the world. `DeviceRoutedExperts` given a rank deals
+  the experts out, and then the routed partial joins the shared one on **one** message;
+  `RoutedExperts.partial` is how `MoE.forward` tells the two cases apart, and the two lines change
   together.
 * the indexer splits its 32 heads 8 ways. Its score sums *over heads*, so a sharded indexer's score
   is a partial and needs its own `all_reduce` of `[1, 1, t]` before the top-k -- and a flip there is

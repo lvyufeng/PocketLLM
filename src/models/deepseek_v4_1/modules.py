@@ -137,7 +137,17 @@ class RoutedExperts:
     An interface rather than a base class: `MoE.forward` needs exactly one thing from it, and the
     two implementations have nothing else in common -- one owns tensors, the other owns a byte
     range of a mapped checkpoint.
+
+    `partial` is the second thing, and it is a class attribute rather than a method because it is a
+    property of the *store* and not of a call: every store built today holds all of a layer's experts
+    and sums them here, so what it returns is the whole routed sum. `DeviceRoutedExperts` deals the
+    experts out once it is given a rank, and then what it returns is one rank's share. The `MoE`
+    above has to know which of the two it is holding, because the difference decides whether the
+    shared expert's partial travels alone or joins the routed one on a single all-reduce.
     """
+
+    #: whether `forward` returns one rank's share of the layer's routed sum rather than all of it.
+    partial = False
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """`x` is `[n, dim]` bf16, `weights`/`indices` are `[n, topk]`. Returns `[n, dim]` fp32."""
@@ -402,19 +412,24 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
-        # The routed half is complete on every rank, and the shared expert is the half that is cut.
-        # No store in the tree deals the experts out yet -- `CheckpointRoutedExperts`,
-        # `ResidentRoutedExperts` and `DeviceRoutedExperts` all hold every expert of the layer and
-        # sum it on the host -- so all four ranks compute the same routed sum and the all-reduce has
-        # to complete the shared expert's row-parallel partial *alone*. Reducing `routed + shared`
-        # would multiply the routed sum by the world, which is a wrong answer that still looks like
-        # a number. When `DeviceRoutedExperts` learns a rank (Phase 2.4) the routed sum becomes a
-        # partial too, and the two join on one message as `tp.py` describes; that change and this
-        # line are the same change.
+        # Two cases, and which one this is depends on the store rather than on the split: a store
+        # that holds every expert of the layer returns the whole routed sum on every rank, and only
+        # the shared expert is cut. `CheckpointRoutedExperts`, `ResidentRoutedExperts` and a
+        # `DeviceRoutedExperts` without a rank are all that case, and reducing `routed + shared`
+        # there would multiply the routed sum by the world -- a wrong answer that still looks like a
+        # number. A `DeviceRoutedExperts` that was given a rank deals the experts out, so its result
+        # is a partial like the shared expert's and the two join on **one** message, which is the
+        # fewer-collectives arrangement `tp.py` describes. The two stores say which they are through
+        # `RoutedExperts.partial`, so this line and that flag change together.
         y = self.routed.forward(x, weights, indices)
         shared = self.shared_experts(x)
         tp = self.tp
-        y += tp.reduce(shared) if tp is not None else shared
+        if tp is None:
+            y += shared
+        elif self.routed.partial:
+            y = tp.reduce(y + shared)
+        else:
+            y += tp.reduce(shared)
         return y.type_as(x).view(shape)
 
 

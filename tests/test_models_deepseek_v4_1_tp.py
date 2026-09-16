@@ -20,16 +20,18 @@ checkpoint, which no test can hold:
   barrier instead of a process group.
 
 The forward test has to be honest about its own reach, and three of its limits are the fixture's or
-the dtype's rather than the split's. The routed experts are not dealt out yet -- every store in the
-tree holds all 384 of a layer and sums them on the host -- so four ranks compute the same routed sum
-and the ffn's all-reduce completes the shared expert's partial *alone*; that is why `MoE.forward`
-reduces the shared half and not the total, and it is the line Phase 2.4 changes when
-`DeviceRoutedExperts` learns a rank. The mini geometry's `index_topk` is wide enough that no block is
-ever truncated, so a tie in the indexer's selection cannot arise here: the discrete half of
-`probe_tp4_block.py`'s parity check has nothing to catch on this checkpoint, and what the logits
-comparison below covers is the arithmetic. And the arithmetic is bf16, where a row-parallel partial
-is rounded before it is summed, so the comparison is between two roundings of one value rather than
-between two spellings of it -- `_close` states the bound that follows and how it is derived.
+the dtype's rather than the split's. The routed experts are not dealt out here -- the mini
+checkpoint's store holds all 384 of a layer and sums them on the host -- so four ranks compute the
+same routed sum and the ffn's all-reduce completes the shared expert's partial *alone*; that is why
+`MoE.forward` reduces the shared half and not the total, and
+`test_the_ffn_completes_the_routed_partial_only_when_the_store_was_dealt_out` is what covers the
+other branch, where the two halves travel on one message. The mini geometry's `index_topk` is wide
+enough that no block is ever truncated, so a tie in the indexer's selection cannot arise here: the
+discrete half of `probe_tp4_block.py`'s parity check has nothing to catch on this checkpoint, and
+what the logits comparison below covers is the arithmetic. And the arithmetic is bf16, where a
+row-parallel partial is rounded before it is summed, so the comparison is between two roundings of
+one value rather than between two spellings of it -- `_close` states the bound that follows and how
+it is derived.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ import torch
 
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.loader import V41Checkpoint, load_backbone
+from src.models.deepseek_v4_1.modules import RoutedExperts
 from src.models.deepseek_v4_1.tp import ShardPlan, attach_tp, make_all_reduce, split_names
 from tests.test_models_deepseek_v4_1_loader import (
     MINI,
@@ -366,3 +369,118 @@ def _close(want: torch.Tensor, got: list[torch.Tensor], what: str, dtype: torch.
             f"tree, and {N_LAYERS} layers of {torch.finfo(dtype).eps:.3e} roundings allow "
             f"{bound:.3e}"
         )
+
+
+# -- the routed experts, once a rank owns a share of them -----------------------------------------
+
+
+class _DealtRoutedExperts(RoutedExperts):
+    """A routed store that says it was dealt out, over the fixture's whole-expert store.
+
+    `MoE.forward` reads two things off its store: a tensor, and the bit that says whether that
+    tensor is one rank's share of the layer's routed sum or all of it. `DeviceRoutedExperts` is the
+    only store that deals one out and it needs the packed checkpoint and a card, so what this varies
+    is the bit: the same routed sum arrives either whole or cut into `world` equal shares whose sum
+    is the whole, which is the arithmetic a real deal produces without the checkpoint to produce it
+    from. A clone, because the whole-sum case is added into in place by the `MoE` above.
+    """
+
+    def __init__(self, inner: RoutedExperts, world: int, dealt: bool):
+        self.inner = inner
+        self.world = world
+        self.partial = dealt
+
+    def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        whole = self.inner.forward(x, weights, indices).clone()
+        return whole / self.world if self.partial else whole
+
+
+def test_the_ffn_completes_the_routed_partial_only_when_the_store_was_dealt_out(trees) -> None:
+    """Which of the two all-reduce arrangements a layer's ffn uses, decided by the store and not by
+    the split.
+
+    Both arrangements are correct in their own configuration: reduce `routed + shared` when the
+    routed store dealt the experts out, reduce `shared` alone when every rank computed the same
+    routed sum. They are also a factor of `world` apart on the routed term, so taking the wrong one
+    is an order-one error and not a rounding -- which is what makes this test worth its four extra
+    forwards. Same fixture, same sharded trees, same message board, one flipped bit.
+    """
+    board = _MessageBoard(WORLD)
+    for rank, shard in enumerate(trees.shards):
+        attach_tp(shard.model, ShardPlan.build(trees.cfg, rank, WORLD, reduce=board.reduce_for(rank)))
+
+    layer = 0
+    whole_ffn = trees.whole.model.layers[layer].ffn
+    ffns = [shard.model.layers[layer].ffn for shard in trees.shards]
+    stores = [ffn.routed for ffn in ffns]
+
+    x = torch.randn(3, trees.cfg.dim, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(3))
+    # The inner `no_grad` is not redundant with the outer one: grad mode is thread-local, and the
+    # board runs each rank on a thread of its own, which starts with it enabled. `load_backbone`
+    # fills the tree inside `inference_mode`, so a parameter there is an inference tensor and a
+    # call that builds a graph on one is an error rather than a cost.
+    def step(rank: int) -> torch.Tensor:
+        with torch.no_grad():
+            return ffns[rank](x)
+
+    with torch.no_grad():
+        want = whole_ffn(x).clone()
+
+    # the routed term is a factor of two apart between the two cases, against a difference between
+    # two bf16 roundings of one value; anything in between is a margin, not a coincidence
+    bound = 4 * torch.finfo(torch.bfloat16).eps
+    for dealt in (False, True):
+        for ffn, store in zip(ffns, stores):
+            ffn.routed = _DealtRoutedExperts(store, WORLD, dealt)
+        got = board.run(step)
+        scale = want.abs().max().item()
+        for rank, y in enumerate(got):
+            worst = (y - want).abs().max().item() / scale
+            assert worst <= bound, (
+                f"dealt_out={dealt}: rank {rank} is {worst:.3e} of a max |ffn out| of "
+                f"{scale:.3e} from the whole tree's ffn, so the routed partial was completed "
+                f"{'wrongly' if dealt else 'twice'}"
+            )
+
+    # the fixture is module-scoped, so put the trees back the way the test found them
+    for ffn, store in zip(ffns, stores):
+        ffn.routed = store
+
+
+def test_the_deal_is_the_same_partition_whichever_way_it_is_driven(trees) -> None:
+    """`DeviceRoutedExperts._split` under one rank per process and under one process for all.
+
+    Round-robin over the *global* expert ordering and `ranks` selecting from it, rather than dealing
+    over `len(ranks)`: the two are the same for a one-process run and differ for a rank that owns
+    one share, and only the first one comes out the same in every process. A process that dealt the
+    layer from its own position would stage a different subset than its neighbours, each subset
+    would be a plausible partial, and the all-reduce would return a number.
+
+    Called unbound, on a stub, because the deal is arithmetic on two integers and everything else in
+    the class needs a packed checkpoint and four cards to exist at all.
+    """
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+
+    ids = [30, 10, 60, 20, 50, 40]
+    order = sorted(range(len(ids)), key=lambda slot: ids[slot])
+
+    for world in (1, 2, 3, 4):
+        # one rank per process, four processes: the pieces tile the routes, once each
+        pieces: list[tuple[int, int]] = []
+        for rank in range(world):
+            cards = DeviceRoutedExperts._split(SimpleNamespace(world=world, ranks=[rank]), ids)
+            assert len(cards) == 1, "one rank per process drives one card, not a world of them"
+            pieces += cards[0]
+        assert sorted(pieces) == sorted(
+            (position // world, slot) for position, slot in enumerate(order)
+        )
+
+        # one process for all of them: the same deal, one card per rank, 2/2/1/1 over four
+        cards = DeviceRoutedExperts._split(
+            SimpleNamespace(world=world, ranks=list(range(world))), ids
+        )
+        assert cards == [[(p // world, order[p]) for p in range(r, len(order), world)] for r in range(world)]
+
+    # and the roster is what selects, not the order it is written in
+    picked = DeviceRoutedExperts._split(SimpleNamespace(world=4, ranks=[2]), ids)
+    assert picked[0] == [(p // 4, order[p]) for p in (2,)]

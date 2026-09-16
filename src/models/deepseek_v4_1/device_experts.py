@@ -34,10 +34,19 @@ pinned arena is those rows for every card laid end to end, 35.9 MiB per card and
 and the device holds the matching per-card slice.
 
 The cards never talk to each other. Each holds its own arena, is handed the same `[1, 5120]`
-activation, and returns `[1, 5120]` fp32; the host sums the `world` partials. That is 20 KiB back per
-card per layer, 3.2 MB per token across four cards, and it is why this needs no NCCL, no all-to-all
-and no collective to debug. It also makes `world=1` the single-card configuration rather than a
-second implementation.
+activation, and returns `[1, 5120]` fp32; whoever asked for the row sums the partials. That is
+20 KiB back per card per layer, 3.2 MB per token across four cards, and it is why this needs no
+all-to-all and no collective of its own. It also makes `world=1` the single-card configuration
+rather than a second implementation.
+
+**Who does the summing is the one thing `ranks` decides.** Deal every rank of the layer into one
+process -- `ranks` left unset, `world` devices -- and that process returns the layer's whole routed
+output, which is what the host-side probes measure. Deal one rank per process -- `ranks=[r]`, one
+device -- and it returns that rank's share, and the routed partial then joins the shared expert's on
+the ffn's all-reduce instead of at a host `+`. The deal itself is unchanged: `world` is still how
+many ways the sorted ids are dealt, so rank `r` stages exactly the experts it staged before, into
+exactly the rows it staged them into, and the two configurations differ only in who adds the pieces
+up. `partial` is that distinction, and `MoE.forward` reads it.
 
 How it is checked: `/tmp/probe_device_experts.py` runs this class against `expert_forward` on layer
 0's captured prefill activation. `world=4` and `world=1` agree with each other to **5.960e-08**, fp32
@@ -170,7 +179,7 @@ def _copy_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 class DeviceRoutedExperts(RoutedExperts):
-    """One layer's routed experts held as fixed `ceil(topk / world)`-row arenas on `world` cards.
+    """One layer's routed experts held as fixed `ceil(topk / world)`-row arenas, one per card driven.
 
     Not an `nn.Module`, for the same reason `CheckpointRoutedExperts` is not: the experts are not
     part of the tree, and a module would put them in `state_dict()` and in `parameters()`.
@@ -179,6 +188,10 @@ class DeviceRoutedExperts(RoutedExperts):
     arenas, the copy streams, one event per pinned buffer so a buffer is not overwritten while the
     DMA that reads it is still in flight, one event per card for the result copy back, and the
     per-row scratch. Nothing on either side of PCIe is allocated per card or per row.
+
+    `ranks` is which of the `world` dealt shares this process owns, and it is what makes the class
+    usable one-card-per-process as well as one-process-for-every-card. See the module docstring for
+    the deal and `partial` for what changes downstream.
     """
 
     def __init__(
@@ -192,6 +205,7 @@ class DeviceRoutedExperts(RoutedExperts):
         topk: int,
         swiglu_limit: float = 0.0,
         world: int = 1,
+        ranks: Sequence[int] | None = None,
         devices: Sequence[torch.device | str] | None = None,
         pinned_buffers: int = 2,
     ) -> None:
@@ -217,13 +231,24 @@ class DeviceRoutedExperts(RoutedExperts):
         self.inter_dim = inter_dim
         self.topk = topk
         self.swiglu_limit = swiglu_limit
+        # `world` is how the layer's experts are dealt and `ranks` is which of those shares *this*
+        # process owns. The default -- every rank of the deal, one device each -- is the
+        # one-process-drives-every-card configuration this class was written for; one entry is a
+        # single card in a process of its own, which is what TP4 needs.
         self.world = world
+        self.ranks = list(range(world)) if ranks is None else [int(r) for r in ranks]
+        if not self.ranks:
+            raise ValueError("a rank list with nothing in it drives no card")
+        if len(set(self.ranks)) != len(self.ranks) or any(
+            not 0 <= r < world for r in self.ranks
+        ):
+            raise ValueError(f"ranks {self.ranks} are not distinct ranks of a world of {world}")
         self.devices = [
             d if isinstance(d, torch.device) else torch.device(d)
-            for d in (devices if devices is not None else [f"cuda:{i}" for i in range(world)])
+            for d in (devices if devices is not None else [f"cuda:{r}" for r in self.ranks])
         ]
-        if len(self.devices) != world:
-            raise ValueError(f"{len(self.devices)} devices for a world of {world}")
+        if len(self.devices) != len(self.ranks):
+            raise ValueError(f"{len(self.devices)} devices for {len(self.ranks)} ranks")
 
         # Counters rather than a timing harness: how many rows and expert rows this class has moved
         # is what says whether a run is behaving like the model it started as.
@@ -245,15 +270,15 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._shapes[(which, kind)] = tuple(checkpoint.reader.entry(key).shape)
         self._check_shapes()
 
-        # One pinned arena per buffer, holding **every card's** rows laid out end to end: card `c`
-        # owns `[c * rows_per_card, (c + 1) * rows_per_card)`. It is one allocation rather than one
-        # per card so that a row stages into it the same way whichever card will read it, and the
-        # device side is the matching per-card slice -- a card's arena is `rows_per_card` rows and
-        # not the whole token's.
+        # One pinned arena per buffer, holding **every card this process drives** laid out end to
+        # end: local card `c` owns `[c * rows_per_card, (c + 1) * rows_per_card)`. It is one
+        # allocation rather than one per card so that a row stages into it the same way whichever
+        # card will read it, and the device side is the matching per-card slice -- a card's arena is
+        # `rows_per_card` rows and not the whole token's.
         self._pinned = [
             {
                 (which, kind): torch.empty(
-                    (self.world * self.rows_per_card,) + self._shapes[(which, kind)],
+                    (len(self.ranks) * self.rows_per_card,) + self._shapes[(which, kind)],
                     dtype=torch.uint8,
                     pin_memory=True,
                 )
@@ -283,7 +308,7 @@ class DeviceRoutedExperts(RoutedExperts):
         for device in self.devices:
             with torch.cuda.device(device):
                 self._events.append([torch.cuda.Event() for _ in range(self._buffers)])
-        self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in range(world)]
+        self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in self.ranks]
         self._next_buffer = 0
 
         # One event per card for the *result* copy back, reused the same way. `_launch` records it
@@ -333,27 +358,45 @@ class DeviceRoutedExperts(RoutedExperts):
                 )
 
     @property
+    def partial(self) -> bool:
+        """Whether a `forward` is one rank's share of the routed sum rather than all of it.
+
+        It is `ranks` and not `world` that decides: an instance driving every rank of the deal sums
+        them here and returns the whole routed sum, which is what the one-process configuration does
+        and what `RoutedExperts.partial` documents as the default. An instance driving one of them
+        returns a partial, and the `MoE` above has to complete it -- which it does on the same
+        all-reduce that carries the shared expert's, since both are cut the same way.
+        """
+        return len(self.ranks) < self.world
+
+    @property
     def arena_bytes(self) -> int:
         """Packed fp4 bytes this instance holds per side of PCIe, summed over its cards."""
         per_card = sum(
             self.rows_per_card * shape[0] * shape[1] for shape in self._shapes.values()
         )
-        return per_card * self.world
+        return per_card * len(self.ranks)
 
     # -- the plan ---------------------------------------------------------------------------
 
     def _split(self, ids: Sequence[int]) -> list[list[tuple[int, int]]]:
-        """Per card, the `(arena row, route slot)` pairs that card owns.
+        """Per card this process drives, the `(arena row, route slot)` pairs that card owns.
 
         Sorted by global expert id and dealt round-robin, which makes the split a property of the
         routing rather than of the order the gate happened to emit it in: two runs that route to the
         same six experts stage the same bytes into the same rows. The host path walks a layer's
         experts in id order for the same reason.
+
+        Round-robin over `world` and *select* the ranks this process owns, rather than dealing over
+        `len(self.ranks)`: the deal is a property of the layer and has to come out the same in every
+        process, or two ranks would stage the same expert into different rows and the all-reduce
+        would sum the layer twice and never once.
         """
         order = sorted(range(len(ids)), key=lambda slot: ids[slot])
-        cards: list[list[tuple[int, int]]] = [[] for _ in range(self.world)]
+        cards: list[list[tuple[int, int]]] = [[] for _ in self.ranks]
         for position, slot in enumerate(order):
-            cards[position % self.world].append((position // self.world, slot))
+            if position % self.world in self.ranks:
+                cards[self.ranks.index(position % self.world)].append((position // self.world, slot))
         return cards
 
     def _key(self, expert: int, which: str) -> str:
@@ -369,14 +412,14 @@ class DeviceRoutedExperts(RoutedExperts):
         """
         slot = self._next_buffer
         self._next_buffer = (self._next_buffer + 1) % self._buffers
-        for card in range(self.world):
+        for card in range(len(self.ranks)):
             if self._uploaded[card][slot]:
                 self._events[card][slot].synchronize()
                 self._uploaded[card][slot] = False
         return slot
 
     def _row(self, card: int, arena_row: int) -> slice:
-        """The pinned rows card `card`'s `arena_row` lives in."""
+        """The pinned rows the local card `card`'s `arena_row` lives in."""
         start = card * self.rows_per_card + arena_row
         return slice(start, start + 1)
 
@@ -459,7 +502,7 @@ class DeviceRoutedExperts(RoutedExperts):
                 torch.arange(self.rows_per_card, dtype=torch.int64, device=d)
                 for d in self.devices
             ],
-            "y_device": [None] * self.world,
+            "y_device": [None] * len(self.devices),
             "y": [torch.empty((1, dim), dtype=torch.float32, pin_memory=True) for _ in self.devices],
         }
         self._scratch = scratch
@@ -471,7 +514,13 @@ class DeviceRoutedExperts(RoutedExperts):
         weights_row: torch.Tensor,
         cards: list[list[tuple[int, int]]],
     ) -> torch.Tensor:
-        """One kernel call per card, all of them issued before any is drained, summed on the host.
+        """One kernel call per local card, all of them issued before any is drained, summed here.
+
+        The sum is over the cards *this process drives*, and `partial` says what that sum is: with
+        every rank of the deal in `ranks` it is the layer's whole routed output, and with one it is
+        that rank's share, which the `MoE` above completes on the same all-reduce as the shared
+        expert's. Nothing else about a row changes -- the arena is the same, the deal is the same,
+        and a card that is not in `ranks` is staged by whoever owns it.
 
         The arena's expert ids are relative -- a card's rows are 0 and 1 -- so the 384-expert space
         never reaches a kernel, and `experts_start_idx` is 0 because there is nothing to rebase:

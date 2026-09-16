@@ -831,6 +831,22 @@ def load_backbone(
         # names where the split starts and the world says how wide it is.
         base = torch.device(expert_device)
         first = base.index if base.index is not None else 0
+        # A sharded tree deals the experts the same way it cuts everything else: this process drives
+        # one card and holds one share, and the ffn's all-reduce completes the routed partial beside
+        # the shared expert's. The `world=1` tree keeps the older shape -- one process driving
+        # `expert_world` cards and summing them on the host -- which is what `DeviceRoutedExperts`
+        # was written for and stays the control column for it.
+        if world > 1:
+            if expert_world != world:
+                raise ValueError(
+                    f"a tree cut {world} ways and experts dealt {expert_world} ways: the routed "
+                    "partial has to be one rank's share of the same deal the all-reduce completes, "
+                    "so use `--expert-world` equal to the tree's world"
+                )
+            ranks: list[int] | None = [rank]
+        else:
+            ranks = None
+        owned = ranks if ranks is not None else list(range(expert_world))
         try:
             return DeviceRoutedExperts(
                 checkpoint,
@@ -841,7 +857,8 @@ def load_backbone(
                 topk=_moe_shape(config, layer_id)[1],
                 swiglu_limit=config.swiglu_limit or 0.0,
                 world=expert_world,
-                devices=[torch.device(base.type, first + c) for c in range(expert_world)],
+                ranks=ranks,
+                devices=[torch.device(base.type, first + r) for r in owned],
             )
         except (RuntimeError, ValueError) as error:
             if progress is not None:
