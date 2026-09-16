@@ -76,9 +76,13 @@ What this does and does not buy, measured
 It buys the disk read: cold staging becomes resident staging, and the 27.2 s first token that was
 99% paging becomes the forward it is. It does **not** remove the `page cache -> pinned` copy that
 `DeviceRoutedExperts._stage` makes -- that copy is 0.30 s/step whether its source is the page cache
-or this bank, because 14 GiB/s is a memcpy's rate and not a disk's. Deleting *that* needs the bank
-to be pinned and the H2D to read it directly, which is a separate measurement with its own risk: the
-packed fp4 rows are the op's ABI and a per-expert copy has to replace a per-card one.
+or this bank, because 14 GiB/s is a memcpy's rate and not a disk's. That prediction is now measured
+on the device path with the page cache emptied (`/tmp/fadvise_drop.py`): the same 8-token row goes
+from **17.01 s a step and 9.91 s of `_stage`** to **782.9 ms and 242.1 ms** -- 21.7x and 41x --
+while warm the pair is 804.5 against 754.0 ms and `_stage` 224.7 against 244.0, which is to say no
+difference at all. Deleting *that* needs the bank to be pinned and the H2D to read it directly, which
+is a separate measurement with its own risk: the packed fp4 rows are the op's ABI and a per-expert
+copy has to replace a per-card one.
 """
 
 from __future__ import annotations

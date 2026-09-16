@@ -41,13 +41,18 @@ it across the cards halved the half that was the dense tree's. Prefill is the st
 always was: the same probe measures **3.0 tok/s at 128 tokens**, 41.85 of its 42.86 s inside
 `DeviceRoutedExperts`, because the class stages 4.2 GiB per row and a prefill is 128 rows of it.
 
-That 722-747 ms is a warm-page-cache figure and only as durable as the cache: `DeviceRoutedExperts`
-stages out of the checkpoint mapping, and this host holds 68-100 GiB of the checkpoint's 475.25 GiB
-because 457.78 GiB of its RAM is already the resident bank's tmpfs segment. With the pages dropped
-(`/tmp/fadvise_drop.py`) the same 8-token row measures **17.01 s a step**, 9.91 s of it in `_stage`
-against 0.30 s resident, while `_upload` and `_launch` do not move at all. Staging from a resident
-bank rather than from the mapping is the follow-on that makes the headline hold; until then, quote it
-with the cache it was measured on.
+That 722-747 ms is a warm-page-cache figure, and until recently it was only as durable as the cache:
+`DeviceRoutedExperts` stages out of the checkpoint mapping, and this host holds 68-100 GiB of the
+checkpoint's 475.25 GiB because 457.78 GiB of its RAM is already the resident bank's tmpfs segment.
+With the pages dropped (`/tmp/fadvise_drop.py`) the same 8-token row measures **17.01 s a step**,
+9.91 s of it in `_stage` against 0.30 s resident, while `_upload` and `_launch` do not move at all.
+`V41Checkpoint.packed` falls through to `resident_bank` when one is attached, so
+`DEEPSEEK_V41_RESIDENT_EXPERTS=1` moves the stage's source from the mapping into the segment and the
+number stops depending on the cache: the same cold row is **782.9 ms a step**, 242.1 ms of it in
+`_stage`, against 17.01 s. Warm it is a wash -- 754.0 ms banked against 804.5 unbanked, with `_stage`
+at 244.0 against 224.7 -- because `_stage` is the copy into the pinned arena, and a memcpy from tmpfs
+costs what a memcpy from the page cache costs. What the bank buys is the disk, and the disk is what
+the cold row was measuring.
 
 **Pass `--threads`, because torchrun does not.** `torch.distributed.run` sets `OMP_NUM_THREADS` to 1
 for every worker unless the environment already had it, and a share of a step is host work -- the

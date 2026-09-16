@@ -505,10 +505,94 @@ already names the floor — a scattered expert row is **1308.0 ms** cold against
 is the step-level version of it: **19.4×**, on the same row, from the cache alone.
 
 None of that changes the measurement above it; it says which claim it is. The 722–747 ms step is the
-configuration where the expert source is in RAM, which is exactly the configuration the resident bank
-exists to produce and **the one `DeviceRoutedExperts` does not yet read from** — it stages out of the
-checkpoint mapping. Wiring the bank into it is [the first follow-on](#what-this-does-not-do-yet), and
-this table is what it is worth.
+configuration where the expert source is in RAM, which is the configuration the resident bank exists
+to produce — and the stage had to be pointed at that bank before the number meant anything on a host
+that does not keep the working set. That is the next section, and between the two this table is what
+the wiring is worth.
+
+### The resident bank takes the disk out of `_stage`, and not the copy into pinned
+
+`V41Checkpoint.packed` already falls through to `resident_bank` when one is attached, so the class's
+staging has read from that segment since the bank was written; what was missing was a run that had
+both. The segment is filled once per boot of it — one process, 457.78 GiB, 36.6 minutes of
+`/mnt/data3`, `src/models/deepseek_v4_1/resident_bank.py` is the module and its docstring is the
+account of it — and any later run attaches in milliseconds by environment:
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+    /tmp/probe_v41_tp4_e2e.py --lengths 8 --steps 8
+```
+
+All four ranks attach the same 457.8 GiB segment and report it, and the experts come back
+`DeviceRoutedExperts` on all 40 layers rather than falling back. The same 8-token row, instrumented,
+bank on against bank off — both with the page cache as it was:
+
+| 8 tokens, 22 threads | bank on | bank off |
+| --- | ---: | ---: |
+| load, per rank | 37.2–39.4 s | 23.3–24.4 s |
+| `_stage` | 244.0 ms | 224.7 ms |
+| `_upload` | 15.4 ms | 16.0 ms |
+| `_launch` | 165.5 ms | 192.9 ms |
+| unattributed inside the class | 37.2 ms | 59.3 ms |
+| inside the class | 462.1 ms | 492.9 ms |
+| whole step | 754.0 ms | 804.5 ms |
+
+**Warm, the bank is neither a win nor a cost.** Its `_stage` — 242.1 and 244.0 ms across the two runs
+here — lands inside the spread the page-cache-sourced stage already shows, 224.7 ms in the run above
+against 302.9–319.9 ms in the deliberate pair, and nothing else in the table moves outside the 20–50
+ms this host's runs differ by. That is the class's own docstring being right rather than corrected:
+`resident_bank` says in as many words that it does not remove the page cache → pinned copy, and
+`_stage` is that copy — 4.2 GiB a row into the pinned arena, a memcpy at ~17 GiB/s whether it reads
+tmpfs or the page cache. What the bank removes is the *disk*, and the disk only appears when the cache
+does not hold the working set.
+
+So the experiment that shows what it is worth is the cold one. `/tmp/fadvise_drop.py` over the 48
+shards — **0.00 GiB** confirmed resident by `mincore` — and then the same banked run:
+
+| 8 tokens, 22 threads | bank on, cache dropped | bank off, cache dropped |
+| --- | ---: | ---: |
+| load, per rank | 83.6–83.9 s | 85.0–85.1 s |
+| `_stage` | **242.1 ms** | 9911.7 ms |
+| `_upload` | 17.4 ms | 25.7 ms |
+| `_launch` | 174.2 ms | 156.9 ms |
+| unattributed inside the class | 24.7 ms | 84.1 ms |
+| inside the class | 458.4 ms | 10178.4 ms |
+| whole step | **782.9 ms** | **17013.4 ms** |
+
+**21.7× on the step and 41× on `_stage`**, on the same row, the same prompt and the same probe, one
+environment variable apart. The step with the cache emptied is 782.9 ms against the 754.0 ms the warm
+banked run measures — 3.7% — where without the bank the same pair is 19.4×. That is the whole of what
+the bank buys, and it is the whole of what was at stake: **the 722–747 ms headline now holds on a host
+whose page cache holds none of the checkpoint**, which is the state this host is in after a reboot and
+the state the 457.78 GiB tmpfs segment keeps it in besides.
+
+Two costs come with it, both recorded rather than argued. Loading is slower when the cache is cold —
+83.6 s against 37.2 s — because the dense tree is deliberately not in the segment: the fill reads its
+16.79 GiB *whole* on each of four ranks and slices, so a cold start pays ~67 GiB of SMR reads for
+16.79 GiB of parameters, and only the warm case has those pages already. And the run leaves the cache
+where it found it: `mincore` after the cold banked run reads **9.60 GiB of 475.25 GiB (2.0%)**, which
+is the tree's own fill and rounding, against the 68–100 GiB a page-cache-sourced run warms. The expert
+path contributed nothing to it, which is the same statement as the 242.1 ms.
+
+**The long row says the same thing, and it is the row where the Engram tables are on the route.** The
+same probe at `--lengths 128 --steps 4` on the same emptied cache, banked:
+
+| 128 tokens, 22 threads, cache dropped | |
+| --- | ---: |
+| load, per rank | 82.7–82.9 s |
+| prefill | **53.42 s** (2.4 tok/s), 52.95 s of it inside the class |
+| decode | 802.2 ms, 487.4 in the class and 314.8 in the tree |
+| decode phases | stage 265.0, upload 16.8, launch 159.7, unattributed 45.9 ms |
+| `mincore` after | **9.61 GiB** of 475.25 GiB |
+
+The prefill is 99.1% inside the class and its staging is 265.0 ms a row against the 242.1–244.0 ms the
+8-token rows measure — the same copy, paid 128 times — so the bank does not reach it and was never
+going to. The number to read is the last one: a cold banked run that gathers **3,072 Engram rows per
+table** leaves the page cache at 9.61 GiB, one hundredth of a GiB above the 9.60 GiB the 8-token run
+left. The tables are in the segment and `rows` reads them out of it, so a banked prefill's gather is
+not on the 253.4 s/table cold path the host page records. 53.42 s against the 42.86 s the warm
+uninstrumented run records is a 25% difference this pair does not separate into the instrumentation
+and the cold host's own reads, and neither of those is the bank.
 
 ### `--threads` is worth 1.13× with the source resident, and 6.8× without it
 
@@ -549,17 +633,19 @@ All of these are separate measurements rather than separate opinions.
   side would be fully hidden. It needs one more generation of the activation, the weights and the
   partials and it changes the shape of the row loop rather than any of its parts, so it is the next
   follow-on with its own measurement.
-- **The staging reads the page cache and not a resident bank.** The class stages out of the
-  checkpoint mapping, so the step is 722–747 ms only while the host happens to hold the working set —
-  68–100 GiB of 475.25 GiB on this host, [measured above](#the-747-ms-is-a-page-cache-number-and-this-host-does-not-keep-the-working-set),
-  where the same row costs 19.4× more. `SharedCPUMoEWeightArena` already solves this shape for
-  V4-Flash (POSIX shared memory, one arena per rank, `pre_touch`/`mark_ready`), so the work is one
-  fp4-packed `build_specs` beside its int8 one and a stage that copies host RAM → pinned instead of
-  page cache → pinned. It is first because it is the difference between the 747 ms headline and a
-  number that holds after a reboot.
-- **The Engram tables are not resident.** `resident_engram=False` re-reads the shards on every
-  gather, which is the 253.4 s/table path the host page records, and 189.13 GiB is too much for four
-  ranks to hold each. One resident copy shared through the arena is the shape.
+- **The bank removes the disk from `_stage`, not the copy out of it.** With
+  `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
+  without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —
+  [measured above](#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned). What
+  it does not remove is the join: the segment is not the pinned arena, so a row is copied into that
+  arena whichever source it came from, and `_stage` is still 242 ms of a 458 ms class. That copy is
+  what the pipeline above is for, and the arithmetic is on its side — 6.1 ms of staging a row against
+  1.0 ms of device work in it.
+- **The Engram tables are in the segment, and what a banked prefill's gather costs is unmeasured.**
+  `rows` reaches the segment under the same environment variable (`resident_bank.parse_engram_key`),
+  so the 253.4 s/table cold path the host page records is not on a banked run's route. But the gathers
+  are per row and a 512-token prefill makes 12,288 of them per table, which is the workload the
+  resident-tables half of the 457.78 GiB was paid for and the one no run here has priced.
 
 ## Reproducing
 
@@ -612,6 +698,14 @@ PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_first
 # attribution as above so the two tables read line for line
 torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8,128 --steps 8
 
+# ... with the experts staged from the resident bank instead of the checkpoint mapping. The bank is
+# filled once by `resident_bank` and every later run attaches it in milliseconds; this flag is the
+# whole wiring. Warm it is a wash, cold it is the difference between 782.9 ms and 17.01 s a step
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_tp4_e2e.py --lengths 8 --steps 8
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_tp4_e2e.py --lengths 128 --steps 4
+
 # ... and the same step with the page cache deliberately emptied first, which is the 17 s one --
 # `mincore_resident.py` counts resident pages, so run it before and after to see the two states
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/mincore_resident.py /mnt/data3/DeepSeek-V4.1-Flash
@@ -633,3 +727,14 @@ The host path stays the default: the device path needs `--expert-device` (or
 `DEEPSEEK_V41_EXPERT_DEVICE`) and falls back to `CheckpointRoutedExperts` with one line on `progress`
 if the extension is unloadable, the card is missing or the checkpoint's expert is laid out the other
 way round.
+
+**Read that fallback line, and run the device path from the `deepseek` environment.** The repository
+root holds two builds of the same extension, `cuda_kernel.cpython-310-x86_64-linux-gnu.so` and
+`cuda_kernel.cpython-311-x86_64-linux-gnu.so`, and `cuda_loader._find_built_extension` resolves by the
+running interpreter's cpython tag: whichever one matches is loaded, silently, whether or not it is the
+newer build. The 3.10 one predates the fp4 MoE ops, so a device-path run under the base conda
+environment (3.10.10) reports `moe_single_token_fp4_forward is not available in the built extension`
+on all 40 layers and quietly keeps the hosts' experts — a full run of the wrong configuration that
+looks like a run. The `deepseek` environment is 3.11 and picks the 3.11 build, which carries both
+`moe_single_token_fp4_forward` and `moe_multi_token_fp4_forward`; every command above that touches a
+card is written with it for that reason.

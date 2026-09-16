@@ -113,9 +113,16 @@ confirmed with `/tmp/mincore_resident.py` -- is the other column. With the pages
 not move, so it is not the cards, the kernels or the link -- it is one phase reading the same bytes
 off an SMR disk. The reason is arithmetic: **457.78 GiB of this host's 1007 GiB is the resident
 bank's tmpfs segment**, which is not reclaimable, so the 475.25 GiB this path reads cannot also be in
-the page cache. Quote the step with the cache it was measured on, and note that staging from a
-resident bank rather than from the mapping is what would make it hold after a reboot -- the follow-on
-at the end of this docstring.
+the page cache.
+
+Quote the step with the cache it was measured on, and note that the source is a choice: `banked()`
+below reaches the segment when one is attached, so `DEEPSEEK_V41_RESIDENT_EXPERTS=1` moves `_stage`
+off the mapping and the step stops depending on the cache. Measured on the same cold row, that is
+**782.9 ms a step and 242.1 ms of staging** against the 17.01 s and 9.91 s above -- 21.7x and 41x.
+Warm it is a wash, and for the obvious reason: 244.0 ms banked against 224.7 unbanked, both memcpys
+of the same 4.20 GiB into the same pinned arena, the first out of tmpfs and the second out of the page
+cache. The bank removes the disk; it does not remove the copy, so `_stage` is still the largest term
+inside the class and still what the pipeline at the end of this docstring is for.
 
 The staging rate is the one term that had to be measured rather than argued, because the whole plan
 turns on it: a step stages 40 rows x 6 experts x 17.9 MiB = 4.20 GiB and the phase costs 0.30 s, so
@@ -152,10 +159,11 @@ than separate opinions:
   wants it on. Measured that way at 8 tokens of decode, **722-747 ms per step, 409-444 of it in this
   class and 303-313 in the tree** -- against the recorded 1060-1140 ms per step with the tree on the
   host, so the move took 620 ms of dense tree down to 310 and left the staging as the larger half.
-  Read that pair with the warm cache the paragraph above describes: it is the resident-source column,
-  and the staging it leaves behind is the term the resident bank would take next. This is also why the
-  class no longer raises when a rank holds none of a row's routes: under a deal that rank's share is
-  zero and it has to stay in the all-reduce to say so.
+  Read that pair with the warm cache the paragraph above describes, and read the banked cold pair with
+  the same paragraph's last table: the resident source is a `DEEPSEEK_V41_RESIDENT_EXPERTS` away, and
+  what it does not take away is the 242 ms `_stage` still spends copying into pinned. This is also why
+  the class no longer raises when a rank holds none of a row's routes: under a deal that rank's share
+  is zero and it has to stay in the all-reduce to say so.
 """
 
 from __future__ import annotations

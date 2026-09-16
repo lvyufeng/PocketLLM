@@ -299,8 +299,10 @@ takes it to **0.15 s** and the step to **1.06–1.14 s**; the 0.27 s is kept her
 measured. Moving the tree itself off the host, onto the same four cards under `torchrun
 --nproc_per_node=4`, is the device page's
 [later section](../performance/deepseek_v4_1_flash_device_experts.md#the-dense-tree-across-the-four-cards-tp4)
-and takes that step to **722–747 ms** — again with the caveat that the staging underneath it is a
-page-cache read, 19× worse on the same row once the cache is emptied.
+and takes that step to **722–747 ms** — with the staging underneath it reading the page cache, 19×
+worse on the same row once the cache is emptied, and 782.9 ms rather than 17.01 s on that emptied row
+once [the resident bank](../performance/deepseek_v4_1_flash_device_experts.md#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned)
+is attached to it.
 
 That reverses the reading this page first drew from the carrier table. It took the repeated forward's
 0.44 s of MoE as the host-RAM carrier's floor and set it against 0.68 s of PCIe, and concluded that
