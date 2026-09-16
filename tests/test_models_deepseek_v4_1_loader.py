@@ -538,6 +538,61 @@ def test_the_engram_table_gathers_the_rows_the_hasher_named(mini) -> None:
         assert CheckpointEngramTable(mini.ckpt, layer_id).lookup(wider).shape == (2, 3, ENGRAM_HEAD_DIM)
 
 
+def test_a_resident_engram_table_answers_the_same_rows_without_the_shards(mini, monkeypatch) -> None:
+    """`resident=True` copies the table in, and the gather has to use the copy.
+
+    The released pair is 189.1 GiB and a scattered row whose page is not resident costs 21 to 49 ms on
+    the disk this checkpoint lives on -- 253 s for one 512-token prefill's worth of rows, against 9 ms
+    for the same rows out of the copy -- so the copy is the whole point. Making the reader raise
+    afterwards is the only way to tell a lookup that reads `codes` from one that quietly goes back to
+    the shards: both return the right rows.
+    """
+    for index, layer_id in enumerate(mini.layout.layer_ids):
+        weight_key = f"layers.{layer_id}.engram.embed.weight"
+        indices = torch.tensor([0, 1, mini.layout.row_counts()[index] - 1, 4, 4, 2])
+        streaming = CheckpointEngramTable(mini.ckpt, layer_id)
+        resident = CheckpointEngramTable(mini.ckpt, layer_id, resident=True)
+
+        assert resident.rows_total == streaming.rows_total
+        assert resident.head_dim == ENGRAM_HEAD_DIM
+        # one byte wide, because that is the only width the CPU can index
+        assert resident.codes.dtype is torch.uint8
+        assert resident.codes.shape == (streaming.rows_total, ENGRAM_HEAD_DIM)
+        assert resident.scales.shape == mini.stored[scale_key(weight_key)].shape
+        assert torch.equal(resident.lookup(indices), streaming.lookup(indices))
+        assert resident.rows_gathered == indices.numel()
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("a resident table went back to the shards")
+
+        monkeypatch.setattr(mini.ckpt, "rows", refuse)
+        assert resident.lookup(indices.reshape(2, 3)).shape == (2, 3, ENGRAM_HEAD_DIM)
+        monkeypatch.undo()
+
+
+def test_a_resident_load_is_the_same_model(mini) -> None:
+    """The option has to reach the table the forward uses, not just allocate a copy somewhere.
+
+    Same tokens through both, from a reset state: identical logits, and the table the loaded backbone
+    holds is the resident one.
+    """
+    resident = load_backbone(
+        mini.cfg, mini.ckpt, layout=mini.layout, hasher=_toy_hasher(mini.layout), resident_engram=True
+    )
+    resident.model.temperature = 0.0
+    for layer_id in mini.layout.layer_ids:
+        assert resident.model.layers[layer_id].engram.embed.codes is not None
+
+    tokens = torch.tensor([[3, 5, 7, 11]])
+    got = []
+    for backbone in (mini.loaded, resident):
+        backbone.reset_state(1)
+        _, logits, _ = backbone(tokens, 0)
+        got.append(logits)
+    assert torch.equal(got[0], got[1])
+    assert got[0].shape == (1, VOCAB)
+
+
 def test_a_skipped_name_is_not_a_missing_one(mini) -> None:
     """`skip` is how a caller declares storage the file does not name, and `prefix` how it says where.
 

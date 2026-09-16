@@ -37,9 +37,17 @@ never has to decide any of them:
   compressor's norm, `wgate` and `wkv` on the ratio-2 KV sources, the indexer's `k_norm`, the root
   `norm` and `head` -- and `checkpoint_weights` casts each into its parameter's own dtype rather than
   special-casing any of them.
-* **Neither Engram table can be read as a tensor.** They are 91.56 and 91.55 GiB of rows, and a
-  forward touches one row per hash column -- 24 per position -- so `CheckpointEngramTable` gathers
-  rows out of the mapping instead. The gather goes through a `uint8` alias because the CPU has no
+* **Neither Engram table belongs anywhere but host RAM, and gathering from the shards is not an
+  option either.** They are 91.56 and 91.55 GiB of rows, and a forward touches one row per hash
+  column -- 24 per position, per table -- so `CheckpointEngramTable` either copies the table into RAM
+  (189.1 GiB of codes and scales for both) or gathers each row out of the mapping. The gather is what
+  decides it, and it is a page-cache question rather than a bandwidth one: measured on a quiet disk,
+  a row whose page is not yet resident costs **21 to 49 ms** out of the mapping -- one seek per row on
+  this shingled drive, the low end when a batch of them queues up behind each other -- and the same
+  row costs **0.004 ms** once it is. A 512-token prefill gathers 12,288 rows per table, which measured
+  **253 s** from a cold cache, where the same rows out of the copy take **9 ms**. The copy is one
+  sequential pass -- **373 s** per table here, 271 MiB/s, and 747 s for both -- and it is paid once.
+  Both paths gather through a `uint8` alias because the CPU has no
   float8 `index_select`: `view[rows]` raises `NotImplementedError: "index_cpu" not implemented for
   'Float8_e4m3fn'` and the E8M0 scales raise it too.
 * **The three DSpark draft layers, the vision tower and the aligner are simply not asked for.**
@@ -95,11 +103,12 @@ FP8_WEIGHT = "F8_E4M3"
 FP4_PACKED_WEIGHT = "I8"
 
 # Dequantized experts one layer keeps on the host. The released layer is 384
-# experts of 7.06 GiB fp4 -- 3.51 GiB in bf16 -- so a whole layer cannot be held,
-# and the correctness path re-reads and re-expands on a miss. 16 experts is
-# 1.13 GiB per layer and 45 GiB across the backbone, which bounds the cache
-# without pretending to be the serving design: a device-side expert cache fed by
-# fp4 kernels is what a measured run needs, and it replaces this, not tunes it.
+# experts of 16.9 MiB packed fp4 each -- 67.5 MiB each once expanded to bf16, so
+# 25.3 GiB for the whole layer -- and the correctness path re-reads and re-expands
+# on a miss. 16 experts is 1.03 GiB per layer and 41 GiB across the backbone, which
+# bounds the cache without pretending to be the serving design: a device-side
+# expert cache fed by fp4 kernels is what a measured run needs, and it replaces
+# this, not tunes it.
 DEFAULT_EXPERT_CACHE = 16
 
 _EXPERT_PROJECTIONS = ("w1", "w2", "w3")
@@ -346,6 +355,15 @@ class CheckpointRoutedExperts(RoutedExperts):
     the same width the resident bank holds and the width `expert_forward` consumes. bf16 and not
     fp32: the released fp4 is four bits of mantissa, so bf16's eight are already more than the
     expansion can recover, and the cache below is what makes the cost per miss bearable.
+
+    It barely does. A token routes to 8 of the layer's 384 experts, so a 16-expert window returns
+    about 2 of them: measured, 6 misses per layer per token, warm. That is 25% saved for the 41 GiB
+    the window costs across the backbone, and it puts the whole model's token time on the disk --
+    the first token costs 27.2 s because all 240 of its experts are cold, against 1.0 s once the
+    previous token's working set is in the page cache. This class is a correctness path, and the
+    number that says so is that its ffn is 0.44 s of that second: 240 fresh experts is 4.2 GiB read
+    and 15.8 GiB expanded per token, on a host whose RAM holds all 269 GiB of them in their packed
+    form. A device-side cache is what replaces it, not a larger `cache_size`.
     """
 
     def __init__(
@@ -412,11 +430,22 @@ class CheckpointRoutedExperts(RoutedExperts):
 
 
 class CheckpointEngramTable(EngramTable):
-    """One Engram layer's n-gram table, left in the shards.
+    """One Engram layer's n-gram table, either left in the shards or copied into host RAM.
 
-    The two tables are 91.56 and 91.55 GiB of rows, so neither can be read as a whole tensor, and
-    neither ever needs to be: a position resolves to one row per hash column, and there are 24 of
-    those, so the widest a prefill ever gathers is `positions x 24` rows of 256 bytes.
+    The two tables are 91.56 and 91.55 GiB of rows, and a forward touches one row per hash column --
+    24 per position, two tables -- so the question is not whether the table fits but what a gather
+    costs. Out of the mapping it is one seek per row, and on the shingled disk this checkpoint lives
+    on that is expensive enough to decide how the model is served: measured 21 to 49 ms for a row
+    whose page is not resident, against 0.004 ms for one that is. A 512-token prefill gathers 12,288
+    rows per table, so a cold one is 253 s per table and a corpus would keep paying that as it moved
+    onto new n-grams, where the same 12,288 rows out of the copy take 9 ms.
+
+    So `resident` is not a tuning knob but a choice of when to pay, and the answer is not close. A
+    real run sets it and pays one sequential pass -- measured 373 s per table, 747 s for both, at 271
+    MiB/s -- from which every later gather is a memcpy out of a 91.6 GiB array. The host has the room:
+    189.1 GiB of codes and scales against the 930 GiB this machine reports available. The streaming
+    path exists for a host that cannot spare the memory, and for a test that wants the two to be
+    comparable. It is not wrong, it is just cold on every n-gram it has not seen before.
 
     Dequantization is `modules.dequantize_rows`, the same function `ResidentEngramTable` calls, so a
     truncated table and the real one agree element for element instead of being two writings of one
@@ -424,22 +453,55 @@ class CheckpointEngramTable(EngramTable):
     over a 256-wide row reaches 2**-13 and narrowing first would round the scale away.
     """
 
-    def __init__(self, checkpoint: V41Checkpoint, layer_id: int) -> None:
+    def __init__(
+        self,
+        checkpoint: V41Checkpoint,
+        layer_id: int,
+        *,
+        resident: bool = False,
+        progress: Callable[[str], None] | None = None,
+    ) -> None:
         self.checkpoint = checkpoint
         self.layer_id = layer_id
         self.weight_key = f"layers.{layer_id}.engram.embed.weight"
         self.scale_key = scale_key(self.weight_key)
         self.block_size = checkpoint.block_size(self.weight_key)
-        self.rows_total = checkpoint.reader.entry(self.weight_key).shape[0]
-        self.head_dim = checkpoint.reader.entry(self.weight_key).shape[1]
+        weight_entry = checkpoint.reader.entry(self.weight_key)
+        self.rows_total, self.head_dim = weight_entry.shape
         self.rows_gathered = 0
+        # Held as bytes and reinterpreted at the gather, not as float8: the CPU has no float8
+        # `index_select` either, so the copy is only useful if it is addressed one byte wide.
+        self.codes = self.scales = None
+        self.code_dtype = SAFETENSORS_DTYPES[weight_entry.dtype][1]
+        self.scale_dtype = SAFETENSORS_DTYPES[checkpoint.reader.entry(self.scale_key).dtype][1]
+        if resident:
+            self.codes = self._copy_into_ram(self.weight_key, progress)
+            self.scales = self._copy_into_ram(self.scale_key, progress)
+
+    def _copy_into_ram(self, key: str, progress: Callable[[str], None] | None) -> torch.Tensor:
+        """One sequential pass over one table, then hand its pages back.
+
+        `advise_dontneed_entry` after the copy matters: the pass fills the page cache with as many
+        bytes as the copy itself occupies, and the second table needs the same room again.
+        """
+        entry = self.checkpoint.reader.entry(key)
+        if progress is not None:
+            progress(f"engram {key} ({entry.nbytes / 2**30:.1f} GiB)")
+        tensor = self.checkpoint.reader.load(key)
+        self.checkpoint.reader.advise_dontneed_entry(entry)
+        return tensor.view(torch.uint8)
 
     def lookup(self, indices: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:
         """Dequantize the rows `indices` names into bf16 `[..., head_dim]`."""
         flat = indices.reshape(-1)
         self.rows_gathered += int(flat.numel())
-        values = self.checkpoint.rows(self.weight_key, flat)
-        scales = self.checkpoint.rows(self.scale_key, flat)
+        if self.codes is None:
+            values = self.checkpoint.rows(self.weight_key, flat)
+            scales = self.checkpoint.rows(self.scale_key, flat)
+        else:
+            flat = flat.to(device="cpu", dtype=torch.int64)
+            values = self.codes[flat].view(self.code_dtype)
+            scales = self.scales[flat].view(self.scale_dtype)
         out = dequantize_rows(values, scales, self.block_size)
         out = out.reshape(*indices.shape, self.head_dim)
         return out if device is None else out.to(device)
@@ -617,6 +679,7 @@ def load_backbone(
     max_batch_size: int = 1,
     max_seq_len: int | None = None,
     engram: bool = True,
+    resident_engram: bool = False,
     layout: EngramLayout | None = None,
     hasher: NgramHasher | None = None,
     tokenizer_dir: str | None = None,
@@ -625,11 +688,17 @@ def load_backbone(
 ) -> LoadedBackbone:
     """Build the V4.1 text backbone and fill it from `checkpoint`.
 
-    The routed experts and both Engram tables stay in the shards, so what this allocates is the
-    dense half: about 16 GiB in bf16 for the released geometry, against the 476 GiB on disk. The
-    forward that follows is the host-offload correctness path, not a measured one -- a routed expert
-    is expanded to bf16 the first time a step routes to it -- and the cost of that is the subject of
-    `CheckpointRoutedExperts`, not of this function.
+    The routed experts stay in the shards, so what this allocates is the dense half: about 16 GiB in
+    bf16 for the released geometry, against the 476 GiB on disk. `resident_engram` adds the two
+    Engram tables on top of that -- 189.1 GiB -- and is what a real run wants; see
+    `CheckpointEngramTable` for why gathering them from the shards is not an option here.
+
+    The forward that follows is the host-offload correctness path, and it is measured now rather than
+    assumed: one token at position 0 costs 27.2 s with nothing in the page cache and 1.0 s with the
+    previous token's working set in it, of which 0.37 s is the attention stack and 0.44 s the MoE.
+    The 27 s is 240 routed experts expanded for the first time, so what stands between this and a
+    usable token rate is not the tree but where the 269 GiB of experts live -- `CheckpointRoutedExperts`
+    is that subject, and this function's is only the dense half.
     """
     if hasher is not None:
         layout = hasher.layout
@@ -653,7 +722,12 @@ def load_backbone(
         for layer_id in range(n_layers)
     }
     tables = (
-        {layer_id: CheckpointEngramTable(checkpoint, layer_id) for layer_id in layout.layer_ids}
+        {
+            layer_id: CheckpointEngramTable(
+                checkpoint, layer_id, resident=resident_engram, progress=progress
+            )
+            for layer_id in layout.layer_ids
+        }
         if layout is not None
         else {}
     )
