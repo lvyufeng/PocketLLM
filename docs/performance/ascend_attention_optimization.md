@@ -186,9 +186,18 @@ is easy to misread a short-layer smoke run as a solved decode target.
 | 3840 MB | ~320 |
 
 The rate is **flat over a 256x weight-size range**, so a single-row GEMV has no amortisable per-call
-overhead: **~320 GB/s is the streaming ceiling** for this access pattern on this part, not a
-launch-cost artefact. That the 15 MB case (fully L2-resident, 32 MB L2) is no faster than the 3840 MB
-case is the strongest evidence — the limit is not HBM capacity traffic.
+overhead: ~320 GB/s is this access pattern's rate, not a launch-cost artefact. That the 15 MB case
+(fully L2-resident, 32 MB L2) is no faster than the 3840 MB case is the strongest evidence that the
+limit is not HBM capacity traffic.
+
+It is not the hardware's rate either. The scan only covers **M=1**, and M=1 is the shape the Cube
+cannot fill: the unit is 16 rows tall, so a one-row `Mmad` leaves fifteen sixteenths of every tile
+idle. Re-run on the current tree at `--iters 20`, 5 and 50, the plateau holds (15/60/240/960/3840 MB
+-> 285.5/355.7/333.4/315.0/322.2 GB/s at 20 iterations; the 15 MB point is the noisy one, reading
+215.2 to 303.2 GB/s across iteration counts, and never faster than the large cases). Widening the
+batch is what the hardware was waiting for, and it is 75% faster at M=16 — see
+[ascend_decode_collective_ab.md](ascend_decode_collective_ab.md) §6.2 for the M sweep, and the HBM
+read probe below for the same point from the other side.
 
 `bench_qwen_ascend_gemm --mem`, 512 MB D2D `aclrtMemcpy`: **8.7 GB/s**, i.e. **37x slower than the
 GEMV**. Two consequences: any hot path using this copy is unaffordable, and this probe must not be
@@ -206,6 +215,14 @@ Flat from 10 KB to 640 KB, against a device-op floor of 0.0183 ms. It is a pure 
 the fix is fewer collectives, not a faster collective. TP4 is the sweet spot (TP2 0.4554 ms, TP8
 0.5156 ms at 10 KB).
 
+That table prices the internal-stream call, which is **not** the one the engine executes.
+`QWEN_NCCL_COMM_STREAM` defaults on, so every collective is bracketed by `begin_nccl_collective` /
+`end_nccl_collective` and issued on the communication stream. `bench_qwen_ascend_allreduce`'s `comm`
+variant reproduces exactly that sequence, and measures **0.4430 ms at 10 KB** on rank 0 — 0.4438,
+0.4429 and 0.4436 ms on ranks 1-3, a spread under 0.2%. It is also flat in payload, like `sync`. That
+is the per-call price the decode step pays: **129 calls x 0.4430 ms = 57.1 ms**, not the 50.6 ms the
+`sync` row implies.
+
 ### Decode is not at the bandwidth ceiling
 
 Per-rank resident weights, from the engine's own startup line: `resident_weight_bytes=13449011456` =
@@ -220,8 +237,11 @@ named:
   gated-delta matrix work (two 128x128 reductions and a rank-1 update currently done as 128-wide
   vector ops, with `broadcast_rows` the documented hot spot), the norms, and the transposes;
 - 129 TP all-reduce calls per decode token (64 `ar.mlp` + 48 `ar.lin.out` + 16 `ar.full.out` +
-  1 `ar.hidden_a`) at ~540 us each, serialised by the per-call `stream_synchronize` inside
-  `end_nccl_collective`, which is roughly 70 ms of the 108 ms step.
+  1 `ar.hidden_a`) at the measured 0.4430 ms each — flat in payload, so per-call and not per-byte —
+  serialised by the per-call `stream_synchronize` inside `end_nccl_collective`. That is **57.1 ms** of
+  the 108.6 ms step. (Two earlier revisions of this page and of the roadmap priced the same calls at
+  ~540 us each and at 0.3923 ms; the latter is the bench's `sync` row, and neither is the path the
+  engine runs.)
 
 **100 TPS is not reachable on this part at fp16.** It needs <= 10 ms/token; the perfect-streaming
 bound at TP8 is 21 ms with zero collective cost, which would already require 673 GB/s per card.
@@ -236,6 +256,9 @@ per-step collective serialisation. Note also that 8 cards is the practical maxim
   from `STACK.r`; attributing the 66% to it would point the next optimisation at the wrong unit.
 - **A faster collective.** The HCCL floor is flat in payload size up to 640 KB.
 - **`aclrtMemcpy`-based bandwidth work.** 8.7 GB/s.
+- **Reading the M=1 GEMV plateau as the hardware ceiling.** It is the rate of a shape the Cube cannot
+  fill. The same matmul measures 248.6 GB/s at M=1 and 435.8 GB/s at M=16 (`matmul Mx5120x4352`,
+  `bench_qwen_ascend_decode_ops`), against an HBM read probe of 1148 GB/s.
 - **Reading a short-layer smoke run as decode throughput.** See the layer scaling table.
 
 ## 8. Files

@@ -38,15 +38,23 @@ A linear fit gives **~7.8 ms fixed per step + ~1.63 ms per layer**. The fixed te
 per-layer, and the per-layer term contains both the weight streaming and the collectives. Both
 terms are candidates for amortisation over a batch; only the first is free of per-row work.
 
-The 129 collectives at the standalone 0.3923 ms per call measure **50.6 ms** of the 108.6 ms step,
-and the direct ablation agrees: removing the collective calls entirely from an otherwise unchanged
-step moves 139.7 -> 74.2 ms at rows=16, 188.0 -> 124.6 ms at rows=32 and 298.8 -> 241.4 ms at
-rows=64. Those three deltas — 65.5, 63.3 and 57.4 ms — are the same number three times, which is
-what a per-call cost looks like. The ablation was measured through a temporary `POCKET_TP_AR_NOOP`
-gate in a scratch build; the gate is not in this tree and the numbers are recorded here rather than
-left reproducible, because the same ablation is also the easiest way to make the engine produce
-wrong tokens. It does: with the reductions removed every row decodes something else, and the harness
-reports it (`verify_mismatches=16/48`).
+The 129 collectives at the **0.4430 ms** per call the engine actually pays measure **57.1 ms** of the
+108.6 ms step, and the direct ablation agrees: removing the collective calls entirely from an
+otherwise unchanged step moves 139.7 -> 74.2 ms at rows=16, 188.0 -> 124.6 ms at rows=32 and
+298.8 -> 241.4 ms at rows=64. Those three deltas — 65.5, 63.3 and 57.4 ms — are the same number three
+times, which is what a per-call cost looks like. The ablation was measured through a temporary
+`POCKET_TP_AR_NOOP` gate in a scratch build; the gate is not in this tree and the numbers are recorded
+here rather than left reproducible, because the same ablation is also the easiest way to make the
+engine produce wrong tokens. It does: with the reductions removed every row decodes something else,
+and the harness reports it (`verify_mismatches=16/48`).
+
+That 0.4430 ms is `bench_qwen_ascend_allreduce`'s `comm` variant, which is the sequence
+`begin_nccl_collective` / `end_nccl_collective` performs — event record on the default stream, wait on
+the communication stream, the `HcclAllReduce` there, then the `stream_synchronize`. The `sync` variant
+in §2's table is the internal-stream call at 0.3923 ms and is **not** the path the engine runs, since
+`QWEN_NCCL_COMM_STREAM` defaults on; pricing the step from it gave 50.6 ms and is what this paragraph
+replaces. The ablation deltas above bracket the corrected figure from the other side, and 0.3923 is
+13% low against all four of them.
 
 ## 2. The collective is host latency, not device time
 
@@ -67,6 +75,11 @@ call. `HcclAllReduce` **blocks the calling host thread for ~0.35 ms per call**; 
 hand the work to and return from, and the 1.85 ms of drain after 100 issued calls says the device
 never falls behind the host. Against a device-op floor of 0.0180 ms measured on the same part
 (`memset-10kb+sync`, `sync-only` 0.0019 ms), **95% of the collective is host time inside the call**.
+
+The `comm` variant — the sequence the engine actually issues, per §1 — measures 0.4430 ms at 10 KB,
+0.4942 ms at 80 KB and 0.4795 ms at 640 KB on the same rank, again flat in payload, with the four
+ranks agreeing to 0.2% at 10 KB. The 0.09 ms it adds over `sync` is the communication-stream wait and
+the `stream_synchronize` that closes it.
 
 That is what makes the second-stream construction attractive: if the host is blocked but the device
 is not, a communication thread could carry the block while the compute thread runs layer work. The
@@ -147,8 +160,8 @@ rather than a fallback from it.
   is latency. `HCCL_BUFFSIZE`, `HCCL_MULTI_QP_THRESHOLD` and `HCCL_INTRA_PCIE_ENABLE` were each
   tried and each left it within noise of 0.39 ms. `HCCL_ALGO=HD` and `NHR` **hang** on this stack;
   do not retry them.
-- **Fewer collectives as the whole answer.** Merging them removes at most 50.6 ms of a 108.6 ms step,
-  which is 17 TPS at rows=1 even if the merge were free — see the roadmap's own correction of the
+- **Fewer collectives as the whole answer.** Merging them removes at most 57.1 ms of a 108.6 ms step,
+  which is 19.4 TPS at rows=1 even if the merge were free — see the roadmap's own correction of the
   20-23 TPS figure.
 
 ## 6. The route that reaches the target: batch scaling
@@ -321,12 +334,23 @@ offset moved from 0.637895 to 0.63701. Unchanged.
 ### 6.2 The M=1 GEMV rate is not the hardware ceiling
 
 `ascend_attention_optimization.md` §6 reads the `bench_qwen_ascend_gemm --scan` table — flat at
-~320 GB/s over a 256x weight-size range — as "**~320 GB/s is the streaming ceiling** for this access
-pattern on this part, not a launch-cost artefact", and derives a 42.0 ms/token = 23.8 TPS hard floor
-at TP4 from it. The flatness argument is sound as far as it goes, but the scan only covers **M=1**,
-and it is flat because M=1 is the shape the Cube cannot fill: the unit is 16 rows tall, so a batch of
-one leaves fifteen sixteenths of every Mmad tile idle. Widening the batch is what the hardware was
-waiting for, and it is 30% faster at M=16.
+~320 GB/s over a 256x weight-size range — as the streaming rate for this access pattern, and derives
+a 42.0 ms/token = 23.8 TPS hard floor at TP4 from it. The flatness argument is sound as far as it
+goes, but the scan only covers **M=1**, and it is flat because M=1 is the shape the Cube cannot fill:
+the unit is 16 rows tall, so a batch of one leaves fifteen sixteenths of every `Mmad` tile idle.
+Widening the batch is what the hardware was waiting for. `bench_qwen_ascend_decode_ops --device 0`,
+`matmul Mx5120x4352`, device time:
+
+| M | device | GB/s | note |
+|---|---|---|---|
+| 1 | 179.3 us | 248.6 | |
+| 4 | 174.5 us | 255.3 | still a fraction of the tile |
+| 16 | **102.3 us** | **435.8** | the tile is full |
+| 64 | 332.7 us | 134.0 | four tiles deep |
+
+M=4 is within 3% of M=1 — the tile is a sixteenth full at both — while M=16 is 1.75x the M=1 rate. The
+batch is not a free axis either: M=64 falls back to 134 GB/s, so the rate peaks at a batch of about
+one tile row rather than continuing to climb.
 
 The ceiling that matters is the one every remaining target has to clear, and it is the memory system,
 not the GEMV: the HBM read probe measures **1148 GB/s**, so 13.449 GB of resident weights is

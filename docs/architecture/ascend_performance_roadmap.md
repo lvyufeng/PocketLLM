@@ -45,22 +45,25 @@ faster, and the single-card GEMM measurement (74-115 TFLOPS at batch 4096) says 
 
 The hard bound is bandwidth, and it is measurable rather than arguable. Per-rank resident weights are
 13.45 GB and every linear is read once per token. The standalone single-row GEMV plateaus at ~320 GB/s
-(flat over a 256x weight-size range, so this is the streaming ceiling and not a launch-cost artefact).
-That gives:
+(flat over a 256x weight-size range, so this is not a launch-cost artefact — but it is the **M=1**
+rate, not the hardware's: M=1 is the shape the Cube cannot fill, and the same matmul runs 435.8 GB/s
+at M=16 against 248.6 GB/s at M=1). That gives an M=1 floor of:
 
 | | ms/token | TPS |
 |---|---|---|
-| perfect streaming, TP4 | 42.0 | 23.8 |
-| perfect streaming, TP8 | 21.0 | 47.6 |
+| perfect streaming, TP4, M=1 | 42.0 | 23.8 |
+| perfect streaming, TP8, M=1 | 21.0 | 47.6 |
 | **required for 100 TPS** | **<= 10** | **100** |
 
 100 TPS at TP8 would need 673 GB/s per card with zero collective cost. Two separate deficits sit on
 top of the bound, and neither is small:
 
-1. **129 TP all-reduce calls per decode token**, ~540 us each, serialised by the per-call
-   `stream_synchronize` in `end_nccl_collective` — roughly 70 ms of the 108 ms step. The collective
-   floor is flat in payload size up to 640 KB (0.3923 ms at 10 KB, 0.3989 ms at 640 KB against a
-   0.0183 ms device-op floor), so this is latency, and the fix is fewer collectives.
+1. **129 TP all-reduce calls per decode token**, serialised by the per-call `stream_synchronize` in
+   `end_nccl_collective` — **57.1 ms** of the 108.6 ms step at the measured 0.4430 ms per call on the
+   path the engine takes. The collective floor is flat in payload size up to 640 KB, so this is
+   latency, and the fix is fewer collectives. (The 0.3923 ms this page previously quoted is the
+   bench's internal-stream `sync` variant, which is not what `QWEN_NCCL_COMM_STREAM` defaults the
+   engine to.)
 2. **The per-layer cost is ~2.4x the pure weight-streaming cost** (13.45 GB / 108.6 ms = 124 GB/s
    effective vs the ~320 GB/s ceiling). The excess is layer work that moves no weights: the
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
@@ -70,14 +73,19 @@ top of the bound, and neither is small:
 
 **Ranked next steps:**
 
-1. **Merge the per-layer collectives.** 129 calls at ~0.5 ms is the largest single identified cost in
-   the decode step and needs no new hardware capability. Removing it should land decode at the
-   streaming bound of roughly 20-23 TPS at TP4.
+1. **Merge the per-layer collectives.** 129 calls at 0.44 ms is the largest single identified cost in
+   the decode step and needs no new hardware capability. Subtracting it wholesale leaves 51.5 ms =
+   **19.4 TPS** at TP4, so the 20-23 TPS streaming bound above is only reached if the collective
+   latency is also overlapped with layer work — which is the case the communication-stream path is
+   already making.
 2. **Move the gated-delta matrix work onto the Cube.** Same argument as the attention kernel: it is a
    matrix operation running on the vector unit.
-3. **Weight quantization (int8, then int4).** This is the only route to 100 TPS. int8 halves the
-   42 ms floor to 21 ms (47 TPS at TP4), int4 quarters it to 10.5 ms (95 TPS at TP4, ~190 at TP8).
-   Accuracy validation is the cost, not the kernel.
+3. **Weight quantization (int8, then int4).** At the streaming rates above this is the only route to
+   100 TPS: int8 halves the 42 ms floor to 21 ms (47 TPS at TP4), int4 quarters it to 10.5 ms (95 TPS
+   at TP4, ~190 at TP8). The arithmetic assumes the M=1 time scales with the bytes read, and nothing
+   measured here establishes that — the smallest, L2-resident scan point is no faster than the
+   HBM-bound ones, which is what a byte-bound limit would not look like. Half the bytes for half the
+   time is the hypothesis to test before it is the plan; accuracy validation is the other cost.
 4. **Continuous batching.** Note this multiplies *throughput*, not per-token latency: it is currently
    blocked by a throw in the scheduler path and by the missing `runtime.batch_rows` branch in
    `qwen_layer_components.inl`. It is a throughput lever on top of the above, not a substitute for it.
@@ -96,4 +104,11 @@ listed so they are not picked up again:
   matmul. Gains of this kind come from removing a scalar loop, not from the unit's peak rate.
 - "FlashDecoding reduce to <20 ms gives 3.4x decode" — FlashDecoding is 5224 us in decode attention
   and loses to both Cube paths; it is a fallback for shapes the Cube path refuses.
+- "129 TP all-reduce calls per decode token at ~540 us each, roughly 70 ms of the 108 ms step" — the
+  calls are real but the price is not. No measurement on this stack produces 0.54 ms per call, and
+  the ~540 us figure has none behind it either.
+- "129 x 0.3923 ms = 50.6 ms", which replaced the item above — 0.3923 ms is `bench_qwen_ascend_allreduce`'s
+  internal-stream `sync` variant, and the engine runs the communication-stream `comm` variant at
+  **0.4430 ms**, so the total is **57.1 ms**. The lesson is not the 13% but that the price was read off
+  a row the engine does not execute.
 - The week-by-week schedule with per-week TPS targets.
