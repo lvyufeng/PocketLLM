@@ -104,6 +104,19 @@ issued before any is drained, so its 0.15 s is one kernel's worth of arithmetic 
 of H2D the kernels wait on -- a card's arena copy is ordered behind that card's previous kernel, so
 the transfer, unlike the issue, is on the device's critical path and not the host's.
 
+**Every number above is a warm-page-cache number, and on this host the cache holds 14-21% of the
+checkpoint.** This class stages out of the checkpoint mapping, so `_stage`'s 0.30 s is a read of
+4.20 GiB out of RAM, and `/tmp/fadvise_drop.py` -- `POSIX_FADV_DONTNEED` over the 48 shards,
+confirmed with `/tmp/mincore_resident.py` -- is the other column. With the pages dropped, the same
+8-token row measures **9.91 s of staging and 17.01 s a step** against 0.30 and 0.83-0.88 resident --
+33x and 19x, the same bytes and the same row. `_upload` (16 -> 26 ms) and `_launch` (161 -> 157 ms) do
+not move, so it is not the cards, the kernels or the link -- it is one phase reading the same bytes
+off an SMR disk. The reason is arithmetic: **457.78 GiB of this host's 1007 GiB is the resident
+bank's tmpfs segment**, which is not reclaimable, so the 475.25 GiB this path reads cannot also be in
+the page cache. Quote the step with the cache it was measured on, and note that staging from a
+resident bank rather than from the mapping is what would make it hold after a reboot -- the follow-on
+at the end of this docstring.
+
 The staging rate is the one term that had to be measured rather than argued, because the whole plan
 turns on it: a step stages 40 rows x 6 experts x 17.9 MiB = 4.20 GiB and the phase costs 0.30 s, so
 **14 GiB/s**, which is the 11.49 GiB/s an isolated `copy_` into a pinned arena reaches and not the
@@ -139,8 +152,10 @@ than separate opinions:
   wants it on. Measured that way at 8 tokens of decode, **722-747 ms per step, 409-444 of it in this
   class and 303-313 in the tree** -- against the recorded 1060-1140 ms per step with the tree on the
   host, so the move took 620 ms of dense tree down to 310 and left the staging as the larger half.
-  This is also why the class no longer raises when a rank holds none of a row's routes: under a deal
-  that rank's share is zero and it has to stay in the all-reduce to say so.
+  Read that pair with the warm cache the paragraph above describes: it is the resident-source column,
+  and the staging it leaves behind is the term the resident bank would take next. This is also why the
+  class no longer raises when a rank holds none of a row's routes: under a deal that rank's share is
+  zero and it has to stay in the all-reduce to say so.
 """
 
 from __future__ import annotations

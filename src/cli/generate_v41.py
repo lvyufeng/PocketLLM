@@ -41,12 +41,27 @@ it across the cards halved the half that was the dense tree's. Prefill is the st
 always was: the same probe measures **3.0 tok/s at 128 tokens**, 41.85 of its 42.86 s inside
 `DeviceRoutedExperts`, because the class stages 4.2 GiB per row and a prefill is 128 rows of it.
 
+That 722-747 ms is a warm-page-cache figure and only as durable as the cache: `DeviceRoutedExperts`
+stages out of the checkpoint mapping, and this host holds 68-100 GiB of the checkpoint's 475.25 GiB
+because 457.78 GiB of its RAM is already the resident bank's tmpfs segment. With the pages dropped
+(`/tmp/fadvise_drop.py`) the same 8-token row measures **17.01 s a step**, 9.91 s of it in `_stage`
+against 0.30 s resident, while `_upload` and `_launch` do not move at all. Staging from a resident
+bank rather than from the mapping is the follow-on that makes the headline hold; until then, quote it
+with the cache it was measured on.
+
 **Pass `--threads`, because torchrun does not.** `torch.distributed.run` sets `OMP_NUM_THREADS` to 1
-for every worker unless the environment already had it, and a large share of a step is host work --
-the expert staging, the gate, the head, the layer glue. The same three tokens on this host measure
-**5.1 s at `--threads 22` against 6.6 s at the single thread torchrun picked**, both emitting the same
-text; every other number in this round used 22, and the flag is how a run says so out loud instead of
-inheriting it.
+for every worker unless the environment already had it, and a share of a step is host work -- the
+expert staging, the gate, the head, the layer glue. The same three tokens on this host, with the
+resident bank in place so the two columns differ only in the flag, measure **5.7-5.8 s at
+`--threads 22` against 6.5-6.6 s at one**; every other number in this round used 22, and the flag is
+how a run says so out loud instead of inheriting it.
+
+Be careful what this flag is credited with. With no resident bank -- the class staging out of the
+checkpoint mapping, so the read is `/mnt/data3` -- those same three tokens are 6.5 s at 22 threads and
+**44.1 s at one**, 14.70 s/token: one thread serializes a per-row read out of an SMR disk. That 6.8x
+is the flag's when there is no resident source, and it is the resident bank's under the same
+conditions, so the two cannot be credited to each other. An earlier pair of runs here recorded 5.1 s
+against 6.6 s as if it were a thread effect; they differed in the bank as well.
 """
 
 from __future__ import annotations

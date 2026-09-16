@@ -19,6 +19,7 @@ other half: the same model with the experts on the CPU, at 15 to 42 s per genera
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB (SMR disk, `/dev/sda`) |
 | Runtime | PyTorch resident, `src/models/deepseek_v4_1`, no native engine; `moe_single_token_fp4_forward` from the built `pocketllm_cpp` CUDA extension |
 | Commit | `df3ed3d` on `feature/v41-backbone-runtime` plus the uncommitted `device_experts.py`; the ordering fix and its re-measured step are in [the launch](#the-launch-was-four-kernels-serialized-not-one-plus-copies) |
+| TP4 | The same path with the dense tree cut across the four cards — one process per card under `torchrun --nproc_per_node=4`, `src/cli/generate_v41.py`. It is a different configuration of the same measurements, not a later commit of them, and [the section below](#the-dense-tree-across-the-four-cards-tp4) is what it changes |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each; expert-parallel `world=4` across all four and `world=1` on `cuda:0`, both measured |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env |
@@ -59,9 +60,13 @@ no collective here to debug. It also makes `world=1` the single-card configurati
 second implementation, which is what Verification item 3 in the plan asked for: the same code, one
 flag.
 
-The dense tree stays on the host in this phase. It is 16.79 GiB, it works, and moving it is worth
-0.4–0.6 s/token on its own; doing both at once would put two independent sources of divergence inside
-one debugging session.
+**The dense tree is on the host in this configuration and on the cards in the next one.** It is
+16.79 GiB, it worked first, and moving it is worth 0.4–0.6 s/token on its own; doing both at once
+would have put two independent sources of divergence inside one debugging session. It has since been
+cut across the four cards — a different launcher and a different process shape,
+`src/cli/generate_v41.py` under `torchrun --nproc_per_node=4` — and [that section](#the-dense-tree-across-the-four-cards-tp4)
+has the numbers. Everything above it and everything under *What a step costs* is the
+tree-on-host configuration.
 
 ## Two conventions that had to be settled before the first run
 
@@ -358,10 +363,12 @@ assumes — the transfer is not hiding in the buffer handshake. And `_launch`'s 
 row measured above against the 0.83 ms an isolated call of that shape costs, so roughly a quarter of
 it is arithmetic and the rest is the pinned H2D each kernel's arena copy is ordered behind.
 
-What that leaves is the honest headline: **the host's own dense stack is now the largest single term
-of a device step**, 0.55–0.67 s against the 0.30 s of staging, and it is the same 0.51 s the earlier
-coarse probe measured from the other direction. Moving it is worth 0.4–0.6 s/token on its own and is
-[still not done](#what-this-does-not-do-yet).
+What that leaves is the honest headline of this configuration: **the host's own dense stack is the
+largest single term of the step**, 0.55–0.67 s against the 0.30 s of staging, and it is the same
+0.51 s the earlier coarse probe measured from the other direction. It has since been moved — the tree
+is cut across the four cards and the step is
+[722–747 ms rather than 1.06–1.14 s](#the-dense-tree-across-the-four-cards-tp4) — which leaves the
+staging in this table as the largest term of what is left.
 
 On one device and serialized, the same arithmetic measures: **2,077.3 µs per layer** for one call
 over all six experts against **3,302.6 µs** for four calls of 2/2/1/1 — 83.1 ms against 132.1 ms per
@@ -400,9 +407,132 @@ parallelism that pays is the four links, not four threads.
 The staging is a read of `/mnt/data3`, an SMR disk, so the floor under a cold first token is the
 disk: one scattered expert row is **1308.0 ms** cold against 11.2 ms warm.
 
+## The dense tree across the four cards (TP4)
+
+Everything above this section is the tree on the host. The configuration the round was for is the tree
+cut across the cards — one process per card, the experts dealt to the same cards — and this is what it
+measures.
+
+The launcher is `src/cli/generate_v41.py`:
+
+```bash
+torchrun --nproc_per_node=4 -m src.cli.generate_v41 \
+    --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" \
+    --max-new-tokens 8 --threads 22
+```
+
+The split is the one settled in advance: `wq_b` by head, `wo_a` by `o_groups` so a rank owning 16 of
+64 heads owns whole groups and needs no collective of its own, `wo_b` row-parallel, the indexer's 32
+heads to 8 a rank, and three all-reduces a layer — the attention output, the ffn output, and a small
+`[1, 1, t]` for the indexer, whose score sums over heads. `wq_a` and `wkv` stay whole, for the
+reasons [the split](#the-split) gives. `DeviceRoutedExperts` is unchanged in shape and changed in
+owner: rank `r` holds experts `r`, `r + 4`, … by global id and returns its own partial, which the ffn
+all-reduce completes, with the host's summation moved into the collective.
+
+**The step.** `/tmp/probe_v41_tp4_e2e.py` runs the phases `/tmp/probe_v41_e2e.py` clocks with the tree
+on the cards, so the two tables read line for line. Uninstrumented, 22 threads, warm:
+
+| Context | Prefill | Prefill tok/s | Decode | in `DeviceRoutedExperts` | in the tree | Decode tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 tokens | 3.05 s | 2.6 | **746.8 ms** | 444.3 ms | 302.5 ms | 1.34 |
+| 128 tokens | 42.86 s | 3.0 | **722.0 ms** | 408.8 ms | 313.2 ms | 1.39 |
+
+against the **1.06–1.14 s a step** [the section above](#where-the-106-s-goes) records with the tree on
+the host. The tree and the glue around it went from 550–670 ms to **300–310 ms**, while the class's
+half is 409–444 ms here against the 0.48 s (0.30 staging, 0.03 upload, 0.15 launch) it was inside that
+1.06–1.14 s step — the same staging and the same launch, with the host's summation replaced by the
+ffn's collective. The tree's factor is **1.9× and not 4×**, which is what `probe_tp4_block.py` said
+before any of this ran: that cost is Python dispatch and small GEMVs, and a rank running a quarter of
+the launches on a quarter of the weights still runs a quarter of the launches at the same price each.
+Both lengths measure the same step — the 8-token row is the run's first and carries the per-process
+first-frame cost, which is why it is the larger of the two — because the experts are re-staged every
+row whatever is in the KV cache.
+
+**Where it goes.** With `_stage`, `_upload` and `_launch` wrapped as well (`--lengths 8,128`):
+
+| | 8 tokens | 128 tokens |
+| --- | ---: | ---: |
+| `_stage` | 224.7 ms | 256.0 ms |
+| `_upload` | 16.0 ms | 17.8 ms |
+| `_launch` | 192.9 ms | 177.6 ms |
+| unattributed inside the class | 59.3 ms | 39.7 ms |
+| whole step | 804.5 ms | 815.9 ms |
+
+Instrumenting costs 60–90 ms a step (746.8 uninstrumented against 804.5 instrumented, same probe, same
+prompt), so the unqualified numbers are the table above and this one is read for the split rather than
+the total: **the staging is the largest term inside the class** — 225–256 ms of the 805 ms step,
+ahead of the launch's 178–193 — and the class is the larger half of the step, 493 ms against the 312
+the tree and the glue around it cost. Prefill is unchanged and still the problem — 3.0 tok/s at 128
+tokens, 41.85 of its 42.86 s inside the class — because a prefill of `n` rows stages 4.2 GiB `n`
+times, and 128 rows is what it says it is.
+
+**The four ranks agree on the token by construction rather than by broadcast.** Each collective's
+result is identical on all four, the head and the embedding are replicated rather than cut, and a ring
+all-reduce sums in one order everywhere, so all four compute the same logits; greedy decoding is an
+argmax over that and needs no message to enforce what is already true. Every run above prints
+`The capital of France is Paris.<｜end▁of▁sentence｜>` on all four ranks, 3 tokens, `stopped on eos`,
+and the same text comes out of the `world=1` host run.
+
+### The 747 ms is a page-cache number, and this host does not keep the working set
+
+`DeviceRoutedExperts` stages out of the checkpoint mapping, so its cost is a function of what the page
+cache holds, and the class's own `_stage` line is the instrument that reads it off a run. That was
+worth one deliberate experiment, because the same 8-token row has since been measured on both sides of
+the line. `/tmp/fadvise_drop.py` issues `POSIX_FADV_DONTNEED` over the 48 shards — 475.25 GiB dropped
+in 13.9 s, and `/tmp/mincore_resident.py`, which counts resident pages with `mincore`, confirms
+**0.00 GiB** of the checkpoint left — and the same probe then measures:
+
+| 8 tokens, 22 threads | resident | dropped |
+| --- | ---: | ---: |
+| load, per rank | 23.3–24.4 s | 85.0–85.1 s |
+| `_stage` | 302.9–319.9 ms | **9911.7 ms** |
+| `_upload` | 15.4–16.0 ms | 25.7 ms |
+| `_launch` | 161.0–161.2 ms | 156.9 ms |
+| unattributed inside the class | 46.8–47.1 ms | 84.1 ms |
+| **whole step** | **826.7–878.0 ms** | **17013.4 ms** |
+
+`_upload` and `_launch` do not move — 16 ms and 161 ms either way — so the difference is not the
+cards, not the kernels and not the four links. It is one phase reading the same bytes off a disk
+instead of out of RAM, and at 40 rows a step it is the step. The same effect showed up first as an
+unexplained **15,654.7 ms** in a run whose page cache had gone cold on its own, with `stage` at
+8,998.8 ms and everything else where it belongs; the drop above is that reading made deliberate.
+
+The page cache on this host holds **68.39–99.93 GiB of the checkpoint's 475.25 GiB** (14.4–21.0%),
+measured with `mincore` after and before a run, and the reason is arithmetic: **457.78 GiB of this
+host's 1007 GiB is the resident bank's tmpfs segment**, which is not reclaimable with 8 GB of swap
+fully used, so the 475.25 GiB the expert path reads cannot fit beside it. The class's docstring
+already names the floor — a scattered expert row is **1308.0 ms** cold against 11.2 ms warm — and this
+is the step-level version of it: **19.4×**, on the same row, from the cache alone.
+
+None of that changes the measurement above it; it says which claim it is. The 722–747 ms step is the
+configuration where the expert source is in RAM, which is exactly the configuration the resident bank
+exists to produce and **the one `DeviceRoutedExperts` does not yet read from** — it stages out of the
+checkpoint mapping. Wiring the bank into it is [the first follow-on](#what-this-does-not-do-yet), and
+this table is what it is worth.
+
+### `--threads` is worth 1.13× with the source resident, and 6.8× without it
+
+`torch.distributed.run` sets `OMP_NUM_THREADS` to 1 for every worker unless the environment already
+had one, so the launcher takes `--threads` and says so out loud. Three tokens of `The capital of
+France is`, two runs each way in both orders, in one session:
+
+| `--threads` | resident bank on | off |
+| --- | ---: | ---: |
+| 22 | 5.7 s, 5.8 s | 6.5 s |
+| 1 | 6.6 s, 6.5 s | **44.1 s** |
+
+With the source resident the flag is worth **1.13×** — 5.7–5.8 s against 6.5–6.6 s, reproduced in both
+orders — and what it buys is host work: the gate, the head, the layer glue. Without the bank the same
+three tokens are 6.5 s at 22 threads and **44.1 s at one**, 14.70 s/token, because the per-row read
+out of `/mnt/data3` is serialized on a single thread. The launcher's docstring used to record this
+flag as 5.1 s against 6.6 s as if it were a thread effect; those two runs differed in the resident
+bank as well as the thread count, so what the pair measured was the disk. The table above is the
+controlled pair, and the 6.8× belongs to the configuration with no resident source rather than to the
+flag.
+
 ## What this does not do yet
 
-All three are separate measurements rather than separate opinions.
+All of these are separate measurements rather than separate opinions.
 
 - **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
   is refilled every row, so a prefill of `n` rows pays 4.20 GiB `n` times: the 5-token prefill above
@@ -419,8 +549,17 @@ All three are separate measurements rather than separate opinions.
   side would be fully hidden. It needs one more generation of the activation, the weights and the
   partials and it changes the shape of the row loop rather than any of its parts, so it is the next
   follow-on with its own measurement.
-- **The dense tree is still host code**, now the largest single term at 0.55–0.67 s of the 1.06–1.14 s
-  step — worth 0.4–0.6 s/token on its own.
+- **The staging reads the page cache and not a resident bank.** The class stages out of the
+  checkpoint mapping, so the step is 722–747 ms only while the host happens to hold the working set —
+  68–100 GiB of 475.25 GiB on this host, [measured above](#the-747-ms-is-a-page-cache-number-and-this-host-does-not-keep-the-working-set),
+  where the same row costs 19.4× more. `SharedCPUMoEWeightArena` already solves this shape for
+  V4-Flash (POSIX shared memory, one arena per rank, `pre_touch`/`mark_ready`), so the work is one
+  fp4-packed `build_specs` beside its int8 one and a stage that copies host RAM → pinned instead of
+  page cache → pinned. It is first because it is the difference between the 747 ms headline and a
+  number that holds after a reboot.
+- **The Engram tables are not resident.** `resident_engram=False` re-reads the shards on every
+  gather, which is the 253.4 s/table path the host page records, and 189.13 GiB is too much for four
+  ranks to hold each. One resident copy shared through the arena is the shape.
 
 ## Reproducing
 
@@ -468,6 +607,21 @@ PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_launc
 PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_first_tokens.py \
   --device cuda --world 4
 PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_first_tokens.py
+
+# the TP4 configuration: the tree on the four cards, one process per card, the same phase
+# attribution as above so the two tables read line for line
+torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8,128 --steps 8
+
+# ... and the same step with the page cache deliberately emptied first, which is the 17 s one --
+# `mincore_resident.py` counts resident pages, so run it before and after to see the two states
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/mincore_resident.py /mnt/data3/DeepSeek-V4.1-Flash
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/fadvise_drop.py /mnt/data3/DeepSeek-V4.1-Flash
+torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8 --steps 8
+
+# the checked-in TP4 launcher, which is what `--threads` is about
+torchrun --nproc_per_node=4 -m src.cli.generate_v41 \
+  --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" \
+  --max-new-tokens 3 --threads 22
 ```
 
 Each takes about 90 s, most of it the ~70 s load. The three probes that touch a card want all four
