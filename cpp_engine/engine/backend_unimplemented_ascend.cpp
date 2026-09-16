@@ -132,6 +132,10 @@ int PersistentEngine::max_slots() const {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
+bool PersistentEngine::batched_decode_enabled() const {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
 int PersistentEngine::prefill(const std::vector<int>&, const SamplingParams&) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
@@ -178,11 +182,11 @@ void PersistentEngine::warmup_tp() {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
-void PersistentEngine::worker_command_prefill(const std::vector<int>&) {
+void PersistentEngine::worker_command_prefill(const std::vector<int>&, int32_t) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
-void PersistentEngine::worker_command_decode(int32_t, int32_t) {
+void PersistentEngine::worker_command_decode(int32_t, int32_t, int32_t) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 
@@ -192,6 +196,10 @@ void PersistentEngine::worker_command_batch_decode(
 }
 
 void PersistentEngine::worker_command_reset() {
+    unimplemented("DeepSeek-V4 PersistentEngine");
+}
+
+void PersistentEngine::worker_command_reset_slot(int32_t) {
     unimplemented("DeepSeek-V4 PersistentEngine");
 }
 

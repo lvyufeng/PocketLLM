@@ -23,6 +23,12 @@ namespace pocket {
 struct SchedulerGenerationResult {
     uint64_t request_id = 0;
     std::vector<int> generated_tokens;
+    // Log probabilities for `generated_tokens`, one entry per token and in the
+    // same order, so the two can be indexed by position together. Empty when the
+    // request asked for none. The scheduler truncates it wherever it truncates
+    // the tokens, which is what keeps a client's stop sequence from leaving
+    // probabilities behind for text it never received.
+    std::vector<TokenLogprob> logprobs;
     std::string finish_reason;  // "stop", "length", "cancelled", or "error"
     // True when the final emitted token completed a TokenConstraint. Structured
     // output uses the same public "stop" finish reason, but this flag prevents
@@ -92,6 +98,9 @@ struct SchedulerRequest {
     std::string error;
     int last_token = 0;
     std::vector<int> generated_tokens;
+    // Log probabilities accumulated alongside `generated_tokens`, one per token.
+    // A request that asked for none carries an empty vector throughout.
+    std::vector<TokenLogprob> logprobs;
     int proposed_drafts = 0;
     int accepted_drafts = 0;
     int speculative_steps = 0;

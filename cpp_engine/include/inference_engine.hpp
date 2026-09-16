@@ -52,6 +52,30 @@ struct Capabilities {
     // When false, the server refuses requests with response_format rather than
     // returning unconstrained text.
     bool structured_outputs = false;
+    // Per-token log probabilities can be reported alongside each generated
+    // token. When false the engine cannot rank the alternatives at a position,
+    // so a server has to refuse a request that asks for them rather than
+    // returning a choice with no "logprobs" object on it.
+    bool logprobs = false;
+};
+
+// Per-token log probabilities for one generated position.
+//
+// The values describe the model's own next-token distribution: they are taken
+// from the raw logits, before the temperature and the top-k/top-p truncation
+// the sampler draws from, so they do not change with the request's sampling
+// parameters. `top_tokens` is ranked most likely first.
+struct TokenLogprob {
+    // False when the engine produced none for this position, which is every
+    // position of a request that did not ask for any.
+    bool present = false;
+    // The log probability of the token that was generated. Reported separately
+    // from `top_tokens` because the sampled token is not necessarily among the
+    // ranked entries when the request asked for fewer of them than the sampler
+    // kept as candidates.
+    float logprob = 0.0f;
+    std::vector<int> top_tokens;
+    std::vector<float> top_logprobs;
 };
 
 // One forward pass over one sequence.
@@ -72,6 +96,10 @@ struct ForwardResult {
     float top_logit = 0.0f;
     float checksum = 0.0f;
     int position = 0;
+    // Filled only when the request asked for log probabilities. A speculative
+    // step emits several tokens and reports the ranking for the last one, since
+    // that is the position `top_token` predicts from.
+    TokenLogprob logprob;
 };
 
 class TokenConstraint;
@@ -92,6 +120,13 @@ struct BatchSamplingParams {
     // Optional token-level constraint (e.g., JSON grammar). Non-owning pointer;
     // the scheduler owns the constraint lifetime via shared_ptr in SchedulerRequest.
     TokenConstraint* constraint = nullptr;
+    // How many alternatives to rank at each generated position, alongside the
+    // generated token's own log probability. 0 -- the default -- asks for
+    // neither and leaves the engine computing nothing. Only meaningful for an
+    // engine whose caps().logprobs is true; one that reports false produces no
+    // ranking whatever this says, which is why the server refuses such a request
+    // instead of forwarding it.
+    int logprobs_n = 0;
 };
 
 // Per-request state for batched continuous execution.
@@ -151,6 +186,12 @@ struct BatchDecodeResult {
     std::vector<int> accepted_drafts;
     std::vector<bool> used_speculative;
     std::vector<bool> rolled_back;
+    // Log probabilities for the row's first emitted token, parallel to
+    // `next_tokens` and empty when none were requested. A speculative row can
+    // emit several tokens in one step and only its first has an entry here; such
+    // a row belongs to a configuration whose caps().logprobs is false, so a row
+    // that asks for a ranking never emits more than one token at a time.
+    std::vector<TokenLogprob> logprobs;
     double seconds = 0.0;
 };
 

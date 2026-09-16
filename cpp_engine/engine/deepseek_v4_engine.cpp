@@ -1178,6 +1178,7 @@ struct DeviceContinuationWorkspace {
     int index_q_dim = 0;
     int index_head_dim = 0;
     int32_t* positions = nullptr;
+    int* row_kv_offsets = nullptr;
     int* token_ids = nullptr;
     float* x = nullptr;
     float* h4 = nullptr;
@@ -1227,7 +1228,7 @@ struct DeviceContinuationWorkspace {
         device_free(attn_out); device_free(compressor_input_bf16); device_free(compressor_input_rounded);
         device_free(compressor_kv); device_free(compressor_score); device_free(indexer_comp_kv);
         device_free(indexer_comp_score); device_free(index_q); device_free(index_scores);
-        device_free(positions); device_free(kv_row_starts); device_free(kv_indices);
+        device_free(positions); device_free(row_kv_offsets); device_free(kv_row_starts); device_free(kv_indices);
         device_free(ffn_x); device_free(ffn_norm);
         device_free(shared_gate); device_free(shared_up); device_free(shared_hidden); device_free(shared_out);
         device_free(moe); device_free(route_indices); device_free(route_weights); device_free(final_x);
@@ -1284,6 +1285,7 @@ struct DeviceContinuationWorkspace {
         if (index_q_dim > 0) alloc_f(&index_q, r * index_q_dim, "device_malloc continuation index q");
         alloc_f(&index_scores, static_cast<size_t>(max_indices + index_q_dim), "device_malloc continuation index scores");
         check_device(device_malloc_into(positions, r * sizeof(int32_t)), "device_malloc continuation positions");
+        alloc_i(&row_kv_offsets, r, "device_malloc continuation row kv offsets");
         check_device(device_malloc_into(kv_row_starts, (r + 1) * sizeof(int32_t)), "device_malloc continuation row starts");
         check_device(device_malloc_into(kv_indices, r * max_kv_indices * sizeof(int32_t)), "device_malloc continuation kv indices");
         alloc_f(&ffn_x, r * dim, "device_malloc continuation ffn x");
@@ -2796,6 +2798,17 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     int layer_count,
     int start_position);
 
+// Batched form. The rows need not form one contiguous position run and need not
+// share a request slot: a batched decode puts one row per independent request,
+// each at its own position, each with its own KV ring. The single-range overload
+// above is a thin wrapper over this one.
+ContinuationBatchResult run_safetensors_continuation_batch_impl(
+    SafeForwardContext& ctx,
+    const std::vector<int>& tokens,
+    int layer_count,
+    const std::vector<int>& slots,
+    const std::vector<int>& positions);
+
 DeepSeekV4Engine::DeepSeekV4Engine(const std::string& model_path) : gguf_(model_path), config_(ModelConfig::from_gguf(gguf_)) {}
 
 ForwardSmokeResult run_safetensors_min_layer_smoke(const std::string& ckpt_dir) {
@@ -3723,20 +3736,63 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(
     return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
 
+// Single-range form: one request's rows, at consecutive positions in one slot.
+// This is what the spec-verify path drives, so it must stay bit-identical to the
+// original implementation -- it does nothing but spell the old scalar
+// `start_position` out as the per-row table the general form already understands.
 ContinuationBatchResult run_safetensors_continuation_batch_impl(
         SafeForwardContext& ctx,
         const std::vector<int>& tokens,
         int layer_count,
         int start_position) {
+    std::vector<int> slots(tokens.size(), 0);
+    std::vector<int> positions(tokens.size(), 0);
+    for (size_t row = 0; row < tokens.size(); ++row) {
+        positions[row] = start_position + static_cast<int>(row);
+    }
+    return run_safetensors_continuation_batch_impl(ctx, tokens, layer_count, slots, positions);
+}
+
+ContinuationBatchResult run_safetensors_continuation_batch_impl(
+        SafeForwardContext& ctx,
+        const std::vector<int>& tokens,
+        int layer_count,
+        const std::vector<int>& slots,
+        const std::vector<int>& positions) {
     if (!device_runtime_available()) throw std::runtime_error("device runtime is not available");
     if (tokens.empty() || tokens.size() > DeviceContinuationWorkspace::kMaxRows) {
         throw std::runtime_error("continuation batch must contain 1..8 tokens");
     }
-    if (start_position < 0) throw std::runtime_error("negative continuation start position");
+    if (slots.size() != tokens.size() || positions.size() != tokens.size()) {
+        throw std::runtime_error("continuation batch slot/position table must match the token rows");
+    }
     if (layer_count <= 0) layer_count = 1;
     if (ctx.config.n_layers > 0) layer_count = std::min(layer_count, static_cast<int>(ctx.config.n_layers));
 
     const int rows = static_cast<int>(tokens.size());
+    const int max_slots = std::max(1, ctx.max_slots);
+    int max_position = 0;
+    for (int row = 0; row < rows; ++row) {
+        if (positions[static_cast<size_t>(row)] < 0) throw std::runtime_error("negative continuation position");
+        if (slots[static_cast<size_t>(row)] < 0 || slots[static_cast<size_t>(row)] >= max_slots) {
+            throw std::runtime_error("continuation row request slot out of range");
+        }
+        max_position = std::max(max_position, positions[static_cast<size_t>(row)]);
+    }
+    // Rows that share a slot are consecutive positions inside that request's own
+    // stream, so the first position of a slot's group is where the still-unpublished
+    // part of the group starts. With one slot and one contiguous run this is the
+    // old start_position, which is what makes the spec-verify path unchanged.
+    std::vector<int> group_start(static_cast<size_t>(rows), 0);
+    for (int row = 0; row < rows; ++row) {
+        int first_of_group = positions[static_cast<size_t>(row)];
+        for (int other = 0; other < rows; ++other) {
+            if (slots[static_cast<size_t>(other)] == slots[static_cast<size_t>(row)]) {
+                first_of_group = std::min(first_of_group, positions[static_cast<size_t>(other)]);
+            }
+        }
+        group_start[static_cast<size_t>(row)] = first_of_group;
+    }
     const int tp_world = std::max(1, ctx.options.tp_world);
     const int tp_rank = std::max(0, ctx.options.tp_rank);
     if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in continuation options");
@@ -3746,7 +3802,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     const int route_count = static_cast<int>(std::min<uint64_t>(
         ctx.config.n_activated_experts, ctx.config.n_routed_experts));
     AttentionSmokeDims dims = make_attention_dims(ctx.config, dim, tp_world,
-                                                  start_position + rows - 1);
+                                                  max_position);
     DeviceDenseModelCache& dense = ctx.dense_model_device_cache(tp_world, tp_rank, dim);
     const int max_compressed = std::max(1, (ctx.kv_cache_tokens + 3) / 4);
     const int max_keep = static_cast<int>(std::max<uint64_t>(1, ctx.config.index_topk));
@@ -3777,6 +3833,9 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
     const float attn_scale = 1.0f / std::sqrt(static_cast<float>(dims.head_dim));
 
     check_device(memcpy_h2d(w.token_ids, tokens.data(), static_cast<size_t>(rows) * sizeof(int)), "copy continuation token ids");
+    check_device(memcpy_h2d(w.positions, positions.data(),
+                            static_cast<size_t>(rows) * sizeof(int32_t)),
+                 "copy continuation row positions");
     if (!bf16_rows_to_float_cuda(dense.embed, w.token_ids, w.x, rows, dim)) {
         throw std::runtime_error("continuation embedding rows launch failed");
     }
@@ -3788,11 +3847,23 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         const std::string prefix = "layers." + std::to_string(li) + ".";
         DeviceAttentionCache& attn = ctx.attention_device_cache(li, tp_world, tp_rank, dims);
         DeviceHcCache& hc = ctx.hc_device_cache(li);
-        float* layer_kv = ctx.kv_cache_tokens > 0
-            ? ctx.kv_cache_for_layer(li, dims.head_dim) : nullptr;
-        if (layer_kv == nullptr) {
+        if (ctx.kv_cache_tokens <= 0) {
             throw std::runtime_error("continuation batch requires a live KV cache");
         }
+        // Every row reads and writes its own request's KV ring, so the ring base is
+        // per row. Carry it as an element offset into the layer storage: that is
+        // what the attention kernel indexes with, and it keeps the offset table
+        // independent of ring capacity.
+        const size_t kv_stride = ctx.kv_cache_stride_elements(li, dims.head_dim);
+        std::vector<int> row_kv_offsets(static_cast<size_t>(rows), 0);
+        for (int row = 0; row < rows; ++row) {
+            row_kv_offsets[static_cast<size_t>(row)] = static_cast<int>(
+                static_cast<size_t>(slots[static_cast<size_t>(row)]) * kv_stride);
+        }
+        check_device(memcpy_h2d(w.row_kv_offsets, row_kv_offsets.data(),
+                                static_cast<size_t>(rows) * sizeof(int)),
+                     "copy continuation row kv offsets");
+        float* layer_kv = ctx.kv_cache_for_layer(li, dims.head_dim);
         const uint64_t compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size()
             ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
         const float rope_theta = static_cast<float>(
@@ -3864,9 +3935,9 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                                           rows, dims.q_a_dim, 1e-6f) ||
             !fp8_e4m3_e8m0_matmul_cuda(w.q_norm, attn.wq_b, attn.wq_b_scale,
                                        w.q, rows, dims.q_dim, dims.q_a_dim) ||
-            !head_rmsnorm_rope_freqs_rows_cuda(w.q, inv_freqs, rows, dims.heads,
-                                               dims.head_dim, dims.rope_dim,
-                                               start_position, false, 1e-6f)) {
+            !head_rmsnorm_rope_freqs_rows_positions_cuda(
+                w.q, inv_freqs, w.positions, rows, dims.heads, dims.head_dim,
+                dims.rope_dim, false, 1e-6f)) {
             throw std::runtime_error("continuation Q projection rows launch failed");
         }
 
@@ -3913,10 +3984,9 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             if (!fp8_e4m3_e8m0_matmul_cuda(w.q_norm, idx.wq_b, idx.wq_b_scale,
                                            w.index_q, rows, idx_heads * idx_head_dim,
                                            dims.q_a_dim) ||
-                !head_rmsnorm_rope_freqs_rows_cuda(w.index_q, inv_freqs, rows,
-                                                   idx_heads, idx_head_dim,
-                                                   dims.rope_dim, start_position,
-                                                   false, 0.0f) ||
+                !head_rmsnorm_rope_freqs_rows_positions_cuda(
+                    w.index_q, inv_freqs, w.positions, rows, idx_heads,
+                    idx_head_dim, dims.rope_dim, false, 0.0f) ||
                 !hadamard128_rows_cuda(w.index_q, w.index_q, rows * idx_heads) ||
                 !fp4_fake_quant128_rows_cuda(w.index_q, rows * idx_heads)) {
                 throw std::runtime_error("continuation indexer query rows failed");
@@ -3927,15 +3997,28 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                                        w.kv_a, rows, dims.kv_dim, dim) ||
             !rmsnorm_bf16_gamma_rows_cuda(w.kv_a, attn.kv_norm, w.kv_norm,
                                           rows, dims.kv_dim, 1e-6f) ||
-            !head_rmsnorm_rope_freqs_rows_cuda(w.kv_norm, inv_freqs, rows, 1,
-                                               dims.head_dim, dims.rope_dim,
-                                               start_position, false, 0.0f) ||
+            !head_rmsnorm_rope_freqs_rows_positions_cuda(
+                w.kv_norm, inv_freqs, w.positions, rows, 1, dims.head_dim,
+                dims.rope_dim, false, 0.0f) ||
             !fp8_act_quant_dequant_rows_strided_cuda(
                 w.kv_norm, rows, dims.head_dim - dims.rope_dim,
                 dims.head_dim, 64)) {
             throw std::runtime_error("continuation KV projection rows launch failed");
         }
 
+        // `-2 - r` names row r of this batch, and the attention kernel resolves it
+        // against the whole batch's KV, so the encoding is batch-global rather
+        // than group-local. A row can only reference rows of its own slot, and
+        // only at positions its own slot actually holds here.
+        auto row_holding = [&](int slot, int position) {
+            for (int r = 0; r < rows; ++r) {
+                if (slots[static_cast<size_t>(r)] == slot &&
+                    positions[static_cast<size_t>(r)] == position) {
+                    return r;
+                }
+            }
+            return -1;
+        };
         std::vector<int32_t> row_starts(static_cast<size_t>(rows) + 1, 0);
         std::vector<int32_t> indices;
         std::vector<int> indexer_offsets(static_cast<size_t>(rows), -1);
@@ -3943,14 +4026,20 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         indices.reserve(static_cast<size_t>(rows) * w.max_kv_indices);
         int max_count = 0;
         for (int row = 0; row < rows; ++row) {
-            const int position = start_position + row;
+            const int position = positions[static_cast<size_t>(row)];
+            const int group_pos = group_start[static_cast<size_t>(row)];
             const int first = std::max(0, position - dims.window_size + 1);
-            const int history_end = std::min(start_position, position + 1);
+            const int history_end = std::min(group_pos, position + 1);
             for (int p = first; p < history_end; ++p) {
                 indices.push_back(p % dims.window_size);
             }
-            for (int p = std::max(first, start_position); p <= position; ++p) {
-                indices.push_back(-2 - (p - start_position));
+            for (int p = std::max(first, group_pos); p <= position; ++p) {
+                const int source = row_holding(slots[static_cast<size_t>(row)], p);
+                if (source < 0) {
+                    throw std::runtime_error(
+                        "continuation batch: one slot's rows must be consecutive positions");
+                }
+                indices.push_back(-2 - source);
             }
             if (compress_ratio > 0) {
                 const int ready = (position + 1) / static_cast<int>(compress_ratio);
@@ -3989,12 +4078,13 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             for (int row = 0; row < rows; ++row) {
                 const int keep = indexer_counts[static_cast<size_t>(row)];
                 if (keep <= 0) continue;
-                const int ready = (start_position + row + 1) / 4;
+                const int ready = (positions[static_cast<size_t>(row)] + 1) / 4;
                 const int available = std::min(ready,
                     std::max(0, ctx.kv_cache_capacity_for_layer(li) - dims.window_size));
                 if (!indexer_select_topk_cuda(
                         w.index_q + static_cast<size_t>(row) * idx_heads * idx_head_dim,
-                        ctx.indexer_kv_cache_for_layer(li, idx_head_dim),
+                        ctx.indexer_kv_cache_for_layer(
+                            li, idx_head_dim, slots[static_cast<size_t>(row)]),
                         idx.weights_proj,
                         w.x + static_cast<size_t>(row) * dim,
                         w.index_scores,
@@ -4007,14 +4097,14 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             }
         }
         if (!indexed_cached_attention_rows_batch_kv_cuda(
-                w.q, layer_kv, w.kv_norm, w.kv_row_starts, w.kv_indices,
-                attn.attn_sink, w.attn_value, rows, dims.heads, dims.head_dim,
-                max_count, attn_scale)) {
+                w.q, layer_kv, w.row_kv_offsets, w.kv_norm, w.kv_row_starts,
+                w.kv_indices, attn.attn_sink, w.attn_value, rows, dims.heads,
+                dims.head_dim, max_count, attn_scale)) {
             throw std::runtime_error("continuation indexed attention rows launch failed");
         }
-        if (!head_rmsnorm_rope_freqs_rows_cuda(
-                w.attn_value, inv_freqs, rows, dims.heads, dims.head_dim,
-                dims.rope_dim, start_position, true, 0.0f)) {
+        if (!head_rmsnorm_rope_freqs_rows_positions_cuda(
+                w.attn_value, inv_freqs, w.positions, rows, dims.heads,
+                dims.head_dim, dims.rope_dim, true, 0.0f)) {
             throw std::runtime_error("continuation attention inverse rope rows launch failed");
         }
         for (int g = 0; g < dims.groups; ++g) {
@@ -4244,12 +4334,17 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         // logits independent of rejected suffix token contents.
         if (comp_state != nullptr) {
             for (int row = 0; row < rows; ++row) {
-                const int position = start_position + row;
+                const int position = positions[static_cast<size_t>(row)];
+                // Streaming compressor state is per request: two requests in the
+                // same batch must not share a ring, or one request's step boundary
+                // would shift the other's state.
+                float* state_kv = comp_state->kv_for_request(slots[static_cast<size_t>(row)]);
+                float* state_score = comp_state->score_for_request(slots[static_cast<size_t>(row)]);
                 const int offset = position % comp_ratio;
                 const int write_slot = comp_overlap ? comp_ratio + offset : offset;
-                float* kv_slot = comp_state->kv +
+                float* kv_slot = state_kv +
                     static_cast<size_t>(write_slot) * comp_state_cols;
-                float* score_slot = comp_state->score +
+                float* score_slot = state_score +
                     static_cast<size_t>(write_slot) * comp_state_cols;
                 ctx.continuation_journal.record(kv_slot,
                     static_cast<size_t>(comp_state_cols) * sizeof(float), row);
@@ -4259,7 +4354,7 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                         w.compressor_kv + static_cast<size_t>(row) * comp_cols,
                         w.compressor_score + static_cast<size_t>(row) * comp_cols,
                         comp_cache->ape + static_cast<size_t>(offset) * comp_cols,
-                        comp_state->kv, comp_state->score, offset, write_slot,
+                        state_kv, state_score, offset, write_slot,
                         comp_state_cols)) {
                     throw std::runtime_error("continuation compressor state update failed");
                 }
@@ -4267,10 +4362,16 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                 const int compressed_slot = dims.window_size + position / comp_ratio;
                 if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
                     float* pooled = layer_kv +
+                        static_cast<size_t>(row_kv_offsets[static_cast<size_t>(row)]) +
                         static_cast<size_t>(compressed_slot) * dims.head_dim;
                     ctx.continuation_journal.record(pooled,
                         static_cast<size_t>(dims.head_dim) * sizeof(float), row);
-                    if (!compressor_pool_cuda(comp_state->kv, comp_state->score,
+                    // Pool from this row's ring, not the cache base: the base
+                    // pointer is slot 0, so a slot-1 row would pool another
+                    // request's accumulator and publish it as its own compressed
+                    // KV. The update above already writes the row's ring; this
+                    // has to read the same one.
+                    if (!compressor_pool_cuda(state_kv, state_score,
                                               pooled, comp_ratio, dims.head_dim,
                                               comp_state_cols, comp_overlap) ||
                         !rmsnorm_bf16_gamma_cuda(pooled, comp_cache->norm, pooled,
@@ -4294,11 +4395,11 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                     const size_t state_bytes = static_cast<size_t>(comp_slots) *
                         comp_state_cols * sizeof(float);
                     ctx.continuation_journal.record(
-                        comp_state->kv, state_bytes, row);
+                        state_kv, state_bytes, row);
                     ctx.continuation_journal.record(
-                        comp_state->score, state_bytes, row);
+                        state_score, state_bytes, row);
                     if (!compressor_shift_overlap_state_cuda(
-                            comp_state->kv, comp_state->score, comp_ratio,
+                            state_kv, state_score, comp_ratio,
                             comp_state_cols)) {
                         throw std::runtime_error("continuation compressor overlap shift failed");
                     }
@@ -4321,12 +4422,14 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
             DeviceCompressorState& idx_state =
                 ctx.indexer_compressor_state_for_layer(li, idx_slots, idx_state_cols);
             for (int row = 0; row < rows; ++row) {
-                const int position = start_position + row;
+                const int position = positions[static_cast<size_t>(row)];
+                float* state_kv = idx_state.kv_for_request(slots[static_cast<size_t>(row)]);
+                float* state_score = idx_state.score_for_request(slots[static_cast<size_t>(row)]);
                 const int offset = position % 4;
                 const int write_slot = idx_overlap ? 4 + offset : offset;
-                float* kv_slot = idx_state.kv +
+                float* kv_slot = state_kv +
                     static_cast<size_t>(write_slot) * idx_state_cols;
-                float* score_slot = idx_state.score +
+                float* score_slot = state_score +
                     static_cast<size_t>(write_slot) * idx_state_cols;
                 ctx.continuation_journal.record(kv_slot,
                     static_cast<size_t>(idx_state_cols) * sizeof(float), row);
@@ -4336,18 +4439,18 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                         w.indexer_comp_kv + static_cast<size_t>(row) * idx_cols,
                         w.indexer_comp_score + static_cast<size_t>(row) * idx_cols,
                         idx_comp.ape + static_cast<size_t>(offset) * idx_cols,
-                        idx_state.kv, idx_state.score, offset, write_slot,
+                        state_kv, state_score, offset, write_slot,
                         idx_state_cols)) {
                     throw std::runtime_error("continuation indexer compressor state update failed");
                 }
                 if ((position + 1) % 4 != 0) continue;
-                float* idx_cache =
-                    ctx.indexer_kv_cache_for_layer(li, idx_head_dim);
+                float* idx_cache = ctx.indexer_kv_cache_for_layer(
+                    li, idx_head_dim, slots[static_cast<size_t>(row)]);
                 float* idx_slot = idx_cache +
                     static_cast<size_t>(position / 4) * idx_head_dim;
                 ctx.continuation_journal.record(idx_slot,
                     static_cast<size_t>(idx_head_dim) * sizeof(float), row);
-                if (!compressor_pool_cuda(idx_state.kv, idx_state.score, idx_slot,
+                if (!compressor_pool_cuda(state_kv, state_score, idx_slot,
                                           4, idx_head_dim, idx_state_cols,
                                           idx_overlap) ||
                     !rmsnorm_bf16_gamma_cuda(idx_slot, idx_comp.norm, idx_slot,
@@ -4370,11 +4473,11 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
                     const size_t state_bytes = static_cast<size_t>(idx_slots) *
                         idx_state_cols * sizeof(float);
                     ctx.continuation_journal.record(
-                        idx_state.kv, state_bytes, row);
+                        state_kv, state_bytes, row);
                     ctx.continuation_journal.record(
-                        idx_state.score, state_bytes, row);
+                        state_score, state_bytes, row);
                     if (!compressor_shift_overlap_state_cuda(
-                            idx_state.kv, idx_state.score, 4, idx_state_cols)) {
+                            state_kv, state_score, 4, idx_state_cols)) {
                         throw std::runtime_error("continuation indexer overlap shift failed");
                     }
                 }
@@ -4384,10 +4487,13 @@ ContinuationBatchResult run_safetensors_continuation_batch_impl(
         // Publish the whole input block only after every row has read the old
         // ring plus batch-local KV. Journal each physical slot immediately before
         // its row overwrites it, so wraparound within the block is reversible in
-        // exact row order.
+        // exact row order. Rows of different requests land in different rings, so
+        // the only wraparound a row can publish over is its own request's.
         for (int row = 0; row < rows; ++row) {
-            const int slot = (start_position + row) % dims.window_size;
-            float* destination = layer_kv + static_cast<size_t>(slot) * dims.head_dim;
+            const int ring_slot = positions[static_cast<size_t>(row)] % dims.window_size;
+            float* destination = layer_kv +
+                static_cast<size_t>(row_kv_offsets[static_cast<size_t>(row)]) +
+                static_cast<size_t>(ring_slot) * dims.head_dim;
             ctx.continuation_journal.record(
                 destination, static_cast<size_t>(dims.head_dim) * sizeof(float), row);
             check_device(memcpy_d2d(destination,
@@ -4949,18 +5055,24 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
         const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
         const int expert_start = ctx.options.tp_rank * experts_per_rank;
         const int expert_end = ctx.options.tp_world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
-        std::vector<int64_t> route_indices;
         std::vector<Fp4View> active_w1;
         std::vector<Fp4View> active_w2;
         std::vector<Fp4View> active_w3;
-        route_indices.reserve(routed.size());
         active_w1.reserve(routed.size());
         active_w2.reserve(routed.size());
         active_w3.reserve(routed.size());
         std::vector<int> active_local_ids;
-        for (const RoutedExpert& route : routed) {
+        std::vector<size_t> active_route_positions;
+        // The decode MoE kernels read d_route_weights[route] for every route they
+        // are launched over and skip the experts that are not on this rank, so the
+        // index buffer has to stay in the gate's route order -- the weights are not
+        // filtered with it. Compacting the indices alone (as this used to do) moved
+        // every weight onto the wrong expert and re-ran whatever local expert the
+        // gate had left in the tail past the filtered count.
+        for (size_t ri = 0; ri < routed.size(); ++ri) {
+            const RoutedExpert& route = routed[ri];
             if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
-            route_indices.push_back(route.id);
+            active_route_positions.push_back(ri);
             active_local_ids.push_back(route.id - expert_start);
             active_w1.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight"));
             active_w2.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight"));
@@ -4978,7 +5090,14 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
             sample.s3_bytes = active_w3.front().s->nbytes;
             active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, use_sparse_arena ? sparse_slots_per_layer : experts_per_rank, sample, use_sparse_arena);
             if (moe_stage_event_recorded) check_device(stream_wait_event(moe_copy_stream, moe_stage_event), "wait prior moe stage event");
-            std::vector<int64_t> route_indices_kernel = route_indices;
+            // Sparse-slot indices address arena slots rather than expert ids, so a
+            // route this rank does not own holds no valid slot and is marked
+            // invalid instead of keeping the raw gate id, which would name a slot
+            // holding a different expert.
+            std::vector<int64_t> route_indices_kernel =
+                use_sparse_arena
+                    ? std::vector<int64_t>(selected_route_ids.size(), static_cast<int64_t>(-1))
+                    : selected_route_ids;
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
                 const int local = active_local_ids[ri];
                 int slot = local;
@@ -4987,7 +5106,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(
                     bool already_staged = false;
                     slot = ctx.acquire_sparse_slot(*active_arena, local, already_staged);
                     need_stage = !already_staged;
-                    route_indices_kernel[ri] = static_cast<int64_t>(expert_start + slot);
+                    route_indices_kernel[active_route_positions[ri]] = static_cast<int64_t>(expert_start + slot);
                 } else {
                     need_stage = active_arena->staged_local.insert(local).second;
                 }
@@ -10555,6 +10674,10 @@ struct PersistentEngine::State {
     std::mt19937 rng{0xDEEDBEEFu};
     uint64_t rng_seed = 0;
     std::unique_ptr<CmdChannel> cmd;
+    // How many batch_decode_step() calls took the batched forward. Diagnostic
+    // only: it is what lets a test tell that the POCKETLLM_CPP_BATCHED_DECODE arm
+    // it just ran was the arm it meant to run rather than the serial fallback.
+    int64_t batched_decode_steps = 0;
     // Per-draft-token hiddens from the last verify_step, [draft_len, stride].
     std::vector<float> verify_dspark_hidden;
     // Full hidden block held while a batched continuation transaction is pending.
@@ -10660,6 +10783,12 @@ void PersistentEngine::reset_slot(int slot_id) {
 
 int PersistentEngine::max_slots() const { return state_->max_slots; }
 
+bool PersistentEngine::batched_decode_enabled() const {
+    // The same switch batch_decode_step() reads. Asked through the accessor so
+    // the capability report and the code path can never disagree about it.
+    return env_int_or_default("POCKETLLM_CPP_BATCHED_DECODE", 0) != 0;
+}
+
 void PersistentEngine::claim_slot(int slot_id, uint64_t request_id) {
     auto& s = *state_;
     if (slot_id < 0 || slot_id >= s.max_slots || request_id == 0) {
@@ -10703,6 +10832,61 @@ void record_topk_diag(ForwardSlotState& slot, const float* values, int count,
     }
 }
 
+int argmax_token(const float* values, int count, int base_token) {
+    int best = base_token;
+    float best_v = -INFINITY;
+    for (int i = 0; i < count; ++i) {
+        if (values[i] > best_v) {
+            best_v = values[i];
+            best = base_token + i;
+        }
+    }
+    return best;
+}
+
+// The one place that knows the token-selection NCCL protocol. `values` is this
+// rank's logits: a contiguous vocabulary slice when TP is off, or a full
+// vocabularies worth of rows to gather when it is on. Rank 0 chooses, then every
+// rank takes the same broadcast, so the collective sequence does not depend on
+// the sampling mode. `diag_slot` is optional and only feeds the top-k diagnostic.
+int pick_token(const float* values, int count, int base_token,
+               const ForwardSmokeOptions& opts, const SamplingParams& sp,
+               std::mt19937& rng, ForwardSlotState* diag_slot) {
+    if (values == nullptr || count <= 0) throw std::runtime_error("pick_token: empty logits");
+    const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
+    const int topk_diag = env_int_or_default("POCKETLLM_CPP_TOPK_DIAG", 0);
+
+#ifdef POCKET_HAVE_TP_COMM
+    if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
+        std::vector<float> all;
+        if (opts.tp_rank == 0) all.resize(static_cast<size_t>(opts.tp_world) * static_cast<size_t>(count));
+        tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
+                                   opts.nccl_id_path.c_str(), values, count,
+                                   opts.tp_rank == 0 ? all.data() : nullptr, 0);
+        int32_t token_buf[1] = {0};
+        if (opts.tp_rank == 0) {
+            const int vocab = static_cast<int>(all.size());
+            // The gather is rank-major and the shards are contiguous vocabulary
+            // ranges, so index i in `all` is token id i.
+            if (diag_slot != nullptr && topk_diag > 0) {
+                record_topk_diag(*diag_slot, all.data(), vocab, 0, topk_diag);
+            }
+            token_buf[0] = greedy
+                ? argmax_token(all.data(), vocab, 0)
+                : sample_token_top_p(all.data(), vocab, sp.temperature, sp.top_p, rng);
+        }
+        tp_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
+                             opts.nccl_id_path.c_str(), token_buf, 1, 0);
+        return token_buf[0];
+    }
+#endif
+    if (diag_slot != nullptr && topk_diag > 0) {
+        record_topk_diag(*diag_slot, values, count, base_token, topk_diag);
+    }
+    return greedy ? argmax_token(values, count, base_token)
+                  : sample_token_top_p(values, count, sp.temperature, sp.top_p, rng);
+}
+
 int select_token_for_slot(SafeForwardContext& ctx,
                           const ForwardSmokeOptions& opts,
                           const SamplingParams& sp,
@@ -10711,56 +10895,8 @@ int select_token_for_slot(SafeForwardContext& ctx,
     ForwardSlotState& slot = ctx.slot_state_for(slot_id);
     const int local = static_cast<int>(slot.last_local_logits.size());
     if (local <= 0) throw std::runtime_error("select_token: empty local logits");
-    const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
-    const int topk_diag = env_int_or_default("POCKETLLM_CPP_TOPK_DIAG", 0);
-
-#ifdef POCKET_HAVE_TP_COMM
-    if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
-        std::vector<float> all;
-        if (opts.tp_rank == 0) all.resize(static_cast<size_t>(opts.tp_world) * static_cast<size_t>(local));
-        tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
-                                   opts.nccl_id_path.c_str(),
-                                   slot.last_local_logits.data(), local,
-                                   opts.tp_rank == 0 ? all.data() : nullptr, 0);
-        int32_t token_buf[1] = {0};
-        if (opts.tp_rank == 0) {
-            const int vocab = static_cast<int>(all.size());
-            // The gather is rank-major and the shards are contiguous vocabulary
-            // ranges, so index i in `all` is token id i.
-            if (topk_diag > 0) record_topk_diag(slot, all.data(), vocab, 0, topk_diag);
-            if (greedy) {
-                int best = 0;
-                float best_v = all[0];
-                for (int i = 1; i < vocab; ++i) {
-                    if (all[i] > best_v) { best_v = all[i]; best = i; }
-                }
-                token_buf[0] = best;
-            } else {
-                token_buf[0] = sample_token_top_p(all.data(), vocab, sp.temperature, sp.top_p, rng);
-            }
-        }
-        tp_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
-                             opts.nccl_id_path.c_str(), token_buf, 1, 0);
-        return token_buf[0];
-    }
-#endif
-    if (topk_diag > 0) {
-        record_topk_diag(slot, slot.last_local_logits.data(), local,
-                         slot.last_local_head_start, topk_diag);
-    }
-    if (greedy) {
-        int best = slot.last_local_head_start;
-        float best_v = -INFINITY;
-        for (int i = 0; i < local; ++i) {
-            if (slot.last_local_logits[i] > best_v) {
-                best_v = slot.last_local_logits[i];
-                best = slot.last_local_head_start + i;
-            }
-        }
-        return best;
-    }
-    return sample_token_top_p(slot.last_local_logits.data(), local,
-                              sp.temperature, sp.top_p, rng);
+    return pick_token(slot.last_local_logits.data(), local,
+                      slot.last_local_head_start, opts, sp, rng, &slot);
 }
 
 int select_token(SafeForwardContext& ctx, const ForwardSmokeOptions& opts,
@@ -10790,79 +10926,69 @@ void publish_continuation_seed_hidden(SafeForwardContext& ctx,
     ctx.dspark_hidden_positions = 1;
 }
 
-std::vector<int> select_continuation_tokens(const ContinuationBatchResult& result,
-                                            const ForwardSmokeOptions& opts,
-                                            const SamplingParams& sp,
-                                            std::mt19937& rng) {
+// Row-batched selection. Every row carries its own SamplingParams and its own
+// RNG, because in a batched decode the rows are independent requests: sharing one
+// sampler across them would make one request's tokens depend on how many the
+// other drew. Spec verify passes the same params and the same RNG for every row,
+// which is what the wrapper below does, so its row order still drives the RNG
+// exactly as before.
+//
+// `diag_ctx` / `diag_slots` are optional and only feed the POCKETLLM_CPP_TOPK_DIAG
+// recording: a row's top-k lands on its own slot's state, so the token a run chose
+// and the ranking behind it can be read per row rather than only for row 0.
+std::vector<int> select_continuation_tokens_rows(
+    const ContinuationBatchResult& result,
+    const ForwardSmokeOptions& opts,
+    const std::vector<SamplingParams>& sps,
+    const std::vector<std::mt19937*>& rngs,
+    SafeForwardContext* diag_ctx = nullptr,
+    const std::vector<int>* diag_slots = nullptr) {
     if (result.rows <= 0 || result.local_head_rows <= 0 ||
         result.local_logits.size() !=
             static_cast<size_t>(result.rows) * result.local_head_rows) {
         throw std::runtime_error("select_continuation_tokens: invalid logits shape");
     }
-    const bool greedy = sp.greedy || sp.temperature <= 1.0e-5f;
-    std::vector<int> tokens(static_cast<size_t>(result.rows));
-
-#ifdef POCKET_HAVE_TP_COMM
-    if (opts.tp_world > 1 && !opts.nccl_id_path.empty()) {
-        std::vector<float> gathered;
-        if (opts.tp_rank == 0) {
-            gathered.resize(static_cast<size_t>(opts.tp_world) * result.local_head_rows);
-        }
-        std::vector<float> full_logits;
-        if (opts.tp_rank == 0) {
-            full_logits.resize(static_cast<size_t>(opts.tp_world) * result.local_head_rows);
-        }
-        for (int row = 0; row < result.rows; ++row) {
-            const float* local = result.local_logits.data() +
-                static_cast<size_t>(row) * result.local_head_rows;
-            tp_gather_floats_to_root(opts.tp_world, opts.tp_rank, opts.device,
-                                       opts.nccl_id_path.c_str(), local,
-                                       result.local_head_rows,
-                                       opts.tp_rank == 0 ? gathered.data() : nullptr, 0);
-            int32_t token_buf[1] = {0};
-            if (opts.tp_rank == 0) {
-                // The gather is rank-major, matching contiguous vocabulary shards.
-                full_logits = gathered;
-                const int vocab = static_cast<int>(full_logits.size());
-                if (greedy) {
-                    int best = 0;
-                    float best_v = full_logits[0];
-                    for (int i = 1; i < vocab; ++i) {
-                        if (full_logits[i] > best_v) { best_v = full_logits[i]; best = i; }
-                    }
-                    token_buf[0] = best;
-                } else {
-                    token_buf[0] = sample_token_top_p(
-                        full_logits.data(), vocab, sp.temperature, sp.top_p, rng);
-                }
-            }
-            tp_broadcast_int32(opts.tp_world, opts.tp_rank, opts.device,
-                                 opts.nccl_id_path.c_str(), token_buf, 1, 0);
-            tokens[static_cast<size_t>(row)] = token_buf[0];
-        }
-        return tokens;
+    if (sps.size() != static_cast<size_t>(result.rows) ||
+        rngs.size() != static_cast<size_t>(result.rows)) {
+        throw std::runtime_error("select_continuation_tokens: per-row sampler shape mismatch");
     }
-#endif
-
+    if (diag_ctx != nullptr && diag_slots != nullptr &&
+        diag_slots->size() != static_cast<size_t>(result.rows)) {
+        throw std::runtime_error("select_continuation_tokens: per-row diagnostic shape mismatch");
+    }
+    std::vector<int> tokens(static_cast<size_t>(result.rows));
     for (int row = 0; row < result.rows; ++row) {
         const float* local = result.local_logits.data() +
             static_cast<size_t>(row) * result.local_head_rows;
-        if (greedy) {
-            int best = result.local_head_start;
-            float best_v = -INFINITY;
-            for (int i = 0; i < result.local_head_rows; ++i) {
-                if (local[i] > best_v) {
-                    best_v = local[i];
-                    best = result.local_head_start + i;
-                }
-            }
-            tokens[static_cast<size_t>(row)] = best;
-        } else {
-            tokens[static_cast<size_t>(row)] = sample_token_top_p(
-                local, result.local_head_rows, sp.temperature, sp.top_p, rng);
+        if (rngs[static_cast<size_t>(row)] == nullptr) {
+            throw std::runtime_error("select_continuation_tokens: null row RNG");
         }
+        ForwardSlotState* diag = nullptr;
+        if (diag_ctx != nullptr && diag_slots != nullptr) {
+            diag = &diag_ctx->slot_state_for((*diag_slots)[static_cast<size_t>(row)]);
+        }
+        tokens[static_cast<size_t>(row)] = pick_token(
+            local, result.local_head_rows, result.local_head_start, opts,
+            sps[static_cast<size_t>(row)], *rngs[static_cast<size_t>(row)], diag);
     }
     return tokens;
+}
+
+// Single-slot wrapper: every row belongs to the same request, which is what spec
+// verify is. It records the diagnostic on that one slot, as the per-token path
+// does.
+std::vector<int> select_continuation_tokens(const ContinuationBatchResult& result,
+                                            const ForwardSmokeOptions& opts,
+                                            const SamplingParams& sp,
+                                            std::mt19937& rng,
+                                            SafeForwardContext& ctx,
+                                            int slot_id) {
+    const std::vector<int> slots(static_cast<size_t>(result.rows), slot_id);
+    return select_continuation_tokens_rows(
+        result, opts,
+        std::vector<SamplingParams>(static_cast<size_t>(result.rows), sp),
+        std::vector<std::mt19937*>(static_cast<size_t>(result.rows), &rng),
+        &ctx, &slots);
 }
 
 void maybe_reseed(uint64_t seed, uint64_t& current_seed, std::mt19937& rng) {
@@ -10922,12 +11048,9 @@ int PersistentEngine::decode_step(int last_token, int position, const SamplingPa
     return token;
 }
 
-std::vector<int> PersistentEngine::batch_decode_step(
-    const std::vector<PersistentBatchRequest>& requests) {
-    auto& s = *state_;
-    auto& ctx = *s.ctx;
-    ctx.options = s.opts;
-
+void PersistentEngine::validate_batch_decode_requests(
+    const std::vector<PersistentBatchRequest>& requests) const {
+    const auto& s = *state_;
     if (requests.empty()) {
         throw std::runtime_error("batch_decode_step: empty requests");
     }
@@ -10946,25 +11069,110 @@ std::vector<int> PersistentEngine::batch_decode_step(
         }
         slot_used[static_cast<size_t>(req.slot_id)] = true;
     }
+}
 
-    // For now, use sequential decode as a safe implementation
-    // TODO: Implement true batched forward using continuation_batch_impl
+std::vector<int> PersistentEngine::batch_decode_step(
+    const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+
+    validate_batch_decode_requests(requests);
+
+    // Serial by default: one forward per request. It is the reference the
+    // batched path has to match, and the only option while the batched forward
+    // is still being validated against it.
+    //
+    // This switch is read here and nowhere else. Its value leaves rank 0 as one
+    // ::DecodeStep per row (serial) or one ::BatchDecode for the whole batch
+    // (batched), and that command is what a worker obeys.
+    const bool batched = env_int_or_default("POCKETLLM_CPP_BATCHED_DECODE", 0) != 0 &&
+                         requests.size() > 1;
+
     std::vector<int> result_tokens;
     result_tokens.reserve(requests.size());
 
+    if (!batched) {
+        for (const auto& req : requests) {
+            auto& slot = s.slots[static_cast<size_t>(req.slot_id)];
+            maybe_reseed(req.sampling.seed, slot.rng_seed, slot.rng);
+
+            worker_command_decode(req.last_token, req.position, req.slot_id);
+            (void)run_safetensors_token_forward_impl(ctx, req.last_token, s.layer_count,
+                                                     req.position, req.slot_id);
+            const int token = select_token_for_slot(ctx, s.opts, req.sampling, slot.rng, req.slot_id);
+            slot.position = req.position + 1;
+            result_tokens.push_back(token);
+        }
+        return result_tokens;
+    }
+
+    return batch_decode_step_batched(requests);
+}
+
+std::vector<int> PersistentEngine::batch_decode_step_batched(
+    const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    auto& ctx = *s.ctx;
+    ctx.options = s.opts;
+    validate_batch_decode_requests(requests);
+
+    // Batched: one row per request, each at its own position and in its own
+    // request slot, so N independent requests advance in a single forward. A
+    // single-request batch stays on the serial path on purpose -- the batched
+    // forward shares `continuation_journal` and the row-keyed continuation
+    // workspace with spec verify, and spec verify is a one-request caller.
+    std::vector<int> row_tokens;
+    std::vector<int> row_slots;
+    std::vector<int> row_positions;
+    std::vector<SamplingParams> row_samplers;
+    std::vector<std::mt19937*> row_rngs;
+    row_tokens.reserve(requests.size());
+    row_slots.reserve(requests.size());
+    row_positions.reserve(requests.size());
+    row_samplers.reserve(requests.size());
+    row_rngs.reserve(requests.size());
     for (const auto& req : requests) {
         auto& slot = s.slots[static_cast<size_t>(req.slot_id)];
         maybe_reseed(req.sampling.seed, slot.rng_seed, slot.rng);
-
-        worker_command_decode(req.last_token, req.position);
-        (void)run_safetensors_token_forward_impl(ctx, req.last_token, s.layer_count,
-                                                 req.position, req.slot_id);
-        const int token = select_token_for_slot(ctx, s.opts, req.sampling, slot.rng, req.slot_id);
-        slot.position = req.position + 1;
-        result_tokens.push_back(token);
+        row_tokens.push_back(req.last_token);
+        row_slots.push_back(req.slot_id);
+        row_positions.push_back(req.position);
+        row_samplers.push_back(req.sampling);
+        row_rngs.push_back(&slot.rng);
     }
 
-    return result_tokens;
+    worker_command_batch_decode(requests);
+    ++s.batched_decode_steps;
+    ContinuationBatchResult result;
+    try {
+        result = run_safetensors_continuation_batch_impl(ctx, row_tokens, s.layer_count,
+                                                         row_slots, row_positions);
+    } catch (...) {
+        // Workers that already entered the batched forward are left holding the
+        // journal transaction this rank just abandoned; release it with the same
+        // zero-row finalize the batch-verify failure path uses.
+        ctx.continuation_journal.abort_noexcept();
+        worker_command_finalize_batch_verify(0);
+        throw;
+    }
+    std::vector<int> next_tokens;
+    try {
+        next_tokens = select_continuation_tokens_rows(result, s.opts, row_samplers,
+                                                      row_rngs, &ctx, &row_slots);
+    } catch (...) {
+        ctx.continuation_journal.abort_noexcept();
+        worker_command_finalize_batch_verify(0);
+        throw;
+    }
+    // Every row of a batched decode is committed, so there is no accepted-prefix
+    // rollback here -- just the publish, in row order, exactly as spec verify
+    // does when its whole block is accepted.
+    ctx.continuation_journal.finalize(result.rows);
+    for (const auto& req : requests) {
+        s.slots[static_cast<size_t>(req.slot_id)].position = req.position + 1;
+    }
+    return next_tokens;
 }
 
 // Verify a block of draft tokens: forward each one and report what the target
@@ -11049,7 +11257,7 @@ std::vector<int> PersistentEngine::batch_verify_step(
     }
     std::vector<int> next_tokens;
     try {
-        next_tokens = select_continuation_tokens(result, s.opts, sp, slot.rng);
+        next_tokens = select_continuation_tokens(result, s.opts, sp, slot.rng, ctx, 0);
         slot.pending_batch_dspark_hidden = std::move(result.dspark_hidden);
         slot.pending_batch_rows = result.rows;
     } catch (...) {
@@ -11222,12 +11430,16 @@ const std::vector<float>& PersistentEngine::last_verify_dspark_hidden() const {
     return state_->slots[0].verify_dspark_hidden_slots;
 }
 
-const std::vector<int>& PersistentEngine::last_topk_tokens() const {
-    return state_->ctx->slot_state_for(0).last_topk_tokens;
+const std::vector<int>& PersistentEngine::last_topk_tokens(int slot_id) const {
+    return state_->ctx->slot_state_for(slot_id).last_topk_tokens;
 }
 
-const std::vector<float>& PersistentEngine::last_topk_logits() const {
-    return state_->ctx->slot_state_for(0).last_topk_logits;
+const std::vector<float>& PersistentEngine::last_topk_logits(int slot_id) const {
+    return state_->ctx->slot_state_for(slot_id).last_topk_logits;
+}
+
+int64_t PersistentEngine::batched_decode_steps() const {
+    return state_->batched_decode_steps;
 }
 
 void PersistentEngine::load_dspark(const std::string& ckpt_dir) {
@@ -11327,12 +11539,13 @@ constexpr int kCmdHeaderInts = 4;
 
 }  // namespace
 
-void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids) {
+void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids,
+                                              int32_t slot_id) {
     auto& s = *state_;
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Prefill),
-        0,
+        slot_id,
         0,
         static_cast<int32_t>(token_ids.size())
     };
@@ -11343,16 +11556,48 @@ void PersistentEngine::worker_command_prefill(const std::vector<int>& token_ids)
     }
 }
 
-void PersistentEngine::worker_command_decode(int32_t last_token, int32_t position) {
+void PersistentEngine::worker_command_decode(int32_t last_token, int32_t position,
+                                             int32_t slot_id) {
     auto& s = *state_;
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    // header[3] carries the slot rather than the token count: DecodeStep has no
+    // payload, so this field is free and the drain above never reads it.
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::DecodeStep),
         last_token,
         position,
-        0
+        slot_id
     };
     s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
+// Batched decode: one row per request, sent as a flat (token, position, slot)
+// triple per row so the payload length alone carries the batch width. Workers
+// run the same batched forward and take part in the same per-row sampling
+// collectives; the SamplingParams are not transmitted because in the TP path the
+// token is decided on rank 0 and broadcast (which is how BatchVerify already
+// leaves its worker-side sampler at the default).
+void PersistentEngine::worker_command_batch_decode(
+        const std::vector<PersistentBatchRequest>& requests) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    if (requests.empty()) return;
+    constexpr int kIntsPerRow = 3;
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::BatchDecode),
+        0,
+        0,
+        static_cast<int32_t>(requests.size() * kIntsPerRow)
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+    std::vector<int32_t> payload;
+    payload.reserve(requests.size() * kIntsPerRow);
+    for (const auto& req : requests) {
+        payload.push_back(static_cast<int32_t>(req.last_token));
+        payload.push_back(static_cast<int32_t>(req.position));
+        payload.push_back(static_cast<int32_t>(req.slot_id));
+    }
+    s.cmd->send_to_workers(payload.data(), payload.size());
 }
 
 void PersistentEngine::worker_command_reset() {
@@ -11360,6 +11605,17 @@ void PersistentEngine::worker_command_reset() {
     if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
     int32_t header[kCmdHeaderInts] = {
         static_cast<int32_t>(WorkerCommand::Reset), 0, 0, 0
+    };
+    s.cmd->send_to_workers(header, kCmdHeaderInts);
+}
+
+void PersistentEngine::worker_command_reset_slot(int32_t slot_id) {
+    auto& s = *state_;
+    if (s.opts.tp_world <= 1 || s.opts.tp_rank != 0 || !s.cmd) return;
+    // ResetSlot has no payload, so header[1] carries the slot -- the same field
+    // DecodeStep uses for the last token.
+    int32_t header[kCmdHeaderInts] = {
+        static_cast<int32_t>(WorkerCommand::ResetSlot), slot_id, 0, 0
     };
     s.cmd->send_to_workers(header, kCmdHeaderInts);
 }
@@ -11468,6 +11724,7 @@ void PersistentEngine::run_worker_loop() {
         // unrecoverable — let them kill the worker.
         std::vector<int> prefill_tokens;
         std::vector<int> verify_block;
+        std::vector<int> batch_decode_payload;
         if (cmd == WorkerCommand::Prefill && header[3] > 0) {
             std::vector<int32_t> payload(static_cast<size_t>(header[3]));
             s.cmd->recv_from_root(payload.data(), payload.size());
@@ -11479,6 +11736,11 @@ void PersistentEngine::run_worker_loop() {
             s.cmd->recv_from_root(payload.data(), payload.size());
             verify_block.assign(payload.begin(), payload.end());
         }
+        if (cmd == WorkerCommand::BatchDecode && header[3] > 0) {
+            std::vector<int32_t> payload(static_cast<size_t>(header[3]));
+            s.cmd->recv_from_root(payload.data(), payload.size());
+            batch_decode_payload.assign(payload.begin(), payload.end());
+        }
 
         // Catch per-command compute exceptions (OOM, CUDA errors) so a single
         // failed request doesn't kill the worker and deadlock the server.
@@ -11487,14 +11749,31 @@ void PersistentEngine::run_worker_loop() {
         try {
             if (cmd == WorkerCommand::Reset) {
                 reset_session();
+            } else if (cmd == WorkerCommand::ResetSlot) {
+                reset_slot(header[1]);
             } else if (cmd == WorkerCommand::Prefill) {
-                (void)prefill(prefill_tokens, sp);
+                (void)prefill(prefill_tokens, sp, header[1]);
             } else if (cmd == WorkerCommand::DecodeStep) {
-                (void)decode_step(header[1], header[2], sp);
+                (void)decode_step(header[1], header[2], sp, header[3]);
             } else if (cmd == WorkerCommand::Verify) {
                 (void)verify_step(verify_block, header[1], sp);
             } else if (cmd == WorkerCommand::BatchVerify) {
                 (void)batch_verify_step(verify_block, header[1], sp);
+            } else if (cmd == WorkerCommand::BatchDecode) {
+                if (header[3] <= 0 || header[3] % 3 != 0) {
+                    throw std::runtime_error("invalid BatchDecode payload");
+                }
+                const size_t rows = static_cast<size_t>(header[3] / 3);
+                if (batch_decode_payload.size() != rows * 3) {
+                    throw std::runtime_error("truncated BatchDecode payload");
+                }
+                std::vector<PersistentBatchRequest> batch(rows);
+                for (size_t i = 0; i < rows; ++i) {
+                    batch[i].last_token = batch_decode_payload[i * 3 + 0];
+                    batch[i].position = batch_decode_payload[i * 3 + 1];
+                    batch[i].slot_id = batch_decode_payload[i * 3 + 2];
+                }
+                (void)batch_decode_step_batched(batch);
             } else if (cmd == WorkerCommand::FinalizeBatchVerify) {
                 if (!s.ctx->continuation_journal.pending ||
                     header[1] < 0 || header[1] > s.pending_batch_rows) {
@@ -11539,6 +11818,7 @@ void PersistentEngine::run_worker_loop() {
             }
         } catch (const std::exception& ex) {
             if (cmd == WorkerCommand::BatchVerify ||
+                cmd == WorkerCommand::BatchDecode ||
                 cmd == WorkerCommand::FinalizeBatchVerify) {
                 s.ctx->continuation_journal.abort_noexcept();
                 s.pending_batch_dspark_hidden.clear();

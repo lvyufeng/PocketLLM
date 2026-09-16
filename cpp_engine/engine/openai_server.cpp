@@ -3,18 +3,22 @@
 #include "batch_scheduler.hpp"
 #include "metrics.hpp"
 #include "json_lite.hpp"
+#include "openai_request_fields.hpp"
+#include "openai_stop_strings.hpp"
 #include "qwen_engine.hpp"
 #include "token_constraint.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
 #include "httplib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -182,6 +186,30 @@ std::string render_choice_message(const std::string& content, const std::string&
     return os.str();
 }
 
+// Seeds for the choices of one request.
+//
+// Choice 0 keeps the seed the client named, so a pinned "seed" still describes
+// the first choice, and the others are derived from it. Varying the seed is what
+// makes the choices different answers instead of the same answer repeated, and
+// it only means anything once sampling is stochastic: a greedy sampler ignores
+// the seed entirely.
+//
+// splitmix64 rather than std::seed_seq with an mt19937: libstdc++'s seed_seq
+// output is an implementation detail that may change between GCC versions, and a
+// seed that depends on the toolchain would change the generated text from one
+// build to the next. Plain 64-bit arithmetic does not.
+uint64_t derived_choice_seed(uint64_t base, int choice) {
+    uint64_t z = base + 0x9E3779B97F4A7C15ULL * static_cast<uint64_t>(choice + 1);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+uint64_t choice_seed(uint64_t base, int choice, bool vary) {
+    if (choice == 0 || !vary) return base;
+    return derived_choice_seed(base, choice);
+}
+
 // Hand-off between the scheduler thread, which produces tokens, and the HTTP
 // thread, which writes them to the socket.
 //
@@ -232,6 +260,59 @@ struct TokenStream {
         tokens.pop_front();
         return Next::Token;
     }
+
+    // Non-blocking, for the emitters that drain several choices at once and must
+    // not block on any one of them. False means "nothing queued right now", which
+    // is not the same as finished: ask is_finished() for that, after draining.
+    bool try_pop(int* token) {
+        std::lock_guard<std::mutex> lk(m);
+        if (tokens.empty()) return false;
+        *token = tokens.front();
+        tokens.pop_front();
+        return true;
+    }
+
+    bool is_finished() {
+        std::lock_guard<std::mutex> lk(m);
+        return done;
+    }
+};
+
+// Activity notifier shared by the choices of one request.
+//
+// A streaming request with several choices cannot wait on them one after
+// another: the chunks of the later choices are already produced and would sit in
+// their streams until the first choice finished, which is a batch download
+// dressed up as a stream. So the choices share this counter instead -- every
+// token and every completion bumps it -- and the HTTP thread drains whichever
+// choices have something and then waits here for any of them to move.
+struct ChoiceGroup {
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t activity = 0;
+
+    void bump() {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            ++activity;
+        }
+        cv.notify_all();
+    }
+
+    // Waits until the counter moves past `seen`, which `seen` is then advanced
+    // to. False means the deadline passed with nothing moving.
+    bool wait_for_activity(uint64_t& seen, std::chrono::steady_clock::time_point deadline) {
+        std::unique_lock<std::mutex> lk(m);
+        if (activity != seen) {
+            seen = activity;
+            return true;
+        }
+        if (cv.wait_until(lk, deadline) == std::cv_status::timeout && activity == seen) {
+            return false;
+        }
+        seen = activity;
+        return true;
+    }
 };
 
 }  // namespace
@@ -254,7 +335,10 @@ struct OpenAIServer::Impl {
 
     // Request tracking for cancellation API
     struct TrackedRequest {
-        uint64_t scheduler_id;
+        // A request that asked for n choices runs as n scheduler requests, so
+        // cancelling it has to cancel all of them rather than whichever one was
+        // registered last.
+        std::vector<uint64_t> scheduler_ids;
         std::string client_id;
         std::chrono::steady_clock::time_point start_time;
     };
@@ -317,7 +401,7 @@ struct OpenAIServer::Impl {
     void handle_cancel_request(const httplib::Request& req, httplib::Response& res) {
         const std::string request_id = req.path_params.at("id");
 
-        uint64_t scheduler_id = 0;
+        std::vector<uint64_t> scheduler_ids;
         {
             std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
             auto it = tracked_requests_.find(request_id);
@@ -329,10 +413,13 @@ struct OpenAIServer::Impl {
                 res.set_content(os.str(), "application/json");
                 return;
             }
-            scheduler_id = it->second.scheduler_id;
+            scheduler_ids = it->second.scheduler_ids;
         }
 
-        const bool cancelled = sched.cancel_request(scheduler_id);
+        bool cancelled = false;
+        for (uint64_t id : scheduler_ids) {
+            cancelled = sched.cancel_request(id) || cancelled;
+        }
 
         std::ostringstream os;
         os << "{\"id\":\"" << json_escape(request_id) << "\""
@@ -392,6 +479,29 @@ struct OpenAIServer::Impl {
             mismatch("seed", v->number(), static_cast<double>(caps.fixed_seed));
             return false;
         }
+
+        // Several choices are several sampling runs, and the one thing that
+        // would collapse them into one run repeated is a sampling distribution
+        // the engine fixes engine-wide: every choice would then be drawn from
+        // that same distribution with the same seed, and n identical texts
+        // would be handed back as n independent samples.
+        //
+        // Greedy sampling is deliberately not that case. "The same text n
+        // times" is what a greedy request for n choices asks for, so it is
+        // served; what is refused is claiming to have sampled when the engine
+        // could not have varied anything.
+        const int choices = requested_choices(obj);
+        if (choices > 1 && stochastic && !caps.per_request_sampling) {
+            std::ostringstream os;
+            os << "\"n\" = " << choices << " is not supported by this engine: it "
+               << "samples at engine-wide values (temperature "
+               << caps.fixed_temperature << ") that it cannot vary per request, "
+               << "so all " << choices << " choices would be the same text "
+               << "presented as independent samples. Remove \"n\", or run an "
+               << "engine configuration that samples per request.";
+            err_out = os.str();
+            return false;
+        }
         return true;
     }
 
@@ -446,15 +556,64 @@ struct OpenAIServer::Impl {
         return false;
     }
 
+    // What one request asked for in the way of per-token log probabilities,
+    // reduced to the two numbers the engine and the response need.
+    //
+    // `width` is what the engine ranks with, and it is 0 only when the client
+    // asked for nothing: a client that wants the sampled token's own probability
+    // and no alternatives still wants one number per position, so its width is 1
+    // even though `alternatives` is 0. Those two differ exactly in that case,
+    // which is why they are kept apart -- the width is the sampler's argument and
+    // the count is how much of the ranking is written out.
+    struct LogprobsSpec {
+        int width = 0;
+        int alternatives = 0;
+        bool asked() const { return width > 0; }
+    };
+
+    // Reads the two fields that ask for log probabilities into that pair. The
+    // audit has already established the shape is one this server accepts, for the
+    // endpoint the request came in on, so what is left is combining the fields
+    // and confirming the engine can produce a ranking at all.
+    bool parse_logprobs(const JsonObject& obj, OpenAiEndpoint endpoint,
+                        LogprobsSpec& out, std::string& err_out) const {
+        const bool chat = endpoint == OpenAiEndpoint::ChatCompletions;
+        const JsonValue* value = object_get(obj, "logprobs");
+        int alternatives = 0;
+        if (chat) {
+            if (value == nullptr || !value->is_bool() || !value->boolean()) return true;
+            const JsonValue* top = object_get(obj, "top_logprobs");
+            if (top != nullptr && top->is_number()) {
+                alternatives = static_cast<int>(top->number());
+            }
+        } else {
+            if (value == nullptr || !value->is_number()) return true;
+            alternatives = static_cast<int>(value->number());
+        }
+        if (!sched.engine_caps().logprobs) {
+            err_out = "this engine does not report per-token log probabilities "
+                      "(\"logprobs\"). Omit the field, or run an engine "
+                      "configuration that ranks them.";
+            return false;
+        }
+        out.width = std::max(alternatives, 1);
+        out.alternatives = alternatives;
+        return true;
+    }
+
     bool encode_request(const std::string& body, const JsonObject& obj,
                         EncodeReply& out, std::string& thinking_mode_out,
                         int& max_tokens_out, bool& stream_out,
                         BatchSamplingParams& sp_out, std::string& request_id_out,
                         std::shared_ptr<TokenConstraint>& constraint_out,
-                        std::string& err_out) {
+                        LogprobsSpec& logprobs_out, std::string& err_out) {
         if (!check_sampling_supported(obj, err_out)) return false;
 
         if (!parse_response_format(obj, constraint_out, err_out)) return false;
+
+        if (!parse_logprobs(obj, OpenAiEndpoint::ChatCompletions, logprobs_out, err_out)) {
+            return false;
+        }
 
         EncodeRequest enc;
         enc.messages_json = extract_messages_json(body);
@@ -465,8 +624,10 @@ struct OpenAIServer::Impl {
         enc.add_generation_prompt = get_bool(obj, "add_generation_prompt", true);
         enc.drop_thinking = get_bool(obj, "drop_thinking", true);
 
-        max_tokens_out = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
-        if (max_tokens_out <= 0) max_tokens_out = cfg.default_max_tokens;
+        // "max_completion_tokens" wins over the deprecated "max_tokens" when a
+        // request carries both, which is OpenAI's rule; reading only
+        // "max_tokens" silently handed such a request the server default.
+        max_tokens_out = effective_max_tokens(obj, cfg.default_max_tokens);
         stream_out = get_bool(obj, "stream", false);
 
         // Extract optional request_id from client, or generate one
@@ -483,6 +644,7 @@ struct OpenAIServer::Impl {
         sp_out.top_k = static_cast<int>(get_number(obj, "top_k", 20));
         sp_out.seed = static_cast<unsigned long long>(get_number(obj, "seed", 0));
         sp_out.max_new_tokens = max_tokens_out;
+        sp_out.logprobs_n = logprobs_out.width;
 
         out = sidecar.encode(enc);
         if (!out.ok) {
@@ -504,6 +666,38 @@ struct OpenAIServer::Impl {
         res.set_content(os.str(), "application/json");
     }
 
+    // 400 in the OpenAI error shape, with `param` naming the field the caller
+    // has to change so a client can act on it without parsing the prose. That
+    // field is the difference between this and the generic shape emit_error
+    // writes, and it is what makes a refusal machine-readable.
+    void emit_request_error(httplib::Response& res, const std::string& msg,
+                            const std::string& param) {
+        std::ostringstream os;
+        os << "{\"error\":{\"message\":\"" << json_escape(msg)
+           << "\",\"type\":\"invalid_request_error\"";
+        if (!param.empty()) {
+            os << ",\"param\":\"" << json_escape(param) << "\"";
+        }
+        os << ",\"code\":null}}";
+        res.status = 400;
+        res.set_content(os.str(), "application/json");
+    }
+
+    // Audits the body against the request fields this server implements and, on
+    // refusal, writes the 400 itself. Returns whether the handler should carry
+    // on. Called before any generation work -- and before the sidecar is asked
+    // to tokenize or encode -- so a request that cannot be honoured costs
+    // nothing and is refused for the field it named rather than for whatever
+    // the engine would have failed on later.
+    bool audit_request_fields(httplib::Response& res, const JsonObject& obj,
+                              OpenAiEndpoint endpoint) {
+        const RequestFieldCheck check = check_request_fields(obj, endpoint);
+        if (check.ok) return true;
+        metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+        emit_request_error(res, check.message, check.field);
+        return false;
+    }
+
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
         const auto request_start = std::chrono::steady_clock::now();
         metrics.record_request_start();
@@ -521,6 +715,7 @@ struct OpenAIServer::Impl {
             return;
         }
         const auto& obj = jv.object();
+        if (!audit_request_fields(res, obj, OpenAiEndpoint::ChatCompletions)) return;
         EncodeReply enc_reply;
         std::string thinking_mode;
         int max_tokens = 0;
@@ -528,8 +723,9 @@ struct OpenAIServer::Impl {
         BatchSamplingParams sp;
         std::string client_id;
         std::shared_ptr<TokenConstraint> constraint;
+        LogprobsSpec logprobs;
         std::string err;
-        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, constraint, err)) {
+        if (!encode_request(body, obj, enc_reply, thinking_mode, max_tokens, stream, sp, client_id, constraint, logprobs, err)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 400, err);
             return;
@@ -550,10 +746,28 @@ struct OpenAIServer::Impl {
             return;
         }
 
+        // Parsed once per request: every emitter below applies the same list to
+        // the text it is about to hand over.
+        const std::vector<std::string> stops = parse_stop_sequences(obj);
+
+        // One constraint object per choice: a TokenConstraint is stateful and
+        // only the scheduler advances it, so two choices sharing one object
+        // would let one choice's grammar state decide what the other may
+        // generate. The audit has already vouched for the count.
+        std::vector<std::shared_ptr<TokenConstraint>> constraints;
+        if (!build_choice_constraints(obj, requested_choices(obj), std::move(constraint),
+                                      constraints, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
+        }
+
         if (stream) {
-            handle_stream(req, res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
+            handle_stream(req, res, enc_reply, sp, constraints, stops, thinking_mode,
+                          client_id, request_start);
         } else {
-            handle_nonstream(res, enc_reply, sp, constraint, thinking_mode, client_id, request_start);
+            handle_nonstream(res, enc_reply, sp, constraints, stops, thinking_mode,
+                             client_id, logprobs, enc_reply.tools_json, request_start);
         }
     }
 
@@ -605,6 +819,8 @@ struct OpenAIServer::Impl {
             return;
         }
 
+        if (!audit_request_fields(res, obj, OpenAiEndpoint::Completions)) return;
+
         // Tokenize without chat template
         TokenizeRequest tok_req;
         tok_req.prompt = prompt_str;
@@ -634,8 +850,9 @@ struct OpenAIServer::Impl {
             return;
         }
 
-        int max_tokens = static_cast<int>(get_number(obj, "max_tokens", cfg.default_max_tokens));
-        if (max_tokens <= 0) max_tokens = cfg.default_max_tokens;
+        // Same precedence rule as /v1/chat/completions: "max_completion_tokens"
+        // wins over the deprecated "max_tokens" when both are present.
+        int max_tokens = effective_max_tokens(obj, cfg.default_max_tokens);
         bool stream = get_bool(obj, "stream", false);
 
         std::string client_id = get_string(obj, "request_id", "");
@@ -649,6 +866,18 @@ struct OpenAIServer::Impl {
         sp.top_k = static_cast<int>(get_number(obj, "top_k", 20));
         sp.seed = static_cast<unsigned long long>(get_number(obj, "seed", 0));
         sp.max_new_tokens = max_tokens;
+
+        // This endpoint names the count in "logprobs" itself, where even 0 asks
+        // for the sampled token's own probability; the chat handler's spelling of
+        // the same request is a boolean plus "top_logprobs", so the two go
+        // through different readers.
+        LogprobsSpec logprobs;
+        if (!parse_logprobs(obj, OpenAiEndpoint::Completions, logprobs, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
+        }
+        sp.logprobs_n = logprobs.width;
 
         if (static_cast<int>(tok_reply.token_ids.size()) + max_tokens > engine.max_context()) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
@@ -667,11 +896,375 @@ struct OpenAIServer::Impl {
         enc_reply.token_ids = std::move(tok_reply.token_ids);
         enc_reply.prompt_text = prompt_str;
 
-        if (stream) {
-            handle_completions_stream(enc_reply, sp, constraint, client_id, request_start, res);
-        } else {
-            handle_completions_nonstream(enc_reply, sp, constraint, client_id, request_start, res);
+        // Parsed once per request: every emitter below applies the same list to
+        // the text it is about to hand over.
+        const std::vector<std::string> stops = parse_stop_sequences(obj);
+
+        // One constraint object per choice, for the reason given in the chat
+        // handler above.
+        std::vector<std::shared_ptr<TokenConstraint>> constraints;
+        if (!build_choice_constraints(obj, requested_choices(obj), std::move(constraint),
+                                      constraints, err)) {
+            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            emit_error(res, 400, err);
+            return;
         }
+
+        if (stream) {
+            handle_completions_stream(enc_reply, sp, constraints, stops, client_id,
+                                      request_start, res);
+        } else {
+            handle_completions_nonstream(enc_reply, sp, constraints, stops, client_id,
+                                         logprobs, request_start, res);
+        }
+    }
+
+    // One in-flight choice: the scheduler request it runs as, and the hand-off
+    // its tokens and its result arrive on. A choice is one scheduler request
+    // because one request is one slot with one sampling configuration, and that
+    // produces one sequence.
+    struct ChoiceRun {
+        uint64_t request_id = 0;
+        std::shared_ptr<TokenStream> stream;
+    };
+
+    // Per-choice streaming state: the tokens seen so far, the bytes already
+    // written, and how the choice ended. Every choice advances through these
+    // independently -- one choice finishing does not end the response.
+    struct ChoiceStream {
+        std::vector<int> generated;
+        std::size_t sent_offset = 0;  // bytes of decode_tokens(generated) already sent
+        bool in_reasoning = false;    // chat only: the prompt ended inside <think>
+        bool stop_matched = false;
+        bool finished = false;        // its token stream has been drained
+        bool timed_out = false;
+        std::string finish_reason = "length";
+        std::string error;
+    };
+
+    // What one completed choice produced: the text a client reads and the counts
+    // the usage block is built from.
+    struct ChoiceText {
+        int index = 0;
+        std::string finish_reason;
+        std::string text;
+        std::size_t completion_tokens = 0;
+        // The choice's OpenAI "logprobs" object, serialized at the point the text
+        // was cut so the two cover the same positions, or empty when the request
+        // asked for none.
+        std::string logprobs_json;
+    };
+
+    // One grammar per choice.
+    //
+    // A TokenConstraint is stateful: the scheduler advances it with the tokens it
+    // accepts and resets it when it completes. Choices sharing one object would
+    // let a choice that finished wipe the grammar out from under the ones still
+    // generating, and would have them all accept each other's tokens.
+    // parse_response_format is a pure function of the body, so running it once
+    // per choice is what gives each choice its own machine; the first one comes
+    // from the audit path, which already built it.
+    bool build_choice_constraints(const JsonObject& obj, int choices,
+                                  std::shared_ptr<TokenConstraint> first,
+                                  std::vector<std::shared_ptr<TokenConstraint>>& out,
+                                  std::string& err_out) {
+        out.assign(static_cast<std::size_t>(choices), nullptr);
+        if (first == nullptr) return true;  // no structured output was requested
+        out[0] = std::move(first);
+        for (int i = 1; i < choices; ++i) {
+            if (!parse_response_format(obj, out[i], err_out)) return false;
+            if (out[i] == nullptr) {
+                err_out = "response_format produced no constraint";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Submits one scheduler request per choice.
+    //
+    // `group` non-null additionally streams each choice's tokens onto its stream
+    // as they are produced and bumps the group on every token and every
+    // completion; that is what the streaming emitters drain. The non-streaming
+    // emitters pass null and wait on the completion result alone.
+    //
+    // Returns false when the request could never be admitted. That is decided by
+    // the prompt and the budget, which every choice shares, so it is one decision
+    // for the group rather than one per choice -- and when it happens, nothing is
+    // left submitted.
+    bool submit_choices(const std::vector<int>& prompt_tokens,
+                        const BatchSamplingParams& sp,
+                        const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
+                        const std::shared_ptr<ChoiceGroup>& group,
+                        std::vector<ChoiceRun>& out) {
+        out.assign(constraints.size(), ChoiceRun{});
+        // Distinct seeds are what makes the choices different answers rather than
+        // one answer repeated. They only differ when the sampler reads them --
+        // under greedy every seed produces the same tokens -- and the case where
+        // the engine samples stochastically at values it cannot vary per request
+        // is refused for n > 1 before it reaches here.
+        const bool vary_seed = sp.temperature > 1.0e-5f;
+        for (std::size_t i = 0; i < constraints.size(); ++i) {
+            const std::shared_ptr<TokenStream> stream = std::make_shared<TokenStream>();
+            BatchSamplingParams choice_sp = sp;
+            choice_sp.seed = choice_seed(sp.seed, static_cast<int>(i), vary_seed);
+            choice_sp.constraint = constraints[i].get();
+            std::function<void(const SchedulerGenerationResult&)> on_finish =
+                [stream, group](const SchedulerGenerationResult& r) {
+                    stream->finish(r);
+                    if (group) group->bump();
+                };
+            TokenCallback on_token;
+            if (group) {
+                on_token = [stream, group](uint64_t, int token) {
+                    stream->push(token);
+                    group->bump();
+                };
+            }
+            const uint64_t id = sched.submit_request(prompt_tokens, choice_sp, on_finish,
+                                                     on_token, constraints[i]);
+            if (id == 0) {
+                for (std::size_t j = 0; j < i; ++j) {
+                    sched.cancel_request(out[j].request_id);
+                }
+                out.clear();
+                return false;
+            }
+            out[i].request_id = id;
+            out[i].stream = stream;
+        }
+        return true;
+    }
+
+    // Tracks every choice under the one client-visible id, so cancelling the
+    // request cancels all of it.
+    void track_request(const std::string& client_id, const std::vector<ChoiceRun>& runs) {
+        std::vector<uint64_t> ids;
+        ids.reserve(runs.size());
+        for (const ChoiceRun& run : runs) ids.push_back(run.request_id);
+        std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+        tracked_requests_[client_id] = {std::move(ids), client_id,
+                                        std::chrono::steady_clock::now()};
+    }
+
+    void untrack_request(const std::string& client_id) {
+        std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
+        tracked_requests_.erase(client_id);
+    }
+
+    // Whether the engine reported a ranking for every position it was asked
+    // about. A ranking that arrives short would leave the response's "content"
+    // array describing fewer positions than the text covers, and a caller reading
+    // a probability per token has no way to notice the two drifted apart -- so
+    // the choice is failed instead of reported with less than was asked for.
+    //
+    // The comparison is against the tokens the engine generated, before the stop
+    // token is stripped: the ranking is parallel to that vector, not to the text.
+    static bool ranking_complete(const SchedulerGenerationResult& out,
+                                 const LogprobsSpec& spec) {
+        if (!spec.asked()) return true;
+        if (out.logprobs.size() != out.generated_tokens.size()) return false;
+        for (const TokenLogprob& entry : out.logprobs) {
+            if (!entry.present) return false;
+        }
+        return true;
+    }
+
+    // Renders the OpenAI "logprobs" object for one choice, or an empty string when
+    // the client asked for none.
+    //
+    // The shape is the one the Python server produces, so a caller cannot tell
+    // which engine answered: a "content" array with one entry per token, each
+    // carrying the token's text, its log probability, the UTF-8 bytes of that
+    // text, and -- only when the request named a count -- that position's ranked
+    // alternatives. The bytes are there because the text alone does not say where
+    // a token begins and ends: a caller reassembling an answer from token
+    // boundaries needs them, and a piece whose text decodes to nothing (a special
+    // token, say) is invisible without them.
+    //
+    // `tokens` and `rankings` are parallel, and `rankings` also covers tokens the
+    // text below does not: the ranking is produced for everything the engine
+    // generated, while `text_bytes` is where the caller's own stop sequence ended
+    // the answer, possibly inside a token. Walking the surfaces until they reach
+    // that byte is what cuts the two to the same positions -- a probability
+    // reported for text the caller never received describes a position it cannot
+    // line up against anything.
+    std::string render_logprobs(const std::vector<int>& tokens,
+                                const std::vector<TokenLogprob>& rankings,
+                                std::size_t text_bytes,
+                                const LogprobsSpec& spec) const {
+        if (!spec.asked()) return std::string();
+
+        std::size_t kept = 0;
+        std::size_t covered = 0;
+        std::vector<std::string> surfaces;
+        surfaces.reserve(tokens.size());
+        while (kept < tokens.size() && kept < rankings.size()) {
+            const std::string surface = tok.decode_tokens({tokens[kept]});
+            if (covered + surface.size() > text_bytes) break;
+            covered += surface.size();
+            surfaces.push_back(surface);
+            ++kept;
+        }
+
+        std::ostringstream os;
+        os << std::setprecision(9);
+        os << "{\"content\":[";
+        for (std::size_t i = 0; i < kept; ++i) {
+            if (i > 0) os << ",";
+            os << "{\"token\":\"" << json_escape(surfaces[i]) << "\""
+               << ",\"logprob\":" << rankings[i].logprob
+               << ",\"bytes\":[";
+            append_utf8_bytes(os, surfaces[i]);
+            os << "]";
+            if (spec.alternatives > 0 && !rankings[i].top_tokens.empty()) {
+                const std::size_t count = std::min(
+                    rankings[i].top_tokens.size(),
+                    static_cast<std::size_t>(spec.alternatives));
+                os << ",\"top_logprobs\":[";
+                for (std::size_t c = 0; c < count; ++c) {
+                    const std::string candidate =
+                        tok.decode_tokens({rankings[i].top_tokens[c]});
+                    if (c > 0) os << ",";
+                    os << "{\"token\":\"" << json_escape(candidate) << "\""
+                       << ",\"logprob\":" << rankings[i].top_logprobs[c]
+                       << ",\"bytes\":[";
+                    append_utf8_bytes(os, candidate);
+                    os << "]}";
+                }
+                os << "]";
+            }
+            os << "}";
+        }
+        os << "]}";
+        return os.str();
+    }
+
+    // The UTF-8 bytes of a token's text, as the numbers a JSON array of bytes
+    // holds. Taken from the decoded string rather than from the token's id: what
+    // a caller needs to reassemble is the bytes it was handed, and for a token
+    // whose text is a partial character those are not derivable from the id.
+    static void append_utf8_bytes(std::ostringstream& os, const std::string& text) {
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            if (i > 0) os << ",";
+            os << static_cast<int>(static_cast<unsigned char>(text[i]));
+        }
+    }
+
+    // Waits for every choice, records the request's metrics, and reduces the
+    // outcomes to the answers that arrived. The two non-streaming emitters do the
+    // same thing up to how one answer is rendered, which is how much of it is
+    // shared here.
+    //
+    // Returns false -- having written the error response -- when no choice
+    // produced anything. A choice that did not arrive is left out rather than
+    // reported as an empty answer, and each entry carries the index of the choice
+    // it is, so a caller can see which ones are missing.
+    bool finish_choices(httplib::Response& res, const std::vector<ChoiceRun>& runs,
+                        const std::vector<std::string>& stops,
+                        const std::vector<int>& prompt_tokens,
+                        const std::string& client_id,
+                        const LogprobsSpec& logprobs,
+                        std::chrono::steady_clock::time_point request_start,
+                        std::vector<ChoiceText>& texts_out,
+                        std::size_t& completion_tokens_out) {
+        texts_out.clear();
+        completion_tokens_out = 0;
+
+        std::chrono::steady_clock::time_point ttft_time;
+        bool ttft_recorded = false;
+        std::string first_error;
+
+        // The timeout is the request's, not the choice's: a group of choices gets
+        // the one budget a single-choice request would have had, measured the
+        // same way, from just after submission. A request wide enough to queue
+        // some of its choices behind the batch can therefore come back short.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(cfg.request_timeout_seconds);
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            int unused_token = 0;
+            if (runs[i].stream->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
+                // Abandoning one choice of several leaves no result behind: the
+                // callback owns the stream, so it stays valid until the scheduler
+                // observes the cancellation, and a callback-mode request is not
+                // duplicated into poll_result().
+                sched.cancel_request(runs[i].request_id);
+                continue;
+            }
+            if (!ttft_recorded) {
+                ttft_time = std::chrono::steady_clock::now();
+                ttft_recorded = true;
+            }
+            SchedulerGenerationResult out;
+            {
+                std::lock_guard<std::mutex> lk(runs[i].stream->m);
+                out = runs[i].stream->result;
+            }
+            if (!out.error.empty()) {
+                if (first_error.empty()) first_error = out.error;
+                continue;
+            }
+            if (!ranking_complete(out, logprobs)) {
+                // Treated like any other engine failure rather than answered with
+                // an array shorter than the text: see ranking_complete.
+                if (first_error.empty()) {
+                    first_error = "the engine returned no log probabilities for a "
+                                  "position it was asked to rank";
+                }
+                continue;
+            }
+
+            const std::vector<int> generated = strip_stop_token(
+                out.generated_tokens, out.finish_reason, out.constraint_completed);
+            // A client stop sequence ends the answer at its first byte. Matching
+            // runs on the decoded text rather than on token ids because a
+            // sequence is not one token; see openai_stop_strings.hpp. The engine
+            // still ran to max_tokens -- the scheduler has no way to see a
+            // text-level sequence -- but the completion the client reads ends at
+            // the sequence, which is what "stop" means to a caller.
+            const std::string decoded = tok.decode_tokens(generated);
+            const StopScan scan = scan_stop_strings(decoded, stops);
+
+            ChoiceText text;
+            text.index = static_cast<int>(i);
+            text.text = decoded.substr(0, scan.final_length);
+            text.finish_reason = scan.matched ? "stop" : out.finish_reason;
+            text.completion_tokens = generated.size();
+            // Rendered against the same two cuts the text just took -- the stop
+            // token the engine appended and the client stop sequence -- so the
+            // array and the text describe the same positions.
+            text.logprobs_json =
+                render_logprobs(generated, out.logprobs, scan.final_length, logprobs);
+            completion_tokens_out += generated.size();
+            texts_out.push_back(std::move(text));
+        }
+
+        const auto request_end = std::chrono::steady_clock::now();
+        const double duration =
+            std::chrono::duration<double>(request_end - request_start).count();
+        const double ttft = ttft_recorded
+            ? std::chrono::duration<double>(ttft_time - request_start).count()
+            : 0.0;
+
+        if (texts_out.empty()) {
+            metrics.record_request_end(false, duration, ttft, prompt_tokens.size(), 0);
+            if (!first_error.empty()) {
+                emit_error(res, 500, first_error);
+            } else {
+                emit_error(res, 504, "generation timed out");
+            }
+            return false;
+        }
+
+        // A short answer is reported rather than returned silently: the response
+        // is a 200 with fewer choices than were asked for.
+        if (cfg.log_requests && texts_out.size() != runs.size()) {
+            std::cerr << "[server] request " << client_id << " returned "
+                      << texts_out.size() << " of " << runs.size() << " choices\n";
+        }
+        metrics.record_request_end(true, duration, ttft, prompt_tokens.size(),
+                                   completion_tokens_out);
+        return true;
     }
 
     // A stop token is the last token of a sequence and is still counted and
@@ -691,98 +1284,56 @@ struct OpenAIServer::Impl {
 
     void handle_completions_nonstream(
         const EncodeReply& enc, const BatchSamplingParams& sp,
-        const std::shared_ptr<TokenConstraint>& constraint,
+        const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
+        const std::vector<std::string>& stops,
         const std::string& client_id,
+        const LogprobsSpec& logprobs,
         std::chrono::steady_clock::time_point request_start,
         httplib::Response& res) {
-        std::chrono::steady_clock::time_point ttft_time;
-        bool ttft_recorded = false;
-
-        auto completion = std::make_shared<TokenStream>();
-        BatchSamplingParams sp_with_constraint = sp;
-        sp_with_constraint.constraint = constraint.get();
-        const uint64_t request_id = sched.submit_request(
-            enc.token_ids, sp_with_constraint,
-            [completion](const SchedulerGenerationResult& r) { completion->finish(r); },
-            nullptr, constraint);
-        if (request_id == 0) {
+        std::vector<ChoiceRun> runs;
+        if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
             return;
         }
+        track_request(client_id, runs);
 
-        {
-            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-            tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
-        }
-
-        int unused_token = 0;
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(cfg.request_timeout_seconds);
-        if (completion->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
-            const auto request_end = std::chrono::steady_clock::now();
-            const double duration = std::chrono::duration<double>(request_end - request_start).count();
-            metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
-            sched.cancel_request(request_id);
-
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_.erase(client_id);
-            }
-
-            emit_error(res, 504, "generation timed out");
-            return;
-        }
-        if (!ttft_recorded) {
-            ttft_time = std::chrono::steady_clock::now();
-            ttft_recorded = true;
-        }
-
-        SchedulerGenerationResult out;
-        {
-            std::lock_guard<std::mutex> lk(completion->m);
-            out = completion->result;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-            tracked_requests_.erase(client_id);
-        }
-
-        const auto request_end = std::chrono::steady_clock::now();
-        const double duration = std::chrono::duration<double>(request_end - request_start).count();
-        const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
-
-        if (!out.error.empty()) {
-            metrics.record_request_end(false, duration, ttft, enc.token_ids.size(), 0);
-            emit_error(res, 500, out.error);
-            return;
-        }
-
-        const std::vector<int> generated = strip_stop_token(
-            out.generated_tokens, out.finish_reason, out.constraint_completed);
-        metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
-
-        const std::string text = tok.decode_tokens(generated);
+        std::vector<ChoiceText> texts;
+        std::size_t completion_tokens = 0;
+        const bool answered = finish_choices(res, runs, stops, enc.token_ids, client_id,
+                                             logprobs, request_start, texts,
+                                             completion_tokens);
+        untrack_request(client_id);
+        if (!answered) return;
 
         std::ostringstream os;
         os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"text_completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << out.finish_reason << "\""
-           << ",\"text\":\"" << json_escape(text) << "\"}]"
-           << ",\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
-           << ",\"completion_tokens\":" << generated.size()
-           << ",\"total_tokens\":" << (enc.token_ids.size() + generated.size()) << "}}";
+           << ",\"choices\":[";
+        for (std::size_t i = 0; i < texts.size(); ++i) {
+            if (i > 0) os << ",";
+            os << "{\"index\":" << texts[i].index
+               << ",\"finish_reason\":\"" << texts[i].finish_reason << "\""
+               << ",\"text\":\"" << json_escape(texts[i].text) << "\"";
+            if (!texts[i].logprobs_json.empty()) {
+                os << ",\"logprobs\":" << texts[i].logprobs_json;
+            }
+            os << "}";
+        }
+        os << "],\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
+           << ",\"completion_tokens\":" << completion_tokens
+           << ",\"total_tokens\":" << (enc.token_ids.size() + completion_tokens) << "}}";
         res.set_content(os.str(), "application/json");
     }
 
     void handle_completions_stream(
         const EncodeReply& enc, const BatchSamplingParams& sp,
-        const std::shared_ptr<TokenConstraint>& constraint,
+        const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
+        const std::vector<std::string>& stops,
         const std::string& client_id,
         std::chrono::steady_clock::time_point request_start,
         httplib::Response& res) {
@@ -790,17 +1341,22 @@ struct OpenAIServer::Impl {
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, constraint, client_id, created, request_start]
+            [this, enc, sp, constraints, stops, client_id, created, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
+            const std::size_t choices = constraints.size();
             std::chrono::steady_clock::time_point ttft_time;
             bool ttft_recorded = false;
 
-            auto send_chunk = [&](const std::string& text, const char* finish_reason = nullptr) {
+            // Every chunk names the choice it carries, so a client reading
+            // several answers out of one stream can tell them apart.
+            auto send_chunk = [&](std::size_t index, const std::string& text,
+                                  const char* finish_reason = nullptr) {
                 std::ostringstream os;
                 os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"text_completion\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-                   << ",\"choices\":[{\"index\":0,\"text\":\"" << json_escape(text) << "\"";
+                   << ",\"choices\":[{\"index\":" << index
+                   << ",\"text\":\"" << json_escape(text) << "\"";
                 if (finish_reason != nullptr) {
                     os << ",\"finish_reason\":\"" << finish_reason << "\"";
                 } else {
@@ -819,14 +1375,16 @@ struct OpenAIServer::Impl {
                 sink.write(line.data(), line.size());
             };
 
-            auto stream = std::make_shared<TokenStream>();
-            BatchSamplingParams sp_with_constraint = sp;
-            sp_with_constraint.constraint = constraint.get();
-            const uint64_t request_id = sched.submit_request(
-                enc.token_ids, sp_with_constraint,
-                [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
-                [stream](uint64_t, int token) { stream->push(token); }, constraint);
-            if (request_id == 0) {
+            // A message about one choice of several says which one; a request
+            // that asked for one choice keeps the request-level wording.
+            auto describe = [&](std::size_t index, const std::string& message) {
+                if (choices == 1) return message;
+                return "choice " + std::to_string(index) + ": " + message;
+            };
+
+            const std::shared_ptr<ChoiceGroup> group = std::make_shared<ChoiceGroup>();
+            std::vector<ChoiceRun> runs;
+            if (!submit_choices(enc.token_ids, sp, constraints, group, runs)) {
                 const auto request_end = std::chrono::steady_clock::now();
                 const double duration = std::chrono::duration<double>(request_end - request_start).count();
                 metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
@@ -837,91 +1395,135 @@ struct OpenAIServer::Impl {
                 sink.done();
                 return true;
             }
+            track_request(client_id, runs);
 
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
-            }
+            std::vector<ChoiceStream> state(choices);
+            int token_count = 0;
 
-            std::vector<int> generated;
-            size_t sent_offset = 0;
-
-            auto emit_delta = [&]() {
-                const std::string full = tok.decode_tokens(generated);
-                if (full.size() <= sent_offset) return;
-                std::string candidate = full.substr(sent_offset);
+            auto emit_delta = [&](std::size_t index) {
+                ChoiceStream& s = state[index];
+                const std::string full = tok.decode_tokens(s.generated);
+                // Deliverable-now: everything before a matched sequence, or
+                // everything except a trailing partial sequence, which the next
+                // token may complete. Text already sent cannot be taken back, so
+                // the half-formed sequence is held rather than streamed and
+                // retracted.
+                const StopScan scan = scan_stop_strings(full, stops);
+                if (scan.matched) s.stop_matched = true;
+                if (scan.safe_length <= s.sent_offset) return;
+                std::string candidate =
+                    full.substr(s.sent_offset, scan.safe_length - s.sent_offset);
                 auto [complete, leftover] = split_utf8_complete(candidate);
                 if (!complete.empty()) {
-                    sent_offset += complete.size();
-                    send_chunk(complete);
+                    s.sent_offset += complete.size();
+                    send_chunk(index, complete);
                 }
             };
 
+            // Round-robin over the choices: drain whatever each one has queued,
+            // then wait for any of them to move. Waiting on one choice at a time
+            // would hold the others' chunks -- already produced -- until it
+            // finished, which is a batch download wearing a stream's clothes.
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(cfg.request_timeout_seconds);
             bool timed_out = false;
-            int token_count = 0;
+            uint64_t seen = 0;
             while (true) {
-                int token = 0;
-                const TokenStream::Next next = stream->next(&token, deadline);
-                if (next == TokenStream::Next::Token) {
-                    if (!ttft_recorded) {
-                        ttft_time = std::chrono::steady_clock::now();
-                        ttft_recorded = true;
+                bool all_finished = true;
+                for (std::size_t i = 0; i < choices; ++i) {
+                    if (state[i].finished) continue;
+                    int token = 0;
+                    while (runs[i].stream->try_pop(&token)) {
+                        if (!ttft_recorded) {
+                            ttft_time = std::chrono::steady_clock::now();
+                            ttft_recorded = true;
+                        }
+                        state[i].generated.push_back(token);
+                        emit_delta(i);
+                        ++token_count;
                     }
-                    generated.push_back(token);
-                    emit_delta();
-                    ++token_count;
-                    continue;
+                    if (runs[i].stream->is_finished()) {
+                        state[i].finished = true;
+                        continue;
+                    }
+                    all_finished = false;
                 }
-                if (next == TokenStream::Next::Timeout) {
+                if (all_finished) break;
+                if (!group->wait_for_activity(seen, deadline)) {
                     timed_out = true;
-                    sched.cancel_request(request_id);
+                    break;
                 }
-                break;
+            }
+
+            // Whatever arrived is taken, including anything the last token
+            // queued before the deadline: those bytes are part of the answer.
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].finished) continue;
+                int token = 0;
+                while (runs[i].stream->try_pop(&token)) {
+                    state[i].generated.push_back(token);
+                    ++token_count;
+                }
+                if (runs[i].stream->is_finished()) {
+                    state[i].finished = true;
+                } else {
+                    // The deadline belongs to the request, so a choice still
+                    // running when the group stops waiting has timed out -- and
+                    // one choice timing out does not discard the others.
+                    state[i].timed_out = true;
+                    state[i].finish_reason = "timeout";
+                    sched.cancel_request(runs[i].request_id);
+                }
             }
 
             const auto request_end = std::chrono::steady_clock::now();
             const double duration = std::chrono::duration<double>(request_end - request_start).count();
             const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
-            std::string finish_reason = "length";
-            std::string generation_error;
-            if (timed_out) {
-                finish_reason = "timeout";
-            } else {
-                std::lock_guard<std::mutex> lk(stream->m);
-                finish_reason = stream->result.finish_reason;
-                generation_error = stream->result.error;
+            bool any_error = false;
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].timed_out) continue;
+                std::lock_guard<std::mutex> lk(runs[i].stream->m);
+                state[i].finish_reason = runs[i].stream->result.finish_reason;
+                state[i].error = runs[i].stream->result.error;
+                if (!state[i].error.empty()) any_error = true;
             }
 
-            {
-                const std::string full = tok.decode_tokens(generated);
-                if (full.size() > sent_offset) {
-                    std::string tail = full.substr(sent_offset);
-                    sent_offset += tail.size();
-                    send_chunk(tail);
+            // Generation has ended, so a trailing partial sequence can no longer
+            // complete: those bytes are part of the answer and are flushed rather
+            // than withheld. A match still truncates.
+            for (std::size_t i = 0; i < choices; ++i) {
+                ChoiceStream& s = state[i];
+                const std::string full = tok.decode_tokens(s.generated);
+                const StopScan scan = scan_stop_strings(full, stops);
+                if (scan.matched) s.stop_matched = true;
+                const std::size_t deliverable = std::max(scan.final_length, s.sent_offset);
+                if (deliverable > s.sent_offset) {
+                    std::string tail = full.substr(s.sent_offset, deliverable - s.sent_offset);
+                    s.sent_offset += tail.size();
+                    send_chunk(i, tail);
                 }
+                // The scheduler saw no stop token, so it reports "length" even
+                // when the answer it produced was cut short at a client sequence.
+                if (s.stop_matched && s.finish_reason != "timeout") s.finish_reason = "stop";
             }
 
-            const bool success = !timed_out && generation_error.empty();
+            const bool success = !timed_out && !any_error;
             metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
-
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_.erase(client_id);
-            }
+            untrack_request(client_id);
 
             if (timed_out) send_error("generation timed out");
-            if (!generation_error.empty()) {
-                send_error(generation_error);
-                const std::string done = "data: [DONE]\n\n";
-                sink.write(done.data(), done.size());
-                sink.done();
-                return true;
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (!state[i].error.empty()) send_error(describe(i, state[i].error));
             }
-
-            send_chunk("", finish_reason.c_str());
+            // A choice that failed has no answer to terminate, so a request whose
+            // choices all failed ends after the error events above -- which is
+            // exactly how it ended before choices existed.
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].error.empty()) {
+                    send_chunk(i, "", state[i].finish_reason.c_str());
+                }
+            }
             const std::string done = "data: [DONE]\n\n";
             sink.write(done.data(), done.size());
             sink.done();
@@ -931,130 +1533,98 @@ struct OpenAIServer::Impl {
 
     void handle_nonstream(httplib::Response& res, const EncodeReply& enc,
                           const BatchSamplingParams& sp,
-                          const std::shared_ptr<TokenConstraint>& constraint,
+                          const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
+                          const std::vector<std::string>& stops,
                           const std::string& thinking_mode,
                           const std::string& client_id,
+                          const LogprobsSpec& logprobs,
+                          const std::string& tools_json,
                           std::chrono::steady_clock::time_point request_start) {
-        std::chrono::steady_clock::time_point ttft_time;
-        bool ttft_recorded = false;
-
-        auto completion = std::make_shared<TokenStream>();
-
-        // Create a copy of sampling params to attach the constraint pointer
-        BatchSamplingParams sp_with_constraint = sp;
-        sp_with_constraint.constraint = constraint.get();
-
-        const uint64_t request_id = sched.submit_request(
-            enc.token_ids, sp_with_constraint,
-            [completion](const SchedulerGenerationResult& r) { completion->finish(r); },
-            nullptr, constraint);
-        if (request_id == 0) {
+        std::vector<ChoiceRun> runs;
+        if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
             metrics.record_request_end(false, 0.0, 0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
             return;
         }
+        track_request(client_id, runs);
 
-        // Track request for cancellation API
-        {
-            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-            tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
-        }
-
-        int unused_token = 0;
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::seconds(cfg.request_timeout_seconds);
-        if (completion->next(&unused_token, deadline) == TokenStream::Next::Timeout) {
-            const auto request_end = std::chrono::steady_clock::now();
-            const double duration = std::chrono::duration<double>(request_end - request_start).count();
-            metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
-            // The callback owns `completion`, so it remains valid until the
-            // scheduler observes the cancellation. Because callback-mode
-            // requests are not duplicated into poll_result(), abandoning this
-            // HTTP response leaves no completed-result map entry behind.
-            sched.cancel_request(request_id);
-
-            // Cleanup tracking
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_.erase(client_id);
-            }
-
-            emit_error(res, 504, "generation timed out");
-            return;
-        }
-        if (!ttft_recorded) {
-            ttft_time = std::chrono::steady_clock::now();
-            ttft_recorded = true;
-        }
-
-        SchedulerGenerationResult out;
-        {
-            std::lock_guard<std::mutex> lk(completion->m);
-            out = completion->result;
-        }
-
-        // Cleanup tracking
-        {
-            std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-            tracked_requests_.erase(client_id);
-        }
-
-        const auto request_end = std::chrono::steady_clock::now();
-        const double duration = std::chrono::duration<double>(request_end - request_start).count();
-        const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
-
-        if (!out.error.empty()) {
-            metrics.record_request_end(false, duration, ttft, enc.token_ids.size(), 0);
-            emit_error(res, 500, out.error);
-            return;
-        }
-
-        const std::vector<int> generated = strip_stop_token(
-            out.generated_tokens, out.finish_reason, out.constraint_completed);
-        metrics.record_request_end(true, duration, ttft, enc.token_ids.size(), generated.size());
-
-        const std::string text = tok.decode_tokens(generated);
-        const ParsedMessage parsed = sidecar.parse(text, thinking_mode);
-        std::string content = parsed.ok ? parsed.content : text;
-        std::string reasoning = parsed.ok ? parsed.reasoning : std::string();
-        std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
+        std::vector<ChoiceText> texts;
+        std::size_t completion_tokens = 0;
+        const bool answered = finish_choices(res, runs, stops, enc.token_ids, client_id,
+                                             logprobs, request_start, texts,
+                                             completion_tokens);
+        untrack_request(client_id);
+        if (!answered) return;
 
         std::ostringstream os;
         os << "{\"id\":\"" << json_escape(client_id) << "\""
            << ",\"object\":\"chat.completion\""
            << ",\"created\":" << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()
            << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-           << ",\"choices\":[{\"index\":0,\"finish_reason\":\"" << out.finish_reason << "\""
-           << ",\"message\":" << render_choice_message(content, reasoning, tool_calls_json) << "}]"
-           << ",\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
-           << ",\"completion_tokens\":" << generated.size()
-           << ",\"total_tokens\":" << (enc.token_ids.size() + generated.size()) << "}}";
+           << ",\"choices\":[";
+        for (std::size_t i = 0; i < texts.size(); ++i) {
+            // Truncated before the sidecar sees them: the parser splits the text
+            // into content / reasoning / tool calls, and a stop sequence that
+            // lands inside a tool call would otherwise be parsed as part of one.
+            const ParsedMessage parsed = sidecar.parse(texts[i].text, thinking_mode, tools_json);
+            const std::string content = parsed.ok ? parsed.content : texts[i].text;
+            const std::string reasoning = parsed.ok ? parsed.reasoning : std::string();
+            const std::string tool_calls_json = parsed.ok ? parsed.tool_calls_json : "[]";
+            // A turn that ends in a tool call is reported as one, whatever the
+            // engine's own reason was. A client that branches on "tool_calls" to
+            // decide whether to run something and send the result back would,
+            // under "stop", read the call as the final answer and stop there. The
+            // parse is all-or-nothing, so a reported call is a complete one and
+            // the assistant turn really did end at it.
+            const std::string finish_reason =
+                tool_calls_json != "[]" ? std::string("tool_calls") : texts[i].finish_reason;
+            if (i > 0) os << ",";
+            os << "{\"index\":" << texts[i].index
+               << ",\"finish_reason\":\"" << finish_reason << "\""
+               << ",\"message\":"
+               << render_choice_message(content, reasoning, tool_calls_json);
+            // Beside the message rather than inside it: the ranking describes the
+            // token stream, which the sidecar has by now split into content,
+            // reasoning and tool calls, so a client that wants it per field has
+            // to do that split itself.
+            if (!texts[i].logprobs_json.empty()) {
+                os << ",\"logprobs\":" << texts[i].logprobs_json;
+            }
+            os << "}";
+        }
+        os << "],\"usage\":{\"prompt_tokens\":" << enc.token_ids.size()
+           << ",\"completion_tokens\":" << completion_tokens
+           << ",\"total_tokens\":" << (enc.token_ids.size() + completion_tokens) << "}}";
         res.set_content(os.str(), "application/json");
     }
 
     void handle_stream(const httplib::Request& /*req*/, httplib::Response& res,
                        const EncodeReply& enc, const BatchSamplingParams& sp,
-                       const std::shared_ptr<TokenConstraint>& constraint,
+                       const std::vector<std::shared_ptr<TokenConstraint>>& constraints,
+                       const std::vector<std::string>& stops,
                        const std::string& thinking_mode, const std::string& client_id,
                        std::chrono::steady_clock::time_point request_start) {
         const long long created = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 
         res.set_header("Cache-Control", "no-cache");
         res.set_chunked_content_provider("text/event-stream",
-            [this, enc, sp, constraint, client_id, created, thinking_mode, request_start]
+            [this, enc, sp, constraints, stops, client_id, created, thinking_mode, request_start]
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
+            const std::size_t choices = constraints.size();
             std::chrono::steady_clock::time_point ttft_time;
             bool ttft_recorded = false;
 
-            auto send_chunk = [&](const std::string& delta, const char* field,
-                                  const char* finish_reason = nullptr) {
+            // Every chunk names the choice it carries, so a client reading
+            // several answers out of one stream can tell them apart.
+            auto send_chunk = [&](std::size_t index, const std::string& delta,
+                                  const char* field, const char* finish_reason = nullptr) {
                 std::ostringstream os;
                 os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-                   << ",\"choices\":[{\"index\":0,\"delta\":{";
+                   << ",\"choices\":[{\"index\":" << index << ",\"delta\":{";
                 if (!delta.empty()) {
                     os << "\"" << field << "\":\"" << json_escape(delta) << "\"";
                 }
@@ -1077,27 +1647,34 @@ struct OpenAIServer::Impl {
                 sink.write(line.data(), line.size());
             };
 
-            // First chunk: role marker.
+            // A message about one choice of several says which one; a request
+            // that asked for one choice keeps the request-level wording.
+            auto describe = [&](std::size_t index, const std::string& message) {
+                if (choices == 1) return message;
+                return "choice " + std::to_string(index) + ": " + message;
+            };
+
+            // First chunk: one role marker per choice. They share a chunk because
+            // they arrive at the same moment and a client that reads them in one
+            // parse is no worse off than one that reads them in several.
             {
                 std::ostringstream os;
                 os << "{\"id\":\"" << json_escape(client_id) << "\",\"object\":\"chat.completion.chunk\""
                    << ",\"created\":" << created << ",\"model\":\"" << json_escape(cfg.model_name) << "\""
-                   << ",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}";
+                   << ",\"choices\":[";
+                for (std::size_t i = 0; i < choices; ++i) {
+                    if (i > 0) os << ",";
+                    os << "{\"index\":" << i
+                       << ",\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}";
+                }
+                os << "]}";
                 std::string line = "data: " + os.str() + "\n\n";
                 sink.write(line.data(), line.size());
             }
 
-            auto stream = std::make_shared<TokenStream>();
-
-            // Create a copy of sampling params to attach the constraint pointer
-            BatchSamplingParams sp_with_constraint = sp;
-            sp_with_constraint.constraint = constraint.get();
-
-            const uint64_t request_id = sched.submit_request(
-                enc.token_ids, sp_with_constraint,
-                [stream](const SchedulerGenerationResult& r) { stream->finish(r); },
-                [stream](uint64_t, int token) { stream->push(token); }, constraint);
-            if (request_id == 0) {
+            const std::shared_ptr<ChoiceGroup> group = std::make_shared<ChoiceGroup>();
+            std::vector<ChoiceRun> runs;
+            if (!submit_choices(enc.token_ids, sp, constraints, group, runs)) {
                 const auto request_end = std::chrono::steady_clock::now();
                 const double duration = std::chrono::duration<double>(request_end - request_start).count();
                 metrics.record_request_end(false, duration, 0.0, enc.token_ids.size(), 0);
@@ -1108,85 +1685,130 @@ struct OpenAIServer::Impl {
                 sink.done();
                 return true;
             }
+            track_request(client_id, runs);
 
-            // Track request for cancellation API
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_[client_id] = {request_id, client_id, std::chrono::steady_clock::now()};
+            // Sliding-window prefix used to compute deltas + UTF-8 boundary buffer,
+            // plus the per-choice reasoning state. In thinking mode the prompt ends
+            // with <think>, so a completion starts inside the reasoning block and
+            // switches to the answer at the first </think>. Splitting on the token
+            // id rather than the decoded text keeps each stream's UTF-8 decoding
+            // self-contained and cannot be fooled by a model that writes the
+            // literal characters.
+            std::vector<ChoiceStream> state(choices);
+            for (ChoiceStream& s : state) {
+                s.in_reasoning = (thinking_mode == "thinking");
             }
+            int token_count = 0;
 
-            // Sliding-window prefix used to compute deltas + UTF-8 boundary buffer.
-            std::vector<int> generated;
-            size_t sent_offset = 0;  // bytes of decode_tokens(generated) already sent
-
-            // In thinking mode the prompt ends with <think>, so the completion
-            // starts inside the reasoning block and switches to the answer at the
-            // first </think>. Splitting on the token id rather than the decoded
-            // text keeps each stream's UTF-8 decoding self-contained and cannot be
-            // fooled by a model that writes the literal characters.
-            bool in_reasoning = (thinking_mode == "thinking");
-
-            auto emit_delta = [&]() {
-                const std::string full = tok.decode_tokens(generated);
-                if (full.size() <= sent_offset) return;
-                std::string candidate = full.substr(sent_offset);
+            auto emit_delta = [&](std::size_t index) {
+                ChoiceStream& s = state[index];
+                const std::string full = tok.decode_tokens(s.generated);
+                // Stop sequences apply to the answer only. The reasoning block
+                // is a separate field that ends on a token id, and truncating it
+                // mid-block would drop the answer that follows.
+                std::size_t deliverable = full.size();
+                if (!s.in_reasoning) {
+                    // Deliverable-now: everything before a matched sequence, or
+                    // everything except a trailing partial sequence, which the
+                    // next token may complete. Text already sent cannot be taken
+                    // back, so the half-formed sequence is held rather than
+                    // streamed and retracted.
+                    const StopScan scan = scan_stop_strings(full, stops);
+                    if (scan.matched) s.stop_matched = true;
+                    deliverable = scan.safe_length;
+                }
+                if (deliverable <= s.sent_offset) return;
+                std::string candidate = full.substr(s.sent_offset, deliverable - s.sent_offset);
                 auto [complete, leftover] = split_utf8_complete(candidate);
                 if (!complete.empty()) {
-                    sent_offset += complete.size();
-                    send_chunk(complete, in_reasoning ? "reasoning_content" : "content");
+                    s.sent_offset += complete.size();
+                    send_chunk(index, complete,
+                               s.in_reasoning ? "reasoning_content" : "content");
                 }
             };
 
             // Closing the reasoning block restarts the delta window: the marker
             // itself belongs to neither stream, and dropping the tokens before it
             // keeps decode_tokens() cheap on long generations.
-            auto accept = [&](int tok_id) {
-                if (in_reasoning && tok_id == think_end_id) {
-                    emit_delta();
-                    generated.clear();
-                    sent_offset = 0;
-                    in_reasoning = false;
+            auto accept = [&](std::size_t index, int tok_id) {
+                ChoiceStream& s = state[index];
+                if (s.in_reasoning && tok_id == think_end_id) {
+                    emit_delta(index);
+                    s.generated.clear();
+                    s.sent_offset = 0;
+                    s.in_reasoning = false;
                     return;
                 }
-                generated.push_back(tok_id);
-                emit_delta();
+                s.generated.push_back(tok_id);
+                emit_delta(index);
             };
 
+            // Round-robin over the choices: drain whatever each one has queued,
+            // then wait for any of them to move. Waiting on one choice at a time
+            // would hold the others' chunks -- already produced -- until it
+            // finished, which is a batch download wearing a stream's clothes.
             const auto deadline = std::chrono::steady_clock::now() +
                                   std::chrono::seconds(cfg.request_timeout_seconds);
             bool timed_out = false;
-            int token_count = 0;
+            uint64_t seen = 0;
             while (true) {
-                int token = 0;
-                const TokenStream::Next next = stream->next(&token, deadline);
-                if (next == TokenStream::Next::Token) {
-                    if (!ttft_recorded) {
-                        ttft_time = std::chrono::steady_clock::now();
-                        ttft_recorded = true;
+                bool all_finished = true;
+                for (std::size_t i = 0; i < choices; ++i) {
+                    if (state[i].finished) continue;
+                    int token = 0;
+                    while (runs[i].stream->try_pop(&token)) {
+                        if (!ttft_recorded) {
+                            ttft_time = std::chrono::steady_clock::now();
+                            ttft_recorded = true;
+                        }
+                        accept(i, token);
+                        ++token_count;
                     }
-                    accept(token);
-                    ++token_count;
-                    continue;
+                    if (runs[i].stream->is_finished()) {
+                        state[i].finished = true;
+                        continue;
+                    }
+                    all_finished = false;
                 }
-                if (next == TokenStream::Next::Timeout) {
+                if (all_finished) break;
+                if (!group->wait_for_activity(seen, deadline)) {
                     timed_out = true;
-                    sched.cancel_request(request_id);
+                    break;
                 }
-                break;
+            }
+
+            // Whatever arrived is taken, including anything the last token
+            // queued before the deadline: those bytes are part of the answer.
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].finished) continue;
+                int token = 0;
+                while (runs[i].stream->try_pop(&token)) {
+                    accept(i, token);
+                    ++token_count;
+                }
+                if (runs[i].stream->is_finished()) {
+                    state[i].finished = true;
+                } else {
+                    // The deadline belongs to the request, so a choice still
+                    // running when the group stops waiting has timed out -- and
+                    // one choice timing out does not discard the others.
+                    state[i].timed_out = true;
+                    state[i].finish_reason = "timeout";
+                    sched.cancel_request(runs[i].request_id);
+                }
             }
 
             const auto request_end = std::chrono::steady_clock::now();
             const double duration = std::chrono::duration<double>(request_end - request_start).count();
             const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
-            std::string finish_reason = "length";
-            std::string generation_error;
-            if (timed_out) {
-                finish_reason = "timeout";
-            } else {
-                std::lock_guard<std::mutex> lk(stream->m);
-                finish_reason = stream->result.finish_reason;
-                generation_error = stream->result.error;
+            bool any_error = false;
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].timed_out) continue;
+                std::lock_guard<std::mutex> lk(runs[i].stream->m);
+                state[i].finish_reason = runs[i].stream->result.finish_reason;
+                state[i].error = runs[i].stream->result.error;
+                if (!state[i].error.empty()) any_error = true;
                 // Stop tokens are not queued by the scheduler, so they can never
                 // contribute bytes to the stream even when a caller supplies a
                 // custom, non-special stop id.
@@ -1195,35 +1817,44 @@ struct OpenAIServer::Impl {
             // Flush any remaining tail bytes (e.g. an isolated partial sequence
             // at EOS). In practice decode_tokens at terminal state produces
             // valid UTF-8, so this is usually empty.
-            {
-                const std::string full = tok.decode_tokens(generated);
-                if (full.size() > sent_offset) {
-                    std::string tail = full.substr(sent_offset);
-                    sent_offset += tail.size();
-                    send_chunk(tail, in_reasoning ? "reasoning_content" : "content");
+            for (std::size_t i = 0; i < choices; ++i) {
+                ChoiceStream& s = state[i];
+                const std::string full = tok.decode_tokens(s.generated);
+                std::size_t deliverable = full.size();
+                if (!s.in_reasoning) {
+                    // Generation has ended, so a trailing partial sequence can
+                    // no longer complete: those bytes are part of the answer and
+                    // are flushed rather than withheld. A match still truncates.
+                    const StopScan scan = scan_stop_strings(full, stops);
+                    if (scan.matched) s.stop_matched = true;
+                    deliverable = std::max(scan.final_length, s.sent_offset);
                 }
+                if (deliverable > s.sent_offset) {
+                    std::string tail = full.substr(s.sent_offset, deliverable - s.sent_offset);
+                    s.sent_offset += tail.size();
+                    send_chunk(i, tail, s.in_reasoning ? "reasoning_content" : "content");
+                }
+                // The scheduler saw no stop token, so it reports "length" even
+                // when the answer it produced was cut short at a client sequence.
+                if (s.stop_matched && s.finish_reason != "timeout") s.finish_reason = "stop";
             }
 
-            const bool success = !timed_out && generation_error.empty();
+            const bool success = !timed_out && !any_error;
             metrics.record_request_end(success, duration, ttft, enc.token_ids.size(), token_count);
-
-            // Cleanup tracking
-            {
-                std::lock_guard<std::mutex> lock(tracked_requests_mutex_);
-                tracked_requests_.erase(client_id);
-            }
+            untrack_request(client_id);
 
             if (timed_out) send_error("generation timed out");
-            if (!generation_error.empty()) {
-                send_error(generation_error);
-                const std::string done = "data: [DONE]\n\n";
-                sink.write(done.data(), done.size());
-                sink.done();
-                return true;
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (!state[i].error.empty()) send_error(describe(i, state[i].error));
             }
-
-            // Final chunk with finish_reason.
-            send_chunk("", "content", finish_reason.c_str());
+            // A choice that failed has no answer to terminate, so a request whose
+            // choices all failed ends after the error events above -- which is
+            // exactly how it ended before choices existed.
+            for (std::size_t i = 0; i < choices; ++i) {
+                if (state[i].error.empty()) {
+                    send_chunk(i, "", "content", state[i].finish_reason.c_str());
+                }
+            }
             const std::string done = "data: [DONE]\n\n";
             sink.write(done.data(), done.size());
             sink.done();

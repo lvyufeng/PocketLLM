@@ -56,6 +56,15 @@ public:
 
     int max_slots() const;
 
+    // Whether multi-row batches actually run as one batched forward. False means
+    // batch_decode_step() falls back to its per-request reference loop however
+    // many rows it is handed, so there is no concurrent execution to report and
+    // a caller asking for a wider batch would only lengthen every request's
+    // latency without changing throughput. Capability reporting has to ask:
+    // claiming slots the engine will not run in parallel is what made
+    // --max-batch-size a no-op that still looked configured.
+    bool batched_decode_enabled() const;
+
     // Run prefill on token_ids (which must include the prompt's last token).
     // Returns the sampled token id for the next position (rank 0 valid; on
     // worker ranks the return value is the rank-local argmax, which the
@@ -75,6 +84,15 @@ public:
     // Run independent request rows through one batched continuation forward.
     // Sampling and RNG state remain row-local. This is the true multi-slot
     // decode path used by PersistentEngineAdapter.
+    //
+    // A multi-row batch takes the batched forward only when
+    // POCKETLLM_CPP_BATCHED_DECODE is non-zero, and that switch is read on rank 0
+    // alone. Rank 0 then sends either one ::DecodeStep per row or a single
+    // ::BatchDecode, so the command -- not the variable -- is what tells a worker
+    // which path to run. Reading the variable on both sides would be a deadlock:
+    // it is process-local, and a worker whose environment differs from rank 0's
+    // would run a different number of collectives than rank 0 and stall the
+    // first all-reduce of the forward.
     std::vector<int> batch_decode_step(
         const std::vector<PersistentBatchRequest>& requests);
 
@@ -189,9 +207,15 @@ public:
     // descending logit order. Only populated when POCKETLLM_CPP_TOPK_DIAG > 0, and
     // only on rank 0 at TP > 1 (the only rank holding the whole vocabulary).
     // Read-only diagnostic: it reuses the selection's existing gather and does
-    // not add a collective or change the sampled token.
-    const std::vector<int>& last_topk_tokens() const;
-    const std::vector<float>& last_topk_logits() const;
+    // not add a collective or change the sampled token. The slot argument selects
+    // which request's recording to read; a batched decode writes one per row.
+    const std::vector<int>& last_topk_tokens(int slot_id = 0) const;
+    const std::vector<float>& last_topk_logits(int slot_id = 0) const;
+
+    // How many batch_decode_step() calls ran the batched forward instead of the
+    // per-request loop. Diagnostic: a test needs it to prove that the
+    // POCKETLLM_CPP_BATCHED_DECODE arm it ran was not silently the serial one.
+    int64_t batched_decode_steps() const;
 
     int eos_id() const;
     int max_context() const;
@@ -221,12 +245,30 @@ public:
         BatchVerify = 8,
         FinalizeBatchVerify = 9,
         BatchDecode = 10,
+        ResetSlot = 11,
     };
-    void worker_command_prefill(const std::vector<int>& token_ids);
-    void worker_command_decode(int32_t last_token, int32_t position);
+    // `slot_id` has to travel with the prompt: the worker ranks write KV and
+    // recurrent state into that slot's cache, and every rank's partial
+    // attention reads its own copy. Without it a second concurrent request
+    // would have the workers filling slot 0 while rank 0 filled the request's
+    // own slot, and the all-reduce would mix two different rings.
+    void worker_command_prefill(const std::vector<int>& token_ids, int32_t slot_id = 0);
+    // Same reason as the prefill command: `slot_id` is where the row's cache
+    // lives, and a decode into the wrong slot does not fail -- it reads another
+    // request's ring and all-reduces that into the sampled logits. The serial
+    // branch of batch_decode_step() drives one row at a time, so a slot-1 row
+    // with no slot on the wire was decoded by every worker in slot 0.
+    void worker_command_decode(int32_t last_token, int32_t position, int32_t slot_id = 0);
     void worker_command_batch_decode(
         const std::vector<PersistentBatchRequest>& requests);
     void worker_command_reset();
+    // Hand one slot back before it is reused. Same reason again, in the
+    // direction that matters most: reset_slot() clears the calling process's KV
+    // and compressor accumulators only, so without this every worker rank keeps
+    // the previous request's ring in that slot and all-reduces it into the next
+    // request's logits. The residue is silent -- nothing throws, the first
+    // tokens just belong to a request that has already finished.
+    void worker_command_reset_slot(int32_t slot_id);
     void worker_command_shutdown();
     void worker_command_verify(const std::vector<int>& block, int32_t start_position);
     void worker_command_batch_verify(const std::vector<int>& block, int32_t start_position);
@@ -237,6 +279,17 @@ public:
     void worker_command_prime_draft_kv(int32_t rows, int32_t start_position);
 
 private:
+    // The batched body of batch_decode_step(), with no switch of its own. The
+    // worker command loop calls it directly: receiving ::BatchDecode already
+    // means rank 0 chose the batched forward, and re-deciding from the local
+    // environment is what desynchronized the ranks.
+    std::vector<int> batch_decode_step_batched(
+        const std::vector<PersistentBatchRequest>& requests);
+    // Shape checks shared by both decode entries, so the worker's direct call
+    // rejects the same malformed batches rank 0 does.
+    void validate_batch_decode_requests(
+        const std::vector<PersistentBatchRequest>& requests) const;
+
     struct State;
     std::unique_ptr<State> state_;
 };

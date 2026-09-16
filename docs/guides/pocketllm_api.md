@@ -139,6 +139,227 @@ The unified server provides:
 
 `/ready` returns HTTP 503 while model loading is incomplete. `/metrics` uses dependency-free Prometheus text exposition and can later be wrapped by a richer exporter.
 
+That list is the whole HTTP surface. **`/v1/embeddings` is deliberately unsupported** — PocketLLM
+serves the checkpoint's text-generation path, and nothing in either plane computes a pooled
+embedding, so there is no head to return, no `/v1/moderations`, `/v1/audio`, or `/v1/images` either.
+An unregistered path answers 404 rather than accepting a request it would have to reinterpret.
+Callers that need embeddings should run an embedding model; adding a pooling head to this engine is
+a separate project from serving generation.
+
+## Request fields
+
+A request field is accepted only when the server acts on it. Every documented OpenAI request field
+therefore falls into one of three groups, and a field in the second group has to be removed rather
+than trusted.
+
+### Implemented
+
+| Field | Endpoints | Behaviour |
+| --- | --- | --- |
+| `messages` | chat | The conversation, rendered by the checkpoint's own chat template (see [Request normalization](#request-normalization)). |
+| `prompt` | completions | Tokenized and prefilled unchanged. |
+| `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. |
+| `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
+| `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
+| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
+| `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
+| `tools` | chat | Tool definitions reach the chat template, and a call the model writes back is reported in the assistant message's `tool_calls` rather than left in the text; see [Tool calls](#tool-calls). |
+| `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
+| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. |
+| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. |
+| `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. |
+
+#### Stop sequences
+
+`stop` is matched against the **decoded text**, not against token ids. A stop string is not one
+token — `"USER:"` is three in most vocabularies — and a sequence can begin inside one token and end
+inside the next, so the only place it exists as a unit is the text the caller reads anyway. Matching
+is applied to the cumulative text as it is produced, which gives the field the same meaning on a
+non-streaming response and on a stream. The earliest occurrence of any sequence in the list ends the
+completion, the sequence itself is not part of the answer, and `finish_reason` is reported as
+`"stop"`.
+
+Three details are worth knowing before relying on the field:
+
+- **A partial sequence is withheld while streaming.** If the text so far ends in a run of characters
+  that is the beginning of a stop sequence, those bytes are held rather than sent, because the next
+  token may complete the sequence and text already written to the socket cannot be taken back. Once
+  generation ends the same bytes can no longer complete anything, so they are flushed as part of the
+  answer. Nothing is withheld when the trailing characters cannot begin a sequence, which is the
+  usual case — the hold is bounded by the longest sequence, not by the length of the text.
+- **On chat, `stop` applies to the answer and not to `reasoning_content`.** The reasoning block is a
+  separate field that ends on a token id, and a sequence that appeared inside it would otherwise
+  truncate the answer that follows.
+- **`usage.completion_tokens` counts the tokens the engine generated**, which can exceed the number
+  of tokens in the returned text when a sequence truncated it. The engine is not stopped early: the
+  scheduler ends a request on token ids, and a client sequence is not one, so the request runs to its
+  budget and only the text handed back is cut.
+
+#### Choices
+
+`n` is the number of completions one request asks for, and the server serves it by running the
+request `n` times: each choice is its own scheduler request, with its own seed derived from the
+request's `seed` and — when `response_format` asks for one — its own grammar. The response carries
+one entry per choice with `index` running 0..`n`-1, and a streaming response **interleaves** the
+choices rather than sending one after another, so a client watching four choices sees all four
+advance together. `usage` is counted the way OpenAI counts it: `prompt_tokens` once for the request,
+`completion_tokens` the sum over the choices.
+
+Three consequences are worth knowing:
+
+- **Under greedy decoding every choice is the same text.** With `temperature` at 0 the seed is not
+  read, so `n=3` returns the greedy answer three times. That is what a greedy request for three
+  choices asks for; a caller who wants three different answers has to sample. The corresponding
+  refusal is on the other side: an engine that fixes its sampling distribution engine-wide while the
+  request asks for stochastic sampling cannot vary a choice at all, so `n>1` there is a 400 — three
+  identical texts would otherwise be handed back as three independent samples.
+- **`n` is refused above 128**, and refused for a fraction, a non-number, or a count below 1. The
+  ceiling is this server's, not OpenAI's: one choice is one scheduler request, so the field is what
+  bounds how much of the queue a single client can occupy.
+- **The timeout is the request's, not the choice's.** A group of choices gets the one budget a
+  single-choice request would have had, so a request wide enough that some of its choices wait
+  behind the batch comes back with fewer entries than `n`. That is a 200 with a short `choices`
+  array — the choices that did arrive are real answers — and not a failure. A response with no
+  entries at all is a 500, or a 504 when the deadline was the reason. Cancelling the request cancels
+  every choice.
+
+#### Log probabilities
+
+`logprobs` reports the probability the model assigned to each token it generated, and — when a count
+of alternatives is given — the probabilities it assigned to the tokens it did *not* generate. The
+two endpoints spell the same request differently, and this server follows each spelling rather than
+picking one: on chat `logprobs` is a **boolean** and the number of alternatives lives in
+`top_logprobs`, while on `/v1/completions` `logprobs` is the **count** itself. They are not
+interchangeable, and the difference is not cosmetic — on chat `logprobs=false` means "not asked for",
+while on completions `logprobs=0` is a real request for the sampled token's own probability with no
+alternatives. A count sent to chat, or a boolean sent to completions, is a 400.
+
+The answer is an array of one object per generated token, in order, under the choice's `logprobs`
+key:
+
+```json
+{"logprobs":{"content":[
+  {"token":"1","logprob":-0.0001234,"bytes":[49],"top_logprobs":[
+    {"token":"1","logprob":-0.0001234,"bytes":[49]},
+    {"token":"2","logprob":-9.21,"bytes":[50]}
+  ]}
+]}}
+```
+
+- **`token` is the surface text of one token**, not a word: `bytes` holds its UTF-8 encoding, which
+  is how a caller reassembles text that a multi-byte character was split across. A token holding one
+  piece of a multi-byte character is not valid UTF-8 on its own, so a client that wants the exact
+  bytes should read `bytes` rather than re-encoding `token` — concatenating the `bytes` arrays in
+  order reproduces the answer.
+- **`logprob` is a natural log**, so it is always ≤ 0 and `exp(logprob)` is the probability.
+- **`top_logprobs` ranks the model's own distribution, not the sampler's candidate set.** It is
+  computed from the same raw logits the sampler draws from but over the whole vocabulary and before
+  `temperature`, `top_k` or `top_p` touch it, so the numbers are comparable across positions and
+  across requests. Ranking only the sampler's top-k candidates would inflate every probability by
+  whatever mass the truncation dropped. Under `temperature` 0 the generated token is the argmax and
+  is therefore the first entry, with the same `logprob` reported twice; when the request samples, the
+  generated token is somewhere inside the requested alternatives rather than necessarily first.
+
+Four things are worth knowing before relying on the field:
+
+- **The array covers the text, not the token budget.** A stop token or a client `stop` sequence cuts
+  the answer, and the array is cut with it — a position the caller never received is not reported.
+  `usage.completion_tokens` still counts the tokens the engine generated, so it can exceed the number
+  of entries in `content`.
+- **On chat the array sits beside `message`, not inside it.** The sidecar splits the token stream
+  into `content`, `reasoning_content` and `tool_calls`, so a client that wants a probability per
+  field has to do that split itself — the ranking describes the stream the model produced.
+- **Streaming is not supported**, because a chunk carries the text of its token with no ranking
+  beside it. `{"stream":true,"logprobs":...}` is a 400 rather than a stream that looks the same as
+  one whose request asked for no ranking at all.
+- **The engine has to declare it.** `logprobs` is refused when the capability is off, which is the
+  case for speculative decoding (its verify step ranks no tokens) and for the Ascend backend. The
+  limit on alternatives is this server's — 20 per position, above OpenAI's documented range — and a
+  request past it is a 400 naming the ceiling.
+
+#### Tool calls
+
+`tools` is forwarded to the checkpoint's own chat template, and a call the model writes back is
+reported in the assistant message's `tool_calls` array instead of being left in the text. The array
+uses the OpenAI shape — an `id`, `type` set to `"function"`, and `function.name` with
+`function.arguments` as a JSON string — and `finish_reason` is `"tool_calls"`, which is what a client
+branching on the field expects to see before it runs the call and sends the result back in a
+`tool`-role message.
+
+That round trip is the one the acceptance test drives: the assistant message the server returned is
+replayed verbatim alongside a `role: "tool"` result keyed on its `id`, and the answer comes back as an
+ordinary `stop`. Both turns were checked through the `openai` and `langchain-openai` clients as well as
+over bare HTTP — the [tool-calling acceptance record](../performance/cpp_openai_tool_acceptance.md)
+has the request and response shapes.
+
+Five things are worth knowing before relying on the field:
+
+- **The schema is what types the arguments.** Qwen's template writes a call as XML —
+  `<tool_call><function=NAME><parameter=ARG>VALUE</parameter></function></tool_call>` — and that shape
+  records no type of its own: `<parameter=days>3</parameter>` is one character more than
+  `<parameter=days>two</parameter>`. Each value is therefore read back against the type the request's
+  own `parameters.properties` declares, so an argument declared `integer` arrives as the number `3`
+  and one whose declared type is missing, unknown, or not parseable from the text arrives as the
+  characters that were written. A request with no `tools` at all leaves every argument a string,
+  because nothing in the text can settle whether `01234` meant a number.
+- **Parsing is all-or-nothing.** A completion whose call was truncated at the token budget, is
+  malformed, or has prose between two calls yields **no** `tool_calls`, and the text stays in
+  `content` exactly as generated. A half-read call whose arguments look complete is worse than one
+  whose syntax the caller can see.
+- **Only a call syntax this server has read is parsed.** That is Qwen's template (`qwen3_5`,
+  including the `qwen3_5_text` spelling) and DeepSeek-V4's own encoder, which already parsed its
+  DSML calls. Any other architecture keeps the older behaviour and leaves the call in `content`;
+  inventing a parse for a syntax nobody has read would drop or corrupt calls silently.
+- **Streaming is not supported.** A streamed response carries the call syntax as content, exactly as
+  it did before, and reports the engine's own `finish_reason`. Ask for a non-streaming response when
+  you want `tool_calls`.
+- **The selection policy is not applied.** `tool_choice` other than `"auto"` and
+  `parallel_tool_calls: false` are 400s, listed below: the model still decides whether to call
+  anything and how many calls to make.
+
+### Refused with HTTP 400
+
+Each of these is refused only at a value that would change the output. The same field at the value
+naming what the server already does — `logprobs=false` on chat, penalties of zero, an empty `stop`
+list, an empty `logit_bias`, `echo=false` — is accepted, so a client that sends the documented
+defaults explicitly is not punished for it. The two entries for a field this server *does* implement
+are shape checks on the endpoint that defines the value, not refusals of the feature.
+
+| Field | Endpoints | Refused when | What this server does instead |
+| --- | --- | --- | --- |
+| `stop` | both | the value is not a string and not a list of strings | Nothing is matched, so a well-formed `stop` is refused on shape alone rather than half-applied. Empty strings match nothing and are accepted, which is what makes an empty `stop` list — or the empty entries some clients pad it with — harmless. |
+| `logprobs` | chat | not a boolean | A count is the other endpoint's spelling of the field; see [Log probabilities](#log-probabilities). |
+| `logprobs` | completions | not a whole number in 0..20 | It is the number of alternatives to rank per position, above this server's ceiling of 20. |
+| `top_logprobs` | completions | any value but `null` | The completions endpoint names the count in `logprobs` itself. |
+| `top_logprobs` | chat | not a whole number in 0..20, or positive while `logprobs` is absent or `false` | There is no ranking to take alternatives from unless the request asked for log probabilities. |
+| `logprobs` | both | asked for on a streaming request | A streamed chunk carries the text of its token with no ranking beside it. |
+| `frequency_penalty`, `presence_penalty` | both | non-zero | The sampler has no repetition or presence term, so the request is generated as if the penalty were 0. |
+| `logit_bias` | both | the object is not empty | No per-token bias is applied, so biased tokens are sampled at their unmodified probability. |
+| `best_of` | completions | not 1 | One candidate is generated per request; there is no second candidate to compare it against. |
+| `suffix` | completions | non-empty | The completion is returned on its own, with no suffix appended. |
+| `echo` | completions | `true` | `text` holds only the generated continuation, never the prompt. |
+| `tool_choice` | chat | anything but `"auto"` | Tool definitions reach the chat template, but the model is not constrained to call a tool, skip them, or call one function, so the policy has no effect. |
+| `parallel_tool_calls` | chat | `false` | The number of tool calls the model emits is not limited. |
+| `stream_options.include_usage` | both | `true` on a streaming request | A stream is delta chunks followed by `[DONE]`, and none of them carries `usage`. A non-streaming response already reports usage, so the option is satisfied there and accepted. |
+
+The refusal uses the OpenAI error shape with `type` set to `invalid_request_error` and `param` set
+to the offending field, so a client can act on it without parsing the prose:
+
+```json
+{"error":{"message":"\"stop\" = 5 is not supported by this server: a stop sequence is a string, or a list of strings, and this value is neither. Send \"stop\" as a string or an array of strings.","type":"invalid_request_error","param":"stop","code":null}}
+```
+
+### Accepted and inert
+
+These cannot change the generated text, so they are accepted and ignored rather than refused:
+`user`, `store`, `metadata`, `service_tier`, and `model`. The server serves exactly one model and
+echoes its configured name back, so a `model` naming something else is not a routing request it can
+honour — but rejecting it would break clients over nothing.
+
+`parallel_tool_calls` is the exception that shows the rule is applied per value rather than per
+field: `true` is inert and accepted, while `false` asks for a limit that is not enforced and is
+refused with the rest of the table above.
+
 ## Configuration precedence
 
 Prefer typed `EngineArgs` and explicit CLI options. `EngineArgs.from_env()` exists as a compatibility bridge for legacy deployments. Runtime tuning variables are named `POCKETLLM_*` (renamed from `DSV4_*`, a breaking change — see [the migration note](../migration/dsv4-to-pocket-rename.md)); `QWEN_*` and related names are unchanged. Backend-specific tuning belongs in `backend_options` and must not be assumed portable between CUDA and Ascend.

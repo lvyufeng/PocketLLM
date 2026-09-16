@@ -623,20 +623,20 @@ __global__ void head_rmsnorm_rope_freqs_kernel(
 __device__ float round_pow2_device(float x);
 __device__ float fp8_e4m3_quant_dequant(float v, float scale);
 
-__global__ void head_rmsnorm_rope_freqs_rows_kernel(
-    float* x,
+// Shared body of the two rows kernels below. They differ only in where the
+// row's absolute position comes from, and keeping the arithmetic in one place is
+// what makes the position-carrying variant bit-identical to the start_position
+// one: not merely equivalent, the same code. The two callers launch 256 threads
+// per block and one block per (head, token), which this body assumes for the
+// `partial` reduction.
+__device__ void head_rmsnorm_rope_freqs_row_body(
+    float* row,
     const float* inv_freqs,
-    int tokens,
-    int heads,
+    int position,
     int head_dim,
     int rope_dim,
-    int start_position,
     bool inverse,
     float eps) {
-    const int head = blockIdx.x;
-    const int token = blockIdx.y;
-    if (token >= tokens || head >= heads) return;
-    float* row = x + (static_cast<size_t>(token) * heads + head) * head_dim;
     if (eps > 0.0f) {
         float sum_sq = 0.0f;
         for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -655,7 +655,6 @@ __global__ void head_rmsnorm_rope_freqs_rows_kernel(
         __syncthreads();
     }
     const int rope_start = head_dim - rope_dim;
-    const int position = start_position + token;
     for (int pair = threadIdx.x * 2; pair < rope_dim; pair += blockDim.x * 2) {
         const int offset = rope_start + pair;
         const float angle = static_cast<float>(position) * inv_freqs[pair >> 1];
@@ -666,6 +665,47 @@ __global__ void head_rmsnorm_rope_freqs_rows_kernel(
         row[offset] = a * c - b * s;
         row[offset + 1] = a * s + b * c;
     }
+}
+
+__global__ void head_rmsnorm_rope_freqs_rows_kernel(
+    float* x,
+    const float* inv_freqs,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int start_position,
+    bool inverse,
+    float eps) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    if (token >= tokens || head >= heads) return;
+    float* row = x + (static_cast<size_t>(token) * heads + head) * head_dim;
+    head_rmsnorm_rope_freqs_row_body(row, inv_freqs, start_position + token,
+                                     head_dim, rope_dim, inverse, eps);
+}
+
+// Same arithmetic, but every row carries its own absolute position. A batch of
+// rows is only a contiguous run of positions while it is one request's prefill
+// or one request's verify block; independent requests in the same forward are at
+// unrelated positions, and deriving them from a single start_position would rope
+// every row but the first to the wrong angle.
+__global__ void head_rmsnorm_rope_freqs_rows_positions_kernel(
+    float* x,
+    const float* inv_freqs,
+    const int* positions,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    bool inverse,
+    float eps) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    if (token >= tokens || head >= heads) return;
+    float* row = x + (static_cast<size_t>(token) * heads + head) * head_dim;
+    head_rmsnorm_rope_freqs_row_body(row, inv_freqs, positions[token],
+                                     head_dim, rope_dim, inverse, eps);
 }
 
 __global__ void fp8_act_quant_dequant_rows_kernel(float* x, int cols, int block_size) {
@@ -1729,6 +1769,7 @@ __global__ void indexed_cached_attention_rows_kernel(
 __global__ void indexed_cached_attention_rows_batch_kv_kernel(
     const float* q,
     const float* kv_cache,
+    const int* row_kv_offset,
     const float* batch_kv,
     const int32_t* row_starts,
     const int32_t* indices,
@@ -1747,6 +1788,12 @@ __global__ void indexed_cached_attention_rows_batch_kv_kernel(
     const int end = row_starts[row + 1];
     const int index_count = end - begin;
     if (index_count <= 0 || index_count > max_index_count) return;
+    // Element offset of this row's KV ring inside kv_cache. A batch of one
+    // request's rows shares a ring and passes nullptr; independent requests each
+    // have their own ring, so each row carries its own offset. Read once, so the
+    // index loops below stay branch-free.
+    const float* row_cache = kv_cache +
+        (row_kv_offset == nullptr ? 0 : static_cast<size_t>(row_kv_offset[row]));
 
     extern __shared__ float smem[];
     float* q_shared = smem;
@@ -1761,7 +1808,7 @@ __global__ void indexed_cached_attention_rows_batch_kv_kernel(
     for (int t = tid; t < index_count; t += blockDim.x) {
         const int idx = indices[begin + t];
         const float* kv = idx >= 0
-            ? kv_cache + static_cast<size_t>(idx) * head_dim
+            ? row_cache + static_cast<size_t>(idx) * head_dim
             : (idx <= -2 ? batch_kv + static_cast<size_t>(-idx - 2) * head_dim : nullptr);
         float logit = -INFINITY;
         if (kv != nullptr) {
@@ -1802,7 +1849,7 @@ __global__ void indexed_cached_attention_rows_batch_kv_kernel(
         for (int t = 0; t < index_count; ++t) {
             const int idx = indices[begin + t];
             const float* kv = idx >= 0
-                ? kv_cache + static_cast<size_t>(idx) * head_dim
+                ? row_cache + static_cast<size_t>(idx) * head_dim
                 : (idx <= -2 ? batch_kv + static_cast<size_t>(-idx - 2) * head_dim : nullptr);
             if (kv != nullptr) out += weights[t] * kv[i];
         }
@@ -2442,6 +2489,7 @@ bool indexed_cached_attention_rows_cuda(
 bool indexed_cached_attention_rows_batch_kv_cuda(
     const float* d_q,
     const float* d_kv_cache,
+    const int* d_row_kv_offset,
     const float* d_batch_kv,
     const int32_t* d_row_starts,
     const int32_t* d_indices,
@@ -2465,8 +2513,8 @@ bool indexed_cached_attention_rows_batch_kv_cuda(
     if (shared_bytes > 48 * 1024) return false;
     indexed_cached_attention_rows_batch_kv_kernel<<<
         dim3(heads, rows), threads, shared_bytes, cuda_stream>>>(
-        d_q, d_kv_cache, d_batch_kv, d_row_starts, d_indices, d_attn_sink,
-        d_y, rows, heads, head_dim, max_index_count, scale);
+        d_q, d_kv_cache, d_row_kv_offset, d_batch_kv, d_row_starts, d_indices,
+        d_attn_sink, d_y, rows, heads, head_dim, max_index_count, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2643,6 +2691,16 @@ bool head_rmsnorm_rope_freqs_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+// Argument check shared by the two rows launch wrappers. The rows kernel and the
+// positions kernel must accept exactly the same shapes; if one of them started
+// rejecting (or accepting) an argument the other did not, the batched path would
+// silently disagree with the single-request path about which shapes are legal.
+static bool head_rmsnorm_rope_freqs_rows_launchable(
+    const float* d_x, const float* d_inv_freqs, int tokens, int heads, int head_dim, int rope_dim) {
+    return !(d_x == nullptr || d_inv_freqs == nullptr || tokens <= 0 || heads <= 0 || head_dim <= 0 ||
+             rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0);
+}
+
 bool head_rmsnorm_rope_freqs_rows_cuda(
     float* d_x,
     const float* d_inv_freqs,
@@ -2654,9 +2712,27 @@ bool head_rmsnorm_rope_freqs_rows_cuda(
     bool inverse,
     float eps,
     void* stream) {
-    if (d_x == nullptr || d_inv_freqs == nullptr || tokens <= 0 || heads <= 0 || head_dim <= 0 || rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) return false;
+    if (!head_rmsnorm_rope_freqs_rows_launchable(d_x, d_inv_freqs, tokens, heads, head_dim, rope_dim)) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     head_rmsnorm_rope_freqs_rows_kernel<<<dim3(heads, tokens), 256, 0, cuda_stream>>>(d_x, d_inv_freqs, tokens, heads, head_dim, rope_dim, start_position, inverse, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool head_rmsnorm_rope_freqs_rows_positions_cuda(
+    float* d_x,
+    const float* d_inv_freqs,
+    const int* d_positions,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    bool inverse,
+    float eps,
+    void* stream) {
+    if (d_positions == nullptr) return false;
+    if (!head_rmsnorm_rope_freqs_rows_launchable(d_x, d_inv_freqs, tokens, heads, head_dim, rope_dim)) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    head_rmsnorm_rope_freqs_rows_positions_kernel<<<dim3(heads, tokens), 256, 0, cuda_stream>>>(d_x, d_inv_freqs, d_positions, tokens, heads, head_dim, rope_dim, inverse, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 

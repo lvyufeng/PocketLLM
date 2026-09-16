@@ -171,7 +171,7 @@ python scripts/verify_cpp_qwen_openai.py \\
   --devices 0,1,2,3
 ```
 
-该 harness 会检查 health、model discovery、非流式和流式 chat completion、固定 sampling 校验，以及并发 scheduler admission。
+该 harness 会检查 health、model discovery、非流式和流式的 chat 与 text completion、固定 sampling 校验、请求字段拒绝、stop 序列截断，以及并发 scheduler admission。
 
 对于单并发客户端，如果后续请求会追加或压缩上一次请求，使用长期存活的 TP4 token-ID worker。rank 0 读取 `<max_new_tokens> token0 token1 ...`，并输出 exact prefix 统计；追加请求复用 live state，分叉请求从 GPU snapshot 恢复：
 

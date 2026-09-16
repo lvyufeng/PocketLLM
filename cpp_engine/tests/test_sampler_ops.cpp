@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -101,6 +102,143 @@ DeviceRun run_sampler(const std::vector<float>& host_logits, int rows,
     cudaFree(d_states);
     if (d_uniforms != nullptr) cudaFree(d_uniforms);
     return out;
+}
+
+// Sampler outputs plus the ranking and the normalizer a log-probability report
+// needs. The two launches are kept paired here because a ranking without its
+// denominator is not a probability, and the tests below always want both.
+struct RankingRun {
+    std::vector<int> tokens;       // [rows]
+    std::vector<float> logits;     // [rows], the raw logit of the drawn token
+    std::vector<float> max_logit;  // [rows]
+    std::vector<float> sumexp;     // [rows]
+    std::vector<int> top_tokens;   // [rows, top_n]
+    std::vector<float> top_logits; // [rows, top_n]
+};
+
+RankingRun run_ranking(const std::vector<float>& host_logits, int rows, int vocab,
+                       int vocab_start, float temperature, float top_p,
+                       int top_k, int top_n,
+                       const std::vector<float>& uniforms) {
+    float* d_logits = nullptr;
+    int* d_tokens = nullptr;
+    float* d_out_logits = nullptr;
+    float* d_uniforms = nullptr;
+    float* d_max = nullptr;
+    float* d_sumexp = nullptr;
+    int* d_top_tokens = nullptr;
+    float* d_top_logits = nullptr;
+    pocket::DeviceRngState* d_states = nullptr;
+
+    const int stride = top_n > 0 ? top_n : 0;
+    const size_t slots = static_cast<size_t>(rows) * stride;
+
+    check(cudaMalloc(&d_logits, host_logits.size() * sizeof(float)), "rank malloc logits");
+    check(cudaMalloc(&d_tokens, static_cast<size_t>(rows) * sizeof(int)), "rank malloc tokens");
+    check(cudaMalloc(&d_out_logits, static_cast<size_t>(rows) * sizeof(float)), "rank malloc out logits");
+    check(cudaMalloc(&d_max, static_cast<size_t>(rows) * sizeof(float)), "rank malloc max");
+    check(cudaMalloc(&d_sumexp, static_cast<size_t>(rows) * sizeof(float)), "rank malloc sumexp");
+    check(cudaMalloc(&d_states, static_cast<size_t>(rows) * pocket::sampler_rng_state_size()), "rank malloc states");
+    if (slots > 0) {
+        check(cudaMalloc(&d_top_tokens, slots * sizeof(int)), "rank malloc top tokens");
+        check(cudaMalloc(&d_top_logits, slots * sizeof(float)), "rank malloc top logits");
+    }
+    check(cudaMemcpy(d_logits, host_logits.data(),
+                     host_logits.size() * sizeof(float), cudaMemcpyHostToDevice),
+          "rank copy logits");
+    check(pocket::init_rng_states(d_states, rows, 1234ULL, nullptr), "rank init states");
+    if (!uniforms.empty()) {
+        check(cudaMalloc(&d_uniforms, uniforms.size() * sizeof(float)), "rank malloc uniforms");
+        check(cudaMemcpy(d_uniforms, uniforms.data(),
+                         uniforms.size() * sizeof(float), cudaMemcpyHostToDevice),
+              "rank copy uniforms");
+    }
+
+    check(pocket::sample_top_k_top_p_rows(
+              d_logits, d_tokens, d_out_logits, rows, vocab, vocab_start,
+              temperature, top_p, top_k, d_states, d_uniforms, nullptr, d_max,
+              d_top_tokens, d_top_logits, top_n),
+          "rank launch sampler");
+    check(pocket::vocab_logsumexp_rows(d_logits, d_max, d_sumexp, rows, vocab,
+                                       nullptr),
+          "rank launch logsumexp");
+    check(cudaDeviceSynchronize(), "rank sync");
+
+    RankingRun out;
+    out.tokens.resize(static_cast<size_t>(rows));
+    out.logits.resize(static_cast<size_t>(rows));
+    out.max_logit.resize(static_cast<size_t>(rows));
+    out.sumexp.resize(static_cast<size_t>(rows));
+    out.top_tokens.resize(slots);
+    out.top_logits.resize(slots);
+    check(cudaMemcpy(out.tokens.data(), d_tokens,
+                     out.tokens.size() * sizeof(int), cudaMemcpyDeviceToHost),
+          "rank copy tokens");
+    check(cudaMemcpy(out.logits.data(), d_out_logits,
+                     out.logits.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "rank copy out logits");
+    check(cudaMemcpy(out.max_logit.data(), d_max,
+                     out.max_logit.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "rank copy max");
+    check(cudaMemcpy(out.sumexp.data(), d_sumexp,
+                     out.sumexp.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "rank copy sumexp");
+    if (slots > 0) {
+        check(cudaMemcpy(out.top_tokens.data(), d_top_tokens,
+                         slots * sizeof(int), cudaMemcpyDeviceToHost),
+              "rank copy top tokens");
+        check(cudaMemcpy(out.top_logits.data(), d_top_logits,
+                         slots * sizeof(float), cudaMemcpyDeviceToHost),
+              "rank copy top logits");
+    }
+
+    cudaFree(d_logits);
+    cudaFree(d_tokens);
+    cudaFree(d_out_logits);
+    cudaFree(d_max);
+    cudaFree(d_sumexp);
+    cudaFree(d_states);
+    if (d_uniforms != nullptr) cudaFree(d_uniforms);
+    if (d_top_tokens != nullptr) cudaFree(d_top_tokens);
+    if (d_top_logits != nullptr) cudaFree(d_top_logits);
+    return out;
+}
+
+// Full-vocabulary CPU reference for one row: the row max, the log-softmax
+// denominator, and the descending order the ranking must reproduce. Double
+// precision throughout so a mismatch is about the kernels, not about float
+// rounding in the oracle.
+struct LogSoftmaxRef {
+    double max_logit = 0.0;
+    double log_denom = 0.0;
+    std::vector<int> order;
+};
+
+LogSoftmaxRef reference_log_softmax(const float* row, int vocab) {
+    LogSoftmaxRef ref;
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < vocab; ++i) {
+        max_logit = std::max(max_logit, static_cast<double>(row[i]));
+    }
+    double denom = 0.0;
+    for (int i = 0; i < vocab; ++i) {
+        denom += std::exp(static_cast<double>(row[i]) - max_logit);
+    }
+    ref.max_logit = max_logit;
+    ref.log_denom = std::log(denom);
+    ref.order.resize(static_cast<size_t>(vocab));
+    std::iota(ref.order.begin(), ref.order.end(), 0);
+    std::stable_sort(ref.order.begin(), ref.order.end(), [&](int a, int b) {
+        if (row[a] != row[b]) return row[a] > row[b];
+        return a < b;
+    });
+    return ref;
+}
+
+// log P(token) under the model's own next-token distribution: the raw logit,
+// shifted by the row max and normalized by the full-vocabulary denominator.
+double reference_logprob(const LogSoftmaxRef& ref, const float* row, int token) {
+    return static_cast<double>(row[token]) - ref.max_logit - ref.log_denom;
 }
 
 // CPU reference: top-k, then softmax at temperature, then top-p, then inverse
@@ -530,6 +668,162 @@ int main() {
             }
         }
         expect(same, "sharded two-stage sampling equals unsharded sampling");
+    }
+
+    // 9. The ranking a logprobs request reports must describe the model's own
+    //    next-token distribution. The sampler draws from a top-k set, so the
+    //    tempting shortcut -- normalizing over the candidates it keeps -- would
+    //    inflate every reported probability by the mass the truncation dropped.
+    //    The reference here is a full-vocabulary log-softmax, which is what the
+    //    engine must match.
+    {
+        const int lvocab = 4096;
+        const int lrows = 4;
+        const int top_n = 5;
+        const int top_k = 20;
+        const int offset = 1000;
+        auto logits = random_logits(lrows, lvocab, 99);
+        std::vector<float> uniforms{0.02f, 0.3f, 0.61f, 0.94f};
+        auto run = run_ranking(logits, lrows, lvocab, offset, 1.0f, 0.95f, top_k,
+                               top_n, uniforms);
+
+        bool max_ok = true;
+        bool sumexp_ok = true;
+        bool rank_ok = true;
+        bool logprob_ok = true;
+        for (int r = 0; r < lrows; ++r) {
+            const float* row = logits.data() + static_cast<size_t>(r) * lvocab;
+            const LogSoftmaxRef ref = reference_log_softmax(row, lvocab);
+
+            if (run.max_logit[static_cast<size_t>(r)] !=
+                static_cast<float>(ref.max_logit)) {
+                max_ok = false;
+            }
+            // expf against a double exp, summed in float over 4096 terms.
+            if (std::fabs(static_cast<double>(run.sumexp[static_cast<size_t>(r)]) /
+                              std::exp(ref.log_denom) -
+                          1.0) > 1e-4) {
+                sumexp_ok = false;
+            }
+
+            for (int i = 0; i < top_n; ++i) {
+                const size_t slot = static_cast<size_t>(r) * top_n + i;
+                if (run.top_tokens[slot] != ref.order[static_cast<size_t>(i)] + offset) {
+                    rank_ok = false;
+                }
+                if (run.top_logits[slot] !=
+                    row[ref.order[static_cast<size_t>(i)]]) {
+                    rank_ok = false;
+                }
+            }
+
+            // The value a client actually reads: the generated token's log
+            // probability, computed the way the engine will compute it. The
+            // reported token is a global id, so it is shifted back before
+            // indexing the host row.
+            const int sampled = run.tokens[static_cast<size_t>(r)] - offset;
+            const double reported =
+                static_cast<double>(run.logits[static_cast<size_t>(r)] -
+                                    run.max_logit[static_cast<size_t>(r)]) -
+                std::log(static_cast<double>(run.sumexp[static_cast<size_t>(r)]));
+            const double expected = reference_logprob(ref, row, sampled);
+            if (std::fabs(reported - expected) > 1e-4) {
+                std::printf("  row %d reported=%.6f expected=%.6f\n", r, reported,
+                            expected);
+                logprob_ok = false;
+            }
+            // No reported log probability may exceed the argmax's, since the
+            // argmax is the largest entry of the same distribution.
+            if (reference_logprob(ref, row, sampled) >
+                reference_logprob(ref, row, ref.order[0]) + 1e-6) {
+                logprob_ok = false;
+            }
+        }
+        expect(max_ok, "ranking reports the row's true maximum logit");
+        expect(sumexp_ok, "vocab logsumexp matches a host full-vocab sum of exp");
+        expect(rank_ok, "ranking matches a full-vocab descending sort, as global ids");
+        expect(logprob_ok, "sampled logprob matches a host full-vocab log-softmax");
+    }
+
+    // 10. A greedy request has a distribution behind its argmax, so it must
+    //     still report one. This is the path a temperature-0 benchmark takes,
+    //     and it reaches a different branch of the sampler kernel.
+    {
+        const int lvocab = 4096;
+        const int lrows = 3;
+        const int top_n = 5;
+        auto logits = random_logits(lrows, lvocab, 7);
+        auto run = run_ranking(logits, lrows, lvocab, 0, 0.0f, 0.95f, 20, top_n,
+                               {});
+
+        bool greedy_ok = true;
+        bool prob_ok = true;
+        for (int r = 0; r < lrows; ++r) {
+            const float* row = logits.data() + static_cast<size_t>(r) * lvocab;
+            const LogSoftmaxRef ref = reference_log_softmax(row, lvocab);
+            if (run.tokens[static_cast<size_t>(r)] != ref.order[0]) greedy_ok = false;
+            if (run.top_tokens[static_cast<size_t>(r) * top_n] != ref.order[0]) {
+                greedy_ok = false;
+            }
+            for (int i = 0; i < top_n; ++i) {
+                if (run.top_tokens[static_cast<size_t>(r) * top_n + i] !=
+                    ref.order[static_cast<size_t>(i)]) {
+                    greedy_ok = false;
+                }
+            }
+            // Sampling the argmax means the reported log probability is exactly
+            // -log(denominator), because the max cancels.
+            const double reported =
+                static_cast<double>(run.logits[static_cast<size_t>(r)] -
+                                    run.max_logit[static_cast<size_t>(r)]) -
+                std::log(static_cast<double>(run.sumexp[static_cast<size_t>(r)]));
+            if (std::fabs(reported + ref.log_denom) > 1e-4) prob_ok = false;
+        }
+        expect(greedy_ok, "the greedy path still reports a ranking");
+        expect(prob_ok, "an argmax draw reports -log(denominator)");
+    }
+
+    // 11. Asking for more alternatives than the sampler retained must pad rather
+    //     than read past the list. The engine clamps top_n to top_k, so this
+    //     pins the convention a consumer relies on rather than a live path.
+    {
+        const int lvocab = 512;
+        const int top_n = 25;
+        auto logits = random_logits(1, lvocab, 11);
+        auto run = run_ranking(logits, 1, lvocab, 0, 1.0f, 1.0f, 20, top_n, {0.5f});
+
+        bool padded = true;
+        for (int i = 20; i < top_n; ++i) {
+            if (run.top_tokens[static_cast<size_t>(i)] != -1) padded = false;
+            if (run.top_logits[static_cast<size_t>(i)] != -INFINITY) padded = false;
+        }
+        expect(padded, "ranks beyond the retained candidates pad with token -1");
+    }
+
+    // 12. With no ranking asked for, the sampler must still produce its own
+    //     output and leave the null ranking pointers alone. This is every
+    //     request that does not mention logprobs.
+    {
+        const int lvocab = 512;
+        auto logits = random_logits(2, lvocab, 13);
+        auto run = run_ranking(logits, 2, lvocab, 0, 1.0f, 0.9f, 20, 0, {0.4f, 0.8f});
+        bool ran = true;
+        for (int r = 0; r < 2; ++r) {
+            const float* row = logits.data() + static_cast<size_t>(r) * lvocab;
+            const LogSoftmaxRef ref = reference_log_softmax(row, lvocab);
+            // The sampled token must still be the reference's, and the row max
+            // is still reported even though no ranking was requested.
+            if (run.max_logit[static_cast<size_t>(r)] !=
+                static_cast<float>(ref.max_logit)) {
+                ran = false;
+            }
+            if (run.tokens[static_cast<size_t>(r)] !=
+                reference_sample(row, lvocab, 1.0f, 0.9f, 20,
+                                 (r == 0) ? 0.4f : 0.8f)) {
+                ran = false;
+            }
+        }
+        expect(ran, "top_n = 0 samples normally and reports only the maximum");
     }
 
     std::printf("%s\n", g_failures == 0 ? "PASS" : "FAILURES PRESENT");

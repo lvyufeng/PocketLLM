@@ -113,6 +113,7 @@ nav:
       - Qwen3.8-27B-FP8: models/qwen3.8-27b-fp8.md
       - Qwen3.8-27B-NVFP4: models/qwen3.8-27b-nvfp4.md
       - Qwen3.8-27B-BF16: models/qwen3.8-27b-bf16.md
+      - DeepSeek-V4.1-Flash: models/deepseek-v4.1-flash.md
   - Guides:
       - Overview: guides/index.md
       - Benchmarking and reporting: guides/benchmarking.md
@@ -125,10 +126,16 @@ nav:
       - FlashMemory 1M context: performance/flashmemory_1m_context.md
       - MiniMax decode bottleneck: performance/minimax_decode_bottleneck_analysis.md
       - Qwen4-Exp expert placement: performance/qwen4_exp_performance.md
+      - CPU offload and prefetch ceiling: performance/cpu_offload_profile.md
       - Qwen KV cache at 65K: performance/qwen_kv_cache_65k_tg512.md
       - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
+      - OpenAI API tool-calling acceptance: performance/cpp_openai_tool_acceptance.md
       - Ascend 910A attention: performance/ascend_attention_optimization.md
       - Ascend decode collectives and batch scaling: performance/ascend_decode_collective_ab.md
+      - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
+      - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
+      - DeepSeek-V4.1-Flash host run: performance/deepseek_v4_1_flash_host_run.md
+      - DeepSeek-V4.1-Flash device experts: performance/deepseek_v4_1_flash_device_experts.md
   - Architecture:
       - Overview: architecture/index.md
       - Backend unification design: architecture/backend_unification_design.md
