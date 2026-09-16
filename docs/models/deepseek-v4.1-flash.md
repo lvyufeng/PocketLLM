@@ -2,13 +2,14 @@
 
 ## Runtime status
 
-**Inspect only: the config parses, a 37-check safetensors-header audit is validated on the host, and the Engram hash front end that addresses the two 189 GiB tables is reproduced and tested; no V4.1 execution path exists in this repository.**
+**Inspect only: both config layouts the release ships are read into one schema, a 37-check safetensors-header audit is validated on the host, and the Engram hash front end that addresses the two 189 GiB tables is reproduced and tested; no V4.1 execution path exists in this repository.**
 
-Nothing in this page generates tokens. The repository has no V4.1 layer code: `kv_source_layers`, `candidate_source_layer` and `bias_vl` do not appear anywhere under `cpp_engine/`, `src/`, `pocketllm/`, `tests/` or `docs/` except in this page and the files it documents. `engram` does appear — `src/encoding/engram.py` reproduces the reference's tokenizer-side front end — but that is address arithmetic over a tokenizer, not a layer of the model. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
+Nothing in this page generates tokens. The repository has no V4.1 layer code: `kv_source_layers` and `candidate_source_layer` appear only as config key names, in the schema, the audit and the tests this page documents, and never as anything a forward pass reads; `bias_vl` appears nowhere but this page. `engram` does appear — `src/encoding/engram.py` reproduces the reference's tokenizer-side front end — but that is address arithmetic over a tokenizer, not a layer of the model. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
 
 What *was* validated is a set of facts read out of the checkpoint's own metadata, plus an Engram front end that needs only the config and a tokenizer:
 
-- `scripts/audit_dsv41_headers.py` parses the V4.1 config and runs 37 checks over the safetensors headers.
+- `src/models/deepseek_v4_1/config.py` reads either config layout into one schema, so the two files that describe this model are checked against each other rather than parsed ad hoc by each consumer.
+- `scripts/audit_dsv41_headers.py` reads the config through that schema and runs 37 checks over the safetensors headers.
 - The audit ran against the first 3,000,001 bytes of each of the 48 published shards — roughly 144 MB in total. **No weight payload was downloaded or read.**
 - `src/encoding/engram.py` re-derives the Engram bucket layout and hashes token n-grams onto it. The primes it draws add up to the declared `engram_num_embeddings` exactly, so the 189.13 GiB of Engram tables are addressable rather than merely counted.
 - Upshot: 96,085 tensors, 510,286,023,000 B (475.24 GiB), a fully consistent tensor inventory, an Engram layout that closes to the row, and a checkpoint-specific configuration that differs from the validated V4-Flash config in the ways listed below.
@@ -55,7 +56,7 @@ The geometry below is transcribed from the released `config.json` and cross-chec
 
 ### Configuration delta against DeepSeek-V4-Flash
 
-`configs/config.json` is the validated V4-Flash config; the V4.1 config is the released `inference_config.json`. Same-named keys that changed:
+`configs/config.json` is the validated V4-Flash config; the V4.1 config is the released `inference/config.json`, whose flat key names the table below uses. Same-named keys that changed:
 
 | Key | V4-Flash | V4.1-Flash |
 | --- | ---: | ---: |
@@ -67,7 +68,7 @@ The geometry below is transcribed from the released `config.json` and cross-chec
 | `index_n_heads` | 64 | 32 |
 | `compress_ratios` | alternating 4 / 128 | 0,0 then 18×2, 20×1, 0,0,0 |
 | `n_hash_layers` | 3 | absent |
-| `scale_fmt` | `ue8m0` | absent |
+| `scale_fmt` | `ue8m0` | `ue8m0`, under `config.json`'s `quantization_config` only |
 
 Unchanged between the two: `head_dim` 512, `n_heads` 64, `rope_head_dim` 64, `o_groups` 8, `o_lora_rank` 1024, `window_size` 128, `index_head_dim` 128, `index_topk` 512, `n_shared_experts` 1, `n_activated_experts` 6, `route_scale` 1.5, `score_func` `sqrtsoftplus`, `swiglu_limit` 10.0, `rope_factor` 16, `rope_theta` 10000, `compress_rope_theta` 160000, `original_seq_len` 65536, `vocab_size` 129280, `hc_mult` 4, `hc_sinkhorn_iters` 20.
 
@@ -111,11 +112,45 @@ Two Engram tables dominate the checkpoint. `layers.1.engram.embed.weight` is F8_
 
 ## Implemented execution path
 
-**There is no V4.1 execution path.** What exists is a host-only audit, an Engram front end that needs no checkpoint at all, and a V4-Flash runtime that the layer-level comparison below suggests is a partial starting point.
+**There is no V4.1 execution path.** What exists is a config schema, a host-only audit, an Engram front end that needs no checkpoint at all, and a V4-Flash runtime that the layer-level comparison below suggests is a partial starting point.
+
+### The config schema
+
+A V4.1 checkpoint describes the same model twice, in two layouts that are each silent about something the other states, and until this schema existed every reader parsed whichever one it happened to be handed. `src/models/deepseek_v4_1/config.py` reads both into one `V41Config`:
+
+| | `config.json` | `inference/config.json` |
+| --- | --- | --- |
+| Layout | 11 top-level keys; the text half under `text_config`, the vision tower under `vision_config`, the weight quantization under `quantization_config` | one flat level of 64 keys |
+| Backbone names | `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `sliding_window`, `scoring_func` | `dim`, `n_layers`, `n_heads`, `window_size`, `score_func` |
+| MoE / norm names | `moe_intermediate_size`, `num_experts_per_tok`, `routed_scaling_factor`, `rms_norm_eps` | `moe_inter_dim`, `n_activated_experts`, `route_scale`, `norm_eps` |
+| Layer lists | `kv_source_layer_ids`, `index_source_layer_ids`, `candidate_source_layer_id` | `kv_source_layers`, `index_source_layers`, `candidate_source_layer` |
+| YaRN | `rope_scaling.{type, factor, original_max_position_embeddings}` | `rope_factor` / `rope_theta` / `original_seq_len`, flat |
+| Vision | `vision_config.{num_hidden_layers, hidden_size, …}` | `vision_n_layers`, `vision_dim`, … |
+| Top-level `dtype` means | the storage dtype of the unquantized tensors, `bfloat16` | the quantization dtype, `fp8` |
+
+The `dtype` row is the one that bites hardest: the two files use the same key name for different facts, and the Transformers file's value is *not* the quantization format — the dense linears are FP8 and the routed experts FP4, which that file states under `quantization_config` (`quant_method` `fp8`, `expert_dtype` `fp4`, `weight_block_size` `[32, 32]`, `scale_fmt` `ue8m0`) and the flat file states as `dtype`/`expert_dtype`. Reading `dtype` as `bfloat16` and concluding the checkpoint is unquantized is exactly the mistake the schema exists to prevent. `param_dtype` is the canonical name for the Transformers file's storage dtype, and the flat file has no counterpart for it — as it has none for 11 other fields, `model_type`, `architectures`, the three token ids, `hidden_act`, `max_position_embeddings`, `num_key_value_heads`, `tie_word_embeddings`, `topk_method` and `norm_topk_prob`.
+
+What makes the two files checkable against each other is `as_reference_dict()`: it maps a parsed config back into the flat layout, and on the released pair it reproduces `inference/config.json` **exactly** — same 64 keys, same values — from either input file, so the nested file round-trips to the flat one and the flat one round-trips to itself. `differs_from()` then reports every field on which two configs disagree *or* one is silent, and on the released pair it returns exactly the 12 fields above and nothing else. That is the schema's real claim: the checkpoint's two descriptions of itself do not contradict each other anywhere, and the only asymmetries are omissions in the flat file rather than different values.
+
+`verify()` checks a config against itself and is run by the module's command line:
+
+```bash
+python -m src.models.deepseek_v4_1.config /path/to/DeepSeek-V4.1-Flash
+```
+
+which prints the file it resolved, the shape it read, and the verdict:
+
+```
+/path/to/DeepSeek-V4.1-Flash/config.json (nested)
+  40 layers + 3 draft, dim 5120, 64 heads of 512, 384 experts (6 active); Engram on layers [1, 14], vision 32 layers, DSpark block 5 over layers [37, 38, 39]
+  [ok] the config is self-consistent
+```
+
+Passing a directory resolves the config the same way every consumer does, and printing `(nested)` or `(flat)` says which file was read. The checks are the relationships a reader would otherwise have to hold in their head: `compress_ratios` is as long as the backbone plus the MTP layers and is not all zero; every layer that reads compressed positions has a KV source at or before it *with its own ratio* (the source writes the cache and divides the position by its ratio, so a mismatch reads a cache written at a different granularity) and an index source likewise; `candidate_source_layer` is an index source; the Engram tables are on distinct ascending layers inside the backbone with one row count each; `engram_pad_id` is the tokenizer's pad; every embedding id is inside `vocab_size`; and the vision tower's `dim` divides by its `n_heads` with an even `patch_size` (it unshuffles 2×2). The 12 Transformers-only fields are required only when the nested file was read — the flat one is a reference-runtime artifact that never had them, so demanding them there would report the release's own choice as a defect. `--json` writes the normalized config and the problem list, and the exit status is non-zero only when `verify()` finds something.
 
 ### The audit script
 
-`scripts/audit_dsv41_headers.py` is pure standard library — `argparse`, `json`, `os`, `re`, `struct`, `sys`, `collections` — so it runs under any interpreter with no `torch`, `safetensors` or `numpy`. It reads the 8-byte little-endian header length at the start of each shard, parses the header JSON, and validates the declared `dtype`/`shape`/`data_offsets` against the config. It never reads a payload, which is why it works identically on complete shards and on 3 MB header prefixes.
+`scripts/audit_dsv41_headers.py` is standard library only — its own `argparse`, `json`, `os`, `re`, `struct`, `sys` and `collections`, plus the config schema above, which is likewise standard library only — so it needs no `torch`, `safetensors` or `numpy` and runs under any interpreter as long as the repository root is importable. It reads the 8-byte little-endian header length at the start of each shard, parses the header JSON, and validates the declared `dtype`/`shape`/`data_offsets` against the config. It never reads a payload, which is why it works identically on complete shards and on 3 MB header prefixes.
 
 ### The Engram hash front end
 
@@ -130,11 +165,13 @@ Two Engram tables dominate the checkpoint. `layers.1.engram.embed.weight` is F8_
 
 ```bash
 python -m src.encoding.engram \
-  --config /path/to/inference_config.json \
+  --config /path/to/config.json \          # or .../inference/config.json: either shape
   --tokenizer /path/to/tokenizer_dir     # optional
 ```
 
 It prints, per Engram layer, the derived row count against the declared one and the difference, the GiB the two readings imply, the multipliers, the pad id's compressed id, and a sample of hash ids checked to be inside the table, then exits non-zero if anything disagrees. With `--tokenizer` it additionally rebuilds the compressed map and fails when its size does not match `engram_compressed_vocab_size`.
+
+The module reads its eight keys through `V41Config.engram_block()` rather than parsing the file itself. Seven of the eight — the layer ids, the n-gram size, the head count, the head dim, the vocabulary, the compressed vocabulary and the row counts — are spelled identically in both layouts, so the derivation was never shape-dependent; the pad id is the one real rename (`engram_pad_id` against `engram_pad_token_id`), and the schema is where it is paid.
 
 ### What the V4-Flash runtime already provides
 
@@ -161,7 +198,7 @@ The removed `hc_head_*` is not a cosmetic deletion, and the parameter shapes alo
 
 **None.** No prefill or decode throughput, latency or memory figure has been measured for V4.1-Flash, and none is implied by the audit. The reasons are concrete:
 
-- The checkpoint is 475.24 GiB and is not present on this host; only 48 header prefixes were fetched.
+- The checkpoint's 475.24 GiB of tensor payload is not on this host in full, and no weight byte has been read from the shards that are.
 - The four RTX 2080 Ti cards in the reference host hold 22 GiB each, so even a TP4 shard of the routed-expert and Engram tensors does not fit.
 - The released reference stack (`inference_requirements.txt`) requires `torch>=2.10.0` and `tilelang==0.1.8`. The `deepseek` environment has `torch 2.9.1+cu128` and no `tilelang`, so the reference implementation cannot be run here to produce a comparison point either.
 
@@ -180,6 +217,8 @@ The audit's 37 checks currently pass on the real headers. They are grouped as fo
 - **Vision (2 checks).** All 32 blocks present; the encoder and projector shapes match the config.
 - **DSpark (3 checks).** The Markov and confidence heads match the config; `main_proj` is `n_mtp_layers * dim` wide; every MTP layer carries attention and FFN, but only the last carries the heads.
 
+The config schema is checked in both directions against the released pair, not only against a fixture. `as_reference_dict()` on the nested file reproduces the flat file exactly — all 64 keys, every value equal — and on the flat file it round-trips to itself, so the alias table is lossy in neither direction; `differs_from()` reports exactly the 12 Transformers-only fields and nothing else, which is the statement that no field both files state disagrees. All 76 canonical fields (66 text, 10 vision) have an alias row, every row names a key the released files actually carry, and the 64 the flat file is expected to carry are exactly the 64 it has — no key unaccounted for and none named that is absent. `tests/test_models_deepseek_v4_1_config.py` holds all of that: 13 tests that need no checkpoint — a 64-key toy config in the flat layout and the same toy model written out in the nested layout by hand, asserted to read identically, plus the negative direction (a `candidate_source_layer` that is not an index source, a compress ratio with no source at or before it, two configs disagreeing on a field, and an unknown key, each reported or ignored rather than fatal) — and 8 more that skip unless a released pair is on the host. The toy nested file is built by hand rather than derived from the alias table on purpose: deriving it would make the round-trip test agree with whatever the table happens to say.
+
 Two facts from this section deserve emphasis because they were derived rather than read off:
 
 The Engram row counts are *derived*, and the derivation is exact to the row. The reference draws primes in order starting just above `engram_vocab_size` (16,000,000), hands them out across both layers without reuse, taking `(max_ngram_size − 1) × n_heads = 3 × 8 = 24` primes per layer, and `NgramHashState` builds its bucket offsets as a running sum over the layer's *flattened* prime list. The largest id a layer can produce is therefore `sum(primes) − 1` and the table needs exactly `sum(primes)` rows. Both layers match `engram_num_embeddings` with a difference of zero: the declared `[384006168, 384016682]` equals the derived values. That derivation is no longer only a claim on this page: `EngramLayout.from_config` reproduces it, `verify()` returns no problems, and `python -m src.encoding.engram --config …` prints a difference of 0 for both layers and exits 0. Layer 1's 24 primes run from 16,000,057 to 16,000,463 and layer 14's from 16,000,477 to 16,000,889; all 48 are distinct and all sit above `engram_vocab_size`, which is why one shared prime stream can serve both tables without overlap.
@@ -194,7 +233,7 @@ The audit establishes nothing about numerics. No tensor value has been read, so 
 
 The Engram front end is held to a different and stronger standard than the rest of this page, because it is executable. `tests/test_encoding_engram.py` pins the eight multipliers, both row counts and each layer's prime range as literals, so a change that would silently rehash 189 GiB fails the suite instead of passing quietly; it also asserts the negative direction (a tampered `engram_num_embeddings` is reported, not accepted) and checks `is_prime` against `sympy.isprime` across both bucket windows plus its edge cases, skipping rather than passing where `sympy` is absent. Separately, `NgramHasher.hash_ids` was compared position-for-position against the released reference's `NgramHashState.forward` on the host — plain sequences, masked sequences, a prefill-then-decode split across the cache, and a batch of two — and the outputs agree exactly. That comparison needs the unpacked reference under `/tmp` and the reference's `torch`, so it is a host run rather than a committed test, and it was made with the compressed map stubbed to an identity map over 99,092 entries; it validates the hashing arithmetic, not the tokenizer normalization feeding it.
 
-Two limits on the Engram result remain, and neither is a formality. First, the compressed vocabulary was reproduced against the **V4-Flash** tokenizer that is on this host, not V4.1's: `len(tokenizer)` is 129,280 and the map collapses to exactly 99,092 distinct keys with the ids filling `[0, 99092)` with no gaps, matching `engram_compressed_vocab_size` — but that `tokenizer.json` is 6,367,146 bytes against V4.1's 6,367,257, and it lacks the `<｜deepseek_image｜>` and `<｜System｜>` tokens V4.1's prompt format requires. A 111-byte difference is not obviously enough to change a count that folds 129,280 ids into 99,092 keys, and the two added tokens would collapse onto existing keys if they normalize the same way, but this is strong evidence rather than a self-contained proof. Second, no row has been read out of either table: the row count and the id range are consistent with each other, and nothing here confirms that the FP8 payload at a given row is the embedding the reference would fetch.
+One limit on the Engram result remains, and it is narrower than it was. The compressed vocabulary has since been rebuilt against **V4.1's own** `tokenizer.json` rather than the V4-Flash one: 6,367,257 bytes, sha256 `c90dfa01…`, carrying `<｜System｜>` and `<｜deepseek_image｜>` where the V4-Flash tokenizer instead carries `<｜image｜>` and `<｜image2｜>`. It collapses to exactly 99,092 distinct keys with the ids filling `[0, 99092)` with no gaps, matching `engram_compressed_vocab_size`, and it produces the same eight hash multipliers and the same sampled hash ids as the V4-Flash tokenizer did — which is the expected outcome, since the multipliers range over the *compressed* vocabulary size and that size is 99,092 either way, but it is now measured rather than argued. The 111-byte difference and the substituted special tokens change which id spells a marker, not how many distinct keys the normalization folds 129,280 ids into. The limit that stays open is downstream of the tokenizer entirely: no row has been read out of either table, so the row count and the id range are consistent with each other while nothing here confirms that the FP8 payload at a given row is the embedding the reference would fetch.
 
 ## Reproduction
 
@@ -203,9 +242,11 @@ The audit needs only the first few megabytes of each shard. Downloading just eno
 ```bash
 python scripts/audit_dsv41_headers.py \
   --checkpoint-dir /path/to/dsv41-header-prefixes \
-  --config /path/to/inference_config.json \
+  --config /path/to/config.json \
   --header-prefix
 ```
+
+`--config` takes either released shape; the schema normalizes it to the flat key set before the first check runs, so `inference/config.json` gives the identical 37/37. Without `--config` the script resolves `<checkpoint-dir>/config.json` first and falls back to `<checkpoint-dir>/inference/config.json`.
 
 Against a complete checkpoint the same command runs without `--header-prefix`; results are identical because the payload is never read. `--json out.json` writes the report as machine-readable JSON, and `--list-tensors PATTERN` prints individual tensors as `name<TAB>dtype<TAB>shape<TAB>bytes<TAB>shard`. `--expect-fp8-block 32 32` overrides the FP8 block size the scale check assumes.
 
@@ -225,10 +266,12 @@ To confirm the checks are live, make a copy of the config with `engram_n_heads` 
 The Engram front end needs only the config, and optionally a tokenizer directory; neither the checkpoint nor any of the header prefixes above are required:
 
 ```bash
-python -m src.encoding.engram --config /path/to/inference_config.json
+python -m src.encoding.engram \
+  --config /path/to/config.json \
+  --tokenizer /path/to/DeepSeek-V4.1-Flash   # optional
 ```
 
-On this host that prints:
+On this host, against the released `config.json` and V4.1's own tokenizer, that prints:
 
 ```
 Engram layers [1, 14] | 24 hash columns per position
@@ -238,7 +281,7 @@ Engram layers [1, 14] | 24 hash columns per position
             embedding rows [384016682 x 256] = 91.56 GiB at one byte per element, plus 2.86 GiB of row scales
   [ok] the primes add up to the declared row counts
 
-tokenizer /mnt/data3/DeepSeek-V4-Flash-0731: 129280 tokens -> 99092 compressed ids
+tokenizer /mnt/data3/DeepSeek-V4.1-Flash: 129280 tokens -> 99092 compressed ids
   [ok] matches engram_compressed_vocab_size (99092)
   pad id 2 -> compressed 2
   layer 1 multipliers: [76632096046245, 4839876093313, 35959672319349, 73987337458391]
@@ -251,6 +294,27 @@ tokenizer /mnt/data3/DeepSeek-V4-Flash-0731: 129280 tokens -> 99092 compressed i
 
 Exit code 0. Both row counts are `ok` — the difference is zero for each layer — and the sampled ids land inside the tables. `--tokenizer` is optional: without it the second block is replaced by `[SKIP] compressed token map: pass --tokenizer to check it against the config`, and the layout checks still run. Passing a tokenizer whose map does not come out at 99,092 fails instead of skipping, because every hash multiplier derives from that size. `--json out.json` writes the same report machine-readably; note that it writes the report *and* the tokenizer leg's findings even when a check fails, so a caller can diff a failure rather than re-run it.
 
+The config schema is its own command, and with the released pair on disk it is the one that checks the checkpoint's two descriptions of itself against each other:
+
+```bash
+python -m src.models.deepseek_v4_1.config /path/to/DeepSeek-V4.1-Flash          # config.json (nested)
+python -m src.models.deepseek_v4_1.config /path/to/DeepSeek-V4.1-Flash/inference/config.json  # (flat)
+```
+
+Both print the same shape line and `[ok] the config is self-consistent` with exit 0. To see the round-trip and the difference list directly:
+
+```python
+from src.models.deepseek_v4_1.config import load_config
+import json
+
+hf = load_config("…/config.json")
+flat = load_config("…/inference/config.json")
+assert hf.as_reference_dict() == json.load(open("…/inference/config.json"))  # 64 keys, exact
+assert flat.as_reference_dict() == json.load(open("…/inference/config.json"))  # round-trips
+for line in hf.differs_from(flat):
+    print(line)   # exactly the 12 Transformers-only fields
+```
+
 The same two directions are covered by the test suite, which needs no checkpoint either:
 
 ```bash
@@ -261,10 +325,11 @@ Expect 21 tests collected with nothing failing. `numpy` is not a declared depend
 
 ## Known limitations
 
-- **No generation of any kind.** No embedding is loaded and no forward pass exists for this architecture. The one tokenizer that has been exercised is the V4-Flash tokenizer, and only to rebuild the Engram compressed vocabulary — not to tokenize a prompt, and not to check that V4.1's own tokenizer would produce the same map.
-- **No local checkpoint.** Only 48 header prefixes were downloaded; the 475.24 GiB of weights is not on this host, and it does not fit on the four 22 GiB cards available here.
+- **No generation of any kind.** No embedding is loaded and no forward pass exists for this architecture. The tokenizers that have been exercised are V4.1's own and the V4-Flash one, and only to rebuild the Engram compressed vocabulary — not to tokenize a prompt, and not to render a chat template.
+- **No complete local checkpoint, and it could not be used here anyway.** Every tensor fact on this page comes from 48 header prefixes — 96,085 tensor descriptors totalling 475.24 GiB, none of whose payloads has been read. That 475.24 GiB does not fit on the four 22 GiB cards available here in any case.
+- **The two config layouts are not interchangeable field for field.** A consumer handed only `inference/config.json` has no `model_type`, no `architectures`, no token ids, no `topk_method`, no `norm_topk_prob` and no `param_dtype`, and its top-level `dtype` is the *quantization* dtype rather than the storage one. `resolve_config` prefers the nested file for exactly this reason and treats the flat one as the fallback; the schema makes the missing fields visibly absent rather than silently defaulted, but it cannot supply them.
 - **The audit validates metadata consistency, not correctness.** It proves the config and the tensor inventory agree with each other. A checkpoint could satisfy all 37 checks and still be unusable, and a wrong value that is *consistently* wrong in both the config and the shapes would pass.
-- **Engram is addressable but not consumed.** The compressed token map, the prime-derived bucket layout and the n-gram hasher now exist in `src/encoding/engram.py`, and the two layers reproduce their declared row counts exactly, so the 189.13 GiB of tables can be indexed. What is still missing is everything downstream: no row has been read, no embedding lookup has been written, no gate or value projection has been run, and the compressed map was verified against the V4-Flash tokenizer rather than V4.1's (see [Correctness and precision](#correctness-and-precision)).
+- **Engram is addressable but not consumed.** The compressed token map, the prime-derived bucket layout and the n-gram hasher now exist in `src/encoding/engram.py`, and the two layers reproduce their declared row counts exactly, so the 189.13 GiB of tables can be indexed. What is still missing is everything downstream: no row has been read, no embedding lookup has been written, and no gate or value projection has been run (see [Correctness and precision](#correctness-and-precision)).
 - **The vision path is unvalidated in both directions.** The 263 vision and aligner tensors are accounted for and their shapes match the config, but no image has been processed and no projector has been run.
 - **No reference comparison is possible on this host.** The released stack needs `torch>=2.10.0` and `tilelang==0.1.8`; neither is available in the `deepseek` environment.
 - **The prompt format changed and is unimplemented here.** DSML tags gain a leading space (`<｜DSML｜ calls>`, `<｜DSML｜ invoke>`, `<｜DSML｜ parameter>`), reasoning effort becomes a numeric budget in 1–100 rendered only under `thinking_mode="thinking"` at index 0, and mid-conversation `<｜System｜>` messages are supported. None of that is wired into this repository's chat templates.
@@ -272,8 +337,10 @@ Expect 21 tests collected with nothing failing. `numpy` is not a declared depend
 
 ## Evidence and related notes
 
-- `scripts/audit_dsv41_headers.py` — the host-only header audit and config parser
+- `src/models/deepseek_v4_1/config.py` — the config schema that reads both released layouts into one view, with an `as_reference_dict` inverse and a `python -m src.models.deepseek_v4_1.config` CLI
+- `scripts/audit_dsv41_headers.py` — the host-only header audit, reading its config through the schema above
 - `src/encoding/engram.py` — the Engram compressed token map, bucket layout, hash multipliers and n-gram hasher, plus a `--config`/`--tokenizer` CLI
+- `tests/test_models_deepseek_v4_1_config.py` — 21 tests over the schema: the alias table, the round-trip to the flat layout, the shape-independent reading of a toy model in both layouts, and the released pair when it is on the host
 - `tests/test_encoding_engram.py` — 21 tests pinning the primes, multipliers and row counts, with the tokenizer and `sympy` legs skipping when unavailable
 - `configs/config.json` — the validated V4-Flash config used as the delta baseline
 - [DeepSeek-V4-Flash](deepseek-v4.md) — the validated runtime whose layer structure the V4.1 backbone reuses
