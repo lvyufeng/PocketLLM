@@ -1,7 +1,8 @@
 """DeepSeek-V4.1-Flash model-shape adapter layer.
 
-Only the configuration schema lives here so far -- no weight loading and no
-execution path. See `config` and `docs/models/deepseek-v4.1-flash.md`.
+The configuration schema and a pure-PyTorch op layer live here so far -- no weight
+loading and no execution path. See `config`, `kernels`, and
+`docs/models/deepseek-v4.1-flash.md`.
 
 The names below are re-exported lazily rather than imported here. An eager
 `from .config import ...` would put `config` in `sys.modules` before `runpy` gets
