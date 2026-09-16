@@ -11,11 +11,15 @@ question this page asks, which is why **one** request is 9.6 TPS and what is lef
 
 The short version: the step is 104.3 ms, **101.2 ms of it does not depend on the row count at all**,
 and of that 101.2 ms about **62 ms is 129 `HcclAllReduce` calls whose per-call price is host latency
-rather than bandwidth**. The remaining ~42 ms is the weight streaming and the recurrence. The
-copy primitives needed to hand-write a collective are cheap and they do work across the process
-boundary the engine runs behind — but the *barrier* that a collective needs costs 0.23 ms per remote
-wait on this stack, which is exactly the number that makes the host-driven replacement lose to the
-`HcclAllReduce` it would replace (§5).
+rather than bandwidth**. The remaining ~42 ms is the weight streaming and the recurrence. The copy
+primitives needed to hand-write a collective are cheap and they do work across the process boundary
+the engine runs behind. The three ordering primitives AscendCL offers across that boundary are *not*
+usable here — an imported notify cannot be waited on and a cross-process event cannot be created —
+but a barrier that reads its arrival signal out of the payload itself is, and it prices a complete
+all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** (§5.4). So the 129 collectives are 62.0 ms
+of the step today and 33.4 ms of it if they are replaced — 28.6 ms saved, and 9.6 TPS against **13.2**.
+That replacement is a design with a measured core, not a shipped one: §5.4 says what is measured and
+what is still assumption.
 
 ## 1. The row sweep: single-request cost is batch-independent cost
 
@@ -230,7 +234,7 @@ out right. Two operator notes fall out of the table:
 - The failure mode is a clean error code at import, not a later fault — which is the good version of
   this problem.
 
-### 5.3 The barrier is the cost, and the copies are not
+### 5.3 A notify-based barrier loses
 
 With the channel proven, the four barrier shapes, 200 iterations, world=4, `--bytes 10240`:
 
@@ -257,38 +261,71 @@ The reading is unambiguous:
   the cross-process signal path and not the peer-access mapping behind it. `--set-import-pid` does
   not work, so it cannot be tested the other way.
 
-**A world-4 all-to-all barrier therefore costs 0.0310 + 0.7212 = 0.75 ms of host time**, against
-`HcclAllReduce`'s 0.4810. Hand-writing the collective in this shape is a 1.6x **loss**, and it would
-be a loss 129 times per decode step. The handoff through shared device memory is not the problem —
-the primitives for it are cheap, they work across processes, and they produce the right answer. The
-problem is that on this stack a host-visible signal from another process is ~0.23 ms, and a
-collective needs one per peer.
+**A world-4 notify barrier therefore costs 0.0310 + 0.7212 = 0.75 ms of host time**, against
+`HcclAllReduce`'s 0.4810 — a 1.6x **loss**, 129 times per decode step. But that is a verdict on *this*
+barrier and not on hand-writing the collective. The notify arms are the ones that need a host-visible
+signal, and on this stack a host-visible signal from another process is ~0.23 ms, one per peer. §5.4
+is the barrier that does not need one.
 
-### 5.4 The shape that could still win
+### 5.4 The barrier that works: the arrival signal is the payload
 
-Two of the four arms are interesting for a reason the table does not make obvious: `self-wait` is
-0.0986 ms and `no-wait` is 0.0922 ms for a *complete, correct* push of this rank's data to every
-peer. The exchange half of an all-reduce is 0.09 ms. All of the 0.48 ms `HcclAllReduce` charges is on
-the other side of it.
+Which leaves one signal path that is neither a notify nor an event: the data. Push the payload into the
+peer's slot, then poll your own slot for it. Nothing has to cross a process boundary except the value
+that was going to cross it anyway.
 
-The only way to spend less than 0.72 ms on the barrier is to spend it somewhere other than the host:
-either a shape whose barrier needs **one** remote wait per round instead of `world-1` — a ring or a
-neighbour exchange, at ~0.25 ms, which beats 0.4810 by 1.9x — or no host-visible wait at all, with
-the ranks synchronizing through device-side counters that only the device reads. The second is the
-larger prize and the larger change: it replaces the 0.4810 ms of host latency with the *enqueue*
-price of one kernel, and the platform floor for that is on the order of the 0.0195 ms a memset plus
-a synchronize costs (§2.3) rather than the 0.23 ms a remote notify costs.
+The form that works is `--poll-wait` in `bench_qwen_ascend_ipc_exchange`. Each rank stamps element 0
+with a counter only it writes — `0x3c00 + 0x400*rank + it`, so the bands are disjoint and the round is
+recoverable from the slot — pushes its buffer to all three peers, and then loops over its own receive
+slots doing a 2-byte D2H read until the stamp of the round it is in is there. The counter is what makes
+the poll mean anything: a fixed sentinel is already in the slot from the previous round, so the poll
+would return before the peer had pushed. It is a genuine barrier and not four processes happening to
+run in lockstep: with `--skew-us 50`, which makes rank r sleep r×50 µs before each round, the four
+ranks' `wait_ms` separate cleanly along the induced arrival order — **0.271 / 0.173 / 0.134 / 0.081**
+for ranks 0-3, against 0.097-0.148 with no skew — so the barrier absorbs the 150 µs rank 0 arrives
+early with and the last rank pays nothing.
 
-That is a design, not a measurement, and it is deliberately not written up as more than that here.
-What the measurements above do establish is the boundary: the pieces all exist and all work, the
-copy half is nearly free, and the decision rests entirely on how many host-visible round trips the
-barrier needs.
+Two receive buffers per (peer, source) pair are required, used on alternate rounds, and that is not a
+detail. With one, a peer that gets a round ahead overwrites the stamp being waited for, and the poll
+then cannot match at all — it burns its deadline and resynchronises a round late, which is a stall
+rather than a wrong number. `--poll-single-set` selects the one-buffer layout so the difference is
+measured rather than asserted; at 5000 rounds it hits the probe's stall cap on **21 rounds** while the
+two-buffer layout stalls **zero times in 20000**:
+
+| layout | rounds run | `wait_ms` | stalled rounds | `total_ms` |
+|---|---|---|---|---|
+| one buffer per pair (`--poll-single-set`) | 2 760 of 5 000 | **7.33** | 21 | 7.65 |
+| two buffers, alternating | 5 000 | 0.092-0.122 | 0 | 0.330 |
+| two buffers, alternating | 20 000 | 0.096-0.116 | 0 | **0.259** |
+
+Every arm reports `result=ok slots_ok=4/4` and `reduce sum_ok=5120/5120 first=0x4b80 (15.0)
+want=15.0` on all four ranks, so the exchange and the reduce are both correct, not only fast.
+
+The steady state at 20000 rounds is `push_ms=0.044`, `wait_ms=0.109`, `reduce_ms=0.070` and a 0.032 ms
+trailing drain, for **0.259 ms for a complete world-4 all-reduce at 10 KB**. The `reduce_ms` figure is
+three `aclnnInplaceAdd` calls and one device copy and it still carries the aclnn first-call
+initialisation: the same number is 4.6655 ms at 100 rounds, 2.4237 at 200 and 1.4158 at 400, i.e. a
+fixed ~480 ms amortised over the run, so the steady per-call reduce is nearer 0.046 ms. Steady buckets
+are flat (0.086-0.118 ms per quarter-run, first quarter included), so the barrier settles immediately
+and the single averaged figure is a fair description of it.
+
+Against `HcclAllReduce`'s 0.4810, that is **1.9x cheaper per call** — 129 calls go from 62.0 ms to
+33.4 ms, and the step from 104.3 ms to 75.7 ms, or **9.6 TPS to 13.2 TPS**.
+
+What this is not yet: the loop around it is empty, so the ranks stay within a fraction of a round of
+each other by construction. The engine has real work between collectives, and the design that follows
+from these numbers — one pair of buffers per rank rotating through a global round counter, exported
+once at startup through the rendezvous the HCCL id already uses, with the reduce staying on the device
+— has not been built or measured. The 0.259 also includes a trailing `stream_synchronize` that the
+engine may not need, since the next layer's work is enqueued on the same stream and only the device
+reads the result; that variant is untested and would be cheaper, not more expensive. What is settled is
+the thing §5.3 could not settle: the barrier itself, at world=4 on four processes, costs less than the
+collective it would replace.
 
 ## 6. What is left, in order of size
 
 | lever | measured size | state |
 |---|---|---|
-| Replace the 129 collectives with a device-synchronised hand-written one | up to 62 ms of 104.3, i.e. 9.6 -> 23.6 TPS | design; the host-driven version is a 1.6x loss (§5.3) |
+| Replace the 129 collectives with the hand-written one | 129 x (0.4810 - 0.259) = **28.6 ms** of 104.3, i.e. 9.6 -> **13.2 TPS** | barrier measured (§5.4); engine integration not built |
 | The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
 | Verifier placement | 0.08%, noise | retracted (§4.2) |
@@ -340,6 +377,13 @@ for r in 0 1 2 3; do
   cpp_engine/build-ascend/tests/bench_qwen_ascend_ipc_exchange \
       --world 4 --rank $r --device $r --dir <shared> --iters 200 --no-pid-check &
 done; wait
+
+# the poll barrier of §5.4, and the one-buffer layout it replaces
+for r in 0 1 2 3; do
+  cpp_engine/build-ascend/tests/bench_qwen_ascend_ipc_exchange \
+      --world 4 --rank $r --device $r --dir <shared> --no-pid-check \
+      --poll-wait [--poll-single-set] --iters 20000 &
+done; wait
 ```
 
 `bench_qwen_ascend_ipc_exchange` exports all `world` slots of its own buffer and imports the slot
@@ -353,8 +397,9 @@ local term of the sum never leaves the rank.
   platform floor, and the overlapped-vs-serial comparison, §2.1-§2.3.
 - `cpp_engine/tests/bench_qwen_ascend_peer_copy.cpp` — the primitives in a single process and the
   first host-driven all-reduce prototype, §5.1.
-- `cpp_engine/tests/bench_qwen_ascend_ipc_exchange.cpp` — the cross-process export/import probe and
-  the four barrier shapes, §5.2-§5.3.
+- `cpp_engine/tests/bench_qwen_ascend_ipc_exchange.cpp` — the cross-process export/import probe, the
+  four notify barrier shapes, and the payload-carried poll barrier with its one-buffer control,
+  §5.2-§5.4.
 - `cpp_engine/tests/bench_qwen_ascend_decode_ops.cpp` — the HBM read probe behind the 85 TPS
   ceiling, §3.
 - `cpp_engine/engine/qwen_engine.cpp` — `all_reduce_half_rows`, the one-wide-collective decision that

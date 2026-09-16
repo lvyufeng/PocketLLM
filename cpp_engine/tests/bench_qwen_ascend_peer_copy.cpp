@@ -69,7 +69,8 @@ void line(const char* fmt, ...) {
 const char* acl_error_note(aclError err) {
     switch (static_cast<int>(err)) {
         case 0: return " (ACL_SUCCESS)";
-        case 107012: return " (RT_PARAM_INVALID)";
+        case 107000: return " (RT_PARAM_INVALID)";
+        case 107012: return " (RT_THREAD_SUBSCRIBE)";
         case 207000: return " (RT_FEATURE_NOT_SUPPORT)";
         case 507899: return " (RT_DRV_INTERNAL_ERROR)";
         default: return "";
