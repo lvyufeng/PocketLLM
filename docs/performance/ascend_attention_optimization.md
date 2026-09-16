@@ -116,28 +116,45 @@ fallback.
 
 ## 4. Measured prefill attribution
 
-`QWEN_HOST_PROFILE=1`, 64 layers, 512-token prompt, `--resident-bench`. The profile emits three
-blocks (kernel warmup, the real prefill, decode) and the per-phase cost is the difference between
-block 0 and block 1. Prefill wall for the differenced pair: **1.6742 s**.
+`QWEN_PHASE_PROFILE=1 QWEN_COMM_OVERLAP_SLICES=1`, 64 layers, four ranks, `--resident-bench`. The
+phase profile synchronises the device on entry and exit of every scope, so each `seconds=` is device
+time for that scope rather than host wall-clock, and the serial slice count keeps a collective from
+hiding behind the GEMM it would otherwise overlap. A run emits four profile blocks and reuses the
+`tag=prefill` label for two of them — one a decode-shaped warmup pass whose scope times do not move
+with the prompt length; the timed block is the one whose `STACK.r` matches the reported
+`prefill_seconds`. See
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md#8-reproducing) for the
+block-identification trap.
 
-| phase | seconds | calls | us/call | share |
-|---|---|---|---|---|
-| `STACK.r` (whole decoder layer) | 1.1031 | 64 | 17236 | **65.9%** |
-| `full_attention` | 0.1646 | 32 | 5144 | 9.8% |
-| `STACK.d` | 0.0967 | 64 | 1512 | 5.8% |
-| `top1_allreduce` | 0.0814 | 2 | 40688 | 4.9% |
-| `tp_all_reduce` | 0.0779 | 130 | 599 | 4.6% |
-| every `pr.*` / `pd.*` projection | ~0.050 | — | — | ~3% |
+An earlier version of this section carried a three-block table and concluded that `STACK.r` at
+17.2 ms/layer was "an unattributed black box". **That conclusion is superseded twice.** The layer was
+instrumented, and that instrumentation then charged the collectives far more than they cost. The
+corrected attribution, device-synced at three prompt lengths, is:
 
-Two conclusions this settles:
+| component | 1105 tokens | 2223 tokens | 4433 tokens |
+|---|---|---|---|
+| `STACK.r` (whole 64-layer stack) | 1.2229 | 2.1187 | 3.9142 |
+| **`gated_delta`** (48 calls) | **0.5493 (44.9%)** | **1.1005 (51.9%)** | **2.2009 (56.2%)** |
+| 129 TP all-reduce calls | 0.3026 (24.7%) | 0.3479 (16.4%) | 0.4961 (12.7%) |
+| all 384 projection GEMMs | 0.1623 (13.3%) | 0.3243 (15.3%) | 0.5471 (14.0%) |
+| `full_attention` (16 calls) | 0.1359 (11.1%) | 0.2331 (11.0%) | 0.4722 (12.1%) |
 
-- **All projection GEMMs together are ~3% of prefill.** The prefill gap is not in the matmuls, so
-  further GEMM tuning cannot close it.
-- **`STACK.r` at 17.2 ms/layer is 66% of prefill and is still an unattributed black box.** It wraps
-  `decoder_layer_component.forward(...)` as a single scope, so it absorbs the layer's norms, transposes,
-  gated-delta work and elementwise passes without naming any of them. Instrumenting inside it is the
-  next measurement, and it is a prerequisite for any further prefill work — attributing this to
-  "attention" would be wrong, since `full_attention` is measured separately and is 9.8%.
+Three conclusions this settles:
+
+- **The linear-attention recurrence is the prefill bottleneck at long prompts, not the collectives.**
+  `gated_delta` is 10.35 us per token per head per layer, exactly linear in length (496.9 / 495.1 /
+  496.5 us per token across a 4x span), and it is 62% vector-instruction issue rather than state
+  bandwidth: ablating its `broadcast_rows` and `Axpy` loops out of the kernel moves the end-to-end
+  prefill 1128 -> 1734 TPS. Its shapes are Cube shapes, so the fix is a Cube step.
+- **The collectives fall as a share while the recurrence rises.** 24.7% at 1105 tokens to 12.7% at
+  4433. Their fixed per-call term is 1.85 ms from the device-synced fit in section 5.3, so the lever
+  is the number of calls per layer, not their payload — but it is no longer the lever that reaches
+  2000 TPS.
+- **`full_attention` is a steady 11-12%** and is profiled separately.
+
+The full per-phase tables, the ablation, the collective's measured fixed/byte split and the reason
+the earlier profile over-charged `ar.*` are in
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md) section 5.
 
 ## 5. Measured throughput
 
@@ -146,10 +163,17 @@ All runs: four ranks, `--smoke-forward --resident-bench`, `tp-world 4`, 64 layer
 | configuration | prompt | new | prefill TPS | decode TPS |
 |---|---|---|---|---|
 | before startup kernel warmup | 512 | 128 | 234.3 | 9.38 |
-| after startup kernel warmup | 512 | 128 | **428.1** | 9.21 |
-| after startup kernel warmup | 4096 | 32 | **1265.3** | 9.55 |
+| after startup kernel warmup | 512 | 128 | 428.1 | 9.21 |
+| after startup kernel warmup | 4096 | 32 | 1265.3 | 9.55 |
+| after the row-count slice rule | 512 | 128 | **878.8** | 8.73 |
+| after the row-count slice rule | 1024 | 8 | 1134.5 | 8.96 |
+| after the row-count slice rule | 2048 | 8 | 1238.3 | 9.11 |
+| after the row-count slice rule | 4096 | 32 | 1261.6 | 8.91 |
 | 64-layer reference, Cube split decode | 512 | 5 | 435.6 | 9.23 |
 | 4096 prefill, prior to this branch | 4096 | 1-16 | 287-325 | 3.20 |
+
+The slice rule is worth 2.05x at 512 tokens and is neutral at 4096; see
+[`ascend_tp_collective_overlap.md`](ascend_tp_collective_overlap.md).
 
 The startup-warmup fix (`QwenEngine::warmup_kernels`) brackets exactly one full forward pass with
 8-row prefill and one decode step. It is worth 512/128: 2.185 s -> 1.196 s (**1.83x** prefill) and
@@ -237,23 +261,30 @@ named:
   gated-delta matrix work (two 128x128 reductions and a rank-1 update currently done as 128-wide
   vector ops, with `broadcast_rows` the documented hot spot), the norms, and the transposes;
 - 129 TP all-reduce calls per decode token (64 `ar.mlp` + 48 `ar.lin.out` + 16 `ar.full.out` +
-  1 `ar.hidden_a`) at the measured 0.4430 ms each — flat in payload, so per-call and not per-byte —
-  serialised by the per-call `stream_synchronize` inside `end_nccl_collective`. That is **57.1 ms** of
-  the 108.6 ms step. (Two earlier revisions of this page and of the roadmap priced the same calls at
-  ~540 us each and at 0.3923 ms; the latter is the bench's `sync` row, and neither is the path the
-  engine runs.)
+  1 `ar.hidden_a`) at the measured 0.4430 ms each — flat in payload, so per-call and not per-byte.
+  That is **57.1 ms** of the 108.6 ms step. (Two earlier revisions of this page and of the roadmap
+  priced the same calls at ~540 us each and at 0.3923 ms; the latter is the bench's `sync` row, and
+  neither is the path the engine runs.) A third blamed the per-call `stream_synchronize` inside
+  `end_nccl_collective` for the whole of it, and **that is wrong too**: the probe line settles it, with
+  enqueueing an event pair costing 0.011 ms against 0.382 ms for one bare collective. The cost is
+  host-side issue of the collective itself, paid once per call regardless of payload, so the fix is
+  fewer collectives and not a cheaper fence around each one.
 
 **100 TPS is not reachable on this part at fp16.** It needs <= 10 ms/token; the perfect-streaming
 bound at TP8 is 21 ms with zero collective cost, which would already require 673 GB/s per card.
 Reaching the target requires weight quantization — int8 for 2x, int4 for 4x — plus removing the
-per-step collective serialisation. Note also that 8 cards is the practical maximum here:
+per-step collectives. Note also that 8 cards is the practical maximum here:
 `HcclCommInitAll` is unusable on this stack and one process per rank is required.
 
 ## 7. What this rules out
 
-- **More GEMM tuning for prefill.** Projections are ~3% of prefill.
-- **Blaming prefill on attention.** `full_attention` is 9.8% at 512 tokens and is measured separately
-  from `STACK.r`; attributing the 66% to it would point the next optimisation at the wrong unit.
+- **More GEMM tuning for prefill.** All 384 projection GEMMs together are 13-15% of the stack at
+  every length from 1105 to 4433 tokens, against a linear-attention recurrence that is 45-56%.
+- **Blaming prefill on attention.** `full_attention` is a steady 11-12% and is measured separately
+  from the collectives.
+- **Reading the prefill wall as collective-bound.** The 87% this section used to assert came from
+  nested host-wall spans; device-synced, the collectives are 12.7% of the stack at 4433 tokens and
+  their share *falls* as the prompt grows. Section 4 has the replacement table.
 - **A faster collective.** The HCCL floor is flat in payload size up to 640 KB.
 - **`aclrtMemcpy`-based bandwidth work.** 8.7 GB/s.
 - **Reading the M=1 GEMV plateau as the hardware ceiling.** It is the rate of a shape the Cube cannot

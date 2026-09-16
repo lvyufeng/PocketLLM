@@ -142,6 +142,43 @@ HcclRootInfo load_or_create_root_info(int rank, const char* path) {
     throw std::runtime_error("timed out waiting for HCCL id file");
 }
 
+// Where HCCL builds an operator's task graph. The default expands every op on
+// the host, and a decode step issues 129 collectives, so if expansion were the
+// per-call cost the decode step would be dominated by it.
+//
+// It is not, and the knob is kept only as a switch to re-measure with. Sweeping
+// HcclCommConfig::hcclOpExpansionMode over 0 (host), 1 (explicit host), 2 (AI
+// CPU) and 3 (vector unit) at 10 KB moves the synchronized all-reduce between
+// 0.380 and 0.397 ms and at 640 KB between 0.442 and 0.499 ms -- all four inside
+// the run-to-run spread. The device modes are not returning "unsupported"; they
+// run, and they change nothing.
+//
+// The size-independent ~0.38 ms is real, but it is the host-side cost of handing
+// one HcclAllReduce to the runtime, not of expanding it. The same binary's
+// `ar_probe` line separates the two: enqueueing a bare all-reduce costs 0.382 ms,
+// and enqueueing an event pair (record + stream-wait, the whole of what the
+// engine wraps around a collective) costs 0.011 ms. So the price is paid once per
+// collective call no matter how small the message, and the only way out is to
+// issue fewer collectives rather than cheaper ones.
+//
+// 0 keeps the default. Anything else is passed straight through to
+// HcclCommInitRootInfoConfig. HCCL's own environment variables are honoured on
+// this install and are not a safer route: `HCCL_OP_EXPANSION_MODE=AIV` runs and
+// changes nothing measurable, while `HCCL_ALGO=RING` and `HCCL_ALGO=NHR` both
+// abort the process with a core dump instead of falling back. Setting it through
+// the comm config keeps a bad value a failed experiment rather than a crash.
+uint32_t hccl_expansion_mode() {
+    const char* value = std::getenv("POCKETLLM_CPP_HCCL_EXPANSION_MODE");
+    if (value == nullptr || *value == '\0') return 0;
+    const int mode = std::atoi(value);
+    if (mode < 0 || mode > 3) {
+        throw std::runtime_error(
+            "POCKETLLM_CPP_HCCL_EXPANSION_MODE must be 0..3, got " +
+            std::string(value));
+    }
+    return static_cast<uint32_t>(mode);
+}
+
 HcclComm cached_comm(int world, int rank, int device, const char* id_path) {
     static std::unordered_map<std::string, HcclComm> comms;
     const std::string key = std::to_string(world) + ":" + std::to_string(rank) +
@@ -157,10 +194,21 @@ HcclComm cached_comm(int world, int rank, int device, const char* id_path) {
 
     bind_device(device);
     const HcclRootInfo info = load_or_create_root_info(rank, id_path);
+    const uint32_t expansion_mode = hccl_expansion_mode();
     HcclComm comm = nullptr;
-    check_hccl(HcclCommInitRootInfo(static_cast<uint32_t>(world), &info,
-                                    static_cast<uint32_t>(rank), &comm),
-               "HcclCommInitRootInfo");
+    if (expansion_mode == 0) {
+        check_hccl(HcclCommInitRootInfo(static_cast<uint32_t>(world), &info,
+                                        static_cast<uint32_t>(rank), &comm),
+                   "HcclCommInitRootInfo");
+    } else {
+        HcclCommConfig config;
+        HcclCommConfigInit(&config);
+        config.hcclOpExpansionMode = expansion_mode;
+        check_hccl(HcclCommInitRootInfoConfig(static_cast<uint32_t>(world), &info,
+                                              static_cast<uint32_t>(rank),
+                                              &config, &comm),
+                   "HcclCommInitRootInfoConfig");
+    }
     if (comm == nullptr) {
         // Reachable if libhccl resolved as a weak stub: the call "succeeds"
         // without producing a communicator.

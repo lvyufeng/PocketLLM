@@ -11,35 +11,70 @@ document only draws conclusions from them.
 
 | | target | measured now | gap |
 |---|---|---|---|
-| Prefill | >= 2000 TPS | 1265 TPS (4096-token prompt) | 1.6x |
+| Prefill | >= 2000 TPS | 1261.6 TPS (4096-token prompt), 878.8 TPS (512-token prompt) | 1.6x |
 | Decode | >= 100 TPS | 9.2 TPS (TP4, 64 layers) | 10.9x |
 
 Decode is not 1.6x away and is not a tuning problem. See "Decode" below.
 
-## Prefill: 1.6x is available, but not where it was assumed
+## Prefill: the wall is the linear-attention recurrence
 
-An earlier version of this document attributed 84% of prefill to attention and planned a 10.9x
-speedup on that basis. **That attribution was wrong and has been retracted.** The measured split at a
-512-token prompt is:
+Two earlier versions of this document got this wrong in different ways, and both retractions matter.
+The first attributed 84% of prefill to attention. The second replaced it with the collectives at
+84-87%, on the strength of a host-wall profile whose spans nest — an outer `ar.*` scope absorbed
+everything that ran between two collective issues, and `TOTAL` came out above the wall it was
+measuring (2.77 s of scopes against a 1.25 s wall). **A device-synced profile at three prompt lengths
+gives a third answer**, and it is the first one the collectives do not own:
 
-- `STACK.r`, the whole decoder layer, **65.9%** — and it is still an unattributed black box
-- `full_attention`, measured separately, 9.8%
-- all projection GEMMs together, ~3%
+| share of `STACK.r` | 1105 tokens | 2223 tokens | 4433 tokens |
+|---|---|---|---|
+| **`gated_delta`** (48 calls) | **44.9%** | **51.9%** | **56.2%** |
+| 129 TP all-reduce calls | 24.7% | 16.4% | 12.7% |
+| all 384 projection GEMMs | 13.3% | 15.3% | 14.0% |
+| `full_attention` (16 calls) | 11.1% | 11.0% | 12.1% |
 
-The projection GEMMs being 3% is the load-bearing fact: prefill cannot be fixed by making matmuls
-faster, and the single-card GEMM measurement (74-115 TFLOPS at batch 4096) says the target needs only
-24-38% of what the hardware already delivers. The missing 1.6x is inside `STACK.r`.
+The recurrence is 10.35 us per token per head per layer and is **exactly linear in sequence length**
+(496.9 / 495.1 / 496.5 us per token across a 4x span), so it is not a fallback path and it does not
+amortise. An ablation of the kernel shows what the time is: removing its `broadcast_rows` calls and
+its 128-iteration rank-1 `Axpy` loop — both Cube-shaped arithmetic expressed as per-row vector
+instructions — moves the end-to-end 4433-token prefill from **1128 to 1734 TPS**, so **62% of the
+recurrence's 2.2 s is vector-instruction issue cost, not state bandwidth.** Both groups are
+independent, to 0.7%.
+
+The consequence is that prefill cannot be fixed by making the collectives fewer, and the projections
+are not the binding constraint either at 13-15%. The lever is one kernel.
+
+**Done:**
+
+- Branch `perf/ascend-overlap-slice-by-rows`: the overlapped all-reduce now slices by row count
+  instead of a constant 4 (`comm_overlap_slices_for_rows`), worth **2.05x at a 512-token prompt**
+  (428.1 -> 878.8 TPS) and neutral at 4096. See
+  [`performance/ascend_tp_collective_overlap.md`](../performance/ascend_tp_collective_overlap.md).
+  That document's section 5 also carries the corrected attribution above and the ablation.
 
 **Next step, in order:**
 
-1. **Instrument inside `decoder_layer_component.forward`.** `STACK.r` wraps the whole layer as one
-   scope, so the norms, transposes, gated-delta work and elementwise passes are all merged into one
-   17.2 ms/layer figure. Nothing further can be aimed until this is broken down. This is the only
-   step that is currently unblocked and worth doing first.
-2. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1265 TPS figure is a
+1. **Move the gated-delta recurrence onto the Cube.** It is 2.20 s of the 3.95 s wall at 4433 tokens
+   and 62% of it is issue cost of per-row vector instructions whose shapes are matrix shapes: the
+   `broadcast_rows` / `fold_rows` pair computes `k^T S` as a broadcast, a multiply and a seven-step
+   fold, and the rank-1 update `S += k (x) delta` is 128 `Axpy` calls. `Brcb` is an unsupported stub
+   on first-generation `dav_c100`, so the scalar `Duplicate` loop is deliberate — but it is 36% of the
+   wall at that length. This is the only identified prefill lever worth more than a few percent.
+2. **Cut the collective count per layer.** Two per layer — one `mlp.down` reduce in every layer and
+   one attention-output reduce — at a measured ~1.85 ms of fixed host-side issue each. At 129 calls
+   that is 0.24 s of the 3.95 s wall at 4433 tokens, and it is the same change decode needs. Worth
+   doing, but it no longer reaches the target on its own.
+3. **Explain `top1_allreduce`.** A single call costs 0.243 s at 4096 tokens (7.5% of that prefill)
+   against 0.011 s for the same scope in the decode block of the same run. It is measured and not
+   yet explained; a 20x phase difference on one call is worth an afternoon.
+4. **Re-check the 2000 TPS target at 512-token prompts separately.** The 1261 TPS figure is a
    4096-token prefill, where the per-token cost is dominated by the layer GEMMs. Shorter prompts pay
    the same fixed per-step costs over fewer tokens, so a single 2000 TPS target across prompt lengths
    may need to be restated per length rather than pursued as one number.
+
+At 4433 tokens, 2000 TPS is a 2.217 s wall. The recurrence is 2.202 s of the 3.948 s measured, so it
+has to fall 4.7x before any other term matters; turning the two ablated groups into Cube ops gives a
+2.6 s wall or about 1700 TPS, and the remainder is then the collectives' fixed term plus the state
+passes that survive.
 
 ## Decode: quantization is required, not optional
 
@@ -58,18 +93,24 @@ at M=16 against 248.6 GB/s at M=1). That gives an M=1 floor of:
 100 TPS at TP8 would need 673 GB/s per card with zero collective cost. Two separate deficits sit on
 top of the bound, and neither is small:
 
-1. **129 TP all-reduce calls per decode token**, serialised by the per-call `stream_synchronize` in
-   `end_nccl_collective` — **57.1 ms** of the 108.6 ms step at the measured 0.4430 ms per call on the
-   path the engine takes. The collective floor is flat in payload size up to 640 KB, so this is
-   latency, and the fix is fewer collectives. (The 0.3923 ms this page previously quoted is the
-   bench's internal-stream `sync` variant, which is not what `QWEN_NCCL_COMM_STREAM` defaults the
-   engine to.)
+1. **129 TP all-reduce calls per decode token** — **57.1 ms** of the 108.6 ms step at the measured
+   0.4430 ms per call on the path the engine takes. The collective floor is flat in payload size up to
+   640 KB, so this is latency, and the fix is fewer collectives, not a cheaper fence around each one.
+   (The 0.3923 ms this page previously quoted is the bench's internal-stream `sync` variant, which is
+   not what `QWEN_NCCL_COMM_STREAM` defaults the engine to.) A still earlier version blamed the
+   per-call `stream_synchronize` in `end_nccl_collective` for the whole of it. **That attribution is
+   wrong**, and the probe line settles it: enqueueing an event pair costs 0.011 ms while enqueueing one
+   bare collective costs 0.382 ms, and pure host enqueue is flat in message size (0.404 ms at 10 KB,
+   0.412 ms at 640 KB). The cost is host-side issue of the collective itself, paid once per call
+   regardless of payload; neither `HcclCommConfig`'s `hcclOpExpansionMode` (swept 0/1/2/3, all within
+   noise) nor `HCCL_OP_EXPANSION_MODE=AIV` moves it.
 2. **The per-layer cost is ~2.4x the pure weight-streaming cost** (13.45 GB / 108.6 ms = 124 GB/s
    effective vs the ~320 GB/s ceiling). The excess is layer work that moves no weights: the
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
    128-wide vector ops, with `broadcast_rows` the documented hot spot — plus the norms and
    transposes. Those are Cube work being done on the vector unit, and unlike attention this one is
-   worth 128x128 scale arithmetic.
+   worth 128x128 scale arithmetic. The prefill ablation prices the same two groups at **62% of the
+   recurrence's device time** (see "Prefill" above), so the estimate is no longer a cost model.
 
 **Ranked next steps:**
 
@@ -96,7 +137,11 @@ The following were estimates presented as a plan and are not supported by measur
 listed so they are not picked up again:
 
 - "attention is 84% of prefill" — measured at 9.8% at 512 tokens, and the phase is separately
-  instrumented from the 65.9% `STACK.r` black box.
+  instrumented from the decoder layer.
+- "the collectives are 84-87% of prefill" — the replacement for the line above, and wrong for the
+  same reason in the other direction: the spans it was read from nest, so an `ar.*` scope was
+  charged whatever ran between two collective issues. Device-synced, the collectives are 12.7% of
+  the decoder stack at 4433 tokens against the linear-attention recurrence's 56.2%.
 - Multiplicative projections of phase gains ("Phase 1 x Phase 2 = ~720 TPS") — the phases are not
   independent and the base attribution was wrong.
 - "Cube is ~2x faster than Vector at matmul, so expect 3-5x" — the measured decode attention result is
@@ -111,4 +156,9 @@ listed so they are not picked up again:
   internal-stream `sync` variant, and the engine runs the communication-stream `comm` variant at
   **0.4430 ms**, so the total is **57.1 ms**. The lesson is not the 13% but that the price was read off
   a row the engine does not execute.
+- "the per-call `stream_synchronize` in `end_nccl_collective` is what serialises the 129 calls" — the
+  fence is not the cost. An event pair enqueues in 0.011 ms against 0.382 ms for one bare collective,
+  and pure host enqueue is flat in message size, so what is paid per call is the collective's own
+  host-side issue. The repair is the same either way — fewer collectives — but a change aimed at the
+  fence would have measured as no change at all.
 - The week-by-week schedule with per-week TPS targets.
