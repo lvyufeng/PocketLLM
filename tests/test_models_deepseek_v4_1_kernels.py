@@ -80,12 +80,20 @@ def _reference_sinkhorn(comb, iters, eps):
 
 
 def test_shared_ops_are_reexported_not_reimplemented() -> None:
-    """Six of the seven names are `src/kernels/ops.py`'s; only the E4M3 quantizer is new here."""
+    """Six names are `src/kernels/ops.py`'s, four are additions that module does not have."""
     for name in ("act_quant", "fp4_act_quant", "fp8_gemm", "fp4_gemm", "sparse_attn", "hc_split_sinkhorn"):
         assert getattr(v41_kernels, name) is getattr(shared_kernels, name), name
     assert not hasattr(shared_kernels, "fp4_act_quant_e4m3")
+    # The two weight expanders are this module's own; the packed layout and the two block-scale
+    # dequantizers they stand on are `src/kernels/ops.py`'s and are re-exported with them.
+    assert v41_kernels.Packed4BitWeightAlongK is shared_kernels.Packed4BitWeightAlongK
+    assert v41_kernels.dequant_fp8_weight is not getattr(shared_kernels, "dequant_fp8_weight", None)
+    assert v41_kernels.dequant_fp4_weight is not getattr(shared_kernels, "dequant_fp4_weight", None)
     assert set(v41_kernels.__all__) == {
+        "Packed4BitWeightAlongK",
         "act_quant",
+        "dequant_fp4_weight",
+        "dequant_fp8_weight",
         "fp4_act_quant",
         "fp4_act_quant_e4m3",
         "fp4_gemm",

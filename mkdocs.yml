@@ -133,6 +133,8 @@ nav:
       - Ascend 910A attention: performance/ascend_attention_optimization.md
       - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
       - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
+      - DeepSeek-V4.1-Flash host run: performance/deepseek_v4_1_flash_host_run.md
+      - DeepSeek-V4.1-Flash device experts: performance/deepseek_v4_1_flash_device_experts.md
   - Architecture:
       - Overview: architecture/index.md
       - Backend unification design: architecture/backend_unification_design.md
