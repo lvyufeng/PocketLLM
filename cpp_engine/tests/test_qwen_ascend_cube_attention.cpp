@@ -12,6 +12,12 @@
 // call rather than caching, so one process can obtain both results.
 //
 //   ./tests/test_qwen_ascend_cube_attention [--device N] [--lengths 64,256,1024]
+//                                           [--contexts 512,1024,4096]
+//                                           [--heads 6,1]
+//
+// `--heads` defaults to the TP4 per-rank shape. Raising the KV head count is how
+// the grouped geometries get exercised; there the Cube prefill entry refuses the
+// shape outright and the run reports the vector column alone.
 
 #include "device_runtime.hpp"
 #include "qwen_ops.hpp"
@@ -29,8 +35,12 @@
 
 namespace {
 
-constexpr int kQHeads = 6;
-constexpr int kKvHeads = 1;
+// The TP4 per-rank shape: six query heads over one KV head. `--heads` overrides
+// both, which is the only way to reach the grouped geometries -- more than one KV
+// head per rank -- where the two kernels' tile loaders stop agreeing on whether a
+// head group is contiguous in the cache.
+int g_q_heads = 6;
+int g_kv_heads = 1;
 constexpr int kHeadDim = 256;
 
 // Above this the double-precision reference is skipped and the vector kernel
@@ -54,10 +64,22 @@ uint16_t float_to_half(float f) {
         return static_cast<uint16_t>(sign | half);
     }
     if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    // The exponent field is not optional. Without it every value in (-1, 1) --
+    // which is the whole of the uniform range this file generates -- packs to a
+    // denormal near 2^-24, the attention output lands three orders of magnitude
+    // below the tolerance below, and every comparison here passes on zeros.
     uint32_t half = mantissa >> 13;
     const uint32_t remainder = mantissa & 0x1fffu;
     if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) ++half;
-    return static_cast<uint16_t>(sign | half);
+    // Rounding up out of the mantissa carries into the exponent, and past the top
+    // of it to infinity. Both are reachable: the largest float below 1.0 has an
+    // all-ones mantissa.
+    if (half == 1024u) {
+        half = 0;
+        if (exponent + 1 >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+        return static_cast<uint16_t>(sign | static_cast<uint32_t>(exponent + 1) << 10);
+    }
+    return static_cast<uint16_t>(sign | static_cast<uint32_t>(exponent) << 10 | half);
 }
 
 float half_to_float(uint16_t h) {
@@ -120,6 +142,13 @@ std::vector<uint16_t> random_halves(size_t count, std::mt19937& rng, float scale
     return out;
 }
 
+// One position of the cache is `g_kv_heads * kHeadDim` wide, and query head `head`
+// reads the KV head it is grouped under. With one KV head every query head reads
+// the same row, which is the shape the cache layout degenerates to.
+size_t kv_offset(int kv_head, int pos, int slot) {
+    return (static_cast<size_t>(pos) * g_kv_heads + kv_head) * kHeadDim + slot;
+}
+
 // Causal GQA attention in double, row by row, straight from the definition. Slow
 // and obvious on purpose: everything the kernels do to be fast is what could be
 // wrong, so the reference does none of it.
@@ -127,17 +156,19 @@ std::vector<float> reference_attention(const std::vector<uint16_t>& q,
                                        const std::vector<uint16_t>& k,
                                        const std::vector<uint16_t>& v, int rows) {
     const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-    std::vector<float> out(static_cast<size_t>(rows) * kQHeads * kHeadDim, 0.0f);
+    const int group = g_q_heads / g_kv_heads;
+    std::vector<float> out(static_cast<size_t>(rows) * g_q_heads * kHeadDim, 0.0f);
     std::vector<double> scores(rows);
     for (int row = 0; row < rows; ++row) {
-        for (int head = 0; head < kQHeads; ++head) {
-            const size_t q_base = (static_cast<size_t>(row) * kQHeads + head) * kHeadDim;
+        for (int head = 0; head < g_q_heads; ++head) {
+            const size_t q_base = (static_cast<size_t>(row) * g_q_heads + head) * kHeadDim;
+            const int kv_head = head / group;
             double maximum = -1e30;
             for (int pos = 0; pos <= row; ++pos) {
                 double dot = 0.0;
                 for (int d = 0; d < kHeadDim; ++d) {
                     dot += static_cast<double>(half_to_float(q[q_base + d])) *
-                           static_cast<double>(half_to_float(k[static_cast<size_t>(pos) * kHeadDim + d]));
+                           static_cast<double>(half_to_float(k[kv_offset(kv_head, pos, d)]));
                 }
                 scores[pos] = dot * scale;
                 if (scores[pos] > maximum) maximum = scores[pos];
@@ -151,7 +182,7 @@ std::vector<float> reference_attention(const std::vector<uint16_t>& q,
                 double accum = 0.0;
                 for (int pos = 0; pos <= row; ++pos) {
                     accum += scores[pos] *
-                             static_cast<double>(half_to_float(v[static_cast<size_t>(pos) * kHeadDim + d]));
+                             static_cast<double>(half_to_float(v[kv_offset(kv_head, pos, d)]));
                 }
                 out[q_base + d] = static_cast<float>(accum / denominator);
             }
@@ -167,17 +198,18 @@ std::vector<float> reference_decode(const std::vector<uint16_t>& q,
                                     const std::vector<uint16_t>& k,
                                     const std::vector<uint16_t>& v, int context_len) {
     const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
-    std::vector<float> out(static_cast<size_t>(kQHeads) * kHeadDim, 0.0f);
+    const int group = g_q_heads / g_kv_heads;
+    std::vector<float> out(static_cast<size_t>(g_q_heads) * kHeadDim, 0.0f);
     std::vector<double> scores(context_len);
-    for (int head = 0; head < kQHeads; ++head) {
+    for (int head = 0; head < g_q_heads; ++head) {
         const size_t q_base = static_cast<size_t>(head) * kHeadDim;
+        const int kv_head = head / group;
         double maximum = -1e30;
         for (int pos = 0; pos < context_len; ++pos) {
             double dot = 0.0;
             for (int d = 0; d < kHeadDim; ++d) {
                 dot += static_cast<double>(half_to_float(q[q_base + d])) *
-                       static_cast<double>(
-                           half_to_float(k[static_cast<size_t>(pos) * kHeadDim + d]));
+                       static_cast<double>(half_to_float(k[kv_offset(kv_head, pos, d)]));
             }
             scores[pos] = dot * scale;
             if (scores[pos] > maximum) maximum = scores[pos];
@@ -191,8 +223,7 @@ std::vector<float> reference_decode(const std::vector<uint16_t>& q,
             double accum = 0.0;
             for (int pos = 0; pos < context_len; ++pos) {
                 accum += scores[pos] *
-                         static_cast<double>(
-                             half_to_float(v[static_cast<size_t>(pos) * kHeadDim + d]));
+                         static_cast<double>(half_to_float(v[kv_offset(kv_head, pos, d)]));
             }
             out[q_base + d] = static_cast<float>(accum / denominator);
         }
@@ -222,8 +253,8 @@ Error compare(const std::vector<uint16_t>& actual, const std::vector<float>& ref
 int run_case(int device, int rows) {
     (void)device;
     std::mt19937 rng(4242u + static_cast<unsigned>(rows));
-    const size_t q_elements = static_cast<size_t>(rows) * kQHeads * kHeadDim;
-    const size_t kv_elements = static_cast<size_t>(rows) * kKvHeads * kHeadDim;
+    const size_t q_elements = static_cast<size_t>(rows) * g_q_heads * kHeadDim;
+    const size_t kv_elements = static_cast<size_t>(rows) * g_kv_heads * kHeadDim;
     const std::vector<uint16_t> host_q = random_halves(q_elements, rng, 0.5f);
     const std::vector<uint16_t> host_k = random_halves(kv_elements, rng, 0.5f);
     const std::vector<uint16_t> host_v = random_halves(kv_elements, rng, 0.5f);
@@ -234,13 +265,20 @@ int run_case(int device, int rows) {
 
     setenv("QWEN_ASCEND_GQA_CUBE", "0", 1);
     if (!pocket::qwen_gqa_prefill_attention_f16(q.get(), k.get(), v.get(), vector_out.get(),
-                                                rows, kQHeads, kKvHeads, kHeadDim, 0, rows)) {
+                                                rows, g_q_heads, g_kv_heads, kHeadDim, 0, rows)) {
         std::printf("[FAIL] vector prefill launch failed rows=%d\n", rows);
         return 1;
     }
     unsetenv("QWEN_ASCEND_GQA_CUBE");
-    if (!pocket::qwen_gqa_prefill_attention_f16(q.get(), k.get(), v.get(), cube_out.get(),
-                                                rows, kQHeads, kKvHeads, kHeadDim, 0, rows)) {
+    // The neutral entry falls through to the vector kernel when the Cube geometry
+    // does not fit, so a successful call says nothing about which kernel answered.
+    // The launcher is asked directly; a refused launch on a shape the Cube path does
+    // claim is still a failure.
+    const bool cube_wanted = pocket::qwen_gqa_prefill_attention_cube_available(
+        g_q_heads, g_kv_heads, kHeadDim, rows, 0, rows);
+    const bool cube_ran = pocket::qwen_gqa_prefill_attention_f16(
+        q.get(), k.get(), v.get(), cube_out.get(), rows, g_q_heads, g_kv_heads, kHeadDim, 0, rows);
+    if (!cube_ran && cube_wanted) {
         std::printf("[FAIL] cube prefill launch failed rows=%d\n", rows);
         return 1;
     }
@@ -250,7 +288,11 @@ int run_case(int device, int rows) {
     }
 
     std::vector<uint16_t> host_vector(q_elements), host_cube(q_elements);
-    if (!pocket::memcpy_d2h(host_vector.data(), vector_out.get(), q_elements * sizeof(uint16_t)) ||
+    if (!pocket::memcpy_d2h(host_vector.data(), vector_out.get(), q_elements * sizeof(uint16_t))) {
+        std::printf("[FAIL] memcpy_d2h failed rows=%d\n", rows);
+        return 1;
+    }
+    if (cube_wanted &&
         !pocket::memcpy_d2h(host_cube.data(), cube_out.get(), q_elements * sizeof(uint16_t))) {
         std::printf("[FAIL] memcpy_d2h failed rows=%d\n", rows);
         return 1;
@@ -272,39 +314,59 @@ int run_case(int device, int rows) {
         // scale; the tolerance is per element and the reported bad count is what
         // distinguishes a few rounding outliers from a real layout error.
         vector_error = compare(host_vector, reference, tolerance);
-        cube_error = compare(host_cube, reference, tolerance);
+        if (cube_wanted) cube_error = compare(host_cube, reference, tolerance);
     } else {
         std::vector<float> reference_half(host_vector.size());
         for (size_t i = 0; i < host_vector.size(); ++i) {
             reference_half[i] = half_to_float(host_vector[i]);
         }
-        vector_error = compare(host_cube, reference_half, tolerance);
-        cube_error = vector_error;
+        // Past the host reference's reach the vector kernel is the reference, so a
+        // Cube run is compared against it; with no Cube run there is nothing left
+        // to compare against and the vector result is unchecked, which the summary
+        // line says rather than implying otherwise.
+        if (cube_wanted) {
+            cube_error = compare(host_cube, reference_half, tolerance);
+            vector_error = cube_error;
+        } else {
+            vector_error.total = host_vector.size();
+        }
     }
 
     size_t diverged_rows = 0;
-    for (int row = 0; row < rows; ++row) {
-        for (int head = 0; head < kQHeads; ++head) {
-            const size_t base = (static_cast<size_t>(row) * kQHeads + head) * kHeadDim;
-            bool diverge = false;
-            for (int d = 0; d < kHeadDim; ++d) {
-                if (std::fabs(static_cast<double>(half_to_float(host_cube[base + d])) -
-                              static_cast<double>(half_to_float(host_vector[base + d]))) > tolerance) {
-                    diverge = true;
-                    break;
+    if (cube_wanted) {
+        for (int row = 0; row < rows; ++row) {
+            for (int head = 0; head < g_q_heads; ++head) {
+                const size_t base = (static_cast<size_t>(row) * g_q_heads + head) * kHeadDim;
+                bool diverge = false;
+                for (int d = 0; d < kHeadDim; ++d) {
+                    if (std::fabs(static_cast<double>(half_to_float(host_cube[base + d])) -
+                                  static_cast<double>(half_to_float(host_vector[base + d]))) >
+                        tolerance) {
+                        diverge = true;
+                        break;
+                    }
                 }
+                if (diverge) ++diverged_rows;
             }
-            if (diverge) ++diverged_rows;
         }
     }
 
     const bool ok = cube_error.bad == 0 && vector_error.bad == 0;
+    if (!cube_wanted) {
+        std::printf(
+            "rows=%-5d ref=%-6s vector max_abs=%.3e bad=%zu/%-7zu  cube not applicable "
+            "(kv_heads=%d)  %s\n",
+            rows, reference.empty() ? "vector" : "double", vector_error.max_abs,
+            vector_error.bad, vector_error.total, g_kv_heads, ok ? "ok" : "MISMATCH");
+        std::fflush(stdout);
+        return ok ? 0 : 1;
+    }
     std::printf(
         "rows=%-5d ref=%-6s vector max_abs=%.3e bad=%zu/%-7zu  cube max_abs=%.3e bad=%zu/%-7zu  "
         "head-rows diverging=%zu/%d %s\n",
         rows, reference.empty() ? "vector" : "double", vector_error.max_abs, vector_error.bad,
         vector_error.total, cube_error.max_abs, cube_error.bad, cube_error.total, diverged_rows,
-        rows * kQHeads, ok ? "ok" : "MISMATCH");
+        rows * g_q_heads, ok ? "ok" : "MISMATCH");
     std::fflush(stdout);
     return ok ? 0 : 1;
 }
@@ -321,8 +383,8 @@ int run_case(int device, int rows) {
 // evidence about the online-softmax rescaling, not about the Cube entry above.
 int run_decode_case(int context) {
     std::mt19937 rng(7311u + static_cast<unsigned>(context));
-    const size_t q_elements = static_cast<size_t>(kQHeads) * kHeadDim;
-    const size_t kv_elements = static_cast<size_t>(context) * kKvHeads * kHeadDim;
+    const size_t q_elements = static_cast<size_t>(g_q_heads) * kHeadDim;
+    const size_t kv_elements = static_cast<size_t>(context) * g_kv_heads * kHeadDim;
     const std::vector<uint16_t> host_q = random_halves(q_elements, rng, 0.5f);
     const std::vector<uint16_t> host_k = random_halves(kv_elements, rng, 0.5f);
     const std::vector<uint16_t> host_v = random_halves(kv_elements, rng, 0.5f);
@@ -332,7 +394,7 @@ int run_decode_case(int context) {
     DeviceBuffer cube_out(q_elements);
     DeviceBuffer split_out(q_elements);
     std::vector<float> scratch(std::max<size_t>(
-        static_cast<size_t>(kQHeads) * context, static_cast<size_t>(kQHeads) * kHeadDim));
+        static_cast<size_t>(g_q_heads) * context, static_cast<size_t>(g_q_heads) * kHeadDim));
     float* scores = nullptr;
     if (!pocket::device_malloc_into(scores, scratch.size() * sizeof(float))) {
         std::printf("[FAIL] scratch malloc failed context=%d\n", context);
@@ -341,11 +403,11 @@ int run_decode_case(int context) {
 
     setenv("QWEN_ASCEND_GQA_CUBE", "0", 1);
     const bool vector_ok = pocket::qwen_gqa_decode_attention_f16(
-        q.get(), k.get(), v.get(), vector_out.get(), scores, kQHeads, kKvHeads, kHeadDim,
+        q.get(), k.get(), v.get(), vector_out.get(), scores, g_q_heads, g_kv_heads, kHeadDim,
         context, context);
     unsetenv("QWEN_ASCEND_GQA_CUBE");
     const bool cube_ok = pocket::qwen_gqa_decode_attention_f16(
-        q.get(), k.get(), v.get(), cube_out.get(), scores, kQHeads, kKvHeads, kHeadDim,
+        q.get(), k.get(), v.get(), cube_out.get(), scores, g_q_heads, g_kv_heads, kHeadDim,
         context, context);
     // `partitions = 0` picks the widest split the context allows. A context that
     // fits in a single 512-column chunk has nothing to split, and the kernel refuses
@@ -353,7 +415,7 @@ int run_decode_case(int context) {
     // past that point and required to refuse before it.
     const bool split_applies = context > 512;
     const bool split_ok = pocket::qwen_gqa_decode_attention_cube_split_f16(
-        q.get(), k.get(), v.get(), split_out.get(), kQHeads, kKvHeads, kHeadDim,
+        q.get(), k.get(), v.get(), split_out.get(), g_q_heads, g_kv_heads, kHeadDim,
         context, context, 0);
     const bool synced = pocket::device_synchronize();
     pocket::device_free(scores);
@@ -400,6 +462,22 @@ int run_decode_case(int context) {
 
 }  // namespace
 
+// Comma-separated integer list, for the three arguments that take one.
+std::vector<int> parse_list(const char* text) {
+    const std::string rest(text);
+    std::vector<int> values;
+    size_t at = 0;
+    while (at <= rest.size()) {
+        const size_t comma = rest.find(',', at);
+        const std::string piece =
+            rest.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        if (!piece.empty()) values.push_back(std::stoi(piece));
+        if (comma == std::string::npos) break;
+        at = comma + 1;
+    }
+    return values;
+}
+
 int main(int argc, char** argv) {
     int device = 0;
     std::vector<int> lengths = {64, 256, 1024};
@@ -409,33 +487,25 @@ int main(int argc, char** argv) {
         if (arg == "--device" && i + 1 < argc) {
             device = std::stoi(argv[++i]);
         } else if (arg == "--lengths" && i + 1 < argc) {
-            lengths.clear();
-            const std::string rest = argv[++i];
-            size_t at = 0;
-            while (at <= rest.size()) {
-                const size_t comma = rest.find(',', at);
-                const std::string piece =
-                    rest.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-                if (!piece.empty()) lengths.push_back(std::stoi(piece));
-                if (comma == std::string::npos) break;
-                at = comma + 1;
-            }
+            lengths = parse_list(argv[++i]);
         } else if (arg == "--contexts" && i + 1 < argc) {
-            contexts.clear();
-            const std::string rest = argv[++i];
-            size_t at = 0;
-            while (at <= rest.size()) {
-                const size_t comma = rest.find(',', at);
-                const std::string piece =
-                    rest.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
-                if (!piece.empty()) contexts.push_back(std::stoi(piece));
-                if (comma == std::string::npos) break;
-                at = comma + 1;
+            contexts = parse_list(argv[++i]);
+        } else if (arg == "--heads" && i + 1 < argc) {
+            const std::vector<int> heads = parse_list(argv[++i]);
+            if (heads.size() != 2) {
+                std::fprintf(stderr, "--heads takes Q_HEADS,KV_HEADS\n");
+                return 2;
             }
+            g_q_heads = heads[0];
+            g_kv_heads = heads[1];
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
             return 2;
         }
+    }
+    if (g_q_heads <= 0 || g_kv_heads <= 0 || g_q_heads % g_kv_heads != 0) {
+        std::fprintf(stderr, "q_heads must be a positive multiple of kv_heads\n");
+        return 2;
     }
     if (!pocket::device_runtime_available()) {
         std::printf("[SKIP] no device runtime available\n");
@@ -446,8 +516,19 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // The geometry belongs in every run's output: the results below are only
+    // interpretable against the shape that produced them.
+    std::printf("q_heads=%d kv_heads=%d head_dim=%d\n", g_q_heads, g_kv_heads, kHeadDim);
     int failures = 0;
     for (const int rows : lengths) failures += run_case(device, rows);
-    for (const int context : contexts) failures += run_decode_case(context);
+    // The decode entries -- vector, Cube and the context-split one alike -- all take
+    // one KV head per rank, which is a property of their work decomposition and not
+    // of anything this file varies. Running them at a grouped shape only reports
+    // that refusal, so the sweep is skipped rather than printed as a failure.
+    if (g_kv_heads == 1) {
+        for (const int context : contexts) failures += run_decode_case(context);
+    } else {
+        std::printf("decode cases skipped: the decode entries take one KV head per rank\n");
+    }
     return failures == 0 ? 0 : 1;
 }

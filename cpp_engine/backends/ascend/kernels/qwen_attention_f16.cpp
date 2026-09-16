@@ -625,6 +625,27 @@ struct VectorAttentionBuffers {
     }
 };
 
+// Load `rows` rows of `head_dim` halfs from a KV cache, where consecutive rows are
+// `row_stride` apart. A single KV head makes `row_stride == head_dim` and the rows
+// are one unbroken run, which is the contiguous copy; with more than one KV head
+// the other heads' rows sit between them and only a block-strided copy skips them.
+__aicore__ inline void load_vector_rows(
+    const AscendC::GlobalTensor<half>& source,
+    AscendC::LocalTensor<half> half_tile,
+    AscendC::LocalTensor<float> float_tile,
+    uint32_t offset, uint32_t rows, uint32_t head_dim, uint32_t row_stride) {
+    wait_scalar_before_load();
+    if (row_stride == head_dim) {
+        load_half_exact(half_tile, source, offset, rows * head_dim);
+    } else {
+        load_half_strided(half_tile, source, offset, rows, head_dim, row_stride);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Cast(float_tile, half_tile, AscendC::RoundMode::CAST_NONE,
+                  rows * head_dim);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
 __aicore__ inline void load_vector_row(
     const AscendC::GlobalTensor<half>& source,
     AscendC::LocalTensor<half> half_tile,
@@ -726,13 +747,13 @@ __aicore__ inline void fold_tile_rows(
 __aicore__ inline void qk_tile_scores(
     VectorAttentionBuffers& buffers,
     const AscendC::GlobalTensor<half>& key_cache, uint32_t cache_base,
-    uint32_t head_dim, const AscendC::LocalTensor<float>& query_rep,
-    uint32_t count) {
+    uint32_t kv_heads, uint32_t head_dim,
+    const AscendC::LocalTensor<float>& query_rep, uint32_t count) {
     AscendC::LocalTensor<half> row_half = buffers.row_half();
     AscendC::LocalTensor<float> row_float = buffers.row_float();
     AscendC::LocalTensor<float> scores = buffers.scores();
-    load_vector_row(key_cache, row_half, row_float, cache_base,
-                    count * head_dim);
+    load_vector_rows(key_cache, row_half, row_float, cache_base, count, head_dim,
+                     kv_heads * head_dim);
     AscendC::Mul(row_float, row_float, query_rep, count * head_dim);
     AscendC::PipeBarrier<PIPE_V>();
     fold_tile_rows(row_float, scores, count, head_dim);
@@ -759,44 +780,12 @@ __aicore__ inline float vector_score(
     return value;
 }
 
-__aicore__ inline float vector_score_tile(
-    VectorAttentionBuffers& buffers,
-    const AscendC::GlobalTensor<half>& cache,
-    uint32_t cache_base, uint32_t kv_heads, uint32_t head_dim,
-    const AscendC::LocalTensor<float>& query,
-    uint32_t count, float scale) {
-    AscendC::LocalTensor<float> scores = buffers.scores();
-    AscendC::LocalTensor<half> row_half = buffers.row_half();
-    AscendC::LocalTensor<float> row_float = buffers.row_float();
-    AscendC::LocalTensor<float> product = buffers.product();
-    load_vector_row(cache, row_half, row_float, cache_base,
-                    count * head_dim);
-    float maximum = -3.402823466e+38F;
-    for (uint32_t i = 0; i < count; ++i) {
-        const float score = vector_score(
-            query, row_float[i * head_dim], product, scores, i, head_dim, scale);
-        if (score > maximum) maximum = score;
-    }
-    (void)kv_heads;
-    return maximum;
-}
-
-__aicore__ inline float vector_max_pass(
-    VectorAttentionBuffers& buffers,
-    const AscendC::GlobalTensor<half>& cache,
-    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
-    uint32_t begin, uint32_t end,
-    const AscendC::LocalTensor<float>& query, float scale) {
-    float maximum = -3.402823466e+38F;
-    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
-        const uint32_t count = min_u32(kVectorPositionTile, end - start);
-            const uint32_t cache_base = (start * kv_heads + kv_head) * head_dim;
-        const float tile_max = vector_score_tile(
-            buffers, cache, cache_base, kv_heads, head_dim, query, count, scale);
-        if (tile_max > maximum) maximum = tile_max;
-    }
-    return maximum;
-}
+// Two-pass siblings of the online-softmax pass above -- a max pass and a value
+// pass sharing a tile scorer -- used to live here. Nothing called them once the
+// online pass landed, and both loaded their key and value tiles as one contiguous
+// run, which is only right for a single KV head. They are gone rather than fixed:
+// an untested second implementation of the same fold is a place for the two to
+// drift apart.
 
 __aicore__ inline void vector_online_softmax_pass(
     VectorAttentionBuffers& buffers,
@@ -831,7 +820,8 @@ __aicore__ inline void vector_online_softmax_pass(
         // the scalar unit synchronized with the fold, so the raw scores below are
         // read without a per-position flag round trip.
         const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
-        qk_tile_scores(buffers, key_cache, key_base, head_dim, query_rep, count);
+        qk_tile_scores(buffers, key_cache, key_base, kv_heads, head_dim, query_rep,
+                       count);
 
         float tile_max = -3.402823466e+38F;
         for (uint32_t i = 0; i < count; ++i) {
@@ -876,8 +866,8 @@ __aicore__ inline void vector_online_softmax_pass(
         // separate Muls + Add needed a barrier between them to keep `product` from
         // overwriting itself, and that barrier drains the vector pipe once per key.
         const uint32_t value_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(value_cache, row_half, row_float, value_base,
-                        count * head_dim);
+        load_vector_rows(value_cache, row_half, row_float, value_base, count,
+                         head_dim, kv_heads * head_dim);
         wait_scalar_before_compute();
         for (uint32_t i = 0; i < count; ++i) {
             const float probability = scores.GetValue(i);
@@ -889,59 +879,6 @@ __aicore__ inline void vector_online_softmax_pass(
     wait_compute_before_scalar();
     out_maximum = m;
     out_denominator = d;
-}
-
-__aicore__ inline float vector_value_pass(
-    VectorAttentionBuffers& buffers,
-    const AscendC::GlobalTensor<half>& key_cache,
-    const AscendC::GlobalTensor<half>& value_cache,
-    uint32_t kv_head, uint32_t kv_heads, uint32_t head_dim,
-    uint32_t begin, uint32_t end,
-    const AscendC::LocalTensor<float>& query, float scale, float maximum) {
-    AscendC::LocalTensor<float> accum = buffers.accum();
-    AscendC::LocalTensor<float> scores = buffers.scores();
-    AscendC::LocalTensor<float> row_float = buffers.row_float();
-    AscendC::LocalTensor<half> row_half = buffers.row_half();
-    AscendC::LocalTensor<float> product = buffers.product();
-    for (uint32_t d = 0; d < head_dim; ++d) accum.SetValue(d, 0.0f);
-    wait_scalar_before_compute();
-    AscendC::PipeBarrier<PIPE_V>();
-
-    float denominator = 0.0f;
-    for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
-        const uint32_t count = min_u32(kVectorPositionTile, end - start);
-        const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(key_cache, row_half, row_float, key_base,
-                        count * head_dim);
-        for (uint32_t i = 0; i < count; ++i) {
-            wait_scalar_before_compute();
-            const float score = vector_dot(
-                query, row_float[i * head_dim], product, head_dim) * scale;
-            scores.SetValue(i, score - maximum);
-        }
-        for (uint32_t i = count; i < kVectorPositionTile; ++i) {
-            scores.SetValue(i, -3.402823466e+38F);
-        }
-        wait_scalar_before_compute();
-        AscendC::Exp(scores, scores, kVectorPositionTile);
-        wait_compute_before_scalar();
-        for (uint32_t i = 0; i < count; ++i) denominator += scores.GetValue(i);
-
-        const uint32_t value_base = (start * kv_heads + kv_head) * head_dim;
-        load_vector_row(value_cache, row_half, row_float, value_base,
-                        count * head_dim);
-        for (uint32_t i = 0; i < count; ++i) {
-            const float probability = scores.GetValue(i);
-            wait_scalar_before_compute();
-            AscendC::Muls(product, row_float[i * head_dim], probability,
-                           head_dim);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(accum, accum, product, head_dim);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-    }
-    wait_compute_before_scalar();
-    return denominator;
 }
 
 __aicore__ inline void vector_publish_probabilities(
@@ -959,7 +896,8 @@ __aicore__ inline void vector_publish_probabilities(
     for (uint32_t start = begin; start < end; start += kVectorPositionTile) {
         const uint32_t count = min_u32(kVectorPositionTile, end - start);
         const uint32_t key_base = (start * kv_heads + kv_head) * head_dim;
-        qk_tile_scores(buffers, key_cache, key_base, head_dim, query_rep, count);
+        qk_tile_scores(buffers, key_cache, key_base, kv_heads, head_dim, query_rep,
+                       count);
         for (uint32_t i = 0; i < count; ++i) {
             scores.SetValue(i, scores.GetValue(i) * scale - maximum);
         }

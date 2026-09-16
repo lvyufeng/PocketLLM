@@ -185,9 +185,16 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_kernel(
         (head_dim % pocket::kAlignHalf) != 0) {
         return;
     }
-    if (causal == 0 && (kv_heads != 1 || seq_len != 1)) {
-        return;
-    }
+    // One KV head only, which is the shape this entry is written for. The tile
+    // stacks a whole head group as rows, and that is a single contiguous run of
+    // the output -- and a single uniformly strided run of Q -- only when the group
+    // is the entire head axis. With two or more KV heads the group boundary falls
+    // inside the tile, both the Q read and the output store would need a pitch that
+    // changes at that boundary, and nothing in this kernel can express it. The
+    // host refuses the shape before it launches; this is the same rule stated where
+    // the kernel can enforce it.
+    if (kv_heads != 1) return;
+    if (causal == 0 && seq_len != 1) return;
 
     const uint32_t core = AscendC::GetBlockIdx();
     const uint32_t cores = AscendC::GetBlockNum();
@@ -266,7 +273,6 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_kernel(
         const uint32_t rows = positions * repeat;
         const uint32_t tile_rows = cube_round_up(rows, kFractal);
         const uint32_t q_base = (row0 * q_heads + kv_head * repeat) * head_dim;
-        const uint32_t q_pitch = q_heads * head_dim;
         const uint32_t limit_block = pocket::min_u32(
             position_offset + row0 + (causal != 0 ? positions : 1u), max_context);
         if (limit_block == 0 || rows > max_rows) continue;
@@ -274,12 +280,20 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_kernel(
         if (chunks * kChunk > score_stride) continue;
 
         // ---- Stage Q once: the same tile is the A operand of every chunk. ----
+        //
+        // `srcDValue` is the pitch of the source rows, and here that is
+        // `head_dim`: the tile stacks whole head groups (see the note on the item
+        // layout above), and the rows inside one group are adjacent in GM. It is
+        // deliberately not `q_heads * head_dim` -- that is the distance between
+        // *positions*, which is what `rows` rows would be strided by only if the
+        // tile held one head over many positions, and the per-row causal limit in
+        // pass 2 is indexed by position, so it cannot be.
         AscendC::Nd2NzParams q_params;
         q_params.ndNum = 1;
         q_params.nValue = static_cast<uint16_t>(rows);
         q_params.dValue = static_cast<uint16_t>(head_dim);
         q_params.srcNdMatrixStride = 0;
-        q_params.srcDValue = static_cast<uint16_t>(q_pitch);
+        q_params.srcDValue = static_cast<uint16_t>(head_dim);
         q_params.dstNzC0Stride = static_cast<uint16_t>(tile_rows);
         q_params.dstNzNStride = 1;
         q_params.dstNzMatrixStride = 0;
@@ -462,10 +476,18 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_kernel(
         AscendC::PipeBarrier<PIPE_ALL>();
 
         // The stacked row order is the GM order, so the whole tile lands with one
-        // store and the head groups need no reassembly.
+        // store and the head groups need no reassembly -- but only when
+        // `dstDStride` is `head_dim`, the pitch of the GM rows the tile covers.
+        // Passing the position pitch instead sends tile row s to GM row `s * q_heads`
+        // and leaves `rows - ceil(rows / q_heads)` of them outside the output
+        // buffer, which is how this store shipped: at 64 rows it wrote head 0 of
+        // every position, ran a megabyte past the end of the allocation, and looked
+        // plausible because the one row that landed where a reader looked was
+        // right. The kernel now refuses `kv_heads != 1` above, so the group is the
+        // whole head axis and the rows really are `head_dim` apart.
         AscendC::Nz2NdParamsFull out_params(
             1, static_cast<uint16_t>(rows), static_cast<uint16_t>(head_dim), 1,
-            static_cast<uint16_t>(tile_rows), static_cast<uint16_t>(q_pitch), 1);
+            static_cast<uint16_t>(tile_rows), static_cast<uint16_t>(head_dim), 1);
         AscendC::DataCopy(out_g[q_base], tile, out_params);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -603,7 +625,6 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_partial_kernel(
     AscendC::PipeBarrier<PIPE_ALL>();
 
     const uint32_t q_base = kv_head * repeat * head_dim;
-    const uint32_t q_pitch = q_heads * head_dim;
     const uint32_t core_scores = item * score_rows * part_stride;
 
     AscendC::TBuffAddr l0c_addr;
@@ -613,12 +634,16 @@ extern "C" __global__ __aicore__ void qwen_gqa_attention_cube_partial_kernel(
     c_l0c.InitBuffer(0, AscendC::TOTAL_L0C_SIZE / sizeof(half));
 
     // ---- Stage Q once: the same tile is the A operand of every chunk. ----
+    //
+    // One decode position's whole head group, so the source rows are `head_dim`
+    // apart in GM and not `q_heads * head_dim`; see the note on the single core
+    // entry's stage above.
     AscendC::Nd2NzParams q_params;
     q_params.ndNum = 1;
     q_params.nValue = static_cast<uint16_t>(rows);
     q_params.dValue = static_cast<uint16_t>(head_dim);
     q_params.srcNdMatrixStride = 0;
-    q_params.srcDValue = static_cast<uint16_t>(q_pitch);
+    q_params.srcDValue = static_cast<uint16_t>(head_dim);
     q_params.dstNzC0Stride = static_cast<uint16_t>(tile_rows);
     q_params.dstNzNStride = 1;
     q_params.dstNzMatrixStride = 0;

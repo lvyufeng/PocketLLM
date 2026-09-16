@@ -20,14 +20,18 @@
 //       --tp-world 4 --tp-rank 0 --device 0 [--iters 200]
 
 #include "device_runtime.hpp"
+#include "qwen_ops.hpp"
 #include "tp_comm.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -182,21 +186,137 @@ int main(int argc, char** argv) {
                                                   id_path.c_str(), buffer, count,
                                                   comm_stream);
         }
-        // Host time only, taken before the drain below. Each HcclAllReduce is
-        // asynchronous on this backend, so this separates "the host cannot issue
-        // collectives fast enough" from "the device takes this long to run one",
-        // which are fixed by entirely different changes.
-        const double host_ms = (now_ms() - started) / iters;
         pocket::stream_synchronize(comm_stream);
         pocket::device_synchronize();
         const double nosync_ms = (now_ms() - started) / iters;
 
+        // The number that decides the fix. `comm-nosync` divides an enqueue loop
+        // plus one trailing synchronize by the iteration count, so it reads the
+        // same whether the time went into the host call or into the device. The
+        // two need opposite repairs: a host that blocks per collective cannot be
+        // hidden by queuing more compute behind it, while a device that
+        // serialises collectives can be. This splits them by timing the enqueue
+        // loop on its own, before any synchronize has run -- which is the same
+        // quantity this branch timed as `host_ms`, on the same sequence, so the
+        // two are one measurement and only the richer of them is kept.
+        std::vector<double> issue_ms;
+        started = now_ms();
+        for (int i = 0; i < iters; ++i) {
+            const double before = now_ms();
+            pocket::event_record(ready, nullptr);
+            pocket::stream_wait_event(comm_stream, ready);
+            pocket::tp_all_reduce_sum_f16_inplace(world, rank, device,
+                                                  id_path.c_str(), buffer, count,
+                                                  comm_stream);
+            issue_ms.push_back(now_ms() - before);
+        }
+        const double enqueue_ms = (now_ms() - started) / iters;
+        pocket::stream_synchronize(comm_stream);
+        pocket::device_synchronize();
+        const double drain_ms = now_ms() - started - enqueue_ms * iters;
+        std::sort(issue_ms.begin(), issue_ms.end());
+        const double host_med = issue_ms[issue_ms.size() / 2];
+        const double host_max = issue_ms.back();
+
+        // The loop above re-records one event object every iteration while the
+        // previous iteration's wait on it may still be outstanding, so a host
+        // that blocks there would be blamed on HCCL. This drops the bracket
+        // entirely: if enqueue is still a full collective, the host blockage is
+        // inside HcclAllReduce and no amount of stream plumbing will hide it.
+        std::vector<double> pure_ms;
+        started = now_ms();
+        for (int i = 0; i < iters; ++i) {
+            const double before = now_ms();
+            pocket::tp_all_reduce_sum_f16_inplace(world, rank, device,
+                                                  id_path.c_str(), buffer, count,
+                                                  comm_stream);
+            pure_ms.push_back(now_ms() - before);
+        }
+        const double pure_enqueue = (now_ms() - started) / iters;
+        pocket::stream_synchronize(comm_stream);
+        pocket::device_synchronize();
+        const double pure_drain = now_ms() - started - pure_enqueue * iters;
+        std::sort(pure_ms.begin(), pure_ms.end());
+        const double pure_med = pure_ms[pure_ms.size() / 2];
+        const double pure_max = pure_ms.back();
+
         std::printf(
             "allreduce rank=%d bytes=%-9zu sync=%8.4f ms  comm=%8.4f ms  "
-            "comm-nosync=%8.4f ms  host-enqueue=%8.4f ms  gbps(sync)=%6.1f\n",
-            rank, bytes, sync_ms, comm_ms, nosync_ms, host_ms,
-            bytes * 8.0 * (world - 1) / (sync_ms * 1e-3) / 1e9);
+            "comm-nosync=%8.4f ms  gbps(sync)=%6.1f\n"
+            "allreduce rank=%d bytes=%-9zu enqueue=%8.4f ms  host-med=%8.4f ms"
+            "  host-max=%8.4f ms  drain=%8.4f ms\n"
+            "allreduce rank=%d bytes=%-9zu pure-enq=%8.4f ms  pure-med=%8.4f ms"
+            "  pure-max=%8.4f ms  pure-drain=%8.4f ms\n",
+            rank, bytes, sync_ms, comm_ms, nosync_ms,
+            bytes * 8.0 * (world - 1) / (sync_ms * 1e-3) / 1e9,
+            rank, bytes, enqueue_ms, host_med, host_max, drain_ms,
+            rank, bytes, pure_enqueue, pure_med, pure_max, pure_drain);
         std::fflush(stdout);
+
+        // Whether the host block is a wait on something the device is actually
+        // doing. A second thread issues independent device work on its own
+        // stream throughout; if that work proceeds at its standalone rate while
+        // the collectives are in flight, the device is idle during them, and the
+        // 0.37 ms is host-side latency a communication thread could hide.
+        //
+        // The side workload is a real Cube GEMM rather than a memset, because a
+        // memset is small enough to slip between SDMA bursts whatever the
+        // collective is doing. A GEMM of comparable device time answers the
+        // question the engine actually faces: if the Cube holds its rate while
+        // the collectives run, a communication thread buys the whole collective
+        // cost back; if it loses time, the two are competing for the same unit.
+        if (count == kCounts[0]) {
+            const int gemm_m = 1024;
+            const int gemm_n = 4352;
+            const int gemm_k = 5120;
+            uint16_t* gx = nullptr;
+            uint16_t* gw = nullptr;
+            uint16_t* gy = nullptr;
+            pocket::device_malloc_into(gx, static_cast<size_t>(gemm_m) * gemm_k * 2);
+            pocket::device_malloc_into(gw, static_cast<size_t>(gemm_n) * gemm_k * 2);
+            pocket::device_malloc_into(gy, static_cast<size_t>(gemm_m) * gemm_n * 2);
+            auto gemm = [&]() {
+                return pocket::qwen_fp16_matmul_rows_f16(
+                    gx, gw, gy, gemm_m, gemm_n, gemm_k, gemm_k, gemm_n, gemm_k);
+            };
+            for (int i = 0; i < 3; ++i) gemm();
+            const int reps = 20;
+            const double started_alone = now_ms();
+            for (int i = 0; i < reps; ++i) gemm();
+            pocket::device_synchronize();
+            const double alone_ms = (now_ms() - started_alone) / reps;
+
+            std::atomic<int> done{0};
+            std::atomic<bool> stop{false};
+            std::thread side([&] {
+                pocket::device_set(device);
+                while (!stop.load(std::memory_order_relaxed)) {
+                    gemm();
+                    pocket::device_synchronize();
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+            const double started_conc = now_ms();
+            for (int i = 0; i < iters; ++i) {
+                pocket::tp_all_reduce_sum_f16_inplace(world, rank, device,
+                                                      id_path.c_str(), buffer,
+                                                      count, comm_stream);
+            }
+            pocket::stream_synchronize(comm_stream);
+            const double conc_ms = now_ms() - started_conc;
+            stop.store(true);
+            side.join();
+            const int n = done.load();
+            std::printf(
+                "allreduce rank=%d overlapped ar=%8.4f ms  gemm-alone=%8.4f ms"
+                "  gemm-concurrent=%8.4f ms  n=%d\n",
+                rank, conc_ms / iters, alone_ms,
+                n > 0 ? conc_ms / n : 0.0, n);
+            std::fflush(stdout);
+            pocket::device_free(gx);
+            pocket::device_free(gw);
+            pocket::device_free(gy);
+        }
         pocket::device_free(buffer);
     }
 

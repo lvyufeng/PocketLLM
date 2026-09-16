@@ -17,10 +17,10 @@
 //      Where a reciprocal has to be exact, take it as a scalar division instead.
 //
 // FP32 block/pair reductions are unavailable: their generic paths instantiate
-// vcgadd/vcpadd, which this SoC supports for float16 only. FP32 WholeReduceSum
-// lowers to vcadd and is supported (`Intrinsic_vcadd|float16,float32` in
-// Ascend910B.ini); use it only after arranging each logical row as one repeat.
-// The halving folds below use nothing but vadd.
+// vcgadd/vcpadd, which this SoC supports for float16 only. Only RepeatReduceSum
+// has a dav_c100 lowering (vcadd); WholeReduceSum has no impl for this arch at
+// all, so the halving folds below use nothing but vadd and are the supported
+// route to a row sum.
 
 #ifndef POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
 #define POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
@@ -152,6 +152,33 @@ __aicore__ inline void load_half_exact(const AscendC::LocalTensor<half>& dst,
     }
 }
 
+// Row-strided fp16 tile load: `rows` rows of `row_len` halfs whose starts sit
+// `row_stride` apart in GM, packed contiguously in the destination.
+//
+// This is what a grouped-query KV cache needs whenever there is more than one KV
+// head. One head's rows are `head_dim` wide but the next position's row for the
+// same head is a whole `kv_heads * head_dim` away, so a contiguous copy of
+// `rows * head_dim` halfs pulls in the other heads' keys instead.
+//
+// DataCopyParams expresses exactly that shape, and its block length and strides
+// are counted in 32-byte units, so both the row and the gap have to be whole
+// units. The launcher's geometry check makes head_dim a multiple of 16 halfs, and
+// the gap is a whole number of rows, so both are.
+__aicore__ inline void load_half_strided(const AscendC::LocalTensor<half>& dst,
+                                         const AscendC::GlobalTensor<half>& src,
+                                         uint32_t offset, uint32_t rows,
+                                         uint32_t row_len, uint32_t row_stride) {
+    AscendC::DataCopyParams params;
+    params.blockCount = static_cast<uint16_t>(rows);
+    params.blockLen = static_cast<uint16_t>(row_len * sizeof(half) / 32);
+    params.srcStride =
+        static_cast<uint16_t>((row_stride - row_len) * sizeof(half) / 32);
+    params.dstStride = 0;
+    AscendC::DataCopy(dst, src[offset], params);
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+}
+
 __aicore__ inline void store_half_exact(AscendC::GlobalTensor<half>& dst,
                                         uint32_t offset,
                                         const AscendC::LocalTensor<half>& src,
@@ -189,16 +216,54 @@ __aicore__ inline float fold_sum(const AscendC::LocalTensor<float>& work,
     return sum;
 }
 
-// Column-wise sum of a [rows, width] tile, leaving the result in the first `width`
-// lanes. `rows` must be a power of two; `width` a multiple of kAlignFloat. Same
-// halving fold as fold_sum, but folding whole rows so all `width` columns reduce at
-// once. Destroys `work`.
-__aicore__ inline void fold_rows(const AscendC::LocalTensor<float>& work,
-                                 uint32_t rows, uint32_t width) {
-    for (uint32_t half = rows / 2; half >= 1; half /= 2) {
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add(work, work, work[half * width], half * width);
+// acc[:] += weights[i] * state[i, :], summed over a contiguous [rows, width] fp32
+// tile. `acc` holds `groups` accumulators of `width` floats laid out
+// contiguously; the sum of all of them comes back in the first. The caller sizes
+// the buffer and does not zero it.
+//
+// This is a weighted reduction down the row axis, and the point of writing it this
+// way is that the weight is a *scalar operand of the instruction*, which this part
+// takes for free, instead of a value that has to be splatted across a row first.
+//
+// The other formulation -- Duplicate each weight across a row, multiply the whole
+// tile elementwise by the result, then fold the rows pairwise -- is the same
+// arithmetic in a different order and costs 2*rows + log2(rows) issues to this
+// form's `rows`. kdiag3 measured which of those two currencies this phase actually
+// spends. Splitting the row broadcast into two half-width issues over the same 128
+// elements, holding the repeat count and the byte count fixed, grew the phase
+// 30.4%; replacing the scalar UB operand with a constant, holding *every*
+// instruction, byte and barrier fixed, moved it 0.09%. So the cost tracks issues,
+// not bytes and not the scalar reads, and the fix is fewer issues.
+//
+// Rows are handed to the accumulators round-robin. With one accumulator the whole
+// loop is a chain of `rows` dependent read-modify-writes and the vector pipe has
+// nothing to overlap; with `groups` of them the dependences are `groups` apart.
+// Which of those two things the phase is paying for -- a chain of latencies or a
+// count of issues -- is what the width ablation left open, since both scale with
+// the row count and the arms only varied the row count.
+//
+// The accumulation order is also the more defensible one: this sums sequentially
+// down the key axis, which is what the CUDA kernel and the tests' double-precision
+// host reference both do, where the fold was a tree with a different rounding.
+__aicore__ inline void accumulate_weighted_rows(const AscendC::LocalTensor<float>& acc,
+                                                const AscendC::LocalTensor<float>& weights,
+                                                const AscendC::LocalTensor<float>& state,
+                                                uint32_t rows, uint32_t width,
+                                                uint32_t groups) {
+    for (uint32_t g = 0; g < groups; ++g) {
+        AscendC::Duplicate(acc[g * width], 0.0f, width);
     }
+    AscendC::PipeBarrier<PIPE_V>();
+    uint32_t g = 0;
+    for (uint32_t i = 0; i < rows; ++i) {
+        AscendC::Axpy(acc[g * width], state[i * width], weights.GetValue(i), width);
+        if (++g == groups) g = 0;
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+    for (uint32_t g = 1; g < groups; ++g) {
+        AscendC::Add(acc, acc, acc[g * width], width);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 // exp() of a single scalar. There is no scalar exp on this part, so this runs the
@@ -214,35 +279,40 @@ __aicore__ inline float scalar_exp(const AscendC::LocalTensor<float>& work,
     return work.GetValue(0);
 }
 
-// Broadcast `src[i]` across a row of `width` lanes, for i in [0, rows).
-//
-// This is the shape a scalar-per-key-row multiply needs, and it is the hot spot of
-// the recurrence: one Duplicate per row. The dsts do not overlap, so no barrier is
-// needed between them, but it is still `rows` instruction issues. Brcb would reduce
-// that issue count, but it is an unsupported stub on first-generation dav_c100, so
-// the scalar broadcast loop is intentional for this target.
-__aicore__ inline void broadcast_rows(const AscendC::LocalTensor<float>& dst,
-                                      const AscendC::LocalTensor<float>& src,
-                                      uint32_t rows, uint32_t width) {
-    for (uint32_t i = 0; i < rows; ++i) {
-        AscendC::Duplicate(dst[i * width], src.GetValue(i), width);
-    }
-}
-
 // Copy a [rows, width] column window out of a [rows, stride] GM tile.
+//
+// DataCopyParams describes the source and the destination in the same two stride
+// fields, so the load and the store of the same window are *not* the same params:
+// whichever side is GM carries the gap, and the rows of the UB side are always
+// packed. Writing the load's params into the store costs nothing at compile time
+// and writes a contiguous block over the neighbouring windows, so the direction is
+// part of the name rather than a comment.
 //
 // DataCopyParams counts in 32-byte blocks, so this needs width*sizeof(T) and
 // (stride-width)*sizeof(T) to both be block multiples. Callers validate that on
 // the host rather than silently truncating here.
 template <typename T>
-__aicore__ inline AscendC::DataCopyParams window_params(uint32_t rows,
-                                                        uint32_t width,
-                                                        uint32_t stride) {
+__aicore__ inline AscendC::DataCopyParams window_load_params(uint32_t rows,
+                                                             uint32_t width,
+                                                             uint32_t stride) {
     AscendC::DataCopyParams params;
     params.blockCount = static_cast<uint16_t>(rows);
     params.blockLen = static_cast<uint16_t>(width * sizeof(T) / kBlockBytes);
     params.srcStride = static_cast<uint16_t>((stride - width) * sizeof(T) / kBlockBytes);
     params.dstStride = 0;
+    return params;
+}
+
+// The mirror of window_load_params: UB rows are packed, GM rows are `stride` apart.
+template <typename T>
+__aicore__ inline AscendC::DataCopyParams window_store_params(uint32_t rows,
+                                                              uint32_t width,
+                                                              uint32_t stride) {
+    AscendC::DataCopyParams params;
+    params.blockCount = static_cast<uint16_t>(rows);
+    params.blockLen = static_cast<uint16_t>(width * sizeof(T) / kBlockBytes);
+    params.srcStride = 0;
+    params.dstStride = static_cast<uint16_t>((stride - width) * sizeof(T) / kBlockBytes);
     return params;
 }
 

@@ -188,6 +188,17 @@ inline bool qwen_gqa_decode_attention_cube_available(int q_heads, int kv_heads, 
 #endif
 }
 
+// The prefill counterpart of the query above, for callers that need to attribute
+// a prefill result to a kernel rather than to "whichever one ran".
+inline bool qwen_gqa_prefill_attention_cube_available(int q_heads, int kv_heads, int head_dim, int seq_len, int position_offset, int max_context) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_gqa_prefill_attention_cube_available_ascend(q_heads, kv_heads, head_dim, seq_len, position_offset, max_context);
+#else
+    (void)q_heads; (void)kv_heads; (void)head_dim; (void)seq_len; (void)position_offset; (void)max_context;
+    return false;
+#endif
+}
+
 // Streams tile_count 64x256 FP16 tiles out of HBM and does one op per element.
 // This is a measurement tool, not part of any model path: it establishes the
 // achievable read bandwidth that the bandwidth-bound decode attention kernels are

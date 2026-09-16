@@ -1,11 +1,11 @@
-# Auditing the DeepSeek-V4.1-Flash shards while the checkpoint is arriving
+# Auditing the DeepSeek-V4.1-Flash shards from arrival to complete
 
 **Date:** 2026-09-16
 **Commit:** `0bafa6f` — where `scripts/audit_dsv41_headers.py` last changed, and the revision all
-three runs below were made with
+four runs below were made with
 **Script:** `scripts/audit_dsv41_headers.py`
-**Artifacts:** `/tmp/v41_hdr.json`, `/tmp/v41_ckpt.json` and `/tmp/v41_run3.json` from the three
-commands in [Reproducing this record](#reproducing-this-record)
+**Artifacts:** `/tmp/v41_hdr.json`, `/tmp/v41_ckpt.json`, `/tmp/v41_run3.json` and `/tmp/v41_run4.json`
+from the four commands in [Reproducing this record](#reproducing-this-record)
 **Checkpoint:** `deepseek-ai/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB
 **Related:** [DeepSeek-V4.1-Flash](../models/deepseek-v4.1-flash.md)
 
@@ -20,9 +20,10 @@ read to produce it.
 ## The question this answers
 
 The audit was written against 48 header prefixes because the checkpoint was not on this
-host. It now is, in part: the release is 48 shards and the download is still running, so
-there is a second, larger question the prefix tree could never ask — **what do the real
-shards say, and can the audit tell a shard that is missing from a shard that is wrong?**
+host. It is now, in full: the release is 48 shards and 475.24 GiB, and the last two shards
+to land were the two Engram tables. So the page has a second, larger question the prefix
+tree could never ask — **what do the real shards say, and can the audit tell a shard that
+is missing from a shard that is wrong?**
 
 That distinction is the whole design. A check has three outcomes rather than two:
 
@@ -48,16 +49,16 @@ fails while other shards are still missing.
 | CPU / RAM | 2 × Intel Xeon E5-2696 v4, 2 NUMA nodes, ~1 TiB |
 | OS / Python | Ubuntu 22.04.5, kernel 5.15, CPython 3.10.10 (conda `deepseek`) |
 | Dependencies | standard library only — no `torch`, `safetensors` or `numpy` |
-| Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 20 of 48 shards on disk at run 2 and 46 of 48 at run 3 |
+| Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 20 of 48 shards on disk at run 2, 46 of 48 at run 3 and 48 of 48 at run 4 |
 | Header tree | `/tmp/dsv41`, 48 × `h0000N.bin`, 3,000,001 B each, ~144 MB total |
 | Payload read | none, in any run |
 
 The checkpoint directory held `model-00001`–`model-00020` plus `model.safetensors.index.json`
-(7,470,294 B), `config.json`, `tokenizer.json` and `inference/` at run 2, and
-`model-00001`–`model-00046` at run 3. It is 127 GiB on disk at run 2 and 286 GiB at run 3;
-the complete set is 475.24 GiB. `/mnt/data3` is a shingled disk, so the download lands on an
-SSD staging directory and a serialized mover copies it across — shards were in flight during
-both runs, which is why the counts below are a snapshot rather than a final state.
+(7,470,294 B), `config.json`, `tokenizer.json` and `inference/` at run 2, `model-00001`–`model-00046`
+at run 3, and all 48 shards at run 4. It is 127 GiB on disk at run 2, 286 GiB at run 3 and
+475.24 GiB at run 4. `/mnt/data3` is a shingled disk, so the download lands on an SSD staging
+directory and a serialized mover copies it across — shards were in flight during runs 2 and 3,
+which is why those counts are a snapshot rather than a final state. Run 4 is the final state.
 
 ## Run 1 — the header-prefix tree: 38 of 38
 
@@ -220,6 +221,72 @@ The shard sizes themselves are the per-layer partition read back off disk: shard
 `norm.weight` pair; shards 44, 45 and 46 carry 801, 798 and 802 tensors — the three MTP stages,
 which is where the per-layer counts stop being uniform.
 
+## Run 4 — the complete checkpoint: 39 of 39, 0 undecided, 0 failures
+
+```bash
+python scripts/audit_dsv41_headers.py --checkpoint-dir /mnt/data3/DeepSeek-V4.1-Flash --json /tmp/v41_run4.json
+```
+
+Exit code 0, and this is the run that closes the question the page was built around. The
+headline:
+
+```
+DeepSeek-V4.1-Flash header audit: 48 shards in /mnt/data3/DeepSeek-V4.1-Flash
+  mode: complete shards
+  index: 96,085 tensors over 48 shards, 48 local, 0 not downloaded
+  readable: 96,085 of 96,085 tensors (100.0%); presence is checked across the checkpoint, shape only where the shard is here
+```
+
+**39 of 39 checks passed, nothing undecided, nothing failed.** The last four to resolve were
+the ones waiting on shards 47 and 48, and each one is now a read rather than a wait:
+
+| Check | Was waiting on | Now |
+| --- | --- | --- |
+| `scales: all non-Engram FP8 weights use a 32x32 block` | `47/48`, `48/48` | pass — `observed blocks {(32, 32): 355}` and no other block observed, so the two `engram.wkv` weights held it open and then agreed with it |
+| `engram: the tables are F8_E4M3 with one E8M0 scale per 32 channels` | `47/48`, `48/48` | pass — `layers.{1,14}.engram.embed.weight` F8_E4M3, with the matching `embed.scale` |
+| `engram: each Engram layer has its gate and value projection` | `47/48`, `48/48` | pass — `layers.{1,14}.engram.{q_weight, k_weight}` and `wkv.weight`/`wkv.scale` |
+| `scales: the Engram tables use a 1x32 per-row block` | `47/48`, `48/48` | pass — `observed blocks {(1, 32): 2}`, one per table |
+
+The `32x32` row is the one that took the longest to answer and the one worth reading: its
+scope is every `.weight` in the checkpoint that ships a `.scale` sibling and is not one of
+the tables' `engram.embed.*` matrices, and exactly two tensors qualified only because they sit
+in shards 47 and 48 — `layers.1.engram.wkv.weight` and `layers.14.engram.wkv.weight`, the
+value projections of the two Engram layers. It went 147 → 353 → 355 observations, all in
+agreement, and the check refused to call any of the intermediate counts a pass. That is the
+whole point of the third outcome: the count was never the evidence.
+
+The largest tensor in the checkpoint is `layers.14.engram.embed.weight` F8_E4M3
+`[384016682, 256]` at 91.56 GiB, and it is one of the twelve Engram tensors that were
+unreadable at both earlier runs. The 768,022,850 rows the run reports across the two tables
+are what the derived bucket minimum `[384006168, 384016682]` was checking against, and the
+declared and derived ranges agree exactly rather than within tolerance.
+
+### Byte inventory at 48 shards — the complete checkpoint
+
+| Category | Tensors | Bytes |
+| --- | ---: | ---: |
+| Routed experts | 94,464 | 275.67 GiB |
+| Engram tables | 12 | 189.13 GiB |
+| Attention | 603 | 4.80 GiB |
+| Embedding and head | 3 | 2.47 GiB |
+| Shared experts | 240 | 1.32 GiB |
+| Vision and aligner | 266 | 0.90 GiB |
+| MTP and DSpark | 97 | 0.66 GiB |
+| Layer norms and hyper-connections | 400 | 0.29 GiB |
+| **Total** | **96,085** | **475.24 GiB** |
+
+The read is 100.0% of the index's `96,085` tensors, and the 475.24 GiB matches the `475.24 GiB`
+this page's model guide has carried since the header-prefix run — which is the property that
+matters: the payload read agrees with the header-only read to the byte, so the header tree was
+a faithful stand-in for the whole time the checkpoint was arriving. The twelve Engram tensors
+are 189.13 GiB of the total, 39.8%, out of 12 tensors of 96,085 — and `routed_experts` is
+275.67 GiB, 58.0%, out of 94,464. **97.8% of the checkpoint is the routed experts plus the two
+Engram tables.**
+
+Shards 47 and 48 are the two that were last, at 6 tensors and 94.56 GiB each. Nothing about
+the partition changed when they landed: shards 3–42 still carry one backbone layer apiece, and
+the per-layer counts in the next section are what the index predicts for all 48.
+
 ## What the index predicts, per shard and per layer
 
 The index assigns one backbone layer to each of shards 3–42, and the headers agree shard for
@@ -255,13 +322,15 @@ fall out that are worth stating precisely:
   six Engram tensors are shipped in shard 47 while layer 1 itself is shard 4, which is why
   shard 4 has 2,334 tensors and the *layer* has 2,340. The index is what makes the two
   counts consistent, and this is the clearest case of why presence had to be separated from
-  shape. It is also why the twelve tensors still unreadable at run 3 are exactly the twelve
-  this table adds to layers 1 and 14.
+  shape. It is also why the twelve tensors unreadable at runs 2 and 3 were exactly the twelve
+  this table adds to layers 1 and 14, and why shards 47 and 48 — six tensors each, 94.56 GiB
+  each — were the last two checks standing.
 
-The canonicalized name inventory over the full index is **114 distinct patterns**; the 46
-local shards show **108** of them, and the 6 that are absent are precisely the six Engram
-patterns on each of the two Engram layers. No pattern appears in the local shards that the
-index does not list.
+Collapsing the index's four indexed positions — `layers.<i>.`, `mtp.<i>.`, `.experts.<i>.` and
+`vision.blocks.<i>.` — leaves **114 distinct name patterns**. The 46 local shards showed **108**
+of them through run 3, and the 6 absent then were precisely the two Engram layers' shared six;
+with all 48 shards the inventory is complete at **114 of 114**. No pattern appears in the shards
+that the index does not list, at either count.
 
 ## What the shards assert, tensor by tensor
 
@@ -328,7 +397,7 @@ and are now reads:
 
 ## Reproducing this record
 
-All three runs are standard-library only and read no payload, so any of them can be repeated
+All four runs are standard-library only and read no payload, so any of them can be repeated
 against whatever has been downloaded at the time; the numbers move as shards land, and the
 report is designed to be read rather than memorized.
 
@@ -345,6 +414,10 @@ python scripts/audit_dsv41_headers.py \
 python scripts/audit_dsv41_headers.py \
   --checkpoint-dir /mnt/data3/DeepSeek-V4.1-Flash --json /tmp/v41_run3.json
 
+# the complete checkpoint: 39/39, nothing undecided, exit 0
+python scripts/audit_dsv41_headers.py \
+  --checkpoint-dir /mnt/data3/DeepSeek-V4.1-Flash --json /tmp/v41_run4.json
+
 # the same run read strictly: undecided counts as failure, exit 1
 python scripts/audit_dsv41_headers.py \
   --checkpoint-dir /mnt/data3/DeepSeek-V4.1-Flash --require-complete
@@ -354,10 +427,12 @@ python scripts/audit_dsv41_headers.py \
   --checkpoint-dir /mnt/data3/DeepSeek-V4.1-Flash --list-tensors 'layers.2.*'
 ```
 
-The 46-shard run and the 20-shard one differ only in which shards are on disk, which is the
-point: the command does not change as the download advances, so a check that flips from
-undecided to passing between two runs flipped because its evidence arrived and for no other
-reason.
+The three checkpoint runs differ only in which shards are on disk, which is the point: the
+command does not change as the download advances, so a check that flips from undecided to
+passing between two runs flipped because its evidence arrived and for no other reason. The one
+command whose verdict changes with completeness is `--require-complete`, which exits 0 on the
+complete checkpoint — nothing is undecided, so there is nothing for it to fail — and exits 1
+whenever any check is undecided, which is the binary answer it exists to give.
 
 `--index PATH` points the presence half at an index other than
 `<checkpoint-dir>/model.safetensors.index.json`. The JSON report carries `checkpoint_dir`,
@@ -382,24 +457,28 @@ checkpoint-backed case skips when the release is not on the host.
 
 ## Limitations
 
-- **Two shards outstanding at the latest run.** 46 of 48 had arrived, and the two that had
-  not are the Engram tables — 94.56 GiB each, the largest in the checkpoint and the last to
-  finish, which is why the four Engram checks have been undecided since the first real run and
-  will be the last to resolve. Twelve of the checkpoint's 96,085 tensors are affected. Every
-  check that needs them reports undecided; none of them is a defect and none of them is a pass.
-- **Metadata only, still.** Nothing on this page reads a tensor value. The audit proves the
-  config and the tensor inventory agree with each other; a checkpoint could satisfy every
-  check and still be unusable, and a value that is *consistently* wrong in both the config
-  and the shapes would pass.
-- **A passing check over partial evidence is not asserted.** Where the evidence is
-  incomplete the check reports undecided even when every observation so far agrees — the
-  `32x32` block check with `353` agreeing observations is undecided, not passing. A caller
-  that wants the weaker monotone claim can read the `detail` field, which always carries the
-  observation alongside the shard count.
-- **The per-layer and per-pattern counts are the index's, not the headers'.** They are
-  computed from `model.safetensors.index.json`, which is the release's own statement about
-  its shards. For the 46 shards on disk the headers agree with it exactly, which is what
-  `index: every local shard holds exactly the tensors the index assigns it` reports; for the
-  other 2 that agreement is not yet observable.
-- **No execution path.** See [DeepSeek-V4.1-Flash](../models/deepseek-v4.1-flash.md) for
-  what a V4.1 runtime would have to add. This page measures a checkpoint, not a runtime.
+- **Metadata only, still.** Nothing on this page reads a tensor value, in any of the four runs.
+  The audit proves the config and the tensor inventory agree with each other; a checkpoint could
+  satisfy every check and still be unusable, and a value that is *consistently* wrong in both the
+  config and the shapes would pass.
+- **No payload is hashed.** The checks that touch bytes compare a declared extent against a
+  shape and a dtype, which is what the header carries; a shard whose payload is corrupt *within*
+  its declared extent passes every check here. The three partial runs and the complete one are
+  the same audit, so completeness buys the shape of the file and not the trustworthiness of its
+  contents. Byte-for-byte integrity is a separate measurement.
+- **A passing check over partial evidence was never asserted, which is why the intermediate
+  verdicts are not the final ones.** The `32x32` block check reported undecided at `353` agreeing
+  observations and passed at `355`; anyone quoting the run-2 or run-3 numbers is quoting a
+  snapshot of an arriving download, and the run-4 report is the one that answers for the release.
+  A caller that wants the weaker monotone claim reads the `detail` field, which always carries
+  the observation alongside the shard count.
+- **The per-layer and per-pattern counts are the index's, not the headers'.** They are computed
+  from `model.safetensors.index.json`, which is the release's own statement about its shards. All
+  48 shards now agree with it exactly, which is what
+  `index: every local shard holds exactly the tensors the index assigns it` reports — but that is
+  agreement between two files the release ships, not an independent statement about either.
+- **The audit says what is in the checkpoint; a runtime says what can be executed from it.** The
+  two are now separate records rather than one guess: this page measures the checkpoint, and
+  [the host run](deepseek_v4_1_flash_host_run.md) loads it and measures what a token costs. What
+  remains unbuilt is the device runtime — the audit cannot tell you that, and neither can this
+  page.

@@ -33,6 +33,11 @@
 #include "aclnn_common.hpp"
 
 #include "qwen_ascend_ops.hpp"
+#include "qwen_gated_delta_geometry.hpp"
+
+// Grid width and tile size, shared with the device kernel so the divisor the
+// kernel partitions on and the block count launched here cannot drift apart.
+#include "qwen_hbm_probe_geometry.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -52,7 +57,7 @@
 #include "aclrtlaunch_qwen_gqa_decode_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_partial_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_reduce_kernel.h"
-// #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"  // Kernel not built yet
+#include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_gqa_verify_attention_kernel.h"
@@ -78,8 +83,9 @@ constexpr uint32_t kLaunchOk = 0;
 // The recurrence kernels hard-code a [128, 128] state tile, so the host has to
 // reject any other head geometry rather than launch a kernel that would read the
 // wrong stride. The CUDA launchers reject the same values.
-constexpr int kRecurrentKeyDim = 128;
-constexpr int kRecurrentValueDim = 128;
+constexpr int kRecurrentKeyDim = pocket::gated_delta::kKeyDim;
+constexpr int kRecurrentValueDim = pocket::gated_delta::kValueDim;
+
 constexpr int kMaxAttentionHeadDim = 256;
 constexpr uint32_t kAttentionAlignmentBytes = 32;
 constexpr uint32_t kAttentionAlignmentHalfs = 16;
@@ -91,7 +97,11 @@ constexpr int kMaxConvKernel = 8;
 // First-generation 910 has 30 AI cores. Every kernel here is a grid-stride loop
 // over independent work items, so more blocks than cores would only add launch
 // overhead; fewer than the work available would leave cores idle.
-constexpr uint32_t kMaxBlocks = 30;
+//
+// Defined in the gated-delta geometry header because the value-axis split there is
+// the one place a kernel's item count and the launcher's grid size are two
+// derivations of the same number, and a mismatch between them would be silent.
+constexpr uint32_t kMaxBlocks = pocket::gated_delta::kMaxBlocks;
 
 // Query the AI core count once per device and fall back to the known
 // first-generation value. Reading it rather than hard-coding it means a run on
@@ -130,6 +140,15 @@ uint32_t blocks_for(uint64_t work) {
     return cores;
 }
 
+// The unit of work in the recurrence kernels is one head times one value range, not
+// one head: the state is separable down the value axis, so a split multiplies the
+// number of independent items. The rule that picks the split, and the argument for
+// it, live in the geometry header next to the constant the kernel derives its own
+// item count from.
+uint64_t recurrent_units(uint64_t heads, uint32_t split) {
+    return heads * static_cast<uint64_t>(split);
+}
+
 // Shared attention preconditions, mirroring valid_attention() in the CUDA
 // launcher so both backends reject the same shapes.
 bool valid_attention(int q_heads, int kv_heads, int head_dim, int context_len,
@@ -139,11 +158,12 @@ bool valid_attention(int q_heads, int kv_heads, int head_dim, int context_len,
            context_len > 0 && context_len <= max_context;
 }
 
-// The first vector path is intentionally limited to contiguous KV rows. The real
-// Qwen TP4 full-attention shape is kv_heads=1; other valid neutral shapes stay on
-// the scalar kernel until a strided UB loader is separately validated. The fast
-// path is enabled by default after hardware validation; set the switch to 0 for
-// an apples-to-apples scalar baseline.
+// The fast vector path scores a whole key tile per issue, which needs the cache
+// rows of one KV head to be addressable as a block. They are `head_dim` wide with
+// the other heads' rows in between whenever there is more than one KV head, so the
+// kernel's tile loader switches to a block-strided copy for those shapes; see
+// load_vector_rows. The switch below is only the scalar baseline control: set it
+// to 0 for an apples-to-apples comparison against the per-element kernel.
 bool vector_gqa_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("QWEN_ASCEND_GQA_VECTOR");
@@ -159,8 +179,11 @@ bool vector_attention_geometry(const void* q, const void* k, const void* v,
         return pointer != nullptr &&
                (reinterpret_cast<uintptr_t>(pointer) & (kAttentionAlignmentBytes - 1)) == 0;
     };
-    return vector_gqa_enabled() && q_heads > 0 && kv_heads == 1 &&
-           head_dim > 0 && head_dim <= kMaxAttentionHeadDim &&
+    // head_dim a multiple of 16 halfs is what keeps both the contiguous and the
+    // strided tile load on 32-byte block boundaries.
+    return vector_gqa_enabled() && q_heads > 0 && kv_heads > 0 &&
+           q_heads % kv_heads == 0 && head_dim > 0 &&
+           head_dim <= kMaxAttentionHeadDim &&
            head_dim % static_cast<int>(kAttentionAlignmentHalfs) == 0 && aligned(q) &&
            aligned(k) && aligned(v) && aligned(out);
 }
@@ -217,8 +240,20 @@ bool cube_gqa_enabled() {
 // The Cube path's preconditions that depend only on the shape. Split out from
 // cube_attention_geometry because the engine-side availability query has no
 // pointers to check, only a shape.
+//
+// One KV head per rank is part of the shape, not a tuning choice. A work item
+// covers a whole query head group stacked as rows, and both the Q read and the
+// output store treat it as one uniformly strided run -- which it is only when the
+// group is the whole head axis. With more KV heads the group boundary falls inside
+// the tile and no single pitch describes it, so those shapes take the vector
+// kernel, whose tile loader skips the interleaved heads.
+//
+// Stated here rather than only in cube_prefill_attention because this is the one
+// place the dispatcher and the engine-side availability query both read; when the
+// two disagreed, the dispatcher tried a launch the entry refused and the shape
+// silently ran on the vector kernel wearing the Cube path's name.
 bool cube_attention_shape_ok(int q_heads, int kv_heads, int head_dim) {
-    return q_heads > 0 && kv_heads > 0 && q_heads % kv_heads == 0 && head_dim > 0 &&
+    return q_heads > 0 && kv_heads == 1 && q_heads % kv_heads == 0 && head_dim > 0 &&
            head_dim <= kMaxAttentionHeadDim &&
            head_dim % static_cast<int>(kAttentionAlignmentHalfs) == 0;
 }
@@ -269,6 +304,10 @@ bool cube_prefill_attention(const uint16_t* d_q_rows_fp16,
     const uint32_t score_stride = (limit + kCubeChunk - 1) / kCubeChunk * kCubeChunk;
     const uint32_t head = static_cast<uint32_t>(head_dim);
     if (score_stride == 0 || score_stride > kCubeMaxScoreStride) return false;
+    // The single-KV-head precondition is cube_attention_shape_ok's; it is not
+    // repeated here. The device entry carries it as well, so a caller that reaches
+    // the kernel without passing through the shape check still cannot launch a
+    // geometry the tile staging cannot express.
 
     uint32_t rows_per_tile = 1;
     while (rows_per_tile * 2 * repeat <= kCubeMaxStackedRows) rows_per_tile *= 2;
@@ -559,6 +598,57 @@ public:
         *sin_rows = device + elements;
         return true;
     }
+
+    // The same table built from one position per row, which is what a batched
+    // decode step needs: `rows` independent sequences, each at its own
+    // position, rather than `rows` consecutive tokens of one sequence.
+    //
+    // The kernel already indexes the table by row, so no new kernel is needed
+    // -- only a table whose rows are the batch's positions instead of
+    // start_position + row. Building it here rather than launching the
+    // single-row entry once per row also keeps this to one blocking upload
+    // instead of `rows` of them.
+    static bool acquire_rows(int rotary_dim, float theta, const int* positions,
+                             int rows, aclrtStream stream, const float** cos_rows,
+                             const float** sin_rows) {
+        const size_t half = static_cast<size_t>(rotary_dim / 2);
+        const size_t elements = static_cast<size_t>(rows) * half;
+        const size_t bytes = elements * sizeof(float);
+        std::vector<float> host_cos(elements);
+        std::vector<float> host_sin(elements);
+        std::vector<double> inv_freq(half);
+        for (size_t i = 0; i < half; ++i) {
+            inv_freq[i] = std::pow(
+                static_cast<double>(theta),
+                -2.0 * static_cast<double>(i) /
+                    static_cast<double>(rotary_dim));
+        }
+        for (int row = 0; row < rows; ++row) {
+            const double position = static_cast<double>(positions[row]);
+            const size_t base = static_cast<size_t>(row) * half;
+            for (size_t i = 0; i < half; ++i) {
+                const double angle = position * inv_freq[i];
+                host_cos[base + i] = static_cast<float>(std::cos(angle));
+                host_sin[base + i] = static_cast<float>(std::sin(angle));
+            }
+        }
+
+        bool pool_ok = true;
+        void* storage = ascend::WorkspacePool::acquire(
+            bytes * 2, stream, pool_ok,
+            ascend::WorkspacePool::Purpose::Intermediate);
+        if (!pool_ok || storage == nullptr) return false;
+        auto* device = static_cast<float*>(storage);
+        if (aclrtMemcpy(device, bytes, host_cos.data(), bytes,
+                        ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS ||
+            aclrtMemcpy(device + elements, bytes, host_sin.data(), bytes,
+                        ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS) {
+            return false;
+        }
+        *cos_rows = device;
+        *sin_rows = device + elements;
+        return true;
+    }
 };
 
 bool valid_rope(int start_position, int rows, int rotary_dim, float theta,
@@ -618,12 +708,15 @@ bool qwen_gated_delta_sequence_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_sequence_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
-               static_cast<uint32_t>(key_heads), q_scale) == kLaunchOk;
+               static_cast<uint32_t>(key_heads), q_scale,
+               split) == kLaunchOk;
 }
 
 bool qwen_gated_delta_sequence_normalized_f16_ascend(
@@ -638,12 +731,15 @@ bool qwen_gated_delta_sequence_normalized_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_sequence_normalized_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_normalized), gm(d_k_normalized),
                gm(d_v_fp16), gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(rows), static_cast<uint32_t>(heads),
-               static_cast<uint32_t>(key_heads), q_scale) == kLaunchOk;
+               static_cast<uint32_t>(key_heads), q_scale,
+               split) == kLaunchOk;
 }
 
 // The CUDA `_shared` variant shards one head's state across a block so several
@@ -675,12 +771,48 @@ bool qwen_gated_delta_step_f16_ascend(
         !valid_recurrent(heads, key_heads, key_dim, value_dim, q_scale)) {
         return false;
     }
+    const uint32_t split = pocket::gated_delta::value_split_for(
+        static_cast<uint32_t>(heads), core_count());
     return aclrtlaunch_qwen_gated_delta_step_kernel(
-               blocks_for(static_cast<uint64_t>(heads)), resolve(stream),
+               blocks_for(recurrent_units(heads, split)), resolve(stream),
                gm(d_state), gm(d_q_fp16), gm(d_k_fp16), gm(d_v_fp16),
                gm(d_g_fp16), gm(d_beta_fp16), gm(d_out_fp16),
                static_cast<uint32_t>(heads), static_cast<uint32_t>(key_heads),
-               q_scale) == kLaunchOk;
+               q_scale, split) == kLaunchOk;
+}
+
+bool qwen_gated_delta_step_batched_f16_ascend(
+    float* d_state, const uint16_t* d_q_fp16, const uint16_t* d_k_fp16,
+    const uint16_t* d_v_fp16, const uint16_t* d_g_fp16,
+    const uint16_t* d_beta_fp16, uint16_t* d_out_fp16,
+    const int* host_slot_ids, int rows, int heads, int key_heads, int key_dim,
+    int value_dim, float q_scale, size_t slot_stride_elements, void* stream) {
+    if (host_slot_ids == nullptr || rows <= 0 || d_state == nullptr) {
+        return false;
+    }
+    // The step kernel reads one row of q/k at `key_heads * key_dim` elements and
+    // one row of v/gate/beta/out at `heads * value_dim`, which is exactly the
+    // per-row pitch these offsets use.
+    const size_t q_row = static_cast<size_t>(key_heads) * key_dim;
+    const size_t v_row = static_cast<size_t>(heads) * value_dim;
+    for (int row = 0; row < rows; ++row) {
+        const int slot = host_slot_ids[row];
+        if (slot < 0) return false;
+        const size_t state_offset =
+            static_cast<size_t>(slot) * slot_stride_elements;
+        if (!qwen_gated_delta_step_f16_ascend(
+                d_state + state_offset,
+                d_q_fp16 + static_cast<size_t>(row) * q_row,
+                d_k_fp16 + static_cast<size_t>(row) * q_row,
+                d_v_fp16 + static_cast<size_t>(row) * v_row,
+                d_g_fp16 + static_cast<size_t>(row) * heads,
+                d_beta_fp16 + static_cast<size_t>(row) * heads,
+                d_out_fp16 + static_cast<size_t>(row) * v_row, heads, key_heads,
+                key_dim, value_dim, q_scale, stream)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool qwen_linear_attn_gates_f16_ascend(
@@ -725,6 +857,33 @@ bool qwen_causal_depthwise_conv_silu_f16_ascend(
                update_tail ? 1u : 0u) == kLaunchOk;
 }
 
+bool qwen_causal_depthwise_conv_silu_f16_batched_ascend(
+    const uint16_t* d_x_fp16, const uint16_t* d_weight_fp16,
+    uint16_t* d_tail_fp16, uint16_t* d_y_fp16, const int* host_slot_ids,
+    int rows, int channels, int kernel, size_t slot_stride_elements,
+    void* stream) {
+    if (host_slot_ids == nullptr || rows <= 0 || channels <= 0 ||
+        (slot_stride_elements != 0 && d_tail_fp16 == nullptr)) {
+        return false;
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int slot = host_slot_ids[row];
+        if (slot < 0) return false;
+        const size_t tail_offset =
+            static_cast<size_t>(slot) * slot_stride_elements;
+        // One token per row, so seq_len is always 1: the row's own conv tail is
+        // where the history lives, and nothing in this call sees another row.
+        if (!qwen_causal_depthwise_conv_silu_f16_ascend(
+                d_x_fp16 + static_cast<size_t>(row) * channels, d_weight_fp16,
+                d_tail_fp16 == nullptr ? nullptr : d_tail_fp16 + tail_offset,
+                d_y_fp16 + static_cast<size_t>(row) * channels, 1, channels,
+                kernel, true, stream)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool qwen_partial_rope_rows_f16_ascend(
     uint16_t* d_q_fp16, uint16_t* d_k_fp16, int start_position, int rows,
     int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim,
@@ -740,6 +899,34 @@ bool qwen_partial_rope_rows_f16_ascend(
     const float* sin_rows = nullptr;
     if (!RopeTables::acquire(rotary_dim, theta, start_position, rows, s,
                              &cos_rows, &sin_rows)) {
+        return false;
+    }
+    const uint64_t pairs = static_cast<uint64_t>(rows) * (rotary_dim / 2);
+    return aclrtlaunch_qwen_partial_rope_rows_kernel(
+               blocks_for(pairs), s, gm(d_q_fp16), gm(d_k_fp16), gm(cos_rows),
+               gm(sin_rows), static_cast<uint32_t>(rows),
+               static_cast<uint32_t>(rotary_dim),
+               static_cast<uint32_t>(q_heads), static_cast<uint32_t>(kv_heads),
+               static_cast<uint32_t>(head_dim)) == kLaunchOk;
+}
+
+bool qwen_partial_rope_rows_f16_batched_ascend(
+    uint16_t* d_q_fp16, uint16_t* d_k_fp16, const int* host_positions, int rows,
+    int rotary_dim, float theta, int q_heads, int kv_heads, int head_dim,
+    void* stream) {
+    if (host_positions == nullptr || rows <= 0) return false;
+    for (int row = 0; row < rows; ++row) {
+        if (host_positions[row] < 0) return false;
+    }
+    // The only thing that makes a batched step different from a chunk is where
+    // the angle comes from, and the kernel reads it from the table rather than
+    // from a start position -- so one table built from the batch's positions
+    // serves the whole batch in a single launch.
+    const aclrtStream s = resolve(stream);
+    const float* cos_rows = nullptr;
+    const float* sin_rows = nullptr;
+    if (!RopeTables::acquire_rows(rotary_dim, theta, host_positions, rows, s,
+                                  &cos_rows, &sin_rows)) {
         return false;
     }
     const uint64_t pairs = static_cast<uint64_t>(rows) * (rotary_dim / 2);
@@ -776,6 +963,37 @@ bool qwen_append_kv_cache_f16_ascend(
                static_cast<uint32_t>(max_context)) == kLaunchOk;
 }
 
+bool qwen_append_kv_cache_f16_batched_ascend(
+    const uint16_t* d_k_rows_fp16, const uint16_t* d_v_rows_fp16,
+    uint16_t* d_k_cache_fp16, uint16_t* d_v_cache_fp16,
+    const int* host_positions, const int* host_slot_ids, int rows, int kv_heads,
+    int head_dim, int max_context, size_t kv_slot_stride_elements,
+    void* stream) {
+    if (host_positions == nullptr || host_slot_ids == nullptr || rows <= 0 ||
+        d_k_rows_fp16 == nullptr || d_v_rows_fp16 == nullptr ||
+        d_k_cache_fp16 == nullptr || d_v_cache_fp16 == nullptr) {
+        return false;
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int slot = host_slot_ids[row];
+        const int position = host_positions[row];
+        if (slot < 0 || position < 0) return false;
+        // The row's token goes to its own slot at its own position. The slot
+        // stride is the caller's, because the arena layout is a property of
+        // the engine's allocation and not of this operator.
+        const size_t slot_offset =
+            static_cast<size_t>(slot) * kv_slot_stride_elements;
+        if (!qwen_append_kv_cache_f16_ascend(
+                d_k_rows_fp16 + static_cast<size_t>(row) * kv_heads * head_dim,
+                d_v_rows_fp16 + static_cast<size_t>(row) * kv_heads * head_dim,
+                d_k_cache_fp16 + slot_offset, d_v_cache_fp16 + slot_offset, 1,
+                kv_heads, head_dim, position, max_context, stream)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Whether a decode call of this shape will reach the Cube path. The engine asks
 // before choosing between splitting the context across cores (FlashDecoding) and
 // the neutral decode entry, because the two are not interchangeable: FlashDecoding
@@ -788,10 +1006,31 @@ bool qwen_gqa_decode_attention_cube_available_ascend(int q_heads, int kv_heads,
                                                      int max_context) {
     if (!cube_gqa_enabled()) return false;
     if (!cube_attention_shape_ok(q_heads, kv_heads, head_dim)) return false;
-    if (kv_heads != 1) return false;
     if (context_len <= 0 || context_len > max_context) return false;
     const uint32_t score_stride =
         (static_cast<uint32_t>(context_len) + kCubeChunk - 1) / kCubeChunk * kCubeChunk;
+    return score_stride != 0 && score_stride <= kCubeMaxScoreStride;
+}
+
+// The prefill counterpart. The engine's dispatch needs no query here -- the
+// neutral entry falls through to the vector kernel on its own -- but the numeric
+// test does: the fall-through is invisible from outside, so a run that reports a
+// Cube column has no way to tell whether the Cube kernel or the vector kernel
+// produced it, and at a grouped shape it is always the latter. Asking the same
+// predicate the dispatcher asks is the only answer that cannot drift from it.
+bool qwen_gqa_prefill_attention_cube_available_ascend(int q_heads, int kv_heads,
+                                                      int head_dim, int seq_len,
+                                                      int position_offset,
+                                                      int max_context) {
+    if (!cube_gqa_enabled()) return false;
+    if (!cube_attention_shape_ok(q_heads, kv_heads, head_dim)) return false;
+    if (seq_len <= 0 || position_offset < 0 ||
+        position_offset + seq_len > max_context) {
+        return false;
+    }
+    const uint32_t score_stride =
+        (static_cast<uint32_t>(position_offset + seq_len) + kCubeChunk - 1) /
+        kCubeChunk * kCubeChunk;
     return score_stride != 0 && score_stride <= kCubeMaxScoreStride;
 }
 
@@ -846,6 +1085,52 @@ bool qwen_gqa_decode_attention_f16_ascend(
                static_cast<uint32_t>(context_len),
                static_cast<uint32_t>(max_context), attention_scale(head_dim)) ==
            kLaunchOk;
+}
+
+// One decode attention call per row. This is the operator where the host loop
+// costs the most, because the Cube decode kernel is not small: at the batch
+// sizes a TP4 server actually runs, a single multi-row launch would be the
+// right shape, and this loop is what says so by measurement rather than by
+// guess.
+//
+// It cannot simply forward to qwen_gqa_verify_attention_f16_ascend, which does
+// take a row count: that kernel reads `rows` consecutive positions out of one
+// contiguous cache, and a batch's rows are in different slots, at
+// uncorrelated positions, with different context lengths.
+bool qwen_gqa_decode_attention_f16_batched_ascend(
+    const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16,
+    const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16,
+    float* d_score_scratch, int scratch_row_stride,
+    const int* host_context_lens, const int* host_slot_ids, int rows,
+    int q_heads, int kv_heads, int head_dim, int max_context,
+    size_t kv_slot_stride_elements, void* stream) {
+    if (host_context_lens == nullptr || host_slot_ids == nullptr ||
+        d_score_scratch == nullptr || scratch_row_stride <= 0 || rows <= 0 ||
+        d_q_fp16 == nullptr || d_k_cache_fp16 == nullptr ||
+        d_v_cache_fp16 == nullptr || d_out_fp16 == nullptr) {
+        return false;
+    }
+    const size_t q_row = static_cast<size_t>(q_heads) * head_dim;
+    for (int row = 0; row < rows; ++row) {
+        const int slot = host_slot_ids[row];
+        const int context_len = host_context_lens[row];
+        if (slot < 0 || context_len <= 0 || context_len > max_context) {
+            return false;
+        }
+        const size_t slot_offset =
+            static_cast<size_t>(slot) * kv_slot_stride_elements;
+        if (!qwen_gqa_decode_attention_f16_ascend(
+                d_q_fp16 + static_cast<size_t>(row) * q_row,
+                d_k_cache_fp16 + slot_offset, d_v_cache_fp16 + slot_offset,
+                d_out_fp16 + static_cast<size_t>(row) * q_row,
+                d_score_scratch + static_cast<size_t>(row) *
+                                      static_cast<size_t>(scratch_row_stride),
+                q_heads, kv_heads, head_dim, context_len, max_context,
+                stream)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool qwen_gqa_decode_attention_flashdec_f16_ascend(
@@ -1023,16 +1308,20 @@ bool qwen_argmax_fp32_rows_ascend(const float* d_logits, int* d_tokens,
 
 // Measurement-only: streams tile_count 64x256 FP16 tiles and touches every
 // element once, to establish the achievable HBM read bandwidth that the
-// bandwidth-bound decode attention kernels are judged against. Fixed at the 30
-// cores those kernels use so the result is an upper bound they could reach.
+// bandwidth-bound decode attention kernels are judged against. Launched on all
+// 30 cores, the same width those kernels use, so the result is an upper bound
+// they could reach rather than a per-core figure.
+//
+// Reads only. `d_sink` receives one element per core and is not part of the
+// measurement; it exists so the reads cannot be optimised away.
 bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink,
                                 int tile_count, void* stream) {
-    // Not implemented yet - stub for measurement
-    (void)d_source;
-    (void)d_sink;
-    (void)tile_count;
-    (void)stream;
-    return false;
+    if (d_source == nullptr || d_sink == nullptr || tile_count <= 0) {
+        return false;
+    }
+    return aclrtlaunch_qwen_hbm_read_probe_kernel(
+               kHbmProbeCores, resolve(stream), gm(d_source),
+               gm(d_sink), static_cast<uint32_t>(tile_count)) == kLaunchOk;
 }
 
 // One-core Cube tile, used to validate the L1 fractal layout that AscendC::Gemm

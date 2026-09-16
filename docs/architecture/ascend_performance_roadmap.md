@@ -80,32 +80,30 @@ passes that survive.
 
 The hard bound is bandwidth, and it is measurable rather than arguable. Per-rank resident weights are
 13.45 GB and every linear is read once per token. The standalone single-row GEMV plateaus at ~320 GB/s
-(flat over a 256x weight-size range, so this is the streaming ceiling and not a launch-cost artefact).
-That gives:
+(flat over a 256x weight-size range, so this is not a launch-cost artefact — but it is the **M=1**
+rate, not the hardware's: M=1 is the shape the Cube cannot fill, and the same matmul runs 435.8 GB/s
+at M=16 against 248.6 GB/s at M=1). That gives an M=1 floor of:
 
 | | ms/token | TPS |
 |---|---|---|
-| perfect streaming, TP4 | 42.0 | 23.8 |
-| perfect streaming, TP8 | 21.0 | 47.6 |
+| perfect streaming, TP4, M=1 | 42.0 | 23.8 |
+| perfect streaming, TP8, M=1 | 21.0 | 47.6 |
 | **required for 100 TPS** | **<= 10** | **100** |
 
 100 TPS at TP8 would need 673 GB/s per card with zero collective cost. Two separate deficits sit on
 top of the bound, and neither is small:
 
-1. **129 TP all-reduce calls per decode token, at ~0.40 ms each** — roughly 52 ms of the ~104 ms
-   step, and confirmed by the post-fix host profile of a 4096-context token: the 129 calls measure
-   0.068 s of the 0.114 s step, **60%**. A previous version of this document blamed the per-call
-   `stream_synchronize` in
-   `end_nccl_collective` for ~70 ms of it. **That attribution is wrong.** In
-   `bench_qwen_ascend_allreduce` the per-call figure is flat in message size (0.404 ms of pure
-   host enqueue at 10 KB, 0.412 ms at 640 KB) and the synchronized round trip is not slower than the
-   unsynchronized one (0.388 vs 0.456 ms at 10 KB — the "sync" variant is measured inside the loop
-   and the "comm" variant pays an extra per-iteration synchronize, so the difference is the
-   measurement, not the fence). The probe line settles it: enqueueing an event pair costs 0.011 ms,
-   enqueueing one bare collective costs 0.382 ms. The cost is host-side issue of the collective
-   itself, it is paid once per call regardless of payload, and neither `HcclCommConfig`'s
-   `hcclOpExpansionMode` (swept 0/1/2/3, all within noise) nor `HCCL_OP_EXPANSION_MODE=AIV` moves
-   it. The fix is fewer collectives, not a cheaper fence around each one.
+1. **129 TP all-reduce calls per decode token** — **57.1 ms** of the 108.6 ms step at the measured
+   0.4430 ms per call on the path the engine takes. The collective floor is flat in payload size up to
+   640 KB, so this is latency, and the fix is fewer collectives, not a cheaper fence around each one.
+   (The 0.3923 ms this page previously quoted is the bench's internal-stream `sync` variant, which is
+   not what `QWEN_NCCL_COMM_STREAM` defaults the engine to.) A still earlier version blamed the
+   per-call `stream_synchronize` in `end_nccl_collective` for the whole of it. **That attribution is
+   wrong**, and the probe line settles it: enqueueing an event pair costs 0.011 ms while enqueueing one
+   bare collective costs 0.382 ms, and pure host enqueue is flat in message size (0.404 ms at 10 KB,
+   0.412 ms at 640 KB). The cost is host-side issue of the collective itself, paid once per call
+   regardless of payload; neither `HcclCommConfig`'s `hcclOpExpansionMode` (swept 0/1/2/3, all within
+   noise) nor `HCCL_OP_EXPANSION_MODE=AIV` moves it.
 2. **The per-layer cost is ~2.4x the pure weight-streaming cost** (13.45 GB / 108.6 ms = 124 GB/s
    effective vs the ~320 GB/s ceiling). The excess is layer work that moves no weights: the
    gated-delta matrix operations — two 128x128 reductions and a rank-1 update currently expressed as
@@ -116,14 +114,19 @@ top of the bound, and neither is small:
 
 **Ranked next steps:**
 
-1. **Merge the per-layer collectives.** 129 calls at ~0.5 ms is the largest single identified cost in
-   the decode step and needs no new hardware capability. Removing it should land decode at the
-   streaming bound of roughly 20-23 TPS at TP4.
+1. **Merge the per-layer collectives.** 129 calls at 0.44 ms is the largest single identified cost in
+   the decode step and needs no new hardware capability. Subtracting it wholesale leaves 51.5 ms =
+   **19.4 TPS** at TP4, so the 20-23 TPS streaming bound above is only reached if the collective
+   latency is also overlapped with layer work — which is the case the communication-stream path is
+   already making.
 2. **Move the gated-delta matrix work onto the Cube.** Same argument as the attention kernel: it is a
    matrix operation running on the vector unit.
-3. **Weight quantization (int8, then int4).** This is the only route to 100 TPS. int8 halves the
-   42 ms floor to 21 ms (47 TPS at TP4), int4 quarters it to 10.5 ms (95 TPS at TP4, ~190 at TP8).
-   Accuracy validation is the cost, not the kernel.
+3. **Weight quantization (int8, then int4).** At the streaming rates above this is the only route to
+   100 TPS: int8 halves the 42 ms floor to 21 ms (47 TPS at TP4), int4 quarters it to 10.5 ms (95 TPS
+   at TP4, ~190 at TP8). The arithmetic assumes the M=1 time scales with the bytes read, and nothing
+   measured here establishes that — the smallest, L2-resident scan point is no faster than the
+   HBM-bound ones, which is what a byte-bound limit would not look like. Half the bytes for half the
+   time is the hypothesis to test before it is the plan; accuracy validation is the other cost.
 4. **Continuous batching.** Note this multiplies *throughput*, not per-token latency: it is currently
    blocked by a throw in the scheduler path and by the missing `runtime.batch_rows` branch in
    `qwen_layer_components.inl`. It is a throughput lever on top of the above, not a substitute for it.
@@ -146,4 +149,16 @@ listed so they are not picked up again:
   matmul. Gains of this kind come from removing a scalar loop, not from the unit's peak rate.
 - "FlashDecoding reduce to <20 ms gives 3.4x decode" — FlashDecoding is 5224 us in decode attention
   and loses to both Cube paths; it is a fallback for shapes the Cube path refuses.
+- "129 TP all-reduce calls per decode token at ~540 us each, roughly 70 ms of the 108 ms step" — the
+  calls are real but the price is not. No measurement on this stack produces 0.54 ms per call, and
+  the ~540 us figure has none behind it either.
+- "129 x 0.3923 ms = 50.6 ms", which replaced the item above — 0.3923 ms is `bench_qwen_ascend_allreduce`'s
+  internal-stream `sync` variant, and the engine runs the communication-stream `comm` variant at
+  **0.4430 ms**, so the total is **57.1 ms**. The lesson is not the 13% but that the price was read off
+  a row the engine does not execute.
+- "the per-call `stream_synchronize` in `end_nccl_collective` is what serialises the 129 calls" — the
+  fence is not the cost. An event pair enqueues in 0.011 ms against 0.382 ms for one bare collective,
+  and pure host enqueue is flat in message size, so what is paid per call is the collective's own
+  host-side issue. The repair is the same either way — fewer collectives — but a change aimed at the
+  fence would have measured as no change at all.
 - The week-by-week schedule with per-week TPS targets.
