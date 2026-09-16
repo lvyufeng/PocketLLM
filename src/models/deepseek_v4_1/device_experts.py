@@ -381,11 +381,16 @@ class DeviceRoutedExperts(RoutedExperts):
         return slice(start, start + 1)
 
     def _stage(self, buffer: int, ids: Sequence[int], cards: list[list[tuple[int, int]]]) -> None:
-        """One `copy_` per tensor out of the mapping into the row an expert owns.
+        """One `copy_` per tensor out of the host source into the row an expert owns.
 
-        `entry_view` and not `view`: it is deliberately uncached, which is exactly right for a 3 MiB
-        expert that will not be read again this step, and it is why this loop is one pass over the
-        shards' address space and not a growing set of handles on whole layers.
+        `checkpoint.packed` is the subject here, and it decides the source: the shard mapping, or the
+        resident bank when one is attached. Out of the mapping it uses `entry_view` and not `view`,
+        deliberately -- uncached, which is exactly right for a 3 MiB expert that will not be read
+        again this step, and it is why this loop is one pass over the shards' address space and not a
+        growing set of handles on whole layers. Out of the bank the mapping's slowest case -- a cold
+        page, 1308.0 ms for a row against 11.2 ms warm -- stops being possible, because the bank was
+        filled from the disk once, before the first step. It is not a faster `copy_`: 14 GiB/s either
+        way. What it removes is the disk.
         """
         for card, members in enumerate(cards):
             arena = self._pinned[buffer]
@@ -393,15 +398,10 @@ class DeviceRoutedExperts(RoutedExperts):
                 for which in PROJECTIONS:
                     weight = self._key(ids[slot], which)
                     for kind, key in (("q", weight), ("s", self._scale_key(weight))):
-                        target = arena[(which, kind)][self._row(card, arena_row)]
                         # F8_E8M0 has no CPU `copy_` from a pyloaded view, so both halves travel as
-                        # the `uint8` the kernel reads them as. The entry is looked up once per row
-                        # rather than cached: `entry` is a metadata record, but the *view* is what
-                        # would hold a page, and holding pages is what the whole host path measures.
-                        target.copy_(
-                            self.checkpoint.reader.entry_view(
-                                self.checkpoint.reader.entry(key)
-                            ).view(torch.uint8)
+                        # the `uint8` the kernel reads them as.
+                        arena[(which, kind)][self._row(card, arena_row)].copy_(
+                            self.checkpoint.packed(key).view(torch.uint8)
                         )
             self.expert_rows += len(members)
 

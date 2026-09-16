@@ -74,6 +74,7 @@ from src.loader.safetensors import SAFETENSORS_DTYPES, MmapSafetensors
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
 from src.models.deepseek_v4_1.kernels import dequant_fp4_weight, dequant_fp8_weight
+from src.models.deepseek_v4_1 import resident_bank
 from src.models.deepseek_v4_1.modules import (
     LINEAR_DTYPE,
     Backbone,
@@ -146,6 +147,18 @@ class V41Checkpoint:
         self.device = device
         self.reader = MmapSafetensors(root)
         self._blocks: dict[str, int] = {}
+        # Set by `attach_bank`; `None` means every read comes out of the shard mapping.
+        self._bank = None
+
+    def attach_bank(self, bank) -> None:
+        """Read the keys a resident bank holds out of it instead of the mapped shards.
+
+        That is the checkpoint's routed experts and its two Engram tables -- 458 of its 476 GiB, and
+        the bytes a forward touches on every token and on every gather; see `packed`. Everything else
+        is unaffected and still faults in from `/mnt/data3`, which is what the dense tree wants: it
+        is read whole once, and copying it into a second resident form would cost the RAM twice.
+        """
+        self._bank = bank
 
     def __contains__(self, key: str) -> bool:
         return key in self.reader
@@ -207,6 +220,38 @@ class V41Checkpoint:
 
     # -- reading --------------------------------------------------------------
 
+    def banked(self, key: str) -> torch.Tensor | None:
+        """The bank's copy of `key`, in its stored dtype, or `None` if no bank holds it.
+
+        Says nothing about the file: a key the bank does not hold is not an error, it is a tensor
+        that has to come off the mapping, and every caller here wants both cases answered in one
+        place rather than by a branch of its own.
+        """
+        if self._bank is None:
+            return None
+        expert = resident_bank.parse_key(key)
+        if expert is not None and self._bank.has_expert(*expert):
+            stored = SAFETENSORS_DTYPES[self.reader.entry(key).dtype][1]
+            return self._bank.tensor(*expert).view(stored)
+        table = resident_bank.parse_engram_key(key)
+        if table is not None and self._bank.has_table(*table):
+            stored = SAFETENSORS_DTYPES[self.reader.entry(key).dtype][1]
+            return self._bank.table_tensor(*table).view(stored)
+        return None
+
+    def packed(self, key: str) -> torch.Tensor:
+        """One tensor's stored bytes, in its stored dtype, from the bank or from the mapping.
+
+        `view` caches and `entry_view` does not; this is neither. It is the one place that decides a
+        routed expert or an Engram row comes from host RAM rather than from `/mnt/data3`, so the
+        device path (`DeviceRoutedExperts._stage`), the host expert path (`dequantize`) and the
+        Engram gather (`rows`) are all pointed at the same source by pointing them here.
+        """
+        banked = self.banked(key)
+        if banked is not None:
+            return banked
+        return self.reader.entry_view(self.reader.entry(key))
+
     def weight(self, key: str, *, dtype: torch.dtype | None = None, device=None) -> torch.Tensor:
         """One weight, expanded if it is quantized, in `dtype` and on `device`."""
         value = self.dequantize(key) if self.is_quantized(key) else self.reader.load(key)
@@ -225,20 +270,24 @@ class V41Checkpoint:
         `dequant_fp4_weight` unpacks two. The checkpoint stores both beside a `.scale`, so which one
         applies is decided by the weight's own stored dtype and not by its name.
         """
-        weight, scale = self.reader.view(key), self.reader.view(scale_key(key))
+        weight, scale = self.packed(key), self.packed(scale_key(key))
         block = self.block_size(key)
         if self.is_packed_fp4(key):
             return dequant_fp4_weight(weight, scale, block)
         return dequant_fp8_weight(weight, scale, block)
 
     def rows(self, key: str, rows: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Gather scattered rows out of a mapped matrix, without reading the rest of it.
+        """Gather scattered rows out of a matrix, from the bank or from the mapping.
 
         The gather goes through a `uint8` alias. The CPU has no float8 `index_select`, so
         `view[rows]` raises `NotImplementedError: "index_cpu" not implemented for 'Float8_e4m3fn'`
         -- and the same for `'Float8_e8m0fnu'` on the scales -- while the byte alias gathers fine
         and is reinterpreted afterwards. Duplicate rows are copies rather than views, which is what
         a repeated hash id needs.
+
+        `packed` rather than `entry_view` is what makes an Engram gather read host RAM: the table is
+        98 GiB of the 476 on disk, and this is the one call that touches it per token. A bank that
+        holds the table answers here; one that does not falls through to the mapping as before.
         """
         entry = self.reader.entry(key)
         if len(entry.shape) != 2:
@@ -248,7 +297,7 @@ class V41Checkpoint:
             low, high = int(flat.min()), int(flat.max())
             if low < 0 or high >= entry.shape[0]:
                 raise IndexError(f"{key} has {entry.shape[0]} rows, so {low}..{high} is out of range")
-        gathered = self.reader.entry_view(entry).view(torch.uint8)[flat]
+        gathered = self.packed(key).view(torch.uint8)[flat]
         gathered = gathered.view(SAFETENSORS_DTYPES[entry.dtype][1])
         if dtype is not None:
             gathered = gathered.to(dtype)
@@ -692,6 +741,8 @@ def load_backbone(
     expert_cache: int = DEFAULT_EXPERT_CACHE,
     expert_device: str | None = None,
     expert_world: int = 1,
+    expert_rank: int = 0,
+    resident_experts: bool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> LoadedBackbone:
     """Build the V4.1 text backbone and fill it from `checkpoint`.
@@ -715,7 +766,26 @@ def load_backbone(
     other way round all land back on `CheckpointRoutedExperts` with one line on `progress`, because a
     slow correct run is worth more than a fast wrong one. The host path is unchanged and is still
     what an unset `expert_device` gives.
+
+    `resident_experts` preloads the checkpoint's routed experts and its two Engram tables into one
+    POSIX shared-memory segment before the tree is built, so that neither path above ever reads
+    `/mnt/data3` again. `None` means ask `DEEPSEEK_V41_RESIDENT_EXPERTS`, which is what keeps this
+    opt-in; see `resident_bank`. Every route the bank takes reads the same bytes it read before -- the
+    segment is filled from `reader.entry_view`'s own offsets and the host comparison is element for
+    element -- so this is a change of source and not of arithmetic.
+
+    A banked run wants `resident_engram=False`, and the two are complements rather than a conflict:
+    the segment holds the tables, `rows` reads them out of it, and the per-process 189.1 GiB copy
+    `resident_engram` would make is the thing four ranks must not each pay. The dense tree is
+    deliberately not in the segment: those keys are not routed experts or tables, `packed` leaves them
+    on the mapping, and a second resident form of 16.79 GiB would cost the RAM twice.
     """
+    if resident_experts is None:
+        resident_experts = resident_bank.enabled()
+    if resident_experts:
+        checkpoint.attach_bank(
+            resident_bank.open_expert_bank(checkpoint, rank=expert_rank, progress=progress)
+        )
     if hasher is not None:
         layout = hasher.layout
     elif engram and layout is None:
