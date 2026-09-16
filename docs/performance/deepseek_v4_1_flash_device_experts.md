@@ -34,7 +34,9 @@ PCIe rates), `/tmp/probe_first_tokens.py` (the top five at each of the first tok
 `/tmp/probe_launch_split.py`, which are the two that priced and then fixed the launch ordering. All
 but the first-token probe read `/tmp/v41_activations.pt`, which `/tmp/probe_capture.py` writes; that
 one runs the loop itself and reads nothing. They are throwaway probes, not checked-in benchmarks; the
-numbers they produced are what this page records.
+numbers they produced are what this page records. The TP4 sections add the probes written for the four
+cards and for the row loop: `/tmp/probe_v41_tp4_e2e.py`, and `/tmp/probe_v41_tp4_pipe_matrix.py`,
+which is [the row loop, serial against one row deep](#the-row-loop-runs-one-row-deep-and-it-is-worth-110-on-a-prefill).
 
 ## The split
 
@@ -268,6 +270,13 @@ and it is why the follow-on that would matter keeps the packed rows on the card 
 them again — the wider arena, below.
 
 ### The launch was four kernels serialized, not one plus copies
+
+Everything from here to the pipeline below was measured while the row's card side was a single method
+named `_launch`, and that is the name this section keeps. It is now two methods — `_issue`, which is
+all of the above and returns without waiting, and `_drain`, which is the waits and the host sum — and
+the split exists so that a row's card time and the next row's staging can be in flight together. The
+numbers this section records are the two halves of that, and none of them moved when it was split; see
+[the pipeline below](#the-row-loop-runs-one-row-deep-and-it-is-worth-110-on-a-prefill).
 
 The phase this page named as "the obvious next thing to instrument" was the 0.27 s of `launch`: 160
 card-calls of 1.7 ms each against the 0.83 ms an isolated call of that shape costs on one device. The
@@ -614,6 +623,57 @@ bank as well as the thread count, so what the pair measured was the disk. The ta
 controlled pair, and the 6.8× belongs to the configuration with no resident source rather than to the
 flag.
 
+### The row loop runs one row deep, and it is worth 1.10× on a prefill
+
+A row used to be strictly serialized: the host could not stage row `k+1` until the card side of row
+`k` had returned, and that returned only once row `k`'s partials had landed. `forward` now holds one
+row — it stages row `k+1` and issues its kernels, and only then drains row `k`. **A decode step is one
+row a layer, so a row-deep pipeline has nothing to overlap there** and the whole of what it can be
+worth is a prefill's, `n` rows a layer with `n` the prompt length. That is what reframes this: not a
+lever on the headline number, a lever on the prefill column beside it.
+
+`/tmp/probe_v41_tp4_pipe_matrix.py` runs both orders over the same prompt in one process — the second
+engine in a process is ~10% slower on this host, which rules out comparing across processes — and
+alternates them, so the node's own ~20% drift between sittings lands on both columns rather than on
+one. Four ranks under `torchrun`, one process a card, the resident bank on, 22 threads. All phase
+columns are totals over the whole prefill. The serial column's 53.61 s at 128 tokens is the same
+sitting-drift figure the banked table above records as 53.42 s, and not the 42.86 s the warm
+uninstrumented run does — the page separates those two [there](#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned)
+and the columns here are the pair to read, not either against a table from another sitting:
+
+| prompt | order | prefill | tok/s | `_stage_row` | `_stage` | `_upload` | `_issue` | `_drain` |
+| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | serial | 13.51 s, 13.77 s | 2.4 | 7488 ms | 6850 ms | 482 ms | 849 ms | 4792 ms |
+| 32 | pipelined | 12.43 s, 12.42 s | 2.6 | 8720 ms | 8048 ms | 594 ms | 989 ms | 2305 ms |
+| 128 | serial | 53.61 s, 53.45 s | 2.4 | 30096 ms | 27542 ms | 1964 ms | 3434 ms | 19264 ms |
+| 128 | pipelined | 48.44 s, 48.18 s | 2.7 | 34975 ms | 32717 ms | 2007 ms | 3501 ms | 9033 ms |
+
+**1.098×** at 32 tokens and **1.108×** at 128, and the per-row-layer account is flat across both
+prompts: the drain falls from **3.75 ms to 1.8 ms** a row-layer and the staging rises from **5.35 ms
+to 6.3 ms**, for a net **~1.0 ms** off a row-layer that costs about 12. The rise is the pipeline
+ceasing to hide a cost rather than creating one: the staging is a memcpy out of tmpfs, and with a row
+in flight it now shares the memory system with that row's H2D reading the *other* pinned arena. The
+residual 1.8 ms drain is the row's own arena copy plus its kernel, which is the floor one row deep —
+a two-row pipeline would have to issue row `k+1`'s H2D while row `k`'s kernel ran, and it needs a
+third pinned arena to do it. The pinned pool is not what limits this: the same probe swept two, three
+and four arenas a layer and `_take_buffer` is 10–29 ms against a stage of 4–8 s, so `pinned_buffers`
+stays at 2.
+
+**Two things had to change for it to pay, and the first version did not.** It measured **1.012×**, and
+the cause was the routing: `indices_row.tolist()` inside the row loop synchronizes the card's stream,
+and under the pipeline that stream already has the *previous* row's kernel on it, so those reads cost
+**2.9 ms a row** where the same reads cost 0.1 ms in a loop that has already drained. That is as much
+as the drain saving, handed straight back. `_route_ids` now takes the whole `[n, topk]` to host memory
+in one pinned copy ahead of the loop, so every row's read is a read of host memory; and the route
+weights, which `_issue` gathers on the card, are copied back `non_blocking`, so nothing in the loop
+waits on a pageable transfer.
+
+**It does not change the answer, and the probe is arranged to show that rather than assert it.** A
+prefill of this path is not bit-reproducible — the same order twice differs by 3.4e-02–7.1e-02 max abs
+on the last token's logits, which is the run-to-run spread this path has on its own — and the
+pipelined run differs from the serial one by 2.0e-02, inside that spread. Reading a serial-against-
+pipelined logit difference as the pipeline's would be reading noise.
+
 ## What this does not do yet
 
 All of these are separate measurements rather than separate opinions.
@@ -624,23 +684,20 @@ All of these are separate measurements rather than separate opinions.
   expert each stage it. A wider arena plus `moe_multi_token_fp4_forward` — one slot per distinct
   expert the batch hit, its tokens contiguous — is the shape that fixes it, and it is a follow-on
   rather than a knob, because an arena size and an eviction policy only mean something once that
-  measurement exists.
-- **The staging does not overlap the launch.** A row is strictly serialized today: the host cannot
-  stage row `k+1` until `_launch` has returned for row `k`. With the launch at 0.15 s and the staging
-  at 0.30 s, a one-row-deep pipeline — stage row `k+1` while row `k`'s kernels run, drain row `k` at
-  the top of row `k+1` — is worth up to the launch, and the isolated row puts a ceiling on it:
-  **1,009.8 µs** of device work against the **7.3 ms** the same row's staging costs, so the device
-  side would be fully hidden. It needs one more generation of the activation, the weights and the
-  partials and it changes the shape of the row loop rather than any of its parts, so it is the next
-  follow-on with its own measurement.
+  measurement exists. The row-layer table above is the number it is worth: at 128 tokens the staging
+  is 6.4 ms of a 12 ms row-layer and 32,717 ms of a 48 s prefill, paid once per route, so what a
+  per-layer slot set saves is the ratio of a rank's routes to the distinct experts among them. At 128
+  tokens, four ranks dealing six sorted ids round-robin leave a rank 256 draws from the 384-expert
+  space over the layer's 128 rows, and the duplicates in those draws are what it would stop paying
+  for. It is worth more the longer the prompt, which is the opposite of the pipeline above.
 - **The bank removes the disk from `_stage`, not the copy out of it.** With
   `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
   without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —
   [measured above](#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned). What
   it does not remove is the join: the segment is not the pinned arena, so a row is copied into that
-  arena whichever source it came from, and `_stage` is still 242 ms of a 458 ms class. That copy is
-  what the pipeline above is for, and the arithmetic is on its side — 6.1 ms of staging a row against
-  1.0 ms of device work in it.
+  arena whichever source it came from, and `_stage` is still 242 ms of a 458 ms class. The pipeline
+  above does not take that copy away either — it hides 2.0 ms a row-layer of a 3.75 ms drain and gives
+  back 0.95 ms of it in staging, which is a 1.10× and not the 7.3-against-1.0 the ceiling suggested.
 - **The Engram tables are in the segment, and what a banked prefill's gather costs is unmeasured.**
   `rows` reaches the segment under the same environment variable (`resident_bank.parse_engram_key`),
   so the 253.4 s/table cold path the host page records is not on a banked run's route. But the gathers
@@ -716,6 +773,15 @@ torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8 --steps 8
 torchrun --nproc_per_node=4 -m src.cli.generate_v41 \
   --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" \
   --max-new-tokens 3 --threads 22
+
+# the row loop, serial against one row deep, both orders in one process and alternated so the node's
+# own drift lands on both columns. The class's own `forward` is the pipelined one; the probe defines
+# the serial loop beside it, because that is a baseline and not a configuration. `--pinned 2,3,4` is
+# the arena sweep that says a third and a fourth are worth nothing
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_tp4_pipe_matrix.py --lengths 32,128 --pinned 2 --threads 22
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_tp4_pipe_matrix.py --lengths 32 --pinned 2,3,4 --threads 22
 ```
 
 Each takes about 90 s, most of it the ~70 s load. The three probes that touch a card want all four

@@ -69,40 +69,42 @@ What it costs, measured on this host (`/tmp/probe_device_experts.py` for the cla
 | `_take_buffer`, the wait for the previous DMA | **0.00 s** | measured in a real step |
 | host staging, page cache -> pinned, 4.20 GiB | 0.30 s, 14 GiB/s | measured in a real step |
 | the four copy chains, enqueued | 0.03-0.04 s | measured; the transfer is awaited later |
-| `_launch`, four kernels plus the H2D they wait on | 0.15 s | measured in a real step, 160 calls |
+| a row's card side, four kernels plus the H2D | 0.15 s | measured in a real step, 160 calls |
 | the host dense tree and the layer glue around it | 0.55-0.67 s | measured, the step's unattributed remainder |
 
 The probes are `/tmp/probe_device_experts.py`, which loops one layer's rows against the captured
 activation and sees 14.8 ms per row-layer; `/tmp/probe_launch_cost.py`, which wraps all four of the
 class's phases in a real step over the prompt and sees 11.4 ms per row-layer inside this class --
-7.3 ms of staging, 0.8 ms of upload issue and 3.75 ms of `_launch` -- with 0.55-0.67 s per token
+7.3 ms of staging, 0.8 ms of upload issue and 3.75 ms of card time -- with 0.55-0.67 s per token
 outside it in the attention stack, the gate, the shared experts, the head and the layer glue; and
 `/tmp/probe_launch_split.py`, which prices one row's four calls three ways and is where the 3.42x
-below comes from.
+below comes from. The last two were written when the row's card side was one method named `_launch`;
+the split into `_issue` and `_drain` is the pipeline below, and the numbers they record are the same
+two halves of it.
 
 **The world size is worth 0.1-0.2 s of that and no more**, which is the one prediction of the plan
 this measurement does not support. At `world=1` the same probe measures 1.40 s against 1.23-1.42 s,
 before the ordering fix below: the staging is identical at 0.32-0.33 s, because it is host work and
-does not care how many cards read the bytes, while `_launch` falls from 0.46 s to 0.27 s. The split
+does not care how many cards read the bytes, while the card side falls from 0.46 s to 0.27 s. The split
 is what makes the launch a fifth of a step instead of a third; it does nothing for the staging, which
 the four cards have made the largest single term. That is the honest reading of the four-against-one
 comparison, and it is why the follow-on that would matter keeps the packed rows on the card rather
 than staging them again -- the wider-arena bullet at the end of this docstring.
 
 Where the 1.14 s goes, measured rather than inferred (`/tmp/probe_launch_cost.py`, warm decode):
-**0.30 s staging, 0.15 s `_launch`, 0.03 s of upload issue, 0.00 s in `_take_buffer`, and 0.55-0.67 s
-of everything else** -- the dense tree, the gate, the shared experts, the head and the loop. Against
-the 29 s the same token costs on the host path cold, and the 14.5 s it costs warm, none of this is
-close; against the step's own terms, what the host still runs is now the largest of them.
+**0.30 s staging, 0.15 s of card time, 0.03 s of upload issue, 0.00 s in `_take_buffer`, and
+0.55-0.67 s of everything else** -- the dense tree, the gate, the shared experts, the head and the
+loop. Against the 29 s the same token costs on the host path cold, and the 14.5 s it costs warm, none
+of this is close; against the step's own terms, what the host still runs is now the largest of them.
 
 `_take_buffer`'s zero is worth recording because it was this docstring's standing inference: the wait
 for the previous upload's DMA is already satisfied, because with two pinned buffers the buffer being
 staged was read by a DMA issued a row and a launch earlier. A third buffer would buy nothing, and
-`_upload`'s 0.03-0.04 s really is issue and not transfer. `_launch` decomposes the same way: a row of
-four calls costs **3.63 ms** with the drain inside the card loop and **1.01 ms** with the four kernels
-issued before any is drained, so its 0.15 s is one kernel's worth of arithmetic plus the **~0.11 s**
-of H2D the kernels wait on -- a card's arena copy is ordered behind that card's previous kernel, so
-the transfer, unlike the issue, is on the device's critical path and not the host's.
+`_upload`'s 0.03-0.04 s really is issue and not transfer. The row's card side decomposes the same way:
+a row of four calls costs **3.63 ms** with the drain inside the card loop and **1.01 ms** with the four
+kernels issued before any is drained, so its 0.15 s is one kernel's worth of arithmetic plus the
+**~0.11 s** of H2D the kernels wait on -- a card's arena copy is ordered behind that card's previous
+kernel, so the transfer, unlike the issue, is on the device's critical path and not the host's.
 
 **Every number above is a warm-page-cache number, and on this host the cache holds 14-21% of the
 checkpoint.** This class stages out of the checkpoint mapping, so `_stage`'s 0.30 s is a read of
@@ -136,22 +138,63 @@ nothing after it does. Multi-threading the staging was measured and regresses --
 ms -- because a 3 MiB `copy_` is already at what one core pulls out of the page cache, so the loop
 here is deliberately single-threaded.
 
-Three things this deliberately does not do yet, all because they are separate measurements rather
+**The row loop is one row deep, and it is worth 1.10x on a prefill.** A row used to be strictly
+serialized -- the host could not stage row `k+1` until the card side of row `k` had returned, and that
+returned only once row `k`'s partials had landed -- so the four cards' work and the *next* row's
+staging were never in flight together. `forward` now holds one row: it stages row `k+1` and issues its
+kernels, and only then drains row `k`. A decode step is one row a layer, so a row-deep pipeline has
+nothing to overlap there and the whole of what it can be worth is a prefill's, `n` rows a layer, `n` =
+the prompt length. Measured with `/tmp/probe_v41_tp4_pipe_matrix.py` -- four ranks under `torchrun`,
+one process a card, the resident bank on, 22 threads, and both orders alternated inside one process so
+that the node's own 20% drift across a sitting lands on both columns instead of on one:
+
+| prompt | order | prefill | tok/s | `_stage_row` | `_stage` | `_upload` | `_issue` | `_drain` |
+| ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | serial | 13.51 s, 13.77 s | 2.4 | 7488 ms | 6850 ms | 482 ms | 849 ms | 4792 ms |
+| 32 | pipelined | 12.43 s, 12.42 s | 2.6 | 8720 ms | 8048 ms | 594 ms | 989 ms | 2305 ms |
+| 128 | serial | 53.61 s, 53.45 s | 2.4 | 30096 ms | 27542 ms | 1964 ms | 3434 ms | 19264 ms |
+| 128 | pipelined | 48.44 s, 48.18 s | 2.7 | 34975 ms | 32717 ms | 2007 ms | 3501 ms | 9033 ms |
+
+That is **1.098x** at 32 tokens and **1.108x** at 128, and the per-row-layer account is flat across
+both: the drain falls from **3.75 ms to 1.8 ms** a row-layer and the staging rises from **5.35 ms to
+6.3 ms**, for a net **~1.0 ms** off a row-layer that costs about 12. The rise is not a mystery and not
+a cost the pipeline introduces so much as one it stops hiding: the staging is a memcpy out of tmpfs
+and, with a row in flight, it now shares the memory system with that row's H2D reading the *other*
+pinned arena. What is left of the drain -- 1.8 ms -- is the row's own arena copy plus its kernel,
+which a one-row-deep pipeline cannot go below; a two-row pipeline would have to issue row `k+1`'s H2D
+while row `k`'s kernel ran, and it needs a third pinned arena to do it. That is the follow-on, and the
+measurement above is the bar it has to clear. The pinned pool is not it: swept at two, three and four
+arenas a layer, `_take_buffer` is 10-29 ms against a stage of 4-8 s, so `pinned_buffers` stays at 2.
+
+Two things had to change for the pipeline to pay, and the first version of it did not. It measured
+**1.012x**, and the reason was the routing: `indices_row.tolist()` inside the row loop synchronizes
+the card's stream, and under the pipeline that stream already has the *previous* row's kernel on it,
+so those reads cost **2.9 ms a row** where they cost 0.1 ms in a loop that has already drained. That
+was as much as the drain saving, given straight back. `_route_ids` takes the whole `[n, topk]` to host
+memory in one pinned copy ahead of the loop, and every row's read is then a read of host memory. The
+second is the route weights: `_issue` gathers them on the card and copies them back `non_blocking`, so
+nothing in the loop waits on a pageable transfer.
+
+It does not change the answer, and the probe is arranged to show that rather than assert it. A prefill
+of this path is not bit-reproducible -- the same order twice differs by 3.4e-02-7.1e-02 max abs on the
+last token's logits -- and the pipelined run differs from the serial one by 2.0e-02, inside that
+spread. Comparing a pipelined prefill against a serial one and reading the difference as the pipeline
+would be reading run-to-run noise.
+
+Two things this deliberately does not do yet, all because they are separate measurements rather
 than separate opinions:
 
 * **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
   is refilled every row, so a prefill of `n` rows pays the 4.20 GiB `n` times. A wider arena plus
   `moe_multi_token_fp4_forward` -- one slot per distinct expert the batch hit, its tokens contiguous
   -- is the shape that fixes it, and it is a follow-on rather than a knob, because an arena size and
-  an eviction policy only mean something once that measurement exists.
-* **The staggering does not overlap the launch.** A row is strictly serialized: the host cannot stage
-  row `k+1` until `_launch` has returned for row `k`, and `_launch` returns only once row `k`'s
-  partials have landed. With the launch now at 0.15 s and the staging at 0.30 s, a one-row-deep
-  pipeline -- stage row `k+1` while row `k`'s kernels run, drain row `k` at the top of row `k+1` --
-  is worth up to the launch, bounded above by the measured **1.01 ms** a row's four device chains
-  cost against the **7.3 ms** the same row's staging costs. It needs one more generation of the
-  activation, the weights and the partials, and it changes the shape of the row loop rather than any
-  of its parts, so it is a follow-on with its own measurement.
+  an eviction policy only mean something once that measurement exists. The row-layer table above is
+  the number it is worth: at 128 tokens the staging is 6.4 ms of a 12 ms row-layer and 32,717 ms of a
+  48 s prefill, and it is paid once per route. What a per-layer slot set saves is the ratio of a
+  rank's routes to the distinct experts among them -- at 128 tokens, four ranks dealing six sorted ids
+  round-robin leave a rank 256 draws from the 384-expert space over the layer's 128 rows, and the
+  duplicates in those draws are what the design would stop paying for. It is worth more the longer
+  the prompt, which is the opposite of the pipeline above.
 * **The dense tree's own quarter is now on the card beside this class, and the split moved.** With
   the tree on the host this class was the whole step's smaller half; with the tree cut across the
   four cards (TP4, `src/cli/generate_v41.py`) the activation arrives on a card rather than from the
@@ -340,9 +383,9 @@ class DeviceRoutedExperts(RoutedExperts):
         self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in self.ranks]
         self._next_buffer = 0
 
-        # One event per card for the *result* copy back, reused the same way. `_launch` records it
-        # after that card's D2H is issued and waits on it once every card has been issued, so the
-        # wait costs what the slowest card costs and not the sum of four.
+        # One event per card for the *result* copy back, reused the same way. `_issue` records it
+        # after that card's D2H is issued and `_drain` waits on it once every card has been issued, so
+        # the wait costs what the slowest card costs and not the sum of four.
         self._drained: list[torch.cuda.Event] = []
         for device in self.devices:
             with torch.cuda.device(device):
@@ -350,6 +393,10 @@ class DeviceRoutedExperts(RoutedExperts):
 
         # The per-row buffers, built on the first row and reused after it. See `_row_scratch`.
         self._scratch: dict | None = None
+
+        # The routing as host memory, one row set at a time. Allocated on the first `forward` and
+        # kept, because the alternative is a pinned allocation per layer per token. See `_route_ids`.
+        self._route: torch.Tensor | None = None
 
     # -- what the checkpoint gave us ---------------------------------------------------------
 
@@ -508,7 +555,7 @@ class DeviceRoutedExperts(RoutedExperts):
         A row is 5120 fp32 of weights, 5120 bf16 of activation and 20 KiB of result per card, so
         allocating them per call looks free and is not: measured on this host, the six allocations
         and four pageable transfers a card-call cost 145 us of a 1.7 ms call, and -- more to the
-        point -- a pageable copy is *synchronous*. `_launch` below is arranged around that second
+        point -- a pageable copy is *synchronous*. `_issue` below is arranged around that second
         fact, and this is the rest of it.
 
         Pinned and not pageable on the host side, one activation for the whole row rather than one
@@ -537,13 +584,17 @@ class DeviceRoutedExperts(RoutedExperts):
         self._scratch = scratch
         return scratch
 
-    def _launch(
+    def _issue(
         self,
         x_row: torch.Tensor,
         weights_row: torch.Tensor,
         cards: list[list[tuple[int, int]]],
-    ) -> torch.Tensor:
-        """One kernel call per local card, all of them issued before any is drained, summed here.
+    ) -> list[int]:
+        """One kernel call per local card, all of them issued before any is drained, and none waited on.
+
+        This is the half of what used to be `_launch` that talks to the card; `_drain` is the half
+        that waits. The split exists so that a row's card-side time and the *next* row's host-side
+        staging can be in flight together -- see `forward`.
 
         The sum is over the cards *this process drives*, and `partial` says what that sum is: with
         every rank of the deal in `ranks` it is the layer's whole routed output, and with one it is
@@ -569,6 +620,13 @@ class DeviceRoutedExperts(RoutedExperts):
         four calls: **3.63 ms** drained in the loop, **1.01 ms** with the drain moved after it, and
         **3.45 ms** with the allocation and the pageable copies removed but the drain left in place --
         so 3.42x of the 3.60x is the ordering and not the transfers.
+
+        What is left here is all issue: the copies are `non_blocking` into buffers that are already
+        pinned and already sized, the kernel is launched, the D2H that reads the result is issued and
+        an event recorded. Nothing below blocks: the activation, the route weights and the result all
+        cross the link as issued copies whose only reader is the next copy on the same stream. The
+        routing used to block here and does not any more -- `_route_ids` takes it once for the whole
+        row set, ahead of the loop, precisely so that nothing in the loop has to.
         """
         scratch = self._row_scratch(x_row)
         # The activation goes to every card, and with the dense tree on a card it is already on one:
@@ -590,9 +648,11 @@ class DeviceRoutedExperts(RoutedExperts):
         # `perm` is the routes *this process* holds, which under a deal is fewer than `topk` -- the
         # else of them are a sibling rank's arena rows and its share of the sum. `scratch["w"]` is
         # sized for `topk` because that is the widest a row's own routes can be, so the copy takes a
-        # view of it rather than the whole buffer.
+        # view of it rather than the whole buffer. Non-blocking: the six values land in pinned memory
+        # and the only reader is the H2D below, on this same stream, so ordering them is the stream's
+        # job and not the host's -- which is what keeps this from being the one sync left in the loop.
         scratch["w"].narrow(0, 0, perm.numel()).copy_(
-            weights_row.reshape(-1).index_select(0, perm)
+            weights_row.reshape(-1).index_select(0, perm), non_blocking=True
         )
 
         issued: list[int] = []
@@ -627,23 +687,33 @@ class DeviceRoutedExperts(RoutedExperts):
             with torch.cuda.device(self.devices[card]):
                 scratch["y"][card].copy_(scratch["y_device"][card], non_blocking=True)
                 self._drained[card].record()
-        y = None
-        for card in issued:
-            self._drained[card].synchronize()
-            y = scratch["y"][card] if y is None else y + scratch["y"][card]
-
-        if y is None:
+        if not issued and not self.partial:
             # Under a deal a rank can hold none of a row's routes -- `topk` below `world`, or a
             # routing that landed every one of them on a sibling. That rank's share of the sum is
             # zero, and returning it is what keeps it in the all-reduce the `MoE` is about to run;
             # raising here would take the process group down over an answer that is not an error.
-            # Without a deal there is no sibling to hold the routes, so nobody routed is a real one.
-            if not self.partial:
-                raise RuntimeError(f"layer {self.layer_id} routed a row to no expert at all")
+            # Without a deal there is no sibling to hold the routes, so nobody routed is a real one,
+            # and it is raised here rather than in `_drain` so that it names the row it happened on.
+            raise RuntimeError(f"layer {self.layer_id} routed a row to no expert at all")
+        return issued
+
+    def _drain(self, issued: list[int]) -> torch.Tensor:
+        """The partials `_issue` left in flight, waited for and summed on the host.
+
+        All the waits come after all the issues -- see `_issue` -- so this costs what the slowest
+        card costs and not the sum of four. A row that reached none of this process's cards sums to
+        zero rather than to nothing, because zero is the rank's share of the all-reduce.
+        """
+        if not issued:
             return torch.zeros(self.dim, dtype=torch.float32)
+        y = None
+        for card in issued:
+            self._drained[card].synchronize()
+            y = self._scratch["y"][card] if y is None else y + self._scratch["y"][card]
         # A tensor of its own and not the view of a reused buffer: the caller assigns this into its
-        # own `[n, dim]` today, and one that kept the result would otherwise watch the next row
-        # overwrite it.
+        # own `[n, dim]`, and one that kept the result would otherwise watch the next row overwrite
+        # it. `_issue` may already have started filling that buffer for the next row by the time a
+        # pipelined caller adds this one up, which is the same reason.
         return y.squeeze(0).clone()
 
     # -- one row ----------------------------------------------------------------------------
@@ -663,23 +733,76 @@ class DeviceRoutedExperts(RoutedExperts):
                 f"a row routed to {indices.shape[1]} experts where this layer has {self.topk}"
             )
         y = torch.empty((n, dim), dtype=torch.float32)
+        # The routing comes back to the host once, before the first row, and not once a row inside the
+        # loop: under the pipeline below the card's stream already has the previous row's kernel on
+        # it when a row would ask, so a per-row read is a per-row wait. See `_route_ids`.
+        route = self._route_ids(indices)
+        # One row in flight, and the row loop is arranged so that the *host* work of row `k+1` runs
+        # while row `k`'s card-side chain does. The order inside the loop is what does it: the stage
+        # and the H2D are issued for row `k+1` first, and only then is row `k` drained -- so the wait
+        # that used to open every row is entered after the staging that can fill it. Measured at 32
+        # and 128 tokens of prefill on layer sizes of the real model, the drain falls from 3.75 ms a
+        # row-layer to 1.8 and the stage rises from 5.35 to 6.3, for 1.10x of wall clock either way.
+        # See the module docstring for the table and for what it does not reach.
+        pending: list[int] | None = None
         for row in range(n):
-            y[row] = self._forward_row(x[row], weights[row], indices[row])
+            cards = self._stage_row(x[row], weights[row], route[row])
+            if pending is not None:
+                y[row - 1] = self._drain(pending)
+            pending = self._issue(x[row], weights[row], cards)
+        if pending is not None:
+            y[n - 1] = self._drain(pending)
         # The result belongs where the activation came from. With the tree on a card this is the
         # half of the layer that follows: the `MoE` above adds the shared expert's output and hands
         # the sum to the all-reduce, and a CPU tensor would make that line a cross-device add. The
         # sum itself is still the host's -- each card's copy is drained into pinned memory and added
-        # there, which is what `_launch` measures -- so this is one H2D of `[n, dim]` per layer and
-        # not a fourth card in the reduction.
+        # there, which is what `_issue` and `_drain` measure between them -- so this is one H2D of
+        # `[n, dim]` per layer and not a fourth card in the reduction.
         return y if x.device.type == "cpu" else y.to(x.device)
 
-    def _forward_row(
-        self, x_row: torch.Tensor, weights_row: torch.Tensor, indices_row: torch.Tensor
-    ) -> torch.Tensor:
-        ids = [int(e) for e in indices_row.reshape(-1).tolist()]
+    def _route_ids(self, indices: torch.Tensor) -> torch.Tensor:
+        """The routing as host memory, in one copy, before the first row of the set is opened.
+
+        `indices_row.tolist()` inside the row loop synchronizes the card's stream, and under the row
+        pipeline that stream already has the *previous* row's kernel on it. Measured at 32 tokens of
+        prefill: those reads cost **2.9 ms a row** there against **0.1 ms** in a loop that has already
+        drained its last row, so as much as the pipeline saves on the drain it gives back here -- and
+        that is what the first version of it did, to 1.01x. One copy of the whole `[n, topk]` ahead of
+        the loop costs the gate's latency once, which is a wait the loop was already paying for its
+        first row, and makes every row's read a read of host memory.
+
+        `weights` is deliberately left on the card. `_issue` indexes it there and copies six values
+        back on the same stream, so it is a copy the host never waits for once it is issued
+        non-blocking, and pulling the whole `[n, topk]` across would be a second round trip for
+        scalars the card already has.
+        """
+        if indices.device.type == "cpu":
+            return indices
+        host = self._route
+        if host is None or host.shape != indices.shape or host.dtype != indices.dtype:
+            host = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
+            self._route = host
+        host.copy_(indices, non_blocking=True)
+        # The one wait: the copy is ordered behind whatever the gate produced `indices` from, which
+        # is earlier in the layer and not part of this loop. Nothing of this class is on the stream
+        # yet, which is the whole difference between this sync and the one it replaces.
+        torch.cuda.current_stream(indices.device).synchronize()
+        return host
+
+    def _stage_row(
+        self, x_row: torch.Tensor, weights_row: torch.Tensor, ids_row: torch.Tensor
+    ) -> list[list[tuple[int, int]]]:
+        """Put one row's bytes where its cards can reach them, and return the deal they were put in.
+
+        Everything here is host-side and none of it reads a result: the routing, the arena row, the
+        pinned staging and the H2D. That is what lets `forward` run it ahead of the *previous* row's
+        drain, and it is the whole of why this is not inside `_issue`. `ids_row` is a row of the host
+        copy `_route_ids` took, so the list comprehension below is a read of host memory.
+        """
+        ids = [int(e) for e in ids_row.tolist()]
         cards = self._split(ids)
         buffer = self._take_buffer()
         self._stage(buffer, ids, cards)
         self._upload(buffer, cards)
         self.rows += 1
-        return self._launch(x_row, weights_row, cards)
+        return cards

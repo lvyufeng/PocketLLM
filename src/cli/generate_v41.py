@@ -39,13 +39,20 @@ told, and one collective a step is not paid to enforce what is already true.
 `docs/performance/deepseek_v4_1_flash_device_experts.md` records with the tree on the host, so cutting
 it across the cards halved the half that was the dense tree's. Prefill is the standing problem and
 always was: the same probe measures **3.0 tok/s at 128 tokens**, 41.85 of its 42.86 s inside
-`DeviceRoutedExperts`, because the class stages 4.2 GiB per row and a prefill is 128 rows of it.
+`DeviceRoutedExperts`, because the class stages 4.2 GiB per row and a prefill is 128 rows of it. The
+row loop runs one row deep, which is a prefill lever alone -- a decode step is one row a layer -- and
+is worth **1.10x** there: 53.53 s against 48.31 s at 128 tokens and 13.64 against 12.43 at 32 in
+`/tmp/probe_v41_tp4_pipe_matrix.py`'s own sitting. That is 25% above the 42.86 s the probe above
+records for the same prefill, which is the node's drift between sittings (it moves 20% for the same
+work) and not a second disagreement about the prompt. See
+`docs/performance/deepseek_v4_1_flash_device_experts.md`'s row-loop section for the measurement.
 
 That 722-747 ms is a warm-page-cache figure, and until recently it was only as durable as the cache:
 `DeviceRoutedExperts` stages out of the checkpoint mapping, and this host holds 68-100 GiB of the
 checkpoint's 475.25 GiB because 457.78 GiB of its RAM is already the resident bank's tmpfs segment.
 With the pages dropped (`/tmp/fadvise_drop.py`) the same 8-token row measures **17.01 s a step**,
-9.91 s of it in `_stage` against 0.30 s resident, while `_upload` and `_launch` do not move at all.
+9.91 s of it in `_stage` against 0.30 s resident, while `_upload` and the row's card time do not move
+at all.
 `V41Checkpoint.packed` falls through to `resident_bank` when one is attached, so
 `DEEPSEEK_V41_RESIDENT_EXPERTS=1` moves the stage's source from the mapping into the segment and the
 number stops depending on the cache: the same cold row is **782.9 ms a step**, 242.1 ms of it in
