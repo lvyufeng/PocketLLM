@@ -19,12 +19,19 @@ than assumed to match:
 | `sparse_attn` | `sparse_attn` — agrees with the reference's arithmetic to the bit on the fixture in `tests/test_models_deepseek_v4_1_kernels.py` |
 | `hc_split_sinkhorn` | `hc_split_sinkhorn` |
 
-so this module re-exports them and adds only the one thing that is genuinely missing.
+so this module re-exports them and adds the two things that are genuinely missing.
 
 **One op is not a re-export: `fp4_act_quant_e4m3`.** The reference's `fp4_quant_kernel` branches on
 its *scale dtype*, and `src/kernels/ops.py` implements only the E8M0 branch. The E4M3 branch is what
 the compressed-KV path calls (`fp4_act_quant(latent, 16, True, scale_dtype=torch.float8_e4m3fn)` in
 `Attention._compress_kv`) and it is not a reformat of the E8M0 one — see the function below.
+
+**The other addition is the inverse direction: `dequant_fp8_weight` and `dequant_fp4_weight`.**
+The reference never needs them — it consumes the quantized weights in a quantized GEMM — but a
+loader that fills a module tree written in ordinary PyTorch does, and the released checkpoint's
+block scales are the only thing that says what its weights are. They are also what makes the
+weights checkable without a tensor core: `dequant(weight, scale)` against a fixture is a statement
+about the checkpoint, where a GEMM result on this host would be a statement about our own kernels.
 
 Why a facade rather than importing `src.kernels.ops` directly at each call site: the two
 implementations agree today, and the tests in `tests/test_models_deepseek_v4_1_kernels.py` are what
@@ -39,16 +46,22 @@ from __future__ import annotations
 import torch
 
 from src.kernels.ops import (
+    Packed4BitWeightAlongK,
     act_quant,
     fp4_act_quant,
     fp4_gemm,
     fp8_gemm,
     hc_split_sinkhorn,
+    soft_fp4_blockfp4_weight_dequant,
+    soft_fp8_blockfp8_weight_dequant,
     sparse_attn,
 )
 
 __all__ = [
+    "Packed4BitWeightAlongK",
     "act_quant",
+    "dequant_fp4_weight",
+    "dequant_fp8_weight",
     "fp4_act_quant",
     "fp4_act_quant_e4m3",
     "fp4_gemm",
@@ -144,3 +157,27 @@ def _fp4_values(codes: torch.Tensor) -> torch.Tensor:
         [*_FP4_MAGNITUDES, *(-m for m in _FP4_MAGNITUDES)], dtype=torch.float32, device=codes.device
     )
     return levels[codes.long()]
+
+
+def dequant_fp8_weight(weight: torch.Tensor, scale: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Expand an fp8 weight with E8M0 block scales back to float32.
+
+    The released checkpoint stores every dense projection this way -- one scale per 32x32 block, so
+    `scale` is `[ceil(out / 32), ceil(in / 32)]` and not a per-row or per-tensor scalar. `weight`
+    keeps its `[out, in]` shape; only `scale` is a grid.
+    """
+    return soft_fp8_blockfp8_weight_dequant(weight, scale, block_size, impl="auto")
+
+
+def dequant_fp4_weight(
+    weight: torch.Tensor, scale: torch.Tensor, block_size: int = 32
+) -> torch.Tensor:
+    """Expand an fp4 weight, packed two-per-byte along K, back to float32.
+
+    `weight` is `[out, in // 2]` of `I8` as the checkpoint stores it, low nibble first, and `scale`
+    is `[out, in // block_size]` of E8M0 -- one scale per 32 elements *along K*, with no block
+    structure on the output axis.
+    """
+    return soft_fp4_blockfp4_weight_dequant(
+        Packed4BitWeightAlongK.convert_from(weight), scale, block_size, impl="auto"
+    )

@@ -197,10 +197,15 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(head_dim, _required_float(cfg, "norm_eps"))
         # ratio 1 is a plain projection, so it stays in the checkpoint's bf16; the softmax pooling
         # above ratio 1 runs in fp32, so those weights are promoted to fp32 to match
-        self.wkv = nn.Linear(_required_int(cfg, "dim"), head_dim, dtype=torch.float32 if ratio > 1 else torch.bfloat16)
+        # `bias=False` throughout this module, as the reference's `Linear` defaults to and as the
+        # checkpoint is: no V4.1 projection carries one.
+        self.wkv = nn.Linear(
+            _required_int(cfg, "dim"), head_dim, bias=False, dtype=torch.float32 if ratio > 1 else torch.bfloat16
+        )
         if ratio <= 1:
             return
-        self.wgate = nn.Linear(_required_int(cfg, "dim"), head_dim, dtype=torch.float32)
+        self.wgate = nn.Linear(_required_int(cfg, "dim"), head_dim, bias=False, dtype=torch.float32)
+
         state_shape = (max_batch_size, ratio, head_dim)
         self.register_buffer("kv_state", torch.zeros(state_shape, dtype=torch.float32), persistent=False)
         self.register_buffer(
@@ -302,11 +307,14 @@ class Indexer(nn.Module):
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
         self.index_topk = _required_int(cfg, "index_topk")
         self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = nn.Linear(_required_int(cfg, "q_lora_rank"), self.n_heads * self.index_head_dim, dtype=LINEAR_DTYPE)
-        self.weights_proj = nn.Linear(_required_int(cfg, "dim"), self.n_heads, dtype=LINEAR_DTYPE)
+        self.wq_b = nn.Linear(
+            _required_int(cfg, "q_lora_rank"), self.n_heads * self.index_head_dim, bias=False, dtype=LINEAR_DTYPE
+        )
+        self.weights_proj = nn.Linear(_required_int(cfg, "dim"), self.n_heads, bias=False, dtype=LINEAR_DTYPE)
         self.freqs_cis: torch.Tensor | None = None
         if self.owns_k:
-            self.wk = nn.Linear(_required_int(cfg, "head_dim"), self.index_head_dim, dtype=LINEAR_DTYPE)
+            self.wk = nn.Linear(_required_int(cfg, "head_dim"), self.index_head_dim, bias=False, dtype=LINEAR_DTYPE)
+
             self.k_norm = RMSNorm(self.index_head_dim, _required_float(cfg, "norm_eps"))
             self.register_buffer(
                 "k_cache",
@@ -422,17 +430,19 @@ class Attention(nn.Module):
         self.eps = _required_float(cfg, "norm_eps")
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.wq_a = nn.Linear(self.dim, _required_int(cfg, "q_lora_rank"), dtype=LINEAR_DTYPE)
+        self.wq_a = nn.Linear(self.dim, _required_int(cfg, "q_lora_rank"), bias=False, dtype=LINEAR_DTYPE)
         self.q_norm = RMSNorm(self.wq_a.out_features, self.eps)
-        self.wq_b = nn.Linear(self.wq_a.out_features, self.n_heads * self.head_dim, dtype=LINEAR_DTYPE)
-        self.wkv = nn.Linear(self.dim, self.head_dim, dtype=LINEAR_DTYPE)
+        self.wq_b = nn.Linear(self.wq_a.out_features, self.n_heads * self.head_dim, bias=False, dtype=LINEAR_DTYPE)
+        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False, dtype=LINEAR_DTYPE)
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = nn.Linear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
+            bias=False,
             dtype=LINEAR_DTYPE,
         )
-        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, dtype=LINEAR_DTYPE)
+        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False, dtype=LINEAR_DTYPE)
+
 
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         is_backbone = layer_id < n_layers

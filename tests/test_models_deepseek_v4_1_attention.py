@@ -79,9 +79,24 @@ LAST_RATIO = 1
 
 
 def _build(seed: int = 0) -> tuple[AttentionStack, V41TextConfig]:
+    """A stack whose weights are finite and reproducible, and the config it was built from.
+
+    The fill is not decoration. `AttentionStack` is built out of `torch.empty` because its real
+    weights arrive from a checkpoint, so without this the tests would be comparing uninitialized
+    memory: a NaN in a weight makes every `torch.equal` below false, and whether a given allocation
+    holds one depends on what the process allocated and freed before it. That is not hypothetical --
+    with this fill absent the file passes alone and fails when `test_models_deepseek_v4_1_config.py`
+    runs first, which is a property of the allocator and not of the layer stack.
+    """
     torch.manual_seed(seed)
     cfg = V41TextConfig(**TOY)
-    return AttentionStack(cfg, max_batch_size=1, max_seq_len=64), cfg
+    stack = AttentionStack(cfg, max_batch_size=1, max_seq_len=64)
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for parameter in stack.parameters():
+            values = torch.randn(parameter.shape, generator=generator, dtype=torch.float32) * 0.2
+            parameter.copy_(values.to(parameter.dtype))
+    return stack, cfg
 
 
 def _run_prefill(stack: AttentionStack, x: torch.Tensor) -> torch.Tensor:
