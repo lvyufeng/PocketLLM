@@ -18,7 +18,7 @@ other half: the same model with the experts on the CPU, at 15 to 42 s per genera
 | Model | DeepSeek-V4.1-Flash, released checkpoint, fp8 dense + packed-fp4 experts |
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB (SMR disk, `/dev/sda`) |
 | Runtime | PyTorch resident, `src/models/deepseek_v4_1`, no native engine; `moe_single_token_fp4_forward` from the built `pocketllm_cpp` CUDA extension |
-| Commit | `df3ed3d` on `feature/v41-backbone-runtime` plus the uncommitted `device_experts.py` |
+| Commit | `df3ed3d` on `feature/v41-backbone-runtime` plus the uncommitted `device_experts.py`; the ordering fix and its re-measured step are in [the launch](#the-launch-was-four-kernels-serialized-not-one-plus-copies) |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each; expert-parallel `world=4` across all four and `world=1` on `cuda:0`, both measured |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env |
@@ -29,10 +29,11 @@ Scripts: `/tmp/probe_device_experts.py` (the class against `expert_forward` on a
 activation), `/tmp/probe_fp4_parity.py` (the kernel against the host expert on real activations, and
 the EP4 decomposition), `/tmp/probe_stage.py` (the staging and H2D terms), `/tmp/probe_h2d.py` (the
 PCIe rates), `/tmp/probe_first_tokens.py` (the top five at each of the first tokens, on either path),
-and `/tmp/probe_device_cost.py` (a whole step, phase by phase). All but the first-token probe read
-`/tmp/v41_activations.pt`, which `/tmp/probe_capture.py` writes; that one runs the loop itself and
-reads nothing. They are throwaway probes, not checked-in benchmarks; the numbers they produced are
-what this page records.
+`/tmp/probe_device_cost.py` (a whole step, phase by phase), and `/tmp/probe_launch_cost.py` and
+`/tmp/probe_launch_split.py`, which are the two that priced and then fixed the launch ordering. All
+but the first-token probe read `/tmp/v41_activations.pt`, which `/tmp/probe_capture.py` writes; that
+one runs the loop itself and reads nothing. They are throwaway probes, not checked-in benchmarks; the
+numbers they produced are what this page records.
 
 ## The split
 
@@ -170,6 +171,11 @@ same token, and neither is a wrong answer at it.
 backbone twice in one process. Each row is one MoE row: a decode step is 40 of them (one per layer, 6
 experts each) and a 5-token prefill is 200.
 
+These two tables are the run that established the shape of the step, and they predate the ordering
+fix in [the launch](#the-launch-was-four-kernels-serialized-not-one-plus-copies) — read their `Launch`
+column as the 0.27 s that fix took to 0.15 s. They are kept as measured rather than back-edited; the
+re-measured step is in that section.
+
 `world=4`, routed experts on `cuda:0..3`, 2 rows per card:
 
 | Pass | Step | Wall | Stage | Upload | Launch | Other | GiB/s |
@@ -192,11 +198,12 @@ experts each) and a 5-token prefill is 200.
 | 2 | 1 | 1.40 s | 0.32 s | 0.01 s | 0.46 s | 0.60 s | 12.94 |
 | 2 | 2 | 1.39 s | 0.33 s | 0.01 s | 0.46 s | 0.59 s | 12.91 |
 
-**A decode step is 1.23–1.42 s at `world=4` across three runs of two probes, and 1.40 s at
-`world=1`, warm**; a 5-token prefill is 4.50–5.00 s and 5.52 s. Every one of those runs returns
-`'The capital of France is Paris.<｜end▁of▁sentence｜>'` with tokens `[11111, 16, 1]`. Against the
-host path's 15.3 s for a warm decode step and 14.5–29 s of expert expansion alone, the step is an
-order of magnitude and the expansion is gone entirely.
+**Before the ordering fix a decode step was 1.23–1.42 s at `world=4` across three runs of two probes,
+and 1.40 s at `world=1`, warm**; a 5-token prefill is 4.50–5.00 s and 5.52 s. After it the step is
+**1.06–1.14 s** at `world=4`, which is [measured below](#the-launch-was-four-kernels-serialized-not-one-plus-copies).
+Every one of those runs returns `'The capital of France is Paris.<｜end▁of▁sentence｜>'` with tokens
+`[11111, 16, 1]`. Against the host path's 15.3 s for a warm decode step and 14.5–29 s of expert
+expansion alone, the step is an order of magnitude and the expansion is gone entirely.
 
 The second probe that measures a step — `/tmp/probe_token_cost.py --expert-device cuda
 --expert-world 4`, the same file the host page uses for the host path — attributes it in the
@@ -204,7 +211,9 @@ coarser pair the two paths share: **1.23 s of step, 0.73 s of it inside `DeviceR
 0.51 s of it the dense tree, the head and the layer glue**. That probe also reports zero misses and
 then divides by them, because its miss counters are `CheckpointRoutedExperts`'s and this path has no
 window at all; the device path's per-step cost is the same whether a step repeats an expert or not,
-which is the second thing it says.
+which is the second thing it says. Both of its figures predate the ordering fix and both keep their
+shape after it: the class's 0.73 s falls to **0.48 s** (0.30 staging + 0.15 launch + 0.03 upload) and
+the 0.51 s outside it is unchanged at 0.55–0.67 s, which sums to the 1.06–1.14 s step measured below.
 
 **The checked-in loop's own numbers are whole-request and do not decompose**, which is the one thing
 to read them for and not for anything else: its timer wraps the entire `generate()` call — the 5-token
@@ -242,36 +251,123 @@ against 0.51 s — but it is not what the step spends its time on, and the measu
 | --- | ---: | ---: |
 | staging, host, per decode step | 0.33 s | 0.33 s |
 | the copy chains, enqueued | 0.01 s | 0.03–0.04 s |
-| the kernels and their D2H | 0.46 s | 0.27 s |
-| **wall** | **1.40 s** | **1.23–1.42 s** |
+| `_launch`, four kernels plus the H2D they wait on | 0.46 s | 0.27 s → **0.15 s** |
+| **wall** | **1.40 s** | **1.23–1.42 s → 1.06–1.14 s** |
 
 **Staging is identical on both and it is host work.** It does not care how many cards read the bytes,
-so what the split buys is the kernels and the partials they hand back — 0.19 s of a step — and
-nothing at all of the 0.33 s that is now the largest single term. The plan's table had H2D on the
-critical path and staging as the unmeasured question; the measurement says the reverse. That is the
-honest reading of four-against-one and it is why the follow-on that would matter keeps the packed
-rows on the card rather than staging them again — the wider arena, below.
+so what the split buys is the kernels and the partials they hand back — 0.19 s of a step before the
+ordering fix and 0.31 s of the re-measured 1.06 s step after it — and nothing at all of the 0.33 s that
+is now the largest single term. The plan's table had H2D on the critical path and staging as the
+unmeasured question; the measurement says the reverse. That is the honest reading of four-against-one
+and it is why the follow-on that would matter keeps the packed rows on the card rather than staging
+them again — the wider arena, below.
 
-### Where the 1.3 s goes
+### The launch was four kernels serialized, not one plus copies
 
-By the class's own three phases: **0.33 s staging, 0.27 s kernels, 0.51 s the host dense tree** — a
-quarter, a fifth, and a half, with the remaining tenth the layer's gate and shared experts and the
-waits inside `_take_buffer`. The dense tree is the same 0.51 s at either world size, because it is
-the host's and this class does not touch it. The coarser split the other probe reports agrees:
-0.73 s inside the class against 0.51 s outside it, with the 0.10 s difference the same tenth.
+The phase this page named as "the obvious next thing to instrument" was the 0.27 s of `launch`: 160
+card-calls of 1.7 ms each against the 0.83 ms an isolated call of that shape costs on one device. The
+guess was that the per-call allocation and the pageable, synchronous copies were the missing
+millisecond. `/tmp/probe_launch_split.py` priced it by measuring one whole row of four cards three
+ways, one change apart, on layer 0's real activation and real arenas:
 
-Two of those phases need their numbers held apart from the isolated ones. `upload`'s 0.03–0.04 s is
-*issue*, not transfer: `_upload` returns as soon as its chains are enqueued, and the transfer is
-awaited inside `_take_buffer`, in the class's own unattributed remainder. And the 0.27 s of `launch`
-is 160 calls of 1.7 ms each against the **0.83 ms** an isolated call of that shape costs on one
-device, so the arithmetic is not what fills it — the 10 KiB activation up and the 20 KiB partial back
-are issued per call and per card and both are pageable and synchronous. That last sentence is an
-inference from two measured numbers rather than a decomposition of the phase, and it is the obvious
-next thing to instrument.
+| A row of four cards | Per row | Per token, 40 layers |
+| --- | ---: | ---: |
+| as it was: allocate per call, pageable transfers, D2H drained inside the card loop | 3,633.4 µs | 145.3 ms |
+| preallocated, pinned, still one card drained at a time | 3,452.5 µs | 138.1 ms |
+| preallocated, every card issued before any card is drained | **1,009.8 µs** | 40.4 ms |
+
+**The allocation and the pageable transfers were worth 1.05x. The serialization was worth 3.42x, and
+3.60x end to end.** `_launch` ran a *pageable, synchronous* D2H of card 0's partial **inside** the card
+loop, and a pageable D2H cannot return until the kernel that produced it has finished — so the host
+could not launch card 1's kernel until card 0 was done, and the four cards were four kernels added up
+rather than four kernels in flight. The fix is ordering, and it fits inside the arenas and the pinned
+buffers the class already had: no arena growth, no wider arena, no multi-token kernel.
+
+`_launch` is now issue-then-drain. A per-instance `_row_scratch` holds one pinned activation, one
+pinned weight vector, per-card device copies of both, per-card device index vectors, and per-card
+pinned results; the row's route weights are gathered once with `index_select` into card order so each
+card's slice is contiguous; every card's H2D and kernel are issued first, with no drain anywhere in
+that loop; then each card's D2H into pinned memory, one `torch.cuda.Event` recorded per card and
+waited on once each. One blocking call per row instead of four blocking calls interleaved with the
+launches. The result is `clone()`d, so a caller that keeps it is not handed a view of a reused buffer.
+
+It is also **bit-neutral**: `probe_launch_split.py`'s part 3 compares the pipelined row against the
+row it replaced and gets `exact True`, `max|d| 0.000e+00` for both the preallocated and the pipelined
+versions. The class-level parity numbers are unchanged to the last digit — `world=4` 1.532% / 2.146% /
+1.913% of scale at cosine 0.999267 / 0.999327 / 0.999700, argmax correct on all three rows, and
+`world=4` against `world=1` still never above 5.960e-08.
+
+Re-measured in a real step, warm (`/tmp/probe_launch_cost.py --world 4`, which also wraps
+`_take_buffer` — no other probe had):
+
+| Phase | Step 1 | Step 2 |
+| --- | ---: | ---: |
+| wall | 1.06 s | 1.14 s |
+| `_take_buffer` | **0.00 s** | **0.00 s** |
+| `_stage` | 0.30 s | 0.29 s |
+| `_upload` | 0.03 s | 0.04 s |
+| `_launch` | **0.16 s** | **0.15 s** |
+| everything else | 0.57 s | 0.66 s |
+
+Both passes decode `'The capital of France is Paris.<｜end▁of▁sentence｜>'`, and the 0.16 s is the
+0.27 s the phase measured before. In the class's own isolation the same change is `world=4`
+17.4 ms → **14.8 ms** per row-layer, 0.70 s → **0.59 s** per token, and `world=1` now measures
+**21.9 ms**, 0.88 s per token. The one-card configuration moves too and by more of its own total,
+which is the tell that the change is not about the four cards: its `launch` phase was the 0.46–0.48 s
+of a single card paying a pageable synchronous D2H per row four times over, and that cost is the same
+whether one card is behind it or four.
+
+**Two things that had to be checked rather than assumed.** First, the hypothesis was wrong in an
+informative way: pinned-and-reused, the change this work was originally scoped as, is 1.05x of a row
+and does not reach the target on its own. Second, a real step's `_take_buffer` is **0.00 s** — on
+every decode step and on the cold prefill too — so the wait for the previous upload's DMA is already
+satisfied and this page's earlier suspicion that part of the 0.33 s staging figure was really PCIe is
+retired, not confirmed. With two pinned buffers the buffer being staged was read by a DMA issued a row
+and a launch earlier; a third buffer would buy nothing.
+
+**A measurement hazard, stated because it is in the numbers above.** The "before" run of
+`probe_launch_cost.py` caught a cold page cache — its pass 1 prefill measured 185.92 s, 167.23 s of it
+staging at 0.13 GiB/s, against the 3.92 s and 11.94 GiB/s of the "after" run where the pages were
+already resident. So `stage` is **not** controlled between the two runs and its 0.30 s comes from the
+after run alone; `launch` and `take` are the controlled terms, and they are the ones the change is
+about. `_launch` decomposes the same way: of its 0.15 s, one kernel's worth of arithmetic is the
+40.4 ms the isolated row costs, and the remaining **~0.11 s** is the H2D the kernels wait on — a card's
+arena copy is ordered behind that card's previous kernel, so the transfer, unlike the issue, is on the
+device's critical path and not the host's.
+
+### Where the 1.06 s goes
+
+This section used to be an inference — three phases of a 1.3 s step with a tenth left unattributed,
+and a closing admission that "the waits inside `_take_buffer`" were the obvious next thing to
+instrument. `/tmp/probe_launch_cost.py` is that instrument, and the answer is measured:
+
+| Term | Per decode step | Per token |
+| --- | ---: | ---: |
+| `_stage`, host page cache → pinned, 4.20 GiB | 0.30 s | 0.30 s |
+| `_launch`, four kernels plus the H2D they wait on | 0.15 s | 0.15 s |
+| `_upload`, the copy chains enqueued | 0.03 s | 0.03 s |
+| `_take_buffer`, the wait for the previous DMA | **0.00 s** | **0.00 s** |
+| the host dense tree, the gate, the shared experts, the head, the layer glue | 0.55–0.67 s | 0.55–0.67 s |
+| **wall** | **1.06–1.14 s** | |
+
+Three of those need their numbers held apart from the isolated ones, and each is now a measurement
+rather than a caveat. `_take_buffer` is zero on every decode step *and* on the cold prefill, so the
+wait for the previous upload's DMA is always already satisfied; a third pinned buffer would buy
+nothing. `_upload`'s 0.03 s is issue and not transfer, which the zero above confirms rather than
+assumes — the transfer is not hiding in the buffer handshake. And `_launch`'s 0.15 s is the 1,009.8 µs
+row measured above against the 0.83 ms an isolated call of that shape costs, so roughly a quarter of
+it is arithmetic and the rest is the pinned H2D each kernel's arena copy is ordered behind.
+
+What that leaves is the honest headline: **the host's own dense stack is now the largest single term
+of a device step**, 0.55–0.67 s against the 0.30 s of staging, and it is the same 0.51 s the earlier
+coarse probe measured from the other direction. Moving it is worth 0.4–0.6 s/token on its own and is
+[still not done](#what-this-does-not-do-yet).
 
 On one device and serialized, the same arithmetic measures: **2,077.3 µs per layer** for one call
 over all six experts against **3,302.6 µs** for four calls of 2/2/1/1 — 83.1 ms against 132.1 ms per
-token, which is the upper bound the four cards beat by overlapping, not a per-call cost.
+token. That was the upper bound the four cards were supposed to beat by overlapping, and it turned out
+they were not overlapping at all; the 1,009.8 µs row above is what they cost once they do, which is
+below even the single-call figure because the four device chains run concurrently.
 
 ## The staging rate, and the number that was wrong
 
@@ -290,11 +386,12 @@ that is what this class does. Measured, warm:
 | H2D, four cards at once | 38.56 GiB/s |
 | the same staging across four threads and four arenas | **regresses**: 733 ms against 365 ms |
 
-**The staging rate in a real step is 12.6 GiB/s**, which is the isolated `copy_` and not the
-allocation storm: a decode step stages 40 rows × 6 experts × 17.9 MiB = 4.20 GiB in 0.33 s. Prefill
-is the same rate over 200 rows — 21.0 GiB in 1.89–1.94 s, 10.8–11.1 GiB/s. The 0.33 GiB/s figure
-measured an allocation pattern no device path uses, and an earlier reading of the host page drew a
-conclusion from it; **the staging model in the plan was right and no correction was needed.**
+**The staging rate in a real step is 12.3–14.0 GiB/s**, which is the isolated `copy_` and not the
+allocation storm: a decode step stages 40 rows × 6 experts × 17.9 MiB = 4.20 GiB in 0.30–0.34 s
+across the runs that measured it. Prefill is the same rate over 200 rows — 21.0 GiB in 1.89–1.94 s,
+10.8–11.1 GiB/s. The 0.33 GiB/s figure measured an allocation pattern no device path uses, and an
+earlier reading of the host page drew a conclusion from it; **the staging model in the plan was right
+and no correction was needed.**
 
 Threading was measured and regresses — 733 ms against 365 ms — because a 3 MiB `copy_` is already at
 what one core pulls out of the page cache. The loop here is deliberately single-threaded; the
@@ -305,7 +402,7 @@ disk: one scattered expert row is **1308.0 ms** cold against 11.2 ms warm.
 
 ## What this does not do yet
 
-Both of these are separate measurements rather than separate opinions.
+All three are separate measurements rather than separate opinions.
 
 - **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
   is refilled every row, so a prefill of `n` rows pays 4.20 GiB `n` times: the 5-token prefill above
@@ -314,7 +411,16 @@ Both of these are separate measurements rather than separate opinions.
   expert the batch hit, its tokens contiguous — is the shape that fixes it, and it is a follow-on
   rather than a knob, because an arena size and an eviction policy only mean something once that
   measurement exists.
-- **The dense tree is still host code**, worth 0.4–0.6 s/token of the 1.3 s.
+- **The staging does not overlap the launch.** A row is strictly serialized today: the host cannot
+  stage row `k+1` until `_launch` has returned for row `k`. With the launch at 0.15 s and the staging
+  at 0.30 s, a one-row-deep pipeline — stage row `k+1` while row `k`'s kernels run, drain row `k` at
+  the top of row `k+1` — is worth up to the launch, and the isolated row puts a ceiling on it:
+  **1,009.8 µs** of device work against the **7.3 ms** the same row's staging costs, so the device
+  side would be fully hidden. It needs one more generation of the activation, the weights and the
+  partials and it changes the shape of the row loop rather than any of its parts, so it is the next
+  follow-on with its own measurement.
+- **The dense tree is still host code**, now the largest single term at 0.55–0.67 s of the 1.06–1.14 s
+  step — worth 0.4–0.6 s/token on its own.
 
 ## Reproducing
 
@@ -335,6 +441,13 @@ Both of these are separate measurements rather than separate opinions.
 # a whole step, phase by phase, twice through the same prompt so pass 2 is a warm page cache
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_device_cost.py --world 4
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_device_cost.py --world 1
+
+# the same step with `_take_buffer` wrapped as well, which probe_device_cost does not do -- and the
+# one that caught a cold page cache in its first pass, so read its `GiB/s` column before its `stage`
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_launch_cost.py --world 4
+
+# one row of four cards, three ways, one change apart, and the three checked against each other
+PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_launch_split.py --layer 0
 
 # the checked-in loop on the device path, which is what the text above is produced by -- the
 # `routed experts:` line it prints is the flag's own report that it did not fall back

@@ -292,7 +292,11 @@ the same 40 layers. The card is two orders of magnitude the cheaper place to do 
 and it stays the cheaper place after being handed the operands. The whole device step — staging the
 packed rows, four links, four kernels a layer, and the dense tree still on the host — measures
 **1.23–1.42 s**, against the 1.00 s the host needs merely to *repeat* a forward it has already cached
-and the 15 to 42 s it needs for a real one.
+and the 15 to 42 s it needs for a real one. That 0.27 s was four kernels serialized rather than one
+plus copies — the drain sat inside the card loop — and the device page's
+[ordering fix](../performance/deepseek_v4_1_flash_device_experts.md#the-launch-was-four-kernels-serialized-not-one-plus-copies)
+takes it to **0.15 s** and the step to **1.06–1.14 s**; the 0.27 s is kept here as what this page
+measured.
 
 That reverses the reading this page first drew from the carrier table. It took the repeated forward's
 0.44 s of MoE as the host-RAM carrier's floor and set it against 0.68 s of PCIe, and concluded that

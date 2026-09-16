@@ -48,48 +48,56 @@ permutation are all accounted for: what is left between this and the host path i
 checkpoint ships with.
 
 What it costs, measured on this host (`/tmp/probe_device_experts.py` for the class on its own,
-`/tmp/probe_stage.py` and `/tmp/probe_fp4_parity.py` for its terms, and `/tmp/probe_device_cost.py`
-for a whole step of a real token):
+`/tmp/probe_launch_cost.py` and `/tmp/probe_launch_split.py` for the terms below, and
+`/tmp/probe_stage.py` and `/tmp/probe_fp4_parity.py` for staging and for the kernel's own error):
 
 | Term | Per token, 40 layers x 6 experts | Source |
 | --- | --- | --- |
-| this class alone, both sides of PCIe, `world=4` | 0.70-0.73 s | measured, 17.4 ms per row-layer |
-| a whole step, this class plus the host dense tree | **1.23-1.42 s** | measured, three runs, two probes |
-| the same step at `world=1` | 1.40 s | measured, same probe, one card |
-| host staging, page cache -> pinned, 4.20 GiB | 0.33 s, 12.6 GiB/s | measured in a real step |
+| this class alone, both sides of PCIe, `world=4` | 0.59 s | measured, 14.8 ms per row-layer |
+| a whole step, this class plus the host dense tree | **1.14 s** | measured, warm decode |
+| the same class at `world=1` | 0.88 s | measured, same probe, one card |
+| a whole step at `world=1` | 1.40 s | measured before the ordering fix below |
+| `_take_buffer`, the wait for the previous DMA | **0.00 s** | measured in a real step |
+| host staging, page cache -> pinned, 4.20 GiB | 0.30 s, 14 GiB/s | measured in a real step |
 | the four copy chains, enqueued | 0.03-0.04 s | measured; the transfer is awaited later |
-| H2D, pinned, `non_blocking`, four links at once | ~0.11 s of transfer | measured, 38.56 GiB/s aggregate |
-| the fp4 kernels, four calls of 2/2/1/1 per layer | 0.27 s | measured in a real step, 160 calls |
-| the host dense tree, which this class does not touch | 0.51 s | measured |
+| `_launch`, four kernels plus the H2D they wait on | 0.15 s | measured in a real step, 160 calls |
+| the host dense tree and the layer glue around it | 0.55-0.67 s | measured, the step's unattributed remainder |
 
-The 0.70 s row and the 1.3 s row are the same class measured two ways, and the difference between
-them is the dense tree: `probe_device_experts.py` loops one layer's six experts against a fixed
-activation and sees 17.4 ms per row-layer, while a real step spends 18.3 ms per row-layer inside
-this class and 12.7 ms in the attention stack, the head and the layer glue around it. So the class
-is 0.73 s of the step and 0.51 s is everything the host still does.
+The probes are `/tmp/probe_device_experts.py`, which loops one layer's rows against the captured
+activation and sees 14.8 ms per row-layer; `/tmp/probe_launch_cost.py`, which wraps all four of the
+class's phases in a real step over the prompt and sees 11.4 ms per row-layer inside this class --
+7.3 ms of staging, 0.8 ms of upload issue and 3.75 ms of `_launch` -- with 0.55-0.67 s per token
+outside it in the attention stack, the gate, the shared experts, the head and the layer glue; and
+`/tmp/probe_launch_split.py`, which prices one row's four calls three ways and is where the 3.42x
+below comes from.
 
 **The world size is worth 0.1-0.2 s of that and no more**, which is the one prediction of the plan
-this measurement does not support. At `world=1` the same probe measures 1.40 s against 1.23-1.42 s:
-the staging is identical at 0.32-0.33 s, because it is host work and does not care how many cards
-read the bytes, while the kernels and their D2H fall from 0.46 s to 0.27 s. The split is what makes
-the kernel a fifth of a step instead of a third; it does nothing for the staging, which the four
-cards have made the largest single term. That is the honest reading of the four-against-one
+this measurement does not support. At `world=1` the same probe measures 1.40 s against 1.23-1.42 s,
+before the ordering fix below: the staging is identical at 0.32-0.33 s, because it is host work and
+does not care how many cards read the bytes, while `_launch` falls from 0.46 s to 0.27 s. The split
+is what makes the launch a fifth of a step instead of a third; it does nothing for the staging, which
+the four cards have made the largest single term. That is the honest reading of the four-against-one
 comparison, and it is why the follow-on that would matter keeps the packed rows on the card rather
 than staging them again -- the wider-arena bullet at the end of this docstring.
 
-Where the 1.3 s goes, by the module's own three phases: **0.33 s staging, 0.27 s kernels, 0.51 s
-host tree** -- a quarter, a fifth, and a half, with the remaining tenth the layer's gate and shared
-experts and the waits inside `_take_buffer`. Several of the terms in that table overlap and cannot
-be added to it. `_upload` returns as soon as its copy chains are enqueued on their streams, so its
-0.03-0.04 s is issue and not transfer; the transfer is awaited inside `_take_buffer`, in the class's
-own unattributed remainder. The kernel row's 132.1 ms is four calls serialized on one device and is
-an upper bound -- on four cards they overlap, and what a step actually spends on them, D2H partials
-and host sum included, is the 0.27 s measured above. Against the 29 s the same token costs on the
-host path cold, and the 14.5 s it costs warm, none of this is close.
+Where the 1.14 s goes, measured rather than inferred (`/tmp/probe_launch_cost.py`, warm decode):
+**0.30 s staging, 0.15 s `_launch`, 0.03 s of upload issue, 0.00 s in `_take_buffer`, and 0.55-0.67 s
+of everything else** -- the dense tree, the gate, the shared experts, the head and the loop. Against
+the 29 s the same token costs on the host path cold, and the 14.5 s it costs warm, none of this is
+close; against the step's own terms, what the host still runs is now the largest of them.
+
+`_take_buffer`'s zero is worth recording because it was this docstring's standing inference: the wait
+for the previous upload's DMA is already satisfied, because with two pinned buffers the buffer being
+staged was read by a DMA issued a row and a launch earlier. A third buffer would buy nothing, and
+`_upload`'s 0.03-0.04 s really is issue and not transfer. `_launch` decomposes the same way: a row of
+four calls costs **3.63 ms** with the drain inside the card loop and **1.01 ms** with the four kernels
+issued before any is drained, so its 0.15 s is one kernel's worth of arithmetic plus the **~0.11 s**
+of H2D the kernels wait on -- a card's arena copy is ordered behind that card's previous kernel, so
+the transfer, unlike the issue, is on the device's critical path and not the host's.
 
 The staging rate is the one term that had to be measured rather than argued, because the whole plan
-turns on it: a step stages 40 rows x 6 experts x 17.9 MiB = 4.20 GiB and the phase costs 0.33 s, so
-**12.6 GiB/s**, which is the 11.49 GiB/s an isolated `copy_` into a pinned arena reaches and not the
+turns on it: a step stages 40 rows x 6 experts x 17.9 MiB = 4.20 GiB and the phase costs 0.30 s, so
+**14 GiB/s**, which is the 11.49 GiB/s an isolated `copy_` into a pinned arena reaches and not the
 0.33 GiB/s that `pin_memory()` inside the loop reaches. Prefill is the same rate over 200 rows:
 1.89-1.94 s for 21.0 GiB, 10.8-11.1 GiB/s.
 
@@ -99,7 +107,7 @@ nothing after it does. Multi-threading the staging was measured and regresses --
 ms -- because a 3 MiB `copy_` is already at what one core pulls out of the page cache, so the loop
 here is deliberately single-threaded.
 
-Two things this deliberately does not do yet, both because they are separate measurements rather
+Three things this deliberately does not do yet, all because they are separate measurements rather
 than separate opinions:
 
 * **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
@@ -107,6 +115,14 @@ than separate opinions:
   `moe_multi_token_fp4_forward` -- one slot per distinct expert the batch hit, its tokens contiguous
   -- is the shape that fixes it, and it is a follow-on rather than a knob, because an arena size and
   an eviction policy only mean something once that measurement exists.
+* **The staggering does not overlap the launch.** A row is strictly serialized: the host cannot stage
+  row `k+1` until `_launch` has returned for row `k`, and `_launch` returns only once row `k`'s
+  partials have landed. With the launch now at 0.15 s and the staging at 0.30 s, a one-row-deep
+  pipeline -- stage row `k+1` while row `k`'s kernels run, drain row `k` at the top of row `k+1` --
+  is worth up to the launch, bounded above by the measured **1.01 ms** a row's four device chains
+  cost against the **7.3 ms** the same row's staging costs. It needs one more generation of the
+  activation, the weights and the partials, and it changes the shape of the row loop rather than any
+  of its parts, so it is a follow-on with its own measurement.
 * **The dense tree stays on the host.** It is 16.79 GiB, it works, and moving it is worth 0.4-0.6
   s/token on its own; doing both at once would put two independent sources of divergence inside one
   debugging session.
@@ -160,9 +176,9 @@ class DeviceRoutedExperts(RoutedExperts):
     part of the tree, and a module would put them in `state_dict()` and in `parameters()`.
 
     The class owns exactly the state a step needs and nothing it allocates: the pinned and device
-    arenas, the copy streams, and one event per pinned buffer, so a buffer is not overwritten while
-    the DMA that reads it is still in flight. Everything else -- the `[1, 5120]` activation, the six
-    route weights, the arena row indices -- is built per row out of the caller's own tensors.
+    arenas, the copy streams, one event per pinned buffer so a buffer is not overwritten while the
+    DMA that reads it is still in flight, one event per card for the result copy back, and the
+    per-row scratch. Nothing on either side of PCIe is allocated per card or per row.
     """
 
     def __init__(
@@ -269,6 +285,17 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._events.append([torch.cuda.Event() for _ in range(self._buffers)])
         self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in range(world)]
         self._next_buffer = 0
+
+        # One event per card for the *result* copy back, reused the same way. `_launch` records it
+        # after that card's D2H is issued and waits on it once every card has been issued, so the
+        # wait costs what the slowest card costs and not the sum of four.
+        self._drained: list[torch.cuda.Event] = []
+        for device in self.devices:
+            with torch.cuda.device(device):
+                self._drained.append(torch.cuda.Event())
+
+        # The per-row buffers, built on the first row and reused after it. See `_row_scratch`.
+        self._scratch: dict | None = None
 
     # -- what the checkpoint gave us ---------------------------------------------------------
 
@@ -403,13 +430,48 @@ class DeviceRoutedExperts(RoutedExperts):
                     self._events[card][buffer].record(stream)
             self._uploaded[card][buffer] = True
 
+    def _row_scratch(self, x_row: torch.Tensor) -> dict:
+        """The per-row buffers, built on the first row and reused for every one after it.
+
+        A row is 5120 fp32 of weights, 5120 bf16 of activation and 20 KiB of result per card, so
+        allocating them per call looks free and is not: measured on this host, the six allocations
+        and four pageable transfers a card-call cost 145 us of a 1.7 ms call, and -- more to the
+        point -- a pageable copy is *synchronous*. `_launch` below is arranged around that second
+        fact, and this is the rest of it.
+
+        Pinned and not pageable on the host side, one activation for the whole row rather than one
+        per card, and the route weights in the order the cards read them.
+        """
+        if self._scratch is not None and self._scratch["x"].dtype == x_row.dtype:
+            return self._scratch
+        dim = self.dim
+        scratch = {
+            "x": torch.empty((1, dim), dtype=x_row.dtype, pin_memory=True),
+            "w": torch.empty((self.topk,), dtype=torch.float32, pin_memory=True),
+            "x_device": [torch.empty((1, dim), dtype=x_row.dtype, device=d) for d in self.devices],
+            "w_device": [
+                torch.empty((self.rows_per_card,), dtype=torch.float32, device=d)
+                for d in self.devices
+            ],
+            # `experts_start_idx` is 0 and the arena's ids are relative -- a card's rows are 0 and 1
+            # -- so this is the whole index arithmetic a call needs, and it never changes.
+            "idx_device": [
+                torch.arange(self.rows_per_card, dtype=torch.int64, device=d)
+                for d in self.devices
+            ],
+            "y_device": [None] * self.world,
+            "y": [torch.empty((1, dim), dtype=torch.float32, pin_memory=True) for _ in self.devices],
+        }
+        self._scratch = scratch
+        return scratch
+
     def _launch(
         self,
         x_row: torch.Tensor,
         weights_row: torch.Tensor,
         cards: list[list[tuple[int, int]]],
     ) -> torch.Tensor:
-        """One kernel call per card, and the sum of their `[1, dim]` fp32 results on the host.
+        """One kernel call per card, all of them issued before any is drained, summed on the host.
 
         The arena's expert ids are relative -- a card's rows are 0 and 1 -- so the 384-expert space
         never reaches a kernel, and `experts_start_idx` is 0 because there is nothing to rebase:
@@ -420,32 +482,67 @@ class DeviceRoutedExperts(RoutedExperts):
         route `r` of the call is arena row `r`, which is `members[r]`, so the two have to be permuted
         together or the kernel would scale one expert's output by another's weight -- a wrong answer
         that no shape check would catch.
+
+        **Issue, then drain.** The two loops below are the same four calls the card loop used to make
+        one at a time, and the split between them is the whole of what a card is worth here: a
+        pageable D2H cannot return until the kernel that produced it has finished, so draining card 0
+        inside the loop left cards 1..3 unlaunched until card 0 was done, and a row cost four kernels
+        added up instead of one plus copies. Measured on this host with the real arenas, one row of
+        four calls: **3.63 ms** drained in the loop, **1.01 ms** with the drain moved after it, and
+        **3.45 ms** with the allocation and the pageable copies removed but the drain left in place --
+        so 3.42x of the 3.60x is the ordering and not the transfers.
         """
-        y = None
+        scratch = self._row_scratch(x_row)
+        scratch["x"].copy_(x_row)
+        # One gather for the row, in card order, so card `c`'s weights are a contiguous slice.
+        perm = torch.tensor(
+            [slot for members in cards for _, slot in members], dtype=torch.int64
+        )
+        scratch["w"].copy_(weights_row.reshape(-1).index_select(0, perm))
+
+        issued: list[int] = []
+        offset = 0
         for card, members in enumerate(cards):
-            if not members:
+            k = len(members)
+            if not k:
                 continue
             device = self.devices[card]
             # Order the compute behind its own copy stream and no one else's: a card's kernel reads
             # only its own arena, so four independent chains is what the hardware is.
             torch.cuda.current_stream(device).wait_stream(_copy_stream(device))
-            route_weights = torch.tensor(
-                [float(weights_row[slot]) for _, slot in members], dtype=torch.float32
-            ).to(device=device).contiguous()
-            partial = self._extension.moe_single_token_fp4_forward(
-                x_row.unsqueeze(0).to(device=device).contiguous(),
-                torch.arange(len(members), dtype=torch.int64, device=device),
-                route_weights,
+            with torch.cuda.device(device):
+                scratch["x_device"][card].copy_(scratch["x"], non_blocking=True)
+                scratch["w_device"][card].narrow(0, 0, k).copy_(
+                    scratch["w"].narrow(0, offset, k), non_blocking=True
+                )
+            offset += k
+            scratch["y_device"][card] = self._extension.moe_single_token_fp4_forward(
+                scratch["x_device"][card],
+                scratch["idx_device"][card].narrow(0, 0, k),
+                scratch["w_device"][card].narrow(0, 0, k),
                 self._on_device[card][("w1", "q")], self._on_device[card][("w1", "s")],
                 self._on_device[card][("w2", "q")], self._on_device[card][("w2", "s")],
                 self._on_device[card][("w3", "q")], self._on_device[card][("w3", "s")],
                 0,
                 float(self.swiglu_limit),
-            ).squeeze(0).to(device="cpu", dtype=torch.float32)
-            y = partial if y is None else y + partial
+            )
+            issued.append(card)
+
+        for card in issued:
+            with torch.cuda.device(self.devices[card]):
+                scratch["y"][card].copy_(scratch["y_device"][card], non_blocking=True)
+                self._drained[card].record()
+        y = None
+        for card in issued:
+            self._drained[card].synchronize()
+            y = scratch["y"][card] if y is None else y + scratch["y"][card]
+
         if y is None:
             raise RuntimeError(f"layer {self.layer_id} routed a row to no expert at all")
-        return y
+        # A tensor of its own and not the view of a reused buffer: the caller assigns this into its
+        # own `[n, dim]` today, and one that kept the result would otherwise watch the next row
+        # overwrite it.
+        return y.squeeze(0).clone()
 
     # -- one row ----------------------------------------------------------------------------
 
