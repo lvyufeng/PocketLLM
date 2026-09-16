@@ -218,9 +218,12 @@ extern "C" __global__ __aicore__ void qwen_linear_attn_gates_kernel(
 // contiguous in, so every load is a straight DataCopy and the accumulation is a
 // plain Axpy against a broadcast weight.
 //
-// The weight is [channels, kernel], i.e. the taps of one channel are contiguous and
-// the channels of one tap are strided. A tile therefore needs a per-lane gather of
-// `kernel` values, done on the scalar unit once per tile rather than once per token.
+// The weight arrives tap-major, [kernel, channels], which is not how the checkpoint
+// stores it: `weight` is [channels, kernel] there and the upload transposes it once
+// (qwen_apply_conv_weight_layout_policy). Loading it tap-major means each of the
+// kernel rows this tile needs is one contiguous run of `count` values, which is one
+// more DataCopy; in the checkpoint's layout the same row is strided by `kernel` and
+// only a per-lane scalar gather can collect it.
 extern "C" __global__ __aicore__ void qwen_causal_depthwise_conv_silu_kernel(
     GM_ADDR x, GM_ADDR weight, GM_ADDR tail, GM_ADDR y, uint32_t seq_len,
     uint32_t channels, uint32_t kernel, uint32_t update_tail) {
@@ -254,15 +257,16 @@ extern "C" __global__ __aicore__ void qwen_causal_depthwise_conv_silu_kernel(
         const uint32_t base = tile * kConvTile;
         const uint32_t count = min_u32(kConvTile, channels - base);
 
-        // Gather this tile's weights: weights[tap * kConvTile + lane] is channel
-        // (base + lane)'s tap `tap`.
-        for (uint32_t lane = 0; lane < count; ++lane) {
-            for (uint32_t tap = 0; tap < kernel; ++tap) {
-                weights.SetValue(tap * kConvTile + lane,
-                                 static_cast<float>(w_gm.GetValue((base + lane) * kernel + tap)));
-            }
+        // Load this tile's weights: the weight is tap-major, so tap `tap`'s row
+        // over channel `base + lane` is the contiguous run that starts at
+        // tap * channels + base. One DataCopy and one Cast per tap, no scalars.
+        for (uint32_t tap = 0; tap < kernel; ++tap) {
+            load_half_exact(staging, w_gm, tap * channels + base, count);
+            AscendC::Cast(weights[tap * kConvTile], staging,
+                          AscendC::RoundMode::CAST_NONE, count);
+            AscendC::PipeBarrier<PIPE_V>();
+            wait_compute_before_load();
         }
-        wait_scalar_before_compute();
 
         // Prime the tap window with the carried tail: taps[j] holds the input at
         // relative position j - tail_len, so the first token's window is exactly

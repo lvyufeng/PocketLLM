@@ -284,6 +284,7 @@ else()
         backends/ascend/kernels/qwen_argmax_f32.cpp
         backends/ascend/kernels/qwen_cube_gemm_probe.cpp
         backends/ascend/kernels/qwen_cube_transpose_probe.cpp
+        backends/ascend/kernels/qwen_hbm_read_probe.cpp
         backends/ascend/kernels/qwen_transpose_f16.cpp
         backends/ascend/kernels/qwen_attention_cube_f16.cpp
     )
@@ -787,7 +788,22 @@ endif()
 # sustains rather than inferring it from a GEMV that may simply be inefficient.
 add_executable(bench_qwen_ascend_bandwidth tests/bench_qwen_ascend_bandwidth.cpp)
 target_link_libraries(bench_qwen_ascend_bandwidth PRIVATE pocket_cpp_core)
+# The probe's tile size and sample count live with the kernel, and the bench has to
+# agree with both to size its buffers and its expected sink sum. The header is
+# plain constexpr, so it is safe to pull in on a backend that never runs the
+# kernel; the device code reaches it through the include of the neighbouring file.
+target_include_directories(bench_qwen_ascend_bandwidth PRIVATE backends/ascend/kernels)
 set_target_properties(bench_qwen_ascend_bandwidth PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# A second stream is the obvious way to hide the TP all-reduce, and it only works
+# if an event recorded on one stream is a real dependency for a kernel on another.
+# The path that was built on that assumption produced wrong results while the same
+# collective issued synchronously was exact, which made the primitive itself the
+# first thing to measure: the probe says the event is sound, so the defect is in
+# what the collective makes visible to it.
+add_executable(bench_qwen_ascend_event_order tests/bench_qwen_ascend_event_order.cpp)
+target_link_libraries(bench_qwen_ascend_event_order PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_event_order PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # The twelve operators with no aclnn equivalent, i.e. the hand-written AscendC
 # kernels. Same neutral-name discipline as test_qwen_ascend_ops; it is a separate

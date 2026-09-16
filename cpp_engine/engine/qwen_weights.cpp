@@ -11,6 +11,8 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace pocket {
 
@@ -85,6 +87,13 @@ uint16_t float_to_fp16_bits(float value) {
         sign | (static_cast<uint32_t>(exponent) << 10) | half);
 }
 
+bool qwen_is_linear_conv_weight(const std::string& name) {
+    static const char* const suffix = "linear_attn.conv1d.weight";
+    const std::string tail(suffix);
+    return name.size() >= tail.size() &&
+           name.compare(name.size() - tail.size(), tail.size(), tail) == 0;
+}
+
 }  // namespace
 
 void qwen_apply_norm_gamma_policy(const QwenTensorRef& ref,
@@ -100,6 +109,48 @@ void qwen_apply_norm_gamma_policy(const QwenTensorRef& ref,
     }
 #else
     // CUDA kernels apply (1 + gamma) themselves; the stored weight is untouched.
+    (void)ref;
+    (void)host;
+#endif
+}
+
+void qwen_apply_conv_weight_layout_policy(const QwenTensorRef& ref,
+                                         QwenHostTensor& host) {
+#ifdef POCKET_BACKEND_ASCEND
+    if (host.device_dtype != SafeDType::F16) return;
+    if (!qwen_is_linear_conv_weight(ref.name)) return;
+    // The checkpoint ships [channels, 1, kernel]; the trailing axis is the kernel.
+    if (host.shape.empty()) return;
+    const size_t kernel = static_cast<size_t>(host.shape.back());
+    if (kernel == 0) return;
+    const size_t elements = host.bytes.size() / sizeof(uint16_t);
+    if (elements == 0 || elements % kernel != 0) return;
+    const size_t channels = elements / kernel;
+
+    // AscendC vectors are contiguous along one axis, and the taps of a single
+    // channel are what the checkpoint makes adjacent. In the checkpoint's layout a
+    // channel tile therefore needs one tap's weights at a stride of `kernel`, which
+    // only a scalar gather can collect: 384 channels x 4 taps of scalar global
+    // reads, measured at ~143 ns each, is 220 us of a 278 us call, and it is paid
+    // once per call for a weight that never changes. Storing the same bytes
+    // tap-major makes each tap's row over the channels contiguous, so the kernel
+    // loads it with the DataCopy it already uses for the activations.
+    //
+    // The transpose is element-preserving: the byte count is unchanged, and the
+    // channel count and kernel width are implied by the op's arguments rather than
+    // read back off this shape. Nothing else consumes this tensor.
+    auto* values = reinterpret_cast<uint16_t*>(host.bytes.data());
+    std::vector<uint16_t> transposed(elements);
+    for (size_t channel = 0; channel < channels; ++channel) {
+        for (size_t tap = 0; tap < kernel; ++tap) {
+            transposed[tap * channels + channel] = values[channel * kernel + tap];
+        }
+    }
+    std::memcpy(values, transposed.data(), host.bytes.size());
+    host.shape = {static_cast<uint64_t>(kernel), static_cast<uint64_t>(channels)};
+#else
+    // The CUDA kernel reads the checkpoint layout directly, so the stored weight
+    // keeps its [channels, 1, kernel] shape.
     (void)ref;
     (void)host;
 #endif
@@ -198,6 +249,7 @@ QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
                                         void* stream) {
     QwenHostTensor host = qwen_materialize_host_tensor(index, ref);
     qwen_apply_norm_gamma_policy(ref, host);
+    qwen_apply_conv_weight_layout_policy(ref, host);
     QwenDeviceTensor device;
     device.device_dtype = host.device_dtype;
     device.shape = host.shape;
