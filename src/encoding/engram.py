@@ -425,14 +425,19 @@ class NgramHasher:
 
 
 def _load_config(path: str) -> Mapping[str, Any]:
-    """A V4.1 inference config, flat or nested under `model` as the release ships it."""
-    import json
+    """A V4.1 inference config, flat or nested either way the release ships it.
 
-    with open(path, encoding="utf-8") as handle:
-        config = json.load(handle)
-    if isinstance(config.get("model"), dict):
-        config = config["model"]
-    return config
+    The released `config.json` nests these fields under `text_config` and spells
+    the pad id `engram_pad_token_id`; `inference/config.json` is flat. Six of the
+    keys this module reads -- the layer ids, the n-gram size, the head count, the
+    vocabulary, the head dim and the row counts -- are spelled identically in
+    both, which is why the derivation is shape-independent and only the pad id
+    has to be aliased. `V41Config` owns that mapping, so this defers to it rather
+    than restating it.
+    """
+    from src.models.deepseek_v4_1.config import load_config
+
+    return load_config(path).engram_block()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -449,7 +454,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m src.encoding.engram",
         description="Verify the Engram hash layout a DeepSeek-V4.1 config implies.",
     )
-    parser.add_argument("--config", required=True, help="inference_config.json, flat or nested under 'model'")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="a released config.json or inference/config.json",
+    )
     parser.add_argument(
         "--tokenizer",
         help="a tokenizer directory; without it the compressed vocab size cannot be checked",

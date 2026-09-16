@@ -48,6 +48,12 @@ import struct
 import sys
 from collections import Counter, defaultdict
 
+# The config is read through `src.models.deepseek_v4_1.config`, which is itself
+# standard library only, so the "runs under any interpreter" property holds --
+# but running this file as a script puts `scripts/` on sys.path rather than the
+# repository root, so the root has to be added before that import resolves.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # safetensors stores the header length as a little-endian u64 ahead of the JSON.
 HEADER_LEN = struct.Struct("<Q")
 
@@ -222,11 +228,20 @@ REQUIRED_CONFIG_KEYS = (
 
 
 def load_config(path: str) -> dict:
-    with open(path) as handle:
+    """The config as the flat reference key set, from either released shape.
+
+    The checkpoint ships `config.json` in the Transformers layout -- the text
+    hyper-parameters nested under `text_config` and the layer lists spelled
+    `*_layer_ids` -- and `inference/config.json` in the reference runtime's flat
+    one. `V41Config` reads both and `as_reference_dict` writes the flat one back
+    out, so every check below this line sees the same keys whichever file was
+    passed and only one place has to know how the two relate.
+    """
+    from src.models.deepseek_v4_1.config import from_dict
+
+    with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
-    # The reference stack flattens the released config; accept either shape.
-    config = raw.get("model", raw)
-    return config
+    return from_dict(raw, source=path).as_reference_dict()
 
 
 def check_config(config: dict, report: Report) -> None:
@@ -796,8 +811,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--config",
         default=None,
-        help="config JSON; defaults to <checkpoint-dir>/config.json, then to the reference "
-        "flattened inference_config.json",
+        help="config JSON in either released shape; defaults to <checkpoint-dir>/config.json, "
+        "then to <checkpoint-dir>/inference/config.json",
     )
     parser.add_argument(
         "--header-prefix",
@@ -813,7 +828,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def resolve_config(checkpoint_dir: str, explicit: str | None) -> str:
     if explicit:
         return explicit
-    for name in ("config.json", "inference_config.json"):
+    for name in ("config.json", "inference/config.json", "inference_config.json"):
         candidate = os.path.join(checkpoint_dir, name)
         if os.path.exists(candidate):
             return candidate
