@@ -369,6 +369,7 @@ class Indexer(nn.Module):
         max_batch_size: int,
         max_seq_len: int,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         kv_sources = _required(cfg, "kv_source_layers")
@@ -382,7 +383,8 @@ class Indexer(nn.Module):
         self.uses_candidates = candidate_source is not None and 0 <= candidate_source < layer_id
         self.candidate_topk_blocks = cfg.candidate_topk_blocks or 0
         self.candidate_block_size = cfg.candidate_block_size or 0
-        self.n_heads = _required_int(cfg, "index_n_heads")
+        self.n_heads = _required_int(cfg, "index_n_heads") // world
+        self.n_heads_global = _required_int(cfg, "index_n_heads")
         self.index_head_dim = _required_int(cfg, "index_head_dim")
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
         self.index_topk = _required_int(cfg, "index_topk")
@@ -394,9 +396,14 @@ class Indexer(nn.Module):
             dtype=LINEAR_DTYPE,
             device=device,
         )
+        # The output width is global while the *parameter* is not cut at all: `weights_proj` is 32
+        # numbers against a 5120-wide input, so slicing it would mean this rank's 8 output columns
+        # are produced by heads 0-31's weights -- the same 8 numbers, for the sake of a slice that
+        # saves 64 bytes. The forward takes the head offset out of the output instead.
         self.weights_proj = nn.Linear(
-            _required_int(cfg, "dim"), self.n_heads, bias=False, dtype=LINEAR_DTYPE, device=device
+            _required_int(cfg, "dim"), self.n_heads_global, bias=False, dtype=LINEAR_DTYPE, device=device
         )
+        self.tp = None
         self.freqs_cis: torch.Tensor | None = None
         if self.owns_k:
             self.wk = nn.Linear(
@@ -463,9 +470,24 @@ class Indexer(nn.Module):
         fp4_act_quant(q, FP4_BLOCK_SIZE, True)
 
         index_k = shared.index_k[:bsz, : end_pos // ratio]
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        # `weights` is one number per index head, and the sum below runs over heads -- so this rank
+        # needs its own slice of the output while the scale stays the *global* head count. Using the
+        # local 8 in `n_heads**-0.5` would scale every index-source layer's partial by 2x.
+        tp = self.tp
+        if tp is None:
+            weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads_global**-0.5)
+        else:
+            lo = tp.rank * tp.index_heads
+            weights = self.weights_proj(x)[..., lo : lo + tp.index_heads] * (
+                self.softmax_scale * self.n_heads_global**-0.5
+            )
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if tp is not None:
+            # the sum above ran over this rank's heads only, so the score is a partial. It has to be
+            # whole before the top-k, because a top-k over partials is a different selection and the
+            # difference is discrete -- it does not average away downstream the way a rounding does.
+            index_score = tp.reduce(index_score)
 
         # how many compressed positions each query can see: a block becomes visible once the query
         # has passed its last token. One query per decode step, so there it is just a number.
@@ -506,6 +528,7 @@ class Attention(nn.Module):
         max_batch_size: int = 1,
         max_seq_len: int | None = None,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         if max_seq_len is None:
@@ -515,10 +538,15 @@ class Attention(nn.Module):
         device = canonical_device(device)
         self.layer_id = layer_id
         self.dim = _required_int(cfg, "dim")
-        self.n_heads = _required_int(cfg, "n_heads")
+        # `world` divides the heads and the groups, and nothing else here: wq_a, wkv and the whole
+        # compressor replicate, for the reasons in `tp.py`. The two counts are local so that every
+        # `unflatten`/`view` below is local too, and there is no place a global head count still
+        # needs to be right except `attn_sink`, whose width is the thing being cut.
+        self.world = world
+        self.n_heads = _required_int(cfg, "n_heads") // world
         self.head_dim = _required_int(cfg, "head_dim")
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
-        self.n_groups = _required_int(cfg, "o_groups")
+        self.n_groups = _required_int(cfg, "o_groups") // world
         self.o_lora_rank = _required_int(cfg, "o_lora_rank")
         self.window_size = _required_int(cfg, "window_size")
         self.softmax_scale = self.head_dim**-0.5
@@ -544,6 +572,7 @@ class Attention(nn.Module):
         self.wo_b = nn.Linear(
             self.n_groups * self.o_lora_rank, self.dim, bias=False, dtype=LINEAR_DTYPE, device=device
         )
+        self.tp = None
 
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         is_backbone = layer_id < n_layers
@@ -555,7 +584,7 @@ class Attention(nn.Module):
         if self.is_kv_source:
             self.compressor = Compressor(cfg, layer_id, max_batch_size, device=device)
         if self.is_index_source:
-            self.indexer = Indexer(cfg, layer_id, max_batch_size, max_seq_len, device=device)
+            self.indexer = Indexer(cfg, layer_id, max_batch_size, max_seq_len, device=device, world=world)
 
         self.register_buffer(
             "window_kv_cache",
@@ -699,11 +728,18 @@ class Attention(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
-        # Linear. The checkpoint stores it fp8; a loader would dequantize it to bf16.
+        # Linear. The checkpoint stores it fp8; a loader would dequantize it to bf16. The local
+        # heads are exactly the local groups -- o_groups divides n_heads and this rank took a
+        # contiguous run of heads, so 16 heads from 16r is groups 2r and 2r+1 whole -- which is why
+        # wo_a needs no collective of its own.
         o = o.view(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return self.wo_b(o.flatten(2))
+        y = self.wo_b(o.flatten(2))
+        # wo_b is row-parallel, so this is the partial sum over groups and the one collective the
+        # attention half of a layer needs.
+        tp = self.tp
+        return y if tp is None else tp.reduce(y)
 
 
 class AttentionStack(nn.Module):
@@ -720,11 +756,13 @@ class AttentionStack(nn.Module):
         max_batch_size: int = 1,
         max_seq_len: int | None = None,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         self.layers = nn.ModuleList(
-            Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device) for layer_id in range(n_layers)
+            Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device, world=world)
+            for layer_id in range(n_layers)
         )
         self.shared = SharedAttentionRuntime()
 

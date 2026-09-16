@@ -85,6 +85,7 @@ from src.models.deepseek_v4_1.modules import (
     dequantize_rows,
     expert_forward,
 )
+from src.models.deepseek_v4_1.tp import ShardPlan, attach_tp
 
 __all__ = [
     "CheckpointEngramTable",
@@ -350,6 +351,7 @@ def checkpoint_weights(
     prefix: str = "",
     skip: Callable[[str], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    plan: "ShardPlan | None" = None,
 ) -> LoadReport:
     """Copy every parameter `module` names out of the checkpoint, expanding what is quantized.
 
@@ -362,6 +364,11 @@ def checkpoint_weights(
     `skip` exists for a caller that built the resident bank or a truncated table, whose storage is
     not named after anything in the file. A skipped name is not a missing one; only `missing` means
     the tree asked for something the checkpoint does not have.
+
+    `plan` is the tensor-parallel cut: the tree was built a quarter wide, so the file's tensor has to
+    be cut the same way before it is copied in. Without it the shape check below refuses the fill --
+    which is the intended failure, since a `[1024, 1280]` parameter filled from a `[4096, 1280]`
+    tensor is either an error or a silent lie depending on which axis the slice landed on.
 
     Raises only through the caller's own check on `missing`. Filling is to the parameter's own dtype
     and device, so `Head`, which is fp32 where the file is bf16, keeps full precision in the logits.
@@ -385,6 +392,8 @@ def checkpoint_weights(
             if checkpoint.is_quantized(key):
                 report.quantized.append(key)
             value = checkpoint.weight(key, dtype=parameter.dtype)
+            if plan is not None:
+                value = plan.local_value(key, value)
             if tuple(value.shape) != tuple(parameter.shape):
                 raise ValueError(
                     f"{key} is {tuple(value.shape)} in the checkpoint and {tuple(parameter.shape)} "
@@ -745,6 +754,8 @@ def load_backbone(
     expert_world: int = 1,
     expert_rank: int = 0,
     resident_experts: bool | None = None,
+    world: int = 1,
+    rank: int = 0,
     progress: Callable[[str], None] | None = None,
 ) -> LoadedBackbone:
     """Build the V4.1 text backbone and fill it from `checkpoint`.
@@ -781,6 +792,18 @@ def load_backbone(
     `resident_engram` would make is the thing four ranks must not each pay. The dense tree is
     deliberately not in the segment: those keys are not routed experts or tables, `packed` leaves them
     on the mapping, and a second resident form of 16.79 GiB would cost the RAM twice.
+
+    `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
+    itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
+    -- and `checkpoint_weights` cuts the file's tensors to match; see `tp.py` for which boundaries are
+    cut and, more importantly, the two that are not. `world=1` builds the whole tree and fills it
+    unsharded, which is the same code path with every division by one.
+
+    One cost worth naming, because it is paid in every configuration and is not small: the fill reads
+    each of those tensors *whole* and then slices, because a shard mapping has no way to hand back a
+    row band. At TP4 that is 4 x 16.79 GiB of reads to fill 16.79 GiB of parameters. Against the
+    resident bank it is a memcpy; against `/mnt/data3` at 213 MiB/s it is about 5 extra minutes of
+    startup, and `expert_rank` already exists to make the four ranks stagger rather than collide.
     """
     if resident_experts is None:
         resident_experts = resident_bank.enabled()
@@ -797,6 +820,8 @@ def load_backbone(
 
     max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     n_layers = config.n_layers if config.n_layers is not None else len(config.compress_ratios)
+
+    plan = ShardPlan.build(config, rank, world, moe_inter_dim=config.moe_inter_dim)
 
     def on_device(layer_id: int, n_experts: int) -> RoutedExperts | None:
         """A card-resident layer if the caller asked for one and the build works, else `None`."""
@@ -857,8 +882,10 @@ def load_backbone(
         engram_tables=tables,
         routed=routed,
         device=device,
+        world=world,
     )
-    report = checkpoint_weights(model, checkpoint, progress=progress)
+    attach_tp(model, plan)
+    report = checkpoint_weights(model, checkpoint, progress=progress, plan=plan)
     if report.missing:
         raise RuntimeError(
             f"{len(report.missing)} parameters have no tensor in the checkpoint and would have "

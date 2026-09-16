@@ -81,13 +81,20 @@ class Expert(nn.Module):
         dtype: torch.dtype = LINEAR_DTYPE,
         swiglu_limit: float = 0.0,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         # `nn.Linear` rather than bare parameters so that the names line up with the checkpoint's:
         # `w1.weight` here is `w1.weight` there, once the fp4 packing is expanded.
-        self.w1 = nn.Linear(dim, inter_dim, bias=False, dtype=dtype, device=device)
-        self.w2 = nn.Linear(inter_dim, dim, bias=False, dtype=dtype, device=device)
-        self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=dtype, device=device)
+        #
+        # `world > 1` is the shared expert's row-parallel split (see `tp.py`): w1/w3 keep a quarter
+        # of the intermediate width and w2's input is that same width, so the three stay consistent
+        # and what they return is a partial that the `MoE` above reduces. The only `Expert` a V4.1
+        # backbone builds with a world is the shared one.
+        inter = inter_dim // world
+        self.w1 = nn.Linear(dim, inter, bias=False, dtype=dtype, device=device)
+        self.w2 = nn.Linear(inter, dim, bias=False, dtype=dtype, device=device)
+        self.w3 = nn.Linear(dim, inter, bias=False, dtype=dtype, device=device)
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -375,6 +382,7 @@ class MoE(nn.Module):
         expert_dtype: torch.dtype = LINEAR_DTYPE,
         routed: RoutedExperts | None = None,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -382,17 +390,31 @@ class MoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_activated_experts = n_activated_experts
         self.gate = Gate(cfg, n_routed_experts, n_activated_experts, device=device)
-        self.shared_experts = Expert(cfg.dim, cfg.moe_inter_dim, expert_dtype, cfg.swiglu_limit, device=device)
+        self.shared_experts = Expert(
+            cfg.dim, cfg.moe_inter_dim, expert_dtype, cfg.swiglu_limit, device=device, world=world
+        )
         self.routed = routed if routed is not None else ResidentRoutedExperts(
             n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, expert_dtype, device=device
         )
+        self.tp = None
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
+        # The routed half is complete on every rank, and the shared expert is the half that is cut.
+        # No store in the tree deals the experts out yet -- `CheckpointRoutedExperts`,
+        # `ResidentRoutedExperts` and `DeviceRoutedExperts` all hold every expert of the layer and
+        # sum it on the host -- so all four ranks compute the same routed sum and the all-reduce has
+        # to complete the shared expert's row-parallel partial *alone*. Reducing `routed + shared`
+        # would multiply the routed sum by the world, which is a wrong answer that still looks like
+        # a number. When `DeviceRoutedExperts` learns a rank (Phase 2.4) the routed sum becomes a
+        # partial too, and the two join on one message as `tp.py` describes; that change and this
+        # line are the same change.
         y = self.routed.forward(x, weights, indices)
-        y += self.shared_experts(x)
+        shared = self.shared_experts(x)
+        tp = self.tp
+        y += tp.reduce(shared) if tp is not None else shared
         return y.type_as(x).view(shape)
 
 
@@ -414,13 +436,14 @@ class Block(nn.Module):
     """
 
     def __init__(self, cfg: V41TextConfig, layer_id: int, max_batch_size: int, max_seq_len: int, layout=None,
-                 engram_table: EngramTable | None = None, routed: RoutedExperts | None = None, device=None):
+                 engram_table: EngramTable | None = None, routed: RoutedExperts | None = None, device=None,
+                 world: int = 1):
         super().__init__()
         device = canonical_device(device)
         self.layer_id = layer_id
         self.norm_eps = cfg.norm_eps
-        self.attn = Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device)
-        self.ffn = MoE(cfg, layer_id, *_moe_shape(cfg, layer_id), routed=routed, device=device)
+        self.attn = Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device, world=world)
+        self.ffn = MoE(cfg, layer_id, *_moe_shape(cfg, layer_id), routed=routed, device=device, world=world)
         self.engram = None
         if layout is not None and layer_id in layout.layer_ids:
             if engram_table is None:
@@ -553,6 +576,7 @@ class Backbone(nn.Module):
         engram_tables: dict[int, EngramTable] | None = None,
         routed: dict[int, RoutedExperts] | None = None,
         device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         device = canonical_device(device)
@@ -573,6 +597,7 @@ class Backbone(nn.Module):
                 engram_table=(engram_tables or {}).get(layer_id),
                 routed=(routed or {}).get(layer_id),
                 device=device,
+                world=world,
             )
             for layer_id in range(n_layers)
         )
