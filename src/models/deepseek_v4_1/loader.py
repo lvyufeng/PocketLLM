@@ -81,6 +81,7 @@ from src.models.deepseek_v4_1.modules import (
     EngramTable,
     RoutedExperts,
     _moe_shape,
+    check_activation_matches_experts,
     dequantize_rows,
     expert_forward,
 )
@@ -471,6 +472,7 @@ class CheckpointRoutedExperts(RoutedExperts):
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """x: [n, dim] bf16, weights/indices: [n, topk]. Returns [n, dim] fp32."""
+        check_activation_matches_experts(x, torch.device("cpu"), "CheckpointRoutedExperts")
         y = torch.zeros_like(x, dtype=torch.float32)
         # Walked in expert id order, like `ResidentRoutedExperts` and like the reference: a token's
         # contributions land in the same order either way, so the two agree bit for bit.
@@ -854,6 +856,7 @@ def load_backbone(
         layout=layout,
         engram_tables=tables,
         routed=routed,
+        device=device,
     )
     report = checkpoint_weights(model, checkpoint, progress=progress)
     if report.missing:
