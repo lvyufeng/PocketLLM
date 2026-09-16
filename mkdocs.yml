@@ -128,6 +128,7 @@ nav:
       - Qwen4-Exp expert placement: performance/qwen4_exp_performance.md
       - CPU offload and prefetch ceiling: performance/cpu_offload_profile.md
       - Qwen KV cache at 65K: performance/qwen_kv_cache_65k_tg512.md
+      - Qwen drafter acceptance: performance/qwen_drafter_acceptance.md
       - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
       - OpenAI API tool-calling acceptance: performance/cpp_openai_tool_acceptance.md
       - Ascend 910A attention: performance/ascend_attention_optimization.md
