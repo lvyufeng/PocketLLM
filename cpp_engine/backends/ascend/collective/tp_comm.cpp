@@ -25,6 +25,7 @@
 
 #ifdef POCKET_HAVE_TP_COMM
 #include "device_runtime.hpp"
+#include "ipc_allreduce.hpp"
 
 #include <acl/acl.h>
 #include <hccl/hccl.h>
@@ -373,6 +374,16 @@ void tp_all_reduce_sum_f16_inplace(int world, int rank, int device,
     validate(world, rank, "TP fp16 all-reduce");
     if (d_values == nullptr || count <= 0) {
         throw std::runtime_error("TP fp16 all-reduce: invalid buffer");
+    }
+    // The hand-written cross-process all-reduce, when it is enabled and this plane
+    // is inside its envelope. Its barrier is a host-side poll of the peers' arrival
+    // stamps, so the issuing thread blocks for the length of the round even though
+    // the copies and the reduce it issues are stream-ordered on the caller's
+    // stream. Outside the envelope this falls through to HCCL unchanged. See
+    // ipc_allreduce.hpp for the measurements that decide the choice.
+    if (ascend_ipc_allreduce_f16_inplace(world, rank, device, id_path, d_values,
+                                         count, stream)) {
+        return;
     }
     HcclComm comm = cached_comm(world, rank, device, id_path);
     bool synchronous = false;

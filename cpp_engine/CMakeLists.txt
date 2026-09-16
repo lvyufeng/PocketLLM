@@ -336,6 +336,7 @@ else()
 
     if(POCKET_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
+        list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/ipc_allreduce.cpp)
         list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}" "${ASCEND_DLOG_LIBRARY}")
         list(APPEND POCKET_BACKEND_DEFINES POCKET_HAVE_TP_COMM=1)
     endif()
