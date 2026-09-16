@@ -17,10 +17,10 @@
 //      Where a reciprocal has to be exact, take it as a scalar division instead.
 //
 // FP32 block/pair reductions are unavailable: their generic paths instantiate
-// vcgadd/vcpadd, which this SoC supports for float16 only. FP32 WholeReduceSum
-// lowers to vcadd and is supported (`Intrinsic_vcadd|float16,float32` in
-// Ascend910B.ini); use it only after arranging each logical row as one repeat.
-// The halving folds below use nothing but vadd.
+// vcgadd/vcpadd, which this SoC supports for float16 only. Only RepeatReduceSum
+// has a dav_c100 lowering (vcadd); WholeReduceSum has no impl for this arch at
+// all, so the halving folds below use nothing but vadd and are the supported
+// route to a row sum.
 
 #ifndef POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
 #define POCKET_QWEN_ASCEND_KERNEL_COMMON_HPP
@@ -189,15 +189,32 @@ __aicore__ inline float fold_sum(const AscendC::LocalTensor<float>& work,
     return sum;
 }
 
-// Column-wise sum of a [rows, width] tile, leaving the result in the first `width`
-// lanes. `rows` must be a power of two; `width` a multiple of kAlignFloat. Same
-// halving fold as fold_sum, but folding whole rows so all `width` columns reduce at
-// once. Destroys `work`.
-__aicore__ inline void fold_rows(const AscendC::LocalTensor<float>& work,
-                                 uint32_t rows, uint32_t width) {
-    for (uint32_t half = rows / 2; half >= 1; half /= 2) {
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add(work, work, work[half * width], half * width);
+// acc[:] += weights[i] * state[i, :], summed over a contiguous [rows, width] fp32
+// tile. The caller zeroes `acc`; `rows` must fit the 128-wide float tile.
+//
+// This is a weighted reduction down the row axis, and the point of writing it this
+// way is that the weight is a *scalar operand of the instruction*, which this part
+// takes for free, instead of a value that has to be splatted across a row first.
+//
+// The other formulation -- Duplicate each weight across a row, multiply the whole
+// tile elementwise by the result, then fold the rows pairwise -- is the same
+// arithmetic in a different order and costs 2*rows + log2(rows) issues to this
+// form's `rows`. kdiag3 measured which of those two currencies this phase actually
+// spends. Splitting the row broadcast into two half-width issues over the same 128
+// elements, holding the repeat count and the byte count fixed, grew the phase
+// 30.4%; replacing the scalar UB operand with a constant, holding *every*
+// instruction, byte and barrier fixed, moved it 0.09%. So the cost tracks issues,
+// not bytes and not the scalar reads, and the fix is fewer issues.
+//
+// The accumulation order is also the more defensible one: this sums sequentially
+// down the key axis, which is what the CUDA kernel and the tests' double-precision
+// host reference both do, where the fold was a tree with a different rounding.
+__aicore__ inline void accumulate_weighted_rows(const AscendC::LocalTensor<float>& acc,
+                                                const AscendC::LocalTensor<float>& weights,
+                                                const AscendC::LocalTensor<float>& state,
+                                                uint32_t rows, uint32_t width) {
+    for (uint32_t i = 0; i < rows; ++i) {
+        AscendC::Axpy(acc, state[i * width], weights.GetValue(i), width);
     }
 }
 
@@ -212,21 +229,6 @@ __aicore__ inline float scalar_exp(const AscendC::LocalTensor<float>& work,
     AscendC::Exp(work, work, kAlignFloat);
     wait_compute_before_scalar();
     return work.GetValue(0);
-}
-
-// Broadcast `src[i]` across a row of `width` lanes, for i in [0, rows).
-//
-// This is the shape a scalar-per-key-row multiply needs, and it is the hot spot of
-// the recurrence: one Duplicate per row. The dsts do not overlap, so no barrier is
-// needed between them, but it is still `rows` instruction issues. Brcb would reduce
-// that issue count, but it is an unsupported stub on first-generation dav_c100, so
-// the scalar broadcast loop is intentional for this target.
-__aicore__ inline void broadcast_rows(const AscendC::LocalTensor<float>& dst,
-                                      const AscendC::LocalTensor<float>& src,
-                                      uint32_t rows, uint32_t width) {
-    for (uint32_t i = 0; i < rows; ++i) {
-        AscendC::Duplicate(dst[i * width], src.GetValue(i), width);
-    }
 }
 
 // Copy a [rows, width] column window out of a [rows, stride] GM tile.

@@ -19,16 +19,22 @@
 //     re-reading the state per token or a cross-core reduction for kv_mem, and this
 //     part has no separate vector cores to win that back.
 //   - `k^T S` and `q^T S` are reductions down the key axis, i.e. across rows of the
-//     state tile. Broadcasting the key scalar over a value-wide row and folding rows
-//     pairwise keeps every instruction a full-width vadd/vmul. The alternative,
-//     one dot product per value column, is 128 narrow reductions.
-//   - The rank-1 update is `Axpy` per key row: S[i,:] += delta * k[i], which is
-//     exactly dst = src*scalar + dst.
+//     state tile. Both are written as one `Axpy` per key row accumulating into a
+//     value-wide row, with the key element as the instruction's scalar operand, so
+//     nothing has to splat it across a row first. The alternative, one dot product
+//     per value column, is 128 narrow reductions.
+//   - The rank-1 update is the same instruction again: `Axpy` per key row,
+//     S[i,:] += delta * k[i], which is exactly dst = src*scalar + dst.
 //
-// Numerical order differs from the CUDA kernel: CUDA accumulates kv_mem as a scalar
-// sequential sum down the key axis, this folds pairwise in a tree. Both are FP32,
-// neither is "the" reference, so the tests compare against a double-precision host
-// reference with a tolerance that covers both.
+// So each of the three passes over the state tile costs 128 issues and no more.
+// Writing `k^T S` as broadcast-multiply-fold instead costs 2*rows + log2(rows)
+// issues -- 264 rather than 128 -- and this part turns out to charge for issues
+// rather than for bytes, so the accumulation form is the cheaper one by roughly
+// the ratio of those two numbers.
+//
+// The accumulation order is also the more defensible one: it sums sequentially
+// down the key axis, which is what the CUDA kernel and the tests' double-precision
+// host reference both do, where the fold was a tree with a different rounding.
 //
 // The state is fp32 and stays fp32 the whole way through; only q/k/v/out are fp16.
 
@@ -39,15 +45,11 @@ namespace {
 using namespace pocket;
 
 // Qwen3.5's linear-attention head geometry. Both are 128, and the host rejects
-// anything else, so they are compile-time constants: the state tile size, the
-// number of Axpy rows and the fold depth all depend on them.
+// anything else, so they are compile-time constants: the state tile size and the
+// number of Axpy rows both depend on them.
 constexpr uint32_t kKeyDim = 128;
 constexpr uint32_t kValueDim = 128;
 constexpr uint32_t kStateElems = kKeyDim * kValueDim;
-
-// Rows are folded pairwise, so the fold works on a power-of-two row count. 128 is
-// already one.
-constexpr uint32_t kFoldRows = kKeyDim;
 
 // One head's working set in UB:
 //   state      64 KiB   [kKeyDim, kValueDim] fp32
@@ -144,37 +146,37 @@ public:
         AscendC::Muls(st, st, decay, kStateElems);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // kv_mem = k^T S, as a row-wise fold of S scaled by broadcast k.
-        broadcast_rows(work, k, kKeyDim, kValueDim);
+        // kv_mem = k^T S. One issue per key row, accumulated into `acc`; the old
+        // form broadcast k across the state, multiplied elementwise and folded the
+        // rows, which is 2*rows + log2(rows) issues for the same sum.
+        AscendC::Duplicate(acc, 0.0f, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(work, work, st, kStateElems);
-        AscendC::PipeBarrier<PIPE_V>();
-        fold_rows(work, kFoldRows, kValueDim);
+        accumulate_weighted_rows(acc, k, st, kKeyDim, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // delta = (v - kv_mem) * beta, held in acc.
-        AscendC::Muls(acc, work, -1.0f, kValueDim);
+        // delta = (v - kv_mem) * beta, held in work.
+        AscendC::Muls(work, acc, -1.0f, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add(acc, acc, v, kValueDim);
+        AscendC::Add(work, work, v, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(acc, acc, beta, kValueDim);
+        AscendC::Muls(work, work, beta, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
 
         // S += k delta^T, one Axpy per key row. Distinct dst rows, so the only
         // barrier needed is the one before the next read of S.
         for (uint32_t i = 0; i < kKeyDim; ++i) {
-            AscendC::Axpy(st[i * kValueDim], acc, k.GetValue(i), kValueDim);
+            AscendC::Axpy(st[i * kValueDim], work, k.GetValue(i), kValueDim);
         }
         AscendC::PipeBarrier<PIPE_V>();
 
-        // out = q^T S * q_scale, same fold as kv_mem.
-        broadcast_rows(work, q, kKeyDim, kValueDim);
+        // out = q^T S * q_scale. Same accumulation over the updated state, and it
+        // reuses `acc`: delta was already formed out of it above and the barrier
+        // after the rank-1 update is what orders this read of S behind that write.
+        AscendC::Duplicate(acc, 0.0f, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mul(work, work, st, kStateElems);
+        accumulate_weighted_rows(acc, q, st, kKeyDim, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
-        fold_rows(work, kFoldRows, kValueDim);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Muls(v, work, q_scale, kValueDim);
+        AscendC::Muls(v, acc, q_scale, kValueDim);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
