@@ -4,181 +4,44 @@ The checkpoint is 335 GiB, of which 225 GiB is routed experts and 95 GiB is the
 PLE n-gram table.  Neither fits in 4x22 GiB of VRAM, so both live on the host and
 the GPU only ever sees the rows a step actually touches.
 
-`MmapSafetensors` maps each shard once and hands out torch views over the raw
-bytes.  BF16 has no numpy dtype, so the mapping is `uint16` and reinterpreted
-with `Tensor.view(torch.bfloat16)`; `float8_e4m3fn` goes the same way through
-`uint8`.
+The reading itself is `src.loader.safetensors.MmapSafetensors`, which maps each
+shard once and hands out torch views over the raw bytes; it is re-exported here
+because this module is where readers of it look.  Reading experts through the
+mapping alone is not enough, though: the mapping is backed by a mechanical disk
+here, so a page that is not resident costs a seek.  `HostExpertShard` therefore
+copies this rank's routed experts into host RAM once at startup (pinned when the
+memlock limit allows), and `Qwen4ExpCheckpoint` serves `expert_rows` from that
+copy afterwards.  Under TP the shards are disjoint
+(`expert_id % world_size == rank`), so the four ranks together hold exactly one
+copy of the expert set.
 
 The FP8 build of the same model halves both of those: routed experts drop from
 229.7 to 114.9 GiB and the PLE table from 95.4 to 47.7 GiB.  It also changes the
-expert *layout* — `experts.{id}.{gate,up,down}_proj.weight` with a
-`weight_scale_inv` each, instead of two packed `[512, ...]` tensors — so the
+expert *layout* -- `experts.{id}.{gate,up,down}_proj.weight` with a
+`weight_scale_inv` each, instead of two packed `[512, ...]` tensors -- so the
 reader assembles the runtime's packed `[2*inter, hidden]` convention itself and
 everything downstream sees one shape regardless of which checkpoint is loaded.
-
-Reading experts through the mapping alone is not enough: the mapping is backed by
-a mechanical disk here, so a page that is not resident costs a seek.
-`HostExpertShard` therefore copies this rank's routed experts into host RAM once
-at startup (pinned when the memlock limit allows), and `Qwen4ExpCheckpoint`
-serves `expert_rows` from that copy afterwards.  Under TP the shards are disjoint
-(`expert_id % world_size == rank`), so the four ranks together hold exactly one
-copy of the expert set.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-import struct
 
-import numpy as np
 import torch
 
+from src.loader.safetensors import MmapSafetensors, TensorEntry
 from src.models.qwen4_exp.quant import FP8Tensor, fp8_scalar_dequantize, pack_gate_up_fp8
 
-_ST_DTYPES: dict[str, tuple[np.dtype, torch.dtype]] = {
-    "F64": (np.dtype("<f8"), torch.float64),
-    "F32": (np.dtype("<f4"), torch.float32),
-    "F16": (np.dtype("<f2"), torch.float16),
-    "BF16": (np.dtype("<u2"), torch.bfloat16),
-    # Neither bf16 nor fp8 has a numpy dtype, so both map through an unsigned
-    # integer of the same width and are reinterpreted by `Tensor.view`.
-    "F8_E4M3": (np.dtype("<u1"), torch.float8_e4m3fn),
-    "I64": (np.dtype("<i8"), torch.int64),
-    "I32": (np.dtype("<i4"), torch.int32),
-    "I16": (np.dtype("<i2"), torch.int16),
-    "I8": (np.dtype("<i1"), torch.int8),
-    "U8": (np.dtype("<u1"), torch.uint8),
-    "BOOL": (np.dtype("?"), torch.bool),
-}
-
-
-@dataclass(frozen=True)
-class TensorEntry:
-    file_name: str
-    dtype: str
-    shape: tuple[int, ...]
-    begin: int
-    end: int
-
-
-class MmapSafetensors:
-    """Read-only view over a sharded safetensors checkpoint.
-
-    Tensors are materialized lazily as torch views over the mmap; slicing a view
-    only faults in the pages it touches, so `expert_rows` costs one expert's
-    worth of I/O rather than a whole layer's.
-    """
-
-    def __init__(self, root: str) -> None:
-        self.root = os.path.abspath(root)
-        self.entries: dict[str, TensorEntry] = {}
-        self._maps: dict[str, np.memmap] = {}
-        self._data_offsets: dict[str, int] = {}
-        self._views: dict[str, torch.Tensor] = {}
-        self._index_files()
-
-    def _index_files(self) -> None:
-        index_path = os.path.join(self.root, "model.safetensors.index.json")
-        if os.path.exists(index_path):
-            with open(index_path) as f:
-                files = sorted(set(json.load(f)["weight_map"].values()))
-        else:
-            files = ["model.safetensors"]
-        for file_name in files:
-            path = os.path.join(self.root, file_name)
-            with open(path, "rb") as fh:
-                header_len = struct.unpack("<Q", fh.read(8))[0]
-                header = json.loads(fh.read(header_len))
-            self._data_offsets[file_name] = 8 + header_len
-            for key, meta in header.items():
-                if key == "__metadata__":
-                    continue
-                begin, end = meta["data_offsets"]
-                self.entries[key] = TensorEntry(
-                    file_name=file_name,
-                    dtype=meta["dtype"],
-                    shape=tuple(meta["shape"]),
-                    begin=begin,
-                    end=end,
-                )
-
-    def _map(self, file_name: str) -> np.memmap:
-        mm = self._maps.get(file_name)
-        if mm is None:
-            mm = np.memmap(os.path.join(self.root, file_name), dtype=np.uint8, mode="r")
-            self._maps[file_name] = mm
-        return mm
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.entries
-
-    def keys(self):
-        return self.entries.keys()
-
-    def view(self, key: str) -> torch.Tensor:
-        """Torch tensor aliasing the mapped bytes (no copy, no device transfer)."""
-        cached = self._views.get(key)
-        if cached is not None:
-            return cached
-        entry = self.entries[key]
-        np_dtype, torch_dtype = _ST_DTYPES[entry.dtype]
-        base = self._data_offsets[entry.file_name]
-        raw = self._map(entry.file_name)[base + entry.begin : base + entry.end]
-        arr = raw.view(np_dtype)
-        # The mapping is read-only; torch warns about that but we never write
-        # through these views (callers copy before mutating).
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*non-writable.*")
-            tensor = torch.from_numpy(arr)
-        if torch_dtype in (torch.bfloat16, torch.float8_e4m3fn):
-            tensor = tensor.view(torch_dtype)
-        tensor = tensor.reshape(entry.shape)
-        self._views[key] = tensor
-        return tensor
-
-    def advise_dontneed(self, key: str) -> int:
-        """Drop this process's page-table entries for one tensor's byte range.
-
-        Used after a tensor has been copied into resident host memory: without it
-        the process keeps ~56 GiB of mapped expert pages referenced on top of the
-        56 GiB copy.  This only drops *this* process's references — the pages stay
-        in the shared page cache, so a sibling rank reading interleaved rows in
-        the same region is not forced back to the disk.  Returns the bytes advised.
-        """
-        import mmap as _mmap
-
-        entry = self.entries[key]
-        raw = self._map(entry.file_name)
-        handle = getattr(raw, "_mmap", None)
-        if handle is None or not hasattr(handle, "madvise"):
-            return 0
-        base = self._data_offsets[entry.file_name]
-        page = _mmap.PAGESIZE
-        # Align inwards so only pages wholly inside this tensor are dropped.
-        start = -(-(base + entry.begin) // page) * page
-        end = ((base + entry.end) // page) * page
-        if end <= start:
-            return 0
-        try:
-            handle.madvise(_mmap.MADV_DONTNEED, start, end - start)
-        except (OSError, ValueError):
-            return 0
-        return end - start
-
-    def load(self, key: str, *, device=None, dtype=None) -> torch.Tensor:
-        """Copy a tensor out of the mapping, optionally to a device/dtype."""
-        tensor = self.view(key)
-        if dtype is not None and tensor.dtype != dtype:
-            tensor = tensor.to(dtype)
-        else:
-            tensor = tensor.clone()
-        if device is not None:
-            tensor = tensor.to(device)
-        return tensor
+__all__ = [
+    "HostEmbedding",
+    "HostExpertShard",
+    "HostNGramTable",
+    "MmapSafetensors",
+    "Qwen4ExpCheckpoint",
+    "TensorEntry",
+    "DeviceEmbedding",
+]
 
 
 class HostExpertShard:
