@@ -575,6 +575,22 @@ std::vector<uint16_t> expected_tail(const std::vector<uint16_t>& old_tail,
     return out;
 }
 
+// The Ascend upload stores the convolution weight tap-major so the kernel can load
+// one tap's row over the channels as a single contiguous run. Every reference below
+// reads the checkpoint's channel-major layout, so a test that builds its own weight
+// has to transpose it the same way before handing it to the op.
+std::vector<uint16_t> transpose_conv_weight(const std::vector<uint16_t>& weight,
+                                            int channels, int kernel) {
+    std::vector<uint16_t> out(weight.size());
+    for (int channel = 0; channel < channels; ++channel) {
+        for (int tap = 0; tap < kernel; ++tap) {
+            out[static_cast<size_t>(tap) * channels + channel] =
+                weight[static_cast<size_t>(channel) * kernel + tap];
+        }
+    }
+    return out;
+}
+
 void test_causal_conv(std::mt19937& rng) {
     const int seq_len = 5;
     const int channels = 517;
@@ -586,7 +602,8 @@ void test_causal_conv(std::mt19937& rng) {
         random_halves(static_cast<size_t>(channels) * kernel, rng, 0.35f);
     const std::vector<uint16_t> tail =
         random_halves(static_cast<size_t>(tail_len) * channels, rng, 0.4f);
-    DeviceBuffer<uint16_t> d_x(x), d_weight(weight), d_tail(tail);
+    DeviceBuffer<uint16_t> d_x(x), d_tail(tail);
+    DeviceBuffer<uint16_t> d_weight(transpose_conv_weight(weight, channels, kernel));
     DeviceBuffer<uint16_t> d_y(static_cast<size_t>(seq_len) * channels);
     expect(pocket::qwen_causal_depthwise_conv_silu_f16(
                d_x.get(), d_weight.get(), d_tail.get(), d_y.get(), seq_len,
@@ -889,6 +906,689 @@ void test_gqa_decode(std::mt19937& rng) {
     test_gqa_decode_case(rng, 17, 65);
     test_gqa_decode_case(rng, 64, 133);
     test_gqa_decode_case(rng, 256, 64, 1);
+}
+
+// The batched decode wrappers against the single-row operators they loop over.
+//
+// Each batched entry point is a host loop around the same single-row launcher,
+// so with identical per-row inputs it has to reproduce it byte for byte. That
+// is what this compares -- the single-row operator, not a host reference. A
+// host reference would only re-test the kernel; comparing the two entry points
+// pins down the per-row wiring the batched path adds on top of it: position,
+// slot and stride arithmetic. A batched step that still disagrees with a
+// single-row reference after passing here disagrees because of what the caller
+// fed in, not because of how the rows were addressed.
+//
+// Every comparison is exact. There is no tolerance to tune: both sides launch
+// the same kernel over the same bytes, so a difference means the addressing
+// differs, which is the failure this test exists to name.
+void test_batched_rows(std::mt19937& rng) {
+    {
+        const int rows = 4;
+        const int q_heads = 5;
+        const int kv_heads = 2;
+        const int head_dim = 80;
+        const int rotary_dim = 64;
+        const float theta = 1000000.0f;
+        // Independent sequences share no position and need not arrive in order,
+        // so the batch covers an out-of-order spread and a repeated position.
+        const std::vector<int> positions = {37, 5, 37, 12};
+        const std::vector<uint16_t> q = random_halves(
+            static_cast<size_t>(rows) * q_heads * head_dim, rng, 0.7f);
+        const std::vector<uint16_t> k = random_halves(
+            static_cast<size_t>(rows) * kv_heads * head_dim, rng, 0.7f);
+
+        DeviceBuffer<uint16_t> d_q(q), d_k(k);
+        expect(pocket::qwen_partial_rope_rows_f16_batched_ascend(
+                   d_q.get(), d_k.get(), positions.data(), rows, rotary_dim,
+                   theta, q_heads, kv_heads, head_dim, nullptr),
+               "batched partial rope launch");
+        sync_or_throw("batched partial rope");
+
+        std::vector<uint16_t> want_q(q.size());
+        std::vector<uint16_t> want_k(k.size());
+        for (int row = 0; row < rows; ++row) {
+            const size_t q_row = static_cast<size_t>(row) * q_heads * head_dim;
+            const size_t k_row = static_cast<size_t>(row) * kv_heads * head_dim;
+            DeviceBuffer<uint16_t> s_q(
+                std::vector<uint16_t>(q.begin() + q_row,
+                                      q.begin() + q_row + q_heads * head_dim));
+            DeviceBuffer<uint16_t> s_k(
+                std::vector<uint16_t>(k.begin() + k_row,
+                                      k.begin() + k_row + kv_heads * head_dim));
+            expect(pocket::qwen_partial_rope_rows_f16(
+                       s_q.get(), s_k.get(), positions[row], 1, rotary_dim, theta,
+                       q_heads, kv_heads, head_dim),
+                   "single-row partial rope launch");
+            sync_or_throw("single-row partial rope");
+            const std::vector<uint16_t> got_q = s_q.download();
+            const std::vector<uint16_t> got_k = s_k.download();
+            std::copy(got_q.begin(), got_q.end(), want_q.begin() + q_row);
+            std::copy(got_k.begin(), got_k.end(), want_k.begin() + k_row);
+        }
+        expect_half_exact(d_q.download(), want_q,
+                          "batched partial rope matches single-row q");
+        expect_half_exact(d_k.download(), want_k,
+                          "batched partial rope matches single-row k");
+    }
+
+    {
+        const int rows = 4;
+        const int kv_heads = 3;
+        const int head_dim = 17;
+        const int max_context = 8;
+        const size_t stride =
+            static_cast<size_t>(max_context) * kv_heads * head_dim;
+        const std::vector<int> positions = {2, 5, 0, 7};
+        // Slots are not the row index on purpose: a wrapper that appends to the
+        // row's slot instead of the row's *assigned* slot still passes when the
+        // two coincide.
+        const std::vector<int> slots = {0, 2, 1, 3};
+        const std::vector<uint16_t> k_rows = random_halves(
+            static_cast<size_t>(rows) * kv_heads * head_dim, rng, 0.8f);
+        const std::vector<uint16_t> v_rows = random_halves(
+            static_cast<size_t>(rows) * kv_heads * head_dim, rng, 0.8f);
+
+        // A distinct poison per slot turns a slot mix-up into a visible number
+        // instead of two slots that happen to hold the same bytes.
+        std::vector<uint16_t> k_cache(stride * rows);
+        std::vector<uint16_t> v_cache(stride * rows);
+        for (int slot = 0; slot < rows; ++slot) {
+            std::fill(k_cache.begin() + slot * stride,
+                      k_cache.begin() + (slot + 1) * stride,
+                      float_to_half(1.0f + static_cast<float>(slot)));
+            std::fill(v_cache.begin() + slot * stride,
+                      v_cache.begin() + (slot + 1) * stride,
+                      float_to_half(-1.0f - static_cast<float>(slot)));
+        }
+
+        DeviceBuffer<uint16_t> d_k_rows(k_rows), d_v_rows(v_rows);
+        DeviceBuffer<uint16_t> d_batched_k(k_cache), d_batched_v(v_cache);
+        expect(pocket::qwen_append_kv_cache_f16_batched_ascend(
+                   d_k_rows.get(), d_v_rows.get(), d_batched_k.get(),
+                   d_batched_v.get(), positions.data(), slots.data(), rows,
+                   kv_heads, head_dim, max_context, stride, nullptr),
+               "batched KV append launch");
+        sync_or_throw("batched KV append");
+
+        DeviceBuffer<uint16_t> d_single_k(k_cache), d_single_v(v_cache);
+        for (int row = 0; row < rows; ++row) {
+            const size_t source =
+                static_cast<size_t>(row) * kv_heads * head_dim;
+            const size_t target = static_cast<size_t>(slots[row]) * stride;
+            expect(pocket::qwen_append_kv_cache_f16(
+                       d_k_rows.get() + source, d_v_rows.get() + source,
+                       d_single_k.get() + target, d_single_v.get() + target, 1,
+                       kv_heads, head_dim, positions[row], max_context),
+                   "single-row KV append launch");
+            sync_or_throw("single-row KV append");
+        }
+        expect_half_exact(d_batched_k.download(), d_single_k.download(),
+                          "batched KV append matches single-row K");
+        expect_half_exact(d_batched_v.download(), d_single_v.download(),
+                          "batched KV append matches single-row V");
+    }
+
+    {
+        const int rows = 4;
+        const int q_heads = 6;
+        const int kv_heads = 2;
+        const int head_dim = 64;
+        const int max_context = 40;
+        const size_t stride =
+            static_cast<size_t>(max_context) * kv_heads * head_dim;
+        const int scratch_row_stride = q_heads * max_context;
+        // Rows in one batch are at different points in their sequences, which is
+        // the case the per-row context length argument exists for.
+        const std::vector<int> context_lens = {3, 17, 40, 1};
+        const std::vector<int> slots = {1, 0, 3, 2};
+        std::vector<int> slot_context(rows, 0);
+        for (int row = 0; row < rows; ++row) {
+            slot_context[slots[row]] = context_lens[row];
+        }
+
+        const std::vector<uint16_t> q = random_halves(
+            static_cast<size_t>(rows) * q_heads * head_dim, rng, 0.45f);
+        // Random inside each slot's live context and poisoned past it, so a row
+        // that reads too far -- or reads the wrong slot -- produces an output
+        // that has nothing to do with the single-row call it is compared to.
+        std::vector<uint16_t> k_cache(stride * rows);
+        std::vector<uint16_t> v_cache(stride * rows);
+        for (int slot = 0; slot < rows; ++slot) {
+            std::vector<uint16_t> k_slot = random_halves(stride, rng, 0.5f);
+            std::vector<uint16_t> v_slot = random_halves(stride, rng, 0.5f);
+            const size_t live =
+                static_cast<size_t>(slot_context[slot]) * kv_heads * head_dim;
+            std::fill(k_slot.begin() + live, k_slot.end(), float_to_half(40.0f));
+            std::fill(v_slot.begin() + live, v_slot.end(), float_to_half(-40.0f));
+            std::copy(k_slot.begin(), k_slot.end(),
+                      k_cache.begin() + slot * stride);
+            std::copy(v_slot.begin(), v_slot.end(),
+                      v_cache.begin() + slot * stride);
+        }
+
+        DeviceBuffer<uint16_t> d_q(q), d_k(k_cache), d_v(v_cache);
+        DeviceBuffer<uint16_t> d_batched_out(
+            static_cast<size_t>(rows) * q_heads * head_dim);
+        DeviceBuffer<float> d_batched_scores(
+            static_cast<size_t>(rows) * scratch_row_stride);
+        expect(pocket::qwen_gqa_decode_attention_f16_batched_ascend(
+                   d_q.get(), d_k.get(), d_v.get(), d_batched_out.get(),
+                   d_batched_scores.get(), scratch_row_stride,
+                   context_lens.data(), slots.data(), rows, q_heads, kv_heads,
+                   head_dim, max_context, stride, nullptr),
+               "batched GQA decode launch");
+        sync_or_throw("batched GQA decode");
+
+        DeviceBuffer<uint16_t> d_single_out(
+            static_cast<size_t>(rows) * q_heads * head_dim);
+        DeviceBuffer<float> d_single_scores(
+            static_cast<size_t>(rows) * scratch_row_stride);
+        for (int row = 0; row < rows; ++row) {
+            expect(pocket::qwen_gqa_decode_attention_f16(
+                       d_q.get() + static_cast<size_t>(row) * q_heads * head_dim,
+                       d_k.get() + static_cast<size_t>(slots[row]) * stride,
+                       d_v.get() + static_cast<size_t>(slots[row]) * stride,
+                       d_single_out.get() +
+                           static_cast<size_t>(row) * q_heads * head_dim,
+                       d_single_scores.get() +
+                           static_cast<size_t>(row) * scratch_row_stride,
+                       q_heads, kv_heads, head_dim, context_lens[row],
+                       max_context),
+                   "single-row GQA decode launch");
+            sync_or_throw("single-row GQA decode");
+        }
+        expect_half_exact(d_batched_out.download(), d_single_out.download(),
+                          "batched GQA decode matches single-row output");
+
+        // The scratch is compared path against path rather than against a host
+        // reference: this test asks whether the two entry points address the
+        // rows the same way, and a host reference would fold in the kernel's own
+        // precision, which the group A suite already covers.
+        const std::vector<float> batched_scores = d_batched_scores.download();
+        const std::vector<float> single_scores = d_single_scores.download();
+        int score_mismatches = 0;
+        size_t first_mismatch = 0;
+        for (size_t i = 0; i < single_scores.size(); ++i) {
+            if (batched_scores[i] != single_scores[i]) {
+                if (score_mismatches == 0) first_mismatch = i;
+                ++score_mismatches;
+            }
+        }
+        std::string score_detail;
+        if (score_mismatches != 0) {
+            score_detail =
+                " first=" + std::to_string(first_mismatch) +
+                " got=" + std::to_string(batched_scores[first_mismatch]) +
+                " want=" + std::to_string(single_scores[first_mismatch]);
+        }
+        expect(score_mismatches == 0,
+               "batched GQA decode matches single-row score scratch mismatches=" +
+                   std::to_string(score_mismatches) + score_detail);
+    }
+
+    {
+        // The linear-attention layers carry the other two batched wrappers.
+        // They matter here because a logit difference that is a fraction of an
+        // ULP at one layer and half a logit at five is a difference that was
+        // seeded early, and these layers are the early ones.
+        const int rows = 4;
+        const int channels = 24;
+        const int kernel = 4;
+        const size_t stride = static_cast<size_t>(channels) * kernel;
+        const std::vector<int> slots = {2, 0, 3, 1};
+        const std::vector<uint16_t> x =
+            random_halves(static_cast<size_t>(rows) * channels, rng, 0.9f);
+        const std::vector<uint16_t> weight =
+            random_halves(static_cast<size_t>(channels) * kernel, rng, 0.6f);
+        std::vector<uint16_t> tail(stride * rows);
+        for (int slot = 0; slot < rows; ++slot) {
+            const std::vector<uint16_t> slice = random_halves(stride, rng, 0.9f);
+            std::copy(slice.begin(), slice.end(), tail.begin() + slot * stride);
+        }
+
+        DeviceBuffer<uint16_t> d_x(x), d_w(weight);
+        DeviceBuffer<uint16_t> d_batched_tail(tail);
+        DeviceBuffer<uint16_t> d_batched_y(
+            static_cast<size_t>(rows) * channels);
+        expect(pocket::qwen_causal_depthwise_conv_silu_f16_batched_ascend(
+                   d_x.get(), d_w.get(), d_batched_tail.get(),
+                   d_batched_y.get(), slots.data(), rows, channels, kernel,
+                   stride, nullptr),
+               "batched conv launch");
+        sync_or_throw("batched conv");
+
+        DeviceBuffer<uint16_t> d_single_tail(tail);
+        DeviceBuffer<uint16_t> d_single_y(static_cast<size_t>(rows) * channels);
+        for (int row = 0; row < rows; ++row) {
+            expect(pocket::qwen_causal_depthwise_conv_silu_f16(
+                       d_x.get() + static_cast<size_t>(row) * channels,
+                       d_w.get(),
+                       d_single_tail.get() +
+                           static_cast<size_t>(slots[row]) * stride,
+                       d_single_y.get() + static_cast<size_t>(row) * channels, 1,
+                       channels, kernel, true),
+                   "single-row conv launch");
+            sync_or_throw("single-row conv");
+        }
+        expect_half_exact(d_batched_y.download(), d_single_y.download(),
+                          "batched conv matches single-row output");
+        // The tail is written as well as read, so a wrapper that updates the
+        // wrong slot leaves the next step's history in a different place even
+        // when this step's output happens to agree.
+        expect_half_exact(d_batched_tail.download(), d_single_tail.download(),
+                          "batched conv matches single-row tail");
+    }
+
+    {
+        const int rows = 4;
+        const int heads = 2;
+        const int key_heads = 1;
+        const int key_dim = kKeyDim;
+        const int value_dim = kValueDim;
+        const float q_scale = 0.1f;
+        const size_t stride = static_cast<size_t>(heads) * key_dim * value_dim;
+        const std::vector<int> slots = {1, 3, 0, 2};
+        const std::vector<uint16_t> q = random_halves(
+            static_cast<size_t>(rows) * key_heads * key_dim, rng, 0.5f);
+        const std::vector<uint16_t> k = random_halves(
+            static_cast<size_t>(rows) * key_heads * key_dim, rng, 0.5f);
+        const std::vector<uint16_t> v = random_halves(
+            static_cast<size_t>(rows) * heads * value_dim, rng, 0.5f);
+        const std::vector<uint16_t> g =
+            random_halves(static_cast<size_t>(rows) * heads, rng, 0.5f);
+        const std::vector<uint16_t> beta =
+            random_halves(static_cast<size_t>(rows) * heads, rng, 0.5f);
+        const std::vector<float> state = random_floats(stride * rows, rng, 0.5f);
+
+        DeviceBuffer<uint16_t> d_q(q), d_k(k), d_v(v), d_g(g), d_beta(beta);
+        DeviceBuffer<float> d_batched_state(state);
+        DeviceBuffer<uint16_t> d_batched_out(
+            static_cast<size_t>(rows) * heads * value_dim);
+        expect(pocket::qwen_gated_delta_step_batched_f16_ascend(
+                   d_batched_state.get(), d_q.get(), d_k.get(), d_v.get(),
+                   d_g.get(), d_beta.get(), d_batched_out.get(), slots.data(),
+                   rows, heads, key_heads, key_dim, value_dim, q_scale, stride,
+                   nullptr),
+               "batched gated delta launch");
+        sync_or_throw("batched gated delta");
+
+        DeviceBuffer<float> d_single_state(state);
+        DeviceBuffer<uint16_t> d_single_out(
+            static_cast<size_t>(rows) * heads * value_dim);
+        for (int row = 0; row < rows; ++row) {
+            const size_t q_row = static_cast<size_t>(row) * key_heads * key_dim;
+            const size_t v_row = static_cast<size_t>(row) * heads * value_dim;
+            expect(pocket::qwen_gated_delta_step_f16(
+                       d_single_state.get() +
+                           static_cast<size_t>(slots[row]) * stride,
+                       d_q.get() + q_row, d_k.get() + q_row, d_v.get() + v_row,
+                       d_g.get() + static_cast<size_t>(row) * heads,
+                       d_beta.get() + static_cast<size_t>(row) * heads,
+                       d_single_out.get() + v_row, heads, key_heads, key_dim,
+                       value_dim, q_scale),
+                   "single-row gated delta launch");
+            sync_or_throw("single-row gated delta");
+        }
+        expect_half_exact(d_batched_out.download(), d_single_out.download(),
+                          "batched gated delta matches single-row output");
+        // The state is the whole point of this operator: the next decode step
+        // reads it, so a difference here is a difference that outlives the call.
+        const std::vector<float> batched_state = d_batched_state.download();
+        const std::vector<float> single_state = d_single_state.download();
+        int state_mismatches = 0;
+        double worst_state = 0.0;
+        for (size_t i = 0; i < single_state.size(); ++i) {
+            if (batched_state[i] == single_state[i]) continue;
+            ++state_mismatches;
+            const double want = static_cast<double>(single_state[i]);
+            worst_state = std::max(
+                worst_state,
+                std::fabs(static_cast<double>(batched_state[i]) - want) /
+                    std::max(std::fabs(want), 1.0e-3));
+        }
+        std::cout << "  batched gated delta state: bit_mismatches="
+                  << state_mismatches << " of " << single_state.size()
+                  << " worst_relative=" << worst_state << "\n";
+        expect(state_mismatches == 0,
+               "batched gated delta matches single-row state");
+    }
+
+    {
+        // The one thing batching does that a single-row reference structurally
+        // cannot: it hands the rows to one aclnn call instead of one aclnn call
+        // per row. aclnn owns its own tiling, and a tiling that changes with M
+        // is free to accumulate in a different order, so the two are not
+        // guaranteed to be bit-identical. This block puts the size of that
+        // difference on record at the shapes the TP4 model actually uses --
+        // hidden 5120 and a per-rank MLP shard of 4352 -- because a per-token
+        // logit offset that starts at a fraction of an ULP and grows with depth
+        // looks the same in a logit diff as a defect does.
+        //
+        // The answer, measured: of the ten operators the decoder layer puts
+        // through aclnn, every fp16 one -- both matmuls, rmsnorm, residual-add
+        // rmsnorm, residual add, silu-mul, swiglu matmul, gated rmsnorm -- is
+        // bit-identical at M=16 to 16 single-row calls, and only the fp32
+        // logits projection is not. That is consistent with the batched path
+        // reproducing the single-row path exactly everywhere the layer's own
+        // arithmetic is involved, which localises the observed batched-vs-
+        // single-row logit offset to this operator's accumulation order.
+        const int batch = 16;
+        const int in_dim = 5120;
+        const int out_dim = 4352;
+        int worst_exact_mismatches = 0;
+        double worst_exact_relative = 0.0;
+        // The fp32 matmul is the only operator in this block that is allowed to
+        // differ at all, and what bounds it is absolute error, not relative
+        // error -- see `report_bounded`.
+        double worst_bounded_absolute = 0.0;
+        auto report = [&](const char* name, int mismatches, size_t total,
+                          double worst) {
+            worst_exact_mismatches = std::max(worst_exact_mismatches, mismatches);
+            worst_exact_relative = std::max(worst_exact_relative, worst);
+            std::cout << "  " << name << " M=" << batch << " vs " << batch
+                      << "x M=1: bit_mismatches=" << mismatches << " of "
+                      << total << " worst_relative=" << worst << "\n";
+        };
+        auto report_bounded = [&](const char* name, int mismatches, size_t total,
+                                  double worst, double absolute) {
+            worst_bounded_absolute = std::max(worst_bounded_absolute, absolute);
+            std::cout << "  " << name << " M=" << batch << " vs " << batch
+                      << "x M=1: bit_mismatches=" << mismatches << " of "
+                      << total << " worst_relative=" << worst
+                      << " (relative is reported, not gated)\n";
+        };
+        auto compare_halves = [](const std::vector<uint16_t>& got,
+                                 const std::vector<uint16_t>& want,
+                                 int& mismatches, double& worst) {
+            for (size_t i = 0; i < want.size(); ++i) {
+                if (got[i] == want[i]) continue;
+                ++mismatches;
+                const double w = half_to_float(want[i]);
+                worst = std::max(worst,
+                                 std::fabs(half_to_float(got[i]) - w) /
+                                     std::max(std::fabs(w), 1.0e-3));
+            }
+        };
+        auto compare_floats = [](const std::vector<float>& got,
+                                 const std::vector<float>& want,
+                                 int& mismatches, double& worst,
+                                 double& worst_absolute) {
+            double sum_absolute = 0.0;
+            for (size_t i = 0; i < want.size(); ++i) {
+                sum_absolute += std::fabs(static_cast<double>(want[i]));
+                if (got[i] == want[i]) continue;
+                ++mismatches;
+                const double w = static_cast<double>(want[i]);
+                worst_absolute = std::max(
+                    worst_absolute,
+                    std::fabs(static_cast<double>(got[i]) - w));
+                // Reported for context only. The reference is a logit-like
+                // distribution with a mean magnitude near 0.19, so elements
+                // that sit next to zero dominate the ratio and make it swing
+                // run to run; it is not a bound anything can be gated on.
+                worst = std::max(worst,
+                                 std::fabs(static_cast<double>(got[i]) - w) /
+                                     std::max(std::fabs(w), 1.0e-6));
+            }
+            std::cout << "    fp32 detail: worst_abs=" << worst_absolute
+                      << " mean_abs_want="
+                      << sum_absolute / static_cast<double>(want.size())
+                      << "\n";
+        };
+
+        const size_t rows_elems = static_cast<size_t>(batch) * in_dim;
+        const std::vector<uint16_t> x = random_halves(rows_elems, rng, 0.5f);
+        const std::vector<uint16_t> weight =
+            random_halves(static_cast<size_t>(out_dim) * in_dim, rng, 0.02f);
+        const std::vector<uint16_t> gamma = random_halves(in_dim, rng, 0.4f);
+        const float eps = 1.0e-6f;
+        DeviceBuffer<uint16_t> d_x(x), d_w(weight), d_gamma(gamma);
+
+        {
+            DeviceBuffer<uint16_t> d_batched(
+                static_cast<size_t>(batch) * out_dim);
+            expect(pocket::qwen_fp16_matmul_rows_f16(
+                       d_x.get(), d_w.get(), d_batched.get(), batch, out_dim,
+                       in_dim, in_dim, out_dim, in_dim),
+                   "batched matmul launch");
+            sync_or_throw("batched matmul");
+            DeviceBuffer<uint16_t> d_single(
+                static_cast<size_t>(batch) * out_dim);
+            for (int row = 0; row < batch; ++row) {
+                expect(pocket::qwen_fp16_matmul_rows_f16(
+                           d_x.get() + static_cast<size_t>(row) * in_dim,
+                           d_w.get(),
+                           d_single.get() + static_cast<size_t>(row) * out_dim,
+                           1, out_dim, in_dim, in_dim, out_dim, in_dim),
+                       "single-row matmul launch");
+                sync_or_throw("single-row matmul");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched.download(), d_single.download(), mismatches,
+                           worst);
+            report("matmul fp16", mismatches,
+                   static_cast<size_t>(batch) * out_dim, worst);
+        }
+
+        {
+            // The logits pass is the one whose output the parity oracle reads
+            // directly, so it is checked at both the per-rank MLP shard and the
+            // real per-rank vocabulary shard (248320 / 4).
+            for (const int fp32_out_dim : {out_dim, 62080}) {
+                const std::vector<uint16_t> fp32_weight =
+                    fp32_out_dim == out_dim
+                        ? weight
+                        : random_halves(
+                              static_cast<size_t>(fp32_out_dim) * in_dim, rng,
+                              0.02f);
+                DeviceBuffer<uint16_t> d_fp32_w(fp32_weight);
+                DeviceBuffer<float> d_batched(
+                    static_cast<size_t>(batch) * fp32_out_dim);
+                expect(pocket::qwen_fp16_matmul_rows_f16_f32(
+                           d_x.get(), d_fp32_w.get(), d_batched.get(), batch,
+                           fp32_out_dim, in_dim, in_dim, fp32_out_dim, in_dim),
+                       "batched matmul fp32 launch");
+                sync_or_throw("batched matmul fp32");
+                DeviceBuffer<float> d_single(
+                    static_cast<size_t>(batch) * fp32_out_dim);
+                for (int row = 0; row < batch; ++row) {
+                    expect(pocket::qwen_fp16_matmul_rows_f16_f32(
+                               d_x.get() + static_cast<size_t>(row) * in_dim,
+                               d_fp32_w.get(),
+                               d_single.get() +
+                                   static_cast<size_t>(row) * fp32_out_dim,
+                               1, fp32_out_dim, in_dim, in_dim, fp32_out_dim,
+                               in_dim),
+                           "single-row matmul fp32 launch");
+                    sync_or_throw("single-row matmul fp32");
+                }
+                int mismatches = 0;
+                double worst = 0.0;
+                double worst_absolute = 0.0;
+                compare_floats(d_batched.download(), d_single.download(),
+                               mismatches, worst, worst_absolute);
+                const std::string name =
+                    "matmul fp32 N=" + std::to_string(fp32_out_dim);
+                report_bounded(name.c_str(), mismatches,
+                               static_cast<size_t>(batch) * fp32_out_dim, worst,
+                               worst_absolute);
+            }
+        }
+
+        {
+            DeviceBuffer<uint16_t> d_batched(rows_elems);
+            expect(pocket::qwen_rmsnorm_fp16_gamma_rows_f16(
+                       d_x.get(), d_gamma.get(), d_batched.get(), batch, in_dim,
+                       eps),
+                   "batched rmsnorm launch");
+            sync_or_throw("batched rmsnorm");
+            DeviceBuffer<uint16_t> d_single(rows_elems);
+            for (int row = 0; row < batch; ++row) {
+                expect(pocket::qwen_rmsnorm_fp16_gamma_rows_f16(
+                           d_x.get() + static_cast<size_t>(row) * in_dim,
+                           d_gamma.get(),
+                           d_single.get() + static_cast<size_t>(row) * in_dim, 1,
+                           in_dim, eps),
+                       "single-row rmsnorm launch");
+                sync_or_throw("single-row rmsnorm");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched.download(), d_single.download(), mismatches,
+                           worst);
+            report("rmsnorm", mismatches, rows_elems, worst);
+        }
+
+        {
+            // Both inputs and the residual output are read-modify-written, so
+            // each path needs its own copy rather than the same buffer replayed.
+            const std::vector<uint16_t> delta = random_halves(rows_elems, rng, 0.5f);
+            DeviceBuffer<uint16_t> d_delta(delta);
+            DeviceBuffer<uint16_t> d_batched_residual(x);
+            DeviceBuffer<uint16_t> d_batched_norm(rows_elems);
+            expect(pocket::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16(
+                       d_x.get(), d_delta.get(), d_gamma.get(),
+                       d_batched_residual.get(), d_batched_norm.get(), batch,
+                       in_dim, eps),
+                   "batched residual add rmsnorm launch");
+            sync_or_throw("batched residual add rmsnorm");
+            DeviceBuffer<uint16_t> d_single_residual(x);
+            DeviceBuffer<uint16_t> d_single_norm(rows_elems);
+            for (int row = 0; row < batch; ++row) {
+                const size_t offset = static_cast<size_t>(row) * in_dim;
+                expect(pocket::qwen_residual_add_rmsnorm_fp16_gamma_rows_f16(
+                           d_x.get() + offset, d_delta.get() + offset,
+                           d_gamma.get(), d_single_residual.get() + offset,
+                           d_single_norm.get() + offset, 1, in_dim, eps),
+                       "single-row residual add rmsnorm launch");
+                sync_or_throw("single-row residual add rmsnorm");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched_norm.download(), d_single_norm.download(),
+                           mismatches, worst);
+            report("residual add rmsnorm", mismatches, rows_elems, worst);
+            mismatches = 0;
+            worst = 0.0;
+            compare_halves(d_batched_residual.download(),
+                           d_single_residual.download(), mismatches, worst);
+            report("residual add", mismatches, rows_elems, worst);
+        }
+
+        {
+            const std::vector<uint16_t> up = random_halves(rows_elems, rng, 0.5f);
+            DeviceBuffer<uint16_t> d_up(up);
+            DeviceBuffer<uint16_t> d_batched(rows_elems);
+            expect(pocket::qwen_silu_mul_rows_f16(d_x.get(), d_up.get(),
+                                                  d_batched.get(), batch, in_dim),
+                   "batched silu mul launch");
+            sync_or_throw("batched silu mul");
+            DeviceBuffer<uint16_t> d_single(rows_elems);
+            for (int row = 0; row < batch; ++row) {
+                const size_t offset = static_cast<size_t>(row) * in_dim;
+                expect(pocket::qwen_silu_mul_rows_f16(
+                           d_x.get() + offset, d_up.get() + offset,
+                           d_single.get() + offset, 1, in_dim),
+                       "single-row silu mul launch");
+                sync_or_throw("single-row silu mul");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched.download(), d_single.download(), mismatches,
+                           worst);
+            report("silu mul", mismatches, rows_elems, worst);
+        }
+
+        {
+            // The two remaining fused operators that feed forward rather than
+            // terminate a layer. Both are aclnn calls whose tiling can depend on
+            // M, and both sit inside every decoder layer, so a ULP here is a
+            // difference the next layer inherits.
+            const std::vector<uint16_t> gate_weight =
+                random_halves(static_cast<size_t>(out_dim) * in_dim, rng, 0.02f);
+            const std::vector<uint16_t> up_weight =
+                random_halves(static_cast<size_t>(out_dim) * in_dim, rng, 0.02f);
+            DeviceBuffer<uint16_t> d_gate_w(gate_weight), d_up_w(up_weight);
+            DeviceBuffer<uint16_t> d_batched(static_cast<size_t>(batch) * out_dim);
+            expect(pocket::qwen_fp16_swiglu_matmul_rows_f16(
+                       d_x.get(), d_gate_w.get(), d_up_w.get(), d_batched.get(),
+                       batch, out_dim, in_dim, in_dim, out_dim, in_dim),
+                   "batched swiglu matmul launch");
+            sync_or_throw("batched swiglu matmul");
+            DeviceBuffer<uint16_t> d_single(static_cast<size_t>(batch) * out_dim);
+            for (int row = 0; row < batch; ++row) {
+                expect(pocket::qwen_fp16_swiglu_matmul_rows_f16(
+                           d_x.get() + static_cast<size_t>(row) * in_dim,
+                           d_gate_w.get(), d_up_w.get(),
+                           d_single.get() + static_cast<size_t>(row) * out_dim, 1,
+                           out_dim, in_dim, in_dim, out_dim, in_dim),
+                       "single-row swiglu matmul launch");
+                sync_or_throw("single-row swiglu matmul");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched.download(), d_single.download(), mismatches,
+                           worst);
+            report("swiglu matmul", mismatches,
+                   static_cast<size_t>(batch) * out_dim, worst);
+        }
+
+        {
+            const std::vector<uint16_t> gate = random_halves(rows_elems, rng, 0.4f);
+            DeviceBuffer<uint16_t> d_gate(gate);
+            DeviceBuffer<uint16_t> d_batched(rows_elems);
+            expect(pocket::qwen_gated_rmsnorm_fp16_gamma_rows_f16(
+                       d_x.get(), d_gamma.get(), d_gate.get(), d_batched.get(),
+                       batch, in_dim, eps),
+                   "batched gated rmsnorm launch");
+            sync_or_throw("batched gated rmsnorm");
+            DeviceBuffer<uint16_t> d_single(rows_elems);
+            for (int row = 0; row < batch; ++row) {
+                const size_t offset = static_cast<size_t>(row) * in_dim;
+                expect(pocket::qwen_gated_rmsnorm_fp16_gamma_rows_f16(
+                           d_x.get() + offset, d_gamma.get(),
+                           d_gate.get() + offset, d_single.get() + offset, 1,
+                           in_dim, eps),
+                       "single-row gated rmsnorm launch");
+                sync_or_throw("single-row gated rmsnorm");
+            }
+            int mismatches = 0;
+            double worst = 0.0;
+            compare_halves(d_batched.download(), d_single.download(), mismatches,
+                           worst);
+            report("gated rmsnorm", mismatches, rows_elems, worst);
+        }
+
+        // Two different claims, held to two different standards on purpose.
+        //
+        // Every fp16 entry point above has to be bit-identical: the same
+        // kernel reads the same bytes on both sides, so any difference at all
+        // is the addressing changing with M, and that is a defect rather than
+        // a tolerance question.
+        //
+        // The fp32 matmul cannot meet that standard, because it is not the
+        // same computation at the two sizes -- one aclnn call over 16 rows
+        // tiles and accumulates differently from 16 calls over one row each.
+        // What it can be held to is the size of the difference, and absolute
+        // error is the meaningful scale for it: the reference is a logit-like
+        // vector of mean magnitude ~0.19, the measured worst case is a handful
+        // of fp32 ULPs, and the parity oracle's own offsets at the first
+        // full-attention layer are of order 1. A bound of 1e-5 sits roughly an
+        // order of magnitude above the measurement and three orders below
+        // anything that could reorder an argmax, so it leaves room for a
+        // different accumulation order without leaving room for a wrong one.
+        std::cout << "  worst over the exact operators: bit_mismatches="
+                  << worst_exact_mismatches
+                  << " worst_relative=" << worst_exact_relative << "\n";
+        std::cout << "  worst fp32 absolute error: " << worst_bounded_absolute
+                  << "\n";
+        expect(worst_exact_mismatches == 0,
+               "batched fp16 aclnn calls are bit-identical to single-row calls");
+        expect(worst_bounded_absolute < 1.0e-5,
+               "batched fp32 logits matmul stays inside its accumulation bound");
+    }
 }
 
 void test_argmax(std::mt19937& rng) {
@@ -1240,6 +1940,7 @@ int main(int argc, char** argv) {
         {"gqa_decode", test_gqa_decode},
         {"gqa_prefill", test_gqa_prefill},
         {"gqa_verify", test_gqa_verify},
+        {"batched_rows", test_batched_rows},
         {"argmax", test_argmax},
     };
     for (const auto& entry : suite) {

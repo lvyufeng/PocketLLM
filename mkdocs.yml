@@ -131,6 +131,7 @@ nav:
       - OpenAI API concurrency validation: performance/cpp_openai_concurrency_validation.md
       - OpenAI API tool-calling acceptance: performance/cpp_openai_tool_acceptance.md
       - Ascend 910A attention: performance/ascend_attention_optimization.md
+      - Ascend decode collectives and batch scaling: performance/ascend_decode_collective_ab.md
       - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
       - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
       - DeepSeek-V4.1-Flash host run: performance/deepseek_v4_1_flash_host_run.md

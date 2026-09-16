@@ -297,6 +297,12 @@ bool qwen_is_one_plus_norm_gamma(const std::string& name);
 // but 1+gamma sits near one where it has 2^-11, so the folded value is the FP16
 // neighbour of the exact sum. See test_qwen_ascend_norm_gamma for the bound.
 void qwen_apply_norm_gamma_policy(const QwenTensorRef& ref, QwenHostTensor& host);
+// Rewrites the linear attention's depthwise convolution weight, which the
+// checkpoint stores [channels, 1, kernel], into the tap-major [kernel, channels]
+// layout the Ascend kernel loads contiguously. Applies to that one tensor only and
+// is a no-op on CUDA, where the kernel reads the checkpoint layout directly.
+void qwen_apply_conv_weight_layout_policy(const QwenTensorRef& ref,
+                                         QwenHostTensor& host);
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
     const SafeTensorsIndex& index, const QwenLinearRef& ref);
 QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
