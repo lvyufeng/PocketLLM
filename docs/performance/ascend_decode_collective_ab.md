@@ -240,10 +240,10 @@ those runs. It localizes to the first full-attention layer. Sweeping the layer c
 
 Below the first full-attention layer every layer is linear attention and the two paths agree to
 rounding level; the deviation appears in the same step that `kv_cache_bytes` stops being zero, and
-then compounds through 64 layers into ~2.6 logits and 9 of 48 greedy tokens. The three operators
-that run for the first time there are the batched partial RoPE, the batched KV append and the
-batched GQA decode, all in `qwen_layer_components.inl`; which of the three is not yet isolated, and
-it is the open correctness item on this path.
+then compounds through 64 layers into ~2.6 logits and 9 of 48 greedy tokens. That points at the
+three operators which run for the first time there — batched partial RoPE, batched KV append and
+batched GQA decode — and ruling them out, or in, took a direct operator-level comparison; §6.1.1
+has the result.
 
 The consequence for the harness is that `verify_mismatches` is a count to be read against
 `repeat_mismatches` from the same run, not a zero test, and that is how
@@ -254,6 +254,69 @@ weaker in a second way as well. The rows were seeded from a constant token list,
 rotation of a constant list is the same list: every row decoded the same sequence, so a slot mix-up
 between two rows cancelled out of the comparison — which is the one failure that comparison exists
 to catch. The launcher now builds the list from consecutive ids and the rotation separates the rows.
+
+### 6.1.1 Where the offset actually comes from
+
+The layer sweep says *when* the two paths separate. It cannot say *which* operator does it, because
+every candidate sits inside a 64-layer stack whose output is a single argmax. The way to separate
+them is to stop comparing logits and start comparing operator outputs, and the comparison to make is
+not against a host reference — a host reference only re-tests the kernel. It is against the other
+entry point: every `*_batched_ascend` wrapper is a host loop around the same single-row launcher, so
+with identical per-row inputs it has to reproduce it **byte for byte**, and any difference is the
+per-row addressing (position, slot, stride arithmetic) that the wrapper adds. That is exactly the
+class of defect the layer sweep could not see.
+
+`cpp_engine/tests/test_qwen_ascend_group_b.cpp`'s `batched_rows` case does this for all five
+wrappers, with slots deliberately unequal to the row index so a row-vs-slot mix-up is visible, and
+with the KV cache poisoned per slot so a row reading another row's history is visible:
+
+| wrapper compared against its single-row loop | compared | result |
+|---|---|---|
+| `qwen_partial_rope_rows_f16_batched_ascend` | q and k, out-of-order and repeated positions | identical |
+| `qwen_append_kv_cache_f16_batched_ascend` | full cache | identical |
+| `qwen_gqa_decode_attention_f16_batched_ascend` | output and score scratch | identical |
+| `qwen_causal_depthwise_conv_silu_f16_batched_ascend` | output and tail | identical |
+| `qwen_gated_delta_step_batched_f16_ascend` | output and the 131072-float state | identical |
+
+The three full-attention operators the layer sweep implicated are therefore **not** the source. The
+batched path addresses its rows correctly.
+
+What is left is the other thing batching does that a per-row reference structurally cannot: it hands
+all the rows to one aclnn call instead of one aclnn call per row. aclnn owns its tiling, and a
+tiling that changes with M is free to accumulate in a different order, so the two are not
+guaranteed to be bit-identical. The same test puts that on record for every operator the layer sends
+through aclnn, at the shapes TP4 uses (hidden 5120, per-rank MLP shard 4352, per-rank vocabulary
+shard 62080):
+
+| operator | M=16 vs 16x M=1 |
+|---|---|
+| `qwen_fp16_matmul_rows_f16` (5120→4352) | bit-identical |
+| `qwen_rmsnorm_fp16_gamma_rows_f16` | bit-identical |
+| `qwen_residual_add_rmsnorm_fp16_gamma_rows_f16` (output and residual) | bit-identical |
+| `qwen_silu_mul_rows_f16` | bit-identical |
+| `qwen_fp16_swiglu_matmul_rows_f16` | bit-identical |
+| `qwen_gated_rmsnorm_fp16_gamma_rows_f16` | bit-identical |
+| `qwen_fp16_matmul_rows_f16_f32` (5120→4352) | **not identical**, 63436 of 69632 elements |
+| `qwen_fp16_matmul_rows_f16_f32` (5120→62080) | **not identical**, 885087 of 993280 elements |
+
+One operator, and it is the one whose output the parity oracle reads. The fp32 logits projection
+accumulates in a different order at M=16 than at M=1. The size of that difference is what matters,
+and absolute error is its meaningful scale: against a reference of mean magnitude 0.19, the worst
+element differs by **8.9e-07**, a handful of fp32 ULPs. The relative figure printed alongside it
+(0.005-0.12) is not a bound — the reference is logit-like, so the elements near zero dominate the
+ratio and it swings run to run on unchanged inputs. The test gates the absolute figure at 1e-5:
+about an order of magnitude above the measurement, three orders below the ~0.5-2.6 offsets the
+layer sweep reports, so it leaves room for a different accumulation order without leaving room for a
+wrong one.
+
+That closes the localization. The offset is a few fp32 ULPs introduced by the logits matmul's
+M-dependent tiling, amplified through 64 layers of argmax into the 9-of-48 token differences at step
+16. It is not an addressing defect, and there is nothing in the full-attention layer to fix.
+
+The all-reduce's accumulator order is excluded as a contributor on separate evidence: with
+`POCKET_BATCH_AR_PER_ROW=1`, which slices the wide collective back into one call per row so its
+buffer size — and therefore its ring order — matches the single-row reference, the measured logit
+offset moved from 0.637895 to 0.63701. Unchanged.
 
 ### 6.2 The M=1 GEMV rate is not the hardware ceiling
 
@@ -311,6 +374,13 @@ cpp_engine/build-ascend/tests/bench_qwen_ascend_allreduce \
 cpp_engine/build-ascend/tests/bench_qwen_ascend_event_order --device 0 --iters 40
 ```
 
+The operator-level parity comparisons in §6.1.1 are a device test rather than a bench, because what
+they run is the production entry points:
+
+```bash
+cpp_engine/build-ascend/tests/test_qwen_ascend_group_b --device 0 --only batched_rows
+```
+
 ## 8. Files
 
 - `cpp_engine/tests/bench_qwen_ascend_allreduce.cpp` — the host-vs-device split and the Cube-GEMM
@@ -321,4 +391,7 @@ cpp_engine/build-ascend/tests/bench_qwen_ascend_event_order --device 0 --iters 4
 - `cpp_engine/engine/qwen_engine.cpp` — `all_reduce_half_rows`, which is where the one-wide-collective
   decision lives.
 - `cpp_engine/engine/main.cpp` — `--batch-decode`, the row-to-slot assignment and the parity oracle.
+- `cpp_engine/tests/test_qwen_ascend_group_b.cpp` — the `batched_rows` case, which compares every
+  batched wrapper against a per-row loop of its single-row counterpart and every aclnn operator the
+  layer sends through it at M=16 against 16 calls at M=1, §6.1.1.
 - `scripts/run_qwen_ascend_tp4.sh` — the TP4 launcher and its `QWEN_BATCH_ROWS` mode.

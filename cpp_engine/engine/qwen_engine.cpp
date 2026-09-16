@@ -2653,9 +2653,27 @@ struct QwenEngine::Impl {
     // Four rows therefore paid 1.7 ms where 0.45 ms does the same work, on every
     // one of the 129 collective sites in a step. The token-parity gate is what
     // decides whether the wider call is acceptable.
+    //
+    // POCKET_BATCH_AR_PER_ROW=1 restores the sliced form. It is a diagnostic, not
+    // a tuning knob: it answers whether a batched-vs-single-row logit offset is
+    // the collective's accumulator order or something downstream of it. A sliced
+    // call has the same buffer size and therefore the same ring order as the
+    // single-row call it is being compared against, so if the offset is the
+    // ordering it disappears here and nowhere else.
     void all_reduce_half_rows(uint16_t* values, int rows, int row_elements,
                               const char* site = "other") {
-        all_reduce_half(values, rows * row_elements, site);
+        static const bool per_row = [] {
+            const char* env = std::getenv("POCKET_BATCH_AR_PER_ROW");
+            return env != nullptr && *env != '\0' && std::atoi(env) != 0;
+        }();
+        if (!per_row || rows <= 1) {
+            all_reduce_half(values, rows * row_elements, site);
+            return;
+        }
+        for (int row = 0; row < rows; ++row) {
+            all_reduce_half(values + static_cast<size_t>(row) * row_elements,
+                            row_elements, site);
+        }
     }
 
     void count_active_linear(QwenLinearKind kind) {
