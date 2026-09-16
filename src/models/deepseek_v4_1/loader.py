@@ -359,12 +359,14 @@ class CheckpointRoutedExperts(RoutedExperts):
 
     It barely does. A token routes to 8 of the layer's 384 experts, so a 16-expert window returns
     about 2 of them: measured, 6 misses per layer per token, warm. That is 25% saved for the 42 GiB
-    the window costs across the backbone, and it puts the whole model's token time on the disk --
-    the first token costs 27.2 s because all 320 of its experts are cold, against 1.0 s once the
-    previous token's working set is in the page cache. This class is a correctness path, and the
-    number that says so is that its ffn is 0.44 s of that second: 240 fresh experts is 4.2 GiB read
-    and 15.8 GiB expanded per token, on a host whose RAM holds all 269 GiB of them in their packed
-    form. A device-side cache is what replaces it, not a larger `cache_size`.
+    the window costs across the backbone, and it puts the whole model's token time on the expansion
+    rather than on the disk -- one miss is 0.3% mapping read and 99.7% the arithmetic that turns fp4
+    codes into fp32 and then bf16, at 0.122 s per expert, so a step that misses 240 of them costs
+    about 29 s against 1.0 s for a forward whose experts are already expanded and 27.2 s for a first,
+    entirely cold one. 240 fresh
+    experts is 4.2 GiB read and 15.8 GiB expanded per token, on a host whose RAM holds all 269 GiB of
+    them in their packed form and hands them over for free; what the host cannot do cheaply is turn
+    them into numbers. A device-side cache is what replaces it, not a larger `cache_size`.
     """
 
     def __init__(
@@ -695,11 +697,11 @@ def load_backbone(
     `CheckpointEngramTable` for why gathering them from the shards is not an option here.
 
     The forward that follows is the host-offload correctness path, and it is measured now rather than
-    assumed: one token at position 0 costs 27.2 s with nothing in the page cache and 1.0 s with the
-    previous token's working set in it, of which 0.37 s is the attention stack and 0.44 s the MoE.
-    The 27 s is 240 routed experts expanded for the first time, so what stands between this and a
-    usable token rate is not the tree but where the 269 GiB of experts live -- `CheckpointRoutedExperts`
-    is that subject, and this function's is only the dense half.
+    assumed: a generated token costs 30 to 40 s, of which the attention stack is 0.37 s, and the rest
+    is the routed experts -- 320 of them expanded on a first, cold forward, 240 on a warm step, at
+    0.122 s each. The cost is the expansion and not the bytes: 0.3% of a miss is reading the mapping
+    and 99.7% is turning fp4 codes into fp32 and then bf16. `CheckpointRoutedExperts` is that
+    subject, and this function's is only the dense half.
     """
     if hasher is not None:
         layout = hasher.layout

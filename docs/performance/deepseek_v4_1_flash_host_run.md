@@ -22,15 +22,20 @@ without touching one.
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each — **idle**; TP/EP world size 1 CPU rank, plus one card timed for PCIe in the last section |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM, 930 GiB available |
 | Software | Python 3.10.10, torch 2.9.1+cu128, `deepseek` conda env |
-| Prompt | `The capital of France is` (4 tokens), and one token at position 0 for the phase table |
+| Prompt | `The capital of France is` (5 tokens), and one token at position 0 for the phase table |
 | Warm/cold | Both reported; the phase table gives three consecutive forwards of the same token |
 
 Scripts: `/tmp/probe_where.py` (phase timing), `/tmp/probe_footprint.py` (what the tree occupies),
-`/tmp/probe_engram_cost.py` (the Engram gather), `/tmp/probe_accept.py` (correctness), and
-`/tmp/probe_h2d.py` (the PCIe and card-side arithmetic in the last section — the only one of the five
-that wants a GPU). They are throwaway probes rather than checked-in benchmarks; the numbers they
-produced are what this page records. The commit above is the code they ran against — this page
-itself, and the comment corrections it prompted, land in later documentation-only commits.
+`/tmp/probe_engram_cost.py` (the Engram gather), `/tmp/probe_accept.py` (correctness),
+`/tmp/probe_expand_vs_read.py` and `/tmp/probe_dequant_floor.py` (the read/expansion split and the
+expansion's headroom), `/tmp/probe_top5_label.py` (which prefix length each quoted top-5 belongs to),
+and `/tmp/probe_h2d.py` (the PCIe and card-side arithmetic in the last section
+— the only one of them that wants a GPU). They are throwaway probes rather than checked-in
+benchmarks; the numbers they produced are what this page records. The commit above is the code the
+phase table, the byte census and the Engram numbers ran against; this page itself, the comment
+corrections it prompted, and the checked-in generation path land in later commits, and the two
+generated-token runs in the next section were made with
+`src/models/deepseek_v4_1/generate.py` on top of `c9694b3`.
 
 ## What is in the 475 GiB
 
@@ -122,18 +127,52 @@ Three consecutive forwards of the same token at position 0, in one process:
 | **total** | **27.23 s** | **2.23 s** | **1.00 s** |
 
 The cold column is every routed expert of the token — 8 per layer, all 320 — expanded to bf16 for the
-first time, off a disk that has never seen them: 5.60 GiB read and 21.09 GiB written out. The third
-column is the steady state: **1.00 s per token**, of which the attention stack is 0.37 s and the MoE
-0.44 s.
+first time: 5.60 GiB read and 21.09 GiB written out. The third column is the *same* forward a third
+time, and by then all 320 of those experts are in the 16-slot window, so its 0.44 s of MoE is
+arithmetic over cached bf16 with no expansion in it at all. **The third column is a repeat cost, not a
+decode cost**, and the difference between the two is the whole of the next section.
 
 The 16-expert FIFO window in `CheckpointRoutedExperts` turns out to be nearly worthless and is
 measured rather than assumed: a token routes to 8 of a layer's 384 experts, and **6 of those 8 are
-misses at every layer, every token, warm**. It saves 25% of the expert reads for 42 GiB of host RAM
-across the backbone. `DEFAULT_EXPERT_CACHE = 16` bounds a correctness path; it is not a cache policy.
+misses at every layer, every token, warm**. It saves 25% of the expert expansions for 42 GiB of host
+RAM across the backbone. `DEFAULT_EXPERT_CACHE = 16` bounds a correctness path; it is not a cache
+policy.
+
+### What a generated token costs, and of what
+
+`src/models/deepseek_v4_1/generate.py` against the complete checkpoint, greedy, from the 5-token
+prompt, two runs in separate processes:
+
+| Run | New tokens | Wall | Per token | Text out |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 4 | 169.5 s | 42.37 s | `The capital of France is Paris. The E` |
+| 2 | 4 | 124.6 s | 31.15 s | `The capital of France is Paris. The E` |
+
+**30 to 40 seconds per generated token**, against the 1.00 s the repeated-forward column reports. The
+gap is exactly the expansion a repeated forward does not have to do. Splitting one miss into its two
+halves, over a layer whose pages are already resident:
+
+| Step of one miss | Per projection tensor |
+| --- | ---: |
+| the mapping read (`reader.load`) | 0.1 ms |
+| the expansion alone (`dequantize`, fp4 → fp32) | 39.4 ms |
+| read + expand + cast (`weight(..., dtype=bf16)`) | 40.7 ms |
+
+**The read is 0.3% of a miss and the expansion is 99.7% of it.** One expert is three of those tensors,
+so 0.122 s per expert: **39.1 s** for a token's 320 experts, **29.3 s** for the 240 that a warm step
+still misses — which is what the measured 31 s is made of.
+
+The expansion is not a bandwidth floor. The same probe times the bf16 cast of the already-expanded
+matrix — the cheapest operation that writes the same 45 MiB — at **1.28 ms**, so the expansion runs at
+304 Mparam/s against 9,223 Mparam/s for the cast alone: **30.4x the cheapest op of the same output
+size**. It reaches `src/kernels/ops.py`'s `soft_fp4_blockfp4_weight_dequant`, a general elementwise
+torch path that materializes intermediates at fp32. That says where the host's token time is spent; it
+does not say the host could not spend less of it.
 
 ## Correctness
 
-Greedy decode from the 4-token prompt, at temperature 0, through the host-offload path:
+Greedy decode from `The capital of France is`, stepped through one token at a time rather than
+prefilled, at temperature 0, through the host-offload path:
 
 ```text
 The capital of France is  ->  ' Paris.<｜end▁of▁sentence｜>\n\n\n\n\n'
@@ -141,8 +180,20 @@ expert misses per layer: min 26 max 52 total 1648
 engram rows gathered:    {1: 456, 14: 456}
 ```
 
-A 4-token prefill's top-5 is `' is'` 25.014, `','` 21.838, `' and'` 20.167, `' was'` 19.553,
-`' ('` 19.430 — a coherent distribution, not a flat one.
+Those 456 gathers per table are 24 rows for each of the 19 positions that probe forwards in one
+process — a profile forward, four prefill/stepwise comparisons and the thirteen-step decode — not
+456 for the prompt on its own.
+
+The distribution at the end of a prefill is coherent rather than flat, and `/tmp/probe_top5_label.py`
+pins which prefix each one belongs to, because the prompt is five tokens and not four:
+
+| Prefill | Top-5 |
+| --- | --- |
+| 4 tokens: `The capital of France` | `' is'` 25.014, `','` 21.838, `' and'` 20.167, `' was'` 19.553, `' ('` 19.430 |
+| 5 tokens: `The capital of France is` | `' Paris'` 20.605, `' ...'` 18.368, `'...'` 18.224, `' a'` 17.956, `' ______'` 17.505 |
+
+The second row is the one the generation path starts from, and `' Paris'`, its argmax, is the first
+token it emits — followed at once by the end-of-sentence token, which is the `' Paris.'` above.
 
 **A prefill and the equivalent stepwise decode do not agree bit for bit, and this is understood
 rather than tolerated.** From position 0:
@@ -172,12 +223,12 @@ combined. The experts cannot be resident on the cards. Everything else in the mo
 924-parameter tree, attention and shared experts and embeddings and norms — is 16.79 GiB, 3.5% of the
 checkpoint, and it fits at 19.1% of a card per rank.
 
-So the floor is set by bytes per token, not by FLOPS. Every carrier that could bring the 5.60 GiB to
-a card is now measured rather than estimated:
+So the floor is set by the expansion, not by the bytes and not by FLOPS. Every carrier that could
+bring the 5.60 GiB to a consumer is now measured rather than estimated:
 
 | Carrier | Rate on this host | Floor per token |
 | --- | ---: | ---: |
-| host RAM, read and expanded to bf16 on the CPU | measured | **0.44 s** (the MoE column above) |
+| host CPU today: read free, expand 240–320 experts | 0.122 s per expert measured | **29–39 s** (the two runs above) |
 | PCIe Gen3 x16, packed fp4 as stored, pinned | 8.29 GiB/s measured | 0.68 s |
 | PCIe Gen3 x16, expanded to bf16 first, pinned | 10.19 GiB/s measured | 2.07 s |
 | the SMR disk behind both | 271 MiB/s | 21 s |
@@ -190,31 +241,58 @@ bytes as stored. The bf16 row is the one that decides whether a device-side expe
 building on the dequant path that already exists, and it costs 3.0x the time: 5.60 GiB of packed fp4
 becomes 21.09 GiB of bf16, which is also why its rate is the higher of the two.
 
-**The cards' arithmetic is not the problem.** The same probe times the batched MoE for one layer — 8
-experts through all three projections — at 1,564 µs, which is **62.6 ms** for the 40 layers of a
-token against the **0.44 s** the host CPU currently spends there. The GPU is 7x the cheaper place to
-do the multiplication. It is 1.5x the more expensive place to be given the operands: 0.68 s of pinned
-PCIe against 0.44 s of host RAM, per token, every token — and that is transfer alone, with the
-dequantization still to come.
+The first row is the one that surprised this page, and the one that decides the rest of it: the bytes
+are already in host RAM, and reading them is 0.3% of what a miss costs. The other 99.7% is arithmetic
+— the fp4 code turned into a bf16 number at 304 Mparam/s, where the cheapest op of the same output
+size runs at 9,223 Mparam/s. Every other row here is a hardware rate; that one is an implementation
+cost, and it is what the host's 30 s per token is made of.
 
-The measured 0.44 s from host RAM is the fastest carrier there is, and that is the finding: **moving
-the experts to the GPU does not move this wall, because the wall is the bytes and the GPU cannot hold
-them.** The four cards can only help with the 0.37 s attention stack and the 0.04 s of `norm` +
-`head`: the part of the model that is neither the MoE nor the Engram tables, 4.20 GiB per rank at
-TP4, and the one part that is a normal port.
+**The cards' arithmetic is not the problem, and neither is the transfer out to them.** The same probe
+times the batched MoE for one layer — 8 experts through all three projections — at 1,564 µs, which is
+**62.6 ms** for the 40 layers of a token, against the **29–39 s** the host spends on the same 40
+layers. The card is two to three orders of magnitude the cheaper place to do the multiplication, and
+it stays the cheaper place after being handed the operands: 0.68 s of pinned PCIe plus 62.6 ms of
+arithmetic is **0.74 s per token** if the two do not overlap and 0.68 s if they do, against the 1.00 s
+the host needs merely to *repeat* a forward it has already cached.
 
-Reaching a materially higher token rate on this hardware needs fewer bytes per token — a lower-bit
-expert format, or fewer active experts — and not a faster kernel. The one design that would remove
-the per-token transfer is a device-side expert cache holding whole layers resident, and it fails on
-arithmetic rather than on engineering: one layer is 25.3 GiB expanded, so all 88 GiB of VRAM holds
-three of the forty, and the remaining 37 layers would still pay the 0.68 s. Only a format that makes a
-layer small enough to sit on a card changes this.
+That reverses the reading this page first drew from the carrier table. It took the repeated forward's
+0.44 s of MoE as the host-RAM carrier's floor and set it against 0.68 s of PCIe, and concluded that
+the bytes were the wall. The fair comparison is against what a real step costs, and a real step
+expands 240 fresh experts: **the bytes are not the wall, the expansion is.** The four cards are the
+fastest way measured to pay it.
+
+What does not change is the constraint underneath: 268.95 GiB of experts against 88 GiB of VRAM, so
+every token still moves 5.60 GiB. A device-side expert cache holding whole layers resident fails on
+arithmetic rather than on engineering — one layer is 25.3 GiB expanded, so all 88 GiB of VRAM holds
+three of the forty and the remaining 37 layers would still pay the 0.68 s. Only a format that makes a
+layer small enough to sit on a card removes the per-token transfer.
+
+The host path's own 30 s is left where it is, and the measurement says where the room is: an
+expansion running at 30.4x the cheapest op of the same output size is a kernel problem, not a
+bandwidth one, so a host that kept the experts on the CPU has that much in front of it without
+touching PCIe at all.
 
 ## Reproducing
 
 ```bash
-# the load report, the phase table, and the first token's cold/warm columns
+# the load report, the phase table, and the three forwards of one token at position 0
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_where.py
+
+# one expert miss split into its mapping read and its fp4 expansion, and the expansion against the
+# cheapest operation that writes the same output size
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_expand_vs_read.py
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_dequant_floor.py
+
+# a generated token, which is the number the expansion actually sets: ~60 s to load, then 30-40 s
+# per token
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python -m src.models.deepseek_v4_1.generate \
+  --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" --max-new-tokens 4
+
+# the correctness run: the profile forward, the prefill/stepwise comparison, and the greedy decode
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_accept.py
+
+# which prefix length each quoted top-5 belongs to, one prefill per length
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_top5_label.py
 
 # the byte census, what the tree occupies, and the TP4 per-rank figure
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_footprint.py
@@ -229,4 +307,8 @@ layer small enough to sit on a card changes this.
 
 Each takes one to fifteen minutes and reads the checkpoint off `/mnt/data3`. The Engram probe's copy
 step alone is 373 s and 94.5 GiB of page cache, so run it alone. `probe_h2d.py` reports whichever
-page-cache state it finds the checkpoint in; run it twice for a warm H2D column.
+page-cache state it finds the checkpoint in; run it twice for a warm H2D column. The two expansion
+probes want the opposite: they warm the pages on purpose, so that what they time is the arithmetic
+and not the disk. `probe_top5_label.py` pays the ~60 s load again for five prefixes at one forward
+each, which is worth it once — the prefix a quoted distribution belongs to is not recoverable from
+the numbers.
