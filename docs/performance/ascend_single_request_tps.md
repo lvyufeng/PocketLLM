@@ -16,10 +16,12 @@ primitives needed to hand-write a collective are cheap and they do work across t
 the engine runs behind. The three ordering primitives AscendCL offers across that boundary are *not*
 usable here — an imported notify cannot be waited on and a cross-process event cannot be created —
 but a barrier that reads its arrival signal out of the payload itself is, and it prices a complete
-all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** (§5.4). So the 129 collectives are 62.0 ms
-of the step today and 33.4 ms of it if they are replaced — 28.6 ms saved, and 9.6 TPS against **13.2**.
-That replacement is a design with a measured core, not a shipped one: §5.4 says what is measured and
-what is still assumption.
+all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** in an empty loop (§5.4). That barrier is
+now built as a kernel-level replacement for the collective (`POCKET_ASCEND_IPC_ALLREDUCE=1`) and it
+has been measured inside the engine: rows=1 goes from **105.1 ms / 9.51 TPS to 91.5 ms / 10.93 TPS**,
++15%, with both arms passing the verifier gates (§5.5). The empty-loop probe projected +38%, so §5.5
+also says where the other 23 points went: the probe priced the collective on an idle device, and the
+engine's collective is never on one.
 
 ## 1. The row sweep: single-request cost is batch-independent cost
 
@@ -308,24 +310,77 @@ fixed ~480 ms amortised over the run, so the steady per-call reduce is nearer 0.
 are flat (0.086-0.118 ms per quarter-run, first quarter included), so the barrier settles immediately
 and the single averaged figure is a fair description of it.
 
-Against `HcclAllReduce`'s 0.4810, that is **1.9x cheaper per call** — 129 calls go from 62.0 ms to
-33.4 ms, and the step from 104.3 ms to 75.7 ms, or **9.6 TPS to 13.2 TPS**.
+Against `HcclAllReduce`'s 0.4810, that is **1.9x cheaper per call**. Extrapolated to the engine's 129
+calls that would take the collective from 62.0 ms to 33.4 ms and the step from 104.3 ms to 75.7 ms, or
+9.6 TPS to **13.2 TPS** — and §5.5 is that extrapolation being wrong, for a reason worth stating
+before the number is used again: this probe reduces on an idle device, and the engine's collective never
+is.
 
-What this is not yet: the loop around it is empty, so the ranks stay within a fraction of a round of
-each other by construction. The engine has real work between collectives, and the design that follows
-from these numbers — one pair of buffers per rank rotating through a global round counter, exported
-once at startup through the rendezvous the HCCL id already uses, with the reduce staying on the device
-— has not been built or measured. The 0.259 also includes a trailing `stream_synchronize` that the
-engine may not need, since the next layer's work is enqueued on the same stream and only the device
-reads the result; that variant is untested and would be cheaper, not more expensive. What is settled is
-the thing §5.3 could not settle: the barrier itself, at world=4 on four processes, costs less than the
-collective it would replace.
+What this probe cannot settle: its loop is empty, so the ranks stay within a fraction of a round of
+each other by construction and every push is issued into an idle device. The engine has a layer's worth
+of compute between collectives. What is settled is the thing §5.3 could not settle: the barrier itself,
+at world=4 on four processes, costs less than the collective it would replace. §5.5 is what happens
+when the same barrier is put where the collective actually is.
+
+### 5.5 The same barrier inside the engine
+
+The barrier is now `cpp_engine/backends/ascend/collective/ipc_allreduce.{hpp,cpp}`, reached through
+`tp_all_reduce_sum_f16_inplace`. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it for any call with world > 1
+and a plane of at most 1 Mi FP16 elements; a call outside that envelope falls through to HCCL unchanged,
+and every rank evaluates the same predicate on the same arguments, so the choice cannot desynchronise
+the group. The ceiling covers batched decode (16 rows x 5120 = 81 920) and deliberately leaves prefill,
+where the payload is large enough that HCCL's bandwidth matters more than its per-call price, on HCCL.
+
+Rows=1, 8 decode steps, 32-token prompt, one process per rank on devices 0-3, `QWEN_BATCH_VERIFY=3`:
+
+| arm | `step_ms` | decode TPS | seed | `verify_agreed` | seed / verify / repeat / batch-repeat mismatches | `verify_logit_abs_matched` |
+|---|---|---|---|---|---|---|
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL) | 105.102 | 9.51456 | 198 | 3 | 0 / 0 / 0 / 0 | 0.076725 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=1` | 91.5055 | 10.9283 | 198 | 3 | 0 / 0 / 0 / 0 | 0.693588 |
+
+Both arms commit the same seed and agree with the verifier on all three comparisons, so the replacement
+is not trading correctness for speed. What does move is the distance between the batched and the
+single-row arithmetic: `verify_logit_abs_matched` is 0.69 against HCCL's 0.077, and the checksum
+distance 0.032 against 0.023. That is a comparison *inside* each arm — a batched decode against a
+single-row decode through the same collective — so it is not the two paths disagreeing with each other.
+It is the same fp16 sum taken in a different order, three pairwise `InplaceAdd` accumulations here
+against HCCL's ring, sitting under a batched-versus-single-row gap both arms already have. The argmax
+is unmoved in all three pairs, which is what `verify_agreed=3` and `verify_mismatches=0` say, and the
+committed tokens are identical.
+
+The same runs, host-profiled, give the per-call figure:
+
+| arm | `tp_all_reduce` | per call |
+|---|---|---|
+| HCCL | 0.0628596 s / 129 | 0.4873 ms |
+| hand-written | 0.059129 s / 129 | 0.4584 ms |
+
+**The collective's own region accounts for only 3.7 ms of the 13.6 ms the step moved.** The rest is the
+default-stream drain that `resolve_stream` performs before every HCCL call (`tp_comm.cpp:244`): the
+nullptr-stream contract on this API means "synchronous, result visible on return", so the wrapper calls
+`aclrtSynchronizeStream(nullptr)` and then runs `HcclAllReduce` on a private stream. That is a device
+that must go idle for a host round trip once per collective, and the bubble lands outside the
+`tp_all_reduce` region. The hand-written path needs no drain at all, because it runs on the caller's
+stream — the same stream the producer kernels are on — and its only ordering is a device-to-device copy
+and a device-side add both queued behind them.
+
+So the honest accounting of the two per-call numbers is 0.4584 against roughly 0.56, not against the
+0.4873 the region reports. It is also still not 0.259, and the remaining 0.2 ms is where the empty loop
+shows: in the probe the push goes out immediately and the peer answers within microseconds, while in
+the engine the push is queued behind a layer's worth of compute on both sides, so `wait_ms` is waiting
+out real work rather than paying a barrier. Closing that gap needs the barrier to overlap the layer it
+belongs to, which is a scheduling change and not a communication one.
+
+At rows=16 the replacement is worth more, not less: 141.28 ms / 113.25 TPS becomes 116.51 ms /
+137.32 TPS, +21%, on the same 8-step prompt. That run had `QWEN_BATCH_VERIFY=0` and so carries no
+verifier gate — the only rows=16 evidence here is timing, not correctness.
 
 ## 6. What is left, in order of size
 
 | lever | measured size | state |
 |---|---|---|
-| Replace the 129 collectives with the hand-written one | 129 x (0.4810 - 0.259) = **28.6 ms** of 104.3, i.e. 9.6 -> **13.2 TPS** | barrier measured (§5.4); engine integration not built |
+| Replace the 129 collectives with the hand-written one | 13.6 ms of 105.1, i.e. 9.51 -> **10.93 TPS** (§5.5) | built and gated; opt in with `POCKET_ASCEND_IPC_ALLREDUCE=1` |
+| The ~0.2 ms/call of peer compute the poll still waits out | up to 26 ms of the 91.5 ms step | not scoped — needs the barrier to overlap its layer, not to be cheaper (§5.5) |
 | The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
 | Verifier placement | 0.08%, noise | retracted (§4.2) |
@@ -339,6 +394,17 @@ The engine numbers come from the repository's TP4 launcher, one process per rank
 # the rows=1 arm of §1
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=0 QWEN_BATCH_PROMPT_LEN=32 \
   scripts/run_qwen_ascend_tp4.sh "" 8
+```
+
+The §5.5 A/B is the same launcher with the hand-written collective on one arm and off the other,
+`QWEN_BATCH_VERIFY=3` so that both arms are gated:
+
+```bash
+# HCCL arm, then the hand-written collective
+QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
+  POCKET_ASCEND_IPC_ALLREDUCE=0 scripts/run_qwen_ascend_tp4.sh "" 8
+QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
+  POCKET_ASCEND_IPC_ALLREDUCE=1 scripts/run_qwen_ascend_tp4.sh "" 8
 ```
 
 The MTP A/B of §4.1 is the same launcher without `QWEN_BATCH_ROWS`, plus `--qwen-mtp-tokens 3` on
