@@ -28,25 +28,49 @@ What it checks, and why each one matters:
   the indexer, where the Engram tables and the DSpark heads live, and how the
   bytes divide between them.
 
-Exit status is 0 only when every check passes; failures are listed with the
-expected and observed values.
+Presence and shape are answered from two different places, and the audit keeps
+them apart. `model.safetensors.index.json` -- which the release ships, 96,085
+tensors over 48 shards -- names the shard holding every tensor, so *is this
+tensor in the checkpoint* is decidable before a byte of payload is downloaded.
+Shapes, dtypes and byte extents come from the headers, so they are decidable only
+for the shards that are here. That is what makes this usable while a download is
+still running: the whole tensor inventory, the CSA2 mode assignment and the expert
+counts are checked on the first shard that lands, and each shape check turns from
+undecided into asserted as its shard arrives.
+
+A check therefore has three outcomes, not two:
+
+- **passed** -- the evidence is local and agrees with the config.
+- **failed** -- the evidence is local and disagrees, or the index says the
+  checkpoint ships a tensor the headers contradict.
+- **undecided** -- the index places the evidence in a shard that is not here yet.
+  Counted separately and never as a pass: a partial checkpoint must not read as a
+  full one. `--require-complete` turns undecided into a failure for callers that
+  need the strict reading.
+
+Exit status is 0 only when no check fails; failures are listed with the expected
+and observed values, and undecided checks are listed separately with the shards
+they are waiting on.
 
 Usage:
 
     python scripts/audit_dsv41_headers.py --checkpoint-dir /path/to/DeepSeek-V4.1-Flash
     python scripts/audit_dsv41_headers.py --checkpoint-dir /tmp/dsv41 --header-prefix
     python scripts/audit_dsv41_headers.py --config cfg.json --list-tensors 'engram'
+    python scripts/audit_dsv41_headers.py --checkpoint-dir partial --require-complete
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import re
 import struct
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 
 # The config is read through `src.models.deepseek_v4_1.config`, which is itself
 # standard library only, so the "runs under any interpreter" property holds --
@@ -87,22 +111,65 @@ NIBBLE_DTYPES = {"F4"}
 ENGRAM_ROW_TOLERANCE = 0
 
 
+def shard_label(name: str) -> str:
+    """`model-00015-of-00048.safetensors` -> `15/48`, short enough for a detail line."""
+    match = re.search(r"(\d+)-of-(\d+)\.safetensors$", name)
+    return f"{int(match.group(1))}/{int(match.group(2))}" if match else name
+
+
+def shard_note(shards: Iterable[str], limit: int = 4) -> str:
+    """A one-line list of the shards a check is waiting on."""
+    ordered = sorted(shards)
+    labels = [shard_label(shard) for shard in ordered[:limit]]
+    if len(ordered) > limit:
+        labels.append(f"+{len(ordered) - limit} more")
+    return f"undecided: {len(ordered)} shard(s) not downloaded ({', '.join(labels)})"
+
+
 class Report:
-    """Collects check outcomes so the summary can be printed in one place."""
+    """Collects check outcomes so the summary can be printed in one place.
+
+    A check has three outcomes, not two. `None` is the third: the index places the
+    evidence in a shard that has not been downloaded, so nothing was found wrong
+    and nothing was verified either. Counting it separately from a pass is what
+    keeps a partial checkpoint from reading as a complete one, and
+    `--require-complete` turns it into a failure for callers that need that.
+    """
 
     def __init__(self) -> None:
-        self.checks: list[tuple[str, bool, str]] = []
+        self.checks: list[tuple[str, bool | None, str]] = []
 
-    def check(self, name: str, ok: bool, detail: str = "") -> bool:
-        self.checks.append((name, bool(ok), detail))
-        return bool(ok)
+    def check(self, name: str, ok: bool, detail: str = "", waiting: Iterable[str] = ()) -> bool | None:
+        """Record one check; `waiting` names the shards whose absence makes it moot.
 
-    def fail(self, name: str, detail: str) -> bool:
-        return self.check(name, False, detail)
+        `waiting` only downgrades a *pass*. A check that found a contradiction is
+        reported as a failure whether or not other shards are missing -- the thing
+        it found is wrong either way, and saying so is more useful than deferring.
+        """
+        pending = sorted(set(waiting))
+        if pending:
+            note = shard_note(pending)
+            if ok:
+                detail, ok = "; ".join(filter(None, (note, detail))), None
+            else:
+                detail = "; ".join(filter(None, (detail, f"{len(pending)} shard(s) also not downloaded")))
+        self.checks.append((name, ok, detail))
+        return ok
+
+    def fail(self, name: str, detail: str = "") -> None:
+        self.checks.append((name, False, detail))
 
     @property
     def failures(self) -> list[tuple[str, str]]:
-        return [(n, d) for n, ok, d in self.checks if not ok]
+        return [(n, d) for n, ok, d in self.checks if ok is False]
+
+    @property
+    def undecided(self) -> list[tuple[str, str]]:
+        return [(n, d) for n, ok, d in self.checks if ok is None]
+
+    @property
+    def passed(self) -> int:
+        return sum(1 for _n, ok, _d in self.checks if ok)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +248,128 @@ def load_inventory(paths: list[str]) -> tuple[dict, dict, bool, list[str]]:
                 raise ValueError(f"{key}: declared in both {tensors[key][3]} and {os.path.basename(path)}")
             tensors[key] = (entry["dtype"], shape, span, os.path.basename(path))
     return tensors, per_shard, all_complete, duplicates
+
+
+# ---------------------------------------------------------------------------
+# index-driven coverage
+# ---------------------------------------------------------------------------
+
+
+def load_index(checkpoint_dir: str, explicit: str | None) -> dict:
+    """The tensor -> shard map the release ships, or `{}` when there is none.
+
+    `model.safetensors.index.json` is the checkpoint's own statement of what each
+    shard contains. Reading it is what makes the audit work on a partial download:
+    a presence question ("does layer 14 own a compressor?") is answerable for all
+    96,085 tensors before any payload arrives, and a shape check whose shard is
+    still missing is reported as undecided rather than as a failure, because a
+    tensor being absent from disk says nothing about the checkpoint.
+    """
+    path = explicit or os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise SystemExit(f"{path}: holds no weight_map; pass --index or remove the file")
+    return dict(weight_map)
+
+
+class Coverage:
+    """Which shards of the checkpoint are on disk, according to the index."""
+
+    def __init__(self, weight_map: dict | None = None) -> None:
+        self.weight_map: dict[str, str] = dict(weight_map or {})
+        self.shard_of: dict[str, str] = {}
+        self.local: set[str] = set()
+        self._names = sorted(self.weight_map)
+        self._owners = [self.weight_map[name] for name in self._names]
+
+    @property
+    def indexed(self) -> bool:
+        return bool(self.weight_map)
+
+    @property
+    def shards(self) -> list[str]:
+        """Every shard the index names, in file order."""
+        return sorted(set(self.weight_map.values()))
+
+    @property
+    def pending(self) -> list[str]:
+        """The indexed shards that are not on disk yet."""
+        return [shard for shard in self.shards if shard not in self.local]
+
+    def identify(self, per_shard: dict) -> None:
+        """Match each local file to the index shard whose tensors it holds.
+
+        Matching on tensor names rather than on file names keeps a header-prefix
+        tree usable: the names a fetch gives those files are free-form, but the
+        tensors inside them are not. A file that holds a different set of tensors
+        than any one index shard is left unmatched on purpose, and `check_index`
+        reports it.
+        """
+        for basename, entries in per_shard.items():
+            owners = {self.weight_map[name] for name in entries if name in self.weight_map}
+            if len(owners) == 1:
+                self.shard_of[basename] = owners.pop()
+        self.local = set(self.shard_of.values())
+
+    def waiting(self, names: Iterable[str]) -> list[str]:
+        """The not-yet-local shards holding any of `names`."""
+        if not self.pending:
+            return []
+        pending = set(self.pending)
+        return sorted({self.weight_map[name] for name in names if self.weight_map.get(name) in pending})
+
+    def waiting_under(self, prefix: str) -> list[str]:
+        """`waiting` for every indexed name that starts with `prefix`."""
+        if not self.pending:
+            return []
+        pending = set(self.pending)
+        low = bisect.bisect_left(self._names, prefix)
+        high = bisect.bisect_left(self._names, prefix + "\U0010ffff")
+        return sorted({self._owners[i] for i in range(low, high)} & pending)
+
+
+class Checkpoint:
+    """The tensor facts the audit reads, split by where each one comes from.
+
+    *Does the checkpoint ship this tensor* is answered by the index when there is
+    one -- it lists all 96,085 -- and by the headers otherwise. *What shape is it*
+    is answered by the header, which exists only for the shards that are here.
+    Keeping the two apart is the whole point: on a partial download they have
+    different answers, and collapsing them would either miss a real defect or
+    invent one.
+    """
+
+    def __init__(self, tensors: dict, per_shard: dict, complete: bool, coverage: Coverage) -> None:
+        self.tensors = tensors
+        self.per_shard = per_shard
+        self.complete = complete
+        self.coverage = coverage
+        self._names: set[str] | None = None
+
+    @property
+    def names(self) -> set[str]:
+        """Every tensor the checkpoint ships, whether or not it is readable yet."""
+        if self._names is None:
+            source = self.coverage.weight_map if self.coverage.indexed else self.tensors
+            self._names = set(source)
+        return self._names
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.names
+
+    def shape(self, name: str):
+        entry = self.tensors.get(name)
+        return entry[1] if entry else None
+
+    def waiting(self, *names: str) -> list[str]:
+        return self.coverage.waiting(names)
+
+    def waiting_under(self, prefix: str) -> list[str]:
+        return self.coverage.waiting_under(prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +624,7 @@ def categorize(name: str) -> str:
     return "layer_other"
 
 
-def check_packing(tensors: dict, report: Report) -> list[str]:
+def check_packing(ckpt: Checkpoint, report: Report) -> list[str]:
     """Every tensor's byte extent must match its shape and dtype.
 
     This is the check that proves the routed experts are packed: an I8 tensor of
@@ -443,7 +632,7 @@ def check_packing(tensors: dict, report: Report) -> list[str]:
     [2304, 5120] weight, and an unpacked export would not match.
     """
     mismatched = []
-    for name, (dtype, shape, span, _shard) in tensors.items():
+    for name, (dtype, shape, span, _shard) in ckpt.tensors.items():
         elements = 1
         for dim in shape:
             elements *= dim
@@ -472,75 +661,146 @@ def block_of(weight_shape, scale_shape) -> tuple[int, int] | None:
     return weight_shape[0] // scale_shape[0], weight_shape[1] // scale_shape[1]
 
 
-def check_scale_pairs(tensors: dict, report: Report, expect_block: tuple[int, int]) -> None:
+def settles(observed: set, expected: set, complete: bool) -> bool:
+    """Whether a claim about a set of tensors holds on the evidence available.
+
+    `observed` can only be built from the shards that are here, so a partial
+    download proves `observed <= expected` and nothing more. Saying `==` here
+    would fail every such check for the wrong reason -- an empty observation is
+    not a contradiction, it is an absence of evidence, and `Report.check` is what
+    records that distinction once `complete` says the evidence is all in.
+    """
+    return observed == expected if complete else observed <= expected
+
+
+def check_scale_pairs(ckpt: Checkpoint, report: Report, expect_block: tuple[int, int]) -> None:
     """Quantized weights must divide evenly by their scale, at the expected block.
 
     The two Engram tables are the exception: they are stored fp8 with one E8M0
     scale per 32 channels and no row blocking at all, so their block is 1 x 32
     rather than the 32 x 32 every other fp8 weight uses. That is a fact about the
     checkpoint, not a rounding of the rule, so it is checked separately.
+
+    The block a pair uses is a property of that pair, so every pair whose shard is
+    here is decided on its own. The claim that *all* fp8 weights in the checkpoint
+    use the block is only as complete as the download, so the two set comparisons
+    below are reported undecided while shards holding unchecked weights are
+    outstanding rather than being read as a statement about the whole checkpoint.
     """
     blocks: Counter = Counter()
     engram_blocks: Counter = Counter()
     broken = []
-    for name, (dtype, shape, _span, _shard) in tensors.items():
+    unreadable = []
+    for name, (dtype, shape, _span, _shard) in ckpt.tensors.items():
         if not name.endswith(".weight") or dtype == "I8":
             continue
         scale_name = name[: -len(".weight")] + ".scale"
-        if scale_name not in tensors:
+        if scale_name not in ckpt:
+            continue  # the checkpoint ships no scale for this weight
+        if scale_name not in ckpt.tensors:
+            unreadable.append(scale_name)
             continue
-        block = block_of(shape, tensors[scale_name][1])
+        block = block_of(shape, ckpt.shape(scale_name))
         if block is None:
-            broken.append(f"{name}{list(shape)} vs {list(tensors[scale_name][1])}")
+            broken.append(f"{name}{list(shape)} vs {list(ckpt.shape(scale_name))}")
             continue
         (engram_blocks if ".engram.embed." in name else blocks)[block] += 1
-    report.check("scales: every weight/scale pair blocks evenly", not broken, "; ".join(broken[:6]))
+    report.check(
+        "scales: every weight/scale pair blocks evenly",
+        not broken,
+        "; ".join(broken[:6]),
+        ckpt.waiting(*unreadable),
+    )
+
+    # Which weights are in scope: `.weight` names that ship a `.scale` sibling, in
+    # the checkpoint's own inventory rather than in the shards on disk.
+    paired = [name for name in ckpt.names if name.endswith(".weight") and name[: -len(".weight")] + ".scale" in ckpt]
+    engram_paired = [name for name in paired if ".engram.embed." in name]
+    plain_paired = [name for name in paired if ".engram.embed." not in name]
     report.check(
         f"scales: all non-Engram FP8 weights use a {expect_block[0]}x{expect_block[1]} block",
-        set(blocks) == {expect_block},
+        settles(set(blocks), {expect_block}, not plain_paired or not ckpt.waiting(*plain_paired)),
         f"observed blocks {dict(blocks)}",
+        ckpt.waiting(*plain_paired),
     )
     report.check(
         "scales: the Engram tables use a 1x32 per-row block",
-        set(engram_blocks) == {(1, 32)},
+        settles(set(engram_blocks), {(1, 32)}, not engram_paired or not ckpt.waiting(*engram_paired)),
         f"observed blocks {dict(engram_blocks)}",
+        ckpt.waiting(*engram_paired),
     )
 
 
-def check_backbone(config: dict, tensors: dict, report: Report) -> None:
+def check_index(ckpt: Checkpoint, report: Report) -> None:
+    """Every local file must hold exactly the tensors the index assigns to one shard.
+
+    This is what lets the rest of the audit trust presence. The index is the
+    checkpoint's own statement of its contents, so a file whose header disagrees
+    with it is a real defect -- a truncated write, a mixed-up shard, a repacked
+    export -- rather than a file that has not arrived yet. It is also the check
+    that keeps a header-prefix tree honest: fetch the wrong range and the tensors
+    that come back name a different shard than the file claims.
+    """
+    coverage = ckpt.coverage
+    if not coverage.indexed:
+        return
+    mismatched = []
+    for basename, entries in sorted(ckpt.per_shard.items()):
+        shard = coverage.shard_of.get(basename)
+        if shard is None:
+            mismatched.append(f"{basename}: holds tensors from no single indexed shard")
+            continue
+        expected = {name for name, owner in coverage.weight_map.items() if owner == shard}
+        if set(entries) != expected:
+            extra = sorted(set(entries) - expected)[:3]
+            absent = sorted(expected - set(entries))[:3]
+            mismatched.append(
+                f"{shard}: {len(entries)} tensors against {len(expected)} in the index"
+                + (f", unexpected {extra}" if extra else "")
+                + (f", absent {absent}" if absent else "")
+            )
+    report.check(
+        "index: every local shard holds exactly the tensors the index assigns it",
+        not mismatched,
+        "; ".join(mismatched[:4]),
+    )
+
+
+BACKBONE_SUFFIXES = (
+    "attn.wq_a.weight",
+    "attn.wq_b.weight",
+    "attn.wkv.weight",
+    "attn.wo_a.weight",
+    "attn.wo_b.weight",
+    "attn.q_norm.weight",
+    "attn.kv_norm.weight",
+    "attn.attn_sink",
+    "attn_norm.weight",
+    "ffn.gate.weight",
+    "ffn_norm.weight",
+    "hc_attn_fn",
+    "hc_attn_base",
+    "hc_attn_scale",
+    "hc_ffn_fn",
+    "hc_ffn_base",
+    "hc_ffn_scale",
+)
+
+
+def check_backbone(config: dict, ckpt: Checkpoint, report: Report) -> None:
     layers, mtp = config["n_layers"], config["n_mtp_layers"]
     dim, inter = config["dim"], config["moe_inter_dim"]
     hc_mult = config["hc_mult"]
     mix_hc = (2 + hc_mult) * hc_mult
 
+    # Presence is an index question, so it is answered for every layer as soon as
+    # the index is readable. With no index it falls back to the headers, which is
+    # the header-prefix case the audit started as.
     missing = []
     for layer in range(layers):
         prefix = f"layers.{layer}."
-        for suffix in (
-            "attn.wq_a.weight",
-            "attn.wq_b.weight",
-            "attn.wkv.weight",
-            "attn.wo_a.weight",
-            "attn.wo_b.weight",
-            "attn.q_norm.weight",
-            "attn.kv_norm.weight",
-            "attn.attn_sink",
-            "attn_norm.weight",
-            "ffn.gate.weight",
-            "ffn_norm.weight",
-            "hc_attn_fn",
-            "hc_attn_base",
-            "hc_attn_scale",
-            "hc_ffn_fn",
-            "hc_ffn_base",
-            "hc_ffn_scale",
-        ):
-            if prefix + suffix not in tensors:
-                missing.append(prefix + suffix)
+        missing += [prefix + suffix for suffix in BACKBONE_SUFFIXES if prefix + suffix not in ckpt]
     report.check("inventory: every backbone layer has its full tensor set", not missing, "; ".join(missing[:6]))
-
-    def shape_of(name):
-        return tensors[name][1] if name in tensors else None
 
     expected = {
         "embed.weight": (config["vocab_size"], dim),
@@ -560,34 +820,58 @@ def check_backbone(config: dict, tensors: dict, report: Report) -> None:
         "layers.0.hc_attn_base": (mix_hc,),
         "layers.0.hc_attn_scale": (3,),
     }
-    wrong = [f"{n}: {shape_of(n)} != {s}" for n, s in expected.items() if shape_of(n) != s]
-    report.check("inventory: the known shapes match the config", not wrong, "; ".join(wrong))
+    wrong, waiting = [], []
+    for name, want in expected.items():
+        if ckpt.shape(name) == want:
+            continue
+        pending = ckpt.waiting(name)
+        if pending:
+            waiting += pending
+        else:
+            wrong.append(f"{name}: {ckpt.shape(name)} != {want}")
+    report.check("inventory: the known shapes match the config", not wrong, "; ".join(wrong), waiting)
 
-    dtype_wrong = [
-        f"{n}: {tensors[n][0]} != {d}"
-        for n, d in (
-            ("layers.0.attn.attn_sink", "F32"),
-            ("layers.0.ffn.gate.weight", "BF16"),
-            ("layers.0.hc_attn_fn", "F32"),
-            ("embed.weight", "BF16"),
-        )
-        if n in tensors and tensors[n][0] != d
-    ]
-    report.check("inventory: the F32/BF16 tensors are not quantized", not dtype_wrong, "; ".join(dtype_wrong))
+    # An unquantized tensor's dtype is readable wherever its shard is, so this only
+    # waits on the ones that have not arrived.
+    dtype_expected = (
+        ("layers.0.attn.attn_sink", "F32"),
+        ("layers.0.ffn.gate.weight", "BF16"),
+        ("layers.0.hc_attn_fn", "F32"),
+        ("embed.weight", "BF16"),
+    )
+    dtype_wrong, dtype_waiting = [], []
+    for name, dtype in dtype_expected:
+        entry = ckpt.tensors.get(name)
+        if entry is None:
+            dtype_waiting += ckpt.waiting(name)
+        elif entry[0] != dtype:
+            dtype_wrong.append(f"{name}: {entry[0]} != {dtype}")
+    report.check(
+        "inventory: the F32/BF16 tensors are not quantized", not dtype_wrong, "; ".join(dtype_wrong), dtype_waiting
+    )
 
-    # Routed experts: FP4 packed into I8, scales as F8_E8M0 over 32 columns.
-    expert_rows = []
-    shape_wrong = []
+    # Routed experts: FP4 packed into I8, scales as F8_E8M0 over 32 columns. The
+    # count comes from presence and the packing from the shapes, so a partially
+    # downloaded checkpoint can still say how many experts each layer has.
+    expert_counts = []
     for layer in range(layers + mtp):
         prefix = f"layers.{layer}." if layer < layers else f"mtp.{layer - layers}."
         count = 0
-        while f"{prefix}ffn.experts.{count}.w1.weight" in tensors:
+        while f"{prefix}ffn.experts.{count}.w1.weight" in ckpt:
             count += 1
-        expert_rows.append(count)
-        for index in range(count):
-            w1 = tensors[f"{prefix}ffn.experts.{index}.w1.weight"]
-            w2 = tensors[f"{prefix}ffn.experts.{index}.w2.weight"]
-            s1 = tensors[f"{prefix}ffn.experts.{index}.w1.scale"]
+        expert_counts.append(count)
+
+    shape_wrong, expert_waiting = [], []
+    for layer in range(layers + mtp):
+        prefix = f"layers.{layer}." if layer < layers else f"mtp.{layer - layers}."
+        pending = ckpt.waiting_under(prefix + "ffn.experts.")
+        if pending:
+            expert_waiting += pending
+            continue
+        for index in range(expert_counts[layer]):
+            w1 = ckpt.tensors[f"{prefix}ffn.experts.{index}.w1.weight"]
+            w2 = ckpt.tensors[f"{prefix}ffn.experts.{index}.w2.weight"]
+            s1 = ckpt.tensors[f"{prefix}ffn.experts.{index}.w1.scale"]
             if w1[:2] != ("I8", (inter, dim // 2)) or w2[:2] != ("I8", (dim, inter // 2)):
                 shape_wrong.append(f"{prefix}ffn.experts.{index}: {w1[0]}{list(w1[1])} {w2[0]}{list(w2[1])}")
             if s1[:2] != ("F8_E8M0", (inter, dim // 32)):
@@ -597,22 +881,22 @@ def check_backbone(config: dict, tensors: dict, report: Report) -> None:
     report.check(
         "experts: w1/w2/w3 are FP4 packed into I8 with FP4-block-32 E8M0 scales",
         not shape_wrong,
-        f"expected I8[{inter},{dim // 2}] and F8_E8M0[{inter},{dim // 32}]; "
-        + "; ".join(shape_wrong[:4]),
+        f"expected I8[{inter},{dim // 2}] and F8_E8M0[{inter},{dim // 32}]; " + "; ".join(shape_wrong[:4]),
+        expert_waiting,
     )
     report.check(
         f"experts: every backbone layer has {config['n_routed_experts']} routed experts",
-        all(count == config["n_routed_experts"] for count in expert_rows[:layers]),
-        f"observed {sorted(set(expert_rows[:layers]))}",
+        all(count == config["n_routed_experts"] for count in expert_counts[:layers]),
+        f"observed {sorted(set(expert_counts[:layers]))}",
     )
     report.check(
         f"experts: every MTP layer has {config['dspark_n_routed_experts']} routed experts",
-        all(count == config["dspark_n_routed_experts"] for count in expert_rows[layers:]),
-        f"observed {sorted(set(expert_rows[layers:])) if expert_rows[layers:] else 'none'}",
+        all(count == config["dspark_n_routed_experts"] for count in expert_counts[layers:]),
+        f"observed {sorted(set(expert_counts[layers:])) if expert_counts[layers:] else 'none'}",
     )
 
 
-def check_csa2(config: dict, tensors: dict, report: Report) -> None:
+def check_csa2(config: dict, ckpt: Checkpoint, report: Report) -> None:
     """Compressor and indexer ownership, and the three CSA2 modes they define.
 
     The model card names three static modes -- Full, Reindex and Reuse. The
@@ -621,6 +905,10 @@ def check_csa2(config: dict, tensors: dict, report: Report) -> None:
     a Reindex layer owns only the indexer's query side (`indexer.wq_b`,
     `indexer.weights_proj`) and reads K from the source below it, and a Reuse
     layer owns neither. Those three groups must partition the backbone.
+
+    Presence is an index question, so all five checks here are decided as soon as
+    the index is readable -- which is the layer assignment a runtime has to
+    implement, and the part of the checkpoint most worth knowing early.
     """
     layers = config["n_layers"]
     kv_sources = set(config["kv_source_layers"])
@@ -637,7 +925,7 @@ def check_csa2(config: dict, tensors: dict, report: Report) -> None:
             ("indexer.wq_b", "attn.indexer.wq_b.weight"),
             ("indexer.weights_proj", "attn.indexer.weights_proj.weight"),
         ):
-            if prefix + suffix in tensors:
+            if prefix + suffix in ckpt:
                 present[label].append(layer)
 
     report.check(
@@ -675,55 +963,66 @@ def check_csa2(config: dict, tensors: dict, report: Report) -> None:
     print(f"    CSA2 modes: Full={full}  Reindex={reindex}  Reuse={len(reuse)} layers")
 
 
-def check_engram_tensors(config: dict, tensors: dict, report: Report, derived_rows: list[int]) -> None:
+def check_engram_tensors(config: dict, ckpt: Checkpoint, report: Report, derived_rows: list[int]) -> None:
     layer_ids = list(config["engram_layer_ids"])
     head_dim = config["engram_head_dim"]
     expected_rows = dict(zip(layer_ids, config["engram_num_embeddings"]))
 
-    wrong, found = [], []
-    for layer in range(config["n_layers"]):
+    misplaced = [
+        f"layers.{layer}: engram present={f'layers.{layer}.engram.embed.weight' in ckpt}, "
+        f"expected={layer in layer_ids}"
+        for layer in range(config["n_layers"])
+        if (f"layers.{layer}.engram.embed.weight" in ckpt) != (layer in layer_ids)
+    ]
+    report.check("engram: the tables sit on exactly engram_layer_ids", not misplaced, "; ".join(misplaced[:4]))
+
+    wrong, waiting = [], []
+    for layer in layer_ids:
         prefix = f"layers.{layer}.engram."
-        has = prefix + "embed.weight" in tensors
-        if has != (layer in layer_ids):
-            wrong.append(f"layers.{layer}: engram present={has}, expected={layer in layer_ids}")
-        if not has:
+        weight = ckpt.tensors.get(prefix + "embed.weight")
+        scale = ckpt.tensors.get(prefix + "embed.scale")
+        if weight is None or scale is None:
+            waiting += ckpt.waiting(prefix + "embed.weight", prefix + "embed.scale")
             continue
-        found.append(layer)
-        weight = tensors[prefix + "embed.weight"]
-        scale = tensors[prefix + "embed.scale"]
         if weight[0] != "F8_E4M3" or weight[1] != (expected_rows[layer], head_dim):
             wrong.append(f"{prefix}embed.weight: {weight[0]}{list(weight[1])}")
         if scale[0] != "F8_E8M0" or scale[1] != (expected_rows[layer], head_dim // 32):
             wrong.append(f"{prefix}embed.scale: {scale[0]}{list(scale[1])}")
     report.check(
-        "engram: the tables sit on exactly engram_layer_ids, F8_E4M3 with E8M0 scales",
+        "engram: the tables are F8_E4M3 with one E8M0 scale per 32 channels",
         not wrong,
         "; ".join(wrong[:4]),
+        waiting,
     )
 
-    per_layer = []
-    for layer in found:
+    per_layer, projection_waiting = [], []
+    for layer in layer_ids:
         prefix = f"layers.{layer}.engram."
-        needed = ("wkv.weight", "q_weight", "k_weight")
-        absent = [prefix + name for name in needed if prefix + name not in tensors]
+        needed = ("wkv.weight", "wkv.scale", "q_weight", "k_weight")
+        absent = [prefix + name for name in needed if prefix + name not in ckpt.tensors]
         if absent:
-            per_layer.append("; ".join(absent))
-        elif tensors[prefix + "q_weight"][1] != (config["hc_mult"], config["dim"]):
-            per_layer.append(f"{prefix}q_weight: {list(tensors[prefix + 'q_weight'][1])}")
-    report.check("engram: each Engram layer has its gate and value projection", not per_layer, "; ".join(per_layer))
+            projection_waiting += ckpt.waiting(*absent)
+        elif ckpt.shape(prefix + "q_weight") != (config["hc_mult"], config["dim"]):
+            per_layer.append(f"{prefix}q_weight: {list(ckpt.shape(prefix + 'q_weight'))}")
+    report.check(
+        "engram: each Engram layer has its gate and value projection",
+        not per_layer,
+        "; ".join(per_layer),
+        projection_waiting,
+    )
 
-    if found:
-        bytes_total = sum(
-            tensors[f"layers.{layer}.engram.embed.{part}"][2] for layer in found for part in ("weight", "scale")
-        )
-        rows = sum(tensors[f"layers.{layer}.engram.embed.weight"][1][0] for layer in found)
-        print(
-            f"    Engram tables: {len(found)} layers, {rows:,} rows, {bytes_total / 2**30:.2f} GiB "
-            f"(derived bucket minimum {derived_rows})"
-        )
+    # The table row count is in the config, so the size is knowable before the two
+    # shards holding 189 GiB of embeddings arrive: one fp8 value per channel plus
+    # one E8M0 scale per 32 channels.
+    rows = sum(config["engram_num_embeddings"])
+    table_bytes = rows * (head_dim + head_dim // 32)
+    print(
+        f"    Engram tables: layers {layer_ids}, {rows:,} rows, {table_bytes / 2**30:.2f} GiB "
+        f"of embed weight+scale (derived bucket minimum {derived_rows})"
+    )
 
 
-def check_vision(config: dict, tensors: dict, report: Report) -> None:
+def check_vision(config: dict, ckpt: Checkpoint, report: Report) -> None:
     n_layers, dim = config["vision_n_layers"], config["vision_dim"]
     patch = config["vision_patch_size"]
     downsample = config.get("vision_downsample_ratio", 3)
@@ -732,7 +1031,7 @@ def check_vision(config: dict, tensors: dict, report: Report) -> None:
     for block in range(n_layers):
         prefix = f"vision.blocks.{block}."
         for suffix in ("attn.wqkv.weight", "attn.wo.weight", "mlp.w1.weight", "mlp.w2.weight", "norm1.weight", "norm2.weight"):
-            if prefix + suffix not in tensors:
+            if prefix + suffix not in ckpt:
                 missing.append(prefix + suffix)
     report.check(f"vision: all {n_layers} blocks are present", not missing, "; ".join(missing[:6]))
 
@@ -741,40 +1040,60 @@ def check_vision(config: dict, tensors: dict, report: Report) -> None:
         "vision.blocks.0.attn.wqkv.weight": (3 * dim, dim),
         "aligner.w1.weight": (config["dim"], dim * downsample * downsample),
     }
-    wrong = [f"{n}: {tensors[n][1]} != {s}" for n, s in expected.items() if n in tensors and tensors[n][1] != s]
-    report.check("vision: the encoder and projector shapes match the config", not wrong, "; ".join(wrong))
+    wrong, waiting = [], []
+    for name, want in expected.items():
+        if ckpt.shape(name) == want:
+            continue
+        pending = ckpt.waiting(name)
+        if pending:
+            waiting += pending
+        else:
+            wrong.append(f"{name}: {ckpt.shape(name)} != {want}")
+    report.check("vision: the encoder and projector shapes match the config", not wrong, "; ".join(wrong), waiting)
 
 
-def check_mtp(config: dict, tensors: dict, report: Report) -> None:
+def check_mtp(config: dict, ckpt: Checkpoint, report: Report) -> None:
     mtp = config["n_mtp_layers"]
     markov_rank, dim = config["dspark_markov_rank"], config["dim"]
     vocab = config["vocab_size"]
+    last = f"mtp.{mtp - 1}."
 
     expected = {
-        "mtp.2.markov_head.embed.weight": (vocab, markov_rank),
-        "mtp.2.markov_head.head.weight": (vocab, markov_rank),
-        "mtp.2.confidence_head.proj.weight": (1, dim + markov_rank),
+        last + "markov_head.embed.weight": (vocab, markov_rank),
+        last + "markov_head.head.weight": (vocab, markov_rank),
+        last + "confidence_head.proj.weight": (1, dim + markov_rank),
     }
-    wrong = [f"{n}: {tensors[n][1]} != {s}" for n, s in expected.items() if n in tensors and tensors[n][1] != s]
-    report.check("dspark: the Markov and confidence heads match the config", not wrong, "; ".join(wrong))
+    wrong, waiting = [], []
+    for name, want in expected.items():
+        if ckpt.shape(name) == want:
+            continue
+        pending = ckpt.waiting(name)
+        if pending:
+            waiting += pending
+        else:
+            wrong.append(f"{name}: {ckpt.shape(name)} != {want}")
+    report.check("dspark: the Markov and confidence heads match the config", not wrong, "; ".join(wrong), waiting)
 
     # The DSpark block consumes the attention input of its target layers, so its
     # projection is as wide as there are targets.
-    main_proj = [k for k in tensors if re.match(r"^mtp\.\d+\.main_proj\.weight$", k)]
+    main_proj = [name for name in ckpt.names if re.match(r"^mtp\.\d+\.main_proj\.weight$", name)]
+    readable = [(name, list(ckpt.shape(name))) for name in main_proj if name in ckpt.tensors]
     report.check(
         "dspark: main_proj is n_mtp_layers * dim wide",
-        all(tensors[k][1] == (dim, mtp * dim) for k in main_proj) and bool(main_proj),
-        f"{[(k, list(tensors[k][1])) for k in main_proj]}",
+        bool(main_proj) and all(ckpt.shape(name) == (dim, mtp * dim) for name in main_proj if name in ckpt.tensors),
+        f"{readable or main_proj} (want shape ({dim}, {mtp * dim}))",
+        ckpt.waiting(*[name for name in main_proj if name not in ckpt.tensors]),
     )
     report.check(
         "dspark: every MTP layer carries attn and ffn but only the last carries the heads",
-        all(f"mtp.{i}.attn.wq_a.weight" in tensors and f"mtp.{i}.ffn.gate.weight" in tensors for i in range(mtp)),
+        all(f"mtp.{i}.attn.wq_a.weight" in ckpt and f"mtp.{i}.ffn.gate.weight" in ckpt for i in range(mtp)),
         f"mtp layers with the DSpark heads: "
-        f"{[i for i in range(mtp) if f'mtp.{i}.markov_head.embed.weight' in tensors]}",
+        f"{[i for i in range(mtp) if f'mtp.{i}.markov_head.embed.weight' in ckpt]}",
     )
 
 
-def report_inventory(tensors: dict, per_shard: dict, report: Report) -> None:
+def report_inventory(ckpt: Checkpoint, report: Report) -> None:
+    tensors = ckpt.tensors
     categories: dict[str, list[int]] = defaultdict(lambda: [0, 0])
     dtypes: dict[str, Counter] = defaultdict(Counter)
     for name, (dtype, _shape, span, _shard) in tensors.items():
@@ -789,15 +1108,23 @@ def report_inventory(tensors: dict, per_shard: dict, report: Report) -> None:
         kinds = " ".join(f"{dtype}x{n}" for dtype, n in sorted(dtypes[label].items()))
         print(f"    {label:16} {count:8,} tensors  {spans / 2**30:9.2f} GiB  {kinds}")
     print(f"    {'TOTAL':16} {len(tensors):8,} tensors  {total / 2**30:9.2f} GiB")
+    if ckpt.coverage.indexed:
+        shipped = len(ckpt.coverage.weight_map)
+        print(
+            f"    {'of':16} {shipped:8,} tensors shipped by the index "
+            f"({100 * len(tensors) / shipped:.1f}% readable from the shards on disk)"
+        )
 
     largest = max(tensors.items(), key=lambda item: item[1][2])
     print(f"    largest tensor: {largest[0]} {largest[1][0]}{list(largest[1][1])} {largest[1][2] / 2**30:.2f} GiB")
     report.check("inventory: the tensor count and byte total are non-zero", len(tensors) > 0 and total > 0)
 
     print("\n  Shards")
-    for shard, entries in sorted(per_shard.items()):
+    for shard, entries in sorted(ckpt.per_shard.items()):
         spans = sum(entry["data_offsets"][1] - entry["data_offsets"][0] for entry in entries.values())
-        print(f"    {shard:24} {len(entries):7,} tensors  {spans / 2**30:9.2f} GiB")
+        indexed = ckpt.coverage.shard_of.get(shard)
+        suffix = f"  {shard_label(indexed)}" if indexed else ""
+        print(f"    {shard:24} {len(entries):7,} tensors  {spans / 2**30:9.2f} GiB{suffix}")
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +1145,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--header-prefix",
         action="store_true",
         help="assert that the shards are header-only prefixes, not complete files",
+    )
+    parser.add_argument(
+        "--index",
+        default=None,
+        help="safetensors index naming each tensor's shard; defaults to <checkpoint-dir>/model.safetensors.index.json. "
+        "With it, presence is checked across the whole checkpoint and shape checks whose shard is missing are "
+        "reported as undecided instead of failing; without it the audit is header-only",
+    )
+    parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="treat an undecided check -- one whose evidence sits in a shard that is not downloaded -- as a failure",
     )
     parser.add_argument("--expect-fp8-block", type=int, nargs=2, default=(32, 32), metavar=("OUT", "IN"))
     parser.add_argument("--json", default=None, help="write the machine-readable result here")
@@ -852,6 +1191,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{name}\t{dtype}\t{list(shape)}\t{span}\t{shard}")
         return 0
 
+    coverage = Coverage(load_index(args.checkpoint_dir, args.index))
+    coverage.identify(per_shard)
+    ckpt = Checkpoint(tensors, per_shard, complete, coverage)
     config = load_config(resolve_config(args.checkpoint_dir, args.config))
     report = Report()
 
@@ -859,28 +1201,55 @@ def main(argv: list[str] | None = None) -> int:
     for duplicate in duplicates:
         print(f"  skipped duplicate shard: {duplicate}")
     print(f"  mode: {'header-only prefixes' if not complete else 'complete shards'}")
+    if coverage.indexed:
+        print(
+            f"  index: {len(coverage.weight_map):,} tensors over {len(coverage.shards)} shards, "
+            f"{len(coverage.local)} local, {len(coverage.pending)} not downloaded"
+        )
+        print(
+            f"  readable: {len(tensors):,} of {len(coverage.weight_map):,} tensors "
+            f"({100 * len(tensors) / len(coverage.weight_map):.1f}%); "
+            "presence is checked across the checkpoint, shape only where the shard is here"
+        )
+    elif complete:
+        print("  note: no index beside the shards, so presence is read from the headers alone")
     if args.header_prefix and complete:
         print("  warning: --header-prefix was given but the shards look complete", file=sys.stderr)
     if not complete and not args.header_prefix:
         print("  note: payloads are absent, so only the headers were read")
 
     check_config(config, report)
+    check_index(ckpt, report)
     derived_rows = check_engram_tables(config, report)
-    check_packing(tensors, report)
-    check_scale_pairs(tensors, report, tuple(args.expect_fp8_block))
-    check_backbone(config, tensors, report)
-    check_csa2(config, tensors, report)
-    check_engram_tensors(config, tensors, report, derived_rows)
-    check_vision(config, tensors, report)
-    check_mtp(config, tensors, report)
-    report_inventory(tensors, per_shard, report)
+    check_packing(ckpt, report)
+    check_scale_pairs(ckpt, report, tuple(args.expect_fp8_block))
+    check_backbone(config, ckpt, report)
+    check_csa2(config, ckpt, report)
+    check_engram_tensors(config, ckpt, report, derived_rows)
+    check_vision(config, ckpt, report)
+    check_mtp(config, ckpt, report)
+    report_inventory(ckpt, report)
 
-    failures = report.failures
-    print(f"\n  {len(report.checks) - len(failures)}/{len(report.checks)} checks passed")
+    failures, undecided = report.failures, report.undecided
+    summary = f"\n  {report.passed}/{len(report.checks)} checks passed"
+    if failures:
+        summary += f", {len(failures)} failed"
+    if undecided:
+        summary += f", {len(undecided)} undecided"
+    print(summary)
     for name, detail in failures:
         print(f"    [FAIL] {name}")
         if detail:
             print(f"           {detail}")
+    for name, detail in undecided:
+        print(f"    [UNDECIDED] {name}")
+        if detail:
+            print(f"           {detail}")
+    if undecided:
+        print("  note: undecided is not a pass -- those checks cover tensors in shards that are not downloaded")
+
+    if args.require_complete and undecided:
+        print(f"  --require-complete: {len(undecided)} undecided check(s) counted as failures", file=sys.stderr)
 
     if args.json:
         with open(args.json, "w") as handle:
@@ -890,13 +1259,23 @@ def main(argv: list[str] | None = None) -> int:
                     "shards": len(paths),
                     "complete": complete,
                     "tensors": len(tensors),
-                    "checks": [{"name": n, "passed": ok, "detail": d} for n, ok, d in report.checks],
+                    "index": {
+                        "indexed": coverage.indexed,
+                        "shipped_tensors": len(coverage.weight_map),
+                        "local_shards": sorted(coverage.local),
+                        "pending_shards": coverage.pending,
+                    },
+                    "checks": [
+                        {"name": n, "status": "undecided" if ok is None else ("pass" if ok else "fail"),
+                         "passed": ok is True, "detail": d}
+                        for n, ok, d in report.checks
+                    ],
                 },
                 handle,
                 indent=2,
             )
 
-    return 1 if failures else 0
+    return 1 if failures or (args.require_complete and undecided) else 0
 
 
 if __name__ == "__main__":

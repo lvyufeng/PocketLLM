@@ -2,17 +2,17 @@
 
 ## Runtime status
 
-**Inspect only: both config layouts the release ships are read into one schema, a 37-check safetensors-header audit is validated on the host, and the Engram hash front end that addresses the two 189 GiB tables is reproduced and tested; no V4.1 execution path exists in this repository.**
+**Inspect only: both config layouts the release ships are read into one schema, a 38-check safetensors-header audit — 39 against the release's own index — runs on the host and distinguishes a shard that has not downloaded from a shard that is wrong, and the Engram hash front end that addresses the two 189 GiB tables is reproduced and tested; no V4.1 execution path exists in this repository.**
 
-Nothing in this page generates tokens. The repository has no V4.1 layer code: `kv_source_layers` and `candidate_source_layer` appear only as config key names, in the schema, the audit and the tests this page documents, and never as anything a forward pass reads; `bias_vl` appears nowhere but this page. `engram` does appear — `src/encoding/engram.py` reproduces the reference's tokenizer-side front end — but that is address arithmetic over a tokenizer, not a layer of the model. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
+Nothing in this page generates tokens. The repository has no V4.1 layer code: `kv_source_layers` and `candidate_source_layer` appear only as config key names — in the schema and the audit and the tests this page documents, and nowhere a forward pass reads them. `ffn.gate.bias_vl` is the same kind of name: it is a real F32 `[384]` tensor on every backbone layer of the checkpoint, read out of the shards, but nothing here consumes it. `engram` does appear — `src/encoding/engram.py` reproduces the reference's tokenizer-side front end — but that is address arithmetic over a tokenizer, not a layer of the model. `cpp_engine/engine/deepseek_v4_engine.cpp` and `src/models/deepseek_v4/` target the 43-layer, 4096-hidden DeepSeek-V4-Flash geometry.
 
 What *was* validated is a set of facts read out of the checkpoint's own metadata, plus an Engram front end that needs only the config and a tokenizer:
 
 - `src/models/deepseek_v4_1/config.py` reads either config layout into one schema, so the two files that describe this model are checked against each other rather than parsed ad hoc by each consumer.
-- `scripts/audit_dsv41_headers.py` reads the config through that schema and runs 37 checks over the safetensors headers.
-- The audit ran against the first 3,000,001 bytes of each of the 48 published shards — roughly 144 MB in total. **No weight payload was downloaded or read.**
+- `scripts/audit_dsv41_headers.py` reads the config through that schema and runs 38 checks over the safetensors headers — 39 when the checkpoint's own `model.safetensors.index.json` is present, which is what the release ships.
+- The audit has run twice: against the first 3,000,001 bytes of each of the 48 published shards (roughly 144 MB in total), where 38 of 38 checks pass, and against the real checkpoint as it downloads, where 20 of 48 shards give 31 passes, 8 undecided and no failures. **No weight payload was downloaded or read** in either run.
 - `src/encoding/engram.py` re-derives the Engram bucket layout and hashes token n-grams onto it. The primes it draws add up to the declared `engram_num_embeddings` exactly, so the 189.13 GiB of Engram tables are addressable rather than merely counted.
-- Upshot: 96,085 tensors, 510,286,023,000 B (475.24 GiB), a fully consistent tensor inventory, an Engram layout that closes to the row, and a checkpoint-specific configuration that differs from the validated V4-Flash config in the ways listed below.
+- Upshot: 96,085 tensors, 510,286,023,000 B (475.24 GiB), a fully consistent tensor inventory, an Engram layout that closes to the row, and a checkpoint-specific configuration that differs from the validated V4-Flash config in the ways listed below. The 8 undecided checks are shape claims waiting on the 28 shards that had not landed — undecided is not a pass, and `--require-complete` turns it into a failure.
 
 Generation, TPS and numerical parity are unmeasured and are not claimed. See [Known limitations](#known-limitations).
 
@@ -101,6 +101,8 @@ Shard layout, from the 48 published headers:
 | `h00044`–`h00046` | `mtp.0`, `mtp.1`, `mtp.2`, ~2.5 GiB each |
 | `h00047`, `h00048` | Engram tables for layers 1 and 14, 94.56 GiB each |
 
+The counts in that table are per *shard*, which is not the same as per *layer*: layer 1's six Engram tensors are shipped in `h00047` while layer 1 itself is `h00004`, so `h00004` holds 2,334 tensors and the layer has 2,340. Counting the index by layer instead gives an exact partition — 2,334 for a Reuse layer, 2,337 for a Reindex layer, 2,342 for a Full layer, 2,340 for layer 1 (+6, Engram), 2,341 for layer 20 (the Full set minus `compressor.wgate`, since `compress_ratios[20] == 1`) and 2,348 for layer 14 (Full + Engram) — with every one of the 40 layers a strict superset of the plain set. The landed shards match the index's assignment shard for shard. [Auditing the shards while the checkpoint arrives](../performance/deepseek_v4_1_shard_audit.md) records that partition in full, together with the tensor shapes read out of the shards that have downloaded; no per-layer count in this paragraph is taken from a model card.
+
 Two Engram tables dominate the checkpoint. `layers.1.engram.embed.weight` is F8_E4M3 `[384006168, 256]` with an F8_E8M0 `[384006168, 8]` scale, 91.55 GiB; `layers.14` is `[384016682, 256]`, 91.56 GiB. Together, 768,022,850 rows. The two tables hold 196,613,849,600 embedding parameters (row count × 256), which is the card's "196B parameters, sparsely accessed via token-based lookup". Each layer also has `engram.wkv` F8_E4M3 `[25600, 6144]`, an F8_E8M0 `[800, 192]` scale, and BF16 `engram.q_weight` / `engram.k_weight` of shape `[4, 5120]`.
 
 ### Quantization, verified from the headers
@@ -150,7 +152,9 @@ Passing a directory resolves the config the same way every consumer does, and pr
 
 ### The audit script
 
-`scripts/audit_dsv41_headers.py` is standard library only — its own `argparse`, `json`, `os`, `re`, `struct`, `sys` and `collections`, plus the config schema above, which is likewise standard library only — so it needs no `torch`, `safetensors` or `numpy` and runs under any interpreter as long as the repository root is importable. It reads the 8-byte little-endian header length at the start of each shard, parses the header JSON, and validates the declared `dtype`/`shape`/`data_offsets` against the config. It never reads a payload, which is why it works identically on complete shards and on 3 MB header prefixes.
+`scripts/audit_dsv41_headers.py` is standard library only — its own `argparse`, `bisect`, `collections`, `collections.abc`, `json`, `os`, `re`, `struct` and `sys`, plus the config schema above, which is likewise standard library only — so it needs no `torch`, `safetensors` or `numpy` and runs under any interpreter as long as the repository root is importable. It reads the 8-byte little-endian header length at the start of each shard, parses the header JSON, and validates the declared `dtype`/`shape`/`data_offsets` against the config. It never reads a payload, which is why it works identically on complete shards and on 3 MB header prefixes.
+
+Presence and shape are answered from two different places, and the audit keeps them apart. The release ships `model.safetensors.index.json`, which names the shard holding each of the 96,085 tensors, so *is this tensor in the checkpoint* is decidable before a byte of payload arrives; shapes, dtypes and byte extents come from the headers and are decidable only per shard. A check therefore has three outcomes rather than two — **passed**, **failed**, and **undecided** for a check whose evidence sits in a shard that is not on disk. Undecided is reported separately, is never counted as a pass, and is turned into a failure by `--require-complete`. A failure is never deferred: a wrong shape inside a shard that *is* on disk fails while other shards are still missing. That is what makes the audit usable while a 475 GiB download is in progress, and it is the difference between this mode and a run over a complete checkpoint, where the two collapse into one.
 
 ### The Engram hash front end
 
@@ -184,7 +188,7 @@ The deltas a V4.1 path would actually have to add:
 | Shared CSA2 compression | `attn.compressor.*` on 4 layers instead of 41, plus new `kv_source_layers` / `index_source_layers` / `Full`/`Reindex`/`Reuse` mode logic |
 | Hierarchical sparse indexer | New `indexer.wk` + `indexer.k_norm` (absent in V4-Flash) and `candidate_source_layer` / `candidate_topk_blocks` / `candidate_block_size` |
 | Engram | 189.13 GiB of n-gram hash tables and a 99,092-entry compressed vocabulary. The tokenizer-side front end is `src/encoding/engram.py`; the GPU consumer of the rows is not written |
-| Vision | 259 `vision.*` tensors, a 4-tensor aligner, and `ffn.gate.bias_vl` — a vision-conditioned routing bias present on all 43 V4.1 layers and absent from V4-Flash |
+| Vision | 259 `vision.*` tensors, a 4-tensor aligner, and `ffn.gate.bias_vl` — a vision-conditioned routing bias present as F32 `[384]` on all 40 backbone layers and on all 3 MTP layers, and absent from V4-Flash |
 | Hash-routing removal | V4-Flash has `layers.{0,1,2}.ffn.gate.tid2eid`; V4.1 has no `tid2eid` tensor and no `n_hash_layers` key |
 | Hyper-connection head removal | V4-Flash has top-level `hc_head_{fn,base,scale}`; V4.1 has none, and the last MTP stage has none either |
 | MTP head rename | V4-Flash `mtp.2.markov_head.{markov_w1,markov_w2}`; V4.1 `mtp.2.markov_head.{embed,head}` |
@@ -206,16 +210,19 @@ The model card's "8B parameters per token during prefill / 16B during decode" an
 
 ## Correctness and precision
 
-The audit's 37 checks currently pass on the real headers. They are grouped as follows:
+The audit runs 38 checks against the header prefixes, and 39 against a checkpoint that ships `model.safetensors.index.json` — the release does. They are grouped as follows:
 
 - **Config (12 checks).** All 36 required keys present; `len(compress_ratios) == n_layers + n_mtp_layers`; MTP layers compress nothing (`compress_ratios[40:43] == 0`); `kv_source_layers ⊆ index_source_layers`; every source layer reads compressed positions; every index source has a KV source at or below it; `candidate_source_layer` is the first layer after `kv_source_layers[-1]`; `dspark_target_layer_ids` are the last `n_mtp_layers` backbone layers; one Engram table size per Engram layer; `engram_layer_ids` inside the backbone; `engram_compressed_vocab_size` set.
-- **Packing and scales (4 checks).** Every tensor's byte extent matches its shape and dtype; every weight/scale pair blocks evenly; all non-Engram FP8 weights use a 32×32 block; the Engram tables use a 1×32 per-row block.
-- **Inventory (4 checks).** Every backbone layer has its full tensor set; the known shapes match the config; the F32/BF16 tensors are not quantized; the tensor count and byte total are non-zero.
-- **Experts (3 checks).** `w1`/`w2`/`w3` are FP4 packed into `I8` with FP4-block-32 E8M0 scales; every backbone layer has 384 routed experts; every MTP layer has 128.
+- **Engram (5 checks).** The tables sit on exactly `engram_layer_ids`; each Engram layer has its gate and value projection; the tables are at least as large as the derived bucket ranges and no larger; the tables are F8_E4M3 with one E8M0 scale per 32 channels; the tables use a 1×32 per-row block.
 - **CSA2 (5 checks).** `compressor.wkv` exactly on `kv_source_layers`; `compressor.wgate` exactly on the ratio>1 KV sources; `indexer.wk` exactly on `kv_source_layers`; `indexer.wq_b` exactly on `index_source_layers`; Full/Reindex/Reuse partition the backbone.
-- **Engram (4 checks).** The tables sit on exactly `engram_layer_ids`, F8_E4M3 with E8M0 scales; each Engram layer has its gate and value projection; the tables are at least as large as the derived bucket ranges and no larger.
-- **Vision (2 checks).** All 32 blocks present; the encoder and projector shapes match the config.
+- **Inventory (4 checks).** Every backbone layer has its full tensor set; the known shapes match the config; the F32/BF16 tensors are not quantized; the tensor count and byte total are non-zero.
+- **Packing and scales (3 checks).** Every tensor's byte extent matches its shape and dtype; every weight/scale pair blocks evenly; all non-Engram FP8 weights use a 32×32 block.
+- **Experts (3 checks).** `w1`/`w2`/`w3` are FP4 packed into `I8` with FP4-block-32 E8M0 scales; every backbone layer has 384 routed experts; every MTP layer has 128.
 - **DSpark (3 checks).** The Markov and confidence heads match the config; `main_proj` is `n_mtp_layers * dim` wide; every MTP layer carries attention and FFN, but only the last carries the heads.
+- **Vision (2 checks).** All 32 blocks present; the encoder and projector shapes match the config.
+- **Index (1 check, only when an index is present).** Every local shard holds exactly the tensors the index assigns it — which is what makes the other 38 answerable over a partial checkpoint at all.
+
+That totals 38 checks without an index and 39 with one. A total is not the same as a "pass" count: on the 20 shards downloaded at the time of the run, 31 passed and 8 were undecided, because a check whose evidence is in a shard that has not landed has a third outcome rather than a pass. [Auditing the shards while the checkpoint arrives](../performance/deepseek_v4_1_shard_audit.md) records both runs and the 8 waiting checks with the shards each one waits on. The 8 are the shape-level claims — the FP8 block size, the FP4 expert packing, the Engram table dtypes and row blocks, the `head`/`norm` shapes, and the two DSpark head claims — while every presence claim (the CSA2 partition, the per-layer tensor sets, the expert counts, the Engram placement, the vision block set) resolves from the index and the first shard that lands.
 
 The config schema is checked in both directions against the released pair, not only against a fixture. `as_reference_dict()` on the nested file reproduces the flat file exactly — all 64 keys, every value equal — and on the flat file it round-trips to itself, so the alias table is lossy in neither direction; `differs_from()` reports exactly the 12 Transformers-only fields and nothing else, which is the statement that no field both files state disagrees. All 76 canonical fields (66 text, 10 vision) have an alias row, every row names a key the released files actually carry, and the 64 the flat file is expected to carry are exactly the 64 it has — no key unaccounted for and none named that is absent. `tests/test_models_deepseek_v4_1_config.py` holds all of that: 13 tests that need no checkpoint — a 64-key toy config in the flat layout and the same toy model written out in the nested layout by hand, asserted to read identically, plus the negative direction (a `candidate_source_layer` that is not an index source, a compress ratio with no source at or before it, two configs disagreeing on a field, and an unknown key, each reported or ignored rather than fatal) — and 8 more that skip unless a released pair is on the host. The toy nested file is built by hand rather than derived from the alias table on purpose: deriving it would make the round-trip test agree with whatever the table happens to say.
 
@@ -227,7 +234,7 @@ The CSA2 modes are derived from tensor presence, not from a config field. Diffin
 
 `compressor.wgate` is the one tensor that separates layer 20 from the other three Full layers, and the reason is in the config value rather than in the tensor set: the reference constructs the gate only `if compress_ratio > 1`, because the gate is the learned softmax that pools `compress_ratio` consecutive tokens into one KV latent and a ratio of 1 has no group to pool. `compress_ratios` is `[0, 0]`, then 18 entries of 2, then 20 entries of 1, then `[0, 0, 0]` — so layer 20 is the single KV source at ratio 1. All four sources store `compressor.wkv` as BF16 `[512, 5120]` on disk; the reference declares that matrix FP32 for the ratio-2 layers and BF16 for ratio 1, so a loader reading the checkpoint has to upcast the three ratio-2 copies itself. (`compress_ratios[0:2]` and `compress_ratios[40:43]` are zero: layers 0 and 1, and all three MTP layers, read no compressed positions at all.)
 
-Negative controls were run to confirm the checks are live rather than vacuous: perturbing a config key the audit does not consume leaves the result at 37/37 with exit 0, while setting `engram_n_heads = 7` drops it to 36/37 with exit 1, reporting `declared=[384006168, 384016682] derived=[336004849, 336012883]`.
+Negative controls were run to confirm the checks are live rather than vacuous: perturbing a config key the audit does not consume leaves the result at 38/38 with exit 0, while setting `engram_n_heads = 7` drops it to 37/38 with exit 1, reporting `declared=[384006168, 384016682] derived=[336004849, 336012883]`.
 
 The audit establishes nothing about numerics. No tensor value has been read, so no claim about quantization error, activation range or output parity is available.
 
@@ -246,9 +253,19 @@ python scripts/audit_dsv41_headers.py \
   --header-prefix
 ```
 
-`--config` takes either released shape; the schema normalizes it to the flat key set before the first check runs, so `inference/config.json` gives the identical 37/37. Without `--config` the script resolves `<checkpoint-dir>/config.json` first and falls back to `<checkpoint-dir>/inference/config.json`.
+`--config` takes either released shape; the schema normalizes it to the flat key set before the first check runs, so `inference/config.json` gives the identical 38/38. Without `--config` the script resolves `<checkpoint-dir>/config.json` first and falls back to `<checkpoint-dir>/inference/config.json`.
 
-Against a complete checkpoint the same command runs without `--header-prefix`; results are identical because the payload is never read. `--json out.json` writes the report as machine-readable JSON, and `--list-tensors PATTERN` prints individual tensors as `name<TAB>dtype<TAB>shape<TAB>bytes<TAB>shard`. `--expect-fp8-block 32 32` overrides the FP8 block size the scale check assumes.
+Against a checkpoint rather than a prefix tree the same command runs without `--header-prefix`; the tensor inventory is identical because the payload is never read. Two flags exist for the checkpoint case. `--index PATH` reads the presence half from an index other than `<checkpoint-dir>/model.safetensors.index.json` — with the release's index in place the script reports how many of the 96,085 tensors are readable and adds the 39th check, `index: every local shard holds exactly the tensors the index assigns it`. `--require-complete` turns every undecided check into a failure and exits non-zero, for a caller that needs a binary answer and not a partial one.
+
+```bash
+# the release as it downloads: 31/39, 8 undecided, exit 0
+python scripts/audit_dsv41_headers.py --checkpoint-dir /path/to/DeepSeek-V4.1-Flash
+
+# the same run read strictly: undecided counts as failure, exit 1
+python scripts/audit_dsv41_headers.py --checkpoint-dir /path/to/DeepSeek-V4.1-Flash --require-complete
+```
+
+`--json out.json` writes the report as machine-readable JSON — every check carrying a `status` of `pass` / `fail` / `undecided` and a `detail` naming the failing evidence or the shards waited on — and `--list-tensors PATTERN` prints individual tensors as `name<TAB>dtype<TAB>shape<TAB>bytes<TAB>shard`. `--expect-fp8-block 32 32` overrides the FP8 block size the scale check assumes.
 
 Getting the prefixes does not need a checkpoint download. Fetch the first 3,000,001 bytes of each of the 48 published shards — a byte range covers the largest header in this checkpoint, 261,440 bytes, many times over — and write them to any 48 local files:
 
@@ -261,7 +278,7 @@ curl -r 0-3000000 -o h00001.bin "<shard-1-url>"
 
 Shard files are detected either by a `.safetensors` suffix or by their first 8 bytes looking like a plausible header length, so the local names above are arbitrary. A shard whose header is byte-identical to another's is skipped as a duplicate — worth knowing because a mirror that serves the same file under two names would otherwise be counted twice. The audit's own inventory (`96,085 tensors`, `475.24 GiB`) is the check that all 48 shards were actually distinct.
 
-To confirm the checks are live, make a copy of the config with `engram_n_heads` changed to 7 and expect 36/37 with exit 1.
+To confirm the checks are live, make a copy of the config with `engram_n_heads` changed to 7 and expect 37/38 with exit 1.
 
 The Engram front end needs only the config, and optionally a tokenizer directory; neither the checkpoint nor any of the header prefixes above are required:
 
@@ -326,9 +343,9 @@ Expect 21 tests collected with nothing failing. `numpy` is not a declared depend
 ## Known limitations
 
 - **No generation of any kind.** No embedding is loaded and no forward pass exists for this architecture. The tokenizers that have been exercised are V4.1's own and the V4-Flash one, and only to rebuild the Engram compressed vocabulary — not to tokenize a prompt, and not to render a chat template.
-- **No complete local checkpoint, and it could not be used here anyway.** Every tensor fact on this page comes from 48 header prefixes — 96,085 tensor descriptors totalling 475.24 GiB, none of whose payloads has been read. That 475.24 GiB does not fit on the four 22 GiB cards available here in any case.
+- **A complete local checkpoint is neither here nor usable here.** The release is 48 shards and 475.24 GiB; 20 of them had downloaded at the time of the audit, so 42,303 of the 96,085 tensor descriptors are readable by header and the other 28 shards' checks are undecided rather than passing. The tensor facts that do not depend on a landed shard come from 48 header prefixes. No weight payload has been read in any run. That 475.24 GiB does not fit on the four 22 GiB cards available here in any case.
 - **The two config layouts are not interchangeable field for field.** A consumer handed only `inference/config.json` has no `model_type`, no `architectures`, no token ids, no `topk_method`, no `norm_topk_prob` and no `param_dtype`, and its top-level `dtype` is the *quantization* dtype rather than the storage one. `resolve_config` prefers the nested file for exactly this reason and treats the flat one as the fallback; the schema makes the missing fields visibly absent rather than silently defaulted, but it cannot supply them.
-- **The audit validates metadata consistency, not correctness.** It proves the config and the tensor inventory agree with each other. A checkpoint could satisfy all 37 checks and still be unusable, and a wrong value that is *consistently* wrong in both the config and the shapes would pass.
+- **The audit validates metadata consistency, not correctness.** It proves the config and the tensor inventory agree with each other. A checkpoint could satisfy all 38 checks and still be unusable, and a wrong value that is *consistently* wrong in both the config and the shapes would pass.
 - **Engram is addressable but not consumed.** The compressed token map, the prime-derived bucket layout and the n-gram hasher now exist in `src/encoding/engram.py`, and the two layers reproduce their declared row counts exactly, so the 189.13 GiB of tables can be indexed. What is still missing is everything downstream: no row has been read, no embedding lookup has been written, and no gate or value projection has been run (see [Correctness and precision](#correctness-and-precision)).
 - **The vision path is unvalidated in both directions.** The 263 vision and aligner tensors are accounted for and their shapes match the config, but no image has been processed and no projector has been run.
 - **No reference comparison is possible on this host.** The released stack needs `torch>=2.10.0` and `tilelang==0.1.8`; neither is available in the `deepseek` environment.
@@ -338,7 +355,9 @@ Expect 21 tests collected with nothing failing. `numpy` is not a declared depend
 ## Evidence and related notes
 
 - `src/models/deepseek_v4_1/config.py` — the config schema that reads both released layouts into one view, with an `as_reference_dict` inverse and a `python -m src.models.deepseek_v4_1.config` CLI
-- `scripts/audit_dsv41_headers.py` — the host-only header audit, reading its config through the schema above
+- `scripts/audit_dsv41_headers.py` — the host-only header audit, reading its config through the schema above and distinguishing a shard that is missing from a shard that is wrong
+- `tests/test_models_deepseek_v4_1_tensor_audit.py` — 16 tests over the audit's three outcomes, the last of which skips unless the released checkpoint is on the host
+- [Auditing the shards while the checkpoint arrives](../performance/deepseek_v4_1_shard_audit.md) — the two audit runs, the per-layer tensor partition and the shapes the landed shards assert
 - `src/encoding/engram.py` — the Engram compressed token map, bucket layout, hash multipliers and n-gram hasher, plus a `--config`/`--tokenizer` CLI
 - `tests/test_models_deepseek_v4_1_config.py` — 21 tests over the schema: the alias table, the round-trip to the flat layout, the shape-independent reading of a toy model in both layouts, and the released pair when it is on the host
 - `tests/test_encoding_engram.py` — 21 tests pinning the primes, multipliers and row counts, with the tokenizer and `sympy` legs skipping when unavailable
