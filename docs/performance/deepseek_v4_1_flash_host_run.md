@@ -4,10 +4,12 @@ The released V4.1-Flash weights now load into `src/models/deepseek_v4_1` and dec
 this machine. This page is the measured cost of doing it, phase by phase, and the arithmetic that
 says which of those phases the four RTX 2080 Ti can and cannot move.
 
-**Nothing in this run used a GPU.** The forward is entirely host code over a memory-mapped
+**Nothing in the forward used a GPU.** The forward is entirely host code over a memory-mapped
 checkpoint, so the four cards are idle throughout and every number below is a CPU, RAM and disk
 number. That is the point: it establishes what the host half costs before any device work, and it is
-the first measurement of this checkpoint anywhere in this repository.
+the first measurement of this checkpoint anywhere in this repository. The one exception is the last
+section, which times PCIe to a card — the single question about this plan that cannot be answered
+without touching one.
 
 ## Run record
 
@@ -17,17 +19,18 @@ the first measurement of this checkpoint anywhere in this repository.
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB (SMR disk, `/dev/sda`) |
 | Runtime | PyTorch resident, `src/models/deepseek_v4_1`, no native engine, no CUDA tensors |
 | Commit | `688d803` on `feature/v41-backbone-runtime` |
-| GPUs | 4 x RTX 2080 Ti, 22528 MiB each — **not used**; TP/EP world size 1 CPU rank |
+| GPUs | 4 x RTX 2080 Ti, 22528 MiB each — **idle**; TP/EP world size 1 CPU rank, plus one card timed for PCIe in the last section |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM, 930 GiB available |
 | Software | Python 3.10.10, torch 2.9.1+cu128, `deepseek` conda env |
 | Prompt | `The capital of France is` (4 tokens), and one token at position 0 for the phase table |
 | Warm/cold | Both reported; the phase table gives three consecutive forwards of the same token |
 
 Scripts: `/tmp/probe_where.py` (phase timing), `/tmp/probe_footprint.py` (what the tree occupies),
-`/tmp/probe_engram_cost.py` (the Engram gather), `/tmp/probe_accept.py` (correctness). They are
-throwaway probes rather than checked-in benchmarks; the numbers they produced are what this page
-records. The commit above is the code they ran against — this page itself, and the comment
-corrections it prompted, land in a later documentation-only commit.
+`/tmp/probe_engram_cost.py` (the Engram gather), `/tmp/probe_accept.py` (correctness), and
+`/tmp/probe_h2d.py` (the PCIe and card-side arithmetic in the last section — the only one of the five
+that wants a GPU). They are throwaway probes rather than checked-in benchmarks; the numbers they
+produced are what this page records. The commit above is the code they ran against — this page
+itself, and the comment corrections it prompted, land in later documentation-only commits.
 
 ## What is in the 475 GiB
 
@@ -74,7 +77,7 @@ What the process then holds:
 | | GiB |
 | --- | ---: |
 | Tree parameters (14.12 bf16 + 2.67 fp32) | 16.79 |
-| Expert window, if all 40 layers were full (16/layer) | 21.09 |
+| Expert window, if all 40 layers were full (16/layer) | 42.19 |
 | Engram tables, resident | 189.13 |
 | Process peak RSS after a plain load | 35.29 |
 
@@ -118,13 +121,14 @@ Three consecutive forwards of the same token at position 0, in one process:
 | per-layer overhead and `embed`, unattributed | 0.24 s | 0.19 s | 0.14 s |
 | **total** | **27.23 s** | **2.23 s** | **1.00 s** |
 
-The cold column is 240 routed experts each expanded to bf16 for the first time, off a disk that has
-never seen them. The third column is the steady state: **1.00 s per token**, of which the attention
-stack is 0.37 s and the MoE 0.44 s.
+The cold column is every routed expert of the token — 8 per layer, all 320 — expanded to bf16 for the
+first time, off a disk that has never seen them: 5.60 GiB read and 21.09 GiB written out. The third
+column is the steady state: **1.00 s per token**, of which the attention stack is 0.37 s and the MoE
+0.44 s.
 
 The 16-expert FIFO window in `CheckpointRoutedExperts` turns out to be nearly worthless and is
 measured rather than assumed: a token routes to 8 of a layer's 384 experts, and **6 of those 8 are
-misses at every layer, every token, warm**. It saves 25% of the expert reads for 21 GiB of host RAM
+misses at every layer, every token, warm**. It saves 25% of the expert reads for 42 GiB of host RAM
 across the backbone. `DEFAULT_EXPERT_CACHE = 16` bounds a correctness path; it is not a cache policy.
 
 ## Correctness
@@ -168,24 +172,43 @@ combined. The experts cannot be resident on the cards. Everything else in the mo
 924-parameter tree, attention and shared experts and embeddings and norms — is 16.79 GiB, 3.5% of the
 checkpoint, and it fits at 19.1% of a card per rank.
 
-So the floor is set by bytes per token, not by FLOPS. 5.60 GiB per token is:
+So the floor is set by bytes per token, not by FLOPS. Every carrier that could bring the 5.60 GiB to
+a card is now measured rather than estimated:
 
 | Carrier | Rate on this host | Floor per token |
 | --- | ---: | ---: |
 | host RAM, read and expanded to bf16 on the CPU | measured | **0.44 s** (the MoE column above) |
-| PCIe Gen3 x16 to a 2080 Ti | ~10 GB/s realistic | ~0.60 s |
+| PCIe Gen3 x16, packed fp4 as stored, pinned | 8.29 GiB/s measured | 0.68 s |
+| PCIe Gen3 x16, expanded to bf16 first, pinned | 10.19 GiB/s measured | 2.07 s |
 | the SMR disk behind both | 271 MiB/s | 21 s |
 
-The measured 0.44 s is the fastest of the three, and that is the finding: **moving the experts to the
-GPU does not move this wall, because the wall is the bytes and the GPU cannot hold them.** Pushing
-the same 5.60 GiB across PCIe is not cheaper than reading it from host RAM and expanding it on the
-CPU — that the two are within 40% of each other is what makes the point, not that they are equal.
-The four cards can only help with the 0.37 s attention stack and the 0.04 s of `norm` + `head`: the
-part of the model that is neither the MoE nor the Engram tables, 4.20 GiB per rank at TP4, and the
-one part that is a normal port.
+These are `/tmp/probe_h2d.py` on `cuda:2`, over the real 1,920-tensor token load and not a synthetic
+buffer. The raw slot sustains 6.4 GiB/s pageable and 10.6 GiB/s pinned on a 512 MiB buffer; the token
+load reaches 5.70 and 8.29 GiB/s of that — 11% and 22% below the slot — so 1,920 separate copies cost
+a fifth and not a factor. The `I8` packing costs nothing on the wire: the 5.60 GiB that crosses is the
+bytes as stored. The bf16 row is the one that decides whether a device-side expert cache is worth
+building on the dequant path that already exists, and it costs 3.0x the time: 5.60 GiB of packed fp4
+becomes 21.09 GiB of bf16, which is also why its rate is the higher of the two.
+
+**The cards' arithmetic is not the problem.** The same probe times the batched MoE for one layer — 8
+experts through all three projections — at 1,564 µs, which is **62.6 ms** for the 40 layers of a
+token against the **0.44 s** the host CPU currently spends there. The GPU is 7x the cheaper place to
+do the multiplication. It is 1.5x the more expensive place to be given the operands: 0.68 s of pinned
+PCIe against 0.44 s of host RAM, per token, every token — and that is transfer alone, with the
+dequantization still to come.
+
+The measured 0.44 s from host RAM is the fastest carrier there is, and that is the finding: **moving
+the experts to the GPU does not move this wall, because the wall is the bytes and the GPU cannot hold
+them.** The four cards can only help with the 0.37 s attention stack and the 0.04 s of `norm` +
+`head`: the part of the model that is neither the MoE nor the Engram tables, 4.20 GiB per rank at
+TP4, and the one part that is a normal port.
 
 Reaching a materially higher token rate on this hardware needs fewer bytes per token — a lower-bit
-expert format, or fewer active experts — and not a faster kernel.
+expert format, or fewer active experts — and not a faster kernel. The one design that would remove
+the per-token transfer is a device-side expert cache holding whole layers resident, and it fails on
+arithmetic rather than on engineering: one layer is 25.3 GiB expanded, so all 88 GiB of VRAM holds
+three of the forty, and the remaining 37 layers would still pay the 0.68 s. Only a format that makes a
+layer small enough to sit on a card changes this.
 
 ## Reproducing
 
@@ -198,7 +221,12 @@ expert format, or fewer active experts — and not a faster kernel.
 
 # the Engram gather, cold, warm, and out of the copy
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_engram_cost.py
+
+# the PCIe rows of the carrier table and the card's MoE arithmetic -- the only probe here that
+# wants a GPU, and the only one that reads 21 GiB instead of 5.6
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_h2d.py
 ```
 
-Each takes one to fifteen minutes and reads the checkpoint off `/mnt/data3`; none of them needs a
-GPU. The Engram probe's copy step alone is 373 s and 94.5 GiB of page cache, so run it alone.
+Each takes one to fifteen minutes and reads the checkpoint off `/mnt/data3`. The Engram probe's copy
+step alone is 373 s and 94.5 GiB of page cache, so run it alone. `probe_h2d.py` reports whichever
+page-cache state it finds the checkpoint in; run it twice for a warm H2D column.
