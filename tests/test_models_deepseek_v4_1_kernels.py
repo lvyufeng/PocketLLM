@@ -28,6 +28,7 @@ right tokens is not measurable on this host; see the V4.1 model page for that li
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.kernels import ops as shared_kernels
@@ -209,6 +210,73 @@ def test_hc_split_sinkhorn_iteration_count_changes_the_result() -> None:
     one = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, 1, EPS)[2]
     twenty = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS)[2]
     assert not torch.allclose(one, twenty, atol=1e-4)
+
+
+@pytest.mark.parametrize("rows", [1, 31, 32, 33, 96, 129])
+def test_hc_split_sinkhorn_kernel_matches_the_loop(rows: int) -> None:
+    """The fused kernel is the loop, to fp32 rounding, including across its own block boundary.
+
+    Row counts on both sides of 32 and just past a second block are the point: a kernel that reads or
+    writes a whole block either way is exactly right at 32 rows and wrong at 33.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from src.kernels import ops
+
+    if not ops._USE_TRITON:
+        pytest.skip("triton is unavailable")
+
+    torch.manual_seed(11 + rows)
+    mix_hc = (2 + HC_MULT) * HC_MULT
+    mixes = torch.randn(1, rows, mix_hc, device="cuda") * 2
+    hc_scale = torch.randn(3, device="cuda")
+    hc_base = torch.randn(mix_hc, device="cuda")
+
+    want = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS, impl="torch")
+    got = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS, impl="triton")
+
+    for a, b in zip(want, got):
+        assert b.shape == a.shape
+        # fp32 rounding, not bit equality: the kernel sums a row's four columns in a different order
+        # than ATen does, so the two agree to the epsilon of the dtype and no further.
+        torch.testing.assert_close(b, a, rtol=1e-5, atol=1e-6)
+
+
+def test_hc_split_sinkhorn_keeps_the_original_shape_front() -> None:
+    """`[b, s, mix_hc]` and `[b, s, h, mix_hc]` both flatten to rows and both come back as they went in."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    torch.manual_seed(12)
+    mix_hc = (2 + HC_MULT) * HC_MULT
+    for shape in ((1, 5, mix_hc), (2, 3, mix_hc), (1, 2, 3, mix_hc)):
+        mixes = torch.randn(*shape, device="cuda")
+        hc_scale = torch.randn(3, device="cuda")
+        hc_base = torch.randn(mix_hc, device="cuda")
+        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS)
+        assert pre.shape == (*shape[:-1], HC_MULT)
+        assert post.shape == (*shape[:-1], HC_MULT)
+        assert comb.shape == (*shape[:-1], HC_MULT, HC_MULT)
+
+
+def test_hc_split_sinkhorn_falls_back_when_the_kernel_cannot_run() -> None:
+    """`impl="triton"` on a host tensor is a request, not a promise: it must still be correct."""
+    torch.manual_seed(13)
+    mix_hc = (2 + HC_MULT) * HC_MULT
+    mixes = torch.randn(4, mix_hc)
+    hc_scale = torch.randn(3)
+    hc_base = torch.randn(mix_hc)
+    want = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS, impl="torch")
+    got = hc_split_sinkhorn(mixes, hc_scale, hc_base, HC_MULT, SINKHORN_ITERS, EPS, impl="triton")
+    for a, b in zip(want, got):
+        torch.testing.assert_close(b, a, rtol=0, atol=0)
+
+    # `hc_mult` has to be a power of two for `tl.arange`; three is not, and the loop handles it.
+    three = torch.randn(4, (2 + 3) * 3)
+    scale, base = torch.randn(3), torch.randn(5 * 3)
+    a = hc_split_sinkhorn(three, scale, base, 3, SINKHORN_ITERS, EPS, impl="torch")
+    b = hc_split_sinkhorn(three, scale, base, 3, SINKHORN_ITERS, EPS, impl="triton")
+    for x, y in zip(a, b):
+        torch.testing.assert_close(y, x, rtol=0, atol=0)
 
 
 def test_fp4_codes_round_half_to_even() -> None:
