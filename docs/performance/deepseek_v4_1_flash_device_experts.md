@@ -37,6 +37,29 @@ one runs the loop itself and reads nothing. They are throwaway probes, not check
 numbers they produced are what this page records. The TP4 sections add the probes written for the four
 cards and for the row loop: `/tmp/probe_v41_tp4_e2e.py`, and `/tmp/probe_v41_tp4_pipe_matrix.py`,
 which is [the row loop, serial against one row deep](#the-row-loop-runs-one-row-deep-and-it-is-worth-110-on-a-prefill).
+The resident set adds two more: `/tmp/probe_v41_hot_ab.py`, which is the width sweep and the logit
+comparison behind [the section below](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it),
+and `/tmp/probe_v41_resident_fill.py`, which is the only instrument here that times a per-*layer*
+cost and the only one that reads the process's own `smaps_rollup`. The width pair is re-run by
+`/tmp/run_quiet_width.sh`, which is not a probe but the driver of the A-B-A-B: it runs
+`probe_v41_hot_ab.py` at 148 and 192 twice in one sitting, waits on `WAIT_FOR=<pid>` so the four
+cards are free, and echoes `/proc/loadavg` at every leg — that load trace is what says whether a
+sitting's numbers are worth comparing to the last one's, and the answer for the sittings recorded
+here is that they are worth comparing only to themselves. `/tmp/probe_v41_resident.py` is the bank's
+acceptance instrument and the only one here that reads `/proc/self/io`'s `read_bytes`: it brackets the
+load, each prefill and each decode with the kernel's own block-device counter, which is the one figure
+a wall clock cannot produce. The dense tree is `/tmp/probe_dense_tree.py`, per op and per layer and at
+five thread counts — and with `--tree cuda`, under a `torchrun` driver (`/tmp/run_quiet_dtree.sh`), the
+same per-op table with the tree on the four cards, which is the sitting where `hc_mixes` stops being a
+fallback and becomes the thing the fusion was measured for. `/tmp/probe_hc_split_card.py` prices that
+one op against the loop it replaced on an idle card, with no checkpoint and no second rank in the
+process. The same probe under `--launches` then counts what the step launches, under a CUPTI window
+(`/tmp/run_quiet_dtree_launches.sh`); that report is taken twice, to `/tmp/dt_cuda_launches.out` and
+`/tmp/dt_cuda_launches2.out`, because only the pair says which of its columns is a count and which is
+a sample. The last one closes the bank's own open number: `/tmp/probe_engram_bank.py` attaches the
+filled segment read-only and prices a 512-token prefill's 12,288 gathers a table — the call, the
+scatter under it and the dequant over it — against the per-row control the host page took, on a host
+with no card in the process at all.
 
 ## The split
 
@@ -171,6 +194,22 @@ tokens and each continues coherently** — the cards end the sentence at the per
 `' The Eiffel'` out of it — and the one token they disagree about is a near-tie on a distribution
 that does not distinguish its two candidates. Both device worlds and both device runs put EOS on the
 same token, and neither is a wrong answer at it.
+
+**Every number in the table above is a comparison inside one run, and that is what makes it hold.**
+The two `5.960e-08` rows are one process, one activation, the same six experts summed four ways and
+one way; the kernel rows are one process on a captured row. Nothing there is a comparison *between*
+two runs. That used to matter a great deal: **the tree was not reproducible from one run to the
+next**, and two sittings of one configuration kept the greedy tokens and 30 of the top 32 ids while
+moving 30 of the 32 out of position, which is why every configuration below was compared on its
+tokens and its tok/s and not on a logit column. It does not matter any more, because the cause was
+found and it was not a tolerance: **one missing `__syncthreads()` in the six sparse-attention
+kernels**, and with it in place two runs of one configuration are **32 of 32 in position at `|dlogit|
+0.000e+00`** — as is a pair that differs by a whole configuration. Being able to say that is a fact
+about the code rather than a choice of tolerance, and it restores the columns as a measurement, so
+the configurations below are still separated on their tok/s — not because the logits are noisy, but
+because what separates them is a staging cost and the logits are exactly where it does not show. The
+evidence chain, and what the old drifting pairs measured before it existed, are in *What this does
+not do yet*.
 
 ## What a step costs
 
@@ -457,6 +496,28 @@ Both lengths measure the same step — the 8-token row is the run's first and ca
 first-frame cost, which is why it is the larger of the two — because the experts are re-staged every
 row whatever is in the KV cache.
 
+**The same step, op by op.** `/tmp/probe_dense_tree.py --tree cuda` is the per-op instrument the host
+section below is built on, with the tree on each rank's own card — one process a card, the experts dealt
+to the same four, so it is the configuration above and not a variant of it. It clocks the step at
+**688.9 ms** — 22 threads, the resident bank on, `/tmp/dt_cuda.out` — the class at **414.45 ms** against
+the e2e probe's 444.3 and 408.8, and the named dense calls at **191.32 ms**:
+
+| card, decode | ms/step | | card, decode | ms/step |
+| --- | ---: | --- | --- | ---: |
+| `routed` (the class) | 414.45 | | `hc_post` + `hc_pre` | 17.15 |
+| `hc_mixes` | 27.72 | | the four norms | 25.73 |
+| `csa2` | 23.64 | | `engram` | 6.78 |
+| `kv_quant` | 21.42 | | 5 GEMVs + `compressor` | 11.84 |
+| `gate` | 15.30 | | `head` + `norm` + `embed` | 0.29 |
+| `shared_experts` | 14.19 | | | |
+| `rope` | 13.64 | | **dense, all of it** | **191.32** |
+| `indexer` | 13.62 | | **whole step** | **688.9** |
+
+The 191.32 is the sum of the named calls, so it is narrower than the 302–313 ms "in the tree" column
+above: that one is a phase clock over the whole block, and it carries the block's own glue and its three
+collectives, which the named-call wrappers here do not own. The two agree on the step — 688.9 against
+746.8 and 722.0, where the 8-token row is a run's first frame — and on the class to 1.3%.
+
 **Where it goes.** With `_stage`, `_upload` and `_launch` wrapped as well (`--lengths 8,128`):
 
 | | 8 tokens | 128 tokens |
@@ -480,7 +541,155 @@ result is identical on all four, the head and the embedding are replicated rathe
 all-reduce sums in one order everywhere, so all four compute the same logits; greedy decoding is an
 argmax over that and needs no message to enforce what is already true. Every run above prints
 `The capital of France is Paris.<｜end▁of▁sentence｜>` on all four ranks, 3 tokens, `stopped on eos`,
-and the same text comes out of the `world=1` host run.
+and the same text comes out of the `world=1` host run. That is a statement about the four ranks within
+one run and not about two runs of the same configuration; [the caveats](#what-this-does-not-do-yet)
+carry the second question.
+
+### The tree's largest launch source was one Python loop, and cutting the tree could not cut it
+
+The 300–310 ms above is with `hc_split_sinkhorn` fused, and part of the reason the tree's factor is 1.9×
+rather than 4× is that this op was never the tree's to cut. `Block.hc_mixes` calls it twice a layer, it
+normalizes a `[b, s, 4, 4]` matrix, and it did so through a Python loop of `hc_sinkhorn_iters - 1`
+iterations — 19 of them at V4.1's `hc_sinkhorn_iters` of 20 — of up to six elementwise ops. That is
+about 114 ATen dispatches a call and **~9,100 launches a step for arithmetic that fits in a register
+file**. `hc_mixes` is not one of the tensors the split cuts: it is glue, the gate and the `hc_*`
+coefficients replicate on every rank, and a quarter of the tree on a quarter of the cards is nothing to
+an op whose cost is its dispatch count rather than its bytes — 0.6 GB/s on the line this round was
+planned against, the least traffic in the tree and the most launches.
+
+Measured on the card, one decode row: **1.931 ms a call, 154.45 ms over a step's 80 calls**, at the same
+price for batch 1 and batch 512 — which is the evidence that the number is dispatch and not arithmetic.
+The fix is one kernel that runs all `ITERS` normalizations in registers, 32 rows a program, placed
+behind `_resolve_impl` with the loop kept as `hc_split_sinkhorn_torch`; it falls back to that loop when
+`hc_mult` is not a power of two, when the input is not CUDA, or when triton is unavailable — so a host
+tensor still takes the loop and the host-tree configuration above keeps this cost by design. Agreement
+with the loop over batch 1/8/128/512/2048 against iterations 1/5/20 is **2.98e-07 worst relative
+error**, and the speedup runs from 3.8× at one iteration to **25.4× at the twenty this model uses**: in
+the step, the loop's 154.45 ms becomes the kernel's **7.19**. Those are the two endpoints of that
+bench, and the card sitting below measures each of them again on this branch.
+
+**The dense-tree sitting the rest of this section is built on cannot see any of that, because it is the
+host tree.** The kernel's third fallback is the decisive one here: `Block.hc_mixes` on a CPU block
+hands it a CPU tensor, `flat.is_cuda` is false, and the op takes the loop — so `hc_mixes` is 86.13
+ms/step in that table (`/tmp/probe_dense_tree.out6`, 1152.9 ms/step, 1.077 ms a call) and 88.93 in the
+sitting before it, not because the kernel is missing but because nothing on the host path can call it.
+Nothing in that table changes when the fusion lands. What the fusion changes is what the term costs
+**once the block is on a card**, and that is the opposite of a detail in this round: the same 80 calls
+go from **1.077 ms each to 1.931** the moment the input is a CUDA tensor, so a move that is otherwise a
+wash would have *added* about 68 ms a step to this term alone before the kernel and removes about 79
+with it. The move needs the fusion to be affordable; the fusion needs the move to be reachable.
+
+**The card sitting has now been taken, and the prediction holds.** `/tmp/probe_dense_tree.py --tree
+cuda` builds the tree on each rank's own card under `torchrun` — one process a card, the experts dealt
+to the same four — which is the configuration the paragraph above is about and the only one in which
+`Block.hc_mixes` is handed a CUDA tensor. Its per-op table puts `hc_mixes` at **27.72 ms/step over 80
+calls**, 0.347 ms a call. That row times the whole method, and the method is more than the op, so
+`/tmp/probe_hc_split_card.py` prices the pieces on an idle card with no model in the process, at the
+shape this model runs — 1 row, `hc_mult` 4, 24 flattened, 20 iterations:
+
+| card, 1 row | µs/call | ms/step at 80 calls |
+| --- | ---: | ---: |
+| the fused kernel alone | 98.6 | **7.89** |
+| the loop it replaced, same card, same shape | 1476.1 | 118.09 |
+| the rest of the method: `flatten`+`float`, `square`+`mean`, `rsqrt`, `F.linear`, `mul` | 151.2 | 12.10 |
+| the whole method, fused | 249.8 | 19.99 |
+| the whole method, loop | 1623.1 | 129.85 |
+
+**7.19 predicted against 7.89 measured**, and flat across the batch, which is the part only the card
+can say: 1 row and 512 rows cost the fused kernel 98.6 and 98.3 µs, the loop 1476.1 and 1499.9 — the
+same dispatch-bound behaviour the commit's bench reported, at the shapes the model actually uses. The
+run's 0.347 a call against the idle card's 0.250 is four-rank contention and the probe's own wrapper,
+not a second kernel. What is left is **12.10 ms/step** of six ATen launches over a tensor of 24
+numbers, and no fusion inside this op reaches them — that is the next thing the term has to give, and
+it is the graph's to give rather than this kernel's. The comparison that matters for the move is the
+two whole-method rows on the card: **129.85 ms/step to 19.99**. Read against the host's 86.13, the
+fusion is what keeps the card from being *slower* than the host at this term — an unfused card method
+would be half again the host's — and so what makes the move a win there rather than a wash. The
+corresponding arithmetic for the tree is that without the kernel its half of the card step would be
+191.32 + (118.09 − 7.89) ≈ 302 ms, which is arithmetic over two measured terms rather than a sitting.
+
+The lineage is worth stating precisely because it was got wrong once here: all six sittings of
+`/tmp/probe_dense_tree.*` were written between 15:17 and 16:01, and the Triton compiler's own cache —
+`~/.triton/cache/*/_hc_split_sinkhorn_kernel.cubin` — is stamped **17:59**, seven minutes before the
+`d21d018` commit. So the kernel first ran at 17:59 and every one of the six probe outputs predates it,
+which makes the 262.73-to-86 spread across those sittings a page-cache and contention difference and
+not the fusion. It is also why the 262.73 ms/step figure in the plan this round was written against
+carries no weight: that sitting is a 19,137.6 ms/step configuration.
+
+### The step launches 7,076 kernels, where the sinkhorn loop alone used to launch 9,100
+
+The plan's last unreported number is this one, and it is the number the fusion exists to move: the loop
+above was **~9,100 launches a step** for arithmetic that fits in a register file, and what the step
+launches now is the question that figure leaves open. `/tmp/probe_dense_tree.py --launches` takes it —
+one more decode trajectory under a `torch.profiler` window on CUDA activity, the same instrument the
+single-block breakdown uses. Its rows are split on `device_type`, because `cudaLaunchKernel` and
+`cudaDeviceSynchronize` are rows in that report too and counting them would count the launches rather
+than be one. Every rank runs the pass and rank 0 holds the window: the step's collectives need both
+ends, and the first attempt at this number had three ranks return while the fourth was still in the
+window — what was left was a rank 0 hanging in an all-reduce with no peer, no report and nothing in
+the log.
+
+| one decode step, 4 ranks, rank 0 | |
+| --- | ---: |
+| kernel launches | **7,076** |
+| memcpy/memset | 770 |
+| distinct kernels / distinct copies | 122 / 5 |
+| the 16 heaviest kernels' share of the launches | 47% |
+| device-busy under the window | 24% and 49% |
+| the same step without the window | 692.7, 770.4 ms |
+
+Two sittings of that command, back to back, and the counts are identical to the tenth: 7,076 launches
+and 770 memcpy/memset both times, 122 distinct kernels and 5 distinct copies both times, the sixteen
+heaviest at 47% of the launches both times, and every per-kernel call count in the table unchanged —
+`ncclDevKernel_AllReduce` 88.0, `moe_single_w1w3_fp4_kernel` 40.0 and `moe_single_w2_partial_fp4_kernel`
+40.0, the ATen elementwise kernels with the most calls 809.5 and 596.5, the 280 pinned→device copies.
+That is what makes this a count rather than a sample, and it is the only part of the report that
+survives a second sitting.
+
+**The device-time columns do not, and the largest of them moves by a factor of 73.**
+`ncclDevKernel_AllReduce_Sum_f32_RING_LL` is charged **166,991 µs a step in one sitting and 2,278.7 in
+the next** — 46.9% of the recorded device time against 1.2%, at 88.0 calls a step in both — and the
+step's busy fraction follows it, 355.9 of 731.6 ms against 197.5 of 814.1. The ring kernel's device
+time is a peer wait rather than work, and how much of a wait a per-rank CUPTI window charges to the
+kernel instead of to the gap around it is not stable across sittings. The copies on the same report
+are — 132,829 against 133,068 µs a step, 0.2% apart — so what swings is the collective's own
+attribution and not the window's arithmetic, and the practical reading is that nothing here may be
+priced off that table. The stable row says the same thing on its own: 280 pinned→device copies a step
+is the expert upload, the class's own `_upload` phase prices that traffic at **16.0–17.8 ms**, and the
+window prices the same copies at 133 — a factor of eight on a row that reproduces to 0.2%. The one
+time number this sitting does contribute is its unprofiled wall, 692.7 and 770.4 ms a step against the
+**688.9** the sitting above times the same step at; the second is 12% high, on a host that is not idle.
+
+**The fusion's share is 8,640 of them.** `hc_split_sinkhorn` was ~114 ATen dispatches a call at 80
+calls a step — 19 iterations of up to six elementwise ops, twice a layer — and the kernel that
+replaced it is one launch plus the six ATen calls `Block.hc_mixes` makes around it: 480 a step against
+the loop's ~9,600. Put the loop back and the step is ~15,700 launches; it is 7,076. That is a
+derivation and not a second sitting — the 9,100 is arithmetic over the loop's body and the 7,076 is
+counted — and it is the cleanest statement of what the round did: the term that was cut was larger by
+itself than everything the step now launches.
+
+**The rest of the shape is why the count is still the number that matters.** 122 distinct kernels
+launch 7,076 times and the sixteen heaviest are 47% of the launches, so **~3,750 of them are a long
+tail** spread over the other 106, most of them ATen elementwise and reduce kernels over a few hundred
+numbers. That is `hc_mixes`' signature one level up: the arithmetic is small and the launches are
+many, and no kernel inside any one op reaches them. It is what a per-layer graph is for, and it is the
+one thing here a second sitting confirms rather than contradicts.
+
+**The largest kernel in the step is the collective, and its count is what to keep.**
+`ncclDevKernel_AllReduce_Sum_f32_RING_LL` runs **88 times a step** — two a layer, plus one in each of
+the eight layers that run the indexer — and each is a device-wide rendezvous inside a step of 40
+layers. That is the reason the routed experts' partial and the shared expert's partial were made to
+land in one message rather than two, and it is the other two fifths of the reconciliation above: the
+tree's phase clock is 302–313 ms, the named calls account for 191.32 of it, and the wrappers do not own
+the collectives — so the **111–122 ms** that gap leaves is the block's own glue and these 88 issued,
+not their device time.
+
+Beside it the experts' arithmetic is visible and small, and stable enough to read across the two
+sittings: `moe_single_w1w3_fp4_kernel` **19.9 then 22.7 ms/step over 40 calls** and
+`moe_single_w2_partial_fp4_kernel` **5.45 then 6.27 over 40** — 25 to 29 ms of device time a step,
+against the class's 414.45, which is the staging and the issue around those products and not the
+products. And the row that is neither is `hc_mixes`: six ATen launches on 24 numbers, 80 times a step,
+which is this section's tail rather than a term with a kernel left to find.
 
 ### The 747 ms is a page-cache number, and this host does not keep the working set
 
@@ -603,6 +812,106 @@ not on the 253.4 s/table cold path the host page records. 53.42 s against the 42
 uninstrumented run records is a 25% difference this pair does not separate into the instrumentation
 and the cold host's own reads, and neither of those is the bank.
 
+### A pass over the banked checkpoint reads zero bytes from the device, and `read_bytes` is what says so
+
+Every number above this line is a wall clock, and a wall clock cannot tell a run that read its
+experts out of the segment from one that read them off `/mnt/data3` and found them in the page cache.
+`/proc/self/io`'s `read_bytes` can: it counts what the kernel fetched from the block device and not
+what it served from cache, so a checkpoint that is resident reads **zero** there whatever the clock
+does. `/tmp/probe_v41_resident.py` brackets each phase with it, one process, four cards attached, the
+457.78 GiB segment attached by `DEEPSEEK_V41_RESIDENT_EXPERTS=1`:
+
+```
+load_backbone                   74.98 s       0.00 GiB read       45.99 GiB rss
+
+residency, counted:
+  process rss 46.74 GiB, peak 49.21 GiB
+  /dev/shm 457.78 GiB
+  torch pinned 0.00 GiB
+  cuda:0 allocated 1.49 GiB, reserved 1.52 GiB
+  cuda:1 allocated 1.49 GiB, reserved 1.52 GiB
+  cuda:2 allocated 1.49 GiB, reserved 1.52 GiB
+  cuda:3 allocated 1.49 GiB, reserved 1.52 GiB
+  device expert class DeviceRoutedExperts, world 4
+
+  prompt 128 warmup             66.94 s       0.00 GiB read       96.95 GiB rss
+  prompt 128 prefill            62.33 s       0.00 GiB read        0.07 GiB rss
+  prompt 128 decode              5.51 s       0.02 GiB read        6.04 GiB rss
+  prompt 512 warmup            264.47 s       0.00 GiB read       48.59 GiB rss
+  prompt 512 prefill           261.95 s       0.00 GiB read        0.10 GiB rss
+  prompt 512 decode              4.99 s       0.03 GiB read        0.91 GiB rss
+```
+
+**Zero across both warmups, both prefills and the load**, which is the acceptance the plan asked for
+and the first time it has been read off the kernel's own counter rather than inferred: the 41040
+packed rows a 512-token prefill stages on a two-route rank and the 12,288 Engram gathers it makes per
+table come out of the segment, and the 0.00 on `load_backbone` is the *dense tree*, which is
+deliberately not in the
+segment, being served out of the page cache on this host — the 83.6 s / 67 GiB read the cold banked
+table above records is what that line reads when the cache is dropped. Decode is 0.02 and 0.03 GiB
+over four steps each, 5–8 MiB a step: real, three orders below the 17.9 MiB a row a disk-sourced
+stage would be, and this run does not attempt to attribute it, so it is recorded rather than
+explained.
+
+The residency block is verification 5 and it is the number the directive is about. The process's own
+`VmRSS` is **46.74 GiB**, its peak 49.21 GiB; `/dev/shm` holds **457.78 GiB** — one copy of the
+segment, counted on disk, not four; `torch` pinned host memory is **0.00 GiB**; and each of the four
+cards holds **1.49 GiB allocated, 1.52 GiB reserved**. Against the plan's ~477 GiB budget, the
+checkpoint's share is the 457.78 GiB of shared memory plus the 16.79 GiB of tree that lives in the
+process's own RSS and nowhere else — no replica of it exists on any other rank, which is the failure
+mode this measurement exists to rule out.
+
+Two things the numbers are not. They are **one process driving four cards**, not four processes under
+`torchrun`, so the clock columns here are not comparable with the ones above — 261.95 s for a
+512-token prefill against the sweep's 137.9–143.9 s at 0 rows is that difference and not the bank.
+And every prompt is measured after a warmup pass over the same prompt at the same length, so the
+`prefill` row is the second one by construction; that the *warmup* also reads 0.00 is the point —
+there is no cold pass left for the bank to fix.
+
+### Zero disk reads is also, at this size, near-zero cost: 1.4–2.3 ms a table for a 512-token prefill
+
+`read_bytes` says the gathers read nothing off the device, and that is a route rather than a price —
+the segment is tmpfs, and `V41Checkpoint.rows` reaches it through a `torch.frombuffer` view rather
+than through a privately allocated array, which is not the copy the host page prices. So
+`/tmp/probe_engram_bank.py` attaches the same 457.78 GiB segment, draws the released geometry's ids
+— **12,288 rows a table**, 512 tokens by the config's 24 hash columns, uniform over each table's
+whole range so the scatter is not flattered — and times the call a forward makes:
+
+| segment, one 512-token prefill's gathers, per table | layer 1 | layer 14 |
+| --- | ---: | ---: |
+| codes, `view[rows]`, scattered | 0.22 ms | 0.22–0.26 ms |
+| scales, the same | 0.03–0.04 ms | 0.04 ms |
+| `V41Checkpoint.rows`, the real call | 0.28–0.29 ms | 0.29–0.42 ms |
+| `dequantize_rows` over the gathered rows | 1.19–1.39 ms | 1.03–1.88 ms |
+| **a table, gather and dequant** | **1.5–1.7 ms** | **1.4–2.3 ms** |
+| the same 3.00 MiB copied contiguously | 0.07–0.26 ms | 0.05 ms |
+
+Two attachments on a host that was not idle (a `soong_build` at 833% CPU), so each row is a band
+rather than a point; the conclusion survives it — **both tables together are 3–4 ms**, against the
+**253.4 s** the same rows cost from a cold shingled disk and the **3.0 tok/s** the 128-token card
+prefill above measures. Zero disk reads is also, at this size, near-zero cost.
+
+The scatter is free and the dequant is not. Scattered and sequential row ids cost the same
+0.20–0.26 ms, because 3 MiB is a working set rather than a stream and the segment is RAM either
+way — the 91.55 GiB the ids are drawn across never enters it. What is left is
+`dequantize_rows`' three passes over a 12.6 MB fp32 expansion, and it is two thirds of the table's
+cost at a size where nothing is bytes-bound.
+
+The last control is the one that reconciles this with the host page's **0.009 s** for the same
+12,288 rows out of a `resident_engram=True` copy, which reads as a 31× difference in the segment's
+favour and is not one. The same rows gathered one at a time, a Python call each, are **19.96 and
+19.61 ms** here against the 9 ms recorded there — the same operation in two writings, the gap being
+the loop's own overhead and not the array — where ATen's batched `index_select` is **0.22–0.26 ms**
+for them. The batched number is the one a forward pays; the per-row pair is an artefact of how each
+page took its control, and the two pages agree once they are read that way.
+
+The card's own `engram` row says the same from the other side. It is **6.78 ms a decode step** over
+two calls in the op-by-op table above, and the gather is not what that buys: a decode step asks for
+24 rows a table against the 12,288 measured here, so the host half of an engram call is a fraction
+of a millisecond, and what is left is the card's own `wkv` — `[1, 6144] x [6144, 25600]`, 314 MB of
+bf16 read once a call — plus the gate and the handover of 12 KiB. Engram is on the host because its
+*tables* are 189.13 GiB and cannot be anywhere else, not because the arithmetic wants to be there.
+
 ### `--threads` is worth 1.13× with the source resident, and 6.8× without it
 
 `torch.distributed.run` sets `OMP_NUM_THREADS` to 1 for every worker unless the environment already
@@ -674,22 +983,167 @@ on the last token's logits, which is the run-to-run spread this path has on its 
 pipelined run differs from the serial one by 2.0e-02, inside that spread. Reading a serial-against-
 pipelined logit difference as the pipeline's would be reading noise.
 
+**The 1.10× is measured on the un-resident path and is not claimed for the resident one.** What that
+pipeline overlaps is a drain of 3.75 ms a row-layer against a staging of 6.3 ms, and the next section
+takes 7.8× of that staging away: a prefill staging a fifth of these bytes has a fifth as much to hide
+behind a row. The two configurations have not been run against each other, so this number belongs to
+the column it was measured on (`--hot-rows 0`, which is the default) and not to the one below.
+
+### A per-layer resident set is worth 2.7× on a prefill, and it is the fill that pays for it
+
+`--expert-hot-rows N` is the knob the two sections above set up. An expert is resident iff the layer
+asks this rank for it at least twice over the pass, so the set is a property of the routing and not of
+a policy; the arena and the pinned block are one a card, shared by all forty layers and refilled by
+whichever layer is running, which is what makes 148 rows affordable at all — forty layers holding
+their own would be 105 GiB of a 22 GiB card. The class docstring is the mechanism
+(`ResidentSet`, `_hot_rows`, `_fill`); this is what it measures.
+
+`/tmp/probe_v41_hot_ab.py`, four ranks under `torchrun`, one process a card, 22 threads, the resident
+bank on, one 512-token prompt, `--length 512 --decode 1`, the four configurations run one after
+another on the same cards in one session. `drawn_rows` is every route a rank was dealt and
+`expert_rows` the ones that missed, so `drawn - staged` is the coverage the set bought. Every counter
+below is the whole run — the 512-row prefill plus the one decode row `--decode 1` asks for — so the
+staged column carries 80 draws on ranks 0 and 1 and 40 on ranks 2 and 3 that the prefill did not make,
+and the tok/s column is the mean of the four ranks:
+
+| `--hot-rows` | prefill, ranks 0-3 | prefill tok/s | draws, r0/r1 | staged, r0/r1/r2/r3 | % resident | filled, r0 | layers cut |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 143.9 / 140.1 / 138.0 / 137.9 s | 3.7 | 41040 | 41040 / 41040 / 20520 / 20520 | 0.0 / 0.0 / 0.0 / 0.0 | 0 | 0 |
+| 64 | **52.8 / 51.1 / 53.2 / 51.8 s** | 9.8 | 41040 | 5307 / 5419 / 1696 / 1681 | 87.1 / 86.8 / 91.7 / 91.8 | 2547 | 39 / 40 / 19 / 19 |
+| 148 | **49.1 / 50.7 / 52.5 / 49.0 s** | 10.2 | 41040 | 1730 / 1743 / 1308 / 1322 | 95.8 / 95.8 / 93.6 / 93.6 | 3932 | 0 / 0 / 0 / 0 |
+| 192 | 55.0 / 52.9 / 54.3 / 54.5 s | 9.5 | 41040 | 1724 / 1685 / 1361 / 1301 | 95.8 / 95.9 / 93.4 / 93.7 | 3929 | 0 / 0 / 0 / 0 |
+
+**2.6–2.7× on every rank at 64 rows**, and **7.8× fewer packed rows staged** on rank 0 — 41040 to
+5307 — against the **6.54×** the offline sweep predicted for this length. The prediction was a
+four-rank sum; the deal is not even, and the per-rank columns are what says so. `_split` sorts the
+row's six slots by global expert id, walks that order round-robin over four ranks and keeps whichever
+ranks this process names, so a rank holding two of the six is dealt two routes a row and a rank
+holding one is dealt one: ranks 0 and 1 draw 41040 over the pass and ranks 2 and 3 draw 20520. The
+narrower deal repeats more, so ranks 2 and 3 come out **91.7% resident against rank 0's 87.1%** at the
+same `hot_rows`. Every rank prints `first token 2413` and `[2413, 21779]` in every column.
+
+**64 is where the curve flattens, and the counters said otherwise.** The 39 and 40 layers cut on ranks
+0 and 1 at 64 rows are the arena being the binding constraint — that is what `capped_layers` is for —
+and uncapping it at 148 rows takes the staged count down a further **3.1×**, 5307 to 1730, with no
+layer cut anywhere. It buys **6–7%** of the prefill and costs **2.3×** the arena. Past that it is a
+loss: at 192 rows the staged and filled rows are within 60 of 148's on every rank — the arena is not
+doing less work, it is only wider — and the prefill costs more. The pair was re-run three times
+because a single sitting is worth what the node's own drift says it is worth:
+
+| sitting | `--decode` | order | prefill at 148, ranks 0-3 | at 192, ranks 0-3 | rank mean |
+| --- | ---: | --- | ---: | ---: | ---: |
+| the width sweep above | 1 | 0, 64, 148, 192 | 49.1 / 50.7 / 52.5 / 49.0 | 55.0 / 52.9 / 54.3 / 54.5 | 50.3 → 54.2 s, +7.6% |
+| `/tmp/r512_{a,b}.pt` | 4 | 148 then 192 | 50.1 / 48.5 / 50.0 / 49.0 | 57.3 / 53.4 / 54.3 / 54.3 | 49.4 → 54.8 s, +11.0% |
+| `/tmp/q512_1{a,b}.pt` | 4 | 148 then 192 | 48.2 / 48.6 / 49.4 / 49.8 | 49.7 / 53.0 / 51.7 / 50.6 | 49.0 → 51.3 s, +4.6% |
+| `/tmp/q512_2{a,b}.pt` | 4 | 148 then 192 | 49.0 / 49.4 / 52.9 / 51.9 | 54.4 / 50.3 / 51.6 / 50.1 | 50.8 → 51.6 s, +1.6% |
+
+The last two rows are the A-B-A-B: 148, 192, then 148, 192 again, one prompt, only the arena width
+differing. On the rank mean 192 is the slower column in all four sittings, and in three of the four
+every rank is on the same side of it — by 0.8 s at the narrowest and 7.2 s at the widest. The fourth
+is the A-B-A-B's second round, and it splits two ranks each way for a mean margin of 1.6%, which is
+less than half the 3.7% the *same* 148-row configuration drifted between the two rounds of that same
+pair (`/tmp/q512_1a.pt` to `/tmp/q512_2a.pt`, 49.0 to 50.8 s, at load average 25 and 34). So the
+direction is measured and the size is not: without a quiet machine this is worth 1.6% to 11.0%, and
+the honest headline is that the wider arena is not buying anything the counters can see while it
+costs more every time it has been run.
+
+The four counters this class keeps are identical across the pair to within a few dozen rows, so what
+the extra 789 MiB of arena and 789 MiB of pinned block cost is not anything this class counts. It is
+reported here as measured and unexplained rather than argued away, and it is the reason `hot_rows` is
+sized to the routing and not above it.
+
+**What it costs is `_fill`, and it is 16–25% of the prefill it sits in.** `_fill` is the one thing the
+class does per *layer* rather than per row, so no counter has a line for it: it is invisible in the
+A/B probe's wall clock and the counters only report what it moved (`filled_rows`). It is timed by
+wrapping the method — `/tmp/probe_v41_resident_fill.py`, one `perf_counter` a layer — on the top of
+the same 512-token prefill:
+
+| `--hot-rows` | rank | fill, 40 layers | a layer | rows filled |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0–3 | 0.00 s | — | 0 |
+| 64 | 0 / 1 / 2 / 3 | 8.64 / 7.95 / 7.92 / 8.20 s | 216.0 / 198.8 / 198.0 / 205.1 ms | 2548 / 2560 / 2311 / 2282 |
+| 148 | 0 / 1 / 2 / 3 | 13.06 / 12.83 / 9.98 / 9.85 s | 326.6 / 320.7 / 249.4 / 246.2 ms | 3865 / 4019 / 2491 / 2400 |
+
+That is near enough **3.4 ms an expert row** in both columns — 8.64 s over 2548 rows and 13.06 s over
+3865 — so the fill is linear in the set's width and indifferent to everything else, and it is charged
+every layer whether or not that layer has anything new to say. It is a **2.6×** correction to the 82 ms
+a layer the class docstring used to claim from arithmetic: the fill pays *two* copies a row where
+`_stage` pays one, the bank into the pinned block at 17.9 MiB and the pinned block into the arena at
+17.9 MiB again, and the second reads bytes the first has just written, so the two halves do not add up
+to the one-directional 14 GiB/s `_stage` reaches.
+
+**Decode is the column the set does not help, and the sweep prices it at 10–11%.** 0.668 s a token at 0
+rows against **0.743** at 64 and **0.736** at 148, all three in the same sitting at `--decode 1`, and
+inside each column the four ranks agree to within 0.006 s. A decode step is one row a layer and one
+row asks
+each expert once, so nothing of it can be resident and `_fill` returns before it looks at anything;
+the only per-row work the set adds is the index copy `_issue` makes because the arena rows are no
+longer `0..k`, four 16-byte H2Ds a layer, which is not 1.9 ms of one. This page does not have the
+mechanism for the 10–11%, and says so rather than crediting the fill with a cost it does not pay.
+
+**It is also the column where the readings disagree, so read the 10–11% as what one sitting found.**
+The widths do not separate from each other here at all, and the A-B-A-B is what says so. Within the
+`--decode 4` instrument, 148 measures **0.788, 0.717 and 0.857** across its three sittings and 192
+measures **0.888, 0.756 and 0.739** across its three — each configuration drifting about 20% between
+its own sittings, which is wider than the widest gap between the two configurations in any one
+sitting. Worse for a one-sitting reading, the sign reverses: 192 is 5.5% slower in the A-B-A-B's first
+round (0.717 against 0.756) and 13.8% faster in its second (0.857 against 0.739), and in that second
+round it is the 148-row column that carries the outlier. The sweep's own 0.949 at 192 rows is the same
+story from the `--decode 1` side: 192 measures 0.756, 0.739 and 0.888 on the other instrument, so
+0.949 is the node and not the arena.
+
+The corollary is that the set-off control was only ever run as the *first* column of one sweep, so the
+11% step from it to the 64-row column cannot be separated from a warm-up that had finished by the
+second column. The check that would settle it is that sweep with the control repeated at the end as
+well as the start, and it has not been run; until it is, `--expert-hot-rows` is recommended for
+prefill and left off for decode on the strength of the mechanism — a decode row repeats nothing, so a
+resident set cannot help it — rather than on the strength of this column.
+
+**The one column the set does not move is the logits, and that is now measured as zero rather than
+inferred.** `--hot-rows 0` against `--hot-rows 64`, same prompt, same sitting: the set takes rank 0
+from 41280 staged rows to 5613 (86.4% resident against 0.0%), ranks 2 and 3 from 20640 to 1807 and
+1792 (91.2 and 91.3%), and the pair then agrees on **32 of the top 32 ids, in position, at `|dlogit|
+0.000e+00` of a max |logit| of 29.15 — on all four ranks**, ranks 1–3 included. Both legs route
+identically, so every expert the prefill asked for was computed from the same packed weights whether
+it came out of the arena or off the checkpoint.
+
+That is the answer a cache has to give and it is worth stating as one: an 86–91% reduction in staged
+rows that moves not one bit of the tail is what makes `_hot_rows` a pure cost knob. It also disposes
+of the reading this page carried before the fix, in which *two different configurations* agreeing on
+28 of 32 ids at a median 0.30 looked like a tighter match than two runs of the *same* one — a
+"comparison inside a ±3% envelope" that would have made the logit columns a repeat. The same
+configuration's floor was 30 of the 32 out of position at the time, so that 28 was noise wearing the
+shape of a result, and the envelope it implied does not exist: both floors are now exactly zero, and
+the columns separate nothing about the resident set because there is nothing there to separate.
+
+**Residency, counted.** `VmRSS` at the end of a 512-token pass, per rank, against the same pass with
+the set off: rank 0 **119.84 GiB → 122.36 GiB at 64 rows and 123.55 at 148**, rank 2 **86.03 → 88.75 →
+90.63**. The pinned block is 1.15 GiB and 2.65 GiB of that, so the set's own cost is its pinned block
+plus 1–2 GiB, which is the honest answer to a question the earlier A/B could not ask: `ru_maxrss` over
+a whole process moves by tens of GiB with the *prompt length*, and reading that as the set was reading
+the prompt. `VmLck` is 0 kB throughout — the driver's pinning does not appear as `mlock` here — and one
+arena a card, not forty, is what the 2690 MiB in the table above already says.
+
+Reproduce with:
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_hot_ab.py \
+    --length 512 --hot-rows 64 --out /tmp/s512_h64.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_resident_fill.py \
+    --length 512 --hot-rows 64 --out /tmp/fill_h64.out
+```
+
 ## What this does not do yet
 
 All of these are separate measurements rather than separate opinions.
 
-- **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
-  is refilled every row, so a prefill of `n` rows pays 4.20 GiB `n` times: the 5-token prefill above
-  stages 21.0 GiB, five times a decode step's traffic, because two tokens that route to the same
-  expert each stage it. A wider arena plus `moe_multi_token_fp4_forward` — one slot per distinct
-  expert the batch hit, its tokens contiguous — is the shape that fixes it, and it is a follow-on
-  rather than a knob, because an arena size and an eviction policy only mean something once that
-  measurement exists. The row-layer table above is the number it is worth: at 128 tokens the staging
-  is 6.4 ms of a 12 ms row-layer and 32,717 ms of a 48 s prefill, paid once per route, so what a
-  per-layer slot set saves is the ratio of a rank's routes to the distinct experts among them. At 128
-  tokens, four ranks dealing six sorted ids round-robin leave a rank 256 draws from the 384-expert
-  space over the layer's 128 rows, and the duplicates in those draws are what it would stop paying
-  for. It is worth more the longer the prompt, which is the opposite of the pipeline above.
+- **Not caching across rows on the device was the first of these, and it is now a knob.** See
+  [the section above](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it):
+  `--expert-hot-rows` keeps a layer's hot experts in the shared arena and is worth 2.6–2.7× on a
+  512-token prefill. What is *not* done is the batch shape that would make it worth more — a wider
+  arena plus `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its tokens
+  contiguous. That is still a follow-on rather than a knob, because it needs a kernel this class does
+  not call, and the resident set above is what proves the arena arithmetic it would rest on.
 - **The bank removes the disk from `_stage`, not the copy out of it.** With
   `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
   without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —
@@ -698,17 +1152,180 @@ All of these are separate measurements rather than separate opinions.
   arena whichever source it came from, and `_stage` is still 242 ms of a 458 ms class. The pipeline
   above does not take that copy away either — it hides 2.0 ms a row-layer of a 3.75 ms drain and gives
   back 0.95 ms of it in staging, which is a 1.10× and not the 7.3-against-1.0 the ceiling suggested.
-- **The Engram tables are in the segment, and what a banked prefill's gather costs is unmeasured.**
-  `rows` reaches the segment under the same environment variable (`resident_bank.parse_engram_key`),
-  so the 253.4 s/table cold path the host page records is not on a banked run's route. But the gathers
-  are per row and a 512-token prefill makes 12,288 of them per table, which is the workload the
-  resident-tables half of the 457.78 GiB was paid for and the one no run here has priced.
+- **The Engram tables are in the segment, and a banked prefill's gather is priced: 1.4–2.3 ms a
+  table, 3–4 ms for both.** `rows` reaches the segment under the same environment variable
+  (`resident_bank.parse_engram_key`), so the 253.4 s/table cold path the host page records is not on
+  a banked run's route, and the `read_bytes` acceptance above puts a 512-token prefill's 12,288
+  gathers a table at zero bytes off the device. **Zero disk reads turned out not to be a cost either
+  at this size** — the gather is 0.22–0.26 ms of the 1.4–2.3, and `dequantize_rows` over the
+  gathered rows is the rest ([measured
+  above](#zero-disk-reads-is-also-at-this-size-near-zero-cost-1423-ms-a-table-for-a-512-token-prefill)).
+  What that does not settle is a corpus that moves onto n-grams it has not hashed before: the ids
+  are uniform over the whole table here and a real one is not, and this measurement does not say
+  what the hot set is.
+- **The determinism check the plan lists was run, and what it found was a real bug rather than a
+  tolerance.** The same configuration twice — `--length 512 --hot-rows 148 --decode 4`, `q512_1a`
+  against `q512_2a` on rank 0 — keeps **all five greedy tokens** and **30 of the top 32 ids**, and
+  moves **30 of the 32 out of position**: positional agreement is 2 of 32 there, 3 of 32 on the
+  192-row repeat, and 2 to 10 of 32 across every pair recorded on this page, the pairs that differ by
+  a whole configuration included. The band is not association order either (5.960e-08 is what that
+  costs on this path): the same id's logit moved by **0.46 median and 1.21 at worst** on that pair,
+  and by up to **2.93** on the other, against a leader at 28.8. Read positionally, slot against slot,
+  the same pair is 0.195 median and 0.875 at worst, smaller precisely because the permutation is most
+  of the positional difference. It was the first hard evidence that the path did not repeat itself,
+  and everything below is what it led to — **the fix is one missing barrier in the sparse-attention
+  kernels, and it takes this pair to 32 of 32 in position at `|dlogit| = 0`.**
+- **The same configuration was run four times in one sitting, no two of them routed alike, and that is
+  what localized the drift to the gate's input.** `d1`, `r1`, `r2` and `d2` are one configuration —
+  `--length 512 --hot-rows 148 --decode 4` — and they disagreed on `expert_rows` (1990, 1963, 2001,
+  1975) and on `filled_rows` (3946, 3969, 3904, 3900), while all four keep the five greedy tokens
+  `[2413, 21779, 14, 305, 270]`. The pair this page was written around, `q512_1a` against `q512_2a`,
+  is the same disagreement in another sitting (2008 against 1983 staged, 3916 against 3909 filled).
+  `_fill` and `_hot_rows` are pure functions of the layer's own routing — the count is of that
+  layer's own draws and nothing is carried between layers — so runs that filled different counts
+  selected different experts: the gate asked for experts the others did not. **Re-run after the fix,
+  the same pair agrees on every one of those numbers, on every rank**: rank 0 stages 2008 and fills
+  3935 in both legs (`/tmp/pf_p1.pt.r0` against `/tmp/pf_p2.pt.r0`), ranks 1, 2 and 3 are identical
+  run to run as well, and the counters that had four different values now have one. The one kernel in
+  the chain whose nondeterminism *is* documented turns out not to be on it: the op the device path
+  calls is `moe_single_token_fp4_forward` (`src/csrc/cuda_kernel_impl.cu`), and its default is the
+  fixed-order `partials` reduce (`DEEPSEEK_MOE_DETERMINISTIC_REDUCE` defaults to 1), whose `atomicAdd`
+  twin is the one whose own comment records `topk>=3` diverging on 60 of 60 repeats. With
+  `n_activated_experts` at 6 this path is in exactly the regime that default exists for.
+- **It is not the collective, and all three ways of asking that agree.** Every rank is bitwise
+  identical to every other *within* a run: on four recorded payload sets, ranks 1, 2 and 3 against
+  rank 0 are 32 of 32 positional, 32 of 32 in set, worst |dlogit| **0.00e+00**. On its own that
+  excludes a rank-asymmetric race and very little else, because an all-reduce hands every rank the
+  same answer by construction — the thing it cannot see is the collective choosing a different
+  reduction order on a different run, which is why the second test pins it rather than observing it.
+  Two of the four runs carried `NCCL_ALGO=Ring` (accepted, with no `Invalid value` warning), and the
+  pinned pair drifts neither more nor less than the unpinned control: all six pairs among the four
+  runs land between **2 and 8 of 32 positions at a median 0.336 to 0.796 logits**, `r1` against `r2`
+  at 6 of 32 and median 0.407 sitting between the control pair's 6 of 32 at 0.336 and the widest
+  pair's 2 of 32 at 0.796. `NCCL_ALGO` is not the whole order, though — the protocol and the channel
+  count are left free, and the partition a ring reduces over is a function of the channel count — so
+  the pin that closes this is the one that fixes those too. **It does not close it.** Two more runs
+  under `NCCL_ALGO=Ring NCCL_PROTO=Simple NCCL_MIN_NCHANNELS=1 NCCL_MAX_NCHANNELS=1` — one channel on
+  a ring under the simple protocol, which leaves NCCL no freedom in the order its arithmetic happens
+  in — are **6 of 32 positions at a median 0.243 and 0.970 at worst**, and they are the *closest*
+  pair of the six, nearer each other than two of the four unpinned runs are. The pin was accepted
+  (no `Invalid value` warning on either leg) and it bought nothing. What settled it is that the
+  pinned pair also **routed differently** — 1988 staged and 3927 filled against 1952 and 3922 — so
+  the order the collective reduces in is not what the counters move with. A collective is the same
+  answer on every rank and that is all it is; the drift is in the host arithmetic the four ranks
+  each do privately, which the next measurement goes after directly.
+- **The first block diverges with its input bitwise identical, and the seed is a swapped pair of
+  tied experts.** `/tmp/probe_v41_routes.py` records, per layer, a bf16 **digest** of the block's own
+  input and output and the gate's own `indices` captured in place — a probe that re-derived the
+  routing would be checking its own arithmetic — and ran twice at `--length 512 --hot-rows 0`, so the
+  resident set is out of the picture by construction and the expert source is the checkpoint it always
+  was. Layer 0 is the answer: **input digest equal, last-row digest equal, output digest not**, and of
+  its 3,072 route entries exactly **2 differ, on 1 row of 512** — every row keeps the same six
+  experts. The row is 64, and the two runs read `[40, 134, 315, 204, 62, 41]` and
+  `[40, 134, 315, 62, 204, 41]`: the same six experts, with **204 and 62 exchanging slots 5 and 6**.
+  What that does not license is the reading that the gate saw two *equal* scores and returned them in
+  the other order: the block's input is the attention's input, and the gate reads the attention's
+  *output* — which moves between two calls on one frozen activation in the same process, one layer
+  further down. The gate therefore scored 204 and 62 differently, the two landed in the other order,
+  and the (weight, expert) pairs were then summed along the row in the other sequence. Two float sums
+  of the same six terms that differ only in order differ in the last bits, so the block output
+  differs, and the page's own reproduction is the amplification: from layer 1 on the input is
+  already different and the divergence compounds without any second cause — **45 experts whose counts
+  disagree at layer 2, 64 at layer 3, 85 at layer 4, and 172 of the layer's 384 by layer 38**, against
+  none at all at layer 0. Layer 1 shows both halves of the same coin: four rows differ, three of them
+  pure swaps (94↔63, 139↔270, 109↔33) and one
+  a **real change of expert** (127 against 252), which is a near-tie not on the ordering boundary but
+  on the cut itself. The whole route is the same six experts in the other order, or a 127th expert
+  swapped for a 252nd, and 40 layers of that is the 2-to-8-of-32 positional spread and the 0.24-to-1.25
+  logit band every pair on this page shows. The counters move for the same reason: `_fill` reads the
+  layer's own routing, and one row's worth of a swapped expert is one more or one fewer row staged.
+- **The producer is a missing `__syncthreads()` in the sparse-attention kernels — one shared buffer,
+  two reductions, and no fence between them.** Every one of the six sparse-attention kernels in
+  `src/csrc/cuda_kernel_impl.cu` reduces twice into the same shared `float*` and reuses index 0 for
+  both. The max tree ends, its result is read out as `max_score = fmaxf(reduce[0], attn_sink[h])`
+  (single-head; `max_score0`/`max_score1` on the two head-pair kernels), and then the *denominator*
+  pass opens with `reduce[tid] = local_denom` — index 0 included — with nothing between the read and
+  the write. A thread that loses that race reads a denominator where it expects the maximum, and every
+  `expf(scores[t] - max_score)` after it is computed against the wrong constant.
+  - The six sites, and no others: `prefill_sparse_attn_kernel` (the read at
+    `cuda_kernel_impl.cu:888`), `prefill_sparse_attn_headpair_kernel` (`:1004`/`:1005`),
+    `fused_decode_sparse_attn_kernel` (`:1118`), `fused_decode_sparse_attn_wmma_kernel` (`:1229`),
+    `flashinfer_style_sparse_attn_kernel` (`:1335`), and `flashinfer_style_sparse_attn_headpair_kernel`
+    (`:1455`/`:1456`).
+  - `compute-sanitizer --tool racecheck` names exactly that pair and nothing else: **Read at `+0x2d10`
+    racing Write at `+0x3350`, and Read at `+0x2d30` racing Write at `+0x3330`, 16,384 hazards
+    each**. With `-lineinfo` they resolve to the two `max_score` reads against the two
+    `reduce[tid] = local_denom` stores. SASS agrees and rules out a compiler artifact: `BAR.SYNC 0x0`
+    sits at `0x3360`, *after* both stores.
+  - **Proof it is the cause and the whole cause.** The kernel text lifted byte-for-byte out of the
+    repository and compiled standalone (`/tmp/probe_headpair_standalone.py`), 50 calls on one frozen
+    input, in one process with one thread configuration — so OpenMP, thread count and the four-card
+    collective are not variables in this test at all:
+
+    | variant | outputs over 50 calls | worst max \|d\| |
+    | --- | ---: | ---: |
+    | as the source reads today, fence in place | **1** | **0.000e+00** |
+    | that one fence deleted | 50 | 1.797e+00 |
+    | same, before the fix, at `-O3` and no `--use_fast_math` | 50 | 1.984e+00 |
+
+    The only difference between the first two rows is one `__syncthreads()`; the third row is the
+    pre-fix source and settles the build flags — `setup.py` does compile this extension with
+    `--use_fast_math`, but a plain `-O3` build drifts 50 of 50 on its own. The same command with the
+    fence deleted reproduces the sanitizer's hazard report exactly (the same two addresses, the same
+    16,384 each), and with the fence in place reports **0 hazards** and returns the same digest on
+    every call.
+  - **Neither of the two fixes the previous draft of this bullet proposed is the fix.** There is no
+    tie to break: `/tmp/probe_v41_gate_ties.py --report` over 12,288 rows finds **0** rows holding two
+    of the six returned weights at a bitwise-equal score, with `redo_mismatch = 0` everywhere; only 3
+    rows carry a tie at the selection cut at all (6th and 7th bitwise equal, layers 3/38/39 and layer
+    39). And the thread count is not the variable: `--threads 1` with `OMP_NUM_THREADS=1` still
+    drifts, and the standalone test above has no OpenMP and no thread-count change in it whatsoever.
+    A `(score, expert id)` tie-break and a single-threaded reduction would each have cost time and
+    fixed nothing.
+  - **One thing that looked like a second hazard is not.** Dropping the barrier between the score
+    loop and the max tree changes nothing (1 distinct over 50 too), and it should not: with
+    `for (t = tid; t < topk; t += blockDim.x)` on both the write and the read, every thread reads
+    back only the entries it wrote itself, so that barrier is redundant by construction.
+  - **Measured after the source fix and the rebuild.** The built module
+    (`setup.py build_ext --inplace`) goes from **4 distinct outputs over 10 calls, worst max |d|
+    5.972e-01 against a max |value| of 3.203e+00** to **1 distinct over 20 calls, 0 of 4,194,304
+    elements moved** on the same probe, and the model's own repeat report goes from
+    `sparse_attn: DIFFERS, 4 distinct over 10 calls … this is the producer` to
+    `sparse_attn: same, the kernel is not the producer`, with every sub-op of layer 0's attention
+    (`sparse_rope_out`, `einsum_wo_a`, `wo_b`, `out`) now `same` across ten repeats on all four ranks,
+    on two separate legs. The fix is one `__syncthreads()` per site, in all six kernels, with a comment
+    saying why; it is in the working tree on `perf/v41-dense-tree` and not yet on a branch of its own.
+- **The second check the plan lists is now run, and it is the segment ids permuted.** Section 2b of
+  `/tmp/probe_fp4_parity.py` calls the op with the *route order reversed*: the arena untouched, and
+  `indices` and `weights` permuted together, so the six (expert, weight) pairs are the same set and
+  the only thing that moved is the order the kernel reads them in — `[277, 128, 155, 137, 206, 251]`
+  named as `[251, 206, 137, 155, 128, 277]` on layer 0. Reading the arena by arrival position instead
+  of by `indices[route]` fails this by orders of magnitude, not in the last decimal. It does not:
+  **`5.960e-08` against the identity-order call**, which is the same fp32 association class the EP4
+  decomposition costs, and **`1.532e-02` of the output scale against `expert_forward` — the
+  digit-for-digit figure the identity order gives**, argmax agreeing. The reduce is a fixed ascending
+  route order precisely so that a permutation of the routes is nothing but a rounding re-association,
+  and that is what the pair measures. What it does not add is a test of the *gate*: the segments it
+  permutes arrive from a route that has already been shown to flip order, so a pass clears the kernel
+  of an ordering dependence and not of being downstream of one.
+- **The per-layer graph the move exists to enable is still not taken, and the number it was gated on is
+  now in — as a count and a shape, not yet as a size.** The tree on the cards is **191.32 ms a decode
+  step** with the step at **688.9**, of which the class is 414.45 — so three fifths of the step is the
+  class's staging, and most of the tree's 191.32 is dispatch over small tensors: 12.10 ms of `hc_mixes`
+  alone is six ATen launches on 24 numbers, and no kernel inside that op reaches them. The step launches
+  **7,076 kernels** and only **47%** of them are the sixteen heaviest, so the tail is exactly the shape a
+  graph addresses. What this sitting does not give is the prize: the profiler's device times do not
+  survive a second sitting, so the upside is bounded by host work that has to be timed directly. The
+  **111–122 ms** the phase clock leaves outside the named calls is the part of it that is currently
+  unattributed, and the 88 `ncclDevKernel_AllReduce` calls a step are the part a graph would have to
+  capture as collective nodes or leave outside it.
 
 ## Reproducing
 
 ```bash
-# the kernel against the host expert on real activations, the EP4 decomposition, and the
-# 2/2/1/1-against-one-call kernel cost -- needs /tmp/v41_activations.pt from probe_capture.py
+# the kernel against the host expert on real activations, the EP4 decomposition, the same six experts
+# with the segment ids permuted and the weights riding with them, and the 2/2/1/1-against-one-call
+# kernel cost -- needs /tmp/v41_activations.pt from probe_capture.py
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_capture.py
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_fp4_parity.py
 
@@ -755,6 +1372,36 @@ PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_first
 # attribution as above so the two tables read line for line
 torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8,128 --steps 8
 
+# ... and the same step per op instead of per phase, with the tree on the cards -- this is the sitting
+# `hc_mixes` is read off, and the one that says the host tree's `hc_mixes` row is a fallback and not a
+# price. `PYTHONPATH` because `src` is a repo-root package and the probe lives in /tmp, so `sys.path[0]`
+# is /tmp under `torchrun` exactly as it is under `python`. `--no-sweep` is the default here: the thread
+# pool does not govern a tree on a card, so the sweep and the replay would re-time the same step
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 PYTHONPATH=/mnt/data1/dsv4_inference \
+  torchrun --nproc_per_node=4 /tmp/probe_dense_tree.py --tree cuda --threads 22 --steps 4 \
+  --out /tmp/dt_cuda.out
+
+# the `hc_mixes` row above, taken apart: the fused kernel, the loop it replaced and the six ATen ops
+# around them, on one idle card, no checkpoint and no second rank. The shape is the decode shape -- 1
+# row, hc_mult 4 -- and it also runs 512 to show that neither implementation is arithmetic-bound
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_hc_split_card.py
+
+# how many kernels the step launches: one more decode trajectory under a CUPTI window, the same
+# `torch.profiler` instrument the single-block breakdown uses, rows split on `device_type` so the
+# CUDA runtime API rows are not counted as launches. Same configuration as the sitting above, because
+# the count is only comparable to the ~9,100 the sinkhorn loop cost if it is the same step. Every
+# rank must run this pass and only rank 0 reports it -- three ranks returning early leaves rank 0 in
+# an all-reduce with no peer, which is how the first attempt at this number died
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 PYTHONPATH=/mnt/data1/dsv4_inference \
+  torchrun --nproc_per_node=4 /tmp/probe_dense_tree.py --tree cuda --threads 22 --steps 4 --launches \
+  --out /tmp/dt_cuda_launches.out
+
+# ... and once more, which is the point of the pair: the launch counts come out identical and the
+# device-time columns do not, so a single sitting of this command cannot tell a count from a sample
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 PYTHONPATH=/mnt/data1/dsv4_inference \
+  torchrun --nproc_per_node=4 /tmp/probe_dense_tree.py --tree cuda --threads 22 --steps 4 --launches \
+  --out /tmp/dt_cuda_launches2.out
+
 # ... with the experts staged from the resident bank instead of the checkpoint mapping. The bank is
 # filled once by `resident_bank` and every later run attaches it in milliseconds; this flag is the
 # whole wiring. Warm it is a wash, cold it is the difference between 782.9 ms and 17.01 s a step
@@ -769,10 +1416,29 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/fadvise_drop.py /mnt/data3/DeepSeek-V4.1-Flash
 torchrun --nproc_per_node=4 /tmp/probe_v41_tp4_e2e.py --lengths 8 --steps 8
 
+# ... and the acceptance: `read_bytes` out of `/proc/self/io` around every phase, plus `/dev/shm`,
+# the process's own RSS and `torch.cuda` host bytes. One process, four cards, a warmup pass before
+# each measured prompt, so the prefill row is the second pass over that prompt by construction
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 /home/lvyufeng/miniconda3/envs/deepseek/bin/python \
+  /tmp/probe_v41_resident.py --lengths 128,512 --steps 4 --threads 22
+
+# what that acceptance's zero means as a price: the same segment attached read-only, 12,288 row ids a
+# table drawn uniform over the whole 91.5 GiB, and the gather, the surrounding call, the dequant and
+# a per-row loop each timed. No card, no checkpoint read past the 0.24 s layout scan, and it never
+# fills the segment -- if `bank.ready` is there it attaches in 0.3 s
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 /home/lvyufeng/miniconda3/envs/deepseek/bin/python \
+  /tmp/probe_engram_bank.py
+
 # the checked-in TP4 launcher, which is what `--threads` is about
 torchrun --nproc_per_node=4 -m src.cli.generate_v41 \
   --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" \
   --max-new-tokens 3 --threads 22
+
+# ... and the same launcher with a per-layer resident expert set, which is the prefill column's
+# whole configuration. It reports its own hit rate and its capping at the end of the run
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 -m src.cli.generate_v41 \
+  --checkpoint /mnt/data3/DeepSeek-V4.1-Flash --prompt "The capital of France is" \
+  --max-new-tokens 3 --threads 22 --expert-hot-rows 64
 
 # the row loop, serial against one row deep, both orders in one process and alternated so the node's
 # own drift lands on both columns. The class's own `forward` is the pipelined one; the probe defines
@@ -782,9 +1448,103 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
   /tmp/probe_v41_tp4_pipe_matrix.py --lengths 32,128 --pinned 2 --threads 22
 DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
   /tmp/probe_v41_tp4_pipe_matrix.py --lengths 32 --pinned 2,3,4 --threads 22
+
+# the resident set, four widths, one sitting, one prompt. `--out` takes a rank suffix, so the four
+# ranks do not write the same file
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_hot_ab.py --length 512 --hot-rows 0 --out /tmp/s512_h0.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_hot_ab.py --length 512 --hot-rows 64 --out /tmp/s512_h64.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_hot_ab.py --length 512 --hot-rows 148 --out /tmp/s512_h148.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_hot_ab.py --length 512 --hot-rows 192 --out /tmp/s512_h192.pt
+
+# ... and 148 against 192 again, twice, A-B-A-B, which is what separates the arena's effect from the
+# node's: the same script at `--decode 4` with nothing between the two widths but the width. The
+# wrapper waits on `WAIT_FOR=<pid>` first, because it wants the four cards to itself, and echoes the
+# load average at each leg so the sitting can be judged
+WAIT_FOR=0 /tmp/run_quiet_width.sh
+
+# ... and the two logit columns against the control. Read all three: the set takes rank 0 from 41280
+# staged rows to 5613 and ranks 2-3 from 20640 to ~1800, and it moves none of the 32 -- 32 of 32 in
+# position at `|dlogit| 0.000e+00` of a max |logit| of 29.15, on every rank. So the columns separate
+# the set's cost and nothing else; it is a cache, not an approximation
+python /tmp/probe_v41_hot_ab.py --compare /tmp/s512_h0.pt.r0 /tmp/s512_h64.pt.r0
+# ... and the same two legs with the compare attached, as one command, so the pair can be re-taken
+# against a sitting rather than against the cards
+WAIT_FOR=0 /tmp/run_quiet_configcmp.sh
+
+# what the fill costs, which no counter has a line for: it wraps `_fill` and charges a
+# `perf_counter` a layer, then reads the process's own RSS and smaps_rollup at four points
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_resident_fill.py --length 512 --hot-rows 64 --out /tmp/fill_h64.out
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_resident_fill.py --length 512 --hot-rows 148 --out /tmp/fill_h148.out
+
+# --- the run-to-run drift, and the one barrier that caused it ---
+
+# layer 0's attention re-run ten times on the activation it actually consumed, every sub-op digested.
+# The repeats are inside one leg, so one leg is enough to name a producer; the second leg is for the
+# case where all ten agree and the question becomes whether the *process's* conditions differ
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_gate_ties.py --length 512 --hot-rows 148 --threads 22 --detail-layers 1 \
+  --repeat 10 --out /tmp/gt_r1.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+  /tmp/probe_v41_gate_ties.py --length 512 --hot-rows 148 --threads 22 --detail-layers 1 \
+  --repeat 10 --out /tmp/gt_r2.pt
+
+# ... and the tie this page used to blame for it. `--report` answers from the gate's own captured
+# `indices` and scores, and prints `redo_mismatch` as the check that it recomputed them the way the
+# gate did; zero rows in 12,288 hold two of the six returned weights at a bitwise-equal score
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_gate_ties.py --report \
+  /tmp/gt_r1.pt.r0 /tmp/gt_r2.pt.r0
+
+# the kernel alone, twenty times: does `prefill_sparse_attn_headpair_forward` repeat itself on frozen
+# arguments? It digests the arguments on every call too, so an instrument that is not in fact holding
+# them fixed says so instead of blaming the kernel. Ten seconds the first time, three minutes after
+PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_sparse_attn_repeat.py \
+  --repeats 20
+
+# where in the output it disagrees, and against a float64 reference: which rows, which heads, how many
+# of the 512 lanes move inside a pair, and whether the calls straddle the truth or all sit on one side
+PYTHONPATH=. /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_sparse_attn_where.py
+
+# the same kernel text lifted byte-for-byte out of `src/csrc/cuda_kernel_impl.cu` and compiled
+# standalone, so the answer cannot be a fact about the model: as the source reads today, with the
+# max-read fence deleted, and with the *other* barrier deleted (the control that a stable result is
+# not a harness that cannot see a race). The `nvcc` on `PATH` is 13.0 while this torch is a 12.4
+# build, so the toolkit has to be pinned the same way the extension build pins it
+PATH=/usr/local/cuda-12.4/bin:$PATH CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.5 \
+  /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_headpair_standalone.py --repeats 50
+
+# ... and the sanitizer that named the pair in the first place: 16,384 hazards on the max-read against
+# the denominator store with the fence deleted, `0 hazards` and one digest on every call with it in
+# place. `--unfenced` builds the variant; `-lineinfo` is what puts the addresses on source lines
+PATH=/usr/local/cuda-12.4/bin:$PATH CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.5 \
+  compute-sanitizer --tool racecheck --print-limit 4 \
+  /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/run_headpair_once.py --unfenced
+PATH=/usr/local/cuda-12.4/bin:$PATH CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.5 \
+  compute-sanitizer --tool racecheck --print-limit 4 \
+  /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/run_headpair_once.py
+
+# the rebuild every model-level leg above needs before it can see the fix. `build_ext` builds *every*
+# extension in `setup.py`, and `pocketllm_cpp` does not survive `TORCH_CUDA_ARCH_LIST=7.5` -- its
+# qwen NVFP4 kernels are sm_80+ -- but `cuda_kernel` is linked and copied before that failure, so
+# read the timestamp on `cuda_kernel.cpython-311-x86_64-linux-gnu.so` rather than the exit code
+PATH=/usr/local/cuda-12.4/bin:$PATH CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.5 \
+  /home/lvyufeng/miniconda3/envs/deepseek/bin/python setup.py build_ext --inplace
+
+# ... and the pair of full legs that closes it, the same configuration twice, compared on the counters
+# and on the logits at every rank: 32/32 in position at `|dlogit| 0.000e+00`, and every counter equal
+WAIT_FOR=0 /tmp/run_quiet_postfix.sh
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_hot_ab.py --compare \
+  /tmp/pf_p1.pt.r0 /tmp/pf_p2.pt.r0
 ```
 
-Each takes about 90 s, most of it the ~70 s load. The three probes that touch a card want all four
+Each takes about 90 s, most of it the ~70 s load; the standalone and sanitizer runs at the end take
+minutes, because they compile CUDA from scratch, and `racecheck` serializes execution on top of that.
+The probes that touch a card want all four
 of them free. `probe_stage.py` and `probe_h2d.py` report whichever page-cache state they find, and
 `probe_device_cost.py` prints a `GiB/s` column so the same is true of it and readable rather than
 silent.
@@ -792,7 +1552,13 @@ silent.
 The host path stays the default: the device path needs `--expert-device` (or
 `DEEPSEEK_V41_EXPERT_DEVICE`) and falls back to `CheckpointRoutedExperts` with one line on `progress`
 if the extension is unloadable, the card is missing or the checkpoint's expert is laid out the other
-way round.
+way round. The resident set is off by default too and is a knob rather than a default for a measured
+reason: it is worth **2.6–2.7×** on a 512-token prefill, and the one sitting that priced its decode
+against a no-set control put that at **10–11%** — so `--expert-hot-rows N` is a prefill knob and the
+launcher that leaves it unset is the decode configuration (the decode column is also the one the
+readings disagree on; see the resident-set section above). It costs no memory when it is zero — the
+arena is the same two rows — and the flag
+prints its own hit rate, its capping and its misses when the run ends.
 
 **Read that fallback line, and run the device path from the `deepseek` environment.** The repository
 root holds two builds of the same extension, `cuda_kernel.cpython-310-x86_64-linux-gnu.so` and
