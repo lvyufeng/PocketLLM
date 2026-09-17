@@ -250,6 +250,19 @@ class MmapSafetensors:
     def nbytes_total(self) -> int:
         return sum(entry.nbytes for entry in self.entries.values())
 
+    def data_offset(self, file_name: str) -> int:
+        """Where a shard's data section starts in the file.
+
+        `TensorEntry.begin` is relative to it, not to the file, so a caller that wants to `pread` a
+        tensor's bytes rather than map them -- because a mapping would leave the same bytes in the
+        page cache under the copy -- has to add this, and getting it wrong reads a plausible tensor
+        out of the wrong place. The 258,144 bytes here are `model-00003-of-00048`'s header.
+        """
+        try:
+            return self._data_offsets[file_name]
+        except KeyError:
+            raise KeyError(f"{file_name} is not one of this checkpoint's shards") from None
+
     def group_bytes(self, group_of) -> dict[object, int]:
         """Sum every tensor's bytes into the group `group_of(key)` names.
 

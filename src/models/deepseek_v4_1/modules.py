@@ -35,7 +35,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.models.deepseek_v4_1.attention import Attention, RMSNorm, SharedAttentionRuntime
+from src.models.deepseek_v4_1.attention import (
+    Attention,
+    RMSNorm,
+    SharedAttentionRuntime,
+    canonical_device,
+)
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.kernels.ops import hc_split_sinkhorn
 
@@ -52,6 +57,7 @@ __all__ = [
     "ResidentEngramTable",
     "ResidentRoutedExperts",
     "RoutedExperts",
+    "check_activation_matches_experts",
     "expert_forward",
     "make_identity_pre_mix",
     "sample",
@@ -68,13 +74,27 @@ class Expert(nn.Module):
     """One SwiGLU FFN. The clamps come straight from training, where they keep fp8/fp4 activations
     in range: the up branch is clamped on both sides, the gate branch only from above."""
 
-    def __init__(self, dim: int, inter_dim: int, dtype: torch.dtype = LINEAR_DTYPE, swiglu_limit: float = 0.0):
+    def __init__(
+        self,
+        dim: int,
+        inter_dim: int,
+        dtype: torch.dtype = LINEAR_DTYPE,
+        swiglu_limit: float = 0.0,
+        device: torch.device | str | None = None,
+        world: int = 1,
+    ):
         super().__init__()
         # `nn.Linear` rather than bare parameters so that the names line up with the checkpoint's:
         # `w1.weight` here is `w1.weight` there, once the fp4 packing is expanded.
-        self.w1 = nn.Linear(dim, inter_dim, bias=False, dtype=dtype)
-        self.w2 = nn.Linear(inter_dim, dim, bias=False, dtype=dtype)
-        self.w3 = nn.Linear(dim, inter_dim, bias=False, dtype=dtype)
+        #
+        # `world > 1` is the shared expert's row-parallel split (see `tp.py`): w1/w3 keep a quarter
+        # of the intermediate width and w2's input is that same width, so the three stay consistent
+        # and what they return is a partial that the `MoE` above reduces. The only `Expert` a V4.1
+        # backbone builds with a world is the shared one.
+        inter = inter_dim // world
+        self.w1 = nn.Linear(dim, inter, bias=False, dtype=dtype, device=device)
+        self.w2 = nn.Linear(inter, dim, bias=False, dtype=dtype, device=device)
+        self.w3 = nn.Linear(dim, inter, bias=False, dtype=dtype, device=device)
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -117,11 +137,41 @@ class RoutedExperts:
     An interface rather than a base class: `MoE.forward` needs exactly one thing from it, and the
     two implementations have nothing else in common -- one owns tensors, the other owns a byte
     range of a mapped checkpoint.
+
+    `partial` is the second thing, and it is a class attribute rather than a method because it is a
+    property of the *store* and not of a call: every store built today holds all of a layer's experts
+    and sums them here, so what it returns is the whole routed sum. `DeviceRoutedExperts` deals the
+    experts out once it is given a rank, and then what it returns is one rank's share. The `MoE`
+    above has to know which of the two it is holding, because the difference decides whether the
+    shared expert's partial travels alone or joins the routed one on a single all-reduce.
     """
+
+    #: whether `forward` returns one rank's share of the layer's routed sum rather than all of it.
+    partial = False
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """`x` is `[n, dim]` bf16, `weights`/`indices` are `[n, topk]`. Returns `[n, dim]` fp32."""
         raise NotImplementedError
+
+
+def check_activation_matches_experts(x: torch.Tensor, where: torch.device, what: str) -> None:
+    """Refuse a card-side activation at a host-side expert bank, by name.
+
+    The dense tree can be built on a card while the routed experts stay in host memory -- that is the
+    shape this model is served in -- but the two halves do not meet here. A bank that owns host
+    tensors can only run the expert on the host, and the path that stages host rows onto the card is
+    `DeviceRoutedExperts`, which consumes the checkpoint's packed fp4 rather than an expanded bf16
+    matrix. Left unchecked this surfaces as a device mismatch inside `F.linear`, forty layers and
+    several minutes into a run, in a kernel that says nothing about which of the two halves is the
+    wrong one.
+    """
+    if x.device != where:
+        raise RuntimeError(
+            f"{what} holds its experts on {where} but was handed an activation on {x.device}. "
+            "A dense tree on a card needs the staging path: build this layer's bank as "
+            "`DeviceRoutedExperts` (loader.py, `expert_device=`), which keeps the experts in host "
+            "memory and uploads the rows a token routes to."
+        )
 
 
 class ResidentRoutedExperts(RoutedExperts, nn.Module):
@@ -141,6 +191,7 @@ class ResidentRoutedExperts(RoutedExperts, nn.Module):
         inter_dim: int,
         swiglu_limit: float = 0.0,
         dtype: torch.dtype = LINEAR_DTYPE,
+        device: torch.device | str | None = None,
     ):
         super().__init__()
         self.n_experts = n_experts
@@ -149,11 +200,12 @@ class ResidentRoutedExperts(RoutedExperts, nn.Module):
         # names are `experts.{i}.w{1,2,3}.weight`; a bank indexes instead, so a loader mapping one
         # onto the other has to slice. That is the whole of the difference, and it is what keeps a
         # 384-expert layer from being 1152 modules.
-        self.w1 = nn.Parameter(torch.empty(n_experts, inter_dim, dim, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(n_experts, dim, inter_dim, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(n_experts, inter_dim, dim, dtype=dtype))
+        self.w1 = nn.Parameter(torch.empty(n_experts, inter_dim, dim, dtype=dtype, device=device))
+        self.w2 = nn.Parameter(torch.empty(n_experts, dim, inter_dim, dtype=dtype, device=device))
+        self.w3 = nn.Parameter(torch.empty(n_experts, inter_dim, dim, dtype=dtype, device=device))
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        check_activation_matches_experts(x, self.w1.device, "ResidentRoutedExperts")
         y = torch.zeros_like(x, dtype=torch.float32)
         # The reference walks experts in id order and not in token order, so a token's contribution
         # from expert 7 lands before its contribution from expert 300. The accumulation is a sum, so
@@ -190,11 +242,23 @@ class ResidentEngramTable(EngramTable, nn.Module):
         self.register_buffer("scale", scale)
 
     def lookup(self, indices: torch.Tensor, device: torch.device | None = None) -> torch.Tensor:
-        return dequantize_rows(
+        """Gather where the table is, then hand the rows to `device`.
+
+        The table stays where it was built -- that is the point of this class and of
+        `CheckpointEngramTable` both, the table being 91.55 GiB a layer -- so the indices have to come
+        to it before the gather, and only the rows that were asked for travel back. `Engram.wkv` is
+        on the card whenever the dense tree is, so a lookup that returned the table's own device
+        would put a host tensor into a card-side `Linear`; the explicit move is what makes the two
+        halves of that split meet.
+        """
+        where = self.weight.device
+        indices = indices.to(where)
+        gathered = dequantize_rows(
             F.embedding(indices, self.weight),
             F.embedding(indices, self.scale),
             self.block_size,
         )
+        return gathered if device is None else gathered.to(device)
 
 
 def dequantize_rows(values: torch.Tensor, scales: torch.Tensor, block_size: int = 32) -> torch.Tensor:
@@ -216,7 +280,7 @@ class Engram(nn.Module):
     sigmoid, which is what the training kernel does and not what a plain sigmoid would.
     """
 
-    def __init__(self, cfg: V41TextConfig, layer_id: int, layout, table: EngramTable):
+    def __init__(self, cfg: V41TextConfig, layer_id: int, layout, table: EngramTable, device=None):
         super().__init__()
         self.layer_id = layer_id
         self.layer_hash_index = list(layout.layer_ids).index(layer_id)
@@ -226,12 +290,18 @@ class Engram(nn.Module):
 
         self.embed = table
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = nn.Linear(n_hash_cols * layout.head_dim, cfg.dim * (cfg.hc_mult + 1), bias=False, dtype=LINEAR_DTYPE)
+        self.wkv = nn.Linear(
+            n_hash_cols * layout.head_dim,
+            cfg.dim * (cfg.hc_mult + 1),
+            bias=False,
+            dtype=LINEAR_DTYPE,
+            device=device,
+        )
         self.eps = cfg.norm_eps
         # bf16 rather than the default dtype the reference inherits here: the checkpoint holds them
         # bf16, and `weight` is only ever used as `q_weight * k_weight`, so the width buys nothing.
-        self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE))
-        self.k_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE))
+        self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
+        self.k_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
 
     def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L], False shuts
@@ -265,7 +335,14 @@ class Gate(nn.Module):
     `ModelArgs`, so it is written here as a divisor defaulting to the same value.
     """
 
-    def __init__(self, cfg: V41TextConfig, n_routed_experts: int, n_activated_experts: int, gate_temp: float = 1.0):
+    def __init__(
+        self,
+        cfg: V41TextConfig,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        gate_temp: float = 1.0,
+        device: torch.device | str | None = None,
+    ):
         super().__init__()
         self.dim = cfg.dim
         self.topk = n_activated_experts
@@ -273,9 +350,9 @@ class Gate(nn.Module):
         self.gate_temp = gate_temp
         self.norm_topk_prob = True if cfg.norm_topk_prob is None else cfg.norm_topk_prob
         self.route_scale = cfg.route_scale
-        self.weight = nn.Parameter(torch.empty(n_routed_experts, cfg.dim, dtype=LINEAR_DTYPE))
-        self.bias = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32))
-        self.bias_vl = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(n_routed_experts, cfg.dim, dtype=LINEAR_DTYPE, device=device))
+        self.bias = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32, device=device))
+        self.bias_vl = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """x: [n, dim]; image_mask: [n] bool, True for tokens inside an image span."""
@@ -314,24 +391,45 @@ class MoE(nn.Module):
         n_activated_experts: int,
         expert_dtype: torch.dtype = LINEAR_DTYPE,
         routed: RoutedExperts | None = None,
+        device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.dim = cfg.dim
         self.n_routed_experts = n_routed_experts
         self.n_activated_experts = n_activated_experts
-        self.gate = Gate(cfg, n_routed_experts, n_activated_experts)
-        self.shared_experts = Expert(cfg.dim, cfg.moe_inter_dim, expert_dtype, cfg.swiglu_limit)
-        self.routed = routed if routed is not None else ResidentRoutedExperts(
-            n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, expert_dtype
+        self.gate = Gate(cfg, n_routed_experts, n_activated_experts, device=device)
+        self.shared_experts = Expert(
+            cfg.dim, cfg.moe_inter_dim, expert_dtype, cfg.swiglu_limit, device=device, world=world
         )
+        self.routed = routed if routed is not None else ResidentRoutedExperts(
+            n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, expert_dtype, device=device
+        )
+        self.tp = None
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
+        # Two cases, and which one this is depends on the store rather than on the split: a store
+        # that holds every expert of the layer returns the whole routed sum on every rank, and only
+        # the shared expert is cut. `CheckpointRoutedExperts`, `ResidentRoutedExperts` and a
+        # `DeviceRoutedExperts` without a rank are all that case, and reducing `routed + shared`
+        # there would multiply the routed sum by the world -- a wrong answer that still looks like a
+        # number. A `DeviceRoutedExperts` that was given a rank deals the experts out, so its result
+        # is a partial like the shared expert's and the two join on **one** message, which is the
+        # fewer-collectives arrangement `tp.py` describes. The two stores say which they are through
+        # `RoutedExperts.partial`, so this line and that flag change together.
         y = self.routed.forward(x, weights, indices)
-        y += self.shared_experts(x)
+        shared = self.shared_experts(x)
+        tp = self.tp
+        if tp is None:
+            y += shared
+        elif self.routed.partial:
+            y = tp.reduce(y + shared)
+        else:
+            y += tp.reduce(shared)
         return y.type_as(x).view(shape)
 
 
@@ -353,31 +451,33 @@ class Block(nn.Module):
     """
 
     def __init__(self, cfg: V41TextConfig, layer_id: int, max_batch_size: int, max_seq_len: int, layout=None,
-                 engram_table: EngramTable | None = None, routed: RoutedExperts | None = None):
+                 engram_table: EngramTable | None = None, routed: RoutedExperts | None = None, device=None,
+                 world: int = 1):
         super().__init__()
+        device = canonical_device(device)
         self.layer_id = layer_id
         self.norm_eps = cfg.norm_eps
-        self.attn = Attention(layer_id, cfg, max_batch_size, max_seq_len)
-        self.ffn = MoE(cfg, layer_id, *_moe_shape(cfg, layer_id), routed=routed)
+        self.attn = Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device, world=world)
+        self.ffn = MoE(cfg, layer_id, *_moe_shape(cfg, layer_id), routed=routed, device=device, world=world)
         self.engram = None
         if layout is not None and layer_id in layout.layer_ids:
             if engram_table is None:
                 raise ValueError(f"layer {layer_id} carries an Engram memory but no table was supplied")
-            self.engram = Engram(cfg, layer_id, layout, engram_table)
-        self.attn_norm = RMSNorm(cfg.dim, self.norm_eps)
-        self.ffn_norm = RMSNorm(cfg.dim, self.norm_eps)
+            self.engram = Engram(cfg, layer_id, layout, engram_table, device=device)
+        self.attn_norm = RMSNorm(cfg.dim, self.norm_eps, device=device)
+        self.ffn_norm = RMSNorm(cfg.dim, self.norm_eps, device=device)
         self.hc_mult = hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * cfg.dim
         # fp32 in the checkpoint, not bf16: these are the residual coefficients themselves.
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32, device=device))
+        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32, device=device))
+        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32, device=device))
+        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32, device=device))
+        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
+        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
 
     def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
@@ -447,9 +547,9 @@ def _moe_shape(cfg: V41TextConfig, layer_id: int) -> tuple[int, int]:
 class Embedding(nn.Module):
     """`ParallelEmbedding` at one rank. The checkpoint stores it bf16."""
 
-    def __init__(self, vocab_size: int, dim: int):
+    def __init__(self, vocab_size: int, dim: int, device: torch.device | str | None = None):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=LINEAR_DTYPE))
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=LINEAR_DTYPE, device=device))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.embedding(x, self.weight)
@@ -462,9 +562,9 @@ class Head(nn.Module):
     because the logits come out of it and the sampler's Gumbel-max reads them at full width.
     """
 
-    def __init__(self, vocab_size: int, dim: int):
+    def __init__(self, vocab_size: int, dim: int, device: torch.device | str | None = None):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
         if not full_logits:
@@ -490,10 +590,14 @@ class Backbone(nn.Module):
         layout=None,
         engram_tables: dict[int, EngramTable] | None = None,
         routed: dict[int, RoutedExperts] | None = None,
+        device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
+        device = canonical_device(device)
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         max_seq_len = cfg.max_position_embeddings if max_seq_len is None else max_seq_len
+        self.device = device
         self.max_seq_len = max_seq_len
         self.hc_mult = cfg.hc_mult
         self.norm_eps = cfg.norm_eps
@@ -508,12 +612,14 @@ class Backbone(nn.Module):
                 layout=layout,
                 engram_table=(engram_tables or {}).get(layer_id),
                 routed=(routed or {}).get(layer_id),
+                device=device,
+                world=world,
             )
             for layer_id in range(n_layers)
         )
-        self.embed = Embedding(cfg.vocab_size, cfg.dim)
-        self.norm = RMSNorm(cfg.dim, self.norm_eps)
-        self.head = Head(cfg.vocab_size, cfg.dim)
+        self.embed = Embedding(cfg.vocab_size, cfg.dim, device=device)
+        self.norm = RMSNorm(cfg.dim, self.norm_eps, device=device)
+        self.head = Head(cfg.vocab_size, cfg.dim, device=device)
 
     @torch.inference_mode()
     def forward(
@@ -532,6 +638,15 @@ class Backbone(nn.Module):
         """
         if any(block.engram is not None for block in self.layers) and hash_ids is None:
             raise ValueError("this model has Engram layers, so `hash_ids` is required")
+        # The tree is built where it runs, so a caller's token ids land on the card here rather than
+        # one module at a time -- `EngramHashIds` already moves its own input the same way, which is
+        # why a device forward used to get as far as this line and no further. Host is a no-op:
+        # `Tensor.to` returns self when the device already matches, so the host path is the one it
+        # always was.
+        if self.device is not None:
+            input_ids = input_ids.to(self.device)
+            if image_mask is not None:
+                image_mask = image_mask.to(self.device)
         # image tokens take no part in an n-gram and get no engram contribution; text-only needs no mask
         engram_mask = None if image_mask is None else ~image_mask
 

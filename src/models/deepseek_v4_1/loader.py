@@ -74,15 +74,18 @@ from src.loader.safetensors import SAFETENSORS_DTYPES, MmapSafetensors
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
 from src.models.deepseek_v4_1.kernels import dequant_fp4_weight, dequant_fp8_weight
+from src.models.deepseek_v4_1 import resident_bank
 from src.models.deepseek_v4_1.modules import (
     LINEAR_DTYPE,
     Backbone,
     EngramTable,
     RoutedExperts,
     _moe_shape,
+    check_activation_matches_experts,
     dequantize_rows,
     expert_forward,
 )
+from src.models.deepseek_v4_1.tp import ShardPlan, attach_tp
 
 __all__ = [
     "CheckpointEngramTable",
@@ -146,6 +149,18 @@ class V41Checkpoint:
         self.device = device
         self.reader = MmapSafetensors(root)
         self._blocks: dict[str, int] = {}
+        # Set by `attach_bank`; `None` means every read comes out of the shard mapping.
+        self._bank = None
+
+    def attach_bank(self, bank) -> None:
+        """Read the keys a resident bank holds out of it instead of the mapped shards.
+
+        That is the checkpoint's routed experts and its two Engram tables -- 458 of its 476 GiB, and
+        the bytes a forward touches on every token and on every gather; see `packed`. Everything else
+        is unaffected and still faults in from `/mnt/data3`, which is what the dense tree wants: it
+        is read whole once, and copying it into a second resident form would cost the RAM twice.
+        """
+        self._bank = bank
 
     def __contains__(self, key: str) -> bool:
         return key in self.reader
@@ -207,6 +222,38 @@ class V41Checkpoint:
 
     # -- reading --------------------------------------------------------------
 
+    def banked(self, key: str) -> torch.Tensor | None:
+        """The bank's copy of `key`, in its stored dtype, or `None` if no bank holds it.
+
+        Says nothing about the file: a key the bank does not hold is not an error, it is a tensor
+        that has to come off the mapping, and every caller here wants both cases answered in one
+        place rather than by a branch of its own.
+        """
+        if self._bank is None:
+            return None
+        expert = resident_bank.parse_key(key)
+        if expert is not None and self._bank.has_expert(*expert):
+            stored = SAFETENSORS_DTYPES[self.reader.entry(key).dtype][1]
+            return self._bank.tensor(*expert).view(stored)
+        table = resident_bank.parse_engram_key(key)
+        if table is not None and self._bank.has_table(*table):
+            stored = SAFETENSORS_DTYPES[self.reader.entry(key).dtype][1]
+            return self._bank.table_tensor(*table).view(stored)
+        return None
+
+    def packed(self, key: str) -> torch.Tensor:
+        """One tensor's stored bytes, in its stored dtype, from the bank or from the mapping.
+
+        `view` caches and `entry_view` does not; this is neither. It is the one place that decides a
+        routed expert or an Engram row comes from host RAM rather than from `/mnt/data3`, so the
+        device path (`DeviceRoutedExperts._stage`), the host expert path (`dequantize`) and the
+        Engram gather (`rows`) are all pointed at the same source by pointing them here.
+        """
+        banked = self.banked(key)
+        if banked is not None:
+            return banked
+        return self.reader.entry_view(self.reader.entry(key))
+
     def weight(self, key: str, *, dtype: torch.dtype | None = None, device=None) -> torch.Tensor:
         """One weight, expanded if it is quantized, in `dtype` and on `device`."""
         value = self.dequantize(key) if self.is_quantized(key) else self.reader.load(key)
@@ -225,20 +272,24 @@ class V41Checkpoint:
         `dequant_fp4_weight` unpacks two. The checkpoint stores both beside a `.scale`, so which one
         applies is decided by the weight's own stored dtype and not by its name.
         """
-        weight, scale = self.reader.view(key), self.reader.view(scale_key(key))
+        weight, scale = self.packed(key), self.packed(scale_key(key))
         block = self.block_size(key)
         if self.is_packed_fp4(key):
             return dequant_fp4_weight(weight, scale, block)
         return dequant_fp8_weight(weight, scale, block)
 
     def rows(self, key: str, rows: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Gather scattered rows out of a mapped matrix, without reading the rest of it.
+        """Gather scattered rows out of a matrix, from the bank or from the mapping.
 
         The gather goes through a `uint8` alias. The CPU has no float8 `index_select`, so
         `view[rows]` raises `NotImplementedError: "index_cpu" not implemented for 'Float8_e4m3fn'`
         -- and the same for `'Float8_e8m0fnu'` on the scales -- while the byte alias gathers fine
         and is reinterpreted afterwards. Duplicate rows are copies rather than views, which is what
         a repeated hash id needs.
+
+        `packed` rather than `entry_view` is what makes an Engram gather read host RAM: the table is
+        98 GiB of the 476 on disk, and this is the one call that touches it per token. A bank that
+        holds the table answers here; one that does not falls through to the mapping as before.
         """
         entry = self.reader.entry(key)
         if len(entry.shape) != 2:
@@ -248,7 +299,7 @@ class V41Checkpoint:
             low, high = int(flat.min()), int(flat.max())
             if low < 0 or high >= entry.shape[0]:
                 raise IndexError(f"{key} has {entry.shape[0]} rows, so {low}..{high} is out of range")
-        gathered = self.reader.entry_view(entry).view(torch.uint8)[flat]
+        gathered = self.packed(key).view(torch.uint8)[flat]
         gathered = gathered.view(SAFETENSORS_DTYPES[entry.dtype][1])
         if dtype is not None:
             gathered = gathered.to(dtype)
@@ -300,6 +351,7 @@ def checkpoint_weights(
     prefix: str = "",
     skip: Callable[[str], bool] | None = None,
     progress: Callable[[str], None] | None = None,
+    plan: "ShardPlan | None" = None,
 ) -> LoadReport:
     """Copy every parameter `module` names out of the checkpoint, expanding what is quantized.
 
@@ -312,6 +364,11 @@ def checkpoint_weights(
     `skip` exists for a caller that built the resident bank or a truncated table, whose storage is
     not named after anything in the file. A skipped name is not a missing one; only `missing` means
     the tree asked for something the checkpoint does not have.
+
+    `plan` is the tensor-parallel cut: the tree was built a quarter wide, so the file's tensor has to
+    be cut the same way before it is copied in. Without it the shape check below refuses the fill --
+    which is the intended failure, since a `[1024, 1280]` parameter filled from a `[4096, 1280]`
+    tensor is either an error or a silent lie depending on which axis the slice landed on.
 
     Raises only through the caller's own check on `missing`. Filling is to the parameter's own dtype
     and device, so `Head`, which is fp32 where the file is bf16, keeps full precision in the logits.
@@ -335,6 +392,8 @@ def checkpoint_weights(
             if checkpoint.is_quantized(key):
                 report.quantized.append(key)
             value = checkpoint.weight(key, dtype=parameter.dtype)
+            if plan is not None:
+                value = plan.local_value(key, value)
             if tuple(value.shape) != tuple(parameter.shape):
                 raise ValueError(
                     f"{key} is {tuple(value.shape)} in the checkpoint and {tuple(parameter.shape)} "
@@ -422,6 +481,7 @@ class CheckpointRoutedExperts(RoutedExperts):
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """x: [n, dim] bf16, weights/indices: [n, topk]. Returns [n, dim] fp32."""
+        check_activation_matches_experts(x, torch.device("cpu"), "CheckpointRoutedExperts")
         y = torch.zeros_like(x, dtype=torch.float32)
         # Walked in expert id order, like `ResidentRoutedExperts` and like the reference: a token's
         # contributions land in the same order either way, so the two agree bit for bit.
@@ -692,6 +752,12 @@ def load_backbone(
     expert_cache: int = DEFAULT_EXPERT_CACHE,
     expert_device: str | None = None,
     expert_world: int = 1,
+    expert_rank: int = 0,
+    expert_hot_rows: int = 0,
+    expert_pool_rows: int = 0,
+    resident_experts: bool | None = None,
+    world: int = 1,
+    rank: int = 0,
     progress: Callable[[str], None] | None = None,
 ) -> LoadedBackbone:
     """Build the V4.1 text backbone and fill it from `checkpoint`.
@@ -715,7 +781,71 @@ def load_backbone(
     other way round all land back on `CheckpointRoutedExperts` with one line on `progress`, because a
     slow correct run is worth more than a fast wrong one. The host path is unchanged and is still
     what an unset `expert_device` gives.
+
+    `resident_experts` preloads the checkpoint's routed experts and its two Engram tables into one
+    POSIX shared-memory segment before the tree is built, so that neither path above ever reads
+    `/mnt/data3` again. `None` means ask `DEEPSEEK_V41_RESIDENT_EXPERTS`, which is what keeps this
+    opt-in; see `resident_bank`. Every route the bank takes reads the same bytes it read before -- the
+    segment is filled from `reader.entry_view`'s own offsets and the host comparison is element for
+    element -- so this is a change of source and not of arithmetic.
+
+    A banked run wants `resident_engram=False`, and the two are complements rather than a conflict:
+    the segment holds the tables, `rows` reads them out of it, and the per-process 189.1 GiB copy
+    `resident_engram` would make is the thing four ranks must not each pay. The dense tree is
+    deliberately not in the segment: those keys are not routed experts or tables, `packed` leaves them
+    on the mapping, and a second resident form of 16.79 GiB would cost the RAM twice.
+
+    `expert_hot_rows` gives each card a resident set of its own dealt experts and refills it once a
+    layer, so a prefill stages what a row asks for beyond the set rather than every draw. It is a
+    capacity, but the rule that fills it is not one: an expert is resident iff the layer asks this
+    card for it at least twice, which is what the sweep in
+    `docs/performance/deepseek_v4_1_flash_device_experts.md` measured to be worth 3.04x fewer packed
+    rows staged at 128 tokens and 6.54x at 512, four ranks summed. It needs `expert_device`, because
+    there is no arena to keep anything in otherwise, and it needs one arena a card rather than one a
+    layer: 64 slots a card of page-locked memory is 1.2 GiB, and forty layers each holding their own
+    is 47 GiB of a 22 GiB card. Both the arena and the pinned block it fills through are sized by
+    this number, so the memory is spent at startup and not as the layers get to it. Zero -- the
+    default -- is the configuration every number above it was measured on.
+
+    `expert_pool_rows` is the other half of that idea: it sizes a pool of arena rows a card keeps
+    experts in, handing out a row on an expert's first sight and taking it back least-recently-used
+    when the pool runs out. A pool row is filled on demand and keeps its bytes until the pool gives
+    the row to somebody else, where a fill row is chosen up front for the whole layer and rewritten
+    by the next layer's fill -- so the pool pays only for the rows a layer actually draws and never
+    for the ones it does not, and it pays them as they are drawn rather than in one block before the
+    layer starts.
+
+    **The key is `(layer, expert)` and it has to be**, because an expert id is not an identity: the
+    weights are `layers.{layer}.ffn.experts.{expert}.*`, so layer 6's expert 7 is a different tensor
+    from layer 5's. The first version of this keyed on the id alone and answered a layer 6 draw with
+    layer 5's bytes; it is measured in
+    `docs/performance/deepseek_v4_1_flash_device_experts.md`, and the short of it is that every
+    pooled run moved the top 32 logits by 4.7-6.8 of a max of 29.15 while agreeing with the other run
+    at the same width to the digit. So the pool holds a layer's working set and not the model's:
+    nothing is carried across a layer boundary, and a decode step -- one row a layer, one draw an
+    expert -- is the case it cannot help at all, which is the same reason `expert_hot_rows` cannot.
+    Leave `expert_hot_rows` at zero with it; both can be set and the resident set is then consulted
+    first, but the two are alternatives and the sweep above is the one that prices them against each
+    other.
+
+    `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
+    itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
+    -- and `checkpoint_weights` cuts the file's tensors to match; see `tp.py` for which boundaries are
+    cut and, more importantly, the two that are not. `world=1` builds the whole tree and fills it
+    unsharded, which is the same code path with every division by one.
+
+    One cost worth naming, because it is paid in every configuration and is not small: the fill reads
+    each of those tensors *whole* and then slices, because a shard mapping has no way to hand back a
+    row band. At TP4 that is 4 x 16.79 GiB of reads to fill 16.79 GiB of parameters. Against the
+    resident bank it is a memcpy; against `/mnt/data3` at 213 MiB/s it is about 5 extra minutes of
+    startup, and `expert_rank` already exists to make the four ranks stagger rather than collide.
     """
+    if resident_experts is None:
+        resident_experts = resident_bank.enabled()
+    if resident_experts:
+        checkpoint.attach_bank(
+            resident_bank.open_expert_bank(checkpoint, rank=expert_rank, progress=progress)
+        )
     if hasher is not None:
         layout = hasher.layout
     elif engram and layout is None:
@@ -726,16 +856,54 @@ def load_backbone(
     max_seq_len = config.max_position_embeddings if max_seq_len is None else max_seq_len
     n_layers = config.n_layers if config.n_layers is not None else len(config.compress_ratios)
 
+    plan = ShardPlan.build(config, rank, world, moe_inter_dim=config.moe_inter_dim)
+
+    if (expert_hot_rows or expert_pool_rows) and expert_device is None:
+        if progress is not None:
+            progress(
+                f"--expert-hot-rows {expert_hot_rows} / --expert-pool-rows {expert_pool_rows} need "
+                "--expert-device: both are sets of arena rows, and there is no arena on the host path"
+            )
+    # The arena and staging block every layer's resident experts share, built by whichever layer is
+    # constructed first. `hot_rows` slots a card is 1.2 GiB of device memory and as much again of
+    # page-locked RAM, so a layer holding its own would be 47 GiB of a 22 GiB card -- at a set worth
+    # having, one a layer does not fit. It is safe because the layers run one at a time and `forward`
+    # drains every kernel it issued before returning; `DeviceRoutedExperts.residents` documents it.
+    # Zero leaves the sharing off with it: with no resident set an arena is a row's own deal and
+    # nothing survives it, and one a layer is the configuration every number above was taken on.
+    residents = None
+
     def on_device(layer_id: int, n_experts: int) -> RoutedExperts | None:
         """A card-resident layer if the caller asked for one and the build works, else `None`."""
+        # The first layer built is the one that allocates the shared set, and every layer after it
+        # is handed the same one -- so this closure both reads and writes the binding, which is what
+        # `nonlocal` is here for. Without it the assignment at the end of this function would make
+        # `residents` a local of the closure and the read above it an error.
+        nonlocal residents
         if expert_device is None:
             return None
         # `--expert-device cuda:1 --expert-world 4` is cards 1 through 4, not `cuda:1:0`: the flag
         # names where the split starts and the world says how wide it is.
         base = torch.device(expert_device)
         first = base.index if base.index is not None else 0
+        # A sharded tree deals the experts the same way it cuts everything else: this process drives
+        # one card and holds one share, and the ffn's all-reduce completes the routed partial beside
+        # the shared expert's. The `world=1` tree keeps the older shape -- one process driving
+        # `expert_world` cards and summing them on the host -- which is what `DeviceRoutedExperts`
+        # was written for and stays the control column for it.
+        if world > 1:
+            if expert_world != world:
+                raise ValueError(
+                    f"a tree cut {world} ways and experts dealt {expert_world} ways: the routed "
+                    "partial has to be one rank's share of the same deal the all-reduce completes, "
+                    "so use `--expert-world` equal to the tree's world"
+                )
+            ranks: list[int] | None = [rank]
+        else:
+            ranks = None
+        owned = ranks if ranks is not None else list(range(expert_world))
         try:
-            return DeviceRoutedExperts(
+            instance = DeviceRoutedExperts(
                 checkpoint,
                 layer_id,
                 n_experts=n_experts,
@@ -744,7 +912,11 @@ def load_backbone(
                 topk=_moe_shape(config, layer_id)[1],
                 swiglu_limit=config.swiglu_limit or 0.0,
                 world=expert_world,
-                devices=[torch.device(base.type, first + c) for c in range(expert_world)],
+                ranks=ranks,
+                devices=[torch.device(base.type, first + r) for r in owned],
+                hot_rows=expert_hot_rows,
+                pool_rows=expert_pool_rows,
+                residents=residents,
             )
         except (RuntimeError, ValueError) as error:
             if progress is not None:
@@ -753,6 +925,9 @@ def load_backbone(
                     f"{type(error).__name__}: {error}"
                 )
             return None
+        if residents is None and instance.residents is not None:
+            residents = instance.residents
+        return instance
 
     routed = {}
     for layer_id in range(n_layers):
@@ -784,8 +959,11 @@ def load_backbone(
         layout=layout,
         engram_tables=tables,
         routed=routed,
+        device=device,
+        world=world,
     )
-    report = checkpoint_weights(model, checkpoint, progress=progress)
+    attach_tp(model, plan)
+    report = checkpoint_weights(model, checkpoint, progress=progress, plan=plan)
     if report.missing:
         raise RuntimeError(
             f"{len(report.missing)} parameters have no tensor in the checkpoint and would have "

@@ -881,7 +881,12 @@ __global__ void prefill_sparse_attn_kernel(
         if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
         __syncthreads();
     }
+    // The max tree and the denominator tree reduce into the same buffer, so every thread has to
+    // finish reading `reduce[0]` here before the denominator's `reduce[tid] = local_denom`
+    // overwrites it. A thread that loses that race reads a denominator where it expects the max,
+    // and the run stops being reproducible -- `--tool racecheck` reports it, one barrier removes it.
     const float max_score = fmaxf(reduce[0], attn_sink[h]);
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -994,8 +999,11 @@ __global__ void prefill_sparse_attn_headpair_kernel(
         }
         __syncthreads();
     }
+    // Same hazard as the single-head kernel above, on both halves: the denominator tree stores into
+    // `reduce0[0]`/`reduce1[0]`, which these two reads of the max tree's result depend on.
     const float max_score0 = fmaxf(reduce0[0], attn_sink[h0]);
     const float max_score1 = has_h1 ? fmaxf(reduce1[0], attn_sink[h1]) : -INFINITY;
+    __syncthreads();
 
     float local_denom0 = 0.0f;
     float local_denom1 = 0.0f;
@@ -1103,7 +1111,12 @@ __global__ void fused_decode_sparse_attn_kernel(
         if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
         __syncthreads();
     }
+    // The max tree and the denominator tree reduce into the same buffer, so every thread has to
+    // finish reading `reduce[0]` here before the denominator's `reduce[tid] = local_denom`
+    // overwrites it. A thread that loses that race reads a denominator where it expects the max,
+    // and the run stops being reproducible -- `--tool racecheck` reports it, one barrier removes it.
     const float max_score = fmaxf(reduce[0], attn_sink[h]);
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -1209,7 +1222,12 @@ __global__ void fused_decode_sparse_attn_wmma_kernel(
         if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
         __syncthreads();
     }
+    // The max tree and the denominator tree reduce into the same buffer, so every thread has to
+    // finish reading `reduce[0]` here before the denominator's `reduce[tid] = local_denom`
+    // overwrites it. A thread that loses that race reads a denominator where it expects the max,
+    // and the run stops being reproducible -- `--tool racecheck` reports it, one barrier removes it.
     const float max_score = fmaxf(reduce[0], attn_sink[h]);
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -1310,7 +1328,12 @@ __global__ void flashinfer_style_sparse_attn_kernel(
         if (tid < stride) reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]);
         __syncthreads();
     }
+    // The max tree and the denominator tree reduce into the same buffer, so every thread has to
+    // finish reading `reduce[0]` here before the denominator's `reduce[tid] = local_denom`
+    // overwrites it. A thread that loses that race reads a denominator where it expects the max,
+    // and the run stops being reproducible -- `--tool racecheck` reports it, one barrier removes it.
     const float max_score = fmaxf(reduce[0], attn_sink[h]);
+    __syncthreads();
 
     float local_denom = 0.0f;
     for (int t = tid; t < topk; t += blockDim.x) {
@@ -1428,8 +1451,10 @@ __global__ void flashinfer_style_sparse_attn_headpair_kernel(
         }
         __syncthreads();
     }
+    // Same hazard as the single-head kernel above, on both halves.
     const float max0 = fmaxf(reduce0[0], attn_sink[h0]);
     const float max1 = has_h1 ? fmaxf(reduce1[0], attn_sink[h1]) : -INFINITY;
+    __syncthreads();
 
     float denom0_local = 0.0f;
     float denom1_local = 0.0f;
