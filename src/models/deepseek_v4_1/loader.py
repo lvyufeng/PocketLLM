@@ -755,6 +755,7 @@ def load_backbone(
     expert_rank: int = 0,
     expert_hot_rows: int = 0,
     expert_pool_rows: int = 0,
+    expert_batched: bool = False,
     resident_experts: bool | None = None,
     world: int = 1,
     rank: int = 0,
@@ -822,11 +823,40 @@ def load_backbone(
     `docs/performance/deepseek_v4_1_flash_device_experts.md`, and the short of it is that every
     pooled run moved the top 32 logits by 4.7-6.8 of a max of 29.15 while agreeing with the other run
     at the same width to the digit. So the pool holds a layer's working set and not the model's:
-    nothing is carried across a layer boundary, and a decode step -- one row a layer, one draw an
-    expert -- is the case it cannot help at all, which is the same reason `expert_hot_rows` cannot.
+    nothing is carried across a layer boundary.
+
+    **That does not make it a prefill-only mechanism, which is what an earlier version of this
+    paragraph said and what a one-step decode appears to confirm.** The pool *survives the step*: a
+    decode step asks for one row's worth of experts and nothing in it repeats, but the next step asks
+    for much the same set, so a pool wide enough to hold a layer's decode working set answers a
+    fraction of every step after the first few. Measured on a 128-token prompt, A-B-A-B with the
+    control at both ends, 256 decode steps a leg: **0.780 and 0.750 s a token with no arena against
+    0.528 and 0.566 s at `expert_pool_rows=600`** -- 765.0 against 547.0 ms on the pair means, 1.399x
+    -- with 53.4% of the run's draws answered without staging (45% of the decode phase's own draws,
+    the prefill being the better hit rate). Top-32 logits identical at `|dlogit| 0.000e+00` on all
+    four ranks of all four legs. What hid it is that a decode measured as *one* token cannot show a
+    cache that amortises over steps, and every decode column this flag had been read on was one token
+    wide. See the pool's decode subsection in
+    `docs/performance/deepseek_v4_1_flash_device_experts.md`.
+
     Leave `expert_hot_rows` at zero with it; both can be set and the resident set is then consulted
     first, but the two are alternatives and the sweep above is the one that prices them against each
     other.
+
+    `expert_batched` issues a prefill's chunks through `moe_multi_token_fp4_forward` instead of a
+    `moe_single_token_fp4_forward` a row a card. It is the first lever on this path that moves
+    prefill at all: measured on one card of the real deal's shapes, 3.04x at a 128-token layer's
+    working set and 3.69x at 512's, with the results **bit-identical** to the per-row path, and the
+    host's share of a layer falling from 230.68 ms to 0.08 at 512 tokens. It is a batch and not a
+    prefill flag -- a decode step is one row and takes the per-row path either way, since the batched
+    call allocates 53 MiB of intermediates against the per-row path's 0.12 -- so what it costs a
+    decode is nothing and what it costs a prefill's card is that allocation.
+
+    It requires a pool: the batched call reads every arena row it is handed as one expert's bytes for
+    the whole call, so a batch whose rows re-draw an arena row underneath it reads the wrong weights,
+    and it is the pool's rows that get re-drawn. `DeviceRoutedExperts._chunk_bounds` cuts the pass
+    where that would happen, and without a pool there is nothing to cut around. Asking without one is
+    not an error: the flag is dropped and the per-row path is what runs.
 
     `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
     itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
@@ -916,6 +946,7 @@ def load_backbone(
                 devices=[torch.device(base.type, first + r) for r in owned],
                 hot_rows=expert_hot_rows,
                 pool_rows=expert_pool_rows,
+                batched=expert_batched,
                 residents=residents,
             )
         except (RuntimeError, ValueError) as error:

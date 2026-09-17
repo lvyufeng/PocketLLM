@@ -972,7 +972,11 @@ residual 1.8 ms drain is the row's own arena copy plus its kernel, which is the 
 a two-row pipeline would have to issue row `k+1`'s H2D while row `k`'s kernel ran, and it needs a
 third pinned arena to do it. The pinned pool is not what limits this: the same probe swept two, three
 and four arenas a layer and `_take_buffer` is 10–29 ms against a stage of 4–8 s, so `pinned_buffers`
-stays at 2.
+stays at 2. **That 10–29 ms is this configuration's, not the rotation's** — with no pool every row
+stages, so the rotation and the row count agree; a pool makes them disagree and turns this wait into
+the pass's second-largest term. See [the buffer
+rotation](#a-pool-hit-used-to-take-a-staging-buffer-and-the-copy-behind-it-was-left-uncovered) below
+for the 6.89 s and the fix.
 
 **Two things had to change for it to pay, and the first version did not.** It measured **1.012×**, and
 the cause was the routing: `indices_row.tolist()` inside the row loop synchronizes the card's stream,
@@ -1262,13 +1266,19 @@ both 96-row sittings match the set's, and the row counts are identical between t
 every configuration — 6579, 5761 and 5700 staged on rank 0 twice each, to the row.
 
 **Decode is not this knob either, and this sweep is the clearest evidence yet that its column is the
-node.** A decode step asks a layer for one row's worth of experts and nothing in it repeats, so a pool
-evicts everything it stages there, and the two 288-row sittings — the same configuration, adjacent in
-time — read **0.698 and 0.807 s a token, 15.6% apart**, which is wider than the gap between any two
-configurations in the sweep. The corrected six-sitting sweep says the same thing about the set: control
-0.717 and 0.756, `--hot-rows 148` 0.714 and 0.669, so the set is on the fast side of the control in
-one pairing and on the slow side in the other and the 10–11% the width sweep measured does not
-reproduce. Both mechanisms are prefill knobs.
+node — because every decode column in it is one token wide.** A decode step asks a layer for one
+row's worth of experts and nothing in it repeats, so a pool evicts everything it stages there, and
+the two 288-row sittings — the same configuration, adjacent in time — read **0.698 and 0.807 s a
+token, 15.6% apart**, which is wider than the gap between any two configurations in the sweep. That
+is true of one step. A pool *survives* the step, and the next step asks for much the same set, so a
+decode read as a single token cannot show it: [the subsection
+below](#the-pool-is-a-decode-lever-and-a-one-token-decode-is-the-measurement-that-hid-it) runs the
+same 128-token prompt with 64 and 256 decode steps a leg and the pool is worth 1.27x and 1.40x
+there, with the first step as expensive as the control. The corrected six-sitting sweep says the
+same thing about the set: control 0.717 and 0.756, `--hot-rows 148` 0.714 and 0.669, so the set is on
+the fast side of the control in one pairing and on the slow side in the other and the 10–11% the
+width sweep measured does not reproduce. A one-step decode prices neither mechanism, and the set is
+the one that does not amortise.
 
 Reproduce with:
 
@@ -1337,9 +1347,12 @@ prompt is neither comparable to a quarter of the 512-token width nor useful as a
 **Everything else the mechanism is measured on holds at this length too.** The identity does:
 `pool_staged − pool_evicted` is the width exactly in all three pooled legs (4085 − 4053 = 32,
 3335 − 3271 = 64, 3175 − 3027 = 148), so the eviction counter remains the one that says whether the
-width was the binding constraint. And the decode column separates nothing, as before: 0.710–0.757 s a
-token across all five sittings, with the two controls — one configuration — at 0.757 and 0.712, 6%
-apart, and every pooled leg inside that band. The sweep is a prefill measurement and only that.
+width was the binding constraint. And the decode column separates nothing **at one token**, as
+before: 0.710–0.757 s a token across all five sittings, with the two controls — one configuration —
+at 0.757 and 0.712, 6% apart, and every pooled leg inside that band. That is a one-step decode, which
+is the width at which this pool cannot show anything at all; the same probe at the same length with
+256 decode steps a leg reads 0.780/0.750 against 0.528/0.566, which is [the subsection
+below](#the-pool-is-a-decode-lever-and-a-one-token-decode-is-the-measurement-that-hid-it).
 
 **What it says about sizing is that the width belongs to the prompt.** At 128 tokens 64 rows buys the
 prefill 148 rows buys — 20.42 against 21.20 s on the rank mean, inside the drift — for 1183 MiB of
@@ -1356,6 +1369,202 @@ Reproduce with:
 /tmp/run_poolshort.sh
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_hot_ab.py --compare \
   /tmp/ps_1_p0.pt.r0 /tmp/ps_4_p148.pt.r0
+```
+
+### The pool is a decode lever, and a one-token decode is the measurement that hid it
+
+**Every decode column on this page is one token wide, and that is the one width at which a pool cannot
+show anything.** The paragraph above states the mechanism as if it settled the question — a decode
+step asks a layer for one row's worth of experts and nothing in it repeats — and the measurement it
+rests on is a two-token decode added to a 512-token prefill. The first half is true of *a step*. It is
+not true of a *generation*: the pool outlives the step, so the step after it asks for much the same
+experts, and a cache that amortises over steps is invisible to a column read at step one. This
+subsection is the same probe, the same four cards, the same bank and the same arena with the decode
+run long enough to be measured: **256 steps a leg, A-B-A-B, control at both ends.**
+
+| leg | `--expert-pool-rows` | prefill, rank mean (ranks 0-3) | decode | tok/s | draws / staged, rank 0 | decode-phase hit | arena | cuda |
+| ---: | ---: | --- | ---: | ---: | --- | ---: | ---: | ---: |
+| 1 | 600 | **16.90 s** (18.6 / 16.5 / 16.2 / 16.3) | **0.528 s** | 1.89 | 30720 / 14303 | 45.5% | 10794 MiB | 18.76 GiB |
+| 2 | 0 | 46.38 s (47.4 / 48.0 / 45.0 / 45.1) | 0.780 s | 1.28 | 30720 / 30720 | 0.0% | 36 MiB | 9.71 GiB |
+| 3 | 600 | **20.02 s** (21.8 / 19.4 / 19.8 / 19.1) | **0.566 s** | 1.77 | 30720 / 14417 | 44.9% | 10794 MiB | 18.76 GiB |
+| 4 | 0 | 42.40 s (42.6 / 42.8 / 42.6 / 41.6) | 0.750 s | 1.33 | 30720 / 30720 | 0.0% | 36 MiB | 9.71 GiB |
+
+The controls are 0.780 and 0.750 s a token — 765.0 ms on the mean, 3.9% apart — and the pooled legs
+are 0.528 and 0.566, 547.0 ms on the mean, 6.9% apart. **1.399×, and the two configurations do not
+overlap on either end of the sitting.** The prefill moves with them and by more — 44.4 against 16.9
+and 20.0 s on the rank means, 2.4× — which is the 4.0–4.2× mechanism above, read at a prompt a
+quarter the length. The classification is the logits: **top-32 ids in position at
+`|dlogit| 0.000e+00` on all four ranks of all four legs.** A pool is a cache, not an approximation,
+and this sitting reads the last prefill position's logits the same way the six-sitting A-B-C-C-B-A
+did.
+
+**The win is the hit rate and not the length of the run, which is why the phases have to be split.**
+The run-level `% resident` column mixes a prefill — where a layer's whole draw is in flight and the
+pool is at 69–86% — with a decode, which is the question here. Rank 0's own log lines separate them:
+the prefill prints its own staged count, and the run's total minus it is the decode phase's.
+
+| prompt | decode steps | pool | control | pooled | speedup | decode hit, r0 | prefill, rank mean |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 64 | 0 | 0.743 s | — | — | 0.0% | 5.95 s |
+| 8 | 64 | 600 | 0.743 s | **0.451 s** | **1.647×** | **61.3%** | 5.82 s |
+| 8 | 128 | 600 | — | 0.333 s | — | 86.2% | 5.23 s |
+| 128 | 64 | 0 | 0.706 / 0.765 s | — | — | 0.0% | 38.02 / 46.48 s |
+| 128 | 64 | 300 | 0.7355 s (pair mean) | 0.601 s | 1.224× | 29.9% | 18.85 s |
+| 128 | 64 | 600 | 0.7355 s (pair mean) | **0.557 s** | **1.320×** | 44.6% | 20.20 s |
+| 128 | 256 | 0 | 0.780 / 0.750 s | — | — | 0.0% | 46.38 / 42.40 s |
+| 128 | 256 | 600 | 0.765 s (pair mean) | **0.547 s** | **1.399×** | 45.2% | 16.90 / 20.02 s |
+| 512 | 64 | 0 | 0.734 s | — | — | 0.0% | 190.12 s |
+| 512 | 64 | 600 | 0.734 s | **0.564 s** | **1.301×** | 42.9% | 44.67 s |
+| 512 | 128 | 0 | 0.764 s | — | — | 0.0% | 189.30 s |
+| 512 | 128 | 600 | 0.764 s | **0.565 s** | **1.352×** | 43.8% | 45.62 s |
+| 512 | 256 | 600 | — | 0.537 s | — | 44.5% | 43.45 s |
+
+**The decode phase's hit rate is 42.9–45.5% at every prompt length, and 61.3% at eight tokens.** The
+prompt length does not change it; what it changes is how much of the run is prefill, which is what
+moves the run-level column the earlier tables print. The 8-token row is the outlier and it is the
+mechanism, not noise: an eight-token context routes through a narrower set of experts, so the pool
+covers 61.3% of its decode draws instead of ~45% and the same width is worth 1.647× instead of
+1.30–1.40×. Two rows in that table have no control beside them — `8 × 128` and `512 × 256` — so they
+are the trend of the pooled column and not speedups, and the 8 × 128 leg's 86.2% is a hit rate from a
+run whose prefill is only 640 of its 10880 draws.
+
+**In the decode window a hit is worth 5.0–6.4 ms of the step, and that is what prices the lever rather
+than the hit rate alone.** Divide each pair's saving by the rows a step stops staging (the decode
+phase's staged count over its step count, both on rank 0) and the eight sittings land in one narrow
+band: **292 ms over 49.0 rows 5.96, 178.5 over 35.7 5.00, 134.5 over 23.9 5.62, 218.0 over 36.2 6.03,
+170.0 over 34.3 4.96, 199.0 over 35.0 5.68, 227.0 over 35.6 6.38 ms a row**, at 17.93 MiB a row. That
+is 2.9–3.9 GiB/s of effective source rate *inside the step*, against the 14 GiB/s the same copy loop
+reaches when it is replayed on its own. The two legs at their own measured rates do not reach it
+either: `_stage` in situ is 2.48 ms a row (198.5 ms over 40 calls, two rows a call), the row's H2D is
+1.67 ms at the 10.47 GiB/s a card measures, and whether that second leg is chargeable depends on
+whether the profiler's 16.0–17.8 ms `_upload` is the DMA or its issue — so the legs price a hit at
+2.7–4.2 ms against the 5.0–6.4 the decode phase drops. **The difference is the loop and not the
+bytes**, which is the same conclusion `_stage`'s own docstring reaches: "It is not a faster `copy_`:
+14 GiB/s either way." A row is 12 `copy_` through `at::parallel_for` and a set of non-blocking H2D
+issues, and a step that stops staging 36 of them stops paying 432 fork-joins; the per-row cost of that
+is the term Lever 1 measured and could not attribute, and a profile of the pooled step is what would
+close it. The figure the lever's price rests on is the measured 5.0–6.4, not the decomposition.
+
+**Both figures above are decode-window figures, and that is a limit of the instrument rather than of
+the mechanism.** Every one of the eight sittings divides a *decode* phase's saving by the rows that
+phase stopped staging, because only the decode has a per-step wall to divide by; a prefill's saving
+arrives at a different step count and the same division has not been run on its rows. So read
+5.0–6.4 as what a decode step stops paying, and do not carry it to a prefill row or to "a hit" in
+general.
+
+**Half the arena buys 69% of the win, and that is the sizing datum.** At 128 tokens and 64 steps the
+same sitting carries `--expert-pool-rows 300` against 600: 0.601 against 0.557 s a token, a decode hit
+rate of 29.9% against 44.6%, for 5415 MiB of arena against 10794 and 13.51 GiB of card memory
+against 18.76. So the win is not linear in the width — the first 300 rows carry most of it and the
+second 300 carry the rest — and the arena a decode wants is one it can fill and refill, not the
+prompt-wide width a prefill wants. This is the one place the two readings of the mechanism disagree
+about sizing, and it is why the flag stays a flag: a prefill's width is set by a layer's distinct
+experts, which rises with the prompt, and a decode's is set by the working set of the experts a
+generation re-draws, which is flat in the prompt length and is what the 42.9–45.5% column above is.
+The control's own step is also flat across the whole sweep — 0.706–0.780 s over 8 to 512 tokens of
+context and 64 to 256 steps — so nothing in the ratio is the node's drift on the control side.
+
+**What it costs, and what it does not change.** 10794 MiB of arena a card, which is the 18.76 GiB of
+`cuda` against the control's 9.71 — and 22 GiB less 9.7 leaves the KV cache 3–4 GiB at this width,
+which is the same charge the remaining-bottlenecks page measures as 9.05 GiB above the step's own. The
+prefill column is the same mechanism
+at a different step count and not a second effect. And the bank is on in every leg above, as it is in
+every number on this page's device sections: `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, so `_stage` reads
+`/dev/shm` and not `/mnt/data3`, which is what makes the control's 0.75 s a compute number rather
+than a disk one.
+
+Reproduce with:
+
+```bash
+# the A-B-A-B: 600 / 0 / 600 / 0 at `--length 128 --decode 256`, control at both ends so the node's
+# own drift lands on the column it would otherwise be credited to
+for pool in 600 0 600 0; do
+  DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_hot_ab.py \
+    --length 128 --decode 256 --threads 22 --hot-rows 0 --pool-rows "$pool" --out /tmp/pr_$pool.pt
+done
+# the prompt-length and step-count sweep behind the second table, one sitting each
+sed -n '1,40p' /tmp/run_pooldepth.sh
+# and the phase split, which is arithmetic off the run's own two counters
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/tab_pool.py
+```
+
+### A pool hit used to take a staging buffer, and the copy behind it was left uncovered
+
+The two pinned buffers exist so that the host can stage row `k+1` while the card still reads row `k`.
+The guarantee is the wait: `_take_buffer` hands out the next slot *and waits on the event that last
+read it*, so what makes the wait free is that a whole **staging** has happened between the copy being
+issued into that slot and the wait — not that a whole *row* has. The rotation used to advance once a
+row, and against a pool that answers most of a pass's rows the two are not the same thing: at
+`--expert-pool-rows 288`, a 512-token prefill resolves **20480 rows** and stages in **~141 a layer**,
+so **72.5% of the rows move nothing at all**. Those rows still took a slot, so the rotation walked
+through empty rows and handed out the slot the previous *working* row had uploaded immediately
+before, with the copy it issued still in flight and no staging in between to cover it.
+
+It is measurable as one number inside `_take_buffer`: **6.89 / 6.87 / 4.11 / 4.02 s** of a
+**30.35 / 30.55 / 18.97 / 18.62 s** class wall — 21.6–22.7% of the pass, in a wait whose own DMA is
+~2.5 s. The expected value from the counters alone is 512 rows a layer less 141 staging ones, one
+1.71 ms DMA each, 40 layers: **7.0 s against the 6.89 measured**, a 1.6% match. It also explains the
+one column that never showed it — the decode step recorded **0.00 s** here, because a decode row
+misses by construction and so was the only configuration where the wait always had a row's staging in
+front of it.
+
+`_stage_misses` now returns before `_take_buffer` when a row has nothing to move, so the rotation
+advances only over rows that stage. Consecutive working rows take consecutive slots, which restores
+the guarantee by construction rather than by luck:
+
+| | before | after |
+| --- | ---: | ---: |
+| `_take_buffer` calls, rank 0–3 | 20480 each | **4807 / 4872 / 3791 / 3740** |
+| `_take_buffer`, ranks 2–3 | 4.11 / 4.02 s | **0.09–0.25 s** |
+
+**The end-to-end gain is not cleanly separable from this host's noise, and the honest reading is the
+mechanism rather than the percentage.** An interleaved A/B — `before`, `before2`, `after`, `before3`,
+`after2`, back to back, same leg, the file swapped under the same path and `diff`-verified at the end
+— gives **BEFORE 33.95 s mean over 12 rank-runs against AFTER 31.90 over 8**, i.e. −6%, but the two
+ranges are 28.3–35.5 s and **they overlap**. The un-fixed legs' own `_take_buffer` ranges **0.11–9.92 s
+within the same code**, and a fixed leg still reads 6.26 s on one rank, so the column is worth less
+than the effect it is supposed to show. What does not move in either direction is `_stage` (16.91 /
+17.12 / 10.16 / 9.97 s) and `_upload` (2.16 / 2.18 / 1.53 / 1.50): **the byte cost is the floor and
+the wait was only ever a fraction of it.** And the explanation for that is this host's own shape — the
+four ranks share one memory system, so rank 0 waiting on an event is time the other three are spending
+on their own staging, and removing rank 0's exposed wait relocates contention rather than removing
+work.
+
+The change is bit-exact, which is what makes it a pipeline fix and not a numerical one: across all
+five legs, on all four ranks, **32/32 of the top 32 identical, worst `|dlogit| 0.000e+00`**, the
+sampled token equal, and every counter equal — staged 5623 / 5673 / 3791 / 3740, `pool_staged`,
+`pool_evicted`, and the batched path's 40 chunks / 40 calls.
+
+Two things this pass ruled out on the way, both worth not retrying:
+
+- **Caching the key strings and `checkpoint.packed()` in `_stage`.** The proposition was that
+  `_stage`'s 501 µs a copy had ~230 µs of Python in it. `/tmp/probe_v41_stage_micro.py` decomposes it
+  over 768 copies a round: `_key` + `scale_key` **0.5 µs**, `+ packed() + view` **8.3 µs**, `+`
+  precomputed keys **7.7 µs**, the full `_stage` body **130.2 µs**, and `copy_` alone into pinned
+  **77.3 µs**. So the Python is **~16 µs of the 501**, a ceiling of **~0.3 s** and not the 8 s the
+  proposition implied.
+- **The 501 µs being Python at all.** `/tmp/probe_v41_stage_contend.py` runs the identical loop solo
+  and then four processes at once on disjoint expert bands: solo **133.8 µs a copy**, its `copy_`
+  alone **78.6 µs (37.14 GiB/s in-pinned)** — and four at once **5353 / 5416 / 7258 / 6180 µs**, a
+  **40–54×** spread that is asymmetric across the four and so is not a shared constant. What the four
+  ranks contend for is the host's memory bandwidth, which is why a fix that removes a *wait* cannot
+  move a wall that a *bandwidth* sets.
+
+Reproduce with:
+
+```bash
+# the interleaved A/B on the guard: three un-fixed legs and two fixed ones, back to back, the file
+# swapped under the shipped path between legs and diffed afterwards
+bash /tmp/v41_guard_ab.sh
+# the 501 us decomposed: key strings, the checkpoint lookup, and the copy alone
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 /home/lvyufeng/miniconda3/envs/deepseek/bin/python \
+  /tmp/probe_v41_stage_micro.py
+# the same loop solo against four processes on disjoint bands -- the contention measurement
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 /home/lvyufeng/miniconda3/envs/deepseek/bin/python \
+  /tmp/probe_v41_stage_contend.py --tag solo
+for i in 0 1 2 3; do DEEPSEEK_V41_RESIDENT_EXPERTS=1 \
+  /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_stage_contend.py \
+  --tag "q$i" --offset "$i" & done; wait
 ```
 
 ### The probe's tokens are the sampler's draw, and the logit column is the parity check
@@ -1407,22 +1616,25 @@ All of these are separate measurements rather than separate opinions.
   and reads **43.7 s against the set's 48.5 s** at the two mechanisms' own 148-row width — the same
   2690 MiB either way, and the pool with no pinned block at all, which is where the set's 2654 MiB
   go.
-- **What is still not done is the batch shape, and the pool is what now says what it would be worth.**
-  `--expert-pool-rows 148` is sized to a 512-token prefill because its floor is *a layer's distinct
-  experts* — ~142 of 384 on rank 0 here, which is why 148 and 288 stage the same 5700 rows and 96
-  stages 6579 ([the width table
-  above](#the-pool-spends-the-same-arena-on-what-the-pass-draws-and-its-first-key-answered-the-wrong-layer)).
-  A longer prefill raises that floor toward 384 rows — **6.9 GiB a card**, more than the four cards
-  can give once the tree and the caches are on them — and a shorter one lowers it by less than the
-  draw count falls, measured: [a quarter-length pass puts the floor at ~79 experts a layer and the
-  width that sits on it at 64 rows rather than 148](#a-quarter-length-pass-moves-the-floor-and-by-less-than-the-draw-count-moves),
-  for 2.3–2.4× instead of 4.0–4.2×. So there is no prompt-independent width — not a large one and not
-  a small one — and `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its
-  tokens contiguous, is the change that makes the floor a function of the batch rather than of the
-  layer. It needs a kernel this class does not call. That is still a follow-on rather than a knob.
-  What the two mechanisms above did establish is the arena arithmetic it would rest on: the rows are
-  priced, the stage-from-bank path exists, and the counters that would move are the ones this page
-  reports.
+- **The batch shape was the follow-on, and it has landed without moving the floor.** `--expert-batched`
+  resolves the whole pass before staging any of it and then issues `moe_multi_token_fp4_forward` once a
+  chunk — one slot per distinct expert the chunk hit, its tokens contiguous — instead of
+  `moe_single_token_fp4_forward` once a row. The staging is **unchanged**: 512 tokens at 288 rows stage
+  5623/5673/3791/3740 rows a rank batched, exactly what the per-row path stages, and the pool's
+  took-in/evicted columns with them. What collapses is the call count — 512 rows a layer becomes **40
+  calls, one a layer, 512.0 rows a call** — and that is worth **47.63 → 34.75 s a rank (−27.0%,
+  10.75 → 14.73 tok/s)** with the top-32 logits bit-identical on all four ranks. So the floor is still
+  *a layer's distinct experts* and the width table above still stands: `--expert-pool-rows 148` is
+  still sized to a 512-token prefill because 148 and 288 stage the same 5700 rows and 96 stages 6579
+  ([the width table
+  above](#the-pool-spends-the-same-arena-on-what-the-pass-draws-and-its-first-key-answered-the-wrong-layer)),
+  and a shorter pass still lowers the floor by less than the draw count falls —
+  [a quarter-length pass puts it at ~79 experts a layer and the width that sits on it at 64 rows
+  rather than 148](#a-quarter-length-pass-moves-the-floor-and-by-less-than-the-draw-count-moves). The
+  path is default on and falls back to the per-row call without a pool, since the batched call reads
+  each arena row it is handed as one expert's bytes for a whole chunk; the full A/B and the chunk rule
+  are on [the bottlenecks
+  page](deepseek_v4_1_flash_remaining_bottlenecks.md#lever-5--the-prefill-is-a-batch-shape-problem-and-the-fix-is-in-27-at-512-tokens).
 - **The bank removes the disk from `_stage`, not the copy out of it.** With
   `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
   without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —

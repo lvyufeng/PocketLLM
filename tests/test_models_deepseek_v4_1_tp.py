@@ -603,7 +603,10 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     the number that was wrong the first time this was measured.
 
     Called on a stub, the way the two tests above are: the split, the map and the counters are host
-    arithmetic, and everything else in the class needs the packed checkpoint and four cards.
+    arithmetic, and everything else in the class needs the packed checkpoint and four cards. The stub
+    binds `_resolve_row`/`_stage_misses` and not only `_stage_row`, so what it drives is the same
+    two halves the batched path runs for a whole batch -- the resolution that must move nothing and
+    the staging that must happen exactly once a row.
     """
     from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts, ResidentSet
 
@@ -613,6 +616,10 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     ids = [30, 10, 60, 20, 50, 40]
     layer_id = 7
     staged: list[list[tuple[int, int]]] = []
+    # The two ends of `_stage_misses`, recorded as separate lists because they are separately
+    # skipped: a row with nothing to move takes no buffer *and* stages nothing, and the wait a
+    # buffer carries is the half of a pool hit's cost that `staged` alone cannot show.
+    takes: list[int] = []
 
     def pool(held: dict[tuple[int, int], int], free: list[int], width: int = 4) -> SimpleNamespace:
         """A `ResidentSet` carrying only what the pool's own arithmetic reads.
@@ -650,11 +657,18 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
             _residents=pooled,
         )
         one._split = lambda ids: DeviceRoutedExperts._split(one, ids)
-        one._take_buffer = lambda: 0
+        one._take_buffer = lambda: takes.append(1) or 0
+        # The shipped composition, with only its two ends stubbed: `_take_buffer` does not have to
+        # wait on an event that a stub never recorded, and `_stage` records the triples instead of
+        # copying the checkpoint's bytes. Everything between them -- `_resolve_row`'s arena
+        # arithmetic and `_stage_misses`' buffer, counters and H2D -- is the real thing, which is
+        # what the batched path shares and what must not drift under it.
+        one._resolve_row = lambda ids_row: DeviceRoutedExperts._resolve_row(one, ids_row)
         # One card in `ranks`, so the row's staging is `misses[0]`: `(miss row, route slot, arena
         # row)` triples, the arena row being where `_upload` will put those bytes.
         one._stage = lambda buffer, ids, misses: staged.append(misses[0])
         one._upload = lambda buffer, misses: None
+        one._stage_misses = lambda ids, misses: DeviceRoutedExperts._stage_misses(one, ids, misses)
         one._pool_row = lambda card, expert: DeviceRoutedExperts._pool_row(one, card, expert)
         return one
 
@@ -695,12 +709,16 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     # 60 is this layer's and the pool holds it in row 3, so the route names row 3 and the row stages
     # nothing at all -- which is the whole of what the mechanism buys. The set still answers first,
     # so expert 20 names row 1 rather than anything the pool has.
+    before, buffers = len(staged), len(takes)
     hit = stub(1, [10, 20], pooled=pool({(layer_id, 60): 3}, free=[4, 5, 6]))
     assert DeviceRoutedExperts._stage_row(hit, None, None, torch.tensor(ids)) == [[(1, 3), (3, 2)]], (
         "a pooled route did not name the row the pool holds it in, or the pool was asked before the "
         "set and took a draw the set had already answered"
     )
-    assert staged[-1] == [], "a pool hit staged, which is the copy this mechanism exists to not pay"
+    assert len(staged) == before and len(takes) == buffers, (
+        "a pool hit staged, which is the copy this mechanism exists to not pay -- and it must not "
+        "take a buffer either, or the wait that buffer has been holding covers no staging at all"
+    )
     assert hit._residents.pool_staged == 0 and hit.drawn_rows == 2
 
     # The key carries the layer. The pool below holds layer 6's expert 60 in the row a layer 7 draw
@@ -743,3 +761,210 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
         DeviceRoutedExperts._stage_row(one, None, None, torch.tensor(ids))
     assert [one.drawn_rows for one in across] == [2, 2, 1, 1]
     assert sum(one.drawn_rows for one in across) == topk
+
+
+def test_a_chunk_is_cut_where_a_later_row_would_re_draw_an_arena_row() -> None:
+    """`DeviceRoutedExperts._chunk_bounds`' rule -- the one thing the batched path can be wrong by.
+
+    A batched call reads each arena row it is handed as one expert's bytes *for the whole call*,
+    where the per-row path reads a row once and moves on. So a batch is the same computation as the
+    rows it replaces only while every arena row it names still holds what it held when the row that
+    named it was staged -- and the pool is what breaks that, because a draw that misses can evict a
+    row an earlier row of the same batch is still going to read. Wrong, it is a right-shaped answer
+    out of the wrong expert's weights, in a kernel that reads them through a bare pointer.
+
+    The cut is decidable because `_forward_chunked` resolves the whole batch before it stages any of
+    it: the batch's claim on the pool is a property of the routing and not of a race, so the rule is
+    a pure function of the resolve lists and is checked as one here. Hand-built entries rather than a
+    pool driven through `_resolve_row`, because what is under test is where the line falls and not
+    how a row comes to be on one side of it -- the pool would have to be made to evict on cue.
+    """
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+
+    one = SimpleNamespace(ranks=[0])
+    two = SimpleNamespace(ranks=[0, 1])
+
+    def row(*arena_rows: int) -> tuple:
+        """One resolved row on one card whose draws all missed, into the arena rows given.
+
+        Both halves of what `_resolve_row` returns are filled and they agree, because the rule reads
+        both: `cards` is what the row *reads* -- every route names an arena row, hit or miss -- and
+        `misses` is the subset of it that has to be moved in first. A fixture that filled only
+        `misses` would be a row that reads nothing, which no row is.
+        """
+        return (
+            [],
+            [[(arena, i) for i, arena in enumerate(arena_rows)]],
+            [[(i, 0, arena) for i, arena in enumerate(arena_rows)]],
+            len(arena_rows),
+        )
+
+    def hit(*arena_rows: int) -> tuple:
+        """One resolved row whose draws all hit the pool: it reads rows and stages none of them."""
+        return ([], [[(arena, i) for i, arena in enumerate(arena_rows)]], [[]], len(arena_rows))
+
+    # Nothing to cut. A batch whose draws were all pool hits staged nothing, and one whose misses are
+    # into rows no other row of the batch names is reading what it wrote -- both are one call, which
+    # is the case the whole mechanism is for.
+    assert DeviceRoutedExperts._chunk_bounds(one, [row(), row(), row()]) == [(0, 3)], (
+        "a batch that moved nothing was cut, which is exactly the batch this exists for"
+    )
+    assert DeviceRoutedExperts._chunk_bounds(one, [row(4), row(5), row(6)]) == [(0, 3)], (
+        "disjoint misses were cut: the pool hands out fresh rows, so a row taking one is not reading "
+        "another row's"
+    )
+
+    # The case the rule is for: row 2 draws an expert the pool puts back in arena row 4, which row 0
+    # staged, so one call over both would apply row 0's bytes to row 2's token.
+    assert DeviceRoutedExperts._chunk_bounds(one, [row(4), row(5), row(4)]) == [(0, 2), (2, 3)], (
+        "a row that re-draws an arena row an earlier row of the batch staged was left in the same "
+        "call as that row, which reads the wrong expert for whichever of the two it is not holding"
+    )
+    # A row cannot clash with itself, and every row after the first here clashes with the one before.
+    assert DeviceRoutedExperts._chunk_bounds(one, [row(4, 5), row(4), row(4)]) == [(0, 1), (1, 2), (2, 3)], (
+        "a row's own two misses were treated as a clash, or two rows that both re-draw row 4 were "
+        "not"
+    )
+    # A row that hit the pool moves nothing, so it is free to sit in the chunk -- but it still *reads*
+    # the row it was pooled into, and a later row's miss can be handed that same row. A claim built
+    # from the misses alone sees a row with nothing to stage and lets it sit beside the row that is
+    # about to overwrite what it reads, and the failure is silent: the right shapes out of the wrong
+    # expert's weights. Both halves of the resolve entry are therefore claims, which is why `row()` and
+    # `hit()` above fill `cards` and `misses` consistently.
+    assert DeviceRoutedExperts._chunk_bounds(one, [hit(4), row(5), row(4)]) == [(0, 2), (2, 3)], (
+        "a row whose draws were all pool hits was not counted as a claim on the arena, so a later "
+        "row's miss can be handed the row it is reading"
+    )
+    # And the reverse is not a clash: a hit row reads rows that no later row claims.
+    assert DeviceRoutedExperts._chunk_bounds(one, [hit(4), row(5), row(6)]) == [(0, 3)], (
+        "a hit row's read cut a batch that never recycled the row it reads"
+    )
+
+    # The rule is per card. A clash on the second card cuts even when the first card's rows are clean,
+    # because the two cards' kernels are two calls -- but a clash on card 0 does not by itself make
+    # card 1's rows clash, and the cut is on the row and not on the card.
+    def pair(first: list[int], second: list[int]) -> tuple:
+        return (
+            [],
+            [
+                [(arena, i) for i, arena in enumerate(first)],
+                [(arena, i) for i, arena in enumerate(second)],
+            ],
+            [
+                [(i, 0, arena) for i, arena in enumerate(first)],
+                [(i, 0, arena) for i, arena in enumerate(second)],
+            ],
+            len(first) + len(second),
+        )
+
+    assert DeviceRoutedExperts._chunk_bounds(two, [pair([4], []), pair([5], [9]), pair([6], [9])]) == [
+        (0, 2),
+        (2, 3),
+    ], "a clash on the second card's arena did not cut, so that card's kernel would read its own row 9 twice"
+
+
+def test_a_batched_pass_resolves_the_whole_batch_before_it_stages_any_of_it() -> None:
+    """`DeviceRoutedExperts._forward_chunked`'s schedule, which is the row loop's at a wider unit.
+
+    Two things have to hold for the batched path to be the per-row path's answer and not a different
+    one, and neither is a shape. **Every row is resolved before any row is staged**, in row order,
+    because the pool's state after the batch has to be the state the row loop would have left it in
+    -- and at `hot_rows > 0` more than that, since `_fill` chose which experts deserve a resident row
+    from the whole batch's routing. **And the pipeline survives the wider unit**: a chunk's drain is
+    entered after the *next* chunk has been issued, which is the only ordering in the class that is
+    not free to change. **A row with nothing to move is not a stage**: it takes no buffer and issues
+    no copy, so a batch the pool answers entirely neither waits nor writes, and the buffer rotation
+    advances only over the rows that do -- which is what keeps a slot's copy a whole *staging* old.
+
+    Counted on a stub whose resolve, chunk and stage are the real ones and whose issue and drain are
+    recorded instead of run, since the point is the order of the calls and not what is on the cards.
+    """
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts, ResidentSet
+
+    world, topk, layer_id = 4, 6, 7
+
+    def pool(held: dict[tuple[int, int], int], free: list[int], width: int) -> SimpleNamespace:
+        out = SimpleNamespace(
+            pool_rows=width,
+            pool_staged=0,
+            pool_evicted=0,
+            pool_free=[list(free)],
+            pool_map=[dict(held)],
+            pool_lru=[OrderedDict((key, None) for key in held)],
+        )
+        out.pool_row = lambda card, key: ResidentSet.pool_row(out, card, key)
+        return out
+
+    def stub(pooled: SimpleNamespace | None) -> tuple[SimpleNamespace, list, list, list]:
+        staged: list = []
+        takes: list = []
+        calls: list = []
+        one = SimpleNamespace(
+            world=world,
+            topk=topk,
+            ranks=[1],
+            hot_rows=0,
+            layer_id=layer_id,
+            partial=True,
+            rows=0,
+            drawn_rows=0,
+            expert_rows=0,
+            _hot_map=[{}],
+            _residents=pooled,
+        )
+        one._split = lambda ids: DeviceRoutedExperts._split(one, ids)
+        one._pool_row = lambda card, expert: DeviceRoutedExperts._pool_row(one, card, expert)
+        one._resolve_row = lambda ids_row: DeviceRoutedExperts._resolve_row(one, ids_row)
+        one._take_buffer = lambda: takes.append(1) or 0
+        one._stage = lambda buffer, ids, misses: staged.append(misses[0])
+        one._upload = lambda buffer, misses: None
+        one._stage_misses = lambda ids, misses: DeviceRoutedExperts._stage_misses(one, ids, misses)
+        one._chunk_bounds = lambda resolved: DeviceRoutedExperts._chunk_bounds(one, resolved)
+        one._issue_chunk = lambda row0, row1, resolved, x, weights: (
+            calls.append(("issue", row0, row1)) or [0]
+        )
+        one._drain_chunk = lambda row0, row1, issued, y: calls.append(("drain", row0, row1))
+        return one, staged, takes, calls
+
+    # Everything the two rows ask for is already in the pool, so the batch is one chunk that stages
+    # nothing at all -- and a chunk that stages nothing is still a chunk: the resolve still ran, in
+    # row order, and the pass still ends with exactly one drain.
+    held = pool({(layer_id, 20): 2, (layer_id, 60): 3}, free=[4, 5], width=4)
+    one, staged, takes, calls = stub(held)
+    route = torch.tensor([[30, 10, 60, 20, 50, 40]] * 2)
+    DeviceRoutedExperts._forward_chunked(one, None, None, route, None, 2)
+    assert calls == [("issue", 0, 2), ("drain", 0, 2)], (
+        "a batch that staged nothing was not one issue and one drain, so the unit is not the batch"
+    )
+    assert staged == [] and takes == [], (
+        "a pool hit staged, which is the copy this mechanism exists to not pay -- and a run of hits "
+        "must leave the buffer rotation where it found it, or the slot it hands out has a copy "
+        "issued immediately before it with no staging in between to cover it"
+    )
+    assert one.drawn_rows == 4 and one.rows == 2
+
+    # Two rows that want two different experts out of a pool with one free row: the second row's
+    # draws evict what the first staged, so the batch is cut and the cut is what the calls show. The
+    # drain of the first chunk is entered after the second chunk has been issued, which is the
+    # pipeline -- a drain before its own issue would be a wait the row loop does not take either.
+    squeezed = pool({(layer_id, 20): 2}, free=[4], width=2)
+    one, staged, takes, calls = stub(squeezed)
+    route = torch.tensor([[30, 10, 60, 20, 50, 40], [30, 10, 61, 21, 50, 40]])
+    DeviceRoutedExperts._forward_chunked(one, None, None, route, None, 2)
+    assert calls == [
+        ("issue", 0, 1),
+        ("drain", 0, 1),
+        ("issue", 1, 2),
+        ("drain", 1, 2),
+    ], (
+        "a batch whose second row re-draws the row the first staged was not cut, or the drain stopped "
+        "being one chunk behind the issue"
+    )
+    assert staged == [[(0, 2, 4)], [(0, 3, 2), (1, 2, 4)]], (
+        "the second row's evictions do not name the rows its own draws were put in, so the kernel "
+        "would read the first row's experts"
+    )
+    assert len(takes) == len(staged) == 2, (
+        "a buffer was taken for a row that moved nothing, or two staging rows shared one -- either "
+        "way a slot's copy is not a whole staging old when it is waited on"
+    )
