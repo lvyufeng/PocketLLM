@@ -39,6 +39,10 @@
 // kernel partitions on and the block count launched here cannot drift apart.
 #include "qwen_hbm_probe_geometry.hpp"
 
+// Stamp layout, shared with the arrival-wait kernel and with the collective that
+// issues it. See the header: a drift here is a wait that always runs to its bound.
+#include "qwen_ipc_arrive_geometry.hpp"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +62,7 @@
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_partial_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_reduce_kernel.h"
 #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
+#include "aclrtlaunch_qwen_ipc_arrive_wait_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
 #include "aclrtlaunch_qwen_gqa_verify_attention_kernel.h"
@@ -1322,6 +1327,31 @@ bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink,
     return aclrtlaunch_qwen_hbm_read_probe_kernel(
                kHbmProbeCores, resolve(stream), gm(d_source),
                gm(d_sink), static_cast<uint32_t>(tile_count)) == kLaunchOk;
+}
+
+// Device-side arrival wait for the hand-written cross-process all-reduce. One
+// block, because the check is `world - 1` scalar loads and a second core would
+// only add traffic to the line the peers are writing.
+//
+// The bound is derived from the host poll's own deadline rather than being a
+// second knob: `kIpcArriveIterationsPerMs` is a generous iterations-per-millisecond
+// figure, so the kernel gives up no earlier than the host loop would have. What
+// comes back in `d_status` is the missing-peer count, not the launch status -- a
+// launch that succeeded against a dead group is exactly the case this has to
+// report.
+bool qwen_ipc_arrive_wait_ascend(const uint16_t* d_stamps, uint32_t* d_status,
+                                 int world, int rank, int64_t round,
+                                 int deadline_ms, void* stream) {
+    if (d_stamps == nullptr || d_status == nullptr || world <= 1 ||
+        world > kIpcMaxWorld || rank < 0 || rank >= world || deadline_ms <= 0) {
+        return false;
+    }
+    const uint32_t limit = static_cast<uint32_t>(
+        static_cast<int64_t>(deadline_ms) * kIpcArriveIterationsPerMs);
+    return aclrtlaunch_qwen_ipc_arrive_wait_kernel(
+               1, resolve(stream), gm(d_stamps), gm(d_status),
+               static_cast<uint32_t>(world), static_cast<uint32_t>(rank),
+               static_cast<uint32_t>(round), limit) == kLaunchOk;
 }
 
 // One-core Cube tile, used to validate the L1 fractal layout that AscendC::Gemm

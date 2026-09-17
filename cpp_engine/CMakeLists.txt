@@ -259,6 +259,12 @@ else()
 
     list(APPEND POCKET_RUNTIME_SOURCES backends/ascend/runtime/device_runtime_ascend.cpp)
     list(APPEND POCKET_BACKEND_INCLUDES "${ASCEND_ARCH_DIR}/include")
+    # The geometry headers in backends/ascend/kernels are included by their device
+    # kernel, by the host launcher next to them, *and* by
+    # collective/ipc_allreduce.cpp, which is where the stamp layout is produced and
+    # has to match the arrival-wait kernel that consumes it. The first two find
+    # them as neighbours; the third needs the directory on the include path.
+    list(APPEND POCKET_BACKEND_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/backends/ascend/kernels")
     list(APPEND POCKET_BACKEND_LIBS
         "${ASCEND_ACL_LIBRARY}"
         "${ASCEND_OPAPI_LIBRARY}"
@@ -287,6 +293,7 @@ else()
         backends/ascend/kernels/qwen_cube_gemm_probe.cpp
         backends/ascend/kernels/qwen_cube_transpose_probe.cpp
         backends/ascend/kernels/qwen_hbm_read_probe.cpp
+        backends/ascend/kernels/qwen_ipc_arrive_wait.cpp
         backends/ascend/kernels/qwen_transpose_f16.cpp
         backends/ascend/kernels/qwen_attention_cube_f16.cpp
     )

@@ -446,10 +446,32 @@ for 4.8 ms of the 9.24 ms regression (0.0371 ms per call over 129 calls); the ot
 the barrier's own timing, which is what a host that no longer paces itself to the device looks like from
 the step clock.
 
-So the 26.4 ms is waiting on peers rather than on the host, and a device-side poll would not have
-addressed it: what is being waited for is another process's push, and the arrival signal is already the
-completion signal. Removing it means the barrier has to overlap the layer it belongs to, which is a
-scheduling change and not a communication one, and it is not scoped on this page.
+**The wait is the host's round trip, and the peers are already there when it is made.** The paragraph
+that used to close this section read the 26.4 ms as a peer-compute wait that only rescheduling could
+recover, and that is retracted. The switch that moves the wait onto the device says what it actually
+is. `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` enqueues `qwen_ipc_arrive_wait_kernel` on the caller's stream
+— one core spinning on the same stamps against the same values the host loop checks — and returns
+without blocking. Ten interleaved pairs, one run of each arm alternating, the launcher, shapes and gate
+of §5.5.4's pairs:
+
+| arm | `step_ms` | decode TPS | `wait_ms` per call | poll iterations | gate |
+|---|---|---|---|---|---|
+| host poll (shipped) | 77.117 (76.551-77.648) | 12.968 | 0.285 | 1.00-1.31 | 0 of 10 |
+| device wait | 53.745 (53.069-54.247) | 18.607 | 0.130 | — | **10 of 10** |
+
+23.4 ms of a 77.1 ms step, 30.3% of it, is the host's round trip through the runtime, and it is device
+idle time behind that round trip rather than anything the group is waiting for. The poll's own 1.00-1.31
+iterations say the peers have arrived before the first blocking read completes. What the drain buys is
+that ordering in front of the read — which is why `ASYNCPOLL`, which removed the drain, lost 10.7%, and
+why `DEVWAIT`, which removes the round trip and keeps the ordering, gains 30%. The device wait lands
+1.8 ms above the `NOPOLL` floor of 51.905 ms, the same order as the run-to-run spread between two
+sessions; what is left is the part of the wait the device does have to do for itself.
+
+**It is a bound, not a candidate, and what it exposes is worth more than what it saves.** Every one of
+the ten device-wait runs fails the launcher's reproducibility gate. §5.5.4 has the dose-response that
+identifies the cause, and it is the same event as the hand-written arm's own 8 failures in 36. So the
+26.4 ms is recoverable in principle and this particular way of recovering it is not correct: the host
+round trip is not only waiting, it is also the fence the arrival signal does not have.
 
 At rows=16 the replacement is not in the picture at all: 16 rows x 5120 is 81 920 elements, twice the
 ceiling §5.5.4 re-tests, so a batched decode falls back to HCCL and the rows=16 arm is HCCL against
@@ -533,6 +555,40 @@ Named runs of the record: `rate_hccl_2` (HCCL, repeat-only, `worst_logit_abs` 0.
 `rate2_hccl_6` (HCCL, repeat-only, 0.048), `rate_ipc_1` (hand-written, repeat-only, 0.436),
 `rate_ipc_9` (hand-written, step-0 flip, 23.759) and `rate2_ipc_14` (hand-written, step-0 flip,
 24.212).
+
+**What the gate has been catching.** The device wait of §5.5.3 is the accident that makes this gate
+legible. It deletes the host's round trip and nothing else, and it fails the gate 10 times in 10 while
+the host poll fails it 0 times in 10, same launcher, same shapes, same session, alternating run for
+run. The round trip is a ~0.25 ms delay *after* the last peer's stamp is seen and *before* the reduce
+is enqueued, so the switch that inserts exactly that delay and nothing else — `SETTLE_US`, on the same
+device-wait arm; with `DEVWAIT` it drains the device wait first, or the sleep lands before the arrival
+and opens no window at all — puts the failure rate on a dose-response:
+
+| post-arrival delay | `batch_repeat_mismatches` failures | runs | `step_ms` | decode TPS |
+|---|---|---|---|---|
+| none, device wait | 10 | 10 | 53.7 | 18.61 |
+| none, host poll — the shipped arm | 0 | 10 | 77.1 | 12.97 |
+| 20 us | 2 | 4 | 84.3-85.3 | 11.7-12.0 |
+| 100 us | 1 | 4 | 94.7-95.4 | 10.5-10.6 |
+| 500 us | 0 | 4 | 145.5-146.6 | 6.8-6.9 |
+
+The reading is that a peer's stamp can land before its plane is readable by this rank's reduce kernel,
+and that the delay covers the window without repairing anything. The delay is not a clean knob and the
+20 and 100 us rows are four runs each, so the shape of the curve is much weaker than its direction.
+What keeps the direction from being an artifact of those runs simply being slower is that the 20 us arm
+runs at 84.3-85.3 ms — *above* the shipped arm's 77.1 ms — and fails 2 of 4 where the shipped arm fails
+0 of 10; and that the delay is inserted after this rank's own arrival, so it is not slack the peers are
+being given.
+
+That is also the most economical explanation of the numbers above it: the shipped arm's 8 failures in
+36 are the residue that leaks past its round trip, the failures track plane size because the larger
+copy has the longer window, and the step-0 flip shape appears in the hand-written arm and in none of
+HCCL's 36. It is not proved for the shipped arm. `SETTLE_US` on the host-poll arm is the experiment
+that would prove it and it is not run here, because that arm has to be shown falling from a 22% rate
+and this page has already established that a sample that could do that is about 120 pairs per arm. What
+is established is that the mechanism exists on this fabric with these primitives, and that the two arms
+which remove the round trip are the two that are worse — `ASYNCPOLL` in time (§5.5.3) and `DEVWAIT` in
+correctness.
 
 **The size ceiling, re-tested against the control it was set against.** The replacement is scoped to
 planes of at most 40 960 FP16 elements, and that number came from a sweep read against "HCCL failed
@@ -618,7 +674,8 @@ the place the remaining answer is.
 | lever | measured size | state |
 |---|---|---|
 | Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | built; opt-in with `POCKET_ASCEND_IPC_ALLREDUCE=1`. The launcher's reproducibility gate is failed by both arms (3 of 36 HCCL, 8 of 36 hand-written) and does not separate them |
-| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3) | priced, not scoped — it waits on peers, and a device-side poll does not address that (§5.5.3) |
+| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | priced, not recovered: the device-side form is 30% faster and fails the gate 10 of 10, because the round trip is also the fence the arrival signal does not have (§5.5.3, §5.5.4) |
+| The arrival signal has no release ordering | exposed, not sized: removing the host round trip takes the gate from 0 of 10 to 10 of 10 (§5.5.4) | not scoped; the primitives tried here cannot make a peer's stamp a release for its plane |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
 | The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
@@ -644,6 +701,17 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE=0 scripts/run_qwen_ascend_tp4.sh "" 8
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE=1 scripts/run_qwen_ascend_tp4.sh "" 8
+```
+
+The §5.5.3/§5.5.4 device wait is the same again with `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, and its
+dose-response rows add `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`:
+
+```bash
+QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
+  POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_STATS=1 \
+  POCKET_ASCEND_IPC_ALLREDUCE_DEADLINE_MS=3000 \
+  POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1 [POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US=100] \
+  scripts/run_qwen_ascend_tp4.sh "" 8
 ```
 
 The MTP A/B of §4.1 is the same launcher without `QWEN_BATCH_ROWS`, plus `--qwen-mtp-tokens 3` on

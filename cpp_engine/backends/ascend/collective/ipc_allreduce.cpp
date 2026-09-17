@@ -6,6 +6,11 @@
 
 #include "device_runtime.hpp"
 #include "qwen_ascend_ops.hpp"
+// The stamp layout. The arrival-wait kernel reads it too, and the two derivations
+// of "where peer k's stamp for this round is" have to be one definition: they are
+// compiled by different compilers into different binaries and a drift between them
+// is a wait that always runs to its bound, with nothing in the output to say so.
+#include "qwen_ipc_arrive_geometry.hpp"
 
 #include <acl/acl.h>
 
@@ -36,14 +41,14 @@ constexpr size_t kKeyLen = 4096;
 // N overwrites what is being waited for, and the poll can then never match. The
 // probe measured 21 stalls in 5000 rounds with one buffer and none in 20000 with
 // two, so this is a correctness requirement and not a tuning choice.
-constexpr int kSets = 2;
+constexpr int kSets = kIpcSets;
 
 // The stamp a rank sends is read out of a device-side table rather than written by
 // the host, so that nothing in the loop depends on a host buffer staying alive
 // until an asynchronous copy has run. The receiver computes the same value
 // arithmetically from its own round counter, which is what the modulo here has to
 // keep consistent between the two.
-constexpr long long kStampTable = 4096;
+constexpr long long kStampTable = kIpcStampTable;
 
 // Spacing between two stamps in a peer's stamp array, in uint16 words, so 32 is 64
 // bytes. A stamp is two bytes and four processes write into every peer's array
@@ -55,11 +60,11 @@ constexpr long long kStampTable = 4096;
 // its arrival signal inside the payload, where every write is a large aligned copy
 // of its own and no two processes share a block. Padding each stamp out to a full
 // 64-byte block gives every writer its own.
-constexpr int kStampStride = 32;
+constexpr int kStampStride = kIpcStampStride;
 
 // Worlds above this would make the per-rank stamp ranges collide after the modulo
 // above. The 910B host this backend targets has eight cards.
-constexpr int kMaxWorld = 8;
+constexpr int kMaxWorld = kIpcMaxWorld;
 
 // The largest plane the hand-written path accepts, in FP16 elements.
 //
@@ -161,6 +166,10 @@ int poll_sleep_us() {
 // makes the window empty, which is what separates "the arrival signal is early"
 // from every other explanation. See
 // docs/performance/ascend_single_request_tps.md 5.5.4.
+//
+// It composes with `DEVWAIT`, which is the arm that most needs it: there the
+// arrival is decided on the device, so the delay has to be preceded by a stream
+// drain or it opens a window that does not exist. See the call site.
 int settle_us() {
     static const int us = [] {
         const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US");
@@ -170,6 +179,49 @@ int settle_us() {
     }();
     return us;
 }
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` moves the arrival wait off the host and
+// onto the device. The host poll blocks inside `memcpy_d2h` for the whole
+// rendezvous, so nothing can be enqueued behind it and the device runs dry; this
+// enqueues `qwen_ipc_arrive_wait_kernel` instead and returns, leaving stream order
+// to carry the dependency.
+//
+// It was written as a candidate and it is not one. Measured interleaved against the
+// host poll -- ten pairs, one run of each arm per pair -- it takes the step from
+// 77.117 to 53.745 ms and the decode from 12.968 to 18.607 TPS, and it fails the
+// launcher's reproducibility gate in **ten of the ten** runs while the host poll
+// fails it in none of ten. The wait is not wrong; the arrival signal is early. A
+// peer's stamp can land before its plane is readable by this rank's reduce kernel,
+// and the host round trip -- ~0.25 ms spent between seeing the last stamp and
+// enqueuing the reduce -- is what has been covering that window, imperfectly: the
+// shipped arm fails the same gate 8 times in 36. `SETTLE_US`, which inserts exactly
+// that delay and nothing else, puts the failure rate on a dose-response (10 of 10
+// at 0 us, 2 of 4 at 20, 1 of 4 at 100, 0 of 4 at 500), which is the evidence that
+// the window is what it is.
+//
+// So this switch is a **bound on what the host round trip costs**, in the same
+// class as NOPOLL and SKIP: a token from a run with it on is not a token. The one
+// configuration that computes the right answer is this switch *with* SETTLE_US, and
+// it is slower than the arm it was meant to replace. Both numbers and the reason are
+// in docs/performance/ascend_single_request_tps.md 5.5.3 and 5.5.4.
+//
+// It stays in the tree because it is how the round trip was priced and how the
+// arrival signal's missing release ordering was found; the kernel it launches is
+// correct and the host reads its status word to keep a lost peer a reported failure
+// rather than a hung device.
+bool devwait_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT");
+        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Collectives between two host reads of the device wait's status word. One read
+// costs a drain of the default stream, which is the host wait this switch exists to
+// delete, so reading it per call would defeat the change; 32 calls is a fraction of
+// a decode step's 129, so a dead group is still reported inside the step it killed.
+constexpr long long kStatusCheckEvery = 32;
 
 // `POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM` moves this collective off the caller's
 // stream and onto a stream of its own when the caller passed none, which is what
@@ -181,8 +233,9 @@ int settle_us() {
 // HCCL issues its collective on a real one.
 //
 // Everything measured so far says the copies are ordered correctly (the drain in
-// the poll below covers this rank's own pushes, and a peer's stamp cannot be
-// observed before the plane before it has executed), but "ordered" and "handled
+// the poll below covers this rank's own pushes, and a peer's stamp cannot be *sent*
+// before the plane before it has executed -- which is not the same as the plane
+// being readable when the stamp is, see the push loop below), but "ordered" and "handled
 // the same way by the runtime" are not the same claim, and a null stream is the
 // one argument this path passes that the validating probe never does -- the probe
 // always creates a stream. This switch is how that is tested: with it on, the
@@ -259,6 +312,29 @@ void warn_diagnostics() {
                          "on a stream of its own with a drain on either side, so its "
                          "tokens are meaningful and its step time is a bound, not a "
                          "step time.\n");
+            std::fflush(stderr);
+        }
+        if (devwait_enabled()) {
+            // Not the note this used to be. It was written as "computes the right
+            // answer, so a step time from it is a step time"; ten interleaved pairs
+            // against the host poll say otherwise -- 10 of 10 gate failures against
+            // 0 of 10, because the host round trip this deletes is also the thing
+            // keeping the reduce off a plane that has not landed. Announced as
+            // loudly as NOPOLL, and for the same reason. See devwait_enabled.
+            std::fprintf(stderr,
+                         "[ipc_allreduce] WARNING: DEVWAIT is on. The arrival wait runs "
+                         "on the device instead of the host, and the host round trip "
+                         "that goes away with it is also what covers the window "
+                         "between a peer's stamp and its plane. This configuration "
+                         "fails the reproducibility gate on every run measured; its "
+                         "tokens are not the shipped path's tokens and its step time "
+                         "is a bound on what removing the round trip could be worth."
+                         "%s\n",
+                         settle_us() > 0
+                             ? " SETTLE_US is also on, which covers the window and "
+                               "matches the shipped arm's answer -- more slowly than "
+                               "the arm it was meant to replace."
+                             : "");
             std::fflush(stderr);
         }
         return true;
@@ -348,8 +424,15 @@ aclrtStream private_stream(int device) {
 // distinct per rank, so a slot that received the wrong rank's data fails the poll
 // instead of passing it.
 uint16_t stamp_value(long long round, int who, int world) {
-    const long long step = ((round % kStampTable) * world + who) & 0x7fff;
-    return static_cast<uint16_t>(step * 2 + 1);
+    // The one definition, in the geometry header, because the device-side arrival
+    // wait computes the same expected value for itself and the two must agree
+    // exactly: a mismatch is a barrier that never completes rather than a barrier
+    // that completes wrongly. It is a macro rather than a function because the
+    // device compiler will not let a kernel call anything it cannot see marked
+    // `__aicore__`, and a keyword the host compiler does not know cannot appear in a
+    // header both of them read. The header carries the long version.
+    return POCKET_IPC_STAMP_VALUE(round, static_cast<uint32_t>(who),
+                                  static_cast<uint32_t>(world));
 }
 
 // Slot index of the stamp array in the per-rank export set. The payload slots take
@@ -491,6 +574,11 @@ struct IpcState {
     // pinned because that is what the 76.73 ms blocking arm above was measured with.
     // Process-lifetime like everything else here, so it is never freed.
     uint16_t* seen = nullptr;
+    // One word, written by this rank's arrival-wait kernel and read by this rank's
+    // host. It is not shared with any peer, so it needs no IPC region: zero means
+    // the wait saw every stamp it wanted, anything else is the count it was still
+    // missing when it ran out of iterations. See `devwait_enabled`.
+    uint32_t* status = nullptr;
     long long round = 0;
 };
 
@@ -565,6 +653,17 @@ std::unique_ptr<IpcState> initialize(const std::string& id_path, int world, int 
     }
     if (!memcpy_h2d(state.stamps, table.data(), table.size() * sizeof(uint16_t))) {
         throw std::runtime_error("Ascend IPC all-reduce: cannot fill stamp table");
+    }
+    // The arrival wait's status word. Zeroed for the same reason the stamps are:
+    // the host read happens before the first launch has necessarily run, and zero
+    // is the value that means "every peer arrived".
+    if (!device_malloc_into(state.status, sizeof(uint32_t))) {
+        throw std::runtime_error(
+            "Ascend IPC all-reduce: cannot allocate the arrival-wait status word");
+    }
+    if (!device_memset(state.status, 0, sizeof(uint32_t))) {
+        throw std::runtime_error(
+            "Ascend IPC all-reduce: cannot zero the arrival-wait status word");
     }
 
     for (int s = 0; s < kSets * world; ++s) {
@@ -686,8 +785,12 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
 
     // Push this rank's plane into every peer's slot for this rank, and the round's
     // stamp into every peer's stamp array at (set, this rank). Both copies are on
-    // one stream, so the stamp lands after the plane it announces and a peer that
-    // sees the stamp knows the plane before it is complete.
+    // one stream, so the stamp's copy is issued after the plane's and the copy
+    // engine executes them in order -- the stamp cannot be *sent* before the plane
+    // has been. That is the whole of what this ordering buys, and it is less than it
+    // reads like: it does not make the plane *readable* at the peer when the stamp
+    // is. `..._DEVWAIT` is the measurement that separates those two, and the host
+    // poll's round trip below is what covers the gap. See 5.5.3 and 5.5.4.
     for (int j = 0; j < world; ++j) {
         if (j == rank) continue;
         check_acl(aclrtMemcpyAsync(state.remote[static_cast<size_t>(set * world + j)],
@@ -722,53 +825,94 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // stream it is a drain of the layer queued behind it -- the same class of host
     // round trip the bracket below is removed to avoid -- but it is buying the wait,
     // not wasting it. See docs/performance/ascend_single_request_tps.md 5.5.3.
+    //
+    // The whole loop is `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT`'s to replace. The
+    // drain above is not only buying the wait, it is also what the device is idle
+    // for: the host is inside the runtime until every peer has arrived, so nothing
+    // is enqueued behind this call and the 25 ms `NOPOLL` prices is host time the
+    // device could have been given work across. The stamps are in GM that this rank
+    // and its peers both address, and every rank's wait is the same length (5.5.3),
+    // so the wait is a condition the device can test for itself. The device branch
+    // below enqueues that test instead of running it here.
+    //
+    // This is not `ASYNCPOLL` returning under a new name, and the earlier loss does
+    // not predict this one. ASYNCPOLL skipped the drain and repeated a read that was
+    // still going to be early, which cost an extra round trip per iteration. This
+    // reads nothing on the host at all until the device says the wait is over, and
+    // the probe that rejected ASYNCPOLL was a loop with no work in it, where the
+    // peers were behind by construction. The engine has a whole layer of compute
+    // between two collectives, so by the time a rank reaches this point its peers
+    // have been arriving for a layer's worth of time. Whether they actually have is
+    // the measurement, and `5.5.3` has it.
     const double deadline = now_ms() + poll_deadline_ms();
     long long poll_iters = 0;
     const int sleep_us = poll_sleep_us();
-    while (!nopoll_enabled()) {
-        uint16_t* const landing = state.seen;
+    if (devwait_enabled()) {
         const uint16_t* const stamps_at =
             state.stamp_recv + static_cast<size_t>(set * world) * kStampStride;
-        const size_t stamp_read_bytes =
-            static_cast<size_t>(world) * kStampStride * sizeof(uint16_t);
-        if (!memcpy_d2h(landing, stamps_at, stamp_read_bytes)) {
+        if (!qwen_ipc_arrive_wait_ascend(stamps_at, state.status, world, rank,
+                                         state.round, poll_deadline_ms(),
+                                         acl_stream)) {
             throw std::runtime_error(
-                "Ascend IPC all-reduce: cannot read the receive stamps");
+                "Ascend IPC all-reduce: cannot launch the device arrival wait");
         }
-        ++poll_iters;
-        int pending = 0;
-        uint16_t first_want = 0;
-        uint16_t first_got = 0;
-        for (int k = 0; k < world; ++k) {
-            if (k == rank) continue;
-            const uint16_t want = stamp_value(state.round, k, world);
-            const uint16_t got = state.seen[static_cast<size_t>(k) * kStampStride];
-            if (got != want) {
-                if (pending == 0) {
-                    first_want = want;
-                    first_got = got;
-                }
-                ++pending;
+    } else {
+        while (!nopoll_enabled()) {
+            uint16_t* const landing = state.seen;
+            const uint16_t* const stamps_at =
+                state.stamp_recv + static_cast<size_t>(set * world) * kStampStride;
+            const size_t stamp_read_bytes =
+                static_cast<size_t>(world) * kStampStride * sizeof(uint16_t);
+            if (!memcpy_d2h(landing, stamps_at, stamp_read_bytes)) {
+                throw std::runtime_error(
+                    "Ascend IPC all-reduce: cannot read the receive stamps");
             }
+            ++poll_iters;
+            int pending = 0;
+            uint16_t first_want = 0;
+            uint16_t first_got = 0;
+            for (int k = 0; k < world; ++k) {
+                if (k == rank) continue;
+                const uint16_t want = stamp_value(state.round, k, world);
+                const uint16_t got = state.seen[static_cast<size_t>(k) * kStampStride];
+                if (got != want) {
+                    if (pending == 0) {
+                        first_want = want;
+                        first_got = got;
+                    }
+                    ++pending;
+                }
+            }
+            if (pending == 0) break;
+            if (now_ms() > deadline) {
+                throw std::runtime_error(
+                    "Ascend IPC all-reduce: " + std::to_string(pending) +
+                    " of " + std::to_string(world - 1) +
+                    " peers sent nothing for round " + std::to_string(state.round) +
+                    " (expected stamp " + std::to_string(first_want) + ", saw " +
+                    std::to_string(first_got) +
+                    "); the group is dead or desynchronised");
+            }
+            if (sleep_us > 0) usleep(static_cast<unsigned int>(sleep_us));
         }
-        if (pending == 0) break;
-        if (now_ms() > deadline) {
-            throw std::runtime_error(
-                "Ascend IPC all-reduce: " + std::to_string(pending) +
-                " of " + std::to_string(world - 1) +
-                " peers sent nothing for round " + std::to_string(state.round) +
-                " (expected stamp " + std::to_string(first_want) + ", saw " +
-                std::to_string(first_got) +
-                "); the group is dead or desynchronised");
-        }
-        if (sleep_us > 0) usleep(static_cast<unsigned int>(sleep_us));
     }
     // Diagnostic only, default off. See settle_us(): this is the delay that makes
     // the window between a peer's stamp landing and its plane landing empty, so an
     // engine run that stops being non-reproducible with it on was reading planes
     // that had not finished arriving. It is charged to wait_ms because that is
     // what it is -- waiting -- and a run with it set is flagged at startup.
+    //
+    // Under `DEVWAIT` the host no longer knows when the last stamp landed -- the
+    // device does -- so the plain sleep below would land while the wait kernel is
+    // still spinning and open no window at all. Draining the stream first puts it
+    // where the host poll's sleep is: after the arrival, before the reduce is
+    // enqueued. That drain is the host wait this arm exists to delete, which is
+    // what keeps this a diagnostic and not a second implementation.
     if (const int settle = settle_us(); settle > 0) {
+        if (devwait_enabled()) {
+            check_acl(aclrtSynchronizeStream(acl_stream),
+                      "drain the device arrival wait before the settle delay");
+        }
         usleep(static_cast<unsigned int>(settle));
     }
     const double t2 = timing ? now_ms() : 0.0;
@@ -801,11 +945,58 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     }
     const double t3 = timing ? now_ms() : 0.0;
 
+    // `DEVWAIT` put the wait out of this thread's reach, so the only way its bound
+    // can become a reported failure is for the host to read the latch the kernel
+    // writes. Reading it drains the default stream, which is the one thing this arm
+    // exists to stop doing, so it happens every `kStatusCheckEvery` calls rather than
+    // every call: one drain in 32 is a thirty-second of the cost of the drain per
+    // call it replaces, and the kernel never clears the latch itself, so a failure in
+    // the other 31 calls is still there when this one looks. See qwen_ipc_arrive_wait.cpp.
+    //
+    // The read is `memcpy_d2h`, which is a blocking copy and therefore ordered only
+    // against the default stream. That is the stream this collective is on whenever
+    // the caller passes none, which is what the engine does at all 129 decode sites,
+    // so the drain is real and the latch is read after the wait it belongs to. With
+    // `..._RSTREAM` on it would not be, and this word could be read stale -- another
+    // reason the two switches are not meant to be combined, on top of the arm being a
+    // bound already. Neither is on by default.
+    double status_check_ms = 0.0;
+    if (devwait_enabled()) {
+        const double t_check = timing ? now_ms() : 0.0;
+        if ((state.round + 1) % kStatusCheckEvery == 0) {
+            uint32_t reported = 0;
+            if (!memcpy_d2h(&reported, state.status, sizeof(reported))) {
+                throw std::runtime_error(
+                    "Ascend IPC all-reduce: cannot read the device arrival wait's "
+                    "status");
+            }
+            if (reported != 0) {
+                throw std::runtime_error(
+                    "Ascend IPC all-reduce: " + std::to_string(reported) + " of " +
+                    std::to_string(world - 1) + " peers sent nothing within " +
+                    std::to_string(poll_deadline_ms()) + " ms of round " +
+                    std::to_string(state.round) +
+                    "; the group is dead or desynchronised");
+            }
+            // Only after a zero came back, and only here: the stream was drained a
+            // line ago, so no in-flight wait can be holding a write to this word.
+            // Charged to wait_ms like the poll loop it replaces, because a host
+            // thread blocked in the runtime is what it is.
+            const uint32_t zero = 0;
+            if (!memcpy_h2d(state.status, &zero, sizeof(zero))) {
+                throw std::runtime_error(
+                    "Ascend IPC all-reduce: cannot clear the device arrival wait's "
+                    "status");
+            }
+        }
+        if (timing) status_check_ms = now_ms() - t_check;
+    }
+
     if (timing) {
         Stats& s = stats();
         s.prologue_ms += t0 - t_entry;
         s.push_ms += t1 - t0;
-        s.wait_ms += t2 - t1;
+        s.wait_ms += t2 - t1 + status_check_ms;
         s.reduce_ms += t3 - t2;
         s.poll_iters += poll_iters;
         ++s.calls;
