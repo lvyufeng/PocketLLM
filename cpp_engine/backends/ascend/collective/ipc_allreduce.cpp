@@ -100,6 +100,12 @@ double now_ms() {
 // the three terms below -- but only in aggregate and only from outside the call.
 // Splitting them is what says whether the barrier is waiting on peers or paying
 // for its own host-side calls, and those two point at different fixes.
+//
+// It answered neither, which is why the terms are worth keeping. The poll completes
+// in 1.00-1.31 iterations, so the peers are there before the read; the cost is the
+// read itself, and what it costs is the runtime round trip in front of it. See
+// devwait_enabled and docs/performance/ascend_single_request_tps.md 5.5.3.
+//
 bool stats_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_STATS");
