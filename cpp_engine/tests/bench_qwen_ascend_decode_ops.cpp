@@ -326,6 +326,151 @@ int main(int argc, char** argv) {
                            kMlp, kHidden);
                    }, iters));
     }
+    // The same weight with an activation block whose rows are all copies of one.
+    //
+    // The sweep above reads the operand once per M, so M=16 winning does not by
+    // itself say anything about a decode step: a decode step is M=1 and has no
+    // second sequence to put in rows 1..15. What this block asks is whether it
+    // has to be. If the 1.65x at M=16 is the Cube's tile filling up rather than
+    // the extra rows doing work, then filling it with fifteen copies of the one
+    // row buys the same rate, and the arithmetic that gets thrown away was never
+    // the limit -- a GEMV at 1152 GB/s asks the unit for 2.3 TFLOP/s and the
+    // square GEMM below reaches 71.
+    //
+    // Which is the whole question for this axis, because M=1 is not a shape the
+    // engine chose, it is what a single request is. If replication holds, the
+    // decode step's linear ops can run at a rate the M=1 tile does not reach.
+    //
+    // The copies are made on the host here. In the engine they would come from
+    // the producing op or from a zero-stride view of `x`; neither is timed by
+    // this block, which is why `enqueue` is printed next to `device`.
+    for (int m : {1, 2, 4, 8, 16, 32}) {
+        const std::vector<uint16_t> row = random_halves(kHidden, rng);
+        std::vector<uint16_t> rows(static_cast<size_t>(m) * kHidden);
+        for (int i = 0; i < m; ++i) {
+            std::copy(row.begin(), row.end(),
+                      rows.begin() + static_cast<size_t>(i) * kHidden);
+        }
+        DeviceBuffer x(rows);
+        DeviceBuffer w(random_halves(static_cast<size_t>(kMlp) * kHidden, rng));
+        DeviceBuffer y(static_cast<size_t>(m) * kMlp);
+        DeviceBuffer y_one(static_cast<size_t>(kMlp));
+        char label[64];
+        std::snprintf(label, sizeof(label), "replicated %dx5120x4352", m);
+        report_gbs(label, static_cast<double>(kMlp) * kHidden * 2,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), m, kMlp, kHidden, kHidden,
+                           kMlp, kHidden);
+                   }, iters));
+        // Every row of the result has to equal row 0, and row 0 has to equal the
+        // single-row product. Without both, what the block timed is a replicated
+        // *input* producing sixteen different answers.
+        bool rows_match = true;
+        for (int i = 1; i < m; ++i) {
+            rows_match = rows_match &&
+                         max_abs_diff(y.get(),
+                                      y.get() + static_cast<size_t>(i) * kMlp,
+                                      kMlp) < 0.5f;
+        }
+        const bool launched = pocket::qwen_fp16_matmul_rows_f16(
+            x.get(), w.get(), y_one.get(), 1, kMlp, kHidden, kHidden, kMlp,
+            kHidden);
+        if (!launched || !pocket::device_synchronize()) {
+            std::printf("    parity check: single-row launch failed\n");
+        } else {
+            std::printf("    rows identical: %s   vs the single-row product: %s\n",
+                        rows_match ? "yes" : "NO",
+                        parity_label(y_one.get(), y.get(), kMlp));
+        }
+    }
+    // The same thing with the copies left implicit, because the block above paid
+    // for them on the host and that is exactly the cost that would eat the win.
+    //
+    // A stride of 0 on the activation describes sixteen rows that are all one row
+    // of storage, so nothing is copied and nothing is read twice; the batch
+    // dimension is a view over a single row. The three sub-blocks differ only in
+    // where the sixteen results land:
+    //
+    //   "broadcast x"   sixteen output rows, so the destination has to grow to
+    //                   hold them and the caller reads row 0
+    //   "broadcast xy"  the output collapses too, so the caller's buffer is
+    //                   unchanged -- IF aclnn is fast with a zero output stride,
+    //                   which is the half that has to be measured
+    //   "copy out"      what "broadcast x" costs when the caller's buffer cannot
+    //                   grow after all: one row copied out of the tall result
+    //
+    // Both output widths are swept because the engine's two shapes are 4352 (the
+    // TP4 MLP shard) and 8704 (its fused gate+up), and the rate at M=16 does not
+    // have to scale the same way at both.
+    for (int out_rows : {kMlp, 2 * kMlp}) {
+        const std::vector<uint16_t> row = random_halves(kHidden, rng);
+        DeviceBuffer x(row);  // one row, and the batch dimension is stride 0
+        DeviceBuffer w(random_halves(static_cast<size_t>(out_rows) * kHidden, rng));
+        DeviceBuffer y(static_cast<size_t>(16) * out_rows);
+        DeviceBuffer y_collapsed(static_cast<size_t>(out_rows));
+        DeviceBuffer reference(static_cast<size_t>(out_rows));
+        const double weight_bytes = static_cast<double>(out_rows) * kHidden * 2;
+        char label[64];
+
+        std::snprintf(label, sizeof(label), "matmul 1x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 1, out_rows, kHidden, kHidden,
+                           out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "matmul 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 16, out_rows, kHidden,
+                           kHidden, out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "broadcast x 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 16, out_rows, kHidden, 0,
+                           out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "broadcast xy 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y_collapsed.get(), 16, out_rows,
+                           kHidden, 0, 0, kHidden);
+                   }, iters));
+        // The copy that makes a tall result usable from an unchanged caller: row
+        // 0 of the sixteen, read back into a buffer of exactly one row. Priced on
+        // its own because it is the whole reason to prefer a collapsed output.
+        std::snprintf(label, sizeof(label), "copy row 0 of 16x%d", out_rows);
+        report(label, time_op([&] {
+                   return pocket::qwen_copy_rows_strided_f16(
+                       y.get(), out_rows, reference.get(), out_rows, 1, out_rows);
+               }, iters));
+
+        const bool launched = pocket::qwen_fp16_matmul_rows_f16(
+            x.get(), w.get(), reference.get(), 1, out_rows, kHidden, kHidden,
+            out_rows, kHidden);
+        if (!launched || !pocket::device_synchronize()) {
+            std::printf("    parity check: single-row launch failed\n");
+        } else {
+            bool spread = true;
+            for (int i = 0; i < 16; ++i) {
+                spread = spread &&
+                         max_abs_diff(reference.get(),
+                                      y.get() + static_cast<size_t>(i) * out_rows,
+                                      out_rows) < 0.5f;
+            }
+            std::printf(
+                "    vs the single-row product: broadcast x row0=%s all 16 rows=%s "
+                "broadcast xy=%s\n",
+                parity_label(reference.get(), y.get(), out_rows),
+                spread ? "ok" : "NO",
+                parity_label(reference.get(), y_collapsed.get(), out_rows));
+        }
+    }
     // The same sweep with the weight on the Cube's A operand instead of its B.
     //
     // Operand order is the whole difference: A is indexed by the uncontracted

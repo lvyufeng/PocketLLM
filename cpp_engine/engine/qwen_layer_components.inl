@@ -22,10 +22,28 @@ void Linear::forward(
             std::string("Qwen Ascend path is not implemented for ") +
             qwen_linear_kind_name(linear.kind));
     }
+    // One activation row against the weight shard, with the activation's batch
+    // dimension broadcast over that row so the Cube's M tile is full.
+    //
+    // The zero stride is what makes this a broadcast rather than a copy: the
+    // sixteen rows read the same row of storage. The destination is the caller's,
+    // and it is only as wide as `output_rows` unless the allocator grew it --
+    // which it does for every one-row FP16 activation at
+    // `QWEN_ASCEND_REPLICATE_ROWS > 1`, and that is where the tall write lands.
+    // Row 0 is the answer and every consumer reads it as row 0, so nothing
+    // downstream sees the other fifteen.
+    const int replicate = rows == 1 ? ascend_replicate_rows() : 1;
+    if (replicate > 1) {
+        qwen_ascend_require_replicated_room(
+            output,
+            static_cast<size_t>(replicate) * output_rows * sizeof(uint16_t),
+            site);
+    }
     require_launch(qwen_fp16_matmul_rows_f16(
-        input, linear.weight.f16_data(), output, rows, output_rows,
-        columns, columns, output_rows, columns),
-        "FP16 activation/weight projection");
+        input, linear.weight.f16_data(), output, replicate, output_rows,
+        columns, replicate > 1 ? 0 : columns, output_rows, columns),
+        replicate > 1 ? "FP16 replicated activation/weight projection"
+                      : "FP16 activation/weight projection");
     return;
 #else
     if (linear.kind == QwenLinearKind::Fp8Block128) {

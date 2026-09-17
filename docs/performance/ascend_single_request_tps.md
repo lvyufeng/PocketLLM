@@ -36,6 +36,14 @@ around the new collective and paid 12.9 ms of host round trips for ordering it d
 The empty-loop probe projected 13.2 TPS, so the barrier itself delivered what it promised; §5.5.3
 prices what is left, and it is the arrival poll rather than the payload.
 
+That is the collective side. §3 named the other side — 42.3 ms of non-collective per-layer work,
+3.6x off the memory floor — and left it unscoped, on the reading that the rows=1 shape was what a
+single request is and therefore not a lever. It is a lever: the Cube's M tile is sixteen rows, a
+decode step has one, and the fifteen the tile wants do not have to be real. §6 is the layer's own
+projections issued with the activation's batch dimension broadcast over the row it already has, and
+it is worth **13.05 -> 17.59 TPS at rows=1 over three interleaved pairs**, +34.8%, on top of the
+hand-written collective rather than against it.
+
 ## 1. The row sweep: single-request cost is batch-independent cost
 
 8 decode steps, a 32-token prompt, verifier off, `QWEN_BATCH_ROWS` swept 1 to 8:
@@ -148,9 +156,10 @@ none of it is the memory system: the 42.3 ms of non-collective work is already 3
 floor, and the collectives are on top of that.
 
 The size of the collective prize is bounded and worth stating explicitly: **make every collective
-free and the step is 42.3 ms, or 23.6 TPS.** That is a 2.5x on single-request throughput, and it is
-the entire remaining headroom on this axis — the rest of the gap to 85 TPS is in the 42.3 ms of
-per-layer work, which is a different project.
+free and the step is 42.3 ms, or 23.6 TPS.** That is a 2.5x on single-request throughput — but it is
+not the only term left, because the 42.3 ms of per-layer work is itself above its own floor. §6 is
+that term: the layer's own projections, issued so the Cube's sixteen-row tile is full, for 20.1 ms of
+a 76.6 ms step.
 
 ## 4. Two levers that measured to nothing
 
@@ -724,7 +733,217 @@ with `slots_ok=4/4` and no mismatch, which is what makes the engine context rath
 the place the remaining answer is.
 
 
-## 6. What is left, in order of size
+## 6. The Cube's M tile is sixteen rows and a decode step has one
+
+§3 left the 42.3 ms of non-collective work named and unscoped, on the reading that rows=1 is what a
+single request is and so not something a lever can act on. The row count is not the shape the
+hardware sees. `bench_qwen_ascend_decode_ops` sweeps M over the two weight shards the layer's
+projections actually use — the TP4 MLP shard (`4352 = 17408/4`) and its fused gate+up (`8704`) — with
+the weight read once per call:
+
+| M | 5120x4352 device us | GB/s | 5120x8704 device us | GB/s |
+|---|---|---|---|---|
+| 1 | 167.1 | 266.7 | 301.2 | 295.9 |
+| 4 | 165.2 | 269.7 | — | — |
+| 16 | 101.1 | 440.7 | 156.4 | 570.0 |
+| 64 | 328.9 | 135.5 | — | — |
+
+**Sixteen times the rows for 1.65x the rate**, and M=64 — four tiles of them — is slower than M=1.
+That is not a compute curve: the weight bytes are the same at every row of that table, so what the M
+axis is changing is the rate at which they are read, and the shape that reads them fastest is the one
+that fills the tile's sixteen rows exactly. Against the 1148 GB/s the HBM probe reaches, a decode
+step's 267-296 GB/s is the whole of the gap §3 attributed to "per-layer work".
+
+### 6.1 The fifteen rows do not have to be real
+
+A decode step has one row and no second sequence to put in rows 1-15. What makes the table above a
+lever is that those rows do not have to contain anything: a zero stride on the activation's row
+dimension describes a batch that repeats one row of storage, so nothing is copied, nothing is read
+twice, and all sixteen outputs come back equal to the one the caller wanted. The bench checks both
+halves of that at both widths — row 0 against a separate single-row product, and all sixteen rows
+against row 0 — and reports `identical: yes` / `row0=ok all 16 rows=ok` throughout.
+
+| shape | `matmul 1x` | `broadcast x 16x` (zero input stride) | `matmul 16x` (real rows) |
+|---|---|---|---|
+| 5120x4352 | 167.1 us / 266.7 GB/s | **112.0 us / 397.9 GB/s** | 101.1 us / 440.7 GB/s |
+| 5120x8704 | 301.2 us / 295.9 GB/s | **149.0 us / 598.1 GB/s** | 156.4 us / 570.0 GB/s |
+
+The broadcast form is within 11% of a genuine sixteen-row matmul at 4352 and *faster* than one at
+8704. Filling the tile with copies is what buys the rate; the arithmetic that gets thrown away was
+never what the unit was waiting for.
+
+**The destination has to stay tall.** The other way to leave the caller's buffer untouched is to
+collapse the output as well — a zero stride on the output's row dimension, so all sixteen writes land
+on row 0 and the consumer reads the one row it always read. It is the tidier shape and it is a loss:
+
+| shape | `broadcast x` (tall y) | `broadcast xy` (zero output stride) |
+|---|---|---|
+| 5120x4352 | 112.0 us, enqueue 13.7 us | 302.6 us, enqueue 115.3 us |
+| 5120x8704 | 149.0 us, enqueue 14.0 us | 348.5 us, enqueue 109.9 us |
+
+2.7x and 2.3x, and the enqueue column says where it comes from: a zero output stride turns the store
+into a scatter the aclnn side cannot batch. The engine grows the allocation instead (§6.2), which
+costs one `qwen_copy_rows_strided_f16` that it does not have to run: nothing downstream ever reads
+row 1.
+
+### 6.2 The engine: one rule at the allocator, one condition at the projection
+
+Two changes, and both are shaped so that the batched path cannot see them.
+
+**The allocation.** `allocate_elements` is the single point every activation allocation in the layer
+passes through, so the rule lives there: a one-row FP16 activation is allocated with room for
+`QWEN_ASCEND_REPLICATE_ROWS` rows. Its `shape` is deliberately left alone — every consumer in the
+layer reads row 0 through the extent it reads today, so the copies are never observed and no
+downstream kernel has to know they exist. Only the allocation grows.
+
+"One row" is both spellings of it, a rank-1 shape and a rank-2 shape whose first dimension is 1,
+because a rule that depended on how a call site punctuated its shape is exactly the gap a replicated
+write turns into an overflow. Rank 3 and above is where the rule stops, and that boundary is the KV
+cache rather than an artifact: a cache is `{slots, context, heads, dim}`, its append and attention
+kernels index those strides themselves, nothing replicated ever writes one, and growing one would
+cost `replicate` times the cache — 2.1 GB against 134 MB at an 8192-token context — to buy nothing.
+No activation in the layer is spelled that way.
+
+**The projection.** `Linear::forward` in `qwen_layer_components.inl` is the one site every one of the
+layer's linear projections goes through — the 17 call sites for `lin.qkv`, `lin.ab`, `lin.a`/`lin.b`,
+`lin.z`, `lin.out`, `full.q`/`full.kv`, `full.k`/`full.v`, `full.out`, `mlp.gate_up`,
+`mlp.gate`/`mlp.up`, `mlp.down`, plus `mtp.fc` and the target head. It takes `replicate` rows and a
+zero activation stride when the caller asked for one row, and the unchanged call otherwise:
+
+```cpp
+const int replicate = rows == 1 ? ascend_replicate_rows() : 1;
+require_launch(qwen_fp16_matmul_rows_f16(
+    input, linear.weight.f16_data(), output, replicate, output_rows,
+    columns, replicate > 1 ? 0 : columns, output_rows, columns), ...);
+```
+
+`rows != 1` leaves `replicate` at 1, so prefill and batched decode take the identical path they took
+before, by construction rather than by a check. The zero-stride case is not a special case in the
+backend either: `aclnn_ops.cpp`'s `matmul_rows` accepts a zero stride on either operand's row
+dimension as a broadcast, and every other stride it validates is unchanged.
+
+### 6.3 What it is worth: 13.05 -> 17.59 TPS at rows=1
+
+Three interleaved pairs, one arm alternating with the other inside one session, the TP4 launcher, one
+process per rank on devices 0-3, the hand-written collective on in both arms so that what is
+measured is this lever and not §5's:
+
+| pair | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` | step, rep=1 | step, rep=16 |
+|---|---|---|---|---|
+| 1 | 13.1333 TPS | 17.4303 TPS | 76.9-76.5 ms | 56.9-56.3 ms |
+| 2 | 13.0327 TPS | 17.6771 TPS | — | — |
+| 3 | 12.9902 TPS | 17.6566 TPS | — | — |
+
+**13.05 -> 17.59 TPS, +34.8%**, and 76.6 ms -> 56.5 ms per step. Both arms exit
+`qwen_ascend_tp4_status=0` on all four ranks. The control band is 12.99-13.13 across the session and
+the replicated band is 17.43-17.71, so the separation is far outside the spread — unlike §5's
+collective A/B, this one does not need thirty-six pairs to be legible.
+
+The width is swept rather than assumed, and 16 is where it stops:
+
+| `QWEN_ASCEND_REPLICATE_ROWS` | 1 | 8 | 16 | 32 | 1 | 16 |
+|---|---|---|---|---|---|---|
+| decode TPS | 12.927 | 12.4983 | **17.6432** | 16.8139 | 12.7466 | **17.6649** |
+
+8 is *below* the control and 32 is below 16, which is the tile boundary showing through: the unit
+has sixteen rows and any count that is not a multiple of sixteen pays for a partly-filled tile, while
+32 pays for two of them at a rate (321.7 GB/s, `replicated 32x5120x4352`) that does not cover the
+second. The bench's own `replicated {4,8,16,32}` row — the same matmul with the sixteen rows actually
+materialised on the host — is 166.1 / 166.0 / 101.0 / 138.5 us, the same shape of curve, and it is
+what makes the sweep's 8 and 32 rows a hardware result rather than a scheduling one.
+
+The cost is workspace, and it is small because only one-row activations grow: `activation_workspace_peak_bytes`
+is 1825704 at the default and 3090728 at 16, +1.2 MB, against 13.45 GB of resident weights per card.
+`gpu_memory_used_bytes` moves by the same 4 MB over four ranks.
+
+### 6.4 Where the 20.1 ms went
+
+`QWEN_PHASE_PROFILE` brackets every scope with a `device_synchronize`, so its numbers are device work
+at that site and its scopes are fully serialized; that means the sum of the scopes is larger than the
+step and only the deltas between the two arms are readable. Seven decode steps on rank 0, both arms
+in one session:
+
+| scope | rep=1 ms | rep=16 ms | delta |
+|---|---|---|---|
+| `pd.mlp.gate_up` | 137.38 | 86.33 | **-51.05** |
+| `pd.mlp.down` | 103.96 | 60.89 | **-43.07** |
+| `pd.lin.qkv` | 54.72 | 41.13 | -13.59 |
+| `pd.lin.out` | 45.87 | 36.40 | -9.47 |
+| `pd.lin.z` | 47.70 | 38.97 | -8.73 |
+| `pd.full.q` | 19.66 | 14.15 | -5.51 |
+| `pd.full.out` | 15.77 | 12.53 | -3.24 |
+| `pd.lin.ab` | 42.56 | 44.15 | +1.59 |
+| `pd.full.k` / `pd.full.v` | 12.86 / 12.68 | 12.76 / 13.07 | -0.10 / +0.39 |
+| **all `pd.*` scopes** | **493.16** | **359.39** | **-133.77** |
+| `full_attention` | 184.62 | 177.15 | -7.47 |
+| `attn_resid_norm` | 37.27 | 40.83 | +3.56 |
+| `tp_all_reduce` (the collective) | 261.44 | 245.03 | -16.40 |
+| `STACK.d` (the step) | 1188.34 | 1051.69 | -136.65 |
+
+**-133.77 of the -136.65 ms is the projections**, and the collective moves by -16.40 ms, which is
+inside the run-to-run spread these arms already show (an earlier session of the same pair put it at
++5.50). The lever does what it says and touches nothing else.
+
+`pd.lin.ab` is the one projection that does not move, and it is the one that should not: it is a
+gated-delta site whose input row is produced at the width the fused path expects, and its `+1.59` is
+the same order as `attn_resid_norm`'s `+3.56`. Both are the cost of the larger activation
+allocations, and both are a tenth of what the two MLP projections return.
+
+The host profile says the same thing from the issuing thread's side, with no synchronization at all.
+Its `tp_all_reduce` scope falls 123.91 ms over the same seven steps, which is not the collective
+getting faster — the peers' arrival work is unchanged — but the blocking `memcpy_d2h` in the poll
+waiting out less queued layer, the mechanism §5.5.3 already identified. The projections' own host
+cost falls 2.4-3.7 ms each. Neither number is a share of the step; they are what the thread that
+issues the step spends, and the step itself is §6.3.
+
+### 6.5 The gate that proves the rule fired
+
+The rule of §6.2 is stated over shape rank and dtype, and a destination spelled some third way would
+be sized for one row and then written sixteen deep, with nothing else in the engine noticing. How
+much room a destination has is also the one thing the projection cannot work out for itself: it is
+handed a bare pointer, and whether that buffer holds one row or sixteen was decided at an allocation
+somewhere else.
+
+`QWEN_ASCEND_REPLICATE_CHECK=1` closes that. Every activation remembers its capacity at
+`allocate_elements`; every replicated projection looks its destination up and declines to launch if
+the tall write does not fit, naming the site and both extents. A buffer that reached the device
+through a bare `allocate` rather than through `allocate_elements` is not in the map and is refused
+rather than assumed fine, which is the same failure the check exists to catch. It is off by default —
+a hash lookup per allocation, and a check on the code rather than on the hardware.
+
+Both controls were run. With the rule in place and `QWEN_ASCEND_REPLICATE_CHECK=1`, `replicate=16`
+completes at **17.5072 TPS, `qwen_ascend_tp4_status=0`**: every one of the 17 sites found a
+destination with room. With the rule temporarily disabled (`ascend_replicated_elements` returning
+its argument) and the check still on, the run fails at the first projection:
+
+```
+error: Qwen replicated projection at lin.qkv has 49152 destination bytes for 81920
+qwen_ascend_tp4_status=1
+```
+
+The second extent is `replicate x output_rows x 2` at that site: 16 x 2560 x 2 = 81920 B, where 2560
+is `lin.qkv`'s output width — `2 * key_dim + value_dim` at TP4, i.e. `2 * (16/4) * 128 +
+(48/4) * 128`. The first is what the slot held with the rule off: less than one replicated row, so
+the launch is refused instead of writing past the end of it. The rule was restored, the engine
+rebuilt, and the A/B re-measured; the pairs in §6.3 are from the restored build.
+
+What this gate does not establish is that the sixteen rows carry the right *numbers*. It verifies the
+room, not the arithmetic, and on this platform the tokens cannot stand in for it: §5.5.4 measured
+four runs of two identical binaries producing three distinct greedy step-0 tokens, and the two arms
+of §6.3 produce different greedy sequences. What is checked is the half the bench can check — the
+broadcast's parity at both widths (§6.1) — and the half the engine can check, which is the extent.
+
+Three further things are not established, and are named so they are not read as done. The
+`full_attention` and `attn_resid_norm` deltas above are a single session's, on a step that has 112
+attention calls in it, and the interaction between a 1.7 MB larger workspace and the attention
+kernels' own allocations is not separated from noise. The lever is untested against §5's collective
+in the other direction — every pair in §6.3 has `POCKET_ASCEND_IPC_ALLREDUCE=1` on both arms, so what
+is measured is this lever on top of that path, not on the shipped HCCL default. And the fused versus
+unfused `mlp.gate_up` choice the engine makes from the checkpoint's own layout is not swept against
+`QWEN_ASCEND_REPLICATE_ROWS`; only the layout this checkpoint selects (fused, 8704) is measured
+here.
+
+## 7. What is left, in order of size
 
 | lever | measured size | state |
 |---|---|---|
@@ -732,12 +951,12 @@ the place the remaining answer is.
 | The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | recovered: the device-side form is 30% faster, 53.0-53.9 ms and 18.56-18.86 TPS, and passes the gate 10 of 10 once the RoPE table has its own workspace slot (§5.5.3) |
 | ~~The arrival signal has no release ordering~~ | **retracted**: the 10-of-10 rate that exposed it was the RoPE table's workspace aliasing, and it goes to 0 of 10 without the barrier changing at all (§5.5.3, §5.5.4) | withdrawn |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
-| The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
+| The 42.3 ms of non-collective per-layer work | 133.8 of the 136.7 ms step saving, i.e. 13.05 -> **17.59 TPS**, interleaved (§6.3, §6.4) | taken for the one-row activations; opt-in with `QWEN_ASCEND_REPLICATE_ROWS=16`. What is left of the 42.3 ms is not priced here |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
 | Verifier placement | 0.08%, noise | retracted (§4.2) |
 | The row axis | 1.17x the time for 6.8x the throughput | already the shipped answer, rows=16+ |
 
-## 7. Reproducing this
+## 8. Reproducing this
 
 The engine numbers come from the repository's TP4 launcher, one process per rank on devices 0-3:
 
@@ -767,6 +986,25 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE_DEADLINE_MS=3000 \
   POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1 [POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US=100] \
   scripts/run_qwen_ascend_tp4.sh "" 8
+```
+
+The §6 A/B is the plain single-request path on both arms — 5-token prompt, 8 new tokens — with the
+row replication on one arm and off the other, interleaved and repeated:
+
+```bash
+# §6.3, three interleaved pairs against the same build
+for pair in 1 2 3; do
+  for rep in 1 16; do
+    env QWEN_ASCEND_REPLICATE_ROWS=${rep} QWEN_ASCEND_DEVICES=0,1,2,3 \
+        POCKET_ASCEND_IPC_ALLREDUCE=1 \
+        scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+  done
+done
+
+# §6.5's gates: the same with the check on, and the same one-row width the
+# negative control failed at
+QWEN_ASCEND_REPLICATE_ROWS=16 QWEN_ASCEND_REPLICATE_CHECK=1 \
+  POCKET_ASCEND_IPC_ALLREDUCE=1 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 ```
 
 The MTP A/B of §4.1 is the same launcher without `QWEN_BATCH_ROWS`, plus `--qwen-mtp-tokens 3` on
@@ -812,6 +1050,10 @@ for r in 0 1 2 3; do
       --world 4 --rank $r --device $r --dir <shared> --no-pid-check \
       --poll-wait [--poll-single-set] --iters 20000 &
 done; wait
+
+# the HBM read probe of §3, the M/width sweeps of §6.1, and the broadcast
+# shapes the replicated launch is
+cpp_engine/build-ascend/tests/bench_qwen_ascend_decode_ops --device 0
 ```
 
 `bench_qwen_ascend_ipc_exchange` exports all `world` slots of its own buffer and imports the slot
@@ -819,7 +1061,7 @@ that belongs to *this* rank out of every peer, so `slots_ok=4/4` means slot `k` 
 value on every rank. A rank's own slot is legitimately `0x0000`: nothing pushes into it, because the
 local term of the sum never leaves the rank.
 
-## 8. Files
+## 9. Files
 
 - `cpp_engine/tests/bench_qwen_ascend_allreduce.cpp` — the per-call price, the size sweep, the
   platform floor, and the overlapped-vs-serial comparison, §2.1-§2.3.
@@ -829,9 +1071,16 @@ local term of the sum never leaves the rank.
   four notify barrier shapes, and the payload-carried poll barrier with its one-buffer control,
   §5.2-§5.4.
 - `cpp_engine/tests/bench_qwen_ascend_decode_ops.cpp` — the HBM read probe behind the 85 TPS
-  ceiling, §3.
+  ceiling (§3), and the M sweep, the replicated-launch parity checks, and the broadcast/broadcast-xy
+  comparison of §6.1.
 - `cpp_engine/engine/qwen_engine.cpp` — `all_reduce_half_rows`, the one-wide-collective decision that
-  makes 129 the count.
+  makes 129 the count; and, for §6, `ascend_replicate_rows`, the allocation rule
+  `ascend_replicated_elements`, and the `QWEN_ASCEND_REPLICATE_CHECK` gate.
+- `cpp_engine/engine/qwen_layer_components.inl` — `Linear::forward`'s Ascend branch, the single site
+  the replicated projection is issued from, §6.2.
+- `cpp_engine/backends/ascend/kernels/aclnn_ops.cpp` — `matmul_rows`' stride guard, which is where a
+  zero on either operand's row stride is admitted as a broadcast rather than rejected as a short
+  pitch, §6.2.
 - `cpp_engine/engine/main.cpp` — `--batch-decode`, `QWEN_BATCH_ROWS`, and the `batch_decode=1` line
   §1 is read from.
 - `scripts/run_qwen_ascend_tp4.sh` — the TP4 launcher used for every engine number here.
