@@ -40,7 +40,13 @@ which is [the row loop, serial against one row deep](#the-row-loop-runs-one-row-
 The resident set adds two more: `/tmp/probe_v41_hot_ab.py`, which is the width sweep and the logit
 comparison behind [the section below](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it),
 and `/tmp/probe_v41_resident_fill.py`, which is the only instrument here that times a per-*layer*
-cost and the only one that reads the process's own `smaps_rollup`. The width pair is re-run by
+cost and the only one that reads the process's own `smaps_rollup`. The pool is the same probe under
+`--pool-rows`, driven three times: `/tmp/run_poolfix.sh` is the six-sitting A-B-C-C-B-A behind its
+first table, `/tmp/run_poolwidth.sh` the eight-sitting width sweep behind the second, and
+`/tmp/run_poolshort.sh` the five-sitting A-B-C-D-A that shortens the pass instead of moving the width
+— the last of which records one sampled token that disagrees with the other twenty-nine, and
+[the subsection on the probe's sampler](#the-probes-tokens-are-the-samplers-draw-and-the-logit-column-is-the-parity-check)
+is what that is. The width pair is re-run by
 `/tmp/run_quiet_width.sh`, which is not a probe but the driver of the A-B-A-B: it runs
 `probe_v41_hot_ab.py` at 148 and 192 twice in one sitting, waits on `WAIT_FOR=<pid>` so the four
 cards are free, and echoes `/proc/loadavg` at every leg — that load trace is what says whether a
@@ -1147,24 +1153,30 @@ slower path.** An expert id is not an identity: the weights are
 layer 5's, and a pool keyed on the id alone answers the later draw with an earlier layer's bytes. It
 does so *more* often the wider the pool is, and it does so silently — the rows are the right shape and
 the bytes are a real expert's. The counters could not see it: the pre-fix sweep's counters were
-exactly reproducible (1423 rows staged at 288 on rank 0, 1423 again; 2993 at 192, 2993 again) while
-the tokens were not. Same prompt, same cards, per-rank greedy tokens:
+exactly reproducible (1434 rows staged at 288 on rank 0, 1434 again; 3037 at 192, 3037 again, on the
+same counter the tables below read) while the tokens were not. Same prompt, same cards, per-rank
+tokens as this probe drew them — and they *are*
+draws rather than an argmax, which is [its own subsection below](#the-probes-tokens-are-the-samplers-draw-and-the-logit-column-is-the-parity-check):
 
 | `--expert-pool-rows` | r0 | r1 | r2 | r3 | staged, r0/r1 |
 | ---: | --- | --- | --- | --- | --- |
 | 0 | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | 41040 / 41040 |
-| 192 | `[2413, 45539]` | `[2413, 82761]` | `[2413, 3373]` | `[2413, 63767]` | 2993 / 2972 |
-| 288 | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | 1423 / 1372 |
+| 192 | `[2413, 45539]` | `[2413, 82761]` | `[2413, 3373]` | `[2413, 63767]` | 3037 / 3010 |
+| 288 | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | 1434 / 1386 |
 
 Four ranks of one run disagreeing with each other is not a race — the tree is cut so that every rank
 computes the same logits — and the top-32 comparison prices it: against the control, **1 of the top 32
 ids in position at a worst |dlogit| of 4.717e+00 at 192 rows and 6.787e+00 at 288, against a max
 |logit| of 2.915e+01**, with 288 landing on the control's second token by luck and 192 missing it on
 every rank but a different way each time. The fix is the key: `pool_map`/`pool_lru` are keyed on
-`(layer_id, expert)` and `_pool_row` composes the tuple. And the verification is the same column that
-caught it — every rank of every pooled run on this page below reads `[2413, 21779]`, and the logit
-comparison over **six sittings and four ranks is 32 of 32 ids in position at `|dlogit| 0.000e+00`:
-28 pairs, every one of them zero**, pooled runs against the control and against each other.
+`(layer_id, expert)` and `_pool_row` composes the tuple. And the verification is the column that
+priced it: the logit comparison over **six sittings and four ranks is 32 of 32 ids in position at
+`|dlogit| 0.000e+00`: 24 payloads, 276 pairs, every one of them exactly zero and 32 of 32 ids in
+position**, pooled runs against the control and against
+each other. The token columns of every pooled run above agree too, but a token column is a weak
+instrument under this probe's sampler — [the subsection below](#the-probes-tokens-are-the-samplers-draw-and-the-logit-column-is-the-parity-check)
+prices how weak — and what convicted the key was the logit comparison behind the pre-fix table rather
+than its tokens.
 
 **What the corrected key means is that a pool row belongs to a layer, not to the model.** With the
 layer in the key nothing carries across a layer boundary, so the pool holds the working set of *one*
@@ -1236,7 +1248,10 @@ prefill draws more distinct experts a layer, up to one per expert the model has,
 cannot be below the floor at any prompt is 384 rows — **6.9 GiB a card**, more than the four cards
 have to give once the tree and the caches are on them. `--pool-rows 148` is sized to a 512-token
 prefill and is not a constant of the mechanism; what is a constant is that below the layer's distinct
-count the pool pays twice for the same expert.
+count the pool pays twice for the same expert. The sweep below takes the arrow the other way — a pass
+a quarter the length — and the floor moves **less** than proportionally, which is the same
+concentration that makes 148 and 288 the same width here; read the two together before sizing a width
+for a prompt that is neither.
 
 **The sitting drifts in a U, and the pair means are what say so.** The rank means in time order are
 48.03, 47.73, 45.80, 46.03, 45.98, 41.60, 48.28, 48.93: the two 148-row sittings sit on the fast
@@ -1268,7 +1283,116 @@ python /tmp/probe_v41_hot_ab.py --compare /tmp/pw_h148.pt.r0 /tmp/pw_p148.pt.r0
 `/tmp/run_poolfix.sh` is the six-sitting A-B-C-C-B-A behind the first table — the control at both ends,
 which the resident-set section above says had not been run and which comes back 186.13 against 186.60 s
 on the rank mean, 0.25% apart, with the decode column 5.5% apart on the same two runs.
-`/tmp/run_poolwidth.sh` is the eight-sitting width sweep behind the second.
+`/tmp/run_poolwidth.sh` is the eight-sitting width sweep behind the second, and `/tmp/run_poolshort.sh`
+the five-sitting A-B-C-D-A on the subsection below, which moves the length rather than the width.
+
+### A quarter-length pass moves the floor, and by less than the draw count moves
+
+**The corrected key makes the floor a property of the pass, and the way to test that is to hold the
+width and shorten the pass.** Every pool measurement above sits on a 512-token prompt. This one is the
+same probe, the same four cards and three widths at `--length 128` — a quarter of the tokens, the
+control at both ends, A B C D A, one sitting. Both predictions were in the sweep's own header before
+it ran: **(1)** a layer is drawn ~256 times at 128 tokens against ~1024 at 512, so if the distinct
+count scaled with the draw count the floor would land near 40 and `--pool-rows 64` would be sitting on
+it while 32 staged strictly more; **(2)** the pool should still beat the control, but by less than the
+4.0–4.2× at 512, because both mechanisms are paid per row staged and this pass stages a quarter as
+many.
+
+| configuration | arena | staged, r0/r1/r2/r3 | % resident, r0/r1 | prefill, ranks 0-3 | rank mean |
+| --- | ---: | --- | ---: | --- | ---: |
+| `--pool-rows 0` | 36 MiB | 10320 / 10320 / 5160 / 5160 | 0.0 / 0.0 | 51.1 / 52.2 / 48.5 / 49.4 s | 50.30 s |
+| `--pool-rows 32` | 610 MiB | 4085 / 4165 / 2150 / 2170 | 60.4 / 59.6 | 22.5 / 20.1 / 19.8 / 24.9 s | 21.84 s |
+| `--pool-rows 64` | 1183 MiB | 3335 / 3368 / 1977 / 2003 | 67.7 / 67.4 | 21.3 / 19.8 / 20.6 / 20.0 s | 20.42 s |
+| `--pool-rows 148` | 2690 MiB | 3175 / 3217 / 1976 / 2003 | 69.2 / 68.8 | 21.4 / 21.9 / 22.0 / 19.5 s | 21.20 s |
+| `--pool-rows 0` | 36 MiB | 10320 / 10320 / 5160 / 5160 | 0.0 / 0.0 | 49.0 / 49.5 / 48.8 / 48.8 s | 49.04 s |
+
+The staged column is the cumulative counter, so it carries the decode row's 80 draws on ranks 0 and 1
+and 40 on ranks 2 and 3 as the 512-token tables do. The prefill's own draw count falls **exactly 4×**:
+the control stages 10320 rows on rank 0 here against 41040 over the same forty layers at 512 — **258
+draws a layer against 1026**, of which the last two a layer are the decode row's, so the prefill itself
+makes 256 a layer at 128 tokens against 1024 at 512.
+
+**Prediction 2 holds. The pool is 2.3–2.4× here, not 4.0–4.2×.** The control's two sittings come back
+50.30 and 49.04 s, 2.5% apart, and against their mean of 49.67 the three pooled legs read 21.84,
+20.42 and 21.20 s — 2.27×, 2.43× and 2.34×. The mechanism reproduces; the size of it is a property of
+how much staging the pass does, which is what the three knobs on this page all have in common.
+
+**Prediction 1 holds in its second half and the first half is where it fails.** Below the floor a
+width does stage strictly more — 32 rows stages 4085 on rank 0 against 64's 3335 and 148's 3175, **+23%
+and +29%**, with the coverage column reading 60.4% against 67.7% and 69.2% — but the floor is **not**
+near 40. At 148 rows rank 0 stages 3175 rows over the pass, and over forty layers that is **~79
+distinct experts a layer against the ~142 distinct a 512-token pass draws** where a floor that scaled
+with the draw count would have been ~36. The two widths at and above it are within 5% of each other
+(3335 and 3175) and the one below is 23% over both, so ~79 is a floor and not a slope on this pass:
+64 rows is already more rows than a layer asks for, and 32 is below the line.
+
+**The floor is sub-linear in the draw count because the routing is concentrated, and that is the same
+concentration the 512-token sweep ran into from the other side.** A layer's 258 draws at 128 tokens
+over 384 experts would cover ~188 distinct if the gate were uniform — `384 · (1 − e^{−258/384})` — and
+a 512-token pass's 1026 draws would cover ~357. Measured, they cover ~79 and ~142. Both are far below
+the uniform estimate, and the consequence is that four times the draws buys 1.8× the distinct experts
+rather than 4×: the tail of the routing accrues new experts slowly, which is why a width sized to this
+prompt is neither comparable to a quarter of the 512-token width nor useful as a fraction of anything.
+
+**Everything else the mechanism is measured on holds at this length too.** The identity does:
+`pool_staged − pool_evicted` is the width exactly in all three pooled legs (4085 − 4053 = 32,
+3335 − 3271 = 64, 3175 − 3027 = 148), so the eviction counter remains the one that says whether the
+width was the binding constraint. And the decode column separates nothing, as before: 0.710–0.757 s a
+token across all five sittings, with the two controls — one configuration — at 0.757 and 0.712, 6%
+apart, and every pooled leg inside that band. The sweep is a prefill measurement and only that.
+
+**What it says about sizing is that the width belongs to the prompt.** At 128 tokens 64 rows buys the
+prefill 148 rows buys — 20.42 against 21.20 s on the rank mean, inside the drift — for 1183 MiB of
+arena instead of 2690, which is the same conclusion the 512-token sweep reached at 148 rows against
+192 and 288. There is no width to hard-code, so the flag stays a flag; what the two sweeps together
+establish is the shape of the curve it moves along, and that the mechanism's worth is the staging it
+removes and nothing else.
+
+Reproduce with:
+
+```bash
+# the width against a quarter-length pass: A B C D A at `--length 128`, control at both ends so the
+# node's own drift lands on the column it would otherwise be credited to
+/tmp/run_poolshort.sh
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_hot_ab.py --compare \
+  /tmp/ps_1_p0.pt.r0 /tmp/ps_4_p148.pt.r0
+```
+
+### The probe's tokens are the sampler's draw, and the logit column is the parity check
+
+**The tokens this probe records are not an argmax.** `Backbone.__init__` reads
+`self.temperature = getattr(cfg, "temperature", 1.0)` (`modules.py:604`), the released V4.1
+`config.json` carries no `temperature` field in either its top level or its `text_config` (checked),
+and `sample(logits, self.temperature)` (`modules.py:668`) therefore takes its non-zero branch —
+`probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)` (`modules.py:677`), an unseeded
+Gumbel-max over the whole vocabulary at temperature 1.0. The probe calls `front(...)` directly, so the
+model samples at its own default; the checked-in loop is the greedy one because
+`src/models/deepseek_v4_1/generate.py:105` zeroes `model.temperature` around `_decode`, and the token
+columns on this page that come out of *that* loop are argmaxes. Every token column taken with
+`probe_v41_hot_ab.py` — the pre-fix table above, the four sittings under "the same configuration was
+run four times", the pool's own runs — is a draw.
+
+**The 128-token sweep is where that shows, and it is one payload of twenty.** The pool-32 leg's rank 2
+drew `[1613, 270]` where the other three ranks of its own run and the other 19 payloads drew
+`[14, 270]`. Nothing in the mechanism can move it and nothing in the logits did: that rank's top-32 at
+the last prefill position is `[14, 1613, 305, 16]` at 27.8221 / 22.2702 / 20.9814 / 20.9665,
+bit-identical to every other rank's and to every other run's — `torch.equal` on the stored top-32
+values is true for all twenty of them, not merely close — and the pairwise comparison over all five
+sittings × four ranks is **32 of 32 in position at `|dlogit| 0.000e+00`**. The top-2 margin is
+5.55 logits and at temperature 1.0 the draw is `logit + Gumbel(0, 1)`, so 1613 wins about
+`e^{−5.55}` = 0.39% of the time on this row, with its closer competitors (305 at 20.98, 16 at 20.97,
+295 at 20.96) adding about a tenth of a percent each and the tail beyond them a little more — call it
+1% a draw that the argmax is not the top-1. The 40 sampled tokens those twenty payloads hold would
+carry 0.4 deviations at that rate, so one of them is the rate's ordinary outcome rather than a second
+defect to chase.
+
+**So the token columns are a weak instrument and the logit columns are the ones the claims rest on.**
+The rate above is what makes an agreeing token column evidence about a margin rather than about
+reproduction, and it cuts both ways: the pre-fix table's four ranks disagreeing with each other is
+worth reading only because the logits behind it moved by 4.717 and 6.787 against a 2.915e+01 maximum,
+which is far outside anything the sampler does. Every parity statement on this page — the six-sitting
+pair, the pool's runs, the two post-fix legs — is the `|dlogit|` comparison, and the tokens are
+reported beside it because they were recorded, not because they decide anything.
 
 ## What this does not do yet
 
@@ -1289,10 +1413,13 @@ All of these are separate measurements rather than separate opinions.
   stages 6579 ([the width table
   above](#the-pool-spends-the-same-arena-on-what-the-pass-draws-and-its-first-key-answered-the-wrong-layer)).
   A longer prefill raises that floor toward 384 rows — **6.9 GiB a card**, more than the four cards
-  can give once the tree and the caches are on them — so no prompt-independent width buys the
-  mechanism out. `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its
+  can give once the tree and the caches are on them — and a shorter one lowers it by less than the
+  draw count falls, measured: [a quarter-length pass puts the floor at ~79 experts a layer and the
+  width that sits on it at 64 rows rather than 148](#a-quarter-length-pass-moves-the-floor-and-by-less-than-the-draw-count-moves),
+  for 2.3–2.4× instead of 4.0–4.2×. So there is no prompt-independent width — not a large one and not
+  a small one — and `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its
   tokens contiguous, is the change that makes the floor a function of the batch rather than of the
-  layer, and it needs a kernel this class does not call. That is still a follow-on rather than a knob.
+  layer. It needs a kernel this class does not call. That is still a follow-on rather than a knob.
   What the two mechanisms above did establish is the arena arithmetic it would rest on: the rows are
   priced, the stage-from-bank path exists, and the counters that would move are the ones this page
   reports.
