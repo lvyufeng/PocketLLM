@@ -18,10 +18,17 @@ usable here — an imported notify cannot be waited on and a cross-process event
 but a barrier that reads its arrival signal out of the payload itself is, and it prices a complete
 all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** in an empty loop (§5.4). That barrier is
 now built as a kernel-level replacement for the collective (`POCKET_ASCEND_IPC_ALLREDUCE=1`) and it
-has been measured inside the engine: rows=1 goes from **105.1 ms / 9.51 TPS to 91.5 ms / 10.93 TPS**,
-+15%, with both arms passing the verifier gates (§5.5). The empty-loop probe projected +38%, so §5.5
-also says where the other 23 points went: the probe priced the collective on an idle device, and the
-engine's collective is never on one.
+has been measured inside the engine against the shipped path **interleaved run for run**, so the two
+arms share a session: rows=1 goes from **106.33 ms / 9.408 TPS to 77.32 ms / 12.935 TPS**, +37.7%
+(§5.5.4). It ships opt-in rather than on for one reason: the launcher's hard gate is
+`batch_repeat_mismatches`, the batched pass against its own repeat, and **both** arms fail it —
+3 of 36 runs under HCCL, 8 of 36 under the replacement — so thirty-six interleaved pairs still do not
+separate the two rates and the gate neither rejects the replacement nor validates it. What the same
+pairs do not leave in doubt is the step. Half of the saving came from deleting a bracket rather than
+from the barrier: the first integration kept the engine's `begin`/`end` pair around the new
+collective and paid 12.9 ms of host round trips for ordering it did not need (§5.5.1). The empty-loop
+probe projected 13.2 TPS, so the barrier itself delivered what it promised; §5.5.3 prices what is
+left, and it is the arrival poll rather than the payload.
 
 ## 1. The row sweep: single-request cost is batch-independent cost
 
@@ -312,9 +319,11 @@ and the single averaged figure is a fair description of it.
 
 Against `HcclAllReduce`'s 0.4810, that is **1.9x cheaper per call**. Extrapolated to the engine's 129
 calls that would take the collective from 62.0 ms to 33.4 ms and the step from 104.3 ms to 75.7 ms, or
-9.6 TPS to **13.2 TPS** — and §5.5 is that extrapolation being wrong, for a reason worth stating
-before the number is used again: this probe reduces on an idle device, and the engine's collective never
-is.
+9.6 TPS to **13.2 TPS**. The caveat this number has to be read under: this probe reduces on an idle
+device, and the engine's collective never is, so the projection is an upper bound on what the barrier
+is worth in place. §5.5 puts the same barrier in the engine and lands at 77.32 ms / 12.935 TPS — 2.1%
+short of the projection, which is close enough that the barrier was never the problem. What made the
+first engine integration miss it by 17% was not the barrier but the bracket the engine wrapped it in.
 
 What this probe cannot settle: its loop is empty, so the ranks stay within a fraction of a round of
 each other by construction and every push is issued into an idle device. The engine has a layer's worth
@@ -326,61 +335,291 @@ when the same barrier is put where the collective actually is.
 
 The barrier is now `cpp_engine/backends/ascend/collective/ipc_allreduce.{hpp,cpp}`, reached through
 `tp_all_reduce_sum_f16_inplace`. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it for any call with world > 1
-and a plane of at most 1 Mi FP16 elements; a call outside that envelope falls through to HCCL unchanged,
-and every rank evaluates the same predicate on the same arguments, so the choice cannot desynchronise
-the group. The ceiling covers batched decode (16 rows x 5120 = 81 920) and deliberately leaves prefill,
-where the payload is large enough that HCCL's bandwidth matters more than its per-call price, on HCCL.
+and a plane of at most 40 960 FP16 elements; a call outside that envelope falls through to HCCL
+unchanged, and every rank evaluates the same predicate on the same arguments, so the choice cannot
+desynchronise the group. The ceiling is **not** a measured bound — §5.5.4 re-tests the sweep that set
+it and cannot separate the sizes it chose between — so what it is is a conservative default on a path
+that is opt-in. It covers one row's 5120-element decode plane, 129 times a step, which is the whole
+point of the replacement; it does **not** cover a 16-row batched decode plane (81 920) or prefill, so
+both stay on HCCL.
+
+#### 5.5.1 The bracket cost more than the collective saved
+
+The first engine integration wrapped the new collective in the same `begin_nccl_collective()` /
+`end_nccl_collective()` bracket the HCCL path uses, and that is the version that was measured first:
+
+| arm | `step_ms` | decode TPS | vs the shipped default |
+|---|---|---|---|
+| HCCL, bracketed (the shipped default) | 105.783 | 9.45333 | — |
+| hand-written, bracketed | 91.5055 | 10.9283 | +15.6% |
+| hand-written, bracket removed | **78.593** | **12.7238** | **+34.6%** |
+
+`end_nccl_collective()` ends with `stream_synchronize(nccl_comm_stream)` — a host round trip that waits
+for the default stream to drain and *then* for the collective to finish — and around a call that
+already runs on the caller's stream it buys no ordering at all. It is worth 12.9 ms of a 91.5 ms step,
+0.100 ms per call over 129 calls, and it is the whole difference between the middle row and the last
+one. Removing it turns the replacement from a 13.6 ms saving into a 27.2 ms one.
+
+The bracket cannot simply be deleted, because the HCCL path does need it: a null-stream `HcclAllReduce`
+drains the default stream and then runs on a private one, so the ready-event plus the synchronize is
+the only thing ordering it against the compute stream. What the caller has to know is *which*
+collectives it is wrapping, which the backend knows and the engine does not, so the contract gained
+`pocket::tp_all_reduce_f16_on_caller_stream(world, count)`. Ascend's hand-written collective answers
+true, because everything it issues is stream-ordered on the stream it is handed; the Ascend HCCL path
+and NCCL on CUDA both answer false. `all_reduce_half` brackets only where that answer is false. The
+predicate failing in the other direction is a correctness hazard rather than a slow step, which is
+why it is the backend that answers and not the caller.
+
+#### 5.5.2 The gate it has to pass
 
 Rows=1, 8 decode steps, 32-token prompt, one process per rank on devices 0-3, `QWEN_BATCH_VERIFY=3`:
 
-| arm | `step_ms` | decode TPS | seed | `verify_agreed` | seed / verify / repeat / batch-repeat mismatches | `verify_logit_abs_matched` |
-|---|---|---|---|---|---|---|
-| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL) | 105.102 | 9.51456 | 198 | 3 | 0 / 0 / 0 / 0 | 0.076725 |
-| `POCKET_ASCEND_IPC_ALLREDUCE=1` | 91.5055 | 10.9283 | 198 | 3 | 0 / 0 / 0 / 0 | 0.693588 |
+| arm | `step_ms` | decode TPS | `verify_agreed` | seed / verify / repeat / batch-repeat mismatches | `verify_logit_abs_matched` |
+|---|---|---|---|---|---|
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL) | 105.102 | 9.51456 | 3 | 0 / 0 / 0 / 0 | 0.076725 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=1` (before 5.5.1) | 91.5055 | 10.9283 | 3 | 0 / 0 / 0 / 0 | 0.693588 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=1` (with 5.5.1) | 78.593 | 12.7238 | 3 | see 5.5.4 | — |
 
-Both arms commit the same seed and agree with the verifier on all three comparisons, so the replacement
-is not trading correctness for speed. What does move is the distance between the batched and the
-single-row arithmetic: `verify_logit_abs_matched` is 0.69 against HCCL's 0.077, and the checksum
-distance 0.032 against 0.023. That is a comparison *inside* each arm — a batched decode against a
-single-row decode through the same collective — so it is not the two paths disagreeing with each other.
-It is the same fp16 sum taken in a different order, three pairwise `InplaceAdd` accumulations here
-against HCCL's ring, sitting under a batched-versus-single-row gap both arms already have. The argmax
-is unmoved in all three pairs, which is what `verify_agreed=3` and `verify_mismatches=0` say, and the
-committed tokens are identical.
+The middle row is the replacement before the bracket was removed and the last row is what it costs
+today. The last row's mismatch column is a pointer forward rather than a zero, because the number in
+it is not a gate. `verify_mismatches` compares a batched row against the single-row reference on a
+checkpoint whose per-step top-1 is a near-tie, and the launcher's gate explicitly does not require it
+to be zero; an earlier revision of this page read it as a correctness gate and concluded from it that
+the replacement was clean. The number that does gate is `batch_repeat_mismatches`, and §5.5.4 is what
+it says about the replacement: the interleaved A/B fails it 8 times in 36 under the hand-written
+collective and 3 times in 36 under the shipped HCCL path, which is not a separation, and 106.33 ms /
+9.408 TPS against 77.32 ms / 12.935 TPS is.
 
-The same runs, host-profiled, give the per-call figure:
+What does move between the arms is the distance between the batched and the single-row arithmetic:
+`verify_logit_abs_matched` is 0.69 against HCCL's 0.077, and the checksum distance 0.032 against
+0.023. That is a comparison *inside* each arm — a batched decode against a single-row decode through
+the same collective — so it is not the two paths disagreeing with each other. It is the same fp16 sum
+taken in a different order, three pairwise `InplaceAdd` accumulations here against HCCL's ring,
+sitting under a batched-versus-single-row gap both arms already have.
 
-| arm | `tp_all_reduce` | per call |
-|---|---|---|
-| HCCL | 0.0628596 s / 129 | 0.4873 ms |
-| hand-written | 0.059129 s / 129 | 0.4584 ms |
+The timing rows above carry `QWEN_BATCH_VERIFY=0`; the gate rows below carry the verifier. Both are
+separate runs because the verifier re-prefills and re-decodes the grid three times over, which would
+land inside the clock window.
 
-**The collective's own region accounts for only 3.7 ms of the 13.6 ms the step moved.** The rest is the
-default-stream drain that `resolve_stream` performs before every HCCL call (`tp_comm.cpp:244`): the
-nullptr-stream contract on this API means "synchronous, result visible on return", so the wrapper calls
-`aclrtSynchronizeStream(nullptr)` and then runs `HcclAllReduce` on a private stream. That is a device
-that must go idle for a host round trip once per collective, and the bubble lands outside the
-`tp_all_reduce` region. The hand-written path needs no drain at all, because it runs on the caller's
-stream — the same stream the producer kernels are on — and its only ordering is a device-to-device copy
-and a device-side add both queued behind them.
+#### 5.5.3 What the hand-written collective still costs
 
-So the honest accounting of the two per-call numbers is 0.4584 against roughly 0.56, not against the
-0.4873 the region reports. It is also still not 0.259, and the remaining 0.2 ms is where the empty loop
-shows: in the probe the push goes out immediately and the peer answers within microseconds, while in
-the engine the push is queued behind a layer's worth of compute on both sides, so `wait_ms` is waiting
-out real work rather than paying a barrier. Closing that gap needs the barrier to overlap the layer it
-belongs to, which is a scheduling change and not a communication one.
+Against the projection in §5.4 (75.7 ms) the barrier in place is 77.2-78.6 ms across runs, so the
+empty-loop probe was 2-4% optimistic about its own lever and the barrier itself was never the problem.
+What is left is measurable against two floors. Both come from diagnostic switches that produce wrong
+results and exist only to price the parts: `SKIP` drops the push, the poll and the reduce; `NOPOLL`
+keeps the push and the reduce and drops the poll. Same shape, same devices, same bracket-off
+configuration:
 
-At rows=16 the replacement is worth more, not less: 141.28 ms / 113.25 TPS becomes 116.51 ms /
-137.32 TPS, +21%, on the same 8-step prompt. That run had `QWEN_BATCH_VERIFY=0` and so carries no
-verifier gate — the only rows=16 evidence here is timing, not correctness.
+| arm | `step_ms` | decode TPS | what it contains | in-kernel total per call |
+|---|---|---|---|---|
+| `SKIP` + `NOPOLL` | 50.7318 | 19.7115 | the layer, no collective at all | 0.0026 ms |
+| `NOPOLL` | 51.9047 | 19.2661 | payload push and three `InplaceAdd`s, no wait | 0.079 ms |
+| the real collective | 78.3432 | 12.7644 | the same, plus the poll | 0.367 ms |
+
+**The poll is what the hand-written collective spends.** Its payload path costs the step 1.2 ms over the
+collective-free floor even though its in-kernel total is 0.079 ms per call — nine tenths of that is
+hidden behind device work that was queued anyway. The poll is the other 26.4 ms, and it is not hidden at
+any level.
+
+The same barrier on an idle device with an empty loop is 0.109 ms of `wait_ms` (§5.4). In the engine
+the steady-state bucket is **0.285 ms** per call — `POCKET_ASCEND_IPC_ALLREDUCE_STATS`, the last 32-call
+window of three decode runs, 0.2799 / 0.2836 / 0.2909. Two candidate causes for the 0.18 ms difference,
+and these numbers no longer leave them undecided: the first has been built and refuted.
+
+**The read is not the cost, and removing its drain makes it worse.** `pocket::memcpy_d2h` drains the
+default stream before its blocking `aclrtMemcpy`, and the collective is issued on that same stream, so a
+poll iteration looked like it was waiting out the whole layer queued behind it — a host round trip of
+exactly the class §5.5.1 removed, reintroduced once per iteration, and unable to order the write being
+waited for in any case, because that write belongs to another process. The read was replaced with an
+`aclrtMemcpyAsync` into pinned host memory on a stream this collective owns, draining only that stream,
+and the two were interleaved eight pairs against each other: the asynchronous read is slower in **eight
+of eight**, 76.73 → 85.96 ms and 13.035 → 11.634 TPS, a 10.7% loss. The switch was removed rather than
+shipped.
+
+The same diagnostic says why. The blocking read finishes in 1.0-1.31 iterations (1.31 / 1.00 / 1.28) at
+0.285 ms of `wait_ms` per call; the asynchronous one takes 2.97-3.19 iterations (3.03 / 2.97 / 3.19) at
+0.322. The drain is not dead time — it *is* the wait, and it is a cheap way to spend it. Waiting out the
+layer is what makes the peers arrive before the read, so the loop runs once; skipping the drain returns
+the read promptly enough to find nothing, and a repeat does cost less than half of a blocking iteration
+(0.105 ms against 0.238, over the three-run means) but three of them cost more than one. That accounts
+for 4.8 ms of the 9.24 ms regression (0.0371 ms per call over 129 calls); the other 4.4 ms is outside
+the barrier's own timing, which is what a host that no longer paces itself to the device looks like from
+the step clock.
+
+So the 26.4 ms is waiting on peers rather than on the host, and a device-side poll would not have
+addressed it: what is being waited for is another process's push, and the arrival signal is already the
+completion signal. Removing it means the barrier has to overlap the layer it belongs to, which is a
+scheduling change and not a communication one, and it is not scoped on this page.
+
+At rows=16 the replacement is not in the picture at all: 16 rows x 5120 is 81 920 elements, twice the
+ceiling §5.5.4 re-tests, so a batched decode falls back to HCCL and the rows=16 arm is HCCL against
+itself. An earlier revision of this page quoted +33% here (141.184 ms / 113.327 TPS becoming
+106.365 ms / 150.425 TPS). That measurement was taken with the ceiling at 1 Mi elements, i.e. before
+the reproducibility sweep, and with `QWEN_BATCH_VERIFY=0`, so it is a timing number from a
+configuration that did not gate. It is retracted rather than corrected: with the shipped ceiling there
+is nothing to measure, and the ceiling itself is a default rather than a bound (§5.5.4), so re-raising
+it to re-measure would be choosing a configuration to produce a number rather than measuring the
+shipped one.
+
+#### 5.5.4 The reproducibility gate, and which arm it actually separates
+
+`batch_repeat_mismatches` is the batched pass run twice from a reset engine with nothing else
+changed — the reproducibility the batched path owes its callers, and a hard zero in the launcher's
+gate (`scripts/run_qwen_ascend_tp4.sh`). Two earlier revisions of this page read it wrong in opposite
+directions, and the way it is easy to get wrong is worth stating before the numbers.
+
+**It is not `verify_mismatches`.** That one compares the batched pass against a single-row reference
+built from a different set of kernels, and on this checkpoint's near-ties that comparison is a coin
+flip the launcher does not gate on. At rows=1, on the token the two paths *both* choose, their logits
+differ by 0.05 to 0.61. When the top-1 margin is narrower than that they choose differently, and every
+step after the divergence differs for a reason that is not a defect. That is where the
+`worst_logit_abs` of 23.76-23.98 comes from, and an earlier revision of this page read it as "a whole
+contribution missing".
+
+**It is not a gate that separates the two collectives.** An earlier revision of this section asserted
+the opposite — that HCCL reproduces the batched pass 20 times in 20 while the replacement fails it 7
+times in 32 — and that reading does not survive interleaving. Same launcher, same checkpoint, same
+shapes, `QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32`, 8 decode steps, one process
+per rank on devices 0-3, the two arms alternating run for run:
+
+| arm | `batch_repeat_mismatches` failures | runs | step | decode TPS |
+|---|---|---|---|---|
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL, the shipped default) | 3 | 36 | 106.33 ms | 9.408 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=1` (hand-written) | 8 | 36 | 77.32 ms | 12.935 |
+
+**HCCL fails this gate too.** The point estimates are 8.3% against 22.2% and the rates are still not
+separated (Fisher two-tailed p = 0.19), so this gate neither rejects the replacement nor validates it.
+Thirty-six interleaved pairs is not a sample that could have separated them: at those two rates it has
+about 37% power at the 5% level, and roughly 120 pairs per arm would be needed for 85%. The interleaved
+pairs are the comparison that counts, because it is the only one where the two arms
+share a session; pooling every rows=1 gate-on run of the session — HCCL 3 of 62 across several
+configurations, hand-written 12 of 56 — does separate them (p = 0.011), and that number is not
+trustworthy for the same reason: the arms are not matched, and every run in the pool that is not one
+of the thirty-six interleaved pairs was launched whenever it was convenient. The honest statement is
+the one the interleaved runs support, which is that the batched path at rows=1 is not run-to-run
+reproducible on this platform under **either** collective, and that the rate at which it is not has
+not been pinned down for either.
+
+**What the failures look like.** Both arms fail it in one of two shapes, and the two shapes are the
+same event observed through two comparisons.
+
+- *A top-1 flip at step 0.* The batched pass and the single-row reference put the same two tokens on
+  top — `248046` and `197`, at the last prompt position, 33 — and disagree about which of the two wins.
+  Across the four runs that do this in the thirty-six interleaved pairs, the single-row path's logit
+  for its choice is 6.269-6.282 and the batched path's for its own is 6.329-6.477; every run reports
+  the identical pair, which is what a *systematic* near-tie looks like when a run-to-run perturbation
+  is large enough to cross it. Nothing is corrupted. The gate does not record the top-1/top-2 margin
+  inside either path, so the pair is what identifies this shape rather than the margin.
+- *A repeat-only flip.* The first batched pass agrees with the single-row reference on all three
+  gated steps and the second batched pass, launched from a reset engine with the same tokens and
+  slots, does not. `verify_mismatches=0`, `verify_agreed=3`, `worst_logit_abs` 0.048 to 0.95 across the
+  recorded runs. This shape is the cleanest evidence available, because the single-row reference
+  reproduces itself in almost every one of these runs: what is not reproducible is specifically the
+  batched path.
+
+Both shapes are present, and every recorded failure of either shape is real: in all of them
+`batch_repeat_mismatches=1`, which is the batched path disagreeing with itself. What is *not* evenly
+distributed is the first shape. All four step-0 flips in the thirty-six pairs are in the hand-written
+arm; no HCCL run has one. That is a difference in the direction the section's earlier claim needed, so
+it is worth saying why it is not evidence for it: the hand-written sum is a different order of
+operations from the single-row reference's, §5.5.2 already measures it landing further from that
+reference (`verify_logit_abs_matched` median 0.24 against HCCL's 0.12), and a near-tie flips in
+proportion to the distance to the thing being compared against. The sixty-two-against-fifty-six pool
+does show the same lean — one trip of `verify_mismatches` in the HCCL arm against ten in the
+hand-written one — and it is the same unmatched pool that cannot support a conclusion about the rate.
+The gate for this shape is `verify_mismatches`, and the launcher explicitly does not gate on it.
+
+Named runs of the record: `rate_hccl_2` (HCCL, repeat-only, `worst_logit_abs` 0.607),
+`rate2_hccl_6` (HCCL, repeat-only, 0.048), `rate_ipc_1` (hand-written, repeat-only, 0.436),
+`rate_ipc_9` (hand-written, step-0 flip, 23.759) and `rate2_ipc_14` (hand-written, step-0 flip,
+24.212).
+
+**The size ceiling, re-tested against the control it was set against.** The replacement is scoped to
+planes of at most 40 960 FP16 elements, and that number came from a sweep read against "HCCL failed
+none of 10 gate runs": 5120 clean in 16 of 17, 40 960 clean in 4 of 4, 81 920 failing 3 of 7,
+163 840 failing 4 of 9. The control is now measured failing 3 times in 36, so the same logs have to be
+read against that instead:
+
+| plane | arm | `batch_repeat_mismatches` failures | runs |
+|---|---|---|---|
+| ≤ 40 960 | hand-written, rows=1 | 9 | 41 |
+| > 40 960 | hand-written, rows=1 | 7 | 16 |
+| 81 920 | hand-written, rows=16 | 2 | 3 |
+| 40 960 | HCCL, rows=16 — the matched control | 0 | 3 |
+
+7 of 16 against 9 of 41 is Fisher two-tailed p = 0.11, and the matched rows=16 pair is 2 of 3 against
+0 of 3, p = 0.40. Displacing the hand-written baseline by the pooled 22% does not change the reading,
+because the rows=1 arms below the ceiling already sit at 22% themselves. So the sweep does not
+establish a bound: the direction is the same at every size above the ceiling, but no arm in it is large
+enough to separate from a baseline that is itself this high, and one arm that ought to be worst — a
+rows=1 run with the ceiling raised so the 32×5120 prefill plane also goes hand-written — fails 2 of 5,
+which is not above the hand-written baseline at all. The ceiling is kept on three weaker grounds: the
+plane the replacement exists for is two orders of magnitude inside it; every large-plane arm that has
+been run leans the same way rather than contradicting; and raising it would change a shipped default's
+behaviour on no evidence. It costs nothing that §5.5 measures, because rows=1 planes are 5120.
+
+**This is a property of the stack, not of the replacement.** It was measured independently, on a
+different model and in a different phase, in
+[the gated-delta slice work](ascend_gated_delta_slice.md#the-generated-tokens-are-not-a-usable-ab-signal-here):
+four runs of two identical binaries over a 4966-token prompt produced three distinct greedy step-0
+tokens and top logits spanning 10.42-10.94, "well above fp16 rounding", with the two runs either side
+of the kernel swap no more alike than two runs of the same kernel. The failures above are the same
+observation through a different gate. The gap that work left is the same one here: neither measurement
+can drop the TP collective from the path — `QWEN_TP_WORLD=1` OOMs on this checkpoint — so both say
+"not reproducible with a collective active" and neither can say it is the collective.
+[The benchmarking rules](../guides/benchmarking.md) already carry the operational consequence as
+rule 8: establish run-to-run stability before comparing generated tokens across configurations.
+
+**Four candidate mechanisms for the hand-written collective, tested and ruled out.** They were worth
+testing while the failure looked collective-specific; with the failure present in both arms none of
+them is load-bearing, and they are kept because each closes off a real hazard for the next person.
+
+- *The arrival window.* A peer's stamp rides behind its plane on one stream, so a stamp that has
+  landed ought to mean the plane before it has landed — unless two cross-device D2D copies issued on
+  one stream do not complete in order at the destination. `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`
+  empties exactly that window, sleeping between the poll succeeding and the reduce reading. 500 µs was
+  tried; 3000 µs was tried again with the failure still in place. The arithmetic confirms the switch
+  was doing what it says — 3000 µs across 129 calls is 387 ms, and the step goes from 77 to 472 ms.
+- *Cache-line contention between the four stamp writers.* A stamp is two bytes and four processes
+  write into every peer's stamp array concurrently, one slot each; at their natural spacing all four
+  land inside a single 32-byte block, which is the hazard this backend has already been bitten by for
+  scalar GM stores. `kStampStride` now pads each stamp out to its own 64-byte block. The rate does not
+  move (4 of 20 padded against 2 of 6 packed). The padding stays, because the hazard it removes is
+  real and it costs nothing measurable — 76.2-78.5 ms either way — but it is not the cause.
+- *The null stream.* The validating probe always creates a stream; the collective runs on whatever
+  the caller passed, and at all 129 engine sites that is nothing.
+  `POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM` substitutes a private stream with a drain on either side —
+  the shape `resolve_stream` gives tp_comm's HCCL branch — and it costs half of what the replacement
+  is worth (91.4 ms against 77.0 ms). It changes the failure's shape and not its rate.
+- *The reduction's arithmetic.* The sum is three pairwise `aclnnInplaceAdd` accumulations in rank
+  order into the accumulating buffer, with no atomics, no reduction tree and no racing accumulator,
+  so two runs that receive the same three planes must produce the same sum bit for bit. An
+  FP32-accumulator form was built on the theory that FP16 rounding was the perturbation; it made the
+  measured deviation wider and cost 6.4 ms of a 77 ms step, and it was removed.
+
+**What this leaves.** The replacement is worth 29.0 ms of a 106.3 ms step, +37.5%, and this section
+gives no reason to prefer HCCL's reproducibility to its own. It still ships opt-in
+(`POCKET_ASCEND_IPC_ALLREDUCE=1`, default off), because a batched path that is not run-to-run
+reproducible is exactly the kind of defect that shows up in production as a rare bad token rather
+than as an error, and because the one number that would settle it — the two arms' true rates, at
+matched configurations and a sample large enough to separate them — is not in hand.
+
+Two controls could not be run and are named so the gap is visible. `QWEN_TP_WORLD=1` — no collective
+in the program — cannot host this checkpoint at all: one 32 GB card OOMs on
+`model.language_model.layers.7.mlp.up_proj.weight`, so there is no collective-free arm, and the
+batched path's reproducibility cannot be measured without a collective in it. And the isolated probe
+of §5.4 never sees the failure at all: `bench_qwen_ascend_ipc_exchange --poll-wait` runs 20 000 rounds
+with `slots_ok=4/4` and no mismatch, which is what makes the engine context rather than the barrier
+the place the remaining answer is.
+
 
 ## 6. What is left, in order of size
 
 | lever | measured size | state |
 |---|---|---|
-| Replace the 129 collectives with the hand-written one | 13.6 ms of 105.1, i.e. 9.51 -> **10.93 TPS** (§5.5) | built and gated; opt in with `POCKET_ASCEND_IPC_ALLREDUCE=1` |
-| The ~0.2 ms/call of peer compute the poll still waits out | up to 26 ms of the 91.5 ms step | not scoped — needs the barrier to overlap its layer, not to be cheaper (§5.5) |
+| Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | built; opt-in with `POCKET_ASCEND_IPC_ALLREDUCE=1`. The launcher's reproducibility gate is failed by both arms (3 of 36 HCCL, 8 of 36 hand-written) and does not separate them |
+| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3) | priced, not scoped — it waits on peers, and a device-side poll does not address that (§5.5.3) |
+| The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
 | The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
 | Verifier placement | 0.08%, noise | retracted (§4.2) |

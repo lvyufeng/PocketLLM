@@ -2699,7 +2699,20 @@ struct QwenEngine::Impl {
         }
         {
             PhaseScope scope(this, "tp_all_reduce");
-            if (use_nccl_comm_stream) {
+            // The bracket exists for the HCCL path: substituting a communication
+            // stream avoids draining the default stream before every collective,
+            // and the event pair plus the synchronize in end_nccl_collective is
+            // what keeps that substitution ordered. A collective that already runs
+            // on the caller's stream gets none of that benefit and pays the
+            // synchronize as a host round trip per call: on Ascend, bracketing the
+            // hand-written one anyway cost 12.9 ms of a 91.5 ms rows=1 step, while
+            // the collective region it wraps is 0.073 ms against the 0.28 ms its
+            // own arrival poll blocks for. So bracket only what needs bracketing.
+            // See tp_all_reduce_f16_on_caller_stream.
+            const bool bracket =
+                use_nccl_comm_stream &&
+                !tp_all_reduce_f16_on_caller_stream(options.tp_world, count);
+            if (bracket) {
                 begin_nccl_collective();
                 tp_all_reduce_sum_f16_inplace(
                     options.tp_world, options.tp_rank, options.device,

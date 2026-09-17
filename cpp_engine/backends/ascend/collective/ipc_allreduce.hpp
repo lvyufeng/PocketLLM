@@ -48,6 +48,27 @@
 //
 // Everything here is opt-in. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it, and any
 // call outside the configured envelope falls back to HCCL rather than failing.
+//
+// What justified building it took arms that are not the shipped configuration, so
+// they are listed here rather than left to be found in the source. All default off
+// and none of them widens the envelope:
+//
+//   * `POCKET_ASCEND_IPC_ALLREDUCE_STATS` prints a per-call split of the
+//     collective's host time every 32 calls. Side-effect free.
+//   * `..._SKIP` and `..._NOPOLL` do not compute the all-reduce at all -- the
+//     first issues nothing, the second reduces whatever the peer slot happened to
+//     hold -- so a token from such a run is meaningless. They bound what the
+//     barrier costs by deleting parts of it.
+//   * `..._POLL_SLEEP_US`, `..._SETTLE_US` and `..._RSTREAM` compute the right
+//     answer and pay host or device time the shipped path does not, so a token
+//     from one of them is meaningful and a step time from one is a bound.
+//   * `..._DEADLINE_MS` and `..._MAX_ELEMENTS` change when the barrier gives up and
+//     which calls take this path at all.
+//
+// The numbers they produced are in docs/performance/ascend_single_request_tps.md
+// 5.5.3 and 5.5.4; a process with one of them set says so on stderr before its
+// first collective. One earlier switch, `..._ASYNCPOLL`, was measured and removed
+// -- the blocking stamp read is faster -- and the .cpp carries why.
 #pragma once
 
 #include <cstddef>

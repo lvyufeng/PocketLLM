@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -43,15 +45,38 @@ constexpr int kSets = 2;
 // keep consistent between the two.
 constexpr long long kStampTable = 4096;
 
+// Spacing between two stamps in a peer's stamp array, in uint16 words, so 32 is 64
+// bytes. A stamp is two bytes and four processes write into every peer's array
+// concurrently, one slot each; packed at their natural spacing all four land inside
+// a single 32-byte block, and a cross-device write into a block another process is
+// also writing can lose one of the two -- the 32-byte-disjoint hazard this backend
+// has already been bitten by for scalar GM stores. It is the one structural
+// difference between this barrier and the probe that validates it: the probe carries
+// its arrival signal inside the payload, where every write is a large aligned copy
+// of its own and no two processes share a block. Padding each stamp out to a full
+// 64-byte block gives every writer its own.
+constexpr int kStampStride = 32;
+
 // Worlds above this would make the per-rank stamp ranges collide after the modulo
 // above. The 910B host this backend targets has eight cards.
 constexpr int kMaxWorld = 8;
 
-// The largest plane the hand-written path accepts, in FP16 elements. It covers
-// batched decode comfortably -- 16 rows of a 5120-wide hidden is 81920 -- and
-// leaves prefill, where the payload is large enough for HCCL's bandwidth to matter
-// and the extra copies to cost real time, on HCCL.
-constexpr size_t kDefaultMaxElements = 1u << 20;  // 1 Mi elements, 2 MiB
+// The largest plane the hand-written path accepts, in FP16 elements.
+//
+// It is a conservative default, not a measured bound. The sweep that set it
+// (docs/performance/ascend_single_request_tps.md 5.5.4) compared planes of 5120,
+// 40960, 81920 and 163840 against a shipped HCCL path believed to reproduce the
+// batched pass every time; that control has since been measured failing the same
+// gate 3 times in 36, and against it the large-plane arms are 7 of 16 against 9 of
+// 41 below the ceiling, which is a direction and not a separation (Fisher two-tailed
+// p = 0.11). What the ceiling has going for it is that the evidence points the same
+// way at every size above it, that the plane it exists to admit -- one row's
+// 5120-element decode plane, 129 times a step -- is two orders of magnitude inside
+// it, and that raising it would change the shipped default's behaviour on no
+// evidence. A caller that batched today, a 16-row decode plane (81920) or a prefill
+// plane, stays on HCCL, which is the path it was on before this file existed.
+// `POCKET_ASCEND_IPC_ALLREDUCE_MAX_ELEMENTS` overrides it for measurement.
+constexpr size_t kDefaultMaxElements = 40960;
 
 // How long a receiver waits for one round's stamps before declaring the round
 // lost. A rows=1 decode step is ~100 ms, so this is hundreds of steps of slack: it
@@ -65,6 +90,233 @@ double now_ms() {
         .count();
 }
 
+// Where the collective's host time goes. `tp_all_reduce` in the engine's host
+// profile is wall time on the issuing thread, which for this path is the sum of
+// the three terms below -- but only in aggregate and only from outside the call.
+// Splitting them is what says whether the barrier is waiting on peers or paying
+// for its own host-side calls, and those two point at different fixes.
+bool stats_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_STATS");
+        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Diagnostic arms for a timing experiment, not for a run. They exist to price the
+// barrier's host wait and are documented with the numbers they produced in
+// docs/performance/ascend_single_request_tps.md 5.5.3-5.5.4, and in the header;
+// SKIP and NOPOLL produce wrong results, and every switch here announces itself
+// through `warn_diagnostics`.
+//
+// `POCKET_ASCEND_IPC_ALLREDUCE_NOPOLL` skips the arrival poll entirely, so the
+// reduce runs on whatever the peer slot happened to hold. It bounds what a
+// barrier with no host wait at all would be worth.
+bool nopoll_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_NOPOLL");
+        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_SKIP` returns success without issuing anything --
+// no push, no poll, no reduce. It prices the layer with the collectives removed
+// altogether, which is the only way to separate "the barrier is expensive" from
+// "the layer is expensive and the barrier only sits on top of it". The ranks stop
+// being coupled at all, so this is a bound on a hypothetical, not a mode.
+bool skip_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_SKIP");
+        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_POLL_SLEEP_US` pauses between poll attempts and is a
+// diagnostic, not a tuning knob: it separates two explanations for a poll that costs
+// more than the plane it is waiting on. Either the peer really is that far behind --
+// in which case sleeping only makes the wait longer -- or the poll's own 8-byte
+// blocking reads over the IPC fabric are contending with the pushes it is waiting
+// for, in which case backing off shortens the wait. Zero, the default, polls flat out.
+int poll_sleep_us() {
+    static const int us = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_POLL_SLEEP_US");
+        if (value == nullptr || *value == '\0') return 0;
+        const int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return us;
+}
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US` pauses between the poll finding every
+// peer's stamp and the reduce reading the plane that stamp announces. It is a
+// diagnostic, not a tuning knob, and it exists to test one hypothesis about a
+// non-reproducibility that the engine sees and the isolated probe does not: a
+// peer's stamp is pushed behind its plane on one stream, so a stamp that has
+// landed means the plane before it has landed -- but only if two cross-device
+// D2D copies on one stream really do complete in order. If they do not, the
+// reduce reads a plane that is still arriving and the sum is wrong by however
+// much of the copy had not landed. Sleeping here cannot repair that; it only
+// makes the window empty, which is what separates "the arrival signal is early"
+// from every other explanation. See
+// docs/performance/ascend_single_request_tps.md 5.5.4.
+int settle_us() {
+    static const int us = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US");
+        if (value == nullptr || *value == '\0') return 0;
+        const int parsed = std::atoi(value);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return us;
+}
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM` moves this collective off the caller's
+// stream and onto a stream of its own when the caller passed none, which is what
+// the engine does at all 129 decode sites: `all_reduce_half` omits the stream
+// precisely because this path is supposed to run on the caller's. Tp_comm's HCCL
+// branch does the opposite -- `resolve_stream` substitutes a private stream for a
+// null one -- and the two therefore differ in one more way than "hand-written
+// versus HCCL": this path issues its cross-device copies on the null stream and
+// HCCL issues its collective on a real one.
+//
+// Everything measured so far says the copies are ordered correctly (the drain in
+// the poll below covers this rank's own pushes, and a peer's stamp cannot be
+// observed before the plane before it has executed), but "ordered" and "handled
+// the same way by the runtime" are not the same claim, and a null stream is the
+// one argument this path passes that the validating probe never does -- the probe
+// always creates a stream. This switch is how that is tested: with it on, the
+// collective runs exactly as it does now except that `acl_stream` is a real
+// stream, drained into and out of, which is slower and correct by construction.
+// See docs/performance/ascend_single_request_tps.md 5.5.4.
+bool rstream_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM");
+        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// There was a `POCKET_ASCEND_IPC_ALLREDUCE_ASYNCPOLL` here, which read the arrival
+// stamps with `aclrtMemcpyAsync` into pinned host memory on a stream of this
+// collective's own instead of `pocket::memcpy_d2h`, so that a poll iteration drained
+// a 256-byte copy rather than the *default* stream -- which is where the collective
+// is issued, so draining it means waiting out the whole layer queued behind it. The
+// reasoning was that this drain is dead time: it cannot order the write being waited
+// for, because the write belongs to another process. It was built and measured
+// against this read, interleaved, and it is a **10.7% loss**: 8 of 8 pairs slower,
+// 76.73 -> 85.96 ms, 13.035 -> 11.634 TPS, at 129 calls a step. The drain is not
+// dead time -- it *is* the wait. `POCKET_ASCEND_IPC_ALLREDUCE_STATS` shows the
+// blocking read finishing in 1.0-1.31 iterations at 0.285 ms of `wait_ms` per call,
+// because by the time it has drained the layer every peer's stamp is already there;
+// the async read returns before they are and has to be repeated, 2.97-3.19
+// iterations at 0.322 ms of `wait_ms` per call, so the loop spins at 0.105 ms an
+// iteration where a single blocking iteration costs 0.238 -- and 3 x 0.105 is more
+// than 1.2 x 0.238. See docs/performance/ascend_single_request_tps.md 5.5.3.
+
+// A run with one of the switches above set is not producing the measurement it
+// looks like it is, so the announcement is unconditional: no number from such a
+// run can be quoted without the caveat travelling with it. They stay in the tree
+// because they are how the barrier's cost is split and its arrival signal is
+// tested in docs/performance/ascend_single_request_tps.md 5.5.3 and 5.5.4. Which
+// caveat depends on which one, and the two classes are not the same: SKIP issues
+// nothing and NOPOLL reduces whatever the peer slot happened to hold, so those two
+// do not compute the all-reduce at all; POLL_SLEEP_US, SETTLE_US and RSTREAM only
+// move host time around, and a run of any of them has meaningful tokens and a step
+// time that is a bound. Once per process, before the first collective.
+void warn_diagnostics() {
+    static const bool done = [] {
+        const bool wrong = nopoll_enabled() || skip_enabled();
+        if (wrong) {
+            std::fprintf(stderr,
+                         "[ipc_allreduce] WARNING: a wrong-result diagnostic is on "
+                         "(NOPOLL/SKIP). This process does not compute the "
+                         "all-reduce, so its tokens are meaningless and its step "
+                         "time is a bound, not a measurement.\n");
+            std::fflush(stderr);
+        }
+        if (poll_sleep_us() > 0) {
+            std::fprintf(stderr,
+                         "[ipc_allreduce] WARNING: POLL_SLEEP_US is on. This process "
+                         "computes the all-reduce but paces its arrival poll with a "
+                         "%d us sleep, so its tokens are meaningful and its step time "
+                         "is a bound, not a step time.\n",
+                         poll_sleep_us());
+            std::fflush(stderr);
+        }
+        if (settle_us() > 0) {
+            std::fprintf(stderr,
+                         "[ipc_allreduce] WARNING: SETTLE_US is on. This process "
+                         "computes the all-reduce but pays %d us per call for it, so "
+                         "its tokens are meaningful and its step time is not a step "
+                         "time.\n",
+                         settle_us());
+            std::fflush(stderr);
+        }
+        if (rstream_enabled()) {
+            std::fprintf(stderr,
+                         "[ipc_allreduce] WARNING: RSTREAM is on. The collective runs "
+                         "on a stream of its own with a drain on either side, so its "
+                         "tokens are meaningful and its step time is a bound, not a "
+                         "step time.\n");
+            std::fflush(stderr);
+        }
+        return true;
+    }();
+    (void)done;
+}
+
+struct Stats {
+    long long calls = 0;
+    double push_ms = 0.0;
+    double wait_ms = 0.0;
+    double reduce_ms = 0.0;
+    long long poll_iters = 0;
+    // Cumulative values as of the last report, so the line printed every
+    // kReportEvery calls is the average over that interval rather than over the
+    // whole process. A run's first calls include prefill and op warm-up, and a
+    // whole-run mean would carry them into every later line.
+    long long reported_calls = 0;
+    double reported_push_ms = 0.0;
+    double reported_wait_ms = 0.0;
+    double reported_reduce_ms = 0.0;
+    double reported_prologue_ms = 0.0;
+    long long reported_poll_iters = 0;
+    double prologue_ms = 0.0;
+};
+
+constexpr long long kReportEvery = 32;
+
+Stats& stats() {
+    static Stats state;
+    return state;
+}
+
+void report_stats() {
+    Stats& s = stats();
+    const long long calls = s.calls - s.reported_calls;
+    if (calls <= 0) return;
+    const double n = static_cast<double>(calls);
+    const double push = (s.push_ms - s.reported_push_ms) / n;
+    const double wait = (s.wait_ms - s.reported_wait_ms) / n;
+    const double reduce = (s.reduce_ms - s.reported_reduce_ms) / n;
+    const double prologue = (s.prologue_ms - s.reported_prologue_ms) / n;
+    const double iters =
+        static_cast<double>(s.poll_iters - s.reported_poll_iters) / n;
+    std::fprintf(stderr,
+                 "[ipc_allreduce] calls=%lld..%lld prologue=%.4f push=%.4f wait=%.4f "
+                 "reduce=%.4f total=%.4f ms poll_iters=%.2f\n",
+                 s.reported_calls, s.calls, prologue, push, wait, reduce,
+                 prologue + push + wait + reduce, iters);
+    std::fflush(stderr);
+    s.reported_calls = s.calls;
+    s.reported_push_ms = s.push_ms;
+    s.reported_wait_ms = s.wait_ms;
+    s.reported_reduce_ms = s.reduce_ms;
+    s.reported_prologue_ms = s.prologue_ms;
+    s.reported_poll_iters = s.poll_iters;
+}
+
 bool env_flag(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && *value != '\0' && std::atoi(value) != 0;
@@ -76,6 +328,19 @@ void check_acl(aclError err, const char* what) {
                                  " failed with ACL error " +
                                  std::to_string(static_cast<int>(err)));
     }
+}
+
+// One stream per device for `rstream_enabled`. Same construction as tp_comm's
+// `internal_stream`, kept local rather than exported because this is the only
+// caller outside that translation unit and the two have opposite defaults.
+aclrtStream private_stream(int device) {
+    static std::unordered_map<int, aclrtStream> streams;
+    auto it = streams.find(device);
+    if (it != streams.end()) return it->second;
+    aclrtStream stream = nullptr;
+    check_acl(aclrtCreateStream(&stream), "aclrtCreateStream for IPC collective");
+    streams.emplace(device, stream);
+    return stream;
 }
 
 // The stamp a rank sends at round `round`, and the value every peer expects from
@@ -214,13 +479,18 @@ struct IpcState {
     int device = 0;
     size_t capacity = 0;    // FP16 elements per plane
     size_t slot_bytes = 0;  // capacity elements
-    size_t stamp_bytes = 0; // kSets * world stamps
+    size_t stamp_bytes = 0; // kSets * world stamps, each kStampStride words apart
     std::vector<uint16_t*> recv;   // kSets * world planes this rank receives into
     std::vector<uint16_t*> remote; // kSets * world peers' planes for this rank
-    uint16_t* stamp_recv = nullptr;      // kSets * world, this rank polls it
+    uint16_t* stamp_recv = nullptr;      // kSets * world * kStampStride, this rank polls it
     std::vector<uint16_t*> stamp_remote; // world, peers' stamp arrays
     uint16_t* stamps = nullptr;          // kStampTable entries
-    std::vector<uint16_t> seen;          // world, the poll's landing buffer
+    // world * kStampStride, the poll's landing buffer. Pinned because it is a
+    // device-to-host copy's destination, which is the shape `aclrtMallocHost` exists
+    // for; it was a plain vector until the asynchronous poll was tried, and it stays
+    // pinned because that is what the 76.73 ms blocking arm above was measured with.
+    // Process-lifetime like everything else here, so it is never freed.
+    uint16_t* seen = nullptr;
     long long round = 0;
 };
 
@@ -245,12 +515,23 @@ std::unique_ptr<IpcState> initialize(const std::string& id_path, int world, int 
     state.device = device;
     state.capacity = capacity;
     state.slot_bytes = capacity * sizeof(uint16_t);
-    state.stamp_bytes = static_cast<size_t>(kSets * world) * sizeof(uint16_t);
+    state.stamp_bytes = static_cast<size_t>(kSets * world) * kStampStride *
+                        sizeof(uint16_t);
 
     state.recv.assign(static_cast<size_t>(kSets * world), nullptr);
     state.remote.assign(static_cast<size_t>(kSets * world), nullptr);
     state.stamp_remote.assign(static_cast<size_t>(world), nullptr);
-    state.seen.assign(static_cast<size_t>(world), 0);
+    if (!host_alloc_pinned_into(
+            state.seen, static_cast<size_t>(world) * kStampStride * sizeof(uint16_t))) {
+        throw std::runtime_error(
+            "Ascend IPC all-reduce: cannot allocate the poll's landing buffer");
+    }
+    // `aclrtMallocHost` hands back whatever the pages held. The loop writes before
+    // it reads, so this is belt-and-braces rather than a requirement -- but the
+    // buffer used to be a zeroed vector and there is no reason for the difference
+    // to be discoverable later.
+    std::memset(state.seen, 0,
+                static_cast<size_t>(world) * kStampStride * sizeof(uint16_t));
 
     // Slot (set, source) is the buffer this rank owns for source `source` in round
     // parity `set`: `source` pushes into it, this rank polls and reduces out of it.
@@ -353,7 +634,10 @@ bool ascend_ipc_allreduce_f16_applies(int world, int count) {
 bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
                                       const char* id_path, uint16_t* values,
                                       int count, void* stream) {
+    const bool timing = stats_enabled();
+    const double t_entry = timing ? now_ms() : 0.0;
     if (!ascend_ipc_allreduce_f16_applies(world, count)) return false;
+    warn_diagnostics();
     if (id_path == nullptr || id_path[0] == '\0') {
         throw std::runtime_error(
             "Ascend IPC all-reduce needs the rendezvous id path the HCCL "
@@ -373,10 +657,32 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // The caller's stream, default stream included. See the header: substituting a
     // private stream would make these copies unordered against the kernels that
     // produce `values` and force a full drain before every one of the 129 calls.
+    // `rstream_enabled` is the diagnostic that pays for both of those on purpose,
+    // to separate "the null stream is handled differently" from every other
+    // explanation; it is off by default and the two drains it adds are the price
+    // of the answer, not a configuration to ship.
     aclrtStream acl_stream = static_cast<aclrtStream>(stream);
+    const bool substitute_stream = acl_stream == nullptr && rstream_enabled();
+    if (substitute_stream) {
+        check_acl(aclrtSynchronizeStream(nullptr),
+                  "drain the default stream before the IPC collective");
+        acl_stream = private_stream(device);
+    }
 
     const int set = static_cast<int>(state.round % kSets);
     const size_t plane_bytes = static_cast<size_t>(count) * sizeof(uint16_t);
+    const double t0 = timing ? now_ms() : 0.0;
+
+    if (skip_enabled()) {
+        if (timing) {
+            Stats& s = stats();
+            s.prologue_ms += t0 - t_entry;
+            ++s.calls;
+            if (s.calls % kReportEvery == 0) report_stats();
+        }
+        ++state.round;
+        return true;
+    }
 
     // Push this rank's plane into every peer's slot for this rank, and the round's
     // stamp into every peer's stamp array at (set, this rank). Both copies are on
@@ -389,30 +695,54 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
                                    ACL_MEMCPY_DEVICE_TO_DEVICE, acl_stream),
                   "push a plane to a peer");
         check_acl(aclrtMemcpyAsync(
-                      state.stamp_remote[static_cast<size_t>(j)] + set * world + rank,
+                      state.stamp_remote[static_cast<size_t>(j)] +
+                          (static_cast<size_t>(set * world + rank)) * kStampStride,
                       sizeof(uint16_t), state.stamps + (state.round % kStampTable),
                       sizeof(uint16_t), ACL_MEMCPY_DEVICE_TO_DEVICE, acl_stream),
                   "push a stamp to a peer");
     }
+    const double t1 = timing ? now_ms() : 0.0;
 
-    // The barrier. Every rank's stamps for this round are one contiguous read, and
-    // the read is a blocking D2H that is deliberately not stream-ordered: the write
-    // it waits for belongs to another process, so no local stream's completion
-    // would order it.
+    // The barrier. Every rank's stamp for this round sits in one contiguous block of
+    // `world * kStampStride` words, so a poll iteration costs one D2H of 256 bytes
+    // rather than one per peer. The stamps inside it are `kStampStride` words apart
+    // and only every stride-th word is a stamp; the rest is padding that exists so no
+    // two writers share a block.
+    //
+    // The read is what the poll costs, not the comparison that follows it, and the
+    // read is `pocket::memcpy_d2h`: it drains the default stream, then blocks in
+    // `aclrtMemcpy`. The drain is what makes the read safe against this rank's own
+    // outstanding pushes, and it is also what makes the loop short. The copy itself
+    // waits on a write that belongs to another process, so no local stream can order
+    // the answer -- the loop is a poll, not a fence -- and a read that skipped the
+    // drain would return before the peers arrive and have to be repeated. That was
+    // built as `POCKET_ASCEND_IPC_ALLREDUCE_ASYNCPOLL` and measured as a 10.7% loss;
+    // the comment where that switch used to live has the numbers. It is one default
+    // stream drain per collective, and since the collective is issued *on* the default
+    // stream it is a drain of the layer queued behind it -- the same class of host
+    // round trip the bracket below is removed to avoid -- but it is buying the wait,
+    // not wasting it. See docs/performance/ascend_single_request_tps.md 5.5.3.
     const double deadline = now_ms() + poll_deadline_ms();
-    for (;;) {
-        if (!memcpy_d2h(state.seen.data(), state.stamp_recv + set * world,
-                        static_cast<size_t>(world) * sizeof(uint16_t))) {
+    long long poll_iters = 0;
+    const int sleep_us = poll_sleep_us();
+    while (!nopoll_enabled()) {
+        uint16_t* const landing = state.seen;
+        const uint16_t* const stamps_at =
+            state.stamp_recv + static_cast<size_t>(set * world) * kStampStride;
+        const size_t stamp_read_bytes =
+            static_cast<size_t>(world) * kStampStride * sizeof(uint16_t);
+        if (!memcpy_d2h(landing, stamps_at, stamp_read_bytes)) {
             throw std::runtime_error(
                 "Ascend IPC all-reduce: cannot read the receive stamps");
         }
+        ++poll_iters;
         int pending = 0;
         uint16_t first_want = 0;
         uint16_t first_got = 0;
         for (int k = 0; k < world; ++k) {
             if (k == rank) continue;
             const uint16_t want = stamp_value(state.round, k, world);
-            const uint16_t got = state.seen[static_cast<size_t>(k)];
+            const uint16_t got = state.seen[static_cast<size_t>(k) * kStampStride];
             if (got != want) {
                 if (pending == 0) {
                     first_want = want;
@@ -431,10 +761,27 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
                 std::to_string(first_got) +
                 "); the group is dead or desynchronised");
         }
+        if (sleep_us > 0) usleep(static_cast<unsigned int>(sleep_us));
     }
+    // Diagnostic only, default off. See settle_us(): this is the delay that makes
+    // the window between a peer's stamp landing and its plane landing empty, so an
+    // engine run that stops being non-reproducible with it on was reading planes
+    // that had not finished arriving. It is charged to wait_ms because that is
+    // what it is -- waiting -- and a run with it set is flagged at startup.
+    if (const int settle = settle_us(); settle > 0) {
+        usleep(static_cast<unsigned int>(settle));
+    }
+    const double t2 = timing ? now_ms() : 0.0;
 
     // Only now, with every peer's plane known to have landed, is the reduction
     // correct. In place: `values` already holds this rank's own contribution.
+    //
+    // The sum is taken on FP16's own grid, which rounds after every add. That was
+    // suspected of causing the step-0 scatter in
+    // docs/performance/ascend_single_request_tps.md 5.5.4, and an FP32-accumulator
+    // form was built and measured: it made the scatter wider, not narrower, and
+    // cost 6.4 ms of a 77 ms step. It was removed. What the scatter actually
+    // tracks is the size of the plane, and 5.5.4 has that measurement.
     for (int k = 0; k < world; ++k) {
         if (k == rank) continue;
         if (!qwen_add_inplace_f16_ascend(
@@ -442,6 +789,27 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
                 acl_stream)) {
             throw std::runtime_error("Ascend IPC all-reduce: the reduce failed");
         }
+    }
+    // Close the substitution opened above: the caller's next kernel runs on the
+    // default stream and reads `values`, so it has to wait for a reduce that is no
+    // longer on that stream. This is the second of the two drains and is the whole
+    // cost of the diagnostic. Charged to reduce_ms, because it is the reduce's
+    // completion being waited for.
+    if (substitute_stream) {
+        check_acl(aclrtSynchronizeStream(acl_stream),
+                  "drain the IPC collective stream");
+    }
+    const double t3 = timing ? now_ms() : 0.0;
+
+    if (timing) {
+        Stats& s = stats();
+        s.prologue_ms += t0 - t_entry;
+        s.push_ms += t1 - t0;
+        s.wait_ms += t2 - t1;
+        s.reduce_ms += t3 - t2;
+        s.poll_iters += poll_iters;
+        ++s.calls;
+        if (s.calls % kReportEvery == 0) report_stats();
     }
 
     ++state.round;
