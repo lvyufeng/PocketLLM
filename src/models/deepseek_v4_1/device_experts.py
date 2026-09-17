@@ -243,6 +243,7 @@ Not yet, then:
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 from typing import Sequence
 
@@ -264,6 +265,20 @@ PROJECTIONS = ("w1", "w2", "w3")
 # The two halves of a quantized projection: the packed codes, and the E8M0 scale beside them. Every
 # loop here does the same thing to both, so they travel together.
 KINDS = ("q", "s")
+
+# Whether a `forward` of more than one row hands the whole chunk to `moe_multi_token_fp4_forward`
+# instead of one row at a time to `moe_single_token_fp4_forward`. Off unless asked for, either here
+# or through the caller's own flag -- `src/cli/generate_v41.py`'s `--expert-batched` defaults it on,
+# since it is worth 27.0% of a 512-token prefill and the logits do not move; this layer keeps its own
+# default off because it is the one that would have to fall back, and it does: the pool width is the
+# one thing about the batched call that can silently not apply. `_issue_chunk` has the measurement
+# and the reasons.
+BATCHED_ENV = "DEEPSEEK_V41_EXPERT_BATCHED"
+
+
+def batched_enabled() -> bool:
+    """Whether a chunk should be issued as one call a card. `DeviceRoutedExperts`' own default."""
+    return os.environ.get(BATCHED_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
 def device_experts_available() -> bool:
@@ -483,6 +498,7 @@ class DeviceRoutedExperts(RoutedExperts):
         hot_rows: int = 0,
         pool_rows: int = 0,
         residents: ResidentSet | None = None,
+        batched: bool | None = None,
     ) -> None:
         # Bound here rather than imported at module scope: `loader.py` is what builds this class, so
         # a module-level import of it would be a cycle. By the time an instance exists `loader` is
@@ -556,6 +572,25 @@ class DeviceRoutedExperts(RoutedExperts):
         # `hot_rows=0` is the pool on its own and the configuration worth measuring.
         self.pool_rows = max(0, int(pool_rows))
         self.arena_rows = self.rows_per_card + self.hot_rows + self.pool_rows
+        # One `moe_multi_token_fp4_forward` a card a chunk, instead of one `moe_single_token_fp4_forward`
+        # a row a card. It is asked for through the env or `--expert-batched` and it is not always
+        # grantable, which is why this is an `and` rather than the request: a batch hands every draw
+        # an arena row of its own and reads them all back through one kernel call, so it needs the
+        # pool (`pool_rows=0` has nowhere to keep a row after the row that staged it) and it needs
+        # the pool to be at least `rows_per_card` wide, or two of one row's own draws could take the
+        # same arena row and the second would overwrite the first's bytes before the kernel read
+        # them. `_issue_chunk` is where that is argued properly; neither condition is an error, and
+        # a run that asks and does not get it falls back to the per-row path it had before.
+        self.batched = (batched_enabled() if batched is None else bool(batched)) and (
+            self.pool_rows >= self.rows_per_card
+        )
+        # Counted rather than timed, like `rows` and `expert_rows`: how much of the pass went through
+        # the batched path at all. `batched_calls` is one a card a chunk and `batched_rows` one a row
+        # of a chunk, so the two together are the mean width the batches actually reached -- which at
+        # a prefill is the number the whole mechanism is amortizing over, and at a decode is one.
+        self.batched_calls = 0
+        self.batched_rows = 0
+        self.batched_chunks = 0
         # Counted rather than timed, like `rows` and `expert_rows`: how much of a prefill the resident
         # set actually covered is the number that says whether it is doing what it was built for. A
         # fill is a row staged too, just once for the layer rather than once for the row, so the two
@@ -677,6 +712,10 @@ class DeviceRoutedExperts(RoutedExperts):
 
         # The per-row buffers, built on the first row and reused after it. See `_row_scratch`.
         self._scratch: dict | None = None
+
+        # The per-chunk buffers, built on the first chunk and reused after it, and separate from the
+        # per-row ones because they are sized by the batch and not by the deal. See `_chunk_scratch`.
+        self._chunk: dict | None = None
 
         # The routing as host memory, one row set at a time. Allocated on the first `forward` and
         # kept, because the alternative is a pinned allocation per layer per token. See `_route_ids`.
@@ -941,9 +980,14 @@ class DeviceRoutedExperts(RoutedExperts):
         """The next pinned buffer to stage into, after the DMA that last read it has finished.
 
         The pinned arena is what the H2D copies read from, and the host runs ahead of the cards, so
-        a buffer two rows old is the earliest one whose copy has a chance of being done. Waiting on
-        its event turns that into a guarantee; with two buffers and the copy taking about as long as
-        the staging, the wait is usually already satisfied and costs nothing.
+        a buffer a whole *staging* old is the earliest one whose copy has a chance of being done.
+        Waiting on its event turns that into a guarantee; with two buffers and the copy taking about
+        as long as the staging, the wait is usually already satisfied and costs nothing.
+
+        "A whole staging" and not "two rows", which is the distinction `_stage_misses` pays for: the
+        rotation is advanced by the callers that stage, not by every row, so that the guarantee is
+        about the work between two waits and not about the row count between them. A row that stages
+        nothing neither takes a slot nor waits on one.
         """
         slot = self._next_buffer
         self._next_buffer = (self._next_buffer + 1) % self._buffers
@@ -1226,6 +1270,287 @@ class DeviceRoutedExperts(RoutedExperts):
         # pipelined caller adds this one up, which is the same reason.
         return y.squeeze(0).clone()
 
+    # -- one chunk --------------------------------------------------------------------------
+
+    def _chunk_bounds(
+        self, resolved: Sequence[tuple[list[int], list, list, int]]
+    ) -> list[tuple[int, int]]:
+        """The row ranges that can share one kernel call, in order, covering every row exactly once.
+
+        `moe_multi_token_fp4_forward` reads each arena row it is handed as one expert's packed bytes
+        and applies it to every token routed to it, so a row appears once in the call and holds the
+        same bytes for the whole call. The pool is what breaks that, because a batch's rows are all
+        resolved before any of them is staged and the pool can hand two of them the same arena row.
+        One call over both then reads the wrong expert for whichever of the two it is not holding --
+        a wrong answer with the right shapes, which is the kind this file keeps having to say out
+        loud. The cut is decidable because `_forward_chunked` resolves the whole batch before it
+        stages any of it: the batch's claim on the pool is a property of the routing and not of a
+        race, so the rule below is a pure function of the resolve lists.
+
+        **A chunk member's bytes are the rows it reads and not only the rows it stages.** A row whose
+        draws all hit the pool stages nothing and still reads two arena rows, and a later row's miss
+        can be handed one of them. That takes a layer that recycles its own rows, which is more
+        misses in one layer than the pool has rows -- at `--pool-rows 288` a 512-token prefill never
+        does it, and the misses-only rule that shipped first is right there by luck, while at
+        `--pool-rows 64` a 128-token prefill does: the misses-only rule leaves **two** arena rows
+        holding two rows' experts inside one call, in one of the forty layers, on two of the four
+        ranks, and the run it measured moved 12 of the top 32 logits by 1.220e+00 of a max |logit| of
+        2.782e+01 -- 4.39e-02 relative, on every rank, against a cross-sitting drift floor of 3.4e-02
+        to 7.1e-02. Claiming the rows a row reads instead leaves zero such rows at either width, and
+        the same configuration comes out **bit-identical** to the per-row path: 32/32 of the top 32,
+        worst |dlogit| 0.000e+00, on all four ranks, twice at 128 tokens and once at 512.
+
+        What that costs is the number of chunks, and it is small: at `--pool-rows 288` a 512-token
+        prefill measures **one chunk a layer** (40 calls, 40 chunks), and at `--pool-rows 64` a
+        128-token one measures 42, 42, 75 and 80 chunks over its 40 layers on the four ranks -- the
+        ranks differ because the expert deal does, not the rule. A chunk the size of one row is what
+        `pool_rows=0` would give, which is why the batched path is not offered without a pool at all.
+        The count is a property of the routing, so it is the same on every run of the same prompt,
+        which is what keeps two configurations' batches comparable.
+
+        The self-check is not the row's own draws: a row's own misses are a subset of what it reads,
+        and it is checked before it is claimed, so a row cannot clash with itself once
+        `pool_rows >= rows_per_card`, which is the width `__init__` requires before offering this.
+        """
+        bounds: list[tuple[int, int]] = []
+        start = 0
+        claimed: list[set[int]] = [set() for _ in self.ranks]
+        for row, entry in enumerate(resolved):
+            cards, misses = entry[1], entry[2]
+            if any(
+                any(arena_row in claimed[card] for _, _, arena_row in misses[card])
+                for card in range(len(self.ranks))
+            ):
+                bounds.append((start, row))
+                start = row
+                claimed = [set() for _ in self.ranks]
+            for card, members in enumerate(cards):
+                for arena_row, _ in members:
+                    claimed[card].add(arena_row)
+        bounds.append((start, len(resolved)))
+        return bounds
+
+    def _chunk_scratch(self, n: int, dtype: torch.dtype) -> dict:
+        """The per-chunk buffers: the activation in, the result out, one a card.
+
+        Sized by the batch and not by the deal, and separate from `_row_scratch` because the two are
+        not the same shape: a `[T, 5120]` activation is one H2D for the whole chunk where the per-row
+        path takes T of them, which is the point of the batched call, and a result is `[T, 5120]` fp32
+        per card for the host to sum.
+
+        Allocated at the widest batch the instance has seen and kept, like the per-row scratch and for
+        the same reason: a pinned allocation a layer is not free, and this one is a few MiB either
+        way. `y_device` holds the kernel's own output tensor, which has to outlive the `non_blocking`
+        D2H that reads it and would otherwise be handed back to the caching allocator.
+        """
+        chunk = self._chunk
+        if chunk is not None and chunk["rows"] >= n and chunk["dtype"] == dtype:
+            return chunk
+        dim = self.dim
+        chunk = {
+            "rows": n,
+            "dtype": dtype,
+            "x": torch.empty((n, dim), dtype=dtype, pin_memory=True),
+            "x_device": [torch.empty((n, dim), dtype=dtype, device=d) for d in self.devices],
+            "y": [torch.empty((n, dim), dtype=torch.float32, pin_memory=True) for _ in self.devices],
+            "y_device": [None] * len(self.devices),
+        }
+        self._chunk = chunk
+        return chunk
+
+    def _issue_chunk(
+        self,
+        row0: int,
+        row1: int,
+        resolved: Sequence[tuple[list[int], list, list, int]],
+        x: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> list[int]:
+        """One `moe_multi_token_fp4_forward` a card for rows `[row0, row1)`, and no wait on any.
+
+        This replaces the per-row `_issue`'s `moe_single_token_fp4_forward` with the kernel the
+        library already had and this class never called. Measured on one card of the real deal's
+        shapes (`/tmp/probe_v41_multi_token.py`), per-row call chain against one batched call over
+        the same draws, at the working sets a recorded pooled run actually touched:
+
+        | tokens | rows a layer | per-row | batched | |
+        | ---: | ---: | ---: | ---: | ---: |
+        | 128 | 146 | 80.42 ms | 26.46 ms | **3.04x** |
+        | 512 | 430 | 322.73 ms | 87.40 ms | **3.69x** |
+
+        and the results are bit-identical to the per-row path at n=8 and n=128 (`max |diff| 0.000e+00`
+        on the same arena bytes), which is what makes this a swap rather than a trade. The host's share
+        of a layer falls with it: 230.68 ms of issue at 512 tokens to 0.08, and 8.89 to 0.07 at 128, so
+        what is left is the card and not the Python. The end-to-end run is taken and it landed where
+        the extrapolation said: **47.63 -> 34.75 s a rank on a 512-token prefill** at `--decode 0`,
+        `--expert-pool-rows 288` (10.75 -> 14.73 tok/s, **-27.0%**, one chunk a layer and 512.0 rows a
+        call), and 21.65 -> 19.20/19.33 s at 128 tokens and 64 pool rows (-11.3%), both with `32/32 of
+        the top 32 identical, worst |dlogit| 0.000e+00` on all four ranks and the pool counters equal
+        to the per-row path's -- the staged rows are the same, so what moved is the call count and not
+        the floor. The row-deep pipeline this replaces is worth 1.10x on its own; this supersedes it.
+
+        What it costs is the card's own allocation: the call builds its intermediates for the whole
+        batch, measured at 53.01 MiB at 512 tokens against the per-row path's 0.12 MiB. That is the
+        one thing that stops this from being the path for a decode step, where a batch is one row and
+        the probe measures a wash (0.94x) -- win, lose or draw, a decode step pays 53 MiB an allocation
+        for nothing. `forward` decides between them on `n`, and never on `n == 1`.
+
+        The slot layout is `tests/test_moe_multi_token_fp4.py:_build_routes`': one slot a distinct
+        arena row the chunk touches, in ascending row order, `slot_starts` its exclusive prefix sum,
+        `slot_tokens` the chunk-relative row of each pair and `pair_weights` that pair's routing
+        weight. Ascending row order and not encounter order, so that two runs of the same routing
+        hand the kernel the same slots in the same order -- the same reason `_split` sorts.
+
+        The routing weights are gathered on the card and not pulled across: `weights` is `[n, topk]`
+        and the pairs are a subset of it, so one advanced index is a kernel launch and a pageable D2H
+        would be a host wait inside the loop this path exists to keep short. `_route_ids` argues the
+        same point for the ids.
+        """
+        chunk = self._chunk_scratch(len(x), x.dtype)
+        T = row1 - row0
+        if x.is_cuda:
+            source = x[row0:row1]
+            if not source.is_contiguous():
+                source = source.contiguous()
+        else:
+            # One pageable-to-pinned copy for the whole chunk, and the H2D reads the pinned block --
+            # the per-row path's arrangement, at the batch's width. A pageable H2D is synchronous and
+            # this is the one place a chunk could stall the host, so it is not one.
+            chunk["x"][:T].copy_(x[row0:row1])
+            source = chunk["x"][:T]
+
+        # The chunk's pairs, per card, in the order `_split` dealt them: `_resolve_row` gave each row
+        # its `(arena row, route slot)` and the token it belongs to is the row's place in the chunk.
+        pairs: list[list[tuple[int, int, int]]] = [[] for _ in self.devices]
+        for token, row in enumerate(range(row0, row1)):
+            for card, members in enumerate(resolved[row][1]):
+                pairs[card].extend(
+                    (token, arena_row, slot) for arena_row, slot in members
+                )
+
+        issued: list[int] = []
+        for card, members in enumerate(pairs):
+            if not members:
+                continue
+            device = self.devices[card]
+            by_row: dict[int, list[tuple[int, int]]] = {}
+            for token, arena_row, slot in members:
+                by_row.setdefault(arena_row, []).append((token, slot))
+            rows = sorted(by_row)
+            tokens: list[int] = []
+            slots: list[int] = []
+            for arena_row in rows:
+                for token, slot in by_row[arena_row]:
+                    tokens.append(token)
+                    slots.append(slot)
+            starts = [0]
+            for arena_row in rows:
+                starts.append(starts[-1] + len(by_row[arena_row]))
+            # Order this chunk's kernel behind its own card's copies, which is where the arena rows
+            # `_upload` just wrote are: the kernel reads them, and the two are on different streams.
+            torch.cuda.current_stream(device).wait_stream(_copy_stream(device))
+            with torch.cuda.device(device):
+                # A pinned host source goes straight across and asynchronously, which is the copy
+                # this path exists to keep off the host's critical path. Only the multi-card case --
+                # one process driving every card, where `x` is already on a card and not on this one
+                # -- needs the detour, and there the tensor is `[T, dim]` and a few MiB.
+                if source.device.type == "cpu" or source.device == device:
+                    chunk["x_device"][card][:T].copy_(source, non_blocking=True)
+                else:
+                    chunk["x_device"][card][:T].copy_(source.to(device), non_blocking=True)
+                weights_on = weights if weights.device == device else weights.to(device)
+                picked = torch.tensor(
+                    [row0 + token for token in tokens], dtype=torch.int64, device=device
+                )
+                by_slot = torch.tensor(slots, dtype=torch.int64, device=device)
+                chunk["y_device"][card] = self._extension.moe_multi_token_fp4_forward(
+                    chunk["x_device"][card][:T],
+                    torch.tensor(rows, dtype=torch.int32, device=device),
+                    torch.tensor(starts, dtype=torch.int32, device=device),
+                    torch.tensor(tokens, dtype=torch.int32, device=device),
+                    weights_on[picked, by_slot].to(torch.float32),
+                    self._on_device[card][("w1", "q")], self._on_device[card][("w1", "s")],
+                    self._on_device[card][("w2", "q")], self._on_device[card][("w2", "s")],
+                    self._on_device[card][("w3", "q")], self._on_device[card][("w3", "s")],
+                    float(self.swiglu_limit),
+                )
+            issued.append(card)
+            self.batched_calls += 1
+
+        for card in issued:
+            with torch.cuda.device(self.devices[card]):
+                chunk["y"][card][:T].copy_(chunk["y_device"][card], non_blocking=True)
+                self._drained[card].record()
+        self.batched_rows += T if issued else 0
+        self.batched_chunks += 1
+        return issued
+
+    def _drain_chunk(
+        self, row0: int, row1: int, issued: Sequence[int], y: torch.Tensor
+    ) -> None:
+        """The chunk's partials, waited for and summed on the host, into `y[row0:row1]`.
+
+        All the waits come after all the issues, as in `_drain`, so this costs the slowest card's
+        chunk and not the sum of four. A chunk that reached none of this process's cards sums to zero
+        rather than to nothing, because zero is the rank's share of the all-reduce.
+
+        The copy into `y` is what replaces `_drain`'s `clone()`: the caller's `[n, dim]` is the only
+        thing that has to outlive the pinned buffer, and the batches of a pass sum into it in chunk
+        order, which is exactly the order the per-row path summed in. The four partials are summed in
+        `issued` order in both, so the two paths agree to the bit and not only to fp32.
+        """
+        if not issued:
+            y[row0:row1] = 0.0
+            return
+        chunk = self._chunk
+        total = None
+        for card in issued:
+            self._drained[card].synchronize()
+            partial = chunk["y"][card][: row1 - row0]
+            total = partial if total is None else total + partial
+        y[row0:row1] = total
+
+    def _forward_chunked(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        route: torch.Tensor,
+        y: torch.Tensor,
+        n: int,
+    ) -> None:
+        """The whole `[n, dim]` activation in as few card calls as the arena's own state allows.
+
+        The same one-deep pipeline as the row loop, one level up: every row of a chunk is resolved and
+        staged first, then the chunk before it is drained while this chunk's kernel runs. Both
+        halves of that pipeline are the row loop's, so what this changes is the unit and not the
+        schedule -- and the unit is where the 1.7x to 3.7x the module docstring records comes from.
+
+        The rows are resolved up front, in row order, and that is load-bearing rather than tidy. The
+        pool's state after resolving rows `[0, n)` must be the state the per-row path would be in
+        after staging them in the same order and no other, or the same prompt puts different experts
+        in different arena rows and the two paths stop being comparable -- and, at `hot_rows > 0`,
+        stop being *correct*, because `_fill` decided which experts deserve a resident row by
+        consulting the routing of the whole batch. So resolution is a separate pass, it is in row
+        order, and `_chunk_bounds` cuts the staging into calls only after the whole batch's claim on
+        the pool is known. `_resolve_row` moves nothing, which is exactly what makes that possible.
+        """
+        resolved = [self._resolve_row(route[row]) for row in range(n)]
+        pending: tuple[int, int, list[int]] | None = None
+        for row0, row1 in self._chunk_bounds(resolved):
+            for row in range(row0, row1):
+                ids, _, misses, drawn = resolved[row]
+                self._stage_misses(ids, misses)
+                self.drawn_rows += drawn
+                if not drawn and not self.partial:
+                    raise RuntimeError(
+                        f"layer {self.layer_id} routed a row to none of this process's experts"
+                    )
+            if pending is not None:
+                self._drain_chunk(pending[0], pending[1], pending[2], y)
+            pending = (row0, row1, self._issue_chunk(row0, row1, resolved, x, weights))
+        if pending is not None:
+            self._drain_chunk(pending[0], pending[1], pending[2], y)
+
     # -- one row ----------------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -1234,6 +1559,12 @@ class DeviceRoutedExperts(RoutedExperts):
         A MoE is a row-wise map, so `n` is a loop here and not a batch: the kernel is single-token,
         which is what the arenas are sized for. See the module docstring for what that costs a
         prefill and what replaces it.
+
+        `n > 1` with `self.batched` set goes through the batched path instead and not through this
+        loop; `n == 1` never does, because one row's card work is the same either way and the batched
+        call's allocation is 53 MiB against this path's 0.12. The switch is on `n` and not on the
+        caller's `prefill`/`decode`, so a decode step and a prefill's first row take the same branch
+        and there is one implementation of one row.
         """
         n, dim = x.shape
         if dim != self.dim:
@@ -1253,6 +1584,9 @@ class DeviceRoutedExperts(RoutedExperts):
         # and `_fill` clears it and returns; only a prefill has rows to compare against each other.
         if self.hot_rows:
             self._fill(route)
+        if self.batched and n > 1:
+            self._forward_chunked(x, weights, route, y, n)
+            return y if x.device.type == "cpu" else y.to(x.device)
         # One row in flight, and the row loop is arranged so that the *host* work of row `k+1` runs
         # while row `k`'s card-side chain does. The order inside the loop is what does it: the stage
         # and the H2D are issued for row `k+1` first, and only then is row `k` drained -- so the wait
@@ -1318,22 +1652,32 @@ class DeviceRoutedExperts(RoutedExperts):
         pooled = self._residents.pool_row(card, (self.layer_id, expert))
         return (None, False) if pooled is None else pooled
 
-    def _stage_row(
-        self, x_row: torch.Tensor, weights_row: torch.Tensor, ids_row: torch.Tensor
-    ) -> list[list[tuple[int, int]]]:
-        """Put one row's bytes where its cards can reach them, and return the deal they were put in.
+    def _resolve_row(
+        self, ids_row: torch.Tensor
+    ) -> tuple[list[int], list[list[tuple[int, int]]], list[list[tuple[int, int, int]]], int]:
+        """Where one row's routes have to read from, and nothing moved to get there.
 
-        What comes back is `(arena row, route slot)` per local card and it is the whole of what the
-        row hands the kernel: the resident set and the pool have both been resolved here, so a route
-        whose expert is resident names the row it was filled into, a route whose expert is in the pool
-        names the row it was pooled into, and a route that is neither names the next free row of the
-        arena's staging tail. The staging below is only ever the draws that neither of those answered,
-        which is where the class stops paying for the repeats.
+        What comes back is `(ids, cards, misses, drawn)`: the row's expert ids, the `(arena row,
+        route slot)` pairs per local card, the draws that neither the set nor the pool answered as
+        `(staging row, route slot, arena row)`, and how many routes this process holds at all. The
+        resident set and the pool have both been resolved here, so a route whose expert is resident
+        names the row it was filled into, a route whose expert is in the pool names the row it was
+        pooled into, and a route that is neither names the next free row of the arena's staging tail.
+        Staging is only ever the draws that neither of those answered, which is where the class stops
+        paying for the repeats.
 
-        Everything here is host-side and none of it reads a result: the routing, the arena row, the
-        pinned staging and the H2D. That is what lets `forward` run it ahead of the *previous* row's
-        drain, and it is the whole of why this is not inside `_issue`. `ids_row` is a row of the host
-        copy `_route_ids` took, so the list comprehension below is a read of host memory.
+        **This is the half of a row that moves nothing, and that is what makes the batched path
+        possible.** It is dictionary probes, one `tolist` of host memory and the pool's own
+        arithmetic: no `copy_`, no H2D, nothing that reads a card. So a `forward` can run it for
+        *every* row of the pass before staging any of them -- see `_forward_chunked` -- and the pool
+        it asks is in exactly the state it would have been in had the rows been resolved one at a
+        time, because `ResidentSet.pool_row` is the only thing that writes that state and nothing
+        between two rows reads it. `ids_row` is a row of the host copy `_route_ids` took, so the
+        comprehension below is a read of host memory and not a card's.
+
+        The rows a miss stages into start at `self.hot_rows` and not at `len(miss)`, so that every
+        layer's misses land in the same place in the arena -- an off-by-`hot_rows` here hands the
+        kernel another expert's weights, which is a wrong answer with the right shape.
         """
         ids = [int(e) for e in ids_row.tolist()]
         cards: list[list[tuple[int, int]]] = []
@@ -1362,9 +1706,56 @@ class DeviceRoutedExperts(RoutedExperts):
                 placed.append((row, slot))
             cards.append(placed)
             misses.append(miss)
+        return ids, cards, misses, drawn
+
+    def _stage_misses(self, ids: Sequence[int], misses: list[list[tuple[int, int, int]]]) -> None:
+        """Move one row's misses: the pinned staging, the H2D, and the two counters that report it.
+
+        Split from `_resolve_row` so that the two can be a pass apart, which is what the batched path
+        does with them. Both halves are the row's own work and nothing here reads a result, so the
+        ordering between a row's staging and any other row's resolve is free; the ordering that is
+        *not* free is against the kernel that reads the arena, and that is `_issue`'s wait and
+        `_upload`'s, not this.
+
+        **A row with nothing to move returns before `_take_buffer`, and that is not an early exit for
+        its own sake.** `_take_buffer` hands out the next buffer *and waits for the DMA that last read
+        it*, so the two-buffer pipeline's guarantee -- the slot being staged has had a whole row's
+        staging since its copy was issued -- only holds if every row that takes a slot also does work
+        with it. A pool answers most of a prefill's rows without staging anything (86.3% on the
+        512-token leg), and against that hit rate the rotation advances through rows that move nothing
+        and lands on the slot the previous *working* row uploaded immediately, with no staging in
+        between to cover the copy. Measured on that leg: 6.89 s of a 30.35 s class wall in this one
+        wait, against the ~2.5 s of DMA it covers. It also explains why the decode step recorded
+        0.00 s here -- a decode row misses by construction, so it was the one configuration where the
+        wait always had a row's staging in front of it.
+
+        Rotating only on rows that stage restores the guarantee by construction rather than by luck:
+        consecutive working rows take consecutive slots, so a slot's copy is issued one working row
+        before it is waited on, whatever the pool's hit rate is. Rows that stage nothing leave the
+        rotation where it is, which is what makes that true.
+        """
+        self.rows += 1
+        if not any(misses):
+            return
         buffer = self._take_buffer()
         self._stage(buffer, ids, misses)
         self._upload(buffer, misses)
-        self.rows += 1
+
+    def _stage_row(
+        self, x_row: torch.Tensor, weights_row: torch.Tensor, ids_row: torch.Tensor
+    ) -> list[list[tuple[int, int]]]:
+        """One row, resolved and moved, and the deal it was put in -- the whole of a row's host work.
+
+        What comes back is `(arena row, route slot)` per local card and it is the whole of what the
+        row hands the kernel. Everything here is host-side and none of it reads a result: the routing,
+        the arena row, the pinned staging and the H2D. That is what lets `forward` run it ahead of the
+        *previous* row's drain, and it is the whole of why this is not inside `_issue`.
+
+        `x_row` and `weights_row` are the row's activation and routing weights and neither is read
+        here -- they belong to `_issue`, which is handed them again -- but they stay in the signature
+        because this is the row-shaped entry point a caller names and the test drives it as one.
+        """
+        ids, cards, misses, drawn = self._resolve_row(ids_row)
+        self._stage_misses(ids, misses)
         self.drawn_rows += drawn
         return cards
