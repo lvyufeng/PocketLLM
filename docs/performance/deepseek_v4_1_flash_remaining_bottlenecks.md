@@ -2,10 +2,12 @@
 
 The [routed-experts page](deepseek_v4_1_flash_device_experts.md) ends with a configuration: the dense
 tree cut across four 2080 Ti, one process a card, **722.0 ms a decode step** and **3.0 tok/s** a
-prefill. This page is the pass that follows it. It adds no configuration — it takes that step apart
-by measurement and asks what each remaining lever is actually worth, including the ones that turn out
-to be worth nothing. Every number here is either re-taken for this pass or is quoted from the sitting
-that produced it, with the file it came from named.
+prefill. This page is the pass that follows it. It takes that step apart by measurement and asks what
+each remaining lever is actually worth, including the ones that turn out to be worth nothing — and it
+carries one change that the measurement did earn, the batched expert call in
+[Lever 5](#lever-5--the-prefill-is-a-batch-shape-problem-and-the-fix-is-in-27-at-512-tokens), which
+took a 512-token prefill down 27.0% with the logits unmoved. Every number here is either re-taken for
+this pass or is quoted from the sitting that produced it, with the file it came from named.
 
 The frame the whole page rests on is the one the TP4 sitting established: **this step is
 Python-dispatch-bound, not compute-bound.** Device-busy is 11% (≈1.5 ms of a 13.7 ms block probe),
@@ -94,6 +96,23 @@ is the 7.19 ms a step the table above records. There is nothing left to fuse her
 
 ## Lever 1 — `_stage` is not slow, it is on the critical path, and the thread count is spent
 
+**⚠ Closed, and the third reading below is why.** Everything this section measures about `_stage` is
+reproduced: it is 145.8 / 185.2 / 192.1 / 220.2 / 241.2 ms on rank 0 across five sittings against the
+198.5 ms recorded here, and it is on the critical path. What does not survive is the inference drawn
+from the in-situ/replay gap — that the gap is *scheduling*, and therefore recoverable by issuing layer
+`k+1`'s stage under layer `k`'s tree. `/tmp/probe_stage_sched.py`, five sittings at 128 tokens:
+the gap is a **one-time pool warm-up** (rank 0's back-to-back replay runs 467.5 → 295.8 → 207.3 →
+153.3 ms over four passes of the *same* copies, and this section's 91.8 ms is the *seventh* pass of a
+thread sweep that ends at 22), and re-inserting the recorded 13.3–15.6 ms gap between the calls costs
+**679–940 ms a step across the four ranks against the step's own 116–225 ms** — the stage-after-tree
+shape this section proposes is 3–8× *more* expensive, not 15% cheaper. The other two candidate
+mechanisms are excluded with it: CPU/wall is **8.84–13.91×**, so the calling thread is not the copy's
+bottleneck and a background thread buys nothing, and spending the gap sleeping with the pool released
+is no better than spinning (698–736 against 679–940 ms), so pool sleep/wake is not it either. The
+sweep, the per-call wall times and the gapped replays are in `/tmp/sched.log`–`/tmp/sched5.log`. **The
+two readings that do survive are 1 and 2** — the 14 GiB/s is not a machine floor, and a per-rank
+thread count is worth up to 9.8% of the term; the ranked table at the top of this page carries both.
+
 The class's own docstring for `_stage` says "It is not a faster `copy_`: 14 GiB/s either way."
 This pass put a clock on the real call instead of arguing from that sentence, and the answer is that
 the sentence is right about the rate at 22 threads and wrong about it being a floor.
@@ -137,26 +156,35 @@ the staging term, and it is why the step's gate is rank 1 rather than a round-ro
    is worth reading before anything else is tried here: 1 thread is 202–516 ms, 4 threads 79–190, 8
    threads 69–124, and the four ranks disagree about where the optimum is, so a thread count is not
    one number on this host — but nothing above 8 threads is ever more than 1.6× off a rank's own best.
-3. **The in-situ/replay gap is the lever, and it is a scheduling gap.** The same bytes at the same
+3. ~~**The in-situ/replay gap is the lever, and it is a scheduling gap.**~~ **Falsified — see the
+   banner at the top of this section.** The gap and the per-layer burst below are measured correctly,
+   and the bytes and calls are the same; what does not survive is that the gap is recoverable. The
+   same bytes at the same
    thread count cost **2.2× on rank 0, 1.3× on rank 1, 2.0× on rank 2 and 1.3× on rank 3** in the
    real step. One decode layer draws **2 rows = 35.9 MiB** on the two-draw ranks, so a layer's
    `_stage` is **12 `copy_` calls of 35.9 MiB total — six of 5.625 MiB (the packed `w1`/`w2`/`w3`)
    and six of 352 KiB (their scale rows)** — and 40 of those calls in sequence are what the 198.5 ms
    is. Back to back the identical 40 calls take **91.8 ms**, i.e. **2.30 ms a layer's copies against
    the 4.96 the step pays for them**. The per-layer burst is far too short to reach steady state on
-   its own and there is a fork-join at each one, which is what the 2.66 ms a layer of gap is. What
-   that says is that **layer `k+1`'s stage should be issued while layer `k`'s tree computes** rather
-   than after it, which is the same shape the row-deep pipeline takes on a prefill — except the
-   pipeline that exists only overlaps a *row* against a *row*, and a decode step is one row a layer,
-   so nothing in the class currently overlaps anything across layers.
+   its own and there is a fork-join at each one, which is what the 2.66 ms a layer of gap is.
+   **The sentence that followed — that layer `k+1`'s stage should be issued while layer `k`'s tree
+   computes — is falsified; see the banner at the top of this section.** The burst and the fork-join
+   are real; what the replay column is not is a floor the step fails to reach, because 91.8 ms is the
+   seventh of seven consecutive replays of the same copies and a one-time pool warm-up decays across
+   them.
 
-   **The ceiling, stated as a ceiling.** The part of `_stage` that is not the copy is
-   **106.7 / 40.8 / 75.5 / 26.4 ms a step** by rank, and the step is gated by the slowest rank, so the
-   most a perfect overlap can return is **~107 ms of a 722 ms step, 15%**. This is not a prediction:
-   on V4-Flash the same idea was tried as cross-layer prefetch and **the configuration with it off was
-   the fastest one**, so a cross-layer stage in this class has to be A/B'd rather than argued from a
-   ratio — the mechanism is the same and the machine is not, because there the source was a page-cache
-   read and here it is a `/dev/shm` segment.
+   **The ceiling that followed, kept for the record and not as a price.** The part of `_stage` that is
+   not the copy is **106.7 / 40.8 / 75.5 / 26.4 ms a step** by rank, and the step is gated by the
+   slowest rank, so the most a perfect overlap could return is **~107 ms of a 722 ms step, 15%**. On
+   V4-Flash the same idea was tried as cross-layer prefetch and **the configuration with it off was
+   the fastest one** — that caution was the finding and it should have been read as the answer rather
+   than as a reason to A/B. Measured here it is not 15% recovered but 3–8× spent: the copies do not
+   overlap with the tree, they contend with it for the same DRAM and the same intra-op pool, and
+   issuing them from under the tree's own dispatch is the worst of the three orders rather than the
+   best. The other two candidate mechanisms are excluded by the same probe — CPU/wall is
+   **8.84–13.91×**, so the main thread is not the copy's bottleneck and a background thread buys
+   nothing, and spending the gap *sleeping with the pool released* is no better than spinning on it
+   (698–736 against 679–940 ms), so pool sleep/wake is not the mechanism either.
 
 **A caution that belongs with the lever.** Do not fold the `_stage` copies and the `_upload` copies
 into one another. Merging the **host-side** `shm → pinned` copies into fewer, larger `copy_` calls is
@@ -164,11 +192,47 @@ safe and is not what has been tried; merging the **pinned → device** H2D calls
 regression on this hardware — V4-Flash's decode went from 3.4 to 1.5 with a single large H2D, because
 the transfer then had no overlap left to hide behind.
 
-## Lever 2 — a decode-resident set is worth 27–43%, and below 300 rows it is worth exactly zero
+## Lever 2 — a decode-resident set is worth 1.40× on a decode, and this section priced it at 1.09–1.15×
+
+**This section's original price of this lever was wrong by a factor of three, and the correction comes
+first.** 61–97 ms was applied to a *draw-count* percentage from the offline replay further down, and
+the direct measurement — a
+256-step decode at 128 tokens, A-B-A-B with the control at both ends, `--expert-pool-rows 600` against
+`--expert-pool-rows 0` — reads **0.780 / 0.750 s a token against 0.528 / 0.566**: **765.0 against
+547.0 ms on the pair means, 1.399×, 218 ms off the step**, and the top-32 logits are identical at
+`|dlogit| 0.000e+00` on all four ranks of all four legs, so this is a cache and not an approximation.
+The full sitting — the A-B-A-B table, the phase split, the across-length sweep, the arena identity,
+the parity column and the reproduce lines — is
+[the pool's decode subsection](deepseek_v4_1_flash_device_experts.md#the-pool-is-a-decode-lever-and-a-one-token-decode-is-the-measurement-that-hid-it)
+on the device-experts page.
+
+**What the offline replay could not see.** It replays the draws faithfully — the same 240 draws a
+step, the recorded `indices`, the same set width, a real LRU and a real LFU — and it is a model of the
+*draws* rather than of the **path**: it counts hits and never prices a step. And the price is not
+simply the `_stage` term a hit removes. **In the decode window a hit is worth 5.0–6.4 ms of the step
+a row** across eight sittings, against the 2.7–4.2 ms the two legs cost at their own measured rates,
+because a row is 12 `copy_` through `at::parallel_for` and a step that stops staging 36 of them stops
+paying 432 fork-joins. The decomposition is a decode-window one and should be read as such: all eight
+sittings divide a decode phase's saving by the rows that phase stopped staging, and the same
+instrument has not been run on the prefill phase's rows, so **5.0–6.4 is a property of the decode
+window and not a price for a hit in both phases.** Two of its columns are also low against the real arena on the column that compares:
+
+| resident set | bytes | LRU, all steps (replay) | **measured, decode-phase** | replay vs measured |
+| ---: | ---: | ---: | ---: | ---: |
+| 300 rows | 5.25 GiB, 5415 MiB of arena | 25.8% | **29.9%** | −4.1 |
+| 600 rows | 10.51 GiB, 10794 MiB of arena | 39.6% | **44.6%** | −5.0 |
+
+Four to five points, the same direction at both widths, and the same order as the two pooled legs'
+own spread against each other (45.5% against 44.9%). The likely reason is the cold start — the
+replay's set is empty at step 1 while the real arena has 128 tokens of prefill behind it — and rather
+than settle it, the useful conclusion is that **the replay is a floor on this lever and not a price.**
+The rows below 300 are the one regime the pool has not tested: the 0.0% there is a statement about a
+set narrower than one step's 240 draws, and the narrowest width the real arena has been run at is 300.
 
 `--expert-hot-rows` and `--expert-pool-rows` are 2.6–4.2× levers on a **prefill**. This pass asked
 the decode question directly, by recording what a decode step actually draws and replaying it through
-a cache, and the answer is a negative result with a shape worth knowing.
+a cache, and got a negative-looking result whose *shape* is worth knowing even though its price is
+not — the shape is the boundary at one step's width, and the price is above.
 
 A row is **18,800,640 B = 17.93 MiB**. `/tmp/probe_v41_decode_locality.py --locality` records the
 gate's own `indices` for 24 decode steps, which is **240 draws a step** (40 layers × 6 slots) and is a
@@ -192,24 +256,41 @@ set of `N` rows:
 | 1400 rows | 24.51 GiB | 54.5% | 59.5% | 54.6% | 59.6% |
 | 2400 rows | 42.02 GiB | 58.9% | 70.3% | 58.9% | 70.3% |
 
-**The 0.0% rows are the finding.** A set narrower than one step's own width is not a smaller cache,
-it is no cache at all: a step inserts 240 rows with no repeat *inside* the step, so 100 or 200
-sequential insertions evict everything that would have been a hit before the next step asks for it.
-Any design that sizes a decode set below ~300 rows should be expected to return nothing, and the
-boundary is sharp rather than gradual — 200 rows is 0.0% and 300 is 25.8%.
+**The 0.0% rows are the shape worth keeping.** A set narrower than one step's own width is not a
+smaller cache, it is no cache at all: a step inserts 240 rows with no repeat *inside* the step, so 100
+or 200 sequential insertions evict everything that would have been a hit before the next step asks for
+it, and the boundary is sharp rather than gradual — 200 rows is 0.0% and 300 is 25.8%. **The real
+path has not been run below 300 rows**, so this is a bound on the replay and not a measured property
+of the arena; it belongs with the two columns above as a reason to read the replay as a floor. Note
+also that the real arena is keyed on `(layer, expert)` — a fix that had to be made before any of the
+measured columns here were quotable, because the earlier key was the bare expert id, which answers a
+different layer's row with a confidently wrong tensor.
 
-**What it is worth at a size a card can hold.** 22 GiB a card less the 9.71 GiB the step already
-holds and the KV cache leaves **8–10 GiB**, which is **~450–600 rows**: **27–43%** of the draws
-answered without a copy. Applied to the 226.5 ms `_stage` term that is **61–97 ms off a 722 ms step**,
-1.09–1.15× — against 8–10 GiB of card space, which is the space Lever 6's graph also wants. The full
-2374-row union would be 42.02 GiB and still only 58.9% overall / 70.3% steady, i.e. **a decode set
-cannot be made to pay for the card it needs**; it is a 1.1× lever and not a 2× one.
+**What it is worth, and what it costs, as measured.** The sitting above returns **218 ms of a 765 ms
+step, 1.399×**, for **10794 MiB of arena a card** and 18.76 GiB of `cuda` against the no-arena step's
+9.71 — so it takes **9.05 GiB more than the step already holds**, which is a real charge against a
+22 GiB card and the KV cache's share rather than the "8–10 GiB spare" this section originally
+budgeted. That is why `--expert-pool-rows` is opt-in at 0, and why the default is a decision rather
+than a conclusion.
 
-**Why the prefill result does not transfer.** A prefill's floor is *a layer's distinct experts* — ~142
+**Half the arena buys 69% of the win.** At 128 tokens and 64 steps the same sitting carries 300 rows
+against 600: **1.224× against 1.320×**, a decode-phase hit rate of 29.9% against 44.6%, for 5415 MiB
+of arena against 10794 and 13.51 GiB of card against 18.76. So the width is a tuning knob with a
+knee in it rather than an on/off switch, and the arena a decode wants is one it can fill and refill
+rather than the prompt-wide width a prefill wants. What that says about the earlier conclusion here —
+that 600 rows is a quarter of the 2374-row union and therefore cannot pay for its card, and that "the
+same knob is a 2.7× on one and a 1.1× on the other" — is that both are falsified by the direct
+sitting. The prefill result does transfer, at 1.40×, and the two columns above are why the replay did
+not show it.
+
+**Why the two readings differ, stated once.** A prefill's floor is *a layer's distinct experts* — ~142
 of 384 on rank 0 there — because a prefill's rows are in flight together and a layer asks for its
-whole draw at once. A decode step's floor is *the union of 24 steps' draws*, because it asks for 240
-scattered rows that prove to have little locality against each other. The same knob is a 2.7× on one
-and a 1.1× on the other, and the reason is the shape of the access pattern and not the width.
+whole draw at once. A decode *step*'s floor is its own 240 scattered draws, and that is the floor the
+replay measures. A decode *generation*'s floor is the working set it re-draws, which is smaller and
+is what the pool holds across steps: 42.9–45.5% of every step's draws at every prompt length, 61.3%
+at an eight-token prompt, and 69.3–86.1% of a prefill's. The knob is a 4.0–4.2× on a prefill and a
+1.40× on a decode, and the difference between those two numbers is the number of steps, not the shape
+of the access pattern.
 
 ## Lever 3 — `_upload` is the leg that becomes the wall
 
@@ -234,12 +315,13 @@ Across four cards the aggregate is **38.56 GiB/s** against one card's **10.47** 
 and that aggregation is the entire reason the split exists: the same 4.20 GiB of a step is **0.11 s of
 transfer on four cards against 0.51 s on one**. One link is already saturated by a single card.
 
-So the ordering of the two largest terms is a consequence of Lever 1 rather than a fact about the
-step: today the host copy is the longer leg by ~14×, and a solution to it makes the H2D the longer leg.
-The only way past it is **not to move the bytes**, which is Lever 2 — and Lever 2 caps at 27–43%, so
-the honest statement is that the expert path's floor on this host is one queue of 4.2 GiB a step
-through a PCIe 3.0 x16 link, and every remaining lever is about how much of it is on the critical path
-rather than how fast it goes.
+So the ordering of the two largest terms is a fact about the step rather than a consequence of Lever 1,
+which is now closed: today the host copy is the longer leg by ~14×, and removing it makes the H2D the
+longer leg. The only way past either is **not to move the bytes**, which is Lever 2 — and Lever 2 is
+**1.399× measured**, so the honest statement is that the expert path's floor on this host is one queue
+of 4.2 GiB a step through a PCIe 3.0 x16 link, that a decode-resident set answers ~45% of that queue
+at a width the card can pay for, and that every remaining lever is about how much of the queue is on
+the critical path rather than how fast it goes.
 
 ## Lever 4 — `hc_mixes` has 208 µs a call that is inside no kernel
 
@@ -286,7 +368,7 @@ than this one. Sized that way it is the least valuable of the six levers; it is 
 the cheapest to try and because it is a prerequisite-free way to see the glue's size before paying
 for a graph.
 
-## Lever 5 — the prefill is a batch-shape problem and the kernel already exists
+## Lever 5 — the prefill is a batch-shape problem, and the fix is in: −27% at 512 tokens
 
 A 128-token prefill is **42.86 s, 3.0 tok/s, 41.85 of it inside `DeviceRoutedExperts`** — because a
 prefill of `n` rows stages a layer's 4.2 GiB *n* times, once per row, and 128 rows is what that says.
@@ -300,18 +382,49 @@ a layer and the right width to 64 rows rather than 148, for 2.3–2.4× instead 
 prefill raises the floor toward 384 rows, **6.9 GiB a card**, past what the four cards can give once
 the tree and the caches are on them.
 
-**`moe_multi_token_fp4_forward` (`src/csrc/cuda_kernel_impl.cu:3175`) is the change that makes the
-floor a function of the batch instead of the layer**: one slot per distinct expert the batch hit, the
-tokens contiguous. It is written, it is built into the extension this page's numbers come from, and
-**`DeviceRoutedExperts` does not call it** — the class issues `moe_single_token_fp4_forward` one row
-at a time. Wiring it in is the largest single prefill lever on this path and the only one that changes
-the floor's form rather than its constant, which is why it is the one the experts page already names
-as the follow-on.
+**`moe_multi_token_fp4_forward` (`src/csrc/cuda_kernel_impl.cu:3175`) was the change this page bet
+would make the floor a function of the batch instead of the layer**, and it is now wired in — the
+`--expert-batched` path in `DeviceRoutedExperts`, which resolves the whole pass before staging any of
+it and then issues one call a chunk instead of one call a row. **The bet was half right.** It is the
+largest prefill lever measured on this path, but not through the floor: the staged rows come out
+**identical to the per-row path** (3255/3288/1937/1963 at 128 tokens, 5623/5673/3791/3740 at 512, and
+the pool's took-in/evicted columns with them), so the floor is still a layer's distinct experts. What
+collapses is the number of kernel invocations that each read those rows: 128 rows a layer is 42–80
+calls instead of 128, and 512 rows is **40 calls — one a layer, 512.0 rows a call**.
 
-Two traps carried from the work that got here: the pool's key must carry the **layer** as well as the
-expert (it was keyed on the bare expert id once, which returned a wrong answer deterministically), and
-the routed experts' expert-parallel partial has to land in the same all-reduce as the shared expert's
-row-parallel partial rather than beside it.
+End to end, `--decode 0` so the prefill's own counters are what is compared, against the same sitting
+of the per-row path:
+
+| | r0 | r1 | r2 | r3 | mean | tok/s | chunks |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 512 tokens, `--expert-pool-rows 288`, per-row | 45.4 | 47.3 | 47.4 | 50.4 | 47.63 s | 10.75 | — |
+| 512 tokens, 288 rows, batched | 36.5 | 35.6 | 33.6 | 33.3 | **34.75 s** | **14.73** | 40/40/40/40 |
+| 128 tokens, `--expert-pool-rows 64`, per-row | 22.4 | 20.5 | 19.8 | 23.9 | 21.65 s | 5.91 | — |
+| 128 tokens, 64 rows, batched | 18.9 | 21.0 | 18.1 | 18.8 | **19.20 s** | **6.66** | 75/80/42/42 |
+| 128 tokens, 64 rows, batched again | 19.0 | 19.8 | 19.8 | 18.7 | **19.33 s** | **6.62** | 75/80/42/42 |
+
+**−27.0% at 512 tokens and −11.3% at 128**, and the logits are **bit-identical on all four ranks at
+both widths**: `32/32 of the top 32 identical, worst |dlogit| 0.000e+00` of a max |logit| of 2.915e+01
+and 2.782e+01 respectively, with the pool counters exactly equal. The two repeat legs cut the same
+chunk counts on every rank, so the partition is a property of the routing and not of a race. The arena
+grows by what a chunk holds in flight: 13.31 → 13.90 GiB a card at 288 rows, 9.38 → 9.53 at 64.
+
+Three traps carried from the work that got here, the third of which this round paid for:
+
+- The pool's key must carry the **layer** as well as the expert — it was keyed on the bare expert id
+  once, which returned a wrong answer deterministically.
+- The routed experts' expert-parallel partial has to land in the same all-reduce as the shared
+  expert's row-parallel partial rather than beside it.
+- **A chunk may not contain two rows that read the same arena row for different experts**, and the
+  rule that decides it must claim the rows a row *reads* and not only the rows it *stages*. A row
+  whose draws all hit the pool stages nothing and still reads arena rows, so a rule built from the
+  misses leaves such a row beside the row that is about to overwrite what it reads. At
+  `--expert-pool-rows 64` the misses-only rule leaves **two arena rows holding two experts inside one
+  call**, on two of the four ranks, and the run it measured moved **12 of the top 32 logits by
+  1.220e+00 of a max |logit| of 2.782e+01 (4.39e-02 relative)**; at 288 rows it leaves none, which is
+  why a sweep at the width above never caught it. Both readings are from the same probe, the same
+  prompt and the same routing, differing only in which rule cut the chunks
+  (`/tmp/probe_v41_oldrule.py`, `/tmp/probe_v41_keyalias.py`).
 
 ## Lever 6 — the graph, which is bounded by the same thing every other lever is
 
@@ -352,18 +465,25 @@ supports as an **upper bound** at the configuration named, and the two gated row
 
 | # | Lever | Measured basis | Worth | Cost / gate |
 | ---: | --- | --- | ---: | --- |
-| 1 | Overlap layer `k+1`'s `_stage` with layer `k`'s tree | in-situ 198.5 ms against 91.8 ms replayed, same threads, same copies | **≤107 ms** (15%) | needs its own A/B; the V4-Flash precedent for cross-layer prefetch is a regression |
-| 2 | A decode-resident set of ~450–600 rows | LRU/LFU replay over 24 steps of recorded draws | **61–97 ms** (1.09–1.15×) | 8–10 GiB a card, which is Lever 6's space; worth 0 below 300 rows |
-| 3 | Wire in `moe_multi_token_fp4_forward` | prefill's floor is a layer's distinct experts and 41.85 of 42.86 s is the class | **prefill only**, and the only lever that changes the floor's shape | a kernel exists at `cuda_kernel_impl.cu:3175` and is not called |
+| 1 | ~~Overlap layer `k+1`'s `_stage` with layer `k`'s tree~~ | five sittings of the same probe: the 91.8 ms replay is the seventh pass of a pool that is warming, and re-inserting the recorded gap between the copies costs 679–940 ms a step against the step's own 116–225 | **falsified** — 3–8× spent, not 15% returned | closed; the banner in Lever 1 and `/tmp/sched5.log` |
+| 2 | A decode-resident set, `--expert-pool-rows 600` | A-B-A-B at 128 tokens, 256 decode steps, control at both ends: 765.0 against 547.0 ms a token, top-32 logits bit-identical | **218 ms** (1.399×), and 1.224× at 300 rows for half the arena | 10794 MiB of arena, 9.05 GiB a card above the no-arena step's own 9.71; opt-in at 0 |
+| 3 | **Wire in `moe_multi_token_fp4_forward`** | `--decode 0`, per-row against batched on the same sitting: 512 tokens at 288 rows is 47.63 → 34.75 s a rank, 128 at 64 rows is 21.65 → 19.20/19.33 s, top-32 logits bit-identical on all four ranks and the pool counters equal | **−27.0%** on a 512-token prefill, −11.3% on a 128-token one; the staged rows are unchanged, so it is the call count (512 → 40, one a layer) and not the floor | **spent**; default on, and it falls back to the per-row path without a pool |
 | 4 | Per-layer CUDA graph | 7,076 launches, 111–122 ms unattributed, 11% device-busy | the largest, and **not sized** — bounded by the step, ~2–4× on the tree's own terms is the shape | **gated** on the round's own numbers, per 先搬，量完再说 |
 | 5 | A fused `hc_mixes` | 346.5 µs a call against 138.5 µs of the method timed as one call | **~17 ms** (2.3%) | row 4's graph eats the same glue — do one, not both |
 | 6 | Per-rank `--threads` | replay optimum 22/8/12/22 against a uniform 22 | **≤16 ms** on `_stage` | the thread count is otherwise spent; 8 is the cliff |
-| 7 | Anything on `_upload` | 11.3–11.5 GB/s, `cudaHostRegister` measured not to help | **0 ms** today; it becomes the longer leg only after #1 | only #2 addresses it, by not moving the bytes |
+| 7 | Anything on `_upload` | 11.3–11.5 GB/s, `cudaHostRegister` measured not to help | **0 ms** today; it becomes the longer leg only if the host copy is removed | only #2 addresses it, by not moving the bytes |
 
 ## Falsified, so do not re-run these
 
+- **Cross-layer `_stage` overlap.** The in-situ/replay gap is a one-time pool warm-up and not a
+  schedule: re-inserting the recorded 13.3–15.6 ms gap between the same copies costs **679–940 ms a
+  step against the step's own 116–225**, and the calling thread is not the copy's bottleneck
+  (CPU/wall 8.84–13.91×), so a background thread buys nothing either. Five sittings,
+  `/tmp/probe_stage_sched.py`, `/tmp/sched.log`–`/tmp/sched5.log`.
 - **A resident set narrower than one step.** 100 and 200 rows are exactly **0.0%**, not "less". A
   decode step inserts 240 rows with no repeat inside it, so anything under ~300 thrashes to zero.
+  This is a replay result: the real arena has not been run below 300 rows, so read the boundary as a
+  bound on the mechanism and not as a measured width.
 - **The thread count as a lever.** One thread is 2.91 GB/s and 22 is 16.39, but 22 is already where
   every rank's curve flattens; the per-rank optimum is worth **7.1% of the step's own 256 ms term,
   ~16 ms**, and exactly 0% on the two ranks whose 22-thread curve is already their best.
@@ -375,9 +495,30 @@ supports as an **upper bound** at the configuration named, and the two gated row
   the 1719.1 µs body is a fallback that a CUDA tensor never reaches.
 - **The per-op table's `GB/s` column as a roofline.** It counts unsharded bytes against sharded time;
   at TP4 it reads ~4× high for every op the split cuts.
-- **A single decoder-resident design for prefill and decode.** A prefill's floor is a layer's distinct
-  experts and a decode step's is the union of 24 steps' draws; the same knob is 2.7× on one and 1.1×
-  on the other.
+- **That the prefill's resident set does not transfer to a decode.** The old reason given here was the
+  shape of the access pattern. A prefill's floor is a layer's distinct experts and a decode *step*'s is
+  its own 240 draws, but a decode *generation*'s is the working set it re-draws, which the pool holds
+  across steps. The knob is 4.0–4.2× on a prefill and **1.399×** on a decode, and the difference
+  between those two numbers is the step count, not the access pattern.
+- **Caching `_stage`'s key strings and its `checkpoint.packed()` lookup.** The proposition was that
+  the 501 µs a copy held ~230 µs of Python, which would have been worth seconds a pass.
+  `/tmp/probe_v41_stage_micro.py` splits it: the two f-strings are **0.5 µs**, `packed()` +
+  `view()` **8.3 µs**, the whole `_stage` body **130.2 µs** and `copy_` alone into pinned **77.3 µs**,
+  so the Python is **~16 µs of the 501** and the ceiling is **~0.3 s**. The rest of the 501 is
+  contention for the host's memory system: the identical loop measures **133.8 µs a copy solo** and
+  **5353 / 5416 / 7258 / 6180 µs** as four processes on disjoint expert bands, a 40–54× spread that is
+  asymmetric across the four. Both probes are
+  [in the expert page](deepseek_v4_1_flash_device_experts.md#a-pool-hit-used-to-take-a-staging-buffer-and-the-copy-behind-it-was-left-uncovered).
+  The corollary is a reading rule for every term on this page: **a wait on this path is worth less than
+  the bytes behind it**, which is why the buffer-rotation fix below is bit-exact and still inside the
+  noise.
+- **The two-buffer rotation as a `_take_buffer` cost.** `_take_buffer` is 10–29 ms against a stage of
+  4–8 s *with no pool*, where every row stages; a pool makes the rotation and the row count disagree,
+  and against a 72.5%-empty pass it walks onto a slot whose copy has just been issued. It cost
+  **6.89 s of a 30.35 s class wall** at 512 tokens and 288 rows. The fix — a row that moves nothing
+  takes no slot — is bit-exact and drops the wait to 0.09–0.25 s on the low-pressure ranks, but the
+  end-to-end A/B is −6% with **overlapping ranges** (33.95 against 31.90 s mean) and `_stage` and
+  `_upload` unmoved in both columns, so the honest claim is the mechanism and not the percentage.
 
 ## Reproducing
 
@@ -400,6 +541,44 @@ PYTHONPATH=/mnt/data1/dsv4_inference torchrun --nproc_per_node=4 \
 # the fused sinkhorn against the loop it replaced, and a bf16 GEMV of the same byte count for
 # scale. One idle card, no checkpoint, no second rank.
 python /tmp/bench_hc_mixes.py
+
+# the resident set priced on the path instead of in a replay: A-B-A-B at 128 tokens, 256 decode
+# steps a leg, --expert-pool-rows 600 against 0 with the control at both ends.
+for pool in 600 0 600 0; do
+  DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_hot_ab.py \
+    --length 128 --decode 256 --threads 22 --hot-rows 0 --pool-rows "$pool" --out /tmp/pr_$pool.pt
+done
+
+# and what closed Lever 1: the same 40 calls replayed four times over (the pool's warm-up), then
+# with the recorded gap re-inserted between them, spinning and sleeping. Five sittings.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+    /tmp/probe_stage_sched.py --length 128 --decode 4 --probe-step 2 --out /tmp/sched.pt
+
+# the batched A/B and the chunk rule behind it. Five serial legs at --decode 0 -- so the prefill's
+# own counters are what is compared, the sampler's Gumbel first token not being fed back -- per-row
+# then batched at each width, with the 128-token batched leg repeated. Each leg logs to
+# /tmp/diag_<tag>.log and writes a payload with a rank suffix; --compare pairs one rank's logits
+# between two sittings.
+bash /tmp/v41_diag.sh
+python /tmp/probe_v41_hot_ab.py --compare /tmp/diag_n512row.pt.r0 /tmp/diag_n512batch.pt.r0
+
+# the same program, prompt and routing with the misses-only rule cutting the chunks instead, which
+# is the 12/32 and 4.39e-02 run; and the counter that explains it, one arena row held for two
+# different experts inside one call, under both rules in a single sitting. probe_v41_chunk_diag2.py
+# is the same comparison per call rather than in aggregate.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_oldrule.py \
+    --length 128 --pool-rows 64 --decode 0 --batched --out /tmp/old128.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_keyalias.py \
+    --length 128 --pool-rows 64 --decode 0 --batched --out /tmp/ka.pt
+
+# the buffer-rotation fix, its A/B and the two probes that price what is left of `_stage`. The A/B is
+# interleaved -- before, before2, after, before3, after2 -- with the two variants swapped under the
+# shipped path between legs and diffed at the end, so the host's drift lands on both columns.
+bash /tmp/v41_guard_ab.sh
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 python /tmp/probe_v41_stage_micro.py
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 python /tmp/probe_v41_stage_contend.py --tag solo
+for i in 0 1 2 3; do DEEPSEEK_V41_RESIDENT_EXPERTS=1 \
+  python /tmp/probe_v41_stage_contend.py --tag "q$i" --offset "$i" & done; wait
 ```
 
 `torch.distributed.run` sets `OMP_NUM_THREADS=1` for every worker unless the environment already has
