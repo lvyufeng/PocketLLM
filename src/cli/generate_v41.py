@@ -68,6 +68,32 @@ pays for the win is `_fill`, the one per-*layer* thing the class does -- 216.0 m
 3.4 ms an expert row, 16-25% of the prefill it sits in. Full tables, per rank, in
 `docs/performance/deepseek_v4_1_flash_device_experts.md`.
 
+**`--expert-pool-rows` spends the same arena on what the pass draws, and it is worth 4.0-4.2x.** A
+fill row is chosen up front for a whole layer and paid for whether the layer asks for it or not; a
+pool row is handed to an expert on its first sight *in that layer* and held until the pool needs the
+row back -- so the set pays for what it predicted and the pool for what the pass asked. The key is
+`(layer, expert)` and that is load-bearing: the weights are
+`layers.{layer}.ffn.experts.{expert}.{which}.weight`, so an expert id names a different tensor in
+every layer. It was keyed on the id alone until 2026-09-17, which answered a layer 6 draw with layer
+5's bytes -- silently, more often the wider the pool, and deterministically, so its own counters
+reproduced to the digit while the decoded tokens did not and only a control at the same prompt caught
+it. Every pooled number recorded before that date is void. Corrected, the same six-sitting A-B-C-C-B-A
+on a 512-token prompt reads **186.4 s rank-mean with no arena against 44.7 s at
+`--expert-pool-rows 288`** and 49.0 s at the set's own 148 rows, so the pool is 4.0-4.2x the control
+and **1.10x** the set -- at the same 2690 MiB of arena, and with **no pinned block at all**, which is
+where the set's 2654 MiB go. Both mechanisms move about 5700 packed rows (the set's 1768 staged plus
+3935 filled is 5703); the difference is where in the layer they are paid, `_fill` being one serial
+block a layer against a copy on the draw.
+
+The pool's floor is a *layer's* distinct experts rather than the model's, because nothing carries
+across a layer boundary now: `pool_staged - pool_evicted` is the width exactly (5700-5412=288,
+5761-5613=148, 6579-6483=96), 5700 rows over forty layers at 288 wide is ~142 distinct experts a layer
+of 384 on rank 0, and **at 148 rows the pool stages within 1.1% of 288 while at 96 it stages 15.4%
+more**. So `--expert-pool-rows 148` is what this 512-token prefill's working set is, not a constant of
+the mechanism -- a longer prompt raises the floor toward 384 rows, 6.9 GiB a card. Decode is not helped
+by either mechanism: a decode step asks a layer for one row's worth of experts and nothing in it
+repeats, and both mechanisms' decode columns move with the node rather than with the configuration.
+
 That 722-747 ms is a warm-page-cache figure, and until recently it was only as durable as the cache:
 `DeviceRoutedExperts` stages out of the checkpoint mapping, and this host holds 68-100 GiB of the
 checkpoint's 475.25 GiB because 457.78 GiB of its RAM is already the resident bank's tmpfs segment.
@@ -183,6 +209,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "expert is resident iff the layer asks this rank for it at least twice "
                              "and the set is cut to N by count if it is wider. Needs --expert-device. "
                              "0 is the configuration every number before it was measured on")
+    parser.add_argument("--expert-pool-rows", type=int, default=0, metavar="N",
+                        help="arena rows a card keeps experts in: one is handed out on an expert's "
+                             "first sight and taken back least-recently-used when the pool is full. "
+                             "A pool row is paid for as it is drawn where a --expert-hot-rows fill "
+                             "row is paid for whether the layer wanted it or not, and it is keyed by "
+                             "layer as well as expert because an expert id names a different tensor "
+                             "in every layer. An alternative to --expert-hot-rows, not an addition to "
+                             "it -- leave that one at 0 when using this. Costs 18.8 MB an arena row "
+                             "on the device. Needs --expert-device")
     parser.add_argument("--threads", type=int, default=None, metavar="N",
                         help="host threads this rank may use. `torchrun` sets OMP_NUM_THREADS to 1 "
                              "unless the environment already had one, and the expert staging, the "
@@ -262,6 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"context {max_seq_len}, resident checkpoint "
         f"{'on' if resident_bank.enabled() else 'off'}"
         + (f", {args.expert_hot_rows} resident rows a card" if args.expert_hot_rows else "")
+        + (f", {args.expert_pool_rows} pooled rows a card" if args.expert_pool_rows else "")
     )
     started = time.perf_counter()
     front = load_backbone(
@@ -275,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expert_device=expert_device,
         expert_world=expert_world,
         expert_hot_rows=args.expert_hot_rows,
+        expert_pool_rows=args.expert_pool_rows,
         # The bank is filled by rank 0 and attached by everyone else, so a rank here is both the
         # tree's rank and the stagger the bank wants: four ranks must not read `/mnt/data3` at once.
         expert_rank=rank,
@@ -329,6 +366,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     # capacity cannot say for itself and the reason it is a rule and not a number. A run whose fills
     # are zero did not fill anything, and a run whose `expert_rows` is unchanged from the flag's
     # absence did not help.
+    if expert_device is not None and args.expert_pool_rows and hasattr(held[0], "pool_rows"):
+        # The pool's own counters, and they are the same two numbers the set reports for a different
+        # reason: `expert_rows` is still every draw that had to be staged, so `drawn - staged` is the
+        # coverage the pool bought, and `pool_staged` is what bought it -- rows allocated and filled
+        # once, against `filled_rows` for the set, which is what it kept. The two differ in when they
+        # are paid and in which rows they keep, which is the whole of the difference between the two
+        # mechanisms. Read off one layer and not summed: the set is shared by all forty, so summing
+        # the layers' views of it would count every row forty times.
+        pool = held[0].residents
+        drawn = sum(one.drawn_rows for one in held)
+        staged = sum(one.expert_rows for one in held)
+        covered = f"{100.0 * (drawn - staged) / drawn:.1f}% pooled" if drawn else "nothing run"
+        say(
+            f"expert pool: {pool.pool_staged} expert rows filled over {len(held)} layers, "
+            f"{staged} of {drawn} draws staged ({covered}), {pool.pool_evicted} evictions "
+            f"of {args.expert_pool_rows} rows a card"
+        )
+
     if expert_device is not None and args.expert_hot_rows and hasattr(held[0], "drawn_rows"):
         drawn = sum(one.drawn_rows for one in held)
         staged = sum(one.expert_rows for one in held)

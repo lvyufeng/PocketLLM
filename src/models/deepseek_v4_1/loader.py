@@ -754,6 +754,7 @@ def load_backbone(
     expert_world: int = 1,
     expert_rank: int = 0,
     expert_hot_rows: int = 0,
+    expert_pool_rows: int = 0,
     resident_experts: bool | None = None,
     world: int = 1,
     rank: int = 0,
@@ -806,6 +807,27 @@ def load_backbone(
     this number, so the memory is spent at startup and not as the layers get to it. Zero -- the
     default -- is the configuration every number above it was measured on.
 
+    `expert_pool_rows` is the other half of that idea: it sizes a pool of arena rows a card keeps
+    experts in, handing out a row on an expert's first sight and taking it back least-recently-used
+    when the pool runs out. A pool row is filled on demand and keeps its bytes until the pool gives
+    the row to somebody else, where a fill row is chosen up front for the whole layer and rewritten
+    by the next layer's fill -- so the pool pays only for the rows a layer actually draws and never
+    for the ones it does not, and it pays them as they are drawn rather than in one block before the
+    layer starts.
+
+    **The key is `(layer, expert)` and it has to be**, because an expert id is not an identity: the
+    weights are `layers.{layer}.ffn.experts.{expert}.*`, so layer 6's expert 7 is a different tensor
+    from layer 5's. The first version of this keyed on the id alone and answered a layer 6 draw with
+    layer 5's bytes; it is measured in
+    `docs/performance/deepseek_v4_1_flash_device_experts.md`, and the short of it is that every
+    pooled run moved the top 32 logits by 4.7-6.8 of a max of 29.15 while agreeing with the other run
+    at the same width to the digit. So the pool holds a layer's working set and not the model's:
+    nothing is carried across a layer boundary, and a decode step -- one row a layer, one draw an
+    expert -- is the case it cannot help at all, which is the same reason `expert_hot_rows` cannot.
+    Leave `expert_hot_rows` at zero with it; both can be set and the resident set is then consulted
+    first, but the two are alternatives and the sweep above is the one that prices them against each
+    other.
+
     `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
     itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
     -- and `checkpoint_weights` cuts the file's tensors to match; see `tp.py` for which boundaries are
@@ -836,11 +858,11 @@ def load_backbone(
 
     plan = ShardPlan.build(config, rank, world, moe_inter_dim=config.moe_inter_dim)
 
-    if expert_hot_rows and expert_device is None:
+    if (expert_hot_rows or expert_pool_rows) and expert_device is None:
         if progress is not None:
             progress(
-                f"--expert-hot-rows {expert_hot_rows} needs --expert-device: the resident set is a "
-                "set of arena rows, and there is no arena on the host path"
+                f"--expert-hot-rows {expert_hot_rows} / --expert-pool-rows {expert_pool_rows} need "
+                "--expert-device: both are sets of arena rows, and there is no arena on the host path"
             )
     # The arena and staging block every layer's resident experts share, built by whichever layer is
     # constructed first. `hot_rows` slots a card is 1.2 GiB of device memory and as much again of
@@ -893,6 +915,7 @@ def load_backbone(
                 ranks=ranks,
                 devices=[torch.device(base.type, first + r) for r in owned],
                 hot_rows=expert_hot_rows,
+                pool_rows=expert_pool_rows,
                 residents=residents,
             )
         except (RuntimeError, ValueError) as error:

@@ -1133,17 +1133,169 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_resid
     --length 512 --hot-rows 64 --out /tmp/fill_h64.out
 ```
 
+### The pool spends the same arena on what the pass draws, and its first key answered the wrong layer
+
+`--expert-pool-rows` is the same arena spent the other way round. A fill row is chosen up front for the
+whole layer and paid for whether that layer asks for it or not; a pool row is handed to an expert on
+its first sight *in that layer* and taken back least-recently-used when the pool runs out, so it is
+paid for exactly the draws the pass makes. Both are `expert_hot_rows`' arena, both cost 18.8 MB a row,
+and what differs is which repeats they keep and when the copy is made.
+
+**The first version of it was keyed on the bare expert id, and that is a wrong answer rather than a
+slower path.** An expert id is not an identity: the weights are
+`layers.{layer}.ffn.experts.{expert}.{which}.weight`, so layer 6's expert 7 is a different tensor from
+layer 5's, and a pool keyed on the id alone answers the later draw with an earlier layer's bytes. It
+does so *more* often the wider the pool is, and it does so silently — the rows are the right shape and
+the bytes are a real expert's. The counters could not see it: the pre-fix sweep's counters were
+exactly reproducible (1423 rows staged at 288 on rank 0, 1423 again; 2993 at 192, 2993 again) while
+the tokens were not. Same prompt, same cards, per-rank greedy tokens:
+
+| `--expert-pool-rows` | r0 | r1 | r2 | r3 | staged, r0/r1 |
+| ---: | --- | --- | --- | --- | --- |
+| 0 | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | 41040 / 41040 |
+| 192 | `[2413, 45539]` | `[2413, 82761]` | `[2413, 3373]` | `[2413, 63767]` | 2993 / 2972 |
+| 288 | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | `[2413, 21779]` | 1423 / 1372 |
+
+Four ranks of one run disagreeing with each other is not a race — the tree is cut so that every rank
+computes the same logits — and the top-32 comparison prices it: against the control, **1 of the top 32
+ids in position at a worst |dlogit| of 4.717e+00 at 192 rows and 6.787e+00 at 288, against a max
+|logit| of 2.915e+01**, with 288 landing on the control's second token by luck and 192 missing it on
+every rank but a different way each time. The fix is the key: `pool_map`/`pool_lru` are keyed on
+`(layer_id, expert)` and `_pool_row` composes the tuple. And the verification is the same column that
+caught it — every rank of every pooled run on this page below reads `[2413, 21779]`, and the logit
+comparison over **six sittings and four ranks is 32 of 32 ids in position at `|dlogit| 0.000e+00`:
+28 pairs, every one of them zero**, pooled runs against the control and against each other.
+
+**What the corrected key means is that a pool row belongs to a layer, not to the model.** With the
+layer in the key nothing carries across a layer boundary, so the pool holds the working set of *one*
+layer, and that is visible as an identity rather than an inference: `pool_staged - pool_evicted` is
+the width exactly, in every pooled run (5700 - 5412 = 288; 5761 - 5613 = 148; 6579 - 6483 = 96). A
+512-token pass of 40 layers asks rank 0 for **~142 distinct experts a layer** out of the 384 the model
+has — 5700 rows staged over the pass at 288 rows — and it asks 41040 times, so **86.1% of the pass's
+draws are answered out of the arena and every row the pool pays for is a row the pass asked for at
+least once**.
+
+**It is 4.0–4.2× on the prefill against no arena, and it beats the resident set at the set's own
+width.** Six sittings, one 512-token prompt, the same four cards, the configurations alternating in
+time — control, 148-hot, 288-pool, 288-pool, 148-hot, control — with the 512-row prefill and one
+decode row, both counted, so the staged column carries 80 draws on ranks 0 and 1 and 40 on ranks 2 and
+3 that the prefill did not make:
+
+| configuration | prefill, ranks 0-3 | rank mean | staged, r0/r1/r2/r3 | % resident | filled | arena | pinned |
+| --- | --- | ---: | --- | --- | ---: | ---: | ---: |
+| none | 185.71 / 187.18 / 185.91 / 185.72 s | 186.13 | 41040 / 41040 / 20520 / 20520 | 0.0 / 0.0 / 0.0 / 0.0 | 0 | 36 MiB | 0 |
+| `--hot-rows 148` | 48.57 / 48.75 / 48.57 / 49.60 s | 48.87 | 1768 / 1691 / 1371 / 1346 | 95.7 / 95.9 / 93.3 / 93.4 | 3935 | 2690 MiB | 2654 MiB |
+| `--pool-rows 288` | 46.32 / 44.80 / 44.45 / 45.51 s | 45.27 | 5700 / 5749 / 3828 / 3778 | 86.1 / 86.0 / 81.3 / 81.6 | 0 | 5200 MiB | 0 |
+| `--pool-rows 288` | 42.10 / 45.17 / 47.24 / 42.23 s | 44.19 | 5700 / 5749 / 3828 / 3778 | 86.1 / 86.0 / 81.3 / 81.6 | 0 | 5200 MiB | 0 |
+| `--hot-rows 148` | 52.20 / 47.34 / 47.50 / 49.44 s | 49.12 | 1768 / 1691 / 1371 / 1346 | 95.7 / 95.9 / 93.3 / 93.4 | 3935 | 2690 MiB | 2654 MiB |
+| none | 186.72 / 186.36 / 186.22 / 187.10 s | 186.60 | 41040 / 41040 / 20520 / 20520 | 0.0 / 0.0 / 0.0 / 0.0 | 0 | 36 MiB | 0 |
+
+The pool is **4.0–4.2×** the control — 186.4 to 44.7 on the rank mean of the pair — and **1.10×** the
+set, 49.0 to 44.7, and the row counts are what explains the second rather than contradicting it:
+**both mechanisms move about 5700 packed rows.** The set stages 1768 and *fills* 3935, and a fill row
+is a row moved, so its pass costs 5703 row-moves against the pool's 5700 at the same width and 5761 at
+148. What differs is where in the layer they are paid: `_fill` is one serial block a layer, written
+before that layer's first draw, at the 3.4 ms an expert row the [fill table
+above](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it)
+measures, while a pool row is copied on the draw that needs it and never if the layer does not draw
+it. The same bytes in a different place in the layer are worth 4.4 s of this prefill, and the pool
+reaches them without a hotness model at all: no prediction, no `_fill`, and `capped_layers` is 0
+everywhere because a pool that runs out evicts rather than cutting a layer.
+
+**The width has a floor at one layer's working set, and the counters were read for it before the
+sweep ran.** A B C D D C B A — 148-hot, 96-pool, 148-pool, 288-pool, and back — one prompt, one
+sitting, one process a card, rank means of the two sittings each configuration got:
+
+| configuration | arena | staged, r0 | % resident, r0/r1 | prefill, rank mean | pair mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `--hot-rows 148` | 2690 MiB | 1768 (+ 3935 filled) | 95.7 / 95.9 | 48.03 / 48.93 s | 48.48 s |
+| `--pool-rows 96` | 1757 MiB | 6579 | 84.0 / 83.7 | 47.73 / 48.28 s | 48.01 s |
+| `--pool-rows 148` | 2690 MiB | 5761 | 86.0 / 85.8 | 45.80 / 41.60 s | 43.70 s |
+| `--pool-rows 288` | 5200 MiB | 5700 | 86.1 / 86.0 | 46.03 / 45.98 s | 46.01 s |
+
+The prediction, stated in the sweep's own header before it ran: at 148 rows the pool should stage the
+same ~5700 rows as at 288 rows, because 148 is already more rows than a layer's ~142 distinct experts;
+at 96 it should stage **more**, because below a layer's working set the pool evicts its own keys inside
+one layer and pays to stage the same expert twice in that layer. Both hold — 5761 rows, 1.1% above
+288's, and 6579, 15.4% above it — and the second is the floor showing: 96 rows answers 84.0% of rank
+0's draws where 148 answers 86.0%, costing 818 rows of re-staging over the pass, 20 a layer.
+
+**At 148 rows the pool and the set are the same arena, and that is the comparison the earlier sweeps
+could not make.** Same 2690 MiB, same prompt, same cards: the pool is faster in both of its sittings —
+45.80 and 41.60 s against 48.03 and 48.93 — and it carries **no pinned block at all** where the set
+holds 2654 MiB of one, because a pool row is copied straight out of the bank into its arena row where
+a fill row goes bank → pinned → arena. 288 rows then buys nothing over 148 — 61 fewer rows staged out
+of 5761, and the two inside each other's drift on the wall clock — for 2.5 GiB more arena, which is
+the conclusion the width sweep above reached about 148 rows against 192 for the same reason: on this
+prompt the routing's working set is ~142 a layer and anything above it is holding rows nobody asks for
+again.
+
+**One caveat on that number, and it is about the floor rather than the measurement.** 142 distinct
+experts a layer is what *this* prompt draws in a layer, and the floor moves with the prompt: a longer
+prefill draws more distinct experts a layer, up to one per expert the model has, so the width that
+cannot be below the floor at any prompt is 384 rows — **6.9 GiB a card**, more than the four cards
+have to give once the tree and the caches are on them. `--pool-rows 148` is sized to a 512-token
+prefill and is not a constant of the mechanism; what is a constant is that below the layer's distinct
+count the pool pays twice for the same expert.
+
+**The sitting drifts in a U, and the pair means are what say so.** The rank means in time order are
+48.03, 47.73, 45.80, 46.03, 45.98, 41.60, 48.28, 48.93: the two 148-row sittings sit on the fast
+stretch and the two control sittings on the slow one at either end, so the size of the 148-against-288
+and 148-against-set gaps is partly the order. What survives the order is the direction and the
+counters: both 148-row sittings beat both set sittings, both 288-row sittings beat both set sittings,
+both 96-row sittings match the set's, and the row counts are identical between the two sittings of
+every configuration — 6579, 5761 and 5700 staged on rank 0 twice each, to the row.
+
+**Decode is not this knob either, and this sweep is the clearest evidence yet that its column is the
+node.** A decode step asks a layer for one row's worth of experts and nothing in it repeats, so a pool
+evicts everything it stages there, and the two 288-row sittings — the same configuration, adjacent in
+time — read **0.698 and 0.807 s a token, 15.6% apart**, which is wider than the gap between any two
+configurations in the sweep. The corrected six-sitting sweep says the same thing about the set: control
+0.717 and 0.756, `--hot-rows 148` 0.714 and 0.669, so the set is on the fast side of the control in
+one pairing and on the slow side in the other and the 10–11% the width sweep measured does not
+reproduce. Both mechanisms are prefill knobs.
+
+Reproduce with:
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_hot_ab.py \
+    --length 512 --decode 1 --hot-rows 148 --out /tmp/pw_h148.pt
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_hot_ab.py \
+    --length 512 --decode 1 --pool-rows 148 --out /tmp/pw_p148.pt
+python /tmp/probe_v41_hot_ab.py --compare /tmp/pw_h148.pt.r0 /tmp/pw_p148.pt.r0
+```
+
+`/tmp/run_poolfix.sh` is the six-sitting A-B-C-C-B-A behind the first table — the control at both ends,
+which the resident-set section above says had not been run and which comes back 186.13 against 186.60 s
+on the rank mean, 0.25% apart, with the decode column 5.5% apart on the same two runs.
+`/tmp/run_poolwidth.sh` is the eight-sitting width sweep behind the second.
+
 ## What this does not do yet
 
 All of these are separate measurements rather than separate opinions.
 
-- **Not caching across rows on the device was the first of these, and it is now a knob.** See
-  [the section above](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it):
+- **Not caching across rows on the device was the first of these, and it is now two knobs, both
+  measured.** See
+  [the resident set](#a-per-layer-resident-set-is-worth-27-on-a-prefill-and-it-is-the-fill-that-pays-for-it)
+  and [the pool](#the-pool-spends-the-same-arena-on-what-the-pass-draws-and-its-first-key-answered-the-wrong-layer):
   `--expert-hot-rows` keeps a layer's hot experts in the shared arena and is worth 2.6–2.7× on a
-  512-token prefill. What is *not* done is the batch shape that would make it worth more — a wider
-  arena plus `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its tokens
-  contiguous. That is still a follow-on rather than a knob, because it needs a kernel this class does
-  not call, and the resident set above is what proves the arena arithmetic it would rest on.
+  512-token prefill; `--expert-pool-rows` spends the same arena on the draws the pass actually makes
+  and reads **43.7 s against the set's 48.5 s** at the two mechanisms' own 148-row width — the same
+  2690 MiB either way, and the pool with no pinned block at all, which is where the set's 2654 MiB
+  go.
+- **What is still not done is the batch shape, and the pool is what now says what it would be worth.**
+  `--expert-pool-rows 148` is sized to a 512-token prefill because its floor is *a layer's distinct
+  experts* — ~142 of 384 on rank 0 here, which is why 148 and 288 stage the same 5700 rows and 96
+  stages 6579 ([the width table
+  above](#the-pool-spends-the-same-arena-on-what-the-pass-draws-and-its-first-key-answered-the-wrong-layer)).
+  A longer prefill raises that floor toward 384 rows — **6.9 GiB a card**, more than the four cards
+  can give once the tree and the caches are on them — so no prompt-independent width buys the
+  mechanism out. `moe_multi_token_fp4_forward`, one slot per distinct expert the batch hit with its
+  tokens contiguous, is the change that makes the floor a function of the batch rather than of the
+  layer, and it needs a kernel this class does not call. That is still a follow-on rather than a knob.
+  What the two mechanisms above did establish is the arena arithmetic it would rest on: the rows are
+  priced, the stage-from-bank path exists, and the counters that would move are the ones this page
+  reports.
 - **The bank removes the disk from `_stage`, not the copy out of it.** With
   `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
   without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —

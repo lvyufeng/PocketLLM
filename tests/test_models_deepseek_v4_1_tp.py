@@ -37,7 +37,7 @@ it is derived.
 from __future__ import annotations
 
 import threading
-from collections import Counter
+from collections import Counter, OrderedDict
 from types import SimpleNamespace
 
 import pytest
@@ -592,6 +592,12 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     offset (`slice(self.hot_rows, self.hot_rows + k)`), and `_stage` stages into it, so the row
     index and the bytes that row will read are one fact stated in three places.
 
+    The pool adds a third answer beside the set and the tail, and it is asked with a key that has to
+    carry the layer: the weights are `layers.{layer}.ffn.experts.{expert}.{which}.weight`, so a pool
+    holding another layer's expert under the same id must not answer this layer's draw. That was the
+    bug the 512-token sweep found (`pool_row`'s own docstring has the numbers) and the last two cases
+    below are its regression test, at the level where it is decidable without four cards.
+
     Checked hand in hand with the miss list, because the number of rows a row is dealt is also what
     `drawn_rows` counts -- the denominator the coverage of a resident set is reported over, which is
     the number that was wrong the first time this was measured.
@@ -599,15 +605,37 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     Called on a stub, the way the two tests above are: the split, the map and the counters are host
     arithmetic, and everything else in the class needs the packed checkpoint and four cards.
     """
-    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts, ResidentSet
 
     world, topk, hot_rows = 4, 6, 3
     # Sorted: 10(slot1), 20(slot3), 30(slot0), 40(slot5), 50(slot4), 60(slot2), dealt round-robin
     # over four ranks, so this rank's two routes are 20 and 60 and the siblings hold the other four.
     ids = [30, 10, 60, 20, 50, 40]
+    layer_id = 7
     staged: list[list[tuple[int, int]]] = []
 
-    def stub(rank: int, residents: list[int], hot: int = hot_rows) -> SimpleNamespace:
+    def pool(held: dict[tuple[int, int], int], free: list[int], width: int = 4) -> SimpleNamespace:
+        """A `ResidentSet` carrying only what the pool's own arithmetic reads.
+
+        The real `pool_row` is bound to it rather than re-spelled here, so the eviction order, the
+        counters and the key are the shipped ones. `free` is given in pop order -- `pool_free.pop()`
+        takes the last -- and the rows are the arena's pool band, `rows_per_card + hot_rows` and up,
+        which with no rows-per-card is `hot_rows`.
+        """
+        one = SimpleNamespace(
+            pool_rows=width,
+            pool_staged=0,
+            pool_evicted=0,
+            pool_free=[list(free)],
+            pool_map=[dict(held)],
+            pool_lru=[OrderedDict((key, None) for key in held)],
+        )
+        one.pool_row = lambda card, key: ResidentSet.pool_row(one, card, key)
+        return one
+
+    def stub(
+        rank: int, residents: list[int], hot: int = hot_rows, pooled: SimpleNamespace | None = None
+    ) -> SimpleNamespace:
         one = SimpleNamespace(
             world=world,
             topk=topk,
@@ -616,14 +644,18 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
             rows=0,
             drawn_rows=0,
             expert_rows=0,
+            layer_id=layer_id,
             # The map `_fill` leaves behind, rebuilt here from the ids it filled, in arena order.
             _hot_map=[{expert: row for row, expert in enumerate(residents)}],
+            _residents=pooled,
         )
         one._split = lambda ids: DeviceRoutedExperts._split(one, ids)
         one._take_buffer = lambda: 0
-        # One card in `ranks`, so the row's staging is `misses[0]`: `(miss row, route slot)` pairs.
+        # One card in `ranks`, so the row's staging is `misses[0]`: `(miss row, route slot, arena
+        # row)` triples, the arena row being where `_upload` will put those bytes.
         one._stage = lambda buffer, ids, misses: staged.append(misses[0])
         one._upload = lambda buffer, misses: None
+        one._pool_row = lambda card, expert: DeviceRoutedExperts._pool_row(one, card, expert)
         return one
 
     # Expert 20 is resident in arena row 1 and 60 is not, so the row is dealt one of each. The hit
@@ -637,7 +669,7 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
         "expert and 60 is the row's first miss, so the kernel would read 10's weights for 20 or the "
         "resident block for a miss"
     )
-    assert staged == [[(0, 2)]], (
+    assert staged == [[(0, 2, hot_rows)]], (
         "the pointer written for expert 60 is not its own arena row, so `_upload` and the indices "
         "handed to the kernel disagree about where the bytes are"
     )
@@ -649,7 +681,7 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     assert DeviceRoutedExperts._stage_row(tail, None, None, torch.tensor(ids)) == [
         [(hot_rows, 3), (hot_rows + 1, 2)]
     ], "an empty resident map moved the deal's own rows, or the tail is not the offset it is"
-    assert staged[-1] == [(0, 3), (1, 2)], (
+    assert staged[-1] == [(0, 3, hot_rows), (1, 2, hot_rows + 1)], (
         "with no set the whole deal is staged, once each, into the rows the kernel was handed"
     )
 
@@ -657,6 +689,51 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     assert DeviceRoutedExperts._stage_row(none, None, None, torch.tensor(ids)) == [[(0, 3), (1, 2)]], (
         "zero resident rows is not a small set, it is the configuration before any of this existed, "
         "so its arena rows have to be the deal's own"
+    )
+
+    # The pool is asked after the set and before the tail, and it may answer without a stage: expert
+    # 60 is this layer's and the pool holds it in row 3, so the route names row 3 and the row stages
+    # nothing at all -- which is the whole of what the mechanism buys. The set still answers first,
+    # so expert 20 names row 1 rather than anything the pool has.
+    hit = stub(1, [10, 20], pooled=pool({(layer_id, 60): 3}, free=[4, 5, 6]))
+    assert DeviceRoutedExperts._stage_row(hit, None, None, torch.tensor(ids)) == [[(1, 3), (3, 2)]], (
+        "a pooled route did not name the row the pool holds it in, or the pool was asked before the "
+        "set and took a draw the set had already answered"
+    )
+    assert staged[-1] == [], "a pool hit staged, which is the copy this mechanism exists to not pay"
+    assert hit._residents.pool_staged == 0 and hit.drawn_rows == 2
+
+    # The key carries the layer. The pool below holds layer 6's expert 60 in the row a layer 7 draw
+    # would have been given, and the draw is *not* answered: it takes the next free row and stages
+    # into it. Keyed on the id alone -- which is what shipped first, and what the 512-token sweep
+    # caught -- this route would have named row 3 and read another layer's bytes for the expert.
+    other = pool({(layer_id - 1, 60): 3}, free=[5, 6])
+    miss = stub(1, [10, 20], pooled=other)
+    assert DeviceRoutedExperts._stage_row(miss, None, None, torch.tensor(ids)) == [[(1, 3), (6, 2)]], (
+        "another layer's expert under the same id answered this layer's draw, so the route names the "
+        "row of a tensor that belongs to a different layer"
+    )
+    assert staged[-1] == [(0, 2, 6)], (
+        "the draw that the pool's other-layer key must not answer was not staged into its own row"
+    )
+    assert (layer_id, 60) in other.pool_map[0] and (layer_id - 1, 60) in other.pool_map[0], (
+        "the pool did not record the key it was asked with, so it cannot be telling two layers' "
+        "experts apart in the first place"
+    )
+
+    # And an eviction, which is the other way a wrong row could be handed over: one row of pool, no
+    # free rows, holding layer 6's expert 60. The layer 7 draw takes that row -- the eviction is
+    # allowed, the bytes in it are overwritten -- and the entry it replaces is gone rather than
+    # shadowed by a key that differs only in its layer.
+    squeezed = pool({(layer_id - 1, 60): 3}, free=[], width=1)
+    evicted = stub(1, [10, 20], pooled=squeezed)
+    assert DeviceRoutedExperts._stage_row(evicted, None, None, torch.tensor(ids)) == [[(1, 3), (3, 2)]]
+    assert squeezed.pool_evicted == 1 and squeezed.pool_staged == 1, (
+        "a pool at its width did not evict, so the row it handed over is one the map still believes "
+        "holds the key it took the row from"
+    )
+    assert list(squeezed.pool_map[0]) == [(layer_id, 60)], (
+        "the evicted key survived the key that replaced it"
     )
 
     # And every rank's own share, summed, is every route the layer made -- the other half of what

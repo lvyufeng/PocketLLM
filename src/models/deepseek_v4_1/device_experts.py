@@ -243,6 +243,7 @@ Not yet, then:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Sequence
 
 import torch
@@ -320,14 +321,16 @@ class ResidentSet:
         self,
         *,
         hot_rows: int,
+        pool_rows: int = 0,
         rows_per_card: int,
         ranks: Sequence[int],
         devices: Sequence[torch.device],
         shapes: dict[tuple[str, str], tuple[int, ...]],
     ) -> None:
         self.hot_rows = int(hot_rows)
+        self.pool_rows = max(0, int(pool_rows))
         self.rows_per_card = int(rows_per_card)
-        self.arena_rows = self.rows_per_card + self.hot_rows
+        self.arena_rows = self.rows_per_card + self.hot_rows + self.pool_rows
         self.ranks = list(ranks)
         self.devices = list(devices)
         self._shapes = shapes
@@ -341,6 +344,81 @@ class ResidentSet:
         # Built on the first fill and not here: a decode-only run never fills, and this many rows of
         # page-locked memory is not something to allocate for a set that will always be empty.
         self._pinned: dict[tuple[str, str], torch.Tensor] | None = None
+        # The pool: which arena row a card keeps each expert in. The key is `(layer, expert)` and not
+        # the expert id alone, and that is not a detail -- see `pool_row`, which is where the reason
+        # is written down and where getting it wrong cost a whole sweep. It is on the set rather than
+        # on the layer because the *arena* has to be one a card: an arena wide enough to hold a
+        # layer's working set cannot be forty of them, so the map that says which arena row is whose
+        # lives beside the rows it describes. `pool_free` is the rows never used yet and `pool_lru`
+        # the ones in use, oldest first; a key is evicted only when both are empty. `pool_rows=0` is
+        # the off state and the configuration every number above this was taken on.
+        self.pool_map: list[dict[tuple[int, int], int]] = [{} for _ in self.ranks]
+        self.pool_lru: list[OrderedDict[tuple[int, int], None]] = [
+            OrderedDict() for _ in self.ranks
+        ]
+        self.pool_free: list[list[int]] = [
+            list(range(self.rows_per_card + self.hot_rows, self.arena_rows))
+            for _ in self.ranks
+        ]
+        # Counted, like the class's own counters: how many rows the pool took off the staging path
+        # is what says whether it is doing anything, and `pool_evicted` is what says whether
+        # `pool_rows` was the binding constraint rather than a size.
+        self.pool_staged = 0
+        self.pool_evicted = 0
+
+    def pool_row(self, card: int, key: tuple[int, int]) -> tuple[int, bool] | None:
+        """`(arena row, needs staging)` for `key` on `card`, or `None` when the pool is off.
+
+        `None` is the off state, and a caller that gets it is on the path this class had before the
+        pool existed -- the row's own miss rows, staged and never kept. `True` means the row has just
+        been assigned and holds nothing yet, so the caller stages into it; `False` means it already
+        holds this key's bytes and the draw costs no H2D at all.
+
+        **`key` is `(layer, expert)`, and the layer half is load-bearing.** An expert id is not an
+        identity: the weights live at `layers.{layer}.ffn.experts.{expert}.{which}.weight`, so layer
+        5's expert 7 and layer 6's expert 7 are different tensors that happen to share a number. A
+        pool keyed on the id alone answers a layer 6 draw with layer 5's bytes -- silently, since the
+        rows are the right shape and the bytes are a real expert's -- and it does so *more* often the
+        wider the pool is. That is what the first version of this did, and a 512-token sweep caught
+        it only because the probe keeps the logits: every pooled run at every width moved the top 32
+        by 4.7 to 6.8 of a max logit of 29.15, and the four runs at two widths agreed with each other
+        to the digit, which is what a wrong answer looks like when nothing about it is random. It is
+        worth stating as a rule rather than as an anecdote: a cache keyed on a number that is only
+        unique within a scope must be keyed on the scope too.
+
+        The row is stable for as long as the key is in the pool: a second draw of the same key later
+        in the layer reads the row this returns, and nothing invalidates it but an eviction. That is
+        the whole difference between this and `_fill` -- a fill row means "resident *this layer*" and
+        is rewritten by the next layer's fill, while a pool row holds its bytes until the pool gives
+        the row to somebody else, and a key evicted and re-drawn pays the staging again.
+
+        **Eviction is safe at any size, and it is worth saying why rather than guarding it.** A row
+        handed out to a different key is overwritten by an H2D that `_upload` puts behind that
+        card's compute stream, and `_issue` puts the next kernel behind the copy -- so the overwrite
+        cannot be read by a kernel that was launched before it, however recently the evicted key was
+        drawn. The arena the row lives in is what the ordering already protects; the pool changes
+        which row a key is in and not when a byte is allowed to move. What a too-small pool costs is
+        therefore only the fills it throws away, which is a hit rate and not a correctness property,
+        and `pool_evicted` is the counter that says so. Note what this argument does *not* cover: it
+        is about the bytes in a row and not about which bytes belong there, which is the other half
+        of the problem and the reason the key carries a layer.
+        """
+        if not self.pool_rows:
+            return None
+        row = self.pool_map[card].get(key)
+        if row is not None:
+            self.pool_lru[card].move_to_end(key)
+            return row, False
+        if self.pool_free[card]:
+            row = self.pool_free[card].pop()
+        else:
+            victim, _ = self.pool_lru[card].popitem(last=False)
+            row = self.pool_map[card].pop(victim)
+            self.pool_evicted += 1
+        self.pool_map[card][key] = row
+        self.pool_lru[card][key] = None
+        self.pool_staged += 1
+        return row, True
 
     @property
     def pinned(self) -> dict[tuple[str, str], torch.Tensor]:
@@ -403,6 +481,7 @@ class DeviceRoutedExperts(RoutedExperts):
         devices: Sequence[torch.device | str] | None = None,
         pinned_buffers: int = 2,
         hot_rows: int = 0,
+        pool_rows: int = 0,
         residents: ResidentSet | None = None,
     ) -> None:
         # Bound here rather than imported at module scope: `loader.py` is what builds this class, so
@@ -468,7 +547,15 @@ class DeviceRoutedExperts(RoutedExperts):
         # survives it -- and it is the control column for the set. See `_hot_rows` for which experts
         # go in it, which is not a capacity but a rule.
         self.hot_rows = max(0, int(hot_rows))
-        self.arena_rows = self.rows_per_card + self.hot_rows
+        # The pool above both of those: rows a card keeps an expert in for as long as the run lasts,
+        # handed out on first sight and evicted least-recently-used only when there is nothing free.
+        # It is the same idea as the resident set and it replaces it rather than joining it -- the set
+        # is a per-layer rule that costs a fill (216.0 ms a layer at 64 slots) and forgets everything
+        # at the next layer, while a pool row that answered a layer 5 draw is still there for layer 6
+        # and cost nothing to keep. `_fill` returns early without `hot_rows`, so `pool_rows` with
+        # `hot_rows=0` is the pool on its own and the configuration worth measuring.
+        self.pool_rows = max(0, int(pool_rows))
+        self.arena_rows = self.rows_per_card + self.hot_rows + self.pool_rows
         # Counted rather than timed, like `rows` and `expert_rows`: how much of a prefill the resident
         # set actually covered is the number that says whether it is doing what it was built for. A
         # fill is a row staged too, just once for the layer rather than once for the row, so the two
@@ -521,9 +608,10 @@ class DeviceRoutedExperts(RoutedExperts):
         # one per card and every layer of the model shares it; see `ResidentSet`. With `hot_rows` at
         # zero there is no set and this is `None`, which is what keeps the arena a row's own deal and
         # nothing more, exactly as it was before any of this existed.
-        if self.hot_rows and residents is None:
+        if (self.hot_rows or self.pool_rows) and residents is None:
             residents = ResidentSet(
                 hot_rows=self.hot_rows,
+                pool_rows=self.pool_rows,
                 rows_per_card=self.rows_per_card,
                 ranks=self.ranks,
                 devices=self.devices,
@@ -535,10 +623,16 @@ class DeviceRoutedExperts(RoutedExperts):
                     f"a shared set of {residents.hot_rows} rows for a layer that asked for "
                     f"{self.hot_rows}"
                 )
+            if residents.pool_rows != self.pool_rows:
+                raise ValueError(
+                    f"a shared pool of {residents.pool_rows} rows for a layer that asked for "
+                    f"{self.pool_rows}"
+                )
             if residents.arena_rows != self.arena_rows:
                 raise ValueError(
                     f"a shared arena of {residents.arena_rows} rows where {self.rows_per_card} "
-                    f"staged rows and {self.hot_rows} resident ones need {self.arena_rows}"
+                    f"staged rows, {self.hot_rows} resident ones and {self.pool_rows} pooled ones "
+                    f"need {self.arena_rows}"
                 )
             if len(residents.arena) != len(self.devices):
                 raise ValueError(f"{len(residents.arena)} arenas for {len(self.devices)} devices")
@@ -864,12 +958,13 @@ class DeviceRoutedExperts(RoutedExperts):
         start = card * self.rows_per_card + arena_row
         return slice(start, start + 1)
 
-    def _stage(self, buffer: int, ids: Sequence[int], misses: list[list[tuple[int, int]]]) -> None:
+    def _stage(self, buffer: int, ids: Sequence[int], misses: list[list[tuple[int, int, int]]]) -> None:
         """One `copy_` per tensor out of the host source into the row an expert owns.
 
-        `misses` is what the row still has to stage after the resident set has been accounted for
-        -- `(miss row, route slot)` per local card, in the order `_split` dealt them -- so with
-        `hot_rows=0` it is the whole deal and this is the loop it always was.
+        `misses` is what the row still has to stage after the resident set and the pool have both
+        been accounted for -- `(staging row, route slot, arena row)` per local card, in the order
+        `_split` dealt them -- so with `hot_rows=0` and `pool_rows=0` it is the whole deal and this is
+        the loop it always was.
 
         `checkpoint.packed` is the subject here, and it decides the source: the shard mapping, or the
         resident bank when one is attached. Out of the mapping it uses `entry_view` and not `view`,
@@ -879,23 +974,27 @@ class DeviceRoutedExperts(RoutedExperts):
         page, 1308.0 ms for a row against 11.2 ms warm -- stops being possible, because the bank was
         filled from the disk once, before the first step. It is not a faster `copy_`: 14 GiB/s either
         way. What it removes is the disk.
+
+        The staging row and the arena row are the same number whenever the pool is off, and the
+        third element is carried anyway rather than recomputed by `_upload`: with the pool on it is
+        the row `pool_row` handed out, which is neither the staging row nor anywhere near it.
         """
         for card, members in enumerate(misses):
             if not members:
                 continue
             arena = self._pinned[buffer]
-            for miss_row, slot in members:
+            for staging_row, slot, _ in members:
                 for which in PROJECTIONS:
                     weight = self._key(ids[slot], which)
                     for kind, key in (("q", weight), ("s", self._scale_key(weight))):
                         # F8_E8M0 has no CPU `copy_` from a pyloaded view, so both halves travel as
                         # the `uint8` the kernel reads them as.
-                        arena[(which, kind)][self._row(card, miss_row)].copy_(
+                        arena[(which, kind)][self._row(card, staging_row)].copy_(
                             self.checkpoint.packed(key).view(torch.uint8)
                         )
             self.expert_rows += len(members)
 
-    def _upload(self, buffer: int, misses: list[list[tuple[int, int]]]) -> None:
+    def _upload(self, buffer: int, misses: list[list[tuple[int, int, int]]]) -> None:
         """One asynchronous copy stream per card, each recording an event the host waits on later.
 
         Four links at once is the whole point of the split: measured, one card takes 10.47 GiB/s and
@@ -906,9 +1005,14 @@ class DeviceRoutedExperts(RoutedExperts):
         previous kernel was launched: without that the copy could refill an arena a kernel is still
         reading, and the two are on different streams so nothing else would order them.
 
-        What crosses is the miss rows and not the arena, so a row the resident set covers entirely
-        costs no H2D at all -- and the destination is the arena's own tail, which is where `_stage`
-        put the pinned bytes and where the row's indices will point.
+        What crosses is the miss rows and not the arena, so a row the resident set or the pool covers
+        entirely costs no H2D at all. With the pool off the destination is the arena's own tail and
+        the miss rows are `0..k` in order, which is one copy per tensor a card; with it on each miss
+        goes to the row `pool_row` gave it and there is one copy a miss. At most `rows_per_card` of
+        those a card a row, so the extra calls are bounded by the same deal that bounded the first.
+
+        The pinned source is still the contiguous `0..k` block `_stage` wrote, whichever arena row
+        each of those ends up in -- so the pool changes where a byte lands and not how it leaves.
         """
         for card, members in enumerate(misses):
             k = len(members)
@@ -916,15 +1020,24 @@ class DeviceRoutedExperts(RoutedExperts):
                 continue
             device = self.devices[card]
             stream = _copy_stream(device)
-            source = slice(card * self.rows_per_card, card * self.rows_per_card + k)
-            destination = slice(self.hot_rows, self.hot_rows + k)
             with torch.cuda.device(device):
                 stream.wait_stream(torch.cuda.current_stream(device))
                 with torch.cuda.stream(stream):
-                    for key, target in self._on_device[card].items():
-                        target[destination].copy_(
-                            self._pinned[buffer][key][source], non_blocking=True
-                        )
+                    if self.pool_rows:
+                        for staging_row, _, arena_row in members:
+                            source = self._row(card, staging_row)
+                            destination = slice(arena_row, arena_row + 1)
+                            for key, target in self._on_device[card].items():
+                                target[destination].copy_(
+                                    self._pinned[buffer][key][source], non_blocking=True
+                                )
+                    else:
+                        source = slice(card * self.rows_per_card, card * self.rows_per_card + k)
+                        destination = slice(self.hot_rows, self.hot_rows + k)
+                        for key, target in self._on_device[card].items():
+                            target[destination].copy_(
+                                self._pinned[buffer][key][source], non_blocking=True
+                            )
                     self._events[card][buffer].record(stream)
             self._uploaded[card][buffer] = True
 
@@ -1060,10 +1173,10 @@ class DeviceRoutedExperts(RoutedExperts):
                 scratch["w_device"][card].narrow(0, 0, k).copy_(
                     scratch["w"].narrow(0, offset, k), non_blocking=True
                 )
-                if self.hot_rows:
-                    # The arena rows are not `0..k` once there is a resident set, so the indices
-                    # travel with the weights. Without one they are, and `idx_device` was built as
-                    # that arange once for the whole run.
+                if self.hot_rows or self.pool_rows:
+                    # The arena rows are not `0..k` once there is a resident set or a pool, so the
+                    # indices travel with the weights. Without either they are, and `idx_device` was
+                    # built as that arange once for the whole run.
                     scratch["idx_device"][card].narrow(0, 0, k).copy_(
                         scratch["idx"].narrow(0, offset, k), non_blocking=True
                     )
@@ -1192,16 +1305,30 @@ class DeviceRoutedExperts(RoutedExperts):
         torch.cuda.current_stream(indices.device).synchronize()
         return host
 
+    def _pool_row(self, card: int, expert: int) -> tuple[int | None, bool]:
+        """`(arena row, needs staging)` from the pool, or `(None, False)` when it is off.
+
+        A thin pass-through rather than a second copy of the logic, and it exists so `_stage_row` has
+        one place to ask: the pool lives on the set because the arena does, and the set is what a
+        `hot_rows=0` run does not otherwise touch at all. The key it hands over is this layer's and
+        not the expert's alone -- `pool_row` has the argument for that.
+        """
+        if self._residents is None:
+            return None, False
+        pooled = self._residents.pool_row(card, (self.layer_id, expert))
+        return (None, False) if pooled is None else pooled
+
     def _stage_row(
         self, x_row: torch.Tensor, weights_row: torch.Tensor, ids_row: torch.Tensor
     ) -> list[list[tuple[int, int]]]:
         """Put one row's bytes where its cards can reach them, and return the deal they were put in.
 
         What comes back is `(arena row, route slot)` per local card and it is the whole of what the
-        row hands the kernel: the resident set has been resolved here, so a route whose expert is
-        resident names the row it was filled into and a route that missed names the next free row of
-        the arena's tail. The staging below is only ever the misses, which is where the class stops
-        paying for the repeats.
+        row hands the kernel: the resident set and the pool have both been resolved here, so a route
+        whose expert is resident names the row it was filled into, a route whose expert is in the pool
+        names the row it was pooled into, and a route that is neither names the next free row of the
+        arena's staging tail. The staging below is only ever the draws that neither of those answered,
+        which is where the class stops paying for the repeats.
 
         Everything here is host-side and none of it reads a result: the routing, the arena row, the
         pinned staging and the H2D. That is what lets `forward` run it ahead of the *previous* row's
@@ -1210,18 +1337,28 @@ class DeviceRoutedExperts(RoutedExperts):
         """
         ids = [int(e) for e in ids_row.tolist()]
         cards: list[list[tuple[int, int]]] = []
-        misses: list[list[tuple[int, int]]] = []
+        misses: list[list[tuple[int, int, int]]] = []
         drawn = 0
         for card, members in enumerate(self._split(ids)):
             drawn += len(members)
             resident = self._hot_map[card]
             placed: list[tuple[int, int]] = []
-            miss: list[tuple[int, int]] = []
+            miss: list[tuple[int, int, int]] = []
             for _, slot in members:
                 row = resident.get(ids[slot])
                 if row is None:
-                    row = self.hot_rows + len(miss)
-                    miss.append((len(miss), slot))
+                    # The pool first, and it may answer without staging anything: a draw of an expert
+                    # the pool already holds is the whole of what this class is trying to buy, and it
+                    # costs one dictionary probe and no copy at all.
+                    row, fresh = self._pool_row(card, ids[slot])
+                    if row is None:
+                        # No pool: the arena's own staging tail, rewritten every row. The rows start
+                        # at `hot_rows` and not at `len(miss)` so the index arithmetic a row hands the
+                        # kernel is a constant offset rather than a per-layer one.
+                        row = self.hot_rows + len(miss)
+                        fresh = True
+                    if fresh:
+                        miss.append((len(miss), slot, row))
                 placed.append((row, slot))
             cards.append(placed)
             misses.append(miss)
