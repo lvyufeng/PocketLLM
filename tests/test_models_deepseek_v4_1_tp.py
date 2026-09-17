@@ -3,7 +3,7 @@
 `tp.py` splits the tree *by construction* -- every module derives its own `1/world` slice from a
 `world` -- while the loader has to cut the file's tensors the same way to fill it. Those are two
 spellings of one arithmetic and they cannot be shared, because a constructor divides `n_heads` where
-the loader has to divide `n_heads * head_dim` and land on a whole number of heads. So the three tests
+the loader has to divide `n_heads * head_dim` and land on a whole number of heads. So the tests
 here are written to make the two halves fail against *each other* rather than against the released
 checkpoint, which no test can hold:
 
@@ -484,3 +484,185 @@ def test_the_deal_is_the_same_partition_whichever_way_it_is_driven(trees) -> Non
     # and the roster is what selects, not the order it is written in
     picked = DeviceRoutedExperts._split(SimpleNamespace(world=4, ranks=[2]), ids)
     assert picked[0] == [(p // 4, order[p]) for p in (2,)]
+
+
+def test_the_resident_set_is_this_cards_own_deal_counted() -> None:
+    """`DeviceRoutedExperts._hot_rows`, checked against `_split` and against the layer's routing.
+
+    An expert is resident iff the layer asks *this card* for it at least twice, and the deal hands a
+    card a fixed set of columns of each row's sorted ids -- so the rule is a count over the card's
+    own multiset and not over the layer's routing. Both halves of that are quiet when they are
+    wrong. A set counted over the whole routing holds experts the card is never dealt: arena rows
+    and page-locked bytes for a row nothing reads. A set counted off another rank's columns names
+    arena rows nothing reads at all, and the cards that do read them each pay full price. The first
+    is checked below against the deal `_split` really makes, and the second against a routing where
+    the two rules provably differ.
+
+    Called unbound, on a stub, the way the deal test above calls `_split`: this is arithmetic on a
+    host tensor, and everything else in the class needs the packed checkpoint and four cards.
+    """
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+
+    world, topk, n_experts = 4, 6, 512
+
+    def stub(rank: int, hot_rows: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            world=world,
+            topk=topk,
+            ranks=[rank],
+            hot_rows=hot_rows,
+            capped_layers=0,
+            capped_rows=0,
+        )
+
+    # The control column first: zero is not a small set, it is no set, and it must count nothing --
+    # including the cap counters, which are what a run reports its set as having been cut by.
+    blank = torch.zeros((2, topk), dtype=torch.int64)
+    for rank in range(world):
+        empty = stub(rank, 0)
+        assert DeviceRoutedExperts._hot_rows(empty, blank, 0) == []
+        assert (empty.capped_layers, empty.capped_rows) == (0, 0)
+
+    generator = torch.Generator().manual_seed(11)
+    # 128 rows of six ids off 512 experts: enough rows that a card's draws repeat, few enough
+    # experts that the rule has a tail to leave out -- the shape the sweep was measured on.
+    whole = torch.randint(0, n_experts, (128, topk), generator=generator)
+    ordered = whole.sort(dim=1).values
+
+    def dealt(rank: int) -> list[int]:
+        """This rank's draws, read off `_split` rather than off the columns the rule reads."""
+        who = stub(rank, 0)
+        out: list[int] = []
+        for row in whole:
+            ids = [int(e) for e in row]
+            out += [ids[slot] for _, slot in DeviceRoutedExperts._split(who, ids)[0]]
+        return out
+
+    for rank in range(world):
+        counts = Counter(dealt(rank))
+        want = sorted(e for e, n in counts.items() if n >= 2)
+        assert want, "the fixture's deal does not repeat and this test would count nothing"
+
+        roomy = stub(rank, len(want))
+        assert DeviceRoutedExperts._hot_rows(roomy, ordered, 0) == want
+        assert (roomy.capped_layers, roomy.capped_rows) == (0, 0), (
+            "an arena exactly the width of the rule's own set is not a cap, so a run sized this way "
+            "must not report its set as having been cut"
+        )
+
+        # A cap is a truncation of the same rule rather than a second one: it keeps the hottest, it
+        # counts itself, and a larger arena can then only stage fewer rows.
+        cap = max(1, len(want) // 2)
+        cut = stub(rank, cap)
+        got = DeviceRoutedExperts._hot_rows(cut, ordered, 0)
+        assert len(got) == cap
+        assert (cut.capped_layers, cut.capped_rows) == (1, len(want) - cap)
+        assert set(got) < set(want)
+        dropped = {e: n for e, n in counts.items() if n >= 2 and e not in set(got)}
+        assert min(counts[e] for e in got) >= max(dropped.values()), (
+            "the cap dropped an expert drawn more often than one it kept, which is what would make "
+            "a larger arena not a monotone step towards the rule"
+        )
+
+    # Two rows where the two rules provably differ. Expert 5 is drawn twice by rank 1 and expert 1
+    # once by each of two ranks, so a rule that counted the layer's routing -- `{1, 5}` below --
+    # would keep both while a rule that counts a card's keeps only the one with a second draw to
+    # hit. Expert 1 is asked twice and neither of the cards that asked should hold it.
+    hand = [[0, 1, 2, 3, 4, 5], [5, 1, 12, 13, 14, 15]]
+    twice = Counter(e for row in hand for e in row)
+    assert {e for e, n in twice.items() if n >= 2} == {1, 5}, "the fixture is not the case it exists for"
+
+    small = torch.tensor([sorted(row) for row in hand], dtype=torch.int64)
+    assert [DeviceRoutedExperts._hot_rows(stub(r, 8), small, 0) for r in range(world)] == [
+        [],
+        [5],
+        [],
+        [],
+    ], "the resident sets are not each card's own draws, so a rank is holding an arena row it is never dealt or missing one it is dealt twice"
+
+
+def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
+    """`DeviceRoutedExperts._stage_row`'s arena arithmetic, which no counter and no shape reports.
+
+    A resident route has to name the row `_fill` wrote its expert into, and a route that missed has
+    to name a row of the arena's *tail* -- `hot_rows` and up, not `len(hot)` and up, because the tail
+    is a fixed place in a fixed-height arena so that every layer's misses start it at the same
+    offset. Both are off-by-`hot_rows` errors that hand the kernel another expert's weights: a wrong
+    answer with the right shape, in a kernel that reads bare pointers. `_upload` writes to the same
+    offset (`slice(self.hot_rows, self.hot_rows + k)`), and `_stage` stages into it, so the row
+    index and the bytes that row will read are one fact stated in three places.
+
+    Checked hand in hand with the miss list, because the number of rows a row is dealt is also what
+    `drawn_rows` counts -- the denominator the coverage of a resident set is reported over, which is
+    the number that was wrong the first time this was measured.
+
+    Called on a stub, the way the two tests above are: the split, the map and the counters are host
+    arithmetic, and everything else in the class needs the packed checkpoint and four cards.
+    """
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+
+    world, topk, hot_rows = 4, 6, 3
+    # Sorted: 10(slot1), 20(slot3), 30(slot0), 40(slot5), 50(slot4), 60(slot2), dealt round-robin
+    # over four ranks, so this rank's two routes are 20 and 60 and the siblings hold the other four.
+    ids = [30, 10, 60, 20, 50, 40]
+    staged: list[list[tuple[int, int]]] = []
+
+    def stub(rank: int, residents: list[int], hot: int = hot_rows) -> SimpleNamespace:
+        one = SimpleNamespace(
+            world=world,
+            topk=topk,
+            ranks=[rank],
+            hot_rows=hot,
+            rows=0,
+            drawn_rows=0,
+            expert_rows=0,
+            # The map `_fill` leaves behind, rebuilt here from the ids it filled, in arena order.
+            _hot_map=[{expert: row for row, expert in enumerate(residents)}],
+        )
+        one._split = lambda ids: DeviceRoutedExperts._split(one, ids)
+        one._take_buffer = lambda: 0
+        # One card in `ranks`, so the row's staging is `misses[0]`: `(miss row, route slot)` pairs.
+        one._stage = lambda buffer, ids, misses: staged.append(misses[0])
+        one._upload = lambda buffer, misses: None
+        return one
+
+    # Expert 20 is resident in arena row 1 and 60 is not, so the row is dealt one of each. The hit
+    # names row 1 -- neither the miss row nor the row of the other resident expert -- and the miss
+    # names `hot_rows` and not 0, which is the offset the whole tail hangs on.
+    one = stub(1, [10, 20])
+    got = DeviceRoutedExperts._stage_row(one, None, None, torch.tensor(ids))
+    assert one.drawn_rows == 2, "a row of two routes is two draws, however many of them missed"
+    assert got == [[(1, 3), (hot_rows, 2)]], (
+        "the row's routes do not name the arena rows it staged into: 20 is the second resident "
+        "expert and 60 is the row's first miss, so the kernel would read 10's weights for 20 or the "
+        "resident block for a miss"
+    )
+    assert staged == [[(0, 2)]], (
+        "the pointer written for expert 60 is not its own arena row, so `_upload` and the indices "
+        "handed to the kernel disagree about where the bytes are"
+    )
+
+    # With no set the arena is the row's own deal, and the tail is what the misses ride on: the same
+    # routes off the same empty map name rows 3 and 4 when `hot_rows` is 3 and rows 0 and 1 when it
+    # is zero -- which is the offset, stated as the one number it is.
+    tail = stub(1, [])
+    assert DeviceRoutedExperts._stage_row(tail, None, None, torch.tensor(ids)) == [
+        [(hot_rows, 3), (hot_rows + 1, 2)]
+    ], "an empty resident map moved the deal's own rows, or the tail is not the offset it is"
+    assert staged[-1] == [(0, 3), (1, 2)], (
+        "with no set the whole deal is staged, once each, into the rows the kernel was handed"
+    )
+
+    none = stub(1, [], hot=0)
+    assert DeviceRoutedExperts._stage_row(none, None, None, torch.tensor(ids)) == [[(0, 3), (1, 2)]], (
+        "zero resident rows is not a small set, it is the configuration before any of this existed, "
+        "so its arena rows have to be the deal's own"
+    )
+
+    # And every rank's own share, summed, is every route the layer made -- the other half of what
+    # `drawn_rows` is reported over.
+    across = [stub(rank, [], hot=0) for rank in range(world)]
+    for one in across:
+        DeviceRoutedExperts._stage_row(one, None, None, torch.tensor(ids))
+    assert [one.drawn_rows for one in across] == [2, 2, 1, 1]
+    assert sum(one.drawn_rows for one in across) == topk

@@ -45,7 +45,28 @@ is worth **1.10x** there: 53.53 s against 48.31 s at 128 tokens and 13.64 agains
 `/tmp/probe_v41_tp4_pipe_matrix.py`'s own sitting. That is 25% above the 42.86 s the probe above
 records for the same prefill, which is the node's drift between sittings (it moves 20% for the same
 work) and not a second disagreement about the prompt. See
-`docs/performance/deepseek_v4_1_flash_device_experts.md`'s row-loop section for the measurement.
+`docs/performance/deepseek_v4_1_flash_device_experts.md`'s row-loop section for the measurement. That
+1.10x is measured with the resident set off -- it overlaps a drain against a staging, and the set
+below takes most of that staging away -- so it belongs to `--expert-hot-rows 0`, which is the
+default, and not to the configuration that recommends itself here.
+
+**Prefill is where `--expert-hot-rows` pays, and it is worth 2.6-2.7x.** The flag keeps a layer's
+hot experts in the arena the class already has -- an expert is resident iff this rank is asked for it
+twice or more over the pass -- so a row stages only what it asks for beyond them. The same 512-token
+prompt, the same four cards, the configurations alternating in one sitting: **143.9 / 140.1 / 138.0 /
+137.9 s at 0 rows and 52.8 / 51.1 / 53.2 / 51.8 s at 64**, with 41040 packed rows staged on rank 0
+falling to 5307, 87.1% of its draws answered out of the arena. Decode is not helped: a decode step is
+one row a layer and nothing in it repeats, so the set buys nothing there, and the one sitting that ran
+a no-set control beside it put the cost at 10-11% -- four index copies a layer, which is not the
+mechanism for a number that size, so that column is reported as measured and not explained, and the
+A-B-A-B that repeats the widths moves it further than the widths themselves do.
+`--expert-hot-rows 64` is the recommendation; 148 uncaps the arena
+and buys a further 6-7% for 2.3x the memory, and past it the wider arena is a measured loss -- in all
+four sittings that ran the pair, though the node's own drift is 1.6-5% of that, so it is the direction
+that is measured and not the size. What
+pays for the win is `_fill`, the one per-*layer* thing the class does -- 216.0 ms a layer at 64 rows,
+3.4 ms an expert row, 16-25% of the prefill it sits in. Full tables, per rank, in
+`docs/performance/deepseek_v4_1_flash_device_experts.md`.
 
 That 722-747 ms is a warm-page-cache figure, and until recently it was only as durable as the cache:
 `DeviceRoutedExperts` stages out of the checkpoint mapping, and this host holds 68-100 GiB of the
@@ -156,6 +177,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expert-world", type=int, default=None,
                         help="cards to deal the routed experts over. Default: the tree's world, "
                              "which is what a sharded tree requires")
+    parser.add_argument("--expert-hot-rows", type=int, default=0, metavar="N",
+                        help="arena rows a card keeps this layer's hottest experts in, refilled once "
+                             "a layer, so a prefill stages only what a row asks for beyond them. An "
+                             "expert is resident iff the layer asks this rank for it at least twice "
+                             "and the set is cut to N by count if it is wider. Needs --expert-device. "
+                             "0 is the configuration every number before it was measured on")
     parser.add_argument("--threads", type=int, default=None, metavar="N",
                         help="host threads this rank may use. `torchrun` sets OMP_NUM_THREADS to 1 "
                              "unless the environment already had one, and the expert staging, the "
@@ -234,6 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{'the host' if expert_device is None else f'{expert_device} x{expert_world}'}, "
         f"context {max_seq_len}, resident checkpoint "
         f"{'on' if resident_bank.enabled() else 'off'}"
+        + (f", {args.expert_hot_rows} resident rows a card" if args.expert_hot_rows else "")
     )
     started = time.perf_counter()
     front = load_backbone(
@@ -246,6 +274,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expert_cache=DEFAULT_EXPERT_CACHE if args.expert_cache is None else args.expert_cache,
         expert_device=expert_device,
         expert_world=expert_world,
+        expert_hot_rows=args.expert_hot_rows,
         # The bank is filled by rank 0 and attached by everyone else, so a rank here is both the
         # tree's rank and the stagger the bank wants: four ranks must not read `/mnt/data3` at once.
         expert_rank=rank,
@@ -291,6 +320,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         per = elapsed / len(result.tokens)
         say(f"{len(result.tokens)} tokens in {elapsed:.1f} s ({per:.2f} s/token), "
             f"stopped on {result.stopped}")
+
+    # What the resident set actually did, counted rather than timed -- the same counters the class
+    # keeps for exactly this, summed over the layers because each layer keeps its own. `drawn_rows`
+    # is every route this rank was dealt and `expert_rows` the ones that missed and had to be staged,
+    # so `drawn - staged` is the coverage the set bought and `filled_rows` is what bought it;
+    # `capped_layers` is where the arena was the binding constraint, which is the one thing a fixed
+    # capacity cannot say for itself and the reason it is a rule and not a number. A run whose fills
+    # are zero did not fill anything, and a run whose `expert_rows` is unchanged from the flag's
+    # absence did not help.
+    if expert_device is not None and args.expert_hot_rows and hasattr(held[0], "drawn_rows"):
+        drawn = sum(one.drawn_rows for one in held)
+        staged = sum(one.expert_rows for one in held)
+        covered = f"{100.0 * (drawn - staged) / drawn:.1f}% resident" if drawn else "nothing run"
+        say(
+            f"resident set: {sum(one.filled_rows for one in held)} expert rows filled over "
+            f"{len(held)} layers, {staged} of {drawn} draws staged as misses ({covered}), "
+            f"{sum(one.capped_layers for one in held)} layers cut to {args.expert_hot_rows} rows"
+        )
 
     if rank == 0:
         print(tokenizer.decode(prompt_ids + result.tokens), flush=True)

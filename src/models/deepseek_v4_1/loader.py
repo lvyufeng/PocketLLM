@@ -753,6 +753,7 @@ def load_backbone(
     expert_device: str | None = None,
     expert_world: int = 1,
     expert_rank: int = 0,
+    expert_hot_rows: int = 0,
     resident_experts: bool | None = None,
     world: int = 1,
     rank: int = 0,
@@ -793,6 +794,18 @@ def load_backbone(
     deliberately not in the segment: those keys are not routed experts or tables, `packed` leaves them
     on the mapping, and a second resident form of 16.79 GiB would cost the RAM twice.
 
+    `expert_hot_rows` gives each card a resident set of its own dealt experts and refills it once a
+    layer, so a prefill stages what a row asks for beyond the set rather than every draw. It is a
+    capacity, but the rule that fills it is not one: an expert is resident iff the layer asks this
+    card for it at least twice, which is what the sweep in
+    `docs/performance/deepseek_v4_1_flash_device_experts.md` measured to be worth 3.04x fewer packed
+    rows staged at 128 tokens and 6.54x at 512, four ranks summed. It needs `expert_device`, because
+    there is no arena to keep anything in otherwise, and it needs one arena a card rather than one a
+    layer: 64 slots a card of page-locked memory is 1.2 GiB, and forty layers each holding their own
+    is 47 GiB of a 22 GiB card. Both the arena and the pinned block it fills through are sized by
+    this number, so the memory is spent at startup and not as the layers get to it. Zero -- the
+    default -- is the configuration every number above it was measured on.
+
     `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
     itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
     -- and `checkpoint_weights` cuts the file's tensors to match; see `tp.py` for which boundaries are
@@ -823,8 +836,28 @@ def load_backbone(
 
     plan = ShardPlan.build(config, rank, world, moe_inter_dim=config.moe_inter_dim)
 
+    if expert_hot_rows and expert_device is None:
+        if progress is not None:
+            progress(
+                f"--expert-hot-rows {expert_hot_rows} needs --expert-device: the resident set is a "
+                "set of arena rows, and there is no arena on the host path"
+            )
+    # The arena and staging block every layer's resident experts share, built by whichever layer is
+    # constructed first. `hot_rows` slots a card is 1.2 GiB of device memory and as much again of
+    # page-locked RAM, so a layer holding its own would be 47 GiB of a 22 GiB card -- at a set worth
+    # having, one a layer does not fit. It is safe because the layers run one at a time and `forward`
+    # drains every kernel it issued before returning; `DeviceRoutedExperts.residents` documents it.
+    # Zero leaves the sharing off with it: with no resident set an arena is a row's own deal and
+    # nothing survives it, and one a layer is the configuration every number above was taken on.
+    residents = None
+
     def on_device(layer_id: int, n_experts: int) -> RoutedExperts | None:
         """A card-resident layer if the caller asked for one and the build works, else `None`."""
+        # The first layer built is the one that allocates the shared set, and every layer after it
+        # is handed the same one -- so this closure both reads and writes the binding, which is what
+        # `nonlocal` is here for. Without it the assignment at the end of this function would make
+        # `residents` a local of the closure and the read above it an error.
+        nonlocal residents
         if expert_device is None:
             return None
         # `--expert-device cuda:1 --expert-world 4` is cards 1 through 4, not `cuda:1:0`: the flag
@@ -848,7 +881,7 @@ def load_backbone(
             ranks = None
         owned = ranks if ranks is not None else list(range(expert_world))
         try:
-            return DeviceRoutedExperts(
+            instance = DeviceRoutedExperts(
                 checkpoint,
                 layer_id,
                 n_experts=n_experts,
@@ -859,6 +892,8 @@ def load_backbone(
                 world=expert_world,
                 ranks=ranks,
                 devices=[torch.device(base.type, first + r) for r in owned],
+                hot_rows=expert_hot_rows,
+                residents=residents,
             )
         except (RuntimeError, ValueError) as error:
             if progress is not None:
@@ -867,6 +902,9 @@ def load_backbone(
                     f"{type(error).__name__}: {error}"
                 )
             return None
+        if residents is None and instance.residents is not None:
+            residents = instance.residents
+        return instance
 
     routed = {}
     for layer_id in range(n_layers):

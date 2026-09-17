@@ -181,20 +181,52 @@ last token's logits -- and the pipelined run differs from the serial one by 2.0e
 spread. Comparing a pipelined prefill against a serial one and reading the difference as the pipeline
 would be reading run-to-run noise.
 
-Two things this deliberately does not do yet, all because they are separate measurements rather
-than separate opinions:
+Two things this does not do yet, and one it now does, all because they are separate measurements
+rather than separate opinions.
 
-* **Nothing is cached on the device between rows.** The arena is the two rows this row needs and it
-  is refilled every row, so a prefill of `n` rows pays the 4.20 GiB `n` times. A wider arena plus
-  `moe_multi_token_fp4_forward` -- one slot per distinct expert the batch hit, its tokens contiguous
-  -- is the shape that fixes it, and it is a follow-on rather than a knob, because an arena size and
-  an eviction policy only mean something once that measurement exists. The row-layer table above is
-  the number it is worth: at 128 tokens the staging is 6.4 ms of a 12 ms row-layer and 32,717 ms of a
-  48 s prefill, and it is paid once per route. What a per-layer slot set saves is the ratio of a
-  rank's routes to the distinct experts among them -- at 128 tokens, four ranks dealing six sorted ids
-  round-robin leave a rank 256 draws from the 384-expert space over the layer's 128 rows, and the
-  duplicates in those draws are what the design would stop paying for. It is worth more the longer
-  the prompt, which is the opposite of the pipeline above.
+**A per-layer resident set takes most of that staging off a prefill, and it is worth 2.6-2.7x.** At
+`hot_rows` above zero the layer's hottest experts stay in the shared arena and a row stages only what
+it asks for beyond them. One sitting, the same 512-token prompt, the two configurations alternating
+on the same four cards, four ranks under `torchrun`:
+
+| `--hot-rows` | prefill, ranks 0-3 | tok/s | staged, r0 | resident | filled, r0 | cut layers |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 143.9 / 140.1 / 138.0 / 137.9 s | 3.6 | 41040 | 0.0% | 0 | 0 |
+| 64 | 52.8 / 51.1 / 53.2 / 51.8 s | 9.8 | 5307 | 87.1% | 2547 | 39 / 40 / 19 / 19 |
+| 148 | 49.1 / 50.7 / 52.5 / 49.0 s | 10.4 | 1730 | 95.8% | 3932 | 0 |
+
+**2.6-2.7x** on every rank at 64 rows, and **7.8x** fewer packed rows staged on rank 0 against the
+6.54x the offline sweep predicted for this length -- the prediction was a four-rank sum and the deal
+is not even. `_split` gives a rank holding two of the six sorted slots two draws a row and a rank
+holding one gets one, so ranks 0 and 1 are dealt 41040 routes over the pass and ranks 2 and 3 half of
+that, and the narrower deal repeats more: 91.7% resident against 87.1% at the same width. The 39 and
+40 layers cut on ranks 0 and 1 in that column are the arena being the binding constraint there and
+nowhere else; uncut at 148 rows the staged count falls a further 3.1x, which buys 6-7% and costs 2.3x
+the arena. Wider than the routing needs is a loss: at 192 rows, on the same staged and filled rows as
+148, the prefill is 55.0 / 53.4 / 54.3 / 54.3 s and decode is slower too -- reproducible across two
+sittings and two orderings, and not explained by anything this class counts. 64 rows is where this
+curve flattens.
+
+What it costs is the fill, the one thing this class does per layer rather than per row and the one
+term the row-layer account above has no line for. Timed at the method itself on the top of the same
+512-token prefill, **216.0 ms a layer at 64 rows and 326.6 ms at 148 on rank 0** -- 8.6 s and 13.1 s
+of a 51.7 s and a 48.3 s prefill, near enough 3.4 ms an expert row. The fill is charged every layer
+and buys nothing on the first one, so it is a large fraction of what the set is worth on a prompt
+this length. Decode is the column it does not help: **0.668 s a token to 0.743 at 64 rows and 0.736
+at 148**, 11% either way. A decode step is one row a layer and one row asks each expert once, so
+nothing of it can be resident and `_fill` returns before it looks at anything; the whole of the
+per-row work the set adds is the index copy `_issue` makes only because the arena rows are no longer
+`0..k`, which is four 16-byte H2Ds a layer and not 1.9 ms of one.
+
+**The pipeline above is measured on the un-resident path, and it is not claimed for this one.** Its
+1.10x is a drain of 3.75 ms a row-layer made to overlap a staging of 6.3, and a prefill that stages
+7.8x fewer bytes is a prefill with 7.8x less to hide: what is left for a row-deep pipeline to overlap
+is the 4.20 GiB a full deal stages, and the resident column's staging is a fifth of that. Whether the
+loop still pays there is a separate measurement, and the two configurations have not been run against
+each other.
+
+Not yet, then:
+
 * **The dense tree's own quarter is now on the card beside this class, and the split moved.** With
   the tree on the host this class was the whole step's smaller half; with the tree cut across the
   four cards (TP4, `src/cli/generate_v41.py`) the activation arrives on a card rather than from the
@@ -250,6 +282,96 @@ def _copy_stream(device: torch.device) -> torch.cuda.Stream:
     return stream
 
 
+def _allocate_arena(
+    device: torch.device, rows: int, shapes: dict[tuple[str, str], tuple[int, ...]]
+) -> dict[tuple[str, str], torch.Tensor]:
+    """One card's arena: the rows a row stages into, then the rows the layer keeps."""
+    with torch.cuda.device(device):
+        return {
+            (which, kind): torch.empty(
+                (rows,) + shapes[(which, kind)], dtype=torch.uint8, device=device
+            )
+            for which in PROJECTIONS
+            for kind in KINDS
+        }
+
+
+class ResidentSet:
+    """The arena and the staging block every layer's resident experts share, one of each a card.
+
+    A resident set is worth having only at a size forty of them do not fit. At 64 slots a card it is
+    1.2 GiB of device memory and as much again of page-locked host memory, so a layer holding its own
+    would be 47 GiB of a 22 GiB card and 48 GiB of unswappable RAM. One set, refilled by whichever
+    layer is running, is safe because the layers run one at a time and each `forward` drains every
+    kernel it issued before it returns -- and because the device arena holds no state between layers,
+    only bytes.
+
+    The two halves are the same size and for the same reason. `_fill` copies out of the checkpoint
+    into `pinned` and then DMA-copies `pinned` into `arena`, so the host block is not an
+    implementation detail of the transfer: at `hot_rows` slots it is as much memory as the card's
+    copy, and sharing one without the other would halve the saving.
+
+    `events` is one a card for the fill's own DMA, and it is here rather than in the layer for the
+    same reason: the next layer's host write into `pinned` has to be behind the previous layer's read
+    of it, and with forty layers sharing one block that guarantee cannot live in forty instances.
+    """
+
+    def __init__(
+        self,
+        *,
+        hot_rows: int,
+        rows_per_card: int,
+        ranks: Sequence[int],
+        devices: Sequence[torch.device],
+        shapes: dict[tuple[str, str], tuple[int, ...]],
+    ) -> None:
+        self.hot_rows = int(hot_rows)
+        self.rows_per_card = int(rows_per_card)
+        self.arena_rows = self.rows_per_card + self.hot_rows
+        self.ranks = list(ranks)
+        self.devices = list(devices)
+        self._shapes = shapes
+        self.arena: list[dict[tuple[str, str], torch.Tensor]] = [
+            _allocate_arena(device, self.arena_rows, self._shapes) for device in self.devices
+        ]
+        self.events: list[torch.cuda.Event] = []
+        for device in self.devices:
+            with torch.cuda.device(device):
+                self.events.append(torch.cuda.Event())
+        # Built on the first fill and not here: a decode-only run never fills, and this many rows of
+        # page-locked memory is not something to allocate for a set that will always be empty.
+        self._pinned: dict[tuple[str, str], torch.Tensor] | None = None
+
+    @property
+    def pinned(self) -> dict[tuple[str, str], torch.Tensor]:
+        """The page-locked block the fill stages through, one card's worth laid end to end."""
+        if self._pinned is None:
+            self._pinned = {
+                (which, kind): torch.empty(
+                    (len(self.ranks) * self.hot_rows,) + self._shapes[(which, kind)],
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                )
+                for which in PROJECTIONS
+                for kind in KINDS
+            }
+        return self._pinned
+
+    @property
+    def arena_bytes(self) -> int:
+        """Packed fp4 bytes one card's arena occupies on the device."""
+        return self.arena_rows * sum(shape[0] * shape[1] for shape in self._shapes.values())
+
+    @property
+    def pinned_bytes(self) -> int:
+        """Page-locked host bytes the fill stages through, zero until the first fill asks."""
+        if self._pinned is None:
+            return 0
+        return len(self.ranks) * self.hot_rows * sum(
+            shape[0] * shape[1] for shape in self._shapes.values()
+        )
+
+
 class DeviceRoutedExperts(RoutedExperts):
     """One layer's routed experts held as fixed `ceil(topk / world)`-row arenas, one per card driven.
 
@@ -280,6 +402,8 @@ class DeviceRoutedExperts(RoutedExperts):
         ranks: Sequence[int] | None = None,
         devices: Sequence[torch.device | str] | None = None,
         pinned_buffers: int = 2,
+        hot_rows: int = 0,
+        residents: ResidentSet | None = None,
     ) -> None:
         # Bound here rather than imported at module scope: `loader.py` is what builds this class, so
         # a module-level import of it would be a cycle. By the time an instance exists `loader` is
@@ -325,12 +449,44 @@ class DeviceRoutedExperts(RoutedExperts):
         # Counters rather than a timing harness: how many rows and expert rows this class has moved
         # is what says whether a run is behaving like the model it started as.
         self.rows = 0
+        # The draw is the unit the resident set is sized against -- one route of one row on one
+        # card -- and it is not `expert_rows`, which counts only the draws that missed and had to be
+        # staged. Both are needed: `drawn_rows - expert_rows` is what the set hit, and that over
+        # `drawn_rows` is its hit rate. Counting only the misses would make a set that worked look
+        # like a model doing less work rather than like one that moved less.
+        self.drawn_rows = 0
         self.expert_rows = 0
 
         # The split is round-robin over the sorted expert ids, so a card's widest case is
         # `ceil(topk / world)` and every row is the same shape -- which is what makes it fixed.
         self.rows_per_card = -(-topk // world)
         self._buffers = max(1, pinned_buffers)
+
+        # The resident set above those rows: `hot_rows` slots a layer keeps on the card and refills
+        # once, then the `rows_per_card` a row's misses still stage into. Zero is the configuration
+        # every measurement above this was taken on -- the arena is the row's own deal and nothing
+        # survives it -- and it is the control column for the set. See `_hot_rows` for which experts
+        # go in it, which is not a capacity but a rule.
+        self.hot_rows = max(0, int(hot_rows))
+        self.arena_rows = self.rows_per_card + self.hot_rows
+        # Counted rather than timed, like `rows` and `expert_rows`: how much of a prefill the resident
+        # set actually covered is the number that says whether it is doing what it was built for. A
+        # fill is a row staged too, just once for the layer rather than once for the row, so the two
+        # counters are the two halves of what this class moved and `expert_rows` is the per-row half.
+        # What the set *covered* is then `drawn_rows - expert_rows`: a draw that is resident is a
+        # draw the class did not move at all, and `filled_rows` counts the rows that bought it.
+        self.filled_rows = 0
+        # A layer whose `>= 2` set is wider than the arena, and the count of them. Not an error and
+        # not silent: a nonzero count says `hot_rows` is the binding constraint here and by how much
+        # the set had to be cut, which is the one thing a fixed capacity cannot say for itself.
+        self.capped_rows = 0
+        self.capped_layers = 0
+        # The resident set of the layer currently running, per local card: the expert ids in arena
+        # order, and the id -> arena row map `_stage_row` reads for every route of every row. The two
+        # are per layer and not per run -- `_fill` rewrites them for the pass that is starting -- and
+        # the arena they name is the one below, shared with every other layer of the model.
+        self._hot_ids: list[list[int]] = [[] for _ in self.ranks]
+        self._hot_map: list[dict[int, int]] = [{} for _ in self.ranks]
 
         # Shapes from the checkpoint rather than from the config: the arena has to match the tensor
         # `copy_` is handed, so deriving it from the same place the tensor comes from means a
@@ -359,20 +515,42 @@ class DeviceRoutedExperts(RoutedExperts):
             }
             for _ in range(self._buffers)
         ]
-        self._on_device = []
-        for device in self.devices:
-            with torch.cuda.device(device):
-                self._on_device.append(
-                    {
-                        (which, kind): torch.empty(
-                            (self.rows_per_card,) + self._shapes[(which, kind)],
-                            dtype=torch.uint8,
-                            device=device,
-                        )
-                        for which in PROJECTIONS
-                        for kind in KINDS
-                    }
+        # Where the layer keeps its resident experts, and it is handed in rather than allocated here.
+        # A set is worth having only at a size forty of them do not fit -- 64 slots a card is 1.2 GiB
+        # of a 22 GiB card and as much again of page-locked RAM -- so `loader.load_backbone` builds
+        # one per card and every layer of the model shares it; see `ResidentSet`. With `hot_rows` at
+        # zero there is no set and this is `None`, which is what keeps the arena a row's own deal and
+        # nothing more, exactly as it was before any of this existed.
+        if self.hot_rows and residents is None:
+            residents = ResidentSet(
+                hot_rows=self.hot_rows,
+                rows_per_card=self.rows_per_card,
+                ranks=self.ranks,
+                devices=self.devices,
+                shapes=self._shapes,
+            )
+        if residents is not None:
+            if residents.hot_rows != self.hot_rows:
+                raise ValueError(
+                    f"a shared set of {residents.hot_rows} rows for a layer that asked for "
+                    f"{self.hot_rows}"
                 )
+            if residents.arena_rows != self.arena_rows:
+                raise ValueError(
+                    f"a shared arena of {residents.arena_rows} rows where {self.rows_per_card} "
+                    f"staged rows and {self.hot_rows} resident ones need {self.arena_rows}"
+                )
+            if len(residents.arena) != len(self.devices):
+                raise ValueError(f"{len(residents.arena)} arenas for {len(self.devices)} devices")
+        self._residents = residents
+
+        self._on_device = []
+        if residents is None:
+            for device in self.devices:
+                self._on_device.append(self._allocate(device))
+        else:
+            self._on_device = list(residents.arena)
+
         # `None` means "no copy in flight from this buffer", which is the state a fresh buffer is in.
         # The events themselves are allocated here and reused: one per card per buffer, 8 for the
         # four-card case, rather than one per copy per row, which would be 320 a token.
@@ -382,6 +560,18 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._events.append([torch.cuda.Event() for _ in range(self._buffers)])
         self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in self.ranks]
         self._next_buffer = 0
+
+        # One event per card for the *fill*'s H2D. `_take_buffer`'s events cannot serve here: the
+        # fill reads a block of its own, one fill a layer, and what has to be ordered is the next
+        # layer's host write against this layer's DMA -- which with a shared set is a different
+        # instance's fill, so the events come from the set rather than from this instance.
+        self._hot_events: list[torch.cuda.Event] = []
+        if residents is not None:
+            self._hot_events = residents.events
+        else:
+            for device in self.devices:
+                with torch.cuda.device(device):
+                    self._hot_events.append(torch.cuda.Event())
 
         # One event per card for the *result* copy back, reused the same way. `_issue` records it
         # after that card's D2H is issued and `_drain` waits on it once every card has been issued, so
@@ -399,6 +589,21 @@ class DeviceRoutedExperts(RoutedExperts):
         self._route: torch.Tensor | None = None
 
     # -- what the checkpoint gave us ---------------------------------------------------------
+
+    def _allocate(self, device: torch.device) -> dict[tuple[str, str], torch.Tensor]:
+        """One card's arena, on the `hot_rows=0` path where there is no set to share."""
+        return _allocate_arena(device, self.arena_rows, self._shapes)
+
+    @property
+    def residents(self) -> ResidentSet | None:
+        """The set this layer shares with the rest of the model, or `None` if it keeps its own.
+
+        `loader.load_backbone` builds one and hands it to every layer, which is the only shape that
+        fits: what comes back here is what the next layer should be given. What it must not do is
+        hand it to two layers that run at once -- nothing here is reentrant, and `_fill` rewrites
+        the resident rows of whatever layer is starting.
+        """
+        return self._residents
 
     def _expected(self, which: str) -> tuple[int, int]:
         """The `[rows, K/2]` an expert's `which` projection must be, from this layer's geometry."""
@@ -447,11 +652,32 @@ class DeviceRoutedExperts(RoutedExperts):
 
     @property
     def arena_bytes(self) -> int:
-        """Packed fp4 bytes this instance holds per side of PCIe, summed over its cards."""
+        """Packed fp4 bytes this instance holds per side of PCIe, summed over its cards.
+
+        The whole arena and not only the rows a row stages into: with a resident set the arena is
+        `rows_per_card + hot_rows` tall, it is allocated at that height once, and the fill is what
+        the extra rows are for.
+
+        A layer handed a set holds no arena of its own, so it reports the set's -- which is the same
+        bytes forty times over if a caller sums this across the layers, the failure mode the sharing
+        exists to prevent and the reason this reads the set rather than its own shape.
+        `resident_bytes` gives the same shape of answer for the same reason.
+        """
+        if self._residents is not None:
+            return self._residents.arena_bytes * len(self._residents.ranks)
         per_card = sum(
-            self.rows_per_card * shape[0] * shape[1] for shape in self._shapes.values()
+            self.arena_rows * shape[0] * shape[1] for shape in self._shapes.values()
         )
         return per_card * len(self.ranks)
+
+    @property
+    def resident_bytes(self) -> int:
+        """Pinned host bytes the fill stages through, zero until the first fill allocates them.
+
+        Per *set* and not per layer: forty layers share one block, so this is not forty times what a
+        layer's own would be -- which is the whole reason the set is handed in rather than built.
+        """
+        return 0 if self._residents is None else self._residents.pinned_bytes
 
     # -- the plan ---------------------------------------------------------------------------
 
@@ -478,6 +704,145 @@ class DeviceRoutedExperts(RoutedExperts):
     def _key(self, expert: int, which: str) -> str:
         return f"layers.{self.layer_id}.ffn.experts.{expert}.{which}.weight"
 
+    # -- the resident set -------------------------------------------------------------------
+
+    def _hot_rows(self, ordered: torch.Tensor, card: int) -> list[int]:
+        """The experts this card is dealt **at least twice** over the layer's rows, in id order.
+
+        `ordered` is the layer's whole routing as `[rows, topk]`, sorted along the row -- one sort
+        shared by every card rather than one a card.
+
+        That rule and not a capacity is the whole design, and the measurement is what makes it one:
+        a prefill of `n` rows deals each card `n` x (its share of `topk`) draws from the same 384
+        experts, and the repeats among them are what the arena would otherwise pay for twice. What a
+        cache can save is bounded by the repeats -- an expert asked once has no second draw to hit --
+        so a set chosen by an eviction policy or a cap is choosing a *truncation* of this one, and
+        the sweep that sized the arena is a sweep of those truncations rather than of the rule.
+
+        It is also why the set needs no state between layers: the routing for the whole layer is on
+        the host before the first row is staged (`_route_ids`), so this is counting, not predicting,
+        and the layer it is counted for is the layer it is filled for.
+
+        The deal is the same one `_split` makes, walked from the other end: sort the row's ids and
+        position `p` belongs to rank `p % world`. So the columns a rank owns are `rank, rank +
+        world, ...`, and the multiset of what it was dealt is those columns of the sorted routing.
+        """
+        if not self.hot_rows:
+            return []
+        columns = [p for p in range(self.topk) if p % self.world == self.ranks[card]]
+        if not columns:
+            return []
+        experts, counts = torch.unique(ordered[:, columns].reshape(-1), return_counts=True)
+        repeat = counts >= 2
+        experts, counts = experts[repeat], counts[repeat]
+        width = int(experts.numel())
+        if width > self.hot_rows:
+            # The arena is the ceiling and this is it binding. Keeping the hottest is the only
+            # choice that leaves the count monotone in the arena, so a larger `hot_rows` can only
+            # stage fewer rows -- which is what makes the knob sweepable rather than a step
+            # function. Counted, because a run where this fires is a run whose set was cut.
+            counts, picked = counts.topk(self.hot_rows)
+            experts = experts[picked]
+            self.capped_layers += 1
+            self.capped_rows += width - self.hot_rows
+        return [int(e) for e in experts.sort().values]
+
+    def _reserve_hot(self) -> dict[tuple[str, str], torch.Tensor]:
+        """The pinned block the fill stages through, one card's worth laid end to end.
+
+        On the set, so it is allocated once for the model rather than once a layer, and lazily, so a
+        run that never fills never pays for it.
+        """
+        return self._residents.pinned
+
+    def _hot_row(self, card: int, row: int) -> slice:
+        """The pinned rows the local card `card`'s resident arena row `row` lives in."""
+        start = card * self.hot_rows + row
+        return slice(start, start + 1)
+
+    def _fill(self, route: torch.Tensor) -> None:
+        """Put this layer's resident set on the cards, once, before its first row is staged.
+
+        This is the one place the class does work per *layer* rather than per row, and it is serial
+        on purpose. The host copy out of the bank and the H2D cannot overlap each other the way a
+        row's staging and a previous row's kernel do, because the H2D reads the pinned bytes the
+        host copy is still writing -- and the row's own staging can only start after the arena it
+        will read is complete. So the fill is: count, stage, issue, go.
+
+        Timed here rather than reconstructed from the counters -- `/tmp/probe_v41_resident_fill.py`
+        wraps this method and charges one `perf_counter` a layer -- the fill is **216.0 ms a layer at
+        64 slots a card and 326.6 ms at 148**, on the top of a 512-token prefill, which is 8.6 s and
+        13.1 s of a 51.7 s and a 48.3 s prefill and near enough **3.4 ms an expert row**. That is
+        2.6x what this paragraph used to claim from arithmetic, and the reason is that the fill pays
+        *two* copies a row where `_stage` pays one: the bank into the pinned block at 17.9 MiB and
+        then the pinned block into the arena at 17.9 MiB again, the second reading bytes the first
+        has just written, so the two halves do not add up to the one-directional 14 GiB/s `_stage`
+        reaches. It is charged every layer whether or not the layer has anything new to say, and the
+        first layer of a pass is buying nothing with it.
+
+        What it buys is what `_hot_rows` documents and the sweep in
+        `docs/performance/deepseek_v4_1_flash_device_experts.md` prices: **2.6-2.7x on a 512-token
+        prefill** at 64 slots a card, 7.8x fewer packed rows staged on rank 0 (41040 to 5307) and
+        87.1% of the rank's draws answered out of the arena, four ranks summed, against the arena
+        and the pinned block both sized by `hot_rows`.
+
+        The rows a layer's misses stage into start at `self.hot_rows` and not at `len(hot)` here,
+        so that every layer's rows land in the same place in the arena. The gap between the two is
+        dead bytes in the arena, which is allocated at the capacity anyway, and in exchange the
+        index arithmetic a row hands the kernel is a constant offset rather than a per-layer one.
+        """
+        # Sorted once for every card: the deal reads a row's ids in ascending order, so each card's
+        # multiset is a fixed set of columns of the same sorted routing. `planned` is empty for a
+        # single-row set -- one row asks each expert once and nothing of it can be resident -- and
+        # for a layer where every card drew each of its own experts exactly once.
+        planned = (
+            [self._hot_rows(route.sort(dim=1).values, card) for card in range(len(self.ranks))]
+            if route.shape[0] > 1 and self.hot_rows
+            else []
+        )
+        if not any(planned):
+            # Nothing to move and nothing to keep -- and the maps are emptied rather than left,
+            # because they are state from the last pass this layer ran and a route that read a stale
+            # one would name an arena row this pass never filled. That is the decode-after-prefill
+            # case, and it is the reason this branch is not merely an optimisation.
+            for card in range(len(self.ranks)):
+                self._hot_ids[card] = []
+                self._hot_map[card] = {}
+            return
+        pinned = self._reserve_hot()
+        for card, ids in enumerate(planned):
+            self._hot_ids[card] = ids
+            self._hot_map[card] = {expert: row for row, expert in enumerate(ids)}
+            if not ids:
+                continue
+            # The previous fill's DMA has left this block, or this write races it -- and with one
+            # block shared by forty layers, "the previous fill" is whichever layer last ran, which is
+            # why the event is the set's and not this instance's. It has, by the end of that layer's
+            # `forward`: every row of it waited on the copy stream before its kernel and every kernel
+            # was drained before `forward` returned. This is the wait that says so rather than the
+            # argument that it must be so.
+            self._hot_events[card].synchronize()
+            for row, expert in enumerate(ids):
+                for which in PROJECTIONS:
+                    weight = self._key(expert, which)
+                    for kind, key in (("q", weight), ("s", self._scale_key(weight))):
+                        pinned[(which, kind)][self._hot_row(card, row)].copy_(
+                            self.checkpoint.packed(key).view(torch.uint8)
+                        )
+            device = self.devices[card]
+            stream = _copy_stream(device)
+            rows = slice(card * self.hot_rows, card * self.hot_rows + len(ids))
+            with torch.cuda.device(device):
+                # Behind this card's own compute stream, which is where the previous layer's kernels
+                # were: the fill rewrites arena rows those kernels read, and the two are on different
+                # streams so nothing else would order them.
+                stream.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(stream):
+                    for key, destination in self._on_device[card].items():
+                        destination[: len(ids)].copy_(pinned[key][rows], non_blocking=True)
+                    self._hot_events[card].record(stream)
+            self.filled_rows += len(ids)
+
     def _take_buffer(self) -> int:
         """The next pinned buffer to stage into, after the DMA that last read it has finished.
 
@@ -499,8 +864,12 @@ class DeviceRoutedExperts(RoutedExperts):
         start = card * self.rows_per_card + arena_row
         return slice(start, start + 1)
 
-    def _stage(self, buffer: int, ids: Sequence[int], cards: list[list[tuple[int, int]]]) -> None:
+    def _stage(self, buffer: int, ids: Sequence[int], misses: list[list[tuple[int, int]]]) -> None:
         """One `copy_` per tensor out of the host source into the row an expert owns.
+
+        `misses` is what the row still has to stage after the resident set has been accounted for
+        -- `(miss row, route slot)` per local card, in the order `_split` dealt them -- so with
+        `hot_rows=0` it is the whole deal and this is the loop it always was.
 
         `checkpoint.packed` is the subject here, and it decides the source: the shard mapping, or the
         resident bank when one is attached. Out of the mapping it uses `entry_view` and not `view`,
@@ -511,20 +880,22 @@ class DeviceRoutedExperts(RoutedExperts):
         filled from the disk once, before the first step. It is not a faster `copy_`: 14 GiB/s either
         way. What it removes is the disk.
         """
-        for card, members in enumerate(cards):
+        for card, members in enumerate(misses):
+            if not members:
+                continue
             arena = self._pinned[buffer]
-            for arena_row, slot in members:
+            for miss_row, slot in members:
                 for which in PROJECTIONS:
                     weight = self._key(ids[slot], which)
                     for kind, key in (("q", weight), ("s", self._scale_key(weight))):
                         # F8_E8M0 has no CPU `copy_` from a pyloaded view, so both halves travel as
                         # the `uint8` the kernel reads them as.
-                        arena[(which, kind)][self._row(card, arena_row)].copy_(
+                        arena[(which, kind)][self._row(card, miss_row)].copy_(
                             self.checkpoint.packed(key).view(torch.uint8)
                         )
             self.expert_rows += len(members)
 
-    def _upload(self, buffer: int, cards: list[list[tuple[int, int]]]) -> None:
+    def _upload(self, buffer: int, misses: list[list[tuple[int, int]]]) -> None:
         """One asynchronous copy stream per card, each recording an event the host waits on later.
 
         Four links at once is the whole point of the split: measured, one card takes 10.47 GiB/s and
@@ -534,18 +905,26 @@ class DeviceRoutedExperts(RoutedExperts):
         A card's copy is also ordered behind that card's own compute stream, which is where its
         previous kernel was launched: without that the copy could refill an arena a kernel is still
         reading, and the two are on different streams so nothing else would order them.
+
+        What crosses is the miss rows and not the arena, so a row the resident set covers entirely
+        costs no H2D at all -- and the destination is the arena's own tail, which is where `_stage`
+        put the pinned bytes and where the row's indices will point.
         """
-        for card, members in enumerate(cards):
-            if not members:
+        for card, members in enumerate(misses):
+            k = len(members)
+            if not k:
                 continue
             device = self.devices[card]
             stream = _copy_stream(device)
-            rows = slice(card * self.rows_per_card, (card + 1) * self.rows_per_card)
+            source = slice(card * self.rows_per_card, card * self.rows_per_card + k)
+            destination = slice(self.hot_rows, self.hot_rows + k)
             with torch.cuda.device(device):
                 stream.wait_stream(torch.cuda.current_stream(device))
                 with torch.cuda.stream(stream):
-                    for key, destination in self._on_device[card].items():
-                        destination.copy_(self._pinned[buffer][key][rows], non_blocking=True)
+                    for key, target in self._on_device[card].items():
+                        target[destination].copy_(
+                            self._pinned[buffer][key][source], non_blocking=True
+                        )
                     self._events[card][buffer].record(stream)
             self._uploaded[card][buffer] = True
 
@@ -567,6 +946,11 @@ class DeviceRoutedExperts(RoutedExperts):
         scratch = {
             "x": torch.empty((1, dim), dtype=x_row.dtype, pin_memory=True),
             "w": torch.empty((self.topk,), dtype=torch.float32, pin_memory=True),
+            # The arena row per route, in the same card order `w` is gathered in. Sized for `topk`
+            # because that is the widest a row's own routes can be, and only filled when there is a
+            # resident set -- without one the arena rows are `0..rows_per_card` in order and
+            # `idx_device` below is already that, which is what keeps `hot_rows=0` the same call.
+            "idx": torch.empty((self.topk,), dtype=torch.int64, pin_memory=True),
             "x_device": [torch.empty((1, dim), dtype=x_row.dtype, device=d) for d in self.devices],
             "w_device": [
                 torch.empty((self.rows_per_card,), dtype=torch.float32, device=d)
@@ -602,15 +986,16 @@ class DeviceRoutedExperts(RoutedExperts):
         expert's. Nothing else about a row changes -- the arena is the same, the deal is the same,
         and a card that is not in `ranks` is staged by whoever owns it.
 
-        The arena's expert ids are relative -- a card's rows are 0 and 1 -- so the 384-expert space
-        never reaches a kernel, and `experts_start_idx` is 0 because there is nothing to rebase:
-        `local` is only ever an arena row. A card holding one expert is called with one index rather
-        than with a zero second row, so the unused row is never read.
+        The arena's expert ids are relative -- a card's rows are its own arena's rows whatever the
+        384-expert space did -- so the global id never reaches a kernel, and `experts_start_idx` is 0
+        because there is nothing to rebase: `local` is only ever an arena row. A card holding one
+        expert is called with one index rather than with a zero second row, so the unused row is
+        never read.
 
         The routing weights are gathered on the host, in the same order the indices are handed over:
-        route `r` of the call is arena row `r`, which is `members[r]`, so the two have to be permuted
-        together or the kernel would scale one expert's output by another's weight -- a wrong answer
-        that no shape check would catch.
+        route `r` of the call is arena row `r`, and `_stage_row` has already resolved which row that
+        is, so the two lists travel together or the kernel would scale one expert's output by
+        another's weight -- a wrong answer that no shape check would catch.
 
         **Issue, then drain.** The two loops below are the same four calls the card loop used to make
         one at a time, and the split between them is the whole of what a card is worth here: a
@@ -639,11 +1024,16 @@ class DeviceRoutedExperts(RoutedExperts):
         else:
             scratch["x"].copy_(x_row)
         # One gather for the row, in card order, so card `c`'s weights are a contiguous slice. The
-        # permutation follows the weights to whichever device the gate produced them on.
+        # permutation follows the weights to whichever device the gate produced them on. `flat` is
+        # the row's routes *this process* holds as `(arena row, route slot)` -- `_stage_row` resolved
+        # the arena row, which is the resident one where the expert is in the set and a miss row
+        # otherwise -- and the two lists below are its two halves.
+        flat = [(row, slot) for members in cards for row, slot in members]
         perm = torch.tensor(
-            [slot for members in cards for _, slot in members],
-            dtype=torch.int64,
-            device=weights_row.device,
+            [slot for _, slot in flat], dtype=torch.int64, device=weights_row.device
+        )
+        scratch["idx"].narrow(0, 0, len(flat)).copy_(
+            torch.tensor([row for row, _ in flat], dtype=torch.int64)
         )
         # `perm` is the routes *this process* holds, which under a deal is fewer than `topk` -- the
         # else of them are a sibling rank's arena rows and its share of the sum. `scratch["w"]` is
@@ -670,6 +1060,13 @@ class DeviceRoutedExperts(RoutedExperts):
                 scratch["w_device"][card].narrow(0, 0, k).copy_(
                     scratch["w"].narrow(0, offset, k), non_blocking=True
                 )
+                if self.hot_rows:
+                    # The arena rows are not `0..k` once there is a resident set, so the indices
+                    # travel with the weights. Without one they are, and `idx_device` was built as
+                    # that arange once for the whole run.
+                    scratch["idx_device"][card].narrow(0, 0, k).copy_(
+                        scratch["idx"].narrow(0, offset, k), non_blocking=True
+                    )
             offset += k
             scratch["y_device"][card] = self._extension.moe_single_token_fp4_forward(
                 scratch["x_device"][card],
@@ -737,6 +1134,12 @@ class DeviceRoutedExperts(RoutedExperts):
         # loop: under the pipeline below the card's stream already has the previous row's kernel on
         # it when a row would ask, so a per-row read is a per-row wait. See `_route_ids`.
         route = self._route_ids(indices)
+        # The resident set is a pass over the routing this process already has in host memory, so it
+        # is made here, before the first row is staged, rather than inside the loop. A decode step is
+        # one row and a single row asks each expert once, so the set is empty there by construction
+        # and `_fill` clears it and returns; only a prefill has rows to compare against each other.
+        if self.hot_rows:
+            self._fill(route)
         # One row in flight, and the row loop is arranged so that the *host* work of row `k+1` runs
         # while row `k`'s card-side chain does. The order inside the loop is what does it: the stage
         # and the H2D are issued for row `k+1` first, and only then is row `k` drained -- so the wait
@@ -794,15 +1197,37 @@ class DeviceRoutedExperts(RoutedExperts):
     ) -> list[list[tuple[int, int]]]:
         """Put one row's bytes where its cards can reach them, and return the deal they were put in.
 
+        What comes back is `(arena row, route slot)` per local card and it is the whole of what the
+        row hands the kernel: the resident set has been resolved here, so a route whose expert is
+        resident names the row it was filled into and a route that missed names the next free row of
+        the arena's tail. The staging below is only ever the misses, which is where the class stops
+        paying for the repeats.
+
         Everything here is host-side and none of it reads a result: the routing, the arena row, the
         pinned staging and the H2D. That is what lets `forward` run it ahead of the *previous* row's
         drain, and it is the whole of why this is not inside `_issue`. `ids_row` is a row of the host
         copy `_route_ids` took, so the list comprehension below is a read of host memory.
         """
         ids = [int(e) for e in ids_row.tolist()]
-        cards = self._split(ids)
+        cards: list[list[tuple[int, int]]] = []
+        misses: list[list[tuple[int, int]]] = []
+        drawn = 0
+        for card, members in enumerate(self._split(ids)):
+            drawn += len(members)
+            resident = self._hot_map[card]
+            placed: list[tuple[int, int]] = []
+            miss: list[tuple[int, int]] = []
+            for _, slot in members:
+                row = resident.get(ids[slot])
+                if row is None:
+                    row = self.hot_rows + len(miss)
+                    miss.append((len(miss), slot))
+                placed.append((row, slot))
+            cards.append(placed)
+            misses.append(miss)
         buffer = self._take_buffer()
-        self._stage(buffer, ids, cards)
-        self._upload(buffer, cards)
+        self._stage(buffer, ids, misses)
+        self._upload(buffer, misses)
         self.rows += 1
+        self.drawn_rows += drawn
         return cards
