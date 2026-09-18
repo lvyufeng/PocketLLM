@@ -100,12 +100,22 @@ bool invoke(Plan plan, Run run, aclrtStream stream) {
 }
 
 // y[b, r] = dot(x[b, :], weight[r, :]) for either an FP16 or an FP32 output.
+//
+// `x_stride` or `y_stride` of 0 is not a degenerate pitch, it is a broadcast: the
+// tensor's row dimension repeats one row of storage, so a batch of sixteen is
+// sixteen reads of the same row (or sixteen writes of the same row). A decode
+// step reaches the first of those on every projection it makes -- one activation
+// row, a sixteen-row tile, and a zero activation stride -- which is what put the
+// case here.
 bool matmul_rows(const uint16_t* x, const uint16_t* weight, void* y,
                  aclDataType out_dtype, int batch, int rows, int cols,
                  int x_stride, int y_stride, int weight_stride, void* stream) {
     if (x == nullptr || weight == nullptr || y == nullptr) return false;
     if (batch <= 0 || rows <= 0 || cols <= 0) return false;
-    if (x_stride < cols || y_stride < rows || weight_stride < cols) return false;
+    if ((x_stride != 0 && x_stride < cols) ||
+        (y_stride != 0 && y_stride < rows) || weight_stride < cols) {
+        return false;
+    }
 
     const int64_t b = batch;
     const int64_t r = rows;
