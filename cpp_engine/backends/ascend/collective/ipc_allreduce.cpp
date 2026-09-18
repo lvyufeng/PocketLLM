@@ -162,20 +162,25 @@ int poll_sleep_us() {
 
 // `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US` pauses between the poll finding every
 // peer's stamp and the reduce reading the plane that stamp announces. It is a
-// diagnostic, not a tuning knob, and it exists to test one hypothesis about a
-// non-reproducibility that the engine sees and the isolated probe does not: a
-// peer's stamp is pushed behind its plane on one stream, so a stamp that has
-// landed means the plane before it has landed -- but only if two cross-device
-// D2D copies on one stream really do complete in order. If they do not, the
-// reduce reads a plane that is still arriving and the sum is wrong by however
-// much of the copy had not landed. Sleeping here cannot repair that; it only
-// makes the window empty, which is what separates "the arrival signal is early"
-// from every other explanation. See
-// docs/performance/ascend_single_request_tps.md 5.5.4.
+// diagnostic, not a tuning knob, and the hypothesis it was built to test is
+// withdrawn. That hypothesis was a non-reproducibility the engine saw and the
+// isolated probe did not: a peer's stamp is pushed behind its plane on one stream,
+// so a stamp that has landed means the plane before it has landed -- but only if two
+// cross-device D2D copies on one stream really do complete in order. The failures it
+// was read against were the partial-RoPE table aliasing WorkspacePool's Intermediate
+// slot, a race between a blocking H2D copy and an attention kernel the host had
+// already queued, and they are gone with that slot separated and nothing about the
+// barrier changed.
 //
-// It composes with `DEVWAIT`, which is the arm that most needs it: there the
-// arrival is decided on the device, so the delay has to be preceded by a stream
-// drain or it opens a window that does not exist. See the call site.
+// What the switch does is still real -- on a build that has that race it puts the
+// failure rate on a dose-response -- but what it sorts on is not the arrival signal.
+// Delaying here moves the phase of the table's upload window against the kernels
+// already queued behind it, and the rate falls from 10 of 10 at 0 us to 0 of 4 at
+// 500. See docs/performance/ascend_single_request_tps.md 5.5.4.
+//
+// It composes with `DEVWAIT`, where the arrival is decided on the device, so the
+// delay has to be preceded by a stream drain or it lands while the wait kernel is
+// still spinning and opens no window at all. See the call site.
 int settle_us() {
     static const int us = [] {
         const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US");
@@ -192,29 +197,20 @@ int settle_us() {
 // enqueues `qwen_ipc_arrive_wait_kernel` instead and returns, leaving stream order
 // to carry the dependency.
 //
-// It was written as a candidate and it is not one. Measured interleaved against the
-// host poll -- ten pairs, one run of each arm per pair -- it takes the step from
-// 77.117 to 53.745 ms and the decode from 12.968 to 18.607 TPS, and it fails the
-// launcher's reproducibility gate in **ten of the ten** runs while the host poll
-// fails it in none of ten. The wait is not wrong; the arrival signal is early. A
-// peer's stamp can land before its plane is readable by this rank's reduce kernel,
-// and the host round trip -- ~0.25 ms spent between seeing the last stamp and
-// enqueuing the reduce -- is what has been covering that window, imperfectly: the
-// shipped arm fails the same gate 8 times in 36. `SETTLE_US`, which inserts exactly
-// that delay and nothing else, puts the failure rate on a dose-response (10 of 10
-// at 0 us, 2 of 4 at 20, 1 of 4 at 100, 0 of 4 at 500), which is the evidence that
-// the window is what it is.
+// It was written as a candidate, withdrawn as a wrong-result arm, and is a candidate
+// again. The rate it was withdrawn on -- ten interleaved pairs, ten gate failures
+// against the host poll's none -- was the partial-RoPE table aliasing a
+// WorkspacePool slot, a defect with a fix of its own and nothing to do with the
+// arrival wait. Interleaved on that fix it takes the step from 76.10-77.66 to
+// 53.02-53.88 ms and the decode from 12.88-13.14 to 18.56-18.86 TPS, fails the gate
+// in none of five runs against the host poll's none of five, and the same 32 tokens
+// come out of all four runs -- the reference's sequence. `SETTLE_US` still puts a
+// build with that race on a dose-response, but it is sorting on the table's upload
+// window rather than on anything the barrier does.
 //
-// So this switch is a **bound on what the host round trip costs**, in the same
-// class as NOPOLL and SKIP: a token from a run with it on is not a token. The one
-// configuration that computes the right answer is this switch *with* SETTLE_US, and
-// it is slower than the arm it was meant to replace. Both numbers and the reason are
-// in docs/performance/ascend_single_request_tps.md 5.5.3 and 5.5.4.
-//
-// It stays in the tree because it is how the round trip was priced and how the
-// arrival signal's missing release ordering was found; the kernel it launches is
-// correct and the host reads its status word to keep a lost peer a reported failure
-// rather than a hung device.
+// It stays default off because flipping a default is its own change, not because of
+// its answer. The kernel it launches is bounded, and the host reads its status word
+// to keep a lost peer a reported failure rather than a hung device.
 bool devwait_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT");
@@ -276,8 +272,10 @@ bool rstream_enabled() {
 // A run with one of the switches above set is not producing the measurement it
 // looks like it is, so the announcement is unconditional: no number from such a
 // run can be quoted without the caveat travelling with it. They stay in the tree
-// because they are how the barrier's cost is split and its arrival signal is
-// tested in docs/performance/ascend_single_request_tps.md 5.5.3 and 5.5.4. Which
+// because they are how the barrier's cost is split -- 5.5.3 -- and because
+// SETTLE_US is what put the rate this collective used to fail at on a
+// dose-response, where the rate turned out to be a workspace race elsewhere and
+// neither the barrier nor the arrival signal was sorting it. Which
 // caveat depends on which one, and the two classes are not the same: SKIP issues
 // nothing and NOPOLL reduces whatever the peer slot happened to hold, so those two
 // do not compute the all-reduce at all; POLL_SLEEP_US, SETTLE_US and RSTREAM only
@@ -321,25 +319,21 @@ void warn_diagnostics() {
             std::fflush(stderr);
         }
         if (devwait_enabled()) {
-            // Not the note this used to be. It was written as "computes the right
-            // answer, so a step time from it is a step time"; ten interleaved pairs
-            // against the host poll say otherwise -- 10 of 10 gate failures against
-            // 0 of 10, because the host round trip this deletes is also the thing
-            // keeping the reduce off a plane that has not landed. Announced as
-            // loudly as NOPOLL, and for the same reason. See devwait_enabled.
+            // Not the note this used to be, in either direction. It was written as
+            // "computes the right answer, so a step time from it is a step time",
+            // then as loudly as NOPOLL on ten gate failures in ten interleaved pairs.
+            // Those were the RoPE table's workspace aliasing and are 0 of 5 on the
+            // fix, at 18.56-18.86 TPS. Kept here because it is still not the shipped
+            // path. See devwait_enabled.
             std::fprintf(stderr,
                          "[ipc_allreduce] WARNING: DEVWAIT is on. The arrival wait runs "
-                         "on the device instead of the host, and the host round trip "
-                         "that goes away with it is also what covers the window "
-                         "between a peer's stamp and its plane. This configuration "
-                         "fails the reproducibility gate on every run measured; its "
-                         "tokens are not the shipped path's tokens and its step time "
-                         "is a bound on what removing the round trip could be worth."
-                         "%s\n",
+                         "on the device instead of the host. It computes the "
+                         "all-reduce and its tokens are meaningful; it is not the "
+                         "shipped path, so its step time is not the shipped step "
+                         "time.%s\n",
                          settle_us() > 0
-                             ? " SETTLE_US is also on, which covers the window and "
-                               "matches the shipped arm's answer -- more slowly than "
-                               "the arm it was meant to replace."
+                             ? " SETTLE_US is also on, which charges the wait an extra "
+                               "delay it does not need."
                              : "");
             std::fflush(stderr);
         }
@@ -902,11 +896,11 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
             if (sleep_us > 0) usleep(static_cast<unsigned int>(sleep_us));
         }
     }
-    // Diagnostic only, default off. See settle_us(): this is the delay that makes
-    // the window between a peer's stamp landing and its plane landing empty, so an
-    // engine run that stops being non-reproducible with it on was reading planes
-    // that had not finished arriving. It is charged to wait_ms because that is
-    // what it is -- waiting -- and a run with it set is flagged at startup.
+    // Diagnostic only, default off. See settle_us(): an engine run that stops being
+    // non-reproducible with this on was reading a workspace buffer an earlier kernel
+    // had landed on, and the delay moves the phase of that window rather than
+    // anything the collective does. It is charged to wait_ms because that is what it
+    // is -- waiting -- and a run with it set is flagged at startup.
     //
     // Under `DEVWAIT` the host no longer knows when the last stamp landed -- the
     // device does -- so the plain sleep below would land while the wait kernel is
@@ -951,11 +945,11 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     }
     const double t3 = timing ? now_ms() : 0.0;
 
-    // `DEVWAIT` put the wait out of this thread's reach, so the only way its bound
-    // can become a reported failure is for the host to read the latch the kernel
-    // writes. Reading it drains the default stream, which is the one thing this arm
-    // exists to stop doing, so it happens every `kStatusCheckEvery` calls rather than
-    // every call: one drain in 32 is a thirty-second of the cost of the drain per
+    // `DEVWAIT` put the wait out of this thread's reach, so the only way a peer that
+    // never arrives becomes a reported failure is for the host to read the latch the
+    // kernel writes. Reading it drains the default stream, which is the one thing this
+    // arm exists to stop doing, so it happens every `kStatusCheckEvery` calls rather
+    // than every call: one drain in 32 is a thirty-second of the cost of the drain per
     // call it replaces, and the kernel never clears the latch itself, so a failure in
     // the other 31 calls is still there when this one looks. See qwen_ipc_arrive_wait.cpp.
     //
@@ -963,9 +957,8 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // against the default stream. That is the stream this collective is on whenever
     // the caller passes none, which is what the engine does at all 129 decode sites,
     // so the drain is real and the latch is read after the wait it belongs to. With
-    // `..._RSTREAM` on it would not be, and this word could be read stale -- another
-    // reason the two switches are not meant to be combined, on top of the arm being a
-    // bound already. Neither is on by default.
+    // `..._RSTREAM` on it would not be, and this word could be read stale -- which is
+    // why the two switches are not meant to be combined. Neither is on by default.
     double status_check_ms = 0.0;
     if (devwait_enabled()) {
         const double t_check = timing ? now_ms() : 0.0;

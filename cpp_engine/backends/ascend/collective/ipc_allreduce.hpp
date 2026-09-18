@@ -63,18 +63,15 @@
 //     answer and pay host or device time the shipped path does not, so a token
 //     from one of them is meaningful and a step time from one is a bound.
 //   * `..._DEVWAIT` moves the arrival wait onto a kernel on the caller's stream. It
-//     computes that wait correctly and it is still a **wrong-result** arm: the host
-//     round trip it deletes is also what covers the window between a peer's stamp
-//     landing and its plane being readable, so ten interleaved pairs put it at 10
-//     of 10 gate failures against the host poll's 0 of 10, at 77.117 -> 53.745 ms
-//     and 12.968 -> 18.607 TPS. A token from it is not a token and its step time is
-//     a bound on what removing the round trip could be worth, not a candidate. The
-//     kernel is bounded and the host reads its status word every 32 calls, so a
-//     lost peer is still reported rather than waited out; `..._DEADLINE_MS` bounds
-//     the device spin from the same value it bounds the host poll with.
-//     `..._SETTLE_US` is what turns it back into a correct arm -- the delay after
-//     the arrival is exactly the window, and the dose-response is in 5.5.4 -- but
-//     by then it is slower than the arm it was going to replace.
+//     computes that wait correctly, and it is a candidate again: it was withdrawn as
+//     a wrong-result arm on ten gate failures out of ten interleaved pairs, and those
+//     failures were elsewhere. On the fix they are 0 of 5 against the host poll's
+//     0 of 5, at 76.10-77.66 -> 53.02-53.88 ms and 12.88-13.14 -> 18.56-18.86 TPS,
+//     with the same 32 tokens out of all four runs. It stays default **off** because
+//     flipping a default is its own change rather than because of its answer. The
+//     kernel is bounded and the host reads its status word every 32 calls, so a lost
+//     peer is still reported rather than waited out; `..._DEADLINE_MS` bounds the
+//     device spin from the same value it bounds the host poll with.
 //   * `..._DEADLINE_MS` and `..._MAX_ELEMENTS` change when the barrier gives up and
 //     which calls take this path at all.
 //

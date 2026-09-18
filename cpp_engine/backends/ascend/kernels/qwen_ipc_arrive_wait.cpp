@@ -13,13 +13,13 @@
 // work across, so the same wait moved onto the device should recover it, provided
 // the peers do arrive while the device is still busy with the layer before.
 //
-// Three things were meant to make it safe rather than merely faster, and the
-// measurement says one of them does not hold.
+// Three things were meant to make it safe rather than merely faster, and all three
+// hold.
 //
 //   * It waits for exactly the condition the host poll waits for -- every peer's
-//     stamp for this round -- and that part is right. Across ten interleaved pairs
-//     it never hit its iteration bound and never had to write a failure status, so
-//     the stamps arrive when the host loop would have seen them too.
+//     stamp for this round. Across ten interleaved pairs it never hit its iteration
+//     bound and never had to write a failure status, so the stamps arrive when the
+//     host loop would have seen them too.
 //   * It is bounded. `limit` iterations and then it gives up and reports the
 //     pending count, so a lost peer becomes a nonzero status the host raises
 //     rather than a device that spins forever.
@@ -31,24 +31,28 @@
 //     peer's round N push, which is issued after the peer's round N wait. The
 //     device executing in order is what enforces it, not the host.
 //
-// What does not hold is the first one's conclusion: waiting for the stamp is not
-// waiting for the plane. A peer's stamp can be readable here while the plane it
-// announces is not yet readable by the reduce behind this kernel, and the host round
-// trip this kernel exists to delete was -- without ever being designed as one -- the
-// window that covered it. Delete the round trip and the cover goes with it. Ten
-// interleaved pairs fail the launcher's reproducibility gate ten times in ten
-// against the host poll's zero in ten, and putting the delay back on the host
-// (`POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`) puts the failure rate on a dose-response:
-// 10 of 10 runs at 0 us, 2 of 4 at 20, 1 of 4 at 100, 0 of 4 at 500 -- with the 20 us
-// arm still running *above* the shipped step time, so mere slowness does not explain
-// it. That is why this kernel is a bound on what the host round trip costs and not a
-// candidate: it takes the step from 77.117 to 53.745 ms and the decode from 12.968 to
-// 18.607 TPS, and the token it produces is not the shipped path's token.
+// An earlier revision of this comment argued the opposite of all three: that
+// waiting for the stamp is not waiting for the plane, that a peer's stamp can be
+// readable here before the plane it announces is readable by the reduce behind this
+// kernel, and that the host round trip this kernel deletes was -- without ever being
+// designed as one -- the cover over that window. It was read off ten interleaved
+// pairs that failed the launcher's reproducibility gate ten times in ten against the
+// host poll's zero in ten, and off the dose-response `SETTLE_US` put those failures
+// on (10 of 10 at 0 us, 2 of 4 at 20, 1 of 4 at 100, 0 of 4 at 500, with the 20 us
+// arm still above the shipped step time, so mere slowness did not explain it).
 //
-// The shipped host-poll path has the same defect at a lower rate -- it fails the same
-// gate 8 times in 36 -- so this is not a new bug introduced here. It is that one with
-// the cover taken off, which is also why the fix belongs in the collective rather
-// than in this kernel.
+// That reading is withdrawn. The failures were the partial-RoPE table aliasing a
+// WorkspacePool slot, a race between a blocking H2D copy and an attention kernel the
+// host had already queued, and `SETTLE_US` was sorting on how much work is in flight
+// on the default stream when the table is uploaded. With the table given its own slot
+// the gate is failed 0 times in 22 interleaved runs across both arms, this arm
+// included, and interleaved against the host poll it takes the step from 76.10-77.66
+// to 53.02-53.88 ms and the decode from 12.88-13.14 to 18.56-18.86 TPS with the same
+// 32 tokens out of all four runs -- the reference's sequence. It is default off
+// because flipping a default is its own change, not because of its answer.
+//
+// The earlier claim that the shipped host-poll path had the same defect at a lower
+// rate (8 of 36) is withdrawn with it: that rate was the same workspace race.
 //
 // Reads are scalar loads of `uint16_t`. They are not hoistable: the load is the
 // loop's exit condition, so no iteration can be folded into another.
@@ -63,18 +67,12 @@
 // here would be insulating against a hazard the reduce behind it would still be
 // exposed to.
 //
-// What that argument does not cover is *when* the write becomes visible, which is
-// the window above, and a *stale* line this rank's own core read in an earlier round,
-// since the table is reused every round. If this ever spins to its bound on a group
-// that is clearly alive, the stale-line reading is the one to test, by invalidating
-// the block with `AscendC::DataCacheCleanAndInvalid<uint16_t,
-// CacheLine::ENTIRE_DATA_CACHE>` before re-reading. It is not the reading the
-// measurements support: the observed failure is a wrong sum, not a spin to the bound.
-// Two readings survive there -- the sender's plane copy is still in flight when its
-// stamp lands, which wants a real release ordering on the sender, or the reduce's own
-// loads hit a line the peer's write has not invalidated yet, which is what a DCCI on
-// the reduce's input would address. Neither is implemented; both are priced by the
-// dose-response rather than sized.
+// What that argument does not cover is a *stale* line this rank's own core read in
+// an earlier round, since the table is reused every round. If this ever spins to its
+// bound on a group that is clearly alive, that is the reading to test, by
+// invalidating the block with `AscendC::DataCacheCleanAndInvalid<uint16_t,
+// CacheLine::ENTIRE_DATA_CACHE>` before re-reading. It is not a reading any
+// measurement here supports: nothing observed has been a spin to the bound.
 //
 // First-generation 910 only, like every kernel in this directory.
 
