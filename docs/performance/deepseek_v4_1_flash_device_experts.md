@@ -54,10 +54,15 @@ sitting's numbers are worth comparing to the last one's, and the answer for the 
 here is that they are worth comparing only to themselves. `/tmp/probe_v41_resident.py` is the bank's
 acceptance instrument and the only one here that reads `/proc/self/io`'s `read_bytes`: it brackets the
 load, each prefill and each decode with the kernel's own block-device counter, which is the one figure
-a wall clock cannot produce. The dense tree is `/tmp/probe_dense_tree.py`, per op and per layer and at
-five thread counts — and with `--tree cuda`, under a `torchrun` driver (`/tmp/run_quiet_dtree.sh`), the
+a wall clock cannot produce. The dense tree is `/tmp/probe_dense_tree.py`, per op and per layer and at five thread counts — and with `--tree cuda`, under a `torchrun` driver (`/tmp/run_quiet_dtree.sh`), the
 same per-op table with the tree on the four cards, which is the sitting where `hc_mixes` stops being a
-fallback and becomes the thing the fusion was measured for. `/tmp/probe_hc_split_card.py` prices that
+fallback and becomes the thing the fusion was measured for. The launcher's default adds the two
+drivers it was accepted on: `/tmp/v41_default_accept.sh`, four legs of one configuration a process
+with the default and its off state alternating, and `/tmp/v41_default_accept2.sh`, which is the third
+prefill leg that splits the pool's worth from the batch's and then the decode A-B-A-B at the width
+that ships, with `/tmp/probe_v41_hot_ab.py --compare` pairing the two decode legs' top-32 logits at
+`|dlogit| 0.000e+00`. Both echo `/proc/loadavg` at every leg, for the reason `run_quiet_width.sh`
+does. `/tmp/probe_hc_split_card.py` prices that
 one op against the loop it replaced on an idle card, with no checkpoint and no second rank in the
 process. The same probe under `--launches` then counts what the step launches, under a CUPTI window
 (`/tmp/run_quiet_dtree_launches.sh`); that report is taken twice, to `/tmp/dt_cuda_launches.out` and
@@ -1357,9 +1362,10 @@ below](#the-pool-is-a-decode-lever-and-a-one-token-decode-is-the-measurement-tha
 **What it says about sizing is that the width belongs to the prompt.** At 128 tokens 64 rows buys the
 prefill 148 rows buys — 20.42 against 21.20 s on the rank mean, inside the drift — for 1183 MiB of
 arena instead of 2690, which is the same conclusion the 512-token sweep reached at 148 rows against
-192 and 288. There is no width to hard-code, so the flag stays a flag; what the two sweeps together
-establish is the shape of the curve it moves along, and that the mechanism's worth is the staging it
-removes and nothing else.
+192 and 288. There is no width a *prefill* can be handed as a constant, so what the two sweeps
+together establish is the shape of the curve the flag moves along, and that the mechanism's worth is
+the staging it removes and nothing else; the size the launcher ships is [the decode's knee, not this
+table's](#the-launchers-default-is-288-and-the-acceptance-sitting-behind-it).
 
 Reproduce with:
 
@@ -1458,9 +1464,13 @@ rate of 29.9% against 44.6%, for 5415 MiB of arena against 10794 and 13.51 GiB o
 against 18.76. So the win is not linear in the width — the first 300 rows carry most of it and the
 second 300 carry the rest — and the arena a decode wants is one it can fill and refill, not the
 prompt-wide width a prefill wants. This is the one place the two readings of the mechanism disagree
-about sizing, and it is why the flag stays a flag: a prefill's width is set by a layer's distinct
-experts, which rises with the prompt, and a decode's is set by the working set of the experts a
-generation re-draws, which is flat in the prompt length and is what the 42.9–45.5% column above is.
+about sizing, and it is where the shipped default comes from: a prefill's width is set by a layer's
+distinct experts, which rises with the prompt, and a decode's is set by the working set of the experts
+a generation re-draws, which is flat in the prompt length and is what the 42.9–45.5% column above is.
+So the width a prefill would hard-code is the wrong one to ship — it scales with a prompt the run has
+not seen yet — and 288 is sized to this flat column instead, between 300's 1.224× and 600's 1.399× and
+under the arena charge that keeps 600 from being the default ([why
+288](#the-launchers-default-is-288-and-the-acceptance-sitting-behind-it)).
 The control's own step is also flat across the whole sweep — 0.706–0.780 s over 8 to 512 tokens of
 context and 64 to 256 steps — so nothing in the ratio is the node's drift on the control side.
 
@@ -1602,6 +1612,89 @@ worth reading only because the logits behind it moved by 4.717 and 6.787 against
 which is far outside anything the sampler does. Every parity statement on this page — the six-sitting
 pair, the pool's runs, the two post-fix legs — is the `|dlogit|` comparison, and the tokens are
 reported beside it because they were recorded, not because they decide anything.
+
+### The launcher's default is 288, and the acceptance sitting behind it
+
+**The width is a construction-time decision, and that is why the default is a number and not a
+per-run choice.** `ResidentSet.arena_rows` is `rows_per_card + hot_rows + pool_rows`, the arena is
+allocated at that height once, and `DeviceRoutedExperts.__init__` accepts a shared set only when its
+own width matches and raises otherwise — so nothing raises the pool after the fact, and the number the
+launcher hands `load_backbone` is the number the run gets. The library level is deliberately
+unchanged: `load_backbone(expert_pool_rows=...)` still defaults to 0, because it cannot tell whether
+its caller has an arena to spend, and `src/cli/generate_v41.py` is the caller that can. It also
+resolves the flag to 0 on the host path, where `--expert-device` is unset and there is no arena to
+pool rows in, so the size becomes the off state there instead of a number the loader would warn about
+and then ignore.
+
+**The direction of the default is forced by a coupling, and the size of it is what the acceptance
+sitting measured.** The pool's own two sweeps price the width from opposite ends: a prefill saturates
+at ~148 rows (a 512-token pass stages 5700 rows at 288, 5761 at 148 and 6579 at 96, so the rows above
+148 are bought for the decode), and a decode keeps paying (1.224× at 300 rows, 1.399× at 600). 288
+sits above the saturation and below the point where the arena starts eating the KV cache — 5200 MiB of
+it, 13.3 GiB of a 22 GiB card, against 600's 10794 MiB and 18.76 GiB — which is the trade a *default*
+has to make rather than the one a named flag on a decode-heavy short-context run should. 600 stays
+reachable by name. What is not arguable is that 0 would not be neutral: `expert_batched` cannot run
+without a pool, because the batched call reads each arena row it is handed as one expert's bytes for a
+whole chunk, so `--expert-pool-rows 0` drops the prefill's two best-measured mechanisms at once.
+
+One configuration a process, a real 512-token prompt, the resident bank on in all of them, the default
+and its off state run as a pair a header apart so a drift on the node lands across the pair rather
+than inside it, and the separating leg added in a second sitting:
+
+| leg | `--expert-pool-rows` | batched | 512-token prefill | pooled rows staged, ranks 0-3 | call shape |
+| --- | ---: | --- | ---: | --- | --- |
+| default | 288 | yes | **21.28 s** | 3997 / 4078 / 2643 / 2709 of 41040 / 41040 / 20520 / 20520 (90.3–87.1%) | 40 calls, 20480 rows, **512.0 rows a call** |
+| control | 0 | — | **179.67 s** | every draw | 20480 calls, one row each |
+| the missing point | 288 | no | **38.40 s** | 3997 / 4078 / 2643 / 2709, the same | 20480 calls, one row each |
+
+**So the third leg is the one that separates the two mechanisms, and it is the leg the control
+cannot be.** `--expert-pool-rows 0` drops the batch with the pool, so the default's own pair prices
+both at once — **179.67 against 21.28 s, 8.44×** — and only the third leg says which is which: the
+pool is **4.68×** (179.67 → 38.40 s) and the batch is **1.80×** on top of it (38.40 → 21.28 s), which
+is 17.12 s over 20,440 fewer calls, **0.84 ms a call**. The staged rows are equal across the two
+288-row legs to the row, so the batch half is the call count and not the floor, as
+[the batch shape's own A/B](deepseek_v4_1_flash_remaining_bottlenecks.md#lever-5--the-prefill-is-a-batch-shape-problem-and-the-fix-is-in-27-at-512-tokens)
+already had it.
+
+**The decode is priced at the default's own width rather than at 600's.** A-B-A-B at 128 tokens and
+256 decode steps a leg, the control at both ends, per-row so that this A/B isolates the pool:
+
+| | pool 288 | pool 0 |
+| --- | ---: | ---: |
+| decode, s a token | **0.601 / 0.578** | **0.769 / 0.769** |
+| 128-token prefill, rank mean | 20.2 s | 50.8 s |
+| arena | 5200 MiB | 36 MiB |
+| `cuda` | 13.3 GiB | 9.7 GiB |
+| pooled share of the run's draws | 44.6% / 52.5% | 0.0% |
+
+**0.5895 against 0.769, 1.305×, 180 ms a token**, for 5200 MiB of arena and 3.6 GiB of the card, and
+the top-32 logits are identical at `|dlogit| 0.000e+00` on rank 0 with both counters equal. The two
+controls read 0.769 twice, to the digit, which is what makes the 1.305× readable; the two pooled legs
+differ by 3.8% between themselves, so quote the pair means and not one of them. The 0.601 s a token at
+288 rows is the page's own 300-row column to the digit — 288 is twelve rows under that sitting — and
+the control at 0.769 sits inside the 0.706–0.780 band the earlier 600-against-0 sitting recorded, so
+this is the same measurement at the width that now ships and not a new one.
+
+**Two limits on the numbers above.** The 512-token prompt is one paragraph repeated thirteen times, so
+its routing is more concentrated than a document's: the pool answers 90.3% of rank 0's draws where the
+512-token width sweep above answered 86.1%, and it stages 3997 distinct rows against that sweep's
+5700 — which is why 21.28 s here is below the 34.75 s the same configuration records in
+[the batch shape's own A/B](deepseek_v4_1_flash_remaining_bottlenecks.md#lever-5--the-prefill-is-a-batch-shape-problem-and-the-fix-is-in-27-at-512-tokens).
+Within the sitting the A-B is clean; across sittings the prompt is the difference. And the batch's
+share is larger here (**−44.6%** against the recorded −27.0% at the same two configurations), which
+is 0.84 ms a call against 0.63 — a host-state difference the two sittings cannot separate, so read the
+batch's worth as a band rather than as either figure.
+
+Reproduce with:
+
+```bash
+# the acceptance: four legs, one configuration a process, default/off then default/off. The prompt is
+# 512 tokens exactly and re-tokenizes to itself; --threads 22 because torchrun sets OMP_NUM_THREADS=1.
+bash /tmp/v41_default_accept.sh      # default_long and off_long are the two legs of the table above
+bash /tmp/v41_default_accept2.sh     # the third leg, and the decode A-B-A-B at the default's width
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_hot_ab.py --compare \
+  /tmp/dd_288.pt.r0 /tmp/dd_0.pt.r0
+```
 
 ## What this does not do yet
 
@@ -2043,13 +2136,15 @@ silent.
 The host path stays the default: the device path needs `--expert-device` (or
 `DEEPSEEK_V41_EXPERT_DEVICE`) and falls back to `CheckpointRoutedExperts` with one line on `progress`
 if the extension is unloadable, the card is missing or the checkpoint's expert is laid out the other
-way round. The resident set is off by default too and is a knob rather than a default for a measured
-reason: it is worth **2.6–2.7×** on a 512-token prefill, and the one sitting that priced its decode
-against a no-set control put that at **10–11%** — so `--expert-hot-rows N` is a prefill knob and the
-launcher that leaves it unset is the decode configuration (the decode column is also the one the
-readings disagree on; see the resident-set section above). It costs no memory when it is zero — the
-arena is the same two rows — and the flag
-prints its own hit rate, its capping and its misses when the run ends.
+way round. The *resident set*'s width, `--expert-hot-rows`, is off at 0 and is a knob rather than a
+default for a measured reason: it is worth **2.6–2.7×** on a 512-token prefill, and the one sitting
+that priced its decode against a no-set control put that at **10–11%** — so `N` here is a prefill knob
+and the launcher that leaves it unset is the decode configuration (the decode column is also the one
+the readings disagree on; see the resident-set section above). It costs no memory when it is zero —
+the arena is the same two rows — and the flag prints its own hit rate, its capping and its misses when
+the run ends. The **pool**'s width, `--expert-pool-rows`, is the other way round and ships at 288:
+its decode column is the larger of the two and it is the mechanism the batched prefill runs on
+([why 288](#the-launchers-default-is-288-and-the-acceptance-sitting-behind-it)).
 
 **Read that fallback line, and run the device path from the `deepseek` environment.** The repository
 root holds two builds of the same extension, `cuda_kernel.cpython-310-x86_64-linux-gnu.so` and

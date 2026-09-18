@@ -270,8 +270,16 @@ different layer's row with a confidently wrong tensor.
 step, 1.399×**, for **10794 MiB of arena a card** and 18.76 GiB of `cuda` against the no-arena step's
 9.71 — so it takes **9.05 GiB more than the step already holds**, which is a real charge against a
 22 GiB card and the KV cache's share rather than the "8–10 GiB spare" this section originally
-budgeted. That is why `--expert-pool-rows` is opt-in at 0, and why the default is a decision rather
-than a conclusion.
+budgeted. **That charge is what sizes the shipped default, and the default is 288.** 600 buys its
+1.399× for 18.76 GiB of the card and leaves the KV cache 3–4 GiB; 288 buys the 1.224× the 300-row
+column below measures — 288 is a few rows under that sitting — for 5200 MiB of arena and leaves about
+8.5 GiB, and a default that OOMs on a long prompt is not a default. 600 stays reachable by name for a
+decode-heavy short-context run. What settles the *direction* of the default is that 0 is not the
+neutral one: `expert_batched` cannot run without a pool, because the batched call reads each arena row
+it is handed as one expert's bytes for a whole chunk, so `--expert-pool-rows 0` drops the prefill's
+two best-measured mechanisms at once. On a 512-token prompt that coupling is **179.67 s against
+21.28 s, 8.44×**, in [the acceptance sitting
+on the device page](deepseek_v4_1_flash_device_experts.md#the-launchers-default-is-288-and-the-acceptance-sitting-behind-it).
 
 **Half the arena buys 69% of the win.** At 128 tokens and 64 steps the same sitting carries 300 rows
 against 600: **1.224× against 1.320×**, a decode-phase hit rate of 29.9% against 44.6%, for 5415 MiB
@@ -466,7 +474,7 @@ supports as an **upper bound** at the configuration named, and the two gated row
 | # | Lever | Measured basis | Worth | Cost / gate |
 | ---: | --- | --- | ---: | --- |
 | 1 | ~~Overlap layer `k+1`'s `_stage` with layer `k`'s tree~~ | five sittings of the same probe: the 91.8 ms replay is the seventh pass of a pool that is warming, and re-inserting the recorded gap between the copies costs 679–940 ms a step against the step's own 116–225 | **falsified** — 3–8× spent, not 15% returned | closed; the banner in Lever 1 and `/tmp/sched5.log` |
-| 2 | A decode-resident set, `--expert-pool-rows 600` | A-B-A-B at 128 tokens, 256 decode steps, control at both ends: 765.0 against 547.0 ms a token, top-32 logits bit-identical | **218 ms** (1.399×), and 1.224× at 300 rows for half the arena | 10794 MiB of arena, 9.05 GiB a card above the no-arena step's own 9.71; opt-in at 0 |
+| 2 | A decode-resident set, `--expert-pool-rows` | A-B-A-B at 128 tokens, 256 decode steps, control at both ends: 765.0 against 547.0 ms a token at 600 rows, top-32 logits bit-identical; and at the shipped default's own 288 rows the same sitting reads **0.601 / 0.578 against 0.769 s** | **218 ms** (1.399×) at 600 rows, **~0.19 s (1.28×)** at 288 for half the arena | **default 288** — 5200 MiB of arena, 13.3 GiB of `cuda`, leaves ~8.5 GiB for the KV cache; 600 is 10794 MiB and 9.05 GiB a card above the no-arena step's own 9.71 |
 | 3 | **Wire in `moe_multi_token_fp4_forward`** | `--decode 0`, per-row against batched on the same sitting: 512 tokens at 288 rows is 47.63 → 34.75 s a rank, 128 at 64 rows is 21.65 → 19.20/19.33 s, top-32 logits bit-identical on all four ranks and the pool counters equal | **−27.0%** on a 512-token prefill, −11.3% on a 128-token one; the staged rows are unchanged, so it is the call count (512 → 40, one a layer) and not the floor | **spent**; default on, and it falls back to the per-row path without a pool |
 | 4 | Per-layer CUDA graph | 7,076 launches, 111–122 ms unattributed, 11% device-busy | the largest, and **not sized** — bounded by the step, ~2–4× on the tree's own terms is the shape | **gated** on the round's own numbers, per 先搬，量完再说 |
 | 5 | A fused `hc_mixes` | 346.5 µs a call against 138.5 µs of the method timed as one call | **~17 ms** (2.3%) | row 4's graph eats the same glue — do one, not both |

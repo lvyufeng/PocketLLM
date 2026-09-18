@@ -843,6 +843,17 @@ def load_backbone(
     first, but the two are alternatives and the sweep above is the one that prices them against each
     other.
 
+    **0 here is the off state and 288 is the default a launcher should pick**, which is what
+    `src/cli/generate_v41.py` does; this parameter stays at 0 because the library cannot tell whether
+    a caller has an arena to spend, and the CLI can. 288 is not neutral in the other direction either:
+    it is the width the batched path's number was taken at, and `expert_batched` cannot run without a
+    pool, so a launcher that leaves this at 0 drops both mechanisms at once. The width is decided
+    *here* and cannot be raised later -- `ResidentSet.arena_rows` is `rows_per_card + hot_rows +
+    pool_rows` and the arena is allocated at that height once, so `DeviceRoutedExperts.__init__` can
+    only accept a shared set whose width matches its own and raises otherwise. Nothing between a
+    prefill's saturation (~148 rows on a 512-token pass) and 288 stages a row fewer, and the rows
+    above it are bought for the decode.
+
     `expert_batched` issues a prefill's chunks through `moe_multi_token_fp4_forward` instead of a
     `moe_single_token_fp4_forward` a row a card. It is the first lever on this path that moves
     prefill at all: measured on one card of the real deal's shapes, 3.04x at a 128-token layer's
@@ -892,7 +903,8 @@ def load_backbone(
         if progress is not None:
             progress(
                 f"--expert-hot-rows {expert_hot_rows} / --expert-pool-rows {expert_pool_rows} need "
-                "--expert-device: both are sets of arena rows, and there is no arena on the host path"
+                "--expert-device: both are sets of arena rows, and there is no arena on the host path, "
+                "so the experts are built without one"
             )
     # The arena and staging block every layer's resident experts share, built by whichever layer is
     # constructed first. `hot_rows` slots a card is 1.2 GiB of device memory and as much again of
