@@ -104,10 +104,30 @@ pooled decode is faster in every sitting taken: 1.647x at an 8-token prompt, 1.3
 with 64 steps (600 and 300 rows), 1.301x and 1.352x at 512. The decode phase's own hit rate is
 42.9-45.5% at every prompt length and 61.3% at eight tokens, so it is the prompt and not the arena
 that moves the run-level column. It costs a 10794 MiB arena at 600 rows, which is **9.05 GiB a card
-above the 9.71 the step already holds** -- 22 GiB less that leaves the KV cache 3-4 GiB at this width,
-which is why it stays opt-in at 0. Tables and the sweeps behind them in
+above the 9.71 the step already holds** -- 22 GiB less that leaves the KV cache 3-4 GiB at this width.
+Tables and the sweeps behind them in
 `docs/performance/deepseek_v4_1_flash_device_experts.md`; the prefill above and this are the same
 mechanism read at two different step counts.
+
+**The default is 288, and it is a decision rather than a leftover.** The two sweeps price the width
+from opposite ends and they agree on where the knee is: a prefill saturates at ~148 rows (a 512-token
+pass stages 5700 rows at 288, 5761 at 148 and 6579 at 96, so everything above 148 is bought for the
+decode), and a decode keeps paying (1.224x at 300, 1.399x at 600). 288 sits above the saturation and
+under the point where the arena starts eating the KV cache: 5200 MiB of it, 13.5 GiB of a 22 GiB card
+against 600's 18.76, so about 8.5 GiB stays for the KV cache instead of 3-4. That trades the second
+300 rows' decode quarter for the context a default has to be able to hold -- a default that OOMs on a
+long prompt is not a default -- and `--expert-pool-rows 600` is how a decode-heavy short-context run
+takes it back. It also makes the batched path reachable at all, which is the other half of the same
+argument below; the pool is the recommended arena of the two mechanisms, since at the set's own 148
+rows it is 1.10x the set for the same 2690 MiB and needs no pinned block.
+
+What the default is worth was taken on the default path rather than on the flag by name, four legs of
+one configuration a process on a 512-token prompt: **21.28 s against `--expert-pool-rows 0`'s 179.67 s**,
+and 0 is the expensive leg because it drops the batch with the pool. A third leg at 288 rows with
+`--no-expert-batched` splits the 8.44x into the pool's **4.68x** and the batch's **1.80x** on top of
+it. The decode at 288 rows, A-B-A-B at 128 tokens and 256 steps a leg, is **0.601 / 0.578 s a token
+against 0.769 / 0.769**, 1.305x, with the top-32 logits identical at `|dlogit| 0.000e+00`. Tables and
+the two limits on them in `docs/performance/deepseek_v4_1_flash_device_experts.md`.
 
 **The prefill's other half is the batch shape, and it is on by default now.** `--expert-batched`
 resolves the whole pass before staging any of it and then issues one `moe_multi_token_fp4_forward` a
@@ -118,9 +138,10 @@ read once. `--decode 0` against the per-row path in the same sitting, pool width
 19.33 s at 128 tokens and 64 rows (-11.3%). The logits do not move: `32/32 of the top 32 identical,
 worst |dlogit| 0.000e+00` on all four ranks at both widths, with the pool's counters equal, so the
 staged rows are identical to the per-row path's and what changed is the call count. `--no-expert-batched`
-is the way back, and the flag is dropped by itself without a pool, since the batched call reads each
-arena row it is handed as one expert's bytes for a whole chunk. Full tables and the chunk rule that
-decides where such a call may not be cut: `docs/performance/deepseek_v4_1_flash_remaining_bottlenecks.md`.
+is the way back, and the flag is dropped by itself at `--expert-pool-rows 0`, since the batched call
+reads each arena row it is handed as one expert's bytes for a whole chunk. Full tables and the chunk
+rule that decides where such a call may not be cut:
+`docs/performance/deepseek_v4_1_flash_remaining_bottlenecks.md`.
 
 That 722-747 ms is a warm-page-cache figure, and until recently it was only as durable as the cache:
 `DeviceRoutedExperts` stages out of the checkpoint mapping, and this host holds 68-100 GiB of the
@@ -164,7 +185,7 @@ import torch
 
 from src.models.deepseek_v4_1.generate import generate
 
-__all__ = ["main", "setup_distributed"]
+__all__ = ["main", "resolve_pool_rows", "setup_distributed"]
 
 
 def setup_distributed() -> tuple[int, int, int, torch.device | None]:
@@ -193,6 +214,23 @@ def setup_distributed() -> tuple[int, int, int, torch.device | None]:
         # store timeout would tear the communicator down underneath a run that is behaving.
         dist.init_process_group("nccl", timeout=timedelta(hours=2))
     return world, rank, local_rank, torch.device("cuda", local_rank)
+
+
+def resolve_pool_rows(requested: int, expert_device: str | None) -> int:
+    """The pool width this run gets: `requested` on the device path, 0 on the host one.
+
+    `--expert-pool-rows` defaults to a size and not to off, so the resolution has to know where the
+    experts landed, and that is not something the flag can see: `--expert-device` is *unset* in the
+    configuration the default is for, and it is the resolution in `main` that puts them on a card.
+    A host path has no arena to pool rows in -- `DeviceRoutedExperts` is handed no `ResidentSet` and
+    `ResidentSet.pool_row` returns `None` -- so the size becomes the off state there rather than a
+    number the loader would warn about and then ignore.
+
+    It is a function rather than an expression in `main` because it is the whole of the default's
+    logic and the one thing about it that a test can hold still: everything else the default does is
+    measured on the cards.
+    """
+    return int(requested) if expert_device is not None else 0
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -237,7 +275,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "expert is resident iff the layer asks this rank for it at least twice "
                              "and the set is cut to N by count if it is wider. Needs --expert-device. "
                              "0 is the configuration every number before it was measured on")
-    parser.add_argument("--expert-pool-rows", type=int, default=0, metavar="N",
+    # 288 is the default because it is the width the batched path's own number was taken at and
+    # because it is above the point the prefill saturates: a 512-token pass stages the same ~5700 rows
+    # at 148 as at 288 and 6579 at 96, so the rows past 148 are bought for the decode, where the width
+    # is a knob with a knee -- 1.224x at 300 against 1.399x at 600 -- and not an on/off switch. Half
+    # of 600's arena for three quarters of its decode saving and all of the prefill's is the trade a
+    # default should make; 600 stays reachable by name for a decode-heavy short-context run. The
+    # alternative default, 0, is not neutral: it drops the batched path with it, since that call
+    # reads each arena row as one expert for a whole chunk and cannot run without a pool.
+    parser.add_argument("--expert-pool-rows", type=int, default=288, metavar="N",
                         help="arena rows a card keeps experts in: one is handed out on an expert's "
                              "first sight and taken back least-recently-used when the pool is full. "
                              "A pool row is paid for as it is drawn where a --expert-hot-rows fill "
@@ -251,7 +297,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "steps a leg at 600 rows, A-B-A-B, logits bit-identical). "
                              "Costs 18.8 MB an arena row on the device -- a 10794 MiB arena at 600, "
                              "which is 9.05 GiB a card above the step's own 9.71, so 3-4 GiB of a "
-                             "22 GiB card is left for the KV cache. Needs --expert-device")
+                             "22 GiB card is left for the KV cache; 288 is 5200 MiB and leaves about "
+                             "8.5 GiB of it, and 148 stages the same prefill rows as 288 does for "
+                             "2690. 0 turns the mechanism off and is the control column. Defaults to "
+                             "288 on the device path and is forced to 0 on the host path, where "
+                             "there is no arena to pool rows in. Needs --expert-device")
     parser.add_argument("--expert-batched", action=argparse.BooleanOptionalAction, default=True,
                         help="issue a prefill a chunk at a time through moe_multi_token_fp4_forward "
                              "instead of a row at a time through moe_single_token_fp4_forward. "
@@ -259,15 +309,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "3.69x at 512, results bit-identical to the per-row path, and the host's "
                              "own share of a layer falls from 230.68 ms to 0.08 at 512 tokens. "
                              "End to end, --decode 0 against the per-row path: a 512-token prefill at "
-                             "--expert-pool-rows 288 is 47.63 -> 34.75 s a rank (10.75 -> 14.73 tok/s, "
-                             "one chunk a layer, 512.0 rows a call) and a 128-token one at 64 rows is "
+                             "288 rows -- the default -- is 47.63 -> 34.75 s a rank (10.75 -> 14.73 "
+                             "tok/s, one chunk a layer, 512.0 rows a call) and a 128-token one at 64 "
+                             "rows is "
                              "21.65 -> 19.20/19.33 s (5.91 -> 6.66/6.62 tok/s, 42/42/75/80 chunks over "
                              "40 layers), both 32/32 of the top 32 identical at a worst |dlogit| of "
                              "0.000e+00 on all four ranks with the pool counters equal. A decode step "
                              "is one row and is unaffected either way. Needs a pool: the batched call "
                              "reads each arena row it is handed as one expert's bytes for the whole "
-                             "call, so the flag is dropped to the per-row path without "
-                             "--expert-pool-rows rather than run wrong")
+                             "call, so the flag is dropped to the per-row path at "
+                             "--expert-pool-rows 0 rather than run wrong")
     parser.add_argument("--threads", type=int, default=None, metavar="N",
                         help="host threads this rank may use. `torchrun` sets OMP_NUM_THREADS to 1 "
                              "unless the environment already had one, and the expert staging, the "
@@ -319,6 +370,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     expert_world = args.expert_world
     if expert_world is None:
         expert_world = world if expert_device is not None else 1
+    # `--expert-device host` and a run with no card at all are the control column: no arena exists on
+    # that path, so no arena row can be pooled, and the default has to become the off state rather
+    # than a size the loader would only warn about. See `resolve_pool_rows`.
+    pool_rows = resolve_pool_rows(args.expert_pool_rows, expert_device)
 
     config = load_config(f"{args.checkpoint}/config.json").text
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
@@ -347,7 +402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"context {max_seq_len}, resident checkpoint "
         f"{'on' if resident_bank.enabled() else 'off'}"
         + (f", {args.expert_hot_rows} resident rows a card" if args.expert_hot_rows else "")
-        + (f", {args.expert_pool_rows} pooled rows a card" if args.expert_pool_rows else "")
+        + (f", {pool_rows} pooled rows a card" if pool_rows else "")
         + (", experts batched a chunk a call" if args.expert_batched else "")
     )
     started = time.perf_counter()
@@ -362,7 +417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expert_device=expert_device,
         expert_world=expert_world,
         expert_hot_rows=args.expert_hot_rows,
-        expert_pool_rows=args.expert_pool_rows,
+        expert_pool_rows=pool_rows,
         expert_batched=args.expert_batched,
         # The bank is filled by rank 0 and attached by everyone else, so a rank here is both the
         # tree's rank and the stagger the bank wants: four ranks must not read `/mnt/data3` at once.
@@ -418,7 +473,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # capacity cannot say for itself and the reason it is a rule and not a number. A run whose fills
     # are zero did not fill anything, and a run whose `expert_rows` is unchanged from the flag's
     # absence did not help.
-    if expert_device is not None and args.expert_pool_rows and hasattr(held[0], "pool_rows"):
+    if expert_device is not None and pool_rows and hasattr(held[0], "pool_rows"):
         # The pool's own counters, and they are the same two numbers the set reports for a different
         # reason: `expert_rows` is still every draw that had to be staged, so `drawn - staged` is the
         # coverage the pool bought, and `pool_staged` is what bought it -- rows allocated and filled
@@ -433,7 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         say(
             f"expert pool: {pool.pool_staged} expert rows filled over {len(held)} layers, "
             f"{staged} of {drawn} draws staged ({covered}), {pool.pool_evicted} evictions "
-            f"of {args.expert_pool_rows} rows a card"
+            f"of {pool_rows} rows a card"
         )
 
     if args.expert_batched and expert_device is not None and hasattr(held[0], "batched"):
@@ -442,8 +497,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # one-row chunks reports 1.0 whatever the flag says and a run that did not reports what the
         # batch is amortizing over. `batched_chunks` is the count `_chunk_bounds` cut, which is the
         # pool's own cost showing up: a pool too narrow for the pass cuts it more often. The flag is
-        # dropped entirely without a pool -- which is the default configuration, since the pool's own
-        # default is 0 -- so that one is only worth saying when it was asked for by name.
+        # dropped entirely without a pool, and with the pool's default at 288 that is now the state
+        # `--expert-pool-rows 0` asks for -- the control column -- so the line is only worth saying
+        # when the drop was asked for by name and not when it is the default.
         if not held[0].batched:
             if "--expert-batched" in (argv if argv is not None else sys.argv[1:]):
                 say(
