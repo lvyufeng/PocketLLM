@@ -158,6 +158,23 @@ _TOOL_CALL_PARSERS = {
 }
 
 
+def _token_id_list(encoded: Any) -> list[int]:
+    """Normalize ``apply_chat_template(..., tokenize=True)`` to a list of ids.
+
+    The return type is not stable across tokenizers and transformers versions:
+    a plain list, or a ``BatchEncoding`` whose ``input_ids`` holds the ids.
+    A ``BatchEncoding`` iterates as its *keys*, so the naive
+    ``[int(t) for t in encoded]`` raises ``invalid literal for int() with base
+    10: 'input_ids'`` - a failure that surfaces as an HTTP 400 on every chat
+    request while the completions path, which tokenizes in C++, keeps working.
+    Both shapes are accepted rather than pinning a transformers version.
+    """
+    input_ids = getattr(encoded, "input_ids", None)
+    if input_ids is not None:
+        encoded = input_ids
+    return [int(token) for token in encoded]
+
+
 class ChatTemplateTemplater:
     """The checkpoint's own HF chat template, for models with no bespoke encoder.
 
@@ -206,7 +223,7 @@ class ChatTemplateTemplater:
         # from encode().
         token_ids = self._apply(messages, tools, add_generation_prompt, thinking_mode, True)
         prompt_text = self._apply(messages, tools, add_generation_prompt, thinking_mode, False)
-        return str(prompt_text), [int(t) for t in token_ids]
+        return str(prompt_text), _token_id_list(token_ids)
 
     def parse(self, text: str, thinking_mode: str, tools: Any = None) -> dict[str, Any]:
         reasoning = ""
