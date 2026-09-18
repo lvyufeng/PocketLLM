@@ -56,6 +56,7 @@ The vision tower ships inside the same 18 shards as the text model, so every sha
 - Explicit coverage accounting. Every index entry must be either mapped by the text map, recognized as a vision tensor, or reported as unexpected. Strict mode throws on any unexpected entry, so an unrecognized checkpoint variant fails instead of loading a partial model.
 - BF16 storage to FP16 device residency. RTX 2080 Ti has no native BF16 arithmetic, so every BF16 tensor is converted at materialization. FP8 and NVFP4 checkpoints keep their existing compressed paths untouched.
 - Host/device split of the loader. The mapping, coverage and host materialization live in `cpp_engine/core/qwen_weight_map.cpp` and link only `pocket_core`; device residency and uploads stay in `cpp_engine/engine/qwen_weights.cpp`.
+- Plain rotary positions, not MRoPE. The checkpoint declares `mrope_section [11, 11, 10]` and `mrope_interleaved: true` inside `rope_parameters`, and `cpp_engine/core/qwen_config.cpp` reads only `rope_theta` and `partial_rotary_factor` out of that object. Dropping the other two is exact rather than an approximation: PocketLLM executes text only, and in text-only input the three MRoPE position axes carry the same positions, so the interleave is a numerical no-op — `src/models/qwen4_exp/layers.py` says so where it builds `MRoPE`, and keeps the general path for image and video position ids later.
 
 ## TP4 shard contract
 
@@ -87,7 +88,7 @@ Verified on the real 51.7 GiB checkpoint, host-only:
 - A synthetic fixture carrying an unrecognized tensor is rejected by strict coverage.
 - A BF16 `1.0` payload materializes to FP16 `1.0`.
 
-Numerical parity of BF16 generation against a reference implementation has not been measured.
+Numerical parity of BF16 generation against a reference implementation has not been measured on this backend. It has been on the Ascend backend, at TP4 and against a Hugging Face run of the same checkpoint; what that comparison covers and what it does not is in the single-request decode page added by [PR #272](https://github.com/lvyufeng/PocketLLM/pull/272).
 
 ## Reproduction
 
