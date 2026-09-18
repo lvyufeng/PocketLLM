@@ -686,12 +686,17 @@ can drop the TP collective from the path — `QWEN_TP_WORLD=1` OOMs on this chec
 
 That paragraph is left standing as what was measured and is not relied on. The banner retraction above
 re-opens it: the mechanism it needed to be independent of the collective is a race in a pooled
-workspace slot that any phase uses, and the tree it was measured on had the same one. Whether that
-prefill instability survives the RoPE table's fix is **not** measured — this page's 0 of 22 is the
-decode gate — so the two are indistinguishable from here. The operational consequence it drew is
-recorded as rule 8 in [the benchmarking rules](../guides/benchmarking.md), which is the right rule to
-keep either way: establish run-to-run stability before comparing generated tokens across
-configurations.
+workspace slot that any phase uses, and the tree it was measured on had the same one. **That has since
+been measured: the prefill instability does not survive the RoPE table's fix.** Eight runs of one
+binary at the original 4966-token prompt length, 9 new tokens, the TP all-reduce enabled — one
+identical step-0 token, one identical top logit, and one identical 9-token sequence across all eight,
+where the pre-fix tree gave three distinct tokens in four runs. The repeat and the caveat that bounds
+it are recorded in
+[the gated-delta slice page](ascend_gated_delta_slice.md#the-generated-tokens-are-not-a-usable-ab-signal-here);
+the short of it is that it shows the spread is gone on the fixed tree, not that the pooled slot was
+the only thing producing it. The operational consequence it drew is recorded as rule 8 in
+[the benchmarking rules](../guides/benchmarking.md), which is the right rule to keep either way:
+establish run-to-run stability before comparing generated tokens across configurations.
 
 **Four candidate mechanisms for the hand-written collective, tested and ruled out.** They were worth
 testing while the failure looked collective-specific; with the failure present in both arms none of

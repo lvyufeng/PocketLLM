@@ -79,8 +79,11 @@ These constraints are part of the result. Moving to a newer GPU, NVLink system, 
    binaries over a 4966-token prompt produced three distinct greedy step-0 tokens and top logits
    spanning 10.42-10.94 — well above fp16 rounding ([measurement](../performance/ascend_gated_delta_slice.md#the-generated-tokens-are-not-a-usable-ab-signal-here)).
    That instance has since been attributed to a pooled workspace race rather than to the platform, and
-   the runs have not been repeated on the fix; the rule is kept because establishing the stability is
-   cheap and discovering its absence late is not, not because this stack is known to be unstable.
+   the runs **were repeated on the fix**: eight runs of one binary over a 4966-token prompt with the
+   TP all-reduce still active produced one identical step-0 token and one identical 9-token sequence,
+   against three distinct tokens in four runs before. The rule is kept anyway, because establishing
+   the stability is cheap and discovering its absence late is not — the eight runs do not establish
+   that the race was the *only* mechanism, only that this stack currently reproduces.
    Numerical A/B comparisons against a host reference inside one process are not affected by this,
    and neither are repeated timings of a kernel; it is specifically generated-token comparison that
    needs the stability established first.
