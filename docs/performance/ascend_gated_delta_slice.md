@@ -157,16 +157,31 @@ binaries, identical prompt, no other activity on the part:
 | value-axis slice, rep 2 | 125017 | 10.6803 | 10.2094 |
 
 Three distinct continuations in four runs. The two runs either side of the kernel swap are no more
-alike than two runs of the same kernel, so the divergence is not the slice: with the TP all-reduce
-active, prefill logits on this stack are **not reproducible run to run**, and by a margin (top logit
+alike than two runs of the same kernel, so the divergence is not the slice, and by a margin (top logit
 10.42-10.94, checksum 10.08-10.25 on a 4966-token prompt) well above fp16 rounding.
 
-Two consequences for reading this page: the token sequences are deliberately not used as evidence
-either way above, and anything on this backend that compares generated output across configurations
-has to establish run-to-run stability before the comparison means anything. The `--check` arms in
-section 3 are unaffected — they compare the operator against a double-precision host reference in one
-process, with no collective in the path. The rule is recorded with the other reporting rules in
-[Benchmarking and reporting rules](../guides/benchmarking.md).
+**The conclusion originally drawn from it — that with the TP all-reduce active, prefill logits on this
+stack are simply not reproducible run to run — is withdrawn.** The observation is not; the four runs
+did disagree. What replaces the reading is smaller than it: the same signature was found later in the
+decode path, and was traced there to a pooled workspace slot rather than to the platform. The
+partial-RoPE table was uploaded into `WorkspacePool`'s `Intermediate` slot, the one the attention
+launchers use for scratch, so a blocking H2D copy could land on the table between an attention kernel
+the host had already queued and the rope kernel that read it — one cache sector of the table, once per
+process, with the token that comes out of it unconstrained. That is fixed by giving the table its own
+slot ([#280](https://github.com/lvyufeng/PocketLLM/pull/280)).
+
+These four runs predate that fix and have not been repeated on it, so whether the prefill divergence
+*is* that race or a second cause of its own is **not measured** here, and nothing below separates the
+two. What can be said is that the retraction is not a reinterpretation of these runs: the claim was
+that the instability was a property of the stack, and the tree it was measured on carried a known
+defect that produces exactly this signature.
+
+Two consequences for reading this page, unchanged either way. The token sequences are deliberately not
+used as evidence above, and anything on this backend that compares generated output across
+configurations has to establish run-to-run stability before the comparison means anything. The
+`--check` arms in section 3 are unaffected — they compare the operator against a double-precision host
+reference in one process, with no collective in the path. The rule is recorded with the other
+reporting rules in [Benchmarking and reporting rules](../guides/benchmarking.md).
 
 ## 5. What this does not do
 
