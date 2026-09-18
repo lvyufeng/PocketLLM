@@ -323,6 +323,10 @@ void BatchScheduler::admit_requests() {
         }
 
         req->slot_id = slot_id;
+        // Admitted, not merely popped: the queue wait this measures ends here,
+        // and the branch above re-queues a request whose slot allocation failed
+        // so that its wait keeps running.
+        req->admitted_time = std::chrono::steady_clock::now();
         // Held until the request completes, so later passes see this request's
         // full future footprint rather than only the blocks it has taken so far.
         reserved_blocks_ += worst_case_blocks(*req);
@@ -836,6 +840,7 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
 
     // Calculate timings
     auto submit = req->submit_time;
+    auto admitted = req->admitted_time;
     auto first_token = req->first_token_time;
     auto completion = req->completion_time;
 
@@ -844,6 +849,30 @@ void BatchScheduler::notify_result(SchedulerRequest* req) {
     }
     if (first_token > submit) {
         result.ttft_seconds = std::chrono::duration<double>(first_token - submit).count();
+    }
+
+    // The phase split, each interval named only when both of its endpoints were
+    // observed -- the stamps default to the epoch, so an unstamped one fails the
+    // comparison and the field keeps its "unknown" sentinel. A request cancelled
+    // while waiting was never admitted and reports all three as unknown; one
+    // cancelled after admission but before its first token still reports its
+    // queue wait.
+    //
+    // Decode is guarded on the first token rather than on the completion alone:
+    // the completion is always real, so `completion > first_token` is true even
+    // for a request that never produced one, and the difference would be an
+    // interval measured from the epoch.
+    if (admitted > submit) {
+        result.queue_seconds =
+            std::chrono::duration<double>(admitted - submit).count();
+    }
+    if (first_token > admitted) {
+        result.prefill_seconds =
+            std::chrono::duration<double>(first_token - admitted).count();
+    }
+    if (first_token > submit && completion > first_token) {
+        result.decode_seconds =
+            std::chrono::duration<double>(completion - first_token).count();
     }
 
     req->callback_invoked = true;

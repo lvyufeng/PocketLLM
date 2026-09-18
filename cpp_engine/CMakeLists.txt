@@ -894,6 +894,12 @@ add_executable(test_openai_request_fields tests/test_openai_request_fields.cpp)
 target_link_libraries(test_openai_request_fields PRIVATE pocket_core)
 set_target_properties(test_openai_request_fields PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# The metrics collector is a struct of relaxed atomics and a serializer, so it is
+# testable the same way: no checkpoint, no device, no server.
+add_executable(test_engine_metrics tests/test_engine_metrics.cpp)
+target_link_libraries(test_engine_metrics PRIVATE pocket_core)
+set_target_properties(test_engine_metrics PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 # Stop-sequence matching is pure string work over decoded text, so it is
 # testable the same way and without a server to stream through.
 add_executable(test_openai_stop_strings tests/test_openai_stop_strings.cpp)

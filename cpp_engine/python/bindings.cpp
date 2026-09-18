@@ -569,6 +569,14 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("rollback_steps", &SchedulerGenerationResult::rollback_steps)
         .def_readwrite("total_seconds", &SchedulerGenerationResult::total_seconds)
         .def_readwrite("ttft_seconds", &SchedulerGenerationResult::ttft_seconds)
+        // The same split the server records into its Prometheus histograms, so a
+        // Python caller can attribute a request without scraping /metrics. Each
+        // is negative when the interval has no second endpoint: a request that
+        // was never admitted has no queue wait, and one that produced no token
+        // has neither a prefill nor a decode interval.
+        .def_readwrite("queue_seconds", &SchedulerGenerationResult::queue_seconds)
+        .def_readwrite("prefill_seconds", &SchedulerGenerationResult::prefill_seconds)
+        .def_readwrite("decode_seconds", &SchedulerGenerationResult::decode_seconds)
         .def_readwrite("error", &SchedulerGenerationResult::error);
 
     py::class_<BatchScheduler::Stats>(module, "QwenBatchSchedulerStats")

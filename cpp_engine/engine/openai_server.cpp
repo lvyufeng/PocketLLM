@@ -224,15 +224,42 @@ struct TokenStream {
     std::deque<int> tokens;
     bool done = false;
     SchedulerGenerationResult result;
+    // Seconds between successive tokens, one entry per token after the first,
+    // stamped in push() -- that is, at token *production* on the scheduler
+    // thread. Stamping at the drain instead would measure this HTTP loop rather
+    // than the engine: a drain pops everything a decode step queued at once, and
+    // a speculative row emits several tokens in a single step, so the gaps would
+    // read as microseconds between tokens the engine spent real time on. Guarded
+    // by m, like the queue itself.
+    std::vector<double> token_gaps;
+    std::chrono::steady_clock::time_point last_token_time;
+    bool has_last_token = false;
 
     enum class Next { Token, Done, Timeout };
 
     void push(int token) {
+        const auto produced = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lk(m);
+            if (has_last_token) {
+                token_gaps.push_back(
+                    std::chrono::duration<double>(produced - last_token_time).count());
+            }
+            last_token_time = produced;
+            has_last_token = true;
             tokens.push_back(token);
         }
         cv.notify_one();
+    }
+
+    // Hands the gaps observed so far to the caller, so a handler can fold them
+    // into the histograms after releasing the lock. Clearing as it goes keeps the
+    // buffer from growing for the life of a request that folds repeatedly, and
+    // keeps the lock hold to a copy of a few doubles.
+    void take_gaps(std::vector<double>& out) {
+        std::lock_guard<std::mutex> lk(m);
+        out.insert(out.end(), token_gaps.begin(), token_gaps.end());
+        token_gaps.clear();
     }
 
     void finish(const SchedulerGenerationResult& r) {
@@ -1171,9 +1198,16 @@ struct OpenAIServer::Impl {
         texts_out.clear();
         completion_tokens_out = 0;
 
-        std::chrono::steady_clock::time_point ttft_time;
-        bool ttft_recorded = false;
         std::string first_error;
+        // The scheduler's own TTFT and phase split for this request, taken from
+        // the first choice that resolves. A non-streaming request has no
+        // token-bearing chunk to latch on, so the old pop-time latch reported the
+        // completion itself and put a full e2e duration into pocket_ttft_seconds.
+        double ttft = 0.0;
+        double queue_seconds = -1.0;
+        double prefill_seconds = -1.0;
+        double decode_seconds = -1.0;
+        bool have_result = false;
 
         // The timeout is the request's, not the choice's: a group of choices gets
         // the one budget a single-choice request would have had, measured the
@@ -1191,14 +1225,19 @@ struct OpenAIServer::Impl {
                 sched.cancel_request(runs[i].request_id);
                 continue;
             }
-            if (!ttft_recorded) {
-                ttft_time = std::chrono::steady_clock::now();
-                ttft_recorded = true;
-            }
             SchedulerGenerationResult out;
             {
                 std::lock_guard<std::mutex> lk(runs[i].stream->m);
                 out = runs[i].stream->result;
+            }
+            // Per request, from the first choice that resolves. A choice that
+            // failed still ran, so it still carries a real queue wait and prefill.
+            if (!have_result) {
+                ttft = out.ttft_seconds;
+                queue_seconds = out.queue_seconds;
+                prefill_seconds = out.prefill_seconds;
+                decode_seconds = out.decode_seconds;
+                have_result = true;
             }
             if (!out.error.empty()) {
                 if (first_error.empty()) first_error = out.error;
@@ -1242,9 +1281,10 @@ struct OpenAIServer::Impl {
         const auto request_end = std::chrono::steady_clock::now();
         const double duration =
             std::chrono::duration<double>(request_end - request_start).count();
-        const double ttft = ttft_recorded
-            ? std::chrono::duration<double>(ttft_time - request_start).count()
-            : 0.0;
+
+        if (have_result) {
+            metrics.record_request_phases(queue_seconds, prefill_seconds, decode_seconds);
+        }
 
         if (texts_out.empty()) {
             metrics.record_request_end(false, duration, ttft, prompt_tokens.size(), 0);
@@ -1292,7 +1332,14 @@ struct OpenAIServer::Impl {
         httplib::Response& res) {
         std::vector<ChoiceRun> runs;
         if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
-            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            // The real elapsed time, not a synthetic zero: nothing was processed,
+            // so no tokens are counted, but the wait the client actually paid is
+            // what the latency histogram is for. TTFT stays at its sentinel.
+            metrics.record_request_end(
+                false,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - request_start).count(),
+                0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
@@ -1345,8 +1392,14 @@ struct OpenAIServer::Impl {
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             const std::size_t choices = constraints.size();
-            std::chrono::steady_clock::time_point ttft_time;
-            bool ttft_recorded = false;
+            // The scheduler's own TTFT and phase split for this request, taken
+            // from the first choice that resolves -- see the drain loop below for
+            // why these are not stamped here.
+            double ttft = 0.0;
+            double queue_seconds = -1.0;
+            double prefill_seconds = -1.0;
+            double decode_seconds = -1.0;
+            bool have_result = false;
 
             // Every chunk names the choice it carries, so a client reading
             // several answers out of one stream can tell them apart.
@@ -1434,10 +1487,6 @@ struct OpenAIServer::Impl {
                     if (state[i].finished) continue;
                     int token = 0;
                     while (runs[i].stream->try_pop(&token)) {
-                        if (!ttft_recorded) {
-                            ttft_time = std::chrono::steady_clock::now();
-                            ttft_recorded = true;
-                        }
                         state[i].generated.push_back(token);
                         emit_delta(i);
                         ++token_count;
@@ -1478,15 +1527,41 @@ struct OpenAIServer::Impl {
 
             const auto request_end = std::chrono::steady_clock::now();
             const double duration = std::chrono::duration<double>(request_end - request_start).count();
-            const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
             bool any_error = false;
             for (std::size_t i = 0; i < choices; ++i) {
-                if (state[i].timed_out) continue;
-                std::lock_guard<std::mutex> lk(runs[i].stream->m);
-                state[i].finish_reason = runs[i].stream->result.finish_reason;
-                state[i].error = runs[i].stream->result.error;
-                if (!state[i].error.empty()) any_error = true;
+                // An abandoned choice has no scheduler result to read -- it is
+                // still being generated, or being cancelled, and its struct
+                // still holds the defaults. Reading it anyway would overwrite
+                // the request's TTFT and phase split with zeros.
+                if (!state[i].timed_out) {
+                    std::lock_guard<std::mutex> lk(runs[i].stream->m);
+                    state[i].finish_reason = runs[i].stream->result.finish_reason;
+                    state[i].error = runs[i].stream->result.error;
+                    if (!state[i].error.empty()) any_error = true;
+                    // Per request, from the first choice that resolves: TTFT and
+                    // the phase split come from the scheduler, where ITL and TPOT
+                    // below are per choice.
+                    if (!have_result) {
+                        ttft = runs[i].stream->result.ttft_seconds;
+                        queue_seconds = runs[i].stream->result.queue_seconds;
+                        prefill_seconds = runs[i].stream->result.prefill_seconds;
+                        decode_seconds = runs[i].stream->result.decode_seconds;
+                        have_result = true;
+                    }
+                }
+                // Per choice, abandoned or not: the intervals in the buffer were
+                // all observed between tokens the engine actually produced, and
+                // a timed-out choice's tokens were counted and, up to the last
+                // drain, delivered. Dropping them would leave the ITL count
+                // short of `token_count - 1` for the very requests whose token
+                // accounting a reader is most likely to be checking.
+                std::vector<double> gaps;
+                runs[i].stream->take_gaps(gaps);
+                metrics.record_token_gaps(gaps);
+            }
+            if (have_result) {
+                metrics.record_request_phases(queue_seconds, prefill_seconds, decode_seconds);
             }
 
             // Generation has ended, so a trailing partial sequence can no longer
@@ -1542,7 +1617,13 @@ struct OpenAIServer::Impl {
                           std::chrono::steady_clock::time_point request_start) {
         std::vector<ChoiceRun> runs;
         if (!submit_choices(enc.token_ids, sp, constraints, nullptr, runs)) {
-            metrics.record_request_end(false, 0.0, 0.0, 0, 0);
+            // See handle_completions_nonstream: the elapsed wait is real even
+            // though nothing was processed, and TTFT stays at its sentinel.
+            metrics.record_request_end(
+                false,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - request_start).count(),
+                0.0, 0, 0);
             emit_error(res, 503,
                        "request rejected: its worst-case KV footprint exceeds the "
                        "whole block pool, so it could never be admitted");
@@ -1614,8 +1695,14 @@ struct OpenAIServer::Impl {
             (size_t /*offset*/, httplib::DataSink& sink) mutable -> bool {
 
             const std::size_t choices = constraints.size();
-            std::chrono::steady_clock::time_point ttft_time;
-            bool ttft_recorded = false;
+            // The scheduler's own TTFT and phase split for this request, taken
+            // from the first choice that resolves -- see the drain loop below for
+            // why these are not stamped here.
+            double ttft = 0.0;
+            double queue_seconds = -1.0;
+            double prefill_seconds = -1.0;
+            double decode_seconds = -1.0;
+            bool have_result = false;
 
             // Every chunk names the choice it carries, so a client reading
             // several answers out of one stream can tell them apart.
@@ -1757,10 +1844,6 @@ struct OpenAIServer::Impl {
                     if (state[i].finished) continue;
                     int token = 0;
                     while (runs[i].stream->try_pop(&token)) {
-                        if (!ttft_recorded) {
-                            ttft_time = std::chrono::steady_clock::now();
-                            ttft_recorded = true;
-                        }
                         accept(i, token);
                         ++token_count;
                     }
@@ -1800,18 +1883,44 @@ struct OpenAIServer::Impl {
 
             const auto request_end = std::chrono::steady_clock::now();
             const double duration = std::chrono::duration<double>(request_end - request_start).count();
-            const double ttft = ttft_recorded ? std::chrono::duration<double>(ttft_time - request_start).count() : 0.0;
 
             bool any_error = false;
             for (std::size_t i = 0; i < choices; ++i) {
-                if (state[i].timed_out) continue;
-                std::lock_guard<std::mutex> lk(runs[i].stream->m);
-                state[i].finish_reason = runs[i].stream->result.finish_reason;
-                state[i].error = runs[i].stream->result.error;
-                if (!state[i].error.empty()) any_error = true;
-                // Stop tokens are not queued by the scheduler, so they can never
-                // contribute bytes to the stream even when a caller supplies a
-                // custom, non-special stop id.
+                // An abandoned choice has no scheduler result to read -- it is
+                // still being generated, or being cancelled, and its struct
+                // still holds the defaults. Reading it anyway would overwrite
+                // the request's TTFT and phase split with zeros.
+                if (!state[i].timed_out) {
+                    std::lock_guard<std::mutex> lk(runs[i].stream->m);
+                    state[i].finish_reason = runs[i].stream->result.finish_reason;
+                    state[i].error = runs[i].stream->result.error;
+                    if (!state[i].error.empty()) any_error = true;
+                    // Per request, from the first choice that resolves: TTFT and
+                    // the phase split come from the scheduler, where ITL and TPOT
+                    // below are per choice.
+                    if (!have_result) {
+                        ttft = runs[i].stream->result.ttft_seconds;
+                        queue_seconds = runs[i].stream->result.queue_seconds;
+                        prefill_seconds = runs[i].stream->result.prefill_seconds;
+                        decode_seconds = runs[i].stream->result.decode_seconds;
+                        have_result = true;
+                    }
+                    // Stop tokens are not queued by the scheduler, so they can
+                    // never contribute bytes to the stream even when a caller
+                    // supplies a custom, non-special stop id.
+                }
+                // Per choice, abandoned or not: the intervals in the buffer were
+                // all observed between tokens the engine actually produced, and
+                // a timed-out choice's tokens were counted and, up to the last
+                // drain, delivered. Dropping them would leave the ITL count
+                // short of `token_count - 1` for the very requests whose token
+                // accounting a reader is most likely to be checking.
+                std::vector<double> gaps;
+                runs[i].stream->take_gaps(gaps);
+                metrics.record_token_gaps(gaps);
+            }
+            if (have_result) {
+                metrics.record_request_phases(queue_seconds, prefill_seconds, decode_seconds);
             }
 
             // Flush any remaining tail bytes (e.g. an isolated partial sequence
