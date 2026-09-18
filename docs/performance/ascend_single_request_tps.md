@@ -856,6 +856,22 @@ The cost is workspace, and it is small because only one-row activations grow: `a
 is 1825704 at the default and 3090728 at 16, +1.2 MB, against 13.45 GB of resident weights per card.
 `gpu_memory_used_bytes` moves by the same 4 MB over four ranks.
 
+**The accuracy question, since this is the width that exposed one.** An earlier revision of this
+page could not show that `QWEN_ASCEND_REPLICATE_ROWS=16` generated what the default generated: three
+runs produced three different first tokens where widths 2, 4 and 8 were stable. That was not the
+replication. It was the RoPE table sharing a workspace slot with an attention kernel the host had
+already queued, and the replication changed the timing of that window rather than inventing it. With
+the table given its own slot the two arms produce the same 32 tokens, byte for byte, and both are the
+reference's:
+
+| pair | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` |
+|---|---|---|
+| 1 | 13.0088 TPS | 17.5931 TPS |
+| 2 | 12.9874 TPS | 17.2694 TPS |
+
+All four runs emit `11751 13 198 760 6511 314 9564 369 19241 ...`. The lever is worth the same
+13.05 -> 17.59 TPS with the accuracy intact; it is not paid for with it.
+
 ### 6.4 Where the 20.1 ms went
 
 `QWEN_PHASE_PROFILE` brackets every scope with a `device_synchronize`, so its numbers are device work
@@ -928,10 +944,11 @@ the launch is refused instead of writing past the end of it. The rule was restor
 rebuilt, and the A/B re-measured; the pairs in §6.3 are from the restored build.
 
 What this gate does not establish is that the sixteen rows carry the right *numbers*. It verifies the
-room, not the arithmetic, and on this platform the tokens cannot stand in for it: §5.5.4 measured
-four runs of two identical binaries producing three distinct greedy step-0 tokens, and the two arms
-of §6.3 produce different greedy sequences. What is checked is the half the bench can check — the
-broadcast's parity at both widths (§6.1) — and the half the engine can check, which is the extent.
+room, not the arithmetic. The rest of the arithmetic is covered elsewhere rather than here: the
+broadcast's parity at both widths is the bench's own check (§6.1), the extent is what this gate
+checks, and the tokens are what §6.3 has — the two arms, and the widths either side of them, emitting
+one 32-token sequence that is the HF reference's. Before the workspace fix that third leg was not
+available and this paragraph said so; it is available now.
 
 Three further things are not established, and are named so they are not read as done. The
 `full_attention` and `attn_resid_norm` deltas above are a single session's, on a step that has 112
