@@ -32,6 +32,30 @@ class NoThinkingArgumentTokenizer:
         return [4, 5] if tokenize else "fallback prompt"
 
 
+class BatchEncodingTokenizer:
+    """Reproduces what transformers 5.x returns for ``tokenize=True``.
+
+    ``apply_chat_template(..., tokenize=True)`` returns a ``BatchEncoding`` when
+    the tokenizer is a fast one, and a ``BatchEncoding`` iterates as its *keys*.
+    """
+
+    class BatchEncoding:
+        def __init__(self, input_ids) -> None:
+            self.input_ids = list(input_ids)
+            self.attention_mask = [1] * len(self.input_ids)
+
+        def __iter__(self):
+            return iter(("input_ids", "attention_mask"))
+
+        def __getitem__(self, key):
+            return getattr(self, key)
+
+    def apply_chat_template(self, messages, **kwargs):
+        if kwargs["tokenize"]:
+            return self.BatchEncoding([11, 12, 13])
+        return "rendered prompt"
+
+
 def test_cpp_sidecar_detects_root_and_nested_architectures(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -79,6 +103,23 @@ def test_generic_sidecar_uses_checkpoint_chat_template_for_ids_and_text():
         assert kwargs["enable_thinking"] is True
     assert tokenizer.calls[0][1]["tokenize"] is True
     assert tokenizer.calls[1][1]["tokenize"] is False
+
+
+def test_generic_sidecar_reads_ids_from_a_batch_encoding():
+    """A fast tokenizer's chat template returns a BatchEncoding, not a list.
+
+    Iterating that for ids yields its keys, so ``int(token)`` raised
+    ``invalid literal for int() with base 10: 'input_ids'`` - an HTTP 400 on
+    every chat request, while the completions path (tokenized in C++) kept
+    working.  The real shape is faked here rather than reached through a
+    checkpoint, so the regression is covered without a model to load.
+    """
+    templater = ChatTemplateTemplater(BatchEncodingTokenizer())
+
+    prompt, token_ids = templater.encode({"messages": [{"role": "user", "content": "hi"}]})
+
+    assert token_ids == [11, 12, 13]
+    assert prompt == "rendered prompt"
 
 
 def test_generic_sidecar_decodes_replayed_tool_arguments_for_the_template():
