@@ -150,6 +150,24 @@ bool qwen_gqa_decode_attention_cube_split_f16_ascend(const uint16_t* d_q_fp16, c
 
 bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink, int tile_count, void* stream);
 
+// Device-side arrival wait for the hand-written cross-process all-reduce: block on
+// the caller's stream until every peer's stamp for `round` carries the value
+// `ipc_stamp_value` says it should, then return. `d_stamps` is this rank's receive
+// array, `world * kIpcStampStride` uint16_t words with peer `k`'s stamp at word
+// `k * kIpcStampStride`. `deadline_ms` is the host poll's own deadline and is what
+// bounds the spin.
+//
+// `d_status` is a one-word latch, not a result of this call: the kernel writes the
+// number of still-missing peers when it runs out of iterations and leaves the word
+// alone when the wait succeeds, so a failure survives until the host reads it --
+// which it does only every kStatusCheckEvery calls, to keep the read off the
+// per-call path. The caller must start it at zero and zero it after reading one.
+//
+// Returns false when the arguments are outside the geometry the kernel is
+// instantiated for, and the launch status otherwise -- it says nothing about
+// whether the peers arrived, which is only ever in `d_status`.
+bool qwen_ipc_arrive_wait_ascend(const uint16_t* d_stamps, uint32_t* d_status, int world, int rank, int64_t round, int deadline_ms, void* stream);
+
 bool qwen_gqa_prefill_attention_f16_ascend(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, int seq_len, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, void* stream);
 
 bool qwen_gqa_verify_attention_f16_ascend(const uint16_t* d_q_rows_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_rows_fp16, float* d_partial_scratch, int rows, int q_heads, int kv_heads, int head_dim, int position_offset, int max_context, int splits, void* stream);

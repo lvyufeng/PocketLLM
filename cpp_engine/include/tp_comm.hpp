@@ -63,6 +63,24 @@ void tp_global_topk_rows_device(int world, int rank, int device,
                                 void* stream = nullptr);
 void tp_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count, void* stream = nullptr);
 void tp_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream = nullptr);
+// Whether that call, for this shape, runs on the stream it is handed rather than
+// on one the backend substitutes. The Ascend HCCL path answers false: with a
+// non-null stream it runs on that stream, and with a null one it drains the
+// default stream and runs on a private one, so either way the caller's bracket --
+// a ready event into the communication stream plus a `stream_synchronize` on it --
+// is what keeps the call ordered against the compute stream. The hand-written
+// Ascend collective answers true, because everything it issues is stream-ordered
+// on the caller's stream and it needs neither half of that bracket.
+//
+// A caller that brackets every collective for the HCCL case must therefore consult
+// this before bracketing. On Ascend the bracket's `stream_synchronize` is a host
+// round trip that waits for the default stream to drain and then for the
+// collective to finish; around a call that was already ordered on the default
+// stream it buys nothing and costs 12.9 ms of a 91.5 ms rows=1 decode step, 0.100
+// ms per call over 129 calls. The wrong answer here is a correctness hazard of a
+// worse kind than a slow step, so it is the backend -- which knows what its
+// collective did -- that answers, not the caller.
+bool tp_all_reduce_f16_on_caller_stream(int world, int count);
 // BF16 reduce. Available on CUDA (Ampere and later); the Ascend backend throws,
 // because first-generation 910 has no BF16 at all and every device tensor there
 // is FP16. See qwen_device_dtype in core/qwen_weight_map.cpp.
