@@ -159,6 +159,17 @@ decode_tokens   = pocket_tokens_total{type="generation"} delta - 1
 decode_seconds  = pocket_request_duration_seconds_sum delta - prefill_seconds
 ```
 
+!!! note "True of the commit this run was taken on"
+    The subtraction above is how the phases had to be recovered when this page
+    was measured: `/metrics` exported a TTFT family and an end-to-end family and
+    nothing else. The engine now records `pocket_request_queue_time_seconds`,
+    `pocket_request_prefill_time_seconds` and `pocket_request_decode_time_seconds`
+    directly, from the scheduler's own clock, so neither phase is derived any
+    more and the decode interval no longer absorbs the duration family's
+    response assembly. TTFT comes from the same scheduler result rather than
+    from a latch in the HTTP handler. The results below are unchanged: they are a
+    record of commit `1536681`, not of the current tree.
+
 The first generated token belongs to prefill, so it is subtracted from the
 decode count. The deltas are attributed to one request by asserting that the
 TTFT, duration, and success counters each moved by exactly 1; without that check
@@ -180,6 +191,16 @@ engine has no first-token instant on that path and its TTFT equals its full
 duration. That was measured, not assumed — the first attempt at this harness
 failed on `duration 8.8587 does not exceed ttft 8.8588`. The phase harness
 therefore streams, and asserts that the first stream event arrives before TTFT.
+
+!!! note "Fixed since"
+    That equality was a property of the pop-time latch, not of the engine: the
+    latch fired on the first read that did not time out, which for a
+    non-streaming request is the completion itself. TTFT now comes from the
+    scheduler's result — the instant the first token was produced, on the
+    engine's own clock — so a non-streaming request reports a TTFT well below its
+    duration and the failure quoted above can no longer occur. Why this page's
+    harness streams is unchanged: the non-streaming path still has no
+    token-bearing event to delimit the phases on the wire.
 
 ## Results
 

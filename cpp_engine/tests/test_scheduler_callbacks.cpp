@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <iostream>
@@ -294,6 +295,65 @@ void test_engine_failure_is_terminal() {
     scheduler.stop();
 }
 
+// The phase split is what makes a request's duration attributable: queueing is
+// the scheduler's fault, prefill and decode are the engine's. It is measured
+// here rather than in the server because the admission instant -- the one that
+// ends the queue wait -- happens inside admit_requests() under the queue mutex,
+// where no caller can see it.
+void test_phase_split_is_reported() {
+    std::cout << "a completed request reports a queue/prefill/decode split\n";
+    CountingEngine engine;
+    pocket::BatchScheduler scheduler(&engine, 1);
+
+    pocket::BatchSamplingParams sampling;
+    sampling.max_new_tokens = 4;
+    CallbackState state;
+    submit_with_callbacks(scheduler, sampling, state);
+
+    check(wait_done(state), "phase-split request completes");
+    const pocket::SchedulerGenerationResult& result = state.result;
+    check(result.queue_seconds >= 0.0, "the queue wait was observed");
+    check(result.prefill_seconds > 0.0, "the prefill interval was observed");
+    check(result.decode_seconds > 0.0, "the decode interval was observed");
+    // The three intervals are consecutive and cover exactly the total, which is
+    // what lets a reader trust them over the `total - ttft` subtraction the
+    // completion timestamp cannot support.
+    check(std::fabs(result.queue_seconds + result.prefill_seconds +
+                    result.decode_seconds - result.total_seconds) < 1e-9,
+          "the three phases sum to the reported duration");
+    check(std::fabs(result.queue_seconds + result.prefill_seconds -
+                    result.ttft_seconds) < 1e-9,
+          "time to first token is the queue wait plus the prefill");
+    scheduler.stop();
+}
+
+// A request the engine failed before it produced anything still waited in the
+// queue, so that phase is known while the other two are not. Reporting them as
+// 0.0 would put two fake instantaneous samples into the histograms and make a
+// request that never started look like the fastest one served.
+void test_request_without_a_first_token_reports_only_its_queue() {
+    std::cout << "a request that produced no token reports only its queue wait\n";
+    CountingEngine engine;
+    engine.fail_prefill = true;
+    pocket::BatchScheduler scheduler(&engine, 1);
+
+    pocket::BatchSamplingParams sampling;
+    sampling.max_new_tokens = 4;
+    CallbackState state;
+    submit_with_callbacks(scheduler, sampling, state);
+
+    check(wait_done(state), "the failed request completes");
+    const pocket::SchedulerGenerationResult& result = state.result;
+    check(result.finish_reason == "error", "the request is reported as failed");
+    check(result.queue_seconds >= 0.0, "the queue wait it did serve is reported");
+    check(result.prefill_seconds < 0.0,
+          "a prefill that never finished its first token is unknown, not zero");
+    check(result.decode_seconds < 0.0,
+          "a decode interval is unknown when no token was ever produced");
+    check(result.ttft_seconds == 0.0, "time to first token stays at its sentinel");
+    scheduler.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -302,6 +362,8 @@ int main() {
     test_poll_result_without_callback();
     test_multi_token_row_respects_budget_and_reports_stats();
     test_engine_failure_is_terminal();
+    test_phase_split_is_reported();
+    test_request_without_a_first_token_reports_only_its_queue();
 
     if (failures != 0) {
         std::cout << "[FAIL] " << failures << " scheduler callback checks failed\n";

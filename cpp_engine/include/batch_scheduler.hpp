@@ -45,6 +45,20 @@ struct SchedulerGenerationResult {
     int rollback_steps = 0;
     double total_seconds = 0.0;
     double ttft_seconds = 0.0;  // Time to first token
+    // The phase split of `total_seconds`, on the scheduler's clock: queue is
+    // submission -> admission, prefill is admission -> first token, and decode
+    // is first token -> completion. Each is negative when its boundaries were
+    // never both observed -- a request cancelled before its first token has no
+    // prefill and no decode interval -- so a consumer must skip negatives rather
+    // than read them as zero. Where all three are known they sum to
+    // `total_seconds` exactly.
+    //
+    // This is stricter than inferring decode as `total - ttft`, because
+    // `completion_time` is the engine's own completion and excludes response
+    // assembly.
+    double queue_seconds = -1.0;
+    double prefill_seconds = -1.0;
+    double decode_seconds = -1.0;
     // Non-empty when the engine rejected or failed a forward. The old direct
     // server path surfaced that exception as HTTP 500; routing through a
     // background scheduler must preserve it rather than retrying forever until
@@ -108,6 +122,8 @@ struct SchedulerRequest {
 
     // Timing
     std::chrono::steady_clock::time_point submit_time;
+    // When a slot was reserved for this request, or the epoch if it never was.
+    std::chrono::steady_clock::time_point admitted_time;
     std::chrono::steady_clock::time_point first_token_time;
     std::chrono::steady_clock::time_point completion_time;
 
