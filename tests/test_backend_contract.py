@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from urllib import error, request
+
+import pytest
 
 from pocketllm.api import (
     BackendCapabilities,
@@ -12,6 +15,7 @@ from pocketllm.api import (
     Usage,
 )
 from pocketllm.backends.base import BackendBase
+from pocketllm.server.metrics import HISTOGRAMS, Metrics
 from pocketllm.server.openai import OpenAIHandler, PocketLLMHTTPServer
 
 
@@ -86,9 +90,45 @@ def _metric_value(text: str, name: str) -> float:
     raise AssertionError(f"metric {name} not exported:\n{text}")
 
 
+_BUCKET_LINE = re.compile(
+    r'^pocketllm_(?P<family>\w+)_bucket\{le="(?P<bound>[^"]+)"\} (?P<count>\S+)$'
+)
+
+
+def _buckets(text: str, family: str) -> list[tuple[str, float]]:
+    """The `_bucket` series of one family, in exposition order."""
+    found = []
+    for line in text.splitlines():
+        match = _BUCKET_LINE.match(line)
+        if match and match.group("family") == family:
+            found.append((match.group("bound"), float(match.group("count"))))
+    return found
+
+
 def _metrics(base: str) -> str:
     with request.urlopen(base + "/metrics", timeout=10) as response:
         return response.read().decode()
+
+
+class TokenCountBackend(ContractBackend):
+    """Streams a fixed number of token-bearing events and nothing else."""
+
+    def __init__(self, tokens: int):
+        super().__init__()
+        self._tokens = tokens
+
+    def stream(self, req):
+        self._begin_request(req.request_id)
+        try:
+            for index in range(self._tokens):
+                yield TokenEvent(
+                    req.request_id,
+                    text="x",
+                    token_id=100 + index,
+                    finish_reason="stop" if index == self._tokens - 1 else None,
+                )
+        finally:
+            self._clear_request(req.request_id)
 
 
 def test_shared_server_routes_chat_and_completions():
@@ -338,6 +378,116 @@ def test_cancelling_unknown_request_returns_404():
         except error.HTTPError as exc:
             assert exc.code == 404
             assert json.loads(exc.read().decode())["cancelled"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_metrics_exposition_is_a_prometheus_histogram():
+    """Every declared family exposes `_bucket` series, not just `_sum`/`_count`.
+
+    A `_count` and a `_sum` alone are not a histogram -- a scraper cannot take a
+    quantile from them -- so the shape is asserted before any sample exists, the
+    way the families are exported from process start.
+    """
+    text = Metrics().render()
+    for family, (bounds, help_text) in HISTOGRAMS.items():
+        assert f"# HELP pocketllm_{family} {help_text}\n" in text
+        assert f"# TYPE pocketllm_{family} histogram\n" in text
+        buckets = _buckets(text, family)
+        # One series per finite bound plus the trailing +Inf slot.
+        assert len(buckets) == len(bounds) + 1, family
+        assert buckets[-1][0] == "+Inf"
+        finite = [float(bound) for bound, _ in buckets[:-1]]
+        assert finite == sorted(finite) == list(bounds), family
+        counts = [count for _, count in buckets]
+        assert all(a <= b for a, b in zip(counts, counts[1:])), family
+        assert counts[-1] == _metric_value(text, f"{family}_count") == 0.0
+        assert _metric_value(text, f"{family}_sum") == 0.0
+
+
+def test_metrics_counters_and_gauges_carry_their_prometheus_type():
+    metrics = Metrics()
+    metrics.inc("requests_total")
+    metrics.set("build_info", 1)
+    text = metrics.render()
+    assert "# TYPE pocketllm_requests_total counter\n" in text
+    assert "# TYPE pocketllm_build_info gauge\n" in text
+
+
+def test_observed_samples_land_in_inclusive_cumulative_buckets():
+    metrics = Metrics()
+    for value in (0.05, 0.4, 3.0, 9000.0):
+        metrics.observe("inter_token_latency_seconds", value)
+    text = metrics.render()
+    buckets = dict(_buckets(text, "inter_token_latency_seconds"))
+
+    # A sample exactly on a bound belongs to that bound's bucket (`le` is
+    # inclusive), and each series counts everything at or below it.
+    assert buckets["0.05"] == 1
+    assert buckets["0.1"] == 1
+    assert buckets["0.5"] == 2
+    assert buckets["5.0"] == 3
+    # The 9000 s sample is above every finite bound, so only +Inf sees it.
+    assert buckets["80.0"] == 3
+    assert buckets["+Inf"] == 4
+    assert _metric_value(text, "inter_token_latency_seconds_count") == 4.0
+    assert _metric_value(text, "inter_token_latency_seconds_sum") == pytest.approx(9003.45)
+
+
+def test_undeclared_histogram_is_rejected():
+    """A histogram cannot be created on first use the way a counter can."""
+    with pytest.raises(KeyError, match="undeclared histogram"):
+        Metrics().observe("decoded_tokens_per_second", 1.0)
+
+
+def test_streaming_records_ttft_itl_and_tpot():
+    server, base = _server(backend=TokenCountBackend(4))
+    try:
+        _post_raw(base, "/v1/completions", {"prompt": "hi", "stream": True})
+        text = _metrics(base)
+        # The role delta the chat path writes first is not a token, so TTFT is
+        # latched on the first event that carries one.
+        assert _metric_value(text, "ttft_seconds_count") == 1.0
+        assert _metric_value(text, "inter_token_latency_seconds_count") == 3.0
+        assert _metric_value(text, "request_time_per_output_token_seconds_count") == 1.0
+        assert _metric_value(text, "request_duration_seconds_count") == 1.0
+        # The per-request mean times the number of intervals is the pooled
+        # interval sum: the two families are derived from the same gaps.
+        itl = _metric_value(text, "inter_token_latency_seconds_sum")
+        tpot = _metric_value(text, "request_time_per_output_token_seconds_sum")
+        assert tpot * 3 == pytest.approx(itl, rel=1e-6)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_single_token_stream_has_no_interval_to_average():
+    server, base = _server(backend=TokenCountBackend(1))
+    try:
+        _post_raw(base, "/v1/completions", {"prompt": "hi", "stream": True})
+        text = _metrics(base)
+        assert _metric_value(text, "ttft_seconds_count") == 1.0
+        assert _metric_value(text, "inter_token_latency_seconds_count") == 0.0
+        # vLLM excludes `output_len <= 1` for the same reason: there is no
+        # interval, and a zero would read as an instantaneous one.
+        assert _metric_value(text, "request_time_per_output_token_seconds_count") == 0.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_non_streaming_records_no_per_token_latency():
+    server, base = _server()
+    try:
+        _post(base, "/v1/completions", {"prompt": "hi"})
+        text = _metrics(base)
+        assert _metric_value(text, "request_duration_seconds_count") == 1.0
+        # The non-streaming path has no per-token boundary to observe; it
+        # reports the end-to-end latency and invents nothing else.
+        assert _metric_value(text, "ttft_seconds_count") == 0.0
+        assert _metric_value(text, "inter_token_latency_seconds_count") == 0.0
+        assert _metric_value(text, "request_time_per_output_token_seconds_count") == 0.0
     finally:
         server.shutdown()
         server.server_close()

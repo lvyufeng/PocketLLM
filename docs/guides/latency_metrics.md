@@ -95,38 +95,66 @@ distinction is specific to `/v1/chat/completions`.
 ## Naming map: vLLM series → PocketLLM series
 
 The names stay `pocket_*` / `pocketllm_*`; only the definitions are aligned.
-There are no `vllm:` aliases. The last column is the state of the repository
-today: `pocket_ttft_seconds` and `pocket_request_duration_seconds` are exported
-by the native server, and **the other five are defined here but not yet
-exported by either server** — the table is the target the server-side work is
-held to, and the row is updated in the commit that implements it.
+There are no `vllm:` aliases. The native server prefixes with `pocket_` and the
+Python server with `pocketllm_`, and a series exists only where the table names
+one:
 
-| vLLM series | PocketLLM series | Status |
+| vLLM series | Native server (`cpp_engine`) | Python server (`pocketllm`) |
 | --- | --- | --- |
-| `vllm:time_to_first_token_seconds` | `pocket_ttft_seconds` | native server exports it; 8 bounds, to be replaced by upstream's 22 |
-| `vllm:e2e_request_latency_seconds` | `pocket_request_duration_seconds` | native server exports it; 8 bounds, to be replaced by upstream's 21 |
-| `vllm:inter_token_latency_seconds` | `pocket_inter_token_latency_seconds` | not exported yet — upstream's 19 bounds |
-| `vllm:request_time_per_output_token_seconds` | `pocket_request_time_per_output_token_seconds` | not exported yet — the per-request **mean**, not a pooled per-token sample; shares the ITL bounds |
-| `vllm:request_queue_time_seconds` | `pocket_request_queue_time_seconds` | not exported yet — shares the request-latency bounds |
-| `vllm:request_prefill_time_seconds` | `pocket_request_prefill_time_seconds` | not exported yet — shares the request-latency bounds |
-| `vllm:request_decode_time_seconds` | `pocket_request_decode_time_seconds` | not exported yet — shares the request-latency bounds |
+| `vllm:time_to_first_token_seconds` | `pocket_ttft_seconds` | `pocketllm_ttft_seconds` |
+| `vllm:e2e_request_latency_seconds` | `pocket_request_duration_seconds` | `pocketllm_request_duration_seconds` |
+| `vllm:inter_token_latency_seconds` | `pocket_inter_token_latency_seconds` | `pocketllm_inter_token_latency_seconds` |
+| `vllm:request_time_per_output_token_seconds` | `pocket_request_time_per_output_token_seconds` | `pocketllm_request_time_per_output_token_seconds` |
+| `vllm:request_queue_time_seconds` | `pocket_request_queue_time_seconds` | — |
+| `vllm:request_prefill_time_seconds` | `pocket_request_prefill_time_seconds` | — |
+| `vllm:request_decode_time_seconds` | `pocket_request_decode_time_seconds` | — |
 
-Each family's bucket vector is to be copied verbatim from upstream, so that a
-`_bucket` line from a PocketLLM scrape is comparable with the vLLM line of the
-same name. The gap in the two families that already exist is not cosmetic:
-`pocket_ttft_seconds` tops out at **5 s** today, which is below a single
-6497-token prefill on the 2080 Ti baseline, so on that workload every real
-sample lands only in `+Inf` and the histogram cannot be quantiled at all.
-Upstream's top finite bound for TTFT is 2560 s.
+Bucket vectors are copied verbatim from upstream rather than chosen here, so a
+`_bucket` line from a PocketLLM scrape can be compared with the vLLM line of the
+same name line by line. Both servers use the same three vectors:
 
-The Python server (`pocketllm/server/metrics.py`) emits `_count` and `_sum` per
-family plus `{quantile=…}` lines it computes by list index, and no `_bucket`
-series at all — so it is not a Prometheus histogram in the sense a scraper
-expects, and it retains every raw sample, which is an unbounded leak in a
-long-lived process. It also has no queue/prefill/decode term to expose: the
-Python timing surface has no queue term and the streaming path yields no final
-result to read a split from. Both gaps are recorded here rather than
-approximated in code.
+| Upstream family | Bounds | Used by |
+| --- | --- | --- |
+| `request_latency` | 21, `0.3` … `7680` | E2EL, queue, prefill, decode |
+| `time_to_first_token` | 22, `0.001` … `2560` | TTFT |
+| `inter_token_latency` | 19, `0.01` … `80` | ITL, and the per-request TPOT mean |
+
+Copying the vector is not cosmetic. The families this repository had before the
+alignment topped out at 5 s for TTFT, which is below a single 6497-token prefill
+on the 2080 Ti baseline, so on that workload every real sample landed only in
+`+Inf` and the histogram could not be quantiled at all.
+
+!!! note "The `le` label is spelled differently by the two servers"
+    The Python exporter writes ``le="1.0"`` and the native one writes
+    ``le="1"``, because C++'s default float formatting drops the trailing
+    zero. The bucket *sets* are identical, and both are valid Prometheus; a
+    dashboard that matches on the label text rather than on the parsed bucket
+    bound will see the difference.
+
+### What each server observes, and what it does not
+
+**Native server.** All seven series. It owns the scheduler's clock, so it
+reports the three request phases directly and derives TTFT from the same
+scheduler result. The phase columns have independent counts, unlike vLLM's,
+which observes all three for every finished request: a request cancelled before
+its first token has a real queue wait and no prefill interval, and it records
+only what it has.
+
+**Python server.** The four latency series, and only the four. It has no queue
+term in its timing surface and its streaming path yields no final result to
+read a phase split from, so the three phase series are absent rather than
+approximated — a permanently-zero `_count` would read as "no queueing" instead
+of "not measured".
+
+Two further caveats on the Python server:
+
+- **`pocketllm_ttft_seconds` and the two per-token series are streaming-only.**
+  A non-streaming request has no per-token boundary to observe, so it records
+  `pocketllm_request_duration_seconds` and nothing else. The families are still
+  exported from process start, at zero, so a rate over the first scrape window
+  is defined; read them together with their `_count`.
+- **A single-token response contributes no ITL and no TPOT sample**, matching
+  vLLM's `output_len ≤ 1` exclusion on both sides.
 
 ## Server-side vs client-side TPOT
 
@@ -135,16 +163,25 @@ Upstream observes server-side TPOT as the **per-request mean**
 sample per request that produced at least two tokens, not one sample per gap. So
 
 ```text
-pocket_inter_token_latency_seconds_count ≡ Σ(n_i − 1)
-pocket_request_time_per_output_token_seconds_count ≡ #{requests with n_i ≥ 2}
+<prefix>_inter_token_latency_seconds_count ≡ Σ(n_i − 1)
+<prefix>_request_time_per_output_token_seconds_count ≡ #{requests with n_i ≥ 2}
 ```
 
-and, on the native server, `pocket_inter_token_latency_seconds_sum` equals
-`pocket_request_time_per_output_token_seconds_sum` — because the gaps it sums are
-the very intervals that mean averages. A client-side ITL computed from chunk
-arrival times will **not** match the server-side sum, because the client's clock
-starts at the socket and the server's at token production; report which side a
-number came from.
+where `<prefix>` is `pocket_` on the native server and `pocketllm_` on the
+Python one. Summed over one stream that produced `n ≥ 2` tokens,
+
+```text
+inter_token_latency_seconds_sum == request_time_per_output_token_seconds_sum × (n − 1)
+```
+
+— because the gaps the first family sums are the very intervals the second
+averages. The identity is per request: a scrape pools several requests, and
+requests with different output lengths have no single multiplier between the two
+sums. Both servers satisfy it by construction, since both derive the two samples
+from one set of intervals. A client-side ITL computed from chunk arrival times
+will **not** match the server-side sum, because the client's clock starts at the
+socket and the server's at token production; report which side a number came
+from.
 
 ## Relation to the prefill/decode convention
 
