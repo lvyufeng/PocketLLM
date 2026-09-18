@@ -388,7 +388,14 @@ int ascend_replicate_rows() {
 // heads, dim}` and its append and attention kernels index those strides
 // themselves; nothing replicated ever writes one, so growing one would cost
 // `replicate` times the cache -- 2.1 GB against 134 MB at a 8192-token context
-// -- to buy nothing. No activation in the layer is spelled that way.
+// -- to buy nothing.
+//
+// The boundary is load-bearing for activations too, and not only for caches: an
+// activation a replicated projection writes has to be spelled rank 2 or lower,
+// because a rank-3 spelling of the same storage (`{rows, heads, dim}`) falls on
+// the wrong side of this line and is then sized for one row and written sixteen
+// deep. The K and V workspaces in the full-attention layer were spelled that way
+// once; the fix was to flatten them, not to widen the rule.
 size_t ascend_replicated_elements(size_t elements,
                                   const std::vector<uint64_t>& shape,
                                   SafeDType dtype) {
@@ -412,10 +419,10 @@ size_t ascend_replicated_elements(size_t elements,
 // for one row and then written sixteen deep, and nothing else in the engine
 // would notice.
 //
-// `QWEN_ASCEND_REPLICATE_CHECK=1` makes every activation remember its capacity
-// and every replicated projection look its destination up and decline to launch
-// if the tall write does not fit. A buffer that reached the device through a
-// bare `allocate` rather than through here is not in the map, and is refused
+// `QWEN_ASCEND_REPLICATE_CHECK=1` makes every activation remember its declared
+// extent and every replicated projection look its destination up and decline to
+// launch if the tall write does not fit. A buffer that reached the device through
+// a bare `allocate` rather than through here is not in the map, and is refused
 // rather than assumed to be fine, which is the same failure this exists to
 // catch.
 //
@@ -461,7 +468,13 @@ void allocate_elements(QwenDeviceTensor& tensor, size_t elements,
     allocate(tensor, elements * item_size, shape, dtype);
 #ifdef POCKET_BACKEND_ASCEND
     if (ascend_replicate_check()) {
-        ascend_activation_capacity()[tensor.data] = tensor.capacity;
+        // The declared extent, not the block's capacity. A workspace slot is
+        // reused for whatever shape the next layer asks for, so its capacity is
+        // the largest extent it has ever held -- a bound on what the hardware
+        // can take, and exactly the wrong number here. What the projection needs
+        // to know is whether this destination was declared with room for
+        // `replicate` rows, which is what `nbytes` records.
+        ascend_activation_capacity()[tensor.data] = tensor.nbytes;
     }
 #endif
 }
