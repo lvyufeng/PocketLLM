@@ -20,15 +20,21 @@ all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** in an empty loop (§5
 now built as a kernel-level replacement for the collective (`POCKET_ASCEND_IPC_ALLREDUCE=1`) and it
 has been measured inside the engine against the shipped path **interleaved run for run**, so the two
 arms share a session: rows=1 goes from **106.33 ms / 9.408 TPS to 77.32 ms / 12.935 TPS**, +37.7%
-(§5.5.4). It ships opt-in rather than on for one reason: the launcher's hard gate is
-`batch_repeat_mismatches`, the batched pass against its own repeat, and **both** arms fail it —
-3 of 36 runs under HCCL, 8 of 36 under the replacement — so thirty-six interleaved pairs still do not
-separate the two rates and the gate neither rejects the replacement nor validates it. What the same
-pairs do not leave in doubt is the step. Half of the saving came from deleting a bracket rather than
-from the barrier: the first integration kept the engine's `begin`/`end` pair around the new
-collective and paid 12.9 ms of host round trips for ordering it did not need (§5.5.1). The empty-loop
-probe projected 13.2 TPS, so the barrier itself delivered what it promised; §5.5.3 prices what is
-left, and it is the arrival poll rather than the payload.
+(§5.5.4). It ships opt-in, and the reason this page gave for that — the launcher's hard gate,
+`batch_repeat_mismatches`, failed by **both** arms, 3 of 36 runs under HCCL and 8 of 36 under the
+replacement — is retracted. Those failures were the partial-RoPE table aliasing a pooled workspace
+buffer with a kernel the host had already queued, which is a separate defect with a separate fix and
+nothing to do with the collective. With it fixed the gate is failed 0 times in 22 runs across both
+arms. The replacement stays opt-in here only because flipping a default is its own change: the
+device-side wait of §5.5.3 also passes the gate once the table has its own slot, and takes rows=1 to
+**53.0-53.9 ms and 18.56-18.86 TPS** — 18.6 TPS on a single request at the shipped row count, with
+the tokens the reference produces.
+
+What those same pairs do not leave in doubt is the step. Half of the saving came from deleting a
+bracket rather than from the barrier: the first integration kept the engine's `begin`/`end` pair
+around the new collective and paid 12.9 ms of host round trips for ordering it did not need (§5.5.1).
+The empty-loop probe projected 13.2 TPS, so the barrier itself delivered what it promised; §5.5.3
+prices what is left, and it is the arrival poll rather than the payload.
 
 ## 1. The row sweep: single-request cost is batch-independent cost
 
@@ -388,7 +394,9 @@ to be zero; an earlier revision of this page read it as a correctness gate and c
 the replacement was clean. The number that does gate is `batch_repeat_mismatches`, and §5.5.4 is what
 it says about the replacement: the interleaved A/B fails it 8 times in 36 under the hand-written
 collective and 3 times in 36 under the shipped HCCL path, which is not a separation, and 106.33 ms /
-9.408 TPS against 77.32 ms / 12.935 TPS is.
+9.408 TPS against 77.32 ms / 12.935 TPS is. The failure counts are a workspace race and not the
+collective — the retraction opening §5.5.4 says what they were — so neither arm can be read off them
+at all.
 
 What does move between the arms is the distance between the batched and the single-row arithmetic:
 `verify_logit_abs_matched` is 0.69 against HCCL's 0.077, and the checksum distance 0.032 against
@@ -467,11 +475,33 @@ why `DEVWAIT`, which removes the round trip and keeps the ordering, gains 30%. T
 1.8 ms above the `NOPOLL` floor of 51.905 ms, the same order as the run-to-run spread between two
 sessions; what is left is the part of the wait the device does have to do for itself.
 
-**It is a bound, not a candidate, and what it exposes is worth more than what it saves.** Every one of
-the ten device-wait runs fails the launcher's reproducibility gate. §5.5.4 has the dose-response that
-identifies the cause, and it is the same event as the hand-written arm's own 8 failures in 36. So the
-26.4 ms is recoverable in principle and this particular way of recovering it is not correct: the host
-round trip is not only waiting, it is also the fence the arrival signal does not have.
+**The device wait is correct, and the 10 of 10 in that table is not about the collective.** The gate
+column above was read as the device wait being wrong, and the paragraph that used to follow it — kept
+as the retraction below — built a whole mechanism out of it. It was wrong. The gate failures were the
+partial-RoPE table's workspace aliasing, a race in a pooled buffer between a blocking H2D copy and an
+attention kernel the host had already queued, and the device wait was failing the gate more often than
+the poll for the same mundane reason the replicated rows were: it moves the timing of that window.
+With the table given its own slot (the RoPE table's workspace slot page, `#280`), five interleaved
+pairs of poll against device wait, the gate of §5.5.4 on both arms:
+
+| arm | `step_ms` | decode TPS | gate failures |
+|---|---|---|---|
+| host poll | 76.10-77.66 | 12.88-13.14 | 0 of 5 |
+| device wait | 53.02-53.88 | 18.56-18.86 | **0 of 5** |
+
+and the same 32 tokens come out of all four runs made for it — poll twice, device wait twice — which
+are the reference's own: `11751 13 198 760 6511 314 9564 369 19241 ...`. So the 26.4 ms is recovered
+rather than bounded, at the shipped row count, and the switch is the shape it should ship in once the
+workspace fix is in the same tree.
+
+**It was read as a bound rather than a candidate, and that reading is retracted.** What used to stand
+here: every one of those ten device-wait runs fails the launcher's reproducibility gate, §5.5.4 has
+the dose-response that identifies the cause, it is the same event as the hand-written arm's own 8
+failures in 36, so the 26.4 ms is recoverable in principle and this particular way of recovering it is
+not correct — the host round trip is not only waiting, it is also the fence the arrival signal does not
+have. The first three clauses were true and the last one does not follow from them. The failures were
+the RoPE table's workspace aliasing, which lands on the same comparison; the device wait did not lack
+a fence, it changed the window. The paragraph above has the re-measurement.
 
 At rows=16 the replacement is not in the picture at all: 16 rows x 5120 is 81 920 elements, twice the
 ceiling §5.5.4 re-tests, so a batched decode falls back to HCCL and the rows=16 arm is HCCL against
@@ -484,6 +514,18 @@ it to re-measure would be choosing a configuration to produce a number rather th
 shipped one.
 
 #### 5.5.4 The reproducibility gate, and which arm it actually separates
+
+> **Retracted: this gate was never measuring the collective.** Every failure recorded in this
+> subsection — both shapes, both arms, all thirty-six interleaved pairs and the pooled runs behind
+> them — is the partial-RoPE table aliasing the `Intermediate` workspace slot, a race between a
+> blocking H2D copy and an attention kernel the host had already queued. It is a defect in the
+> workspace pool with a two-file fix, and it has nothing to do with which collective is in the step.
+> With it fixed the gate is failed 0 times in 22 interleaved runs across both arms, including the
+> device-wait arm of §5.5.3 that used to fail it 10 times in 10. The analysis below is kept because
+> the rates, the shapes and the argument about interleaving are a correct description of what the gate
+> *looked* like, and because the retraction is easier to read against them; the conclusions it draws
+> about the platform, the barrier and the two collectives are withdrawn. A batched pass at rows=1 is
+> reproducible on this platform.
 
 `batch_repeat_mismatches` is the batched pass run twice from a reset engine with nothing else
 changed — the reproducibility the batched path owes its callers, and a hard zero in the launcher's
@@ -522,6 +564,11 @@ the one the interleaved runs support, which is that the batched path at rows=1 i
 reproducible on this platform under **either** collective, and that the rate at which it is not has
 not been pinned down for either.
 
+That last sentence is withdrawn with the rest of the subsection: what the rates are rates *of* is the
+RoPE table's workspace race, which is in both arms, and with it fixed the same gate the same way is
+failed 0 times in 22 runs. What survives here is the arithmetic about samples — the interleaved pairs
+are still the only matched comparison, and still too few to have separated two rates this close.
+
 **What the failures look like.** Both arms fail it in one of two shapes, and the two shapes are the
 same event observed through two comparisons.
 
@@ -556,13 +603,20 @@ Named runs of the record: `rate_hccl_2` (HCCL, repeat-only, `worst_logit_abs` 0.
 `rate_ipc_9` (hand-written, step-0 flip, 23.759) and `rate2_ipc_14` (hand-written, step-0 flip,
 24.212).
 
-**What the gate has been catching.** The device wait of §5.5.3 is the accident that makes this gate
-legible. It deletes the host's round trip and nothing else, and it fails the gate 10 times in 10 while
-the host poll fails it 0 times in 10, same launcher, same shapes, same session, alternating run for
-run. The round trip is a ~0.25 ms delay *after* the last peer's stamp is seen and *before* the reduce
-is enqueued, so the switch that inserts exactly that delay and nothing else — `SETTLE_US`, on the same
-device-wait arm; with `DEVWAIT` it drains the device wait first, or the sleep lands before the arrival
-and opens no window at all — puts the failure rate on a dose-response:
+**What the gate has been catching — and the answer, which is not the collective.** This subsection was
+written to read the dose-response below as a peer-stamp/plane ordering defect in the barrier and to
+attribute the gate failures to it. The table's own numbers are real and are kept; the reading is
+retracted. It was the partial-RoPE table aliasing the `Intermediate` workspace slot, and any lever that
+moved when the host reached the copy moved the failure rate — which is what the delay column below
+actually sorts on.
+
+The device wait of §5.5.3 is what made the gate legible. It deletes the host's round trip and nothing
+else, and on the unfixed build it failed the gate 10 times in 10 while the host poll failed it 0 times
+in 10, same launcher, same shapes, same session, alternating run for run. The round trip is a ~0.25 ms
+delay *after* the last peer's stamp is seen and *before* the reduce is enqueued, so the switch that
+inserts exactly that delay and nothing else — `SETTLE_US`, on the same device-wait arm; with `DEVWAIT`
+it drains the device wait first, or the sleep lands before the arrival and opens no window at all —
+put the failure rate on a dose-response:
 
 | post-arrival delay | `batch_repeat_mismatches` failures | runs | `step_ms` | decode TPS |
 |---|---|---|---|---|
@@ -572,23 +626,17 @@ and opens no window at all — puts the failure rate on a dose-response:
 | 100 us | 1 | 4 | 94.7-95.4 | 10.5-10.6 |
 | 500 us | 0 | 4 | 145.5-146.6 | 6.8-6.9 |
 
-The reading is that a peer's stamp can land before its plane is readable by this rank's reduce kernel,
-and that the delay covers the window without repairing anything. The delay is not a clean knob and the
-20 and 100 us rows are four runs each, so the shape of the curve is much weaker than its direction.
-What keeps the direction from being an artifact of those runs simply being slower is that the 20 us arm
-runs at 84.3-85.3 ms — *above* the shipped arm's 77.1 ms — and fails 2 of 4 where the shipped arm fails
-0 of 10; and that the delay is inserted after this rank's own arrival, so it is not slack the peers are
-being given.
-
-That is also the most economical explanation of the numbers above it: the shipped arm's 8 failures in
-36 are the residue that leaks past its round trip, the failures track plane size because the larger
-copy has the longer window, and the step-0 flip shape appears in the hand-written arm and in none of
-HCCL's 36. It is not proved for the shipped arm. `SETTLE_US` on the host-poll arm is the experiment
-that would prove it and it is not run here, because that arm has to be shown falling from a 22% rate
-and this page has already established that a sample that could do that is about 120 pairs per arm. What
-is established is that the mechanism exists on this fabric with these primitives, and that the two arms
-which remove the round trip are the two that are worse — `ASYNCPOLL` in time (§5.5.3) and `DEVWAIT` in
-correctness.
+The delay is not a clean knob and the 20 and 100 us rows are four runs each, so the shape of the curve
+is much weaker than its direction. What the direction is a direction *in* is the workspace race, not
+the barrier: the delay sits in front of work the host then queues, so it changes what is in flight on
+the stream when the rope table is uploaded, and a longer delay drains more of it. The 20 us arm running
+at 84.3-85.3 ms — *above* the shipped arm's 77.1 ms — and failing 2 of 4 where the shipped arm fails 0
+of 10 is consistent with that and is not evidence about a stamp. The same reading covers the numbers
+above it: the shipped arm's 8 failures in 36 are the same race on a narrower window, the failures
+tracking plane size is the failures tracking how the workspace is churned, and the step-0 flip shape
+appearing in the hand-written arm and in none of HCCL's 36 is a difference in what the two arms queue.
+With the table given its own slot the gate is failed 0 times in 22 runs across both arms, and the
+device wait passes it 10 of 10 — see §5.5.3 and the RoPE table's workspace slot page (`#280`).
 
 **The size ceiling, re-tested against the control it was set against.** The replacement is scoped to
 planes of at most 40 960 FP16 elements, and that number came from a sweep read against "HCCL failed
@@ -614,8 +662,8 @@ plane the replacement exists for is two orders of magnitude inside it; every lar
 been run leans the same way rather than contradicting; and raising it would change a shipped default's
 behaviour on no evidence. It costs nothing that §5.5 measures, because rows=1 planes are 5120.
 
-**This is a property of the stack, not of the replacement.** It was measured independently, on a
-different model and in a different phase, in
+**This is a property of the stack, not of the replacement.** It was measured independently, on the
+same checkpoint in a different phase, in
 [the gated-delta slice work](ascend_gated_delta_slice.md#the-generated-tokens-are-not-a-usable-ab-signal-here):
 four runs of two identical binaries over a 4966-token prompt produced three distinct greedy step-0
 tokens and top logits spanning 10.42-10.94, "well above fp16 rounding", with the two runs either side
@@ -623,8 +671,15 @@ of the kernel swap no more alike than two runs of the same kernel. The failures 
 observation through a different gate. The gap that work left is the same one here: neither measurement
 can drop the TP collective from the path — `QWEN_TP_WORLD=1` OOMs on this checkpoint — so both say
 "not reproducible with a collective active" and neither can say it is the collective.
-[The benchmarking rules](../guides/benchmarking.md) already carry the operational consequence as
-rule 8: establish run-to-run stability before comparing generated tokens across configurations.
+
+That paragraph is left standing as what was measured and is not relied on. The banner retraction above
+re-opens it: the mechanism it needed to be independent of the collective is a race in a pooled
+workspace slot that any phase uses, and the tree it was measured on had the same one. Whether that
+prefill instability survives the RoPE table's fix is **not** measured — this page's 0 of 22 is the
+decode gate — so the two are indistinguishable from here. The operational consequence it drew is
+recorded as rule 8 in [the benchmarking rules](../guides/benchmarking.md), which is the right rule to
+keep either way: establish run-to-run stability before comparing generated tokens across
+configurations.
 
 **Four candidate mechanisms for the hand-written collective, tested and ruled out.** They were worth
 testing while the failure looked collective-specific; with the failure present in both arms none of
@@ -673,9 +728,9 @@ the place the remaining answer is.
 
 | lever | measured size | state |
 |---|---|---|
-| Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | built; opt-in with `POCKET_ASCEND_IPC_ALLREDUCE=1`. The launcher's reproducibility gate is failed by both arms (3 of 36 HCCL, 8 of 36 hand-written) and does not separate them |
-| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | priced, not recovered: the device-side form is 30% faster and fails the gate 10 of 10, because the round trip is also the fence the arrival signal does not have (§5.5.3, §5.5.4) |
-| The arrival signal has no release ordering | exposed, not sized: removing the host round trip takes the gate from 0 of 10 to 10 of 10 (§5.5.4) | not scoped; the primitives tried here cannot make a peer's stamp a release for its plane |
+| Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | built; opt-in with `POCKET_ASCEND_IPC_ALLREDUCE=1`. The gate failures this row used to cite (3 of 36 HCCL, 8 of 36 hand-written) were a workspace race elsewhere and are 0 of 22 with it fixed, so the gate no longer argues either way |
+| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | recovered: the device-side form is 30% faster, 53.0-53.9 ms and 18.56-18.86 TPS, and passes the gate 10 of 10 once the RoPE table has its own workspace slot (§5.5.3) |
+| ~~The arrival signal has no release ordering~~ | **retracted**: the 10-of-10 rate that exposed it was the RoPE table's workspace aliasing, and it goes to 0 of 10 without the barrier changing at all (§5.5.3, §5.5.4) | withdrawn |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
 | The 42.3 ms of non-collective per-layer work | 3.6x above the 11.7 ms memory floor | not scoped on this page |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
