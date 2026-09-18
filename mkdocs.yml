@@ -117,6 +117,7 @@ nav:
   - Guides:
       - Overview: guides/index.md
       - Benchmarking and reporting: guides/benchmarking.md
+      - Serving latency metrics: guides/latency_metrics.md
       - Native engine API: guides/pocketllm_api.md
       - PyPI release: guides/pypi_release.md
       - Ascend SoC generations: guides/ascend_soc_generations.md

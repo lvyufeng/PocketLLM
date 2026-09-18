@@ -8,6 +8,7 @@ conventions the rest of the documentation assumes.
 | Guide | What it covers |
 | --- | --- |
 | [Benchmarking and reporting rules](benchmarking.md) | The prefill/decode split, what every result record must contain, and the hardware and invocation details a comparable number needs. |
+| [Serving latency metrics (vLLM convention)](latency_metrics.md) | TTFT, TPOT, ITL and E2EL as vLLM defines them, the `pocket_*` series that back each one, and how they relate to the prefill/decode convention. |
 | [PocketLLM API and backend guide](pocketllm_api.md) | The single user-facing API over the two execution planes (Torch and C++), backend selection, tensor parallelism, and the batch/scheduler surface. |
 | [PyPI release guide](pypi_release.md) | The single source of truth for releasing `pocketllm` to PyPI, including the Test PyPI dry run. |
 | [Ascend SoC generations](ascend_soc_generations.md) | Why `910B` and `910B1`–`910B4` are different chips, how to read `Short_SoC_version`, and why they cannot share kernels. |
