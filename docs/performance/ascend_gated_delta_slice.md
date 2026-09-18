@@ -170,11 +170,35 @@ the host had already queued and the rope kernel that read it — one cache secto
 process, with the token that comes out of it unconstrained. That is fixed by giving the table its own
 slot ([#280](https://github.com/lvyufeng/PocketLLM/pull/280)).
 
-These four runs predate that fix and have not been repeated on it, so whether the prefill divergence
-*is* that race or a second cause of its own is **not measured** here, and nothing below separates the
-two. What can be said is that the retraction is not a reinterpretation of these runs: the claim was
-that the instability was a property of the stack, and the tree it was measured on carried a known
-defect that produces exactly this signature.
+These four runs predate that fix, so the question the paragraph above leaves open is whether the
+prefill divergence *is* that race or a second cause of its own. **It has since been re-measured, and
+the spread is gone.** Eight runs of one binary over a 4966-token prompt, 9 new tokens, the TP
+all-reduce left enabled exactly as above and the same launcher:
+
+| run | step-0 token | top logit | checksum |
+|---|---|---|---|
+| 1-8, identical | 271 | 14.8354 | 14.8354 |
+
+All eight are the same line to the four decimals the log prints, and all eight carry one identical
+9-token sequence. The prompt is not the original one — its text was not retained, which is why the
+logit is 14.8354 rather than the 10.42-10.94 the table above spans — so what is compared here is the
+run-to-run spread, which is the thing that was broken: 0.52 of top logit across four runs before, none
+at all across eight runs after. Reproducibility in this phase is restored, and the attribution above
+is supported by it rather than merely left standing on it.
+
+The timings from the same eight runs separate cleanly from the tokens, which is the other half of the
+same point: prefill 1450.6-1474.3 tokens/s and decode 9.25-9.58 tokens/s, spread both ways while not
+one of the eight moved a token. That is the behaviour this stack is supposed to have, and it is what
+the four runs above were missing. Their repeat pairs agreed to under 1% on throughput — the two
+whole-head runs came in at 1006.29 and 1005.47 prefill tokens/s — which is exactly what made a
+divergence in the tokens look like a result rather than a fault.
+
+What that does not establish is that the mechanism was *the same one*. Both measurements put a
+collective in the path and neither can remove it — `QWEN_TP_WORLD=1` OOMs on this checkpoint — so the
+re-measurement shows the instability is gone on the tree that carries the fix, not that the fix is
+what removed it. The operational consequence below is unchanged and so is rule 8: establishing
+run-to-run stability before comparing generated tokens is cheap, and this is the second time on this
+backend that skipping it would have read a defect as a property of the stack.
 
 Two consequences for reading this page, unchanged either way. The token sequences are deliberately not
 used as evidence above, and anything on this backend that compares generated output across
@@ -182,6 +206,11 @@ configurations has to establish run-to-run stability before the comparison means
 `--check` arms in section 3 are unaffected — they compare the operator against a double-precision host
 reference in one process, with no collective in the path. The rule is recorded with the other
 reporting rules in [Benchmarking and reporting rules](../guides/benchmarking.md).
+
+The section heading stays as it is, for a different reason than the one it was written for: the four
+runs above still do not support an A/B, and the comparison that would now be stable cannot be redone
+in this form — the branch binary that produced both arms lost its shape flags when the change merged
+(section 6), so the two kernels are no longer switchable from `master` on this command line.
 
 ## 5. What this does not do
 
