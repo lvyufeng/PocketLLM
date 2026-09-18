@@ -22,10 +22,42 @@ void Linear::forward(
             std::string("Qwen Ascend path is not implemented for ") +
             qwen_linear_kind_name(linear.kind));
     }
+    // One activation row against the weight shard, with the activation's batch
+    // dimension broadcast over that row so the Cube's M tile is full.
+    //
+    // The zero stride is what makes this a broadcast rather than a copy: the
+    // sixteen rows read the same row of storage. The destination is the caller's,
+    // and it is only as wide as `output_rows` unless the allocator grew it --
+    // which it does for every one-row FP16 activation at
+    // `QWEN_ASCEND_REPLICATE_ROWS > 1`, and that is where the tall write lands.
+    // Row 0 is the answer and every consumer reads it as row 0, so nothing
+    // downstream sees the other fifteen.
+    //
+    // The batch is `rows` unless the broadcast is on, and the broadcast only
+    // exists in the one-row case -- so the two disagree exactly where one of
+    // them is wrong. Handing `replicate` to a multi-row call issues a one-row
+    // projection: `replicate` is 1 whenever `rows != 1`, so a prefill chunk
+    // computes row 0 and nothing else, every other prompt position still holds
+    // its embedding where the logits are read off the last one, and the
+    // recurrent state the decode steps run against is built from those
+    // embeddings. Handing `rows` to a replicated decode step issues a one-row
+    // projection too, which is correct but is the whole of the 34.8%.
+    //
+    // `x_stride` is 0 only when the same row is being read more than once; the
+    // multi-row case reads consecutive rows at the row pitch it always did.
+    const int replicate = rows == 1 ? ascend_replicate_rows() : 1;
+    const int batch = rows == 1 ? replicate : rows;
+    if (replicate > 1) {
+        qwen_ascend_require_replicated_room(
+            output,
+            static_cast<size_t>(replicate) * output_rows * sizeof(uint16_t),
+            site);
+    }
     require_launch(qwen_fp16_matmul_rows_f16(
-        input, linear.weight.f16_data(), output, rows, output_rows,
-        columns, columns, output_rows, columns),
-        "FP16 activation/weight projection");
+        input, linear.weight.f16_data(), output, batch, output_rows,
+        columns, replicate > 1 ? 0 : columns, output_rows, columns),
+        replicate > 1 ? "FP16 replicated activation/weight projection"
+                      : "FP16 activation/weight projection");
     return;
 #else
     if (linear.kind == QwenLinearKind::Fp8Block128) {
@@ -423,10 +455,15 @@ void GqaAttention::forward(
         attention_elements, {static_cast<uint64_t>(rows),
                              static_cast<uint64_t>(attention_dim)});
     QwenDeviceTensor& gate = runtime.workspace_half(attention_elements, q.shape);
+    // Spelled `{rows, kv_heads * head_dim}` rather than `{rows, kv_heads,
+    // head_dim}`. Both describe the same storage, and every kernel here indexes
+    // it flat, but only the rank-2 spelling is a shape the replicated-activation
+    // rule recognises: it grows a one-row FP16 destination by the replication
+    // factor, and it stops at rank 2. A rank-3 `k` in a replicated decode step is
+    // sized for one row and then written sixteen deep.
     QwenDeviceTensor& k = runtime.workspace_half(
         kv_elements, {static_cast<uint64_t>(rows),
-                      static_cast<uint64_t>(kv_heads),
-                      static_cast<uint64_t>(head_dim)});
+                      static_cast<uint64_t>(kv_heads * head_dim)});
     QwenDeviceTensor& v = runtime.workspace_half(kv_elements, k.shape);
     QwenDeviceTensor* kv_projection = nullptr;
     // Keep the candidate isolated to the fixed-width target verify batch;

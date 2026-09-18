@@ -25,6 +25,7 @@
 
 #ifdef POCKET_HAVE_TP_COMM
 #include "device_runtime.hpp"
+#include "ipc_allreduce.hpp"
 
 #include <acl/acl.h>
 #include <hccl/hccl.h>
@@ -374,6 +375,16 @@ void tp_all_reduce_sum_f16_inplace(int world, int rank, int device,
     if (d_values == nullptr || count <= 0) {
         throw std::runtime_error("TP fp16 all-reduce: invalid buffer");
     }
+    // The hand-written cross-process all-reduce, when it is enabled and this plane
+    // is inside its envelope. Its barrier is a host-side poll of the peers' arrival
+    // stamps, so the issuing thread blocks for the length of the round even though
+    // the copies and the reduce it issues are stream-ordered on the caller's
+    // stream. Outside the envelope this falls through to HCCL unchanged. See
+    // ipc_allreduce.hpp for the measurements that decide the choice.
+    if (ascend_ipc_allreduce_f16_inplace(world, rank, device, id_path, d_values,
+                                         count, stream)) {
+        return;
+    }
     HcclComm comm = cached_comm(world, rank, device, id_path);
     bool synchronous = false;
     aclrtStream acl_stream = resolve_stream(stream, device, synchronous);
@@ -383,6 +394,21 @@ void tp_all_reduce_sum_f16_inplace(int world, int rank, int device,
     if (synchronous) {
         check_acl(aclrtSynchronizeStream(acl_stream), "sync fp16 all-reduce");
     }
+}
+
+bool tp_all_reduce_f16_on_caller_stream(int world, int count) {
+    // True only for the hand-written collective, which issues nothing but
+    // stream-ordered copies and adds on the caller's stream and needs neither a
+    // drain nor a substituted one.
+    //
+    // This has to keep agreeing with the dispatch in
+    // `tp_all_reduce_sum_f16_inplace` above, which reaches the hand-written
+    // collective whenever the envelope allows it without consulting this
+    // function. The two disagreeing in the direction of "false" would only cost a
+    // host round trip, but in the direction of "true" it would leave an HCCL call
+    // unordered against the compute stream, which is a wrong answer rather than a
+    // slow one.
+    return ascend_ipc_allreduce_f16_applies(world, count);
 }
 
 void tp_all_reduce_sum_bf16_inplace(int world, int rank, int device,

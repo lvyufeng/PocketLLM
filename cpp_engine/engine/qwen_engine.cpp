@@ -345,13 +345,138 @@ void allocate(QwenDeviceTensor& tensor, size_t bytes,
     tensor.capacity = bytes;
 }
 
+#ifdef POCKET_BACKEND_ASCEND
+// How many copies of the decode row the Cube is handed.
+//
+// A decode step is one row of activations against a weight shard, and the Cube's
+// M tile wants sixteen: at M=1 the operand stream runs at 267-296 GB/s against
+// the 441-570 GB/s the same bytes reach at M=16, measured by
+// `bench_qwen_ascend_decode_ops` on the shapes the layer actually uses. The extra
+// rows are free to compute -- the unit is stalled on the weight read, not on the
+// arithmetic -- so the projection is issued with the batch dimension broadcast
+// over the row it already has (a zero stride) and every one of the sixteen
+// outputs comes back equal to the one the caller wanted.
+//
+// Read once, like every other layer policy here, so one process cannot change
+// the kernel sequence midway through a request. `1` is off.
+int ascend_replicate_rows() {
+    static const int rows = qwen_env_int("QWEN_ASCEND_REPLICATE_ROWS", 1);
+    return rows;
+}
+
+// Size a one-row FP16 activation for that launch.
+//
+// The engine allocates its activations at exactly the extent it needs, so a
+// destination that is one row wide is one row of storage and a replicated write
+// would run off the end of it. The taller allocation is made here, at the single
+// point both activation allocators pass through, rather than at the call sites
+// that know the shape -- a linear writes to a caller's buffer and cannot resize
+// it, and every call site that knows the shape would have to learn the rule.
+//
+// The tensor's `shape` is left alone: every consumer in the layer reads row 0
+// through the same extent it reads today, so the copies are never observed. Only
+// the allocation grows, which is why this is safe to do for every one-row
+// activation rather than only the ones a projection writes.
+//
+// Both spellings of "one row" count, a rank-1 shape and a rank-2 shape whose
+// first dimension is 1. Making the rule depend on how a call site happened to
+// punctuate its shape is exactly the kind of gap a replicated write turns into
+// an overflow.
+//
+// Rank 3 and above is where the rule stops, and that boundary is the KV cache
+// rather than an accident of the arithmetic. A cache is `{slots, context,
+// heads, dim}` and its append and attention kernels index those strides
+// themselves; nothing replicated ever writes one, so growing one would cost
+// `replicate` times the cache -- 2.1 GB against 134 MB at a 8192-token context
+// -- to buy nothing.
+//
+// The boundary is load-bearing for activations too, and not only for caches: an
+// activation a replicated projection writes has to be spelled rank 2 or lower,
+// because a rank-3 spelling of the same storage (`{rows, heads, dim}`) falls on
+// the wrong side of this line and is then sized for one row and written sixteen
+// deep. The K and V workspaces in the full-attention layer were spelled that way
+// once; the fix was to flatten them, not to widen the rule.
+size_t ascend_replicated_elements(size_t elements,
+                                  const std::vector<uint64_t>& shape,
+                                  SafeDType dtype) {
+    const int replicate = ascend_replicate_rows();
+    if (replicate <= 1 || dtype != SafeDType::F16) return elements;
+    if (shape.empty() || shape.size() > 2 || shape[0] != 1) return elements;
+    if (elements > static_cast<size_t>(UINT64_MAX / replicate)) {
+        throw std::runtime_error("Qwen replicated activation extent overflow");
+    }
+    return elements * static_cast<size_t>(replicate);
+}
+
+// The backstop for the rule above.
+//
+// How much room the destination has is the one thing the projection cannot work
+// out for itself: it is handed a bare pointer, and whether that buffer holds one
+// row or sixteen was decided at an allocation somewhere else. The rule above is
+// what gives it sixteen. This is how a run proves the rule fired for every
+// destination instead of taking it on trust -- the rule is stated over shape
+// rank and dtype, so a destination that is spelled some third way would be sized
+// for one row and then written sixteen deep, and nothing else in the engine
+// would notice.
+//
+// `QWEN_ASCEND_REPLICATE_CHECK=1` makes every activation remember its declared
+// extent and every replicated projection look its destination up and decline to
+// launch if the tall write does not fit. A buffer that reached the device through
+// a bare `allocate` rather than through here is not in the map, and is refused
+// rather than assumed to be fine, which is the same failure this exists to
+// catch.
+//
+// Off by default: the map costs a hash lookup per allocation, and this is a
+// check on the code rather than on the hardware.
+bool ascend_replicate_check() {
+    static const bool enabled = qwen_env_enabled("QWEN_ASCEND_REPLICATE_CHECK");
+    return enabled;
+}
+
+std::unordered_map<const void*, size_t>& ascend_activation_capacity() {
+    static std::unordered_map<const void*, size_t> capacities;
+    return capacities;
+}
+
+// Fails the launch when the destination cannot hold the replicated write, and
+// names the site and both extents, because the useful output of this check is
+// which projection the rule missed rather than that one was missed.
+void qwen_ascend_require_replicated_room(const void* destination, size_t bytes,
+                                         const char* site) {
+    if (!ascend_replicate_check()) return;
+    const std::unordered_map<const void*, size_t>& capacities =
+        ascend_activation_capacity();
+    const auto found = capacities.find(destination);
+    const size_t room = found == capacities.end() ? 0 : found->second;
+    if (room >= bytes) return;
+    throw std::runtime_error(
+        std::string("Qwen replicated projection at ") + site + " has " +
+        std::to_string(room) + " destination bytes for " +
+        std::to_string(bytes));
+}
+#endif
+
 void allocate_elements(QwenDeviceTensor& tensor, size_t elements,
                        const std::vector<uint64_t>& shape, SafeDType dtype) {
+#ifdef POCKET_BACKEND_ASCEND
+    elements = ascend_replicated_elements(elements, shape, dtype);
+#endif
     const uint64_t item_size = safe_dtype_size(dtype);
     if (elements > static_cast<size_t>(UINT64_MAX / item_size)) {
         throw std::runtime_error("Qwen tensor byte extent overflow");
     }
     allocate(tensor, elements * item_size, shape, dtype);
+#ifdef POCKET_BACKEND_ASCEND
+    if (ascend_replicate_check()) {
+        // The declared extent, not the block's capacity. A workspace slot is
+        // reused for whatever shape the next layer asks for, so its capacity is
+        // the largest extent it has ever held -- a bound on what the hardware
+        // can take, and exactly the wrong number here. What the projection needs
+        // to know is whether this destination was declared with room for
+        // `replicate` rows, which is what `nbytes` records.
+        ascend_activation_capacity()[tensor.data] = tensor.nbytes;
+    }
+#endif
 }
 
 void allocate_float(QwenDeviceTensor& tensor, size_t elements,
@@ -2699,7 +2824,20 @@ struct QwenEngine::Impl {
         }
         {
             PhaseScope scope(this, "tp_all_reduce");
-            if (use_nccl_comm_stream) {
+            // The bracket exists for the HCCL path: substituting a communication
+            // stream avoids draining the default stream before every collective,
+            // and the event pair plus the synchronize in end_nccl_collective is
+            // what keeps that substitution ordered. A collective that already runs
+            // on the caller's stream gets none of that benefit and pays the
+            // synchronize as a host round trip per call: on Ascend, bracketing the
+            // hand-written one anyway cost 12.9 ms of a 91.5 ms rows=1 step, while
+            // the collective region it wraps is 0.073 ms against the 0.28 ms its
+            // own arrival poll blocks for. So bracket only what needs bracketing.
+            // See tp_all_reduce_f16_on_caller_stream.
+            const bool bracket =
+                use_nccl_comm_stream &&
+                !tp_all_reduce_f16_on_caller_stream(options.tp_world, count);
+            if (bracket) {
                 begin_nccl_collective();
                 tp_all_reduce_sum_f16_inplace(
                     options.tp_world, options.tp_rank, options.device,

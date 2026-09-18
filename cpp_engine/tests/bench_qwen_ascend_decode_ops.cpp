@@ -27,6 +27,15 @@
 // the same `sync` number and need opposite fixes.
 //
 //   ./tests/bench_qwen_ascend_decode_ops [--device N] [--iters 200]
+//                                        [--shape OUTxIN ...]
+//                                        [--accuracy OUTxIN ...]
+//
+// `--shape` adds a broadcast-parity point for a projection shape the caller
+// names; see the block before the end of `main`.
+//
+// `--accuracy` adds a host double-precision reference point at the same shapes,
+// which is the only check here that can say which of the two launch forms is
+// right rather than that they agree.
 
 #include "device_runtime.hpp"
 #include "qwen_ops.hpp"
@@ -38,9 +47,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -80,10 +91,24 @@ uint16_t float_to_half(float f) {
         return static_cast<uint16_t>(sign | half);
     }
     if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    // The exponent field is not optional. Without it every value in (-1, 1) --
+    // which is the whole of the uniform range this file generates -- packs to a
+    // denormal near 2^-24, so the activations and weights below are three orders
+    // of magnitude off and any two correct results agree on nothing at all.
     uint32_t half = mantissa >> 13;
     const uint32_t remainder = mantissa & 0x1fffu;
     if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) ++half;
-    return static_cast<uint16_t>(sign | half);
+    // Rounding up out of the mantissa carries into the exponent, and past the top
+    // of it to infinity. Both are reachable: the largest float below 1.0 has an
+    // all-ones mantissa.
+    if (half == 1024u) {
+        half = 0;
+        if (exponent + 1 >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+        return static_cast<uint16_t>(sign |
+                                     static_cast<uint32_t>(exponent + 1) << 10);
+    }
+    return static_cast<uint16_t>(sign | static_cast<uint32_t>(exponent) << 10 |
+                                 half);
 }
 
 float half_to_float(uint16_t h) {
@@ -244,6 +269,25 @@ float max_abs_diff(const uint16_t* a, const uint16_t* b, size_t count) {
     return worst;
 }
 
+// The same comparison for an FP32 output buffer, which is what the logits
+// projection writes. It cannot reuse the FP16 helper above: the point of that
+// buffer is to hold differences far below the FP16 spacing, and rounding it back
+// through `half_to_float` would erase exactly the quantity being measured.
+float max_abs_diff_f32(const float* a, const float* b, size_t count) {
+    std::vector<float> host_a(count);
+    std::vector<float> host_b(count);
+    if (!pocket::memcpy_d2h(host_a.data(), a, count * sizeof(float)) ||
+        !pocket::memcpy_d2h(host_b.data(), b, count * sizeof(float))) {
+        throw std::runtime_error("memcpy_d2h failed");
+    }
+    float worst = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+        const float diff = std::fabs(host_a[i] - host_b[i]);
+        if (diff > worst) worst = diff;
+    }
+    return worst;
+}
+
 // The operands here are values in [-0.5, 0.5) and a row dot product is 5120 terms
 // of them, so an individual output is order-one. A reordering of the same
 // accumulation differs in the last bits of FP16; a wrong weight layout differs by
@@ -252,17 +296,129 @@ const char* parity_label(const uint16_t* a, const uint16_t* b, size_t count) {
     return max_abs_diff(a, b, count) < 0.5f ? "ok" : "FAIL";
 }
 
+// Error of a device FP16 result against a product accumulated in double on the
+// host.
+//
+// The two figures are relative to the largest reference output rather than to
+// each output, because a row whose exact value is near zero has no relative error
+// worth reporting and would dominate a per-element ratio. `max` is the worst
+// single output and `rms` is the whole row, so a fault that moves one element and
+// a fault that moves all of them are told apart.
+struct DoubleError {
+    double max_relative = 0.0;
+    double rms_relative = 0.0;
+    double scale = 0.0;
+    double max_absolute = 0.0;
+};
+
+// The two absolute figures are what say whether a ratio is a rounding artefact
+// or a real disagreement: `scale` is the largest reference output, so a max
+// difference a thousandth of it is FP16's own precision and one the size of it
+// means the device is not computing the product at all.
+DoubleError error_vs_double(const uint16_t* device_out,
+                           const std::vector<double>& reference) {
+    std::vector<uint16_t> host(reference.size());
+    if (!pocket::memcpy_d2h(host.data(), device_out,
+                            reference.size() * sizeof(uint16_t))) {
+        throw std::runtime_error("memcpy_d2h failed");
+    }
+    double scale = 0.0;
+    for (double value : reference) scale = std::max(scale, std::fabs(value));
+    if (scale == 0.0) return {};
+    DoubleError error;
+    double sum_squares = 0.0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double diff =
+            std::fabs(static_cast<double>(half_to_float(host[i])) - reference[i]);
+        error.max_absolute = std::max(error.max_absolute, diff);
+        sum_squares += diff * diff;
+    }
+    error.scale = scale;
+    error.max_relative = error.max_absolute / scale;
+    error.rms_relative =
+        std::sqrt(sum_squares / static_cast<double>(reference.size())) / scale;
+    return error;
+}
+
+// The same, for the FP32-output projection the logits are read off.
+DoubleError error_vs_double_f32(const float* device_out,
+                                const std::vector<double>& reference) {
+    std::vector<float> host(reference.size());
+    if (!pocket::memcpy_d2h(host.data(), device_out,
+                            reference.size() * sizeof(float))) {
+        throw std::runtime_error("memcpy_d2h failed");
+    }
+    double scale = 0.0;
+    for (double value : reference) scale = std::max(scale, std::fabs(value));
+    if (scale == 0.0) return {};
+    DoubleError error;
+    double sum_squares = 0.0;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double diff = std::fabs(static_cast<double>(host[i]) - reference[i]);
+        error.max_absolute = std::max(error.max_absolute, diff);
+        sum_squares += diff * diff;
+    }
+    error.scale = scale;
+    error.max_relative = error.max_absolute / scale;
+    error.rms_relative =
+        std::sqrt(sum_squares / static_cast<double>(reference.size())) / scale;
+    return error;
+}
+
+// The three largest reference outputs and what the device put in their place.
+// It is what tells a uniformly zero result, a result shifted by one output, and
+// a result off by a constant factor apart -- all three of which a single ratio
+// reports as "about one".
+void print_head(const uint16_t* device_out,
+                const std::vector<double>& reference) {
+    std::vector<uint16_t> host(reference.size());
+    if (!pocket::memcpy_d2h(host.data(), device_out,
+                            reference.size() * sizeof(uint16_t))) {
+        return;
+    }
+    std::vector<size_t> order(reference.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    const size_t shown = std::min<size_t>(3, order.size());
+    std::partial_sort(order.begin(), order.begin() + shown, order.end(),
+                      [&](size_t a, size_t b) {
+                          return std::fabs(reference[a]) > std::fabs(reference[b]);
+                      });
+    std::printf("\n    top ref");
+    for (size_t i = 0; i < shown; ++i) {
+        std::printf(" [%zu] %.4g device %.4g", order[i], reference[order[i]],
+                    static_cast<double>(half_to_float(host[order[i]])));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     int device = 0;
     int iters = 200;
+    std::vector<std::pair<int, int>> parity_shapes;
+    std::vector<std::pair<int, int>> accuracy_shapes;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--device" && i + 1 < argc) {
             device = std::stoi(argv[++i]);
         } else if (arg == "--iters" && i + 1 < argc) {
             iters = std::stoi(argv[++i]);
+        } else if ((arg == "--shape" || arg == "--accuracy") && i + 1 < argc) {
+            const std::string value = argv[++i];
+            const size_t separator = value.find('x');
+            if (separator == std::string::npos) {
+                std::fprintf(stderr, "%s wants OUTxIN, got %s\n", arg.c_str(),
+                             value.c_str());
+                return 2;
+            }
+            const std::pair<int, int> shape(
+                std::atoi(value.substr(0, separator).c_str()),
+                std::atoi(value.substr(separator + 1).c_str()));
+            if (arg == "--shape") {
+                parity_shapes.push_back(shape);
+            } else {
+                accuracy_shapes.push_back(shape);
+            }
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
             return 2;
@@ -325,6 +481,234 @@ int main(int argc, char** argv) {
                            x.get(), w.get(), y.get(), m, kMlp, kHidden, kHidden,
                            kMlp, kHidden);
                    }, iters));
+    }
+    // The same weight with an activation block whose rows are all copies of one.
+    //
+    // The sweep above reads the operand once per M, so M=16 winning does not by
+    // itself say anything about a decode step: a decode step is M=1 and has no
+    // second sequence to put in rows 1..15. What this block asks is whether it
+    // has to be. If the 1.65x at M=16 is the Cube's tile filling up rather than
+    // the extra rows doing work, then filling it with fifteen copies of the one
+    // row buys the same rate, and the arithmetic that gets thrown away was never
+    // the limit -- a GEMV at 1152 GB/s asks the unit for 2.3 TFLOP/s and the
+    // square GEMM below reaches 71.
+    //
+    // Which is the whole question for this axis, because M=1 is not a shape the
+    // engine chose, it is what a single request is. If replication holds, the
+    // decode step's linear ops can run at a rate the M=1 tile does not reach.
+    //
+    // The copies are made on the host here. In the engine they would come from
+    // the producing op or from a zero-stride view of `x`; neither is timed by
+    // this block, which is why `enqueue` is printed next to `device`.
+    for (int m : {1, 2, 4, 8, 16, 32}) {
+        const std::vector<uint16_t> row = random_halves(kHidden, rng);
+        std::vector<uint16_t> rows(static_cast<size_t>(m) * kHidden);
+        for (int i = 0; i < m; ++i) {
+            std::copy(row.begin(), row.end(),
+                      rows.begin() + static_cast<size_t>(i) * kHidden);
+        }
+        DeviceBuffer x(rows);
+        DeviceBuffer w(random_halves(static_cast<size_t>(kMlp) * kHidden, rng));
+        DeviceBuffer y(static_cast<size_t>(m) * kMlp);
+        DeviceBuffer y_one(static_cast<size_t>(kMlp));
+        char label[64];
+        std::snprintf(label, sizeof(label), "replicated %dx5120x4352", m);
+        report_gbs(label, static_cast<double>(kMlp) * kHidden * 2,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), m, kMlp, kHidden, kHidden,
+                           kMlp, kHidden);
+                   }, iters));
+        // Every row of the result has to equal row 0, and row 0 has to equal the
+        // single-row product. Without both, what the block timed is a replicated
+        // *input* producing sixteen different answers.
+        //
+        // Reported as numbers rather than as a verdict, because the two questions
+        // are not the same size. Rows 1..15 against row 0 is the broadcast itself:
+        // a non-zero there means the sixteen rows are not one computation. Row 0
+        // against the single-row product is the one that decides the lever -- the
+        // M dimension does not enter the K accumulation, so if the tile schedule
+        // is M-independent at all this is bit-identical, and anything above the
+        // last FP16 bit is that assumption failing rather than a rounding story.
+        const bool launched = pocket::qwen_fp16_matmul_rows_f16(
+            x.get(), w.get(), y_one.get(), 1, kMlp, kHidden, kHidden, kMlp,
+            kHidden);
+        if (!launched || !pocket::device_synchronize()) {
+            std::printf("    parity check: single-row launch failed\n");
+        } else {
+            float worst_rows = 0.0f;
+            for (int i = 1; i < m; ++i) {
+                worst_rows = std::max(
+                    worst_rows,
+                    max_abs_diff(y.get(),
+                                 y.get() + static_cast<size_t>(i) * kMlp,
+                                 kMlp));
+            }
+            std::printf(
+                "    rows 1..%d vs row 0: worst %.6g   row 0 vs the single-row "
+                "product: worst %.6g\n",
+                m, worst_rows, max_abs_diff(y_one.get(), y.get(), kMlp));
+        }
+    }
+    // The same thing with the copies left implicit, because the block above paid
+    // for them on the host and that is exactly the cost that would eat the win.
+    //
+    // A stride of 0 on the activation describes sixteen rows that are all one row
+    // of storage, so nothing is copied and nothing is read twice; the batch
+    // dimension is a view over a single row. The three sub-blocks differ only in
+    // where the sixteen results land:
+    //
+    //   "broadcast x"   sixteen output rows, so the destination has to grow to
+    //                   hold them and the caller reads row 0
+    //   "broadcast xy"  the output collapses too, so the caller's buffer is
+    //                   unchanged -- IF aclnn is fast with a zero output stride,
+    //                   which is the half that has to be measured
+    //   "copy out"      what "broadcast x" costs when the caller's buffer cannot
+    //                   grow after all: one row copied out of the tall result
+    //
+    // Both output widths are swept because the engine's two shapes are 4352 (the
+    // TP4 MLP shard) and 8704 (its fused gate+up), and the rate at M=16 does not
+    // have to scale the same way at both.
+    for (int out_rows : {kMlp, 2 * kMlp}) {
+        const std::vector<uint16_t> row = random_halves(kHidden, rng);
+        DeviceBuffer x(row);  // one row, and the batch dimension is stride 0
+        DeviceBuffer w(random_halves(static_cast<size_t>(out_rows) * kHidden, rng));
+        DeviceBuffer y(static_cast<size_t>(16) * out_rows);
+        DeviceBuffer y_collapsed(static_cast<size_t>(out_rows));
+        DeviceBuffer reference(static_cast<size_t>(out_rows));
+        const double weight_bytes = static_cast<double>(out_rows) * kHidden * 2;
+        char label[64];
+
+        std::snprintf(label, sizeof(label), "matmul 1x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 1, out_rows, kHidden, kHidden,
+                           out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "matmul 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 16, out_rows, kHidden,
+                           kHidden, out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "broadcast x 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y.get(), 16, out_rows, kHidden, 0,
+                           out_rows, kHidden);
+                   }, iters));
+        std::snprintf(label, sizeof(label), "broadcast xy 16x5120x%d", out_rows);
+        report_gbs(label, weight_bytes,
+                   time_op([&] {
+                       return pocket::qwen_fp16_matmul_rows_f16(
+                           x.get(), w.get(), y_collapsed.get(), 16, out_rows,
+                           kHidden, 0, 0, kHidden);
+                   }, iters));
+        // The copy that makes a tall result usable from an unchanged caller: row
+        // 0 of the sixteen, read back into a buffer of exactly one row. Priced on
+        // its own because it is the whole reason to prefer a collapsed output.
+        std::snprintf(label, sizeof(label), "copy row 0 of 16x%d", out_rows);
+        report(label, time_op([&] {
+                   return pocket::qwen_copy_rows_strided_f16(
+                       y.get(), out_rows, reference.get(), out_rows, 1, out_rows);
+               }, iters));
+
+        const bool launched = pocket::qwen_fp16_matmul_rows_f16(
+            x.get(), w.get(), reference.get(), 1, out_rows, kHidden, kHidden,
+            out_rows, kHidden);
+        if (!launched || !pocket::device_synchronize()) {
+            std::printf("    parity check: single-row launch failed\n");
+        } else {
+            float worst_spread = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                worst_spread = std::max(
+                    worst_spread,
+                    max_abs_diff(reference.get(),
+                                 y.get() + static_cast<size_t>(i) * out_rows,
+                                 out_rows));
+            }
+            std::printf(
+                "    row 0 vs the single-row product: worst %.6g   all 16 rows vs "
+                "it: worst %.6g   broadcast xy: worst %.6g\n",
+                max_abs_diff(reference.get(), y.get(), out_rows), worst_spread,
+                max_abs_diff(reference.get(), y_collapsed.get(), out_rows));
+        }
+    }
+    // Is the broadcast form reproducible launch to launch?
+    //
+    // The parity check above answers whether the sixteen rows agree, and it
+    // answers it once, from a single pair of launches. That is the wrong question
+    // for a run-to-run fault: a launch that is wrong the same way every time and a
+    // launch that is right are indistinguishable from one sample, and a launch
+    // that is *different* every time passes the parity check on the iteration it
+    // was taken from. The engine's replicated decode step is reproducible at
+    // widths 2, 4 and 8 and is not at 16, so the width is a sweep here too: if the
+    // same discontinuity appears in this file, the engine's workspace arrangement
+    // is not what produces it and the operand description is.
+    //
+    // Every launch writes 16 rows and is compared against the first, bit for bit.
+    // The single-row form is repeated alongside as the control: it is the same
+    // operand description with a batch of one, and it is the arm the engine has
+    // measured as stable.
+    {
+        constexpr int kRepeats = 8;
+        for (int m : {1, 2, 4, 8, 16}) {
+            for (int out_rows : {kMlp, 2 * kMlp}) {
+                DeviceBuffer x(random_halves(kHidden, rng));
+                DeviceBuffer w(
+                    random_halves(static_cast<size_t>(out_rows) * kHidden, rng));
+                std::vector<std::unique_ptr<DeviceBuffer>> y;
+                for (int i = 0; i < kRepeats; ++i) {
+                    y.push_back(std::make_unique<DeviceBuffer>(
+                        static_cast<size_t>(m) * out_rows));
+                }
+                for (int i = 0; i < kRepeats; ++i) {
+                    if (!pocket::qwen_fp16_matmul_rows_f16(
+                            x.get(), w.get(), y[static_cast<size_t>(i)]->get(), m,
+                            out_rows, kHidden, m == 1 ? kHidden : 0, out_rows,
+                            kHidden)) {
+                        std::printf(
+                            "reproducible %2dx5120x%-5d: launch failed\n", m,
+                            out_rows);
+                        break;
+                    }
+                }
+                if (!pocket::device_synchronize()) {
+                    throw std::runtime_error("sync failed");
+                }
+                float worst = 0.0f;
+                float worst_row_spread = 0.0f;
+                for (int i = 1; i < kRepeats; ++i) {
+                    for (int r = 0; r < m; ++r) {
+                        worst = std::max(
+                            worst,
+                            max_abs_diff(
+                                y[0]->get() + static_cast<size_t>(r) * out_rows,
+                                y[static_cast<size_t>(i)]->get() +
+                                    static_cast<size_t>(r) * out_rows,
+                                out_rows));
+                    }
+                }
+                // Rows 1..m-1 against row 0 of the first launch, so a spread that
+                // appears within one launch is not confused with one between them.
+                for (int r = 1; r < m; ++r) {
+                    worst_row_spread =
+                        std::max(worst_row_spread,
+                                 max_abs_diff(y[0]->get(),
+                                              y[0]->get() +
+                                                  static_cast<size_t>(r) * out_rows,
+                                              out_rows));
+                }
+                std::printf(
+                    "reproducible %2dx5120x%-5d: %d launches, worst spread %.6g   "
+                    "rows 1..%d vs row 0 %.6g\n",
+                    m, out_rows, kRepeats, worst, m - 1, worst_row_spread);
+                std::fflush(stdout);
+            }
+        }
     }
     // The same sweep with the weight on the Cube's A operand instead of its B.
     //
@@ -647,6 +1031,217 @@ int main(int argc, char** argv) {
         pocket::device_free(d_logits);
         pocket::device_free(d_tokens);
         pocket::device_free(d_values);
+    }
+
+    // The broadcast against the single-row product at every projection shape a
+    // decode step issues, not just the MLP shard.
+    //
+    // The block above runs this comparison at 4352x5120, which is the widest
+    // projection in the layer and the shape the 1.65x was measured on. It is not
+    // the only shape the lever drives: one decode step makes seventeen
+    // `Linear::forward` calls and they do not all have 4352 output rows -- the
+    // linear-attention ones are 1536 wide and the full-attention ones are 2048
+    // and 1536. Nothing guarantees the Cube's M=16 schedule splits K the way M=1
+    // does at every one of them, and the engine's answer at row 0 is only the
+    // single-row answer if it does. A shape that fails here is a decode step
+    // whose row 0 is not what the unreplicated path computes.
+    //
+    // The list comes from the caller rather than from a second copy of the
+    // engine's layer definition kept in this file, so pointing it at the real
+    // set is `--shape` repeated per site. With no `--shape` the block does not
+    // run, which leaves the default invocation as short as it was.
+    for (const std::pair<int, int>& shape : parity_shapes) {
+        const int out_rows = shape.first;
+        const int columns = shape.second;
+        DeviceBuffer x(random_halves(columns, rng));
+        DeviceBuffer w(random_halves(static_cast<size_t>(out_rows) * columns, rng));
+        DeviceBuffer y(static_cast<size_t>(32) * out_rows);
+        DeviceBuffer reference(static_cast<size_t>(out_rows));
+        // The unreplicated call, at the stride the engine uses when it does not
+        // replicate: `x_stride = columns`, the ordinary one-row invocation.
+        if (!pocket::qwen_fp16_matmul_rows_f16(
+                x.get(), w.get(), reference.get(), 1, out_rows, columns, columns,
+                out_rows, columns) ||
+            !pocket::device_synchronize()) {
+            std::printf("shape %5dx%-5d single-row launch failed\n", out_rows,
+                        columns);
+            continue;
+        }
+        std::printf("shape %5dx%-5d", out_rows, columns);
+        for (int m : {2, 4, 8, 16, 32}) {
+            if (!pocket::qwen_fp16_matmul_rows_f16(
+                    x.get(), w.get(), y.get(), m, out_rows, columns, 0, out_rows,
+                    columns) ||
+                !pocket::device_synchronize()) {
+                std::printf("  m=%-2d launch failed", m);
+                continue;
+            }
+            float spread = 0.0f;
+            for (int i = 1; i < m; ++i) {
+                spread = std::max(
+                    spread,
+                    max_abs_diff(y.get(),
+                                 y.get() + static_cast<size_t>(i) * out_rows,
+                                 out_rows));
+            }
+            std::printf("  m=%-2d row0 %.3g rows %.3g", m,
+                        max_abs_diff(reference.get(), y.get(), out_rows), spread);
+        }
+        std::printf("\n");
+
+        // The same question for the FP32-output variant, at the same shapes and
+        // against the same single-row reference.
+        //
+        // This is the one projection the FP16 sweep above cannot speak for, and
+        // the one a previous commit had to localize a batched-row offset in: the
+        // logits projection writes FP32, so its own tiling is free to reorder K
+        // differently at M=16 than at M=1 without the FP16 comparison noticing
+        // anything. It is also the only op in a decode step whose output feeds an
+        // `argmax`, which means the only one where a last-bit difference is
+        // visible as a different token rather than as a last-bit difference.
+        float* logits_reference = nullptr;
+        float* logits_replicated = nullptr;
+        if (!pocket::device_malloc_into(
+                logits_reference, static_cast<size_t>(out_rows) * sizeof(float)) ||
+            !pocket::device_malloc_into(
+                logits_replicated,
+                static_cast<size_t>(32) * out_rows * sizeof(float))) {
+            std::printf("  fp32 logits: allocation failed\n");
+            continue;
+        }
+        if (!pocket::qwen_fp16_matmul_rows_f16_f32(
+                x.get(), w.get(), logits_reference, 1, out_rows, columns, columns,
+                out_rows, columns) ||
+            !pocket::device_synchronize()) {
+            std::printf("  fp32 logits: single-row launch failed\n");
+            pocket::device_free(logits_reference);
+            pocket::device_free(logits_replicated);
+            continue;
+        }
+        std::printf("  fp32 logits");
+        for (int m : {2, 4, 8, 16, 32}) {
+            if (!pocket::qwen_fp16_matmul_rows_f16_f32(
+                    x.get(), w.get(), logits_replicated, m, out_rows, columns, 0,
+                    out_rows, columns) ||
+                !pocket::device_synchronize()) {
+                std::printf("  m=%-2d launch failed", m);
+                continue;
+            }
+            float spread = 0.0f;
+            for (int i = 1; i < m; ++i) {
+                spread = std::max(
+                    spread,
+                    max_abs_diff_f32(
+                        logits_replicated,
+                        logits_replicated + static_cast<size_t>(i) * out_rows,
+                        out_rows));
+            }
+            std::printf("  m=%-2d row0 %.3g rows %.3g", m,
+                        max_abs_diff_f32(logits_reference, logits_replicated,
+                                         out_rows),
+                        spread);
+        }
+        std::printf("\n");
+        pocket::device_free(logits_reference);
+        pocket::device_free(logits_replicated);
+        std::fflush(stdout);
+    }
+
+    // What the parity sweep above cannot say: which of the two forms is right.
+    //
+    // Every check in the sweep compares two launches of this op against each
+    // other, so agreement there means the two agree and nothing more -- and the
+    // verdict it prints comes from a threshold a fifth of the output scale, which
+    // a systematic difference between the forms fits inside comfortably. The
+    // question that matters for the lever is the error each form makes against
+    // something that is not this op, and that is what this block measures: the
+    // same product accumulated in double on the host.
+    //
+    // It is not a formality. A decode step's projections are one activation row
+    // and a prefill's are as many rows as the chunk has, so the two shapes are
+    // the two halves of the same engine, and they have to agree about which token
+    // comes next. If the single-row form is the less accurate of the pair, then a
+    // replicated decode step is faster *and* closer to the model than the
+    // unreplicated one, and the lever is not a trade at all.
+    for (const std::pair<int, int>& shape : accuracy_shapes) {
+        const int out_rows = shape.first;
+        const int columns = shape.second;
+        // Sixteen distinct activation rows, so a launch that reads five of them
+        // at a positive stride is reading five rows rather than four rows it was
+        // never given. Only row 0 is ever compared, because row 0 is the row a
+        // broadcast repeats and the row every consumer of a replicated write
+        // reads.
+        const std::vector<uint16_t> host_x =
+            random_halves(static_cast<size_t>(16) * columns, rng);
+        const std::vector<uint16_t> host_w =
+            random_halves(static_cast<size_t>(out_rows) * columns, rng);
+        DeviceBuffer x(host_x);
+        DeviceBuffer w(host_w);
+        DeviceBuffer y(static_cast<size_t>(16) * out_rows);
+        float* logits = nullptr;
+        if (!pocket::device_malloc_into(logits,
+                                        static_cast<size_t>(16) * out_rows *
+                                            sizeof(float))) {
+            std::printf("accuracy %5dx%-5d allocation failed\n", out_rows,
+                        columns);
+            continue;
+        }
+        // The reference the device is being held to, in the order the device
+        // accumulates it: one FP16 product per term, summed in double.
+        std::vector<double> reference(static_cast<size_t>(out_rows), 0.0);
+        for (int r = 0; r < out_rows; ++r) {
+            double sum = 0.0;
+            const size_t base = static_cast<size_t>(r) * columns;
+            for (int k = 0; k < columns; ++k) {
+                sum += static_cast<double>(half_to_float(host_x[k])) *
+                       static_cast<double>(half_to_float(host_w[base + k]));
+            }
+            reference[static_cast<size_t>(r)] = sum;
+        }
+
+        std::printf("accuracy %5dx%-5d", out_rows, columns);
+        struct Point {
+            const char* name;
+            int batch;
+            int x_stride;
+        };
+        // One point per batch the engine actually issues: the decode step at
+        // each replication width, and the prefill chunk. The engine reaches M=1
+        // through a positive stride and every wider batch through the zero one,
+        // so both spellings are here at the widths that matter.
+        const Point points[] = {{"m=1 ", 1, columns}, {"m=2 ", 2, 0},
+                                {"m=4 ", 4, 0},       {"m=5 ", 5, columns},
+                                {"m=8 ", 8, 0},       {"m=16", 16, 0}};
+        for (const Point& point : points) {
+            if (!pocket::qwen_fp16_matmul_rows_f16(
+                    x.get(), w.get(), y.get(), point.batch, out_rows, columns,
+                    point.x_stride, out_rows, columns) ||
+                !pocket::device_synchronize()) {
+                std::printf("  %s launch failed", point.name);
+                continue;
+            }
+            const DoubleError error = error_vs_double(y.get(), reference);
+            std::printf("  %s fp16 max %.3g rms %.3g abs %.3g of %.3g",
+                        point.name, error.max_relative, error.rms_relative,
+                        error.max_absolute, error.scale);
+            if (point.batch == 1) print_head(y.get(), reference);
+        }
+        for (const Point& point : points) {
+            if (!pocket::qwen_fp16_matmul_rows_f16_f32(
+                    x.get(), w.get(), logits, point.batch, out_rows, columns,
+                    point.x_stride, out_rows, columns) ||
+                !pocket::device_synchronize()) {
+                std::printf("  %s launch failed", point.name);
+                continue;
+            }
+            const DoubleError error = error_vs_double_f32(logits, reference);
+            std::printf("  %s fp32 max %.3g rms %.3g abs %.3g of %.3g",
+                        point.name, error.max_relative, error.rms_relative,
+                        error.max_absolute, error.scale);
+        }
+        std::printf("\n");
+        pocket::device_free(logits);
+        std::fflush(stdout);
     }
 
     return 0;

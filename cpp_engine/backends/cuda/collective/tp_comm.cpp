@@ -434,6 +434,15 @@ void tp_all_reduce_sum_f16_inplace(int world, int rank, int device, const char* 
                              static_cast<cudaStream_t>(stream)), "ncclAllReduce fp16 inplace");
 }
 
+bool tp_all_reduce_f16_on_caller_stream(int world, int count) {
+    // NCCL runs on whatever stream it is handed, and this backend never
+    // substitutes one, but the caller's bracket is what keeps the collective
+    // ordered against the compute stream -- there is no drain to save here.
+    (void)world;
+    (void)count;
+    return false;
+}
+
 void tp_all_reduce_sum_bf16_inplace(int world, int rank, int device, const char* id_path, uint16_t* d_values, int count, void* stream) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bf16 all-reduce args");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);

@@ -259,6 +259,12 @@ else()
 
     list(APPEND POCKET_RUNTIME_SOURCES backends/ascend/runtime/device_runtime_ascend.cpp)
     list(APPEND POCKET_BACKEND_INCLUDES "${ASCEND_ARCH_DIR}/include")
+    # The geometry headers in backends/ascend/kernels are included by their device
+    # kernel, by the host launcher next to them, *and* by
+    # collective/ipc_allreduce.cpp, which is where the stamp layout is produced and
+    # has to match the arrival-wait kernel that consumes it. The first two find
+    # them as neighbours; the third needs the directory on the include path.
+    list(APPEND POCKET_BACKEND_INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/backends/ascend/kernels")
     list(APPEND POCKET_BACKEND_LIBS
         "${ASCEND_ACL_LIBRARY}"
         "${ASCEND_OPAPI_LIBRARY}"
@@ -287,6 +293,7 @@ else()
         backends/ascend/kernels/qwen_cube_gemm_probe.cpp
         backends/ascend/kernels/qwen_cube_transpose_probe.cpp
         backends/ascend/kernels/qwen_hbm_read_probe.cpp
+        backends/ascend/kernels/qwen_ipc_arrive_wait.cpp
         backends/ascend/kernels/qwen_transpose_f16.cpp
         backends/ascend/kernels/qwen_attention_cube_f16.cpp
     )
@@ -336,6 +343,7 @@ else()
 
     if(POCKET_HAVE_TP_COMM)
         list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/tp_comm.cpp)
+        list(APPEND POCKET_BACKEND_SOURCES backends/ascend/collective/ipc_allreduce.cpp)
         list(APPEND POCKET_BACKEND_LIBS "${ASCEND_HCCL_LIBRARY}" "${ASCEND_DLOG_LIBRARY}")
         list(APPEND POCKET_BACKEND_DEFINES POCKET_HAVE_TP_COMM=1)
     endif()
@@ -783,6 +791,27 @@ if(POCKET_HAVE_TP_COMM AND POCKET_BACKEND STREQUAL "ascend")
     add_executable(bench_qwen_ascend_allreduce tests/bench_qwen_ascend_allreduce.cpp)
     target_link_libraries(bench_qwen_ascend_allreduce PRIVATE pocket_cpp_core)
     set_target_properties(bench_qwen_ascend_allreduce PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
+# That measurement leaves replacing HcclAllReduce as the only remaining lever, so
+# the ACL primitives such a replacement would be built from are priced separately:
+# peer access, cross-device copies, the batch copy entry point and the notify pair.
+# Uses raw AscendCL beyond the device runtime, so it is Ascend-only.
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_peer_copy tests/bench_qwen_ascend_peer_copy.cpp)
+    target_link_libraries(bench_qwen_ascend_peer_copy PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_peer_copy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
+# That probe prices the primitives in a single process, where a peer's address is an
+# ordinary pointer, but the engine runs one process per TP rank. Whether a
+# hand-written collective is buildable at all therefore turns on
+# aclrtIpcMemGetExportKey / aclrtIpcMemImportByKey working across processes here,
+# which is what this one measures.
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(bench_qwen_ascend_ipc_exchange tests/bench_qwen_ascend_ipc_exchange.cpp)
+    target_link_libraries(bench_qwen_ascend_ipc_exchange PRIVATE pocket_cpp_core)
+    set_target_properties(bench_qwen_ascend_ipc_exchange PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()
 
 # The decode target is a question about a physical limit: one decode step re-reads
