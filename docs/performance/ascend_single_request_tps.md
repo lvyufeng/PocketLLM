@@ -42,7 +42,10 @@ single request is and therefore not a lever. It is a lever: the Cube's M tile is
 decode step has one, and the fifteen the tile wants do not have to be real. §6 is the layer's own
 projections issued with the activation's batch dimension broadcast over the row it already has, and
 it is worth **13.05 -> 17.59 TPS at rows=1 over three interleaved pairs**, +34.8%, on top of the
-hand-written collective rather than against it.
+hand-written collective rather than against it. On the merged tree the two levers stack: the widths
+generate one 32-token sequence — the reference's — across ten runs at both collectives and both
+arrival waits, and with the device-side wait the step is **39.4-39.8 ms, 25.15-25.37 TPS**, still on
+that sequence (§6.3).
 
 ## 1. The row sweep: single-request cost is batch-independent cost
 
@@ -839,6 +842,11 @@ measured is this lever and not §5's:
 the replicated band is 17.43-17.71, so the separation is far outside the spread — unlike §5's
 collective A/B, this one does not need thirty-six pairs to be legible.
 
+That session predates the RoPE-table fix, so it is a timing result and nothing more: it makes no
+claim about the tokens, which is the claim that later turned out to be wrong. The bands survive it —
+the merged-tree matrix further down measures the same two, 12.96-13.06 and 17.46-17.71 — and it is
+there, not here, that the widths are shown to generate what the default generates.
+
 The width is swept rather than assumed, and 16 is where it stops:
 
 | `QWEN_ASCEND_REPLICATE_ROWS` | 1 | 8 | 16 | 32 | 1 | 16 |
@@ -853,24 +861,46 @@ materialised on the host — is 166.1 / 166.0 / 101.0 / 138.5 us, the same shape
 what makes the sweep's 8 and 32 rows a hardware result rather than a scheduling one.
 
 The cost is workspace, and it is small because only one-row activations grow: `activation_workspace_peak_bytes`
-is 1825704 at the default and 3090728 at 16, +1.2 MB, against 13.45 GB of resident weights per card.
+is 1825704 at the default and 3094824 at 16, +1.2 MB, against 13.45 GB of resident weights per card.
 `gpu_memory_used_bytes` moves by the same 4 MB over four ranks.
 
 **The accuracy question, since this is the width that exposed one.** An earlier revision of this
 page could not show that `QWEN_ASCEND_REPLICATE_ROWS=16` generated what the default generated: three
 runs produced three different first tokens where widths 2, 4 and 8 were stable. That was not the
-replication. It was the RoPE table sharing a workspace slot with an attention kernel the host had
-already queued, and the replication changed the timing of that window rather than inventing it. With
-the table given its own slot the two arms produce the same 32 tokens, byte for byte, and both are the
-reference's:
+replication. It was the partial-RoPE cos/sin table sharing a workspace slot with an attention kernel
+the host had already queued -- the table is written by a blocking `aclrtMemcpy` H2D, which the stream
+does not order against work queued before it, so a kernel issued ahead of the upload lands on the
+table between the copy and the rotation's read. Replication changed the timing of that window rather
+than inventing it. The table has a slot of its own now
+([the RoPE table's workspace slot](ascend_rope_table_workspace_aliasing.md), #280).
 
-| pair | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` |
+The corruption was localized independently of that attribution, from this branch's own dumps, before
+the fix was in. At `QWEN_DUMP_KV_LAYER=3`: the pre-norm K projection is **bit-exact** between widths
+1 and 16, while the post-RoPE K and Q differ by up to 7.61 in exactly the 32-byte lanes `[0..7]` and
+`[32..39]` of the 256-wide row. The divergence opens between the projection and the rotation, which
+is inside RoPE and not in the projection the lever changes.
+
+With the table in its own slot, one session, the TP4 launcher, one process per rank on devices 0-3:
+
+| arm | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` |
 |---|---|---|
-| 1 | 13.0088 TPS | 17.5931 TPS |
-| 2 | 12.9874 TPS | 17.2694 TPS |
+| HCCL (the shipped collective) | 9.63 TPS / 103.8 ms | 9.76 TPS / 102.5 ms |
+| host poll (hand-written collective) | 12.96-13.06 TPS / 76.6-77.1 ms | 17.46-17.71 TPS / 56.5-57.3 ms |
+| device wait (same collective, §5.5.3) | 18.66-18.79 TPS / 53.2-53.6 ms | 25.15-25.37 TPS / 39.4-39.8 ms |
 
-All four runs emit `11751 13 198 760 6511 314 9564 369 19241 ...`. The lever is worth the same
-13.05 -> 17.59 TPS with the accuracy intact; it is not paid for with it.
+All ten runs emit `11751 13 198 760 6511 314 9564 369 19241 ...` -- the reference's 32 tokens, one
+sequence, at both widths, at both collectives, and at both of the hand-written collective's arrival
+waits. The four hand-written configurations were then repeated at 128 tokens, two runs each: all
+eight emit one identical 128-token sequence, whose first 32 are the reference's. The lever is worth
+the same 13.05 -> 17.59 TPS with the accuracy intact; it is not paid for with it.
+
+An earlier revision of this page quoted two pairs at 13.0088 / 17.5931 and 12.9874 / 17.2694 TPS and
+claimed the reference's tokens for all four runs. That pair is **withdrawn rather than corrected**:
+it is not reproducible from the tree it is printed against, because `Linear::forward` was handing the
+replication factor to a multi-row projection as the batch at the time, so a prefill chunk projected
+row 0 alone and the first token could not have been the reference's. The session above replaces it.
+The 34.8% this section is named for survives the correction unchanged; what did not survive is the
+claim that the tokens were already right.
 
 ### 6.4 Where the 20.1 ms went
 
@@ -920,12 +950,14 @@ much room a destination has is also the one thing the projection cannot work out
 handed a bare pointer, and whether that buffer holds one row or sixteen was decided at an allocation
 somewhere else.
 
-`QWEN_ASCEND_REPLICATE_CHECK=1` closes that. Every activation remembers its capacity at
-`allocate_elements`; every replicated projection looks its destination up and declines to launch if
-the tall write does not fit, naming the site and both extents. A buffer that reached the device
-through a bare `allocate` rather than through `allocate_elements` is not in the map and is refused
-rather than assumed fine, which is the same failure the check exists to catch. It is off by default —
-a hash lookup per allocation, and a check on the code rather than on the hardware.
+`QWEN_ASCEND_REPLICATE_CHECK=1` closes that. Every activation remembers its **declared extent** at
+`allocate_elements` — not the block's capacity, which is a workspace slot's largest-ever extent and
+therefore a bound on what the hardware can take rather than on what this write was sized for. Every
+replicated projection looks its destination up and declines to launch if the tall write does not fit,
+naming the site and both extents. A buffer that reached the device through a bare `allocate` rather
+than through `allocate_elements` is not in the map and is refused rather than assumed fine, which is
+the same failure the check exists to catch. It is off by default — a hash lookup per allocation, and a
+check on the code rather than on the hardware.
 
 Both controls were run. With the rule in place and `QWEN_ASCEND_REPLICATE_CHECK=1`, `replicate=16`
 completes at **17.5072 TPS, `qwen_ascend_tp4_status=0`**: every one of the 17 sites found a
@@ -941,21 +973,26 @@ The second extent is `replicate x output_rows x 2` at that site: 16 x 2560 x 2 =
 is `lin.qkv`'s output width — `2 * key_dim + value_dim` at TP4, i.e. `2 * (16/4) * 128 +
 (48/4) * 128`. The first is what the slot held with the rule off: less than one replicated row, so
 the launch is refused instead of writing past the end of it. The rule was restored, the engine
-rebuilt, and the A/B re-measured; the pairs in §6.3 are from the restored build.
+rebuilt, and the A/B re-measured; the matrix in §6.3 is from that restored build merged with the
+RoPE-table fix, and the projection's batch width was corrected in the same pass.
 
 What this gate does not establish is that the sixteen rows carry the right *numbers*. It verifies the
 room, not the arithmetic. The rest of the arithmetic is covered elsewhere rather than here: the
 broadcast's parity at both widths is the bench's own check (§6.1), the extent is what this gate
 checks, and the tokens are what §6.3 has — the two arms, and the widths either side of them, emitting
 one 32-token sequence that is the HF reference's. Before the workspace fix that third leg was not
-available and this paragraph said so; it is available now.
+available and this paragraph said so; it is available now. The bench grew a fourth leg with it: each
+batch width's row 0 against the same product accumulated in double on the host, where `m=1` and `m=16`
+both come out at a max relative error of 3.45e-4 of scale on `4352x5120` and 3.24e-4 on `8704x5120`.
+The broadcast is the single-row form's arithmetic, to the figures the measurement resolves.
 
 Three further things are not established, and are named so they are not read as done. The
 `full_attention` and `attn_resid_norm` deltas above are a single session's, on a step that has 112
-attention calls in it, and the interaction between a 1.7 MB larger workspace and the attention
-kernels' own allocations is not separated from noise. The lever is untested against §5's collective
-in the other direction — every pair in §6.3 has `POCKET_ASCEND_IPC_ALLREDUCE=1` on both arms, so what
-is measured is this lever on top of that path, not on the shipped HCCL default. And the fused versus
+attention calls in it, and the interaction between a 1.2 MB larger workspace and the attention
+kernels' own allocations is not separated from noise. The HCCL row in §6.3 is the shipped default and
+is measured at both widths — 9.63 and 9.76 TPS, +1.3% — so the lever is nearly free there but nearly
+worthless too: a 103.8 ms step leaves the ~20 ms the tile buys buried in the collective. The 34.8%
+§6.3 reports is this lever on top of the hand-written path, not on the default. And the fused versus
 unfused `mlp.gate_up` choice the engine makes from the checkpoint's own layout is not swept against
 `QWEN_ASCEND_REPLICATE_ROWS`; only the layout this checkpoint selects (fused, 8704) is measured
 here.
