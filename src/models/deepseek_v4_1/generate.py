@@ -220,6 +220,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         kinds = sorted({type(r).__name__ for r in held})
         world = getattr(held[0], "world", None)
         where = "" if world is None else f", world {world}"
+        # A rank that drives one share of the deal returns a partial the ffn's all-reduce completes;
+        # one that drives all of them sums them here. Both are correct and they are different runs,
+        # so the line says which one this is.
+        ranks = getattr(held[0], "ranks", None)
+        if ranks is not None and world is not None and len(ranks) < world:
+            where += f", holding rank {ranks[0]} of the deal"
         say(f"routed experts: {', '.join(kinds)} on {len(held)} layers{where}")
 
     prompt_ids = tokenizer(args.prompt)["input_ids"]

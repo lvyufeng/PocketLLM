@@ -553,10 +553,37 @@ bool valid_recurrent(int heads, int key_heads, int key_dim, int value_dim,
 // the CUDA device implementation's float powf/cosf path is therefore not copied
 // into this first-generation kernel, which has no classic-aicore trig primitive.
 //
-// The device allocation comes from WorkspacePool's Intermediate slot rather than
-// aclrtMalloc. The copy is queued on the same stream as the kernel, so the table
-// remains live until the launch consumes it and can be reused by the next
-// serialized operator without a stream-wide synchronization.
+// The device allocation comes from the pool rather than aclrtMalloc, and it has a
+// slot to itself.
+//
+// This was shared with the Intermediate slot -- the norms' rstd buffers and the
+// attention launchers' scratch -- on the reasoning that a blocking aclrtMemcpy of
+// the table is ordered against the launch that reads it. It is not: a blocking
+// copy does not fail until the *host* would, and it is not enqueued on the stream
+// at all, so it is not ordered against work already queued there. An attention
+// kernel queued before the copy then lands on the table between the copy and the
+// rope kernel's read, and the rotation comes out wrong.
+//
+// What that cost was measured on a decode step. The K cache entry written at
+// position 5 disagreed with the same position written by a six-row prefill by
+// maxabs 7.61, rel 0.50, in exactly the 32-byte lanes [0..7] and [32..39] of the
+// 256-wide row; the V entry was bit-exact and the K tail [64:255] agreed to
+// 0.0012. Recovering the rotation the decode arm actually applied to the same
+// pre-norm input gives cosines above 1 for the first eight lanes and a correct
+// sine half, which is a clobbered cos table rather than a rotation. Every one of
+// those lanes is 4 bytes and the two runs are 32 bytes apart, one cache sector.
+//
+// `QWEN_ASCEND_ROPE_WS=shared` selects the aliased slot again. It is the negative
+// control that keeps this fix legible -- the tokens and the cache lane pattern
+// above both come back when it is set -- and nothing else should use it.
+ascend::WorkspacePool::Purpose rope_table_purpose() {
+    const char* value = std::getenv("QWEN_ASCEND_ROPE_WS");
+    if (value != nullptr && value[0] == 's') {
+        return ascend::WorkspacePool::Purpose::Intermediate;
+    }
+    return ascend::WorkspacePool::Purpose::RopeTable;
+}
+
 class RopeTables {
 public:
     static bool acquire(int rotary_dim, float theta, int start_position, int rows,
@@ -586,8 +613,7 @@ public:
 
         bool pool_ok = true;
         void* storage = ascend::WorkspacePool::acquire(
-            bytes * 2, stream, pool_ok,
-            ascend::WorkspacePool::Purpose::Intermediate);
+            bytes * 2, stream, pool_ok, rope_table_purpose());
         if (!pool_ok || storage == nullptr) return false;
         auto* device = static_cast<float*>(storage);
         // The host vectors are temporary. A synchronous copy keeps their lifetime
@@ -640,8 +666,7 @@ public:
 
         bool pool_ok = true;
         void* storage = ascend::WorkspacePool::acquire(
-            bytes * 2, stream, pool_ok,
-            ascend::WorkspacePool::Purpose::Intermediate);
+            bytes * 2, stream, pool_ok, rope_table_purpose());
         if (!pool_ok || storage == nullptr) return false;
         auto* device = static_cast<float*>(storage);
         if (aclrtMemcpy(device, bytes, host_cos.data(), bytes,

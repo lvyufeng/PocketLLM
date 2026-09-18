@@ -23,6 +23,7 @@ _PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "1").
 _PREFILL_SPARSE_ATTN_HEADPAIR_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_HEADPAIR_CUDA", "1").lower() in {"1", "true", "yes"}
 _SHARED_EXPERT_PAIR_INT8_CUDA = os.getenv("DEEPSEEK_SHARED_EXPERT_PAIR_INT8_CUDA", "0").lower() in {"1", "true", "yes"}
 _Q8_0_CUDA_EXT = os.getenv("DEEPSEEK_Q8_0_CUDA_EXT", "1").lower() in {"1", "true", "yes"}
+_HC_SPLIT_IMPL = os.getenv("DEEPSEEK_HC_SPLIT_IMPL", "auto")
 _INT8_CUDA_EXT = None
 
 
@@ -78,6 +79,10 @@ def _auto_impl(kind: str) -> str:
             return "triton"
         return "torch"
     if kind == "int8":
+        if _USE_TRITON:
+            return "triton"
+        return "torch"
+    if kind == "hc_split":
         if _USE_TRITON:
             return "triton"
         return "torch"
@@ -1221,7 +1226,113 @@ def sparse_attn(
     return out.to(q.dtype)
 
 
-def hc_split_sinkhorn(
+_HC_SPLIT_BLOCK_ROWS = 32
+
+
+if _USE_TRITON:
+
+    @triton.jit
+    def _hc_split_sinkhorn_kernel(
+        MIXES,
+        SCALE,
+        BASE,
+        PRE,
+        POST,
+        COMB,
+        n_rows,
+        str_mix_row,
+        eps,
+        HCM: tl.constexpr,
+        ITERS: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+    ):
+        """pre / post / comb for `BLOCK_ROWS` rows, with every normalization in registers.
+
+        The alternative is a Python loop of `ITERS - 1` iterations of six elementwise ops on a tensor
+        whose largest instance is 8 KiB. At V4.1's config that is 19 iterations, ~114 launches a call,
+        and `Block.hc_mixes` calls it twice a layer -- so ~9100 launches a step for arithmetic that
+        fits in a register file. The loop index is the whole point of the kernel being a kernel.
+
+        `BLOCK_ROWS` rows a program and not one, because a decode step is a single row: one row a
+        program would leave thousands of programs idle beside the one doing the work.
+        """
+        pid = tl.program_id(0)
+        rows = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+        row_mask = rows < n_rows
+
+        off_h = tl.arange(0, HCM)
+        off_c = tl.arange(0, HCM * HCM)
+
+        base_row = rows[:, None] * str_mix_row
+        pre = tl.load(MIXES + base_row + off_h[None, :], mask=row_mask[:, None], other=0.0)
+        post = tl.load(MIXES + base_row + (HCM + off_h)[None, :], mask=row_mask[:, None], other=0.0)
+        flat = tl.load(MIXES + base_row + (2 * HCM + off_c)[None, :], mask=row_mask[:, None], other=0.0)
+
+        s0 = tl.load(SCALE + 0)
+        s1 = tl.load(SCALE + 1)
+        s2 = tl.load(SCALE + 2)
+        b_pre = tl.load(BASE + off_h)
+        b_post = tl.load(BASE + HCM + off_h)
+
+        pre = tl.sigmoid(pre * s0 + b_pre[None, :]) + eps
+        post = 2.0 * tl.sigmoid(post * s1 + b_post[None, :])
+
+        # The comb affine transform is applied flat and only then reshaped, so the pointer arithmetic
+        # stays two-dimensional: `[:, None, None]` on an index that is already rank 2 builds a rank-4
+        # pointer, and the broadcast that follows is not the one this kernel wants.
+        flat = flat * s2 + tl.load(BASE + 2 * HCM + off_c)[None, :]
+        comb = tl.reshape(flat, (BLOCK_ROWS, HCM, HCM))
+
+        e = tl.exp(comb - tl.max(comb, axis=2, keep_dims=True))
+        comb = e / tl.sum(e, axis=2, keep_dims=True) + eps
+        comb = comb / (tl.sum(comb, axis=1, keep_dims=True) + eps)
+        for _ in tl.static_range(ITERS - 1):
+            comb = comb / (tl.sum(comb, axis=2, keep_dims=True) + eps)
+            comb = comb / (tl.sum(comb, axis=1, keep_dims=True) + eps)
+
+        # Rows past `n_rows` are loaded as zeros and written nowhere. Every step of the arithmetic
+        # above is total on zeros -- the softmax of a zero row is uniform, and each normalization
+        # divides a finite numerator by at least `eps` -- so the padding cannot produce a NaN.
+        keep = row_mask[:, None]
+        out_2d = rows[:, None] * HCM
+        tl.store(PRE + out_2d + off_h[None, :], pre, mask=keep)
+        tl.store(POST + out_2d + off_h[None, :], post, mask=keep)
+        out_flat = rows[:, None] * (HCM * HCM)
+        tl.store(COMB + out_flat + off_c[None, :], tl.reshape(comb, (BLOCK_ROWS, HCM * HCM)), mask=keep)
+
+
+def _hc_split_sinkhorn_triton(
+    flat: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_rows = flat.shape[0]
+    pre = torch.empty((n_rows, hc_mult), device=flat.device, dtype=torch.float32)
+    post = torch.empty((n_rows, hc_mult), device=flat.device, dtype=torch.float32)
+    comb = torch.empty((n_rows, hc_mult, hc_mult), device=flat.device, dtype=torch.float32)
+    grid = (triton.cdiv(max(n_rows, 1), _HC_SPLIT_BLOCK_ROWS),)
+    _hc_split_sinkhorn_kernel[grid](
+        flat,
+        hc_scale,
+        hc_base,
+        pre,
+        post,
+        comb,
+        n_rows,
+        flat.stride(0),
+        float(eps),
+        HCM=hc_mult,
+        ITERS=sinkhorn_iters,
+        BLOCK_ROWS=_HC_SPLIT_BLOCK_ROWS,
+        num_warps=4,
+    )
+    return pre, post, comb
+
+
+def hc_split_sinkhorn_torch(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
@@ -1229,6 +1340,7 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ):
+    """The reference body: `sinkhorn_iters` explicit elementwise normalizations of a [n, hc, hc]."""
     mix_hc = (2 + hc_mult) * hc_mult
     flat = mixes.view(-1, mix_hc).to(torch.float32)
     base = hc_base.to(torch.float32)
@@ -1248,3 +1360,51 @@ def hc_split_sinkhorn(
 
     shape = mixes.shape[:-1]
     return pre.view(*shape, hc_mult), post.view(*shape, hc_mult), comb.view(*shape, hc_mult, hc_mult)
+
+
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+    impl: str = _HC_SPLIT_IMPL,
+):
+    """pre / post / comb of the hyper-connection mix, one kernel instead of a Python loop.
+
+    The kernel needs `hc_mult` a power of two (`tl.arange`) and its three operands fp32 and
+    contiguous; anything else falls back to the loop, which is the same result at fp32 rounding.
+    """
+    mix_hc = (2 + hc_mult) * hc_mult
+    flat = mixes.view(-1, mix_hc)
+    impl = _resolve_impl("hc_split", impl)
+    supported = (
+        impl == "triton"
+        and _USE_TRITON
+        and flat.is_cuda
+        and hc_mult > 0
+        and hc_mult & (hc_mult - 1) == 0
+    )
+    if not supported:
+        return hc_split_sinkhorn_torch(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+    if flat.dtype != torch.float32 or not flat.is_contiguous():
+        flat = flat.to(torch.float32).contiguous()
+    shape = mixes.shape[:-1]
+    pre, post, comb = _hc_split_sinkhorn_triton(
+        flat,
+        _hc_split_operand(hc_scale),
+        _hc_split_operand(hc_base),
+        hc_mult,
+        max(sinkhorn_iters, 1),
+        eps,
+    )
+    return pre.view(*shape, hc_mult), post.view(*shape, hc_mult), comb.view(*shape, hc_mult, hc_mult)
+
+
+def _hc_split_operand(t: torch.Tensor) -> torch.Tensor:
+    """fp32 and contiguous, without dispatching a copy when it already is -- this runs 80 times a step."""
+    if t.dtype != torch.float32:
+        t = t.to(torch.float32)
+    return t if t.is_contiguous() else t.contiguous()

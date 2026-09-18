@@ -46,7 +46,9 @@ __all__ = [
     "Compressor",
     "Indexer",
     "SharedAttentionRuntime",
+    "canonical_device",
     "get_window_topk_idxs",
+    "precompute_freqs_cis",
     "select_candidate_blocks",
 ]
 
@@ -75,11 +77,11 @@ class RMSNorm(nn.Module):
     """The checkpoint stores these in bf16; the parameter is kept fp32 and the input upcast, which
     is what the reference does unconditionally rather than only when the dtype is low."""
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, device: torch.device | str | None = None):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32, device=device))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
@@ -88,7 +90,24 @@ class RMSNorm(nn.Module):
         return (self.weight * x).to(dtype)
 
 
-@lru_cache(2)
+def canonical_device(device: torch.device | str | None) -> torch.device | None:
+    """`device` with an unindexed `cuda` resolved to the card we are actually on.
+
+    Every node in the tree builds its own copy of the rope table, and they share one by asking for
+    the same key. `torch.device("cuda")` is not the same key as `torch.device("cuda", 0)` and lands
+    wherever the current device happens to point, so it is resolved here rather than at each cache
+    lookup -- otherwise the first node to be built would decide, silently, which card the other
+    thirty-nine read their roperies from.
+    """
+    if device is None:
+        return None
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
+@lru_cache(16)
 def precompute_freqs_cis(
     dim: int,
     seqlen: int,
@@ -97,6 +116,7 @@ def precompute_freqs_cis(
     factor: float,
     beta_fast: int,
     beta_slow: int,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """Rotary frequencies as complex exponentials, one row per position.
 
@@ -105,6 +125,20 @@ def precompute_freqs_cis(
     band between `beta_fast` and `beta_slow` is faded across with a linear ramp. The V4.1 config
     turns YaRN on for the layers that read compressed positions (`compress_rope_theta`, 160,000)
     and off for the pure sliding-window layers (`rope_theta`, 10,000).
+
+    `device` is part of the cache key and not just of the result, and that is the whole point of it.
+    The table is large -- `max_position_embeddings` is 1,048,576 and `rope_head_dim` 64, so one
+    variant is 268 MB of complex64 -- and all forty layers of a backbone want the same one or the
+    other of exactly two. `nn.Module.to` does not dedupe a buffer two modules share (measured, torch
+    2.9.1: `_apply` rebuilds each module's own copy), so a `.to(cuda)` on a host-built tree would
+    turn those 536 MB into 10.7 GiB per card. Keyed on the device, the tree gets one object per
+    variant and the modules alias it.
+
+    The size is not two. Two variants times one card per process is four entries, but a process that
+    drives four cards itself asks for all eight, and an eviction is worse than a miss: the modules
+    still hold the object they were handed, so the next call for the same key builds a *second* 268 MB
+    table beside it rather than reusing the live one. Sixteen leaves room for that without ever
+    reaching for it.
     """
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if original_seq_len > 0:
@@ -118,7 +152,10 @@ def precompute_freqs_cis(
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    return torch.polar(torch.ones_like(torch.outer(torch.arange(seqlen), freqs)), torch.outer(torch.arange(seqlen), freqs))
+    table = torch.polar(
+        torch.ones_like(torch.outer(torch.arange(seqlen), freqs)), torch.outer(torch.arange(seqlen), freqs)
+    )
+    return table if device is None else table.to(device)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
@@ -140,13 +177,26 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     return y
 
 
-@lru_cache(1)
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int) -> torch.Tensor:
+def get_window_topk_idxs(
+    window_size: int,
+    bsz: int,
+    seqlen: int,
+    start_pos: int,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     """Which sliding-window cache slots each query attends to; `-1` marks a slot holding nothing.
 
     The cache is a ring of `window_size` slots. Prefill needs one row per query, each seeing its own
     causal window. A decode step has a single query that sees the whole ring, listed oldest first.
     Order within a row does not matter to `sparse_attn`, which handles every slot independently.
+
+    `device` is where the table has to end up, because `Attention.forward` concatenates it against
+    the card's own tensors -- a CPU table fails there the moment the tree runs anywhere but the host,
+    and the shapes are equal enough that only the `cat` catches it. The table is *built* on the host
+    and moved, not built in place: at the config's window of 128 a decode step's table is 512 bytes,
+    while the eight `arange`/`clamp`/`where` kernels it takes to build one are eight launches on a
+    stream whose busy fraction this round exists to raise. `None` -- the host's own answer -- stays
+    the default, so the host path issues exactly what it issued before.
     """
     if start_pos == 0:
         end = torch.arange(seqlen).unsqueeze(1)
@@ -157,7 +207,16 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
         idxs = torch.cat([torch.arange(oldest, window_size), torch.arange(oldest)])
         idxs = torch.where(idxs > start_pos, -1, idxs)  # ring still filling
     # `sparse_attn` needs real [b, m, topk] int32 memory, hence the materializing expand
-    return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+    idxs = idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+    return idxs if device is None else idxs.to(device)
+
+
+# There is deliberately no cache here. The one this replaced was `@lru_cache(1)` keyed on the
+# arguments and not on the device, so a second device silently received the first device's tensor --
+# and it could not have helped anyway: `start_pos` is in the key and advances every decode step, so
+# the steady state was a miss per layer per step. What is worth caching is the ring listing, which
+# depends on `start_pos % window_size` alone, and that belongs with the module that owns the
+# per-step launch budget rather than with a free function two callers share.
 
 
 class SharedAttentionRuntime:
@@ -188,28 +247,42 @@ class Compressor(nn.Module):
     rotates afterwards.
     """
 
-    def __init__(self, cfg: V41TextConfig, layer_id: int, max_batch_size: int):
+    def __init__(
+        self,
+        cfg: V41TextConfig,
+        layer_id: int,
+        max_batch_size: int,
+        device: torch.device | str | None = None,
+    ):
         super().__init__()
         ratio = _compress_ratio_at(cfg, layer_id)
         head_dim = _required_int(cfg, "head_dim")
         self.compress_ratio = ratio
         self.head_dim = head_dim
-        self.norm = RMSNorm(head_dim, _required_float(cfg, "norm_eps"))
+        self.norm = RMSNorm(head_dim, _required_float(cfg, "norm_eps"), device=device)
         # ratio 1 is a plain projection, so it stays in the checkpoint's bf16; the softmax pooling
         # above ratio 1 runs in fp32, so those weights are promoted to fp32 to match
         # `bias=False` throughout this module, as the reference's `Linear` defaults to and as the
         # checkpoint is: no V4.1 projection carries one.
         self.wkv = nn.Linear(
-            _required_int(cfg, "dim"), head_dim, bias=False, dtype=torch.float32 if ratio > 1 else torch.bfloat16
+            _required_int(cfg, "dim"),
+            head_dim,
+            bias=False,
+            dtype=torch.float32 if ratio > 1 else torch.bfloat16,
+            device=device,
         )
         if ratio <= 1:
             return
-        self.wgate = nn.Linear(_required_int(cfg, "dim"), head_dim, bias=False, dtype=torch.float32)
+        self.wgate = nn.Linear(_required_int(cfg, "dim"), head_dim, bias=False, dtype=torch.float32, device=device)
 
         state_shape = (max_batch_size, ratio, head_dim)
-        self.register_buffer("kv_state", torch.zeros(state_shape, dtype=torch.float32), persistent=False)
         self.register_buffer(
-            "score_state", torch.full(state_shape, -torch.inf, dtype=torch.float32), persistent=False
+            "kv_state", torch.zeros(state_shape, dtype=torch.float32, device=device), persistent=False
+        )
+        self.register_buffer(
+            "score_state",
+            torch.full(state_shape, -torch.inf, dtype=torch.float32, device=device),
+            persistent=False,
         )
 
     def reset_state(self, batch_size: int) -> None:
@@ -289,7 +362,15 @@ class Indexer(nn.Module):
     levels; `select_candidate_blocks` is the first.
     """
 
-    def __init__(self, cfg: V41TextConfig, layer_id: int, max_batch_size: int, max_seq_len: int):
+    def __init__(
+        self,
+        cfg: V41TextConfig,
+        layer_id: int,
+        max_batch_size: int,
+        max_seq_len: int,
+        device: torch.device | str | None = None,
+        world: int = 1,
+    ):
         super().__init__()
         kv_sources = _required(cfg, "kv_source_layers")
         candidate_source = cfg.candidate_source_layer
@@ -302,20 +383,38 @@ class Indexer(nn.Module):
         self.uses_candidates = candidate_source is not None and 0 <= candidate_source < layer_id
         self.candidate_topk_blocks = cfg.candidate_topk_blocks or 0
         self.candidate_block_size = cfg.candidate_block_size or 0
-        self.n_heads = _required_int(cfg, "index_n_heads")
+        self.n_heads = _required_int(cfg, "index_n_heads") // world
+        self.n_heads_global = _required_int(cfg, "index_n_heads")
         self.index_head_dim = _required_int(cfg, "index_head_dim")
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
         self.index_topk = _required_int(cfg, "index_topk")
         self.softmax_scale = self.index_head_dim**-0.5
         self.wq_b = nn.Linear(
-            _required_int(cfg, "q_lora_rank"), self.n_heads * self.index_head_dim, bias=False, dtype=LINEAR_DTYPE
+            _required_int(cfg, "q_lora_rank"),
+            self.n_heads * self.index_head_dim,
+            bias=False,
+            dtype=LINEAR_DTYPE,
+            device=device,
         )
-        self.weights_proj = nn.Linear(_required_int(cfg, "dim"), self.n_heads, bias=False, dtype=LINEAR_DTYPE)
+        # The output width is global while the *parameter* is not cut at all: `weights_proj` is 32
+        # numbers against a 5120-wide input, so slicing it would mean this rank's 8 output columns
+        # are produced by heads 0-31's weights -- the same 8 numbers, for the sake of a slice that
+        # saves 64 bytes. The forward takes the head offset out of the output instead.
+        self.weights_proj = nn.Linear(
+            _required_int(cfg, "dim"), self.n_heads_global, bias=False, dtype=LINEAR_DTYPE, device=device
+        )
+        self.tp = None
         self.freqs_cis: torch.Tensor | None = None
         if self.owns_k:
-            self.wk = nn.Linear(_required_int(cfg, "head_dim"), self.index_head_dim, bias=False, dtype=LINEAR_DTYPE)
+            self.wk = nn.Linear(
+                _required_int(cfg, "head_dim"),
+                self.index_head_dim,
+                bias=False,
+                dtype=LINEAR_DTYPE,
+                device=device,
+            )
 
-            self.k_norm = RMSNorm(self.index_head_dim, _required_float(cfg, "norm_eps"))
+            self.k_norm = RMSNorm(self.index_head_dim, _required_float(cfg, "norm_eps"), device=device)
             self.register_buffer(
                 "k_cache",
                 torch.zeros(
@@ -323,6 +422,7 @@ class Indexer(nn.Module):
                     max_seq_len // self.compress_ratio,
                     self.index_head_dim,
                     dtype=CACHE_DTYPE,
+                    device=device,
                 ),
                 persistent=False,
             )
@@ -370,9 +470,24 @@ class Indexer(nn.Module):
         fp4_act_quant(q, FP4_BLOCK_SIZE, True)
 
         index_k = shared.index_k[:bsz, : end_pos // ratio]
-        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        # `weights` is one number per index head, and the sum below runs over heads -- so this rank
+        # needs its own slice of the output while the scale stays the *global* head count. Using the
+        # local 8 in `n_heads**-0.5` would scale every index-source layer's partial by 2x.
+        tp = self.tp
+        if tp is None:
+            weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads_global**-0.5)
+        else:
+            lo = tp.rank * tp.index_heads
+            weights = self.weights_proj(x)[..., lo : lo + tp.index_heads] * (
+                self.softmax_scale * self.n_heads_global**-0.5
+            )
         index_score = torch.einsum("bshd,btd->bsht", q, index_k)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if tp is not None:
+            # the sum above ran over this rank's heads only, so the score is a partial. It has to be
+            # whole before the top-k, because a top-k over partials is a different selection and the
+            # difference is discrete -- it does not average away downstream the way a rounding does.
+            index_score = tp.reduce(index_score)
 
         # how many compressed positions each query can see: a block becomes visible once the query
         # has passed its last token. One query per decode step, so there it is just a number.
@@ -412,37 +527,52 @@ class Attention(nn.Module):
         cfg: V41TextConfig,
         max_batch_size: int = 1,
         max_seq_len: int | None = None,
+        device: torch.device | str | None = None,
+        world: int = 1,
     ):
         super().__init__()
         if max_seq_len is None:
             max_seq_len = cfg.original_seq_len or cfg.max_position_embeddings
         if not max_seq_len:
             raise ValueError("a max_seq_len is required: the config states neither original_seq_len nor max_position_embeddings")
+        device = canonical_device(device)
         self.layer_id = layer_id
         self.dim = _required_int(cfg, "dim")
-        self.n_heads = _required_int(cfg, "n_heads")
+        # `world` divides the heads and the groups, and nothing else here: wq_a, wkv and the whole
+        # compressor replicate, for the reasons in `tp.py`. The two counts are local so that every
+        # `unflatten`/`view` below is local too, and there is no place a global head count still
+        # needs to be right except `attn_sink`, whose width is the thing being cut.
+        self.world = world
+        self.n_heads = _required_int(cfg, "n_heads") // world
         self.head_dim = _required_int(cfg, "head_dim")
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
-        self.n_groups = _required_int(cfg, "o_groups")
+        self.n_groups = _required_int(cfg, "o_groups") // world
         self.o_lora_rank = _required_int(cfg, "o_lora_rank")
         self.window_size = _required_int(cfg, "window_size")
         self.softmax_scale = self.head_dim**-0.5
         self.eps = _required_float(cfg, "norm_eps")
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.wq_a = nn.Linear(self.dim, _required_int(cfg, "q_lora_rank"), bias=False, dtype=LINEAR_DTYPE)
-        self.q_norm = RMSNorm(self.wq_a.out_features, self.eps)
-        self.wq_b = nn.Linear(self.wq_a.out_features, self.n_heads * self.head_dim, bias=False, dtype=LINEAR_DTYPE)
-        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False, dtype=LINEAR_DTYPE)
-        self.kv_norm = RMSNorm(self.head_dim, self.eps)
+        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32, device=device))
+        self.wq_a = nn.Linear(
+            self.dim, _required_int(cfg, "q_lora_rank"), bias=False, dtype=LINEAR_DTYPE, device=device
+        )
+        self.q_norm = RMSNorm(self.wq_a.out_features, self.eps, device=device)
+        self.wq_b = nn.Linear(
+            self.wq_a.out_features, self.n_heads * self.head_dim, bias=False, dtype=LINEAR_DTYPE, device=device
+        )
+        self.wkv = nn.Linear(self.dim, self.head_dim, bias=False, dtype=LINEAR_DTYPE, device=device)
+        self.kv_norm = RMSNorm(self.head_dim, self.eps, device=device)
         self.wo_a = nn.Linear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             bias=False,
             dtype=LINEAR_DTYPE,
+            device=device,
         )
-        self.wo_b = nn.Linear(self.n_groups * self.o_lora_rank, self.dim, bias=False, dtype=LINEAR_DTYPE)
-
+        self.wo_b = nn.Linear(
+            self.n_groups * self.o_lora_rank, self.dim, bias=False, dtype=LINEAR_DTYPE, device=device
+        )
+        self.tp = None
 
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         is_backbone = layer_id < n_layers
@@ -452,13 +582,13 @@ class Attention(nn.Module):
         self.compressor: Compressor | None = None
         self.indexer: Indexer | None = None
         if self.is_kv_source:
-            self.compressor = Compressor(cfg, layer_id, max_batch_size)
+            self.compressor = Compressor(cfg, layer_id, max_batch_size, device=device)
         if self.is_index_source:
-            self.indexer = Indexer(cfg, layer_id, max_batch_size, max_seq_len)
+            self.indexer = Indexer(cfg, layer_id, max_batch_size, max_seq_len, device=device, world=world)
 
         self.register_buffer(
             "window_kv_cache",
-            torch.zeros(max_batch_size, self.window_size, self.head_dim, dtype=CACHE_DTYPE),
+            torch.zeros(max_batch_size, self.window_size, self.head_dim, dtype=CACHE_DTYPE, device=device),
             persistent=False,
         )
         if self.is_kv_source:
@@ -469,6 +599,7 @@ class Attention(nn.Module):
                     max_seq_len // self.compress_ratio,
                     self.head_dim,
                     dtype=CACHE_DTYPE,
+                    device=device,
                 ),
                 persistent=False,
             )
@@ -489,6 +620,7 @@ class Attention(nn.Module):
                 _required_float(cfg, "rope_factor"),
                 _required_int(cfg, "beta_fast"),
                 _required_int(cfg, "beta_slow"),
+                device,
             ),
             persistent=False,
         )
@@ -529,7 +661,7 @@ class Attention(nn.Module):
         else:  # decode: one token into the ring buffer, attend over the whole window
             self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             window_kv = self.window_kv_cache[:bsz]
-        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos, device=x.device)
 
     def _compress_topk_idxs(self, x, qr, latent, start_pos, offset, compress_len, shared):
         """Which compressed positions each query attends to. Index sources run their own indexer;
@@ -596,11 +728,18 @@ class Attention(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
-        # Linear. The checkpoint stores it fp8; a loader would dequantize it to bf16.
+        # Linear. The checkpoint stores it fp8; a loader would dequantize it to bf16. The local
+        # heads are exactly the local groups -- o_groups divides n_heads and this rank took a
+        # contiguous run of heads, so 16 heads from 16r is groups 2r and 2r+1 whole -- which is why
+        # wo_a needs no collective of its own.
         o = o.view(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return self.wo_b(o.flatten(2))
+        y = self.wo_b(o.flatten(2))
+        # wo_b is row-parallel, so this is the partial sum over groups and the one collective the
+        # attention half of a layer needs.
+        tp = self.tp
+        return y if tp is None else tp.reduce(y)
 
 
 class AttentionStack(nn.Module):
@@ -611,11 +750,19 @@ class AttentionStack(nn.Module):
     unit the smoke test drives, not a model.
     """
 
-    def __init__(self, cfg: V41TextConfig, max_batch_size: int = 1, max_seq_len: int | None = None):
+    def __init__(
+        self,
+        cfg: V41TextConfig,
+        max_batch_size: int = 1,
+        max_seq_len: int | None = None,
+        device: torch.device | str | None = None,
+        world: int = 1,
+    ):
         super().__init__()
         n_layers = cfg.n_layers if cfg.n_layers is not None else len(cfg.compress_ratios)
         self.layers = nn.ModuleList(
-            Attention(layer_id, cfg, max_batch_size, max_seq_len) for layer_id in range(n_layers)
+            Attention(layer_id, cfg, max_batch_size, max_seq_len, device=device, world=world)
+            for layer_id in range(n_layers)
         )
         self.shared = SharedAttentionRuntime()
 

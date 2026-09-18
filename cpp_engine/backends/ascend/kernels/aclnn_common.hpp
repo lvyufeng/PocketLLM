@@ -41,6 +41,13 @@ public:
     enum class Purpose {
         OpWorkspace,
         Intermediate,
+        // The partial-RoPE cos/sin table. It cannot share a slot with the norms'
+        // rstd buffers and the attention scratch the way those share with each
+        // other, because it is written by a blocking H2D copy from the host and
+        // the stream does not order that copy against work already queued on it.
+        // A kernel queued before the copy then lands on top of the table between
+        // the copy and the rope kernel's read, and the rotation comes out wrong.
+        RopeTable,
     };
 
     // Returns nullptr both when `bytes` is zero (aclnn accepts a null workspace
