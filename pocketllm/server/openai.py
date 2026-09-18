@@ -237,7 +237,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             request = self._request(body, completion=completion)
             if bool(body.get("stream", False)):
-                self._stream(request, completion=completion)
+                self._stream(request, started=started, completion=completion)
                 return
             result = server.backend.generate([request])[0]
             server.metrics.inc("generation_tokens_total", result.usage.completion_tokens)
@@ -254,7 +254,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             server.metrics.add("requests_active", -1)
             server.metrics.observe("request_duration_seconds", time.perf_counter() - started)
 
-    def _stream(self, request: GenerationRequest, *, completion: bool = False) -> None:
+    def _stream(self, request: GenerationRequest, *, started: float, completion: bool = False) -> None:
         server = self.pocket_server
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -267,10 +267,27 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: " + _json_bytes(_event_json(role, server.model)) + b"\n\n")
             self.wfile.flush()
         prompt_counted = False
+        # Latency sampling. The role delta written above is not a token, so TTFT
+        # is latched on the first event that actually carries one -- the same
+        # signal the generation-token counter already keys off.
+        tokens_seen = 0
+        first_token_at: float | None = None
+        last_token_at = 0.0
+        inter_token_total = 0.0
         try:
             for event in server.backend.stream(request):
                 if event.token_id is not None:
                     server.metrics.inc("generation_tokens_total")
+                    now = time.perf_counter()
+                    if first_token_at is None:
+                        first_token_at = now
+                        server.metrics.observe("ttft_seconds", now - started)
+                    else:
+                        gap = now - last_token_at
+                        inter_token_total += gap
+                        server.metrics.observe("inter_token_latency_seconds", gap)
+                    last_token_at = now
+                    tokens_seen += 1
                 if event.usage is not None and not prompt_counted:
                     server.metrics.inc("prompt_tokens_total", event.usage.prompt_tokens)
                     prompt_counted = True
@@ -294,6 +311,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
         finally:
+            # Recorded on every terminal path, including a truncated stream: the
+            # tokens that were generated took the time they took. A single-token
+            # response has no interval to average and contributes nothing, the
+            # same way vLLM excludes `output_len <= 1`.
+            if tokens_seen >= 2:
+                server.metrics.observe(
+                    "request_time_per_output_token_seconds",
+                    inter_token_total / (tokens_seen - 1),
+                )
             self.close_connection = True
 
 
