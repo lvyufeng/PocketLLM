@@ -31,6 +31,12 @@ The first generated token is produced by the prompt forward and therefore belong
 
 Do not report a combined tokens/s number as a replacement for these two fields. Combined throughput is useful only as an additional end-to-end figure.
 
+This is one of two conventions in this repository. For client-observed serving
+numbers — TTFT, TPOT, ITL, E2EL, throughput and goodput, defined the way vLLM
+defines them — see [Serving latency metrics](latency_metrics.md). The two answer
+different questions and neither replaces the other; a number that claims to be
+`prefill_tps` or `decode_tps` must be measured the way this section describes.
+
 ## Comparison rules
 
 Results are directly comparable only when the checkpoint, quantization, runtime, prompt, generation length, hardware, TP/EP layout, and warm/cold policy match. In particular:

@@ -255,7 +255,17 @@ def validate_stream(result: HttpResult, expected_model: str) -> dict[str, Any]:
 
 
 def start_server(args: argparse.Namespace, log_dir: pathlib.Path) -> ServerGroup:
+    """Launch one server process per rank and wait for readiness.
+
+    Two device-selection styles. CUDA picks the card with
+    `CUDA_VISIBLE_DEVICES` and every rank then opens device 0; Ascend has no
+    equivalent the runtime honours, so a rank is handed the absolute card index
+    with `--device` and the collective whitelist is disabled the way
+    `scripts/run_qwen_ascend_tp4.sh` does it. `--device-style` chooses; the
+    default keeps every existing caller on the CUDA path.
+    """
     devices = parse_devices(args.devices)
+    device_style = getattr(args, "device_style", "cuda")
     rendezvous = log_dir / f"nccl-{uuid.uuid4().hex}.id"
     processes: list[subprocess.Popen[bytes]] = []
     handles: list[Any] = []
@@ -270,12 +280,26 @@ def start_server(args: argparse.Namespace, log_dir: pathlib.Path) -> ServerGroup
     ]
     if args.kv_paged:
         common.append("--kv-paged")
+    elif device_style == "ascend":
+        # The CLI defaults kv_paged to true, and the Ascend batched per-row
+        # operators address a slot by a constant element stride, which a paged
+        # arena has no equivalent of. The engine therefore rejects the
+        # combination outright (qwen_engine.cpp:4499). Without this the server
+        # comes up, passes the readiness gate, and then fails every request for
+        # a reason that reads like a client bug.
+        common.append("--no-kv-paged")
     for rank, visible_device in enumerate(devices):
         handle = (log_dir / f"rank{rank}.log").open("wb")
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = visible_device
+        if device_style == "ascend":
+            env["HCCL_WHITELIST_DISABLE"] = "1"
+            env.setdefault("POCKETLLM_CPP_NCCL_ID_WAIT_ATTEMPTS", "12000")
+            rank_device = ["--device", visible_device]
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = visible_device
+            rank_device = ["--device", "0"]
         process = subprocess.Popen(
-            common + ["--tp-rank", str(rank), "--device", "0"],
+            common + ["--tp-rank", str(rank)] + rank_device,
             stdout=handle,
             stderr=subprocess.STDOUT,
             env=env,
