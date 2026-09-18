@@ -135,6 +135,7 @@ nav:
       - Ascend 910A TP collective overlap: performance/ascend_tp_collective_overlap.md
       - Ascend decode collectives and batch scaling: performance/ascend_decode_collective_ab.md
       - Ascend gated-delta value-axis slice: performance/ascend_gated_delta_slice.md
+      - Ascend RoPE table workspace slot: performance/ascend_rope_table_workspace_aliasing.md
       - DeepSeek-V4 PersistentEngine baseline: performance/deepseek_v4_serial_baseline.md
       - DeepSeek-V4.1 shard audit: performance/deepseek_v4_1_shard_audit.md
       - DeepSeek-V4.1-Flash host run: performance/deepseek_v4_1_flash_host_run.md
