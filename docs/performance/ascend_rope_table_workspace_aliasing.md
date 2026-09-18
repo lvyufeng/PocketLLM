@@ -159,14 +159,22 @@ layer churns through, so it moves the timing of exactly the window this race liv
 into the running state rather than out of it. With the slot separated, the two arms of `1` and `16`
 produce the same 32-token sequence, byte for byte:
 
-| pair | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` |
+| arm | `QWEN_ASCEND_REPLICATE_ROWS=1` | `=16` |
 |---|---|---|
-| 1 | 13.0088 TPS | 17.5931 TPS |
-| 2 | 12.9874 TPS | 17.2694 TPS |
+| host poll (hand-written collective) | 12.96-13.06 TPS / 76.6-77.1 ms | 17.46-17.71 TPS / 56.5-57.3 ms |
 
-All four runs emit `11751 13 198 760 6511 314 9564 369 19241 ...`. `QWEN_ASCEND_REPLICATE_ROWS` is
-not on `master`; it arrives with the single-request decode work, and the lever itself is measured
-there.
+Every run behind that row, and every other cell of the matrix, emits `11751 13 198 760 6511 314 9564
+369 19241 ...`. An earlier revision of this subsection quoted the pair as 13.0088 / 17.5931 and
+12.9874 / 17.2694 TPS; those four numbers are **withdrawn rather than corrected**, because
+`Linear::forward` was handing the replication factor to a multi-row projection as the batch at the
+time, so a prefill chunk projected row 0 alone and the first token could not have been the reference's.
+The row above is the same A/B re-measured on the fixed tree; the full sweep — both widths across all
+three collectives, and the 128-token repeats — is
+[section 6.3 of the single-request page](ascend_single_request_tps.md#63-what-it-is-worth-1305---1759-tps-at-rows1).
+
+`QWEN_ASCEND_REPLICATE_ROWS` is on `master`, shipped off by default, and `QWEN_ASCEND_REPLICATE_CHECK`
+is the opt-in that makes every replicated projection refuse to launch if its destination activation
+does not actually hold the taller write.
 
 ### 5.3 The device wait, which turns out to be correct
 
@@ -210,9 +218,9 @@ accuracy repaired rather than traded against it.
 
 The gate rates above are 12 runs against the 72 the earlier measurement used, which is enough to
 separate 0 from 15% but not to put a bound on the residual failure rate, and the device-wait pairs
-re-run it at 10 more. The width-16 sweep is two pairs rather than the fourteen runs the instability
-was first seen in. What the fix establishes is the direction and the mechanism, and that the negative
-control reproduces the symptoms on demand.
+re-run it at 10 more. The width-16 sweep is one session's interleaved pairs on the fixed tree, against
+the fourteen runs the instability was first seen in. What the fix establishes is the direction and the
+mechanism, and that the negative control reproduces the symptoms on demand.
 
 ## 6. Reproducing this
 
@@ -225,8 +233,8 @@ QWEN_ASCEND_ROPE_WS=shared scripts/run_qwen_ascend_tp4.sh "The capital of France
 ```
 
 The gate re-run of §5.1 is the launcher's batched path with the verifier on. `POCKET_ASCEND_IPC_ALLREDUCE`
-is opt-in and lives on the hand-written-collective branch; leaving it unset runs the HCCL arm, which
-is the shipped default:
+is on `master` and opt-in — `1` runs the hand-written collective, unset runs the HCCL arm, which is
+the shipped default:
 
 ```bash
 for pair in 1 2 3 4 5 6; do
