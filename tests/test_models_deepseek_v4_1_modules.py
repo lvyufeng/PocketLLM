@@ -27,8 +27,10 @@ import torch
 import torch.nn.functional as F
 
 from src.encoding.engram import EngramLayout
+from src.models.deepseek_v4_1 import modules as modules_module
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.modules import (
+    Block,
     Engram,
     Gate,
     MoE,
@@ -43,6 +45,52 @@ N_EXPERTS = 6
 TOPK = 2
 ENGRAM_HEAD_DIM = 32
 ENGRAM_ROWS = 64
+
+# The smallest geometry `Block` accepts. The attention fields mirror `TOY` in
+# `test_models_deepseek_v4_1_attention.py` and the MoE fields mirror `MINI` in
+# `test_models_deepseek_v4_1_loader.py`, because those two files already pin what each half needs to
+# be valid and a third spelling would be a third thing to keep in step. Only the Hyper-Connections
+# fields are this file's own, and `hc_sinkhorn_iters`/`hc_eps` are stated rather than defaulted:
+# `V41TextConfig.validate` rejects a config that leaves them out, and `Block` reads them.
+_BLOCK_FIELDS = dict(
+    dim=DIM,
+    norm_eps=1e-6,
+    hc_mult=2,
+    hc_sinkhorn_iters=20,
+    hc_eps=1e-6,
+    moe_inter_dim=INTER_DIM,
+    n_routed_experts=N_EXPERTS,
+    n_shared_experts=1,
+    n_activated_experts=TOPK,
+    score_func="sqrtsoftplus",
+    route_scale=1.5,
+    swiglu_limit=10.0,
+    n_layers=6,
+    n_mtp_layers=0,
+    n_heads=4,
+    head_dim=32,
+    rope_head_dim=8,
+    q_lora_rank=32,
+    o_groups=2,
+    o_lora_rank=16,
+    window_size=4,
+    compress_ratios=(0, 0, 2, 2, 1, 1),
+    kv_source_layers=(2, 4),
+    index_source_layers=(2, 4, 5),
+    index_n_heads=2,
+    index_head_dim=32,
+    index_topk=16,
+    candidate_source_layer=4,
+    candidate_topk_blocks=16,
+    candidate_block_size=2,
+    rope_theta=10000.0,
+    compress_rope_theta=160000.0,
+    rope_factor=40.0,
+    beta_fast=32,
+    beta_slow=1,
+    original_seq_len=512,
+    max_position_embeddings=64,
+)
 
 # One Engram layer at id 0, so `Engram.layer_hash_index` is 0 and a test can address the table
 # directly. The primes this derives are the released arithmetic over a smaller vocabulary.
@@ -197,6 +245,60 @@ def test_the_moe_is_the_routed_half_plus_one_shared_expert() -> None:
     assert torch.allclose(moe(x), shared, atol=1e-6)
 
 
+def test_the_token_tile_leaves_the_hyper_connections_unchanged(monkeypatch) -> None:
+    """`HC_TOKEN_TILE` walks the token axis of the three Hyper-Connections methods. Does it move them?
+
+    The tile is a memory device and nothing else: `hc_mixes` flattens to fp32 `[b,s,hc*d]` and
+    `hc_pre`/`hc_post` build fp32 products of the `hc`-shaped stream, and on a card whose 256K caches
+    leave under 2 GiB those allocations are the prefill's wall. Every one of the three reduces over
+    `dim` or over the `hc_mult` copies and never over the token axis, so a tile partitions independent
+    work and the answer must be the arithmetic the untiled pass states. This pins that.
+
+    A tile is exercised at a width *smaller than the sequence* rather than at the default 1024, so
+    that this file's small geometry crosses several boundaries; a tile wider than the sequence takes
+    the fall-through and is asserted to be the untiled pass exactly.
+
+    `hc_pre` and `hc_post` are exact at every width, because the reduction they do is over `hc` and
+    the tile never splits one. `hc_mixes` is the one that only *stays* exact, and the reason is the
+    Sinkhorn normalization rather than the tiling: `hc_split_sinkhorn` assigns rows to buckets with a
+    `topk`, which is a discrete pick, so a narrower call can break an exact tie differently and change
+    which rows share a bucket -- after which the fp32 that follows is not the same sum. At this
+    geometry that never happens and all three come out `torch.equal`. At the released geometry it does:
+    8192 tokens, `dim` 5120, `hc_mult` 4, a tile of 1024, and the three coefficients move by
+    5.0e-06 / 5.4e-06 / 1.2e-05. So the coefficients are bounded at `1e-4` -- two orders below the
+    `O(0.1)` a tiling bug would move them, an order above the measured rounding -- and only `hc_pre`
+    and `hc_post` are asserted equal. `test_models_deepseek_v4_1_kernels.py` pins the same discreteness
+    for the op itself.
+    """
+    block = _fill(Block(_cfg(**_BLOCK_FIELDS), 0, 1, 16))
+    torch.manual_seed(0)
+    tokens, tile = 10, 3
+    x = torch.randn(1, tokens, block.hc_mult, DIM, dtype=torch.bfloat16)
+    residual = torch.randn(1, tokens, block.hc_mult, DIM, dtype=torch.bfloat16)
+    sub = torch.randn(1, tokens, DIM, dtype=torch.bfloat16)
+    pre_mix = torch.randn(1, tokens, block.hc_mult).softmax(-1)
+    post = torch.randn(1, tokens, block.hc_mult).softmax(-1)
+    comb = torch.randn(1, tokens, block.hc_mult, block.hc_mult).softmax(-1)
+    gates = (block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base)
+
+    monkeypatch.setattr(modules_module, "HC_TOKEN_TILE", 0)
+    whole = (block.hc_mixes(x, *gates), block.hc_pre(x, pre_mix), block.hc_post(sub, residual, post, comb))
+    monkeypatch.setattr(modules_module, "HC_TOKEN_TILE", tile)
+    tiled = (block.hc_mixes(x, *gates), block.hc_pre(x, pre_mix), block.hc_post(sub, residual, post, comb))
+
+    assert torch.equal(tiled[1], whole[1]), "hc_pre is a sum over hc, which the tile does not touch"
+    assert torch.equal(tiled[2], whole[2]), "hc_post is a broadcast over hc, which the tile does not touch"
+    assert tiled[0][0].shape == whole[0][0].shape == pre_mix.shape
+    for got, want, name in zip(tiled[0], whole[0], ("pre", "post", "comb")):
+        assert (got - want).abs().max() <= 1e-4, f"hc_mixes {name} moved more than a fp32 rounding"
+
+    # A tile wider than the sequence must be the untiled pass and nothing else.
+    monkeypatch.setattr(modules_module, "HC_TOKEN_TILE", tokens + 1)
+    wider = (block.hc_mixes(x, *gates), block.hc_pre(x, pre_mix), block.hc_post(sub, residual, post, comb))
+    assert torch.equal(wider[1], whole[1]) and torch.equal(wider[2], whole[2])
+    assert all(torch.equal(a, b) for a, b in zip(wider[0], whole[0]))
+
+
 def test_a_masked_engram_position_passes_the_stream_through_untouched() -> None:
     """The mask is what keeps an image token, which takes no part in an n-gram, out of the memory."""
     layout = EngramLayout.from_config({**_cfg().__dict__, **_ENGRAM_FIELDS})
@@ -217,6 +319,44 @@ def test_a_masked_engram_position_passes_the_stream_through_untouched() -> None:
     assert torch.equal(masked[0, 1], x[0, 1])
     assert torch.equal(masked[0, 3], x[0, 3])
     assert torch.allclose(masked[0, 0], unmasked[0, 0])
+
+
+def test_the_token_tile_leaves_the_engram_unchanged(monkeypatch) -> None:
+    """The Engram takes the same tile as the Hyper-Connections arithmetic, one module later.
+
+    `Engram.forward` is fp32 `[b,s,hc_mult,dim]` twice over -- `x` and the `key` half of the
+    projection -- which is sixteen times the hidden width a token, and the 256K prefill OOMed on
+    `key.float()` here once the block's own Hyper-Connections walls were tiled. Its steps are a gather
+    by hash id, a reduce over `dim` and a reduce over the `hc_mult` copies, so the token axis is
+    again independent work and the tiling is exact rather than approximate.
+
+    This is asserted with `torch.equal` and not a tolerance, and the reason is that the *mask* is
+    sliced per tile: a tile that took the wrong span of it would move a position's gate by a large
+    amount at one boundary and be invisible at a tile width that happened to land on it. So the mask
+    is a block of contiguous False rows in the middle, which every tile boundary below crosses.
+    """
+    layout = EngramLayout.from_config({**_cfg().__dict__, **_ENGRAM_FIELDS})
+    torch.manual_seed(0)
+    table = ResidentEngramTable(
+        weight=torch.randn(ENGRAM_ROWS, ENGRAM_HEAD_DIM).to(torch.float8_e4m3fn),
+        scale=torch.ones(ENGRAM_ROWS, 1).to(torch.float8_e8m0fnu),
+    )
+    engram = _fill(Engram(_cfg(**_ENGRAM_FIELDS), 0, layout, table))
+    tokens = 10
+    x = torch.randn(1, tokens, 2, DIM, dtype=torch.bfloat16)
+    ids = torch.randint(0, ENGRAM_ROWS, (1, tokens, layout.n_hash_columns))
+    mask = torch.ones(1, tokens, dtype=torch.bool)
+    mask[:, 3:7] = False
+
+    monkeypatch.setattr(modules_module, "HC_TOKEN_TILE", 0)
+    whole = (engram(x, ids), engram(x, ids, mask))
+    # A tile narrower than the sequence, so several boundaries fall inside the masked block, and one
+    # wider, which is the fall-through and has to be the same pass.
+    for tile in (3, 4, tokens + 1):
+        monkeypatch.setattr(modules_module, "HC_TOKEN_TILE", tile)
+        got = (engram(x, ids), engram(x, ids, mask))
+        assert torch.equal(got[0], whole[0]), f"tile {tile} moved the ungated stream"
+        assert torch.equal(got[1], whole[1]), f"tile {tile} moved the gated stream"
 
 
 def test_temperature_zero_samples_the_argmax() -> None:

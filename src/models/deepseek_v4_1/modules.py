@@ -31,6 +31,8 @@ from a mapped shard.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +70,24 @@ __all__ = [
 # expanded into it at load; bf16 is what the reference's norms and residual stream already use, and
 # sm_75 has no fp8 or fp4 tensor core to keep them quantized for.
 LINEAR_DTYPE = torch.bfloat16
+
+# How many tokens of the Hyper-Connections arithmetic one pass covers.
+#
+# The three methods that do it -- `Block.hc_mixes`, `hc_pre` and `hc_post` -- are all per token, but
+# each builds an fp32 intermediate sized by the whole flattened stream: `hc_mixes` flattens to
+# `[s, hc_mult * dim]` to take one mean and one projection, `hc_pre` builds `[s, hc_mult, dim]` to
+# collapse it, and `hc_post` builds `[s, hc_mult, hc_mult, dim]` to mix the copies back in. The
+# widest of those is 5-D and 16 times the hidden width per token, so at V4.1's config it is 640 MiB
+# for `hc_mixes` and 2.5 GiB for `hc_post` at an 8192-token chunk, against a 22 GiB card whose caches
+# a 262144 context already fills: the 256K prefill died at `hc_post` on exactly that allocation.
+#
+# Nothing is reduced over the token axis, so walking it in tiles partitions independent work and the
+# answer is the arithmetic the reference states, not an approximation of it. What it costs is
+# launches, and the tile below is 1024 tokens because that is 80 MiB for the widest intermediate --
+# small enough to sit beside a 256K of caches -- while a decode step is one token and therefore one
+# tile, which is what keeps the recorded decode graph on the path it was captured from. `0` turns
+# the tiling off and is only for measuring what it costs.
+HC_TOKEN_TILE = max(0, int(os.getenv("DEEPSEEK_V41_HC_TOKEN_TILE", "1024")))
 
 
 class Expert(nn.Module):
@@ -303,9 +323,12 @@ class Engram(nn.Module):
         self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
         self.k_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
 
-    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L], False shuts
-        the gate so those positions pass through untouched."""
+    def _forward_pass(self, x: torch.Tensor, hash_ids: torch.Tensor,
+                      token_mask: torch.Tensor | None) -> torch.Tensor:
+        """One pass of `forward` over whatever token span it is handed.
+
+        x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L], False shuts the
+        gate so those positions pass through untouched."""
         kv = self.wkv(self.embed.lookup(hash_ids, x.device).flatten(-2))
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
@@ -319,6 +342,32 @@ class Engram(nn.Module):
         if token_mask is not None:
             gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+
+    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor,
+                token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """The lookup, the key/value split and the gate, a token tile at a time.
+
+        Every step here reduces over `dim` or over the `hc_mult` copies and never over the token
+        axis, so walking that axis in tiles partitions independent work and the answer is the
+        arithmetic `_forward_pass` states, not an approximation of it. What makes it necessary is
+        that the intermediates are Hyper-Connections shaped: `x` and `key` both go fp32 as
+        `[b, s, hc_mult, dim]`, which is 16 times the hidden width a token and 640 MiB at an
+        8192-token chunk -- two of them, plus the fp32 sum, on a card whose 256K caches leave under
+        2 GiB. The 256K prefill OOMed on `key.float()` here once `hc_post` was tiled; it is the same
+        wall one module later, so it takes the same tile. See `HC_TOKEN_TILE`."""
+        if HC_TOKEN_TILE == 0 or x.size(1) <= HC_TOKEN_TILE:
+            return self._forward_pass(x, hash_ids, token_mask)
+        return torch.cat(
+            [
+                self._forward_pass(
+                    x[:, start : start + HC_TOKEN_TILE],
+                    hash_ids[:, start : start + HC_TOKEN_TILE],
+                    None if token_mask is None else token_mask[:, start : start + HC_TOKEN_TILE],
+                )
+                for start in range(0, x.size(1), HC_TOKEN_TILE)
+            ],
+            dim=1,
+        )
 
 
 class Gate(nn.Module):
@@ -486,25 +535,74 @@ class Block(nn.Module):
         # the check costs one attribute read a layer.
         self.decode_graph = None
 
-    def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
-        pre / post / comb coefficients, split out of one projection of the flattened stream."""
+    def _hc_mixes_pass(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        """One pass of `hc_mixes` over whatever token span it is handed."""
         # normalized over the whole flattened hc*d stream, one statistic per token
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
         return hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
 
-    def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor):
-        """Collapse the hc copies into one, weighted by pre_mix. [b,s,hc,d] x [b,s,hc] -> [b,s,d]"""
+    def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
+        pre / post / comb coefficients, split out of one projection of the flattened stream.
+
+        The three outputs are fp32 `[b,s,hc]`, `[b,s,hc]` and `[b,s,hc,hc]`, each far narrower than
+        the `[b,s,hc*d]` fp32 stream this reads, which is why the token axis is tiled rather than the
+        output held for the whole chunk -- see `HC_TOKEN_TILE`."""
+        if HC_TOKEN_TILE == 0 or x.size(1) <= HC_TOKEN_TILE:
+            return self._hc_mixes_pass(x, hc_fn, hc_scale, hc_base)
+        parts = [
+            self._hc_mixes_pass(x[:, start : start + HC_TOKEN_TILE], hc_fn, hc_scale, hc_base)
+            for start in range(0, x.size(1), HC_TOKEN_TILE)
+        ]
+        return tuple(torch.cat(one, dim=1) for one in zip(*parts))
+
+    def _hc_pre_pass(self, x: torch.Tensor, pre_mix: torch.Tensor):
+        """One pass of `hc_pre` over whatever token span it is handed."""
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2)
         return y.to(x.dtype)
 
-    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
-        x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]"""
+    def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor):
+        """Collapse the hc copies into one, weighted by pre_mix. [b,s,hc,d] x [b,s,hc] -> [b,s,d]
+
+        The product is fp32 `[b,s,hc,d]`, four times the stream it reads; see `HC_TOKEN_TILE`."""
+        if HC_TOKEN_TILE == 0 or x.size(1) <= HC_TOKEN_TILE:
+            return self._hc_pre_pass(x, pre_mix)
+        return torch.cat(
+            [
+                self._hc_pre_pass(x[:, start : start + HC_TOKEN_TILE], pre_mix[:, start : start + HC_TOKEN_TILE])
+                for start in range(0, x.size(1), HC_TOKEN_TILE)
+            ],
+            dim=1,
+        )
+
+    def _hc_post_pass(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        """One pass of `hc_post` over whatever token span it is handed."""
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
+
+    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
+        x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]
+
+        The `comb * residual` sum is the widest intermediate in the block -- fp32 `[b,s,hc,hc,d]`, the
+        broadcast of two operands that are `[b,s,hc,hc,1]` and `[b,s,hc,1,d]` -- so this is the method
+        the tiling exists for. See `HC_TOKEN_TILE`."""
+        if HC_TOKEN_TILE == 0 or x.size(1) <= HC_TOKEN_TILE:
+            return self._hc_post_pass(x, residual, post, comb)
+        return torch.cat(
+            [
+                self._hc_post_pass(
+                    x[:, start : start + HC_TOKEN_TILE],
+                    residual[:, start : start + HC_TOKEN_TILE],
+                    post[:, start : start + HC_TOKEN_TILE],
+                    comb[:, start : start + HC_TOKEN_TILE],
+                )
+                for start in range(0, x.size(1), HC_TOKEN_TILE)
+            ],
+            dim=1,
+        )
 
     def forward(
         self,
