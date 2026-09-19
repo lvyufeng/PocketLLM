@@ -227,3 +227,46 @@ def test_atomic_path_still_reachable_and_still_nondeterministic():
     finally:
         os.environ.pop("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", None)
     assert torch.isfinite(y).all()
+
+
+CSR_MIN_WORK = 50_000
+
+
+def test_csr_reduce_matches_the_scan_it_replaced():
+    """The per-token CSR reduce and the all-pairs scan are the same sum in the same order.
+
+    `moe_multi_token_fp4_forward` groups a token's pairs into a CSR once `tokens * pairs` is past
+    `kCsrMinWork` and scans the whole pair list below that, so every other MoE test in the suite
+    takes the scan and this is the one that reaches the new kernel. The bar here is bit-identity
+    rather than a tolerance: the CSR lists a row's pairs in ascending pair order, which is the order
+    the scan adds them in, so the two are the same float additions in the same sequence. Anything
+    but `equal` means the grouping reordered them, and reordering is what moves logits.
+
+    Bit-identity between the two paths is also why this test can be this strict where
+    `test_moe_multi_token_fp4.py` cannot: that file bounds the *batched* kernel against the
+    one-token reference, and at a token count large enough to reach the CSR the elementwise
+    relative bound there is dominated by swiglu cancellation in near-zero outputs, not by the
+    reduction.
+    """
+    import os
+
+    tokens = 160
+    args = _multi_args(tokens)
+    pairs = int(args[3].numel())
+    assert tokens * pairs >= CSR_MIN_WORK, (
+        f"tokens={tokens} pairs={pairs} no longer reaches the CSR reduce path; "
+        "pick a larger token count or lower kCsrMinWork")
+
+    os.environ["DEEPSEEK_MOE_DETERMINISTIC_REDUCE"] = "1"
+    try:
+        os.environ["DEEPSEEK_MOE_CSR_REDUCE"] = "1"
+        csr = _run_multi(args).clone()
+        os.environ["DEEPSEEK_MOE_CSR_REDUCE"] = "0"
+        scan = _run_multi(args).clone()
+    finally:
+        os.environ.pop("DEEPSEEK_MOE_CSR_REDUCE", None)
+        os.environ.pop("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", None)
+
+    assert torch.equal(csr, scan), (
+        f"CSR reduce and all-pairs scan disagree at tokens={tokens}: "
+        f"max|diff|={(csr - scan).abs().max().item():.3e}")
