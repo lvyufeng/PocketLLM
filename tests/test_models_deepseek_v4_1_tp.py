@@ -588,9 +588,8 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
     to name a row of the arena's *tail* -- `hot_rows` and up, not `len(hot)` and up, because the tail
     is a fixed place in a fixed-height arena so that every layer's misses start it at the same
     offset. Both are off-by-`hot_rows` errors that hand the kernel another expert's weights: a wrong
-    answer with the right shape, in a kernel that reads bare pointers. `_upload` writes to the same
-    offset (`slice(self.hot_rows, self.hot_rows + k)`), and `_stage` stages into it, so the row
-    index and the bytes that row will read are one fact stated in three places.
+    answer with the right shape, in a kernel that reads bare pointers. `_upload` copies each miss
+    into the arena row it names, so the row index and the bytes that row will read are one fact.
 
     The pool adds a third answer beside the set and the tail, and it is asked with a key that has to
     carry the layer: the weights are `layers.{layer}.ffn.experts.{expert}.{which}.weight`, so a pool
@@ -761,6 +760,143 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
         DeviceRoutedExperts._stage_row(one, None, None, torch.tensor(ids))
     assert [one.drawn_rows for one in across] == [2, 2, 1, 1]
     assert sum(one.drawn_rows for one in across) == topk
+
+
+def test_the_stage_copies_nothing_and_the_upload_reads_the_bank(monkeypatch) -> None:
+    """A miss is one `packed` tensor a projection a kind, into the arena row the row named.
+
+    This is the pair that replaced the pinned staging arena, and both halves are asserted here
+    because either one alone can look right while the mechanism is gone. `_stage` must ask the
+    checkpoint for **nothing** -- no key, no tensor -- since a staging call that touches the bank is
+    a copy, and the copy is what made every byte cross host DRAM three times (read the bank, write
+    the pinned row, DMA read the pinned row) instead of once. `_upload` must ask `packed` for exactly
+    the six (projection, kind) pairs of every miss and put each one in the arena row that miss named,
+    which is the fact the kernel reads through a bare pointer -- wrong, it is a right-shaped answer
+    out of another expert's weights.
+
+    The arena rows here are neither the pool's nor the pool-off tail's but a hand-drawn pair, `4` and
+    `6`, because the two configurations differ only in which rows those are: with the pool off they
+    are `hot_rows .. hot_rows + k` and with it on they are whatever `pool_row` handed back, and both
+    are the same loop. A contiguous block is covered by the empty-set case above; what this covers is
+    that a row that is *not* the miss's index still receives the right bytes.
+
+    Called on a stub, and the stub is the two stream calls and nothing else: `_stage`, `_upload`,
+    `_key` and `scale_key` are the shipped ones, and the three CUDA entry points `_upload` uses are
+    replaced with no-ops so this runs with no card in the machine.
+    """
+    import contextlib
+
+    from src.models.deepseek_v4_1 import device_experts
+    from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
+    from src.models.deepseek_v4_1.loader import scale_key
+
+    kinds = (("w1", "q"), ("w1", "s"), ("w2", "q"), ("w2", "s"), ("w3", "q"), ("w3", "s"))
+    rows, width, layer_id = 8, 8, 7
+
+    class Bank:
+        """`Checkpoint.packed` as `_upload` uses it: one tensor a key, and a record of every key.
+
+        The bytes are the ordinal of the call, so where they land says which key they came from
+        without the test having to predict the order the six pairs are asked in.
+        """
+
+        def __init__(self) -> None:
+            self.asked: list[str] = []
+
+        def packed(self, key: str) -> torch.Tensor:
+            self.asked.append(key)
+            return torch.full((1, width), len(self.asked), dtype=torch.uint8)
+
+    class Stream:
+        """The copy stream, seen only through what `_upload` does to it: wait, and order behind."""
+
+        def __init__(self) -> None:
+            self.waited: list[object] = []
+
+        def wait_stream(self, other: object) -> None:
+            self.waited.append(other)
+
+    class Event:
+        """The one thing `_upload` leaves behind for `_take_buffer`: that the copies were issued."""
+
+        def __init__(self) -> None:
+            self.recorded = 0
+
+        def record(self, stream: object) -> None:
+            self.recorded += 1
+
+    opened: dict[object, Stream] = {}
+    monkeypatch.setattr(
+        device_experts, "_copy_stream", lambda device: opened.setdefault(device, Stream())
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: "compute")
+
+    bank = Bank()
+    arena = [{kind: torch.zeros((rows, width), dtype=torch.uint8) for kind in kinds}]
+    events = [[Event(), Event()]]
+    one = SimpleNamespace(
+        layer_id=layer_id,
+        devices=[torch.device("cpu")],
+        _carried={},
+        _uploaded=[{}],
+        _events=events,
+        expert_rows=0,
+        _on_device=arena,
+        checkpoint=bank,
+    )
+    one._key = lambda expert, which: DeviceRoutedExperts._key(one, expert, which)
+    one._scale_key = scale_key
+    one._stage = lambda buffer, ids, misses: DeviceRoutedExperts._stage(one, buffer, ids, misses)
+    one._upload = lambda buffer, misses: DeviceRoutedExperts._upload(one, buffer, misses)
+
+    # Sorted: 10(slot1), 20(slot3), 30(slot0), 40(slot5), 50(slot4), 60(slot2). This rank's row is
+    # dealt 10 and 60, and the two misses name arena rows 4 and 6 -- so the second miss's bytes must
+    # reach row 6 even though it is the first miss's index plus two.
+    ids = [30, 10, 60, 20, 50, 40]
+    misses = [[(0, 1, 4), (1, 2, 6)]]
+
+    one._stage(0, ids, misses)
+    assert bank.asked == [], (
+        "the staging call read the checkpoint, so the copy the bank exists to delete is back: every "
+        "byte would cross host DRAM twice more than it has to"
+    )
+    assert one.expert_rows == 2, "the misses are the draws the resident set and the pool did not answer"
+
+    one._upload(0, misses)
+    assert one.expert_rows == 2, "the upload recounted the row instead of counting what it moved"
+    assert one._carried == {}, "the row's ids were left parked under the buffer for the next row"
+
+    for card in range(1):
+        for (which, kind), target in arena[card].items():
+            for slot, arena_row, expert in ((1, 4, 10), (2, 6, 60)):
+                weight = f"layers.{layer_id}.ffn.experts.{expert}.{which}.weight"
+                key = weight if kind == "q" else scale_key(weight)
+                assert key in bank.asked, (
+                    f"{kind} of {which} for expert {expert} was never asked of the checkpoint, so "
+                    f"the kernel will read whatever the arena row held before"
+                )
+                ordinal = bank.asked.index(key) + 1
+                assert target[arena_row].tolist() == [ordinal] * width, (
+                    f"{key}'s bytes did not land in arena row {arena_row}, which is the row the "
+                    f"kernel is handed for expert {expert}"
+                )
+            untouched = [row for row in range(rows) if row not in {4, 6}]
+            assert all(int(target[row].abs().sum()) == 0 for row in untouched), (
+                "an upload wrote outside the arena rows its misses named"
+            )
+    assert len(bank.asked) == 2 * len(kinds), (
+        "the upload moved an expert's whole six tensors a miss, or moved some of them twice"
+    )
+    assert events[0][0].recorded == 1, (
+        "the buffer's event was not recorded, so `_take_buffer` cannot tell the copies were issued"
+    )
+
+    # And the pair cannot be taken apart: `_upload` with no `_stage` before it has no ids and no way
+    # to name an expert, and it has already been asked for the buffer by `_take_buffer`.
+    with pytest.raises(RuntimeError, match="no staging call claimed"):
+        one._upload(0, misses)
 
 
 def test_a_chunk_is_cut_where_a_later_row_would_re_draw_an_arena_row() -> None:

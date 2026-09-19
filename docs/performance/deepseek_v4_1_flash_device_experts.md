@@ -70,7 +70,12 @@ process. The same probe under `--launches` then counts what the step launches, u
 a sample. The last one closes the bank's own open number: `/tmp/probe_engram_bank.py` attaches the
 filled segment read-only and prices a 512-token prefill's 12,288 gathers a table — the call, the
 scatter under it and the dequant over it — against the per-row control the host page took, on a host
-with no card in the process at all.
+with no card in the process at all. [The pin and the copy removal](#the-pin-and-the-copy-removal-landed-200-ms-a-decode-token-and-160-s-a-prefill)
+are the last round and add three: `/tmp/probe_v41_prefill_landed.py`, which is
+`/tmp/probe_v41_prefill_direct.py` with its two overrides deleted so the phase clocks instrument the
+shipped class rather than a copy of it, `/tmp/ab_prefill_landed.sh` which drives it twice against
+`/tmp/ab_reg.sh`'s pre-landing legs, and `/tmp/ab_landed.sh`, which is the decode A-B-A-B on the
+shipped CLI with `/tmp/cmp_logits.py` comparing the dumps and `read_bytes` beside the logits.
 
 ## The split
 
@@ -739,7 +744,7 @@ to produce — and the stage had to be pointed at that bank before the number me
 that does not keep the working set. That is the next section, and between the two this table is what
 the wiring is worth.
 
-### The resident bank takes the disk out of `_stage`, and not the copy into pinned
+### The resident bank takes the disk out of `_stage`, and it is the copy into pinned that was left
 
 `V41Checkpoint.packed` already falls through to `resident_bank` when one is attached, so the class's
 staging has read from that segment since the bank was written; what was missing was a run that had
@@ -766,14 +771,24 @@ bank on against bank off — both with the page cache as it was:
 | inside the class | 462.1 ms | 492.9 ms |
 | whole step | 754.0 ms | 804.5 ms |
 
-**Warm, the bank is neither a win nor a cost.** Its `_stage` — 242.1 and 244.0 ms across the two runs
-here — lands inside the spread the page-cache-sourced stage already shows, 224.7 ms in the run above
-against 302.9–319.9 ms in the deliberate pair, and nothing else in the table moves outside the 20–50
-ms this host's runs differ by. That is the class's own docstring being right rather than corrected:
-`resident_bank` says in as many words that it does not remove the page cache → pinned copy, and
-`_stage` is that copy — 4.2 GiB a row into the pinned arena, a memcpy at ~17 GiB/s whether it reads
-tmpfs or the page cache. What the bank removes is the *disk*, and the disk only appears when the cache
-does not hold the working set.
+**Warm, the bank is neither a win nor a cost — for as long as `_stage` is a copy.** Its `_stage` —
+242.1 and 244.0 ms across the two runs here — lands inside the spread the page-cache-sourced stage
+already shows, 224.7 ms in the run above against 302.9–319.9 ms in the deliberate pair, and nothing
+else in the table moves outside the 20–50 ms this host's runs differ by. That is the class's own
+docstring being right rather than corrected: `resident_bank` says in as many words that it does not
+remove the page cache → pinned copy, and `_stage` **is** that copy — 4.2 GiB a row into the pinned
+arena, a memcpy at ~17 GiB/s whether it reads tmpfs or the page cache. What the bank removes is the
+*disk*, and the disk only appears when the cache does not hold the working set.
+
+**Which makes the second half of this section's heading the part that mattered, and it has since been
+done.** The bank's source change was worth nothing warm because the destination was still a copy: every
+byte crossed host DRAM three times — read out of tmpfs, written into the pinned arena, then re-read by
+the DMA — with the `memcpy` racing the `cudaMemcpyAsync` for the same memory system. Registering the
+*segment* instead removes the middle crossing, and it is the largest single measured win on this page:
+[the pin and the copy removal, landed](#the-pin-and-the-copy-removal-landed-200-ms-a-decode-token-and-160-s-a-prefill)
+has it at **200 ms a decode token against 342 without the registration** and **16.0 s against 31.2 s on
+a 512-token prefill**, bit-identical. Everything above this line stands as the reading of the bank
+*alone*, which is what it is a record of; read the copy's removal out of that section instead.
 
 So the experiment that shows what it is worth is the cold one. `/tmp/fadvise_drop.py` over the 48
 shards — **0.00 GiB** confirmed resident by `mincore` — and then the same banked run:
@@ -958,7 +973,7 @@ alternates them, so the node's own ~20% drift between sittings lands on both col
 one. Four ranks under `torchrun`, one process a card, the resident bank on, 22 threads. All phase
 columns are totals over the whole prefill. The serial column's 53.61 s at 128 tokens is the same
 sitting-drift figure the banked table above records as 53.42 s, and not the 42.86 s the warm
-uninstrumented run does — the page separates those two [there](#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned)
+uninstrumented run does — the page separates those two [there](#the-resident-bank-takes-the-disk-out-of-_stage-and-it-is-the-copy-into-pinned-that-was-left)
 and the columns here are the pair to read, not either against a table from another sitting:
 
 | prompt | order | prefill | tok/s | `_stage_row` | `_stage` | `_upload` | `_issue` | `_drain` |
@@ -1675,6 +1690,17 @@ differ by 3.8% between themselves, so quote the pair means and not one of them. 
 the control at 0.769 sits inside the 0.706–0.780 band the earlier 600-against-0 sitting recorded, so
 this is the same measurement at the width that now ships and not a new one.
 
+**The 0.578/0.601 s a token above is the eager step, and it has since been split.** Both pages after
+this one graph the tree half per layer and leave the routed call eager — `_route_ids` synchronizes on
+the host, so that half cannot be captured:
+[at a frozen position](deepseek_v4_1_flash_decode_graph.md) 833.6 → 561.6 ms, and
+[with the position actually advancing](deepseek_v4_1_flash_decode_graph_live.md) 638/618 → 431/408 ms
+over 64 greedy tokens, bit-identical. That is where the end-to-end split now lives: **2.4 ms of
+graph A, 369.4 ms of the eager expert call, 2.7 ms of graph B**, so 89% of a decode step is the
+expert half this page is about and the tree half is a rounding error. Those legs carry the resident
+bank and a warm page cache, so they are a different configuration from the 0.578/0.601 above and must
+not be subtracted from it.
+
 **Two limits on the numbers above.** The 512-token prompt is one paragraph repeated thirteen times, so
 its routing is more concentrated than a document's: the pool answers 90.3% of rank 0's draws where the
 512-token width sweep above answered 86.1%, and it stages 3997 distinct rows against that sweep's
@@ -1694,6 +1720,114 @@ bash /tmp/v41_default_accept.sh      # default_long and off_long are the two leg
 bash /tmp/v41_default_accept2.sh     # the third leg, and the decode A-B-A-B at the default's width
 /home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/probe_v41_hot_ab.py --compare \
   /tmp/dd_288.pt.r0 /tmp/dd_0.pt.r0
+```
+
+### The pin and the copy removal, landed: 200 ms a decode token and 16.0 s a prefill
+
+**The change is one registration and one deletion, and the deletion is the whole of it.**
+`ResidentExpertBank.pin()` registers the segment with a single `cudaHostRegister` over the whole
+mapping, and `DeviceRoutedExperts._stage` stops copying: it now records which miss goes into which
+arena row, and `_upload` reads `checkpoint.packed(key)` — the bank — straight into the card. `packed`
+has fallen through to the bank for both the routed experts and the Engram rows since the bank was
+written, so the class's *source* was never the change; the **destination** was, and removing it removes
+the crossing rather than a hop. Every byte used to cross host DRAM three times — read out of tmpfs,
+written into the pinned arena at ~17 GiB/s, and then re-read by the DMA — with the `memcpy` racing the
+`cudaMemcpyAsync` for the same memory system, which is why neither of the two copies looked expensive
+in isolation. `DEEPSEEK_V41_PIN_RESIDENT_EXPERTS=1` is the shipped default and `=0` is the pageable
+mapping the control below runs; a refused registration is a **value rather than an exception**, so a
+run whose registration is not accepted continues pageable and slower and says so in as many words
+(`457.8 GiB NOT pinned: cudaHostRegister returned <rc> after <s> s`), which is the shape the isolated
+probe and the in-situ runs share.
+
+**What it costs is startup, and only startup.** The whole 457.8 GiB registers in **one** call — the
+segment is one mapping — and isolated that is **rc=0 in 59.57 s, 130.1 ms a GiB**. With the launcher's
+four ranks registering at once, which contend over the same page-table walk, the identical call reads
+**91.3–104.0 s, 199.4–227.1 ms a GiB** across the six legs below. The price on the host is 457.8 GiB
+of pinned memory for the life of the process: it does not occupy swap, `si`/`so` stay at zero through
+it, and it is returned on exit. It is a *registration* and not a copy, so process RSS does not move —
+the bank was already mapped.
+
+**The decode is the A-B-A-B, on the shipped CLI in the shipped configuration.** One process a leg,
+`python -m src.cli.generate_v41`, the 1024-token prompt, `--decode-graphs`, 64 greedy tokens, and the
+four legs ordered default / off / default / off so a drift on the node lands across a pair rather than
+inside one:
+
+| leg | registration | decode, ms a token | split (graph A / eager experts / graph B) |
+| --- | --- | ---: | --- |
+| `stock_a` | 93.1–96.5 s (203.4–210.7 ms a GiB) | **200** | 1.1–1.2 + 178.5 + 1.1 |
+| `stock_b` | 101.1–104.0 s (220.8–227.1 ms a GiB) | **202** | 1.1–1.2 + 178.9–184.3 + 1.1–1.2 |
+| `nopin_a` | none | **341 / 342** | 1.3–1.6 + 309.0–318.1 + 1.2–1.4 |
+| `nopin_b` | none | **348** | 1.3–1.6 + 314.8–323.2 + 1.2–1.3 |
+
+**1.70–1.72×, or 4.95–5.0 tokens a second against 2.87–2.93**, and the two pooled legs are one digit
+apart from each other the way the two unpinned legs are, so the ratio is read off the columns and not
+off a single pair. The split says where it comes from and it is not the tree: **the eager expert call
+is 178.5–184.3 ms of the 200–202 with the registration and 309.0–323.2 of the 341–348 without it**,
+while graph A and graph B are 1.1–1.6 ms each in both — so the copy's removal is a **~1.75× on the
+expert call** and a rounding error everywhere else. That is the same expert call
+[the live graph page](deepseek_v4_1_flash_decode_graph_live.md) prices at 369.4 ms of a 408 ms step:
+those legs carry the copy into pinned and these do not, and the difference between the two, 369.4
+against 178.5, is what the join was worth.
+
+**The prefill is where it is larger, and it is the phase table rather than the wall clock that says
+so.** The same probe, the same 512-token prompt, `--pool-rows 288 --batched`, the resident bank on, two
+legs, with the pre-landing legs of the same sitting beside them:
+
+| leg (512 tokens, rank 0) | class wall | `_stage` | `_take_buffer` | `_upload` | `_drain_chunk` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `phases` — pinned bank, two-step `_stage` | 27.88 s | **19.16 s** (68.7%) | 2.39 s (8.6%) | 1.89 s | 2.19 s |
+| `reg` — pinned bank, same path, second leg | 27.54–27.76 s | — | — | — | — |
+| `reg_direct` — the probe's own copy of this change | 13.38 / 13.40 s | — | — | — | — |
+| `landed_a` — the shipped library | **13.37 s** | **0.01 s** (0.0%) | 7.29 s (54.5%) | 2.19 s (16.4%) | 2.23 s (16.7%) |
+| `landed_b` — the shipped library | **13.34 s** | **0.01 s** (0.0%) | 7.40 s (55.5%) | 2.13 s (16.0%) | 2.20 s (16.5%) |
+
+**`_stage` goes from 19.16 s of a 27.88 s class to 0.01 s, and the class wall falls 51.2%**, which
+end to end is **16.0 s a rank against 26.7–31.3 s** for the two pre-landing legs of that sitting —
+`landed_a` at 16.0 / 17.0 / 16.6 / 16.6 s and `landed_b` at 16.0 / 16.7 / 17.1 / 16.3 s on ranks 0-3,
+against `phases` at 31.2 / 31.2 / 31.3 / 31.3 and 30.3 / 27.5 / 27.4 / 26.7. The landed library lands on
+`reg_direct` — the probe's own transcription of the same change, 16.1 / 17.8 / 16.9 / 16.2 and
+16.0 / 16.3 / 16.0 / 17.6 s — to the digit on the class wall (13.37 / 13.34 against 13.38 / 13.40),
+which is the check that the shipped path is the path that was measured rather than a near neighbour of
+it. Staged rows are identical across all six legs, 5623 / 5673 / 3791 / 3740, and the first token is
+2413 in every one.
+
+**What is left is a different bottleneck, and the table names it.** `_take_buffer` goes *up*, 2.39 →
+7.29 s, because the wait it does was previously covered by the 3.99 ms a call the `memcpy` took: the
+copy is gone, so the ring's rotation is now exposed, and it is **54.5–55.5% of what is left** of the
+class. `_upload` and `_drain_chunk` are essentially unmoved (`1.89 → 2.19` and `2.19 → 2.23 s`), which
+is the other half of the same reading — the H2D was never the term the removal was going to move, and
+it did not move. The probe's counters agree with the code path rather than with the class's own
+bookkeeping: **`_stage 0, _upload 33738`** on rank 0, where the input to `_stage` is unchanged at
+4807 calls and the same row count, so the deletion is visible as a zero rather than inferred from a
+clock.
+
+**Nothing about the output moved, and that is the acceptance rather than a tolerance.** The five dumps
+— the pre-landing reference plus all four decode legs above — compare **64/64 tokens identical**,
+**`max |diff| = 0.000e+00` over the 64 × 129280 logit matrix**, **0 rows differing** and **64/64
+argmax agreement**, on every pair; and `read_bytes` out of `/proc/<pid>/io` is **flat at 0 across the
+64 measured tokens in all four legs**, which is the check that says the expert rows came out of the
+segment rather than off `/mnt/data3`.
+
+**Two things this section does not claim.** The 512-token prefill is the probe rather than the
+launcher — `src/cli/generate_v41.py` does not print a prefill wall — so the prefill column is the
+instrumented library at the launcher's own configuration (288 pooled rows, batched, bank attached),
+and the decode column is the launcher undecorated. And the four-rank registration is the only part of
+the cost that scales badly: 130.1 ms a GiB alone against 199.4–227.1 with four, which is a host
+page-table walk and not a driver limit, and it is paid on every start rather than amortized.
+
+Reproduce with:
+
+```bash
+# decode: the shipped CLI, one process a leg, default / off / default / off. The prompt is
+# /tmp/prompt1024.txt and --threads 22 because torchrun sets OMP_NUM_THREADS=1.
+bash /tmp/ab_landed.sh
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/cmp_logits.py \
+    /tmp/dump_graph_144706.pt /tmp/dumpland_stock_a.pt /tmp/dumpland_nopin_a.pt \
+    /tmp/dumpland_stock_b.pt /tmp/dumpland_nopin_b.pt
+
+# prefill: the same probe before and after the change, which is the phase table above.
+bash /tmp/ab_prefill_landed.sh     # landed_a / landed_b
+bash /tmp/ab_reg.sh                # phases / reg_direct / reg -- the pre-landing legs
 ```
 
 ## What this does not do yet
@@ -1728,12 +1862,17 @@ All of these are separate measurements rather than separate opinions.
   each arena row it is handed as one expert's bytes for a whole chunk; the full A/B and the chunk rule
   are on [the bottlenecks
   page](deepseek_v4_1_flash_remaining_bottlenecks.md#lever-5--the-prefill-is-a-batch-shape-problem-and-the-fix-is-in-27-at-512-tokens).
-- **The bank removes the disk from `_stage`, not the copy out of it.** With
-  `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache against 17.01 s
-  without it, so the 722–747 ms headline holds on a host that has forgotten the checkpoint —
-  [measured above](#the-resident-bank-takes-the-disk-out-of-_stage-and-not-the-copy-into-pinned). What
-  it does not remove is the join: the segment is not the pinned arena, so a row is copied into that
-  arena whichever source it came from, and `_stage` is still 242 ms of a 458 ms class. The pipeline
+- **The copy into the pinned arena used to be the bank's uncollected half, and it has since been
+  collected.** With `DEEPSEEK_V41_RESIDENT_EXPERTS=1` the step is 782.9 ms on an emptied page cache
+  against 17.01 s without it, so the 722–747 ms headline holds on a host that has forgotten the
+  checkpoint —
+  [measured above](#the-resident-bank-takes-the-disk-out-of-_stage-and-it-is-the-copy-into-pinned-that-was-left).
+  What that section left was the join: the segment is not the pinned arena, so a row was copied into
+  that arena whichever source it came from, and `_stage` was 242 ms of a 458 ms class. Registering the
+  segment itself removes the join, and
+  [the landed pair](#the-pin-and-the-copy-removal-landed-200-ms-a-decode-token-and-160-s-a-prefill) is
+  where its worth is: `_stage` **19.16 → 0.01 s** on a 512-token prefill and the class wall
+  **27.88 → 13.37 s**, with the decode at 200 ms a token against 342. The pipeline
   above does not take that copy away either — it hides 2.0 ms a row-layer of a 3.75 ms drain and gives
   back 0.95 ms of it in staging, which is a 1.10× and not the 7.3-against-1.0 the ceiling suggested.
 - **The Engram tables are in the segment, and a banked prefill's gather is priced: 1.4–2.3 ms a

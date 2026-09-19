@@ -620,23 +620,12 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._shapes[(which, kind)] = tuple(checkpoint.reader.entry(key).shape)
         self._check_shapes()
 
-        # One pinned arena per buffer, holding **every card this process drives** laid out end to
-        # end: local card `c` owns `[c * rows_per_card, (c + 1) * rows_per_card)`. It is one
-        # allocation rather than one per card so that a row stages into it the same way whichever
-        # card will read it, and the device side is the matching per-card slice -- a card's arena is
-        # `rows_per_card` rows and not the whole token's.
-        self._pinned = [
-            {
-                (which, kind): torch.empty(
-                    (len(self.ranks) * self.rows_per_card,) + self._shapes[(which, kind)],
-                    dtype=torch.uint8,
-                    pin_memory=True,
-                )
-                for which in PROJECTIONS
-                for kind in KINDS
-            }
-            for _ in range(self._buffers)
-        ]
+        # There is no pinned staging arena here any more. It used to hold a card's own row of every
+        # miss -- `len(ranks) * rows_per_card` rows of all six tensors, 287 MiB of page-locked host
+        # memory at the four-card deal -- because the H2D has to read pinned memory to be
+        # asynchronous. The resident bank is pinned *in place* now (`ResidentExpertBank.pin`), so
+        # `_upload` copies straight out of it and there is nothing to stage into; see `_upload` and
+        # `_stage`.
         # Where the layer keeps its resident experts, and it is handed in rather than allocated here.
         # A set is worth having only at a size forty of them do not fit -- 64 slots a card is 1.2 GiB
         # of a 22 GiB card and as much again of page-locked RAM -- so `loader.load_backbone` builds
@@ -689,6 +678,11 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._events.append([torch.cuda.Event() for _ in range(self._buffers)])
         self._uploaded: list[list[bool]] = [[False] * self._buffers for _ in self.ranks]
         self._next_buffer = 0
+        # The row's ids, parked by `_stage` for the `_upload` that follows it on the same buffer.
+        # `misses` names each miss by route slot, and a route slot only means something beside the
+        # ids it indexes; they are the row's and belong to `_resolve_row`, so they cannot be
+        # recomputed downstream. One entry per buffer, written and read within one `_stage_misses`.
+        self._carried: dict[int, Sequence[int]] = {}
 
         # One event per card for the *fill*'s H2D. `_take_buffer`'s events cannot serve here: the
         # fill reads a block of its own, one fill a layer, and what has to be ordered is the next
@@ -977,16 +971,26 @@ class DeviceRoutedExperts(RoutedExperts):
             self.filled_rows += len(ids)
 
     def _take_buffer(self) -> int:
-        """The next pinned buffer to stage into, after the DMA that last read it has finished.
+        """The next buffer slot to upload through, after the DMA that last used it has finished.
 
-        The pinned arena is what the H2D copies read from, and the host runs ahead of the cards, so
-        a buffer a whole *staging* old is the earliest one whose copy has a chance of being done.
-        Waiting on its event turns that into a guarantee; with two buffers and the copy taking about
-        as long as the staging, the wait is usually already satisfied and costs nothing.
+        The wait below used to have a host buffer for its subject: the pinned arena's slot was about
+        to be overwritten by the next row's staging, and the DMA reading it was still in flight. There
+        is no host buffer any more (`_stage`), so what is left is the slot's event alone, and the
+        arena rows a copy writes are ordered by the streams themselves -- the copy stream waits on the
+        compute stream in `_upload` and the compute stream waits on the copy stream before its kernel
+        in `_issue`, so a row's bytes are ordered against the kernel that reads them without the host
+        being involved at all.
 
-        "A whole staging" and not "two rows", which is the distinction `_stage_misses` pays for: the
-        rotation is advanced by the callers that stage, not by every row, so that the guarantee is
-        about the work between two waits and not about the row count between them. A row that stages
+        What the wait still does is bound how far the host runs ahead of the cards. What it costs is
+        measured, and it is the largest single item in a prefill: with the copies gone from `_stage`,
+        a 512-token leg's rank-0 class wall is 13.40 s and **7.57 s of it -- 56.5%, 1.58 ms a call
+        over 4807 calls -- is this one `synchronize`**. Removing it is the next candidate and it is
+        not in this change: the two stream orderings above are what would have to carry the
+        correctness, and that is an argument to measure rather than to write.
+
+        "A whole upload" and not "two rows", which is the distinction `_stage_misses` pays for: the
+        rotation is advanced by the callers that upload, not by every row, so that the guarantee is
+        about the work between two waits and not about the row count between them. A row that uploads
         nothing neither takes a slot nor waits on one.
         """
         slot = self._next_buffer
@@ -997,90 +1001,86 @@ class DeviceRoutedExperts(RoutedExperts):
                 self._uploaded[card][slot] = False
         return slot
 
-    def _row(self, card: int, arena_row: int) -> slice:
-        """The pinned rows the local card `card`'s `arena_row` lives in."""
-        start = card * self.rows_per_card + arena_row
-        return slice(start, start + 1)
-
     def _stage(self, buffer: int, ids: Sequence[int], misses: list[list[tuple[int, int, int]]]) -> None:
-        """One `copy_` per tensor out of the host source into the row an expert owns.
+        """Bookkeeping for one row's misses: the counters, and the ids `_upload` needs to name them.
 
-        `misses` is what the row still has to stage after the resident set and the pool have both
-        been accounted for -- `(staging row, route slot, arena row)` per local card, in the order
-        `_split` dealt them -- so with `hot_rows=0` and `pool_rows=0` it is the whole deal and this is
-        the loop it always was.
+        `misses` is what the row still has to move after the resident set and the pool have both been
+        accounted for -- `(staging row, route slot, arena row)` per local card, in the order `_split`
+        dealt them -- so with `hot_rows=0` and `pool_rows=0` it is the whole deal.
 
-        `checkpoint.packed` is the subject here, and it decides the source: the shard mapping, or the
-        resident bank when one is attached. Out of the mapping it uses `entry_view` and not `view`,
-        deliberately -- uncached, which is exactly right for a 3 MiB expert that will not be read
-        again this step, and it is why this loop is one pass over the shards' address space and not a
-        growing set of handles on whole layers. Out of the bank the mapping's slowest case -- a cold
-        page, 1308.0 ms for a row against 11.2 ms warm -- stops being possible, because the bank was
-        filled from the disk once, before the first step. It is not a faster `copy_`: 14 GiB/s either
-        way. What it removes is the disk.
+        **There is no copy here, and there is nothing for one to read.** The bytes are in the resident
+        bank, the bank is page-locked (`ResidentExpertBank.pin`), and the DMA can therefore read an
+        expert's tensor exactly where it lies -- so a staging arena holding a second host-side copy of
+        a row the copy stream is about to read was a copy of a copy. Removing it is most of what the
+        bank is worth on the device path: every byte used to cross host DRAM three times (read the
+        bank, write the pinned row, DMA read the pinned row) with the host `memcpy` competing with the
+        DMA engine for the same bandwidth, and now it crosses once.
 
-        The staging row and the arena row are the same number whenever the pool is off, and the
-        third element is carried anyway rather than recomputed by `_upload`: with the pool on it is
-        the row `pool_row` handed out, which is neither the staging row nor anywhere near it.
+        What is left is the part `_upload` cannot compute for itself. `misses` names each miss by its
+        *route slot*, and the route slot only means something beside the row's ids, which belong to
+        `_resolve_row`. So the ids are parked here, one row at a time, and `_upload` -- which is called
+        immediately after on the same buffer -- reads them back. The buffer index is the key because
+        that is the pair `_stage_misses` holds together; nothing else may call `_upload` without
+        calling this first.
+
+        `expert_rows` is the counter that makes the removal visible: it counts the draws that were
+        not answered by the resident set or the pool, which is what a run reports as the work it did,
+        and it is the same number before and after the copy left.
         """
-        for card, members in enumerate(misses):
-            if not members:
-                continue
-            arena = self._pinned[buffer]
-            for staging_row, slot, _ in members:
-                for which in PROJECTIONS:
-                    weight = self._key(ids[slot], which)
-                    for kind, key in (("q", weight), ("s", self._scale_key(weight))):
-                        # F8_E8M0 has no CPU `copy_` from a pyloaded view, so both halves travel as
-                        # the `uint8` the kernel reads them as.
-                        arena[(which, kind)][self._row(card, staging_row)].copy_(
-                            self.checkpoint.packed(key).view(torch.uint8)
-                        )
+        self._carried[buffer] = ids
+        for members in misses:
             self.expert_rows += len(members)
 
     def _upload(self, buffer: int, misses: list[list[tuple[int, int, int]]]) -> None:
-        """One asynchronous copy stream per card, each recording an event the host waits on later.
+        """One asynchronous copy stream per card, each reading the pinned bank, each recording an event.
 
         Four links at once is the whole point of the split: measured, one card takes 10.47 GiB/s and
         four take 38.56 GiB/s aggregate, so the same bytes cost 430 ms staged to one card and 117 ms
-        staged to four.
+        staged to four. Out of the registered bank the same measurement is **10.85 GiB/s** isolated
+        and 10.19-10.57 in situ on four ranks, which is the rate this loop runs at.
 
         A card's copy is also ordered behind that card's own compute stream, which is where its
         previous kernel was launched: without that the copy could refill an arena a kernel is still
         reading, and the two are on different streams so nothing else would order them.
 
         What crosses is the miss rows and not the arena, so a row the resident set or the pool covers
-        entirely costs no H2D at all. With the pool off the destination is the arena's own tail and
-        the miss rows are `0..k` in order, which is one copy per tensor a card; with it on each miss
-        goes to the row `pool_row` gave it and there is one copy a miss. At most `rows_per_card` of
-        those a card a row, so the extra calls are bounded by the same deal that bounded the first.
+        entirely costs no H2D at all. Each miss is one `packed` tensor a projection a kind -- six
+        copies of one expert's row, from six ranges of the bank that are nowhere near each other,
+        because the bank stores each layer grouped by kind and every expert of a kind has the same
+        shape. That is why this is a loop of small copies and not one large one, and it is why the
+        source can no longer be described as "the contiguous block `_stage` wrote": there is no block.
 
-        The pinned source is still the contiguous `0..k` block `_stage` wrote, whichever arena row
-        each of those ends up in -- so the pool changes where a byte lands and not how it leaves.
+        The destination is the arena row the miss was given, in every configuration. With the pool off
+        that is `hot_rows + i` in miss order -- exactly the contiguous `hot_rows .. hot_rows + k` block
+        the staged version copied as one range per tensor, now reached one row at a time -- and with
+        the pool on it is the row `pool_row` handed out, which is neither the miss's index nor
+        anywhere near it. At most `rows_per_card` of those a card a row, so the copy count is the
+        same one the pool already paid.
         """
+        ids = self._carried.pop(buffer, None)
         for card, members in enumerate(misses):
-            k = len(members)
-            if not k:
+            if not members:
                 continue
+            if ids is None:
+                raise RuntimeError(
+                    f"layer {self.layer_id} is uploading misses to buffer {buffer} that no staging "
+                    f"call claimed; `_stage` and `_upload` are a pair"
+                )
             device = self.devices[card]
             stream = _copy_stream(device)
             with torch.cuda.device(device):
                 stream.wait_stream(torch.cuda.current_stream(device))
                 with torch.cuda.stream(stream):
-                    if self.pool_rows:
-                        for staging_row, _, arena_row in members:
-                            source = self._row(card, staging_row)
-                            destination = slice(arena_row, arena_row + 1)
-                            for key, target in self._on_device[card].items():
-                                target[destination].copy_(
-                                    self._pinned[buffer][key][source], non_blocking=True
-                                )
-                    else:
-                        source = slice(card * self.rows_per_card, card * self.rows_per_card + k)
-                        destination = slice(self.hot_rows, self.hot_rows + k)
-                        for key, target in self._on_device[card].items():
+                    for _, slot, arena_row in members:
+                        destination = slice(arena_row, arena_row + 1)
+                        expert = ids[slot]
+                        for (which, kind), target in self._on_device[card].items():
+                            weight = self._key(expert, which)
+                            key = weight if kind == "q" else self._scale_key(weight)
+                            # F8_E8M0 has no CPU `copy_` from a pyloaded view, and the kernel reads
+                            # both halves as bytes, so both travel as `uint8`.
                             target[destination].copy_(
-                                self._pinned[buffer][key][source], non_blocking=True
+                                self.checkpoint.packed(key).view(torch.uint8), non_blocking=True
                             )
                     self._events[card][buffer].record(stream)
             self._uploaded[card][buffer] = True
@@ -1709,7 +1709,7 @@ class DeviceRoutedExperts(RoutedExperts):
         return ids, cards, misses, drawn
 
     def _stage_misses(self, ids: Sequence[int], misses: list[list[tuple[int, int, int]]]) -> None:
-        """Move one row's misses: the pinned staging, the H2D, and the two counters that report it.
+        """Move one row's misses: the bookkeeping that counts them and the H2D that lands them.
 
         Split from `_resolve_row` so that the two can be a pass apart, which is what the batched path
         does with them. Both halves are the row's own work and nothing here reads a result, so the
@@ -1718,20 +1718,20 @@ class DeviceRoutedExperts(RoutedExperts):
         `_upload`'s, not this.
 
         **A row with nothing to move returns before `_take_buffer`, and that is not an early exit for
-        its own sake.** `_take_buffer` hands out the next buffer *and waits for the DMA that last read
-        it*, so the two-buffer pipeline's guarantee -- the slot being staged has had a whole row's
-        staging since its copy was issued -- only holds if every row that takes a slot also does work
-        with it. A pool answers most of a prefill's rows without staging anything (86.3% on the
-        512-token leg), and against that hit rate the rotation advances through rows that move nothing
-        and lands on the slot the previous *working* row uploaded immediately, with no staging in
-        between to cover the copy. Measured on that leg: 6.89 s of a 30.35 s class wall in this one
+        its own sake.** `_take_buffer` hands out the next slot *and waits on the DMA that last uploaded
+        through it*, so the two-buffer pipeline's guarantee -- the slot being uploaded has had a whole
+        row's uploading since its copy was issued -- only holds if every row that takes a slot also
+        does work with it. A pool answers most of a prefill's rows without moving anything (86.3% on
+        the 512-token leg), and against that hit rate the rotation advances through rows that move
+        nothing and lands on the slot the previous *working* row uploaded immediately, with no upload
+        in between to cover the copy. Measured on that leg: 6.89 s of a 30.35 s class wall in this one
         wait, against the ~2.5 s of DMA it covers. It also explains why the decode step recorded
         0.00 s here -- a decode row misses by construction, so it was the one configuration where the
-        wait always had a row's staging in front of it.
+        wait always had a row's upload in front of it.
 
-        Rotating only on rows that stage restores the guarantee by construction rather than by luck:
+        Rotating only on rows that move restores the guarantee by construction rather than by luck:
         consecutive working rows take consecutive slots, so a slot's copy is issued one working row
-        before it is waited on, whatever the pool's hit rate is. Rows that stage nothing leave the
+        before it is waited on, whatever the pool's hit rate is. Rows that move nothing leave the
         rotation where it is, which is what makes that true.
         """
         self.rows += 1

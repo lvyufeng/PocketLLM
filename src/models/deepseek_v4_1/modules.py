@@ -478,6 +478,13 @@ class Block(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32, device=device))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32, device=device))
+        # Set by `graph.DecodeGraphs` when a decode step is being replayed instead of run. The
+        # forward below hands this layer to it rather than doing the arithmetic, which is the whole
+        # of how the graph path enters the model: everything above the block -- the embedding, the
+        # Engram gather, the MTP taps -- stays on the eager path, and so does `MoE`'s routed call,
+        # which cannot be captured because it synchronizes on the host. `None` everywhere else, and
+        # the check costs one attribute read a layer.
+        self.decode_graph = None
 
     def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
@@ -512,6 +519,9 @@ class Block(nn.Module):
         previous layer's FFN produced and the FFN uses what this attention produced.
 
         image_mask: [b, s] bool, True inside image spans (selects the VL routing bias)."""
+        graph = self.decode_graph
+        if graph is not None:
+            return graph.step(x, start_pos, pre_mix, image_mask, shared)
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.hc_pre(x, pre_mix)

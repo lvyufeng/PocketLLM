@@ -356,3 +356,64 @@ def test_fp4_act_quant_e4m3_rejects_a_ragged_block() -> None:
         except ValueError:
             continue
         raise AssertionError(f"accepted a last dim of {bad.size(-1)}")
+
+
+def test_fp4_codebooks_are_cached_per_device_not_rebuilt_per_call() -> None:
+    """The two level tables are the same tensor across calls, which is what removes the H2D.
+
+    Both were `torch.tensor(<host tuple>, device=...)` inside the function, so every quantize paid
+    a pageable host-to-device copy of eight or sixteen floats -- a launch-time cost on the decode
+    path, and a hard failure inside a CUDA graph capture, where a pageable copy is not recordable.
+    The cache is keyed by device, so the observable contract is object identity across calls and a
+    separate entry per device.
+    """
+    v41_kernels._FP4_LEVEL_CACHE.clear()
+    v41_kernels._FP4_SIGNED_LEVEL_CACHE.clear()
+    x = torch.tensor([0.0, 0.5, 1.5, 4.0, -2.0])
+
+    first = v41_kernels._levels_for(x.device, v41_kernels._FP4_LEVEL_CACHE, v41_kernels._FP4_MAGNITUDES)
+    second = v41_kernels._levels_for(x.device, v41_kernels._FP4_LEVEL_CACHE, v41_kernels._FP4_MAGNITUDES)
+    assert first is second, "the codebook was rebuilt, so the copy came back"
+
+    signed = [*v41_kernels._FP4_MAGNITUDES, *(-m for m in v41_kernels._FP4_MAGNITUDES)]
+    a = v41_kernels._levels_for(x.device, v41_kernels._FP4_SIGNED_LEVEL_CACHE, signed)
+    b = v41_kernels._levels_for(x.device, v41_kernels._FP4_SIGNED_LEVEL_CACHE, signed)
+    assert a is b and a is not first
+    assert v41_kernels._FP4_SIGNED_LEVEL_CACHE is not v41_kernels._FP4_LEVEL_CACHE
+
+
+def test_fp4_codes_and_values_are_unchanged_by_the_cache() -> None:
+    """The values have to be what the uncached construction produced, bit for bit.
+
+    The cache is an optimization on a quantize the whole compressor runs through, so the only
+    interesting failure is a stale or wrong-width table -- which would show up as a value, not as a
+    crash. `_fp4_codes` and `_fp4_values` are therefore also run against the literal construction
+    they replaced, and the two are required to be equal exactly.
+    """
+    torch.manual_seed(4)
+    values = torch.randn(64, 128) * 7.0
+
+    def uncached_codes(normalized: torch.Tensor) -> torch.Tensor:
+        """The body of `_fp4_codes` with the level table built the old way, per call."""
+        levels = torch.tensor(v41_kernels._FP4_MAGNITUDES, dtype=torch.float32,
+                              device=normalized.device)
+        magnitude = normalized.abs()
+        upper = torch.searchsorted(levels, magnitude, right=False).clamp(
+            1, len(v41_kernels._FP4_MAGNITUDES) - 1)
+        lower = upper - 1
+        to_upper = (magnitude - levels[lower]) > (levels[upper] - magnitude)
+        to_upper |= ((magnitude - levels[lower]) == (levels[upper] - magnitude)) & (upper % 2 == 0)
+        index = torch.where(to_upper, upper, lower)
+        return (index + torch.where(normalized < 0, 8, 0)).to(torch.uint8)
+
+    def uncached_values(codes: torch.Tensor) -> torch.Tensor:
+        levels = torch.tensor(
+            [*v41_kernels._FP4_MAGNITUDES, *(-m for m in v41_kernels._FP4_MAGNITUDES)],
+            dtype=torch.float32, device=codes.device)
+        return levels[codes.long()]
+
+    for _ in range(2):  # the second pass reads the cache the first one filled
+        codes = _fp4_codes(values)
+        assert torch.equal(codes, uncached_codes(values))
+        assert torch.equal(_fp4_values(codes), uncached_values(codes))
+    assert v41_kernels._FP4_LEVEL_CACHE, "nothing was cached"

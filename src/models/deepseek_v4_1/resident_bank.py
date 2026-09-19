@@ -74,19 +74,21 @@ What this does and does not buy, measured
 -----------------------------------------
 
 It buys the disk read: cold staging becomes resident staging, and the 27.2 s first token that was
-99% paging becomes the forward it is. It does **not** remove the `page cache -> pinned` copy that
-`DeviceRoutedExperts._stage` makes -- that copy is 0.30 s/step whether its source is the page cache
-or this bank, because 14 GiB/s is a memcpy's rate and not a disk's. That prediction is now measured
-on the device path with the page cache emptied (`/tmp/fadvise_drop.py`): the same 8-token row goes
-from **17.01 s a step and 9.91 s of `_stage`** to **782.9 ms and 242.1 ms** -- 21.7x and 41x --
-while warm the pair is 804.5 against 754.0 ms and `_stage` 224.7 against 244.0, which is to say no
-difference at all. Deleting *that* needs the bank to be pinned and the H2D to read it directly, which
-is a separate measurement with its own risk: the packed fp4 rows are the op's ABI and a per-expert
-copy has to replace a per-card one.
+99% paging becomes the forward it is. Registering the segment as pinned host memory goes one step
+further and removes the `page cache -> pinned` copy as well, because a pinned source can be the H2D
+copy's source: `cudaHostRegister` over all **457.8 GiB** of the mapping returns 0 in **59.6 s**
+(130.1 ms a GiB), costs ~8 GiB of `MemAvailable` and no swap traffic at all, and the DMA reads out of
+it at **10.85 GiB/s** isolated and 10.19-10.57 GiB/s in situ on four ranks. That is what `pin()` is
+for, and it is why `DEEPSEEK_V41_PIN_RESIDENT_EXPERTS` defaults on: the registration is 60 s of a
+startup that already spends 36.6 minutes filling the segment on the first boot of the host, and the
+alternative is the copy the 457.8 GiB exists to avoid. Pinning the mapping *alone* changes nothing --
+`_stage` has to stop copying -- so the two halves are landed together, `_upload` reading the bank
+through `Checkpoint.packed` (`loader.py`) in place of the staging ring.
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -99,11 +101,13 @@ from typing import Callable, Iterator
 import torch
 
 __all__ = [
+    "PinResult",
     "ResidentExpertBank",
     "enabled",
     "open_expert_bank",
     "parse_engram_key",
     "parse_key",
+    "pin_enabled",
     "resident_bytes",
 ]
 
@@ -136,6 +140,7 @@ TABLE_LEAVES = ("weight", "scale")
 
 ENABLE_ENV = "DEEPSEEK_V41_RESIDENT_EXPERTS"
 DIR_ENV = "DEEPSEEK_V41_RESIDENT_EXPERTS_DIR"
+PIN_ENV = "DEEPSEEK_V41_PIN_RESIDENT_EXPERTS"
 DEFAULT_DIR = "/dev/shm/pocketllm_v41_experts"
 
 # What a `pread` is allowed to be. Large enough that one syscall is tens of milliseconds of disk and
@@ -147,6 +152,17 @@ _READ_CHUNK = 32 << 20
 def enabled() -> bool:
     """Whether a run wants the checkpoint's experts held in host memory."""
     return os.getenv(ENABLE_ENV, "0").lower() in {"1", "true", "yes"}
+
+
+def pin_enabled() -> bool:
+    """Whether a run wants the bank's mapping pinned, so the DMA engine can read it in place.
+
+    On by default, and that is the opposite of `enabled`, deliberately: this is only ever asked by a
+    process that has already decided to read the bank through the device path, and there it is what
+    the reads are worth -- see `ResidentExpertBank.pin`. `0` leaves the mapping pageable, which is
+    correct and slower: the bytes go through the pinned ring as they did before.
+    """
+    return os.getenv(PIN_ENV, "1").lower() not in {"0", "false", "no"}
 
 
 def _root_dir(root_dir: str | None) -> str:
@@ -422,6 +438,32 @@ def resident_bytes(reader) -> int:
     return layout(reader)[2]
 
 
+@dataclass(frozen=True)
+class PinResult:
+    """What one `ResidentExpertBank.pin()` call did, in the units the cost is paid in."""
+
+    code: int
+    seconds: float
+    nbytes: int
+
+    @property
+    def ok(self) -> bool:
+        """Whether the driver accepted the registration. `code` is the raw `cudaHostRegister` rc."""
+        return self.code == 0
+
+    def __str__(self) -> str:
+        gib = self.nbytes / 2**30
+        if not self.ok:
+            return (
+                f"{gib:.1f} GiB NOT pinned: cudaHostRegister returned {self.code} after "
+                f"{self.seconds:.1f} s, staying pageable"
+            )
+        return (
+            f"{gib:.1f} GiB pinned in {self.seconds:.1f} s "
+            f"({self.seconds / max(gib, 1e-9) * 1e3:.1f} ms a GiB)"
+        )
+
+
 class ResidentExpertBank:
     """One POSIX shared-memory segment holding every routed expert and both Engram tables.
 
@@ -459,6 +501,7 @@ class ResidentExpertBank:
         self._shm: shared_memory.SharedMemory | None = None
         self._buffer = None
         self._tensors: dict[tuple, torch.Tensor] = {}
+        self._pin: PinResult | None = None
         self._open(create=create)
 
     # -- opening ----------------------------------------------------------------------------
@@ -721,6 +764,56 @@ class ResidentExpertBank:
         self._tensors[key] = tensor
         return tensor
 
+    def pin(self) -> PinResult:
+        """Register the whole mapping as pinned host memory, so the DMA can read it in place.
+
+        This is what makes `Checkpoint.packed` a legal source for a `non_blocking` H2D: without it the
+        copy still works but PyTorch stages it through its own pinned ring, which is the copy this
+        registration exists to delete. One call covers all 457.8 GiB -- the driver's pin walk is
+        130.1 ms a GiB and there is no per-region cost to split it for -- and it is idempotent, so
+        forty `DeviceRoutedExperts` objects over the one segment pin it once.
+
+        Failure is not raised. A driver that refuses the registration (a container without
+        `CAP_IPC_LOCK` is the plausible one; `/dev/shm` being full is the one that has actually been
+        observed, see below) leaves a bank that is still correct and still resident, just read through
+        the staging ring as before, and a run that aborts at startup over 60 s of a possibly-avoidable
+        startup cost would be the worse trade. The caller reports the `rc`; `PinResult.ok` is the test.
+
+        A *failed* registration is worth reading carefully before blaming a limit: `cudaHostRegister`
+        over a region whose pages are not yet resident makes the pin walk fault them in, so on a host
+        whose tmpfs is full the call fails after a walk of ~23 s with a code that looks exactly like a
+        `RLIMIT_MEMLOCK` refusal. Check `df -h /dev/shm` before `ulimit -l`. The bank's own pages are
+        resident by construction -- `fill` wrote them or a previous run did -- so a full `/dev/shm`
+        does not affect this call.
+        """
+        if self._pin is not None and self._pin.ok:
+            return self._pin
+        if self._buffer is None:
+            raise RuntimeError("the bank is closed; there is no mapping to pin")
+        # `memoryview` is what the segment hands back, and `from_buffer` gives the address the
+        # mapping actually has -- which is the address every cached view in `_tensors` also has, so
+        # registration moves nothing and invalidates nothing.
+        address = ctypes.addressof(ctypes.c_char.from_buffer(self._buffer))
+        size = len(self._buffer)
+        started = time.perf_counter()
+        try:
+            libcudart = ctypes.CDLL("libcudart.so")
+            code = libcudart.cudaHostRegister(
+                ctypes.c_void_p(address), ctypes.c_size_t(size), ctypes.c_uint(0)
+            )
+        except OSError:
+            # No CUDA runtime to register with at all -- a host that built this engine for another
+            # backend, or a test. `-1` is not a `cudaHostRegister` code and is not meant to be read as
+            # one; it is `ok` being false, which is the only thing a caller acts on.
+            code = -1
+        self._pin = PinResult(int(code), time.perf_counter() - started, size)
+        return self._pin
+
+    @property
+    def pin_result(self) -> PinResult | None:
+        """What `pin()` did, or `None` if it has not been called."""
+        return self._pin
+
     def close(self, unlink: bool = False) -> None:
         """Drop this process's handle on the segment, and optionally the segment itself.
 
@@ -733,8 +826,23 @@ class ResidentExpertBank:
         exports the mapping and CPython refuses to release a buffer with exports, so a tensor a caller
         kept alive holds the segment mapped until that tensor is dropped. Both releases are therefore
         attempted and a `BufferError` is not an error -- it means a view is still in flight, and
-        dropping it is the caller's job.
+        dropping it is the caller's job. The registration is dropped first, and only if the mapping
+        goes: `cudaHostUnregister` needs the address it was given.
+
+        The registration is *not* a reason to keep the segment alive -- it belongs to this process
+        alone and dies with it (`cudaDeviceReset` or exit), so an attached rank unpinning its own
+        mapping never disturbs the other ranks' registrations of theirs.
         """
+        if self._pin is not None and self._pin.ok and self._buffer is not None:
+            try:
+                address = ctypes.addressof(ctypes.c_char.from_buffer(self._buffer))
+                ctypes.CDLL("libcudart.so").cudaHostUnregister(ctypes.c_void_p(address))
+            except Exception:
+                # A process on its way out has no work left that needs the region pageable, and a
+                # failure here (no CUDA runtime, a mapping already gone) is not worth an exception in
+                # a teardown path.
+                pass
+        self._pin = None
         self._tensors.clear()
         if self._buffer is not None:
             try:
@@ -804,6 +912,12 @@ def open_expert_bank(
     Every rank computes the layout independently from the checkpoint's own index -- 0.24 s -- rather
     than taking it from the ready file, because the layout is what `_validate_header` checks the
     segment against and a rank that trusted a file for it would be checking nothing.
+
+    With `DEEPSEEK_V41_PIN_RESIDENT_EXPERTS` on -- the default -- every rank then registers its own
+    mapping of the segment as pinned host memory, 59.6 s for the 457.8 GiB and ~8 GiB of
+    `MemAvailable`. That is startup cost paid once per process in exchange for the H2D reading the
+    bank in place rather than through PyTorch's staging ring, and the two are only worth doing
+    together: see `ResidentExpertBank.pin`.
     """
     if not enabled():
         return None
@@ -825,25 +939,34 @@ def open_expert_bank(
         )
         if progress is not None:
             progress(f"resident checkpoint: attached {gi_b:.1f} GiB at {name}")
-        return bank
-
-    bank = ResidentExpertBank(
-        root, layers, size, name, create=True, n_routed_experts=n_experts, engram=tables
-    )
-    if progress is not None:
-        progress(
-            f"resident checkpoint: filling {gi_b:.1f} GiB from {checkpoint.root} "
-            f"({runs} sequential reads)"
+    else:
+        bank = ResidentExpertBank(
+            root, layers, size, name, create=True, n_routed_experts=n_experts, engram=tables
         )
-    started = time.perf_counter()
-    bank.fill(checkpoint, progress=progress)
-    bank.mark_ready()
-    if progress is not None:
-        elapsed = max(time.perf_counter() - started, 1e-9)
-        progress(
-            f"resident checkpoint: {gi_b:.1f} GiB resident in {elapsed:.0f} s "
-            f"({gi_b / elapsed:.2f} GiB/s)"
-        )
+        if progress is not None:
+            progress(
+                f"resident checkpoint: filling {gi_b:.1f} GiB from {checkpoint.root} "
+                f"({runs} sequential reads)"
+            )
+        started = time.perf_counter()
+        bank.fill(checkpoint, progress=progress)
+        bank.mark_ready()
+        if progress is not None:
+            elapsed = max(time.perf_counter() - started, 1e-9)
+            progress(
+                f"resident checkpoint: {gi_b:.1f} GiB resident in {elapsed:.0f} s "
+                f"({gi_b / elapsed:.2f} GiB/s)"
+            )
+    if pin_enabled():
+        # Every rank registers its own mapping of the shared segment, and the registrations do not
+        # interact: pinning is per-process page-table work over the same physical pages, so four
+        # ranks pay 4 x 59.6 s of startup and each one gets the DMA rate on its own H2D. Skipping it
+        # leaves the bank correct and slower.
+        if progress is not None:
+            progress(f"resident checkpoint: pinning {gi_b:.1f} GiB of host memory")
+        result = bank.pin()
+        if progress is not None:
+            progress(f"resident checkpoint: {result}")
     return bank
 
 

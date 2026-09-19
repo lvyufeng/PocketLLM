@@ -144,6 +144,7 @@ nav:
       - DeepSeek-V4.1-Flash device experts: performance/deepseek_v4_1_flash_device_experts.md
       - DeepSeek-V4.1-Flash remaining bottlenecks: performance/deepseek_v4_1_flash_remaining_bottlenecks.md
       - DeepSeek-V4.1-Flash decode graph: performance/deepseek_v4_1_flash_decode_graph.md
+      - DeepSeek-V4.1-Flash graphed decode, live: performance/deepseek_v4_1_flash_decode_graph_live.md
       - Serving latency baseline: performance/serving_latency_baseline.md
   - Architecture:
       - Overview: architecture/index.md

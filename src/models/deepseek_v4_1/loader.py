@@ -728,7 +728,12 @@ class LoadedBackbone:
         if self.hash_ids is not None:
             # An image span takes no part in an n-gram, which is the same statement `Backbone` makes
             # when it turns the image mask into an Engram token mask; spelled once, here.
-            hashes = self.hash_ids(token_ids, start_pos, None if image_mask is None else ~image_mask)
+            # `int(...)` because this half indexes its cache with a Python slice and takes the
+            # position as a number, while the model half is handed the object itself -- on a decode
+            # step replayed from a graph that is a `Pos`, whose `__index__` is the host counter.
+            hashes = self.hash_ids(
+                token_ids, int(start_pos), None if image_mask is None else ~image_mask
+            )
         return self.model(token_ids, start_pos, hashes, image_mask)
 
     def reset_state(self, batch_size: int) -> None:
@@ -755,6 +760,7 @@ def load_backbone(
     expert_rank: int = 0,
     expert_hot_rows: int = 0,
     expert_pool_rows: int = 0,
+    expert_buffers: int = 2,
     expert_batched: bool = False,
     resident_experts: bool | None = None,
     world: int = 1,
@@ -958,6 +964,7 @@ def load_backbone(
                 devices=[torch.device(base.type, first + r) for r in owned],
                 hot_rows=expert_hot_rows,
                 pool_rows=expert_pool_rows,
+                pinned_buffers=expert_buffers,
                 batched=expert_batched,
                 residents=residents,
             )
