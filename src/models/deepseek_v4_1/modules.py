@@ -77,14 +77,20 @@ LINEAR_DTYPE = torch.bfloat16
 # each builds an fp32 intermediate sized by the whole flattened stream: `hc_mixes` flattens to
 # `[s, hc_mult * dim]` to take one mean and one projection, `hc_pre` builds `[s, hc_mult, dim]` to
 # collapse it, and `hc_post` builds `[s, hc_mult, hc_mult, dim]` to mix the copies back in. The
-# widest of those is 5-D and 16 times the hidden width per token, so at V4.1's config it is 640 MiB
-# for `hc_mixes` and 2.5 GiB for `hc_post` at an 8192-token chunk, against a 22 GiB card whose caches
-# a 262144 context already fills: the 256K prefill died at `hc_post` on exactly that allocation.
+# widest of those is 5-D and 16 times the hidden width per token, so at V4.1's config a whole-stream
+# 8192-token chunk asks 640 MiB for `hc_mixes` and 2.5 GiB for `hc_post`, against a 22 GiB card
+# whose caches a 262144 context already fills. Those intermediates are what the tiling below is for.
+# What the tiling does not cover is the chunk-proportional part of the same three methods: each
+# returns `[s, ...]` over the whole stream, so `hc_post`'s concatenation of its passes is 40 KiB a
+# token on top of whatever is live, and that is the wall that caps the chunk once the context is
+# 262144. The ladder as measured: 640 MiB asked for with 572 MiB free at a 16384-token chunk and
+# 262144 context, and 1.25 GiB at a 32768-token chunk, both inside `hc_post`'s `torch.cat`.
 #
 # Nothing is reduced over the token axis, so walking it in tiles partitions independent work and the
 # answer is the arithmetic the reference states, not an approximation of it. What it costs is
-# launches, and the tile below is 1024 tokens because that is 80 MiB for the widest intermediate --
-# small enough to sit beside a 256K of caches -- while a decode step is one token and therefore one
+# launches, and the tile below is 1024 tokens because that is 320 MiB for the widest intermediate --
+# the fp32 `hc_post` broadcast, which is the request the 8192-token chunk at 262144 tokens died on,
+# 320.00 MiB asked for with 216.31 MiB free -- while a decode step is one token and therefore one
 # tile, which is what keeps the recorded decode graph on the path it was captured from. `0` turns
 # the tiling off and is only for measuring what it costs.
 HC_TOKEN_TILE = max(0, int(os.getenv("DEEPSEEK_V41_HC_TOKEN_TILE", "1024")))
@@ -351,10 +357,10 @@ class Engram(nn.Module):
         axis, so walking that axis in tiles partitions independent work and the answer is the
         arithmetic `_forward_pass` states, not an approximation of it. What makes it necessary is
         that the intermediates are Hyper-Connections shaped: `x` and `key` both go fp32 as
-        `[b, s, hc_mult, dim]`, which is 16 times the hidden width a token and 640 MiB at an
+        `[b, s, hc_mult, dim]`, which is four times the hidden width a token and 640 MiB at an
         8192-token chunk -- two of them, plus the fp32 sum, on a card whose 256K caches leave under
-        2 GiB. The 256K prefill OOMed on `key.float()` here once `hc_post` was tiled; it is the same
-        wall one module later, so it takes the same tile. See `HC_TOKEN_TILE`."""
+        2 GiB. That is the same wall `hc_post` hits one module earlier, on the same kind of
+        intermediate, so it takes the same tile. See `HC_TOKEN_TILE`."""
         if HC_TOKEN_TILE == 0 or x.size(1) <= HC_TOKEN_TILE:
             return self._forward_pass(x, hash_ids, token_mask)
         return torch.cat(
