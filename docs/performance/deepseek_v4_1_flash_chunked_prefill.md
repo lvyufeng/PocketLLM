@@ -348,6 +348,19 @@ them — so the instrument is charged to the MoE and the rest of the table is cl
   Python-level per-token loop costs**, and it is the one row here that a device clock would never
   show.
 
+  What those microseconds are *not* is the loop's own list and sort work, which is worth knowing
+  before anyone saves them twice. A shim carrying the real `_split`, the real per-card dictionary
+  probes and a `_pool_row` that answers out of a dict runs the same call at the same shapes — 4096
+  rows, topk 8, world 4, 384 experts — at **4.6 µs a call**: 1.1 µs for `route[row].tolist()` and
+  its `int()`s, 2.1 µs for `_split`, 1.5 µs for the probe loop (`/tmp/probe_v41_resolve_cost.py`;
+  between them the shim's own arithmetic closes, 1.1 + 2.1 + 1.5 = 4.7 against 4.6 measured, and one
+  `route.tolist()` for the whole chunk is 0.8 ms against 4.6 ms for the per-row form). So of the
+  31.9 µs a `_resolve_row` costs in situ, about 3 µs is the loop and the balance is `_pool_row` and
+  the state it walks — the pool's own row arithmetic, its eviction bookkeeping, and the class
+  members the shim does not have. A vectorized `_split`, or hoisting the `tolist()` a chunk, is well
+  under a percent of a chunk; the pool's half of those calls is where the seconds are, and the row
+  below is the one to price before spending them.
+
 `_take_buffer` is worth naming separately, because it is where this path used to lose its seconds:
 0.13 s over 8,658 calls, against **6.89 s of a 30.35 s class wall** before the rotation was made to
 advance only over rows that stage. 0.13 s is less than the barrier costs those same 8,658 calls, so
@@ -383,7 +396,8 @@ both ways to buy bytes back are unavailable at 262144 (a wider chunk does not fi
 pool dies in the second chunk at 288 rows) and the copies already run at two thirds to four fifths of
 the link. The score pass, 8.05 s and 14%. And the host's row bookkeeping, 6.7–9.5 s and 12–17%, which
 is the row to attack once the copy and the GEMM are at their ceilings — and is also, at 327,680 calls
-a chunk of 20–29 µs each, the row that says how much of this chunk is one process's Python.
+a chunk of 20–29 µs each, the row that says how much of this chunk is one process's Python, though
+not its loops: `_split` and the per-row `tolist()` are 3 µs of the 31.9 and the rest is the pool.
 
 ## Reproducing
 
