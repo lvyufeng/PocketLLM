@@ -30,6 +30,7 @@ those paths are the identity, which is what is written here.
 from __future__ import annotations
 
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -178,6 +179,36 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     return y
 
 
+def _is_continuation(pos: Pos, seqlen: int) -> bool:
+    """Whether this forward is a later chunk of a prompt whose earlier chunks have already run.
+
+    `start_pos > 0` alone does not say which of two bodies this is and they are different bodies: a
+    decode step has one query and reads the ring buffer as its whole window, while a continuation
+    chunk has `seqlen` queries whose windows reach *back past the chunk*, into rows this forward has
+    to keep in front of its own. The count of queries is the whole of the difference -- a prompt is
+    never one token and a decode step is never more than one -- and it is the caller's `seqlen`
+    rather than anything about the position, which is why it is passed in.
+    """
+    return not pos.first() and seqlen > 1
+
+
+def _group_freqs(freqs_cis: torch.Tensor, pos: Pos, n_groups: int, ratio: int, seqlen: int) -> torch.Tensor:
+    """The RoPE row for the first token of each of the `n_groups` groups a forward closes.
+
+    A latent stands for the first token of its group, so group `g` takes position `g * ratio`. A
+    chunk starting at 0 indexes the table from 0 in steps of `ratio`; a later chunk starts at the
+    first multiple of `ratio` at or below its own start -- the position the group it completes began
+    on -- and takes `n_groups` steps from there; a decode step has one group and *picks* its row,
+    because it is on the device path and a Python `slice` is a value a capture would freeze.
+    """
+    if pos.first():
+        return freqs_cis[: n_groups * ratio : ratio]
+    if _is_continuation(pos, seqlen):
+        base = pos.host - pos.host % ratio
+        return freqs_cis[base : base + n_groups * ratio : ratio]
+    return pos.pick(freqs_cis, 1 - ratio)
+
+
 def get_window_topk_idxs(
     window_size: int,
     bsz: int,
@@ -198,6 +229,15 @@ def get_window_topk_idxs(
     512 bytes, while the eight `arange`/`clamp`/`where` kernels it takes to build one are eight
     launches on a stream whose busy fraction a decode round exists to raise.
 
+    A *later chunk* of a prompt is the third case and its own expression, because the cache is no
+    longer the chunk. A chunk of more than one query starting past zero reads its window out of two
+    tensors: the ring holds the `window_size` positions that precede the chunk, and the chunk's own K
+    is read beside it, so `Attention._window_kv` hands `sparse_attn` the two concatenated and a
+    position is named by which half it fell in -- a ring slot below `window_size`, or an offset into
+    the chunk above it. Emitted oldest position first, which is the order the prefill branch emits and
+    the order the sparse attention's denominator sums in; a chunk and the same tokens prefilled in one
+    call therefore select the same vectors in the same order.
+
     The device path is in the `pos.on_device` branch below the prefill one, and it is not that build
     moved to the card, it is a different expression with the same value: the ring's listing
     `cat([arange(oldest, win), arange(oldest)])` is the rotation `(j + oldest) % window_size`, so it
@@ -215,6 +255,19 @@ def get_window_topk_idxs(
         end = torch.arange(seqlen).unsqueeze(1)
         idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
         idxs = torch.where(idxs > end, -1, idxs)  # before the sequence started
+    elif _is_continuation(pos, seqlen):
+        # Positions, not slots: the row is one query's whole window by absolute position, and which
+        # half of the concatenated K a position landed in is decided after. `k0` is the first
+        # position the query can still see, which is 0 for the first rows of a prompt shorter than
+        # the window and `end - window_size + 1` once the window is full.
+        assert not pos.on_device, "a chunk of more than one query is the eager path"
+        end = pos.host + torch.arange(seqlen).unsqueeze(1)
+        start = (end - window_size + 1).clamp(0)
+        at = start + torch.arange(window_size)
+        # a position before the chunk is a ring slot, one inside the chunk is an offset past the
+        # ring's `window_size` columns; a position the query has not reached is not attended to
+        idxs = torch.where(at < pos.host, at % window_size, window_size + at - pos.host)
+        idxs = torch.where(at > end, -1, idxs)
     elif pos.on_device:
         oldest = pos.slot(window_size) + 1
         idxs = (torch.arange(window_size, device=pos.torch_device) + oldest) % window_size
@@ -244,6 +297,12 @@ class SharedAttentionRuntime:
     `kv_source_layers`, `topk_idxs` from `index_source_layers`, `candidates` from
     `candidate_source_layer`.
 
+    `candidates` names *blocks*, and a block is `candidate_block_size` compressed positions -- so the
+    ids only mean anything in the ratio they were built in. `candidates_ratio` carries that ratio
+    beside them, and a consumer asserts it: the dense mask this replaced was shaped like the
+    consumer's own score and so could only ever have been consumed by a layer of the same ratio, and
+    the ids would instead be silently wrong.
+
     The reference holds this in a module-level singleton because there is one model per process.
     It is passed explicitly here so that two stacks in one process cannot silently share a cache.
     """
@@ -253,6 +312,7 @@ class SharedAttentionRuntime:
         self.index_k: torch.Tensor | None = None
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
+        self.candidates_ratio: int | None = None
 
 
 class Compressor(nn.Module):
@@ -338,6 +398,38 @@ class Compressor(nn.Module):
             kv = kv.unflatten(1, (-1, ratio))
             score = score.unflatten(1, (-1, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        elif _is_continuation(pos, seqlen):  # a later chunk of a prompt: pool in groups, not per token
+            # The chunk closes every group that ends inside it. A group is `ratio` consecutive
+            # positions, so the group the previous chunk left open -- if this chunk does not start on
+            # a boundary -- is closed by this chunk's first tokens, and those first tokens complete it
+            # *in the state*, which is where its earlier tokens are; the groups that begin and end
+            # inside the chunk pool directly. Both are the same softmax over the same `ratio` rows,
+            # which is why a chunk and the same tokens in one call agree bit for bit.
+            assert not pos.on_device, "a chunk of more than one query is the eager path"
+            carry = pos.host % ratio
+            take = min(ratio - carry, seqlen) if carry else 0
+            if take:
+                self.kv_state[:bsz, carry : carry + take] = kv[:, :take]
+                self.score_state[:bsz, carry : carry + take] = score[:, :take]
+                kv, score = kv[:, take:], score[:, take:]
+            if carry and take < ratio - carry:  # the chunk ends inside the group it did not close
+                return None
+            rest = seqlen - take
+            whole = rest - rest % ratio
+            pooled = []
+            if carry:
+                pooled.append((self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True))
+            if whole:
+                grouped_kv = kv[:, :whole].unflatten(1, (-1, ratio))
+                grouped_score = score[:, :whole].unflatten(1, (-1, ratio))
+                pooled.append((grouped_kv * grouped_score.softmax(dim=2)).sum(dim=2))
+            if rest % ratio:  # trailing partial group waits in the state for the next chunk
+                self.kv_state[:bsz, : rest % ratio] = kv[:, whole:]
+                self.score_state[:bsz, : rest % ratio] = score[:, whole:]
+            if not pooled:  # nothing closed: the whole chunk is still one open group
+                return None
+            should_compress = True
+            kv = torch.cat(pooled, dim=1)
         else:  # one token per step: fill a slot, and pool only when the group just completed
             variant = self.compress_variant
             should_compress = pos.emits(ratio) if variant is None else variant
@@ -351,34 +443,138 @@ class Compressor(nn.Module):
         return self.norm(kv.to(dtype))
 
 
+# The indexer is the one place in V4.1 whose cost is quadratic in the sequence length, and it used to
+# build the whole `[bsz, seqlen, index_heads, width]` score in a single `einsum`. That matrix is what
+# puts a long context out of reach on a 22 GiB card: at 256K positions one ratio-1 index source's is
+# 4.3 TB in bf16, and layers 2/8/14/20 cannot narrow `width` at all -- the candidate level applies
+# only strictly after layer 20. Nothing downstream reads the matrix. A layer wants `index_topk` key
+# ids per query and, at the candidate source, `candidate_topk_blocks` block ids, so the score is built
+# one tile at a time and merged into a running top-k of fixed width.
+#
+# The tiling is exact rather than a threshold approximation: `_TopKStream.push` keeps the top-k of the
+# union of what it holds with the tile, and the top-k of a union is the top-k of the merged top-k
+# lists, so a value that survives is the true k-th best of everything pushed so far. The head
+# reduction runs inside a tile over the head axis it always ran over, and no tile straddles the
+# accumulation axis. What is *not* pinned is the order of equal scores -- `torch.topk(sorted=False)`
+# picks among ties by an order this merge need not share with a one-shot call -- which is the same tie
+# artifact `tests/test_models_deepseek_v4_1_attention.py` already records for `index_topk` truncation.
+# The picks are re-sorted by position before they leave, which *is* pinned: `sparse_attn` sums over
+# that axis, so a different order there is different arithmetic rather than a different tie.
+#
+# The tile is sized from a budget on the *score* tensor rather than fixed, because the two shapes the
+# indexer is asked for are three orders of magnitude apart. A decode step has one query, so the budget
+# buys a single tile spanning the whole width and the loop runs once: the decode graph records the
+# same one pass it used to and the launch count does not change. A 256K prefill has 256K queries
+# against a 256K-wide cache, and there the tiles are what keep the peak finite. Measured peak per
+# index layer at 4096/16384/65536/262144 before this: 0.63/9.87/... GiB, OOM at 24576.
+INDEXER_SCORE_BUDGET = int(os.getenv("DEEPSEEK_V41_INDEXER_SCORE_BUDGET", str(1 << 26)))
+INDEXER_QUERY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_QUERY_TILE", "2048"))
+INDEXER_MIN_KEY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_MIN_KEY_TILE", "1024"))
+# The candidate path gathers its keys per query, so its tiles are bounded by the gathered copy
+# (`q_tile * blocks * block_size * index_head_dim`) rather than by the score alone.
+INDEXER_CAND_QUERY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_QUERY_TILE", "512"))
+INDEXER_CAND_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_TILE", "64"))
+
+
+def _as_column(lens: torch.Tensor | int, bsz: int, seqlen: int, device, dtype) -> torch.Tensor:
+    """`compress_lens` widened to one column per query: `[bsz, seqlen, 1]`.
+
+    The indexer carries it as a per-query column during prefill -- a count per query, counted from the
+    position the forward starts at -- and as a 0-dim tensor during a decode step, where the single
+    number is a read of the recorded position. Every use below wants it aligned with the query axis of
+    a score matrix, and one caller needs it in a *shape*, which is why this exists rather than the
+    `masked_fill` broadcast the other call sites get away with. Widening by `expand` rather than
+    indexing is also what keeps a 0-dim tensor out of `slice`, which refuses it.
+    """
+    if torch.is_tensor(lens):
+        return lens.to(dtype).expand(bsz, seqlen, 1)
+    return torch.full((bsz, seqlen, 1), int(lens), dtype=dtype, device=device)
+
+
+class _TopKStream:
+    """Exact top-`k` along the last axis, merged one tile at a time into a fixed-width buffer.
+
+    `push` keeps the top `k` of the union of what it holds with the tile it is given, which is exact:
+    the top-k of a union equals the top-k of the merged top-k lists, so the k-th value held after any
+    push is the k-th value of everything pushed so far, and the buffer never has to see the whole
+    axis at once. The alternative -- hold a threshold and drop what falls below it -- is exact only if
+    the threshold is the running k-th value, which is what `values` holds anyway.
+
+    A tile whose largest value is below the running k-th cannot contribute, so `push` returns without
+    touching the buffer when `amax(tile) < amin(held)`. That test reads one boolean to the host and is
+    therefore a synchronization; it is worth it because on a long prefill most key tiles of most query
+    tiles are below the running k-th while the merge is the expensive part. It is skipped until the
+    buffer is saturated, because before that `amin(held)` is not yet the k-th value.
+
+    Tie order among equal values is whatever `torch.topk(sorted=False)` returns, so two streams fed
+    the same values in a different order may name different positions. Both are valid top-k results
+    and `Indexer` re-sorts by position afterwards, so the difference never reaches a caller.
+    """
+
+    __slots__ = ("k", "values", "keys")
+
+    def __init__(self, k: int):
+        self.k = k
+        self.values: torch.Tensor | None = None
+        self.keys: torch.Tensor | None = None
+
+    def push(self, values: torch.Tensor, keys: torch.Tensor) -> None:
+        k = self.k
+        if self.values is None:
+            if values.size(-1) <= k:
+                self.values, self.keys = values, keys
+            else:
+                self.values, sel = values.topk(k, dim=-1, sorted=False)
+                self.keys = keys.gather(-1, sel)
+            return
+        if self.values.size(-1) == k and bool((values.amax(dim=-1) < self.values.amin(dim=-1)).all()):
+            return
+        merged = torch.cat([self.values, values], dim=-1)
+        # fewer than `k` values seen so far means the buffer is still filling and there is nothing to
+        # drop; only once it is saturated is its width the top-k's and the buffer stops growing.
+        self.values, sel = merged.topk(min(k, merged.size(-1)), dim=-1, sorted=False)
+        self.keys = torch.cat([self.keys, keys], dim=-1).gather(-1, sel)
+
+    def result(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.values is not None and self.keys is not None, "a stream nothing was pushed into"
+        return self.values, self.keys
+
+
 def select_candidate_blocks(
-    logits: torch.Tensor,
+    scores: torch.Tensor,
     compress_lens: torch.Tensor | int,
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    """Level one of the two-level top-k: keep the `topk_blocks` highest-scoring blocks per query.
+    """Level one of the two-level top-k: which blocks of compressed positions a query may look in.
 
-    `logits` is `[..., n_positions]` with positions the query cannot reach already at `-inf`, which
-    is what makes a block score of `-inf` mean "not reachable yet". `compress_lens` is a plain int
-    during decode, or broadcasts against logits' leading dims during prefill. Returns a bool mask
-    shaped like `logits`, so the layers consuming it just mask and never think about blocks again.
+    `scores` is `[..., n_blocks]`, one entry per block, already the best score inside it, with a block
+    the query cannot reach at `-inf`. Returns the ids it keeps, ascending and `-1` padded out to
+    `min(topk_blocks, n_blocks)`.
+
+    Ids rather than the dense mask this used to return: the mask is `[bsz, seqlen, width]`, which at
+    256K positions is 68 GB of bool per candidate source, and level two only ever *reads* the mask to
+    gather the blocks it names. The ids carry the same selection in 32 bytes a query, and they drop
+    the consumer's need to score a width it is going to throw away -- the gather only touches the
+    blocks that survived.
+
+    Not what runs: this is the whole-axis form of the selection, kept because it is the one that can
+    be read. `Indexer._stream_prefix` applies the same rule a tile at a time, and the pin below is
+    the reason it cannot simply be a top-k there -- inside a stream, a pinned block has to earn its
+    `+inf` from the tile that owns it rather than be appended afterwards, or a block that also scored
+    its way in would appear twice and level two would gather its positions twice.
     """
-    width = logits.size(-1)
-    # score each block by its best position; -inf pads the last one out to block_size
-    scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
-    scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
-
+    keep = min(topk_blocks, num_blocks)
     # the block with this query's newest position is only partly filled, so pin it in: it holds the
     # most recent tokens but could otherwise be outscored by an older, full block
     last = (compress_lens - 1) // block_size
-    scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
-
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    # fewer reachable blocks than topk_blocks means leftover picks came back -inf: drop them
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+    scores = scores.masked_fill(torch.arange(num_blocks, device=scores.device) == last, torch.inf)
+    top = scores.topk(keep, dim=-1)
+    # fewer reachable blocks than topk_blocks means leftover picks came back -inf: they are not
+    # blocks the query may look in, so they become padding rather than a narrow mask
+    picked = torch.where(top.values > -torch.inf, top.indices, -1)
+    return picked.sort(dim=-1).values.int()
 
 
 class Indexer(nn.Module):
@@ -481,12 +677,7 @@ class Indexer(nn.Module):
             shared.index_k = self.k_cache
         # latent is None while a group is still filling up, so there is nothing to publish yet
         if self.owns_k and latent is not None:
-            # a latent stands for the first token of its group, so group j takes position j * ratio
-            freqs = (
-                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if pos.first()
-                else pos.pick(self.freqs_cis, 1 - ratio)
-            )
+            freqs = _group_freqs(self.freqs_cis, pos, latent.size(1), ratio, seqlen)
             k = self.k_norm(self.wk(latent))
             apply_rotary_emb(k[..., -rd:], freqs)
             fp4_act_quant(k, FP4_BLOCK_SIZE, True)
@@ -498,10 +689,11 @@ class Indexer(nn.Module):
         fp4_act_quant(q, FP4_BLOCK_SIZE, True)
 
         # `end_pos // ratio` groups are reachable. Both paths read the whole cache and mask the
-        # tail out of the score below, rather than slicing to the reachable prefix: the prefix is a
+        # tail out of the score, rather than slicing to the reachable prefix: the prefix is a
         # step by step count, and reading one width on both paths is what keeps the graphed column
-        # and the eager column the same arithmetic instead of two softmaxes over different widths.
-        index_k = shared.index_k[:bsz, pos.upto(pos.group(ratio, seqlen), shared.index_k.size(1))]
+        # and the eager column the same arithmetic instead of two score matrices over different
+        # widths. The prefill's `upto` is its own group count, so there the two coincide.
+        index_k = shared.index_k[:bsz, pos.upto(pos.group(ratio, seqlen), shared.index_k.size(1), seqlen)]
         # `weights` is one number per index head, and the sum below runs over heads -- so this rank
         # needs its own slice of the output while the scale stays the *global* head count. Using the
         # local 8 in `n_heads**-0.5` would scale every index-source layer's partial by 2x.
@@ -513,47 +705,220 @@ class Indexer(nn.Module):
             weights = self.weights_proj(x)[..., lo : lo + tp.index_heads] * (
                 self.softmax_scale * self.n_heads_global**-0.5
             )
-        index_score = torch.einsum("bshd,btd->bsht", q, index_k)
-        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if tp is not None:
-            # the sum above ran over this rank's heads only, so the score is a partial. It has to be
-            # whole before the top-k, because a top-k over partials is a different selection and the
-            # difference is discrete -- it does not average away downstream the way a rounding does.
-            index_score = tp.reduce(index_score)
 
-        # how many compressed positions each query can see: a block becomes visible once the query
-        # has passed its last token. One query per decode step, so there it is just a number; the
-        # prefill's is one per query, and masks against the chunk's own width -- which is the width
-        # `index_k` has there, so the same line covers both.
-        compress_lens = pos.group(ratio, seqlen)
-        if pos.first():
-            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-        index_score.masked_fill_(
-            torch.arange(index_score.size(-1), device=x.device) >= compress_lens, -torch.inf
+        # How many compressed positions each query can see: a block becomes visible once the query has
+        # passed its last token, so a query at an absolute position `p` sees `(p + 1) // ratio` of
+        # them. The prefill's is therefore one count per query counted from where the forward starts,
+        # which on a later chunk is not 0 -- a chunk's first query can see the whole history in front
+        # of it, and without that its blocks would all be masked away. A decode step has one query and
+        # one number, and it stays a 0-dim *tensor*: it is a read of the recorded position, and
+        # `_as_column` is what widens it where a shape needs it.
+        if pos.on_device:
+            compress_lens = pos.group(ratio, seqlen)
+        else:
+            compress_lens = ((pos.host + torch.arange(1, seqlen + 1, device=x.device)) // ratio).unsqueeze(-1)
+
+        width = index_k.size(1)
+        topk = min(self.index_topk, width)
+        if topk == 0:
+            return torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
+
+        if self.uses_candidates:
+            # level two: score with our own weights, but only inside the source's blocks. The assert
+            # is the one thing the old dense mask checked for free -- it was shaped like this layer's
+            # own scores, so a source with a different ratio could not have been consumed.
+            assert shared.candidates is not None, "a candidate source must run before a candidate user"
+            assert shared.candidates_ratio == ratio, "the candidate blocks are the source's positions, in the source's ratio"
+            values, keys = self._stream_candidates(q, weights, index_k, shared.candidates, compress_lens, tp)
+        else:
+            values, keys, blocks = self._stream_prefix(
+                q, weights, index_k, compress_lens, tp,
+                self.candidate_block_size if self.is_candidate_source else 0,
+            )
+            if self.is_candidate_source:
+                shared.candidates = publish(shared.candidates, blocks)
+                shared.candidates_ratio = ratio
+
+        # Re-sorted by position, and unreachable picks pushed to the end of the row rather than left
+        # where they fell: the reference's `topk(...).indices.sort()` puts every `-1` after every
+        # reachable id, and `sparse_attn` sums along this axis, so keeping that order is what makes
+        # this the same arithmetic rather than merely the same set. `tail` is past every position the
+        # row can name, so the ones that sort above it are exactly the unreachable ones.
+        tail = width + offset + 1
+        idxs = torch.where(values > -torch.inf, keys + offset, tail).sort(dim=-1).values
+        return torch.where(idxs < tail, idxs, -1).int()
+
+    def _stream_prefix(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k: torch.Tensor,
+        compress_lens: torch.Tensor | int,
+        tp,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """One tiled pass over the reachable prefix, yielding both levels of the two-level top-k.
+
+        Returns the `index_topk` best positions per query with their key ids, plus -- when this layer
+        is the candidate source, i.e. `block_size` is set -- the level-one block ids. Both come out of
+        the same score, which is the expensive part; scoring twice to answer the two questions would
+        double the cost of the one layer that is already the most expensive in the model.
+        """
+        bsz, seqlen, n_heads, _ = q.shape
+        width = index_k.size(1)
+        topk = min(self.index_topk, width)
+        q_tile = min(seqlen, INDEXER_QUERY_TILE)
+        # the budget is on `q_tile * n_heads * key_tile`, which is what the einsum materializes
+        key_tile = max(INDEXER_MIN_KEY_TILE, INDEXER_SCORE_BUDGET // (n_heads * q_tile))
+        if block_size:
+            # a block may not straddle two tiles, or its amax would be split across two pushes
+            key_tile = -(-key_tile // block_size) * block_size
+        key_tile = min(key_tile, width)
+
+        # The one thing level one does that a plain top-k does not: the block holding a query's newest
+        # position is only partly filled, so it holds the most recent tokens and could otherwise be
+        # outscored by an older, full block. It is pinned by giving it `+inf` as its tile goes past --
+        # inside the same top-k rather than appended to it, because a block that also earned its place
+        # on score would then be in the list twice and level two would gather its positions twice.
+        pin = (
+            (_as_column(compress_lens, bsz, seqlen, q.device, torch.int32) - 1) // block_size
+            if block_size
+            else None
         )
 
-        if self.is_candidate_source:
-            shared.candidates = publish(
-                shared.candidates,
-                select_candidate_blocks(
-                    index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
-                ),
-            )
-        elif self.uses_candidates:
-            # level two: score with our own weights, but only inside the source's candidate blocks
-            assert shared.candidates is not None, "a candidate source must run before a candidate user"
-            index_score = index_score.masked_fill(~shared.candidates, -torch.inf)
+        # One stream per query tile, concatenated along the query axis at the end. A stream merges
+        # along the key axis only, so a second query tile pushed into the same buffer would be merged
+        # as more keys of the first: its rows would be dropped and the buffer would keep the first
+        # tile's row count. That hides for as long as the whole chunk fits in one tile, which is
+        # every length a toy test uses and none of the lengths this exists for.
+        out_values: list[torch.Tensor] = []
+        out_keys: list[torch.Tensor] = []
+        out_blocks: list[torch.Tensor] = []
+        for q0 in range(0, seqlen, q_tile):
+            q1 = min(q0 + q_tile, seqlen)
+            q_tile_t = q[:, q0:q1]
+            weights_t = weights[:, q0:q1]
+            # widened through `_as_column` rather than sliced, so that the shapes it can be handed --
+            # a per-query column on the host path, a 0-dim tensor on the device one -- all arrive as
+            # one column per query, which is what the masks below are shaped against
+            lens_t = _as_column(compress_lens, bsz, seqlen, q.device, torch.int32)[:, q0:q1]
+            positions = _TopKStream(topk)
+            blocks = _TopKStream(self.candidate_topk_blocks) if block_size else None
+            for k0 in range(0, width, key_tile):
+                k1 = min(k0 + key_tile, width)
+                score = torch.einsum("bqhd,btd->bqht", q_tile_t, index_k[:, k0:k1])
+                score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
+                if tp is not None:
+                    # the sum above ran over this rank's heads only, so the score is a partial. It
+                    # has to be whole before any top-k, because a top-k over partials is a different
+                    # selection and the difference is discrete -- it does not average away downstream
+                    # the way a rounding does. Tiled, this is one collective a tile, which is the same
+                    # volume as the one it replaced and a fixed count for a fixed width.
+                    score = tp.reduce(score)
+                ids = torch.arange(k0, k1, dtype=torch.int32, device=q.device).reshape(1, 1, -1)
+                score = score.masked_fill(ids >= lens_t, -torch.inf)
+                if blocks is not None:
+                    # `-inf` pads the tail of the last tile out, so that a block is always whole. The
+                    # pad belongs to the block push alone: the position push below carries its own
+                    # `ids`, and padding the score it shares would leave values one column wider than
+                    # the keys they are picked with.
+                    pad = -(-(k1 - k0) // block_size) * block_size - (k1 - k0)
+                    block_score = F.pad(score, (0, pad), value=-torch.inf) if pad else score
+                    block_ids = torch.arange(
+                        k0 // block_size, -(-k1 // block_size), dtype=torch.int32, device=q.device
+                    ).reshape(1, 1, -1)
+                    blocks.push(
+                        block_score.unflatten(-1, (-1, block_size))
+                        .amax(dim=-1)
+                        .masked_fill(block_ids == pin[:, q0:q1], torch.inf),
+                        block_ids.expand(bsz, q1 - q0, -1),
+                    )
+                positions.push(score, ids.expand(bsz, q1 - q0, -1))
 
-        # top-k by score, re-sorted into position order; unreachable -> -1, rest shifted by offset.
-        # The read is the whole cache on both paths, so this always asks for `index_topk` picks and
-        # some of them come back past `compress_lens` or from positions the sequence has not reached:
-        # the `where` below turns those into `-1`, the same value an unreached slot takes, and
-        # `sparse_attn` skips a `-1`. That makes the picks equivalent to the reachable prefix's
-        # `min(index_topk, groups)` that a *narrower* read would have asked for -- and the width it
-        # asks for is a constant, which is what a capture needs.
-        topk = min(self.index_topk, index_score.size(-1))
-        idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+            tile_values, tile_keys = positions.result()
+            out_values.append(tile_values)
+            out_keys.append(tile_keys)
+            if blocks is not None:
+                block_values, block_keys = blocks.result()
+                # a block the query cannot reach yet scored -inf and is not a block it may look in,
+                # the same way `select_candidate_blocks` drops the picks that came back -inf
+                out_blocks.append(
+                    torch.where(block_values > -torch.inf, block_keys, -1).sort(dim=-1).values.int()
+                )
+
+        values = torch.cat(out_values, dim=1)
+        keys = torch.cat(out_keys, dim=1)
+        if blocks is None:
+            return values, keys, None
+        return values, keys, torch.cat(out_blocks, dim=1)
+
+    def _stream_candidates(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k: torch.Tensor,
+        candidates: torch.Tensor,
+        compress_lens: torch.Tensor | int,
+        tp,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Level two: the same score, computed only inside the blocks level one kept.
+
+        `index_k` is *gathered* per query here rather than read as a prefix, because each query kept
+        a different set of blocks. That gather is the whole point of the level: the version this
+        replaces scored the full width with its own weights and then masked more than 99% of it away,
+        so the multiplies outside the mask were paid for and discarded.
+        """
+        bsz, seqlen, _, _ = q.shape
+        width = index_k.size(1)
+        block_size = self.candidate_block_size
+        q_tile = min(seqlen, INDEXER_CAND_QUERY_TILE)
+        span = INDEXER_CAND_TILE * block_size
+        k = min(self.index_topk, width)
+
+        # Same reason as `_stream_prefix`: one stream per query tile, joined along the query axis.
+        # This tile is the smaller of the two, so the whole chunk stops fitting in one as soon as the
+        # chunk is longer than `INDEXER_CAND_QUERY_TILE` -- which is the length every real prefill has.
+        out_values: list[torch.Tensor] = []
+        out_keys: list[torch.Tensor] = []
+        for q0 in range(0, seqlen, q_tile):
+            q1 = min(q0 + q_tile, seqlen)
+            q_tile_t = q[:, q0:q1]
+            weights_t = weights[:, q0:q1]
+            # widened through `_as_column` rather than sliced, so that the shapes it can be handed --
+            # a per-query column on the host path, a 0-dim tensor on the device one -- all arrive as
+            # one column per query, which is what the masks below are shaped against
+            lens_t = _as_column(compress_lens, bsz, seqlen, q.device, torch.int32)[:, q0:q1]
+            # the positions the surviving blocks name, `[bsz, q_tile, n_kept * block_size]`, with a
+            # `-1` for a padded block. Built per query tile rather than for the whole sequence: at
+            # 256K this is 16384 ids a query and the full-sequence form is 34 GB.
+            keys = torch.add(
+                candidates[:, q0:q1].unsqueeze(-1) * block_size,
+                torch.arange(block_size, dtype=torch.int32, device=q.device),
+            ).flatten(-2)
+            positions = _TopKStream(k)
+            for c0 in range(0, keys.size(-1), span):
+                c1 = min(c0 + span, keys.size(-1))
+                tile = keys[:, :, c0:c1]
+                # a block at the end of the cache covers positions past its width, and a padded
+                # block is a `-1`: both are gathered from a valid slot and masked out below, so the
+                # gather index never leaves the cache
+                gathered = index_k[
+                    torch.arange(bsz, device=q.device).reshape(bsz, 1, 1), tile.clamp(0, width - 1)
+                ]
+                score = torch.einsum("bqhd,bqmd->bqhm", q_tile_t, gathered)
+                score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
+                if tp is not None:
+                    score = tp.reduce(score)
+                # a padded block names position -1 and a query cannot see past its own group count;
+                # both are the same `-inf` the prefix path masks with
+                score = score.masked_fill((tile < 0) | (tile >= lens_t), -torch.inf)
+                positions.push(score, tile)
+
+            tile_values, tile_keys = positions.result()
+            out_values.append(tile_values)
+            out_keys.append(tile_keys)
+
+        return torch.cat(out_values, dim=1), torch.cat(out_keys, dim=1)
 
 
 class Attention(nn.Module):
@@ -703,6 +1068,20 @@ class Attention(nn.Module):
                     [win - cutoff, cutoff], dim=1
                 )
             window_kv = kv
+        elif _is_continuation(pos, seqlen):  # a later chunk: the window spans the ring and the chunk
+            # The K handed on is the ring and the chunk concatenated rather than the ring alone,
+            # because this chunk's queries attend to their own rows as well; `get_window_topk_idxs`
+            # names a position by which half it fell in, and the ring half has to be read *before* the
+            # ring is advanced. The chunk's rows go into the slots their absolute positions name --
+            # `slot = position % window_size` -- and those are exactly the slots the `window_size`
+            # positions just in front of the chunk live in, so writing first would overwrite the rows
+            # this chunk's own queries are about to read. `cat` materializes, so the ring can be
+            # advanced after it. Only the last `window_size` rows are kept: a chunk longer than the
+            # ring wraps away rows no later query can see again.
+            window_kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
+            keep = min(seqlen, win)
+            slots = (pos.host + torch.arange(seqlen - keep, seqlen, device=kv.device)) % win
+            self.window_kv_cache[:bsz].index_copy_(1, slots, kv[:, seqlen - keep :])
         else:  # decode: one token into the ring buffer, attend over the whole window
             write_row(self.window_kv_cache[:bsz], pos.slot(win), kv.squeeze(1))
             window_kv = self.window_kv_cache[:bsz]
@@ -744,19 +1123,14 @@ class Attention(nn.Module):
         # the indexer needs the latent before RoPE, so it runs before the cache is written
         idxs = self._compress_topk_idxs(x, qr, latent, pos, offset, shared)
         if latent is not None:
-            # a latent stands for the first token of its group, so group j takes position j * ratio
-            freqs = (
-                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if pos.first()
-                else pos.pick(self.freqs_cis, 1 - ratio)
-            )
+            freqs = _group_freqs(self.freqs_cis, pos, latent.size(1), ratio, seqlen)
             apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
             fp4_act_quant_e4m3(latent, COMPRESS_KV_BLOCK_SIZE, True)
             self.compress_kv_cache[:bsz, pos.span(latent.size(1), pos.group(ratio))] = latent
         # read after the write, so this does not depend on the slice aliasing the cache
         assert shared.compress_kv is not None, "a kv source must run before a layer that reads its cache"
-        return shared.compress_kv[:bsz, pos.upto(pos.group(ratio, seqlen), shared.compress_kv.size(1))], idxs
+        return shared.compress_kv[:bsz, pos.upto(pos.group(ratio, seqlen), shared.compress_kv.size(1), seqlen)], idxs
 
     def forward(self, x: torch.Tensor, start_pos: int | Pos, shared: SharedAttentionRuntime) -> torch.Tensor:
         pos = Pos.of(start_pos)

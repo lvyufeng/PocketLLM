@@ -250,7 +250,7 @@ class Pos:
         base = self._tensor if start is None else start
         return torch.arange(n, device=self._tensor.device, dtype=torch.int64) + base
 
-    def upto(self, stop: "int | torch.Tensor", full: int) -> slice:
+    def upto(self, stop: "int | torch.Tensor", full: int, seqlen: int = 1) -> slice:
         """The first `stop` positions of a cache that is `full` wide.
 
         `stop` grows by one every step, which is the one thing a capture cannot hold -- a slice
@@ -267,10 +267,15 @@ class Pos:
         unreachable for a reason that has nothing to do with the graph. Reading one width is what
         makes the comparison a statement about the capture.
 
-        The prefill keeps its prefix: its `stop` is the chunk's own group count rather than a
-        position in the sequence, and the mask it applies downstream is shaped for it.
+        The prefill keeps its prefix: its `stop` is the forward's own group count rather than a
+        position in the sequence, and the mask it applies downstream is shaped for it. That holds for
+        a *later* chunk too, which is why the count of queries is what the choice turns on and not the
+        position: a chunk's first query reaches every group written before it, so the whole cache is
+        read back with the tail masked, and the prefix is only as wide as the groups this chunk
+        itself reaches. A decode step -- one query, and the only path a capture records -- keeps the
+        whole cache, which is what `seqlen == 1` says.
         """
-        return slice(0, stop) if self.first() else slice(0, full)
+        return slice(0, stop) if seqlen > 1 or self.first() else slice(0, full)
 
     def __repr__(self) -> str:
         where = f"{self._tensor.device} tensor" if self._tensor is not None else "host int"

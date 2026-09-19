@@ -253,13 +253,39 @@ def resolve_pool_rows(requested: int, expert_device: str | None) -> int:
     return int(requested) if expert_device is not None else 0
 
 
+def resolve_prompt(prompt: str | None, prompt_file: str | None) -> str:
+    """The prompt text: from `--prompt-file` when it was given, else from `--prompt`, else the default.
+
+    The two flags are one mutually exclusive group, so at most one of the first two arguments is set
+    and the order of the branches is not a precedence rule but the only case left. It is a function
+    for the same reason `resolve_pool_rows` is: what the flag does to the string is everything about
+    it a test without four cards can hold still -- the tokenizer call that follows needs a
+    checkpoint, and the file read is the part that has a wrong answer.
+    """
+    if prompt_file is not None:
+        with open(prompt_file, encoding="utf-8") as handle:
+            return handle.read()
+    return "The capital of France is" if prompt is None else prompt
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="torchrun --nproc_per_node=4 -m src.cli.generate_v41",
         description="Generate text from DeepSeek-V4.1-Flash with the dense tree cut across the cards.",
     )
     parser.add_argument("--checkpoint", required=True, help="the released checkpoint directory")
-    parser.add_argument("--prompt", default="The capital of France is")
+    # One prompt, two ways to hand it over, and the file is the one a long context has to use: a
+    # single argv entry cannot exceed `MAX_ARG_STRLEN`, 128 KiB, and 256K tokens is several times
+    # that, so the prompt this flag exists for -- the one `--prefill-chunk-tokens` exists for --
+    # does not fit in an argument at all. Both paths tokenize the same string.
+    prompt_source = parser.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompt", default=None,
+                               help="the prompt as one argument. Cannot carry a long context; see "
+                                    "--prompt-file. Default: 'The capital of France is'")
+    prompt_source.add_argument("--prompt-file", default=None, metavar="PATH",
+                               help="read the prompt from PATH. This is how a prompt too long for "
+                                    "an argv entry gets in, which is every prompt the chunked "
+                                    "prefill is for")
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0 is greedy, which is the default and the reproducible one")
@@ -270,6 +296,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "length, so it is a memory budget and not a limit that grows: the "
                              "default is the prompt plus the tokens asked for, rounded up, and "
                              "`--max-seq-len` is how a caller asks for the model's full 1M")
+    parser.add_argument("--prefill-chunk-tokens", type=int, default=None,
+                        help="run the prompt through the layers this many tokens at a time instead "
+                             "of in one forward. The activations that scale with the prompt are the "
+                             "per-row ones -- the Hyper-Connections mixing is `[s, 20480]` fp32, "
+                             "21 GiB at 256K -- so a chunk is what puts a long context on a 22 GiB "
+                             "card at all; the layers' caches carry across chunks, and a chunked "
+                             "prompt is the same arithmetic as an unchunked one only from a chunk "
+                             "of `index_topk * compress_ratio` tokens up, below which a chunk has "
+                             "fewer compressed positions to choose from than the full prompt has. "
+                             "Default: off, one forward")
     parser.add_argument("--decode-graphs", action=argparse.BooleanOptionalAction, default=False,
                         help="replay each layer's decode forward from a captured CUDA graph instead "
                              "of running it. A block is 213 kernel launches and 244 host API calls "
@@ -437,9 +473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Every rank tokenizes the same prompt: it is a deterministic CPU step and cheaper than a
     # broadcast, which is why the GLM entry point does the same thing. It is done before the load
     # because the sequence length the caches are sized at comes out of it.
-    prompt_ids = tokenizer(args.prompt)["input_ids"]
+    prompt_ids = tokenizer(resolve_prompt(args.prompt, args.prompt_file))["input_ids"]
     if not prompt_ids:
-        raise SystemExit("--prompt tokenized to nothing")
+        raise SystemExit("the prompt tokenized to nothing")
     max_seq_len = args.max_seq_len
     if max_seq_len is None:
         # The caches are `register_buffer`-ed at this length rather than grown, and the default the
@@ -459,6 +495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         + (f", {pool_rows} pooled rows a card" if pool_rows else "")
         + (f", {args.expert_buffers} staging arenas a layer" if args.expert_buffers != 2 else "")
         + (", experts batched a chunk a call" if args.expert_batched else "")
+        + (f", prefill {args.prefill_chunk_tokens} tokens a forward" if args.prefill_chunk_tokens else "")
         + (", decode graphed a block at a time" if args.decode_graphs else "")
     )
     started = time.perf_counter()
@@ -535,6 +572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         eos_token_id=tokenizer.eos_token_id,
         seed=args.seed,
         graphs=args.decode_graphs,
+        prefill_chunk=args.prefill_chunk_tokens,
         on_token=on_token if dumping else None,
     )
     if dumping:

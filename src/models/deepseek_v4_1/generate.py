@@ -95,6 +95,7 @@ def generate(
     seed: int | None = None,
     on_token: Callable[[int, torch.Tensor], None] | None = None,
     graphs: bool = False,
+    prefill_chunk: int | None = None,
 ) -> Generation:
     """Prefill `prompt_ids`, then decode up to `max_new_tokens` more.
 
@@ -103,6 +104,14 @@ def generate(
     differ from the second position on, by fp32 reduction order across 40 layers, which
     `docs/performance/deepseek_v4_1_flash_host_run.md` bisects -- so a caller comparing against a
     reference has to pick one and say which.
+
+    `prefill_chunk` splits that one call into calls of `prefill_chunk` tokens, which is what a prompt
+    longer than the card can hold in one forward needs: the activations that are linear in the
+    sequence length -- the Hyper-Connections mixing and the MTP hidden states -- are per-row, so they
+    are the same tensors a chunk at a time and a 21 GiB tensor all at once. It is a *different
+    arithmetic*, by the same reduction order the paragraph above is about, and it is not free: the
+    layers' continuation bodies walk the chunk rather than running one vectorized expression. `None`
+    runs the prompt in one forward.
 
     `on_token` is called with each new token id and the logits that produced it, before the next
     forward, for a caller that wants to stream. With `temperature > 0` the sampling is seeded by
@@ -133,13 +142,15 @@ def generate(
         model.temperature = 0.0
     loop = _decode_graphs if graphs and max_new_tokens > 0 else _decode
     try:
-        return loop(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token)
+        return loop(
+            front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk
+        )
     finally:
         if saved_temperature is not None:
             model.temperature = saved_temperature
 
 
-def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token) -> Generation:
+def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None) -> Generation:
     """The loop, with the model's own sampling already taken out of the picture."""
     generator = None
     if seed is not None:
@@ -151,8 +162,9 @@ def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, 
     result = Generation(prompt_tokens=len(ids))
 
     # The prompt is one forward. Its last row is the distribution the first new token comes from,
-    # so the first new token costs no extra forward.
-    _, logits, _ = front(torch.tensor([ids]), position)
+    # so the first new token costs no extra forward. `decode_seconds` starts after it, so splitting
+    # the forward into chunks moves work between the two numbers rather than into either of them.
+    _, logits, _ = front(torch.tensor([ids]), position, chunk=prefill_chunk)
     position += len(ids)
 
     started = time.perf_counter()
@@ -194,7 +206,9 @@ def _cache_device(model) -> torch.device:
     )
 
 
-def _decode_graphs(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token) -> Generation:
+def _decode_graphs(
+    front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None
+) -> Generation:
     """`_decode` with every block replayed from a captured graph, split around the expert call.
 
     The loop is the same loop and the difference is where the position lives. A graph freezes
@@ -227,8 +241,9 @@ def _decode_graphs(front, ids, max_new_tokens, temperature, top_k, eos_token_id,
 
     # The prompt is one eager forward, before any graph exists: prefill branches on the position
     # being zero and is a different body from the one a graph holds, so a layer handed a graph here
-    # would record the wrong one.
-    _, logits, _ = front(torch.tensor([ids]), 0)
+    # would record the wrong one. Chunked it is still eager and still before the capture, and the
+    # caches it leaves behind are the caches the capture records from.
+    _, logits, _ = front(torch.tensor([ids]), 0, chunk=prefill_chunk)
 
     # The prefill's last row is the distribution the first new token comes from, so it is picked
     # before anything is captured -- and a generation that stops on it never builds a graph at all.

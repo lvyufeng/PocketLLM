@@ -742,6 +742,7 @@ class Backbone(nn.Module):
         start_pos: int = 0,
         hash_ids: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
+        chunk: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """input_ids: [b, s]. Returns (output_ids, logits, main_hidden).
 
@@ -749,6 +750,20 @@ class Backbone(nn.Module):
         out. It is required exactly when the model has Engram layers, checked here rather than
         raised from inside the loop: a missing table would otherwise first show up as an attribute
         error 40 layers in, after minutes of expert staging.
+
+        `chunk` runs the prompt `chunk` tokens at a time, each chunk a forward of its own through
+        layers that carry their caches, and it exists because two of the activations a forward holds
+        are linear in the sequence length and neither is needed for more than the row it is computed
+        on: the Hyper-Connections mixing reads one `[s, hc_mult * dim]` fp32 tensor, which at 256K
+        is 21 GiB by itself, and `main_hiddens` is another 8 GiB. Every layer already keeps its own
+        state in its caches, so the chunks compose into the same forward -- the continuation bodies
+        in `attention.py` are what make that exact rather than approximate, and
+        `tests/test_models_deepseek_v4_1_chunked_prefill.py` holds them to it. `None` (the default)
+        runs the whole prompt at once, which is what every length that fits already does.
+
+        `main_hidden` is the *last* chunk's: the MTP head predicts from the tail of the sequence, and
+        the earlier chunks' rows are exactly the linear-in-`s` tensor this exists to not hold. A
+        chunked forward therefore cannot be asked for the full-sequence form, and does not return it.
         """
         if any(block.engram is not None for block in self.layers) and hash_ids is None:
             raise ValueError("this model has Engram layers, so `hash_ids` is required")
@@ -762,22 +777,32 @@ class Backbone(nn.Module):
             if image_mask is not None:
                 image_mask = image_mask.to(self.device)
         # image tokens take no part in an n-gram and get no engram contribution; text-only needs no mask
-        engram_mask = None if image_mask is None else ~image_mask
-
-        h = self.embed(input_ids)
-        # Expand to hc_mult copies for Hyper-Connections
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        main_hiddens = []
-        pre_mix = make_identity_pre_mix(h, self.hc_mult)
+        total = input_ids.size(1)
+        chunk = total if not chunk else min(int(chunk), total)
         shared = SharedAttentionRuntime()
-        for i, block in enumerate(self.layers):
-            if block.engram is not None:
-                h = block.engram(h, hash_ids[:, :, block.engram.layer_hash_index, :], engram_mask)
-            # the MTP head reads the attention input of its target layers, not their output
-            if i in self.target_layer_ids:
-                main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = block(h, start_pos, pre_mix, image_mask, shared)
-        h = self.layers[-1].hc_pre(h, pre_mix)
+        main_hiddens: list[torch.Tensor] = []
+        h = None
+        for c0 in range(0, total, chunk):
+            c1 = min(c0 + chunk, total)
+            at = start_pos + c0
+            mask = None if image_mask is None else image_mask[:, c0:c1]
+            engram_mask = None if mask is None else ~mask
+            h = self.embed(input_ids[:, c0:c1])
+            # Expand to hc_mult copies for Hyper-Connections
+            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            # Per chunk, not per sequence: the mix is produced by one sub-block and consumed by the
+            # next, so a chunk's first sub-block starts from the identity and the last one's is the
+            # `hc_pre` below. `h`, and so this, is `[s, hc_mult * dim]` -- the reason for the chunk.
+            pre_mix = make_identity_pre_mix(h, self.hc_mult)
+            for i, block in enumerate(self.layers):
+                if block.engram is not None:
+                    h = block.engram(h, hash_ids[:, c0:c1, block.engram.layer_hash_index, :], engram_mask)
+                # the MTP head reads the attention input of its target layers, not their output
+                if i in self.target_layer_ids and c1 == total:
+                    main_hiddens.append(h.mean(dim=2))
+                h, pre_mix = block(h, at, pre_mix, mask, shared)
+            h = self.layers[-1].hc_pre(h, pre_mix)
+        # After the loop, so a chunked forward pays for one head and not one per chunk.
         logits = self.head(self.norm(h))
         output_ids = sample(logits, self.temperature)
         main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None

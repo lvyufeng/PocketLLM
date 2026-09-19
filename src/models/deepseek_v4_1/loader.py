@@ -722,8 +722,16 @@ class LoadedBackbone:
         token_ids: torch.Tensor,
         start_pos: int = 0,
         image_mask: torch.Tensor | None = None,
+        chunk: int | None = None,
     ):
-        """One forward over `token_ids`, hashing them first. Returns `Backbone.forward`'s triple."""
+        """One forward over `token_ids`, hashing them first. Returns `Backbone.forward`'s triple.
+
+        `chunk` is `Backbone.forward`'s, and it is the whole prompt's hash ids either way: the hasher
+        writes them into its cache in one slice, and each chunk of the forward reads the rows that
+        belong to it. Hashing a chunk at a time would write the same rows, one slice per chunk, for
+        no gain -- the ids are `n_hash_cols` int64 per token per Engram layer, which is bytes and not
+        the activations the chunk exists to bound.
+        """
         hashes = None
         if self.hash_ids is not None:
             # An image span takes no part in an n-gram, which is the same statement `Backbone` makes
@@ -734,7 +742,7 @@ class LoadedBackbone:
             hashes = self.hash_ids(
                 token_ids, int(start_pos), None if image_mask is None else ~image_mask
             )
-        return self.model(token_ids, start_pos, hashes, image_mask)
+        return self.model(token_ids, start_pos, hashes, image_mask, chunk)
 
     def reset_state(self, batch_size: int) -> None:
         self.model.reset_state(batch_size)
