@@ -962,24 +962,55 @@ __global__ void prefill_sparse_attn_headpair_kernel(
     }
     __syncthreads();
 
-    for (int t = tid; t < topk; t += blockDim.x) {
+    // One key per warp rather than one per thread. `dim` is 512, so the loop this replaces was 512
+    // dependent FMAs on a single thread whose warp's other 31 lanes were each walking a *different*
+    // 2 KB row: the arithmetic was latency-bound and the loads were 32-way scattered. Splitting the
+    // dot across the lanes makes the 32 loads of a step one coalesced run of the key, and turns the
+    // chain into 16 FMAs plus five shuffles. `blockDim.x` is `kAttnThreads`, 256, so `num_warps` is
+    // eight and every one of them takes keys; the `static_assert` below is what keeps a later edit to
+    // that constant from leaving `num_warps` at zero and spinning this loop.
+    //
+    // The price is a different summation order, and it is measured rather than asserted. On a
+    // 4096-token key set at 16 heads the two builds differ on 0.0056% of the outputs, by at most
+    // 6.104e-05 against a tensor whose largest element is 0.0206 -- and each build sits exactly that
+    // far from the torch fp32 reference for this pass, so the re-association does not move it further
+    // from the reference than the serial dot already is. It does move the whole model: over 32768
+    // tokens at chunk 4096 the top-8 tokens the prompt produces change one member and reorder two,
+    // and the staged expert rows go 77484 -> 78969. Both were reproduced by restoring the serial
+    // build and re-running it, so they are this change and not drift. A caller that needs the serial
+    // dot's exact bits has to keep this kernel out of the build; there is no flag for it.
+    static_assert(kAttnThreads >= 32 && kAttnThreads % 32 == 0,
+                  "prefill_sparse_attn_headpair_kernel scores one key per warp");
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
+    for (int t = warp; t < topk; t += num_warps) {
         const int idx = idx_shared[t];
         float score0 = -INFINITY;
         float score1 = -INFINITY;
         if (idx >= 0 && idx < kv_len) {
             float acc0 = 0.0f;
             float acc1 = 0.0f;
-            const scalar_t* kv_ptr = kv_base + idx * dim;
-            for (int d = 0; d < dim; ++d) {
+            const scalar_t* kv_ptr = kv_base + static_cast<size_t>(idx) * dim;
+            for (int d = lane; d < dim; d += 32) {
                 const float v = static_cast<float>(kv_ptr[d]);
                 acc0 += q0_shared[d] * v;
                 if (has_h1) acc1 += q1_shared[d] * v;
             }
+            for (int off = 16; off > 0; off >>= 1) {
+                acc0 += __shfl_xor_sync(0xffffffffu, acc0, off);
+                if (has_h1) acc1 += __shfl_xor_sync(0xffffffffu, acc1, off);
+            }
             score0 = acc0 * softmax_scale;
             if (has_h1) score1 = acc1 * softmax_scale;
         }
-        scores0[t] = score0;
-        if (has_h1) scores1[t] = score1;
+        // Every lane holds the same sum after the reduction, so lane 0's copy is the score; the keys
+        // whose index was out of range leave it at -INFINITY on all lanes, which is what the serial
+        // version wrote for them too.
+        if (lane == 0) {
+            scores0[t] = score0;
+            if (has_h1) scores1[t] = score1;
+        }
     }
     __syncthreads();
 
