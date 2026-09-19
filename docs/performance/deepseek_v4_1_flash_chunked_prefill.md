@@ -21,12 +21,12 @@ hold it to that; the second half is what a chunk costs, and where those seconds 
 | --- | --- |
 | Model | DeepSeek-V4.1-Flash, released checkpoint, fp8 dense + packed-fp4 experts |
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB, resident bank attached from the 457.78 GiB `/dev/shm` segment |
-| Commit | `5e7ff05` on `feature/v41-256k-context`, stacked on `89d0e88` on `perf/v41-hc-token-tile`, both against `master` `a533a0a` |
+| Commit | `5e7ff05` on `feature/v41-256k-context`, stacked on `89d0e88` on `perf/v41-hc-token-tile` and comments only on that branch since (`83ed600`), both against `master` `a533a0a` |
 | Configuration | TP4, one process a card, `torchrun --nproc_per_node=4`, `--threads 22`, `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, `--pool-rows 148` |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each, GPU0-GPU1 PHB and GPU2-GPU3 NV2, cross-pairs SYS |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env |
-| Probes | `/tmp/probe_v41_chunk_scaling.py` (the sweep), `/tmp/probe_v41_chunk_profile.py` (one chunk, phase by phase), `/tmp/diag_retention.sh` (the per-process retention diagnostic) |
+| Probes | `/tmp/probe_v41_chunk_scaling.py` (the sweep), `/tmp/probe_v41_chunk_profile.py` (one chunk, phase by phase), `/tmp/probe_v41_seed.py` (ten taps inside layer 0 and layer 1), `/tmp/diag_retention.sh` (the per-process retention diagnostic) |
 
 ## Why a chunk and not a bigger card
 
@@ -108,11 +108,31 @@ Two bounds come with that, both stated on the flag rather than discovered:
   for its selection to have the candidates a one-shot forward's has. Below that the indexer chooses
   among fewer compressed positions and the answer genuinely differs, which is `--prefill-chunk-tokens`
   own caveat and not a rounding matter.
-* `/tmp/probe_v41_seed.py` measures that first kind at real scale: one 4093-token prompt at a
-  2048-token chunk, both arms on the four cards, tapped inside layer 0 and layer 1 to name the module
-  the two orderings first separate in. It is the one place here where the two arms are compared
-  inside the stack rather than at the logits, and it is why the taps reach past the attention output
-  of layer 0 — the last tensor both arms are known to agree on — rather than stopping there.
+* `/tmp/probe_v41_seed.py` measures that first kind at real scale and names where it starts. One
+  4093-token prompt at a 2048-token chunk, both arms on the four cards, ten taps read inside layer 0
+  and layer 1 with the compared span cut to the last chunk's 2045 rows. Three of those taps come out
+  **bit-identical**: layer 0's attention output, its MoE input, and its *dense* shared expert. The
+  first of the three is the control, being the last tensor the two arms were already known to agree
+  on; the second is what every cache a boundary carries is ultimately consumed by, and the third is
+  the one MoE path whose call shape did not change. The gate is tapped as the *set* of experts a token
+  picks rather than elementwise, because a top-k over scores that can tie is not pinned in order, and
+  the sets agree exactly: **0 of 2045 rows pick a different expert set**, and none of them reorder.
+
+  The first differences are `1e-6`, in the gate's weights on 89% of their entries and in the **routed**
+  experts on 89% of theirs — the two modules whose GEMM row count went from 4093 to 2045. That is the
+  shape of a re-tiling and not of a boundary carrying a wrong value: a slot written in the wrong place,
+  a group counted from the wrong position or an indexer reaching too short would all have shown up in
+  the attention output or the MoE input first, and those are the two taps that agreed. So the boundary
+  state composes, and what is left is the number of rows the GEMM is handed. `moe_out` then differs by
+  at most `2^-8` — one bf16 ULP of a value in `[1, 2)`, a rounding step and not an error — on 0.03% of
+  its entries. From there it travels and grows: layer 1's Engram by `2^-9` on 0.004% of its entries,
+  layer 1's attention input by `3.7e-4` on 0.007%, and the last row's logits end **0.2159** apart,
+  with the argmax unchanged.
+
+  Running the one-shot arm a second time is the control for all of it, and it is **bit-identical at
+  every one of the ten taps**, last-row logits included. So none of the above is run-to-run drift: the
+  engine is deterministic, and a chunked prefill reproduces exactly at a given chunk width. What it
+  cannot do is reproduce the one-shot logits, which is the point of this section.
 
 ## What a chunked prefill costs
 
