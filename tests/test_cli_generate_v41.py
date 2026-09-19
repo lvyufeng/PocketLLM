@@ -15,13 +15,21 @@ tuning choice but the *decode* path's own rotation, the one every graphed-decode
 with. A default that drifted upward to make a prefill faster would move the decode step under the
 numbers that validated it, so 2 is asserted as a literal here and the layer's ring is the only place
 allowed to consume a different one.
+
+`--prompt-file` is neither a size nor a default, and it is here because of what the flag is *for*:
+the prompt a chunked prefill exists to run. A single argv entry cannot exceed `MAX_ARG_STRLEN`, 128
+KiB, so a 256K-token prompt cannot be passed as an argument at all and the file is the only route
+in. The tests below pin the read and the mutual exclusion; the token count is the caller's business
+and is measured on the cards.
 """
 
 from __future__ import annotations
 
 import inspect
 
-from src.cli.generate_v41 import build_arg_parser, resolve_pool_rows
+import pytest
+
+from src.cli.generate_v41 import build_arg_parser, resolve_pool_rows, resolve_prompt
 from src.models.deepseek_v4_1.loader import load_backbone
 
 # The width the default, the batched path's end-to-end number and the 512-token pool sweeps were all
@@ -89,4 +97,47 @@ def test_the_ring_width_reaches_the_layer_that_builds_it() -> None:
     assert "pinned_buffers=expert_buffers" in inspect.getsource(load_backbone), (
         "`load_backbone` takes the ring width and does not pass it to `DeviceRoutedExperts`, so "
         "`--expert-buffers` parses and is then silently ignored"
+    )
+
+
+def test_the_prompt_defaults_to_the_short_one_and_can_be_given_as_an_argument() -> None:
+    assert resolve_prompt(None, None) == "The capital of France is"
+    assert resolve_prompt("The capital of France is", None) == "The capital of France is"
+    assert resolve_prompt("hello", None) == "hello"
+
+
+def test_the_prompt_file_carries_what_an_argument_cannot(tmp_path) -> None:
+    """The flag's whole reason: a prompt past `MAX_ARG_STRLEN` has no other way in.
+
+    A 256K-token prompt is several megabytes of text, so the file is not a convenience -- writing the
+    prompt into an argument is refused by the kernel at 128 KiB (`MAX_ARG_STRLEN`, 32 pages) with an
+    `E2BIG` that names `execve` and not the flag. The length asserted here is past that page count on
+    purpose, since a file route that worked only up to an argument's size would be no route at all.
+    """
+    assert len(resolve_prompt(None, _prompt_file(tmp_path, "x" * (32 * 4096 + 1)))) == 32 * 4096 + 1
+    assert resolve_prompt(None, _prompt_file(tmp_path, "line one\nline two\n")) == "line one\nline two\n"
+
+
+def _prompt_file(tmp_path, text: str) -> str:
+    path = tmp_path / "prompt.txt"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
+
+
+def test_the_two_ways_of_giving_a_prompt_are_mutually_exclusive() -> None:
+    """Both at once is a run that silently used one of them, which is the failure to refuse.
+
+    `main` reads the file when it is set, so `--prompt` beside it would parse, be dropped, and leave
+    the caller thinking they had overridden a file they had not. `argparse` refuses the pair instead.
+    """
+    with pytest.raises(SystemExit):
+        _defaults("--prompt", "a", "--prompt-file", "/tmp/prompt.txt")
+
+
+def test_a_prompt_file_reaches_the_parser_under_its_own_name() -> None:
+    assert _defaults("--prompt-file", "/tmp/prompt.txt").prompt_file == "/tmp/prompt.txt"
+    assert _defaults("--prompt-file", "/tmp/prompt.txt").prompt is None
+    assert _defaults().prompt is None, (
+        "a parser default here would be indistinguishable from a caller's `--prompt` in "
+        "`resolve_prompt`, which is what makes the two flags mutually exclusive rather than ordered"
     )
