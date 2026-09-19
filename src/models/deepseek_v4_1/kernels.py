@@ -83,6 +83,21 @@ _FP4_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 # derived scale at exactly `2**-9` -- the smallest value E4M3 can still represent as nonzero.
 _E4M3_MIN_SUBNORMAL = 2.0**-9
 
+# Both codebooks are host tuples turned into a device tensor per call, so the same eight or sixteen
+# floats are re-copied over PCIe on every quantize. That is a pageable H2D -- a launch-time cost on
+# the hot path and a hard failure inside a CUDA graph capture -- so the copy is kept per device.
+_FP4_LEVEL_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_SIGNED_LEVEL_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _levels_for(device: torch.device, cache: dict[torch.device, torch.Tensor], values) -> torch.Tensor:
+    device = torch.device(device)
+    levels = cache.get(device)
+    if levels is None:
+        levels = torch.tensor(values, dtype=torch.float32, device=device)
+        cache[device] = levels
+    return levels
+
 
 def fp4_act_quant_e4m3(
     x: torch.Tensor,
@@ -141,7 +156,7 @@ def _fp4_codes(normalized: torch.Tensor) -> torch.Tensor:
     relies on rather than chosen.
     """
     magnitude = normalized.abs()
-    levels = torch.tensor(_FP4_MAGNITUDES, dtype=torch.float32, device=normalized.device)
+    levels = _levels_for(normalized.device, _FP4_LEVEL_CACHE, _FP4_MAGNITUDES)
     upper = torch.searchsorted(levels, magnitude, right=False).clamp(1, len(_FP4_MAGNITUDES) - 1)
     lower = upper - 1
     # Round half to even: a tie goes to whichever of the two codes is even.
@@ -153,8 +168,8 @@ def _fp4_codes(normalized: torch.Tensor) -> torch.Tensor:
 
 def _fp4_values(codes: torch.Tensor) -> torch.Tensor:
     """The inverse of `_fp4_codes`, as float32."""
-    levels = torch.tensor(
-        [*_FP4_MAGNITUDES, *(-m for m in _FP4_MAGNITUDES)], dtype=torch.float32, device=codes.device
+    levels = _levels_for(
+        codes.device, _FP4_SIGNED_LEVEL_CACHE, [*_FP4_MAGNITUDES, *(-m for m in _FP4_MAGNITUDES)]
     )
     return levels[codes.long()]
 

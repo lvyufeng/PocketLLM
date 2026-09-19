@@ -112,8 +112,19 @@ def _repeat_block_scales_2d(scales: torch.Tensor, block_m: int, block_k: int, ro
     return out[:, :cols]
 
 
+# The codebook is a constant, but `_FP4_LEVELS` lives on the host, so every call used to copy it to
+# the card. That copy is a pageable H2D -- a launch-time cost on the hot path and a hard failure
+# inside a CUDA graph capture -- and there is no reason to pay it twice for the same device.
+_FP4_LEVEL_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
 def _fp4_levels(device: torch.device) -> torch.Tensor:
-    return _FP4_LEVELS.to(device=device)
+    device = torch.device(device)
+    levels = _FP4_LEVEL_CACHE.get(device)
+    if levels is None:
+        levels = _FP4_LEVELS.to(device=device)
+        _FP4_LEVEL_CACHE[device] = levels
+    return levels
 
 
 def _quantize_fp4_codes(x: torch.Tensor) -> torch.Tensor:

@@ -188,6 +188,26 @@ from src.models.deepseek_v4_1.generate import generate
 __all__ = ["main", "resolve_pool_rows", "setup_distributed"]
 
 
+def read_bytes() -> int:
+    """What this process has read off the block layer so far, in bytes.
+
+    A decode step whose weights are all resident reads nothing, and one that has quietly fallen back
+    to the checkpoint bank reads gigabytes a token -- so this is the counter that distinguishes a
+    fast step from a step that was fast because the page cache answered for it
+    (`v41_device_step_is_a_page_cache_number`). Summed over the whole process and not per step, so
+    the column to read is whether it is flat across the measured tokens or climbing.
+    """
+    try:
+        with open("/proc/self/io", "rb") as handle:
+            for line in handle:
+                if line.startswith(b"read_bytes:"):
+                    return int(line.split(b":")[1])
+    except OSError:
+        # Not Linux, or a kernel without `io`: the column is then absent rather than wrong.
+        pass
+    return -1
+
+
 def setup_distributed() -> tuple[int, int, int, torch.device | None]:
     """`(world, rank, local_rank, device)` from the environment torchrun left behind.
 
@@ -250,6 +270,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "length, so it is a memory budget and not a limit that grows: the "
                              "default is the prompt plus the tokens asked for, rounded up, and "
                              "`--max-seq-len` is how a caller asks for the model's full 1M")
+    parser.add_argument("--decode-graphs", action=argparse.BooleanOptionalAction, default=False,
+                        help="replay each layer's decode forward from a captured CUDA graph instead "
+                             "of running it. A block is 213 kernel launches and 244 host API calls "
+                             "a token with the device busy 11%% of the time, and the graph is the "
+                             "only lever that reaches the launches; the split is forced rather than "
+                             "chosen, because the routed expert call reads its row ids back to the "
+                             "host and synchronizes, so the step is graph A -> eager experts -> "
+                             "graph B and the experts' own cost is untouched. Same tokens at the "
+                             "same positions as the eager path, and a pool of card memory on the "
+                             "other side of the choice: 40 layers share one pool. Needs a card "
+                             "(the position reaches the graphs as a tensor) and a "
+                             "--max-new-tokens above zero (the recording is a decode step). "
+                             "Default off. `--no-decode-graphs` is the control column")
+    parser.add_argument("--dump-logits", default=None, metavar="PATH",
+                        help="write every generated token and the full logits row that produced "
+                             "it to PATH, as a `torch.save`d dict of `tokens`, `logits` and "
+                             "`read_bytes`. This is how the two columns of a decode comparison are "
+                             "put beside each other: the rows are the thing the graphed and eager "
+                             "paths have to agree on, token for token, and a run that only prints "
+                             "the decoded text cannot show a divergence before the text does. The "
+                             "`read_bytes` column is `/proc/self/io` sampled once per token, which "
+                             "is where a step that quietly went back to the checkpoint bank shows "
+                             "up as a climb instead of as extra milliseconds")
     parser.add_argument("--device", default=None, metavar="DEVICE",
                         help="build the dense tree on DEVICE in this process, with no process group "
                              "and an undivided tree. One card cannot hold the whole tree -- it runs "
@@ -302,6 +345,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "2690. 0 turns the mechanism off and is the control column. Defaults to "
                              "288 on the device path and is forced to 0 on the host path, where "
                              "there is no arena to pool rows in. Needs --expert-device")
+    parser.add_argument("--expert-buffers", type=int, default=2, metavar="N",
+                        help="pinned staging arenas a layer rotates through, so that a buffer is "
+                             "not overwritten while the H2D reading it is still in flight. The ring "
+                             "is the pipeline's depth: the host may stage a row and issue its copy, "
+                             "and the slot it takes is the one whose event was recorded N-1 "
+                             "stagings ago. Costs 35.9 MB of page-locked RAM an arena a layer -- "
+                             "2.9 GiB for the default 2, 5.7 GiB at 4 -- and no device memory. 2 is "
+                             "what the per-row path's sweep chose (`_take_buffer` was 10-29 ms "
+                             "against a stage of 4-8 s there); on the batched path the same wait is "
+                             "7.03 s of a 27.64 s class wall on rank 0, so the width is a prefill "
+                             "question and this flag is how it gets asked")
     parser.add_argument("--expert-batched", action=argparse.BooleanOptionalAction, default=True,
                         help="issue a prefill a chunk at a time through moe_multi_token_fp4_forward "
                              "instead of a row at a time through moe_single_token_fp4_forward. "
@@ -403,7 +457,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{'on' if resident_bank.enabled() else 'off'}"
         + (f", {args.expert_hot_rows} resident rows a card" if args.expert_hot_rows else "")
         + (f", {pool_rows} pooled rows a card" if pool_rows else "")
+        + (f", {args.expert_buffers} staging arenas a layer" if args.expert_buffers != 2 else "")
         + (", experts batched a chunk a call" if args.expert_batched else "")
+        + (", decode graphed a block at a time" if args.decode_graphs else "")
     )
     started = time.perf_counter()
     front = load_backbone(
@@ -418,6 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         expert_world=expert_world,
         expert_hot_rows=args.expert_hot_rows,
         expert_pool_rows=pool_rows,
+        expert_buffers=args.expert_buffers,
         expert_batched=args.expert_batched,
         # The bank is filled by rank 0 and attached by everyone else, so a rank here is both the
         # tree's rank and the stagger the bank wants: four ranks must not read `/mnt/data3` at once.
@@ -450,6 +507,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         dist.barrier()
 
     started = time.perf_counter()
+    # The two columns of a comparison are two runs of this function at the same prompt, so the
+    # per-token records have to come out of the loop itself: `on_token` is called with the row the
+    # greedy pick was made from, before the next step, on both paths and at the same points.
+    tokens_seen: list[int] = []
+    logits_seen: list[torch.Tensor] = []
+    io_seen: list[int] = []
+    # One rank's column, and it is rank 0's: every rank computes the same logits (`the ranks stay
+    # in lockstep without a broadcast` above), and the text the run prints is rank 0's, so a dump
+    # written by all four would be four files agreeing with each other about the same thing.
+    dumping = bool(args.dump_logits) and rank == 0
+
+    def on_token(token: int, logits: torch.Tensor) -> None:
+        tokens_seen.append(int(token))
+        # Off the card and off the graph stream immediately: the row is 129280 floats and the next
+        # step overwrites it in place, so a reference kept on the device would be the same row 64
+        # times over.
+        logits_seen.append(logits.detach().float().cpu().clone())
+        io_seen.append(read_bytes())
+
     result = generate(
         front,
         prompt_ids,
@@ -458,13 +534,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         top_k=args.top_k,
         eos_token_id=tokenizer.eos_token_id,
         seed=args.seed,
+        graphs=args.decode_graphs,
+        on_token=on_token if dumping else None,
     )
+    if dumping:
+        torch.save(
+            {
+                "tokens": tokens_seen,
+                "logits": torch.stack(logits_seen) if logits_seen else torch.empty(0),
+                "read_bytes": io_seen,
+                "decode_graphs": bool(args.decode_graphs),
+                "prompt_tokens": len(prompt_ids),
+            },
+            args.dump_logits,
+        )
+        say(f"logits dumped to {args.dump_logits} ({len(tokens_seen)} rows)")
     elapsed = time.perf_counter() - started
     if result.tokens:
+        # Two rates, and they are not the same number on the graph path. `elapsed` covers the whole
+        # call, which there includes the capture pass -- a decode step that is not one of the
+        # tokens, and the slowest one, since it runs every body twice on a side stream before
+        # recording it. `decode_seconds` is the graphed steps and the graphed steps alone, so it
+        # divides by the token count for a ms/token the eager column is comparable on.
         per = elapsed / len(result.tokens)
         say(f"{len(result.tokens)} tokens in {elapsed:.1f} s ({per:.2f} s/token), "
             f"stopped on {result.stopped}")
+        if result.decode_seconds:
+            say(f"decode steps: {result.decode_seconds:.1f} s for {len(result.tokens)} tokens "
+                f"({1000 * result.decode_seconds / len(result.tokens):.0f} ms/token)")
 
+    driver = result.driver
+    if driver is not None and driver.captured:
+        # The split, timed on the host and therefore indicative rather than a profile: the routed
+        # call synchronizes, so graph A's tail lands in `routed` and the three marks are only worth
+        # reading as a share of their total. The steps counted are the ones the marks cover -- the
+        # capture pass's replay and the step replayed behind it, then one per token -- and the pool
+        # is the forty layers' shared one, so it is a total and not a per-layer figure.
+        steps = len(result.tokens) + 1
+        marks = {key: value / steps for key, value in driver.marks().items()}
+        say(
+            f"decode graphs: {len(driver.layers)} layers, {steps} replays each, "
+            f"{driver.pool_bytes / 2**20:.1f} MiB of shared pool, host split "
+            f"{1000 * marks['a']:.1f} + {1000 * marks['routed']:.1f} + {1000 * marks['b']:.1f} ms "
+            f"(graph A / eager experts / graph B)"
+        )
+        # What the recordings and the caches hold on the card, against the 22 GiB budget
+        # (`gpu_memory_budget`). `reserved` and not `allocated` is the column to read beside a
+        # budget: allocated is what tensors hold, reserved is what the card no longer has for
+        # anything else. The peak is the one that decides whether a longer capture pass fits, and it
+        # is a per-rank number because the ranks are not symmetric -- the expert arena and the KV
+        # split differently, and an average would hide the card that is actually close.
+        say(
+            f"card memory: {torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+            f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved, "
+            f"{torch.cuda.max_memory_allocated() / 2**30:.2f} GiB peak allocated"
+        )
     # What the resident set actually did, counted rather than timed -- the same counters the class
     # keeps for exactly this, summed over the layers because each layer keeps its own. `drawn_rows`
     # is every route this rank was dealt and `expert_rows` the ones that missed and had to be staged,

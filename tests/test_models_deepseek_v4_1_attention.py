@@ -34,8 +34,13 @@ from __future__ import annotations
 
 import torch
 
-from src.models.deepseek_v4_1.attention import AttentionStack, select_candidate_blocks
+from src.models.deepseek_v4_1.attention import (
+    AttentionStack,
+    get_window_topk_idxs,
+    select_candidate_blocks,
+)
 from src.models.deepseek_v4_1.config import V41TextConfig
+from src.models.deepseek_v4_1.decode_pos import Pos
 
 # Toy geometry: six layers, two of them KV sources, three of them index sources, and the second KV
 # source doubling as the candidate source so that one layer owns both published caches. The ratios
@@ -215,3 +220,45 @@ def test_select_candidate_blocks_pins_the_open_block_and_drops_unreachable_ones(
     unreachable = torch.tensor([[2.0, 2.0, 1.0, 1.0, -torch.inf, -torch.inf, -torch.inf, -torch.inf]])
     keep = select_candidate_blocks(unreachable, torch.tensor([[4]]), topk_blocks=4, block_size=2)
     assert keep.tolist() == [[True, True, True, True, False, False, False, False]]
+
+
+def test_window_topk_idxs_agree_across_the_int_and_device_paths() -> None:
+    """The decode branch of `get_window_topk_idxs` became rotation, and the eager path kept the build.
+
+    The graph path cannot call the old code -- it built the table on the CPU and copied it, which is
+    a pageable H2D inside a capture -- so the branch is now arithmetic on the device. That makes the
+    two paths two implementations of one function, which is exactly the shape that drifts. Both are
+    therefore held against the literal `cat` they replaced, and against each other, at every position
+    that matters: below the window, at the wrap, and past it.
+
+    The ring is read oldest-first from `pos % win + 1`, and every slot past `P` is `-1`, so a
+    position near the start of a sequence has a partly-filled ring and the two must still agree.
+    """
+    positions = [1, 2, 7, 8, 63, 127, 128, 129, 255, 1024, 1025, 4095, 4096]
+    for window in (8, 128):
+        for p in positions:
+            oldest = p % window + 1
+            literal = torch.cat([torch.arange(oldest, window), torch.arange(oldest)])
+            literal = torch.where(literal > p, -1, literal).int().unsqueeze(0)
+
+            eager = get_window_topk_idxs(window, 1, 1, p)
+            assert torch.equal(eager, literal.expand(1, -1, -1).contiguous()), f"host path at {p}"
+
+            if torch.cuda.is_available():
+                device = get_window_topk_idxs(window, 1, 1, Pos.device(p, "cuda:0"))
+                assert torch.equal(device.cpu(), eager), f"device path at {p}"
+
+
+def test_window_topk_idxs_prefill_branch_is_untouched() -> None:
+    """`Pos.first()` still routes position 0 to the chunk build, on both paths."""
+    seqlen = 8
+    end = torch.arange(seqlen).unsqueeze(1)
+    literal = (end - 128 + 1).clamp(0) + torch.arange(min(seqlen, 128))
+    literal = torch.where(literal > end, -1, literal).int().unsqueeze(0)
+
+    assert torch.equal(get_window_topk_idxs(128, 1, seqlen, 0), literal.expand(1, -1, -1))
+    if torch.cuda.is_available():
+        assert torch.equal(
+            get_window_topk_idxs(128, 1, seqlen, Pos.device(0, "cuda:0")).cpu(),
+            literal.expand(1, -1, -1),
+        )

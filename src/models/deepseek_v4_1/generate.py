@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -48,6 +49,24 @@ class Generation:
     prompt_tokens: int = 0
     stopped: str = "length"
     """`eos`, `length` (max_new_tokens reached), or `max_seq_len` (the model's context is full)."""
+
+    driver: object | None = None
+    """The `graphs.DecodeGraphs` a `graphs=True` run built, so a caller can report what it cost.
+
+    `None` on the eager path and on a graph run that stopped before its first step. The graphs stay
+    installed on the model when this returns, so a caller that wants the eager body back calls
+    `driver.release()`.
+    """
+
+    decode_seconds: float = 0.0
+    """Wall time of the decode steps alone: the prompt's forward and, on the graph path, the capture
+    pass and the step replayed behind it are all outside it.
+
+    `len(tokens)` steps either way -- both loops run one forward per new token after the first, and
+    the first token comes off the prefill -- so this divides by `len(tokens)` for a ms/token that
+    the two paths can be compared on. `elapsed / len(tokens)` over the whole call does not: on the
+    graph path it carries the capture pass, which is a step that is not one of the tokens.
+    """
 
 
 def _pick(logits: torch.Tensor, temperature: float, top_k: int | None,
@@ -75,6 +94,7 @@ def generate(
     eos_token_id: int | None = None,
     seed: int | None = None,
     on_token: Callable[[int, torch.Tensor], None] | None = None,
+    graphs: bool = False,
 ) -> Generation:
     """Prefill `prompt_ids`, then decode up to `max_new_tokens` more.
 
@@ -88,6 +108,12 @@ def generate(
     forward, for a caller that wants to stream. With `temperature > 0` the sampling is seeded by
     `seed` and reproducible only for a fixed torch build and device; greedy decoding is reproducible
     outright.
+
+    `graphs` replays each block from a captured CUDA graph instead of running it, which is
+    `_decode_graphs` below and is off by default: the same tokens at the same positions either way,
+    and a pool of card memory on the other side of the choice. It needs a card -- the position
+    reaches the graphs as a tensor -- and a `max_new_tokens` of at least one, since the recording is
+    a decode step and there is nothing to record a decode step for otherwise.
 
     Each token comes from the logits this returns, not from `Backbone.forward`'s `output_ids`, which
     the model samples by its own config `temperature` -- a field the released schema does not carry,
@@ -105,8 +131,9 @@ def generate(
     saved_temperature = getattr(model, "temperature", None)
     if saved_temperature is not None:
         model.temperature = 0.0
+    loop = _decode_graphs if graphs and max_new_tokens > 0 else _decode
     try:
-        return _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token)
+        return loop(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token)
     finally:
         if saved_temperature is not None:
             model.temperature = saved_temperature
@@ -128,21 +155,125 @@ def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, 
     _, logits, _ = front(torch.tensor([ids]), position)
     position += len(ids)
 
-    while len(result.tokens) < max_new_tokens:
-        if limit is not None and position >= limit:
-            result.stopped = "max_seq_len"
-            return result
-        token = _pick(logits[0], temperature, top_k, generator)
-        result.tokens.append(token)
-        if on_token is not None:
-            on_token(token, logits[0])
-        if eos_token_id is not None and token == eos_token_id:
-            result.stopped = "eos"
-            return result
-        _, logits, _ = front(torch.tensor([[token]]), position)
-        position += 1
+    started = time.perf_counter()
+    try:
+        while len(result.tokens) < max_new_tokens:
+            if limit is not None and position >= limit:
+                result.stopped = "max_seq_len"
+                return result
+            token = _pick(logits[0], temperature, top_k, generator)
+            result.tokens.append(token)
+            if on_token is not None:
+                on_token(token, logits[0])
+            if eos_token_id is not None and token == eos_token_id:
+                result.stopped = "eos"
+                return result
+            _, logits, _ = front(torch.tensor([[token]]), position)
+            position += 1
 
-    return result
+        return result
+    finally:
+        result.decode_seconds = time.perf_counter() - started
+
+
+def _cache_device(model) -> torch.device:
+    """The card a decode graph has to put the position on: the one the attention caches are on.
+
+    Read off a buffer rather than off `torch.cuda.current_device()`. The two agree whenever the
+    caller set the device first -- `src/cli/generate_v41.py` does -- but nothing in `load_backbone`
+    promises it, and a position tensor built on the wrong card is a device mismatch forty layers
+    down instead of a line here. `named_buffers` is what `graphs.snapshot` walks for the same
+    reason: the caches are buffers and are the only part of the tree whose location is compiled in.
+    """
+    for name, buffer in model.named_buffers():
+        if name.endswith("window_kv_cache"):
+            return buffer.device
+    raise RuntimeError(
+        "the decode graphs replay the attention layers, and this model has no `window_kv_cache` "
+        "buffer for their position to be sized against -- it is not a V4.1 backbone"
+    )
+
+
+def _decode_graphs(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token) -> Generation:
+    """`_decode` with every block replayed from a captured graph, split around the expert call.
+
+    The loop is the same loop and the difference is where the position lives. A graph freezes
+    whatever a Python value said when it was recorded, so the position here is a `decode_pos.Pos`,
+    which carries a 0-dim index tensor for the layers and the integer beside it for this loop --
+    the limit, the eos test and the pick all read the number, and the layers read the tensor.
+
+    The recording is a decode step that has to happen anyway. The prompt is forwarded first, so the
+    graphs are recorded from the activation after a real prefill and at a position in the sequence
+    rather than at zero; the first new token comes off that prefill's logits, exactly as it does in
+    `_decode`; the capture pass is then the step that consumes it. `DecodeGraphs.capture_pass`
+    rewinds the caches behind that pass -- the bodies it runs write the same slots more than once,
+    and on a layer whose compressor can emit the two variants write at positions the other would
+    not have -- so its logits describe a cache state that no longer exists. Those logits are
+    dropped and the step is run once more, this time by the graphs it just recorded, and it is
+    *that* step the loop goes on from. One extra step out of a generation, all of it before the
+    first token is picked from a graphed forward.
+    """
+    from .decode_pos import Pos
+    from .graphs import DecodeGraphs
+
+    model = getattr(front, "model", front)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    front.reset_state(1)
+    limit = getattr(model, "max_seq_len", None)
+    result = Generation(prompt_tokens=len(ids))
+
+    # The prompt is one eager forward, before any graph exists: prefill branches on the position
+    # being zero and is a different body from the one a graph holds, so a layer handed a graph here
+    # would record the wrong one.
+    _, logits, _ = front(torch.tensor([ids]), 0)
+
+    # The prefill's last row is the distribution the first new token comes from, so it is picked
+    # before anything is captured -- and a generation that stops on it never builds a graph at all.
+    if limit is not None and len(ids) >= limit:
+        result.stopped = "max_seq_len"
+        return result
+    token = _pick(logits[0], temperature, top_k, generator)
+    result.tokens.append(token)
+    if on_token is not None:
+        on_token(token, logits[0])
+    if eos_token_id is not None and token == eos_token_id:
+        result.stopped = "eos"
+        return result
+
+    pos = Pos.device(len(ids), _cache_device(model))
+    driver = DecodeGraphs(model)
+    result.driver = driver
+
+    def step(token_id: int):
+        """One decode forward, at wherever the position currently is."""
+        return front(torch.tensor([[token_id]]), pos)
+
+    driver.capture_pass(lambda: step(token))
+    started = time.perf_counter()
+    try:
+        _, logits, _ = step(token)
+        pos.advance()
+
+        while len(result.tokens) < max_new_tokens:
+            if limit is not None and pos.host >= limit:
+                result.stopped = "max_seq_len"
+                return result
+            token = _pick(logits[0], temperature, top_k, generator)
+            result.tokens.append(token)
+            if on_token is not None:
+                on_token(token, logits[0])
+            if eos_token_id is not None and token == eos_token_id:
+                result.stopped = "eos"
+                return result
+            _, logits, _ = step(token)
+            pos.advance()
+
+        return result
+    finally:
+        result.decode_seconds = time.perf_counter() - started
 
 
 def main(argv: Sequence[str] | None = None) -> int:

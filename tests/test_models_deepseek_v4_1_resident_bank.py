@@ -756,3 +756,63 @@ def test_the_environment_variable_is_what_turns_it_on(monkeypatch) -> None:
     assert rb.enabled() is True
     monkeypatch.setenv(rb.ENABLE_ENV, "no")
     assert rb.enabled() is False
+
+
+def test_pinning_is_on_unless_it_is_switched_off(monkeypatch) -> None:
+    """The other direction from `enabled`: this one defaults on, and the run says so out loud.
+
+    It is on by default because it is only ever asked by a process that has already attached the bank
+    and is about to read it through the device path, where a pageable source means every expert the
+    row missed is staged through PyTorch's pinned ring -- the copy the bank exists to delete. `0`
+    leaves the mapping pageable, which is correct and slower, and the run prints which one it got.
+    """
+    monkeypatch.delenv(rb.PIN_ENV, raising=False)
+    assert rb.pin_enabled() is True
+    monkeypatch.setenv(rb.PIN_ENV, "0")
+    assert rb.pin_enabled() is False
+    monkeypatch.setenv(rb.PIN_ENV, "false")
+    assert rb.pin_enabled() is False
+    monkeypatch.setenv(rb.PIN_ENV, "1")
+    assert rb.pin_enabled() is True
+
+
+def test_a_bank_is_not_pinned_until_it_is_asked_to_be(tmp_path) -> None:
+    """Opening a segment must not register it, and this file is the reason why.
+
+    Every bank this file builds is on `tmp_path` with no card in sight, and `open_expert_bank` is not
+    the only way one is made: a constructor that pinned would put a `cudaHostRegister` over a 458 GiB
+    mapping in the tests' path, and over any caller that only wants the offsets. Registration is
+    `pin()`, `pin()` is called from `open_expert_bank` alone, and a bank that has not been asked
+    reports `None` rather than a default.
+    """
+    bank = rb.ResidentExpertBank(
+        str(tmp_path / "segments"),
+        [],
+        1 << 20,
+        f"pocketllm_test_pin_{tmp_path.name}",
+        create=True,
+        n_routed_experts=EXPERTS,
+    )
+    try:
+        assert bank.pin_result is None, "opening a segment registered it"
+        assert bank.size == 1 << 20
+    finally:
+        bank.close(unlink=True)
+
+
+def test_a_pin_result_reports_failure_instead_of_raising() -> None:
+    """A refused registration leaves a correct, slower run, so it is a value and not an exception.
+
+    The one that has actually been observed is `/dev/shm` being full: `cudaHostRegister` over a region
+    whose pages are not resident makes the pin walk fault them in, which fails with a code that looks
+    exactly like an `RLIMIT_MEMLOCK` refusal. Anything the driver says has to reach the operator, and
+    `str` is where it does -- it names the bytes, the code and what to check.
+    """
+    failed = rb.PinResult(1, 23.4, 457 * 2**30)
+    assert failed.ok is False
+    message = str(failed)
+    assert "457.0 GiB" in message and "1" in message and "pageable" in message
+
+    ok = rb.PinResult(0, 59.6, 457 * 2**30)
+    assert ok.ok is True
+    assert "457.0 GiB pinned in 59.6 s" in str(ok)

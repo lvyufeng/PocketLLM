@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 from src.kernels.ops import act_quant, fp4_act_quant, sparse_attn
 from src.models.deepseek_v4_1.config import V41TextConfig
+from src.models.deepseek_v4_1.decode_pos import Pos, publish, write_row
 from src.models.deepseek_v4_1.kernels import fp4_act_quant_e4m3
 
 __all__ = [
@@ -181,7 +182,7 @@ def get_window_topk_idxs(
     window_size: int,
     bsz: int,
     seqlen: int,
-    start_pos: int,
+    pos: int | Pos,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """Which sliding-window cache slots each query attends to; `-1` marks a slot holding nothing.
@@ -192,20 +193,36 @@ def get_window_topk_idxs(
 
     `device` is where the table has to end up, because `Attention.forward` concatenates it against
     the card's own tensors -- a CPU table fails there the moment the tree runs anywhere but the host,
-    and the shapes are equal enough that only the `cat` catches it. The table is *built* on the host
-    and moved, not built in place: at the config's window of 128 a decode step's table is 512 bytes,
-    while the eight `arange`/`clamp`/`where` kernels it takes to build one are eight launches on a
-    stream whose busy fraction this round exists to raise. `None` -- the host's own answer -- stays
-    the default, so the host path issues exactly what it issued before.
+    and the shapes are equal enough that only the `cat` catches it. The int path *builds* the table
+    on the host and moves it, not in place: at the config's window of 128 a decode step's table is
+    512 bytes, while the eight `arange`/`clamp`/`where` kernels it takes to build one are eight
+    launches on a stream whose busy fraction a decode round exists to raise.
+
+    The device path is in the `pos.on_device` branch below the prefill one, and it is not that build
+    moved to the card, it is a different expression with the same value: the ring's listing
+    `cat([arange(oldest, win), arange(oldest)])` is the rotation `(j + oldest) % window_size`, so it
+    is one `arange` and one modulo on shapes the position cannot change -- which is what a capture
+    needs, and what removes the pageable H2D along with the host build. The mask that follows is
+    the *same* comparison on both paths, because it tests a slot index against the position and not
+    the other way round. The prefill branch and the host build stay exactly as they were for the int
+    path, and the prefill branch is checked first: it is the one case the device path does not cover
+    (its table has one row per query, and prefill stays eager), so a device `Pos` at 0 -- which no
+    decode step builds -- reaches the prefill build rather than a rotation that would be wrong for
+    it.
     """
-    if start_pos == 0:
+    pos = Pos.of(pos)
+    if pos.first():
         end = torch.arange(seqlen).unsqueeze(1)
         idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
         idxs = torch.where(idxs > end, -1, idxs)  # before the sequence started
+    elif pos.on_device:
+        oldest = pos.slot(window_size) + 1
+        idxs = (torch.arange(window_size, device=pos.torch_device) + oldest) % window_size
+        idxs = torch.where(idxs > pos.row(), -1, idxs)  # ring still filling
     else:
-        oldest = start_pos % window_size + 1
+        oldest = pos.slot(window_size) + 1
         idxs = torch.cat([torch.arange(oldest, window_size), torch.arange(oldest)])
-        idxs = torch.where(idxs > start_pos, -1, idxs)  # ring still filling
+        idxs = torch.where(idxs > pos.host, -1, idxs)  # ring still filling
     # `sparse_attn` needs real [b, m, topk] int32 memory, hence the materializing expand
     idxs = idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
     return idxs if device is None else idxs.to(device)
@@ -259,6 +276,14 @@ class Compressor(nn.Module):
         head_dim = _required_int(cfg, "head_dim")
         self.compress_ratio = ratio
         self.head_dim = head_dim
+        # Which decode body this forward is, when it is being *recorded* rather than run: `None`
+        # derives it from the position, `True` records the emitting body and `False` the filling
+        # one. What the body contains -- the quantizer and the cache write, or neither -- is
+        # otherwise `(start_pos + 1) % ratio == 0`, a host answer a capture freezes; `DecodeGraphs`
+        # therefore captures the two bodies as two graphs, and this is what lets it record either
+        # of them at a position that would have chosen the other. `None` everywhere else, so the
+        # eager path takes exactly the branch it always took.
+        self.compress_variant: bool | None = None
         self.norm = RMSNorm(head_dim, _required_float(cfg, "norm_eps"), device=device)
         # ratio 1 is a plain projection, so it stays in the checkpoint's bf16; the softmax pooling
         # above ratio 1 runs in fp32, so those weights are promoted to fp32 to match
@@ -294,7 +319,8 @@ class Compressor(nn.Module):
         self.kv_state[:batch_size].zero_()
         self.score_state[:batch_size].fill_(-torch.inf)
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
+    def forward(self, x: torch.Tensor, pos: int | Pos) -> torch.Tensor | None:
+        pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
         ratio, dtype = self.compress_ratio, x.dtype
         if ratio == 1:  # one token per group: nothing to pool, so no gate and no fp32
@@ -302,7 +328,7 @@ class Compressor(nn.Module):
 
         x = x.float()
         kv, score = self.wkv(x), self.wgate(x)
-        if start_pos == 0:
+        if pos.first():
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
@@ -313,10 +339,11 @@ class Compressor(nn.Module):
             score = score.unflatten(1, (-1, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
         else:  # one token per step: fill a slot, and pool only when the group just completed
-            should_compress = (start_pos + 1) % ratio == 0
-            slot = start_pos % ratio
-            self.kv_state[:bsz, slot] = kv.squeeze(1)
-            self.score_state[:bsz, slot] = score.squeeze(1)
+            variant = self.compress_variant
+            should_compress = pos.emits(ratio) if variant is None else variant
+            slot = pos.slot(ratio)
+            write_row(self.kv_state[:bsz], slot, kv.squeeze(1))
+            write_row(self.score_state[:bsz], slot, score.squeeze(1))
             if should_compress:
                 kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
         if not should_compress:
@@ -432,7 +459,7 @@ class Indexer(nn.Module):
         x: torch.Tensor,
         qr: torch.Tensor,
         latent: torch.Tensor | None,
-        start_pos: int,
+        pos: int | Pos,
         offset: int,
         shared: SharedAttentionRuntime,
     ) -> torch.Tensor:
@@ -441,8 +468,9 @@ class Indexer(nn.Module):
         index keys here, which has to happen before `Attention` overwrites that same storage with
         the RoPE'd, quantized values."""
         assert self.freqs_cis is not None, "the owning Attention sets this before the first forward"
+        pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
-        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+        ratio, rd = self.compress_ratio, self.rope_head_dim
 
         # A key owner publishes its cache even when `latent` is None. The reference publishes only
         # inside the write, which leaves `index_k` unset on a forward that starts mid-group with no
@@ -456,20 +484,24 @@ class Indexer(nn.Module):
             # a latent stands for the first token of its group, so group j takes position j * ratio
             freqs = (
                 self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if start_pos == 0
-                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+                if pos.first()
+                else pos.pick(self.freqs_cis, 1 - ratio)
             )
             k = self.k_norm(self.wk(latent))
             apply_rotary_emb(k[..., -rd:], freqs)
             fp4_act_quant(k, FP4_BLOCK_SIZE, True)
-            self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+            self.k_cache[:bsz, pos.span(k.size(1), pos.group(ratio))] = k
 
         assert shared.index_k is not None, "an indexer needs a key cache, and no kv source has published one"
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.index_head_dim))
-        apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        apply_rotary_emb(q[..., -rd:], self.freqs_cis[pos.span(seqlen)])
         fp4_act_quant(q, FP4_BLOCK_SIZE, True)
 
-        index_k = shared.index_k[:bsz, : end_pos // ratio]
+        # `end_pos // ratio` groups are reachable. Both paths read the whole cache and mask the
+        # tail out of the score below, rather than slicing to the reachable prefix: the prefix is a
+        # step by step count, and reading one width on both paths is what keeps the graphed column
+        # and the eager column the same arithmetic instead of two softmaxes over different widths.
+        index_k = shared.index_k[:bsz, pos.upto(pos.group(ratio, seqlen), shared.index_k.size(1))]
         # `weights` is one number per index head, and the sum below runs over heads -- so this rank
         # needs its own slice of the output while the scale stays the *global* head count. Using the
         # local 8 in `n_heads**-0.5` would scale every index-source layer's partial by 2x.
@@ -490,24 +522,36 @@ class Indexer(nn.Module):
             index_score = tp.reduce(index_score)
 
         # how many compressed positions each query can see: a block becomes visible once the query
-        # has passed its last token. One query per decode step, so there it is just a number.
-        if start_pos == 0:
+        # has passed its last token. One query per decode step, so there it is just a number; the
+        # prefill's is one per query, and masks against the chunk's own width -- which is the width
+        # `index_k` has there, so the same line covers both.
+        compress_lens = pos.group(ratio, seqlen)
+        if pos.first():
             compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-            index_score.masked_fill_(torch.arange(seqlen // ratio, device=x.device) >= compress_lens, -torch.inf)
-        else:
-            compress_lens = end_pos // ratio
+        index_score.masked_fill_(
+            torch.arange(index_score.size(-1), device=x.device) >= compress_lens, -torch.inf
+        )
 
         if self.is_candidate_source:
-            shared.candidates = select_candidate_blocks(
-                index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
+            shared.candidates = publish(
+                shared.candidates,
+                select_candidate_blocks(
+                    index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
+                ),
             )
         elif self.uses_candidates:
             # level two: score with our own weights, but only inside the source's candidate blocks
             assert shared.candidates is not None, "a candidate source must run before a candidate user"
             index_score = index_score.masked_fill(~shared.candidates, -torch.inf)
 
-        # top-k by score, re-sorted into position order; unreachable -> -1, rest shifted by offset
-        topk = min(self.index_topk, end_pos // ratio)
+        # top-k by score, re-sorted into position order; unreachable -> -1, rest shifted by offset.
+        # The read is the whole cache on both paths, so this always asks for `index_topk` picks and
+        # some of them come back past `compress_lens` or from positions the sequence has not reached:
+        # the `where` below turns those into `-1`, the same value an unreached slot takes, and
+        # `sparse_attn` skips a `-1`. That makes the picks equivalent to the reachable prefix's
+        # `min(index_topk, groups)` that a *narrower* read would have asked for -- and the width it
+        # asks for is a constant, which is what a capture needs.
+        topk = min(self.index_topk, index_score.size(-1))
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
@@ -641,15 +685,16 @@ class Attention(nn.Module):
         if self.indexer is not None and self.indexer.owns_k:
             self.indexer.k_cache[:batch_size].zero_()
 
-    def _window_kv(self, x, freqs_cis, start_pos):
+    def _window_kv(self, x, freqs_cis, pos):
         """This layer's sliding-window K and the window positions every query may attend to. The K
         stays fp8, quantized over the whole post-RoPE vector, RoPE tail included."""
+        pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
         win = self.window_size
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
         act_quant(kv, FP8_BLOCK_SIZE, SCALE_FMT, SCALE_DTYPE, True)
-        if start_pos == 0:  # prefill: attend over this chunk, seeding the ring buffer for decode
+        if pos.first():  # prefill: attend over this chunk, seeding the ring buffer for decode
             if seqlen <= win:
                 self.window_kv_cache[:bsz, :seqlen] = kv
             else:
@@ -659,68 +704,73 @@ class Attention(nn.Module):
                 )
             window_kv = kv
         else:  # decode: one token into the ring buffer, attend over the whole window
-            self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            write_row(self.window_kv_cache[:bsz], pos.slot(win), kv.squeeze(1))
             window_kv = self.window_kv_cache[:bsz]
-        return window_kv, get_window_topk_idxs(win, bsz, seqlen, start_pos, device=x.device)
+        return window_kv, get_window_topk_idxs(win, bsz, seqlen, pos, device=x.device)
 
-    def _compress_topk_idxs(self, x, qr, latent, start_pos, offset, compress_len, shared):
+    def _compress_topk_idxs(self, x, qr, latent, pos, offset, shared):
         """Which compressed positions each query attends to. Index sources run their own indexer;
         the layers in between reuse the result their source published."""
         if not self.is_index_source:
             assert shared.topk_idxs is not None, "an index source must run before a layer that reuses its indices"
             return shared.topk_idxs
 
+        pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
-        if compress_len == 0:
+        if (pos.host + seqlen) // self.compress_ratio == 0:
+            # no group has closed yet, so there is nothing to index. Asked on the host from `pos.host`
+            # rather than from the device-side group count, which on the graph path is a tensor and
+            # cannot be tested -- and the answer is the same one, because it is the same arithmetic.
             idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
         else:
             assert self.indexer is not None
             if self.indexer.freqs_cis is None:
                 self.indexer.freqs_cis = self.freqs_cis
-            idxs = self.indexer(x, qr, latent, start_pos, offset, shared)
-        shared.topk_idxs = idxs
-        return idxs
+            idxs = self.indexer(x, qr, latent, pos, offset, shared)
+        shared.topk_idxs = publish(shared.topk_idxs, idxs)
+        return shared.topk_idxs
 
-    def _compress_kv(self, x, qr, start_pos, offset, shared):
+    def _compress_kv(self, x, qr, pos, offset, shared):
         """The shared compressed KV and the compressed positions every query may attend to. This
         layer compresses its own KV only when it is a source; otherwise it just reads the cache."""
+        pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
-        compress_len = (start_pos + seqlen) // ratio
         latent = None
         if self.is_kv_source:
             assert self.compressor is not None
-            latent = self.compressor(x, start_pos)
+            latent = self.compressor(x, pos)
             shared.compress_kv = self.compress_kv_cache
         # the indexer needs the latent before RoPE, so it runs before the cache is written
-        idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len, shared)
+        idxs = self._compress_topk_idxs(x, qr, latent, pos, offset, shared)
         if latent is not None:
             # a latent stands for the first token of its group, so group j takes position j * ratio
             freqs = (
                 self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if start_pos == 0
-                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+                if pos.first()
+                else pos.pick(self.freqs_cis, 1 - ratio)
             )
             apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
             # Compressed KV uses groups of 16 with E4M3 scales; the indexer uses 32 with E8M0.
             fp4_act_quant_e4m3(latent, COMPRESS_KV_BLOCK_SIZE, True)
-            self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
+            self.compress_kv_cache[:bsz, pos.span(latent.size(1), pos.group(ratio))] = latent
         # read after the write, so this does not depend on the slice aliasing the cache
         assert shared.compress_kv is not None, "a kv source must run before a layer that reads its cache"
-        return shared.compress_kv[:bsz, :compress_len], idxs
+        return shared.compress_kv[:bsz, pos.upto(pos.group(ratio, seqlen), shared.compress_kv.size(1))], idxs
 
-    def forward(self, x: torch.Tensor, start_pos: int, shared: SharedAttentionRuntime) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int | Pos, shared: SharedAttentionRuntime) -> torch.Tensor:
+        pos = Pos.of(start_pos)
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[pos.span(seqlen)]
         rd = self.rope_head_dim
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
 
-        kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
+        kv, topk_idxs = self._window_kv(x, freqs_cis, pos)
         if self.compress_ratio:
-            compress_kv, compress_idxs = self._compress_kv(x, qr, start_pos, kv.size(1), shared)
+            compress_kv, compress_idxs = self._compress_kv(x, qr, pos, kv.size(1), shared)
             kv = torch.cat([kv, compress_kv], dim=1)
             topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
 
