@@ -305,7 +305,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "prompt is the same arithmetic as an unchunked one only from a chunk "
                              "of `index_topk * compress_ratio` tokens up, below which a chunk has "
                              "fewer compressed positions to choose from than the full prompt has. "
-                             "Default: off, one forward")
+                             "The arena has to come down with the context: `--expert-pool-rows 148` "
+                             "is what 262144 fits in, because the default 288's extra 2.451 GiB "
+                             "leaves the second chunk 170 MiB short of the 320 MiB it asks for and "
+                             "the run dies there, so 288 does not reach the full width and 148 is "
+                             "not optional at it. "
+                             "`docs/performance/deepseek_v4_1_flash_chunked_prefill.md` measures "
+                             "the width at 262144. Default: off, one forward")
     parser.add_argument("--decode-graphs", action=argparse.BooleanOptionalAction, default=False,
                         help="replay each layer's decode forward from a captured CUDA graph instead "
                              "of running it. A block is 213 kernel launches and 244 host API calls "
