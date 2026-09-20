@@ -26,12 +26,21 @@ favour; they are recorded here because each of them looked like a blocker first:
   `[dim, inter/2]`. So an arena row is the checkpoint's own tensor and no transpose, no per-element
   scale expansion and no rebasing happens here.
 
-The split is expert parallelism over `world` cards, and it is static. Per row the six routed experts
-are sorted by global id and dealt round-robin, so card `c` owns sorted positions `c` and `c + world`
--- a **2, 2, 1, 1** split over four cards -- and each card's arena is a fixed
-`ceil(topk / world)` rows. Nothing resizes between steps and nothing is allocated per token: the
-pinned arena is those rows for every card laid end to end, 35.9 MiB per card and 143.4 MiB for four,
-and the device holds the matching per-card slice.
+The split is expert parallelism over `world` cards, and it is static. Which card owns which of a
+row's six drawings is the **deal**, and there are two. The shipped one, `sorted`, sorts the row's
+experts by global id and deals them round-robin, so card `c` owns sorted positions `c` and
+`c + world` -- a **2, 2, 1, 1** split over four cards -- and each card's arena is a fixed
+`ceil(topk / world)` rows. The alternative, `id`, deals drawing `e` to rank `e % world` and is
+selected with `DEEPSEEK_V41_EXPERT_DEAL=id`; it costs a card `topk` arena rows instead of
+`ceil(topk / world)`, because one row may hand a single card all six. `deal_card` is that rule and
+the section comment above it is the argument for having a second one. The deal is applied in exactly
+two places and both of them are walks of it: `_split` decides which card a drawing goes to, and
+`_hot_rows` decides which of a card's experts count as resident -- a fixed set of columns under
+`sorted`, a mask over the ids under `id`. Nothing downstream re-derives it, because `_resolve_row`
+renumbers the row from the pairs `_split` placed and `_issue`/`_upload` read the row they are handed.
+Nothing resizes between steps and nothing is allocated per token: the pinned arena is those rows for
+every card laid end to end, 35.9 MiB per card and 143.4 MiB for four under `sorted`, 107.6 and 430.3
+under `id`, and the device holds the matching per-card slice.
 
 The cards never talk to each other. Each holds its own arena, is handed the same `[1, 5120]`
 activation, and returns `[1, 5120]` fp32; whoever asked for the row sums the partials. That is
@@ -44,7 +53,7 @@ process -- `ranks` left unset, `world` devices -- and that process returns the l
 output, which is what the host-side probes measure. Deal one rank per process -- `ranks=[r]`, one
 device -- and it returns that rank's share, and the routed partial then joins the shared expert's on
 the ffn's all-reduce instead of at a host `+`. The deal itself is unchanged: `world` is still how
-many ways the sorted ids are dealt, so rank `r` stages exactly the experts it staged before, into
+many ways a row's ids are dealt, so rank `r` stages exactly the experts it staged before, into
 exactly the rows it staged them into, and the two configurations differ only in who adds the pieces
 up. `partial` is that distinction, and `MoE.forward` reads it.
 
@@ -281,6 +290,57 @@ def batched_enabled() -> bool:
     return os.environ.get(BATCHED_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+# How a row's routed experts are shared out over the cards. `sorted` sorts the row's ids and gives
+# sorted position `p` to rank `p % world`, which is the deal the module docstring describes and the
+# one every number above this comment was taken on: it is a property of the *routing* rather than of
+# the order the gate emitted the experts in, so two runs that route to the same six experts stage the
+# same bytes into the same rows. `id` gives the drawing to rank `expert % world` instead. It is here
+# because six sorted slots over four cards is a **2, 2, 1, 1** split, and what a chunk's H2D pays for
+# is the width of a rank's *staged set* over the chunk rather than its share of the rows -- an expert
+# is a row of bytes however many times the chunk draws it -- so the card dealt two of the six sorted
+# slots stages roughly twice what the card dealt one stages, and a draw that lands on an expert the
+# rank already has costs nothing. See `_split`.
+DEAL_ENV = "DEEPSEEK_V41_EXPERT_DEAL"
+DEALS = ("sorted", "id")
+
+
+def deal_rule() -> str:
+    """Which deal a `DeviceRoutedExperts` makes unless its constructor is told. `sorted` by default."""
+    asked = os.environ.get(DEAL_ENV, "").strip().lower()
+    return asked if asked in DEALS else "sorted"
+
+
+def deal_card(expert: int, position: int, *, deal: str, world: int) -> int:
+    """Which rank of the deal owns one drawing of `expert`.
+
+    `position` is the drawing's place among the row's ids *sorted*, which is what `sorted` reads and
+    what makes that deal independent of the order the gate emitted them in. `id` reads the expert's
+    own number, so a position is not part of its rule and one row can hand a single rank all `topk`
+    of its drawings -- which is why `rows_per_card` is `topk` under it.
+    """
+    if deal == "id":
+        return expert % world
+    if deal == "sorted":
+        return position % world
+    raise ValueError(f"{deal!r} is not a deal; {DEALS} are")
+
+
+def rows_per_card(deal: str, topk: int, world: int) -> int:
+    """How wide one card's arena has to be under `deal`, for the rows a row stages into.
+
+    `sorted` deals every card at most one drawing of each of the `world` slots it can own, so
+    `ceil(topk / world)` covers it exactly. `id` has no such ceiling: a row's six experts may all be
+    congruent mod `world`, so the only width that always covers a row is `topk`. This is the deal's
+    whole cost, and it is paid in arena rows -- `arena_rows` is this plus the resident and pooled
+    rows, and the pinned and device arenas are that many rows of expert bytes each.
+    """
+    if deal == "id":
+        return topk
+    if deal == "sorted":
+        return -(-topk // world)
+    raise ValueError(f"{deal!r} is not a deal; {DEALS} are")
+
+
 def device_experts_available() -> bool:
     """Whether the extension this class calls is loadable and carries the op it needs."""
     extension = load_cuda_kernel()
@@ -466,7 +526,7 @@ class ResidentSet:
 
 
 class DeviceRoutedExperts(RoutedExperts):
-    """One layer's routed experts held as fixed `ceil(topk / world)`-row arenas, one per card driven.
+    """One layer's routed experts held as fixed `rows_per_card`-row arenas, one per card driven.
 
     Not an `nn.Module`, for the same reason `CheckpointRoutedExperts` is not: the experts are not
     part of the tree, and a module would put them in `state_dict()` and in `parameters()`.
@@ -499,6 +559,7 @@ class DeviceRoutedExperts(RoutedExperts):
         pool_rows: int = 0,
         residents: ResidentSet | None = None,
         batched: bool | None = None,
+        deal: str | None = None,
     ) -> None:
         # Bound here rather than imported at module scope: `loader.py` is what builds this class, so
         # a module-level import of it would be a cycle. By the time an instance exists `loader` is
@@ -552,9 +613,29 @@ class DeviceRoutedExperts(RoutedExperts):
         self.drawn_rows = 0
         self.expert_rows = 0
 
-        # The split is round-robin over the sorted expert ids, so a card's widest case is
-        # `ceil(topk / world)` and every row is the same shape -- which is what makes it fixed.
-        self.rows_per_card = -(-topk // world)
+        # Which rank of the deal owns which of a row's drawings, and therefore which rows of the arena
+        # a row's misses land in. `sorted` unless asked for through the constructor or the env.
+        #
+        # It is the deal for *every* pass this instance runs and not a per-pass choice, because the
+        # three things it decides are all state that outlives a pass: the resident set's column walk
+        # (`_hot_rows`) is a walk of this deal, the pool is keyed per card, and a row's arena rows are
+        # what the next pass's pool probes name. A pass that ran a different deal from the one the
+        # pool was filled under asks a card about experts it was never dealt, so it would miss and
+        # stage rows that are already resident somewhere else -- correct, and a hit rate given away.
+        # It is also why this is read from a uniform source rather than chosen per process: the deal
+        # has to come out the same on all four ranks or the all-reduce sums a layer twice. See
+        # `deal_rule` and `_split`.
+        self.deal = deal_rule() if deal is None else str(deal)
+        if self.deal not in DEALS:
+            raise ValueError(f"deal {self.deal!r} is not one of {DEALS}")
+        # The widest a card's share of *one row* can be, which is the width of the arena's staging
+        # tail. The `sorted` deal gives a card `ceil(topk / world)` of a row's slots -- six over four
+        # cards is two, and every row has the same shape, which is what makes the width fixed -- while
+        # the `id` deal reads the expert's own number and can hand one card all `topk` of them. The
+        # rows above the staging tail are `hot_rows` resident slots and the rows below it are
+        # `pool_rows` pooled ones, so this is the width `pool_rows` has to clear and all four of the
+        # extra arena rows an `id` arena costs a card.
+        self.rows_per_card = rows_per_card(self.deal, topk, world)
         self._buffers = max(1, pinned_buffers)
 
         # The resident set above those rows: `hot_rows` slots a layer keeps on the card and refills
@@ -809,23 +890,35 @@ class DeviceRoutedExperts(RoutedExperts):
     # -- the plan ---------------------------------------------------------------------------
 
     def _split(self, ids: Sequence[int]) -> list[list[tuple[int, int]]]:
-        """Per card this process drives, the `(arena row, route slot)` pairs that card owns.
+        """Per card this process drives, the `(draw index, route slot)` pairs that card owns.
 
-        Sorted by global expert id and dealt round-robin, which makes the split a property of the
-        routing rather than of the order the gate happened to emit it in: two runs that route to the
-        same six experts stage the same bytes into the same rows. The host path walks a layer's
-        experts in id order for the same reason.
+        The draw index is `k` for a card's `k`th drawing of this row, and it is where a row's miss
+        would stage to: `_resolve_row` renumbers it from the pairs it actually places, so this is the
+        shape of the deal and not the arena row, which only the pool and the staging tail decide. It
+        is under `rows_per_card` in both deals, which is the whole of what that width is for.
 
-        Round-robin over `world` and *select* the ranks this process owns, rather than dealing over
-        `len(self.ranks)`: the deal is a property of the layer and has to come out the same in every
-        process, or two ranks would stage the same expert into different rows and the all-reduce
-        would sum the layer twice and never once.
+        Which card owns a drawing is `deal_card`. Under `sorted` the row's ids are sorted and sorted
+        position `p` goes to rank `p % world`, which makes the deal a property of the routing rather
+        than of the order the gate happened to emit it in -- two runs that route to the same six
+        experts stage the same bytes into the same rows, and the host path walks a layer's experts in
+        id order for the same reason. Under `id` the drawing goes to rank `expert % world`.
+
+        Either way the deal is over `world` and the ranks this process owns are *selected* from it
+        rather than dealt over `len(self.ranks)`: the deal is a property of the layer and has to come
+        out the same in every process, or two ranks would stage the same expert into different rows
+        and the all-reduce would sum the layer twice and never once.
         """
+        deal = self.deal
         order = sorted(range(len(ids)), key=lambda slot: ids[slot])
         cards: list[list[tuple[int, int]]] = [[] for _ in self.ranks]
         for position, slot in enumerate(order):
-            if position % self.world in self.ranks:
-                cards[self.ranks.index(position % self.world)].append((position // self.world, slot))
+            owner = deal_card(ids[slot], position, deal=deal, world=self.world)
+            if owner in self.ranks:
+                card = self.ranks.index(owner)
+                # `sorted` would write `position // world` here, and the number of drawings this card
+                # has already appended is that same number; `id` has no such formula and the count is
+                # the one that means something, so both deals count.
+                cards[card].append((len(cards[card]), slot))
         return cards
 
     def _key(self, expert: int, which: str) -> str:
@@ -850,16 +943,27 @@ class DeviceRoutedExperts(RoutedExperts):
         the host before the first row is staged (`_route_ids`), so this is counting, not predicting,
         and the layer it is counted for is the layer it is filled for.
 
-        The deal is the same one `_split` makes, walked from the other end: sort the row's ids and
-        position `p` belongs to rank `p % world`. So the columns a rank owns are `rank, rank +
-        world, ...`, and the multiset of what it was dealt is those columns of the sorted routing.
+        The deal is the same one `_split` makes, walked from the other end. Under `sorted` the row's
+        ids are sorted and position `p` belongs to rank `p % world`, so the columns a rank owns are
+        `rank, rank + world, ...` and the multiset of what it was dealt is those columns of the sorted
+        routing. Under `id` a drawing belongs to the rank the expert's own number names, so the
+        columns are not a fixed walk at all and the multiset is the routing masked by `expert % world
+        == rank`. Both are a walk of `self.deal`, and they have to be: the map this fills is keyed by
+        expert id per card, and a card that looked up an expert some other deal gave it would miss a
+        row that is already on the card.
         """
         if not self.hot_rows:
             return []
-        columns = [p for p in range(self.topk) if p % self.world == self.ranks[card]]
-        if not columns:
-            return []
-        experts, counts = torch.unique(ordered[:, columns].reshape(-1), return_counts=True)
+        if self.deal == "id":
+            # The row's own numbers and not its order, which is why this is a mask: nothing about a
+            # drawing's place among its siblings enters the `id` rule.
+            mine = ordered[ordered % self.world == self.ranks[card]]
+        else:
+            columns = [p for p in range(self.topk) if p % self.world == self.ranks[card]]
+            if not columns:
+                return []
+            mine = ordered[:, columns].reshape(-1)
+        experts, counts = torch.unique(mine, return_counts=True)
         repeat = counts >= 2
         experts, counts = experts[repeat], counts[repeat]
         width = int(experts.numel())
@@ -918,10 +1022,13 @@ class DeviceRoutedExperts(RoutedExperts):
         dead bytes in the arena, which is allocated at the capacity anyway, and in exchange the
         index arithmetic a row hands the kernel is a constant offset rather than a per-layer one.
         """
-        # Sorted once for every card: the deal reads a row's ids in ascending order, so each card's
-        # multiset is a fixed set of columns of the same sorted routing. `planned` is empty for a
-        # single-row set -- one row asks each expert once and nothing of it can be resident -- and
-        # for a layer where every card drew each of its own experts exactly once.
+        # Sorted once for every card. `sorted` reads a row's ids in ascending order, so each card's
+        # multiset is then a fixed set of columns of the same sorted routing; `id` reads the ids
+        # themselves, for which the sort is neither needed nor harmful -- the mask below is over a
+        # per-row multiset either way, and one sort for the whole set is cheaper than one a card.
+        # `planned` is empty for a single-row set -- one row asks each expert once and nothing of it
+        # can be resident -- and for a layer where every card drew each of its own experts exactly
+        # once.
         planned = (
             [self._hot_rows(route.sort(dim=1).values, card) for card in range(len(self.ranks))]
             if route.shape[0] > 1 and self.hot_rows
