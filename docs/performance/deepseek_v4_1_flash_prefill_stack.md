@@ -18,7 +18,8 @@ than only shrinking. The sparse pass falls to a fifth of its former size and the
 kernels lose two thirds of theirs, while the expert H2D goes from 16.71 to 17.38 s — **the copies are
 now 46% of the instrumented chunk and the largest single row in it**, and the third lever the
 chunked-prefill page named is not the host's row loop, which this run measures at 1.52 s of 163,840
-calls in both arms.
+calls in both arms. The logits move and the decisions do not: the stacked tree picks the same token
+as the base tree at all nine dump positions, and the stacked tree run twice is bit-identical.
 
 ## Run record
 
@@ -182,11 +183,37 @@ Three things follow.
 
 ## The logits
 
-Both arms dump the last-position logits after every chunk of the run, nine positions from 4096 to
-36864, and the two stacked runs are a control that says how much of any difference is the change
-rather than the host:
+`/tmp/pr_b_parity.py` dumps the last-position logits after every chunk — nine positions from 4096 to
+36864, 129,280 entries each — and it was run three times through `/tmp/parity_stack.sh`: the base
+tree, the stacked tree, and the stacked tree again. The third arm is the control, and it comes back
+**bit-identical over all nine positions on all four ranks, worst `max |diff| = 0.000e+00`**. There is
+no host-side nondeterminism in this run to discount, so base against stacked is the three kernel
+changes and nothing else.
 
-<!-- parity: filled in from /tmp/parity_stack.log -->
+| | base against stacked | stacked against stacked again |
+| --- | --- | --- |
+| positions with the same argmax | 9 of 9, every rank | 9 of 9, every rank |
+| bit-identical positions | 0 of 9 | **9 of 9** |
+| worst `max \|diff\|` | 4.564e+00, at 8192 | 0.000e+00 |
+| `max \|logit\|` there | 25.28 | 25.28 |
+| top-2 gap there | 12.162 | 12.162 |
+
+The perturbation is not rounding dust. The mean `|diff|` across the vocabulary is 0.33–0.67 at the
+nine positions against a largest logit of 25.3–27.9, so the distribution moves by a fiftieth of its
+own scale — which is what reordering fp32 accumulation through forty layers, a router and an expert
+pool does, and the same shape the [chunked-prefill
+page](deepseek_v4_1_flash_chunked_prefill.md) reported when it localized its own first difference to
+layer 0's gate and routed experts. What it does not do is move the decision. The gap between the top
+two logits is 9.10 to 13.64 at the nine positions, standing at **2.7× to 6.0×** the worst
+perturbation there — 12.162 against 4.564 at 8192, the tightest of the nine — and the argmax is the
+same on both trees at every one of them. Nine decisions out of nine is a weak test on nine positions,
+and it is the test this run has.
+
+Two footnotes. Every rank writes the same nine rows, byte for byte, in all three arms: the expert
+split is reduced back to one activation per layer, and the four cards agree to the bit, which is why
+the log repeats the same comparison four times. And the arms' walls agree with the profile to the
+second — the base arm's nine chunks are 65.23 s for the first and 55.2–56.9 for the rest, the stacked
+arm's 38.5 — so the run that produced these logits is the run this page's tables describe.
 
 ## Reproducing
 
