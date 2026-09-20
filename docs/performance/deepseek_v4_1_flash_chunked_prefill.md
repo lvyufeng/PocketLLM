@@ -195,9 +195,10 @@ width at all is the question the last section answers from below.
 s a chunk, peaking at 15.93 GiB on rank 0 and 17.34 GiB on rank 3 of the 22000 the card reports. That
 is the 256K support the split was for, and the two numbers that say it is *support* and not a lucky
 allocation are that the peak does not move and the rate does not fall. **The deal is the one lever
-left on the table here**, and on this page every figure is the `sorted` deal: the id deal is the same
-leg at **3121.0 s and 83.99 tok/s, 1.19x, 0.53 staged rows a token against 2.31**, for a peak of
-17.72 GiB a card — [the expert page prices both deals, with the parity and the arena](deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set).
+left on the table here**, and on this page every figure is the `sorted` deal, which is no longer the
+default: the id deal is the same leg at **3121.0 s and 83.99 tok/s, 1.19x, 0.53 staged rows a token
+against 2.31**, for a peak of 17.72 GiB a card — [the expert page prices both deals, with the parity
+and the arena](deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set).
 Those are *this* tree's numbers: **on the tree that ships, which is this one plus the three prefill
 kernels that landed after it, the same pair is 2532.75 s to 1789.92 s and 103.50 to 146.46 tok/s,
 1.41x**, because taking a third out of a chunk's compute leaves the staged rows a larger share of what

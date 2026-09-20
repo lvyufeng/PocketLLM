@@ -416,17 +416,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "call, so the flag is dropped to the per-row path at "
                              "--expert-pool-rows 0 rather than run wrong")
     parser.add_argument("--expert-deal", default=None, choices=("sorted", "id"), metavar="RULE",
-                        help="which card owns which of a row's six routed experts. `sorted` sorts "
-                             "the row's ids and deals them round-robin, so card `c` owns sorted "
-                             "positions `c` and `c + world` -- a 2, 2, 1, 1 split over four cards -- "
-                             "and every card's arena is `ceil(topk / world)` rows wide. `id` gives a "
-                             "drawing to `expert %% world` instead, which partitions the experts "
-                             "themselves over the cards: a card is dealt from `n_experts / world` of "
-                             "them rather than from all of them, which is the width of the staged set "
-                             "a chunk's expert H2D moves. It costs `topk` arena rows a card instead "
-                             "of `ceil(topk / world)`, because one row may land all six drawings on "
-                             "one card, whose share of that row's sum is then the whole of it. Unset "
-                             "reads DEEPSEEK_V41_EXPERT_DEAL and defaults to `sorted`")
+                        help="which card owns which of a row's six routed experts. `id` gives a "
+                             "drawing to `expert %% world`, which partitions the experts themselves "
+                             "over the cards: a card is dealt from `n_experts / world` of them rather "
+                             "than from all of them, which is the width of the staged set a chunk's "
+                             "expert H2D moves. It costs `topk` arena rows a card instead of "
+                             "`ceil(topk / world)`, because one row may land all six drawings on one "
+                             "card, whose share of that row's sum is then the whole of it. `sorted` "
+                             "sorts the row's ids and deals them round-robin instead, so card `c` "
+                             "owns sorted positions `c` and `c + world` -- a 2, 2, 1, 1 split over "
+                             "four cards -- and every card's arena is `ceil(topk / world)` rows wide. "
+                             "The two deals do not agree bit for bit. Unset reads "
+                             "DEEPSEEK_V41_EXPERT_DEAL and defaults to `id`")
     parser.add_argument("--threads", type=int, default=None, metavar="N",
                         help="host threads this rank may use. `torchrun` sets OMP_NUM_THREADS to 1 "
                              "unless the environment already had one, and the expert staging, the "
@@ -514,8 +515,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         + (f", {args.expert_buffers} staging arenas a layer" if args.expert_buffers != 2 else "")
         + (", experts batched a chunk a call" if args.expert_batched else "")
         + (f", prefill {args.prefill_chunk_tokens} tokens a forward" if args.prefill_chunk_tokens else "")
-        + (f", the {args.expert_deal} expert deal"
-           if args.expert_deal and args.expert_deal != "sorted" else "")
+        # Named, not merely non-default: which deal is the default is one line in
+        # `device_experts.deal_rule`, and a banner that spelled it a second time would be the place
+        # the two disagree after a change instead of the place a change is visible.
+        + (f", the {args.expert_deal} expert deal" if args.expert_deal else "")
         + (", decode graphed a block at a time" if args.decode_graphs else "")
     )
     started = time.perf_counter()

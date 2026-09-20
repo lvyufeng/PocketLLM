@@ -206,8 +206,9 @@ Three things follow.
   and the attention is TP-sharded work every rank does in full, so there is nothing for it to be
   waiting on. The MoE's row is not the message: it is
   5.4x to 26x that floor, and it is **inverted against the expert load**, which is what says what it
-  is. The deal is static and round-robin over the six sorted routed ids
-  (`device_experts.py:29-34`), so ranks 0 and 1 own two of the six slots and ranks 2 and 3 one, which
+  is. The `sorted` deal is static and round-robin over the six sorted routed ids
+  (`device_experts.py:29-42`) — it is what this page's sitting ran, being the default at the time and
+  one flag off it since — so ranks 0 and 1 own two of the six slots and ranks 2 and 3 one, which
   is 2x the rows staged — 606,192 against 321,354 over the 256K leg — and 1.8x the routed path
   (`MoE.routed` 17.163 and 17.395 s on ranks 0 and 1 against 9.362 and 9.262 on ranks 2 and 3, over
   the same 40 layers). Those are the ranks that reach the reduce *last* and wait *least*; the two that
@@ -218,12 +219,16 @@ Three things follow.
   attractive here — the source activation is 41.9 MiB and the wire carries 80 — and it would take the
   message from 13.58 ms to **7.08 ms** (the same probe's bf16 row, the same 41.9 MiB), which is 0.26 s
   off a 38.07 s chunk: **0.7%**. It would take *nothing* off the row that carries the 2.95 s, because
-  that row is not the bytes. What would move it is even expert work, and six slots dealt over four
-  cards have no static split below a 2, 2, 1, 1 one — `ceil(topk / world)` is the arena every card is
-  sized for (`device_experts.py:557`), and a deal that rotated per row would make every card own every
-  expert over a pass, which is the per-layer resident set this branch's 2.6-2.7x is about. So the
-  straggler is the floor, and reading the other row as the floor would have sent a bf16 kernel after
-  0.7% of a chunk.
+  that row is not the bytes. What would move it is even expert work, and under `sorted` — six slots
+  dealt over four cards — there is no split below a 2, 2, 1, 1 one: `ceil(topk / world)` is the arena
+  every card was sized for there (`device_experts.py:643`), and a deal that rotated per row would make
+  every card own every expert over a pass, which is the per-layer resident set this branch's 2.6-2.7x
+  is about. **The deal that does balance it is `id`**, which partitions the experts themselves over the
+  cards instead of dealing each card a slice of every row, and it is the default now — it is worth
+  1.42x on this same 262144 length, priced [on the expert
+  page](deepseek_v4_1_flash_device_experts.md#the-same-pair-re-taken-on-the-tree-that-ships-149x-and-142x),
+  at four more arena rows a card. Under `sorted` the straggler is the floor, and reading the other row
+  as the floor would have sent a bf16 kernel after 0.7% of a chunk.
 
 ## The same composition at 256K
 
@@ -279,8 +284,8 @@ chunk that is 32% shorter is what says none of the 18.8 s is saved rows. The 2/2
 row counts unchanged — 2.31-2.35 rows a token on ranks 0 and 1 against 1.23-1.24 on ranks 2 and 3,
 against the 2.37 the chunked-prefill page measured for the same 148-row pool.
 
-**Those row counts are the `sorted` deal's, and the deal is one lever this length has already been
-priced on.** 2.31-2.35 rows a token on the ranks dealt two of a row's six sorted slots against
+**Those row counts are the `sorted` deal's, and the deal is a lever this length has priced twice
+over.** 2.31-2.35 rows a token on the ranks dealt two of a row's six sorted slots against
 1.23-1.24 on the two dealt one is that deal's imbalance read straight off the counters — the deal
 walks each card's columns across the whole expert range, so a card dealt two slots stages about twice
 the draws *and* about twice the distinct experts of a card dealt one. Dealing a drawing by expert id

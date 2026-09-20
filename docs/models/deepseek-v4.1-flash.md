@@ -209,7 +209,13 @@ python -m src.models.deepseek_v4_1.generate \
   --prompt "The capital of France is" --max-new-tokens 8
 ```
 
-It prints the generation to stdout and everything else — the load, the token count, the seconds per token — to stderr, so stdout stays pipeable. `--resident-engram` copies the two tables into RAM instead of gathering from the shards, `--expert-cache` bounds the per-layer expert window, `--expert-device cuda --expert-world 4` moves the routed experts off the host and onto the cards (opt-in, and it falls back to the host path with one line on stderr rather than failing), and `--quiet` drops the progress lines. The dense tree moves with `torchrun --nproc_per_node=4 -m src.cli.generate_v41`, which is one process per card and the same flags. On that path `--expert-pool-rows` defaults to **288** — an arena of experts the pass re-draws, worth 8.44× on a 512-token prefill against its own off state and 1.305× on a decode — while `--expert-pool-rows 0` is the control column and turns the batched prefill off with it. `--expert-deal id` (`DEEPSEEK_V41_EXPERT_DEAL`) is the other way to share a row's six experts over the four cards — by expert id instead of by sorted position — which balances the bytes a chunk's expert H2D moves, **1.22× on a 32768-token prefill and 1.19× on a 256K one**, for `topk` arena rows a card instead of `ceil(topk / world)` and about half a gigabyte of peak at 32768 tokens ([the deal, priced](../performance/deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set)). The device path's cost is [its own page](../performance/deepseek_v4_1_flash_device_experts.md).
+It prints the generation to stdout and everything else — the load, the token count, the seconds per token — to stderr, so stdout stays pipeable. `--resident-engram` copies the two tables into RAM instead of gathering from the shards, `--expert-cache` bounds the per-layer expert window, `--expert-device cuda --expert-world 4` moves the routed experts off the host and onto the cards (opt-in, and it falls back to the host path with one line on stderr rather than failing), and `--quiet` drops the progress lines. The dense tree moves with `torchrun --nproc_per_node=4 -m src.cli.generate_v41`, which is one process per card and the same flags. On that path `--expert-pool-rows` defaults to **288** — an arena of experts the pass re-draws, worth 8.44× on a 512-token prefill against its own off state and 1.305× on a decode — while `--expert-pool-rows 0` is the control column and turns the batched prefill off with it. `--expert-deal id` (`DEEPSEEK_V41_EXPERT_DEAL`) is the default way the four cards share a row's six
+experts — by expert id instead of by sorted position — and it balances the bytes a chunk's expert H2D
+moves, **1.22× on a 32768-token prefill and 1.19× on a 256K one** on the kernels the A/B was taken on
+and **1.49× / 1.42× on the tree that ships**, for `topk` arena rows a card instead of
+`ceil(topk / world)` and about half a gigabyte of peak at 32768 tokens. `--expert-deal sorted` is the
+opt-in alternative and is what the tables below were measured on ([the
+deal, priced](../performance/deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set)). The device path's cost is [its own page](../performance/deepseek_v4_1_flash_device_experts.md).
 
 ### The config schema
 
@@ -300,7 +306,8 @@ reasons this section used to record "None." have all been superseded: the checkp
 on disk complete, the four 2080 Ti do not have to hold the routed experts on the cards because a
 457.8 GiB bank of them is pinned in host memory, and `src/cli/generate_v41.py` runs the released
 checkpoint under `torch 2.9.1+cu128` without the reference stack. Four 2080 Ti, TP4, one process a
-card, one stream, the default expert deal, 64 greedy tokens a leg:
+card, one stream, **the `sorted` expert deal** — the deal these legs were taken on, and one flag from
+the default since 2026-09-20 — 64 greedy tokens a leg:
 
 | Prompt | Context | Prefill | Decode | Step |
 | --- | --- | --- | --- | --- |
@@ -313,7 +320,8 @@ Three qualifications travel with the table. The long lengths require
 at 262144. **Decode of 5 tokens a second is not a guarantee** — it holds at a 1024-token context and
 is 4.37 at 32768 and 3.86 at 262144, because 92% of a step is the eager expert call and its pool
 evicts on essentially every row at the long lengths. And the figures are the `sorted` deal, not the
-`id` deal that is 1.41× on prefill at 262144 and still opt-in. Per-leg flags, the derivation of the
+`id` deal that is 1.42× on prefill at 262144 and is the default since 2026-09-20 — `sorted` is the
+opt-in one. Per-leg flags, the derivation of the
 prefill column from the launcher's own two lines, the split of a graphed step and the
 bit-identical continuations are in
 [DeepSeek-V4.1-Flash: what one request costs, through the launcher](../performance/deepseek_v4_1_flash_single_request_capability.md).

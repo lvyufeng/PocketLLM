@@ -885,8 +885,8 @@ def load_backbone(
     not an error: the flag is dropped and the per-row path is what runs.
 
     `expert_deal` is which card owns which of a row's six drawings, and `None` means ask
-    `DEEPSEEK_V41_EXPERT_DEAL`: `sorted` -- the shipped rule -- deals the row's ids round-robin after
-    sorting them, and `id` gives a drawing to `expert % world` instead. It is a property of the run
+    `DEEPSEEK_V41_EXPERT_DEAL`: `id` -- the default rule -- gives a drawing to `expert % world`, and
+    `sorted` deals the row's ids round-robin after sorting them instead. It is a property of the run
     rather than of a pass, because the three things it decides all outlive a pass -- the pool is keyed
     per card, the resident set's rule is a walk of this deal, and a row's arena rows are what the next
     pass's pool probes name -- and it is a property of the *layer*, so all four ranks have to agree or

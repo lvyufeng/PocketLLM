@@ -13,9 +13,10 @@ fill its resident map under keys the split never names, so a card would look up 
 already holding, miss, and stage a row it did not need -- a plausible number and a wrong answer, with
 no counter that reads wrong. So what is checked is the pair rather than either half: on a routing, the
 experts `_hot_rows` returns for a card must be exactly the experts that card's own `_split` drawings
-name, kept by the resident rule. The same file is the regression guard for the shipped deal: `sorted`
-has to come out of this tree exactly as it comes out of the tree before it, which is how a change to
-`rows_per_card` or to `_hot_rows`' columns gets caught rather than measured.
+name, kept by the resident rule. The same file is the regression guard for `sorted`, the deal the
+numbers taken before the default were measured on: it has to come out of this tree exactly as it
+comes out of the tree before it, which is how a change to `rows_per_card` or to `_hot_rows`' columns
+gets caught rather than measured.
 
 **And what the deal costs.** `rows_per_card` is the width of a card's staging tail, so it is the one
 number that says `id` is not free: `sorted` deals a card at most `ceil(topk / world)` of a row's
@@ -97,23 +98,25 @@ def test_the_id_deal_reads_the_expert_and_the_sorted_deal_reads_the_position():
     assert len({de.deal_card(17, position, deal="id", world=WORLD) for position in range(TOP_K)}) == 1
 
 
-def test_an_unknown_deal_is_refused_and_the_environment_defaults_to_sorted(monkeypatch):
-    """The default is the shipped deal, and an unreadable name is not silently one of the two.
+def test_an_unknown_deal_is_refused_and_the_environment_defaults_to_id(monkeypatch):
+    """The default is the `id` deal, and an unreadable name is not silently one of the two.
 
     `DEAL_ENV` is the lever the A/B pulls, so a typo in it has to be a failed run rather than a
-    quietly shipped run: the environment reads as `sorted` when it is unset or empty, and a name
-    that is not a deal is refused by the two functions that would otherwise apply it.
+    quietly shipped run: the environment reads as `id` when it is unset or empty, and a name that is
+    not a deal is refused by the two functions that would otherwise apply it. `sorted` still has to
+    be reachable through the same lever, because it is the deal the recorded numbers were taken on
+    and the one an A/B switches back to.
     """
     monkeypatch.delenv(de.DEAL_ENV, raising=False)
-    assert de.deal_rule() == "sorted"
-    for value in ("", "  ", "SORTED", "sorted "):
-        monkeypatch.setenv(de.DEAL_ENV, value)
-        assert de.deal_rule() == "sorted"
-    for value in ("id", " ID "):
+    assert de.deal_rule() == "id"
+    for value in ("", "  ", "ID", "id "):
         monkeypatch.setenv(de.DEAL_ENV, value)
         assert de.deal_rule() == "id"
+    for value in ("sorted", " SORTED "):
+        monkeypatch.setenv(de.DEAL_ENV, value)
+        assert de.deal_rule() == "sorted"
     monkeypatch.setenv(de.DEAL_ENV, "positions")
-    assert de.deal_rule() == "sorted", "an unknown deal in the environment is not a third deal"
+    assert de.deal_rule() == "id", "an unknown deal in the environment is not a third deal"
     assert de.DEALS == ("sorted", "id")
     for bad in ("positions", "", "ID"):
         with pytest.raises(ValueError):
@@ -192,10 +195,11 @@ def test_the_sorted_deal_fills_the_cards_unevenly_and_the_id_deal_does_not():
 def test_the_launcher_offers_the_deal_and_the_loader_takes_it():
     """The three places the deal is written, pinned so the flag cannot drift off the rule.
 
-    `--expert-deal` defaults to `None` rather than to `"sorted"`, and that is the contract: `None`
-    means ask `DEEPSEEK_V41_EXPERT_DEAL`, which is the lever the A/B pulls, so a launcher default of
-    `"sorted"` would silently out-prioritise the environment. The loader keyword has to exist and has
-    to default to `None` for the same reason -- a run reaches the class through `load_backbone`, and a
+    `--expert-deal` defaults to `None` rather than to `"id"`, and that is the contract: `None` means
+    ask `DEEPSEEK_V41_EXPERT_DEAL`, which is the lever the A/B pulls, so a launcher default of
+    `"id"` would silently out-prioritise the environment and leave the recorded `sorted` numbers
+    unreachable without a flag on every command line. The loader keyword has to exist and has to
+    default to `None` for the same reason -- a run reaches the class through `load_backbone`, and a
     deal that is not threaded through there is a deal the flag cannot set.
 
     `format_help` is called because the help text names the rule, and a bare `%` in an argparse help
