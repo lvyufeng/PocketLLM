@@ -25,6 +25,7 @@
 #   run_serving_sweep.sh ladder   # slots == prompts, one wave: the width ladder
 #   run_serving_sweep.sh limit    # where the KV pool stops fitting a rank
 #   run_serving_sweep.sh ab       # interleaved replicate-rows A/B at concurrency 1
+#   run_serving_sweep.sh prefill  # one call's fixed cost vs its per-token cost
 #
 # `slots` is --max-batch-size, which is the concurrency ceiling: the scheduler
 # admits only while the live slot count is below it. `concurrency` is the
@@ -138,10 +139,41 @@ ab() {
     done
 }
 
+# What one prefill call costs before it costs anything per token. Two sweeps at
+# one slot, so nothing queues and TTFT is the server's own prefill:
+#
+#   slen*   a budget above the prompt, so every point is exactly one call: the
+#           slope is the per-token cost and the intercept the fixed one
+#   calls*  the prompt held fixed and the budget cut, so the same prompt becomes
+#           1/2/4/8 calls. Total tokens are constant within an arm, so each extra
+#           call is worth exactly the fixed cost.
+#
+# The wave points that use the slope are `ladder`'s L1-L32; re-running those four
+# is what checks the single-slot decomposition against a real wave.
+#
+# `in` is --random-input-len, which is not what the engine ran. Read
+# `prompt_tokens=` out of logs-<tag>/rank0.log for the real count, exactly as the
+# ladder does: the two arms below are 3703 and 1242 real tokens.
+prefill() {
+    local inl
+    for inl in 90 170 340 512 680 1024 2048 4096 6144; do
+        PFB=8192 point "slen$inl" 1 1 4 "$inl" 32 inf 8192
+    done
+    local n
+    for n in 1 2 4 8; do
+        PFB=$((4096 / n)) point "callsA_c$n" 1 1 4 6144 32 inf 8192
+    done
+    PFB=2048 point callsB_c1 1 1 4 2048 32 inf 8192
+    PFB=1024 point callsB_c2 1 1 4 2048 32 inf 8192
+    PFB=512  point callsB_c3 1 1 4 2048 32 inf 8192
+    PFB=256  point callsB_c5 1 1 4 2048 32 inf 8192
+}
+
 case "${1:-}" in
     point)  shift; point "$@" ;;
     ladder) ladder ;;
     limit)  limit ;;
     ab)     ab ;;
+    prefill) prefill ;;
     *)      sed -nE 's/^# ?//p' "$0" | sed -n '1,40p'; exit 2 ;;
 esac
