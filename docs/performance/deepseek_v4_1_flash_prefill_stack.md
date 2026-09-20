@@ -21,6 +21,13 @@ chunked-prefill page named is not the host's row loop, which this run measures a
 calls in both arms. The logits move and the decisions do not: the stacked tree picks the same token
 as the base tree at all nine dump positions, and the stacked tree run twice is bit-identical.
 
+The composition holds at the length the branch exists for, which is the other half of what this page
+had to answer. Over a full 262144-token prompt the same two arms go **3722.8 → 2520.7 s and 70.4 →
+104.0 tokens a second (1.477x)**, a 4096-token chunk going 58.17 → 39.39 s — and the ratio is 1.479x
+on the chunk at the 32768 boundary and 1.476x on the last one, so none of the three levers is a term
+that grows with the prefix. The two arms stage the same number of expert rows to within 1.8%, in the
+direction that makes the stacked arm do *more* of the work.
+
 ## Run record
 
 | | |
@@ -218,6 +225,101 @@ Three things follow.
   straggler is the floor, and reading the other row as the floor would have sent a bf16 kernel after
   0.7% of a chunk.
 
+## The same composition at 256K
+
+Every number above is one 4096-token chunk at 32768, which is the geometry the three passes were
+developed against. But the branch the composition sits on is the 256K branch, and a lever worth 33% of
+a chunk at 32768 is not automatically worth 33% of a chunk at 262144 — of the two terms the
+[chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) separates, the expert path is linear in
+the tokens and the indexer's prefix scoring is linear in the tokens *times the prefix width*, so a
+composition can hold at 32768 and thin out at 256K. So both arms were re-run over a full
+262144-token prompt, one leg each, `--lengths 262144 --chunk 4096 --pool-rows 148 --buffers 2
+--threads 22`, with `--max-seq-len` left at the leg's own 262208 so the caches are the 256K ones
+rather than the 41024 the tables above ran against.
+
+| | base (`/tmp/pr_b`) | stacked (`/tmp/prefill_all`) |
+| --- | ---: | ---: |
+| 262144 tokens, rank 0 | 3722.8 s | 2520.7 s |
+| tokens a second | 70.4 | 104.0 |
+| a 4096-token chunk, mean | 58.17 s | 39.39 s |
+| **ratio** | | **1.477x** |
+| chunk at `[32768:36864]` | 56.72 s | 38.35 s |
+| chunk at `[258048:262144]` | 60.91 s | 41.26 s |
+| peak allocated, rank 0 / rank 3 | 15.93 / 17.34 GiB | 16.00 / 17.33 GiB |
+| peak reserved, rank 0 / rank 3 | 16.92 / 18.01 GiB | 16.45 / 18.17 GiB |
+| expert rows staged, rank 0 | 606,192 (2.31 a token) | 616,825 (2.35 a token) |
+| expert rows staged, rank 3 | 321,864 (1.23 a token) | 324,553 (1.24 a token) |
+| top-8 at 262144, all four ranks | `[295, 1, 6273, 1000, 14, 16, 270, 509]` | `[295, 1, 1000, 6273, 14, 270, 509, 16]` |
+
+**The ratio is flat.** 1.479x on the chunk at the 32768 boundary, 1.476x on the last chunk, 1.477x
+over the whole leg. That is the useful negative result as much as the positive one: none of the three
+levers is a term that grows with the prefix, so none of them is what the next pass at this length
+should be looking at, and the 18.80 s the 32768 profile measured is 19.65 s here rather than less.
+
+The two trees are the two above, one commit further on. `/tmp/pr_b` is the 256K branch at `4608981`,
+which is `98e828f` — the tip the 22-tap profile ran — plus two Markdown files; `/tmp/prefill_all` is
+`b7f633a`, which is `98e828f` plus the three merges. So the arms differ in the Python and in the
+kernels by the three changes and in nothing else, and the documentation delta between them is one
+page's corrections, which cannot move a chunk.
+
+**This leg's 32768-token chunk is the chunk above.** Chunk 9 of the leg is `[32768:36864]`, the same
+chunk the 22-tap profile ran, and the two arms come back within 0.8% of it — 56.72 s against 56.87 s
+in the base arm, 38.35 against 38.07 in the stacked one. The two arms here are therefore the two arms
+there, read at a longer prompt; and since the caches are 262208 wide here against 41024 there, the
+wider allocation costs nothing at a 32768-token prefix.
+
+**The stacked arm stages more expert rows, not fewer.** Rank 0 goes 606,192 → 616,825, which is +1.8%;
+rank 1 +1.4%, rank 3 +0.8%. That is the direction the 32768 profile's expert H2D row went too (16.71 →
+17.38 s), and for the same reason: the three kernels reorder fp32 accumulation, the router's argmax
+moves with it, and a few more of the expert ids a pass draws miss the pool. 1.8% more staging inside a
+chunk that is 32% shorter is what says none of the 18.8 s is saved rows. The 2/2/1/1 deal is in the
+row counts unchanged — 2.31-2.35 rows a token on ranks 0 and 1 against 1.23-1.24 on ranks 2 and 3,
+against the 2.37 the chunked-prefill page measured for the same 148-row pool.
+
+**Both arms grow by the same 5.2 s across the leg.** From chunk 5 to chunk 64 — a prefix of 16384
+against one of 262144 — the base arm's chunk goes 55.70 → 60.91 s (+5.21) and the stacked arm's
+36.00 → 41.26 (+5.26). Fitted over the sixteen sampled chunks that is 0.0206 ms a token for the base
+arm and 0.0173 for the stacked one with worst residuals of 1.15 and 1.12 s, so the two slopes are not
+resolved apart and the endpoints are the same seconds. The prefix-dependent part of a 256K chunk is
+therefore ~5.2 s of the stacked arm's 41.26 — 13% of it — and it is the part the three changes leave
+alone. Which phase that is in is not something this probe has a tap for; the two candidates the
+chunked-prefill page names for a context-growing term are the indexer's prefix scoring and its `topk`
+over the group count. The first chunk of each leg is separately dear — 64.47 s against a fitted 55.28
+in the base arm, 47.73 against 36.84 in the stacked one — which is 0.25% and 0.43% of the two legs,
+paid once and in both arms.
+
+**And all four ranks agree on every chunk.** The seventeen printed chunks are one number each rather
+than four: outside chunk 1 the ranks report the same seconds to 0.01 s, and inside it they spread 0.84 s
+in the base arm and 0.56 s in the stacked one, which is the warm-up. So no part of the wall is a
+straggler that one rank sees and another does not — the layer-level split the section above measured
+lives inside a chunk, and eighty collectives a layer is enough to re-lock the ranks before the chunk
+ends.
+
+**The logits at 256K.** Both arms return the same eight tokens and the same next token, 295, on all
+four ranks; the difference is the order. 6273 and 1000 swap places, and 16 drops from sixth to last,
+so at this position the fourth to eighth logits sit within about 0.5 of each other — against the
+0.33-0.67 mean `|diff|` the parity suite measured at 32768, where the top-2 gap stands at 9.10-13.64.
+That is the same perturbation landing on a position whose tail happens to be tight rather than a new
+one, and it does not move the decision. What this run compares is the top-8 and not the matrix — the
+probe prints `topk(logits, 8)` where the parity suite dumps all 129280 columns — so it is the same
+token and the same eight candidates, not bit-equality, and a permutation below the eighth place would
+not be visible in it.
+
+**On naming the arms.** The stacked arm's log names the tree it loaded, on all four ranks —
+`tree /tmp/prefill_all/src/__init__.py` — and the base arm's does not: the `say` that prints it was
+added to the probe at 01:30:41, eleven minutes after that arm's hour began, so the running process had
+already imported `src` from a file that did not yet contain the line. Its identity is not idle
+curiosity, since the probe's `sys.path` order is what the first attempt at this A/B got wrong and
+would go wrong silently; it is established two other ways instead. The repository checkout that
+`V41_TREE` displaces has no `chunk` argument on `LoadedBackbone.__call__` (`loader.py:720`) while
+`/tmp/pr_b` at `4608981` does, and the probe passes `chunk=None` on every chunk, so an arm that
+finished all 64 of them cannot be the checkout — the earlier attempt died on the first chunk exactly
+so, and that death is what the `sys.path` order on the page above was written for. And its numbers are
+the base arm's: 56.72 s at the 32768 boundary against the 56.87 s the profile above measured, and
+70.4 tok/s over the leg against the 3711.0 s / 70.6 tok/s the
+[chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) published for this tree at this length,
+0.4%.
+
 ## The logits
 
 `/tmp/pr_b_parity.py` dumps the last-position logits after every chunk — nine positions from 4096 to
@@ -278,3 +380,23 @@ git merge perf/v41-moe-reduce-csr
 
 `--out X` writes `X.r0` … `X.r3`, one a rank; the parity arms are `/tmp/pr_b_parity.py` with the same
 `--at/--chunk/--pool-rows/--max-seq-len`, and `--compare a b` reads two of its dumps back.
+
+The 256K leg is the same two trees through a different probe, one leg each, with the rendezvous port
+given a moment between the runs — the port is released by the process and not by its exit, which is
+how an earlier attempt at a back-to-back pair came back `EADDRINUSE` and reported success:
+
+```bash
+for arm in base:/tmp/pr_b stacked:/tmp/prefill_all; do
+    name="${arm%%:*}"; tree="${arm#*:}"
+    V41_TREE="$tree" /home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+        /tmp/probe_v41_chunk_scaling.py --lengths 262144 --chunk 4096 --pool-rows 148 \
+        --buffers 2 --threads 22 --out "/tmp/chunk_scaling_$name.pt"
+    sleep 20
+done
+```
+
+`DEEPSEEK_V41_RESIDENT_EXPERTS=1` in the environment as above, and the probe says which tree each arm
+resolved to — `tree /tmp/prefill_all/src/__init__.py` — which is worth watching for, because the two
+`sys.path` inserts in it (`probe_v41_chunk_scaling.py:38-40`) only put a `V41_TREE` in front of the
+repository checkout if the tree's insert is second; written the other way round both arms quietly
+measure this checkout instead.
