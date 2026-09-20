@@ -10,10 +10,16 @@ forward dies of allocation, at 640 MiB asked for with 572 MiB free, inside `hc_p
 
 `Backbone.forward(..., chunk=n)` splits the prompt into `n`-token forwards that compose into the same
 forward, because every layer already keeps its own state in its caches. That is the whole of the 256K
-support: **262144 tokens in 3711.0 s, 70.6 tok/s on all four ranks, 57.98 s a 4096-token chunk, peak
-17.34 GiB of the 22000 the card reports.** It is only *reasonable* if the chunks are exact rather
-than approximate, so the first half of this page is what a chunk has to preserve and the tests that
-hold it to that; the second half is what a chunk costs, and where those seconds go.
+support: **262144 tokens on all four ranks, 1789.92 s at 146.46 tok/s, peak 17.72 GiB of the 22000 the
+card reports.** The split itself landed at 3711.0 s and 70.6 tok/s; the `id` expert deal took that to
+3121.0 and 83.99, and the three stacked prefill kernels under it took it to the 1789.92 — [both legs of
+that last step are re-taken on the expert
+page](deepseek_v4_1_flash_device_experts.md#the-same-pair-re-taken-on-the-tree-that-ships-149x-and-142x),
+which is where the deal's own 1.19x is. What this page adds is what a chunk has to *preserve* and what
+a chunk *costs*: the split is only reasonable if the chunks are exact rather than approximate, so the
+first half is the five caches a boundary carries and the tests that hold it to that, and the second half
+is the seconds inside a chunk — including [the one row that grows with
+context](#the-one-row-that-grows-with-context).
 
 ## Run record
 
@@ -22,6 +28,7 @@ hold it to that; the second half is what a chunk costs, and where those seconds 
 | Model | DeepSeek-V4.1-Flash, released checkpoint, fp8 dense + packed-fp4 experts |
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, 48 shards, 475.24 GiB, resident bank attached from the 457.78 GiB `/dev/shm` segment |
 | Commit | `5e7ff05` on `feature/v41-256k-context`, stacked on `89d0e88` on `perf/v41-hc-token-tile` and comments only on that branch since (`83ed600`), both against `master` `a533a0a` |
+| The tree the headline is on | `master` `126ac19`, one deal later than the sweep above: the `id` deal is the default at `38edf9b`, and the three prefill kernels of `7102c19` (`attn.sparse`), `aa83816` and `b394ddb` (the MoE's weights and its reduce) are under it. The two 262144 legs are taken on the same code as a rebase, `/tmp/deal3` with `DEEPSEEK_V41_EXPERT_DEAL=id`; both phase tables in [the row that grows with context](#the-one-row-that-grows-with-context) are taken on `126ac19` itself, and their `attn.sparse` of 2.05 s against the sweep's 8.05 s is what says so |
 | Configuration | TP4, one process a card, `torchrun --nproc_per_node=4`, `--threads 22`, `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, `--pool-rows 148` |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each, GPU0-GPU1 PHB and GPU2-GPU3 NV2, cross-pairs SYS |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
@@ -424,6 +431,114 @@ the per-row loop is 1.52 s — the row is not the 12–17% this page first read 
 not the one to attack before the copies, but it is the row that says how much of this chunk is one
 process's Python, though not its loops: `_split` and the per-row `tolist()` are 3 µs of the 9.3 and
 the rest is the pool.
+
+**That ordering is the 32768 one and it does not survive to 256K.** `attn.indexer` and
+`attn.compress_kv` are the only rows of this table with a context term, and across the leg they take
+the pair from 11.6% of a chunk to 32.7%, which leaves them and `moe.routed`'s 20.5 s as the two largest
+things in a 256K chunk — no other row reaches 10 s.
+[Below](#the-one-row-that-grows-with-context) is what is inside them and which of their levers are
+still open.
+
+### The one row that grows with context
+
+`attn.indexer` is **2.069 s at 32768 and 5.097 s at 262144** (2.46x), 8 calls at both lengths, and
+`attn.compress_kv` on the same path reads 2.10 and 5.13 s. Those two chunks are this tree's — the three
+prefill kernels and the `id` deal are both in — so the quiet chunk is **27.39 s at 32768 and 31.34 s at
+262144**, and the pair is **3.19 s of the first (11.6%) against 10.24 s of the second (32.7%)**. Both
+fit the ship: 27.39 s at 32768 is the sweep's 57.04 s through the three kernels and the `id` deal, and
+31.34 s at 262144 sits 5% above that leg's own last chunk of 29.82 s. Those
+are the two denominators used below; the table above's 56.96 s is the same chunk on the branch without
+the three kernels, and its `attn.sparse` row of 8.05 s is that tree's score pass rather than this one's
+2.05 s. Across this leg the pair is the *whole* of the growth: every other row of the two phase tables
+is flat or lower over it — `moe.routed` 21.5 → 20.5 s, `attn.sparse` 2.05 → 2.02 s, the routed taps'
+bodies within 2% — while the chunk goes 27.39 → 31.34 s.
+
+**Read the tap's two time columns apart or it will mislead you**, the same rule the phase table above
+needs. A wrapper that drains the GPU before each call records the *enqueue* in `body` and the GPU
+backlog standing at the boundary in `sync`, so a tap over a collective or a D2H read shows its host
+blocking time rather than its kernel's duration. The indexer's own tap is opened below.
+
+Four arms on the same tree priced what is per-tile inside the row:
+
+| arm | tiles moved | `attn.indexer` at 32768 | ratio |
+| --- | --- | ---: | ---: |
+| `INDEXER_QUERY_TILE` 2048 → 4096 | none — `key_tile` halves as `q_tile` doubles, so the tile's size and its count both stay put | 2.069 → 2.111 | 1.02x |
+| `INDEXER_SCORE_BUDGET` 2^26 → 2^28 | `key_tile` 4096 → 16384, i.e. 30 of 1072 tile events (2.8%) | 2.069 → 2.096 | 1.01x |
+| both | 30 | 2.069 → 2.066 | 1.00x |
+| `INDEXER_CAND_TILE` 64 → 256 | `span` 512 → 2048, so 1072 → 304 tile events (**3.5x**) | **2.069 → 1.871** | **0.90x** |
+
+The counts come from the checkpoint's own layout. `index_source_layer_ids`
+`[2, 8, 14, 20, 24, 28, 32, 36]` are the eight indexers and `kv_source_layer_ids` `[2, 8, 14, 20]` the
+four that publish an `index_k`; each indexer reads the `index_k` of the nearest source in front of it,
+so its width is `end_pos // ratio`, with `compress_ratios` 2 for layers 2–19 and 1 for 20–39.
+`candidate_source_layer_id` 20 splits the eight: layers 2/8/14 and 20 run the prefix path, and
+24/28/32/36 run the candidate path. At `--at 32768 --chunk 4096` the widths are 18432 and 36864, so
+
+| path | layers | tiling | calls |
+| --- | --- | --- | ---: |
+| prefix | 2/8/14 | `q_tile` 2048 x `key_tile` 4096 = 2 x 5 | 10 each |
+| prefix | 20 | 2 x 9 | 18 |
+| candidate | 24/28/32/36 | `q_tile` 512 x (`span` 512 over 16384 keys = 32) | 256 each |
+
+**1072 einsum calls, 96% of them the candidate path** — which is what makes the two prefix knobs the
+nulls they are. `INDEXER_SCORE_BUDGET` sizes `key_tile` and so reaches 30 of those 1072 events, a 2.8%
+cut, and `INDEXER_QUERY_TILE` doubles `q_tile` and halves `key_tile`, leaving the tile's size and its
+count exactly where they were. The FLOPs disagree with the counts: a prefix tile is 17.2 GFLOP and a
+candidate one 0.54, so the chunk's 1374 GFLOP splits 825 / 550 between the levels against the counts'
+4% / 96%. **Read the two nulls as "the prefix tile is not the row", never as "nothing per-tile is",
+and read the row itself as 90% something that is neither the tile count nor the arithmetic** — the one
+arm that reaches all the tiles cuts them 3.5x and buys 0.198 s of a 2.07 s row.
+
+At 262144 the two widths are 133120 and 266240, so the 48 prefix tiles become **328** and the total
+1072 → **1352**; the candidate path's do not move, because its `keys` is `candidate_topk_blocks` 2048
+blocks of `candidate_block_size` 8 — 16384 gathered positions a query whatever the context is.
+`/tmp/probe_v41_indexer_steps.py` takes that row apart in place, with a host `synchronize()` around
+every call so a tap records a body and a sync the way the 22-tap table does:
+
+| one 4096-token chunk at 262144 | body s | calls | µs/call | sync s | worst rank |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `indexer` | 5.677 | 8 | 709569.3 | 0.015 | 1 |
+| — `push` | 0.309 | 1482 | 208.3 | 0.359 | 2 |
+| — `einsum` | 0.113 | 1352 | 83.6 | 1.815 | 2 |
+| —— `reduce` | 0.201 | 1352 | 148.5 | 2.381 | 2 |
+| — `stream_prefix` | 3.525 | 4 | 881326.6 | 0.001 | 1 |
+| — `stream_candidates` | 2.084 | 4 | 520967.0 | 0.000 | 1 |
+
+The 1352 is the probe checking its own geometry against the counts above, and the instrumented 5.677 s
+against the uninstrumented 5.097 is the same ~11% the 22-tap instrument costs. **Read the two time
+columns apart or this table will mislead you.** The wrapper drains the GPU before every call, so `body`
+is the *enqueue* — `reduce`'s 0.201 s over 1352 calls is 148.5 µs of `.float()`, `all_reduce` and
+`.to(bf16)` per call and says nothing at all about the collective's duration — and `sync` is the GPU
+backlog standing at the boundary plus that call's own kernel. What the bookkeeping does support is
+
+```
+indexer body 5.677 = sum(inner bodies) 0.66 + sum(inner syncs) 4.60 + unnamed CPU 0.42
+```
+
+so **the row is GPU-bound at 256K: ~4.6 s of GPU against ~1.1 s of host**, and the elementwise that
+sits between the taps — a relu, a weights multiply and a head sum over a `[2048, 8, 4096]` bf16 score,
+134 MB a tile — lands in its neighbours' sync columns rather than in a row of its own. Read the parts
+as bounds and never as a partition.
+
+The level split is **`stream_prefix` 3.525 s against `stream_candidates` 2.084 s**, which is 2.0 ms a
+candidate c-iteration in situ. The candidate path's call count and tile shape do not change with
+context, so if its per-call cost did not either, 2.084 s would be more than the entire row at 32768 —
+so something inside it scales with the width. The two candidates are the address spread of the gather
+out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5 MiB of L2) and 68 MiB at 262144
+(outside it), and the read of a `key_tile` strip at the far end of a 266240-wide dim.
+
+**Two levers, and what gates each.** The collective: `make_all_reduce` upcasts to fp32 around the
+`all_reduce` and the closure casts the answer back to bf16 anyway, so a prefix-tile message travels on
+the wire at **33.6 MB against the 16.8 MB of the tensor it carries** — ~11 GB a chunk at 262144 against
+the candidate path's ~1 GB — for a rounding on a value that is bf16 the moment it leaves the closure.
+Whether that volume is what the collective costs is a property of the fabric rather than of the tap, so
+it is measured directly (`/tmp/bench_nccl_indexer_shape.py` sends both real shapes in both dtypes on the
+real PHB/NV2/SYS topology); parity of the picked ids is the gate on shipping it, because NCCL sums a
+ring in the wire dtype and the score's O(600) values carry 8 mantissa bits there — and if the wire
+dtype moves at all it should move to fp16 before bf16, which is the same 2 bytes with 10 mantissa bits.
+The overlap: the einsum of tile i+1 and the reduce of tile i are independent — only `_TopKStream.push`'s
+D2H read of the score needs the reduce finished — so a one-tile lookahead on a second stream is a
+scheduling change with no numerics in it at all, which makes it the safer of the two.
 
 ## Reproducing
 
