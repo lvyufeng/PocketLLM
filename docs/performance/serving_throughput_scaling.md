@@ -41,10 +41,11 @@ emits nothing — a silent hang rather than an error. Throughput peaks earlier, 
 - `--random-range-ratio 0.0`, so every prompt is exactly 512 tokens, and `inf`
   request rate, so the whole group is offered at once
 
-The engine sources at `645e36b` are the ones the numbers come from. PR #294 adds
-two `report_phase_profile()` calls to the `--batch-decode` bench and was applied
-for the profiled runs only; with `QWEN_PHASE_PROFILE` unset both calls return
-immediately, so the serving numbers are unaffected by it.
+The engine sources at `645e36b` are the ones the numbers come from. The two
+`report_phase_profile()` calls PR #294 added to the `--batch-decode` bench
+(merged as `0d122ea`) were applied for the profiled runs only; with
+`QWEN_PHASE_PROFILE` unset both return immediately, so the serving numbers are
+unaffected by them.
 
 ### Reproduction
 
