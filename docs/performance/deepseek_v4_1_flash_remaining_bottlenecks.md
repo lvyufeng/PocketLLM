@@ -488,7 +488,12 @@ supports as an **upper bound** at the configuration named, and the two gated row
 it **`attn.indexer` plus `attn.compress_kv` are 3.19 s of a chunk at 32768 against 10.24 s of one at
 262144 — 11.6% to 32.7%** — while every other row of the two phase tables is flat or lower over the
 same span. Its two levers are the indexer's `all_reduce`, which upcasts to fp32 and so puts 33.6 MB on
-the wire for a 16.8 MB tile, and a one-tile lookahead over that collective;
+the wire for a 16.8 MB tile — **5.47 ms a level-one tile measured on this fabric against 2.88 ms in
+bf16, 1.79 s of the prefix path's 3.53 s at 262144, and the prediction lands on the tap's own `sync`
+column to 0.89 at 32768 and 0.84 at 262144** — and a one-tile lookahead over that collective, which
+has no numerics gate and can hide the whole of it. The wire dtype's gate is **closed**: fp16 on it
+picks a different set on all eight indexer layers, and the candidate path's half of the row does not
+grow with context at all (2.035 s at 32768 against 2.084 at 262144).
 [the row that grows with context](deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context)
 takes it apart and names what gates each.
 
@@ -538,6 +543,23 @@ takes it apart and names what gates each.
   takes no slot — is bit-exact and drops the wait to 0.09–0.25 s on the low-pressure ranks, but the
   end-to-end A/B is −6% with **overlapping ranges** (33.95 against 31.90 s mean) and `_stage` and
   `_upload` unmoved in both columns, so the honest claim is the mechanism and not the percentage.
+- **That the indexer's candidate path gets slower as `index_k` leaves L2.** The gather's index is 4 MiB
+  at 32768 (inside this card's 5.5 MiB) and 68 MiB at 262144 (outside it), which predicted a
+  per-iteration cost that grows with width — and that growth was the explanation offered for the
+  candidate path's 2.084 s at 262144. The 32768 half of the same probe settles it: **2.035 s over the
+  same 1024 tiles, flat to 2.4%, 1.99 ms a c-iteration against 2.04**. The candidate path is 77% of the
+  2.6 s indexer row at 32768 and does not scale with context at all; the row's growth is the prefix
+  path's — +3.000 s of the +3.049 s — and half of that growth is its collective, which
+  [the chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context)
+  is corrected on. `/tmp/chunk_indexer_steps_32768.log`.
+- **fp16 on the indexer's reduce wire.** Halving the message is worth ~0.93 s of the 5.10 s row at
+  262144 and the arm is a dtype on a closure, so it looked free. It is not: `INDEXER_REDUCE_BITS=16`
+  moves the selected *set* on all eight indexer layers, against a null — two arms with no knob moved —
+  whose own disagreement reproduces to the digit across runs, so the baseline is subtractable and this
+  clears it. Layer 2 goes from 3083 differing rows of 4096 to all 4096, and from 621210 differing
+  elements to 1640362. Layer 2 is the one that settles it rather than 8/14/20/24/28/32/36: being the
+  first indexer, it has no predecessor whose differing selection it could be inheriting.
+  `/tmp/indexer_parity_reduce16.log` against `_null.log`.
 
 ## Reproducing
 

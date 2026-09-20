@@ -485,9 +485,10 @@ nulls they are. `INDEXER_SCORE_BUDGET` sizes `key_tile` and so reaches 30 of tho
 cut, and `INDEXER_QUERY_TILE` doubles `q_tile` and halves `key_tile`, leaving the tile's size and its
 count exactly where they were. The FLOPs disagree with the counts: a prefix tile is 17.2 GFLOP and a
 candidate one 0.54, so the chunk's 1374 GFLOP splits 825 / 550 between the levels against the counts'
-4% / 96%. **Read the two nulls as "the prefix tile is not the row", never as "nothing per-tile is",
-and read the row itself as 90% something that is neither the tile count nor the arithmetic** — the one
-arm that reaches all the tiles cuts them 3.5x and buys 0.198 s of a 2.07 s row.
+4% / 96%. **Read the two nulls as "at 32768 the prefix path is not the row" — it is 0.525 s of the
+2.628 s one, which the level split below measures directly — never as "nothing per-tile is", and read
+the row itself as 90% something that is neither the tile count nor the arithmetic** — the one arm that
+reaches the candidate tiles cuts them 3.5x and buys 0.198 s of a 2.07 s row.
 
 At 262144 the two widths are 133120 and 266240, so the 48 prefix tiles become **328** and the total
 1072 → **1352**; the candidate path's do not move, because its `keys` is `candidate_topk_blocks` 2048
@@ -520,25 +521,58 @@ sits between the taps — a relu, a weights multiply and a head sum over a `[204
 134 MB a tile — lands in its neighbours' sync columns rather than in a row of its own. Read the parts
 as bounds and never as a partition.
 
-The level split is **`stream_prefix` 3.525 s against `stream_candidates` 2.084 s**, which is 2.0 ms a
-candidate c-iteration in situ. The candidate path's call count and tile shape do not change with
-context, so if its per-call cost did not either, 2.084 s would be more than the entire row at 32768 —
-so something inside it scales with the width. The two candidates are the address spread of the gather
-out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5 MiB of L2) and 68 MiB at 262144
-(outside it), and the read of a `key_tile` strip at the far end of a 266240-wide dim.
+The level split is the one thing the two lengths disagree about, and the 32768 half of the probe is
+what shows it. `stream_prefix` is **0.525 s at 32768 against 3.525 s at 262144** — 48 prefix tiles
+against 328 — while `stream_candidates` is **2.035 against 2.084 s** over 1024 tiles both times. So
+the candidate path is **2.035 s of the 2.628 s instrumented row at 32768, 77% of it**, and 37% of the
+one at 262144, and **nothing in it scales with context**: flat to 2.4%, 1.99 ms a c-iteration against
+2.04. An earlier reading here — that 2.084 s "would be more than the entire row at 32768", so
+something inside the candidate path must grow with the width — compared an instrumented 262144 number
+against an *uninstrumented* 32768 row and landed on the answer it was looking for: the candidate
+path's own cost at 32768 is 2.035 s. The L2 hypothesis that reading bought is therefore **untested
+and unsupported**: the gather out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5 MiB
+of L2) against 68 MiB at 262144 (outside it) predicts a per-iteration cost materially lower when the
+index fits, and the 2.4% between 2.035 and 2.084 s — 0.049 s over 1024 of them — is the whole of what
+that difference is worth.
 
-**Two levers, and what gates each.** The collective: `make_all_reduce` upcasts to fp32 around the
-`all_reduce` and the closure casts the answer back to bf16 anyway, so a prefix-tile message travels on
-the wire at **33.6 MB against the 16.8 MB of the tensor it carries** — ~11 GB a chunk at 262144 against
-the candidate path's ~1 GB — for a rounding on a value that is bf16 the moment it leaves the closure.
-Whether that volume is what the collective costs is a property of the fabric rather than of the tap, so
-it is measured directly (`/tmp/bench_nccl_indexer_shape.py` sends both real shapes in both dtypes on the
-real PHB/NV2/SYS topology); parity of the picked ids is the gate on shipping it, because NCCL sums a
-ring in the wire dtype and the score's O(600) values carry 8 mantissa bits there — and if the wire
-dtype moves at all it should move to fp16 before bf16, which is the same 2 bytes with 10 mantissa bits.
-The overlap: the einsum of tile i+1 and the reduce of tile i are independent — only `_TopKStream.push`'s
-D2H read of the score needs the reduce finished — so a one-tile lookahead on a second stream is a
-scheduling change with no numerics in it at all, which makes it the safer of the two.
+**Two levers, and what gates each — and each one owns a different regime.** The collective:
+`make_all_reduce` upcasts to fp32 around the `all_reduce` and the closure casts the answer back to
+bf16 anyway, so a prefix-tile message travels on the wire at **33.6 MB against the 16.8 MB of the
+tensor it carries** — ~11 GB a chunk at 262144 against the candidate path's ~1 GB — for a rounding on
+a value that is bf16 the moment it leaves the closure. Whether that volume is what the collective
+costs is a property of the fabric rather than of the tap, so it is measured directly
+(`/tmp/bench_nccl_indexer_shape.py` sends both real shapes in both dtypes on the real PHB/NV2/SYS
+topology), and the fabric turns out to be the constant: a `[2048, 4096]` level-one tile is **5469.8 µs
+at float32 against 2877.5 µs at bfloat16** — 32 MiB of wire at 6.1 GB/s against 16 MiB at 5.8 GB/s —
+and a `[512, 512]` level-two tile is 201.7 against 126.2 µs.
+
+Over the tile counts above that is **0.469 s at 32768 and 2.001 s at 262144** of fp32 wire — 0.263 of
+it level one and 0.207 level two at 32768, 1.794 and 0.207 at 262144 — against 0.267 and 1.073 in half
+the bytes: **1.794 s of the 3.525 s prefix path at 262144 — 51% of it and 35% of the whole 5.10 s row
+— and 0.263 s of the 0.525 s one at 32768.** The prediction is checkable in situ and it checks out on
+the one tap column that can see a collective, `reduce`'s `sync`, which drains the GPU backlog standing
+at the call boundary: **0.469 s predicted against 0.530 measured at 32768 and 2.001 against 2.381 at
+262144, 0.89 and 0.84**, over two lengths whose level-one tile counts differ 6.8×. That ratio is what
+makes the extrapolation a measurement rather than arithmetic — one agreement would be luck. (Do not
+*add* the sync columns: `einsum`'s 1.104 s at 32768 and its 1.815 s at 262144 are the same backlog
+seen from a different boundary.) Parity of the picked ids is the gate on shipping it, because NCCL
+sums a ring in the wire dtype and the score's O(600) values carry 8 mantissa bits there — and if the
+wire dtype moves at all it should move to fp16 before bf16, which is the same 2 bytes with 10 mantissa
+bits. **That gate is closed on the evidence so far:** `INDEXER_REDUCE_BITS=16` moves the selection on
+all eight indexer layers, against a baseline whose own disagreement — two arms with no knob moved —
+reproduces to the digit across runs, and layer 2 goes from 3083 differing rows of 4096 to all 4096 and
+from 621210 differing elements to 1640362. fp16 on the wire is a different function, so the volume of
+that collective is a lever the numerics has shut for now.
+
+The overlap is the other one and it is the larger where the row is. The einsum of tile i+1 and the
+reduce of tile i are independent — only `_TopKStream.push`'s D2H read of the score needs the reduce
+finished — so a one-tile lookahead on a second stream is a scheduling change with no numerics in it at
+all: **up to the collective's whole 1.79 s can go under the next tile's einsum at 262144, against the
+0.93 s the wire dtype would save if it were shippable**, and it is worth nothing at 32768, where the
+collective is 0.26 s of a 2.07 s row. The retile is the third and it owns 32768: the 0.198 s
+`INDEXER_CAND_TILE` 64 → 256 buys is 9.6% of the row 2.07 s *because* the candidate path is 77% of it
+there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
+grow with the width.
 
 ## Reproducing
 
