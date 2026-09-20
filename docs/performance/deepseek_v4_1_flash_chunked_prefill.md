@@ -564,12 +564,25 @@ reproduces to the digit across runs, and layer 2 goes from 3083 differing rows o
 from 621210 differing elements to 1640362. fp16 on the wire is a different function, so the volume of
 that collective is a lever the numerics has shut for now.
 
+**The closed gate still paid for the price model, and that is why it was run.** The same probe was run
+at 262144 with `--reduce-dtype fp16` (`/tmp/chunk_indexer_steps_262144_fp16.log`) — not as a candidate
+but as the one measurement that could falsify the extrapolation, and it lands on it. `stream_prefix`
+**3.525 → 2.674 s, −0.851**, against the 0.928 s the microbench predicted for halving level one;
+`reduce`'s `sync` 2.381 → 1.551 (−0.830); the whole `indexer` row 5.677 → 4.758 (−0.919); the chunk
+**29.74 → 29.14 s**. `stream_candidates`, which the price model says has almost no level-one wire in
+it, moves 2.084 → 2.016, −0.068. So the model that puts 1.79 s a chunk on the fp32 collective is right
+to within one percent, and the overlap below is a lever on a cost that is now measured from both ends.
+Note the row gains 0.919 s where the chunk gains 0.60 s: about a third of the row's collective is
+already hidden behind other work at the chunk level, and *that* is the number the overlap's ceiling has
+to be read against rather than the whole 4.758 s row.
+
 The overlap is the other one and it is the larger where the row is. The einsum of tile i+1 and the
 reduce of tile i are independent — only `_TopKStream.push`'s D2H read of the score needs the reduce
 finished — so a one-tile lookahead on a second stream is a scheduling change with no numerics in it at
 all: **up to the collective's whole 1.79 s can go under the next tile's einsum at 262144, against the
-0.93 s the wire dtype would save if it were shippable**, and it is worth nothing at 32768, where the
-collective is 0.26 s of a 2.07 s row. The retile is the third and it owns 32768: the 0.198 s
+0.93 s the microbench predicted and the measured 0.851 s that the wire dtype actually bought the prefix
+path when it was run** — and the overlap needs no gate to be worth measuring, while the dtype's is shut.
+At 32768 it is worth nothing: the collective is 0.26 s of a 2.07 s row. The retile is the third and it owns 32768: the 0.198 s
 `INDEXER_CAND_TILE` 64 → 256 buys is 9.6% of the row 2.07 s *because* the candidate path is 77% of it
 there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
 grow with the width.
