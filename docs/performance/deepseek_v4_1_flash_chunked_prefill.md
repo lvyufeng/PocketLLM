@@ -337,16 +337,24 @@ them — so the instrument is charged to the MoE and the rest of the table is cl
   rather than a second mechanism. Both readings are the same finding: **a row's 17.93 MiB crosses at
   two thirds to four fifths of what a PCIe 3.0 x16 link is rated at, and it is not hidden behind
   anything.**
-- **The rest of the routed call — 6.7 to 9.5 s — is the host's own bookkeeping of those rows**: the
-  163,840 `_resolve_row` and 163,840 `_stage_misses` calls (a call a token a layer each), the pinned
-  pointer work `_stage_misses` does itself, the buffer rotation and the two `forward` bodies' glue.
-  It is a band and not a number because the tap's price is spread over the calls at 24.8 µs apiece
-  (8.58 s / 346,042), so `_resolve_row`'s 5.22 s is an upper bound whose 163,840 calls could carry
-  4.06 s of it. The other end gives the device floor: 41.9 s of MoE less that bookkeeping band, which
-  is 32.4–35.2 s — and the two device rows counted directly, the grouped GEMM's 18.5 s and the
-  copies' 16.7 s, add to 35.2 s, the top of it. **20–29 µs a call over 327,680 of them is what a
-  Python-level per-token loop costs**, and it is the one row here that a device clock would never
-  show.
+- **The rest of the routed call is not 6.7–9.5 s of host bookkeeping, and the row this bullet was
+  read from is the instrument.** Every tap here pays two barriers and `_resolve_row` is 163,840 of
+  them, so the run was repeated with the barrier split out of every number
+  (`/tmp/probe_v41_chunk_profile_host.py`: the same 22 taps, each recording its preamble sync, its
+  call body and its postamble sync, then the same width again with the taps off). **`_resolve_row`'s
+  body is 1.52 s over its 163,840 calls — 9.3 µs a call** — and the same run reads it at 1.52 s in
+  this chunk on the tree its three kernel changes are merged into and at 1.52–1.55 s a chunk across
+  the warm-up's eight before either: four independent 163,840-call groups agreeing to 2%, which is
+  the cleanest instance-level measurement in the run. The 5.22 s
+  this table reads for the row is therefore the barriers around it: a tap whose body is empty costs
+  **11.98 µs a call** on this host, 11.12 of it the two `synchronize()`s
+  (`/tmp/probe_tap_price.py`), which is 1.96 s over these calls, and what is left of the row is the
+  preamble barrier waiting on copies and a grouped GEMM the previous call had already issued. What
+  the routed path spends on the host is its *bodies*, and those are **5.11 s**: `_upload` 2.34 s over
+  8,634 calls (271 µs a call), the per-row loop 1.52 s, `DeviceRoutedExperts.forward`'s own glue
+  1.97 s, `_issue_chunk` 0.57 s, `_drain_chunk` 0.34 s and `_stage_misses` itself 0.13 s. A
+  Python-level per-token loop at 20–29 µs a call over 327,680 of them is not one of the rows of this
+  chunk; 2.7% of it is, and the paragraph below prices the part of that a rewrite could take.
 
   What those microseconds are *not* is the loop's own list and sort work, which is worth knowing
   before anyone saves them twice. A shim carrying the real `_split`, the real per-card dictionary
@@ -355,11 +363,14 @@ them — so the instrument is charged to the MoE and the rest of the table is cl
   its `int()`s, 2.1 µs for `_split`, 1.5 µs for the probe loop (`/tmp/probe_v41_resolve_cost.py`;
   between them the shim's own arithmetic closes, 1.1 + 2.1 + 1.5 = 4.7 against 4.6 measured, and one
   `route.tolist()` for the whole chunk is 0.8 ms against 4.6 ms for the per-row form). So of the
-  31.9 µs a `_resolve_row` costs in situ, about 3 µs is the loop and the balance is `_pool_row` and
+  9.3 µs a `_resolve_row` costs in situ, about 3 µs is the loop and the balance is `_pool_row` and
   the state it walks — the pool's own row arithmetic, its eviction bookkeeping, and the class
-  members the shim does not have. A vectorized `_split`, or hoisting the `tolist()` a chunk, is well
-  under a percent of a chunk; the pool's half of those calls is where the seconds are, and the row
-  below is the one to price before spending them.
+  members the shim does not have. That floor is what makes the rewrite small: the shim's 4.6 µs a
+  call is 0.75 s over these 163,840 calls, so of the row's 1.52 s at most 0.8 s sits above what a
+  call that did nothing but this must spend — 1.4% of a chunk, against the copies' 24–29% — while a
+  vectorized `_split` or a `tolist()` hoisted out of the loop, the two thirds the shim cannot avoid,
+  is well under half a percent. The pool's half of those calls is where what is left is, and the row
+  below is the one to price before spending it.
 
 `_take_buffer` is worth naming separately, because it is where this path used to lose its seconds:
 0.13 s over 8,658 calls, against **6.89 s of a 30.35 s class wall** before the rotation was made to
@@ -386,18 +397,22 @@ arithmetic on it costs.
 1.465 ms a staged row**, and the 1.465 is the copies above. The other constant is what this table
 splits, per token: **4.51 ms of grouped fp4 GEMM** (`_issue_chunk` + `_drain_chunk`, 18.49 s),
 **3.14 ms of attention** (12.85 s), **0.56 ms of everything else in a block** (2.28 s), and
-**1.6–2.3 ms of the host's row bookkeeping** (6.7–9.5 s). That is 9.8–10.5 ms against the fit's 10.4,
-so a chunk's two constants are now six measured terms: **two thirds of a chunk is device arithmetic
-and device copies, and the host's share of it is the two milliseconds a token in the middle.**
+**1.25 ms of the routed path's host bodies** (5.11 s, the row above as the barrier split measures it
+rather than as the table reads it). That is 9.5 ms against the fit's 10.4, and the 0.9 between them
+is the host side of what a 22-name tap set does not open — the embedding, the head, the residual
+adds and the bodies of the block's small ops. So a chunk's two constants are now six measured terms:
+**two thirds of a chunk is device arithmetic and device copies, and the host's share of it is one and
+a third milliseconds a token in the middle.**
 
 **What is left, in the order the rows are large.** The grouped fp4 GEMM, 18.5 s and 32% of a chunk,
 over four calls a layer with no host work inside them. The expert H2D, 13.9–16.7 s and 24–29%, where
 both ways to buy bytes back are unavailable at 262144 (a wider chunk does not fit above 4096, a wider
 pool dies in the second chunk at 288 rows) and the copies already run at two thirds to four fifths of
-the link. The score pass, 8.05 s and 14%. And the host's row bookkeeping, 6.7–9.5 s and 12–17%, which
-is the row to attack once the copy and the GEMM are at their ceilings — and is also, at 327,680 calls
-a chunk of 20–29 µs each, the row that says how much of this chunk is one process's Python, though
-not its loops: `_split` and the per-row `tolist()` are 3 µs of the 31.9 and the rest is the pool.
+the link. The score pass, 8.05 s and 14%. And the routed path's host bodies, 5.11 s and 9%, of which
+the per-row loop is 1.52 s — the row is not the 12–17% this page first read off the table and it is
+not the one to attack before the copies, but it is the row that says how much of this chunk is one
+process's Python, though not its loops: `_split` and the per-row `tolist()` are 3 µs of the 9.3 and
+the rest is the pool.
 
 ## Reproducing
 
