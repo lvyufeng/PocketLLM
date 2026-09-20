@@ -174,12 +174,49 @@ Three things follow.
   chunked-prefill page built prices the floor of that loop at 4.6 µs a call — 0.75 s of the 1.52 —
   so the row loop is worth at most 1.4% of a chunk, against the copies' 39%. (That page's band is
   corrected in place.)
-- **The TP combine has become visible.** `MoE.forward`'s own postamble is 2.95 s of the stacked chunk
-  over 40 calls — 73.8 ms a layer — and nothing in it is a kernel this pass touched: it is
-  `tp.reduce` at the end of the MoE (`modules.py:485`), one all-reduce of a `[4096, 5120]` bf16
-  activation, 41.9 MiB, across four cards whose fabric is two PHB pairs and two NV2 pairs joined by
-  SYS. At 8% of the chunk it is now larger than the sparse pass, and it is the one row here that no
-  amount of kernel work inside a layer can shrink.
+- **The TP combine has become visible, and it is not a bandwidth row.** `MoE.forward`'s own postamble
+  is 2.95 s of the stacked chunk over 40 calls — 73.8 ms a layer, 8%, larger than the sparse pass now
+  that the sparse pass is a fifth of what it was — and nothing in it is a kernel this pass touched: it
+  is `tp.reduce` at the end of the MoE (`modules.py:485`). The tap that saw it is a host sync over the
+  whole postamble, and the profiler that separated the collectives underneath it keyed them **by
+  name**, which merged this one with the attention's `wo_b` combine (`attention.py:1166`): both are
+  `tp.reduce` over a `[4096, 5120]` activation, both call `make_all_reduce`, which widens to fp32
+  before reducing, so both are the same **80.00 MiB fp32** once a layer — and merged they read 80
+  calls at 52.28 ms a call. Keyed by the *chain* the scope sits in, they are two rows of 40 calls each
+  and they are not the same cost:
+
+  | 80.00 MiB fp32, 40 calls a rank | rank 0 | rank 1 | rank 2 | rank 3 |
+  | --- | ---: | ---: | ---: | ---: |
+  | under `v41.Attn.forward` | 18.2 ms a call | 19.8 | 13.2 | 16.4 |
+  | under `v41.MoE.forward` | 86.4 ms a call | 74.0 | 347.0 | 352.0 |
+
+  The attention's row is the message. An isolated all-reduce of the same 80 MiB on this fabric, cards
+  otherwise idle and event-timed a call (`/tmp/probe_allreduce_rate.py`, median of 100), is **13.58 ms
+  at 5.75 GiB/s**, on the same curve as the same probe's 32 MiB (5.46 ms, 5.72 GiB/s) and 1 MiB
+  (0.193 ms, 5.07 GiB/s) rows — and the attention site costs that on all four ranks, which is what a
+  message with four ranks that arrive together looks like. The pairs do differ there — the two PHB
+  ranks pay 18.2 and 19.8 ms where the two NV2 ranks pay 13.2 and 16.4 — but by 6 ms and not by 266,
+  and the attention is TP-sharded work every rank does in full, so there is nothing for it to be
+  waiting on. The MoE's row is not the message: it is
+  5.4x to 26x that floor, and it is **inverted against the expert load**, which is what says what it
+  is. The deal is static and round-robin over the six sorted routed ids
+  (`device_experts.py:29-34`), so ranks 0 and 1 own two of the six slots and ranks 2 and 3 one, which
+  is 2x the rows staged — 606,192 against 321,354 over the 256K leg — and 1.8x the routed path
+  (`MoE.routed` 17.163 and 17.395 s on ranks 0 and 1 against 9.362 and 9.262 on ranks 2 and 3, over
+  the same 40 layers). Those are the ranks that reach the reduce *last* and wait *least*; the two that
+  did half the work hold the collective for 347-352 ms a layer. The row is a rendezvous with two
+  ranks' expert paths, not a transfer.
+
+  Two things follow, and the second is why this is recorded rather than fixed. A bf16 reduce is
+  attractive here — the source activation is 41.9 MiB and the wire carries 80 — and it would take the
+  message from 13.58 ms to **7.08 ms** (the same probe's bf16 row, the same 41.9 MiB), which is 0.26 s
+  off a 38.07 s chunk: **0.7%**. It would take *nothing* off the row that carries the 2.95 s, because
+  that row is not the bytes. What would move it is even expert work, and six slots dealt over four
+  cards have no static split below a 2, 2, 1, 1 one — `ceil(topk / world)` is the arena every card is
+  sized for (`device_experts.py:557`), and a deal that rotated per row would make every card own every
+  expert over a pass, which is the per-layer resident set this branch's 2.6-2.7x is about. So the
+  straggler is the floor, and reading the other row as the floor would have sent a bf16 kernel after
+  0.7% of a chunk.
 
 ## The logits
 
