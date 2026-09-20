@@ -295,11 +295,28 @@ The removed `hc_head_*` is not a cosmetic deletion, and the parameter shapes alo
 
 ## Validated performance
 
-**None.** No prefill or decode throughput, latency or memory figure has been measured for V4.1-Flash, and none is implied by the audit. The reasons are concrete:
+**Measured, one request at a time through this repository's own launcher.** The three concrete
+reasons this section used to record "None." have all been superseded: the checkpoint's 475.24 GiB is
+on disk complete, the four 2080 Ti do not have to hold the routed experts on the cards because a
+457.8 GiB bank of them is pinned in host memory, and `src/cli/generate_v41.py` runs the released
+checkpoint under `torch 2.9.1+cu128` without the reference stack. Four 2080 Ti, TP4, one process a
+card, one stream, the default expert deal, 64 greedy tokens a leg:
 
-- The checkpoint's 475.24 GiB of tensor payload is not on this host in full, and no weight byte has been read from the shards that are.
-- The four RTX 2080 Ti cards in the reference host hold 22 GiB each, so even a TP4 shard of the routed-expert and Engram tensors does not fit.
-- The released reference stack (`inference_requirements.txt`) requires `torch>=2.10.0` and `tilelang==0.1.8`. The `deepseek` environment has `torch 2.9.1+cu128` and no `tilelang`, so the reference implementation cannot be run here to produce a comparison point either.
+| Prompt | Context | Prefill | Decode | Step |
+| --- | --- | --- | --- | --- |
+| 1024 | 1088 | 55.0 tok/s | **4.98 tok/s** (2.82 eager) | 201–202 ms |
+| 32716 | 32832 | **105.98 tok/s** | **4.37 tok/s** | 229 ms |
+| 262865 | 262976 | **103.58 tok/s** | **3.86 tok/s** | 259 ms |
+
+Three qualifications travel with the table. The long lengths require
+`--expert-pool-rows 148 --prefill-chunk-tokens 4096`, which the flag's own help says is not optional
+at 262144. **Decode of 5 tokens a second is not a guarantee** — it holds at a 1024-token context and
+is 4.37 at 32768 and 3.86 at 262144, because 92% of a step is the eager expert call and its pool
+evicts on essentially every row at the long lengths. And the figures are the `sorted` deal, not the
+`id` deal that is 1.41× on prefill at 262144 and still opt-in. Per-leg flags, the derivation of the
+prefill column from the launcher's own two lines, the split of a graphed step and the
+bit-identical continuations are in
+[DeepSeek-V4.1-Flash: what one request costs, through the launcher](../performance/deepseek_v4_1_flash_single_request_capability.md).
 
 The model card's "8B parameters per token during prefill / 16B during decode" and "890 bytes per token" KV figures are the vendor's numbers. This repository has not reproduced them and this page does not restate them as measurements.
 
