@@ -21,12 +21,15 @@ the byte**.
 | `c1024_on_b2` | 1024 | `--expert-pool-rows 288 --decode-graphs` | (51.5) | (19.4) | **4.95 tok/s** (202 ms) | 32.8 s |
 | `c32768c_on` | 32716 | `--expert-pool-rows 148 --prefill-chunk-tokens 4096 --decode-graphs` | **105.98 tok/s** | 9.44 | **4.37 tok/s** (229 ms) | 323.3 s |
 | `c262144_on` | 262865 | `--expert-pool-rows 148 --prefill-chunk-tokens 4096 --decode-graphs` | **103.58 tok/s** | 9.66 | **3.86 tok/s** (259 ms) | 2554.5 s |
+| `c262144c_on` | 262874 | as above, extended prompt | **103.54 tok/s** | 9.66 | **3.88 tok/s** (258 ms) | 2555.4 s |
 
 `ms a token` is the prefill's, 1000 / the rate. The 1024 rate is in parentheses on the graphed legs
 because on that path the same subtraction carries the capture pass — a decode step that is not one of
 the 64 tokens — so the figure is a floor rather than a measurement; the eager column beside it is the
 clean one, and the two prompts are one unchunked forward rather than the chunked configuration the
-long lengths run.
+long lengths run. **262144 is in the table twice**, on the two prompts below: 103.58 and 103.54
+tokens a second, 36 bytes apart in the prompt and 0.04% apart in the rate, and 259 against 258 ms a
+decode step.
 
 Every leg is `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, `--threads 22`, `--temperature 0.0`,
 `--max-new-tokens 64`, `torchrun --nproc_per_node=4`, and **the default expert deal (`sorted`)**. That
@@ -139,7 +142,7 @@ step's expert call grows:
 | --- | --- | --- |
 | 1088 | 201–202 ms | 4.95–4.98 tok/s |
 | 32832 | 229 ms | 4.37 tok/s |
-| 262976 | 259 ms | 3.86 tok/s |
+| 262976 | 258–259 ms | 3.86–3.88 tok/s |
 
 A **guarantee at 1024, 4.37 at 32768 and 3.86 at 262144** is what the measurements support. The
 degradation is 28% over a 256× increase in context and it is not the attention's: the eager expert
@@ -190,7 +193,9 @@ decode.
 `/tmp/prompt32768c.txt` and `/tmp/prompt262144c.txt` append `"Chapter 345. The traveller reached"` to
 the two long prompts so that the first token cannot be eos, which is a change to the prompt made for a
 reason that has nothing to do with any rate on this page: the append is 36 and 36 bytes on 155 KB and
-1.2 MB prompts, and both extended legs generate the intended `Chapter 345.` continuation.
+1.2 MB prompts, and both extended legs generate the intended `Chapter 345.` continuation. The second
+262144 leg is that prompt *instead of* the original, and it is the check that the append is inert:
+103.54 against 103.58 tokens a second, 258 against 259 ms a step.
 
 ## Reproduce
 
