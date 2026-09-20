@@ -75,7 +75,16 @@ are the last round and add three: `/tmp/probe_v41_prefill_landed.py`, which is
 `/tmp/probe_v41_prefill_direct.py` with its two overrides deleted so the phase clocks instrument the
 shipped class rather than a copy of it, `/tmp/ab_prefill_landed.sh` which drives it twice against
 `/tmp/ab_reg.sh`'s pre-landing legs, and `/tmp/ab_landed.sh`, which is the decode A-B-A-B on the
-shipped CLI with `/tmp/cmp_logits.py` comparing the dumps and `read_bytes` beside the logits.
+shipped CLI with `/tmp/cmp_logits.py` comparing the dumps and `read_bytes` beside the logits. [The
+deal](#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set) adds a
+probe and four drivers, all of them one env var apart from the arms they A/B: `/tmp/probe_deal_route.py`
+is host-only and prices the two deals on the captured routing before anything runs on a card,
+`/tmp/run_deal_ab.sh` is the prefill A-B-A at 32768 tokens, `/tmp/run_deal_parity.sh` dumps the logits
+at both ends of it, `/tmp/run_deal_decode.sh` is the decode A-B-A-B at `--decode 256`, and
+`/tmp/run_deal_256k.sh` is the 256K leg. The three `_master` drivers —
+`/tmp/run_deal_ab_master.sh`, `/tmp/run_deal_decode_master2.sh` and `/tmp/run_deal_256k_master.sh` —
+are those same three sittings re-taken on the tree that ships, which is this branch with master's
+built kernels under it (`/tmp/deal3`).
 
 ## The split
 
@@ -94,6 +103,17 @@ in flight. The four-card arena is the *larger* of the two because 6 does not div
 eight rows are empty in every token. That is 0.3 GiB of pinned RAM for the four-card path, which is
 not a reason to rebalance it.
 
+**That deal is `sorted`, it is the default, and every number on this page was taken on it — but it
+is a choice.** `DEEPSEEK_V41_EXPERT_DEAL=id` hands a drawing to `expert % world` instead of to its
+sorted position, which partitions the experts themselves over the cards rather than dealing each
+card a slice of every row; [the subsection at the end of this section](#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set)
+has the A/B, and **on the tree that ships it is 1.49x on a 32768-token prefill and 1.42x on the 256K
+one** — 1.22x and 1.19x on the kernels this page's own sitting was taken on, which is the same pair
+before the three stacked prefill kernels landed under it. It costs 1.72 GiB more peak allocated on the
+light cards and 0.46 / 0.39 GiB more on the worst card at 32768 tokens and 256K, and 0.40 / 0.04 GiB
+more reserved. `sorted` stays the default because it is what the run record below is, and because the
+two deals are not bit-identical.
+
 **The cards never talk to each other.** Each holds its own arena, is handed the same `[1, 5120]`
 activation, and returns `[1, 5120]` fp32; the host sums the `world` partials. That is 20 KiB back per
 card per layer, 3.2 MB per token across four cards, and it is why there is no NCCL, no all-to-all and
@@ -108,6 +128,231 @@ cut across the four cards — a different launcher and a different process shape
 `src/cli/generate_v41.py` under `torchrun --nproc_per_node=4` — and [that section](#the-dense-tree-across-the-four-cards-tp4)
 has the numbers. Everything above it and everything under *What a step costs* is the
 tree-on-host configuration.
+
+### The deal is a choice, and dealing ids instead of positions balances the staged set
+
+**A card pays for the width of its *staged set*, not for its share of the rows.** An expert is a row
+of expert bytes however many times a chunk draws it, so what a layer's H2D moves is the distinct
+`(layer, expert)` keys a card was dealt — and the deal above walks each card's columns *across* the
+expert range. Card `c` owns sorted positions `c` and `c + world`: two of a row's six drawings, but a
+set that approaches all 384 experts as a chunk's drawings accumulate, and a card dealt two slots sees
+about twice the draws *and* about twice the keys of a card dealt one. The other deal hands the
+drawing to `expert % world`, which partitions the experts themselves over the cards, so a card is
+dealt from `n_experts / world` = 96 of them rather than from all of them. That is
+`DEEPSEEK_V41_EXPERT_DEAL=id` (`--expert-deal id`), and `deal_card` and `rows_per_card` in
+`device_experts.py` are the whole of it: the deal is read in exactly two places — `_split`, which
+decides where a drawing is staged, and `_hot_rows`, which decides which experts count as resident —
+and nothing downstream re-derives it, which is also why
+`tests/test_models_deepseek_v4_1_expert_deal.py` can check the contract without a card. **`sorted`
+stays the default**, so every other number on this page is still the configuration it was taken on.
+
+The arithmetic came first, on the routing the gate actually produced (`/tmp/probe_deal_route.py`,
+512 rows x 6 experts x 40 layers out of `/tmp/v41_routes.pt`, a 148-row pool a card, no resident
+fill):
+
+| deal | rows a card | draws a card | distinct keys a card | staged rows | spread | pool thrash |
+| --- | ---: | --- | --- | ---: | ---: | --- |
+| `sorted` | 2 | 40960, 40960, 20480, 20480 | 5634, 5639, 3822, 3700 | **18929** | 1.54x | 76, 58, 0, 0 |
+| `id` | 6 | 30494, 31004, 27814, 33568 | 2081, 2042, 2005, 2061 | **8189** | 1.02x | 0, 0, 0, 0 |
+
+**2.31x fewer staged rows, and under `id` every one of them is compulsory**: a card's staged count is
+its distinct-key count exactly, where `sorted`'s two-slot cards stage 76 and 58 rows over their own
+floor. The draws are near-equal — 30.5k to 33.6k against 40.9k/40.9k/20.5k/20.5k — so it is not the
+draws that are lopsided, it is what the draws resolve to. The probe cross-checks its own simulation
+against the capture at all 40 x 512 rows before it reports, so this is the recorded routing's
+arithmetic and not a model of it.
+
+The A/B is `/tmp/run_deal_ab.sh`, three arms on `/tmp/deal2` (this branch plus the deal), 32768
+tokens, chunk 4096, pool 148, `--decode 4`. This is the sitting the change was developed on, and it is
+on the kernels the 256K branch had before the three stacked prefill kernels landed; [the last
+subsection here](#the-same-pair-re-taken-on-the-tree-that-ships-149x-and-142x) re-takes the same pair
+on the tree that ships, where the ratio is larger.
+
+| arm | prefill | tok/s | s a chunk, ranks 0-3 | staged rows, ranks 0-3 | spread | peak reserved a card |
+| --- | ---: | ---: | --- | --- | ---: | --- |
+| `sorted` | 457.99 s | 71.55 | 57.249 / 57.207 / 57.296 / 57.231 | 77484, 79060, 41726, 41553 | 1.90x | 15.717 / 15.873 / 16.891 / 17.045 GiB |
+| `id` | 373.99 s | 87.62 | 46.748 / 46.740 / 46.699 / 46.785 | 17689, 17530, 17755, 17557 | 1.01x | 17.355 / 17.150 / 17.518 / 17.160 GiB |
+| `sorted` again | 455.99 s | 71.86 | 56.999 / 57.121 / 57.241 / 57.128 | identical to the first arm | 1.90x | identical |
+
+**1.22x on the prefill wall, 3.40x fewer staged rows — 239823 to 70531 over the four ranks — and the
+worst-to-best spread 1.90x to 1.01x.** The third arm is the control and it repeats: its staged
+counters are bit-identical to the first arm's and its chunk clocks are 0.16% apart, so the middle
+arm's 18% is the deal and not the sitting. The staged counts are a property of the routing and come
+out the same every run, which is why they are the columns that can be compared without a control and
+the wall clock is the one that needs the third arm. The measured 3.40x is larger than the routing's
+2.31x because at 148 rows `sorted`'s wide cards also re-stage after an eviction — the thrash column
+above is the 76 and 58 rows of it, and a re-staged row is counted again.
+
+#### The cost is four more arena rows a card
+
+`id` cannot bound a card's share of one row: a row's six experts may all be congruent mod `world`, so
+the only width that covers a row is `topk`. `rows_per_card` goes 2 to 6, the arena 2689.5 to 2761.2
+MiB at 148 pool rows (`arena_rows` 150 to 154), and the staging scratch with it. **The peak a card
+reserves converges upward:** the worst card's reservation rises 17.045 to 17.518 GiB at 32768 tokens
+(+0.47 GiB) and 18.17 to 18.21 GiB at 256K (+0.04 GiB), and all four cards land on 16.927 GiB
+allocated where they used to sit between 15.141 and 16.418. On a 22528 MiB card that is a peak of
+17.72 GiB allocated and 18.21 GiB reserved, so 3.8 GiB of reserved headroom, and it is the whole
+price of the deal: it is small at 256K because KV dominates the peak there and larger at 32768
+because the arena is a larger share of it. A shared `ResidentSet` refuses a set whose `arena_rows`
+disagree with its own, so one tree cannot mix the two deals.
+
+**The tree does not move that bill.** Re-taken on the shipping tree the four `id` cards land on the
+same 16.927 GiB allocated at 32768 tokens and 17.72 GiB at 256K — the numbers above to the hundredth —
+against `sorted`'s 15.209 / 15.224 / 16.468 / 16.394 GiB and 16.002 / 16.016 / 17.305 / 17.331 GiB
+there. The worst card's reservation goes 17.123 to 17.518 GiB at 32768 (+0.40) and 18.168 to 18.205
+GiB at 256K (+0.04), and on a 22528 MiB card that is the 3.8 GiB of reserved headroom again. What the
+*light* card pays is the same 1.72 GiB at both lengths, 15.209 to 16.927 and 16.002 to 17.72, because
+both legs are the same 148-row pool and the widening is four rows a card in both; what the wide card
+pays is under half a gigabyte at both. The allocation columns agreeing across two kernel trees is what
+says this is the deal's bill and not the tree's.
+
+#### The parity: the two deals are not bit-identical, and the yardstick is a landed change
+
+Each card sums a different subset of a row's six experts, so the partials are added in a different
+order and the two deals cannot agree bit for bit. `/tmp/run_deal_parity.sh` runs the same 32768-token
+chunked prefill on both and dumps the last position's logits at every chunk boundary, on all four
+ranks (`/tmp/pr_b_parity.py --compare`):
+
+| pair | worst max abs dlogit | argmax |
+| --- | ---: | --- |
+| `sorted` on this tree against the arm the 256K numbers were published on (`/tmp/pr_b`) | **0.000e+00** | 9/9 identical, four ranks |
+| `sorted` against `id`, same tree | 3.643 | 9/9 identical, four ranks |
+| the merged prefill stack against the same 256K base, for scale | 4.564 | 9/9 identical |
+| the merged prefill stack against itself (A-A) | 0.000e+00 | 9/9 |
+
+The first row is what makes the second one readable: **`sorted` on this tree is bit-identical to the
+base arm of the 256K A/B** — all four ranks, all nine positions — so the pair differs in one variable
+and the difference is the deal's. The third row is the scale it has to be read against: the merged
+prefill stack, which is already landed on the 256K branch, moves these same logits by **more** than
+the deal does, at the same 9/9 argmax. The fourth row is the instrument's own repeat, and it is
+exact, so the 3.643 is the deal and not drift.
+
+#### Decode is unmoved, and the wider tail is the thing that could have moved it
+
+`id` widens `rows_per_card` from 2 to 6, and a one-token pass is the case that exercises that width —
+so the A/B's own decode column cannot answer it: it is four steps long, and its two `sorted` arms are
+themselves 3.8% apart (0.4701 and 0.4529 s a token). `/tmp/run_deal_decode.sh` is the same pair at
+`--length 128 --decode 256`, A-B-A-B, on the geometry the pool sections below use:
+
+| arm | decode, s a token | prefill, 128 rows |
+| --- | ---: | ---: |
+| `sorted` | 0.3690 | 11.6 s |
+| `id` | 0.3731 | 9.21 s |
+| `sorted` | 0.3660 | 12.98 s |
+| `id` | 0.3643 | 9.51 s |
+
+**The two configurations overlap — `id`'s 0.3643 is below both `sorted` arms — so the wider tail does
+not show up at one token a step.** The mechanism is the pool: a decode step asks a layer for one row,
+and the 148-row pool is holding the working set, so the six rows are allocated and almost never
+bound. Within one configuration the arms are 0.8% and 2.4% apart, which is this sitting's resolution,
+and the deal's difference is smaller than it. The prefill column moves as it does everywhere else,
+9.2–9.5 s against 11.6–13.0 s, at a length too short for either figure to mean much on its own.
+
+**Re-taken on the tree that ships the answer repeats, and this time with a control on both sides.**
+`/tmp/run_deal_decode_master2.sh` is that sitting on `/tmp/deal3` — this branch with master's kernels
+under it — the same probe and the same geometry, four arms:
+
+| arm | decode, s a token, ranks 0-3 | prefill, 128 rows, rank mean | staged rows, four ranks |
+| --- | --- | ---: | ---: |
+| `sorted` | 0.3673, 0.3673, 0.3673, 0.3673 | 12.97 s | 61235 |
+| `id` | 0.3738, 0.3738, 0.3737, 0.3738 | 9.62 s | 42848 |
+| `sorted` | 0.3653, 0.3653, 0.3653, 0.3653 | 12.38 s | 58978 |
+| `id` | 0.3617, 0.3617, 0.3617, 0.3617 | 9.96 s | 40239 |
+
+**`id` holds both ends of those four arms** — 0.3617 is the fastest decode in the sitting and 0.3738
+the slowest — so the two configurations overlap here too, on a tree where the same deal is worth 1.49x
+on the prefill. The four ranks of one arm print the same figure to four decimals because a decode step
+is synchronous across the four cards and each pays one row; the two arms of one configuration are 0.55%
+(`sorted`) and 3.3% (`id`) apart, and the two configurations' means, 0.3663 and 0.3678, are 0.4% apart
+on a 3.3% resolution. The prefill column moves as it does everywhere else, 1.45x fewer staged rows and
+1.30x on the wall, at a length too short for either figure to mean much on its own. **The four-step
+column of the 32768 A-B-A above is neither repeated nor contradicted by this**: that column's `id` arm
+reads 0.5377 s a token against 0.4959 and 0.4842 for its two `sorted` arms, 8.4% above both, and the
+same configuration here reads 0.3738 in one arm and 0.3617 in the other, which is 3.3% of drift inside
+one configuration inside one sitting, against 4.6% for `sorted` between this sitting and an earlier one
+on the same tree (0.3512). A four-step column cannot resolve that, which is why the sitting that prices
+a step is 256 steps long.
+
+#### The 256K leg, which is the length this work is about
+
+`/tmp/run_deal_256k.sh`, one arm on the same tree at 262144 tokens, chunk 4096, pool 148, against the
+base arm of the 256K A/B (`/tmp/pr_b`, 262144 tokens, the same geometry, 3701.0 s / 70.83 tok/s /
+57.83 s a chunk / 2.31 rows a token / 15.93 GiB peak):
+
+| arm | prefill | tok/s | s a chunk | rows a token | staged rows, ranks 0-3 | peak allocated |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| 256K base (`sorted`) | 3701.0 s | 70.83 | 57.83 | 2.31 | 606192, 614493, 321354, 321864 | 15.93 / 16.00 / 17.33 / 17.34 GiB |
+| 256K, `id` | **3121.0 s** | **83.99** | **48.77** | **0.53** | 138490, 136607, 139853, 138794 | 17.72 GiB, all four |
+
+**1.19x, 70.83 to 83.99 tok/s, and 1863903 staged rows to 553744 — 3.37x fewer, with the four cards'
+spread 1.91x to 1.02x.** The four walls agree to 0.05% within the arm (3121.0 to 3122.4 s) and the
+four chunk clocks to 0.05%, so this is the length at which the deal is worth the most in absolute
+terms: 580 s off one 256K prompt. It is 1.19x against the 32768-token arm's 1.22x, and that
+difference is not the deal's — the staged rows fall by 3.37x here against 3.40x there, and the wall
+clock at 256K is diluted by the attention and collective work a longer context puts in every chunk
+that the deal does not touch.
+
+**On the tree that ships this leg is 1789.92 s and 146.46 tok/s, and both its arms are above.** The
+subsections below this one are the pair re-taken once the three stacked prefill kernels were under it;
+the `sorted` arm there is 2532.75 s, which is *faster than this `id` arm's 3121.0 s* — the stack alone
+is worth more at this length than the deal was on the kernels the deal was measured against. That is
+the whole reason the re-take is a subsection and not a line here.
+
+#### The same pair re-taken on the tree that ships: 1.49x and 1.42x
+
+**The tree moved under this change, and the ratio is not inherited across the rebase.** #296, #297 and
+#298 landed the three prefill kernels and the [prefill-stack page](deepseek_v4_1_flash_prefill_stack.md)
+prices them at 1.477x at 256K by taking about a third out of a chunk's compute. The deal does not touch
+that compute — it takes rows a token off the staged-row slope — so a third off the compute term makes
+the staged-row term a strictly larger share of the same chunk, and the deal's own multiplier has to be
+re-taken rather than carried. `/tmp/run_deal_ab_master.sh` and `/tmp/run_deal_256k_master.sh` are that
+re-take, on `/tmp/deal3`: this branch rebased onto `fb0a5b8`, carrying master's built extensions, the
+same probe, the same geometry, and for 32768 tokens the same A-B-A shape as the sitting above.
+
+| 32768 tokens, shipping tree | prefill, ranks 0-3 | tok/s | s a chunk, ranks 0-3 | staged rows, ranks 0-3 | spread |
+| --- | --- | ---: | --- | --- | ---: |
+| `sorted` | 307.63 / 306.88 / 307.47 / 306.86 s | 106.5–106.8 | 38.453 / 38.360 / 38.434 / 38.357 | 78969, 80785, 42126, 41754 | 1.94x |
+| `id` | **206.49 / 206.83 / 207.59 / 207.40 s** | **158.7–157.9** | **25.811 / 25.853 / 25.949 / 25.925** | 17707, 17504, 17779, 17571 | 1.02x |
+| `sorted` again | 308.32 / 307.66 / 307.95 / 307.86 s | 106.3–106.4 | 38.540 / 38.458 / 38.494 / 38.483 | identical to the first arm | 1.94x |
+
+and the 256K leg, both arms of one sitting, with no third arm because the 32768 one above is the third:
+
+| 262144 tokens, shipping tree | prefill, ranks 0-3 | tok/s | s a chunk | rows a token, ranks 0-3 | staged rows, ranks 0-3 | spread |
+| --- | --- | ---: | ---: | --- | --- | ---: |
+| `sorted` | 2532.75 / 2532.48 / 2531.90 / 2531.72 s | 103.50 | 39.57 | 2.353, 2.376, 1.239, 1.238 | 616825, 622798, 324835, 324553 | 1.92x |
+| `id` | **1789.92 / 1790.07 / 1789.51 / 1790.37 s** | **146.46** | **27.97** | 0.528, 0.521, 0.533, 0.530 | 138465, 136591, 139851, 139025 | 1.02x |
+
+**1.48–1.49x at 32768 tokens and 1.41x at 256K, against 1.22x and 1.19x on the kernels the sitting
+above was taken on.** Rank 0's wall clock goes 307.63 to 206.49 s and its chunk 38.45 to 25.81 s, and
+the four ranks agree on the ratio to 0.7% (1.480 to 1.490); at 256K it is 2532.75 to 1789.92 s, 39.57
+to 27.97 s a chunk, and the four ranks agree to 0.06% (1.4142 to 1.4150). The staged-row term moves as
+it did before — 243634 to 70561 over the four ranks, **3.45x fewer**, and 1889011 to 553932,
+**3.41x fewer** at 256K — and the two deals' tails still land on the same tokens: at 256K the four
+ranks print `[295, 1, 1000, 6273, 14, 270, 509, 16]` under `sorted` and `[295, 1, 1000, 6273, 14, 270,
+509, 271]` under `id`, seven of eight shared, where at 32768 they share all eight and reorder two. That
+is a consistency read off the log line, not a parity measurement — the parity table above is the
+instrument, and it is taken on the other tree. The control arm is the control it was: its staged
+counters are bit-identical to the first `sorted` arm's and its chunk clocks are 0.22% apart, so the
+middle arm's 33% is the deal.
+
+**The `sorted` arm here is the prefill-stack page's stacked arm, and that is what makes the two
+readable together.** That page's stacked arm is 2520.7 s over the same 262144 tokens — 39.39 s a chunk
+against 39.57 here, 0.5% apart — through a different probe (`probe_v41_chunk_profile_host.py` with its
+taps off against `probe_v41_chunk_scaling.py`), so the shipping tree and that page's stacked tree are
+the same tree measured twice, and the 1.415x above is the deal *on top of* that page's 1.477x.
+End to end that is **3701.0 → 1789.92 s, 2.07x** against this page's own pre-stack base arm, or 2.08x
+against that page's 3722.8 s: one 256K prompt goes from 70.8 to 146.5 tokens a second, and 1911 s come
+off it.
+
+**The two compose, and reading which term moved is more use than the product.** 1.477 x 1.415 = 2.090
+against 2.080 measured, so at this length they are multiplicative to within a percent — but only
+because *the deal's own price rose*, 1.19x to 1.415x, when the stack went under it; the stack's share
+falls the other way, 1.477x to about 1.47x. Neither is a term of the other: the three kernels reorder
+fp32 accumulation and so change the deal's row counts not at all (3.37x fewer staged rows without them,
+3.41x with), and the deal changes the compute not at all. What does dilute the deal at 256K is the
+prefix-dependent part of a chunk, which the stack page measures at 5.2 s of a 41.3 s stacked chunk and
+which neither lever touches: it is why the deal's ratio is 1.41x here against 1.49x at 32768, the same
+ordering and a wider gap than the pre-stack pair's 1.19x against 1.22x.
 
 ## Two conventions that had to be settled before the first run
 

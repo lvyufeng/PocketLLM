@@ -279,6 +279,29 @@ chunk that is 32% shorter is what says none of the 18.8 s is saved rows. The 2/2
 row counts unchanged — 2.31-2.35 rows a token on ranks 0 and 1 against 1.23-1.24 on ranks 2 and 3,
 against the 2.37 the chunked-prefill page measured for the same 148-row pool.
 
+**Those row counts are the `sorted` deal's, and the deal is one lever this length has already been
+priced on.** 2.31-2.35 rows a token on the ranks dealt two of a row's six sorted slots against
+1.23-1.24 on the two dealt one is that deal's imbalance read straight off the counters — the deal
+walks each card's columns across the whole expert range, so a card dealt two slots stages about twice
+the draws *and* about twice the distinct experts of a card dealt one. Dealing a drawing by expert id
+instead partitions the experts themselves and removes the imbalance: on this same 262144-token leg, on
+the tree these two arms are cut from but **without** the three changes, `/tmp/run_deal_256k.sh`
+measured **3121.0 s and 83.99 tok/s against 3701.0 s and 70.83 — 1.19x — at 0.53 staged rows a token
+against 2.31 and the four ranks' spread 1.91x to 1.02x**, for four more arena rows a card and +0.04
+GiB of peak. It is [priced on the expert page](deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set),
+and that price is the tree **without** these three changes, so it is not what the deal is worth on top
+of them; the re-take that is is [the same page's last
+subsection](deepseek_v4_1_flash_device_experts.md#the-same-pair-re-taken-on-the-tree-that-ships-149x-and-142x),
+`/tmp/run_deal_256k_master.sh`, both arms of one sitting on the shipping tree: **2532.75 s to 1789.92 s
+and 103.50 to 146.46 tok/s, 1.41x**, at 3.41x fewer staged rows, +0.39 GiB allocated on the worst card
+and +0.04 GiB reserved. Its `sorted` arm is this page's stacked arm read again — 39.57 s a chunk
+against 39.39 s here, 0.5% apart through a different probe — which is what lets the two ratios be put
+end to end: **1.477x and 1.415x make 2.080 against 2.080 measured**, this page's 3722.8 s base arm to
+1789.92 s. The deal's own share of that rose from 1.19x to 1.42x when these three landed under it, and
+that is the part worth keeping: the two are not the same term. The three changes leave the staged-row
+slope where they found it (+1.8% on rank 0) and buy their 1.477x in the compute, while the deal buys
+its 1.42x by taking rows a token off the slope.
+
 **Both arms grow by the same 5.2 s across the leg.** From chunk 5 to chunk 64 — a prefix of 16384
 against one of 262144 — the base arm's chunk goes 55.70 → 60.91 s (+5.21) and the stacked arm's
 36.00 → 41.26 (+5.26). Fitted over the sixteen sampled chunks that is 0.0206 ms a token for the base

@@ -194,7 +194,15 @@ width at all is the question the last section answers from below.
 **A 262144-token prompt prefills in 3711.0 s at 70.6 tok/s on every one of the four ranks**, at 57.98
 s a chunk, peaking at 15.93 GiB on rank 0 and 17.34 GiB on rank 3 of the 22000 the card reports. That
 is the 256K support the split was for, and the two numbers that say it is *support* and not a lucky
-allocation are that the peak does not move and the rate does not fall. The three 4096-token legs put
+allocation are that the peak does not move and the rate does not fall. **The deal is the one lever
+left on the table here**, and on this page every figure is the `sorted` deal: the id deal is the same
+leg at **3121.0 s and 83.99 tok/s, 1.19x, 0.53 staged rows a token against 2.31**, for a peak of
+17.72 GiB a card — [the expert page prices both deals, with the parity and the arena](deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set).
+Those are *this* tree's numbers: **on the tree that ships, which is this one plus the three prefill
+kernels that landed after it, the same pair is 2532.75 s to 1789.92 s and 103.50 to 146.46 tok/s,
+1.41x**, because taking a third out of a chunk's compute leaves the staged rows a larger share of what
+is left ([the re-take](deepseek_v4_1_flash_device_experts.md#the-same-pair-re-taken-on-the-tree-that-ships-149x-and-142x)).
+The three 4096-token legs put
 that second claim three ways: steady state, which is every chunk past the first — the first carries
 the warm-up and costs 64.4 s in all three legs, whatever the prompt — is **56.07 s at a 32768-token
 prompt, 56.76 at 131072 and 57.88 at 262144**. Eight times the context costs 1.81 s a chunk, 3.2%.
@@ -213,7 +221,9 @@ against, because it says the lever is not there.
 
 The staged-row counts differ by rank on purpose and it is the deal, not a defect: rank 0 and rank 1
 own two of a token's six routed experts each and rank 2 and rank 3 own one, so the first pair stages
-2.31–2.34 rows a token against the second pair's 1.23, and all four print the same top-8.
+2.31–2.34 rows a token against the second pair's 1.23, and all four print the same top-8. (That
+spread is the other deal's whole subject, and the `id` deal leaves all four ranks within 2% of each
+other — 138490, 136607, 139853, 138794 rows over the same leg.)
 
 ### How wide the expert pool, at 256K
 
