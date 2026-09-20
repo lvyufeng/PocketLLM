@@ -38,8 +38,14 @@ emits nothing — a silent hang rather than an error. Throughput peaks earlier, 
   --max-context 2048`, with `--max-batch-size` equal to the client's
   `--max-concurrency`; the two saturating runs and the two concurrency-limit
   probes are named where they differ
-- `--random-range-ratio 0.0`, so every prompt is exactly 512 tokens, and `inf`
-  request rate, so the whole group is offered at once
+- `--random-range-ratio 0.0`, so every prompt is nominally 512 tokens and `inf`
+  request rate, so the whole group is offered at once. **The nominal length is
+  not the length the engine ran**: the harness has no tokenizer, so it builds
+  512 tokens' worth of words at `--chars-per-token` and the server re-tokenizes.
+  The engine logs `prompt_tokens=320` or `327`, a mean of **324.8** over `L32`'s
+  32 requests, and that is the count every FLOP figure below is computed from.
+  `analyze_serving_roofline.py --prefill-tokens` takes the engine's number and
+  rejects `--random-input-len` by name for exactly this reason.
 
 The engine sources at `645e36b` are the ones the numbers come from. The two
 `report_phase_profile()` calls PR #294 added to the `--batch-decode` bench
@@ -49,24 +55,56 @@ unaffected by them.
 
 ### Reproduction
 
+The driver is `scripts/run_serving_sweep.sh`, which fixes the arguments every
+point of the sweep shares and varies the width:
+
 ```bash
 source scripts/ascend_env.sh     # without it an ACL binary hangs before aclInit returns
-export POCKET_ASCEND_IPC_ALLREDUCE=1
-export POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1
-python scripts/bench_serving.py \
-    --ckpt /mnt/data1/modelscope/Qwen/Qwen3.8-27B \
-    --binary cpp_engine/build-ascend/pocketllm_engine \
-    --devices 0,1,2,3 --device-style ascend \
-    --endpoint /v1/chat/completions \
-    --random-input-len 512 --random-output-len 512 \
-    --num-prompts 32 --request-rate inf --max-concurrency 32 --num-warmups 0 \
-    --max-batch-size 32 --max-context 2048 --prefill-token-budget 4096 \
-    --goodput ttft:2000 tpot:200 e2el:30000 \
-    --log-dir /tmp/sweep/logs-L32 --json-out /tmp/sweep/L32.json
+export POCKET_SWEEP_CKPT=/mnt/data1/modelscope/Qwen/Qwen3.8-27B
+scripts/run_serving_sweep.sh ladder      # L1 ... L112, then L16x64, L48x192
+scripts/run_serving_sweep.sh limit       # L120, L128, L128c1024
+scripts/run_serving_sweep.sh ab          # the replicate-rows A/B, interleaved
+# one point on its own, which is `L32` in the ladder table:
+#   point <tag> <slots> <concurrency> <prompts> <in> <out> <rate> <ctx> [K=V ...]
+scripts/run_serving_sweep.sh point L32 32 32 32 512 512 inf 2048
 ```
 
-All figures are read from the `--json-out` file, never from the console table,
-which has no `Std` column.
+It exports `POCKET_ASCEND_IPC_ALLREDUCE=1` and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` for every point, and wraps each run in
+`scripts/_serving_metrics_scrape.py`, which polls the engine's `/metrics` while
+the bench is alive. That scrape is the only source of the queue / prefill /
+decode split, because `bench_serving.py`'s record carries no server-side series.
+It is taken from outside the bench, so it can only see counters the engine has
+published while its server is up, and the bench stops that server as soon as the
+last request returns. `point` therefore passes `--server-drain-seconds 1.0`,
+which holds the server for a second past the measured window and moves no figure
+the bench reports, because it runs after `run_measured` has returned. Without it
+the scrape is short by the requests still in flight: the artifacts this page was
+written from predate the flag, and `L4` recorded 3 of its 4 requests while `L1`
+recorded 0 of its 1.
+A point writes four artifacts under `$POCKET_SWEEP_DIR` (default `./sweep-out`):
+`<tag>.json` (the bench's record), `<tag>.metrics` (the last scrape), `<tag>.out`
+(the console output, kept for provenance) and `logs-<tag>/` (the per-rank engine
+logs, which is where `prompt_tokens=` above comes from).
+
+Three readers, each taking those artifacts and nothing else:
+
+```bash
+python scripts/summarize_serving_sweep.py --client    sweep-out/L*.json
+python scripts/summarize_serving_sweep.py --server    sweep-out/L*.metrics
+python scripts/summarize_serving_sweep.py --occupancy sweep-out/L96.json
+python scripts/analyze_serving_roofline.py --prefill-ms 411 --prefill-tokens 325 sweep-out/L*.json
+```
+
+`--client` reproduces the ladder table, `--server` the phase split, and
+`--occupancy` the time-weighted batch width. All figures are read from the
+`--json-out` file, never from the console table, which has no `Std` column and
+truncates when piped. `--occupancy` needs the per-request `start_seconds` the
+record carries: `ttft_seconds` and `itl_seconds` are relative to their own
+request, so a refilled run such as `L16x64` cannot be placed on a shared axis
+without it. `analyze_serving_roofline.py` prints the ceilings it uses and
+derives [Where the FLOPs go](#where-the-flops-go) from the ladder JSONs plus one
+measured prefill.
 
 **The output length is not the 512 that was asked for, and it is not a cap
 either.** Every request in every run below ends at EOS between 57 and 130 tokens,
@@ -109,7 +147,7 @@ on the page is `L4`'s 0.398, and among the runs that keep the batch full it is
 
 **The budget is met at a lower offered concurrency, not by a lower slot count.**
 [serving_latency_optimized.md](serving_latency_optimized.md) clears it — 0.564 of
-0.589 req/s — with the same opt-in stack and the same 512-token prompts, at 24
+0.589 req/s — with the same opt-in stack and the same nominal 512-token prompts, at 24
 prompts, `--request-rate 2` and `--max-concurrency 8`. Its peak concurrency was
 11 and it measured 70.29 tok/s at 99.49 ms TPOT, against `L8`'s 71.37 tok/s at
 84.67 ms and `L16`'s 74.22 at 153.65. Throughput matches at the same width;
@@ -227,7 +265,7 @@ the two: in `L32` the queue is 443.2 ms a request while the prefill is 12241.2
 ms, so **96% of TTFT is prefill**, and the prefill time grows with the width of
 the wave rather than with the size of the prompt.
 
-Per request of a 512-token prompt, the prefill the server charged is nearly flat
+Per request of a ~325-token prompt, the prefill the server charged is nearly flat
 in the width — 240 ms at 4 rows, 311 at 8, then 356, 383, 391, 304, 339, 287 at
 16, 32, 48, 64, 96 and 112 — while mean TTFT is *exactly* linear:
 
@@ -256,7 +294,7 @@ per-request distributions falsify the half-wave form. The slope `c` and the
 server's own per-request prefill histogram are the same measurement taken two
 ways and they agree — 411 against 356 ms at 16 rows, 412 against 383 at 32, 411
 against 391 at 48, 309 against 304 at 64, 283 against 287 at 112. So the prefill
-of a 512-token prompt costs the same whether it shares a wave with 15 others or
+of a ~325-token prompt costs the same whether it shares a wave with 15 others or
 111, with a mild drift down at the widest rows: the wave never shares a forward
 pass, which is the next section's finding stated as a number.
 
@@ -287,7 +325,7 @@ single-request prefills issued back to back before the scheduler next runs a
 decode.
 
 That is the whole of the TTFT scaling. The prefill GEMMs never see more than one
-prompt's rows, and the 512-token prefill runs at 512/0.411 = 1246 tokens/s
+prompt's rows, and the 325-token prefill runs at 325/0.411 = 791 tokens/s
 against a weight-read floor of 11.7 ms a pass.
 
 ### The levers that were tried against it
@@ -295,7 +333,7 @@ against a weight-read floor of 11.7 ms a pass.
 **A smaller prefill token budget makes TTFT worse, not better.** The budget
 documents itself as the thing that stops "a long prompt holding the device"
 (`qwen_engine.cpp:5092`), but it also caps how far each request advances per
-call, so a 128-token budget turns every 512-token prompt into four passes:
+call, so a 128-token budget turns every ~325-token prompt into three passes:
 
 | run | budget | TTFT mean | TTFT P99 | TPOT | tok/s | goodput |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -344,8 +382,9 @@ difference inside the ladder's own spread.
 
 The card's ceiling is read from CANN's own platform config, not assumed:
 `Ascend910B.ini` gives `ai_core_cnt=30`, `cube_m/n/k_size=16`, `cube_freq=900`,
-so 30 x 16^3 x 900 MHz x 2 = **221.2 TFLOP/s a card**, 884.6 across the four.
-The model's arithmetic, per token and for one rank of four:
+so 30 x 16^3 x 900 MHz x 2 = **221.2 TFLOP/s a card**, 884.7 across the four.
+The model's arithmetic, per token and for the whole model — the parameter row is
+one rank of four, and `analyze_serving_roofline.py` prints this same table:
 
 | quantity | value |
 | --- | ---: |
@@ -354,7 +393,7 @@ The model's arithmetic, per token and for one rank of four:
 | engine's own `resident_weight_bytes` | 13,449,011,456 B = 12.525 GiB |
 | machine balance | 192.7 FLOP/byte (at a measured 1148 GB/s HBM read) |
 | decode arithmetic intensity | **0.953 FLOP/byte, 202x below the ridge** |
-| prefill arithmetic intensity, 512 tokens | **1951 FLOP/byte, 10x above the ridge** |
+| prefill arithmetic intensity, 325 tokens | **1238 FLOP/byte, 6.4x above the ridge** |
 
 Decode is therefore irreducibly memory-bound and prefill is not, and the measured
 decode table says the same thing:
@@ -390,19 +429,19 @@ That is why row-steps/s plateaus a little past 190 and why it turns over at 96,
 while the FLOPs available would allow far more.
 
 Prefill sits on the other side of the ridge and is equally far from its ceiling.
-A 512-token prompt costs 411 ms of prefill — the ladder's TTFT slope, which is
+A 324.8-token prompt costs 411 ms of prefill — the ladder's TTFT slope, which is
 that quantity measured directly — and a token of forward pass is 51.244 GFLOP, so
-the prompt is 512 x 51.244 = 26.24 TFLOP for the whole model and 26.24/0.411 =
-63.9 TFLOP/s across the four cards:
+the prompt is 324.8 x 51.244 = 16.64 TFLOP for the whole model and 16.64/0.411 =
+40.5 TFLOP/s across the four cards:
 
 | | ms | tokens/s | TFLOP/s, 4 cards | % of peak |
 | --- | ---: | ---: | ---: | ---: |
-| prefill, one 512-token prompt | 411 | 1246 | 63.9 | 7.2% |
+| prefill, one 325-token prompt | 411 | 791 | 40.5 | 4.6% |
 | decode at 96 rows | 471.00 | — | 10.445 | 1.18% |
 
-So prefill is 6.3x more efficient than the widest decode and still leaves 93% of
+So prefill is 3.9x more efficient than the widest decode and still leaves 95% of
 the Cube idle. That gap is the same serial structure the TTFT section identifies:
-the GEMMs never see more than one prompt's rows, and a 512-row M is small enough
+the GEMMs never see more than one prompt's rows, and a 325-row M is small enough
 that per-op overhead dominates. **Both curves are bounded by the same defect, and
 it is a batching defect rather than a bandwidth one.**
 
@@ -441,6 +480,12 @@ it is a batching defect rather than a bandwidth one.**
   entry and exit (`qwen_engine.cpp:2555`), so the percentages in the profile are
   meaningful and the seconds are not. The prefill block counts above are used for
   their count.
+- **Prompt lengths are nominal, not tokenizer-exact.** `--random-input-len 512`
+  is what the harness asked for; the engine forwarded 320 or 327 tokens, which is
+  the count every FLOP figure on this page uses. A run that measures the same
+  checkpoint with a tokenizer-exact 512-token prompt should expect the prefill
+  and decode rates to move by roughly 325/512 on the token side and not at all on
+  the time side.
 - **One pair is not a series.** The ladder is one run a width; the repeatability
   it has is the `L16`/`rep16` pair, which matched to 1.8% in throughput and 0.8%
   in TPOT, and the `L1`/`ctl1_r*` match against the A/B's control arm. The
@@ -453,6 +498,16 @@ it is a batching defect rather than a bandwidth one.**
   median of 2 tokens gives, and `L128`'s single success is one request. The
   `128 @ ctx 1024` row of the roofline table is `L128c1024`, a different run that
   completed 128/128.
+- **Every server-side figure is a mean over all but the last requests of its
+  run.** The archived `.metrics` artifacts predate `--server-drain-seconds`, so
+  the scrape that ended each run was taken with requests still in flight: 3 of
+  `L4`'s 4, 45 of `L48`'s 48, 61 of `L64`'s 64, 110 of `L112`'s 112, 0 of `L1`'s
+  1. The queue, prefill, decode and TTFT means quoted here are therefore over
+  the requests that had completed by the last poll. The ones left out are the
+  tail of a single wave, and the spread among the requests behind the first is
+  8-29 ms, so dropping one or two moves a mean by under a millisecond. The two
+  that lost a rank are the exception and are excluded already. Re-running a
+  point with the drain makes its scrape exact.
 - **No claim about other checkpoints.** 48 of the 64 layers are linear attention,
   and the gated-delta recurrence is what the prefill profile spends 11.7% of its
   time in. A stack without that recurrence would move.
@@ -473,8 +528,8 @@ In order of what the measurements support, and none of it done here:
    on this page that moves TTFT and prefill TFLOPS together — both are bounded by
    the same one-request-at-a-time loop in `batch_prefill`. The engine's own
    comment cites a saturation sweep that measured 1890 tok/s at a 4096-token
-   chunk against 1330 at 512, which is a single prompt's row count and not a
-   question about several prompts; the cost of *not* merging them is the linear
+   chunk against 1330 at 512 — a chunk of one or two prompts, not a question
+   about several; the cost of *not* merging them is the linear
    TTFT above. The obstacle is real and is named in the code: the linear-attention
    layers carry a per-sequence state, so a merged forward needs a segmented
    recurrence, and the 16 full-attention layers need a block-diagonal mask.
