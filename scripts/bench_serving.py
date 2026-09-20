@@ -120,11 +120,21 @@ class RequestOutput:
     request_id: int = 0
     token_events: int = 0
 
-    def row(self) -> dict[str, Any]:
+    def row(self, origin: float = 0.0) -> dict[str, Any]:
+        """This request's measurements, with times relative to `origin`.
+
+        `start_seconds` is the client's own send time, which is the one figure
+        `ttft_seconds` and `itl_seconds` cannot stand in for: those are relative
+        to the request, so a run that issues more prompts than it holds in
+        flight -- a refilled batch -- has no way to place a request on a shared
+        axis without it. `origin` is the earliest send of the run, so the field
+        is an offset from the first request, not a clock reading.
+        """
         return {
             "request_id": self.request_id,
             "success": self.success,
             "error": self.error,
+            "start_seconds": self.start_time - origin,
             "ttft_seconds": self.ttft,
             "ttft_first_chunk_seconds": self.ttft_first_chunk,
             "itl_seconds": list(self.itl),
@@ -726,6 +736,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     try:
         base_url, group, log_dir = resolve_base_url(args)
         record["base_url"] = base_url
+        if group is not None:
+            # The knobs this script launched the server with. They are recorded
+            # because they are not recoverable from the client-observed figures:
+            # `--max-context` and `--max-batch-size` together size the KV arena,
+            # so a record that omits them cannot be traced back to the
+            # concurrency it was actually able to admit.
+            record["server"] = {
+                "max_batch_size": args.max_batch_size,
+                "max_context": args.max_context,
+                "prefill_token_budget": args.prefill_token_budget,
+                "kv_block_size": args.kv_block_size,
+                # False is not the same as "unspecified": on the Ascend path
+                # start_server() passes --no-kv-paged whenever this is off, so
+                # the engine runs the contiguous arena either way.
+                "kv_paged": bool(args.kv_paged),
+                "device_style": args.device_style,
+                "port": args.port,
+                # Recorded because it dates the /metrics scrape artifacts: a
+                # sweep's `<tag>.metrics` is only the run's full totals if the
+                # server was still up when the scrape was taken.
+                "drain_seconds": args.server_drain_seconds,
+            }
         if log_dir is not None:
             record["log_dir"] = str(log_dir)
         model = args.model or discover_model(base_url)
@@ -749,7 +781,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metrics = calculate_metrics(outputs, duration, percentiles=metrics_percentiles, goodput_config=goodput_config)
         metrics["input_tokens_source"] = "server usage" if all(o.prompt_tokens is not None for o in outputs) else "unavailable"
         record["metrics"] = metrics
-        record["requests"] = [output.row() for output in outputs]
+        # The rows are offset from the earliest send, which is the same origin
+        # `calculate_metrics` used for its per-second concurrency series.
+        origin = min((o.start_time for o in outputs if o.success), default=0.0)
+        record["requests"] = [output.row(origin) for output in outputs]
         record["status"] = "pass" if metrics["failed"] == 0 else "partial"
     except Exception as exc:
         record.update({"status": "fail", "error": f"{type(exc).__name__}: {exc}"})
@@ -758,6 +793,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise
     finally:
         if group is not None:
+            # The engine's counters are cumulative and outlive the client, but
+            # they do not outlive the server: a scrape taken from outside this
+            # process needs the server up for at least one poll interval after
+            # the last request finishes, or that request is never counted. The
+            # drain is after `run_measured` returned, so it moves no figure
+            # this script reports.
+            if args.server_drain_seconds > 0:
+                time.sleep(args.server_drain_seconds)
             group.stop()
         record["elapsed_seconds"] = time.perf_counter() - started
         if args.json_out:
@@ -856,6 +899,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-seconds", type=int, default=900)
     parser.add_argument("--kv-block-size", type=int, default=16)
     parser.add_argument("--kv-paged", action="store_true")
+    parser.add_argument("--server-drain-seconds", type=float, default=0.0,
+                        help="Leave a launched server up this long after the measured run, so an "
+                             "external scrape of its counters sees the final request. No effect "
+                             "with --base-url, and none on the client-side figures.")
     parser.add_argument("--startup-timeout", type=float, default=900.0)
     parser.add_argument("--log-dir")
     parser.add_argument("--json-out")
