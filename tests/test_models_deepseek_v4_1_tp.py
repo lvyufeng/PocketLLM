@@ -468,7 +468,9 @@ def test_the_deal_is_the_same_partition_whichever_way_it_is_driven(trees) -> Non
         # one rank per process, four processes: the pieces tile the routes, once each
         pieces: list[tuple[int, int]] = []
         for rank in range(world):
-            cards = DeviceRoutedExperts._split(SimpleNamespace(world=world, ranks=[rank]), ids)
+            cards = DeviceRoutedExperts._split(
+                SimpleNamespace(world=world, ranks=[rank], deal="sorted"), ids
+            )
             assert len(cards) == 1, "one rank per process drives one card, not a world of them"
             pieces += cards[0]
         assert sorted(pieces) == sorted(
@@ -477,12 +479,12 @@ def test_the_deal_is_the_same_partition_whichever_way_it_is_driven(trees) -> Non
 
         # one process for all of them: the same deal, one card per rank, 2/2/1/1 over four
         cards = DeviceRoutedExperts._split(
-            SimpleNamespace(world=world, ranks=list(range(world))), ids
+            SimpleNamespace(world=world, ranks=list(range(world)), deal="sorted"), ids
         )
         assert cards == [[(p // world, order[p]) for p in range(r, len(order), world)] for r in range(world)]
 
     # and the roster is what selects, not the order it is written in
-    picked = DeviceRoutedExperts._split(SimpleNamespace(world=4, ranks=[2]), ids)
+    picked = DeviceRoutedExperts._split(SimpleNamespace(world=4, ranks=[2], deal="sorted"), ids)
     assert picked[0] == [(p // 4, order[p]) for p in (2,)]
 
 
@@ -506,10 +508,13 @@ def test_the_resident_set_is_this_cards_own_deal_counted() -> None:
     world, topk, n_experts = 4, 6, 512
 
     def stub(rank: int, hot_rows: int) -> SimpleNamespace:
+        # `deal` pinned to the default: this file's expectations are the sorted deal's round-robin
+        # columns, and `test_models_deepseek_v4_1_expert_deal.py` is where the id deal is checked.
         return SimpleNamespace(
             world=world,
             topk=topk,
             ranks=[rank],
+            deal="sorted",
             hot_rows=hot_rows,
             capped_layers=0,
             capped_rows=0,
@@ -646,6 +651,7 @@ def test_a_row_names_the_arena_row_of_every_route_it_was_dealt() -> None:
             world=world,
             topk=topk,
             ranks=[rank],
+            deal="sorted",
             hot_rows=hot,
             rows=0,
             drawn_rows=0,
@@ -1039,6 +1045,7 @@ def test_a_batched_pass_resolves_the_whole_batch_before_it_stages_any_of_it() ->
             world=world,
             topk=topk,
             ranks=[1],
+            deal="sorted",
             hot_rows=0,
             layer_id=layer_id,
             partial=True,

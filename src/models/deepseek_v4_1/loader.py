@@ -770,6 +770,7 @@ def load_backbone(
     expert_pool_rows: int = 0,
     expert_buffers: int = 2,
     expert_batched: bool = False,
+    expert_deal: str | None = None,
     resident_experts: bool | None = None,
     world: int = 1,
     rank: int = 0,
@@ -883,6 +884,18 @@ def load_backbone(
     where that would happen, and without a pool there is nothing to cut around. Asking without one is
     not an error: the flag is dropped and the per-row path is what runs.
 
+    `expert_deal` is which card owns which of a row's six drawings, and `None` means ask
+    `DEEPSEEK_V41_EXPERT_DEAL`: `sorted` -- the shipped rule -- deals the row's ids round-robin after
+    sorting them, and `id` gives a drawing to `expert % world` instead. It is a property of the run
+    rather than of a pass, because the three things it decides all outlive a pass -- the pool is keyed
+    per card, the resident set's rule is a walk of this deal, and a row's arena rows are what the next
+    pass's pool probes name -- and it is a property of the *layer*, so all four ranks have to agree or
+    they would stage the same expert into different rows and the all-reduce would sum the layer twice
+    and never once. The `id` deal's cost is that one row may hand a card all six of its drawings,
+    which makes a card's arena `topk` rows wide instead of `ceil(topk / world)`, and that width is
+    checked when a shared `ResidentSet` is handed to the other layers -- so a tree cannot mix the two.
+    See `DeviceRoutedExperts` and the deal section above `DEAL_ENV`.
+
     `world`/`rank` cut the dense tree across cards. Every module is built a `1/world` wide slice of
     itself -- 16 of the 64 heads, 2 of the 8 o-groups, a quarter of the shared expert's intermediate
     -- and `checkpoint_weights` cuts the file's tensors to match; see `tp.py` for which boundaries are
@@ -974,6 +987,7 @@ def load_backbone(
                 pool_rows=expert_pool_rows,
                 pinned_buffers=expert_buffers,
                 batched=expert_batched,
+                deal=expert_deal,
                 residents=residents,
             )
         except (RuntimeError, ValueError) as error:
