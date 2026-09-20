@@ -1045,6 +1045,21 @@ int main(int argc, char** argv) {
                                 }
                             }
                         }
+                        // Discard whatever the warmup and the single-row
+                        // reference pass cost, so the batch_decode report below
+                        // covers one batched decode and nothing else.
+                        // report_phase_profile() is the only thing in the engine
+                        // that clears these counters, and it does nothing at all
+                        // unless QWEN_PHASE_PROFILE is set.
+                        //
+                        // There is no matching report for the batched prefill:
+                        // batch_prefill() forwards each request through the
+                        // single-sequence prefill path, and that path already
+                        // reports under the tag `prefill` once per request. So a
+                        // batch of N prompts arrives as N `prefill` blocks, and a
+                        // second report here would print an already-drained set
+                        // of zeros.
+                        qwen.report_phase_profile("batch_reference");
                         qwen.reset();
                         prefill_rows();
                         {
@@ -1164,6 +1179,11 @@ int main(int argc, char** argv) {
                         // real throughput.
                         const double decode_seconds =
                             batch_seconds(decode_started, BatchClock::now());
+                        // Attributed after the clock is stopped, on purpose: the
+                        // report drains the device while it times, and doing that
+                        // inside the window would charge the profiler to the step
+                        // it is measuring.
+                        qwen.report_phase_profile("batch_decode");
                         // Second batched pass, outside the timed region. Same
                         // rows, same slots, same shapes, a fresh sequence of
                         // launches: everything except the run is held fixed, so

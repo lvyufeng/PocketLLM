@@ -160,10 +160,12 @@ because that tree is old.
 
 **15.78 ms per token is faster than this engine has ever been measured going, on
 this checkpoint, on this hardware, at any row count.** The single-request record
-for Qwen3.8-27B on the same four 910B cards is **53.0–53.9 ms per decode step**
-(18.56–18.86 TPS) at the shipped configuration, and **39.4–39.8 ms** (25.15–25.37
-TPS) with the device-side wait — the fastest step measured anywhere on this
-checkpoint ([Ascend 910A single-request decode](ascend_single_request_tps.md)).
+for Qwen3.8-27B on the same four 910B cards is **103.8 ms per decode step**
+(9.63 TPS) at the shipped configuration, **53.0–53.9 ms** (18.56–18.86 TPS) with
+the opt-in hand-written collective and its device-side wait, and **39.4–39.8 ms**
+(25.15–25.37 TPS) once the Cube's row replication is added on top — the fastest
+step measured anywhere on this checkpoint
+([Ascend 910A single-request decode](ascend_single_request_tps.md)).
 The smoke reports a step 2.5× faster than the fastest one ever recorded, while
 carrying four concurrent streams rather than one. A measurement that beats the
 platform's own floor by that margin is not measuring this platform's decode.

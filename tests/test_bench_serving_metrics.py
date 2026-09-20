@@ -298,6 +298,39 @@ def test_missing_usage_leaves_input_tokens_unknown_rather_than_guessed():
 # ---------------------------------------------------------------------------
 
 
+def test_request_rows_carry_an_offset_from_the_first_send():
+    """`start_seconds` is what puts a refilled batch on one time axis.
+
+    The other three time fields are relative to their own request, so a run that
+    issues more prompts than it holds in flight -- every short bench above
+    concurrency 1 -- has no shared origin without this one. It must be an offset
+    from the earliest send, not a reading off the process clock.
+    """
+    outputs = [
+        _output(ttft=0.1, latency=0.5, tokens=5, itl=[0.1] * 4),
+        _output(ttft=0.2, latency=0.6, tokens=4, itl=[0.1, 0.1, 0.1]),
+    ]
+    outputs[0].start_time = 1000.0
+    outputs[1].start_time = 1000.3
+
+    origin = min(output.start_time for output in outputs)
+    first, second = (output.row(origin) for output in outputs)
+    assert first["start_seconds"] == 0.0
+    assert abs(second["start_seconds"] - 0.3) < 1e-12
+
+    # A request's own figures keep their meaning; only the origin moved.
+    assert second["ttft_seconds"] == 0.2
+    assert second["latency_seconds"] == 0.6
+    assert second["itl_seconds"] == [0.1, 0.1, 0.1]
+
+    # And the offsets put the two on one axis: the first is still decoding when
+    # the second is sent, which is the overlap the per-request times cannot show.
+    assert first["start_seconds"] < second["start_seconds"]
+    assert first["start_seconds"] + first["latency_seconds"] > second["start_seconds"]
+    row = bench_serving.RequestOutput(start_time=99.0, success=True).row()
+    assert row["start_seconds"] == 99.0, "with no origin given the clock reading stands"
+
+
 def test_infinite_rate_sends_everything_at_once():
     rng = bench_serving.np.random.default_rng(0)
     delays = bench_serving.arrival_delays(8, float("inf"), 1.0, rng)
@@ -381,6 +414,19 @@ def test_argument_parsing_helpers():
         pass
     else:
         raise AssertionError("a goodput entry without ':' must be rejected")
+
+
+def test_server_drain_is_off_unless_asked_for():
+    """The drain is what lets an external `/metrics` scrape see the last request.
+
+    It has to default to zero: a run that takes no scrape would pay a second of
+    wall time for nothing. It sits after the measured window, so it cannot move
+    a figure the bench reports -- which is the property a nonzero value relies
+    on, and the reason it is a hold rather than a warm-up.
+    """
+    parser = bench_serving.build_parser()
+    assert parser.parse_args([]).server_drain_seconds == 0.0
+    assert parser.parse_args(["--server-drain-seconds", "1.0"]).server_drain_seconds == 1.0
 
 
 def test_default_percentile_metrics_match_vllm():

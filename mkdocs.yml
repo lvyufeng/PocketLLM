@@ -147,7 +147,11 @@ nav:
       - DeepSeek-V4.1-Flash graphed decode, live: performance/deepseek_v4_1_flash_decode_graph_live.md
       - DeepSeek-V4.1-Flash chunked prefill: performance/deepseek_v4_1_flash_chunked_prefill.md
       - DeepSeek-V4.1-Flash prefill stack: performance/deepseek_v4_1_flash_prefill_stack.md
+      - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
+      - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md
       - Serving latency baseline: performance/serving_latency_baseline.md
+      - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
+      - Serving concurrency and throughput: performance/serving_throughput_scaling.md
   - Architecture:
       - Overview: architecture/index.md
       - Backend unification design: architecture/backend_unification_design.md
