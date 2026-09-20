@@ -491,9 +491,12 @@ same span. Its two levers are the indexer's `all_reduce`, which upcasts to fp32 
 the wire for a 16.8 MB tile — **5.47 ms a level-one tile measured on this fabric against 2.88 ms in
 bf16, 1.79 s of the prefix path's 3.53 s at 262144, and the prediction lands on the tap's own `sync`
 column to 0.89 at 32768 and 0.84 at 262144** — and a one-tile lookahead over that collective, which
-has no numerics gate and can hide the whole of it. The wire dtype's gate is **closed**: fp16 on it
-picks a different set on all eight indexer layers, and the candidate path's half of the row does not
-grow with context at all (2.035 s at 32768 against 2.084 at 262144).
+has no numerics gate and can hide the whole of it. The wire dtype's gate is **closed**, and running it
+anyway is what prices the model: fp16 picks a different set on the indexer layers — layer 2, the first
+index source and so the one difference that cannot be inherited damage, goes from 3083 differing rows
+of 4096 to all 4096 — and the arm still bought the prefix path **0.851 s of the 3.525 s it is
+predicted at, against 0.93 s predicted**, with the candidate path's half of the row unmoved (2.035 s at
+32768 against 2.084 at 262144, flat with context).
 [the row that grows with context](deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context)
 takes it apart and names what gates each.
 
@@ -554,12 +557,17 @@ takes it apart and names what gates each.
   is corrected on. `/tmp/chunk_indexer_steps_32768.log`.
 - **fp16 on the indexer's reduce wire.** Halving the message is worth ~0.93 s of the 5.10 s row at
   262144 and the arm is a dtype on a closure, so it looked free. It is not: `INDEXER_REDUCE_BITS=16`
-  moves the selected *set* on all eight indexer layers, against a null — two arms with no knob moved —
+  moves the selected *set* on the indexer layers, against a null — two arms with no knob moved —
   whose own disagreement reproduces to the digit across runs, so the baseline is subtractable and this
   clears it. Layer 2 goes from 3083 differing rows of 4096 to all 4096, and from 621210 differing
   elements to 1640362. Layer 2 is the one that settles it rather than 8/14/20/24/28/32/36: being the
   first indexer, it has no predecessor whose differing selection it could be inheriting.
-  `/tmp/indexer_parity_reduce16.log` against `_null.log`.
+  `/tmp/indexer_parity_reduce16.log` against `_null.log`. What the arm is still good for is the price
+  of the *fp32* collective it replaces, and that one it settles: run in situ at 262144 it takes
+  `stream_prefix` from 3.525 to 2.674 s (**−0.851 against 0.928 predicted**), `reduce`'s `sync` from
+  2.381 to 1.551, the row from 5.677 to 4.758, and the chunk from 29.74 to 29.14 s. So the model
+  behind the 1.79 s is confirmed, and the overlap is a lever on a cost measured from both ends.
+  Re-run it as a *price*, not as a candidate. `/tmp/chunk_indexer_steps_262144_fp16.log`.
 
 ## Reproducing
 
