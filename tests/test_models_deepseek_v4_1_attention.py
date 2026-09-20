@@ -17,6 +17,12 @@ released model's tokens. What is checked is the internal arithmetic that *is* de
   padding fills exactly the rest of the `index_topk` width.
 * **The shared slots are wired the way the modes say.** Only `kv_source_layers` own an index key
   cache; only `candidate_source_layer` writes the candidate mask; only layers *after* it read one.
+* **The recorded step is the eager step.** A decode step of the whole stack is recorded into a CUDA
+  graph, replayed at the position it was recorded at and again at a later one, and both replays have
+  to reproduce the eager step bit for bit. That is the constraint `graphs.py` is built on -- the
+  graph is the shipped decode path -- and it is the one two faults in this file broke without any
+  test here noticing: a `Pos + int` that raised while the step was being recorded, and a boolean a
+  recorded body read back to the host, which a capture refuses outright.
 
 One measurement shaped the config below and is worth stating, because it looks like a bug otherwise.
 `index_topk` truncation makes prefill and decode differ, and the difference is a **tie artifact, not
@@ -32,17 +38,21 @@ error the test exists to catch.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.models.deepseek_v4_1 import attention as attention_module
 from src.models.deepseek_v4_1.attention import (
     AttentionStack,
     Indexer,
+    _TopKStream,
     get_window_topk_idxs,
     select_candidate_blocks,
 )
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.decode_pos import Pos
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="a capture needs a card")
 
 # Toy geometry: six layers, two of them KV sources, three of them index sources, and the second KV
 # source doubling as the candidate source so that one layer owns both published caches. The ratios
@@ -87,7 +97,9 @@ LAST_RATIO = 1
 CANDIDATE_LAYER = 4
 
 
-def _build(seed: int = 0) -> tuple[AttentionStack, V41TextConfig]:
+def _build(
+    seed: int = 0, device: torch.device | str | None = None
+) -> tuple[AttentionStack, V41TextConfig]:
     """A stack whose weights are finite and reproducible, and the config it was built from.
 
     The fill is not decoration. `AttentionStack` is built out of `torch.empty` because its real
@@ -96,10 +108,13 @@ def _build(seed: int = 0) -> tuple[AttentionStack, V41TextConfig]:
     holds one depends on what the process allocated and freed before it. That is not hypothetical --
     with this fill absent the file passes alone and fails when `test_models_deepseek_v4_1_config.py`
     runs first, which is a property of the allocator and not of the layer stack.
+
+    `device` is where the whole stack goes, caches included: the graph test records the step on a
+    card, and a stack built on the host would only move its parameters.
     """
     torch.manual_seed(seed)
     cfg = V41TextConfig(**TOY)
-    stack = AttentionStack(cfg, max_batch_size=1, max_seq_len=64)
+    stack = AttentionStack(cfg, max_batch_size=1, max_seq_len=64, device=device)
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for parameter in stack.parameters():
@@ -400,3 +415,212 @@ def test_a_partial_last_key_tile_does_not_widen_the_position_keys(monkeypatch) -
     assert values.shape == keys.shape == (1, width, width)
     assert torch.equal(keys.sort(dim=-1).values, torch.arange(width).expand(1, width, width))
     assert blocks is not None and blocks.shape == (1, width, -(-width // indexer.candidate_block_size))
+
+
+# -- the decode step is what a graph records ------------------------------------------------------
+#
+# `graphs.py` records a decode step into a CUDA graph and replays it once per token at a position that
+# moves, which is a constraint none of the tests above states in a way that can fail: a capture may
+# not branch on a value it is still computing, and everything the step decides has to keep holding at
+# every position the graph is replayed at. Two faults in this file broke that and neither was visible
+# here. `Backbone.forward`'s `start_pos + c0` raised inside `capture_pass` on a chunked prompt,
+# because `start_pos` is a `Pos` there and `Pos + int` was not defined. `_TopKStream.push`'s early-out
+# then read a boolean back to the host, which a capture refuses with
+# `cudaErrorStreamCaptureUnsupported` -- and it is only reached once the running top-k has saturated,
+# which is why it survived every shorter prompt.
+#
+# So the test below records a decode step of the **whole stack**: the two faults were on two layers'
+# paths and in two different mechanisms, and a test of either alone would have caught only its own.
+
+# The two positions the graph is replayed at. They are two apart, and that is not decoration: the
+# ratio-2 layers' compressor branch -- fill a slot, or fill it and pool a group -- is chosen on the
+# host by `pos.emits`, which is exactly how `graphs.py` can hold two captured bodies and pick between
+# them before the launch. One recording holds one of the two, so the replayed positions have to share
+# their answer, which two even positions do at ratio 2.
+RECORDED_AT = 12
+REPLAYED_AT = 14
+N_GRAPH_TOKENS = 16
+
+
+@CUDA
+def test_a_decode_step_records_into_a_graph_and_replays_at_a_moved_position(monkeypatch) -> None:
+    """The step a graph replays has to be the step the card would have computed eagerly.
+
+    Everything the recorded body reads lives in a tensor allocated before the capture: the token in
+    `move`, and the position in the `Pos` the graph was recorded with, which `set` refills between
+    replays. That is the whole point of the exercise -- a step that read either off the host would
+    replay at the position and with the token it was recorded at, which is the failure `Pos` exists
+    to prevent and the one a bit-for-bit comparison against the eager path is able to see.
+
+    The tiles are shrunk so the running top-k actually saturates. At the toy config's own widths a
+    decode step's candidate set is a single tile, `push` is called once per stream, and the width it
+    holds is the width of that one tile -- so the early-out's condition, which needs a saturated
+    buffer, is never reached and the recorded body would be identical with or without the guard. The
+    real model is the other way round: 2048 candidate blocks against `index_topk` 512 saturate on the
+    first push, so the condition is evaluated on every push after it, which is where the capture died.
+
+    `saturated` is what keeps this test from passing for the wrong reason. It counts pushes that left
+    the buffer at its full width, which is the state the early-out branches on, and it asserts the
+    count is non-zero -- a run where no stream ever saturated would still compare equal here even if
+    the guard were missing.
+    """
+    monkeypatch.setattr(attention_module, "INDEXER_CAND_TILE", 1)
+    monkeypatch.setattr(attention_module, "INDEXER_MIN_KEY_TILE", 1)
+    monkeypatch.setattr(attention_module, "INDEXER_SCORE_BUDGET", TOY["index_n_heads"])
+    stack, cfg = _build(device="cuda:0")
+
+    saturated: list[int] = []
+    original = attention_module._TopKStream.push
+
+    def counting(self, values, keys):
+        original(self, values, keys)
+        # width only, so no host read: this wrapper runs inside the recorded body too
+        if self.values is not None and self.values.size(-1) == self.k:
+            saturated.append(1)
+
+    monkeypatch.setattr(attention_module._TopKStream, "push", counting)
+
+    x = torch.randn(1, N_GRAPH_TOKENS, cfg.dim, dtype=torch.bfloat16, device="cuda:0")
+    positions = (RECORDED_AT, RECORDED_AT + 1, REPLAYED_AT)
+
+    # the eager reference: one prefill, then the step at each position in turn on the cache it built
+    stack.reset_state(1)
+    stack(x[:, :RECORDED_AT], 0)
+    reference = {pos: stack(x[:, pos : pos + 1], pos).clone() for pos in positions}
+    torch.cuda.synchronize()
+
+    # the same sequence, with the step at `RECORDED_AT` recorded instead of run
+    stack.reset_state(1)
+    stack(x[:, :RECORDED_AT], 0)
+    pos = Pos.device(RECORDED_AT, "cuda:0")
+    move = torch.empty(1, 1, cfg.dim, dtype=x.dtype, device="cuda:0")
+    out = torch.empty_like(move)
+    move.copy_(x[:, RECORDED_AT : RECORDED_AT + 1])
+
+    def body() -> None:
+        out.copy_(stack(move, pos))
+
+    for _ in range(2):  # the warm launches a capture pass runs before recording
+        body()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    torch.cuda.synchronize()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, reference[RECORDED_AT]), "the replay at the recorded position is not the eager step"
+    # the capture records kernels and writes no cache, so the eager step in between is what advances
+    # the sequence -- and it has to, or the replay below would run at `REPLAYED_AT` on the cache of a
+    # step that never happened
+    stack(x[:, RECORDED_AT + 1 : RECORDED_AT + 2], RECORDED_AT + 1)
+    torch.cuda.synchronize()
+
+    move.copy_(x[:, REPLAYED_AT : REPLAYED_AT + 1])
+    pos.set(REPLAYED_AT)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, reference[REPLAYED_AT]), "the position did not move with the replay"
+
+    assert saturated, "no stream ever saturated, so the early-out was never even considered"
+
+
+def _push_tiles(stream: _TopKStream, values: torch.Tensor, keys: torch.Tensor, width: int) -> None:
+    """`push` the last axis of `values`/`keys` in `width`-column tiles, as both indexer levels do."""
+    for c0 in range(0, values.size(-1), width):
+        c1 = min(c0 + width, values.size(-1))
+        stream.push(values[..., c0:c1], keys[..., c0:c1])
+
+
+def test_the_early_out_changes_no_result(monkeypatch) -> None:
+    """Both behaviours of `push` -- with the skip and without it -- have to return the same top-k.
+
+    This is what makes dropping the skip inside a capture a cost decision rather than an arithmetic
+    one, and it is the claim `_TopKStream`'s docstring makes: every value held is above every value in
+    the tile, so the k largest of the union are the entries the buffer already holds. Checked on the
+    *keys* as well as the values, because a stream that held the right numbers under the wrong
+    positions would be off by a block everywhere downstream.
+
+    The values fall along the axis and every one of them is distinct, for two separate reasons. Falling
+    means the first tile holds the whole top-k and every later tile is below it, so the skip is
+    available on every push after the first -- a stream of i.i.d. values would only ever reach the
+    merge, and the test would compare the merge against itself. Distinct means `torch.topk` has no tie
+    to break: two streams fed the same values in a different merge order may legitimately name
+    different positions for one, so a tie would make the key comparison below a coin flip.
+    """
+    torch.manual_seed(0)
+    values = torch.randn(1, 3, 64, dtype=torch.float32).sort(dim=-1, descending=True).values
+    keys = torch.arange(64, dtype=torch.int32).expand(1, 3, 64).contiguous()
+    k = 8
+
+    skipped: list[int] = []
+    original = _TopKStream.push
+
+    def counting(self, values, keys):
+        before = self.values
+        original(self, values, keys)
+        # an early-out returns before it can rebind the buffer; the width only, so no host read
+        if self.values is before:
+            skipped.append(1)
+
+    monkeypatch.setattr(_TopKStream, "push", counting)
+
+    with_skip, without = _TopKStream(k, host_branch=True), _TopKStream(k, host_branch=False)
+    _push_tiles(with_skip, values, keys, 16)
+    _push_tiles(without, values, keys, 16)
+
+    assert with_skip.host_branch and not without.host_branch
+    assert skipped, "the skip was never taken, so this compares the merge against itself"
+    skip_values, skip_keys = with_skip.result()
+    merge_values, merge_keys = without.result()
+    # sorted, because `torch.topk(sorted=False)` fixes only the multiset: the two runs merge the same
+    # tiles in the same order but the skip leaves one of them in the order the tiles arrived
+    assert torch.equal(skip_values.sort(dim=-1).values, merge_values.sort(dim=-1).values)
+    assert torch.equal(skip_keys.sort(dim=-1).values, merge_keys.sort(dim=-1).values)
+    # and the result is the real top-k, so the comparison above is not two streams agreeing on nothing
+    assert torch.equal(skip_values.sort(dim=-1).values, values.topk(k, dim=-1).values.sort(dim=-1).values)
+
+
+@CUDA
+def test_a_stream_built_inside_a_capture_does_not_read_the_card() -> None:
+    """`push`'s early-out reads a boolean back to the host, and a capture refuses that read.
+
+    Recorded here at the level the fault happened, because the whole-stack test above cannot state it:
+    it needs the running top-k to saturate on the first tile and then be handed a tile that cannot
+    contribute, and at the toy geometry that state is produced by shrinking the tiles rather than by
+    the data. Here the values fall along the axis, so the skip is available on every push after the
+    first -- and with `host_branch` stuck at True, which is what `push` did before this, the capture
+    below fails with `cudaErrorStreamCaptureUnsupported` instead of producing a graph.
+
+    The tiles are on the card on purpose. The condition is a `bool` of a tensor comparison, so on
+    host tensors it is an ordinary host read that a capture has no reason to object to, and the
+    test would pass against the unfixed `push`.
+    """
+    torch.manual_seed(0)
+    device = "cuda:0"
+    values = torch.randn(1, 3, 32, dtype=torch.float32, device=device).sort(dim=-1, descending=True).values
+    keys = torch.arange(32, dtype=torch.int32, device=device).expand(1, 3, 32).contiguous()
+    k = 8
+
+    built: list[_TopKStream] = []
+
+    def body() -> None:
+        stream = _TopKStream(k)
+        _push_tiles(stream, values, keys, 8)
+        built.append(stream)
+
+    for _ in range(2):
+        body()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    torch.cuda.synchronize()
+
+    assert built and not built[-1].host_branch, "a stream built under capture kept the host branch"
+    # and eager, on the same inputs, the branch is there -- otherwise `push` would be merging every
+    # tile on a long prefill, which is the regression the other side of this guard would be
+    assert _TopKStream(k).host_branch

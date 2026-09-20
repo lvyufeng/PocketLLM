@@ -491,6 +491,22 @@ def _as_column(lens: torch.Tensor | int, bsz: int, seqlen: int, device, dtype) -
     return torch.full((bsz, seqlen, 1), int(lens), dtype=dtype, device=device)
 
 
+def _recording() -> bool:
+    """Whether a CUDA graph is being recorded on the current stream.
+
+    Asked by the site that would otherwise read a tensor back to the host: a capture forbids that
+    read (`cudaErrorStreamCaptureUnsupported`), and the answer cannot be hoisted out of the capture,
+    because what the site branches on is a value the body under capture is still computing. So the
+    host is asked what *it* is doing instead of what the card holds -- the stream query enqueues
+    nothing -- and the recorded body takes the branch that needs no answer. Eager, the query is False
+    and the branch is the one the same code has always taken, so nothing about the prefill changes.
+
+    Not `torch.cuda.is_current_stream_capturing()` alone: that raises on a host with no CUDA at all,
+    and the CPU path is a real one for these tests.
+    """
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 class _TopKStream:
     """Exact top-`k` along the last axis, merged one tile at a time into a fixed-width buffer.
 
@@ -506,17 +522,30 @@ class _TopKStream:
     tiles are below the running k-th while the merge is the expensive part. It is skipped until the
     buffer is saturated, because before that `amin(held)` is not yet the k-th value.
 
+    **The skip is exact, not a tie-break, and that is what lets a capture drop it.** Every value held
+    is above every value in the tile, so the k largest of the union are the k that `held` already has:
+    the merge would return the same multisets and the `topk` below would pick exactly the entries the
+    buffer already holds. It is a pure cost saving, and the reason it is not taken inside a capture --
+    see `host_branch` -- is that a capture cannot branch on a value it is still computing, so the
+    recorded body merges and then drops the tile instead of never merging it. The values and the
+    positions that come out are the same either way, tie order aside, and `Indexer` sorts by position
+    at the end.
+
     Tie order among equal values is whatever `torch.topk(sorted=False)` returns, so two streams fed
     the same values in a different order may name different positions. Both are valid top-k results
     and `Indexer` re-sorts by position afterwards, so the difference never reaches a caller.
     """
 
-    __slots__ = ("k", "values", "keys")
+    __slots__ = ("k", "values", "keys", "host_branch")
 
-    def __init__(self, k: int):
+    def __init__(self, k: int, host_branch: bool | None = None):
         self.k = k
         self.values: torch.Tensor | None = None
         self.keys: torch.Tensor | None = None
+        # False inside a capture, where the early-out's read of device data is not permitted. Asked
+        # here rather than by each caller so that every stream a captured body builds is right without
+        # a caller having to remember, and overridable so a test can hold both behaviours side by side.
+        self.host_branch = (not _recording()) if host_branch is None else host_branch
 
     def push(self, values: torch.Tensor, keys: torch.Tensor) -> None:
         k = self.k
@@ -527,7 +556,11 @@ class _TopKStream:
                 self.values, sel = values.topk(k, dim=-1, sorted=False)
                 self.keys = keys.gather(-1, sel)
             return
-        if self.values.size(-1) == k and bool((values.amax(dim=-1) < self.values.amin(dim=-1)).all()):
+        if (
+            self.host_branch
+            and self.values.size(-1) == k
+            and bool((values.amax(dim=-1) < self.values.amin(dim=-1)).all())
+        ):
             return
         merged = torch.cat([self.values, values], dim=-1)
         # fewer than `k` values seen so far means the buffer is still filling and there is nothing to
