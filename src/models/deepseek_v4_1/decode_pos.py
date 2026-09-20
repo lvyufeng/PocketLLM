@@ -160,6 +160,34 @@ class Pos:
         """The next step. The one place a decode loop should move the position from."""
         return self.set(self._host + 1)
 
+    def __add__(self, offset: int) -> "Pos":
+        """The position `offset` further on, as a `Pos`.
+
+        What a chunked forward asks for: `Backbone.forward` runs the prompt a chunk at a time and
+        each chunk's layers see the position their first token sits at, so the expression is
+        `start_pos + c0`. On the eager path `start_pos` is an `int` and the sum is an `int`; on a
+        decode step replayed from a graph it is a `Pos`, and the sum has to stay one, because what
+        the layers do with it is `Pos.of` -- which refuses a bare tensor by design -- and because the
+        index a capture records has to be a tensor. `int(start_pos) + c0` is the other way to keep
+        that expression from raising and it is worse than raising: an `int` is a Python value a
+        recording freezes, so every replay would decode at the position it was captured at.
+
+        `row` is the accessor for the other thing a caller can want from an offset -- the index
+        object a `cache[...]` takes, which on this path is a 0-dim tensor and is not a position.
+
+        A plain `int` on the left is deliberately not supported: `__radd__` would make
+        `offset + start_pos` look like it worked, and every call site in the tree writes the position
+        first.
+
+        `offset=0` returns `self`, so a chunked forward can ask unconditionally and a one-chunk
+        forward hands the layers the object it was given.
+        """
+        if not offset:
+            return self
+        if self._tensor is None:
+            return Pos(self._host + offset)
+        return Pos(self._host + offset, self._tensor + offset)
+
     # -- what the host needs to know -------------------------------------------------------------
 
     @property

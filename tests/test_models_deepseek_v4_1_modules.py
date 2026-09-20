@@ -29,7 +29,9 @@ import torch.nn.functional as F
 from src.encoding.engram import EngramLayout
 from src.models.deepseek_v4_1 import modules as modules_module
 from src.models.deepseek_v4_1.config import V41TextConfig
+from src.models.deepseek_v4_1.decode_pos import Pos
 from src.models.deepseek_v4_1.modules import (
+    Backbone,
     Block,
     Engram,
     Gate,
@@ -366,3 +368,82 @@ def test_temperature_zero_samples_the_argmax() -> None:
     # and a positive temperature is stochastic, so it is not that
     draws = {tuple(sample(logits, 1.0).tolist()) for _ in range(32)}
     assert len(draws) > 1
+
+
+# -- the chunk loop hands each chunk its own position, in the form it was given -------------------
+
+
+class _PositionRecorder:
+    """A `Block` stand-in that keeps the `start_pos` it was handed and passes the stream through.
+
+    `Backbone.forward` asks a block for `(h, pre_mix)` and nothing else, so three lines stand in for
+    a layer here. What this section reads is one argument of the call, and building forty real blocks
+    to read it would be a different test.
+    """
+
+    engram = None
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    def __call__(self, h, start_pos, pre_mix, image_mask, shared):
+        self.seen.append(start_pos)
+        return h, pre_mix
+
+    def hc_pre(self, h, pre_mix):
+        return h
+
+
+def _stub_backbone(layers: int = 2) -> tuple[Backbone, list[_PositionRecorder]]:
+    """A `Backbone` with `__init__` bypassed: the chunk loop is the subject, not the tree."""
+    held = [_PositionRecorder() for _ in range(layers)]
+    model = object.__new__(Backbone)
+    model.__dict__.update(
+        device=None,
+        hc_mult=2,
+        temperature=0.0,
+        target_layer_ids=(),
+        layers=held,
+        embed=lambda ids: torch.zeros(*ids.shape, DIM),
+        norm=lambda h: h,
+        head=lambda h: h.reshape(h.size(0), -1),
+    )
+    return model, held
+
+
+def test_a_chunked_forward_gives_each_chunk_the_position_its_first_token_sits_at() -> None:
+    """Six tokens two at a time from position 10: the layers see 10, 12, 14 -- not 10 three times."""
+    model, held = _stub_backbone()
+    model.forward(torch.zeros(1, 6, dtype=torch.long), 10, None, None, 2)
+    assert held[0].seen == [10, 12, 14]
+    assert held[1].seen == [10, 12, 14], "the layers of one chunk disagree about their position"
+
+
+def test_an_unchunked_forward_hands_the_layer_the_position_it_was_given() -> None:
+    model, held = _stub_backbone(layers=1)
+    model.forward(torch.zeros(1, 4, dtype=torch.long), 7, None, None, None)
+    assert held[0].seen == [7]
+
+
+def test_a_chunked_forward_keeps_the_position_object_a_graph_hands_it() -> None:
+    """The form has to survive the offset, and this is the assertion that failed when it did not.
+
+    A decode step replayed from a graph passes a `Pos` -- its position reaches the card as an index
+    tensor, which is the whole reason the object exists -- so `start_pos + c0` is a `TypeError` on
+    that path and a capture is where it fires: `--decode-graphs` died in `capture_pass` on
+    `unsupported operand type(s) for +: 'Pos' and 'int'`, after the prefill and past every earlier
+    check. `int(start_pos) + c0` is the other way to make it stop crashing and it is worse: an `int`
+    is a Python value a capture records as a constant, so the replay would decode at the position it
+    was recorded at.
+
+    The tensor here is on the host, not on a card: `Pos.__add__` adds to the host counter and rebuilds
+    the index from it, so nothing it does is device arithmetic, and
+    `tests/test_models_deepseek_v4_1_decode_pos.py` pins the CUDA form.
+    """
+    model, held = _stub_backbone(layers=1)
+    pos = Pos.device(10, torch.device("cpu"))
+    model.forward(torch.zeros(1, 6, dtype=torch.long), pos, None, None, 2)
+    seen = held[0].seen
+    assert all(isinstance(at, Pos) for at in seen), "the offset turned the position into an index"
+    assert [at.host for at in seen] == [10, 12, 14]
+    assert [at.row().item() for at in seen] == [10, 12, 14]

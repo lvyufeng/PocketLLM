@@ -347,5 +347,60 @@ def test_host_path_advance_moves_only_the_integer():
     assert pos.host == 9 and not pos.on_device
 
 
+# -- a chunk offset is a position, not an index object ------------------------------------------
+#
+# `Backbone.forward` runs a prompt a chunk at a time and each chunk's layers see the position their
+# first token sits at, so the line is `at = start_pos + c0` -- and `start_pos` is an `int` on the
+# eager path and a `Pos` on a decode step replayed from a graph. What `__add__` has to be is
+# therefore the *same kind of object* back: an `int` on one path, a `Pos` with a tensor on the other.
+
+
+def test_add_on_the_host_path_offsets_the_counter_and_returns_a_pos():
+    """`Pos + int` is always a `Pos`; the eager path stays an `int` because `start_pos` is one there.
+
+    The two halves are one behaviour: what the chunk loop needs is for `start_pos + c0` to be *the
+    kind of object the caller passed*, and that holds on the eager path because `int + int` never
+    reaches this method at all. `tests/test_models_deepseek_v4_1_modules.py` holds that half, on the
+    loop; this holds the half that has to make the device path a position rather than a crash.
+    """
+    pos = Pos.of(8)
+    for offset in (1, 6):
+        at = pos + offset
+        assert isinstance(at, Pos) and at.host == 8 + offset and not at.on_device
+    assert pos.host == 8, "the position it was asked from moved"
+
+
+def test_add_of_zero_is_the_object_it_was_asked_from():
+    """Why the chunk loop can ask unconditionally: the one-chunk case hands back what it was given."""
+    for pos in (Pos.of(8), Pos.device(8, torch.device("cpu"))):
+        assert pos + 0 is pos
+
+
+def test_add_returns_a_position_where_row_returns_an_index_object():
+    """The reason the chunk loop cannot use `row`: the next `Pos.of` down the stack refuses a tensor.
+
+    `row` is the accessor for *indexing* a cache and hands back what the index wants -- an `int`, or
+    a 0-dim tensor once the position lives on the card. A layer's `start_pos` is the other thing: it
+    is unwrapped by `Pos.of`, which rejects a bare tensor on purpose, so a chunk offset built with
+    `row` is a crash and a chunk offset built with `+` is a position.
+    """
+    pos = Pos.device(8, torch.device("cpu"))
+    at = pos + 2
+    assert isinstance(at, Pos) and at.host == 10 and at.on_device and int(at) == 10
+    with pytest.raises(TypeError):
+        Pos.of(pos.row(2))
+
+
+@CUDA
+def test_add_on_the_device_path_keeps_the_tensor_the_capture_reads():
+    pos = Pos.device(1024, "cuda:0")
+    at = pos + 7
+    assert at.on_device and at.host == 1031
+    # the index a graph records, and the host counter beside it, at the offset rather than the base
+    assert at.row().item() == 1031 and int(at) == 1031
+    # and the position it was asked from is untouched
+    assert pos.host == 1024 and pos.row().item() == 1024
+
+
 def test_repr_names_both_paths():
     assert "host int" in repr(Pos.of(1))
