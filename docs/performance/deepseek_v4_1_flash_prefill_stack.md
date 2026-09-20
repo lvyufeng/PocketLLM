@@ -240,6 +240,7 @@ rather than the 41024 the tables above ran against.
 | | base (`/tmp/pr_b`) | stacked (`/tmp/prefill_all`) |
 | --- | ---: | ---: |
 | 262144 tokens, rank 0 | 3722.8 s | 2520.7 s |
+| wall, ranks 1 / 2 / 3 | 3722.5 / 3723.4 / 3723.0 s | 2520.7 / 2520.2 / 2520.7 s |
 | tokens a second | 70.4 | 104.0 |
 | a 4096-token chunk, mean | 58.17 s | 39.39 s |
 | **ratio** | | **1.477x** |
@@ -254,7 +255,9 @@ rather than the 41024 the tables above ran against.
 **The ratio is flat.** 1.479x on the chunk at the 32768 boundary, 1.476x on the last chunk, 1.477x
 over the whole leg. That is the useful negative result as much as the positive one: none of the three
 levers is a term that grows with the prefix, so none of them is what the next pass at this length
-should be looking at, and the 18.80 s the 32768 profile measured is 19.65 s here rather than less.
+should be looking at. The saving the 32768 profile measured, 18.80 s, is 18.37 s on the chunk at that
+same boundary here and 19.65 s on the last one — a drift of about a second across the leg, which is
+the size of the fit's own residual below and not a trend the endpoints resolve.
 
 The two trees are the two above, one commit further on. `/tmp/pr_b` is the 256K branch at `4608981`,
 which is `98e828f` — the tip the 22-tap profile ran — plus two Markdown files; `/tmp/prefill_all` is
