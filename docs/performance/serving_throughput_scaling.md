@@ -13,7 +13,7 @@ engine prints a WARNING for the device-side wait at startup. The shipped
 configuration is the [baseline page](serving_latency_baseline.md)'s.
 
 Headline: **112 concurrent streams is where this configuration stops.** At
-`--max-context 2048` the KV pool stops fitting one rank at 120 slots, the rank
+`--max-context 2048` the KV arena stops fitting one rank at 120 slots, the rank
 exits during `device_malloc`, and the server keeps accepting requests while it
 emits nothing — a silent hang rather than an error. Throughput peaks earlier, at
 96 slots.
@@ -24,13 +24,24 @@ emits nothing — a silent hang rather than an error. Throughput peaks earlier, 
 - native `pocketllm_engine`, TP4 across devices 0-3 of an 8 x Ascend 910B
   (first generation, `Short_SoC_version=Ascend910`; 32 GB HBM a card), CANN 9.0.0
 - OpenAI `/v1/chat/completions`, streaming SSE
-- **KV cache is paged**, which is the server's default (`main.cpp:104`); neither
-  `--kv-paged` nor `--no-kv-paged` was passed. `bench_serving.py:858` defines a
-  `--kv-paged` flag that nothing reads, so it cannot have changed this. The
-  `--no-kv-paged` claim an earlier revision of this page made was wrong, and it
-  matters: the paged pool's size is `max_batch_size x max_context x bytes a
-  token x full-attention layers` (`qwen_engine.cpp:1517-1521`), which is what
-  bounds concurrency in the section below.
+- **KV cache is the contiguous, unpaged arena, not the paged pool the CLI
+  defaults to.** The default is the other way (`main.cpp:104`:
+  `bool kv_paged = true;`), and reading that is what led an earlier revision of
+  this page to say paging was on. It is not: `bench_serving.py` hands the launch
+  to `start_server`, which appends `--no-kv-paged` whenever `--device-style
+  ascend` and `--kv-paged` is unset (`bench_cpp_openai_concurrency.py:281-290`,
+  added in `9c1b017`, an ancestor of `645e36b`). It has to, because
+  `run_batched_decode` rejects that combination outright
+  (`qwen_engine.cpp:4501`): the batched Ascend entry points address a slot by a
+  constant element stride and do no block-table translation, so a paged arena
+  would read the wrong rows rather than fail. The `--no-kv-paged` of the revision
+  this page "corrected" was right, and
+  [latency_metrics.md](../guides/latency_metrics.md) already documents the
+  behaviour. **Nothing below moves**: the arena reserves the identical
+  `max_batch_size x max_context x bytes a token x full-attention layers` the paged
+  pool's zero-budget branch derives (`qwen_engine.cpp:1700` against `1517-1521`,
+  whose own comment calls turning paging on "memory-neutral"), so only the name of
+  the thing that stops fitting a rank at 120 slots was wrong.
 - commit `645e36b` (master as of 2026-09-19), binary
   `cpp_engine/build-ascend/pocketllm_engine`
 - every ladder row: `--random-input-len 512 --random-output-len 512
@@ -184,14 +195,15 @@ for a peer that has already exited, so the server accepts, admits and counts
 every request and never produces a token — the client's only symptom is
 `Never received a valid chunk to calculate TTFT.` after its 900 s timeout.
 
-**It is the KV pool that decides this, and `--max-context` is half of it.** With
-`kv_paged` on, one rank reserves
+**It is the KV cache's size that decides this, and `--max-context` is half of
+it.** The arena reserves
 `max_batch_size x max_context x bytes a token x full_attention_layers`
-(`qwen_engine.cpp:1517-1521`), and for this checkpoint at TP4 that is 1 local KV
+(`qwen_engine.cpp:1700`; the paged pool's zero-budget branch at `1517-1521` derives
+the same product), and for this checkpoint at TP4 that is 1 local KV
 head x 256 head_dim x 2 tensors x 2 bytes = 1024 B a token a layer across 16
 full-attention layers:
 
-| slots | ctx | pool a rank | |
+| slots | ctx | arena a rank | |
 | ---: | ---: | ---: | --- |
 | 112 | 2048 | 3.50 GiB | runs |
 | 120 | 2048 | 3.75 GiB | rank 2 fails, +268 MiB |
@@ -204,10 +216,16 @@ width flag. `npu-smi` reports device 2's HBM as 32741 MB against 32768 MB on
 devices 0, 1 and 3, a 27 MB difference that cannot explain a 268 MiB step — the
 margin is tight for a reason this record does not establish, and if the ceiling
 matters to a deployment it is worth re-measuring per host rather than quoting
-112 as a property of the engine. What is established is the shape: **the pool is
+112 as a property of the engine. What is established is the shape: **the arena is
 sized for worst-case `max_context` on every slot, so concurrency and context
-length buy from the same budget**, and 8 GiB of over-reservation is spent on
-slots that never reach 130 tokens.
+length buy from the same budget**, and almost all of it is spent on slots that
+never reach 130 tokens. `L112` reserves 3.500 GiB a rank and ever holds 0.160 GiB
+of generation, 0.715 GiB once the re-tokenized prompts are counted — 2.8 GiB of
+over-reservation in that one row. Summed over the eleven ladder points it is
+13.906 GiB reserved against 4.102 GiB ever held: 9.8 GiB of reservation for
+tokens that were never there. (Generation is the records' own `output_tokens`;
+the prompt term is the 325-token mean the engine logs, because these artifacts
+predate the harness recording `prompt_tokens`, which reads 0 in all of them.)
 
 ## Where the curve stops paying
 
@@ -237,7 +255,7 @@ the ladder is past the point where the width is doing anything but costing time.
 The marginal ms/row column is the slope of TPOT between consecutive widths, and
 it is not monotone: 4.66, 4.10, 8.62, 3.68, 3.06, 5.00, 4.04, 13.30 ms. The
 16-slot entry is where the step stops being able to hide its fixed costs, and the
-112-slot entry is where the pool's pressure on the arena starts to show. The
+112-slot entry is where the arena's worst-case reservation starts to show. The
 nominal peak of the measured aggregate is `L64`/`L96` at 105.4/105.1 tok/s — a
 dead tie across a 50% wider batch, which is the honest statement of where this
 configuration tops out.
@@ -517,13 +535,23 @@ it is a batching defect rather than a bandwidth one.**
 In order of what the measurements support, and none of it done here:
 
 1. **Size the KV pool by concurrency actually granted, not by worst-case
-   context.** The pool reserves `max_context` for every slot, so at 112 slots
-   it holds 3.5 GiB for generations that end at 130 tokens — 8 GiB of
-   over-reservation at the widths this page runs, and the reason 120 slots hangs
-   a rank instead of admitting fewer. A block pool handed out on demand already
-   exists (`kv_paged` is on); what is missing is a knob that separates "how many
-   slots" from "how many tokens those slots may hold in total", which is the
-   distinction `--kv-block-size` and a token-based budget could carry.
+   context.** The arena reserves `max_context` for every slot, so at 112 slots it
+   holds 3.500 GiB for generations that end at 130 tokens — 2.8 GiB of
+   over-reservation in that one row, 9.8 GiB summed over the ladder, and the
+   reason 120 slots hangs a rank instead of admitting fewer. The token-based
+   budget itself already exists: `ModelOptions::kv_cache_bytes`
+   (`model_registry.hpp:47`) is bridged to the engine
+   (`engine_registry_builtin.cpp:40`), the paged budget reads it and treats 0 as
+   "reserve what the arena would" (`qwen_engine.cpp:1517`), and the Python
+   bindings expose it (`bindings.cpp:323`). **`main.cpp` has no
+   `--kv-cache-bytes`** — only `--kv-paged`, `--no-kv-paged` and
+   `--kv-block-size` — so the server has no way to set it today; that part is a
+   flag. The rest is not: a budget below the worst case is a pool handed out on
+   demand, and `run_batched_decode` rejects that combination on Ascend
+   (`qwen_engine.cpp:4501`) precisely because the batched entry points address a
+   slot by a constant element stride rather than through a block table. Exposing
+   the knob without teaching those kernels the translation would produce a
+   server that starts and answers wrongly, which is worse than the hang above.
 2. **Merge the admission wave into one prefill forward.** It is the only finding
    on this page that moves TTFT and prefill TFLOPS together — both are bounded by
    the same one-request-at-a-time loop in `batch_prefill`. The engine's own

@@ -222,7 +222,7 @@ python scripts/bench_serving.py --base-url http://127.0.0.1:8000
 
 On Ascend the launch adds `--no-kv-paged` by itself, because the engine rejects a
 paged KV cache on the batched decode path outright
-(`cpp_engine/engine/qwen_engine.cpp:4499`); the CUDA launch is unchanged.
+(`cpp_engine/engine/qwen_engine.cpp:4501`); the CUDA launch is unchanged.
 
 `--num-prompts 1000` and `--request-rate inf` are the defaults, matching vLLM:
 by default the harness saturates the server. `--dataset-name random` (the default)
