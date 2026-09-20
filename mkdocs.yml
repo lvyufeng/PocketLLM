@@ -146,6 +146,7 @@ nav:
       - DeepSeek-V4.1-Flash decode graph: performance/deepseek_v4_1_flash_decode_graph.md
       - DeepSeek-V4.1-Flash graphed decode, live: performance/deepseek_v4_1_flash_decode_graph_live.md
       - DeepSeek-V4.1-Flash chunked prefill: performance/deepseek_v4_1_flash_chunked_prefill.md
+      - DeepSeek-V4.1-Flash prefill stack: performance/deepseek_v4_1_flash_prefill_stack.md
       - Serving latency baseline: performance/serving_latency_baseline.md
   - Architecture:
       - Overview: architecture/index.md
