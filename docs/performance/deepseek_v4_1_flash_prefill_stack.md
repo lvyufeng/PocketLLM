@@ -1,0 +1,405 @@
+# DeepSeek-V4.1-Flash: the three prefill optimizations, stacked
+
+The [chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) published the phase table of a
+4096-token chunk at 32768 and named its three largest rows. The three passes that followed each took
+one of them — [#296](https://github.com/lvyufeng/PocketLLM/pull/296) the sparse-attention score pass,
+[#297](https://github.com/lvyufeng/PocketLLM/pull/297) the two grouped fp4 kernels' weight reads, and
+[#298](https://github.com/lvyufeng/PocketLLM/pull/298) the reduction inside them — and each was
+measured against the tree it was cut from. **This page is the composition instead of the parts:** one
+arm on the 256K branch, one on the 256K branch with all three merged, the identical geometry, the
+identical probe, all four ranks.
+
+The chunk goes **65.94 → 48.48 s instrumented** and **56.87 → 38.07 s with the taps off (‑33.1%)**.
+The three changes' own measured deltas — 5.33 s from #296's A/B, 8.98 s from #297's, 4.58 s from
+#298's — add to 18.89 s against the 18.80 s measured here, so **they stack additively**: no overlap,
+no interference, and the two that share a kernel launcher (#297 and #298) are independent in the
+composition as well as in their own measurements. What the chunk is *made of* changes shape rather
+than only shrinking. The sparse pass falls to a fifth of its former size and the grouped GEMM's two
+kernels lose two thirds of theirs, while the expert H2D goes from 16.71 to 17.38 s — **the copies are
+now 46% of the instrumented chunk and the largest single row in it**, and the third lever the
+chunked-prefill page named is not the host's row loop, which this run measures at 1.52 s of 163,840
+calls in both arms. The logits move and the decisions do not: the stacked tree picks the same token
+as the base tree at all nine dump positions, and the stacked tree run twice is bit-identical.
+
+The composition holds at the length the branch exists for, which is the other half of what this page
+had to answer. Over a full 262144-token prompt the same two arms go **3722.8 → 2520.7 s and 70.4 →
+104.0 tokens a second (1.477x)**, a 4096-token chunk going 58.17 → 39.39 s — and the ratio is 1.479x
+on the chunk at the 32768 boundary and 1.476x on the last one, so none of the three levers is a term
+that grows with the prefix. The two arms stage the same number of expert rows to within 1.8%, in the
+direction that makes the stacked arm do *more* of the work.
+
+## Run record
+
+| | |
+| --- | --- |
+| Model | DeepSeek-V4.1-Flash, released checkpoint, fp8 dense + packed-fp4 experts |
+| Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, resident bank attached from the 457.78 GiB `/dev/shm` segment |
+| Commit | base arm: `feature/v41-256k-context` tip `98e828f` (itself `perf/v41-hc-token-tile` `83ed600` plus the 256K work). Stacked arm: `perf/v41-prefill-integration-256k` tip `b7f633a`, which is `98e828f` with three merges — `3d64eca` (`perf/v41-prefill-sparse-attn-warp-dot`, tip `ef53553`), `4f27695` (`perf/v41-moe-multi-coalesced-weights`, tip `0d5a4ec`), `b7f633a` (`perf/v41-moe-reduce-csr`, tip `38d453c`) |
+| The two arms | the base tree's own `cuda_kernel.cpython-311-x86_64-linux-gnu.so` (12709712 bytes, md5 `8cb40d947ae3a9a3e23fcfe0a43781cc`) against the stacked tree's (12853624 bytes, md5 `b4022f063272ee23ad242c8eb7f88c5c`) — and, unlike the [weight-staging page](https://github.com/lvyufeng/PocketLLM/pull/297), the Python differs too, because the coalesced and CSR call sites live in it; **this is two trees run in turn, not one binary swapped** |
+| Configuration | TP4, one process a card, `torchrun --nproc_per_node=4`, `--at 32768 --chunk 4096 --prefill-chunk 4096 --max-seq-len 41024 --pool-rows 148 --buffers 2 --threads 22`, resident bank on |
+| GPUs | 4 x RTX 2080 Ti, 22528 MiB each, `GPU0-GPU1` PHB and `GPU2-GPU3` NV2, cross-pairs SYS |
+| CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
+| Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env, `CUDA_HOME=/usr/local/cuda-12.4`, `TORCH_CUDA_ARCH_LIST=7.5`, `POCKETLLM_BUILD_CPP=0` |
+| Probe | `/tmp/probe_v41_chunk_profile_host.py`, once an arm: warm up eight chunks to 32768, then 22 taps with the barrier split out of each number over one 4096-token chunk, then the same width again with the taps off. Logs `/tmp/chunk_profile_base.log` (23:40) and `/tmp/chunk_profile_all.log` (23:24) |
+| Parity | `/tmp/pr_b_parity.py`, three arms through `/tmp/parity_stack.sh`: the base tree, the stacked tree, and the stacked tree again as the A-A control, compared per rank with `--compare` |
+
+**On the two binaries.** The control this page has is the tree, not a byte-identical extension: both
+arms had their `cuda_kernel` rebuilt *after* their probe run, so the installed `.so` of each arm is
+whatever was in place at 23:24 and 23:40 and is not in the payloads, and neither of the two md5s above
+is the one #297 or #298 recorded for its own A/B — those were 9,490,256 and 9,416,528 bytes, against
+12,709,712 and 12,853,624 here, the gap being the `.nv_fatbin` arch list rather than the kernels. What
+makes the composition readable anyway is that the two trees differ in the Python as well, so "one
+binary swapped" was never the design, and that the rows neither change touches — `attn.window`
+0.81 → 0.82, `hc_mixes`/`hc_pre`/`hc_post`, `norm`, `engram` — agree across the arms to within 2%,
+which is the shared code doing the same thing in both runs. The three changes' own A/Bs, in the
+section below, were each taken on the tree they name.
+
+## The chunk, both arms
+
+Rank 0, seconds, `body` being the call between the tap's two barriers and `sync` the barriers
+themselves. The column order in the payload is `[total, calls, sync, body]`; `total = body + sync`.
+Nested rows are indented, and a nested row's `total` is contained in its parent's `body`.
+
+| phase | calls | base total | base body | base sync | stacked total | stacked body | stacked sync |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `hc_mixes` | 80 | 0.40 | 0.13 | 0.27 | 0.40 | 0.13 | 0.27 |
+| `hc_pre` | 81 | 0.29 | 0.03 | 0.25 | 0.29 | 0.03 | 0.25 |
+| `attn` | 40 | 13.04 | 11.34 | 1.70 | **6.79** | 5.23 | 1.56 |
+| `  attn.sparse` | 40 | 8.07 | 0.00 | 8.06 | **1.98** | 0.00 | 1.97 |
+| `  attn.window` | 40 | 0.81 | 0.40 | 0.41 | 0.82 | 0.42 | 0.41 |
+| `  attn.compress_kv` | 38 | 2.14 | 2.14 | 0.00 | 2.11 | 2.11 | 0.00 |
+| `    attn.compressor` | 4 | 0.02 | 0.02 | 0.00 | 0.02 | 0.02 | 0.00 |
+| `    attn.indexer` | 8 | 2.11 | 2.11 | 0.00 | 2.09 | 2.08 | 0.00 |
+| `hc_post` | 80 | 0.96 | 0.05 | 0.91 | 0.96 | 0.05 | 0.92 |
+| `moe` | 40 | 50.64 | 47.78 | 2.86 | **39.39** | 36.44 | 2.95 |
+| `  moe.gate` | 40 | 0.08 | 0.02 | 0.06 | 0.08 | 0.02 | 0.06 |
+| `  moe.routed` | 40 | 47.28 | 47.28 | 0.00 | **35.95** | 35.95 | 0.00 |
+| `    routed.route_ids` | 40 | 0.01 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `    routed.resolve` | 163,840 | 7.00 | **1.52** | 5.53 | 7.26 | **1.52** | 5.80 |
+| `    routed.stage` | 163,840 | 19.77 | 17.04 | 2.77 | 20.72 | 17.75 | 3.02 |
+| `      routed.upload` | 8,634 / 8,978 | 16.71 | 2.34 | 14.37 | 17.38 | 2.37 | 15.02 |
+| `      routed.buffer` | 8,634 / 8,978 | 0.20 | 0.04 | 0.16 | 0.22 | 0.04 | 0.18 |
+| `    routed.issue` | 156 / 165 | 18.18 | 0.57 | **17.61** | **5.49** | 5.24 | **0.25** |
+| `    routed.drain` | 156 / 165 | 0.35 | 0.34 | 0.01 | 0.38 | 0.37 | 0.01 |
+| `  moe.shared` | 40 | 0.39 | 0.03 | 0.36 | 0.38 | 0.02 | 0.36 |
+| `norm` | 169 | 0.54 | 0.03 | 0.51 | 0.54 | 0.03 | 0.51 |
+| `engram` | 2 | 0.47 | 0.38 | 0.09 | 0.49 | 0.41 | 0.09 |
+| **five phases** | | **65.33** | 59.33 | | **47.83** | 41.88 | |
+
+| | base | stacked |
+| --- | ---: | ---: |
+| instrumented chunk, rank 0 | 65.94 | 48.48 |
+| the same width with the taps off | 56.87 | 38.07 |
+| what the instrument costs | 9.07 | 10.41 |
+| names / calls recorded | 22 / 346,042 | 22 / 346,748 |
+| five phases cover / their bodies cover | 99.1% / 90.0% | 98.7% / 86.4% |
+| warm-up: first chunk, the other seven, spread | 74.80–75.83, 65.71, ≤1.39 | 57.79–60.75, 46.84, ≤1.26 |
+| expert rows staged | 9,509 | 9,843 |
+| peak allocated | 15.05 GiB | 15.12 GiB |
+
+All four ranks report the same wall in both arms — 65.94/65.94/65.94/65.95 and
+48.48/48.48/48.48/48.48 — with the identical taps-off chunk (56.87/56.86 and 38.07/38.06), and the
+tables above are rank 0's; ranks 1 and 2 differ in where the same seconds sit, which is what the
+per-rank `staged` column (9,509/9,516/5,029/5,020 against 9,843/9,918/5,106/5,042) is: the expert
+split is 2/2/1/1 rows a layer, so ranks 2 and 3 stage half as much and their routed taps read
+smaller.
+
+Two reading notes that the `sync` column forces.
+
+- **The instrument's own price is not constant across the arms.** The same 346,748-call tap costs
+  10.41 s of the stacked chunk against 9.07 s of the base one, so the two instrumented walls are
+  65.94 and 48.48 while the two *quiet* walls are 56.87 and 38.07. The quiet pair is the honest
+  ratio: **‑33.1%**, against the instrumented pair's ‑26.5%, which is a floor.
+- **The `routed.issue` row's columns move between the arms and its total does not stay put.** In the
+  base chunk the tap's postamble is the grouped GEMM and it reads 17.61 s of `sync` against 0.57 s of
+  `body`; in the stacked chunk those are 0.25 and 5.24. The function is byte-identical between the two
+  trees — `diff` of the extracted `_issue_chunk` is empty — so what moved is what it waits on: with
+  the kernels three times faster, the issue path's own time is the host's launches and the
+  `wait_stream` on the copy stream it depends on, not the GEMM. The **sum** of the two columns is the
+  number to compare across arms: 18.18 against 5.49.
+
+## Where the 18.80 quiet seconds went
+
+The three passes' own A/Bs, the base each was taken against, and what the composition here reads.
+Each delta is the other page's, measured on the real checkpoint at this same geometry:
+
+| change | its own A/B | its delta | the row it lands in, here |
+| --- | ---: | ---: | --- |
+| #296, the sparse score pass as a warp dot | 56.88 → 51.55 s | ‑5.33 | `attn.sparse` 8.07 → 1.98 (‑6.09 total) |
+| #297, the two fp4 kernels' weight reads coalesced | 56.49 → 47.51 s | ‑8.98 | `routed.issue` 18.18 → 5.49 (‑12.69 total) |
+| #298, the reduction grouped per token into a CSR | 51.46 → 46.88 s | ‑4.58 | the same row: #297's two kernels go 13.72 → 4.44 s of its own device table, and this finishes the reduction inside the second |
+| the three added | | **‑18.89** | measured here: **‑18.80** on the quiet chunk |
+
+The last row is the point of the page. The deltas are taken against three different bases — #296
+against the 256K branch, #297 against `master`-based kernels inside the 256K worktree, #298 against
+the tree with #296 already in it — so their sum is a prediction that only holds if the three do not
+interact, and it holds to **0.1 s in 18.8**, five parts in a thousand. The one interaction worth
+looking for is between #297 and #298, which are stacked: #297 widens the token tile and stages the
+weights through shared, #298 changes the reduction the second kernel does afterwards, and the two
+touch the same launcher and the same two symbols. Their being additive says the reduction loop #298
+replaced was not covered by anything #297 did, which its own page claims by construction (the CSR is
+a different loop over the same pairs) and this page confirms by measurement.
+
+The third row of the table is where the two differ in kind rather than in size. `attn.sparse` is a
+single kernel whose 8.06 s of measured device time becomes 1.97; `routed.issue` is a *path* whose
+total time more than triples its own kernels' improvement, because the 12.69 s it loses is not all
+kernel time — 9.28 s of it is #297's two kernels and the rest is the reduction and the host's share
+of the launch loop, which is only exposed once the card stops being the limit.
+
+## What the chunk is made of now
+
+Attributing the quiet chunk's 38.07 s out of the measured device rows:
+
+| row | base, device | stacked, device | share of the stacked quiet chunk |
+| --- | ---: | ---: | ---: |
+| expert H2D into the arena (`routed.upload`'s sync, 170.5 GiB at ~12 GB/s) | 14.37 | 15.02 | **39%** |
+| the grouped fp4 GEMM (`routed.issue`'s sync, base) | 17.61 | ≤4.4 | ~12% |
+| sparse attention | 8.06 | 1.97 | 5% |
+| the TP combine at the end of `MoE.forward` (`moe`'s own sync) | 2.86 | 2.95 | 8% |
+| the rest of the measured device time (window, indexer, hc, norm, engram, gate, shared) | 8.56 | 8.55 | 22% |
+| the routed path's own host bodies (see below) | 5.11 | 5.11 | 13% |
+
+Three things follow.
+
+- **The lever has moved to the bytes.** 15.02 s of H2D is now the largest single row, and it is not a
+  kernel: it is 170 GiB of expert rows crossing PCIe 3.0 at the 12 GB/s this host measures, 8,978
+  calls of ~19 MiB. #297's own docstring says so about its own change — "the staged rows are the same,
+  so what moved is the call count and not the floor" — and with the kernels out of the way the floor
+  is what is left. The reduction that would move it is the number of rows a chunk stages, which is
+  the same lever the [chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) prices at 1.51 ms
+  a row and the pool width at 148 rows.
+- **The host's row bookkeeping is not the third lever.** The chunked-prefill page read a 6.7–9.5 s
+  band off `_resolve_row`'s row of its table and attributed it to the per-row Python loop at 20–29 µs
+  a call over 327,680 calls. The barrier split says that row's `body` is **1.52 s over 163,840 calls
+  in the base chunk, 1.52 s in the stacked chunk, and 1.52–1.55 s in the base warm-up's eight chunks**
+  — four independent 163,840-call groups agreeing to 2%, the cleanest one-instance measurement in
+  this run — so its 7.00 s row is 1.52 s of loop, ~2.0 s of the probe's own two barriers, and the
+  balance a wait on H2D issued by `_stage_misses`. What the routed path spends on the host is its
+  *bodies*, and they sum to 5.11 s: `_upload` 2.34 s over 8,634 calls (271 µs a call), the per-row
+  loop 1.52 s, `DeviceRoutedExperts.forward`'s own glue 1.97 s, `_issue_chunk` 0.57 s,
+  `_drain_chunk` 0.34 s, `_stage_misses` own 0.13 s. The per-row loop is 30% of it, and the shim the
+  chunked-prefill page built prices the floor of that loop at 4.6 µs a call — 0.75 s of the 1.52 —
+  so the row loop is worth at most 1.4% of a chunk, against the copies' 39%. (That page's band is
+  corrected in place.)
+- **The TP combine has become visible, and it is not a bandwidth row.** `MoE.forward`'s own postamble
+  is 2.95 s of the stacked chunk over 40 calls — 73.8 ms a layer, 8%, larger than the sparse pass now
+  that the sparse pass is a fifth of what it was — and nothing in it is a kernel this pass touched: it
+  is `tp.reduce` at the end of the MoE (`modules.py:485`). The tap that saw it is a host sync over the
+  whole postamble, and the profiler that separated the collectives underneath it keyed them **by
+  name**, which merged this one with the attention's `wo_b` combine (`attention.py:1166`): both are
+  `tp.reduce` over a `[4096, 5120]` activation, both call `make_all_reduce`, which widens to fp32
+  before reducing, so both are the same **80.00 MiB fp32** once a layer — and merged they read 80
+  calls at 52.28 ms a call. Keyed by the *chain* the scope sits in, they are two rows of 40 calls each
+  and they are not the same cost:
+
+  | 80.00 MiB fp32, 40 calls a rank | rank 0 | rank 1 | rank 2 | rank 3 |
+  | --- | ---: | ---: | ---: | ---: |
+  | under `v41.Attn.forward` | 18.2 ms a call | 19.8 | 13.2 | 16.4 |
+  | under `v41.MoE.forward` | 86.4 ms a call | 74.0 | 347.0 | 352.0 |
+
+  The attention's row is the message. An isolated all-reduce of the same 80 MiB on this fabric, cards
+  otherwise idle and event-timed a call (`/tmp/probe_allreduce_rate.py`, median of 100), is **13.58 ms
+  at 5.75 GiB/s**, on the same curve as the same probe's 32 MiB (5.46 ms, 5.72 GiB/s) and 1 MiB
+  (0.193 ms, 5.07 GiB/s) rows — and the attention site costs that on all four ranks, which is what a
+  message with four ranks that arrive together looks like. The pairs do differ there — the two PHB
+  ranks pay 18.2 and 19.8 ms where the two NV2 ranks pay 13.2 and 16.4 — but by 6 ms and not by 266,
+  and the attention is TP-sharded work every rank does in full, so there is nothing for it to be
+  waiting on. The MoE's row is not the message: it is
+  5.4x to 26x that floor, and it is **inverted against the expert load**, which is what says what it
+  is. The deal is static and round-robin over the six sorted routed ids
+  (`device_experts.py:29-34`), so ranks 0 and 1 own two of the six slots and ranks 2 and 3 one, which
+  is 2x the rows staged — 606,192 against 321,354 over the 256K leg — and 1.8x the routed path
+  (`MoE.routed` 17.163 and 17.395 s on ranks 0 and 1 against 9.362 and 9.262 on ranks 2 and 3, over
+  the same 40 layers). Those are the ranks that reach the reduce *last* and wait *least*; the two that
+  did half the work hold the collective for 347-352 ms a layer. The row is a rendezvous with two
+  ranks' expert paths, not a transfer.
+
+  Two things follow, and the second is why this is recorded rather than fixed. A bf16 reduce is
+  attractive here — the source activation is 41.9 MiB and the wire carries 80 — and it would take the
+  message from 13.58 ms to **7.08 ms** (the same probe's bf16 row, the same 41.9 MiB), which is 0.26 s
+  off a 38.07 s chunk: **0.7%**. It would take *nothing* off the row that carries the 2.95 s, because
+  that row is not the bytes. What would move it is even expert work, and six slots dealt over four
+  cards have no static split below a 2, 2, 1, 1 one — `ceil(topk / world)` is the arena every card is
+  sized for (`device_experts.py:557`), and a deal that rotated per row would make every card own every
+  expert over a pass, which is the per-layer resident set this branch's 2.6-2.7x is about. So the
+  straggler is the floor, and reading the other row as the floor would have sent a bf16 kernel after
+  0.7% of a chunk.
+
+## The same composition at 256K
+
+Every number above is one 4096-token chunk at 32768, which is the geometry the three passes were
+developed against. But the branch the composition sits on is the 256K branch, and a lever worth 33% of
+a chunk at 32768 is not automatically worth 33% of a chunk at 262144 — of the two terms the
+[chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) separates, the expert path is linear in
+the tokens and the indexer's prefix scoring is linear in the tokens *times the prefix width*, so a
+composition can hold at 32768 and thin out at 256K. So both arms were re-run over a full
+262144-token prompt, one leg each, `--lengths 262144 --chunk 4096 --pool-rows 148 --buffers 2
+--threads 22`, with `--max-seq-len` left at the leg's own 262208 so the caches are the 256K ones
+rather than the 41024 the tables above ran against.
+
+| | base (`/tmp/pr_b`) | stacked (`/tmp/prefill_all`) |
+| --- | ---: | ---: |
+| 262144 tokens, rank 0 | 3722.8 s | 2520.7 s |
+| wall, ranks 1 / 2 / 3 | 3722.5 / 3723.4 / 3723.0 s | 2520.7 / 2520.2 / 2520.7 s |
+| tokens a second | 70.4 | 104.0 |
+| a 4096-token chunk, mean | 58.17 s | 39.39 s |
+| **ratio** | | **1.477x** |
+| chunk at `[32768:36864]` | 56.72 s | 38.35 s |
+| chunk at `[258048:262144]` | 60.91 s | 41.26 s |
+| peak allocated, rank 0 / rank 3 | 15.93 / 17.34 GiB | 16.00 / 17.33 GiB |
+| peak reserved, rank 0 / rank 3 | 16.92 / 18.01 GiB | 16.45 / 18.17 GiB |
+| expert rows staged, rank 0 | 606,192 (2.31 a token) | 616,825 (2.35 a token) |
+| expert rows staged, rank 3 | 321,864 (1.23 a token) | 324,553 (1.24 a token) |
+| top-8 at 262144, all four ranks | `[295, 1, 6273, 1000, 14, 16, 270, 509]` | `[295, 1, 1000, 6273, 14, 270, 509, 16]` |
+
+**The ratio is flat.** 1.479x on the chunk at the 32768 boundary, 1.476x on the last chunk, 1.477x
+over the whole leg. That is the useful negative result as much as the positive one: none of the three
+levers is a term that grows with the prefix, so none of them is what the next pass at this length
+should be looking at. The saving the 32768 profile measured, 18.80 s, is 18.37 s on the chunk at that
+same boundary here and 19.65 s on the last one — a drift of about a second across the leg, which is
+the size of the fit's own residual below and not a trend the endpoints resolve.
+
+The two trees are the two above, one commit further on. `/tmp/pr_b` is the 256K branch at `4608981`,
+which is `98e828f` — the tip the 22-tap profile ran — plus two Markdown files; `/tmp/prefill_all` is
+`b7f633a`, which is `98e828f` plus the three merges. So the arms differ in the Python and in the
+kernels by the three changes and in nothing else, and the documentation delta between them is one
+page's corrections, which cannot move a chunk.
+
+**This leg's 32768-token chunk is the chunk above.** Chunk 9 of the leg is `[32768:36864]`, the same
+chunk the 22-tap profile ran, and the two arms come back within 0.8% of it — 56.72 s against 56.87 s
+in the base arm, 38.35 against 38.07 in the stacked one. The two arms here are therefore the two arms
+there, read at a longer prompt; and since the caches are 262208 wide here against 41024 there, the
+wider allocation costs nothing at a 32768-token prefix.
+
+**The stacked arm stages more expert rows, not fewer.** Rank 0 goes 606,192 → 616,825, which is +1.8%;
+rank 1 +1.4%, rank 3 +0.8%. That is the direction the 32768 profile's expert H2D row went too (16.71 →
+17.38 s), and for the same reason: the three kernels reorder fp32 accumulation, the router's argmax
+moves with it, and a few more of the expert ids a pass draws miss the pool. 1.8% more staging inside a
+chunk that is 32% shorter is what says none of the 18.8 s is saved rows. The 2/2/1/1 deal is in the
+row counts unchanged — 2.31-2.35 rows a token on ranks 0 and 1 against 1.23-1.24 on ranks 2 and 3,
+against the 2.37 the chunked-prefill page measured for the same 148-row pool.
+
+**Both arms grow by the same 5.2 s across the leg.** From chunk 5 to chunk 64 — a prefix of 16384
+against one of 262144 — the base arm's chunk goes 55.70 → 60.91 s (+5.21) and the stacked arm's
+36.00 → 41.26 (+5.26). Fitted over the sixteen sampled chunks that is 0.0206 ms a token for the base
+arm and 0.0173 for the stacked one with worst residuals of 1.15 and 1.12 s, so the two slopes are not
+resolved apart and the endpoints are the same seconds. The prefix-dependent part of a 256K chunk is
+therefore ~5.2 s of the stacked arm's 41.26 — 13% of it — and it is the part the three changes leave
+alone. Which phase that is in is not something this probe has a tap for; the two candidates the
+chunked-prefill page names for a context-growing term are the indexer's prefix scoring and its `topk`
+over the group count. The first chunk of each leg is separately dear — 64.47 s against a fitted 55.28
+in the base arm, 47.73 against 36.84 in the stacked one — which is 0.25% and 0.43% of the two legs,
+paid once and in both arms.
+
+**And all four ranks agree on every chunk.** The seventeen printed chunks are one number each rather
+than four: outside chunk 1 the ranks report the same seconds to 0.01 s, and inside it they spread 0.84 s
+in the base arm and 0.56 s in the stacked one, which is the warm-up. So no part of the wall is a
+straggler that one rank sees and another does not — the layer-level split the section above measured
+lives inside a chunk, and eighty collectives a layer is enough to re-lock the ranks before the chunk
+ends.
+
+**The logits at 256K.** Both arms return the same eight tokens and the same next token, 295, on all
+four ranks; the difference is the order. 6273 and 1000 swap places, and 16 drops from sixth to last,
+so at this position the fourth to eighth logits sit within about 0.5 of each other — against the
+0.33-0.67 mean `|diff|` the parity suite measured at 32768, where the top-2 gap stands at 9.10-13.64.
+That is the same perturbation landing on a position whose tail happens to be tight rather than a new
+one, and it does not move the decision. What this run compares is the top-8 and not the matrix — the
+probe prints `topk(logits, 8)` where the parity suite dumps all 129280 columns — so it is the same
+token and the same eight candidates, not bit-equality, and a permutation below the eighth place would
+not be visible in it.
+
+**On naming the arms.** The stacked arm's log names the tree it loaded, on all four ranks —
+`tree /tmp/prefill_all/src/__init__.py` — and the base arm's does not: the `say` that prints it was
+added to the probe at 01:30:41, eleven minutes after that arm's hour began, so the running process had
+already imported `src` from a file that did not yet contain the line. Its identity is not idle
+curiosity, since the probe's `sys.path` order is what the first attempt at this A/B got wrong and
+would go wrong silently; it is established two other ways instead. The repository checkout that
+`V41_TREE` displaces has no `chunk` argument on `LoadedBackbone.__call__` (`loader.py:720`) while
+`/tmp/pr_b` at `4608981` does, and the probe passes `chunk=None` on every chunk, so an arm that
+finished all 64 of them cannot be the checkout — the earlier attempt died on the first chunk exactly
+so, and that death is what the `sys.path` order on the page above was written for. And its numbers are
+the base arm's: 56.72 s at the 32768 boundary against the 56.87 s the profile above measured, and
+70.4 tok/s over the leg against the 3711.0 s / 70.6 tok/s the
+[chunked-prefill page](deepseek_v4_1_flash_chunked_prefill.md) published for this tree at this length,
+0.4%.
+
+## The logits
+
+`/tmp/pr_b_parity.py` dumps the last-position logits after every chunk — nine positions from 4096 to
+36864, 129,280 entries each — and it was run three times through `/tmp/parity_stack.sh`: the base
+tree, the stacked tree, and the stacked tree again. The third arm is the control, and it comes back
+**bit-identical over all nine positions on all four ranks, worst `max |diff| = 0.000e+00`**. There is
+no host-side nondeterminism in this run to discount, so base against stacked is the three kernel
+changes and nothing else.
+
+| | base against stacked | stacked against stacked again |
+| --- | --- | --- |
+| positions with the same argmax | 9 of 9, every rank | 9 of 9, every rank |
+| bit-identical positions | 0 of 9 | **9 of 9** |
+| worst `max \|diff\|` | 4.564e+00, at 8192 | 0.000e+00 |
+| `max \|logit\|` there | 25.28 | 25.28 |
+| top-2 gap there | 12.162 | 12.162 |
+
+The perturbation is not rounding dust. The mean `|diff|` across the vocabulary is 0.33–0.67 at the
+nine positions against a largest logit of 25.3–27.9, so the distribution moves by a fiftieth of its
+own scale — which is what reordering fp32 accumulation through forty layers, a router and an expert
+pool does, and the same shape the [chunked-prefill
+page](deepseek_v4_1_flash_chunked_prefill.md) reported when it localized its own first difference to
+layer 0's gate and routed experts. What it does not do is move the decision. The gap between the top
+two logits is 9.10 to 13.64 at the nine positions, standing at **2.7× to 6.0×** the worst
+perturbation there — 12.162 against 4.564 at 8192, the tightest of the nine — and the argmax is the
+same on both trees at every one of them. Nine decisions out of nine is a weak test on nine positions,
+and it is the test this run has.
+
+Two footnotes. Every rank writes the same nine rows, byte for byte, in all three arms: the expert
+split is reduced back to one activation per layer, and the four cards agree to the bit, which is why
+the log repeats the same comparison four times. And the arms' walls agree with the profile to the
+second — the base arm's nine chunks are 65.23 s for the first and 55.2–56.9 for the rest, the stacked
+arm's 38.5 — so the run that produced these logits is the run this page's tables describe.
+
+## Reproducing
+
+```bash
+export DEEPSEEK_V41_RESIDENT_EXPERTS=1
+# the base arm, on the 256K branch
+V41_TREE=/tmp/pr_b /home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+    /tmp/probe_v41_chunk_profile_host.py --at 32768 --chunk 4096 --max-seq-len 41024 \
+    --pool-rows 148 --buffers 2 --threads 22 --out /tmp/chunk_profile_base
+# the stacked arm, on 98e828f with the three merges
+V41_TREE=/tmp/prefill_all /home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+    /tmp/probe_v41_chunk_profile_host.py --at 32768 --chunk 4096 --max-seq-len 41024 \
+    --pool-rows 148 --buffers 2 --threads 22 --out /tmp/chunk_profile_all
+```
+
+The stacked tree is the three branches merged onto `feature/v41-256k-context`, which is what
+`perf/v41-prefill-integration-256k` is:
+
+```bash
+git checkout -b perf/v41-prefill-integration-256k feature/v41-256k-context
+git merge perf/v41-prefill-sparse-attn-warp-dot
+git merge perf/v41-moe-multi-coalesced-weights
+git merge perf/v41-moe-reduce-csr
+```
+
+`--out X` writes `X.r0` … `X.r3`, one a rank; the parity arms are `/tmp/pr_b_parity.py` with the same
+`--at/--chunk/--pool-rows/--max-seq-len`, and `--compare a b` reads two of its dumps back.
+
+The 256K leg is the same two trees through a different probe, one leg each, with the rendezvous port
+given a moment between the runs — the port is released by the process and not by its exit, which is
+how an earlier attempt at a back-to-back pair came back `EADDRINUSE` and reported success:
+
+```bash
+for arm in base:/tmp/pr_b stacked:/tmp/prefill_all; do
+    name="${arm%%:*}"; tree="${arm#*:}"
+    V41_TREE="$tree" /home/lvyufeng/miniconda3/envs/deepseek/bin/torchrun --nproc_per_node=4 \
+        /tmp/probe_v41_chunk_scaling.py --lengths 262144 --chunk 4096 --pool-rows 148 \
+        --buffers 2 --threads 22 --out "/tmp/chunk_scaling_$name.pt"
+    sleep 20
+done
+```
+
+`DEEPSEEK_V41_RESIDENT_EXPERTS=1` in the environment as above, and the probe says which tree each arm
+resolved to — `tree /tmp/prefill_all/src/__init__.py` — which is worth watching for, because the two
+`sys.path` inserts in it (`probe_v41_chunk_scaling.py:38-40`) only put a `V41_TREE` in front of the
+repository checkout if the tree's insert is second; written the other way round both arms quietly
+measure this checkout instead.
