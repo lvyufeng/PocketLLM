@@ -2897,7 +2897,37 @@ torch::Tensor moe_single_token_fp4_forward_cuda(
 // 1.48, which would silently change which draft tokens get accepted.
 // ---------------------------------------------------------------------------
 
+// Tuning for the multi-token kernels below. `kMultiTile` is the token tile: the accumulators live
+// in registers, so it is bounded by register pressure (`4 * kMultiTile` registers a thread for the
+// gate/up pairs), and past 32 the compiler splits the accumulators across two passes. It is also
+// what bounds how often a slot re-walks its weights: at this call's 34.4 rows a slot, the previous
+// `kMaxTokens = 8` walked them 4.3 times and 32 walks them 1.08, which is 1.66x on its own.
+// `kMultiWeightStrip` is the K strip staged through shared, and it is bounded by shared memory:
+// both weight matrices are staged, so it costs `strip * kGemmThreads * 2 * 17` bytes on top of the
+// activations. 32 / 4 measures 3.89x over the unstaged kernel and keeps 3 blocks a multiprocessor
+// (the coalescing is 2.34x of that, on top of the tile's 1.66x); widening the strip to 8 halves
+// the barrier count but drops to 1 block and loses 2x.
+constexpr int kMultiTile = 32;
+constexpr int kMultiWeightStrip = 4;
+
+// The shared staging for one block of a multi-token kernel: the token tile's activations restaged
+// per K strip, then one strip of every weight matrix's fp4 packs, then every matrix's scale bytes.
+// `matrices` is 2 for w1/w3 and 1 for w2.
+__host__ __device__ constexpr size_t multi_stage_bytes(int matrices) {
+    return static_cast<size_t>(kMultiTile) * kMultiWeightStrip * 8 * sizeof(int) +
+           static_cast<size_t>(matrices) * kMultiWeightStrip * kGemmThreads * 16 +
+           static_cast<size_t>(matrices) * kMultiWeightStrip * kGemmThreads;
+}
+
 // One block: (slot, column tile). Loops over the slot's tokens.
+//
+// The weight packs are read through shared memory. A row of the checkpoint's per-expert layout is
+// `[blocks_k][16]` bytes, so one k-block is contiguous but consecutive *columns* are `dim / 2`
+// bytes apart -- under the naive per-column addressing a warp's 32 lanes touch 32 different 32-byte
+// sectors for 16 useful bytes each. Staging a K strip through shared with the load index
+// `idx = (col - col0) * strip + kb` makes each warp load 512 contiguous bytes instead, and the
+// compute reads the strip back out in `(token, kb)` order, so every accumulation keeps its place
+// and the results -- including which roundings happen -- are unchanged.
 __global__ void moe_multi_w1w3_fp4_kernel(
     const int8_t* __restrict__ x_q,          // [tokens, dim] int8
     const float* __restrict__ x_scale,       // [tokens]
@@ -2913,78 +2943,96 @@ __global__ void moe_multi_w1w3_fp4_kernel(
     int dim,
     int inter_dim) {
     const int slot = blockIdx.y;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int cols = blockDim.x;
+    const int col0 = blockIdx.x * cols;
+    const int tid = threadIdx.x;
+    const int col = col0 + tid;
     const int start = slot_starts[slot];
     const int end = slot_starts[slot + 1];
     const int n_tok = end - start;
     if (n_tok <= 0) return;
     const int local = slot_expert[slot];
-    const int dim_packs = dim / 4;
     const int blocks_k = dim / 32;
+    // The weight rows this block is allowed to touch, which is short of `cols` when inter_dim is
+    // not a multiple of the block width.
+    const int rows_here = min(cols, inter_dim - col0);
 
-    extern __shared__ int xs_shared[];
-    const uint8_t* w1_row_bytes = w1q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
-    const uint8_t* w3_row_bytes = w3q + (static_cast<int64_t>(local) * inter_dim + col) * (dim / 2);
-    const uint8_t* w1_scale_row = w1s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
-    const uint8_t* w3_scale_row = w3s + (static_cast<int64_t>(local) * inter_dim + col) * blocks_k;
-    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row_bytes);
-    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
+    extern __shared__ int staged[];
+    int* xs = staged;                                                // [kMultiTile][strip][8]
+    uint4* w1_sm = reinterpret_cast<uint4*>(xs + kMultiTile * kMultiWeightStrip * 8);
+    uint4* w3_sm = w1_sm + kMultiWeightStrip * cols;                 // [strip][cols]
+    uint8_t* w1s_sm = reinterpret_cast<uint8_t*>(w3_sm + kMultiWeightStrip * cols);
+    uint8_t* w3s_sm = w1s_sm + kMultiWeightStrip * cols;             // [strip][cols]
 
-    // Tokens are processed kMaxTokens at a time: the accumulators live in
-    // registers, so the tile width is what bounds register pressure. A slot
-    // with more tokens than that just takes another pass over the weights,
-    // which keeps the kernel correct for any batch size instead of silently
-    // dropping rows.
-    constexpr int kMaxTokens = 8;
-    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
-        const int tile = min(kMaxTokens, n_tok - base_t);
-        // Stage this tile's activations once; the K loop below rereads them
-        // for every weight pack.
-        __syncthreads();
-        for (int idx = threadIdx.x; idx < tile * dim_packs; idx += blockDim.x) {
-            const int r = idx / dim_packs;
-            const int pack = idx - r * dim_packs;
-            const int token = slot_tokens[start + base_t + r];
-            xs_shared[idx] = reinterpret_cast<const int*>(
-                x_q + static_cast<int64_t>(token) * dim)[pack];
-        }
-        __syncthreads();
-        if (col >= inter_dim) continue;
-
-        float gate_acc[kMaxTokens];
-        float up_acc[kMaxTokens];
+    for (int base_t = 0; base_t < n_tok; base_t += kMultiTile) {
+        const int tile = min(kMultiTile, n_tok - base_t);
+        float gate_acc[kMultiTile];
+        float up_acc[kMultiTile];
         #pragma unroll
-        for (int t = 0; t < kMaxTokens; ++t) { gate_acc[t] = 0.0f; up_acc[t] = 0.0f; }
+        for (int t = 0; t < kMultiTile; ++t) { gate_acc[t] = 0.0f; up_acc[t] = 0.0f; }
 
-        for (int kb = 0; kb < blocks_k; ++kb) {
-            const uint16_t* w1_pack = w1_pack_base + kb * 8;
-            const uint16_t* w3_pack = w3_pack_base + kb * 8;
-            int gate_blk[kMaxTokens];
-            int up_blk[kMaxTokens];
-            #pragma unroll
-            for (int t = 0; t < kMaxTokens; ++t) { gate_blk[t] = 0; up_blk[t] = 0; }
-            #pragma unroll
-            for (int ip = 0; ip < 8; ++ip) {
-                const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
-                const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
-                for (int t = 0; t < tile; ++t) {
-                    const int x_p = xs_shared[t * dim_packs + kb * 8 + ip];
-                    gate_blk[t] = __dp4a(x_p, w1_p, gate_blk[t]);
-                    up_blk[t] = __dp4a(x_p, w3_p, up_blk[t]);
-                }
+        for (int kb0 = 0; kb0 < blocks_k; kb0 += kMultiWeightStrip) {
+            const int strip = min(kMultiWeightStrip, blocks_k - kb0);
+            // Everything below the two barriers is staging: the tile's activations for this strip,
+            // and the strip's weight packs and scale bytes. The activation index stays
+            // token-major/k-minor as before, the weight index is column-major so that consecutive
+            // lanes read consecutive packs.
+            __syncthreads();
+            for (int idx = tid; idx < tile * strip * 8; idx += cols) {
+                const int r = idx / (strip * 8);
+                const int rest = idx - r * (strip * 8);
+                const int token = slot_tokens[start + base_t + r];
+                xs[idx] = reinterpret_cast<const int*>(
+                    x_q + static_cast<int64_t>(token) * dim)[kb0 * 8 + rest];
             }
-            const float w1_s = fp4_block_scale(w1_scale_row[kb]);
-            const float w3_s = fp4_block_scale(w3_scale_row[kb]);
-            for (int t = 0; t < tile; ++t) {
-                gate_acc[t] += static_cast<float>(gate_blk[t]) * w1_s;
-                up_acc[t] += static_cast<float>(up_blk[t]) * w3_s;
+            for (int idx = tid; idx < strip * rows_here; idx += cols) {
+                const int c = idx / strip;
+                const int lkb = idx - c * strip;
+                const int64_t row = static_cast<int64_t>(local) * inter_dim + col0 + c;
+                const int64_t kb = static_cast<int64_t>(kb0 + lkb);
+                const uint4* w1_src = reinterpret_cast<const uint4*>(w1q + row * (dim / 2) + kb * 16);
+                const uint4* w3_src = reinterpret_cast<const uint4*>(w3q + row * (dim / 2) + kb * 16);
+                w1_sm[lkb * cols + c] = *w1_src;
+                w3_sm[lkb * cols + c] = *w3_src;
+                w1s_sm[lkb * cols + c] = w1s[row * blocks_k + kb];
+                w3s_sm[lkb * cols + c] = w3s[row * blocks_k + kb];
+            }
+            __syncthreads();
+            if (col >= inter_dim) continue;
+
+            for (int kb = kb0; kb < kb0 + strip; ++kb) {
+                const int lkb = kb - kb0;
+                const uint4 w1_v = w1_sm[lkb * cols + tid];
+                const uint4 w3_v = w3_sm[lkb * cols + tid];
+                const uint16_t* w1_pack = reinterpret_cast<const uint16_t*>(&w1_v);
+                const uint16_t* w3_pack = reinterpret_cast<const uint16_t*>(&w3_v);
+                int gate_blk[kMultiTile];
+                int up_blk[kMultiTile];
+                #pragma unroll
+                for (int t = 0; t < kMultiTile; ++t) { gate_blk[t] = 0; up_blk[t] = 0; }
+                #pragma unroll
+                for (int ip = 0; ip < 8; ++ip) {
+                    const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
+                    const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
+                    for (int t = 0; t < tile; ++t) {
+                        const int x_p = xs[(t * strip + lkb) * 8 + ip];
+                        gate_blk[t] = __dp4a(x_p, w1_p, gate_blk[t]);
+                        up_blk[t] = __dp4a(x_p, w3_p, up_blk[t]);
+                    }
+                }
+                const float w1_s = fp4_block_scale(w1s_sm[lkb * cols + tid]);
+                const float w3_s = fp4_block_scale(w3s_sm[lkb * cols + tid]);
+                for (int t = 0; t < tile; ++t) {
+                    gate_acc[t] += static_cast<float>(gate_blk[t]) * w1_s;
+                    up_acc[t] += static_cast<float>(up_blk[t]) * w3_s;
+                }
             }
         }
         for (int t = 0; t < tile; ++t) {
             const int pair = start + base_t + t;
-            const float xs = x_scale[slot_tokens[pair]];
-            gate_f32[static_cast<int64_t>(pair) * inter_dim + col] = gate_acc[t] * xs;
-            up_f32[static_cast<int64_t>(pair) * inter_dim + col] = up_acc[t] * xs;
+            const float xs_scale = x_scale[slot_tokens[pair]];
+            gate_f32[static_cast<int64_t>(pair) * inter_dim + col] = gate_acc[t] * xs_scale;
+            up_f32[static_cast<int64_t>(pair) * inter_dim + col] = up_acc[t] * xs_scale;
         }
     }
 }
@@ -3053,51 +3101,69 @@ __global__ void moe_multi_w2_accum_fp4_kernel(
     int dim,
     int inter_dim) {
     const int slot = blockIdx.y;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int cols = blockDim.x;
+    const int col0 = blockIdx.x * cols;
+    const int tid = threadIdx.x;
+    const int col = col0 + tid;
     const int start = slot_starts[slot];
     const int end = slot_starts[slot + 1];
     const int n_tok = end - start;
     if (n_tok <= 0) return;
     const int local = slot_expert[slot];
-    const int packs = inter_dim / 4;
     const int blocks_k = inter_dim / 32;
+    const int rows_here = min(cols, dim - col0);
 
-    extern __shared__ int hs_shared[];
-    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
-    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
-    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+    // Same staging as moe_multi_w2_partial_fp4_kernel; see moe_multi_w1w3_fp4_kernel for why.
+    extern __shared__ int staged[];
+    int* hs = staged;                                          // [kMultiTile][strip][8]
+    uint4* w2_sm = reinterpret_cast<uint4*>(hs + kMultiTile * kMultiWeightStrip * 8);
+    uint8_t* w2s_sm = reinterpret_cast<uint8_t*>(w2_sm + kMultiWeightStrip * cols);  // [strip][cols]
 
-    constexpr int kMaxTokens = 8;
-    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
-        const int tile = min(kMaxTokens, n_tok - base_t);
-        __syncthreads();
-        for (int idx = threadIdx.x; idx < tile * packs; idx += blockDim.x) {
-            const int r = idx / packs;
-            const int pack = idx - r * packs;
-            hs_shared[idx] = reinterpret_cast<const int*>(
-                hidden_q + static_cast<int64_t>(start + base_t + r) * inter_dim)[pack];
-        }
-        __syncthreads();
-        if (col >= dim) continue;
-
-        float acc[kMaxTokens];
+    for (int base_t = 0; base_t < n_tok; base_t += kMultiTile) {
+        const int tile = min(kMultiTile, n_tok - base_t);
+        float acc[kMultiTile];
         #pragma unroll
-        for (int t = 0; t < kMaxTokens; ++t) acc[t] = 0.0f;
+        for (int t = 0; t < kMultiTile; ++t) acc[t] = 0.0f;
 
-        for (int kb = 0; kb < blocks_k; ++kb) {
-            const uint16_t* w2_pack = w2_pack_base + kb * 8;
-            int blk[kMaxTokens];
-            #pragma unroll
-            for (int t = 0; t < kMaxTokens; ++t) blk[t] = 0;
-            #pragma unroll
-            for (int ip = 0; ip < 8; ++ip) {
-                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
-                for (int t = 0; t < tile; ++t) {
-                    blk[t] = __dp4a(hs_shared[t * packs + kb * 8 + ip], w_p, blk[t]);
-                }
+        for (int kb0 = 0; kb0 < blocks_k; kb0 += kMultiWeightStrip) {
+            const int strip = min(kMultiWeightStrip, blocks_k - kb0);
+            __syncthreads();
+            for (int idx = tid; idx < tile * strip * 8; idx += cols) {
+                const int r = idx / (strip * 8);
+                const int rest = idx - r * (strip * 8);
+                const int pair = start + base_t + r;
+                hs[idx] = reinterpret_cast<const int*>(
+                    hidden_q + static_cast<int64_t>(pair) * inter_dim)[kb0 * 8 + rest];
             }
-            const float w2_s = fp4_block_scale(w2_scale_row[kb]);
-            for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+            for (int idx = tid; idx < strip * rows_here; idx += cols) {
+                const int c = idx / strip;
+                const int lkb = idx - c * strip;
+                const int64_t row = static_cast<int64_t>(local) * dim + col0 + c;
+                const int64_t kb = static_cast<int64_t>(kb0 + lkb);
+                w2_sm[lkb * cols + c] = *reinterpret_cast<const uint4*>(
+                    w2q + row * (inter_dim / 2) + kb * 16);
+                w2s_sm[lkb * cols + c] = w2s[row * blocks_k + kb];
+            }
+            __syncthreads();
+            if (col >= dim) continue;
+
+            for (int kb = kb0; kb < kb0 + strip; ++kb) {
+                const int lkb = kb - kb0;
+                const uint4 w_v = w2_sm[lkb * cols + tid];
+                const uint16_t* w2_pack = reinterpret_cast<const uint16_t*>(&w_v);
+                int blk[kMultiTile];
+                #pragma unroll
+                for (int t = 0; t < kMultiTile; ++t) blk[t] = 0;
+                #pragma unroll
+                for (int ip = 0; ip < 8; ++ip) {
+                    const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                    for (int t = 0; t < tile; ++t) {
+                        blk[t] = __dp4a(hs[(t * strip + lkb) * 8 + ip], w_p, blk[t]);
+                    }
+                }
+                const float w2_s = fp4_block_scale(w2s_sm[lkb * cols + tid]);
+                for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+            }
         }
         // Different slots can hold the same token (top-k routing), so a token's
         // partial sums must be combined atomically, exactly as the single-token
@@ -3126,51 +3192,71 @@ __global__ void moe_multi_w2_partial_fp4_kernel(
     int dim,
     int inter_dim) {
     const int slot = blockIdx.y;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int cols = blockDim.x;
+    const int col0 = blockIdx.x * cols;
+    const int tid = threadIdx.x;
+    const int col = col0 + tid;
     const int start = slot_starts[slot];
     const int end = slot_starts[slot + 1];
     const int n_tok = end - start;
     if (n_tok <= 0) return;
     const int local = slot_expert[slot];
-    const int packs = inter_dim / 4;
     const int blocks_k = inter_dim / 32;
+    const int rows_here = min(cols, dim - col0);
 
-    extern __shared__ int hs_shared[];
-    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(local) * dim + col) * (inter_dim / 2);
-    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(local) * dim + col) * blocks_k;
-    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
+    // Same staging as moe_multi_w1w3_fp4_kernel, for a single weight matrix: one row of w2 is
+    // `[blocks_k][16]` bytes, so the naive per-column addressing makes a warp touch 32 sectors for
+    // 16 useful bytes each. See the comment there.
+    extern __shared__ int staged[];
+    int* hs = staged;                                          // [kMultiTile][strip][8]
+    uint4* w2_sm = reinterpret_cast<uint4*>(hs + kMultiTile * kMultiWeightStrip * 8);
+    uint8_t* w2s_sm = reinterpret_cast<uint8_t*>(w2_sm + kMultiWeightStrip * cols);  // [strip][cols]
 
-    constexpr int kMaxTokens = 8;
-    for (int base_t = 0; base_t < n_tok; base_t += kMaxTokens) {
-        const int tile = min(kMaxTokens, n_tok - base_t);
-        __syncthreads();
-        for (int idx = threadIdx.x; idx < tile * packs; idx += blockDim.x) {
-            const int r = idx / packs;
-            const int pack = idx - r * packs;
-            hs_shared[idx] = reinterpret_cast<const int*>(
-                hidden_q + static_cast<int64_t>(start + base_t + r) * inter_dim)[pack];
-        }
-        __syncthreads();
-        if (col >= dim) continue;
-
-        float acc[kMaxTokens];
+    for (int base_t = 0; base_t < n_tok; base_t += kMultiTile) {
+        const int tile = min(kMultiTile, n_tok - base_t);
+        float acc[kMultiTile];
         #pragma unroll
-        for (int t = 0; t < kMaxTokens; ++t) acc[t] = 0.0f;
+        for (int t = 0; t < kMultiTile; ++t) acc[t] = 0.0f;
 
-        for (int kb = 0; kb < blocks_k; ++kb) {
-            const uint16_t* w2_pack = w2_pack_base + kb * 8;
-            int blk[kMaxTokens];
-            #pragma unroll
-            for (int t = 0; t < kMaxTokens; ++t) blk[t] = 0;
-            #pragma unroll
-            for (int ip = 0; ip < 8; ++ip) {
-                const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
-                for (int t = 0; t < tile; ++t) {
-                    blk[t] = __dp4a(hs_shared[t * packs + kb * 8 + ip], w_p, blk[t]);
-                }
+        for (int kb0 = 0; kb0 < blocks_k; kb0 += kMultiWeightStrip) {
+            const int strip = min(kMultiWeightStrip, blocks_k - kb0);
+            __syncthreads();
+            for (int idx = tid; idx < tile * strip * 8; idx += cols) {
+                const int r = idx / (strip * 8);
+                const int rest = idx - r * (strip * 8);
+                const int pair = start + base_t + r;
+                hs[idx] = reinterpret_cast<const int*>(
+                    hidden_q + static_cast<int64_t>(pair) * inter_dim)[kb0 * 8 + rest];
             }
-            const float w2_s = fp4_block_scale(w2_scale_row[kb]);
-            for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+            for (int idx = tid; idx < strip * rows_here; idx += cols) {
+                const int c = idx / strip;
+                const int lkb = idx - c * strip;
+                const int64_t row = static_cast<int64_t>(local) * dim + col0 + c;
+                const int64_t kb = static_cast<int64_t>(kb0 + lkb);
+                w2_sm[lkb * cols + c] = *reinterpret_cast<const uint4*>(
+                    w2q + row * (inter_dim / 2) + kb * 16);
+                w2s_sm[lkb * cols + c] = w2s[row * blocks_k + kb];
+            }
+            __syncthreads();
+            if (col >= dim) continue;
+
+            for (int kb = kb0; kb < kb0 + strip; ++kb) {
+                const int lkb = kb - kb0;
+                const uint4 w_v = w2_sm[lkb * cols + tid];
+                const uint16_t* w2_pack = reinterpret_cast<const uint16_t*>(&w_v);
+                int blk[kMultiTile];
+                #pragma unroll
+                for (int t = 0; t < kMultiTile; ++t) blk[t] = 0;
+                #pragma unroll
+                for (int ip = 0; ip < 8; ++ip) {
+                    const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
+                    for (int t = 0; t < tile; ++t) {
+                        blk[t] = __dp4a(hs[(t * strip + lkb) * 8 + ip], w_p, blk[t]);
+                    }
+                }
+                const float w2_s = fp4_block_scale(w2s_sm[lkb * cols + tid]);
+                for (int t = 0; t < tile; ++t) acc[t] += static_cast<float>(blk[t]) * w2_s;
+            }
         }
         for (int t = 0; t < tile; ++t) {
             const int pair = start + base_t + t;
@@ -3248,10 +3334,9 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    constexpr int kMultiMaxTokens = 8;
     const dim3 gemm_block(kGemmThreads);
     const dim3 w1w3_grid(ceil_div(inter_dim, kGemmThreads), slots);
-    const size_t x_shared_bytes = static_cast<size_t>(kMultiMaxTokens) * (dim / 4) * sizeof(int);
+    const size_t x_shared_bytes = multi_stage_bytes(2);
     moe_multi_w1w3_fp4_kernel<<<w1w3_grid, gemm_block, x_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(
         x_q.data_ptr<int8_t>(),
         x_scale.data_ptr<float>(),
@@ -3280,7 +3365,7 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     const dim3 w2_grid(ceil_div(dim, kGemmThreads), slots);
-    const size_t h_shared_bytes = static_cast<size_t>(kMultiMaxTokens) * (inter_dim / 4) * sizeof(int);
+    const size_t h_shared_bytes = multi_stage_bytes(1);
     if (env_int_default("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", 1) != 0) {
         auto partials = torch::zeros({pairs, dim}, x.options().dtype(torch::kFloat32));
         moe_multi_w2_partial_fp4_kernel<<<w2_grid, gemm_block, h_shared_bytes, at::cuda::getCurrentCUDAStream()>>>(

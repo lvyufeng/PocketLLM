@@ -145,6 +145,7 @@ nav:
       - DeepSeek-V4.1-Flash remaining bottlenecks: performance/deepseek_v4_1_flash_remaining_bottlenecks.md
       - DeepSeek-V4.1-Flash decode graph: performance/deepseek_v4_1_flash_decode_graph.md
       - DeepSeek-V4.1-Flash graphed decode, live: performance/deepseek_v4_1_flash_decode_graph_live.md
+      - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
       - Serving latency baseline: performance/serving_latency_baseline.md
       - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md
