@@ -483,6 +483,15 @@ supports as an **upper bound** at the configuration named, and the two gated row
 | 6 | Per-rank `--threads` | replay optimum 22/8/12/22 against a uniform 22 | **≤16 ms** on `_stage` | the thread count is otherwise spent; 8 is the cliff |
 | 7 | Anything on `_upload` | 11.3–11.5 GB/s, `cudaHostRegister` measured not to help | **0 ms** today; it becomes the longer leg only if the host copy is removed | only #2 addresses it, by not moving the bytes |
 
+**Every row above is priced at a short prompt, and only one row of a chunk scales with context.** Rows
+2 and 3 are 512- and 128-token prefill levers; a 4096-token chunk at 262144 is a different list, and on
+it **`attn.indexer` plus `attn.compress_kv` are 3.19 s of a chunk at 32768 against 10.24 s of one at
+262144 — 11.6% to 32.7%** — while every other row of the two phase tables is flat or lower over the
+same span. Its two levers are the indexer's `all_reduce`, which upcasts to fp32 and so puts 33.6 MB on
+the wire for a 16.8 MB tile, and a one-tile lookahead over that collective;
+[the row that grows with context](deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context)
+takes it apart and names what gates each.
+
 ## Falsified, so do not re-run these
 
 - **Cross-layer `_stage` overlap.** The in-situ/replay gap is a one-time pool warm-up and not a
