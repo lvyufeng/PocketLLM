@@ -11,7 +11,8 @@ to a process, every figure derived from lines the CLI itself prints.
 tokens and 103.6 at 262144, decode 4.98 tokens a second at 1024, 4.37 at 32768 and 3.86 at 262144.**
 The graphed decode step is **201–202 ms** at 1024 against **354–364 ms** eager — 1.76–1.81× — and the
 whole call 32.8 s against 41.3–42.1 s, with the eight 1024-token legs' generated text **identical to
-the byte**.
+the byte** and the two paths' 64 x 129280 logit matrices **bit-identical** (`max |diff| = 0.000e+00`,
+0 rows differing, 64/64 argmax).
 
 | Leg | Prompt | Flags | Prefill | ms a token | Decode | Whole call |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -50,7 +51,7 @@ fastest arm that exists.
 | Decode | 64 tokens a leg, `stopped on length` on every leg in the table; first token 271 at 1024 |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each, `GPU0-GPU1` PHB and `GPU2-GPU3` NV2, all four idle before and after |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env; master's built `cuda_kernel` / `moe_dispatch` extensions, nothing rebuilt for these legs |
-| Driver | `/tmp/run_cap_e2e.sh` and `/tmp/run_cap_e2e2.sh`; logs `/tmp/cap_*.log` |
+| Driver | `/tmp/run_cap_e2e.sh`, `/tmp/run_cap_e2e2.sh` (the six legs) and `/tmp/run_cap_e2e3.sh` (the two `--dump-logits` legs); logs `/tmp/cap_*.log`, comparison `/tmp/cmp_logits.py` |
 
 ## The rate the launcher does not print
 
@@ -150,11 +151,38 @@ call moves 184.4 → 211.6 → 239.6 ms across those three lengths while the gra
 3.3 ms, so 55.2 ms of the 58 ms the step grew is expert staging against a pool that evicts on
 essentially every row at the long lengths (96.9% and 97.1% of draws staged).
 
-## The continuation, eight times identical
+## The two paths agree, at the tokens and at the logits
 
-Every 1024-token leg — four in the first sitting and four in the second, alternating the flag, on
-**two trees** — printed the same text. The continuation alone, taken as the printed text minus the
-prompt, is **301 bytes** and hashes `md5 d1775d3580129c2953d16060b73c915c` on all eight:
+**The logits.** Two legs on the merged tree, the same prompt, `--dump-logits` on each, one eager and
+one graphed, compared with `/tmp/cmp_logits.py`:
+
+```text
+/tmp/capdump_off.pt: decode_graphs=False rows=64 prompt_tokens=1024
+  read_bytes delta across the 64 tokens: 0 (per token [0, 0, 0, 0, 0, 0, 0, 0] ...)
+/tmp/capdump_on.pt: decode_graphs=True rows=64 prompt_tokens=1024
+  read_bytes delta across the 64 tokens: 0 (per token [0, 0, 0, 0, 0, 0, 0, 0] ...)
+  tokens vs /tmp/capdump_off.pt: 64/64 identical
+    logits: 64 rows x 129280, max |diff| = 0.000e+00 (worst row 0), rows differing = 0
+    argmax agreement: 64/64
+```
+
+This is the acceptance that matters for #304, because the fix is inside `_TopKStream.push`: when a
+stream is capturing, `_recording()` is True and the early-out that compares the held values against
+the tile's is skipped. That early-out is **exact rather than a tie-break** — if every held value
+exceeds every tile value then the k largest of the union are the k already held, so dropping it
+inside a capture changes neither the values nor the positions, tie order aside, and `Indexer` re-sorts
+by position at the end. The margin by which the two paths agree is the whole matrix, so the argument
+and the measurement say the same thing. `read_bytes` is flat at 0 on both legs, which is the check
+that the expert rows came out of the pinned bank rather than off `/mnt/data3`.
+
+These two legs are not in the table above and their walls are not part of the A-B-A-B: 43.9 s and
+381 ms a token eager against 33.0 s and 203 ms graphed, taken while the pytest suite was running on
+the same host. The eager arm is the one that moved (381 against 354–364 ms); the graphed arm is
+203 against 201–202. Parity is not a timing claim, so the contention costs the comparison nothing.
+
+**The text, eight ways.** Every 1024-token leg — four in the first sitting and four in the second,
+alternating the flag, on **two trees** — printed the same continuation. Taken as the printed text
+minus the prompt, it is **301 bytes** and hashes `md5 d1775d3580129c2953d16060b73c915c` on all eight:
 
 ```text
 …ote in his notebook that a city is a question its river has already answered. Nobody in the hall
@@ -170,13 +198,6 @@ no stream is capturing, so `host_branch` is True and `_TopKStream.push`'s early-
 as before — but *inert by argument* is not *the same tree*, so all four 1024 legs were re-run
 interleaved on one tree. The eager arms moved 358/368 → 354/364 ms, inside this host's noise, and the
 eight-way hash is what says the two paths and the two trees agree on all 64 argmaxes.
-
-Text is a statement about 64 argmaxes and not about the 64 x 129280 rows that produced them, and
-#304 touches `_TopKStream.push` — inside a capture the early-out is skipped — so the stronger
-acceptance is a logit-level comparison of the two paths **on one tree**, which is what
-`--dump-logits` and `/tmp/cmp_logits.py` are for: two legs, one dump each, `max |diff| = 0.000e+00`
-over the 64 x 129280 matrix as the bar. **This page carries the text parity; the logit comparison is
-recorded in the section below when it lands, and nothing here depends on it.**
 
 ## One leg that measured no decode
 
@@ -209,6 +230,10 @@ bash /tmp/run_cap_e2e2.sh
 # The rates, from each leg's own two lines.
 #   prefill = prompt_tokens / (elapsed - decode_seconds)
 grep -a "tokens in\|decode steps\|decode graphs\|prompt .* tokens" /tmp/cap_c262144_on.log
+
+# The two decode paths' logits, one dump each. 64/64 identical, max |diff| = 0.000e+00.
+bash /tmp/run_cap_e2e3.sh
+"$ENV/python" /tmp/cmp_logits.py /tmp/capdump_off.pt /tmp/capdump_on.pt
 
 # The eight continuations, which must hash to d1775d3580129c2953d16060b73c915c.
 ```
