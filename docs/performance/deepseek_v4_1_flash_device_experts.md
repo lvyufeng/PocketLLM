@@ -84,9 +84,17 @@ at both ends of it, `/tmp/run_deal_decode.sh` is the decode A-B-A-B at `--decode
 `/tmp/run_deal_256k.sh` is the 256K leg. The three `_master` drivers —
 `/tmp/run_deal_ab_master.sh`, `/tmp/run_deal_decode_master2.sh` and `/tmp/run_deal_256k_master.sh` —
 are those same three sittings re-taken on the tree that ships, which is this branch with master's
-built kernels under it (`/tmp/deal3`).
+built kernels under it (`/tmp/deal3`). `/tmp/run_deal_default.sh` is the launcher sitting that prices
+the default flip at three lengths, and `/tmp/run_deal_logits.sh` is the same pair one level down at
+the launcher's dumped logits; both are in the last subsection.
 
 ## The split
+
+**Every number on this page is the `sorted` deal, and `sorted` is no longer the default.** The default
+is `id`, the other deal, which [the subsection at the end of this
+section](#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set) prices;
+`sorted` is asked for by name — `DEEPSEEK_V41_EXPERT_DEAL=sorted` or `--expert-deal sorted` — and it is
+the configuration the run record below was taken on. What follows is `sorted`.
 
 Per row, the layer's 6 routed experts are sorted by global id and dealt round-robin, so card `c` owns
 sorted positions `c` and `c + world`: **2, 2, 1, 1** over four cards, from the real routing of layer
@@ -95,24 +103,26 @@ and card 3 took 206. The split is a property of the routing and not of the order
 in, which is what makes two runs that route to the same six experts stage the same bytes into the
 same rows.
 
-Each card's arena is a fixed `ceil(topk / world) = 2` rows, so nothing resizes between steps and
-nothing is allocated per token. The pinned arena holds every card's rows laid end to end — one
-allocation rather than one per card — **143.4 MiB per side** at `world=4` against **107.6 MiB** at
+Under `sorted` each card's arena is a fixed `ceil(topk / world) = 2` rows, so nothing resizes between
+steps and nothing is allocated per token. The pinned arena holds every card's rows laid end to end —
+one allocation rather than one per card — **143.4 MiB per side** at `world=4` against **107.6 MiB** at
 `world=1`, both with two buffers so a row can stage while the DMA that read the previous one is still
 in flight. The four-card arena is the *larger* of the two because 6 does not divide by 4: two of its
 eight rows are empty in every token. That is 0.3 GiB of pinned RAM for the four-card path, which is
 not a reason to rebalance it.
 
-**That deal is `sorted`, it is the default, and every number on this page was taken on it — but it
-is a choice.** `DEEPSEEK_V41_EXPERT_DEAL=id` hands a drawing to `expert % world` instead of to its
-sorted position, which partitions the experts themselves over the cards rather than dealing each
-card a slice of every row; [the subsection at the end of this section](#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set)
-has the A/B, and **on the tree that ships it is 1.49x on a 32768-token prefill and 1.42x on the 256K
-one** — 1.22x and 1.19x on the kernels this page's own sitting was taken on, which is the same pair
-before the three stacked prefill kernels landed under it. It costs 1.72 GiB more peak allocated on the
-light cards and 0.46 / 0.39 GiB more on the worst card at 32768 tokens and 256K, and 0.40 / 0.04 GiB
-more reserved. `sorted` stays the default because it is what the run record below is, and because the
-two deals are not bit-identical.
+**The deal is a choice, and `id` is what a run makes unless it asks otherwise.**
+`DEEPSEEK_V41_EXPERT_DEAL=id` hands a drawing to `expert % world` instead of to its sorted position,
+which partitions the experts themselves over the cards rather than dealing each card a slice of every
+row; [the subsection at the end of this
+section](#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set) has the
+A/B, and **on the tree that ships it is 1.49x on a 32768-token prefill and 1.42x on the 256K one** —
+1.22x and 1.19x on the kernels this page's own sitting was taken on, which is the same pair before the
+three stacked prefill kernels landed under it. It costs 1.72 GiB more peak allocated on the light cards
+and 0.46 / 0.39 GiB more on the worst card at 32768 tokens and 256K, and 0.40 / 0.04 GiB more
+reserved. `sorted` held the default until 2026-09-20 and is still one flag away on every launcher,
+because it is what this page's run record is and because [the two deals are not
+bit-identical](#the-parity-the-two-deals-are-not-bit-identical-and-the-yardstick-is-a-landed-change).
 
 **The cards never talk to each other.** Each holds its own arena, is handed the same `[1, 5120]`
 activation, and returns `[1, 5120]` fp32; the host sums the `world` partials. That is 20 KiB back per
@@ -143,8 +153,9 @@ dealt from `n_experts / world` = 96 of them rather than from all of them. That i
 `device_experts.py` are the whole of it: the deal is read in exactly two places — `_split`, which
 decides where a drawing is staged, and `_hot_rows`, which decides which experts count as resident —
 and nothing downstream re-derives it, which is also why
-`tests/test_models_deepseek_v4_1_expert_deal.py` can check the contract without a card. **`sorted`
-stays the default**, so every other number on this page is still the configuration it was taken on.
+`tests/test_models_deepseek_v4_1_expert_deal.py` can check the contract without a card. **`id` is what
+a run makes unless it asks for `sorted`**, so this page's figures — all of them `sorted` — are the
+configuration one flag away, and not the configuration that runs by default.
 
 The arithmetic came first, on the routing the gate actually produced (`/tmp/probe_deal_route.py`,
 512 rows x 6 experts x 40 layers out of `/tmp/v41_routes.pt`, a 148-row pool a card, no resident
@@ -206,6 +217,13 @@ both legs are the same 148-row pool and the widening is four rows a card in both
 pays is under half a gigabyte at both. The allocation columns agreeing across two kernel trees is what
 says this is the deal's bill and not the tree's.
 
+**At the short-prompt configuration the same four rows cost 70 MiB.** The figures above are at 148 pool
+rows; at the 288 `--expert-pool-rows` recommends for a 1024-token prompt the widening moves allocated
+14.73 → 14.80 GiB, reserved 15.28 → 15.35 GiB and peak 15.06 → 15.13 GiB — the same three numbers on all
+four cards either way. The launcher's own reading of the pair at three lengths, including the fit
+question that configuration raises and the decode it costs at the long ones, is the last subsection of
+this section.
+
 #### The parity: the two deals are not bit-identical, and the yardstick is a landed change
 
 Each card sums a different subset of a row's six experts, so the partials are added in a different
@@ -227,7 +245,7 @@ prefill stack, which is already landed on the 256K branch, moves these same logi
 the deal does, at the same 9/9 argmax. The fourth row is the instrument's own repeat, and it is
 exact, so the 3.643 is the deal and not drift.
 
-#### Decode is unmoved, and the wider tail is the thing that could have moved it
+#### Decode at 128 tokens of context is unmoved, and the wider tail is the thing that could have moved it
 
 `id` widens `rows_per_card` from 2 to 6, and a one-token pass is the case that exercises that width —
 so the A/B's own decode column cannot answer it: it is four steps long, and its two `sorted` arms are
@@ -272,6 +290,12 @@ same configuration here reads 0.3738 in one arm and 0.3617 in the other, which i
 one configuration inside one sitting, against 4.6% for `sorted` between this sitting and an earlier one
 on the same tree (0.3512). A four-step column cannot resolve that, which is why the sitting that prices
 a step is 256 steps long.
+
+**128 tokens of context is also not the regime a long prompt runs in**, and the launcher's own three
+lengths settle the rest: at 32768 and 262144 tokens the same pair is 4.4–4.7% apart a step with `id` the
+slower, because at those lengths both arms' pools cover 96.7–99.1% of their draws and a step's cost is
+the *width* of the row it has to cover rather than the number of rows it stages. That is a subsection
+below, and it prices the pair at 1.62x, 1.48x and 1.40x on the prefill as it goes.
 
 #### The 256K leg, which is the length this work is about
 
@@ -335,6 +359,13 @@ instrument, and it is taken on the other tree. The control arm is the control it
 counters are bit-identical to the first `sorted` arm's and its chunk clocks are 0.22% apart, so the
 middle arm's 33% is the deal.
 
+**The launcher reads the same pair at 1.481x and 1.400x** — 32716 and 262874 tokens rather than 32768
+and 262144, the same tree and the same geometry, on the instrument the
+[capability page](deepseek_v4_1_flash_single_request_capability.md) uses. The two sittings are 0.6% and
+1.1% apart on the two ratios and 0.2% apart on the `sorted` arm's own wall (2537.4 against 2532.75 s),
+which is this host's width rather than a disagreement between the probes; the last subsection of this
+section is that sitting.
+
 **The `sorted` arm here is the prefill-stack page's stacked arm, and that is what makes the two
 readable together.** That page's stacked arm is 2520.7 s over the same 262144 tokens — 39.39 s a chunk
 against 39.57 here, 0.5% apart — through a different probe (`probe_v41_chunk_profile_host.py` with its
@@ -353,6 +384,137 @@ fp32 accumulation and so change the deal's row counts not at all (3.37x fewer st
 prefix-dependent part of a chunk, which the stack page measures at 5.2 s of a 41.3 s stacked chunk and
 which neither lever touches: it is why the deal's ratio is 1.41x here against 1.49x at 32768, the same
 ordering and a wider gap than the pre-stack pair's 1.19x against 1.22x.
+
+#### The flip's own two questions, answered through the launcher
+
+Every measurement above is the deal on a probe. Which deal `src/cli/generate_v41.py` reaches when
+nobody passes `--expert-deal` is a different claim, and it has two parts none of those instruments can
+reach: whether `id` fits the **documented short-prompt configuration**, and what it does to decode at a
+length where the prompt is the run. `/tmp/run_deal_default.sh` is the sitting — **six legs, three
+lengths, two deals, one process a card, `sorted` and `id` adjacent at each length** — at the geometry
+the [capability page](deepseek_v4_1_flash_single_request_capability.md) runs: pool 288 at 1024 tokens,
+pool 148 with `--prefill-chunk-tokens 4096` at the two long ones, `--decode-graphs`, 64 greedy tokens,
+and `--expert-deal` the only flag that moves. The rate is the launcher's own subtraction, `elapsed`
+minus `decode_seconds`, which is the instrument that page documents.
+
+| prompt tokens | deal | prefill | tok/s | ratio | decode, ms a token | whole call |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1024 | `sorted` | 20.1 s | 50.95 | — | 204 | 33.1 s |
+| 1024 | `id` | 12.4 s | **82.58** | **1.621x** | **193** | 24.8 s |
+| 32716 | `sorted` | 308.9 s | 105.91 | — | 228 | 323.5 s |
+| 32716 | `id` | 208.6 s | **156.84** | **1.481x** | 238 | 223.9 s |
+| 262874 | `sorted` | 2537.4 s | 103.60 | — | 258 | 2553.9 s |
+| 262874 | `id` | 1812.3 s | **145.05** | **1.400x** | 270 | 1829.6 s |
+
+**The `sorted` legs are the control, and they reproduce the capability page.** 50.95 against that
+page's graphed 51.2 at 1024, 105.91 against 105.98 at 32716, 103.60 against its 103.58 and 103.54 at
+262874; decode 204 against 201–202 ms, 228 against 229, 258 against 259 and 258. Six legs, twelve
+figures, nothing outside 1.5%, on a page whose own two 262144 sittings were 0.04% apart. The 1024 rows
+are graphed and their prefill carries the capture pass, which is why that page parenthesises its own
+51.2 there; **1.621x is a floor for the same reason** and the deal is worth a little more than it.
+
+**The first question is answered by the memory line, and the answer is 6.6 GiB of room.** `id` widens
+the arena from 150 to 154 rows a card at pool 288 (`ceil(6/4)` columns to `topk`), so the configuration
+`--expert-pool-rows`'s own help recommends at 1024 is only still a default if 288 rows and four more
+arena rows both fit. They do: `id` reads **14.80 GiB allocated, 15.35 GiB reserved, 15.13 GiB peak
+allocated**, the same three numbers on all four cards, against `sorted`'s 14.73 / 15.28 / 15.06 —
+**+0.07 GiB a card**. Reserved is the column to read beside a budget, so 15.35 GiB of the 22 GiB a card
+is allowed is 6.65 GiB of headroom, and the deal's whole memory bill at this length is 70 MiB.
+
+**And at 288 rows the deal is worth more, not less, which is the reverse of what a four-rows-wider
+arena would suggest: 50.95 to 82.58 tokens a second, the widest of the three ratios.** The pool is the
+mechanism and at this length it is the whole of it. Under `sorted` the pool stages 6393 and 6404 rows
+over the run on the two cards the 2/2/1/1 deal gives one column and 10191 and 10290 on the two it gives
+two, covering 85.3–88.3% of the draws. Under `id` it stages **3929, 3946, 3989 and 4011 — fewer than
+half the busy pair's — covering 93.3–94.4%**, and the 2:2:1:1 split is gone; the stage count is a
+whole-run counter, because a 1024-token prompt is one unchunked forward followed by 64 steps and there
+is no chunk to separate the prefill's rows from the decode's. The 1024 leg is where the pool covers the
+least — 85.3–88.3% under `sorted` against 96.9–97.1% at 262144 — so a larger share of the run is the
+term the deal removes, and there is less around it to dilute the removal: a 1024-token prompt's forward
+is 18 ms a token of expert work with no 39-second chunk of attention and collectives behind it, which
+is the dilution the subsection above names for 1.49x at 32768 against 1.41x at 256K, arriving with the
+sign the other way.
+
+**The second question is answered by the decode column, and decode does move — up at the short end and
+down at both long ones.** The instrument is the graph split, which times the eager expert call *inside*
+each leg, so it is the same quantity the step is made of — 92% of it — measured within the process
+rather than between two:
+
+| prompt tokens | eager experts, ms, four ranks | | step, ms a token | |
+| ---: | --- | --- | --- | --- |
+| | `sorted` | `id` | `sorted` | `id` |
+| 1024 | 179.3–186.6 | **171.3–172.4** | 204 | **193** |
+| 32716 | 205.1–210.3 | 211.9–216.6 | 228 | 238 |
+| 262874 | 234.5–240.7 | 244.1–249.2 | 258 | 270 |
+
+**The two columns agree at all three lengths and in both directions.** At 1024 the expert call's
+four-rank interval falls from 179.3–186.6 ms to 171.3–172.4 and the step 204 → 193 ms; at 32716 it rises
+from 205.1–210.3 to 211.9–216.6 with the step 228 → 238; at 262874 from 234.5–240.7 to 244.1–249.2 with
+the step 258 → 270. And the call's own four-rank spread **narrows** under `id` at every length — 7.3 ms
+to 1.1, 5.2 to 4.7, 6.2 to 5.1 — so the balancing the deal exists for shows up in the term that decides
+a step, not only in the staged row counts.
+
+**This does not contradict "Decode is unmoved" above; it bounds it.** That subsection's A-B-A-B runs 128
+tokens of context, and its own answer is that the pool covers the working set there, so the width is
+allocated and never bound. What this sitting adds is the other regime. At 262144 a step is 258–270 ms of
+which 234–249 ms is the expert call, so the call *is* the step and the deal's width is the only term in
+it that changes. **The direction is the one the width predicts.** `sorted` bounds a card's share of one
+row's six experts at exactly two — the same two cards for every token — and `id` bounds it at six, so
+the card that gates the step carries the largest of six draws over four cards instead of a constant two.
+Over uniform routing that maximum averages **2.82 against 2.00**, 41% more rows on the gating card, and
+the 4.4–4.6% the step pays is the share of the call that scales with them. A real routing is skewed
+rather than uniform, which pushes the same way. The short end is the same width with the pool's staging
+in front of it and a much smaller staged count behind it — 3929–4011 rows against 6393–10290 — and there
+the staging term wins.
+
+**One thing the sitting answered that it was not asked.** The deals are not bit-identical, so the greedy
+chain is not obliged to agree, and at 262874 tokens it does not: the two legs generate from the same
+prompt and split on the **first token** — `Chapter 345. The traveller reached Prague` under `sorted`
+against `Chapter 345. The traveller reached Bern` under `id` — with the rest of the paragraph the same
+sentence carrying that city's
+river in place of the other's and each continuation consistent with the city it picked. At 1024 and
+32716 the two deals' printed text is **byte-identical** — all 5424 and 155380 bytes of it, prompt and 64
+generated tokens together. That is the parity table's shape read at the launcher's own output instead of
+at nine chunk boundaries: a few positions' argmax can flip and most cannot, and which few depends on the
+context. **The default flip therefore changes the text at 262144 tokens and not at 1024 or 32768**, which
+matters to anything that validated a command line at a short length and then moved to a long one.
+
+**That paragraph is a claim about printed text, so the same pair is taken at the launcher's own logits.**
+`/tmp/run_deal_logits.sh` re-runs the 1024-token pair with `--dump-logits` on both legs, eager on both so
+the deal is the only variable, at the pool-288 configuration the capability page's short legs run, and
+`/tmp/cmp_logits.py` reads the two matrices:
+
+```text
+  tokens vs /tmp/dealdump_sorted.pt: 64/64 identical
+    logits: 64 rows x 129280, max |diff| = 4.975e+00 (worst row 26), rows differing = 64
+    argmax agreement: 64/64
+```
+
+**Every one of the 64 rows differs and every one of the 64 argmaxes agrees.** The first number is the
+parity table above read at the launcher's output: 4.975 against the 9-position probe's 3.643 and the
+landed stack change's 4.564, the same order, on 8.3 M logits rather than nine rows. The second is the
+mechanism behind the byte-identical text — a deal that moves every row by up to five logits and still
+leaves the argmax where it was. Both legs report `read_bytes delta across the 64 tokens: 0`, which is the
+same check the capability page's decode-path comparison makes: the expert rows came out of the pinned
+bank, so the difference is the deal's and not a staging path's. The three instruments therefore say one
+thing: **the two deals disagree at every position at 1024 tokens and decide none of them.**
+
+**What the long lengths cost in memory is inside the budget, and the light cards are where it lands.** At
+32716 the four `id` cards read 15.93 GiB allocated, 16.77–17.01 GiB reserved and **16.75 GiB peak**, one
+number on all four, against `sorted`'s 13.92–15.27 / 15.20–16.62 / 14.93–16.21; at 262874 they read
+14.20 / 16.31–17.23 / **17.58 peak** against 14.01–14.13 / 16.15–16.62 / 15.89, 15.90, 17.20, 17.20.
+**The worst card's peak goes 17.20 to 17.58 GiB (+0.38) and the two light cards 15.89 to 17.58
+(+1.69)** — the convergence the arena subsection predicts, whose 1.72 GiB on the light card this reads to
+within 2%. On a 22528 MiB card, 17.58 GiB peak is 4.4 GiB of room and the reservation column's worst
+card, 17.23 GiB, is 4.8 GiB. The arena subsection's probe reads the same deal at the same length as
+17.72 GiB peak, 0.8% above this and the same story, which is what makes two instruments one bill.
+
+The six logs are `/tmp/deald_<length>_<deal>.log`; `/tmp/deald_summary.py` reads them into the first
+table above, and the deals' printed text is the non-`[rank` tail of the same files, 5424 / 155380 /
+1238660 bytes, differing by one hunk at 262874 and by nothing at the other two. The logits pair is
+`/tmp/deall_sorted.log` / `/tmp/deall_id.log` with `/tmp/dealdump_sorted.pt` and `/tmp/dealdump_id.pt`
+behind them, 33097761 and 33097733 bytes, both legs started by hand after the six-leg sitting's
+`DEAL-DEFAULT-DONE` marker rather than inside it.
 
 ## Two conventions that had to be settled before the first run
 

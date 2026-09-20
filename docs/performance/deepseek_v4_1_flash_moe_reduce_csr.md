@@ -51,7 +51,8 @@ pairs a slot, `dim` 5120 — so:
   tests are made by all 1050 rows between them. Each thread's 2100 iterations contain the 2 pairs
   that name its row, and nothing else does any work.
 - **The ratio is the routing's, not the shape's.** A row has as many pairs as it has routes to this
-  rank's experts — 2 on ranks 0 and 1, 1 on ranks 2 and 3, given the 2/2/1/1 deal — and it does not
+  rank's experts — 2 on ranks 0 and 1, 1 on ranks 2 and 3, given the 2/2/1/1 deal this page's
+  sittings run (`sorted`, one flag from the default since 2026-09-20) — and it does not
   move when `dim` or `inter_dim` changes. Only `tokens` does, and `tokens` is what a chunk feeds
   the call.
 
@@ -92,7 +93,7 @@ themselves and the outputs would differ in the last bits, which is a different c
 **Built on the device because one of the call sites is there.** `moe_multi_token_fp4_forward` has two
 live callers and they resolve their routing in opposite ways:
 
-- `src/models/deepseek_v4_1/device_experts.py:1466`, inside `_issue_chunk`, passes `tokens` and
+- `src/models/deepseek_v4_1/device_experts.py:1471`, inside `_issue_chunk`, passes `tokens` and
   `slots` as **Python lists** it has just built — the routing is on the host, and a host-side CSR
   would be free there.
 - `src/components/moe/gpu_prefill_backend.py:636` builds the same arguments entirely from **tensor

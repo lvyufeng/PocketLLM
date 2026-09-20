@@ -133,8 +133,10 @@ whole run — the probe times one step where the clock averages a run — which 
 instruments are measuring the same work and not one of them the wrong call.
 
 Note what the 480 against 240 `copy_` is: **only ranks 0 and 1 draw two rows a layer**, so those two
-stage twice the bytes and pay roughly twice the clock. That is the 2/2/1/1 expert deal showing up in
-the staging term, and it is why the step's gate is rank 1 rather than a round-robin rank.
+stage twice the bytes and pay roughly twice the clock. That is the `sorted` deal's 2/2/1/1 split
+showing up in the staging term — this sitting is `sorted`, which was the default then and is one flag
+off it now, and the `id` deal that is the default removes the split — and it is why the step's gate is
+rank 1 rather than a round-robin rank.
 
 **Three readings, and only the third is a lever.**
 

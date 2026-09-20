@@ -53,7 +53,7 @@ The step is **graph A → eager expert call → graph B**, per layer, forty time
 design choice. `routed.forward` cannot be captured because the host has to act in the middle of it:
 `_route_ids` does a pinned D2H plus a `torch.cuda.current_stream(...).synchronize()`, and
 `_resolve_row`'s `[int(e) for e in ids_row.tolist()]` is a host read per row
-(`src/models/deepseek_v4_1/device_experts.py:61`, **2.9 ms a row**). That read is the point of a
+(`src/models/deepseek_v4_1/device_experts.py:1794`, **2.9 ms a row**). That read is the point of a
 host-resident expert bank, so a graph over the whole step is not available at any price — and the
 half that is available is the half this page measures.
 

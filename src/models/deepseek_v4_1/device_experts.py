@@ -27,17 +27,19 @@ favour; they are recorded here because each of them looked like a blocker first:
   scale expansion and no rebasing happens here.
 
 The split is expert parallelism over `world` cards, and it is static. Which card owns which of a
-row's six drawings is the **deal**, and there are two. The shipped one, `sorted`, sorts the row's
-experts by global id and deals them round-robin, so card `c` owns sorted positions `c` and
-`c + world` -- a **2, 2, 1, 1** split over four cards -- and each card's arena is a fixed
-`ceil(topk / world)` rows. The alternative, `id`, deals drawing `e` to rank `e % world` and is
-selected with `DEEPSEEK_V41_EXPERT_DEAL=id`; it costs a card `topk` arena rows instead of
-`ceil(topk / world)`, because one row may hand a single card all six. `deal_card` is that rule and
-the section comment above it is the argument for having a second one. The deal is applied in exactly
-two places and both of them are walks of it: `_split` decides which card a drawing goes to, and
-`_hot_rows` decides which of a card's experts count as resident -- a fixed set of columns under
-`sorted`, a mask over the ids under `id`. Nothing downstream re-derives it, because `_resolve_row`
-renumbers the row from the pairs `_split` placed and `_issue`/`_upload` read the row they are handed.
+row's six drawings is the **deal**, and there are two. The default, `id`, deals drawing `e` to
+rank `e % world`, which partitions the experts themselves over the cards: a rank is dealt from
+`n_experts / world` of them rather than from all of them. It costs a card `topk` arena rows rather
+than `ceil(topk / world)`, because one row may hand a single card all six. The alternative,
+`sorted`, sorts the row's experts by global id and deals them round-robin, so card `c` owns sorted
+positions `c` and `c + world` -- a **2, 2, 1, 1** split over four cards -- and each card's arena is a
+fixed `ceil(topk / world)` rows; it is selected with `DEEPSEEK_V41_EXPERT_DEAL=sorted`. `deal_card`
+is that rule and the section comment above it is the argument for the default. The deal is applied
+in exactly two places and both of them are walks of it: `_split` decides which card a drawing goes
+to, and `_hot_rows` decides which of a card's experts count as resident -- a mask over the ids under
+`id`, a fixed set of columns under `sorted`. Nothing downstream re-derives it, because
+`_resolve_row` renumbers the row from the pairs `_split` placed and `_issue`/`_upload` read the row
+they are handed.
 Nothing resizes between steps and nothing is allocated per token: the pinned arena is those rows for
 every card laid end to end, 35.9 MiB per card and 143.4 MiB for four under `sorted`, 107.6 and 430.3
 under `id`, and the device holds the matching per-card slice.
@@ -290,24 +292,27 @@ def batched_enabled() -> bool:
     return os.environ.get(BATCHED_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
-# How a row's routed experts are shared out over the cards. `sorted` sorts the row's ids and gives
-# sorted position `p` to rank `p % world`, which is the deal the module docstring describes and the
-# one every number above this comment was taken on: it is a property of the *routing* rather than of
-# the order the gate emitted the experts in, so two runs that route to the same six experts stage the
-# same bytes into the same rows. `id` gives the drawing to rank `expert % world` instead. It is here
-# because six sorted slots over four cards is a **2, 2, 1, 1** split, and what a chunk's H2D pays for
-# is the width of a rank's *staged set* over the chunk rather than its share of the rows -- an expert
-# is a row of bytes however many times the chunk draws it -- so the card dealt two of the six sorted
-# slots stages roughly twice what the card dealt one stages, and a draw that lands on an expert the
-# rank already has costs nothing. See `_split`.
+# How a row's routed experts are shared out over the cards. `id` gives the drawing to rank
+# `expert % world`, which is the deal the module docstring describes and the default: it partitions
+# the experts themselves over the cards, so a rank is dealt from `n_experts / world` of them rather
+# than from all of them. That is the deal because what a chunk's H2D pays for is the width of a
+# rank's *staged set* over the chunk rather than its share of the rows -- an expert is a row of bytes
+# however many times the chunk draws it -- and a draw that lands on an expert the rank already has
+# costs nothing. `sorted` sorts the row's ids and gives sorted position `p` to rank `p % world`
+# instead, which is a property of the *routing* rather than of the order the gate emitted the experts
+# in, so two runs that route to the same six experts stage the same bytes into the same rows. Six
+# sorted slots over four cards is a **2, 2, 1, 1** split, so the card dealt two of the six sorted
+# slots stages roughly twice what the card dealt one stages; that is the width the default removes,
+# and `sorted` is kept because it is the deal the numbers taken before this default were measured on
+# and because the two deals do not agree bit for bit. See `_split`.
 DEAL_ENV = "DEEPSEEK_V41_EXPERT_DEAL"
 DEALS = ("sorted", "id")
 
 
 def deal_rule() -> str:
-    """Which deal a `DeviceRoutedExperts` makes unless its constructor is told. `sorted` by default."""
+    """Which deal a `DeviceRoutedExperts` makes unless its constructor is told. `id` by default."""
     asked = os.environ.get(DEAL_ENV, "").strip().lower()
-    return asked if asked in DEALS else "sorted"
+    return asked if asked in DEALS else "id"
 
 
 def deal_card(expert: int, position: int, *, deal: str, world: int) -> int:

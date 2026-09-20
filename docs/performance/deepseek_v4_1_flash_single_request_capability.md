@@ -9,6 +9,10 @@ to a process, every figure derived from lines the CLI itself prints.
 
 **One request on four 2080 Ti, through the shipped CLI: prefill 106.0 tokens a second at 32768 prompt
 tokens and 103.6 at 262144, decode 4.98 tokens a second at 1024, 4.37 at 32768 and 3.86 at 262144.**
+Every figure on this page is the `sorted` expert deal's, which was the default when the legs were run
+and is one flag from it now; the default deal's own rates are **1.62×, 1.48× and 1.40× on the prefill
+and 5.18, 4.20 and 3.70 tokens a second on the decode**, and the paragraph after the table is where
+that matters.
 The graphed decode step is **201–202 ms** at 1024 against **354–364 ms** eager — 1.76–1.81× — and the
 whole call 32.8 s against 41.3–42.1 s, with the eight 1024-token legs' generated text **identical to
 the byte** and the two paths' 64 x 129280 logit matrices **bit-identical** (`max |diff| = 0.000e+00`,
@@ -33,11 +37,18 @@ tokens a second, 36 bytes apart in the prompt and 0.04% apart in the rate, and 2
 decode step.
 
 Every leg is `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, `--threads 22`, `--temperature 0.0`,
-`--max-new-tokens 64`, `torchrun --nproc_per_node=4`, and **the default expert deal (`sorted`)**. That
-last one matters for the prefill column: the `id` deal is priced on the
+`--max-new-tokens 64`, `torchrun --nproc_per_node=4`, and **the `sorted` expert deal** — the deal
+every figure on this page was taken on, and one flag from the default since 2026-09-20. That
+last one matters for the prefill column: `id`, which is the default now, is priced on the
+[device-experts page](deepseek_v4_1_flash_device_experts.md#the-flips-own-two-questions-answered-through-the-launcher)
+at **1.621x at 1024 tokens, 1.481x at 32716 and 1.400x at 262874** by the same subtraction this page
+uses, and on the
 [chunked prefill page](deepseek_v4_1_flash_chunked_prefill.md) at **146.46 tok/s on this same 262144
-length** against the `sorted` arm's 103.50 — the numbers here are the shipping default, not the
-fastest arm that exists.
+length** against the `sorted` arm's 103.50 — the numbers here are the deal the run record was taken
+on, not the one a bare command line makes. That sitting also prices the flip's other half: decode is
+**11 ms a step faster** under `id` at 1024 (204 to 193 ms) and **10 and 12 ms slower** at 32716 and
+262874 (228 to 238, 258 to 270), so the decode rates below are one flag from the shipping default's at
+every length and the default's own rates are, in order, 5.18, 4.20 and 3.70 tokens a second.
 
 ## Run record
 
@@ -246,5 +257,6 @@ bash /tmp/run_cap_e2e3.sh
   says what four streams or a batch of 32 would do.
 - **No warm-page-cache claim.** All six legs ran with the resident bank attached, which is what makes
   the expert rows come out of pinned host memory rather than off `/mnt/data3`.
-- **Not the fastest prefill that exists.** The default `sorted` deal is used throughout; the `id`
-  deal is 1.41× on the same 262144 length and is still opt-in.
+- **Not the fastest prefill that exists, and not the default's either.** Every leg here is the
+  `sorted` deal, which is one flag away from the default rather than the default; the `id` deal is
+  1.400× on the same 262144 length and is what a bare command line makes.
