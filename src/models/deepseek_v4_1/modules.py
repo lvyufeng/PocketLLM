@@ -782,6 +782,12 @@ class Backbone(nn.Module):
         shared = SharedAttentionRuntime()
         main_hiddens: list[torch.Tensor] = []
         h = None
+        # The position, in whatever form the caller gave it. `start_pos` is an `int` on the eager
+        # path and a `Pos` on a decode step replayed from a graph -- the contract
+        # `LoadedBackbone.__call__` states -- and `pos + c0` has to stay in that form, which is what
+        # `Pos.__add__` is for: a capture records index *tensors*, so `int(start_pos) + c0` would stop
+        # the raise and bake the position into the recording instead, and `Pos.row(c0)` hands back the
+        # 0-dim tensor an *index* wants, which the next `Pos.of` down the stack refuses by design.
         for c0 in range(0, total, chunk):
             c1 = min(c0 + chunk, total)
             at = start_pos + c0
