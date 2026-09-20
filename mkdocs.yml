@@ -149,6 +149,7 @@ nav:
       - DeepSeek-V4.1-Flash prefill stack: performance/deepseek_v4_1_flash_prefill_stack.md
       - DeepSeek-V4.1-Flash MoE weight staging: performance/deepseek_v4_1_flash_moe_weight_staging.md
       - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md
+      - DeepSeek-V4.1-Flash single-request capability: performance/deepseek_v4_1_flash_single_request_capability.md
       - Serving latency baseline: performance/serving_latency_baseline.md
       - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md

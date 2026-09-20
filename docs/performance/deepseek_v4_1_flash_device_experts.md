@@ -2056,7 +2056,11 @@ segment rather than off `/mnt/data3`.
 **Two things this section does not claim.** The 512-token prefill is the probe rather than the
 launcher — `src/cli/generate_v41.py` does not print a prefill wall — so the prefill column is the
 instrumented library at the launcher's own configuration (288 pooled rows, batched, bank attached),
-and the decode column is the launcher undecorated. And the four-rank registration is the only part of
+and the decode column is the launcher undecorated. [What one request costs, through the
+launcher](deepseek_v4_1_flash_single_request_capability.md) is the launcher's answer to both columns
+at 1024, 32768 and 262144 prompt tokens: the prefill is read as `prompt_tokens / (elapsed −
+decode_seconds)` off the two walls the CLI does print, and the 200/202 ms this section measures for
+a decode token is that page's 201/202. And the four-rank registration is the only part of
 the cost that scales badly: 130.1 ms a GiB alone against 199.4–227.1 with four, which is a host
 page-table walk and not a driver limit, and it is paid on every start rather than amortized.
 
