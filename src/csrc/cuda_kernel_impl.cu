@@ -3265,12 +3265,16 @@ __global__ void moe_multi_w2_partial_fp4_kernel(
     }
 }
 
-// Sum a token's pairs by scanning all pairs in ascending index order. Building a
-// per-token CSR would need slot_tokens on the host, i.e. a D2H sync on the decode
-// critical path; instead each block rescans the whole pair list, which is tiny
-// (tokens * topk, so <= 48 at the speculative-verify sizes this kernel exists for)
-// and stays resident in L2. The order is fixed by the pair index, not by
-// scheduling, so the result is bitwise reproducible.
+// Sum a token's pairs by scanning all pairs in ascending index order. The order is fixed by the
+// pair index and not by scheduling, so the result is bitwise reproducible.
+//
+// The loop runs `pairs` times a thread whatever the routing is, so a call costs `tokens * pairs`
+// compares -- 11.3 G of them at the prefill call's geometry, 1050 rows over 2100 pairs and 5120
+// columns -- while only the two pairs that name the row do any work: `pairs` of the `tokens *
+// pairs` tests, one in `tokens`, or 0.095% here. That ratio is the routing's, not the shape's, and
+// it only worsens as the row count grows. `moe_multi_reduce_csr_kernel` below is the same sum over
+// the row's own pairs and is what a large call takes; this one is kept for the small ones, where
+// grouping the pairs costs more than the compares it saves. `kCsrMinWork` is where the two cross.
 __global__ void moe_multi_reduce_partials_kernel(
     const float* __restrict__ partials,        // [pairs, dim]
     const int32_t* __restrict__ slot_tokens,   // [pairs]
@@ -3288,6 +3292,31 @@ __global__ void moe_multi_reduce_partials_kernel(
     }
     y[static_cast<int64_t>(token) * dim + col] = acc;
 }
+
+// The same sum, over a row's own pairs instead of all of them. `row_pair` is the pairs grouped by
+// token, each group in ascending pair order, and `row_ptr` that grouping's exclusive prefix sum --
+// so the additions are the same additions in the same order and the result is bit-identical to the
+// scan above. Measured at the prefill call's geometry: 11962.6 us for the scan against 172.8 us
+// here, 69.24x, `exact`.
+__global__ void moe_multi_reduce_csr_kernel(
+    const float* __restrict__ partials,        // [pairs, dim]
+    const int32_t* __restrict__ row_ptr,       // [tokens + 1]
+    const int32_t* __restrict__ row_pair,      // [pairs]
+    float* __restrict__ y,                     // [tokens, dim]
+    int dim) {
+    const int token = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    float acc = 0.0f;
+    for (int i = row_ptr[token]; i < row_ptr[token + 1]; ++i) {
+        acc += partials[static_cast<int64_t>(row_pair[i]) * dim + col];
+    }
+    y[static_cast<int64_t>(token) * dim + col] = acc;
+}
+
+// Where grouping the pairs is cheaper than scanning them: the scan's work is `tokens * pairs`
+// compares, the grouping's is flat. Below this the scan wins.
+constexpr int64_t kCsrMinWork = 50000;
 
 torch::Tensor moe_multi_token_fp4_forward_cuda(
     const torch::Tensor& x,             // [T, dim]
@@ -3380,6 +3409,32 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
             inter_dim);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         const dim3 reduce_grid(ceil_div(dim, kGemmThreads), tokens);
+        // A large call reduces over its rows' own pairs and not over the whole pair list. The
+        // grouping is built here, on the device: `slot_tokens` is a CUDA tensor at both call sites
+        // -- at the on-device one (`gpu_prefill_backend`) reading it back to build the CSR in
+        // Python would be the D2H sync this path exists to avoid -- and a stable sort by token
+        // followed by the counts' prefix sum is three ATen ops on `pairs` elements with no host
+        // round trip and no added synchronization. A stable sort keeps each row's pairs in
+        // ascending pair index inside its group, which is the order the scan adds them in, so the
+        // two kernels agree bit for bit rather than almost. `DEEPSEEK_MOE_CSR_REDUCE=0` turns it
+        // off and takes the scan below; the two are bit-identical, so that is a knob for a
+        // measurement or a bisect and not a correctness switch.
+        if (env_int_default("DEEPSEEK_MOE_CSR_REDUCE", 1) != 0 &&
+            static_cast<int64_t>(pairs) * tokens >= kCsrMinWork) {
+            auto sorted = at::sort(slot_tokens, /*stable=*/true, /*dim=*/-1, /*descending=*/false);
+            auto row_pair = std::get<1>(sorted).to(torch::kInt32);
+            auto counts = at::bincount(slot_tokens.to(torch::kLong), {}, tokens);
+            auto row_ptr = at::zeros({tokens + 1}, slot_tokens.options());
+            row_ptr.narrow(0, 1, tokens).copy_(counts.cumsum(0, torch::kInt32));
+            moe_multi_reduce_csr_kernel<<<reduce_grid, gemm_block, 0, at::cuda::getCurrentCUDAStream()>>>(
+                partials.data_ptr<float>(),
+                row_ptr.data_ptr<int32_t>(),
+                row_pair.data_ptr<int32_t>(),
+                y.data_ptr<float>(),
+                dim);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return y;
+        }
         moe_multi_reduce_partials_kernel<<<reduce_grid, gemm_block, 0, at::cuda::getCurrentCUDAStream()>>>(
             partials.data_ptr<float>(),
             slot_tokens.data_ptr<int32_t>(),

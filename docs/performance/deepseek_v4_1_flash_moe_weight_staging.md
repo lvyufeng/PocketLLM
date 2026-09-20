@@ -55,9 +55,9 @@ The weights come from the checkpoint as `[expert][inter_dim][blocks_k][16]` byte
 16 contiguous bytes, and consecutive columns are `dim / 2 = 2560` bytes apart.** The kernel's inner
 loop is over columns (the lanes), so the lanes of a warp address 32 consecutive columns at the same
 k-block — 32 addresses 2560 bytes apart. Each 32-byte sector delivers 16 useful bytes: the other 16
-belong to two other columns no lane in this warp wants. At 61 slots and 1050 (token, expert) pairs a
+belong to two other columns no lane in this warp wants. At 61 slots and 2100 (token, expert) pairs a
 call that is **729 MiB of w1/w3 weight bytes read through a sector stream that is 50% useful**, and
-it is what the 59.81 µs a call measures.
+it is what the 59.81 ms a call measures.
 
 Two things follow. First, the reads want to be column-major. Second, they cannot be made so by
 addressing alone: the bytes are where they are, and the checkpoint's layout is the checkpoint's. So
@@ -68,8 +68,9 @@ per K strip rather than per k-block is what keeps it affordable.
 
 `/tmp/moe_multi_bench.cu` is the same kernel with the staging parameterised: `TILE` tokens in
 registers a thread, `STRIP` K blocks staged a pass. It is driven at the measured call's geometry —
-**1050 rows, 61 slots (1050 pairs, 34.4 rows a slot, 4.3 passes of 8), dim 5120, inter_dim 2304,
-`blocks_k` 160, grid (18, 61), 1094 MiB of weight bytes a call, 729 MiB of it w1/w3** — with a
+**1050 rows, 61 slots (2100 pairs, 2 routes a row, 34.4 pairs a slot, 4.3 passes of 8), dim 5120,
+inter_dim 2304, `blocks_k` 160, grid (18, 61), 1094 MiB of weight bytes a call, 729 MiB of it
+w1/w3** — with a
 bit-identity check against the shipping kernel before anything is timed. Two runs of that sweep are
 in hand and they agree to within 1% on every row; the table is the second, each variant checked
 `exact` against `bench_v0`:
@@ -138,13 +139,17 @@ Considered as a set, the table rules three routes out and picks a fourth:
   kernel's addressing — recorded here as the lever the staged route is 1.5× short of.
 
 The reduction, priced on the same 1050-row call: `moe_multi_reduce_partials_kernel` rescans all 2100
-pairs for each of the 1050 tokens to find its own, **11962.6 µs**, where a per-token CSR built
-host-side from the routing the call already has — the same additions in the same ascending pair
-order, so bit-identical (`exact` in the sweep) — is **172.8 µs**, 69.24×. The scan's 11962.6 µs is
-0.50× the 23930 µs a call the in-model profile reports, i.e. about 1.9 s of the 3.733 s a chunk; the
-discrepancy is the microbench's idle card against the chunk's concurrency, the same direction as the
-3.89× against 3.06× above. That is the next lever and it is a follow-up rather than this PR: it
-changes what the call is passed, not what the kernel reads.
+pairs for each of the 1050 tokens to find its own, **11962.6 µs**, where a per-token CSR of the same
+additions in the same ascending pair order — bit-identical (`exact` in the sweep) — is **172.8 µs**,
+69.24×. That is the next lever and it is a follow-up rather than this PR: it changes what the call is
+passed, not what the kernel reads. It has since shipped, as
+[the reduction page](deepseek_v4_1_flash_moe_reduce_csr.md); the grouping the microbench built in
+Python is built there **on the device, inside the launcher**, because one of the two call sites
+resolves its routing on the GPU and reading it back would be the D2H sync that path exists to avoid.
+
+The scan's 11962.6 µs is 0.50× the 23930 µs a call the in-model profile reports, i.e. about 1.9 s of
+the 3.733 s a chunk; the discrepancy is the microbench's idle card against the chunk's concurrency,
+the same direction as the 3.89× against 3.06× above.
 
 ## The change
 
@@ -229,7 +234,7 @@ loads have the L2 to themselves; in the chunk it shares the L2 with the sparse-a
 
 - **Bit-identity inside the microbench**: all eight computing variants of
   `bench_strip` — every `tile`/`strip` combination that does the arithmetic, in both the checkpoint
-  and the transposed layout — report `exact` against `bench_v0`, over a call with 1050 pairs across
+  and the transposed layout — report `exact` against `bench_v0`, over a call with 2100 pairs across
   61 slots, i.e. the real call's routing shape.
 - **Bit-identity in the model**: the same two arms, every chunk of the run to 32768 plus one,
   `max |diff|` on the full `[1, 129280]` last-position logits row, with the argmax compared as
@@ -250,9 +255,10 @@ loads have the L2 to themselves; in the chunk it shares the L2 with the sparse-a
 
 The chunk at 32768 is now dominated by terms this change does not touch: `Memcpy HtoD` 15.610 s and
 `aten::copy_` 16.742 s of a 56.36 s wall (57% between them), the sparse-attention kernel 8.079 s, and
-the reduction 3.626 s. Of those, the reduction has a measured 69.24× behind a host-side CSR, and the
-two copy terms are the same [H2D and `_stage` accounting](deepseek_v4_1_flash_device_experts.md) the
-earlier pages priced — a different lever on a different path, not a kernel to rewrite. Inside the
-weight reads that remain, the transposed arena is the 1.5× the shared-staging route is short of, at
-the cost of a one-time rewrite of the bank — and it is the last weight-read lever this page can
-name.
+the reduction 3.626 s. Of those, the reduction's CSR has since shipped as
+[its own page](deepseek_v4_1_flash_moe_reduce_csr.md) — built on the device rather than host-side as
+the microbench had it, which is the correction the second call site forced. The two copy terms are the
+same [H2D and `_stage` accounting](deepseek_v4_1_flash_device_experts.md) the earlier pages priced — a
+different lever on a different path, not a kernel to rewrite. Inside the weight reads that remain, the
+transposed arena is the 1.5× the shared-staging route is short of, at the cost of a one-time rewrite
+of the bank — and it is the last weight-read lever this page can name.
