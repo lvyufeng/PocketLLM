@@ -523,16 +523,33 @@ them — so the instrument is charged to the MoE and the rest of the table is cl
 
 `_take_buffer` is worth naming separately, because it is where this path used to lose its seconds:
 0.13 s over 8,658 calls, against **6.89 s of a 30.35 s class wall** before the rotation was made to
-advance only over rows that stage. 0.13 s is less than the barrier costs those same 8,658 calls, so
-the slot wait is now nothing rather than reduced. **The ship's tree reads the same row at the same
-15 µs a call on both deals** — 0.13–0.14 s over 9,048 on `sorted`, 0.03 s over 1,917 on `id` — which is
-a CUDA event flag check and not a transfer, and the counters are the staged set's because
-`_stage_misses` reaches `_take_buffer` only for a call that advances the slot. The method's own
-docstring still prices it the other way: **1.58 ms a call over 4,807 calls, 7.57 s of a 13.40 s class
-wall**, which is one row's H2D (1.65 ms) and so a wait that was never satisfied — the rotation
-`a34915d` describes and `149bbe0` fixed, and `149bbe0` is the commit that wrote the 7.57 s down in the
-same change. Three separate trees now read 15, 15 and 16 µs where it says 1,580. The docstring is the
-stale artifact here, not a finding.
+advance only over rows that stage. That 0.13 s is not a reading of the wait, and the tell is inside it:
+15 µs a call is less than the barrier those same calls pay, because `wrap` opens every tapped call with
+`torch.cuda.synchronize()`. A drain of both streams satisfies the very event `_take_buffer` is about to
+ask about, so a tap cannot see this wait at all — it charges the copy where it happens, `routed.upload`'s
+16.67 s over the same 8,658 calls, and leaves this row a flag check. **The ship's tree reads the same
+15 µs a call on both deals** — 0.13–0.14 s over 9,048 on `sorted`, 0.03 s over 1,917 on `id` — and the
+counters are the staged set's because `_stage_misses` reaches `_take_buffer` only for a call that
+advances the slot.
+
+**Measured without a drain in front of it, the wait is real and it is free.** A probe that wraps
+`_take_buffer` the same way but leaves the streams alone reads **1.79 ms a call — 15.82 s of a 36.01 s
+chunk on the two ranks that stage 9,711 and 9,781 rows over 8,847 and 8,906 slots** (1.45 ms and 7.33 s
+on the two that stage 5,048 over 5,049, so the wait follows the slots a rank takes), with **96% of the
+waits unsatisfied** and the worst one 420 ms. Its second arm skips the wait for the 0.16 µs a call the
+`query()` costs — arm B's waits total **5.5 ms over 34,635 calls against arm A's 63.28 s** — and the
+chunk comes out at **36.01 s against 35.66 s, 0.9903×, −0.35 s, inside a 3.31 s chunk-to-chunk spread**
+(`/tmp/take_buffer_abab.log`; eight chunks alternating arms at 32768..65536, `sorted`, pool 148, buffers
+2, and the taps-off chunk of the run above is 36.58 s, 1.6% from arm A's mean on a different prompt). So
+the 44% of its own wall clock the host spends in this one `synchronize` is a block it would otherwise
+spend enqueuing ahead, and with two buffers there is nowhere to enqueue to: removing the block moves the
+block, not the chunk. The docstring's per-call figure is one geometry of this same wait — **1.58 ms a
+call over 4,807 calls**, and the paragraph above prices the 17.93 MiB row it is behind at 1.75 ms — the
+docstring's own arithmetic reads 1.65 and lands on the same wait — and its conclusion
+is the part that does not survive: **"removing it is the next candidate" is refuted**, which is worth the
+measurement it cost, because the row reads as 56.5% of a class wall and is worth 1% of one. Arm B is a
+ceiling and not a proposal — skipping the wait lets a slot be overwritten while the copy that read it is
+still in flight, and all four ranks stayed finite on it, which is not the check a race needs.
 
 **Attention is 22.6% of a chunk and the score pass is most of it.** `attn.sparse` is 8.05 s over 40
 calls — 201 ms a layer, 14.1% of the quiet chunk — and 40 calls makes it a measurement. The rest of
@@ -1314,6 +1331,25 @@ torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_profile.py \
 `DEEPSEEK_V41_EXPERT_DEAL` is read at load time and defaults to `id`, so the first line and the sweep
 above are the same configuration and the second is the control that makes the 56.96 → 36.58 s pair a
 tree measurement rather than a tree-plus-deal one.
+
+The slot wait is a separate run, because the phase tap cannot see it: the tap's own preamble drains the
+device, which satisfies the event `_take_buffer` is about to ask about, and the row it reads as a flag
+check is the tap's price rather than the wait's. This one wraps the method the same way, queries each
+event before the timed window, and leaves the streams alone in an alternating A/B whose B arm skips the
+wait entirely:
+
+```bash
+# /tmp/take_buffer_abab.log: A is the shipped wait, B is the same call with it skipped.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 DEEPSEEK_V41_EXPERT_DEAL=sorted \
+torchrun --nproc_per_node=4 /tmp/probe_v41_take_buffer_abab.py \
+    --at 32768 --chunk 4096 --replicates 4 --pool-rows 148 --buffers 2 --threads 22
+```
+
+`--at` is where the arms start, not a length: the run prefills there in `--prefill-chunk` widths and
+then measures `2 × --replicates` chunks forward from it, `--max-seq-len` is derived from that end, and
+the arms alternate rather than block so that neither one gets the cheap half of the position range.
+Arm B's worst wait is the `query()` and its wall is the reading: the wait is 96% unsatisfied and worth
+0.9903×.
 
 The driver is the code, not the probe — this is the call the 256K number above is a forward of:
 

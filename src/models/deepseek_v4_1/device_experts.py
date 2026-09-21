@@ -1096,9 +1096,17 @@ class DeviceRoutedExperts(RoutedExperts):
         What the wait still does is bound how far the host runs ahead of the cards. What it costs is
         measured, and it is the largest single item in a prefill: with the copies gone from `_stage`,
         a 512-token leg's rank-0 class wall is 13.40 s and **7.57 s of it -- 56.5%, 1.58 ms a call
-        over 4807 calls -- is this one `synchronize`**. Removing it is the next candidate and it is
-        not in this change: the two stream orderings above are what would have to carry the
-        correctness, and that is an argument to measure rather than to write.
+        over 4807 calls -- is this one `synchronize`**. That is the block and not a lever. The same
+        wait on the chunked path -- a 4096-token chunk in the 32768..65536 range, the ranks that stage
+        the most rows -- is **1.79 ms a call, 15.8 s of a 36.01 s chunk, and 96% of the waits are
+        unsatisfied**, and an A/B that skips it entirely, 5.5 ms of waits against 63.28 s over the
+        same calls, moves the chunk by **-0.35 s inside a 3.31 s chunk-to-chunk spread** (0.9903x,
+        `/tmp/take_buffer_abab.log`). The host is the producer and this is its throttle: with two
+        buffers there is nowhere to run ahead to, so removing the block moves the block and not the
+        chunk. "Removing it is the next candidate" is therefore the one claim here that a measurement
+        has retired. Note also that a phase tap cannot see this row at all -- its own preamble calls
+        `torch.cuda.synchronize()`, which satisfies the event before it is asked about, which is why
+        the chunk profile's `routed.buffer` row reads 15 us a call where this paragraph reads 1.58 ms.
 
         "A whole upload" and not "two rows", which is the distinction `_stage_misses` pays for: the
         rotation is advanced by the callers that upload, not by every row, so that the guarantee is
