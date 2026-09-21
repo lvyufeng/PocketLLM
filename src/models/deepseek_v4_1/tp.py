@@ -60,12 +60,32 @@ from typing import Any, Callable
 
 import torch
 
-__all__ = ["ShardPlan", "attach_tp", "indexer_row_split", "make_all_gather", "make_all_reduce", "split_names"]
+__all__ = ["REDUCE_BITS_ENV", "ShardPlan", "attach_tp", "indexer_row_split", "make_all_gather",
+           "make_all_reduce", "reduce_bits", "split_names"]
 
 
 # The indexer's `wq_b` is the one parameter whose cut depends on *how* the indexer is parallel, not
 # just on the world: see `indexer_row_split`.
 INDEXER_ROW_SPLIT_ENV = "DEEPSEEK_V41_INDEXER_ROW_SPLIT"
+
+# The wire dtype of an activation collective. `32` is the shipped fp32; `16` sends the same sum in
+# half the bytes; `0` sends nothing at all. **`0` is a diagnostic and not a configuration** -- it
+# returns each rank's partial unscaled, so the answer is wrong and only the timing is worth reading,
+# the same way `INDEXER_CAND_SKIP_TEST`'s test branch is. See `make_all_reduce`.
+REDUCE_BITS_ENV = "DEEPSEEK_V41_REDUCE_BITS"
+
+
+def reduce_bits() -> int:
+    """`REDUCE_BITS_ENV` as one of 32, 16 or 0; anything else is 32, the shipped wire.
+
+    Read per collective rather than once in `make_all_reduce`, for `INDEXER_CAND_SKIP_TEST`'s reason:
+    a probe can then switch arms inside one run and the second arm pays for a `getenv` instead of for
+    a re-load. A capture bakes whichever value was in force when the graph was recorded -- the wire
+    dtype is part of the recorded body -- so a decode graph and a prefill step can disagree across a
+    change of this variable.
+    """
+    raw = os.environ.get(REDUCE_BITS_ENV, "32").strip()
+    return int(raw) if raw in ("0", "16") else 32
 
 
 def indexer_row_split(world: int) -> bool:
@@ -120,18 +140,52 @@ def make_all_reduce(world: int):
     at 5.8 GB/s -- which over a chunk's tile counts is 0.469 s at 32768 and 2.001 s at 262144 of
     fp32 wire against 0.267 and 1.073 in half the bytes. Halving it is closed on the picked ids
     rather than on size: NCCL sums in the wire dtype, the score's O(600) values carry 8 mantissa bits
-    there, and `INDEXER_REDUCE_BITS=16` moves the selection on all eight indexer layers against a
-    baseline that reproduces to the digit. If the dtype moves at all it should move to fp16 -- the
+    there, and the fp16 arm of that experiment moves the selection on all eight indexer layers against
+    a baseline that reproduces to the digit. If the dtype moves at all it should move to fp16 -- the
     same 2 bytes with 10 mantissa bits -- which is a different function and so its own parity run.
     Measurements and both gates: `docs/performance/deepseek_v4_1_flash_chunked_prefill.md`, "Two
     levers, and what gates each".
+
+    **The two messages at the tail of a layer are not that tensor, and they are the ones that pay.**
+    `Attention.forward`'s `wo_b` and `MoE.forward`'s join each carry one `[1, 4096, 5120]` fp32 sum,
+    which is 80 MiB, and a 4096-token chunk sends 80 of them -- 6.4 GiB of wire, where the indexer's
+    1066 collectives together send 1.4. `REDUCE_BITS_ENV` is what separates the two: a caller that
+    passes `discrete=True` -- the two score sites, whose result a top-k reads and a rounding in which
+    is a different selection -- keeps the fp32 path above whatever the variable says, and every other
+    call site follows it. `reduce_bits`'s docstring names the third setting, which is a control column
+    rather than a configuration.
+
+    `/tmp/probe_allreduce_rate.py` prices those messages alone on this fabric, and the curve is flat
+    at ~5.7 GiB/s from 1 MiB to 80 MiB, so on this wire a byte is a byte: 80 MiB fp32 13.582 ms, the
+    same `4096x5120` in bf16 7.080 -- **exactly half** -- 32 MiB fp32 5.460 ms, 1 MiB fp32 0.193 ms,
+    and 11.6 us of event pair with nothing between them. Over one 4096-token chunk that is 1.087 s
+    for the 80 activation messages, 0.245 s for the indexer's 48 prefix tiles and 0.198 s for its
+    1024 candidate tiles: **1.53 s in all**, against 5.96 s of
+    `ncclDevKernel_AllReduce_Sum_f32_RING_LL` in the chunk's own profile
+    (`/tmp/chunk_nccl_attr.log`, 1152 calls, 26.04 s of card timeline). So the fabric's own price is a
+    quarter of what the row costs in situ, and that gap is the question `REDUCE_BITS_ENV=16` answers:
+    if the row follows the bytes it is wire and the halving is worth up to 2.1 s of a 26.0 s chunk,
+    and if it does not then the other 4.4 s is the ring waiting for the last rank to arrive and no
+    message in the model is worth shrinking.
     """
     if world <= 1:
         return None
 
-    def reduce(tensor: torch.Tensor) -> torch.Tensor:
+    def reduce(tensor: torch.Tensor, *, discrete: bool = False) -> torch.Tensor:
+        """Sum `tensor` across the ranks, in the wire dtype `reduce_bits` names.
+
+        `discrete` marks the message whose result a top-k selects on -- the indexer's two score sites
+        -- and pins it to the fp32 path whatever the variable says.
+        """
         import torch.distributed as dist
 
+        bits = 32 if discrete else reduce_bits()
+        if bits == 0:  # the control column: no message, so a wrong answer and a true floor
+            return tensor
+        if bits == 16:
+            narrow = tensor.to(torch.float16).contiguous()
+            dist.all_reduce(narrow, op=dist.ReduceOp.SUM)
+            return narrow.to(tensor.dtype)
         wide = tensor.float().contiguous()
         dist.all_reduce(wide, op=dist.ReduceOp.SUM)
         return wide.to(tensor.dtype)
