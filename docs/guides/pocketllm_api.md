@@ -106,6 +106,18 @@ python -m pocketllm serve \
   --tensor-parallel-size 4 \
   --max-model-len 65536 \
   --port 8000
+
+# DeepSeek-V4.1-Flash, TP4, one request at a time
+python -m pocketllm serve \
+  --model /mnt/data3/DeepSeek-V4.1-Flash \
+  --backend v41 \
+  --tensor-parallel-size 4 \
+  --max-model-len 2048 \
+  --port 8000 \
+  --backend-option expert_pool_rows=288 \
+  --backend-option prefill_chunk=4096 \
+  --backend-option decode_graphs=true \
+  --backend-option threads=22
 ``` 
 
 For `tensor_parallel_size > 1`, the CLI supervises local tensor-parallel ranks by default. It creates a
@@ -120,7 +132,9 @@ placement. A caller-provided rendezvous directory is treated as a parent for a f
 directory and is never removed by PocketLLM.
 
 The built-in supervisor currently works with the Torch backend by reusing its existing NCCL/Gloo
-worker loop. The Python C++ Qwen adapter does not yet expose a native worker entry point, so
+worker loop, and with the V4.1 adapter, which builds its own ranks the same way — rank 0 loads
+inside the rendezvous window, because a V4.1 backend handed back unloaded would find the group gone.
+The Python C++ Qwen adapter does not yet expose a native worker entry point, so
 `backend="cpp"` must use the legacy `pocketllm_engine` launcher or opt out with
 `--no-tensor-parallel-supervisor`. Existing `torchrun` and manual rank launchers remain compatible
 through that opt-out. This process supervisor is not a scheduler and does not provide continuous
@@ -468,9 +482,20 @@ is a Qwen3.5 safetensors model; anything else, including GGUF, stays on Torch. A
 `backend="cpp"` for an unsupported checkpoint raises `UnsupportedFeatureError` before any CUDA
 initialization instead of failing deep inside the native loader.
 
+`backend="v41"` is the third adapter and the first thing `auto` tests for: a checkpoint whose config
+says `deepseek_v41` — at the root, or `deepseek_v41_text` under `text_config`, which is where the
+released V4.1 file keeps it — goes to it before the native adapter is even considered, because the
+native engine has no factory for that architecture. It runs the `src/models/deepseek_v4_1` PyTorch
+runtime over the checkpoint's safetensors shards, one process a rank under `--tensor-parallel-size`,
+and it reports `supports_batch=False`: one mutable KV state, serialized at the backend boundary.
+`--backend v41` on a GGUF checkpoint, or on a config that is not V4.1, raises
+`UnsupportedFeatureError` before anything loads.
+
 Capabilities reported by the C++ adapter follow the linked device backend. An Ascend build advertises
 only the speculative methods it implements, since the external DSpark and DFlash2 drafters are
-CUDA-only.
+CUDA-only. The V4.1 adapter similarly advertises no logprobs and no prefix caching, and its
+`cancellation` detail names the mechanism rather than promising a latency: a cancellation is a
+per-step collective between the ranks and cannot interrupt a prompt's forward.
 
 ## Request normalization
 
@@ -493,6 +518,18 @@ The template receives normalized tool definitions and a private compatibility co
 arguments; public request metadata is never mutated. Template-specific reasoning names are mapped to
 the vocabulary accepted by the checkpoint (for example, `high`/`max` map to Qwen's `xhigh`).
 Unsupported model-specific template features remain the responsibility of the selected backend.
+
+**DeepSeek-V4.1-Flash is the case that contract does not cover, because its tokenizer has no
+template at all**: the format is a Python module the release ships inside the checkpoint, at
+`<checkpoint>/encoding/encoding.py`. `backend="v41"` therefore renders a chat request by importing
+that module by path and calling its own `encode_messages`, rather than by falling back to a generic
+renderer the model was never trained on. What this repository wraps around it is the reasoning-effort
+vocabulary (`1`–`100`, or `minimal`/`medium`/`low`/`high`/`max`) and a tolerant `</think>` split for
+a reply that stops mid-reasoning; tool definitions ride along on the first system message, where the
+control plane already put them. A checkpoint without that module, or an effort the encoder will not
+render, is refused with `ConfigurationError` and a pointer to `/v1/completions`, so a caller can send
+a prompt it rendered itself. `/v1/completions` on this backend passes the prompt through the
+tokenizer untouched, which is also what the launcher does with `--prompt`.
 
 A backend that separates reasoning from content can set `reasoning_content` and `tool_calls` in its
 result or event metadata; those are forwarded to the response and to streamed deltas. A backend that

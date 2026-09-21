@@ -287,6 +287,15 @@ def _decode_graphs(
             pos.advance()
 
         return result
+    except BaseException:
+        # The loop can be left by a callback raising -- the serving adapter's cancellation and
+        # stop-string paths both unwind from `on_token` -- and a driver no caller received is one
+        # nobody can release. Left installed it is not inert: `Block.forward` hands *every* forward
+        # to `block.decode_graph`, whose sink the first real pass allocated one row wide, so the
+        # next prompt dies on the sink's own `copy_` with "output with shape [1, 1, 4, 5120] doesn't
+        # match the broadcast shape [1, 1364, 4, 5120]". A run that unwinds installs nothing.
+        driver.release()
+        raise
     finally:
         result.decode_seconds = time.perf_counter() - started
 

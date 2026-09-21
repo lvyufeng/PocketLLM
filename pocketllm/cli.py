@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve_parser = subparsers.add_parser("serve", help="start the OpenAI-compatible server")
     serve_parser.add_argument("--model", required=True, help="checkpoint directory or model path")
-    serve_parser.add_argument("--backend", choices=["auto", "torch", "cpp"], default="auto")
+    serve_parser.add_argument("--backend", choices=["auto", "torch", "cpp", "v41"], default="auto")
     serve_parser.add_argument("--tokenizer-path")
     serve_parser.add_argument("--config-path")
     serve_parser.add_argument("--model-format", choices=["auto", "safetensors", "gguf"], default="auto")
@@ -191,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
                 "use --no-tensor-parallel-supervisor and launch ranks through the "
                 "native binary instead"
             )
+        # Every other adapter here is a Python one and takes its rank from the
+        # rendezvous the supervisor publishes, so it needs no special case: the V4.1
+        # adapter in particular joins the group and loads inside the child, which is
+        # what the readiness marker below the spawn is waiting for.
         supervisor = TensorParallelSupervisor(
             command=[sys.executable, "-m", "pocketllm", *_supervised_command(argv or sys.argv[1:])],
             world_size=world,
