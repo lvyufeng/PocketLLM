@@ -247,6 +247,12 @@ def test_csr_reduce_matches_the_scan_it_replaced():
     one-token reference, and at a token count large enough to reach the CSR the elementwise
     relative bound there is dominated by swiglu cancellation in near-zero outputs, not by the
     reduction.
+
+    A third arm takes the CSR arm's own construction of `row_ptr` the long way round --
+    `DEEPSEEK_MOE_CSR_BINCOUNT=1`, `at::bincount` and a `cumsum` in place of the `searchsorted` and
+    the closing `fill_` -- because that is the half of the block that has no other check on it. The
+    switch is a bisect knob in the launcher's C++, so a divergence between the two constructions
+    has nowhere else to show up.
     """
     import os
 
@@ -261,12 +267,19 @@ def test_csr_reduce_matches_the_scan_it_replaced():
     try:
         os.environ["DEEPSEEK_MOE_CSR_REDUCE"] = "1"
         csr = _run_multi(args).clone()
+        os.environ["DEEPSEEK_MOE_CSR_BINCOUNT"] = "1"
+        bincount = _run_multi(args).clone()
+        os.environ.pop("DEEPSEEK_MOE_CSR_BINCOUNT", None)
         os.environ["DEEPSEEK_MOE_CSR_REDUCE"] = "0"
         scan = _run_multi(args).clone()
     finally:
+        os.environ.pop("DEEPSEEK_MOE_CSR_BINCOUNT", None)
         os.environ.pop("DEEPSEEK_MOE_CSR_REDUCE", None)
         os.environ.pop("DEEPSEEK_MOE_DETERMINISTIC_REDUCE", None)
 
+    assert torch.equal(csr, bincount), (
+        f"searchsorted and bincount build different row_ptr at tokens={tokens}: "
+        f"max|diff|={(csr - bincount).abs().max().item():.3e}")
     assert torch.equal(csr, scan), (
         f"CSR reduce and all-pairs scan disagree at tokens={tokens}: "
         f"max|diff|={(csr - scan).abs().max().item():.3e}")

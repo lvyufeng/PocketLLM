@@ -24,15 +24,18 @@ resolve past that.
 | --- | --- |
 | Model | DeepSeek-V4.1-Flash, released checkpoint, fp8 dense + packed-fp4 experts |
 | Checkpoint | `/mnt/data3/DeepSeek-V4.1-Flash`, resident bank attached from the 457.78 GiB `/dev/shm` segment |
-| Commit | `perf/v41-moe-reduce-csr` on `perf/v41-moe-multi-coalesced-weights` (`0d5a4ec`, which is master at `a533a0a` plus #297) — this PR is the uncommitted working tree on that base, and the diffs quoted below are against `0d5a4ec` |
+| Commit | two changes, one page. The CSR reduce shipped as `perf/v41-moe-reduce-csr` on `perf/v41-moe-multi-coalesced-weights` (`0d5a4ec`, which is master at `a533a0a` plus #297), merged as PR #298 / `b394ddb`; the `bincount` substitution on that block shipped separately as `perf/moe-csr-device-counts` on master at `fbd139f`, and the sections from [The build's last host synchronization](#the-builds-last-host-synchronization) on are its record |
 | The two arms | **one** binary, `DEEPSEEK_MOE_CSR_REDUCE=1` against `DEEPSEEK_MOE_CSR_REDUCE=0`. `env_int_default` reads the variable per call, so a single sitting can take both arms with the page cache, the pool's fill and the clock held constant, and no binary is swapped between them. Build `cuda_kernel.cpython-311-x86_64-linux-gnu.so`, 9494904 bytes, md5 `4f14b337b7c064b2db042b4dda283cd6`, byte-identical in `/tmp/pr_b/build/extensions/` where the run loads it, in this repository's `build/extensions/` and at the repository root (against #297's two-binary A/B, 9416528 / `37aba9d7c6e932d026b1dcab2f00dd92` before and 9490256 / `0830e3d7bb657c61fd3e683b7104a42a` after) |
 | Configuration | TP4, one process a card, `torchrun --nproc_per_node=4`, `--threads 22`, `--pool-rows 148 --buffers 2`, `DEEPSEEK_V41_RESIDENT_EXPERTS=1`, resident bank on |
+| The third arm | [The build's last host synchronization](#the-builds-last-host-synchronization) is a second change to the same block, and it is a **third** switch on it: `DEEPSEEK_MOE_CSR_BINCOUNT=1` puts `at::bincount` back in place of the `searchsorted`. Build `cuda_kernel.cpython-311-x86_64-linux-gnu.so` 9503488 bytes, md5 `5361aac05f6a77516157326624d5ede3` in this repository's `build/extensions/` and `09949222e6a448e629db8de491b538a0` in `/tmp/prefill_csr/build/extensions/`, where the model-level sessions load it — same source and same size, different md5 because the build path is compiled into the object |
 | Workload | `--at 32768 --chunk 4096 --max-seq-len 53248`: prefill to 32768 eight chunks at a time, then profile one 4096-token chunk at 32768 |
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each, `GPU0-GPU1` PHB and `GPU2-GPU3` NV2, cross-pairs SYS |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env, `CUDA_HOME=/usr/local/cuda-12.4`, `TORCH_CUDA_ARCH_LIST=7.5`, `POCKETLLM_BUILD_CPP=0` |
 | Probes | `/tmp/probe_csr_ab.py` (four profiled chunks, walking the position forward with the arms) and `/tmp/probe_csr_ab_fixed.py` (every arm rewound to **one** position); `/tmp/csr_build_cost.py` and `/tmp/csr_build_ops.py` price the build off the model |
 | Microbench | `/tmp/run_moe_multi_bench.py` driving `/tmp/moe_multi_bench.cu` at the measured per-call geometry |
+| Parity | `/tmp/pr_b_parity.py` at `--at 32768 --chunk 4096 --pool-rows 148`, both arms under the same configuration as the probes, nine positions a rank; `/tmp/bench_issue_kernel.py` carries the three-way parity on random routing for the `bincount` substitution |
+| The chunk, for the substitution | `/tmp/probe_v41_csr_abab.py --at 32768 --chunk 4096` on a mirrored two-arm period, 16 chunks an arm, two sittings (`/tmp/csr_abab.log`, `/tmp/csr_abab_taps.log`), against the taps-off comparator `/tmp/chunk_profile_nobarrier.log` at the same geometry |
 | Parity | `/tmp/pr_b_parity.py` at `--at 32768 --chunk 4096 --pool-rows 148`, both arms under the same configuration as the probes, nine positions a rank |
 
 ## What a scan costs, in the shape the routing has
@@ -74,14 +77,30 @@ by row, in ascending pair order within each group, is four lines in the launcher
 ```cpp
 auto sorted = at::sort(slot_tokens, /*stable=*/true, /*dim=*/-1, /*descending=*/false);
 auto row_pair = std::get<1>(sorted).to(torch::kInt32);
-auto counts = at::bincount(slot_tokens.to(torch::kLong), {}, tokens);
 auto row_ptr = at::zeros({tokens + 1}, slot_tokens.options());
-row_ptr.narrow(0, 1, tokens).copy_(counts.cumsum(0, torch::kInt32));
+row_ptr.narrow(0, 0, tokens).copy_(at::searchsorted(
+    std::get<0>(sorted), at::arange(static_cast<int64_t>(tokens), slot_tokens.options()),
+    /*out_int32=*/true, /*right=*/false));
+row_ptr.narrow(0, tokens, 1).fill_(pairs);
 ```
 
 `row_pair` is the pairs in token order and `row_ptr` that order's exclusive prefix sum, so
 `moe_multi_reduce_csr_kernel` walks `[row_ptr[token], row_ptr[token + 1])` — the row's own pairs, no
-test at all.
+test at all. `searchsorted`'s leftmost insertion index of a token into the sorted tokens *is* that
+token's group start, i.e. the counts' exclusive prefix sum; the `fill_(pairs)` closes the last group,
+because `pairs` pairs cover `tokens` tokens and every one of them names a token.
+
+The four lines were five in the first version, and the op that left was `at::bincount`:
+
+```cpp
+auto counts = at::bincount(slot_tokens.to(torch::kLong), {}, tokens);
+row_ptr.narrow(0, 1, tokens).copy_(counts.cumsum(0, torch::kInt32));
+```
+
+It is an ATen tensor op and it is written as one, but on CUDA it is **not a device op**, and in a
+launcher that both call sites reach with `tokens` and `pairs` already resolved it was the only thing
+in the block that stopped the host. [The section below](#the-builds-last-host-synchronization) prices
+it; `DEEPSEEK_MOE_CSR_BINCOUNT=1` puts it back in process.
 
 **The stable sort is the correctness argument, not an implementation detail.** `slot_tokens` is
 already in ascending pair order, and a stable sort keeps each token's pairs in the order they
@@ -112,8 +131,8 @@ A launcher that took the first caller's convenience would have silently added a 
 arm against **62,650** in the scan arm: the path borrows an existing call rather than adding one,
 because `slot_tokens` is already `int32` and `.to()` is a no-op there, and `row_ptr`'s allocation is
 one `aten::zeros` the chunk already makes for `y`. The kernels the CSR arm adds over the scan arm are
-exactly the stable sort and the two ~1 KB elementwise ops — `bincount`'s and `cumsum`'s outputs are
-`tokens`-sized.
+exactly the stable sort and the two ~1 KB elementwise ops whose outputs are `tokens`-sized —
+`searchsorted`'s indices and the `fill_`, into the `bincount`'s and `cumsum`'s places.
 
 ## The build's price
 
@@ -162,6 +181,125 @@ as the weight-staging page's 3.89× off the model against 3.06× in it. In the s
 has **10** `aten::sort` calls at ~309 µs — the harness's own, not the launcher's — and no `bincount` or
 `cumsum` at all, which is what makes the five rows above attributable to this change rather than to
 the chunk.
+
+The profiler's host column is what a *profiler* sees, and for one row above that is not the whole
+cost. `aten::bincount`'s 37.77 µs is ATen's own CPU time for the op; the op's blocking device-to-host
+reads are not a kernel and the profiler's host column stops at the launch. The next section is about
+that difference, and it is the reason the launcher no longer calls `at::bincount`.
+
+## The build's last host synchronization
+
+Every op in the block above is an ATen tensor op, and the first version of it read as though that were
+the same as being a *device* op. `at::bincount` is not one. In
+`aten/src/ATen/native/cuda/SummaryOps.cu`, `_bincount_cuda` computes
+
+```cpp
+const int64_t nbins = std::max(self.max().item<input_t>() + (int64_t)1, minlength);
+```
+
+and, ahead of that, bounds-checks `*self.min().cpu().const_data_ptr<input_t>() < 0`. `item()` and
+`.cpu()` are both blocking device-to-host reads, so **the op drains the stream twice** — 80 times over
+a chunk's 40 calls — for an answer the stable sort on the line above already holds. That is the one
+thing this block's comment was written to say it does not do ("reading it back to build the CSR in
+Python would be the D2H sync this path exists to avoid"), and it was doing it in C++ instead of
+Python.
+
+`searchsorted` gives the same boundaries with no host read: the leftmost insertion index of a token
+into the sorted tokens *is* that token's group start, so it is the counts' exclusive prefix sum.
+`row_ptr[tokens]` cannot be read off that result — it would come back `0` — and is filled with
+`pairs`, which is exact rather than a clamp: `pairs` pairs cover `tokens` tokens and every one of them
+names a token, so the counts sum to `pairs`.
+
+### What the substitution is worth
+
+`/tmp/bench_issue_kernel.py` drives `moe_multi_token_fp4_forward` at the call's own geometry — 4096
+tokens, `dim` 5120, `inter_dim` 2304, 6144 pairs over 100 rows of a 148-row arena — with nothing else
+on the card, and measures every arm twice: with an empty queue, and with a queue of known width laid
+in front of the call (4 fp32 `4096²` matmuls on the same stream, ~46 ms). A sync inside the call has
+to absorb that queue, so **an arm whose host time grows by the stuffer's width is an arm with a sync
+in it**. `--rounds 30`, seconds are ms a call:
+
+| arm | host | wall | host, stuffed | wall, stuffed |
+| --- | --- | --- | --- | --- |
+| shipped (det=1, csr=1) | **0.32** | 42.82 | **0.34** | 89.25 |
+| as `bincount` (csr=1) | **43.31** | 43.72 | **89.26** | 89.85 |
+| scan reduce (csr=0) | 0.16 | 177.70 | 0.13 | 228.84 |
+| atomic (det=0) | 0.09 | 42.83 | 0.08 | 90.71 |
+| shipped again | 0.31 | 43.66 | 0.32 | 91.60 |
+
+The host column is the whole experiment. **42.4 ms → 0.32 ms a call, ~132×, and the shipped arm does
+not move when the stuffer is laid in front of it** (0.32 → 0.34), where the `bincount` arm grows by
+the stuffer's own width (43.31 → 89.26 against a ~46 ms stuffer; its stuffed host time lands on its
+stuffed wall, which is a stream drained to its end). The `wall` columns say the device side of the
+substitution is free: 42.82 against the atomic path's 42.83 and the construction it replaces at
+43.72. The A B C D A order puts the machine's drift on the repeat, which reads 0.31 against the
+opening 0.32. The `scan` arm is the table's outlier at 177.70 because it carries the scan reduce; that
+is the price the [first section](#what-a-scan-costs-in-the-shape-the-routing-has) already put at
+69.24×, not a term in this comparison, and it is why the scan is not in the model-level rotation
+below.
+
+The mechanism is also checked the other way, on the kernel's own output: on **random** routing it
+prints `bit-identical` for both the `bincount` construction and the `scan` against the new one, so the
+three are the same float additions in the same order and the substitution changed no value.
+
+### The chunk
+
+1.70 s over a 4096-token chunk's 40 calls is below what four separate processes resolve — the
+taps-off comparator for this geometry is 26.22–26.59 s with a 2.1–2.3 s spread across warm-up chunks
+(`/tmp/chunk_profile_nobarrier.log`). So the arms alternate **inside one load**, on the machine's own
+drift, which is what a lever this size needs:
+
+```
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 V41_TREE=<tree> torchrun --nproc_per_node=4 \
+    /tmp/probe_v41_csr_abab.py --at 32768 --chunk 4096
+```
+
+`/tmp/probe_v41_csr_abab.py` binds `_issue_chunk` and `forward` with `perf_counter` and nothing else —
+**no `synchronize` in the instrument**, which is the very thing the arms differ in — and walks a
+**mirrored period**: the arms, then the arms reversed, so that each arm's mean position inside a
+period is identical (a,b,b,a for two arms; a,b,c,c,b,a for three). The context grows across the run,
+so a chunk late in the run is slower than one early in it; a plain a,b,a,b rotation leaves each arm's
+mean position off by half a chunk and books that trend as an arm difference, where the mirror cancels
+it exactly. Sixteen chunks an arm, rank 0, two independent sittings:
+
+| sitting | arm | wall, s a chunk (four positions) | mean | `_issue_chunk` | `forward` |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `device` | 26.75 27.02 27.56 28.52 (×4) | **27.46** | **0.74 s** | 17.64 s |
+| 1 | as `bincount` | 27.03 26.98 28.41 28.49 (×4) | 27.73 | **4.61 s** | 17.52 s |
+| 2 | `device` | 26.91 26.78 27.65 27.71 (×4) | **27.26** | **0.76 s** | 17.69 s |
+| 2 | as `bincount` | 26.80 26.67 27.68 27.97 (×4) | 27.28 | **4.66 s** | 17.62 s |
+
+**The `_issue_chunk` column is the mechanism; the wall column is not the price.** 0.74 s against
+4.61 s over 40 calls is 3.87 s a chunk of host stall removed, and it reproduces (0.76 against 4.66).
+The wall moves by **+0.27 s of 26.75 in the first sitting and +0.02 s in the second** — against the
+1.70 s the bench predicts — and both walls are position-dominated: each arm repeats its four position
+values and climbs ~1.5 s across the run, which is exactly what the mirror cancels, so ±0.15 s is this
+instrument's floor. Two sittings of the same design landing 0.25 s apart is the effect being zero at
+this geometry.
+
+The second sitting also taps the sub-phases of `forward`, to ask whether the seconds *moved* rather
+than left (rank 0, seconds a chunk, mean of 16):
+
+| arm | `_route_ids` | `_upload` | `_issue_chunk` | the three | `forward` |
+| --- | --- | --- | --- | --- | --- |
+| `device` | 4.68 | 0.60 | 0.76 | 6.03 | 17.69 |
+| as `bincount` | 4.69 | 0.59 | 4.66 | 9.93 | 17.62 |
+
+The three rows account for 3.90 s of the difference, and `_route_ids` — the launcher's other sync, and
+the largest single host wait in the chunk at 4.68 s — is **identical across the arms** (4.69), so the
+`bincount` sync was not pre-paying that wait. `forward`'s own total is 0.07 s *lower* on the arm with
+the stall in it, so nothing inside the MoE absorbed it either: the 3.9 s appears in one phase, does
+not appear as a compensating row anywhere, and does not appear at the wall. Read against the
+no-barrier profile of the same geometry — 95.1% of the chunk inside the host's calls, 1.28 s
+device-only, per rank — the only reading that survives its own arithmetic is that at TP4 the chunk's
+wall is set by the collective path's convergence and not by one rank's serial host chain, so a
+rank-local stall of 4 s in a 27 s chunk can sit in slack the collectives already have. The honest
+statement of the change is therefore the narrow one: **it removes two stream drains from the batched
+call's default path, measured in the call and in the phase, and it does not buy wall time at
+32768/4096** (it removes a rank-*asymmetric* host stall, which is worth more at a geometry where the
+ranks' host chains are what converge). What it is worth is what a synchronization is worth
+structurally: it is one fewer capture-hostile site in the launcher, and a drained stream is a
+prerequisite for any overlap that would put the fp4 GEMM behind the host's next rank of work.
 
 ## The in-model A/B
 
