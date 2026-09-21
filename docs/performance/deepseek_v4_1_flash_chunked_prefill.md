@@ -343,6 +343,14 @@ times **one** 4096-token chunk with a host `synchronize()` around every phase of
 taps, 346,042 calls on rank 0 — and reports all four ranks, because the layer split means they are not
 the same measurement.
 
+**That run is the branch before the three prefill kernels.** It is `/tmp/chunk_profile_p148.log`,
+2026-09-19 17:57 UTC, on `5e7ff05`'s line: `7102c19` (`attn.sparse`), `aa83816` and `b394ddb` (the
+MoE's weights and its reduce) merge the next morning at 06:48–06:49 UTC, and the `sorted` deal it runs
+under stops being the default at `38edf9b` that evening. Every number read off the table below is that
+tree's; [the row that grows with context](#the-one-row-that-grows-with-context) says the same of its
+own pair, and until this paragraph it was the only place on the page that said so. What the same probe
+reads at the same arguments on the tree that ships is below the table.
+
 A barrier is not a neutral instrument, so the run measures its own price: the chunk after the
 instrumented one is the same width at the same cache size with the taps off.
 
@@ -356,6 +364,47 @@ instrumented one is the same width at the same cache size with the taps off.
 what says the chunk under the instrument is the chunk the width curve priced. The quiet chunk is one
 chunk further into the prompt than the instrumented one, so it carries about 0.1 s of context the
 other does not; over 4096 tokens that is inside the 8.58 s being measured and not a second finding.
+
+**And this is that same chunk on the tree that ships.** The probe was re-run at the same arguments —
+`--at 32768 --chunk 4096`, pool 148, the same eight warm-up chunks and the same
+instrumented-then-taps-off pair — twice: once with the deal held at `sorted`, so that column is
+comparable to the one above, and once under the `id` deal the ship uses.
+
+| one 4096-token chunk at 32768 tokens of context | `5e7ff05` (the table below) | `master`, `sorted` | `master`, `id` |
+| --- | ---: | ---: | ---: |
+| instrumented | 65.54 s | 46.72 s | 32.08 s |
+| taps off | 56.96 s | 36.58 s | 24.18 s |
+| what the taps cost | 8.58 s | 10.14 s | 7.89 s |
+| staged rows, r0 / r1 / r2 / r3 | 9,509 / 9,516 / 5,029 / 5,020 | 9,861 / 9,925 / 5,055 / 5,062 | 2,184 / 2,129 / 2,179 / 2,156 |
+| the five phases, of the instrumented wall | 99.0% | 99.2% | 98.9% |
+| the rows inside `routed.*`, of the taps' price | 688.8% | 471.7% | 250.6% |
+| the 22 taps' calls, rank 0 | 346,042 | 346,778 | 332,246 |
+
+**The same chunk, the same arguments, the same deal, two days later, is 36.58 s quiet rather than
+56.96.** The three prefill kernels are under that, and so is everything else that landed between that
+run and this one — twenty-five commits on `src/` — so the 1.56x is the tree's rather than theirs to
+claim; the rows that moved say which part of it is theirs. `attn.sparse`
+8.05 → 1.91 s is `7102c19`; `moe.shared` 0.39 → 0.08 and `moe.routed` 47.36 / 47.42 / 31.93 / 32.49 →
+35.47 / 36.16 / 24.35 / 24.15 are `aa83816` and `b394ddb`. Read against each tree's own quiet chunk
+the two shares invert: **attention is 22.6% of the old chunk and 13.9% of the new one, the MoE 73.5%
+and 80.6%.** The instrument's own price moves the other way, 8.58 → 10.14 s, which restates the rule
+below rather than breaking it — the `routed.*` rows are upper bounds on both trees and the attention
+and small-op rows are not.
+
+**The `id` column is the one that ships, and it is a different chunk rather than a faster one.** The
+deal takes the staged set from 2.31 rows a token down to 0.53, so the fourth row of the table is 2,184
+staged rows rather than 9,861 and the expert H2D falls with it. Against its own 24.18 s quiet chunk
+its rows are `routed.issue` 4.74 s (19.6%) over 40 calls, `routed.upload` 3.84 s (15.9%) over 1,917,
+`attn.sparse` 1.91 (7.9%) and `attn.compress_kv` 1.87 (7.7%), inside a `moe` column of 25.04 s and
+70.9% and an `attn` column of 5.04 s and 20.8%. Two of those call counts move for a reason that is not
+the work: `_issue_chunk` is called **once a layer** under `id` and about four times a layer under
+`sorted`, so 4.74 s over 40 calls is 119 ms a call against 5.43 s over 167 in the same place — the same
+GEMM in a quarter as many launches — and `routed.upload`'s 1,917 against 9,048 is the staged set
+itself. The 32768 `id` chunk is also not a constant: `/tmp/chunk_deal_id32.log` two days earlier reads
+27.39 s quiet against this 24.18, with ten commits on `src/` in between. Both `master` columns here are the tree
+at `549a172` — its source side is `f6552f8`'s, `#333` being documentation only — the `id` one taken
+2026-09-21 22:05 UTC and the `sorted` one 23:02, so a figure here is a figure on a tree and the tree is
+named rather than implied.
 
 The taps nest, so the table is a tree: a row indented under another is that parent separated out, not
 a second cost. A row's `calls` count is a per-rank maximum, which matters only for the two ranks that
@@ -400,22 +449,43 @@ instrument costs on ranks 0–1 and 4.2× on ranks 2–3, because `_upload` and 
 inside `_stage_misses` as well as themselves. No nested row is added to another anywhere below, and
 that multiplication is printed so it cannot be.
 
+**Every number from here to the end of the section is read off that pre-kernel table**, and the three
+rows the ship's tree disagrees with it about are the three the paragraphs above re-state: the grouped
+fp4 GEMM's 32% is **15.9%** of the `sorted` quiet chunk and **21.1%** of the `id` one; the expert
+H2D's 24–29% is **47.2%** of the first and **15.9%** of the second, because the two trees move in
+opposite directions on that row and the deal is what decides it; and the MoE's 73.5% against
+attention's 22.6% is **80.6% against 13.9%** under `sorted` and **70.9% against 20.8%** under `id`.
+What the section exists to say does not turn on any of them: one device GEMM a layer that owns a fifth
+to a third of a chunk, a copies row that owns a sixth to a half depending on the deal, a score pass
+that is a measurement rather than an upper bound because it is 40 calls, and a host row whose 5.22 s is
+mostly the probe's own barriers rather than the code's.
+
 **Reading the instrument.** The 346,042 wrapped calls pay the 8.58 s and all but ~600 of them are
 inside the routed expert call — the five block phases and the attention taps are 582 calls between
 them — so the instrument is charged to the MoE and the rest of the table is clean:
 
 - **The MoE is 41.9 s of the quiet 56.96 s chunk (73.5%)**, attention 12.85 s (22.6%), and the
   Hyper-Connections arithmetic, the norms, the Engram, the embedding, the head and the residual adds
-  are 2.2 s between them (3.9%).
+  are 2.2 s between them (3.9%). On the ship's tree the same subtraction reads **29.5 s of 36.58
+  (80.6%) against attention's 5.09 s (13.9%)** under `sorted` and **17.15 s of 24.18 (70.9%) against
+  5.04 s (20.8%)** under `id` — the same instrument price charged to the same phase.
 - **`_issue_chunk` 18.13 s and `_drain_chunk` 0.36 s over 158 calls each** — about four a layer — and
   158 calls is a few hundredths of a second of barrier, so the grouped fp4 GEMM is a measurement and
-  not an upper bound: **18.5 s, 32% of a chunk.**
+  not an upper bound: **18.5 s, 32% of a chunk.** The call count is a deal's, not the work's: on the
+  ship's tree the same pair is 5.81 s of 36.58 (**15.9%**) over 40 + 40 calls under `sorted` and
+  5.09 s of 24.18 (**21.1%**) under `id`, whose `routed.issue` is 4.74 s over the 40 calls a layer
+  gives it rather than the 167 the `sorted` deal's extra chunking costs.
 - **`_upload` 16.67 s for the 9,509 rows rank 0 stages** — 1.75 ms a row, 166.5 GiB at 10.0 GiB/s. The
   uninstrumented width curve prices the same rows at 1.465 ms and 12.8 GB/s, and the instrumented
   chunk's wall is 13% above the quiet one, so the 19% between those two row rates is the instrument
   rather than a second mechanism. Both readings are the same finding: **a row's 17.93 MiB crosses at
   two thirds to four fifths of what a PCIe 3.0 x16 link is rated at, and it is not hidden behind
-  anything.**
+  anything.** This is the one row whose per-row rate survives the tree change, and it is the row that
+  should: 17.25 s for the 9,861 rows of the ship's `sorted` chunk is **1.749 ms a row, 172.6 GiB at
+  10.0 GiB/s**, the same rate to 0.1%. Under `id` the rows are a quarter as many and the rate is not:
+  3.84 s for 1,917 rows is **2.00 ms a row, 8.7 GiB/s**, because a batch of 48 rows a layer instead of
+  247 no longer keeps the copy stream fed. That is the one place the `id` deal pays for what it saves,
+  and at these rows it is **0.49 s** of the 12.4 s it saves.
 - **The rest of the routed call is not 6.7–9.5 s of host bookkeeping, and the row this bullet was
   read from is the instrument.** Every tap here pays two barriers and `_resolve_row` is 163,840 of
   them, so the run was repeated with the barrier split out of every number
@@ -454,7 +524,15 @@ them — so the instrument is charged to the MoE and the rest of the table is cl
 `_take_buffer` is worth naming separately, because it is where this path used to lose its seconds:
 0.13 s over 8,658 calls, against **6.89 s of a 30.35 s class wall** before the rotation was made to
 advance only over rows that stage. 0.13 s is less than the barrier costs those same 8,658 calls, so
-the slot wait is now nothing rather than reduced.
+the slot wait is now nothing rather than reduced. **The ship's tree reads the same row at the same
+15 µs a call on both deals** — 0.13–0.14 s over 9,048 on `sorted`, 0.03 s over 1,917 on `id` — which is
+a CUDA event flag check and not a transfer, and the counters are the staged set's because
+`_stage_misses` reaches `_take_buffer` only for a call that advances the slot. The method's own
+docstring still prices it the other way: **1.58 ms a call over 4,807 calls, 7.57 s of a 13.40 s class
+wall**, which is one row's H2D (1.65 ms) and so a wait that was never satisfied — the rotation
+`a34915d` describes and `149bbe0` fixed, and `149bbe0` is the commit that wrote the 7.57 s down in the
+same change. Three separate trees now read 15, 15 and 16 µs where it says 1,580. The docstring is the
+stale artifact here, not a finding.
 
 **Attention is 22.6% of a chunk and the score pass is most of it.** `attn.sparse` is 8.05 s over 40
 calls — 201 ms a layer, 14.1% of the quiet chunk — and 40 calls makes it a measurement. The rest of
@@ -468,13 +546,25 @@ chunks, whose caches run from 0 to 28672 tokens, average 1.59 s and 1.57 s where
 agrees to a few percent — `attn.sparse` reads 7.95 against 8.05, because its index row is the same
 width wherever in the prompt the chunk is. **Over a 262144-token prefill it is the compressed path that gets more
 expensive per chunk and the score pass that stays flat**, and the score pass is the one the
-sparse-attention work targets.
+sparse-attention work targets. On the ship's tree the score pass is down by four fifths and its two
+neighbours are not, and their nesting is unchanged: `attn.sparse` 1.91 s over the same 40 calls is
+**48 ms a layer, 5.2% of the `sorted`
+quiet chunk** (7.9% of the `id` one), `attn.compress_kv` 1.88 and 1.87 where it was 2.12, `attn.indexer`
+1.85 and 1.84 where it was 2.09 — and the 30 ms between the outer and the contained row is **30 ms on
+all three trees**, which is the offset the paragraph above predicts from the containment rather than
+from the tree. So the score pass is what moved: 201 ms a layer is 48 ms, the 4.2x `7102c19` bought,
+while the compressed path gave back **11%** (2.12 → 1.88) over the same window — which is the same
+statement as the paragraph above: this is the row the sparse-attention work was pointed at, and the
+other one has not been touched.
 
 **And the ceiling the width runs into costs almost nothing.** The Hyper-Connections arithmetic that
 stops a chunk at 8192 tokens — `hc_post` 0.96 s, `hc_mixes` 0.40, `hc_pre` 0.29 over 80, 80 and 81
 calls a chunk — is **1.65 s, 2.9% of a chunk**, and at 240 calls of the 346,042 it reads clean. The
 chunk is capped by what the residual stream *holds*, at 40 MiB a 1024 tokens, and not by what the
-arithmetic on it costs.
+arithmetic on it costs. This is the row that is the same absolute cost on a shorter chunk: 0.96 + 0.40
++ 0.28 = **1.64 s on the ship's `sorted` tree**, against 1.65 here, and the only thing that changed is
+its share — 2.9% of 56.96 becomes **4.5% of 36.58** and **6.8% of 24.18**. Nothing was done to this
+arithmetic and nothing needs to be: at 6.8% it is still not the reason a chunk is 4096 tokens wide.
 
 **Which resolves the intercept of the width curve.** The fit says a chunk costs **10.4 ms a token plus
 1.465 ms a staged row**, and the 1.465 is the copies above. The other constant is what this table
@@ -495,7 +585,12 @@ the link. The score pass, 8.05 s and 14%. And the routed path's host bodies, 5.1
 the per-row loop is 1.52 s — the row is not the 12–17% this page first read off the table and it is
 not the one to attack before the copies, but it is the row that says how much of this chunk is one
 process's Python, though not its loops: `_split` and the per-row `tolist()` are 3 µs of the 9.3 and
-the rest is the pool.
+the rest is the pool. **On the ship's tree it is the same four rows, and `id` swaps the first two:**
+copies 47.2% against grouped fp4 GEMM 15.9% of the `sorted` quiet chunk, and **15.9% against 21.1%**
+of the `id` one, because the deal that quarters the copies does not touch the GEMM. Under either deal
+the score pass is 5.2% and 7.9% of a chunk rather than 14%. So the next lever is not the same one on
+both deals, which is worth knowing before pricing it: under `sorted` the copies still lead by three to
+one, under `id` the GEMM leads.
 
 **That ordering is the 32768 one and it does not survive to 256K.** `attn.compress_kv` is the only row
 of this table with a context term — `attn.indexer` is *inside* it and not a second cost beside it, see
@@ -681,7 +776,17 @@ three prefill kernels and the `id` deal are both in — and both fit the ship: 2
 sweep's 57.04 s through the three kernels and the `id` deal, and 31.34 s at 262144 sits 5% above that
 leg's own last chunk of 29.82 s. Those are the two denominators used below; the table above's 56.96 s is
 the same chunk on the branch without the three kernels, and its `attn.sparse` row of 8.05 s is that
-tree's score pass rather than this one's 2.05 s.
+tree's score pass rather than this one's 1.91–2.05 s.
+
+**Both denominators are taps-off widths, and the two instrumented walls are 35.44 s and 39.24 s.** A
+row read against 31.34 s at 262144 is 13.1% of what that chunk cost with the taps in rather than 16.4%,
+and the instrument's own price is not constant across the leg — +8.05 s at 32768 against +7.89 s at
+262144 — so the two percentages above are shares of the same quantity on both lengths and are the ones
+to quote; the walls are quoted here so that nobody divides by the wrong one. The instrumented chunk at
+32768 is also not the fresh `id` chunk the section above reports as 32.08 s: this pair is
+`/tmp/chunk_deal_id32.log`, 2026-09-20 16:50 UTC, and 35.44 s against 32.08 s is the spread between two
+sittings of the same tree rather than a change in it — `attn.sparse` reads 2.05 there and 1.91 in the
+fresh profile, which is the same 7% on the row the whole section is about.
 
 **The pair this section first gave — 3.19 s against 10.24 s, 11.6% to 32.7% — added a parent row to the
 child nested inside it, so it counted the indexer's 2.46x twice.** Neither half is a row of either
@@ -1188,6 +1293,27 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk
     --at 32768 --chunk 4096 --max-seq-len 41024 --pool-rows 148 --threads 22 \
     --out /tmp/chunk_profile_p148.pt
 ```
+
+The ship's tree is the same command twice more, differing only in the deal the expert split uses —
+which is the one variable that has to be held fixed for the comparison above to be one:
+
+```bash
+# /tmp/chunk_profile_master.log: the ship's default deal.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_profile.py \
+    --at 32768 --chunk 4096 --max-seq-len 41024 --pool-rows 148 --threads 22 \
+    --out /tmp/chunk_profile_master.pt
+
+# /tmp/chunk_profile_sorted.log: the same tree, the deal the p148 run above is under, so that
+# column and this one differ by the tree and not by the deal.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 DEEPSEEK_V41_EXPERT_DEAL=sorted \
+torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_profile.py \
+    --at 32768 --chunk 4096 --max-seq-len 41024 --pool-rows 148 --threads 22 \
+    --out /tmp/chunk_profile_sorted.pt
+```
+
+`DEEPSEEK_V41_EXPERT_DEAL` is read at load time and defaults to `id`, so the first line and the sweep
+above are the same configuration and the second is the control that makes the 56.96 → 36.58 s pair a
+tree measurement rather than a tree-plus-deal one.
 
 The driver is the code, not the probe — this is the call the 256K number above is a forward of:
 
