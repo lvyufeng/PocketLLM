@@ -68,20 +68,42 @@ constexpr int kMaxWorld = kIpcMaxWorld;
 
 // The largest plane the hand-written path accepts, in FP16 elements.
 //
-// It is a conservative default, not a measured bound. The sweep that set it
-// (docs/performance/ascend_single_request_tps.md 5.5.4) compared planes of 5120,
-// 40960, 81920 and 163840 against a shipped HCCL path believed to reproduce the
-// batched pass every time; that control has since been measured failing the same
-// gate 3 times in 36, and against it the large-plane arms are 7 of 16 against 9 of
-// 41 below the ceiling, which is a direction and not a separation (Fisher two-tailed
-// p = 0.11). What the ceiling has going for it is that the evidence points the same
-// way at every size above it, that the plane it exists to admit -- one row's
-// 5120-element decode plane, 129 times a step -- is two orders of magnitude inside
-// it, and that raising it would change the shipped default's behaviour on no
-// evidence. A caller that batched today, a 16-row decode plane (81920) or a prefill
-// plane, stays on HCCL, which is the path it was on before this file existed.
-// `POCKET_ASCEND_IPC_ALLREDUCE_MAX_ELEMENTS` overrides it for measurement.
-constexpr size_t kDefaultMaxElements = 40960;
+// 512 rows of a 5120-wide plane, which is where the two paths cross. The ceiling
+// used to be 40960 -- eight such rows -- set by a sweep whose HCCL control was
+// later measured failing its own reproducibility gate 3 times in 36
+// (docs/performance/ascend_single_request_tps.md 5.5.4), so it was a conservative
+// default rather than a measured bound, and it kept every prefill plane on HCCL.
+//
+// Raising it is not a pure win: the hand-written barrier's per-call cost starts
+// flat and then grows faster than HCCL's, so it wins on small planes and loses on
+// large ones. Measured as whole-prefill TTFT p50 over six requests, single call,
+// single slot, world 4, one process per rank, with only this constant changed
+// (docs/performance/serving_throughput_scaling.md, "What one prefill call costs"):
+//
+//     rows       plane        HCCL      hand-written
+//       67     686 KB      165.0 ms        145.2 ms   -12.0%
+//      219    2.24 MB      369.6 ms        257.0 ms   -30.5%
+//      421    4.31 MB      465.0 ms        401.0 ms   -13.8%
+//      629    6.44 MB      564.9 ms        569.4 ms    +0.8%
+//     1242    12.7 MB      889.6 ms       1021.1 ms   +14.8%
+//
+// The crossing is between 421 and 629 rows, so the constant is pinned inside that
+// gap rather than at either end of it. Every plane the engine issues is
+// `rows * hidden_size` wide -- all of `all_reduce_half`'s engine callers go through
+// `all_reduce_half_rows` with `row_elements == hidden_size`, 5120 for the model
+// this backend targets -- so an element ceiling is a row ceiling in practice, and
+// this one admits every scheduled batch (the widest measured here is 128 rows,
+// 655 K elements, 1.31 MB) as well as the small prefills it was raised for.
+//
+// Token parity over a 432-token prompt, 24 greedy steps, is identical on both
+// sides of the crossing: a barrier that is wrong at a plane size returns different
+// ids, and this one does not.
+//
+// The crossing is a property of the barrier against HCCL at this world size, not a
+// law, so the number is a measurement and not a derivation.
+// `POCKET_ASCEND_IPC_ALLREDUCE_MAX_ELEMENTS` overrides it in both directions, so
+// it is the one place the ceiling is spelled.
+constexpr size_t kDefaultMaxElements = 512 * 5120;
 
 // How long a receiver waits for one round's stamps before declaring the round
 // lost. A rows=1 decode step is ~100 ms, so this is hundreds of steps of slack: it
@@ -726,7 +748,11 @@ bool ascend_ipc_allreduce_f16_applies(int world, int count) {
     if (!env_flag("POCKET_ASCEND_IPC_ALLREDUCE")) return false;
     if (world <= 1 || world > kMaxWorld) return false;
     if (count <= 0) return false;
-    if (count > static_cast<int>(kDefaultMaxElements)) return false;
+    // One gate, not two. A second `count > kDefaultMaxElements` test used to sit
+    // here in front of this one, which made the override write-only in the
+    // direction that mattered: `..._MAX_ELEMENTS` could lower the ceiling and
+    // never raise it, so a caller above the default stayed on HCCL however the
+    // environment was set, and the two spellings of the ceiling could disagree.
     return static_cast<size_t>(count) <= max_elements();
 }
 

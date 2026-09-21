@@ -15,8 +15,9 @@ configuration is the [baseline page](serving_latency_baseline.md)'s.
 Headline: **112 concurrent streams is where this configuration stops.** At
 `--max-context 2048` the KV arena stops fitting one rank at 120 slots, the rank
 exits during `device_malloc`, and the server keeps accepting requests while it
-emits nothing — a silent hang rather than an error. Throughput peaks earlier, at
-96 slots.
+emits nothing — a silent hang rather than an error. Throughput stops paying far
+earlier: from 32 slots to 112 the measured rate is a dead tie inside 1.8%, at a
+nominal peak of 128.59 tok/s, while TPOT grows 3.0x.
 
 ## Scope
 
@@ -42,8 +43,18 @@ emits nothing — a silent hang rather than an error. Throughput peaks earlier, 
   pool's zero-budget branch derives (`qwen_engine.cpp:1700` against `1517-1521`,
   whose own comment calls turning paging on "memory-neutral"), so only the name of
   the thing that stops fitting a rank at 120 slots was wrong.
-- commit `645e36b` (master as of 2026-09-19), binary
-  `cpp_engine/build-ascend/pocketllm_engine`
+- commit `dc11490` (master as of 2026-09-21) plus this PR's one-line raise of the
+  IPC all-reduce element ceiling from 40960 to 2 621 440 (`512 x 5120`), binary
+  `cpp_engine/build-ascend/pocketllm_engine` built from that tree. Every ladder
+  row, every
+  `prefill` point, the concurrency-limit probes and `pf128` below were measured
+  under that ceiling at this commit. Three things on the page were not, and one
+  of them is qualified where it is used: the `QWEN_ASCEND_REPLICATE_ROWS` A/B's
+  concurrency-one pairs, whose planes are one row wide and inside both ceilings,
+  so their comparison stands as measured; that A/B's `rep16` point, which is 16
+  rows wide and is therefore only compared against the `L16` it ran beside; and
+  [serving_latency_optimized.md](serving_latency_optimized.md), whose figures are
+  left as they are and named where they are compared.
 - every ladder row: `--random-input-len 512 --random-output-len 512
   --num-warmups 0 --request-rate inf --prefill-token-budget 4096
   --max-context 2048`, with `--max-batch-size` equal to the client's
@@ -58,20 +69,25 @@ emits nothing — a silent hang rather than an error. Throughput peaks earlier, 
   `analyze_serving_roofline.py --prefill-tokens` takes the engine's number and
   rejects `--random-input-len` by name for exactly this reason.
 
-The engine sources at `645e36b` are the ones the numbers come from. The two
+The engine sources at `dc11490` are the ones the numbers come from. The two
 `report_phase_profile()` calls PR #294 added to the `--batch-decode` bench
 (merged as `0d122ea`) were applied for the profiled runs only; with
 `QWEN_PHASE_PROFILE` unset both return immediately, so the serving numbers are
 unaffected by them.
 
-The `prefill` sweep and the four ladder rows it is checked against were re-run
-after this page was first written, on master at `4fc72a1`. Nothing on the serving
-path changed in between — the only `cpp_engine/` diff across that range is those
-same `+20` lines in `main.cpp` — and the re-run reproduces the page's own
-intercept to 1%, 511.7 ms against the 517 ms recorded here. It is added data, not
-a correction, except where it contradicts the `~1.06x` in
-`qwen_engine.cpp:5091`; see
-[What one prefill call costs](#what-one-prefill-call-costs).
+**This revision is a re-run, not an addition.** The page was first written at
+`645e36b` with the IPC all-reduce ceiling at its old default of 40960 elements,
+under which every prefill plane and every decode plane wider than eight rows went
+to HCCL — a 325-token prompt is 1.66 M elements, forty times that ceiling.
+Raising the ceiling to `512 x 5120` puts all of them on the hand-written barrier,
+and everything the ceiling reaches is re-measured here: the ladder, the prefill
+decomposition, `pf128`, the concurrency limit and the FLOP tables. Across that
+range the serving path changed in exactly one other way — the `+20` lines PR #294
+added to `main.cpp`, which return immediately when `QWEN_PHASE_PROFILE` is unset;
+`qwen_engine.cpp` changed only comments — so where a figure is quoted against its
+old value below, the ceiling is the difference. The one place a *conclusion*
+moves is the `~1.06x` in `qwen_engine.cpp:5091`, now worth 1.6x at the ladder's
+prompt length; see [What one prefill call costs](#what-one-prefill-call-costs).
 
 ### Reproduction
 
@@ -119,7 +135,7 @@ Three readers, each taking those artifacts and nothing else:
 python scripts/summarize_serving_sweep.py --client    sweep-out/L*.json
 python scripts/summarize_serving_sweep.py --server    sweep-out/L*.metrics
 python scripts/summarize_serving_sweep.py --occupancy sweep-out/L96.json
-python scripts/analyze_serving_roofline.py --prefill-ms 411 --prefill-tokens 325 sweep-out/L*.json
+python scripts/analyze_serving_roofline.py --prefill-ms 331 --prefill-tokens 325 sweep-out/L*.json
 ```
 
 `--client` reproduces the ladder table, `--server` the phase split, and
@@ -149,38 +165,64 @@ warm-up count; the only differences are the width and the prompt count.
 
 | run | slots | prompts | TTFT | TTFT P99 | TPOT | TPOT std | E2EL | tok/s | req/s | goodput | out tok | out len min/max |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| `L1` | 1 | 1 | 513.4 | 513.4 | 54.31 | 0.00 | 7.085 | 17.06 | 0.140 | 0.140 | 122 | 122/122 |
-| `L4` | 4 | 4 | 1460.8 | 1777.7 | 68.28 | 4.31 | 9.789 | 48.90 | 0.398 | 0.398 | 492 | 122/126 |
-| `L8` | 8 | 8 | 3032.8 | 3396.3 | 84.67 | 7.52 | 13.398 | 71.37 | 0.579 | 0.072 | 987 | 114/128 |
-| `L16` | 16 | 16 | 6248.4 | 6636.1 | 153.65 | 12.12 | 24.350 | 74.22 | 0.625 | 0.000 | 1901 | 98/129 |
-| `L32` | 32 | 32 | 12790.1 | 13196.4 | 212.55 | 17.68 | 37.943 | 96.14 | 0.806 | 0.000 | 3818 | 77/130 |
-| `L48` | 48 | 48 | 19338.3 | 19751.9 | 261.55 | 38.08 | 46.850 | 100.65 | 0.937 | 0.000 | 5155 | 66/130 |
-| `L64` | 64 | 64 | 22997.6 | 26529.0 | 341.59 | 29.51 | 57.895 | 105.39 | 1.013 | 0.000 | 6656 | 66/130 |
-| `L96` | 96 | 96 | 36077.3 | 39929.3 | 471.00 | 44.86 | 80.055 | 105.07 | 1.099 | 0.000 | 9181 | 66/130 |
-| `L112` | 112 | 112 | 39153.6 | 46329.1 | 683.84 | 80.86 | 100.969 | 95.15 | 1.019 | 0.000 | 10459 | 57/130 |
-| `L16x64` | 16 | 64 | 2373.1 | 6631.5 | 191.94 | 26.90 | 22.177 | 71.93 | 0.688 | 0.194 | 6686 | 66/130 |
-| `L48x192` | 48 | 192 | 5972.2 | 19722.1 | 432.89 | 95.47 | 41.871 | 93.43 | 1.095 | 0.000 | 16379 | 57/130 |
+| `L1` | 1 | 1 | 417.4 | 417.4 | 54.40 | 0.00 | 7.000 | 17.26 | 0.142 | 0.142 | 122 | 122/122 |
+| `L4` | 4 | 4 | 1177.4 | 1431.3 | 67.45 | 3.41 | 9.404 | 50.86 | 0.413 | 0.413 | 492 | 122/126 |
+| `L8` | 8 | 8 | 2422.2 | 2709.5 | 84.35 | 6.06 | 12.658 | 74.50 | 0.609 | 0.076 | 979 | 114/128 |
+| `L16` | 16 | 16 | 4961.5 | 5268.2 | 100.39 | 13.86 | 16.547 | 106.37 | 0.903 | 0.056 | 1885 | 77/129 |
+| `L32` | 32 | 32 | 10018.0 | 10335.6 | 155.70 | 14.21 | 28.584 | 128.59 | 1.070 | 0.000 | 3847 | 98/130 |
+| `L48` | 48 | 48 | 15119.5 | 15443.6 | 212.42 | 29.54 | 37.736 | 126.33 | 1.163 | 0.000 | 5212 | 66/130 |
+| `L64` | 64 | 64 | 18000.1 | 20754.1 | 284.58 | 23.69 | 46.843 | 128.50 | 1.244 | 0.000 | 6611 | 66/130 |
+| `L96` | 96 | 96 | 27282.0 | 31013.1 | 422.04 | 54.37 | 66.791 | 126.56 | 1.313 | 0.000 | 9253 | 66/130 |
+| `L112` | 112 | 112 | 32159.1 | 36257.3 | 472.97 | 48.19 | 75.506 | 127.35 | 1.351 | 0.000 | 10561 | 57/130 |
+| `L16x64` | 16 | 64 | 1786.9 | 5254.8 | 129.34 | 18.49 | 14.827 | 105.21 | 1.021 | 0.782 | 6594 | 66/130 |
+| `L48x192` | 48 | 192 | 4854.3 | 15391.5 | 347.13 | 77.58 | 33.426 | 116.10 | 1.367 | 0.043 | 16303 | 57/130 |
 
-`L1` and `L4` are inside the control band of the `QWEN_ASCEND_REPLICATE_ROWS` A/B
-further down (control 54.05-54.85 ms), so the ladder's floor reproduces an
-independently measured arm.
+**These eleven rows are the re-measurement under the raised ceiling, and the two
+columns that moved are the ones the change predicts.** TPOT at 1, 4 and 8 rows is
+54.40, 67.45 and 84.35 ms against 54.31, 68.28 and 84.67 before — flat to 1.1%,
+because 8 rows x 5120 columns is 40960 elements and the old ceiling admitted
+exactly that. From 16 rows up every decode plane is wider than the old ceiling and
+moved: `L16` 153.65 to 100.39 ms, `L32` 212.55 to 155.70, `L48` 261.55 to 212.42,
+`L64` 341.59 to 284.58, `L96` 471.00 to 422.04, `L112` 683.84 to 472.97. Nine rows is the first width the
+old ceiling refused, so `L16` is the narrowest point in this ladder above the
+boundary and the last two rows below it are the control.
 
-Goodput is a **rate**, not a count, against `ttft:2000 tpot:200 e2el:30000`.
-Nothing at 16 slots or above clears the 200 ms TPOT budget, so from `L16` up the
-goodput column is zero however high the throughput column goes. The best goodput
-on the page is `L4`'s 0.398, and among the runs that keep the batch full it is
-`L16x64`'s 0.194.
+**The lever does not decay with width.** The ladder stops at 112 rows, but the
+`128 @ ctx 1024` probe — re-measured on both sides of the change like the rest —
+moves its TPOT from 811.14 to 536.98 ms, **1.51x**, against 1.53x at 16 rows and
+1.45x at 112. Putting every decode and prefill plane of a serving run on the
+hand-written barrier is therefore worth about the same factor at every width this
+record reaches, and it is paid for out of nothing but the crossing measured under
+[What one prefill call costs](#what-one-prefill-call-costs).
+
+`L1` is also the row the change cannot move at all — a one-row plane is 5120
+elements, inside both ceilings — so its 54.40 ms against the 54.31 ms recorded
+before is a cross-check between the two runs rather than a result of the change.
+It sits inside the control band of the `QWEN_ASCEND_REPLICATE_ROWS` A/B further
+down (54.05-54.85 ms), so the ladder's floor reproduces an independently measured
+arm.
+
+Goodput is a **rate**, not a count, against `ttft:2000 tpot:200 e2el:30000`. The
+200 ms TPOT budget is cleared to 16 slots and not past them: `L16` is 100.39 ms
+and `L32` is 155.70, and no run at 32 slots or above clears it however high the
+throughput column goes. The best goodput on the page is `L16x64`'s 0.782, and
+among the single waves it is `L4`'s 0.413.
 
 **The budget is met at a lower offered concurrency, not by a lower slot count.**
 [serving_latency_optimized.md](serving_latency_optimized.md) clears it — 0.564 of
 0.589 req/s — with the same opt-in stack and the same nominal 512-token prompts, at 24
 prompts, `--request-rate 2` and `--max-concurrency 8`. Its peak concurrency was
-11 and it measured 70.29 tok/s at 99.49 ms TPOT, against `L8`'s 71.37 tok/s at
-84.67 ms and `L16`'s 74.22 at 153.65. Throughput matches at the same width;
-the TPOT lands between the 8- and 16-row rows because a slow arrival never holds
-a full-width batch for the whole decode. The distinction that matters for
-capacity planning is therefore **concurrency offered at once** versus
-**concurrency sustained**, and this page measures the first.
+11 and it measured 70.29 tok/s at 99.49 ms TPOT, against `L8`'s 74.50 tok/s at
+84.35 ms and `L16`'s 106.37 at 100.39. The two configurations no longer meet at
+the same width: `L16` now delivers 1.5x that throughput at a TPOT within 1% of
+it. Part of that gap is the arrival pattern the older page chose — a slow stream
+never holds a full-width batch for a whole decode — and part of it is this
+change, because that page's peak concurrency of 11 puts its decode planes above
+the ceiling this page raises. **Its figures are pre-change numbers and are left
+as they are**; re-running that configuration is a measurement this page does not
+carry. The distinction that matters for capacity planning is still **concurrency
+offered at once** versus **concurrency sustained**, and this page measures the
+first.
 
 ## Maximum concurrency: the KV pool, not the flag
 
@@ -191,10 +233,10 @@ raised too far is the worst kind:
 
 | run | slots | ctx | engine | client | what happened |
 | --- | ---: | ---: | --- | --- | --- |
-| `L112` | 112 | 2048 | `batch width 112`, four ranks up | 112/112 pass | full run, 95.15 tok/s |
-| `L120` | 120 | 2048 | `batch width 120`, **rank 2 dies in `device_malloc`** | 105/120 "pass", 15 failures | every request stubs out after 2 tokens; 901 s wall |
-| `L128` | 128 | 2048 | `batch width 128`, **rank 2 dies in `device_malloc`** | 1/128 pass, 127 failures | one request served, 127 client timeouts at 900 s |
-| `L128c1024` | 128 | 1024 | `batch width 128`, four ranks up | 128/128 pass | full run, 95.72 tok/s |
+| `L112` | 112 | 2048 | `batch width 112`, four ranks up | 112/112 pass | full run, 127.35 tok/s |
+| `L120` | 120 | 2048 | `batch width 120`, **rank 2 dies in `device_malloc`** | 1/120 pass, 119 failures | one request served, 119 timeouts at 900 s; 964 s wall |
+| `L128` | 128 | 2048 | `batch width 128`, **rank 2 dies in `device_malloc`** | 1/128 pass, 127 failures | the same, 964 s wall |
+| `L128c1024` | 128 | 1024 | `batch width 128`, four ranks up | 128/128 pass | full run, 126.72 tok/s |
 
 The failure is not a rejected request. `logs-L120/rank2.log` and
 `logs-L128/rank2.log` each end in
@@ -209,6 +251,27 @@ while rank 0 logs `[server] batch width 120 ... [server] listening on
 for a peer that has already exited, so the server accepts, admits and counts
 every request and never produces a token — the client's only symptom is
 `Never received a valid chunk to calculate TTFT.` after its 900 s timeout.
+
+**The raised ceiling changes what the survivors say about it, and not the wall
+clock.** Both probes take 964 s, which is the client's timeout and not the
+engine's, and `L128` is unchanged at one success. But the hand-written barrier
+has a status latch the host reads once every 32 calls, and that read is the one
+place "a peer that never arrives" can become a reported failure
+(`ipc_allreduce.cpp:974-995`); prefill planes are on that barrier now, so rank 0's
+schedule loop ends in
+
+```
+BatchScheduler: prefill failed: Ascend IPC all-reduce: cannot read the device arrival wait's status
+BatchScheduler: decode failed: CmdChannel: send_to_workers write_all failed: Broken pipe
+```
+
+and ranks 1 and 3 report the same arrival-wait error as their last line, instead
+of spinning to the end of the run. The client outcome moves with it at `L120`:
+under the old ceiling that width produced 105 *successes* — 211 output tokens
+across them, two apiece before each request stopped — and it produces 1 now, 2
+tokens. The engine's own counter is the same verdict in both revisions, 0
+successes and every request an error, so the old run's 105 passes were the client
+counting a stub as a reply.
 
 **It is the KV cache's size that decides this, and `--max-context` is half of
 it.** The arena reserves
@@ -251,88 +314,106 @@ the prefill:
 
 | slots | TPOT | ms/row marginal | row-steps/s | steps/s | measured tok/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 54.31 | — | 18.41 | 18.4 | 17.06 |
-| 4 | 68.28 | 4.66 | 58.58 | 14.6 | 48.90 |
-| 8 | 84.67 | 4.10 | 94.49 | 11.8 | 71.37 |
-| 16 | 153.65 | 8.62 | 104.13 | 6.5 | 74.22 |
-| 32 | 212.55 | 3.68 | 150.56 | 4.7 | 96.14 |
-| 48 | 261.55 | 3.06 | 183.52 | 3.8 | 100.65 |
-| 64 | 341.59 | 5.00 | 187.36 | 2.9 | 105.39 |
-| 96 | 471.00 | 4.04 | **203.82** | 2.1 | 105.07 |
-| 112 | 683.84 | 13.30 | 163.78 | 1.5 | 95.15 |
+| 1 | 54.40 | — | 18.38 | 18.4 | 17.26 |
+| 4 | 67.45 | 4.35 | 59.30 | 14.8 | 50.86 |
+| 8 | 84.35 | 4.22 | 94.85 | 11.9 | 74.50 |
+| 16 | 100.39 | 2.01 | 159.37 | 10.0 | 106.37 |
+| 32 | 155.70 | 3.46 | 205.52 | 6.4 | 128.59 |
+| 48 | 212.42 | 3.55 | 225.96 | 4.7 | 126.33 |
+| 64 | 284.58 | 4.51 | 224.89 | 3.5 | 128.50 |
+| 96 | 422.04 | 4.30 | 227.47 | 2.4 | 126.56 |
+| 112 | 472.97 | 3.18 | **236.80** | 2.1 | 127.35 |
 
-**The knee is at 96 slots, not at 48.** Rows 49 to 64 buy 3.8 row-steps/s and
-rows 65 to 96 buy another 16.5; only past 96 does the step rate fall faster than
-the width grows, and 97 to 112 rows *lose* 40 row-steps/s. So a 112-slot server
-pays 45% more TPOT than a 96-slot one for 9% fewer tokens, and the last row of
-the ladder is past the point where the width is doing anything but costing time.
+**The knee is at 32 slots.** Rows 17 to 32 buy 46.2 row-steps/s and rows 33 to 48
+buy another 20.4; past 48 the rate is flat inside 5% — 225.96, 224.89, 227.47,
+236.80 — while TPOT grows from 212.42 to 472.97 ms. So a 112-slot server pays
+2.2x the TPOT of a 48-slot one for the same token rate, and every row past 48 is
+width that costs time and buys none.
 
 The marginal ms/row column is the slope of TPOT between consecutive widths, and
-it is not monotone: 4.66, 4.10, 8.62, 3.68, 3.06, 5.00, 4.04, 13.30 ms. The
-16-slot entry is where the step stops being able to hide its fixed costs, and the
-112-slot entry is where the arena's worst-case reservation starts to show. The
-nominal peak of the measured aggregate is `L64`/`L96` at 105.4/105.1 tok/s — a
-dead tie across a 50% wider batch, which is the honest statement of where this
+it is now flat: 4.35, 4.22, 2.01, 3.46, 3.55, 4.51, 4.30, 3.18 ms. The two spikes
+the table carried before this re-run — 8.62 ms at 16 rows and 13.30 at 112 — do
+not reproduce. The first was the ceiling's edge: 8 rows is exactly 40960
+elements, so moving from 8 to 16 doubled the plane *and* switched it from the
+hand-written barrier to HCCL, and both halves of that are now gone. The second
+does not survive a re-run in which `L112`'s own TPOT spread is 48.19 ms. The
+nominal peak of the measured aggregate is `L32` at 128.59 tok/s, with `L48`,
+`L64`, `L96` and `L112` at 126.33, 128.50, 126.56 and 127.35 — a dead tie inside
+1.8% across a batch 3.5x wider, which is the honest statement of where this
 configuration tops out.
 
 ### Saturation does not help
 
 `L48x192` offers 192 prompts to 48 slots, so the batch is refilled as it drains
 rather than being allowed to empty. It is **worse than the single wave at the
-same width**: 93.43 tok/s against 100.65, TPOT 432.89 ms against 261.55. The
+same width**: 116.10 tok/s against 126.33, TPOT 347.13 ms against 212.42. The
 scheduler runs `run_prefill_batch()` and `run_decode_batch()` in the same pass
 (`batch_scheduler.cpp:226`), and a continuous supply of new prompts means a
 prefill is always waiting to run in front of the next decode, so the step rate
-drops from 3.8 to 2.3 a second.
+drops from 4.71 to 2.88 a second.
 
 `L16x64` is the opposite case and is a genuine gain on TTFT: 64 prompts against
-16 slots gives mean TTFT 2373.1 ms against `L16`'s 6248.4, because slots free one
-at a time and each prefill group is small, at the same throughput (71.93 against
-74.22 tok/s) and the best goodput among the full-batch runs. The mechanism is the
-one in the next section.
+16 slots gives mean TTFT 1786.9 ms against `L16`'s 4961.5, because slots free one
+at a time and each prefill group is small, at the same throughput (105.21 against
+106.37 tok/s) and the best goodput on the page. The mechanism is the one in the
+next section.
 
 ## TTFT is the whole wave's prefill
 
 TTFT in the ladder is not a queueing term. The server's own histograms separate
-the two: in `L32` the queue is 443.2 ms a request while the prefill is 12241.2
-ms, so **96% of TTFT is prefill**, and the prefill time grows with the width of
+the two: in `L32` the queue is 346.3 ms a request while the prefill is 9566.0
+ms, so **95.5% of TTFT is prefill**, and the prefill time grows with the width of
 the wave rather than with the size of the prompt.
 
-Per request of a ~325-token prompt, the prefill the server charged is nearly flat
-in the width — 240 ms at 4 rows, 311 at 8, then 356, 383, 391, 304, 339, 287 at
-16, 32, 48, 64, 96 and 112 — while mean TTFT is *exactly* linear:
+Per request of a ~325-token prompt, mean TTFT is *exactly* linear in the width up
+to 48 slots, and the distribution behind the mean is bimodal rather than a ramp:
 
-| run | slots | TTFT mean | first request | the rest | spread among the rest |
-| --- | ---: | ---: | ---: | ---: | --- |
-| `L16` | 16 | 6248.4 ms | 517 ms | 6630 ms | 8 ms, over 15 requests |
-| `L32` | 32 | 12790.1 ms | 517 ms | 13186 ms | 14 ms, over 31 requests |
-| `L48` | 48 | 19338.3 ms | 523 ms | 19740 ms | 19 ms, over 47 requests |
-| `L112` | 112 | 39153.6 ms | 504 ms | 38099 ms | 29 ms, over 111 requests |
+| run | slots | TTFT mean | first request | the rest, p50 | the rest, max | of the rest, within 100 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `L4` | 4 | 1177.4 ms | 417.3 ms | 1430.5 ms | 1431.3 ms | 3 of 3 |
+| `L8` | 8 | 2422.2 ms | 424.0 ms | 2707.3 ms | 2709.5 ms | 7 of 7 |
+| `L16` | 16 | 4961.5 ms | 410.9 ms | 5264.8 ms | 5268.2 ms | 15 of 15 |
+| `L32` | 32 | 10018.0 ms | 415.4 ms | 10327.6 ms | 10336.1 ms | 31 of 31 |
+| `L48` | 48 | 15119.5 ms | 417.9 ms | 15432.0 ms | 15443.7 ms | 47 of 47 |
+| `L64` | 64 | 18000.1 ms | 418.7 ms | 17922.3 ms | 20754.4 ms | 55 of 63 |
+| `L96` | 96 | 27282.0 ms | 413.2 ms | 27116.9 ms | 31013.7 ms | 84 of 95 |
+| `L112` | 112 | 32159.1 ms | 418.6 ms | 31986.2 ms | 36257.7 ms | 99 of 111 |
 
-Server-side the means are 6146.3, 12684.4, 19179.7 and 38809.4 ms, so the client
-and the engine agree to 2%.
+Exactly one request latches at 411-424 ms in every row — `L1`'s single-request
+TTFT, reproduced to 3% — and up to 48 slots every one of the others latches
+within 23 ms of the pack. So the engine serves the first request through its own
+prefill and one decode step, and then runs the remaining N-1 prefills inside a
+**single blocking `batch_prefill` call** that only returns when the last of them
+is done. Nobody in that group decodes before it returns, so nobody in it sees a
+token before the slowest member.
 
-**The distribution is bimodal, not a ramp, and that fixes the model.** In `L48`
-the 47 requests behind the first one all latch their first token within 19 ms of
-each other after a 19.7 s wait — 0.1% — while exactly one latches at 523 ms,
-which is `L1`'s single-request TTFT. So the engine serves the first request
-through its own prefill and one decode step, and then runs the remaining N-1
-prefills inside a **single blocking `batch_prefill` call** that only returns when
-the last of them is done. Nobody in that group decodes before it returns, so
-nobody in it sees a token before the slowest member.
-
-TTFT is therefore `517 ms + c x (N - 1)`, where `c` is the per-prompt prefill
+TTFT is therefore `417 ms + c x (N - 1)`, where `c` is the per-prompt prefill
 cost, and not the `slots/2 x prefill` of an earlier revision of this page — the
-per-request distributions falsify the half-wave form. The slope `c` and the
-server's own per-request prefill histogram are the same measurement taken two
-ways and they agree — 411 against 356 ms at 16 rows, 412 against 383 at 32, 411
-against 391 at 48, 309 against 304 at 64, 283 against 287 at 112. So the prefill
-of a ~325-token prompt costs the same whether it shares a wave with 15 others or
-111, with a mild drift down at the widest rows: the wave never shares a forward
-pass, which is the next section's finding stated as a number.
+per-request distributions falsify the half-wave form. Solving each row for `c`
+gives 337.8 ms at 4 slots, 326.2 at 8, 323.6 at 16, 319.8 at 32 and 319.5 at 48:
+**a ~325-token prompt costs 320 ms of prefill whether it shares a wave with three
+others or 47.** The server's own prefill histogram is the same measurement taken
+from the engine's side — 4523.6, 9566.0 and 14663.5 ms a request at 16, 32 and 48
+slots, whose successive differences are 315.2 and 318.6 ms — so the client's
+distribution and the engine's histogram agree on `c` to 1% from two sources that
+do not read each other.
 
-At `L64` and above the queue term also wakes up — 3264.7 ms at 64, 3267.9 at 96,
-6688.9 at 112 — because admission, not prefill, has become the wait.
+The widest run on this page extends the same line past where the decode ladder
+stops. `L128c1024` admits 128 requests into one schedule and its median TTFT is
+36.2 s, which is `417 + c x 127` for **282 ms a request** — 12% below the
+ladder's 320 ms, on the same nominal prompts. The only argument the two runs do
+not share is `--max-context`, which sizes the KV arena and not the prefill
+compute, and if that is not the explanation then this is where the linear form
+starts to soften; what it does not do is break. **The wave's prefill is not
+spread across the batch at any width measured here**, so a deployment that wants
+a wide batch pays for it once per request before any of them decode.
+
+From 64 slots the form breaks, and the table's last two columns show how: the
+pack is still tight — 55 of 63 requests within 100 ms of the median at `L64` — but
+a tail group of 8 to 12 requests latches 2.8-4.3 s later. That is the queue term
+waking up: 2424.6 ms a request at 64, 3264.9 at 96, 3576.1 at 112, against
+346-359 ms up to 48. Past that point admission, not prefill, is what the last
+requests wait for.
 
 ### The root cause, from the engine
 
@@ -358,7 +439,7 @@ single-request prefills issued back to back before the scheduler next runs a
 decode.
 
 That is the whole of the TTFT scaling. The prefill GEMMs never see more than one
-prompt's rows, and the 325-token prefill runs at 325/0.411 = 791 tokens/s
+prompt's rows, and the 325-token prefill runs at 325/0.331 = 981 tokens/s
 against a weight-read floor of 11.7 ms a pass.
 
 ### What one prefill call costs
@@ -371,56 +452,111 @@ same 64-layer stack:
 
 | prompt | budget | calls | TTFT p50 | ms a call |
 | ---: | ---: | ---: | ---: | ---: |
-| 3703 tok | 4096 | 1 | 2425.2 ms | — |
-| 3703 tok | 2048 | 2 | 2614.1 ms | 189 |
-| 3703 tok | 1024 | 4 | 2915.7 ms | 164 |
-| 3703 tok | 512 | 8 | 3771.8 ms | 192 |
-| 1242 tok | 2048 | 1 | 889.3 ms | — |
-| 1242 tok | 1024 | 2 | 1122.1 ms | 233 |
-| 1242 tok | 512 | 3 | 1345.8 ms | 228 |
-| 1242 tok | 256 | 5 | 1868.4 ms | 245 |
+| 3703 tok | 4096 | 1 | 2420.8 ms | — |
+| 3703 tok | 2048 | 2 | 2614.1 ms | 195 |
+| 3703 tok | 1024 | 4 | 2913.2 ms | 164 |
+| 3703 tok | 512 | 8 | 3424.1 ms | 143 |
+| 1242 tok | 2048 | 1 | 888.5 ms | — |
+| 1242 tok | 1024 | 2 | 1011.8 ms | 128 |
+| 1242 tok | 512 | 3 | 1150.8 ms | 130 |
+| 1242 tok | 256 | 5 | 1295.2 ms | 110 |
 
-Total tokens are constant within each arm, so **a call is worth 164-245 ms
-whatever is in it**. A joint least squares over all eight points reads
+Total tokens are constant within each arm, so **a call is worth 110-195 ms
+whatever is in it**. A joint least squares over all seventeen points — the eight
+above and the nine below — reads
 
 ```text
-TTFT = 204.2 ms x n_calls + 577.4 us x prompt_tokens + 27.7
+TTFT = 131.4 ms x n_calls + 637.4 us x prompt_tokens - 7.2
 ```
+
+with a maximum residual of 95.5 ms and an rms of 37.5 ms.
 
 A one-call length sweep agrees from the other side. Nine single-slot runs at a
 budget above the prompt, so every point is exactly one call, over 67, 115, 219,
 320, 421, 629, 1242, 2474 and 3703 real tokens (the engine's own
-`prompt_tokens=`, not the harness's nominal length) fit
+`prompt_tokens=`, not the harness's nominal length):
+
+| nominal | real tokens | TTFT mean | TTFT p50 | server prefill |
+| ---: | ---: | ---: | ---: | ---: |
+| 90 | 67 | 158.1 | 144.4 | 143.1 ms |
+| 170 | 115 | 191.3 | 178.2 | 175.7 ms |
+| 340 | 219 | 269.7 | 257.3 | 252.9 ms |
+| 512 | 320 | 356.5 | 334.2 | 337.3 ms |
+| 680 | 421 | 414.0 | 400.8 | 395.6 ms |
+| 1024 | 629 | 583.9 | 566.8 | 563.8 ms |
+| 2048 | 1242 | 905.7 | 887.8 | 880.0 ms |
+| 4096 | 2474 | 1731.5 | 1713.8 | 1694.9 ms |
+| 6144 | 3703 | 2438.7 | 2420.3 | 2391.0 ms |
+
+with every residual inside ±47 ms of
 
 ```text
-TTFT = 205.7 ms + 599.1 us x prompt_tokens
+TTFT = 142.6 ms + 627.4 us x prompt_tokens
 ```
 
-with every residual inside ±81 ms, and the same fit without the 115-token point
-reads 190.7 ms + 604.9 us. The two fits put the fixed term at 204.2 and 205.7 ms
-from disjoint data.
+fitted on those nine alone. The two fits put the fixed term at 131.4 and 142.6 ms
+from disjoint data: the calls arms never send a 325-token prompt and the length
+sweep never makes more than one call.
 
-Two measurements already on this page land on the same number without being
-asked to. The ladder's own slope `c` is 407-422 ms a request, against the model's
-390.5 ms for the 322.6-token mean prompt `L16` actually sent; and `pf128` against
-`L16` adds two calls to each of 16 requests for 6195.4 ms of mean TTFT. That
-second one is worth working through, because the bimodal structure above says the
-mean is not the increment: the first request waits for its own prefill and the
-other fifteen wait for the whole wave, so a per-call cost `k` moves the mean by
-`k x (32 x 15/16 + 2 x 1/16) = 30.1 k`. The measured 6195.4 ms is therefore
-**205.7 ms a call**.
+One measurement already on this page lands on the same number without being
+asked to. The ladder's own marginal prefill `c` is 319.5-337.8 ms a request,
+against the model's 329.8 ms for the 322.6-token mean prompt `L16` actually sent.
 
-**So a 325-token prefill costs 411 ms and 204 ms of it — half — is paid before
-the first token-dependent FLOP.** Every estimate of that fixed term here —
-204.2, 205.7, 190.7, 205.7, and the 164-245 ms the individual arms span — comes
-from one of four different manipulations of the same server.
+The `pf128` arm below is the one that does **not** land on it, and that is worth
+stating rather than burying. It gives each of sixteen requests two extra calls,
+and if the fixed term were per call the way the fit has it, the mean TTFT would
+move by `k x (32 x 15/16 + 2 x 1/16) = 30.1 k`, or 4.0 s at `k` = 131.4 ms. It
+moves 1.56 s, which reads 52 ms a call — a factor of 2.5 below what the two
+direct arms measure. The wave's own shape says why: `L16`'s bimodality is gone,
+the fifteen pack requests all latch between 6625 and 6632 ms and the first at
+4905.1 ms where `L16`'s first was 410.9 ms. **A budget that cuts a prompt into
+three passes does not add three independent calls to each request; it changes the
+order the scheduler runs them in.** The direct arms stay the measurement of the
+per-call term — they vary the call count at one slot and one prompt, so a call is
+the only one in flight — and this arm bounds what budgeting costs a whole wave
+rather than being a second estimate of the same constant.
 
-It is not the collectives, which is the other thing a fixed per-call cost could
-have been. Setting `POCKET_ASCEND_IPC_ALLREDUCE_SKIP=1`, which makes the IPC
-all-reduce a no-op and returns wrong tokens, moves the server's prefill for a
-1242-token prompt from 881.2 ms to 885.2 ms — 0.5%, inside the spread — across
-the 129 collectives a pass the caller issues. The 276.8 ms the profiler
-attributes to `tp_all_reduce` is latency the ranks absorb, not serialized work.
+**So a 325-token prefill costs 331 ms and 131 of it — 40% — is paid before the
+first token-dependent FLOP.** Every estimate of that fixed term here — 131.4 and
+142.6 from the two fits, and the 110-195 ms the individual arms span — comes from
+one of three different manipulations of the same server.
+
+**It is the collectives.** A forward pass issues 129 of them whatever the prompt's
+width, and the barrier the engine ships for them is not the one it could use.
+Ceiling raised past the prompt against the shipped default, one call, one slot,
+TTFT p50 over six requests:
+
+| rows | plane | default, on HCCL | hand-written | change |
+| ---: | ---: | ---: | ---: | ---: |
+| 67 | 686 KB | 165.0 ms | 145.2 ms | -12.0% |
+| 219 | 2.24 MB | 369.6 ms | 257.0 ms | -30.5% |
+| 421 | 4.31 MB | 465.0 ms | 401.0 ms | -13.8% |
+| 629 | 6.44 MB | 564.9 ms | 569.4 ms | +0.8% |
+| 1242 | 12.7 MB | 889.6 ms | 1021.1 ms | +14.8% |
+
+At 219 rows that is 112.6 ms over the 129 collectives a pass issues, 0.87 ms a
+call, for a barrier that computes the same numbers. **`tp_all_reduce` is serialized
+work on the critical path rather than latency the ranks absorb**, and a cheaper
+call is worth the whole difference.
+
+The two barriers cross between 421 and 629 rows, which is the part of this an
+element ceiling gets wrong. [ascend_single_request_tps.md](ascend_single_request_tps.md)
+§2.2 gives HCCL's side: its 0.481 ms a call is host latency and not wire time, so it
+is flat from 10 KB to 640 KB. The hand-written barrier is cheaper there and costs
+more per element, so it wins where HCCL's fixed price dominates and loses once the
+plane is large enough for that price to stop dominating. The gap below the crossing
+is wider than the barriers alone account for, because the hand-written path also
+skips `all_reduce_half`'s bracket: it runs on the caller's stream, so there is no
+default-stream drain around it, which §5.5.1 of that page prices at 0.100 ms a call.
+**The ceiling is therefore pinned at 512 rows**, between the largest measured win and
+the smallest measured loss, and it stays a count of elements because the collective
+layer does not know the hidden size.
+
+The crossing is also the only place in this change where a barrier could have been
+wrong rather than slow, and it is not: over a 432-token prompt — 2.21 M elements, so
+on the hand-written path under the new ceiling and on HCCL under the old one — 24
+greedy steps emit identical ids. That run is worth 391.9 ms of prefill against
+471.6 ms, **-16.9%**, against the same prompt the length sweep could only bound.
 
 ### What merging would and would not buy
 
@@ -428,28 +564,36 @@ A merged forward pays the fixed term once and the per-token term once per token;
 the serial loop pays both once per request. `L16`'s sixteen prompts are 5162 real
 tokens, ten at 320 and six at 327:
 
-| | prefill | TTFT p50 |
+| | wave prefill | the 16th request |
 | --- | ---: | ---: |
-| `L16` today, 16 serial calls | 16 x (204.2 + 0.5774 x 322.6) = 6248 ms | 6640 ms measured |
-| merged, one 5162-row forward | 204.2 + 5162 x 0.5774 = 3185 ms | ~3310 ms |
-| merged, at the steeper one-call slope 0.5991 | 204.2 + 5162 x 0.5991 = 3300 ms | ~3420 ms |
+| `L16` today, 16 serial calls | 16 x 131.4 + 5162 x 0.6374 - 7.2 = 5385 ms | 5264.8 ms measured |
+| merged, one 5162-row forward | 131.4 + 5162 x 0.6374 - 7.2 = 3414 ms | one decode step later |
+| merged, at the one-call slope 0.6274 | 142.6 + 5162 x 0.6274 = 3381 ms | one decode step later |
 
-**That is 1.9-2.0x, not the ~1.06x the engine's comment quotes.** The two slopes
+The measured column is the check. The serial model's own last request is
+15 x 329.8 + 410.9 = 5358 ms, against 5264.8 ms measured, so the per-request
+prefill the model uses reproduces the wave to 2% — the first request's TTFT is
+410.9 ms against its 329.8 ms of modelled prefill plus one decode step. The
+merged rows are the same 5162 tokens with the call term paid once instead of
+sixteen times, and either would put each request's first token one decode step
+past it: `L16`'s own TPOT at 16 rows, 100.39 ms.
+
+**That is 1.6x, not the ~1.06x the engine's comment quotes.** The two slopes
 are the joint call-count fit's and the one-call length fit's; both are measured
 to 3703 rows and the merged call is 5162, so the table's exposure is that
 extrapolation and not the decomposition.
 
 The comment is not wrong, it answers a different question. The saturation sweep
 that produced it merges prompts into a chunk that is *already* 2048 or 4096
-tokens, where the fixed term is 204/(204 + 0.5774 x 2048) = 15% of a call and
-merging sixteen of them is worth 1.16x. The ladder sends 322-token prompts,
-where the same term is 52% of a call. The smaller the prompt, the larger the
-share of it that is the fixed cost, and the ladder is on the small end.
+tokens, where the fixed term is 131.4/(131.4 + 0.6374 x 2048 - 7.2) = 9.2% of a
+call and merging sixteen of them is worth 1.09x. The ladder sends 322-token
+prompts, where the same term is 40% of a call. The smaller the prompt, the larger
+the share of it that is the fixed cost, and the ladder is on the small end.
 
 In FLOP terms the fixed term is what separates the delivered rate from the
-marginal one. 51.244 GFLOP a token over a 577.4 us slope is **88.8 TFLOP/s of
-884.7, 10.0% of the Cube**, against 40.5 TFLOP/s, 4.6%, delivered on a 325-token
-prompt. Merging recovers that 2.2x — the same 2x as the TTFT figure, because it
+marginal one. 51.244 GFLOP a token over a 637.4 us slope is **80.4 TFLOP/s of
+884.7, 9.1% of the Cube**, against 50.3 TFLOP/s, 5.7%, delivered on a 325-token
+prompt. Merging recovers that 1.6x — the same 1.6x as the TTFT figure, because it
 is the same term.
 
 ### The levers that were tried against it
@@ -461,20 +605,22 @@ call, so a 128-token budget turns every ~325-token prompt into three passes:
 
 | run | budget | TTFT mean | TTFT P99 | TPOT | tok/s | goodput |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `L16` | 4096 | 6248.4 | 6636.1 | 153.65 | 74.22 | 0.000 |
-| `pf128` | 128 | 12443.8 | 12580.2 | 148.90 | 59.74 | 0.000 |
+| `L16` | 4096 | 4961.5 | 5268.2 | 100.39 | 106.37 | 0.056 |
+| `pf128` | 128 | 6521.1 | 6631.8 | 96.85 | 97.60 | 0.000 |
 
-TTFT doubles and throughput drops 20%, while TPOT is unchanged within its spread
-— the cost is entirely in the extra passes through the 64-layer stack. For prompt
-lengths near the budget the budget is a latency tax. It would earn its keep on
-prompts far longer than 4096 tokens, which this record does not measure.
+TTFT is 31% higher and throughput 8% lower, while TPOT is *better* by 3.5 ms —
+inside its own 13.86 ms spread, so the cost is entirely in the extra passes
+through the 64-layer stack and not in the step. For prompt lengths near the
+budget the budget is a latency tax. It would earn its keep on prompts far longer
+than 4096 tokens, which this record does not measure.
 
 **Padding the batch with the client does work, and is the usable lever.** `L16x64`
 is `L16` with 64 prompts offered to 16 slots, so the client holds a wave down to
-16 and refills as slots free: mean TTFT 2373.1 ms against 6248.4 for a 62%
-reduction, at the same throughput and the best goodput among the full-batch runs.
-It costs nothing but a slot count below the offered concurrency, which is the
-opposite of what a throughput-first configuration does.
+16 and refills as slots free: mean TTFT 1786.9 ms against 4961.5 for a 64%
+reduction, at the same throughput (105.21 against 106.37 tok/s) and the best
+goodput among the full-batch runs. It costs nothing but a slot count below the
+offered concurrency, which is the opposite of what a throughput-first
+configuration does.
 
 ## The TPOT lever at concurrency one
 
@@ -498,9 +644,15 @@ concurrency one the decode step is the whole of the run between the first token
 and the last.
 
 **At 16 rows the same lever does nothing**, which is what the mechanism predicts:
-the M tile is already full of real rows, so a broadcast row adds no work.
-`rep16` reads 152.36 ms and 72.86 tok/s against `L16`'s 153.65 and 74.22, a
-difference inside the ladder's own spread.
+the M tile is already full of real rows, so a broadcast row adds no work. The
+`rep16` run is from the earlier revision — it is at `645e36b`, above the old
+ceiling and below the new one — and it reads 152.36 ms and 72.86 tok/s against
+that revision's `L16` of 153.65 ms and 74.22 tok/s, a difference inside the
+ladder's own spread. Compared against the re-measured `L16` it would look like a
+52% loss, and that difference is the ceiling, not the lever: `rep16`'s decode
+planes are 16 rows wide, so under the old ceiling they went to HCCL while the
+current `L16` keeps them on the hand-written barrier. **The arm is not re-run
+here**, so its only valid comparison is against the `L16` it was measured beside.
 
 ## Where the FLOPs go
 
@@ -524,23 +676,28 @@ decode table says the same thing:
 
 | rows | TPOT | row-steps/s | TFLOP/s, 4 cards | % of peak | GB/s a card | % of the 1148 GB/s probe |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 54.31 | 18.41 | 0.944 | 0.11% | 247.6 | 21.6% |
-| 4 | 68.28 | 58.58 | 3.002 | 0.34% | 197.0 | 17.2% |
-| 8 | 84.67 | 94.49 | 4.842 | 0.55% | 158.8 | 13.8% |
-| 16 | 153.65 | 104.13 | 5.336 | 0.60% | 87.5 | 7.6% |
-| 32 | 212.55 | 150.56 | 7.715 | 0.87% | 63.3 | 5.5% |
-| 48 | 261.55 | 183.52 | 9.404 | 1.06% | 51.4 | 4.5% |
-| 64 | 341.59 | 187.36 | 9.601 | 1.09% | 39.4 | 3.4% |
-| 96 | 471.00 | 203.82 | **10.445** | **1.18%** | 28.6 | 2.5% |
-| 112 | 683.84 | 163.78 | 8.393 | 0.95% | 19.7 | 1.7% |
-| 128 @ ctx 1024 | 811.14 | 157.80 | 8.086 | 0.91% | 16.6 | 1.4% |
+| 1 | 54.40 | 18.38 | 0.942 | 0.11% | 247.2 | 21.5% |
+| 4 | 67.45 | 59.30 | 3.039 | 0.34% | 199.4 | 17.4% |
+| 8 | 84.35 | 94.85 | 4.860 | 0.55% | 159.5 | 13.9% |
+| 16 | 100.39 | 159.37 | 8.167 | 0.92% | 134.0 | 11.7% |
+| 32 | 155.70 | 205.52 | 10.532 | 1.19% | 86.4 | 7.5% |
+| 48 | 212.42 | 225.96 | 11.579 | 1.31% | 63.3 | 5.5% |
+| 64 | 284.58 | 224.89 | 11.524 | 1.30% | 47.3 | 4.1% |
+| 96 | 422.04 | 227.47 | 11.656 | 1.32% | 31.9 | 2.8% |
+| 112 | 472.97 | **236.80** | **12.135** | **1.37%** | 28.4 | 2.5% |
+| 128 @ ctx 1024 | 536.98 | 238.37 | 12.215 | 1.38% | 25.0 | 2.2% |
 
 The GB/s column is the step's own traffic if every resident weight byte were read
-once, over the measured step time. It falls from 21.6% of the probe at one row to
-1.7% at 112, so **the weights stop being the binding constraint between 8 and 16
-rows** and the step time keeps growing anyway: 12.6x from one row to 112 while
-the memory floor stays at 11.7 ms. Only ~1.2% of the Cube is ever doing work, and
-the peak of that curve is 96 rows.
+once, over the measured step time. It falls from 21.5% of the probe at one row to
+2.5% at 112, and it is under a quarter of the card's measured read bandwidth at
+every width on the ladder: at 112 rows the step takes 472.97 ms against the
+11.7 ms a full weight read costs. **Memory bandwidth is not what bounds this
+ladder**, and the step time nonetheless grows 8.7x from one row to 112 while that
+floor stays flat. Only 1.4% of the Cube is ever doing work, and the widest rung
+of the ladder is where the ladder's own curve peaks — it has not turned over at
+112. The `128 @ ctx 1024` row sits just above the 112-row one, 12.215 TFLOP/s and
+238.37 row-steps/s, but it is a run at half the context and so a different
+operating point rather than the next rung.
 
 What grows instead is the collective and the stack. At 16 rows the engine
 attributes a 64-step batched decode of 37.0834 s as 41.45% in the 64-layer stack
@@ -549,21 +706,32 @@ scope `STACK.b`, 12.01% in `tp_all_reduce` over 8256 calls — **129 a step**, t
 Between 4 and 16 rows the stack's share falls 45.05% -> 41.45% while the
 collectives' share rises 5.21% -> 12.01%, which is the whole of what width buys:
 the per-step kernel work amortizes and the 129 fixed-latency round trips do not.
-That is why row-steps/s plateaus a little past 190 and why it turns over at 96,
-while the FLOPs available would allow far more.
+That is why the row-step rate is flat from 48 slots on while TPOT is not —
+225.96, 224.89, 227.47 and 236.80 row-steps/s at 48, 64, 96 and 112 against
+212.42 to 472.97 ms of TPOT — so past the knee every extra slot is bought from
+the step time and paid for out of nothing. The FLOPs available would allow far
+more, and the distance between them is the 129 round trips.
+
+Those shares are the **shipped** barrier's, and the profile is the only place on
+this page that measures it. The profiled runs are `--batch-decode` invocations of
+`run_qwen_ascend_tp4.sh`, which exports neither `POCKET_ASCEND_IPC_ALLREDUCE` nor
+its DEVWAIT, so every collective in them is HCCL and the element ceiling this
+revision raises is not on their path at all — with the switch unset the ceiling
+is never consulted. The ladder's numbers are the opt-in stack's; the profile's
+12.01% is what the shipped configuration pays for the same 129 calls.
 
 Prefill sits on the other side of the ridge and is equally far from its ceiling.
-A 324.8-token prompt costs 411 ms of prefill — the ladder's TTFT slope, which is
-that quantity measured directly — and a token of forward pass is 51.244 GFLOP, so
-the prompt is 324.8 x 51.244 = 16.64 TFLOP for the whole model and 16.64/0.411 =
-40.5 TFLOP/s across the four cards:
+A 325-token prompt costs 331 ms of a single call — the fits above are that
+quantity measured directly — and a token of forward pass is 51.244 GFLOP, so the
+prompt is 325 x 51.244 = 16.65 TFLOP for the whole model and 16.65/0.331 =
+50.3 TFLOP/s across the four cards:
 
 | | ms | tokens/s | TFLOP/s, 4 cards | % of peak |
 | --- | ---: | ---: | ---: | ---: |
-| prefill, one 325-token prompt | 411 | 791 | 40.5 | 4.6% |
-| decode at 96 rows | 471.00 | — | 10.445 | 1.18% |
+| prefill, one 325-token prompt | 331 | 982 | 50.3 | 5.7% |
+| decode at 112 rows, the widest | 472.97 | — | 12.135 | 1.37% |
 
-So prefill is 3.9x more efficient than the widest decode and still leaves 95% of
+So prefill is 4.1x more efficient than the widest decode and still leaves 94% of
 the Cube idle. That gap is the same serial structure the TTFT section identifies:
 the GEMMs never see more than one prompt's rows, and a 325-row M is small enough
 that per-op overhead dominates. **Both curves are bounded by the same defect, and
@@ -612,26 +780,29 @@ it is a batching defect rather than a bandwidth one.**
   the time side.
 - **One pair is not a series.** The ladder is one run a width; the repeatability
   it has is the `L16`/`rep16` pair, which matched to 1.8% in throughput and 0.8%
-  in TPOT, and the `L1`/`ctl1_r*` match against the A/B's control arm. The
-  replicate A/B was run interleaved three times for exactly this reason and is the
-  only lever on this page quoted with its spread.
+  in TPOT — both of them at `645e36b`, and `rep16` has no counterpart under the
+  raised ceiling — and the `L1`/`ctl1_r*` match against the A/B's control arm.
+  The replicate A/B was run interleaved three times for exactly this reason and is
+  the only lever on this page quoted with its spread.
 - **The two runs that lost a rank are excluded from every mean on this page.**
   `L120` and `L128` appear only in the concurrency-limit table, as pass/fail
-  counts. Their latency figures are the 900 s client timeout, not the engine:
-  `L120`'s mean TPOT of 911.42 ms is what averaging 105 requests that produced a
-  median of 2 tokens gives, and `L128`'s single success is one request. The
-  `128 @ ctx 1024` row of the roofline table is `L128c1024`, a different run that
-  completed 128/128.
-- **Every server-side figure is a mean over all but the last requests of its
-  run.** The archived `.metrics` artifacts predate `--server-drain-seconds`, so
-  the scrape that ended each run was taken with requests still in flight: 3 of
-  `L4`'s 4, 45 of `L48`'s 48, 61 of `L64`'s 64, 110 of `L112`'s 112, 0 of `L1`'s
-  1. The queue, prefill, decode and TTFT means quoted here are therefore over
-  the requests that had completed by the last poll. The ones left out are the
-  tail of a single wave, and the spread among the requests behind the first is
-  8-29 ms, so dropping one or two moves a mean by under a millisecond. The two
-  that lost a rank are the exception and are excluded already. Re-running a
-  point with the drain makes its scrape exact.
+  counts. Their latency figures are what one surviving request reads, not what
+  the run is: the re-measured `L120` completed a single request at 421.85 ms TTFT
+  and 55.59 ms TPOT for 2 output tokens, and the engine's own counter for that run
+  is 120 errors and 0 successes. The `128 @ ctx 1024` row of the roofline table
+  is `L128c1024`, a different run that completed 128/128.
+- **Every server-side figure on this revision is exact.** The re-measured runs
+  pass `--server-drain-seconds 1.0`, so the scrape that ends a run is taken after
+  the last request has returned: every `.metrics` artifact behind the ladder, the
+  prefill sweep and the limit probes has a `pocket_request_prefill_time_seconds_count`
+  equal to the number of requests the bench completed — 1, 4, 8, 16, 32, 48, 64,
+  96, 112, 16x64, 48x192 on the ladder and 4 of 4 at every prefill point. The
+  `QWEN_ASCEND_REPLICATE_ROWS` A/B arms predate the flag and are the one place it
+  still bites: `rep16` recorded 15 of its 16 requests, `rep1` and the `ctl1_*`
+  controls 0 of 1. An earlier revision of this page read the whole ladder from
+  artifacts of that kind, with `L4` at 3 of its 4 and `L1` at 0 of its 1. The
+  figures the A/B is quoted for are the bench's own record rather than the
+  scrape, so nothing in that table moves.
 - **No claim about other checkpoints.** 48 of the 64 layers are linear attention,
   and the gated-delta recurrence is what the prefill profile spends 11.7% of its
   time in. A stack without that recurrence would move.
@@ -658,14 +829,14 @@ In order of what the measurements support, and none of it done here:
    slot by a constant element stride rather than through a block table. Exposing
    the knob without teaching those kernels the translation would produce a
    server that starts and answers wrongly, which is worse than the hang above.
-2. **Merge the admission wave into one prefill forward, and expect ~2x rather
+2. **Merge the admission wave into one prefill forward, and expect 1.6x rather
    than the ~1.06x the engine's comment quotes.** It is the only finding on this
    page that moves TTFT and prefill TFLOPS together — both are bounded by the
    same one-request-at-a-time loop in `batch_prefill`, and the term that merging
-   removes is 204 of the 411 ms a 325-token prompt costs. At `L16` that is
-   6640 ms of TTFT to ~3.3-3.4 s and 40.5 to ~80 TFLOP/s on four cards. The
+   removes is 131 of the 331 ms a 325-token prompt costs. At `L16` that is
+   5385 ms of wave prefill to 3414 ms, and 49 to ~78 TFLOP/s on four cards. The
    `~1.06x` in that comment is the same arithmetic at 2048 tokens, where the
-   fixed term is 15% of a call instead of 52%; it is the ladder's short prompts,
+   fixed term is 9% of a call instead of 40%; it is the ladder's short prompts,
    not the sweep's, that the merge is worth doing for. The obstacle is real and
    is named in the code: the linear-attention layers carry a per-sequence state,
    so a merged forward needs a segmented recurrence, and the 16 full-attention
@@ -673,13 +844,18 @@ In order of what the measurements support, and none of it done here:
    spend 16x on the dense attention matrix what sixteen 322-row forwards spend in
    total.
 3. **Make the row-step rate rather than the FLOP rate the target, and stop at
-   96.** At 96 slots the step is 471.00 ms for 203.82 row-steps/s and 4.04 ms of
-   new row each; 129 collectives a step are 12% of it and none of it amortizes
-   with width. Going 96 -> 112 costs 45% more TPOT for 9% fewer tokens.
+   48.** At 48 slots the step is 212.42 ms for 225.96 row-steps/s and 3.55 ms of
+   new row each; 129 collectives a step are 12% of the shipped step and none of
+   it amortizes with width. Going 48 -> 112 more than doubles TPOT, 212.42 to
+   472.97 ms, for 4.8% more row-steps/s and 0.8% more tokens. If the step rate is
+   the target rather than the latency, the lever is those 129 round trips, and
+   the ceiling this revision raises is a first step at it: the same TPOT points on
+   the hand-written barrier instead of HCCL are worth 1.53x at 16 rows and 1.45x
+   at 112.
 4. **Default the operating point to a slot count below the offered concurrency.**
-   `L16x64` gets 62% less TTFT than `L16` at the same throughput and the best
+   `L16x64` gets 64% less TTFT than `L16` at the same throughput and the best
    goodput among the full-batch runs. This is a configuration change and not an
    engine one.
 5. **Leave the Cube kernels alone.** Decode is 0.953 FLOP/byte, 202x below the
-   ridge. A faster multiply changes a term that is 1.18% of peak and would have
+   ridge. A faster multiply changes a term that is 1.37% of peak and would have
    to be paid for against 129 collectives and a 41.45% stack.

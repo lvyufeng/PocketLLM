@@ -353,13 +353,17 @@ when the same barrier is put where the collective actually is.
 
 The barrier is now `cpp_engine/backends/ascend/collective/ipc_allreduce.{hpp,cpp}`, reached through
 `tp_all_reduce_sum_f16_inplace`. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it for any call with world > 1
-and a plane of at most 40 960 FP16 elements; a call outside that envelope falls through to HCCL
-unchanged, and every rank evaluates the same predicate on the same arguments, so the choice cannot
-desynchronise the group. The ceiling is **not** a measured bound — §5.5.4 re-tests the sweep that set
-it and cannot separate the sizes it chose between — so what it is is a conservative default on a path
-that is opt-in. It covers one row's 5120-element decode plane, 129 times a step, which is the whole
-point of the replacement; it does **not** cover a 16-row batched decode plane (81 920) or prefill, so
-both stay on HCCL.
+and a plane of at most `kDefaultMaxElements` FP16 elements; a call outside that envelope falls through
+to HCCL unchanged, and every rank evaluates the same predicate on the same arguments, so the choice
+cannot desynchronise the group. That ceiling was 40 960 when this section was written, chosen by a
+sweep §5.5.4 then re-tested and could not separate the sizes between, and it has since been re-derived
+from the other end: [serving_throughput_scaling.md](serving_throughput_scaling.md)
+measures the two barriers against each other as whole-prefill TTFT, finds the hand-written one
+cheaper to 421 rows and dearer from 629, and the default now sits at 512 rows — 2 621 440 elements.
+So the envelope covers prefill and batched decode as well as the one-row plane it was written for,
+which is a change to what a serving run does and not only to what a diagnostic can measure.
+Everything in this section was measured under the old ceiling and none of it moves: §5.5.1-5.5.4 are
+all rows=1 steps, where both ceilings admit the hand-written path.
 
 #### 5.5.1 The bracket cost more than the collective saved
 
