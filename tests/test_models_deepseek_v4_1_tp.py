@@ -46,7 +46,14 @@ import torch
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.loader import V41Checkpoint, load_backbone
 from src.models.deepseek_v4_1.modules import RoutedExperts
-from src.models.deepseek_v4_1.tp import ShardPlan, attach_tp, make_all_reduce, split_names
+from src.models.deepseek_v4_1.tp import (
+    INDEXER_ROW_SPLIT_ENV,
+    ShardPlan,
+    attach_tp,
+    make_all_gather,
+    make_all_reduce,
+    split_names,
+)
 from tests.test_models_deepseek_v4_1_loader import (
     MINI,
     N_LAYERS,
@@ -122,6 +129,24 @@ class _MessageBoard:
 
         return collective
 
+    def gather_for(self, rank: int):
+        """`dist.all_gather` along the sequence axis: the row split's one message.
+
+        No two-phase trick here, unlike `reduce_for`'s documented case. An all-gather is not a
+        reduction -- every rank's own slice *is* part of the answer, whole and already final -- so the
+        first barrier is what makes the slots complete and the second is the same "do not post the
+        next message over a slow rank's read" that `reduce_for` needs.
+        """
+
+        def collective(tensor: torch.Tensor) -> torch.Tensor:
+            self._slots[rank] = tensor.detach().clone()
+            self._barrier.wait()
+            parts = list(self._slots)
+            self._barrier.wait()
+            return torch.cat(parts, dim=1)
+
+        return collective
+
     def run(self, body) -> list:
         """Run `body(rank)` on every rank at once, and give back their results in rank order."""
         results: list = [None] * self.world
@@ -192,6 +217,7 @@ def test_one_rank_is_the_whole_tree_and_attaches_nothing(trees) -> None:
     by anything but one, no collective, and every split name a no-op."""
     plan = ShardPlan.build(trees.cfg, 0, 1)
     assert plan.reduce is None and make_all_reduce(1) is None
+    assert plan.gather is None and make_all_gather(1) is None
     assert attach_tp(trees.whole.model, plan) == 0
     assert getattr(trees.whole.model, "tp", None) is None
 
@@ -369,6 +395,194 @@ def _close(want: torch.Tensor, got: list[torch.Tensor], what: str, dtype: torch.
             f"tree, and {N_LAYERS} layers of {torch.finfo(dtype).eps:.3e} roundings allow "
             f"{bound:.3e}"
         )
+
+
+# -- the indexer's other axis: query rows instead of index heads -----------------------------------
+
+
+def test_the_row_split_replicates_one_parameter_and_moves_no_other_cut(trees) -> None:
+    """`wq_b` is what the row split costs, and it is the whole of what it costs.
+
+    A row band reads every index head of its own rows, so the weight cannot be cut however many ranks
+    there are. Nothing else changes axis: `wq_a` is not in the table at all -- so `qr` is already full
+    width on every rank -- and `weights_proj` is already computed at `index_n_heads` wide and sliced on
+    the way out. Written as a comparison against the head split rather than against a literal, so a
+    table edited in either direction fails here.
+    """
+    whole = dict(trees.whole.model.named_parameters())
+    # built outside the patch, so this is the head split and the comparison below is a comparison of
+    # two layouts rather than of a plan with itself. That holds because `build` is where the switch is
+    # read: a plan answers the same way however long after it was made it is asked.
+    head = ShardPlan.build(trees.cfg, 0, WORLD)
+    # every split name of every layer, less the indexer's own on the layers that have no indexer --
+    # counted for each rank, because the loop below re-checks the whole list on every rank and it is
+    # the re-check that would catch a cut that is right on one rank and wrong on the next
+    expected = WORLD * (len(split_names()) * N_LAYERS - (N_LAYERS - len(MINI["index_source_layers"])))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(INDEXER_ROW_SPLIT_ENV, "1")
+        checked = 0
+        for rank in range(WORLD):
+            rows = ShardPlan.build(trees.cfg, rank, WORLD)
+            assert rows.index_heads == head.index_heads, "the head count is not what moved"
+            for layer in range(N_LAYERS):
+                for tail in split_names():
+                    name = f"layers.{layer}.{tail}"
+                    if name not in whole:
+                        continue
+                    shape = tuple(whole[name].shape)
+                    if tail == "attn.indexer.wq_b.weight":
+                        assert rows.local_shape(name, shape) == shape, "a row band needs all the heads"
+                        assert head.local_shape(name, shape) != shape, "and the head split does not"
+                    else:
+                        assert rows.local_shape(name, shape) == head.local_shape(name, shape), tail
+                    checked += 1
+        assert checked == expected
+
+
+def test_a_row_band_is_the_whole_chunk_for_every_length_it_cannot_cut(trees) -> None:
+    """The four lengths `row_band` is not a band for, and the one it is.
+
+    A chunk that does not divide the world is not a corner to reason about but a length the split has
+    nothing to say about, and the answer for it has to be "the head split", which works at any length.
+    The gather is a fixed-shape call, so a ragged band would need a second code path for a case this
+    model does not have. The bands that *are* taken have to cover the chunk exactly once, which is the
+    property the gather's `cat` depends on for its order.
+    """
+    from src.models.deepseek_v4_1.attention import Indexer
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(INDEXER_ROW_SPLIT_ENV, "1")
+        plans = [ShardPlan.build(trees.cfg, rank, WORLD) for rank in range(WORLD)]
+        indexers = [
+            Indexer(trees.cfg, MINI["index_source_layers"][0], 1, 64, world=WORLD) for _ in range(WORLD)
+        ]
+        for rank, indexer in enumerate(indexers):
+            indexer.tp = plans[rank]
+            # the module was built for the row split, so it holds the whole weight and `forward` takes
+            # the head band out of it on the calls that need one -- and asserts the two agree
+            assert indexer.row_split and indexer.n_heads == indexer.n_heads_global
+            assert indexer.row_band(1) == (0, 1), "one query is below the world"
+            assert indexer.row_band(3) == (0, 3), "three does not divide two"
+            assert indexer.row_band(4) == (rank * 2, 2)
+            assert indexer.row_band(2) == (rank, 1)
+        covered = [
+            row
+            for row0, length in (indexers[rank].row_band(4) for rank in range(WORLD))
+            for row in range(row0, row0 + length)
+        ]
+        assert covered == [0, 1, 2, 3], "the bands have to cover the chunk once, in rank order"
+
+        # and the switch is a switch: with the split off, `world=4` is four bands of heads and the
+        # indexer keeps every query row
+        patch.setenv(INDEXER_ROW_SPLIT_ENV, "0")
+        off = Indexer(trees.cfg, MINI["index_source_layers"][0], 1, 64, world=WORLD)
+        off.tp = ShardPlan.build(trees.cfg, 1, WORLD)
+        assert not off.row_split and off.n_heads == off.n_heads_global // WORLD
+        assert off.row_band(4) == (0, 4)
+
+
+def test_a_row_split_shard_is_the_unsharded_tree_row_for_row(trees) -> None:
+    """The row split against the oracle, on the two things it claims.
+
+    The *discrete* claim is the picks. Every rank computes the ids for its own rows and one all-gather
+    puts them back in rank order, so the concatenation has to be the tensor the whole tree's indexer
+    produced -- not a permutation of it. That is what a band off by a row fails, and it fails here
+    rather than as a logit margin. The hook is on `Indexer.forward`'s return value, which is the
+    gathered tensor: a rank's band is never visible outside the module.
+
+    The *continuous* one is `_close`, at the same bound the head split is held to, because the row
+    split changes nothing about `wo_b` or the shared expert -- still column-parallel partials rounded
+    to bf16 before the all-reduce. What it does change is the indexer's score, which is now summed
+    over all 32 heads in one rank, in the oracle's own order, instead of over 8 heads on each of four
+    ranks and then rounded by a collective. The indexer is closer to the oracle here, not further.
+
+    The decode steps in the loop are the *head* split: one query is below the world, so `row_band`
+    hands back the whole chunk and the module takes its `_wq_b_for_heads` cut. That is deliberate --
+    it is the layout that works at any length -- and it means both axes of one module are covered.
+    """
+    board = _MessageBoard(WORLD)
+
+    def picks_of(loaded):
+        """`Indexer.forward`'s return value, per index source, for the next forward only."""
+        caught: dict[int, torch.Tensor] = {}
+        handles = []
+        for layer in loaded.model.layers:
+            indexer = getattr(layer.attn, "indexer", None)
+            if indexer is None:
+                continue
+            handles.append(
+                indexer.register_forward_hook(
+                    lambda _module, _inputs, output, lid=layer.layer_id: caught.__setitem__(
+                        lid, output.detach().clone()
+                    )
+                )
+            )
+        return caught, handles
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(INDEXER_ROW_SPLIT_ENV, "1")
+        shards = [
+            load_backbone(
+                trees.cfg,
+                trees.ckpt,
+                layout=trees.layout,
+                hasher=_toy_hasher(trees.layout),
+                world=WORLD,
+                rank=rank,
+            )
+            for rank in range(WORLD)
+        ]
+        for rank, shard in enumerate(shards):
+            plan = ShardPlan.build(
+                trees.cfg, rank, WORLD, reduce=board.reduce_for(rank), gather=board.gather_for(rank)
+            )
+            sites = [
+                module
+                for module in shard.model.modules()
+                if type(module).__name__ in ("Attention", "Indexer", "MoE")
+            ]
+            assert attach_tp(shard.model, plan) == len(sites)
+            assert plan.gather is not None, "a row split with no gather cannot put the picks back"
+
+        # the parameter the split costs, against the oracle's own tensor rather than against a shape
+        whole = dict(trees.whole.model.named_parameters())
+        for layer in MINI["index_source_layers"]:
+            name = f"layers.{layer}.attn.indexer.wq_b.weight"
+            for rank, shard in enumerate(shards):
+                assert torch.equal(dict(shard.model.named_parameters())[name], whole[name]), (
+                    f"rank {rank}'s {name} is not the file's whole weight"
+                )
+
+        tokens = [5, 3, 17, 11]
+        trees.whole.reset_state(1)
+        want_picks, handles = picks_of(trees.whole)
+        _, want, _ = trees.whole(torch.tensor([tokens]), 0)
+        for handle in handles:
+            handle.remove()
+        assert want_picks, "no indexer ran on the oracle, so there is nothing to compare picks to"
+
+        dtype = trees.whole.model.layers[0].attn.wo_b.weight.dtype
+
+        def prefill(rank: int):
+            shards[rank].reset_state(1)
+            picks, rank_handles = picks_of(shards[rank])
+            try:
+                return shards[rank](torch.tensor([tokens]), 0)[1], picks
+            finally:
+                for handle in rank_handles:
+                    handle.remove()
+
+        got = board.run(prefill)
+        for rank, (logits, picks) in enumerate(got):
+            assert set(picks) == set(want_picks), "the same layers have to have run their own indexer"
+            for layer, picked in picks.items():
+                assert picked.dtype == want_picks[layer].dtype
+                assert torch.equal(picked, want_picks[layer]), (
+                    f"rank {rank}'s layer {layer} picked {picked.tolist()} and the whole tree picked "
+                    f"{want_picks[layer].tolist()}"
+                )
+        # the logits come out of the *tuples* `board.run` collected, without the picks attached
+        _close(want, [logits for logits, _ in got], "row-split prefill", dtype)
 
 
 # -- the routed experts, once a rank owns a share of them -----------------------------------------

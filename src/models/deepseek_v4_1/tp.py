@@ -54,12 +54,50 @@ nothing, and every forward is the host forward exactly. That is the control colu
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 
-__all__ = ["ShardPlan", "attach_tp", "make_all_reduce", "split_names"]
+__all__ = ["ShardPlan", "attach_tp", "indexer_row_split", "make_all_gather", "make_all_reduce", "split_names"]
+
+
+# The indexer's `wq_b` is the one parameter whose cut depends on *how* the indexer is parallel, not
+# just on the world: see `indexer_row_split`.
+INDEXER_ROW_SPLIT_ENV = "DEEPSEEK_V41_INDEXER_ROW_SPLIT"
+
+
+def indexer_row_split(world: int) -> bool:
+    """Whether the indexer shards query rows instead of index heads.
+
+    The indexer's score is a sum over the 32 index heads, so a head split leaves each rank holding a
+    *partial* score and the top-k over it has to wait for a collective. That collective is the whole
+    of the indexer's context term -- it is issued once per key tile and its payload grows with the
+    compressed width -- so it, and not the arithmetic, is what makes the indexer the expensive row of
+    a long prefill.
+
+    Sharding the query rows instead costs the same arithmetic: folding the query and head axes
+    together, a rank computing `seqlen/world x 32 heads` is the same GEMM against the same `index_k`
+    as one computing `seqlen x 8 heads`. What changes is that the head sum is now over all 32 heads,
+    so the score is *complete for the rank's own rows* and there is nothing to reduce. The picks then
+    have to come back together before `sparse_attn`, which is head-parallel and needs every query's
+    ids -- but that gather is one message an index source over `index_topk` ints a query, against a
+    fp32 score tile an index source over the whole compressed prefix.
+
+    The price is that `wq_b` cannot be cut: a rank needs all 32 heads of its own rows even though it
+    owns a quarter of the rows. It is the only parameter that changes -- `wq_a` is not in the table
+    at all, so `qr` is already full-width everywhere, and `weights_proj` is already computed whole
+    and sliced on the way out. The `index_heads` scale in `Indexer.forward` stays the *global* count
+    for the same reason it is global today: the sum runs over all 32 heads on every rank.
+
+    Only a prefill whose length divides the world takes this path. The gather is a fixed-shape
+    `all_gather`, so a ragged band would need a second code path for no case this model has, and a
+    decode step -- one query -- is below the world for every sensible one.
+    """
+    if world <= 1:
+        return False
+    return os.environ.get(INDEXER_ROW_SPLIT_ENV, "0").strip() not in ("", "0")
 
 
 def make_all_reduce(world: int):
@@ -88,6 +126,30 @@ def make_all_reduce(world: int):
     return reduce
 
 
+def make_all_gather(world: int):
+    """`dist.all_gather` along the sequence axis as a closure, injected for `make_all_reduce`'s reason.
+
+    Only the indexer's row split uses it. The split leaves each rank with the picked positions for
+    its own query rows, and `sparse_attn` is head-parallel: it needs every query's ids, so the rows
+    have to come back together before the layer reads them. `cat` in rank order reassembles exactly
+    the row order the bands were cut in, which is what makes the gathered tensor the one a
+    head-split rank would have produced.
+
+    `world=1` returns `None`, so the unsharded configuration stays the same code path as the control.
+    """
+    if world <= 1:
+        return None
+
+    def gather(tensor: torch.Tensor) -> torch.Tensor:
+        import torch.distributed as dist
+
+        parts = [torch.empty_like(tensor) for _ in range(world)]
+        dist.all_gather(parts, tensor.contiguous())
+        return torch.cat(parts, dim=1)
+
+    return gather
+
+
 # Which parameters are cut, and along which axis. The key is the parameter name *below* its layer --
 # `layers.7.attn.wq_b.weight` is matched on `attn.wq_b.weight` -- because the same block is built 40
 # times and the cut does not depend on which one it is. Exact equality, not a suffix test: `attn.wq_b`
@@ -97,6 +159,10 @@ def make_all_reduce(world: int):
 #   cols         -- axis 1, the row-parallel half of an output projection
 #   grouped_rows -- axis 0 of the `[groups, o_lora_rank, -1]` view of a flat matrix
 #   index_heads  -- axis 0 of the `[n_heads, index_head_dim, -1]` view, same reason as wo_a
+#
+# Every entry is cut on every sharded load. The one exception is the indexer's `wq_b`, which
+# replicates under `indexer_row_split` -- the table names the axis it is cut on by default, and
+# `ShardPlan._kind` is what makes the exception, in one place rather than two.
 _SPLITS: tuple[tuple[str, str], ...] = (
     ("attn.wq_b.weight", "rows"),
     ("attn.attn_sink", "rows"),
@@ -110,7 +176,12 @@ _SPLITS: tuple[tuple[str, str], ...] = (
 
 
 def split_names() -> tuple[str, ...]:
-    """The parameter tails this module cuts. Exported so a test can assert it saw every one."""
+    """The parameter tails this module cuts. Exported so a test can assert it saw every one.
+
+    The table, not the cut: `attn.indexer.wq_b.weight` is listed here and is not cut when
+    `indexer_row_split` is on, because that configuration shards the indexer by query rows and needs
+    all of the heads on every rank. `ShardPlan._kind` is the one place the two are reconciled.
+    """
     return tuple(name for name, _ in _SPLITS)
 
 
@@ -142,11 +213,18 @@ class ShardPlan:
     heads_global: int
     groups_global: int
     index_heads_global: int
+    # Read once, in `build`, and not again. `_kind` is called from `local_shape` and `local_value`,
+    # which the loader calls for every parameter long after the plan was made, so a plan that read
+    # the switch lazily would answer as a head split or a row split depending on when it was asked --
+    # and the one place that disagreement would show up is the cut itself. A plan is a value: the
+    # same question gets the same answer.
+    row_split: bool
     head_dim: int
     o_lora_rank: int
     index_head_dim: int
     moe_inter_dim: int
     reduce: Callable[[torch.Tensor], torch.Tensor] | None
+    gather: Callable[[torch.Tensor], torch.Tensor] | None
 
     @classmethod
     def build(
@@ -157,6 +235,7 @@ class ShardPlan:
         *,
         moe_inter_dim: int | None = None,
         reduce: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> "ShardPlan":
         """Derive the plan, or raise on a split that is not a partition.
 
@@ -195,6 +274,8 @@ class ShardPlan:
 
         if reduce is None:
             reduce = make_all_reduce(world)
+        if gather is None:
+            gather = make_all_gather(world)
 
         return cls(
             rank=rank,
@@ -205,11 +286,13 @@ class ShardPlan:
             heads_global=heads,
             groups_global=groups,
             index_heads_global=index_heads,
+            row_split=indexer_row_split(world),
             head_dim=int(cfg.head_dim),
             o_lora_rank=int(cfg.o_lora_rank),
             index_head_dim=int(cfg.index_head_dim),
             moe_inter_dim=inter,
             reduce=reduce,
+            gather=gather,
         )
 
     def describe(self) -> str:
@@ -276,9 +359,12 @@ class ShardPlan:
 
     # -- internals ------------------------------------------------------------------------------
 
-    @staticmethod
-    def _kind(name: str):
+    def _kind(self, name: str):
         tail = _tail(name)
+        # The one entry whose cut depends on the world's *axis* and not just its size. A row split
+        # needs all 32 heads of a rank's rows, so the parameter replicates; see `indexer_row_split`.
+        if tail == "attn.indexer.wq_b.weight" and self.row_split:
+            return None
         for candidate, kind in _SPLITS:
             if tail == candidate:
                 return kind
