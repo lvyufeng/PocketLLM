@@ -576,13 +576,55 @@ Note the row gains 0.919 s where the chunk gains 0.60 s: about a third of the ro
 already hidden behind other work at the chunk level, and *that* is the number the overlap's ceiling has
 to be read against rather than the whole 4.758 s row.
 
-The overlap is the other one and it is the larger where the row is. The einsum of tile i+1 and the
+The overlap is the other one, and it is the larger where the row is. The einsum of tile i+1 and the
 reduce of tile i are independent — only `_TopKStream.push`'s D2H read of the score needs the reduce
-finished — so a one-tile lookahead on a second stream is a scheduling change with no numerics in it at
-all: **up to the collective's whole 1.79 s can go under the next tile's einsum at 262144, against the
-0.93 s the microbench predicted and the measured 0.851 s that the wire dtype actually bought the prefix
-path when it was run** — and the overlap needs no gate to be worth measuring, while the dtype's is shut.
-At 32768 it is worth nothing: the collective is 0.26 s of a 2.07 s row. The retile is the third and it owns 32768: the 0.198 s
+finished — so issuing tile k's `all_reduce` on a second stream and joining it `depth` tiles later is a
+scheduling change with no numerics in it, and the joins are FIFO, which is what keeps the pushed
+sequence — and so the selection — *identical* rather than merely equivalent.
+`/tmp/bench_indexer_reduce_overlap.py` runs the shipped per-tile arithmetic at these shapes on this
+fabric, four ranks, and compares the arms elementwise — `identical True` at every depth:
+
+| ms a tile | width 16384 | width 133120 |
+|---|---:|---:|
+| floor — the arithmetic with no collective at all | 4.85 | **4.40** |
+| serial — the shipped order | 10.31 | **9.83** |
+| lookahead, depth 1 | 8.88 | 8.44 |
+| lookahead, depth 2 | **7.95** | **6.91** |
+| lookahead, depth 4 | 8.07 | 6.98 |
+| lookahead, depth 8 | 8.05 | 7.11 |
+
+The serial arm is the floor plus the collective to the tenth of a millisecond (4.40 + 5.43 = 9.83), and
+the in-situ prefix tile is 10.75 — the bench is the real loop. **A depth of two hides 2.92 ms of the
+5.43 ms collective: 54% of it and 30% of the tile; deeper buys nothing.** That is the ceiling, and it is
+half of the whole collective rather than the whole of it — with two streams in flight the pipeline
+settles at 6.91 where `max(4.40, 5.43)` = 5.43 would be the floor, so the collective costs about 1.5 ms
+a tile more when it runs beside the arithmetic than when it runs alone, because NCCL's kernels want the
+same SMs the einsum does on a four-card Turing box.
+
+In situ the same 54% does not survive intact, and the instrument that shows it is
+`/tmp/probe_depth_inproc.py` — the arms in *one* process on one set of ranks with the knob rebound and
+the state reset between them, so this box's per-load spread cancels by construction. The four-process
+A-B-A-B (`/tmp/run_depth_ab.sh`, `0/2/2/0`) cannot resolve it: its first arm came back 29.80 s against
+its own setting's 27.48 s, with 0.57 s of the excess in `stream_candidates`, a row no depth can touch.
+Six serial arms across two sittings at 32768 read `stream_prefix` at **0.472–0.500 s** — 28 ms of spread
+over a whole sitting — against the pipelined arms' **0.355–0.392 s four times, −0.08 to −0.15 s under
+every serial arm (17–29%), and 0.490 and 0.501 twice.** `stream_candidates`, the row no depth can touch,
+ranges 1.537–1.613 over the same twelve arms and does not separate by depth at all. A
+`_ReducePipeline.push` count of 48 against the
+serial arms' 0 says the pipeline ran in all six, and the two exceptions are, in both sittings, the one
+pipelined arm that immediately follows another pipelined arm — so that difference is a second *state*
+and not a guard that failed to fire, and nothing here explains what sets it. That caveat is why the
+change is behind a flag rather than in the default. At 16384 the same probe moves the row 0.263 → 0.219 s
+over both of its pipelined arms.
+
+Over 328 prefix tiles the in-situ rate is ~2.2 ms a tile rather than the bench's 2.92, so ~0.7 s of the
+3.525 s prefix path at 262144; the row-vs-chunk transfer the fp16 arm measured above — 0.919 s of row to
+0.60 s of chunk — leaves **~0.46 s of the 29.74 s chunk, 1.6%, not the 1.79 s that hiding the whole
+collective would be, and nothing at all in the second state.** At 32768 it is 0.10 s of a 27.2 s chunk:
+visible on the row and invisible on the wall. So it is implemented behind
+`DEEPSEEK_V41_INDEXER_REDUCE_DEPTH` (`attention.py`'s `_ReducePipeline`, **default 0 — the shipped
+order**), which returns the serial order inside a capture and whenever `tp is None`; moving it into the
+default needs a chunk-level demonstration this box has not given. The retile is the third and it owns 32768: the 0.198 s
 `INDEXER_CAND_TILE` 64 → 256 buys is 9.6% of the row 2.07 s *because* the candidate path is 77% of it
 there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
 grow with the width.
