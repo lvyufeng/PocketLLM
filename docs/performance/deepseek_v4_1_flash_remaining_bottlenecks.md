@@ -485,8 +485,9 @@ supports as an **upper bound** at the configuration named, and the two gated row
 
 **Every row above is priced at a short prompt, and only one row of a chunk scales with context.** Rows
 2 and 3 are 512- and 128-token prefill levers; a 4096-token chunk at 262144 is a different list, and on
-it **`attn.indexer` plus `attn.compress_kv` are 3.19 s of a chunk at 32768 against 10.24 s of one at
-262144 — 11.6% to 32.7%** — while every other row of the two phase tables is flat or lower over the
+it **`attn.compress_kv` — with `attn.indexer` nested inside it rather than beside it, 99% of its parent
+on the eight calls that reach it — is 2.10 s of a chunk at 32768 against 5.14 s of one at 262144, 7.7%
+to 16.4%** — while every other row of the two phase tables is flat or lower over the
 same span. Its two levers are the indexer's `all_reduce`, which upcasts to fp32 and so puts 33.6 MB on
 the wire for a 16.8 MB tile — **5.47 ms a level-one tile measured on this fabric against 2.88 ms in
 bf16, 1.79 s of the prefix path's 3.53 s at 262144, and the prediction lands on the tap's own `sync`
