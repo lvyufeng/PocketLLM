@@ -54,6 +54,13 @@ from src.models.deepseek_v4_1.decode_pos import Pos
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="a capture needs a card")
 
+# Every activation below is drawn at `attention_module.LINEAR_DTYPE` rather than at a literal. The
+# width is the module's, not this file's: a `Linear` this tree builds multiplies its weight by
+# whatever activation it is handed and has no way to reconcile the two, so an activation at some
+# other width does not exercise the module -- it dies inside `F.linear` naming two c10 dtypes and
+# nothing else. Reading the constant is also what keeps the file honest about *which* property it is
+# testing: none of these tests is about the width.
+
 # Toy geometry: six layers, two of them KV sources, three of them index sources, and the second KV
 # source doubling as the candidate source so that one layer owns both published caches. The ratios
 # mix 2 and 1 so that both compressor branches (softmax pooling and a plain projection) run.
@@ -135,7 +142,7 @@ def _run_decode(stack: AttentionStack, x: torch.Tensor) -> torch.Tensor:
 
 def test_prefill_and_token_by_token_decode_agree() -> None:
     stack, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     prefill = _run_prefill(stack, x)
     decode = _run_decode(stack, x)
@@ -168,7 +175,7 @@ def test_both_orderings_select_exactly_the_reachable_compressed_positions() -> N
     anything recomputed per step.
     """
     stack, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     _run_prefill(stack, x)
     assert stack.shared.topk_idxs is not None
@@ -219,7 +226,7 @@ def test_reset_state_makes_two_forwards_independent() -> None:
     """Every test above relies on this: the reference is one conversation per process and never
     resets, so without it a second forward would silently continue the first."""
     stack, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     first = _run_prefill(stack, x)
     second = _run_prefill(stack, x)
@@ -352,7 +359,7 @@ def test_a_query_tile_smaller_than_the_chunk_keeps_every_query(monkeypatch) -> N
     walks several key tiles of one prefix.
     """
     stack, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     whole = _run_prefill(stack, x)
     assert stack.shared.topk_idxs is not None
@@ -480,7 +487,7 @@ def test_a_decode_step_records_into_a_graph_and_replays_at_a_moved_position(monk
 
     monkeypatch.setattr(attention_module._TopKStream, "push", counting)
 
-    x = torch.randn(1, N_GRAPH_TOKENS, cfg.dim, dtype=torch.bfloat16, device="cuda:0")
+    x = torch.randn(1, N_GRAPH_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE, device="cuda:0")
     positions = (RECORDED_AT, RECORDED_AT + 1, REPLAYED_AT)
 
     # the eager reference: one prefill, then the step at each position in turn on the cache it built

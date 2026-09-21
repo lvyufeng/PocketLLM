@@ -221,7 +221,14 @@ def test_the_moe_is_the_routed_half_plus_one_shared_expert() -> None:
     """
     moe = _fill(MoE(_cfg(), 0, N_EXPERTS, TOPK))
     torch.manual_seed(0)
-    x = torch.randn(2, 3, DIM, dtype=torch.bfloat16)
+    # The activation's width is the tree's, not this test's. `expert_forward` multiplies `x` by a
+    # weight it is handed and has no way to reconcile the two, so an `x` written at some other width
+    # does not exercise the MoE -- it dies inside `F.linear` naming two c10 dtypes and no cause. That
+    # was this line until the dense width moved to fp16, which is why it reads the constant rather
+    # than spelling bf16: the width is a property the module owns and this test is measuring the
+    # module.
+    dtype = modules_module.LINEAR_DTYPE
+    x = torch.randn(2, 3, DIM, dtype=dtype)
 
     flat = x.view(-1, DIM)
     weights, indices = moe.gate(flat)
@@ -238,7 +245,7 @@ def test_the_moe_is_the_routed_half_plus_one_shared_expert() -> None:
                 weights[row, slot : slot + 1, None],
             )
             routed[row] += contribution.reshape(DIM)
-    expected = (routed + moe.shared_experts(flat)).to(torch.bfloat16).view(2, 3, DIM)
+    expected = (routed + moe.shared_experts(flat)).to(dtype).view(2, 3, DIM)
     assert torch.allclose(moe(x), expected, atol=1e-6)
 
     # the shared expert is unconditional: with the routing weights zeroed it is all that is left

@@ -38,6 +38,7 @@ from src.encoding.engram import EngramLayout, NgramHasher
 from src.loader.safetensors import MmapSafetensors
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.kernels import _fp4_values
+from src.models.deepseek_v4_1 import loader as loader_module
 from src.models.deepseek_v4_1.loader import (
     CheckpointEngramTable,
     CheckpointRoutedExperts,
@@ -439,11 +440,17 @@ def test_the_expert_bank_is_repacked_from_the_per_expert_names(mini) -> None:
     The oracle is the tree's own bank: the fp4 in the file is an exact encoding of the bf16 the
     resident bank holds, so a name-for-name copy -- which would leave the stack uninitialized -- and a
     transposed nibble order both fail here.
+
+    The width is the loader's own `LINEAR_DTYPE` and not a literal, because the expansion is what this
+    test is about and the width is not: the store expands into the width the activation it will be
+    multiplied by has, and asserting bf16 here would be a second, private opinion about a constant
+    that lives in one place. The oracle survives the cast -- the reference bank holds four-bit ladder
+    values, which both two-byte widths represent exactly -- so the comparison stays `torch.equal`.
     """
     store = CheckpointRoutedExperts(mini.ckpt, 0, n_experts=N_EXPERTS, dim=DIM, inter_dim=INTER_DIM, cache_size=2)
     for expert in (0, 1, N_EXPERTS - 1):
         for which, got in zip(("w1", "w2", "w3"), store.expert(expert)):
-            assert got.dtype == torch.bfloat16
+            assert got.dtype == loader_module.LINEAR_DTYPE
             assert torch.equal(got, mini.reference[f"layers.0.ffn.routed.{which}"][expert])
 
 
@@ -530,7 +537,7 @@ def test_the_engram_table_gathers_the_rows_the_hasher_named(mini) -> None:
             BLOCK,
         )
         assert got.shape == (indices.numel(), ENGRAM_HEAD_DIM)
-        assert got.dtype == torch.bfloat16
+        assert got.dtype == loader_module.LINEAR_DTYPE
         assert torch.equal(got, want)
         assert store.rows_gathered == indices.numel()
 
@@ -622,6 +629,19 @@ def test_the_load_goes_through_the_mmap_reader(mini) -> None:
 # -- a load that runs -------------------------------------------------------------------------
 
 
+def _within_one_ulp(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two orderings agree to the last place of the width this tree computes at.
+
+    One unit in the last place is `eps` times the larger magnitude, and that -- not a round number --
+    is the bound the comparison below holds: it is the smallest bound that admits a value sitting
+    exactly on a rounding boundary, so a disagreement wider than it is a disagreement about the
+    arithmetic rather than about which side of a boundary a sum landed on.
+    """
+    scale = max(a.abs().max().item(), b.abs().max().item())
+    bound = torch.finfo(loader_module.LINEAR_DTYPE).eps * scale
+    return (a.float() - b.float()).abs().max().item() <= bound
+
+
 def test_the_dense_load_leaves_every_store_reading_from_the_shards(mini) -> None:
     """What a load allocates is the dense half. The two Engram tables and every layer's bank of 384
     experts must still be reading from the shards when it is done, or the 476 GiB became an
@@ -648,6 +668,16 @@ def test_the_loaded_backbone_runs_a_prefill_and_a_stepwise_decode_identically(mi
     `Head` returns the last position only, as the reference's generation loop wants, so agreement at
     position `k` is read by prefilling `tokens[:k + 1]` and comparing against the `k`-th step: every
     position is compared, by a prefill that never saw the tokens after it.
+
+    Agreement is one unit in the last place and not `torch.equal`, because the two orderings are two
+    different kernel shapes: a prefill of four queries and four forwards of one are not the same sum
+    in the same order, and the last bit of an fp32 accumulator goes with the order. That last bit is
+    *not* this tree's own doing -- the bf16 tree produces it in `layers.2.attn.compressor.wkv` and
+    `wgate`, both fp32, under the same probe -- but bf16's eight-bit mantissa rounds it away before it
+    reaches the head, while fp16's eleven-bit mantissa carries it over a rounding boundary in the
+    Hyper-Connections residual and publishes one ULP of the logits. So the earlier `torch.equal` here
+    was passing on the width of a boundary rather than on a property, and one ULP is the tightest
+    bound that says so: a load that put the wrong tensor in the wrong place does not land inside it.
     """
     tokens = [5, 3, 17, 11]
     front = mini.loaded
@@ -663,12 +693,18 @@ def test_the_loaded_backbone_runs_a_prefill_and_a_stepwise_decode_identically(mi
     for position, token in enumerate(tokens):
         _, logits, _ = front(torch.tensor([[token]]), position)
         steps.append(logits[0].clone())
-    assert torch.equal(steps[-1], prefill[0]), "a one-shot prefill disagrees with the stepwise decode"
+    assert _within_one_ulp(steps[-1], prefill[0]), (
+        f"a one-shot prefill disagrees with the stepwise decode: max abs diff "
+        f"{(steps[-1] - prefill[0]).abs().max().item()} against a logit scale of "
+        f"{prefill[0].abs().max().item()}"
+    )
 
     for length in range(1, len(tokens)):
         front.reset_state(1)
         _, logits, _ = front(torch.tensor([tokens[:length]]), 0)
-        assert torch.equal(logits[0], steps[length - 1]), f"prefill to {length} disagrees at the last position"
+        assert _within_one_ulp(logits[0], steps[length - 1]), (
+            f"prefill to {length} disagrees at the last position"
+        )
 
 
 def test_the_load_report_names_the_unfilled_and_counts_the_unread(mini) -> None:

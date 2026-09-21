@@ -227,6 +227,74 @@ def _randomize(model: torch.nn.Module, seed: int) -> None:
                 tensor.copy_(torch.randint(0, 4, tensor.shape, generator=generator))
 
 
+def _pin_dense_dtype(dtype: torch.dtype) -> dict[str, torch.dtype]:
+    """Point this tree's dense stack at `dtype`, returning what it was.
+
+    The reference is bf16 by construction and not by argument. `ModelArgs.dtype` names the *weight*
+    storage its `Linear` wraps, and the pieces that are not `Linear` -- `Engram.q_weight`,
+    `k_weight`, the indexer's projections, `ParallelHead` -- are written `torch.bfloat16` in
+    `model.py` itself. So there is no width to build the reference at other than the one it
+    declares, and this tree's dense stack is fp16 in production.
+
+    Two widths cannot be compared exactly, which is what this file does. The weights are not why:
+    every weight the reference holds is bf16, and bf16's 8 significand bits fit inside fp16's 11, so
+    the copy is exact down to fp16's denormal floor of 2**-14. It is the *activations* -- a GEMM's
+    inputs are cast to its weight's width, so a bf16 reference rounds them to 8 bits where this tree
+    keeps 11, and over forty layers the two streams separate to about a tenth of the logit scale.
+    That is arithmetic and not a defect, and it is why the comparison in this file is run at the
+    reference's width.
+
+    The shipping width's own evidence is elsewhere and is not a tie-break this file can make: the
+    same harness run at fp16 against the same bf16 reference reads a max|logit diff| of at most
+    0.116 of the logit scale with the bf16 run as a zero control, recorded in
+    `docs/performance/v41_dense_gemm_dtype.md` and reproduced by `probe_v41_dense_dtype_abab.py` on
+    the real checkpoint.
+
+    Three modules and not one: `attention.py` and `modules.py` each hold the name, and `loader.py`
+    binds it a third time (`from ...attention import LINEAR_DTYPE`), so a build that moved only the
+    first two would leave any reader in the third at the old width. `CACHE_DTYPE` moves with it --
+    not as a detail, but because the sparse-attention kernels dispatch on the query and read the
+    cache, so a linear stack at one width over a cache at another is silent corruption rather than
+    an error.
+
+    A build is not the only reader, which is why this is called from a test-wide fixture rather than
+    from `_build_pair`: `EngramTable.lookup` narrows to `LINEAR_DTYPE` *per call*, inside
+    `Engram.forward`, so a build pinned and unpinned around construction leaves every weight at one
+    width and hands the first `Engram.wkv` an activation at the other. The error that produces is
+    `expected m1 and m2 to have the same dtype`, raised from a stock `nn.Linear` inside a module
+    named nowhere in this file.
+    """
+    from src.models.deepseek_v4_1 import attention, loader, modules
+
+    previous = {"CACHE_DTYPE": attention.CACHE_DTYPE}
+    for name, module in (("attention", attention), ("loader", loader), ("modules", modules)):
+        previous[name] = module.LINEAR_DTYPE
+        module.LINEAR_DTYPE = dtype
+    attention.CACHE_DTYPE = dtype
+    return previous
+
+
+def _restore_dense_dtype(previous: dict[str, torch.dtype]) -> None:
+    from src.models.deepseek_v4_1 import attention, loader, modules
+
+    attention.CACHE_DTYPE = previous["CACHE_DTYPE"]
+    for name, module in (("attention", attention), ("loader", loader), ("modules", modules)):
+        module.LINEAR_DTYPE = previous[name]
+
+
+@pytest.fixture(autouse=True)
+def reference_width():
+    """Hold this tree at the reference's width for the whole test, construction and forward alike.
+
+    Autouse because every test here ends in a comparison against the reference, and a test that ran
+    at the tree's own width would be comparing two widths -- which is the one thing this file is not
+    allowed to do. See `_pin_dense_dtype`.
+    """
+    previous = _pin_dense_dtype(torch.bfloat16)
+    yield
+    _restore_dense_dtype(previous)
+
+
 def _build_pair(seed: int = 0, **overrides):
     """The reference model and this repository's backbone, sharing one config and one set of weights."""
     reference = _load_reference()
@@ -263,6 +331,15 @@ def _build_pair(seed: int = 0, **overrides):
         )
     finally:
         torch.set_default_dtype(default_dtype)
+    # The `reference_width` fixture owns the dense width, and this is the cheap check that it is
+    # still in force: a call from outside a test would build a tree the copy below cannot fill.
+    from src.models.deepseek_v4_1 import attention, modules
+
+    if (modules.LINEAR_DTYPE, attention.CACHE_DTYPE) != (torch.bfloat16, torch.bfloat16):
+        raise RuntimeError(
+            "this pair must be built under the `reference_width` fixture, which holds the tree at "
+            f"the reference's bf16; the tree is at {modules.LINEAR_DTYPE}"
+        )
     mismatched, unfilled = _copy_weights(ref_model, ours)
     assert not mismatched, f"reference tensors this tree cannot hold: {mismatched}"
     assert not unfilled, f"this tree's tensors left at random init: {unfilled}"

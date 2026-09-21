@@ -71,12 +71,12 @@ import torch
 
 from src.encoding.engram import EngramLayout, NgramHasher, build_compressed_token_map
 from src.loader.safetensors import SAFETENSORS_DTYPES, MmapSafetensors
+from src.models.deepseek_v4_1.attention import LINEAR_DTYPE
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.device_experts import DeviceRoutedExperts
 from src.models.deepseek_v4_1.kernels import dequant_fp4_weight, dequant_fp8_weight
 from src.models.deepseek_v4_1 import resident_bank
 from src.models.deepseek_v4_1.modules import (
-    LINEAR_DTYPE,
     Backbone,
     EngramTable,
     RoutedExperts,
@@ -109,7 +109,7 @@ FP4_PACKED_WEIGHT = "I8"
 
 # Dequantized experts one layer keeps on the host. The released layer is 384
 # experts of 16.9 MiB of packed fp4 each, 17.9 MiB with their scales, and 67.5 MiB
-# each once expanded to bf16 -- 25.3 GiB for the whole layer -- and the correctness
+# each once expanded to a dense weight -- 25.3 GiB for the whole layer -- and the correctness
 # path re-reads and re-expands on a miss. 16 experts is 1.05 GiB per layer and 42
 # GiB across the backbone, which bounds the cache without pretending to be the
 # serving design: a device-side expert cache fed by fp4 kernels is what a measured
@@ -412,23 +412,25 @@ class CheckpointRoutedExperts(RoutedExperts):
     tree. `MoE` holds one of these where `ResidentRoutedExperts` would hold a bank, so the backbone
     has no `ffn.routed.*` tensor to fill and the 476 GiB never becomes an allocation.
 
-    A miss reads the expert's three matrices out of the mapping and expands them to bf16, which is
-    the same width the resident bank holds and the width `expert_forward` consumes. bf16 and not
-    fp32: the released fp4 is four bits of mantissa, so bf16's eight are already more than the
-    expansion can recover, and the cache below is what makes the cost per miss bearable.
+    A miss reads the expert's three matrices out of the mapping and expands them to `LINEAR_DTYPE`,
+    which is the width `expert_forward` consumes -- the same width the resident bank holds, because
+    both are multiplied by the same activation (see `RoutedExperts.forward`). fp16 or bf16 and not
+    fp32: the released fp4 is four bits of mantissa, so either two-byte width already carries more
+    precision than the expansion can recover, and the cache below is what makes the cost per miss
+    bearable.
 
     It barely does. A token routes to 6 of the layer's 384 experts, so a 16-expert window returns
     about half of them: measured over four decode steps, 119 of 240 expert rows missed, warm, and
     759 of 1,200 at a five-token prefill (`/tmp/probe_token_cost.py`). That is half a step's
     expansions saved for the 42 GiB the window costs across the backbone, and it puts the whole
     model's token time on the expansion rather than on the disk -- one miss is 0.3% mapping read and
-    99.7% the arithmetic that turns fp4 codes into fp32 and then bf16, at 0.122 s per expert, so a
-    step that misses all 240 of a token's experts costs about 29 s and the 119 a warm step misses
-    about 14.5 s, against 1.0 s for a forward whose experts are already expanded and 27.2 s for a
-    first, entirely cold one. 240 fresh experts is 4.2 GiB read and 15.8 GiB expanded per token, on
-    a host whose RAM holds all 269 GiB of them in their packed form and hands them over for free;
-    what the host cannot do cheaply is turn them into numbers. A device-side cache is what replaces
-    it, not a larger `cache_size`.
+    99.7% the arithmetic that turns fp4 codes into fp32 and then the dense width, at 0.122 s per
+    expert, so a step that misses all 240 of a token's experts costs about 29 s and the 119 a warm
+    step misses about 14.5 s, against 1.0 s for a forward whose experts are already expanded and
+    27.2 s for a first, entirely cold one. 240 fresh experts is 4.2 GiB read and 15.8 GiB expanded
+    per token, on a host whose RAM holds all 269 GiB of them in their packed form and hands them over
+    for free; what the host cannot do cheaply is turn them into numbers. A device-side cache is what
+    replaces it, not a larger `cache_size`.
     """
 
     def __init__(
@@ -457,7 +459,7 @@ class CheckpointRoutedExperts(RoutedExperts):
         return f"layers.{self.layer_id}.ffn.experts.{expert}.{which}.weight"
 
     def expert(self, expert: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(w1, w2, w3) of one expert as `[inter, dim]`, `[dim, inter]`, `[inter, dim]` bf16.
+        """(w1, w2, w3) of one expert as `[inter, dim]`, `[dim, inter]`, `[inter, dim]` dense.
 
         First-in-first-out eviction rather than least-recently-used: what a step touches is the
         experts its own token routed to, so recency within a layer is not informative, and the
@@ -480,8 +482,10 @@ class CheckpointRoutedExperts(RoutedExperts):
         return weights
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """x: [n, dim] bf16, weights/indices: [n, topk]. Returns [n, dim] fp32."""
-        check_activation_matches_experts(x, torch.device("cpu"), "CheckpointRoutedExperts")
+        """x: [n, dim] dense, weights/indices: [n, topk]. Returns [n, dim] fp32."""
+        check_activation_matches_experts(
+            x, torch.device("cpu"), "CheckpointRoutedExperts", LINEAR_DTYPE
+        )
         y = torch.zeros_like(x, dtype=torch.float32)
         # Walked in expert id order, like `ResidentRoutedExperts` and like the reference: a token's
         # contributions land in the same order either way, so the two agree bit for bit.
@@ -787,8 +791,8 @@ def load_backbone(
     assumed: a generated token costs 15 to 42 s, of which the attention stack is 0.37 s, and the rest
     is the routed experts -- 240 of them per token at the checkpoint's 6 per layer, at 0.122 s each
     on a miss. The cost is the expansion and not the bytes: 0.3% of a miss is reading the mapping and
-    99.7% is turning fp4 codes into fp32 and then bf16. `CheckpointRoutedExperts` is that subject,
-    and this function's is only the dense half.
+    99.7% is turning fp4 codes into fp32 and then the dense width. `CheckpointRoutedExperts` is that
+    subject, and this function's is only the dense half.
 
     `expert_device` moves the routed experts off the host and onto `expert_world` cards
     (`DeviceRoutedExperts`), which consumes the packed fp4 in the kernel and so never pays the

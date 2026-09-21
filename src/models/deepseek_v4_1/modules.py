@@ -38,6 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.deepseek_v4_1.attention import (
+    LINEAR_DTYPE,
     Attention,
     RMSNorm,
     SharedAttentionRuntime,
@@ -65,11 +66,6 @@ __all__ = [
     "sample",
 ]
 
-
-# The compute dtype for every dense weight this module holds. The checkpoint's fp8/fp4 weights are
-# expanded into it at load; bf16 is what the reference's norms and residual stream already use, and
-# sm_75 has no fp8 or fp4 tensor core to keep them quantized for.
-LINEAR_DTYPE = torch.bfloat16
 
 # How many tokens of the Hyper-Connections arithmetic one pass covers.
 #
@@ -176,20 +172,41 @@ class RoutedExperts:
     partial = False
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        """`x` is `[n, dim]` bf16, `weights`/`indices` are `[n, topk]`. Returns `[n, dim]` fp32."""
+        """`x` is `[n, dim]` at the activation's width, `weights`/`indices` are `[n, topk]`. Returns
+        `[n, dim]` fp32.
+
+        The width is not the store's to choose: a routed expert is a dense weight multiplied by the
+        residual stream, so `expert_forward`'s `F.linear(x, w1)` needs the two to agree, and the
+        activation's width is the tree's. A store that expands at some other width has to cast on
+        both sides of every call -- and if it does not, the mismatch surfaces as a c10 dtype error
+        inside `F.linear`, forty layers into a run, naming neither the store nor the width. `dtype`
+        on `ResidentRoutedExperts` and `CheckpointRoutedExperts.expert` is therefore `LINEAR_DTYPE`
+        and there is deliberately no second constant to disagree with it.
+        """
         raise NotImplementedError
 
 
-def check_activation_matches_experts(x: torch.Tensor, where: torch.device, what: str) -> None:
-    """Refuse a card-side activation at a host-side expert bank, by name.
+def check_activation_matches_experts(
+    x: torch.Tensor, where: torch.device, what: str, dtype: torch.dtype | None = None
+) -> None:
+    """Refuse an activation the experts cannot consume, by name.
 
-    The dense tree can be built on a card while the routed experts stay in host memory -- that is the
-    shape this model is served in -- but the two halves do not meet here. A bank that owns host
-    tensors can only run the expert on the host, and the path that stages host rows onto the card is
-    `DeviceRoutedExperts`, which consumes the checkpoint's packed fp4 rather than an expanded bf16
-    matrix. Left unchecked this surfaces as a device mismatch inside `F.linear`, forty layers and
-    several minutes into a run, in a kernel that says nothing about which of the two halves is the
-    wrong one.
+    Two things have to line up before a store can run an expert, and neither is the store's to
+    choose, so both are checked on the way in rather than discovered in `F.linear` forty layers and
+    several minutes later.
+
+    **Device.** The dense tree can be built on a card while the routed experts stay in host memory --
+    that is the shape this model is served in -- but the two halves do not meet here. A bank that
+    owns host tensors can only run the expert on the host, and the path that stages host rows onto
+    the card is `DeviceRoutedExperts`, which consumes the checkpoint's packed fp4 rather than an
+    expanded dense matrix.
+
+    **Width.** A routed expert is a dense weight multiplied by the residual stream, so its width is
+    the activation's and not a property of how the expert was stored. `dtype` is what the store
+    expanded to; a store that expanded to something else needs a cast on both sides of every call,
+    and without one the failure is a c10 dtype error inside `F.linear` that names neither the store
+    nor the width. `ResidentRoutedExperts` and `CheckpointRoutedExperts` both pass the width of the
+    tensors they hold; there is no constant for them to read instead.
     """
     if x.device != where:
         raise RuntimeError(
@@ -198,6 +215,12 @@ def check_activation_matches_experts(x: torch.Tensor, where: torch.device, what:
             "`DeviceRoutedExperts` (loader.py, `expert_device=`), which keeps the experts in host "
             "memory and uploads the rows a token routes to."
         )
+    if dtype is not None and x.dtype != dtype:
+        raise RuntimeError(
+            f"{what} holds its experts at {dtype} but was handed an activation at {x.dtype}. The "
+            "two are multiplied, so they have to agree; expand the experts at the activation's "
+            "width (`LINEAR_DTYPE`) or cast the activation at this boundary, not only in one place."
+        )
 
 
 class ResidentRoutedExperts(RoutedExperts, nn.Module):
@@ -205,9 +228,9 @@ class ResidentRoutedExperts(RoutedExperts, nn.Module):
 
     Correct and convenient, and not what the released checkpoint needs: 384 experts is 16.9 MiB of
     packed fp4 each, plus 1.1 MiB of scales, which is 6.7 GiB of codes per layer and 25.3 GiB once
-    every one of them is expanded to bf16, so a 40-layer model cannot hold them. This exists for the
-    small configs the tests build and for a future device-side expert cache; the checkpoint path is
-    `CheckpointRoutedExperts` in `loader.py`.
+    every one of them is expanded to a dense weight, so a 40-layer model cannot hold them. This
+    exists for the small configs the tests build and for a future device-side expert cache; the
+    checkpoint path is `CheckpointRoutedExperts` in `loader.py`.
     """
 
     def __init__(
@@ -231,7 +254,7 @@ class ResidentRoutedExperts(RoutedExperts, nn.Module):
         self.w3 = nn.Parameter(torch.empty(n_experts, inter_dim, dim, dtype=dtype, device=device))
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-        check_activation_matches_experts(x, self.w1.device, "ResidentRoutedExperts")
+        check_activation_matches_experts(x, self.w1.device, "ResidentRoutedExperts", self.w1.dtype)
         y = torch.zeros_like(x, dtype=torch.float32)
         # The reference walks experts in id order and not in token order, so a token's contribution
         # from expert 7 lands before its contribution from expert 300. The accumulation is a sum, so
@@ -291,11 +314,12 @@ def dequantize_rows(values: torch.Tensor, scales: torch.Tensor, block_size: int 
     """The reference's `ParallelEngramEmbedding.forward` dequantization, without the sharding.
 
     The values come back fp8 and the scales E8M0, one per `block_size` columns; the product is
-    formed in fp32 and only then narrowed, which is the order the reference uses. Doing it in bf16
-    would round the scale away -- these are 256-wide rows with e8m0 scales that reach 2**-13.
+    formed in fp32 and only then narrowed, which is the order the reference uses. Forming the product
+    itself in a narrow dtype would round the scale away -- these are 256-wide rows with e8m0 scales
+    that reach 2**-13 -- so the narrow here is the dense stack's, and only the destination.
     """
     values = values.float().unflatten(-1, (-1, block_size)) * scales.float().unsqueeze(-1)
-    return values.flatten(-2).to(torch.bfloat16)
+    return values.flatten(-2).to(LINEAR_DTYPE)
 
 
 class Engram(nn.Module):
@@ -324,8 +348,9 @@ class Engram(nn.Module):
             device=device,
         )
         self.eps = cfg.norm_eps
-        # bf16 rather than the default dtype the reference inherits here: the checkpoint holds them
-        # bf16, and `weight` is only ever used as `q_weight * k_weight`, so the width buys nothing.
+        # These are bf16 in the checkpoint and `LINEAR_DTYPE` carries that value exactly, so they get
+        # no constant of their own; `weight` is only ever used as `q_weight * k_weight`, so the width
+        # buys nothing either way.
         self.q_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
         self.k_weight = nn.Parameter(torch.ones(cfg.hc_mult, cfg.dim, dtype=LINEAR_DTYPE, device=device))
 
@@ -405,6 +430,10 @@ class Gate(nn.Module):
         self.gate_temp = gate_temp
         self.norm_topk_prob = True if cfg.norm_topk_prob is None else cfg.norm_topk_prob
         self.route_scale = cfg.route_scale
+        # The one dense weight whose rounding decides something discrete rather than incremental, so
+        # it is worth saying why it follows `LINEAR_DTYPE` at all: the checkpoint stores it bf16 and
+        # the carry is exact, and the arithmetic is fp32 either way -- `forward` upcasts both operands
+        # before the `F.linear`, so this is a storage width, not a precision of the routing score.
         self.weight = nn.Parameter(torch.empty(n_routed_experts, cfg.dim, dtype=LINEAR_DTYPE, device=device))
         self.bias = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32, device=device))
         self.bias_vl = nn.Parameter(torch.empty(n_routed_experts, dtype=torch.float32, device=device))
@@ -444,7 +473,6 @@ class MoE(nn.Module):
         layer_id: int,
         n_routed_experts: int,
         n_activated_experts: int,
-        expert_dtype: torch.dtype = LINEAR_DTYPE,
         routed: RoutedExperts | None = None,
         device: torch.device | str | None = None,
         world: int = 1,
@@ -455,11 +483,16 @@ class MoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_activated_experts = n_activated_experts
         self.gate = Gate(cfg, n_routed_experts, n_activated_experts, device=device)
+        # Both halves are `LINEAR_DTYPE`, and there is no parameter here to say otherwise: the
+        # shared expert is a dense weight like any other -- one matrix a token, fp8 in the
+        # checkpoint -- and a routed expert is one too, multiplied by the same activation, so a
+        # width other than the activation's is not a choice the two halves can make independently.
+        # See `RoutedExperts.forward` for what a mismatch costs.
         self.shared_experts = Expert(
-            cfg.dim, cfg.moe_inter_dim, expert_dtype, cfg.swiglu_limit, device=device, world=world
+            cfg.dim, cfg.moe_inter_dim, LINEAR_DTYPE, cfg.swiglu_limit, device=device, world=world
         )
         self.routed = routed if routed is not None else ResidentRoutedExperts(
-            n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, expert_dtype, device=device
+            n_routed_experts, cfg.dim, cfg.moe_inter_dim, cfg.swiglu_limit, LINEAR_DTYPE, device=device
         )
         self.tp = None
 
@@ -659,7 +692,9 @@ def _moe_shape(cfg: V41TextConfig, layer_id: int) -> tuple[int, int]:
 
 
 class Embedding(nn.Module):
-    """`ParallelEmbedding` at one rank. The checkpoint stores it bf16."""
+    """`ParallelEmbedding` at one rank. The checkpoint stores it bf16, which `LINEAR_DTYPE` carries
+    exactly, and the forward is a gather -- so the width costs nothing and there is no constant here
+    to keep in step with the projections."""
 
     def __init__(self, vocab_size: int, dim: int, device: torch.device | str | None = None):
         super().__init__()
