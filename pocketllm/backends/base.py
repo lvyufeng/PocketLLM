@@ -82,6 +82,30 @@ class BackendBase:
         with self._state_lock:
             self._closed = True
             self._cancelled.clear()
+        self._release_supervisor()
+
+    def _release_supervisor(self) -> None:
+        """Stop the tensor-parallel ranks this backend's construction started.
+
+        :func:`~pocketllm.backends.factory.create_backend` attaches the supervisor that
+        launched ranks 1..N-1 to the rank-0 backend it returns, and nothing else holds a
+        reference to those processes, so the backend that owns the engine owns the ranks.
+        ``cleanup`` is the supervisor's only teardown; there is no ``stop``.  A backend
+        built without the factory -- every single-rank run, and every injected test
+        double -- simply has no such attribute, and that is not an error.
+
+        The reference is dropped before the call so a second ``close`` cannot clean up a
+        supervisor that has already been torn down, and a failure to tear down must not
+        turn a close into a raise.
+        """
+        supervisor = getattr(self, "_supervisor", None)
+        if supervisor is None:
+            return
+        self._supervisor = None
+        try:
+            supervisor.cleanup()
+        except Exception:
+            pass
 
     def _ensure_open(self) -> None:
         if self._closed:

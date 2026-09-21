@@ -907,6 +907,8 @@ class CppBackend(BackendBase):
     def close(self) -> None:
         if self._closed:
             return
+        # Releases the tensor-parallel supervisor this backend was built with, if any;
+        # see BackendBase._release_supervisor.
         super().close()
         # Never destroy a native engine while a GIL-released kernel is using it.
         # An active generate/stream call releases it from its own finally block.
@@ -915,10 +917,3 @@ class CppBackend(BackendBase):
                 self._release_native()
             finally:
                 self._request_lock.release()
-
-        # Clean up supervisor if this backend owns it
-        if hasattr(self, "_supervisor"):
-            try:
-                self._supervisor.stop()
-            except Exception:
-                pass

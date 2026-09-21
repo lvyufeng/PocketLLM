@@ -17,7 +17,12 @@ from pocketllm.backends import factory
 
 
 class FakeSupervisor:
-    """Stands in for TensorParallelSupervisor; records start/stop only."""
+    """Stands in for TensorParallelSupervisor; records start/cleanup only.
+
+    ``cleanup`` is the real class's teardown -- there is no ``stop`` on it -- so the
+    fake deliberately has no ``stop`` either: a call to a method the supervisor does
+    not define is exactly the mistake this shape catches.
+    """
 
     instances: list["FakeSupervisor"] = []
 
@@ -31,7 +36,7 @@ class FakeSupervisor:
     def start(self) -> None:
         self.started += 1
 
-    def stop(self) -> None:
+    def cleanup(self) -> None:
         self.stopped += 1
 
 

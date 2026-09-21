@@ -226,6 +226,34 @@ def test_supervised_parent_rejects_cpp_before_backend_construction(monkeypatch) 
         ])
 
 
+def test_supervised_parent_allows_a_v41_selection(monkeypatch) -> None:
+    """The V4.1 adapter is Python-side, so the parent spawns it like the torch one.
+
+    Only the native adapter is rejected here; a V4.1 selection that fell through to
+    the same guard would make `--backend v41 --tensor-parallel-size 4` unlaunchable.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeSupervisor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "TensorParallelSupervisor", FakeSupervisor)
+    monkeypatch.setattr(cli, "select_backend", lambda args: "v41")
+    monkeypatch.setattr(cli, "create_backend", lambda args: pytest.fail("backend was constructed"))
+
+    assert cli.main([
+        "serve", "--model", "checkpoint", "--backend", "v41", "--tensor-parallel-size", "4",
+    ]) == 0
+    assert captured["world_size"] == 4
+    # The children re-enter the CLI with their own rank rather than running a worker
+    # script, which is what makes the child path below the shared one.
+    assert "--supervised-child" in captured["command"]
+
+
 def test_supervised_child_rank_zero_prepares_and_serves(monkeypatch) -> None:
     backend = _FakeBackend()
     served: list[tuple[object, dict]] = []
