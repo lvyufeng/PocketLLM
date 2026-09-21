@@ -474,6 +474,12 @@ INDEXER_MIN_KEY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_MIN_KEY_TILE", "1024"
 # (`q_tile * blocks * block_size * index_head_dim`) rather than by the score alone.
 INDEXER_CAND_QUERY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_QUERY_TILE", "512"))
 INDEXER_CAND_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_TILE", "64"))
+# A key tile's collective is a blocking `all_reduce` on the compute stream, and a `[2048, 4096]` tile
+# is 5.4 ms of wire against 4.4 ms of arithmetic on this fabric -- so the loop spends most of its time
+# waiting for the wire with the SMs idle. Deferring the join by `depth` tiles puts that wire under the
+# following tiles' arithmetic; 0 is the shipped order and 2 is where the lookahead saturates. See
+# `_ReducePipeline`.
+INDEXER_REDUCE_DEPTH = int(os.getenv("DEEPSEEK_V41_INDEXER_REDUCE_DEPTH", "0"))
 
 
 def _as_column(lens: torch.Tensor | int, bsz: int, seqlen: int, device, dtype) -> torch.Tensor:
@@ -571,6 +577,88 @@ class _TopKStream:
     def result(self) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.values is not None and self.keys is not None, "a stream nothing was pushed into"
         return self.values, self.keys
+
+
+_SIDE: dict[int, torch.cuda.Stream] = {}
+
+
+def _side_stream(device) -> torch.cuda.Stream:
+    """One side stream a device, kept across calls. A fresh `torch.cuda.Stream` brings its own event
+    pool, and a 262144-token prefill reaches `_ReducePipeline` 8 indexer layers times 64 chunks."""
+    index = device.index if device is not None and device.index is not None \
+        else torch.cuda.current_device()
+    stream = _SIDE.get(index)
+    if stream is None:
+        stream = _SIDE[index] = torch.cuda.Stream(device=device)
+    return stream
+
+
+class _ReducePipeline:
+    """`tp.reduce` with a `depth`-tile lookahead: tile k's collective is issued on a side stream and
+    joined `depth` tiles later, once those tiles' arithmetic has been enqueued on the compute stream.
+
+    The loop this replaces is one blocking `all_reduce` a key tile, and on this fabric a `[2048, 4096]`
+    fp32 tile is 5.4 ms of wire against 4.4 ms of arithmetic, so most of the loop is spent waiting for
+    the fabric with the SMs idle. Nothing below the reduce reads *its own* tile's score: the next
+    tile's einsum reads `index_k`, not `score`, and the one edge that has to be kept is reduce -> push.
+    So the collective may be issued early, and the pushes still land in tile order because the joins
+    are FIFO -- which is what keeps the top-k selection identical rather than merely equivalent.
+
+    `/tmp/bench_indexer_reduce_overlap.py` prices it on the real fabric at these shapes: 9.83 ms a
+    tile serial, 8.44 at a depth of one, **6.91 at two**, 6.98 at four and 7.11 at eight, against a
+    4.40 ms floor with no collective at all. Two is where it saturates, and every depth's result is
+    elementwise identical to the serial arm's.
+
+    A capture gets the serial order, because a captured body may branch on nothing and can record
+    neither an event nor a second stream.
+    """
+
+    __slots__ = ("reduce", "depth", "side", "pending", "events")
+
+    def __init__(self, reduce, depth: int, device):
+        self.reduce = reduce
+        self.depth = depth
+        self.side = _side_stream(device)
+        self.pending: list[tuple[torch.Tensor, torch.cuda.Event, int, int]] = []
+        # an event is only ever waited on before it is recorded again, so `depth` of them is all the
+        # pipeline can have in flight and there is no reason to allocate one a tile
+        self.events: list[torch.cuda.Event] = []
+
+    @classmethod
+    def build(cls, reduce, device) -> "_ReducePipeline | None":
+        """`None` -- the serial call -- unless a lookahead was asked for outside a capture."""
+        if reduce is None or INDEXER_REDUCE_DEPTH <= 1 or _recording():
+            return None
+        return cls(reduce, INDEXER_REDUCE_DEPTH, device)
+
+    def push(self, score: torch.Tensor, k0: int, k1: int):
+        """Issue this tile's collective; return the tile whose turn it now is, if any."""
+        side = self.side
+        stream = torch.cuda.current_stream(score.device)
+        # the side stream has to see the tile's arithmetic before it reduces it
+        side.wait_stream(stream)
+        ready = self.events.pop() if self.events else torch.cuda.Event()
+        with torch.cuda.stream(side):
+            out = self.reduce(score)
+            ready.record(side)
+        # `out` is born on `side` and read on the compute stream, so it is the compute stream's use
+        # that its memory cannot be handed out ahead of
+        out.record_stream(stream)
+        self.pending.append((out, ready, k0, k1))
+        if len(self.pending) < self.depth:
+            return None
+        return self.pop()
+
+    def pop(self):
+        out, ready, k0, k1 = self.pending.pop(0)
+        torch.cuda.current_stream(out.device).wait_event(ready)
+        self.events.append(ready)
+        return out, k0, k1
+
+    def drain(self):
+        """The tiles still in flight when the loop ends, in order."""
+        while self.pending:
+            yield self.pop()
 
 
 def select_candidate_blocks(
@@ -827,6 +915,9 @@ class Indexer(nn.Module):
         out_values: list[torch.Tensor] = []
         out_keys: list[torch.Tensor] = []
         out_blocks: list[torch.Tensor] = []
+        # one pipeline for the whole call: it is drained at the foot of every query tile, so nothing
+        # of one tile's is still in flight when the next tile's first collective is issued
+        pipe = _ReducePipeline.build(None if tp is None else tp.reduce, q.device)
         for q0 in range(0, seqlen, q_tile):
             q1 = min(q0 + q_tile, seqlen)
             q_tile_t = q[:, q0:q1]
@@ -837,17 +928,13 @@ class Indexer(nn.Module):
             lens_t = _as_column(compress_lens, bsz, seqlen, q.device, torch.int32)[:, q0:q1]
             positions = _TopKStream(topk)
             blocks = _TopKStream(self.candidate_topk_blocks) if block_size else None
-            for k0 in range(0, width, key_tile):
-                k1 = min(k0 + key_tile, width)
-                score = torch.einsum("bqhd,btd->bqht", q_tile_t, index_k[:, k0:k1])
-                score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
-                if tp is not None:
-                    # the sum above ran over this rank's heads only, so the score is a partial. It
-                    # has to be whole before any top-k, because a top-k over partials is a different
-                    # selection and the difference is discrete -- it does not average away downstream
-                    # the way a rounding does. Tiled, this is one collective a tile, which is the same
-                    # volume as the one it replaced and a fixed count for a fixed width.
-                    score = tp.reduce(score)
+
+            def flush(score: torch.Tensor, k0: int, k1: int) -> None:
+                """Everything after the collective, for one tile: the mask and the two pushes.
+
+                A closure rather than inline code because the pipelined order calls it on a tile whose
+                index is not the loop's, and the tail has to be the same code in both orders.
+                """
                 ids = torch.arange(k0, k1, dtype=torch.int32, device=q.device).reshape(1, 1, -1)
                 score = score.masked_fill(ids >= lens_t, -torch.inf)
                 if blocks is not None:
@@ -867,6 +954,29 @@ class Indexer(nn.Module):
                         block_ids.expand(bsz, q1 - q0, -1),
                     )
                 positions.push(score, ids.expand(bsz, q1 - q0, -1))
+
+            for k0 in range(0, width, key_tile):
+                k1 = min(k0 + key_tile, width)
+                score = torch.einsum("bqhd,btd->bqht", q_tile_t, index_k[:, k0:k1])
+                score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
+                if pipe is not None:
+                    # the collective is issued now and joined `depth` tiles from here, so this tile's
+                    # tail is not the one the loop is on
+                    due = pipe.push(score, k0, k1)
+                    if due is not None:
+                        flush(*due)
+                else:
+                    if tp is not None:
+                        # the sum above ran over this rank's heads only, so the score is a partial. It
+                        # has to be whole before any top-k, because a top-k over partials is a different
+                        # selection and the difference is discrete -- it does not average away downstream
+                        # the way a rounding does. Tiled, this is one collective a tile, which is the same
+                        # volume as the one it replaced and a fixed count for a fixed width.
+                        score = tp.reduce(score)
+                    flush(score, k0, k1)
+            if pipe is not None:
+                for due in pipe.drain():
+                    flush(*due)
 
             tile_values, tile_keys = positions.result()
             out_values.append(tile_values)

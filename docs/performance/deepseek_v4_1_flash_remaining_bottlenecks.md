@@ -490,8 +490,14 @@ it **`attn.indexer` plus `attn.compress_kv` are 3.19 s of a chunk at 32768 again
 same span. Its two levers are the indexer's `all_reduce`, which upcasts to fp32 and so puts 33.6 MB on
 the wire for a 16.8 MB tile — **5.47 ms a level-one tile measured on this fabric against 2.88 ms in
 bf16, 1.79 s of the prefix path's 3.53 s at 262144, and the prediction lands on the tap's own `sync`
-column to 0.89 at 32768 and 0.84 at 262144** — and a one-tile lookahead over that collective, which
-has no numerics gate and can hide the whole of it. The wire dtype's gate is **closed**, and running it
+column to 0.89 at 32768 and 0.84 at 262144** — and a lookahead over that collective, which has no
+numerics gate and which a tight loop on this fabric prices at a depth of two as **54% of the
+collective and 30% of the tile** (`identical True` elementwise at every depth). In situ it reads
+0.355–0.392 s four times and 0.490/0.501 twice against six serial arms' 0.472–0.500 on the 32768
+prefix row — a 0.10 s move on a 0.485 s row, in a *second state* and not a guard that failed to fire,
+because the push count is 48 in all six pipelined arms and 0 in all six serial ones. That is ~1.6% of a
+262144 chunk, so it ships behind `DEEPSEEK_V41_INDEXER_REDUCE_DEPTH` at **default 0** and not in the
+default order. The wire dtype's gate is **closed**, and running it
 anyway is what prices the model: fp16 picks a different set on the indexer layers — layer 2, the first
 index source and so the one difference that cannot be inherited damage, goes from 3083 differing rows
 of 4096 to all 4096 — and the arm still bought the prefix path **0.851 s of the 3.525 s it is
