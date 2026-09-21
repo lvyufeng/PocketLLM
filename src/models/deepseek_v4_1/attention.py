@@ -41,6 +41,7 @@ from src.kernels.ops import act_quant, fp4_act_quant, sparse_attn
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.decode_pos import Pos, publish, write_row
 from src.models.deepseek_v4_1.kernels import fp4_act_quant_e4m3
+from src.models.deepseek_v4_1.tp import indexer_row_split
 
 __all__ = [
     "Attention",
@@ -748,7 +749,13 @@ class Indexer(nn.Module):
         self.uses_candidates = candidate_source is not None and 0 <= candidate_source < layer_id
         self.candidate_topk_blocks = cfg.candidate_topk_blocks or 0
         self.candidate_block_size = cfg.candidate_block_size or 0
-        self.n_heads = _required_int(cfg, "index_n_heads") // world
+        # Which axis the world cuts: heads (`indexer_row_split` off) or query rows (on). The head
+        # split can be taken out of a replicated `wq_b` at run time, so the module is built with all
+        # the heads whenever the row split is available -- `_wq_b_local` below is that cut, and it is
+        # the same tensor the loader would have written, row for row.
+        self.row_split = indexer_row_split(world)
+        idx_world = 1 if self.row_split else world
+        self.n_heads = _required_int(cfg, "index_n_heads") // idx_world
         self.n_heads_global = _required_int(cfg, "index_n_heads")
         self.index_head_dim = _required_int(cfg, "index_head_dim")
         self.rope_head_dim = _required_int(cfg, "rope_head_dim")
@@ -769,6 +776,11 @@ class Indexer(nn.Module):
             _required_int(cfg, "dim"), self.n_heads_global, bias=False, dtype=LINEAR_DTYPE, device=device
         )
         self.tp = None
+        # The head-split view of a replicated `wq_b`, cut once on the first forward that needs it.
+        # Built lazily rather than in `__init__` because the parameter is filled by a load that runs
+        # after the constructor, and cached rather than re-cut per step because a decode step is the
+        # one place it is used and a per-step `contiguous` would be an allocation inside a capture.
+        self._wq_b_local: torch.Tensor | None = None
         self.freqs_cis: torch.Tensor | None = None
         if self.owns_k:
             self.wk = nn.Linear(
@@ -792,6 +804,58 @@ class Indexer(nn.Module):
                 persistent=False,
             )
 
+    def _local_heads(self) -> int:
+        """How wide this rank's slice of the index heads is, i.e. the head-split output width."""
+        tp = self.tp
+        return self.n_heads if tp is None else tp.index_heads
+
+    def _wq_b_for_heads(self) -> torch.Tensor:
+        """`wq_b`'s weight cut to this rank's index heads -- the tensor the loader would have written.
+
+        Only reached under `indexer_row_split`, where the parameter is replicated and the *rows* are
+        the thing that is sharded. A prefill takes the whole weight; a step whose length is below the
+        world cannot be cut into bands, so it keeps the head split, and that has to be the same cut
+        `ShardPlan.local_value` makes -- `[n_heads, index_head_dim, -1]` view, then a contiguous band
+        of whole heads -- or the decode column would move for a reason that has nothing to do with
+        the split.
+        """
+        tp = self.tp
+        assert tp is not None, "the head split is only ever taken by a rank of a world"
+        cached = self._wq_b_local
+        if cached is None:
+            lo = tp.rank * tp.index_heads
+            cached = (
+                self.wq_b.weight.view(self.n_heads_global, self.index_head_dim, -1)[
+                    lo : lo + tp.index_heads
+                ]
+                .reshape(tp.index_heads * self.index_head_dim, -1)
+                .contiguous()
+            )
+            self._wq_b_local = cached
+        return cached
+
+    def row_band(self, seqlen: int) -> tuple[int, int]:
+        """Which query rows this rank's indexer computes, as `(row, length)`, or `(0, seqlen)`.
+
+        The single place the row split is decided. `Indexer.forward` does not re-derive it -- it reads
+        `seqlen_full` and knows it was handed a band -- so there is one expression that can be wrong
+        here rather than two that can disagree, and this one is checked against the parameter the
+        loader cut by the assertion in `forward`.
+
+        `(0, seqlen)` covers every call that is not a row split: no world at all, the split switched
+        off, and the chunk that cannot be cut. That last one is not an edge case to reason about but a
+        length the split has nothing to say about -- a decode step is one query against a world of
+        four, and a chunk of three is three -- and both keep the head split, which is the layout that
+        works at any length. The band has to be whole for the gather to be a fixed-shape call, so a
+        chunk that does not divide the world takes the whole-chunk path instead of a ragged band that
+        would need an all-gather of a size the other ranks do not have.
+        """
+        tp = self.tp
+        if not self.row_split or tp is None or seqlen < tp.world or seqlen % tp.world:
+            return 0, seqlen
+        band = seqlen // tp.world
+        return tp.rank * band, band
+
     def forward(
         self,
         x: torch.Tensor,
@@ -800,14 +864,23 @@ class Indexer(nn.Module):
         pos: int | Pos,
         offset: int,
         shared: SharedAttentionRuntime,
+        row: int = 0,
+        seqlen_full: int | None = None,
     ) -> torch.Tensor:
         """`latent` is this layer's RoPE-free compressed latent, None when this layer does not
         compress or when its current group is still incomplete. An index-key owner turns it into
         index keys here, which has to happen before `Attention` overwrites that same storage with
-        the RoPE'd, quantized values."""
+        the RoPE'd, quantized values.
+
+        `row` and `seqlen_full` are the row split's: a rank takes the query rows
+        `[row, row + seqlen)` of a `seqlen_full`-long chunk, so `x`/`qr` arrive pre-sliced and only
+        the query side is local. The key side is not -- this layer's compressed latent and the index
+        cache it writes are whole on every rank either way, and the cache is replicated, so the write
+        is the same write and stays unconditional."""
         assert self.freqs_cis is not None, "the owning Attention sets this before the first forward"
         pos = Pos.of(pos)
         bsz, seqlen, _ = x.size()
+        full = seqlen if seqlen_full is None else seqlen_full
         ratio, rd = self.compress_ratio, self.rope_head_dim
 
         # A key owner publishes its cache even when `latent` is None. The reference publishes only
@@ -819,15 +892,68 @@ class Indexer(nn.Module):
             shared.index_k = self.k_cache
         # latent is None while a group is still filling up, so there is nothing to publish yet
         if self.owns_k and latent is not None:
-            freqs = _group_freqs(self.freqs_cis, pos, latent.size(1), ratio, seqlen)
+            # The key side is the *chunk's* on both paths: `latent` arrives whole and the cache write
+            # below is the chunk's, so the group count it has to be dated against is the chunk's as
+            # well. A band shorter than the world can be one row long, and asking about the band's own
+            # length would put a continuation chunk on the decode branch for a reason that is an
+            # artifact of how the rows were dealt out.
+            freqs = _group_freqs(self.freqs_cis, pos, latent.size(1), ratio, full)
             k = self.k_norm(self.wk(latent))
             apply_rotary_emb(k[..., -rd:], freqs)
             fp4_act_quant(k, FP4_BLOCK_SIZE, True)
             self.k_cache[:bsz, pos.span(k.size(1), pos.group(ratio))] = k
 
         assert shared.index_k is not None, "an indexer needs a key cache, and no kv source has published one"
-        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.index_head_dim))
-        apply_rotary_emb(q[..., -rd:], self.freqs_cis[pos.span(seqlen)])
+        # Everything below is the *query* side, and it is what a row band moves: `pos_q` is where
+        # this rank's first row sits, so the RoPE rows, the reachable-group counts and the compressed
+        # prefix are all this rank's own. A whole-chunk call has `row=0` and is byte for byte the
+        # call this made before the split existed.
+        pos_q = pos + row
+        # The two ways the query side can be laid out. A row band completes its own score, so it
+        # needs all the heads and no collective; anything narrower than the world keeps the head
+        # split, which needs the local heads out of a replicated weight and the score reduced.
+        # `tp.reduce` is the same call the head-split path has always made, and on the row path it is
+        # not skipped-and-still-issued -- there is no partial score to complete.
+        #
+        # Which one this call is does not have to be re-derived here: `row_band` is the one place the
+        # split is decided, and a caller that took a band says so by naming the chunk it came out of.
+        # A second derivation from `world` and `full` would be a second chance to disagree with the
+        # parameter the loader cut, and the disagreement would be a wrong answer rather than a crash.
+        banded = seqlen_full is not None
+        if banded:
+            assert full % seqlen == 0 and full > seqlen, "a row band is one of several equal bands"
+            assert self.n_heads == self.n_heads_global, (
+                "a row band reads every index head of its own rows, so `wq_b` has to be whole: this "
+                "module was built with the head split, which means the constructor's world and the "
+                "loader's cut disagree about the axis"
+            )
+            q = self.wq_b(qr).unflatten(-1, (self.n_heads_global, self.index_head_dim))
+            weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads_global**-0.5)
+            tp = None
+        else:
+            # `self.wq_b` is this rank's own width in the head split -- the constructor divided it --
+            # and the *whole* width under the row split, where the parameter replicated and a call
+            # narrower than the world has to take the head band out of it. `world=1` is the control
+            # in both, and its module is the whole width, so it goes through the module either way.
+            q = (
+                F.linear(qr, self._wq_b_for_heads())
+                if self.row_split and self.tp is not None
+                else self.wq_b(qr)
+            ).unflatten(-1, (self._local_heads(), self.index_head_dim))
+            # `weights` is one number per index head, and the sum below runs over heads -- so this
+            # rank needs its own slice of the output while the scale stays the *global* head count.
+            # Using the local 8 in `n_heads**-0.5` would scale every index-source layer's partial by
+            # 2x. A row band has all 32, so its slice is the whole output and the same scale is the
+            # local count.
+            tp = self.tp
+            if tp is None:
+                weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads_global**-0.5)
+            else:
+                lo = tp.rank * tp.index_heads
+                weights = self.weights_proj(x)[..., lo : lo + tp.index_heads] * (
+                    self.softmax_scale * self.n_heads_global**-0.5
+                )
+        apply_rotary_emb(q[..., -rd:], self.freqs_cis[pos_q.span(seqlen)])
         fp4_act_quant(q, FP4_BLOCK_SIZE, True)
 
         # `end_pos // ratio` groups are reachable. Both paths read the whole cache and mask the
@@ -835,18 +961,18 @@ class Indexer(nn.Module):
         # step by step count, and reading one width on both paths is what keeps the graphed column
         # and the eager column the same arithmetic instead of two score matrices over different
         # widths. The prefill's `upto` is its own group count, so there the two coincide.
-        index_k = shared.index_k[:bsz, pos.upto(pos.group(ratio, seqlen), shared.index_k.size(1), seqlen)]
-        # `weights` is one number per index head, and the sum below runs over heads -- so this rank
-        # needs its own slice of the output while the scale stays the *global* head count. Using the
-        # local 8 in `n_heads**-0.5` would scale every index-source layer's partial by 2x.
-        tp = self.tp
-        if tp is None:
-            weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads_global**-0.5)
-        else:
-            lo = tp.rank * tp.index_heads
-            weights = self.weights_proj(x)[..., lo : lo + tp.index_heads] * (
-                self.softmax_scale * self.n_heads_global**-0.5
-            )
+        #
+        # The count is the *chunk's*, read off `pos` and not `pos_q`. `__add__(0)` returns `self`, so
+        # on the whole-chunk path the two are the same position and this is the expression that has
+        # always been here -- but on a row band they are not, and a band's last row is not the chunk's
+        # last row. A rank that read up to its own last row would compute a smaller `width`, and with
+        # it a smaller `topk`: the picks would come out the right length only by accident, and the
+        # fixed-shape all-gather that puts the bands back together would refuse the two. Each band
+        # reading the chunk's prefix is also what the reference reads, so nothing is masked twice and
+        # nothing extra is scored -- the extra columns past a band's own reach are the same columns the
+        # whole-chunk forward masks with the `compress_lens` below.
+        reach = seqlen if seqlen_full is None else seqlen_full
+        index_k = shared.index_k[:bsz, pos.upto(pos.group(ratio, reach), shared.index_k.size(1), reach)]
 
         # How many compressed positions each query can see: a block becomes visible once the query has
         # passed its last token, so a query at an absolute position `p` sees `(p + 1) // ratio` of
@@ -855,10 +981,10 @@ class Indexer(nn.Module):
         # of it, and without that its blocks would all be masked away. A decode step has one query and
         # one number, and it stays a 0-dim *tensor*: it is a read of the recorded position, and
         # `_as_column` is what widens it where a shape needs it.
-        if pos.on_device:
-            compress_lens = pos.group(ratio, seqlen)
+        if pos_q.on_device:
+            compress_lens = pos_q.group(ratio, seqlen)
         else:
-            compress_lens = ((pos.host + torch.arange(1, seqlen + 1, device=x.device)) // ratio).unsqueeze(-1)
+            compress_lens = ((pos_q.host + torch.arange(1, seqlen + 1, device=x.device)) // ratio).unsqueeze(-1)
 
         width = index_k.size(1)
         topk = min(self.index_topk, width)
@@ -888,7 +1014,27 @@ class Indexer(nn.Module):
         # row can name, so the ones that sort above it are exactly the unreachable ones.
         tail = width + offset + 1
         idxs = torch.where(values > -torch.inf, keys + offset, tail).sort(dim=-1).values
-        return torch.where(idxs < tail, idxs, -1).int()
+        idx = torch.where(idxs < tail, idxs, -1).int()
+        if banded:
+            # A row band is complete *for its own rows*, which is what removes the score collective --
+            # but `sparse_attn` is head-parallel, so every rank reads the picks of every query in the
+            # chunk. They come back together here, and this is the only message the indexer sends on
+            # this path. It is per index source and per chunk: `[bsz, chunk, index_topk]` int32, one
+            # all-gather, against a fp32 score tile per key tile over the whole compressed prefix.
+            #
+            # `cat` in rank order reassembles the order `row_band` cut the bands in, so this is the
+            # tensor a head-split rank would have produced rather than a permutation of it. Nothing
+            # else on the row path needs one: `shared.candidates` names *blocks* and is read by the
+            # indexer alone, on this rank, for this rank's own rows. Its two ends are in the same
+            # coordinates for the same reason -- the source publishes from its band and the user
+            # indexes `[:, q0:q1]` in its own, and `row_band` is a function of the chunk's length and
+            # the rank alone, so every layer on this rank cuts the same band out of the same chunk
+            # and both rows `i` are the same absolute query. A band cut per layer, or a source that
+            # published its whole chunk, would be the one place the two could disagree.
+            tp = self.tp
+            assert tp is not None and tp.gather is not None, "a row band is a rank of a world with a gather"
+            idx = tp.gather(idx)
+        return idx
 
     def _stream_prefix(
         self,
@@ -938,6 +1084,12 @@ class Indexer(nn.Module):
         out_blocks: list[torch.Tensor] = []
         # one pipeline for the whole call: it is drained at the foot of every query tile, so nothing
         # of one tile's is still in flight when the next tile's first collective is issued
+        #
+        # `tp is None` is two cases and both want the same answer: there is no world at all, or there
+        # is one and this call is a row band -- whose score is whole already, because the sum above ran
+        # over every index head of its own rows. `forward` is the one place that decides, by not
+        # carrying a world into its banded branch, so a band reaches the loop below with nothing to
+        # reduce rather than with a reduce it then declines to issue.
         pipe = _ReducePipeline.build(None if tp is None else tp.reduce, q.device)
         for q0 in range(0, seqlen, q_tile):
             q1 = min(q0 + q_tile, seqlen)
@@ -987,12 +1139,15 @@ class Indexer(nn.Module):
                     if due is not None:
                         flush(*due)
                 else:
+                    # `tp` is this rank's world on the head split, where the sum above ran over this
+                    # rank's heads only and the score is a partial. It has to be whole before any
+                    # top-k, because a top-k over partials is a different selection and the difference
+                    # is discrete -- it does not average away downstream the way a rounding does.
+                    # Tiled, this is one collective a tile, which is the same volume as the one it
+                    # replaced and a fixed count for a fixed width. On a row band `tp` is None and the
+                    # score is complete for exactly these rows, so the top-k below is the unsharded
+                    # top-k and no collective happens at any tile.
                     if tp is not None:
-                        # the sum above ran over this rank's heads only, so the score is a partial. It
-                        # has to be whole before any top-k, because a top-k over partials is a different
-                        # selection and the difference is discrete -- it does not average away downstream
-                        # the way a rounding does. Tiled, this is one collective a tile, which is the same
-                        # volume as the one it replaced and a fixed count for a fixed width.
                         score = tp.reduce(score)
                     flush(score, k0, k1)
             if pipe is not None:
@@ -1076,6 +1231,8 @@ class Indexer(nn.Module):
                 ]
                 score = torch.einsum("bqhd,bqmd->bqhm", q_tile_t, gathered)
                 score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
+                # As in `_stream_prefix`: `tp` is the world on the head split and None on a row band,
+                # whose score is whole for its own rows and needs no collective before the top-k.
                 if tp is not None:
                     score = tp.reduce(score)
                 # a padded block names position -1 and a query cannot see past its own group count;
@@ -1274,7 +1431,26 @@ class Attention(nn.Module):
             assert self.indexer is not None
             if self.indexer.freqs_cis is None:
                 self.indexer.freqs_cis = self.freqs_cis
-            idxs = self.indexer(x, qr, latent, pos, offset, shared)
+            # The row split's band, which is `(0, seqlen)` for every configuration that is not one.
+            # `x`/`qr` are handed over as views of the chunk's own rows -- a band moves the query side
+            # only, so the *key* side (`latent`, the cache write, the window) stays whole and stays
+            # this layer's, and slicing here rather than inside keeps the compressor the one caller
+            # that reads the whole chunk. `pos`/`offset` are the chunk's, not the band's: what a band
+            # changes is where its first row sits, and `forward` asks for that with `row`.
+            row, band = self.indexer.row_band(seqlen)
+            if band == seqlen:
+                idxs = self.indexer(x, qr, latent, pos, offset, shared)
+            else:
+                idxs = self.indexer(
+                    x[:, row : row + band],
+                    qr[:, row : row + band],
+                    latent,
+                    pos,
+                    offset,
+                    shared,
+                    row=row,
+                    seqlen_full=seqlen,
+                )
         shared.topk_idxs = publish(shared.topk_idxs, idxs)
         return shared.topk_idxs
 

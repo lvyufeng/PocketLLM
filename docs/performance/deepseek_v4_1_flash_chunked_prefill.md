@@ -666,7 +666,10 @@ candidate stream's own section below measures why. The in-tree precedent for one
 gather-score-select is `src/kernels/ops.py`'s `_decode_sparse_attn_kernel`, which already fuses
 exactly that for decode.
 
-**Two levers, and what gates each — and each one owns a different regime.** The collective:
+**Four levers, and what gates each — and each one owns a different regime.** The first two are the
+collective, one on its price and one on its scheduling; the third is the retile, below; and the fourth
+removes the collective rather than paying or hiding it, and it is the one of the four that lands on the
+wall of a 256K prefill. The collective:
 `make_all_reduce` upcasts to fp32 around the `all_reduce` and the closure casts the answer back to
 bf16 anyway, so a prefix-tile message travels on the wire at **33.6 MB against the 16.8 MB of the
 tensor it carries** — ~11 GB a chunk at 262144 against the candidate path's ~1 GB — for a rounding on
@@ -760,7 +763,7 @@ default needs a chunk-level demonstration this box has not given. The retile is 
 there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
 grow with the width.
 
-**The candidate stream's own early-out is the fourth lever, and it is the one that ships off.**
+**The candidate stream's own early-out is the fourth lever, and it ships off by default.**
 `_TopKStream.push` returns without merging when `amax(tile) < amin(held)` and the buffer is already at
 width `k`, which is the test the prefix level wants: there a 4096-key tile is narrowed into a 512-wide
 buffer and most tiles of most query tiles are below the running k-th. This level builds its stream with
@@ -829,6 +832,159 @@ bf16 — the k-th value is shared by 23 entries of a 12288-candidate union in th
 boundary is routinely an equal group. Nothing here can be bit-identical by construction, and the
 selection is value-exact.
 
+
+**The fifth lever removes the collective rather than hiding it — and the collective turns out not to
+be what it collects.** The level-one collective exists because of how the score is laid out:
+`Indexer.forward` computes `einsum("bqhd,btd->bqht", q, index_k)` and then multiplies by `weights` and
+sums over the **32 index heads**, so a rank holding 8 of them holds a *partial* score and every key tile
+needs an `all_reduce` before top-k can run. Fold the query and the head axes into the einsum's M
+dimension instead and a rank computes `seqlen/world x 32 heads` for the same element count, the same
+`index_k` traffic, and a tile that is the same size — the budget is on `q_tile * n_heads * key_tile` and
+it redistributes rather than grows: a band's `q_tile` is `min(seqlen, 2048)` and so halves to 1024, the
+head count quadruples to 32, and `key_tile` comes back 4096 → 2048, leaving 1024 x 32 x 2048 where the
+head split has 2048 x 8 x 4096. What the identity does *not* preserve is the tile count, and the two
+paths differ there: the prefix path's 48 tile events a chunk at 32768 become **45**, the same bytes at
+the same size a tile, while the candidate path's quarters — its `span` is
+`INDEXER_CAND_TILE * block_size`, which no budget touches and no head count enters, so a band runs a
+quarter of the tiles over the same 512-position span and pays the same 67 MB gather under each of them,
+with a score four times as wide. That is the whole reason the two paths move differently below.
+(A chunk past 8192 would put `n_heads * q_tile` over the budget and `key_tile` on
+`INDEXER_MIN_KEY_TILE`'s 1024 floor, where the tile starts growing instead — not reachable at a chunk
+of 4096 on four ranks.) What the layout buys is that the head sum now covers all 32, so a band's score
+is **complete for its own rows** and the level-one collective is not there to pay for. The price is
+`wq_b`: the projection that produces the 32 heads replicates instead of sharding. What replaces the
+collective is one all-gather of the picked ids a chunk an index source — `[bsz, chunk, index_topk]`
+int32, **8.4 MB a source and ~67 MB a chunk over the eight**, ~12 ms at this fabric's 5.8–6.1 GB/s.
+
+**The pair, measured with one instrument on both arms**, `/tmp/probe_v41_row_split.py` one process an
+arm — the two cannot share one, because the loader reads `_kind` → `row_split` and fixes `wq_b`'s own
+width at load time, so a band's module and a head-split module are different objects and a decode step
+(one query against four) takes the head split on both:
+
+| one process an arm | head split | row split | ratio |
+| --- | ---: | ---: | ---: |
+| **4096 rows, chunk 4096** | | | |
+| prefix stream | 0.118 s | 0.075 s | 0.634x |
+| candidate stream | 0.381 s | 0.090 s | 0.235x |
+| whole prefill | 28.6 s | 28.3 s | 0.988x |
+| **32768 rows, chunk 4096** | | | |
+| prefix stream | 1.982 s | 0.822 s | 0.415x |
+| candidate stream | 9.955 s | 2.429 s | **0.244x** |
+| whole prefill | 210.4 s | 199.9 s | 0.950x |
+| **262144 rows, chunk 4096** | | | |
+| prefix stream | 110.165 s | 43.519 s | 0.395x |
+| candidate stream | 99.900 s | 24.308 s | **0.243x** |
+| whole prefill | **1808.1 s** | **1652.9 s** | **0.914x** |
+
+**The candidate path is where the lever is, and the reason is a replication the head split carries that
+has nothing to do with heads.** `_stream_candidates` gathers `index_k` per query — `q_tile` queries
+against `INDEXER_CAND_TILE * block_size` = 512 positions of the full 128-wide key — so the gathered tile
+is `[512, 512, 128]` bf16, **67 MB, and its size does not depend on the head count at all**, while the
+head split pays it on every rank for *every* query in the chunk. A row band is a quarter of the queries
+at the same 512-position span, so the same gather sits under four times the score: the band's einsum
+materializes `[512, 512, 32 heads]` where the head split's is `[512, 512, 8]`. That the iteration does
+not get more expensive anyway is the measurement that locates its cost. Over the 8 chunks at 32768 the
+head split's candidate stream is **1.22 ms a tile event over 1024 of them a chunk** — `q_tile` 512 x
+(`span` 512 over 16384 keys = 32) x 4 candidate layers, the 1024 of the 1072 above — against the row
+split's **1.19 ms over 256** — the same four numbers with `q_tile`'s eight tiles cut to a band's two.
+**The tile's arithmetic grows 4x and its cost moves 2%, so an iteration is the gather and not the
+score**, and the 7.5 s the stream gives up is **0.94 s of the 1.31 s a chunk** the whole prefill moves.
+The prefix path's 0.145 s a chunk is the level-one collective and nothing else: it is the one path with
+no per-query gather in it, and its saving lands under the 0.263 s the fp32 wire model above puts on
+level one at 32768, which is what the model predicts once the third of the row's collective that is
+already hidden behind other work is taken out.
+The two streams hold **1.09 s of that 1.31 s**, and the ~0.22 s a chunk left over sits outside both
+timers: the id all-gather of the picks is the one cost the lever adds that neither instrument contains,
+and nothing here prices the rest. Read the two rows as one finding rather than two — **the indexer's
+context term is mostly a gather that four ranks were each doing for all four ranks' queries**, and the
+collective is the smaller half of what query-row sharding removes.
+
+**The 262144 leg says the same thing at eight times the width, and it is the leg the deployment is
+about.** Read a chunk instead of a leg and the pair separates by *which* path grows: the head split's
+candidate stream at 262144 is **1.561 s a chunk against 1.244 at 32768** — 1.26x for eight times the
+context — because its keys are 16384 gathered positions whatever the prompt is, while its prefix stream
+goes **1.721 against 0.248**, 6.9x, on the whole compressed prefix. The row split takes the candidate
+chunk to **0.380 s against 0.304 at 32768** and the prefix chunk to **0.680 against 0.103**, so the
+ratio on both paths barely moves with the length — **0.243x at 262144 against 0.244x at 32768 on the
+candidates, 0.395x against 0.415x on the prefix** — and what improves is the *composition*: the two
+streams are 11.9 s of a 210.4 s prefill at 32768 (**5.7%**) and 210.1 s of an 1808.1 s one at 262144
+(**11.6%**), all of that growth in the prefix row, which goes from 0.94% of the leg to 6.1% while the
+candidate row holds at ~5%. So the same pair of ratios is worth **0.950x against 0.914x on the wall**
+— and the prefix is the *less* movable of the two, which is why the wall gains 3.6 points where the
+share gained 5.9. At 262144 the two streams give up 142.2 s of the 155.2 s the whole prefill moves —
+**91.6%**, against 82.7% at 32768, with the same ~0.20 s a chunk outside both timers — and the
+candidate path is still the larger of the two in absolute seconds, 75.6 s against the prefix's 66.6,
+even though the prefix is the row that grows. That is the version of this lever that matters:
+**a 262144-token prefill at a 4096-token chunk goes 28.25 s to 25.83 s, and the one row of it that
+grows with context is the row that moves by 0.395x.**
+
+Read the timing with this box's caveat: the arms are two processes and the arm order is not alternated,
+so the absolute seconds carry the host's drift — the same 4096 off-arm prefix reads 0.112 s in one sitting
+and 0.118 s in the next while arm-on's moves 0.053 → 0.075 — and only a ratio across a pair is quotable.
+The parity below does not carry that caveat, because it compares payloads rather than clocks.
+
+**The third lever and the fifth do not add, and the reason is arithmetic rather than interaction.**
+`INDEXER_CAND_TILE` 64 → 256 and the row band act on the same rows, so the retile was re-run against
+the row split in the same sitting (`/tmp/run_rs_retile.sh`, one process an arm, a fresh head-split
+reference reading 2.000 s prefix / 9.988 s candidates against a 211.1 s prefill): the row split alone
+gives 0.806 / 2.431 and **198.0 s**, and the row split with the retile on top **0.808 / 2.147 and
+199.5 s**. The retile's *ratio* survives — 2.431 → 2.147 is **0.883x** on the candidate row, against
+the 0.90x the same lever reads on the whole `attn.indexer` row without a band — and its *share* does
+not: that row is 4.7% of a 32768-token prefill before the row split and 1.2% after, so the 0.284 s it
+buys is 0.14% of the wall and under this box's own spread (the two row-split sittings' prefix rows
+agree to 0.25%, 0.806 against 0.808, while their whole-prefill columns differ by 1.5 s). **The two
+compose on the row and are invisible on the wall**, which is the same statement as the fifth lever's
+own 91.6%: there is no second 0.9x waiting behind this one at 32768. What the sitting also settles is
+that the retile costs no numerics — the two row-split payloads are bit-identical, every layer's digest
+differing 0 on all eight index sources, `real-pick-count differs 0`, reorder 0, and the last step's
+logits `max|delta| 0.000e+00` with the argmax unmoved — so `INDEXER_CAND_TILE` is a re-grouping of the
+same top-k rather than a different one, and the chain is 32 of 32 on both.
+
+**Parity of the picks is not the gate here, and the reason is which arm departs from the tree.** The head
+split computes 8 index heads a rank, rounds those partials to bf16 for the wire and rings them in fp32;
+the row split sums all 32 heads of its own rows in one rank's accumulation order, which is the unsharded
+tree's own order. Which of the two that makes the oracle's is settled by
+`tests/test_models_deepseek_v4_1_tp.py`'s `test_a_row_split_shard_is_the_unsharded_tree_row_for_row`: it
+loads one mini checkpoint whole and once a rank under `DEEPSEEK_V41_INDEXER_ROW_SPLIT=1`, holds every
+rank's `indexer.wq_b.weight` `torch.equal` to the file's whole tensor, and holds the *gathered* picks —
+the tensor `Indexer.forward` returns, so a band off by one row fails there rather than as a logit margin
+— `torch.equal` to the whole tree's on every index source. **The row split is bit-exact against the
+oracle on the discrete quantity and the head split is not**, and the probe's arm-on against arm-off
+difference is the head split's departure measured from the other side: **4096 of 4096 rows re-pick on the
+last chunk** at both 32768 and 262144 — 2799 → 3584 of 4096 at 4096 rows — with the size of the
+difference running from a median of 12 slots on layer 2 at 262144 (largest 146) to a median of 404 on
+layer 28 (largest 996); the one-slot tail — rows whose picks differ in exactly one position, so `|A^B|`
+is 2 — is layer 2 alone and it shrinks as the context widens, 826 of the 2799 re-picking rows at 4096
+rows against 51 of the 4096 at 262144 — the level-one pass picking whole *candidate blocks*, so a
+last-bit score change moves a block and every position inside it, which is the layer mix above showing
+through. `real-pick-count differs 0` everywhere
+at every length: no row has more or fewer real picks and no row reorders the ones it has. What the probe
+gates on is therefore not the picks but the greedy chain off the last chunk — a one-row step takes the
+head split on *both* arms, so a divergence there is the prefill's picks and nothing else — and it is held
+to a bound rather than a match: each step's `|Δlogits|` against the smaller of the two arms' top-2 gaps.
+At 4096 rows over 32 steps that reads **max|delta| 3.334e+00 against a smallest top-2 margin of
+9.607e+00, 0 of 32 steps agreeing with the delta above the margin that decided them (worst ratio 0.328)**,
+with **32 of 32 tokens identical end to end**; at 32768 the chain is 32 of 32, and at 262144 it is
+**96 of 96 over 96 steps, max|delta| 4.695e+00 against a smallest margin of 9.144e+00, 0 of 96 over,
+worst ratio 0.330** — the same worst case at eight times the context, which is what a per-step bound
+buys over a single max. The control that licenses reading those re-picks as the lever's rather than as
+run-to-run drift: two independent off-arm sittings have **bit-identical picks on all eight index
+sources** — digest differs 0, set differs 0, `max|A^B|` 0 — while their logits differ by **26.0**, so a
+logit magnitude on its own says nothing about which arm is right. The same chain priced this path's
+decode while it was there: **470.5 ms a step, 2.13 tok/s at 32768 rows of context** and **484.9 ms,
+2.06 tok/s at 262144 against the on-arm's 471.0 ms and 2.12** — a step is one query against four and
+takes the head split on both arms, so that 2.9% is this box and not the lever, and the number is a
+full-network PyTorch-path one read against the cpp_engine FP4 TP4 gate rather than against this tree.
+
+The knob is `DEEPSEEK_V41_INDEXER_ROW_SPLIT` (`tp.py`'s `indexer_row_split`, **default 0 — the head
+split**), read at load time, and `attention.py`'s `Indexer.row_band(seqlen)` is the one place it is
+applied: it returns the whole chunk for no world, for the knob off, for `seqlen < tp.world` and for
+`seqlen % tp.world`, and `(tp.rank * band, band)` otherwise. Its counterpart on the expert side is the
+`id` deal, and the two compose: a chunk is a row band to the indexer and a `hash % world` expert split to
+the MoE, and neither has anything to say about the other. It is deliberately not a default. The chain is
+the deployment's question and it is answered at all three lengths, but the picks move on every index layer
+of every chunk and the arms are two processes rather than one interleaved sitting, so a service should
+adopt this with its own acceptance run rather than inherit it from a performance branch.
 ## Reproducing
 
 The sweep is one leg a process, ordered by what is at stake rather than by length:
