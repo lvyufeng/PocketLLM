@@ -109,9 +109,14 @@ on is also the reference's own long-context setting for a reason unrelated to th
 decode, and the two runs are not separated by anything on this page.** 139.6–142.4 against 105.98,
 244.8–249.6 s of wall against 323.3 s for a prompt of the same length — the same pool, the same
 chunk, the same deal. The launcher's prefill column is a subtraction between two printed walls and
-the server's is a client-side ttft, which makes the server's the *floor* of the two, and the two
-legs are also two trees: the launcher's rows were taken on a master that predates the three stacked
-prefill kernels and the indexer row split this branch is based on. Decode is the column where the
+the server's is a client-side ttft, which makes the server's the *floor* of the two. The two legs
+are also two trees, and the direction matters for the attribution: the launcher's rows are
+`origin/master` at `f7572f0`, and **the three stacked prefill kernels are ancestors of it** — #296
+(`7102c19`), #297 (`aa83816`) and #298 (`b394ddb`) merged at 14:48–14:49 on 2026-09-20, `f7572f0` at
+20:06 — which is why the launcher's own 262144 rate of 103.5–104.0 tok/s is the stacked arm's 104.0
+and not `98e828f`'s 70.4. What the launcher's rows predate is the `id`/`sorted` deal flip (#306) and
+the indexer row split (#318); the deal is held fixed at `sorted` on the compared arm above, so the
+1.32–1.34× here is not the kernel work re-measured against an older tree. Decode is the column where the
 convention is visible rather than inferred: 253–262 ms a step against the launcher's 229 is ~25 ms
 that is not a step, and roughly half of the 4.37 → 3.85–3.91 gap.
 
