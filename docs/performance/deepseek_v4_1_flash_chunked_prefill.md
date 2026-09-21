@@ -536,6 +536,10 @@ Across this leg the one row is most of the growth and every other row is flat, r
 column of both tables: `attn` goes 6.75 → 9.83 s, of which `compress_kv` is 3.04 of the 3.80 s the
 instrumented chunk gains, while `moe.routed` reads 21.48 → 21.77 s and `attn.sparse` 2.11 → 2.16 s, and
 `hc_post`, `hc_mixes`, `hc_pre`, `engram` and `norm` are unmoved — while the chunk goes 27.39 → 31.34 s.
+Each of those deltas is a difference of two per-rank maxima, and the straggler is not the same rank on
+every row nor necessarily the same rank at the two lengths, so they are five separate statements about
+one rank each rather than a decomposition: summed they read 3.42 s of the chunk's own 3.95, and a row
+called unmoved here is unmoved in the maximum rather than in every rank.
 
 **Read the tap's two time columns apart or it will mislead you**, the same rule the phase table above
 needs. A wrapper that drains the GPU before each call records the *enqueue* in `body` and the GPU
