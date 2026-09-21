@@ -529,11 +529,58 @@ one at 262144, and **nothing in it scales with context**: flat to 2.4%, 1.99 ms 
 2.04. An earlier reading here — that 2.084 s "would be more than the entire row at 32768", so
 something inside the candidate path must grow with the width — compared an instrumented 262144 number
 against an *uninstrumented* 32768 row and landed on the answer it was looking for: the candidate
-path's own cost at 32768 is 2.035 s. The L2 hypothesis that reading bought is therefore **untested
-and unsupported**: the gather out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5 MiB
-of L2) against 68 MiB at 262144 (outside it) predicts a per-iteration cost materially lower when the
-index fits, and the 2.4% between 2.035 and 2.084 s — 0.049 s over 1024 of them — is the whole of what
-that difference is worth.
+path's own cost at 32768 is 2.035 s. The L2 hypothesis that reading bought was **unsupported and, at
+that point, untested**: the gather out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5
+MiB of L2) against 68 MiB at 262144 (outside it) predicts a per-iteration cost materially lower when
+the index fits, and the 2.4% between 2.035 and 2.084 s — 0.049 s over 1024 of them — is the whole of
+what that difference is worth.
+
+**The capacity question is now answered by a direct sweep, and the answer is no.** A synthetic
+c-iteration — the same geometry, an index built from block ids the way the loop builds it, no
+collective and no ranks — prices the pieces at both widths (`/tmp/bench_indexer_cand_tile.py`,
+30 iterations, one RTX 2080 Ti):
+
+| µs a c-iteration | width 36864 (`index_k` 9.0 MiB) | width 266240 (65.0 MiB) |
+| --- | ---: | ---: |
+| gather, scattered | 666.9 | 684.6 |
+| einsum over the gathered tile | 690.3 | 703.0 |
+| mask | 65.8 | 72.6 |
+| merge (cat + topk + gather) | 135.8 | 136.9 |
+| amax/amin boolean read | 71.9 | 76.8 |
+| **whole** | **1612.4** | **1577.1** |
+
+**A 7.2x change in the width — from under twice this card's 5.5 MiB of L2 to twelve times it — moves
+the whole tile by 2.2%**, so the gather is neither capacity- nor residency-bound: 667 against 685 µs
+is the access pattern's own price, and the same 64 MiB of gathered rows either way. The einsum costs
+the same from a contiguous `[1, q, m, d]` copy as from the gathered tile (690.2 against 689.8 µs at
+36864, 616.9 against 618.0 at 266240), so the halves are independent and neither is a layout artifact
+of the other. That leaves the 1612 µs against the in-situ **1988 µs** a c-iteration (2.035 s over 1024)
+as the collective's 202 µs plus ~175 µs of enqueue the synthetic loop does not pay.
+
+**The einsum's 690 µs is the shape, not the bytes.** `out[q, h, m] = sum_d Q[q, h, d] K[q, m, d]` has
+`h` as one operand's only free dimension and `m` as the other's, so it is 512 batches of
+`[8, 128] @ [128, 512]` — `M` = the model's 8 index heads — and the same 0.537 GFLOP as a single
+`[4096, 128] @ [128, 512]` GEMM costs less than a sixth as much: the batched-to-wide ratio is 6.51,
+6.27, 6.53 and 6.15 on four readings of `/tmp/bench_indexer_cand_score.py`, and the ratio is the part
+that survives this box's clock bins, so that is the claim — the absolutes in those readings move
+together by 25% between an allocation-warm and a warm card (`--preheat` tags a bin; without it a
+table here is a reading of the card's state rather than of the shape). `M` cannot be raised — each
+query gathers its own rows, so there
+is no operand shared across the batch — and transposing the pairing to put the 8 on `N` buys nothing
+(672.8 µs against 652.7 at batch 512's shape). Its 64 MiB of input in 690 µs is 97 GB/s, *below* the
+gather's own 201 GB/s,
+which is the same statement from the bandwidth side: this half is not waiting on memory.
+
+**What that prices.** The shipped pair is 1357 µs a c-iteration and moves ~192 MiB (gather read plus
+write, einsum read); a fused gather-and-dot would read the 64 MiB scattered and write 4 MiB, and at the
+gather's own measured 201 GB/s that is **~350 µs** — so the fusion's ceiling is a **~1.0 s** cut of the
+2.035 s row, and the row is 1024 tiles at both lengths, so the same second is on the 32768 chunk as on
+the 262144 one. Nothing is implemented: the number is a bound built from the two measured rates, and
+the arithmetic would have to be kept in bf16-input, fp32-accumulate to land on the same `k` values.
+Note *values* rather than bytes: this level cannot be bit-identical by construction, and the
+candidate stream's own section below measures why. The in-tree precedent for one pass over
+gather-score-select is `src/kernels/ops.py`'s `_decode_sparse_attn_kernel`, which already fuses
+exactly that for decode.
 
 **Two levers, and what gates each — and each one owns a different regime.** The collective:
 `make_all_reduce` upcasts to fp32 around the `all_reduce` and the closure casts the answer back to
@@ -628,6 +675,75 @@ default needs a chunk-level demonstration this box has not given. The retile is 
 `INDEXER_CAND_TILE` 64 → 256 buys is 9.6% of the row 2.07 s *because* the candidate path is 77% of it
 there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
 grow with the width.
+
+**The candidate stream's own early-out is the fourth lever, and it is the one that ships off.**
+`_TopKStream.push` returns without merging when `amax(tile) < amin(held)` and the buffer is already at
+width `k`, which is the test the prefix level wants: there a 4096-key tile is narrowed into a 512-wide
+buffer and most tiles of most query tiles are below the running k-th. This level builds its stream with
+`k = min(index_topk, width)` — 512, which is exactly its own `span` — so the buffer holds the top-k's
+own width from its *first* push and the running k-th value sits inside the incoming tiles rather than
+above them. The guard is live, but the test is a device→host read on every push and a hit is worth one
+merge; that is why the default now answers `False` (`INDEXER_CAND_SKIP_TEST`), and it is also what a
+capture already builds — `_TopKStream` refuses that read inside one — so the eager path is being made
+to agree with the recorded one rather than to differ from it.
+
+`/tmp/bench_indexer_cand_overlap.py` prices the read on the real fabric, four ranks, both cache widths,
+A-B-A-B with the read as one factor and the prefix path's depth-1 lookahead as the other (µs a
+c-iteration, 255 pushes a stream):
+
+| µs a c-iteration | width 16384 | width 131072 |
+| --- | ---: | ---: |
+| serial, read on (what shipped) | 1523.7 | 1543.2 |
+| serial, read off | **1350.1** | **1381.3** |
+| lookahead depth 1, read on | 1583.2 | 1609.8 |
+| lookahead depth 1, read off | **1200.2** | **1233.5** |
+
+Every arm is elementwise identical to every other arm and every arm reports `reads 255 skips 0
+merges 255`. Two things are in that table. The read is 173.6 and 161.9 µs of the shipped tile — 11.4%
+and 10.5% — and with it gone the depth-1 lookahead, which *costs* 3.9% against the same read-on serial
+arm, becomes a **21% saving**. They are the same effect: the read drains the compute stream at every
+push, and that is precisely what stops `_ReducePipeline` from deferring this path's collective, so
+dropping the read is the precondition for the overlap here as well as its own 11%.
+
+In situ the same knob is worth less than the fabric says, and the instrument is
+`/tmp/probe_cand_skip_inproc.py --at 8192 --chunk 4096 --arms 0 1 1 0`: one process, the state reset
+between arms, `INDEXER_REDUCE_DEPTH` held at 0 so this stays one lever, and `_TopKStream.push` wrapped
+to count pushes and early-outs per path. The A-B-A-B order is what makes the column readable — the two
+`skip 0` arms are the determinism floor, and a `1`-versus-`0` difference means nothing until they
+agree.
+
+| arm | `INDEXER_CAND_SKIP_TEST` | chunk s | `stream_candidates` | cand push/skip | logit max\|δ\| vs arm 0 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 25.08 | 1.102 | 896/0 | 0 |
+| 1 | 1 | — | 1.284 | 896/1 | 1.695 |
+| 2 | 1 | — | 1.236 | 896/1 | 2.206 |
+| 3 | 0 | — | 1.137 | 896/0 | 1.695 |
+
+**The timing agrees in sign with the fabric and the parity column does not survive its own floor.**
+`stream_candidates` is 1.102 and 1.137 s with the read gone against 1.284 and 1.236 s with it, a
+~0.14 s move of a ~1.12 s row on a 25.08 s chunk — 0.56% of the wall — and the guard fires **once in
+896 pushes**, so the test is not dead here, it is merely worth one merge. The logits, which were meant
+to be the exactness evidence, cannot carry it: arms 0 and 3 are the same setting with no knob between
+them and they disagree by 1.695, exactly what arm 1 came back with, while arm 2 came back 2.206 — so
+every pairwise comparison among the four differs and the column attributes nothing to either setting.
+The leading explanation is the prefill MoE epilogue's plain `atomicAdd`
+(`moe_fp4_grouped_w2_wmma_scatter_kernel`, `src/csrc/cuda_kernel_impl.cu`) — the deterministic-reduce
+default covers the single-token and multi-slot paths only, so the grouped prefill path accumulates
+its routed output in whatever order the blocks reach the accumulator — which is why
+`/tmp/probe_v41_prefill_moe_order.py` exists to price it. The exactness rests instead on the argument,
+on `tests/test_models_deepseek_v4_1_attention.py`'s two streams, and on
+`/tmp/check_cand_guard_equiv.py`'s six trials at this level's geometry.
+
+**What the argument is, and how far it reaches.** Every value held is *strictly* above every value in
+the tile, so the k largest of the union are the k the buffer already has: the merge would return the
+same multiset, and the skip is exact rather than a tie-break. It is exact in values and no further —
+*which* member of an equal-valued group gets named is `torch.topk`'s choice, so a change that removes
+merges can move a named position among entries the level scored identically, and only at the pushes
+where the skip would have fired. The same freedom is already in the shipped code across any change of
+tiling: at this level's real arithmetic — `relu(q·k)` times a weight, summed over the 8 heads, left in
+bf16 — the k-th value is shared by 23 entries of a 12288-candidate union in the sample checked, so the
+boundary is routinely an equal group. Nothing here can be bit-identical by construction, and the
+selection is value-exact.
 
 ## Reproducing
 
