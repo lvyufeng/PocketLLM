@@ -2201,7 +2201,13 @@ it. Staged rows are identical across all six legs, 5623 / 5673 / 3791 / 3740, an
 **What is left is a different bottleneck, and the table names it.** `_take_buffer` goes *up*, 2.39 →
 7.29 s, because the wait it does was previously covered by the 3.99 ms a call the `memcpy` took: the
 copy is gone, so the ring's rotation is now exposed, and it is **54.5–55.5% of what is left** of the
-class. `_upload` and `_drain_chunk` are essentially unmoved (`1.89 → 2.19` and `2.19 → 2.23 s`), which
+class. Exposed, but not worth cutting, which a later A/B settled rather than argued: on a 4096-token
+chunk of a longer prefill the same wait is 1.79 ms a call and 15.8 s of a 36.01 s chunk with 96% of the
+waits unsatisfied, and skipping it entirely moves that chunk by −0.35 s inside a 3.31 s chunk-to-chunk
+spread — a host that is the producer blocking is a host that would otherwise be enqueuing ahead into a
+ring with no room in it, so the block moves rather than disappears
+([where a chunk's seconds go](deepseek_v4_1_flash_chunked_prefill.md#where-a-chunks-seconds-go)).
+`_upload` and `_drain_chunk` are essentially unmoved (`1.89 → 2.19` and `2.19 → 2.23 s`), which
 is the other half of the same reading — the H2D was never the term the removal was going to move, and
 it did not move. The probe's counters agree with the code path rather than with the class's own
 bookkeeping: **`_stage 0, _upload 33738`** on rank 0, where the input to `_stage` is unchanged at
