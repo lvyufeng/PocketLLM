@@ -259,6 +259,47 @@ expert call's own intermediates: a wider pool means more draws hit and fewer row
 `_chunk_bounds` cuts the same 4096-token forward into **fewer and bigger** chunks. That is also the
 whole of why it is faster, which is why the memory and the speedup are one finding and not two.
 
+**That lever was read A-B-A-B afterwards, and it is real, larger than the single reading, and located
+somewhere else.** Four processes — pool 148 twice, then 288 twice — at `--at 32768 --chunk 4096
+--max-seq-len 41024` with `DEEPSEEK_V41_EXPERT_DEAL=id`, one 4096-token chunk a process, rank 0
+(`/tmp/probe_v41_chunk_profile_host.py`, `/tmp/chunk_ctl_{a1,a2,b1,b2}.pt.r0`):
+
+| column (s) | 148, p1 | 148, p2 | 288, p1 | 288, p2 | floor | lever |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `quiet` — the same width at 36864, taps off | 27.923 | 27.559 | 25.436 | 25.537 | 0.364 | **−2.254 (−8.1%)** |
+| the tapped chunk at 32768 | 35.522 | 35.748 | 34.758 | 34.498 | 0.260 | −1.007 (−2.9%) |
+| `moe` | 26.445 | 26.695 | 25.593 | 25.446 | 0.250 | −1.051 |
+| — `moe.routed` | 21.384 | 21.163 | 21.792 | 21.315 | 0.477 | **+0.280 (+1.3%)** |
+| —— `routed.resolve` | 6.877 | 6.764 | 7.190 | 6.990 | 0.200 | +0.269 |
+| —— `routed.stage` | 6.839 | 6.756 | 6.900 | 6.890 | 0.083 | +0.097 |
+| —— `routed.upload` | 3.843 | 3.851 | 3.832 | 3.825 | 0.008 | −0.018 |
+| `attn` | 6.776 | 6.776 | 6.908 | 6.783 | 0.125 | +0.069 |
+
+Two processes of the *same* setting differ by 0.364 s on `quiet` — **1.3% of its own value** — so the
+−8.1% is **6.2× the floor** and the lever stands. It also sizes the working rule that a single-run
+`quiet` or `moe.routed` move under ~10% is not an effect: on this evidence that threshold is
+conservative by most of an order of magnitude, since `moe.routed`'s own floor is 2.2% and `quiet`'s is
+1.3%. Two repeats bound a spread from below, so read the floor column as a floor.
+
+**And the faster chunk is not a staging win.** `staged` is 2178 rows in both 148 arms against 2174 in
+both 288 arms — 0.2% — and `routed.upload` moves 3.843 → 3.832 s, which is the same bytes: a wider
+pool did **not** make more draws hit. `_issue_chunk` is called 40 times, once a layer, in every arm, so
+`_chunk_bounds` did not cut the forward into fewer pieces either. The routed sub-phases net **+0.11 s
+against the wider pool**, the wrong sign, while the ~1.0 s that does appear sits in the `moe` block's
+own body, the part its three children do not cover. So the mechanism is a per-layer issue/wait effect
+at the MoE boundary rather than the row-hit accounting proposed above, and the accounting is still the
+right way to size the memory — it is the memory *explanation* that the phases do not support. This is a
+second reading of the same lever on a later tree, not a re-measurement of the table above; its own
+memory column reproduces the arithmetic anyway, 16118 MiB allocated at 148 rows against 18631 at 288 —
++2513 MiB, against the 2512 the row size predicts.
+
+The token column separates by setting and by nothing else. All four ranks print one top-8 a process,
+both 148 processes print `[455, 1, 223, 8077, 764, 330, 343, 334]` and both 288 processes print
+`[455, 1, 223, 8077, 330, 334, 764, 343]`, so the two same-setting pairs are exact repeats of one
+another and the wider pool permutes the **5th–8th** ids without changing the set. `topk` on the logits,
+so it is the logits that moved, and if anything the floor here is *stronger* than the indexer probe's:
+there two arms with no knob between them disagreed, and here they do not.
+
 At 262144 the wider pool does not finish. The p288 leg runs its first chunk at 57.62–58.81 s and peaks
 at 20442 MiB — against p148's 16573 at the same chunk — and then dies in the **second** chunk on all
 four ranks:
