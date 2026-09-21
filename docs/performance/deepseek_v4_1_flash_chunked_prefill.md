@@ -514,7 +514,12 @@ and the cast back to bf16 all happen inside one closure with no name of its own.
 is a device-profile number rather than a tap: the same chunk's card timeline
 (`/tmp/chunk_nccl_attr.log`) puts all 1152 of its `ncclDevKernel_AllReduce_Sum_f32_RING_LL` calls
 together at **5.96 s** over a 26.04 s chunk, while the bytes those calls carry are worth **1.59 s**
-sent one message at a time on an idle device. A ring kernel waits on its peer from inside itself, so
+sent one message at a time on an idle device. Re-taken on the merged tree (`/tmp/chunk_nccl_master.log`)
+the same row reads **5.36 s** over a 25.64 s chunk, with the four ranks at 5.36, 6.56, 5.74 and 6.07
+against the first sitting's 5.96, 6.07, 5.93 and 5.86, and the unprofiled chunks 0.6–0.9 s faster in
+the same pass. The row is five to six and a half seconds then, a spread as wide as the 1.59 s of bytes
+it is set against, so the argument below takes its smallest reading and states what follows from it as
+a floor under the row rather than to the digit. A ring kernel waits on its peer from inside itself, so
 its duration is the bytes plus however long the last rank took to arrive — and the two are separable,
 because the collective the model calls has a dtype: `DEEPSEEK_V41_REDUCE_BITS` picks it (`32`, the
 shipped fp32; `16`, the same sum in half the bytes) and `0` is a control column that sends **no message
@@ -630,9 +635,10 @@ repeats the whole shape of it — `attn.window` 5.15 and 4.96 → 0.97 and 0.96,
 on the columns — 17.13 + 6.92 + 0.57 + 0.22 + 0.03 = 24.87 against the 24.95 the two fp32 arms read —
 but a tap's columns are a collection point and never a partition of the work. **So the row is mostly
 rendezvous. The 80 tails are 1.13 s of wire and cost 3.0 s in situ; halving them buys about what their
-bytes are worth and no more; and what the ring spends the rest of its 5.96 s on is not the tails at all.
-Arithmetic puts that remainder at the indexer's 1066 tiles — 5.96 s less the 3.0 s the tails were worth
-— whose own bytes are 0.45 s a chunk, so the small messages are almost pure meeting. No message in this
+bytes are worth and no more; and what the ring spends the rest of its five to six and a half seconds on
+is not the tails at all. Arithmetic puts that remainder at the indexer's 1066 tiles — the row's smallest
+reading, 5.36 s, less the 3.0 s the tails were worth — whose own bytes are 0.45 s a chunk, so the small
+messages are almost pure meeting. No message in this
 model is worth much.**
 
 **The knob is off by default and the parity is why.** Armed at 4096 tokens from position 0 on a reset
