@@ -36,7 +36,6 @@ resolve past that.
 | Microbench | `/tmp/run_moe_multi_bench.py` driving `/tmp/moe_multi_bench.cu` at the measured per-call geometry |
 | Parity | `/tmp/pr_b_parity.py` at `--at 32768 --chunk 4096 --pool-rows 148`, both arms under the same configuration as the probes, nine positions a rank; `/tmp/bench_issue_kernel.py` carries the three-way parity on random routing for the `bincount` substitution |
 | The chunk, for the substitution | `/tmp/probe_v41_csr_abab.py --at 32768 --chunk 4096` on a mirrored two-arm period, 16 chunks an arm, two sittings (`/tmp/csr_abab.log`, `/tmp/csr_abab_taps.log`), against the taps-off comparator `/tmp/chunk_profile_nobarrier.log` at the same geometry |
-| Parity | `/tmp/pr_b_parity.py` at `--at 32768 --chunk 4096 --pool-rows 148`, both arms under the same configuration as the probes, nine positions a rank |
 
 ## What a scan costs, in the shape the routing has
 
