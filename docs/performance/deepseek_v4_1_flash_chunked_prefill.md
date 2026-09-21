@@ -314,7 +314,7 @@ own fewer MoE layers.
 | `attn` | 12.85 | 12.85 | 12.82 | 12.85 | 40 | 19.6% |
 | — `attn.sparse` | 8.05 | 8.01 | 8.26 | 7.97 | 40 | |
 | — `attn.compress_kv` | 2.12 | 2.14 | 2.12 | 2.14 | 38 | |
-| — `attn.indexer` | 2.09 | 2.12 | 2.09 | 2.12 | 8 | |
+| —— `attn.indexer` | 2.09 | 2.12 | 2.09 | 2.12 | 8 | |
 | — `attn.window` | 0.42 | 0.40 | 0.43 | 0.37 | 40 | |
 | `hc_post` | 0.96 | 0.95 | 0.96 | 0.96 | 80 | 1.5% |
 | `hc_mixes` | 0.40 | 0.40 | 0.40 | 0.40 | 80 | 0.6% |
@@ -397,13 +397,17 @@ the slot wait is now nothing rather than reduced.
 
 **Attention is 22.6% of a chunk and the score pass is most of it.** `attn.sparse` is 8.05 s over 40
 calls — 201 ms a layer, 14.1% of the quiet chunk — and 40 calls makes it a measurement. The rest of
-the attention is the compressed path, `attn.compress_kv` 2.12 s over 38 calls and `attn.indexer`
-2.09 s over 8, and those two are the only rows of the table with a context term: the warm-up's eight
+the attention is the compressed path, `attn.compress_kv` 2.12 s over 38 calls, and `attn.indexer`
+2.09 s over 8 is **inside** it rather than beside it: `_compress_kv` calls `_compress_topk_idxs` calls
+`Indexer.forward`, so those eight calls are a subset of the 38 and the 30 ms between the two rows is
+the pooling, the rotary, the fp4 quantize and the cache write. The nesting is visible in the numbers
+as a constant offset, and it is the contained row that carries the context term: the warm-up's eight
 chunks, whose caches run from 0 to 28672 tokens, average 1.59 s and 1.57 s where the chunk sitting at
-32768 pays 2.12 and 2.09. Every other row of the two tables agrees to a few percent — `attn.sparse`
-reads 7.95 against 8.05, because its index row is the same width wherever in the prompt the chunk is.
-**Over a 262144-token prefill it is the compressed path that gets more expensive per chunk and the
-score pass that stays flat**, and the score pass is the one the sparse-attention work targets.
+32768 pays 2.12 and 2.09 — the same 0.02–0.03 s part of it in both. Every other row of the two tables
+agrees to a few percent — `attn.sparse` reads 7.95 against 8.05, because its index row is the same
+width wherever in the prompt the chunk is. **Over a 262144-token prefill it is the compressed path that gets more
+expensive per chunk and the score pass that stays flat**, and the score pass is the one the
+sparse-attention work targets.
 
 **And the ceiling the width runs into costs almost nothing.** The Hyper-Connections arithmetic that
 stops a chunk at 8192 tokens — `hc_post` 0.96 s, `hc_mixes` 0.40, `hc_pre` 0.29 over 80, 80 and 81
@@ -432,26 +436,45 @@ not the one to attack before the copies, but it is the row that says how much of
 process's Python, though not its loops: `_split` and the per-row `tolist()` are 3 µs of the 9.3 and
 the rest is the pool.
 
-**That ordering is the 32768 one and it does not survive to 256K.** `attn.indexer` and
-`attn.compress_kv` are the only rows of this table with a context term, and across the leg they take
-the pair from 11.6% of a chunk to 32.7%, which leaves them and `moe.routed`'s 20.5 s as the two largest
-things in a 256K chunk — no other row reaches 10 s.
-[Below](#the-one-row-that-grows-with-context) is what is inside them and which of their levers are
-still open.
+**That ordering is the 32768 one and it does not survive to 256K.** `attn.compress_kv` is the only row
+of this table with a context term — `attn.indexer` is *inside* it and not a second cost beside it, see
+below — and across the leg it goes from 7.7% of a chunk to 16.4%, which leaves it and `moe.routed`'s
+21.8 s as the two largest things in a 256K chunk — no other row reaches 10 s.
+[Below](#the-one-row-that-grows-with-context) is what is inside that one row and which of its levers
+are still open.
 
 ### The one row that grows with context
 
-`attn.indexer` is **2.069 s at 32768 and 5.097 s at 262144** (2.46x), 8 calls at both lengths, and
-`attn.compress_kv` on the same path reads 2.10 and 5.13 s. Those two chunks are this tree's — the three
-prefill kernels and the `id` deal are both in — so the quiet chunk is **27.39 s at 32768 and 31.34 s at
-262144**, and the pair is **3.19 s of the first (11.6%) against 10.24 s of the second (32.7%)**. Both
-fit the ship: 27.39 s at 32768 is the sweep's 57.04 s through the three kernels and the `id` deal, and
-31.34 s at 262144 sits 5% above that leg's own last chunk of 29.82 s. Those
-are the two denominators used below; the table above's 56.96 s is the same chunk on the branch without
-the three kernels, and its `attn.sparse` row of 8.05 s is that tree's score pass rather than this one's
-2.05 s. Across this leg the pair is the *whole* of the growth: every other row of the two phase tables
-is flat or lower over it — `moe.routed` 21.5 → 20.5 s, `attn.sparse` 2.05 → 2.02 s, the routed taps'
-bodies within 2% — while the chunk goes 27.39 → 31.34 s.
+`attn.compress_kv` is **2.10 s at 32768 and 5.14 s at 262144** (2.45x) over 38 calls at both lengths,
+and the row nested under it — `attn.indexer`, 2.08 and 5.11 s over 8 of those 38 — is **inside** it
+rather than beside it: `Attention._compress_kv` calls `_compress_topk_idxs`, and `_compress_topk_idxs`
+is what calls `Indexer.forward`. Only 8 of the 38 calls reach the indexer, because a compressor emits a
+new row only every `compress_ratio` positions, and on those 8 the child is 99% of the parent: the
+0.02–0.03 s between the two rows is the pooling, the rotary, the fp4 quantize and the cache write, the
+same gap in both chunks and in every warm-up chunk. **So the context term is one row and its magnitude
+is `compress_kv`'s**, and the quiet chunk is **27.39 s at 32768 and 31.34 s at 262144**, with the row
+**2.10 s of the first (7.7%) against 5.14 s of the second (16.4%)**. Both chunks are this tree's — the
+three prefill kernels and the `id` deal are both in — and both fit the ship: 27.39 s at 32768 is the
+sweep's 57.04 s through the three kernels and the `id` deal, and 31.34 s at 262144 sits 5% above that
+leg's own last chunk of 29.82 s. Those are the two denominators used below; the table above's 56.96 s is
+the same chunk on the branch without the three kernels, and its `attn.sparse` row of 8.05 s is that
+tree's score pass rather than this one's 2.05 s.
+
+**The pair this section first gave — 3.19 s against 10.24 s, 11.6% to 32.7% — added a parent row to the
+child nested inside it, so it counted the indexer's 2.46x twice.** Neither half is a row of either
+table. The 262144 one is a sum of two columns and not exactly the sum of the `total` columns either —
+5.14 + 5.11 reads 10.25 against the 10.24 it was written with, so one of the two came off a per-rank
+column rather than the maximum — and the 32768 one does not reproduce from the artifact this section
+cites at all (`/tmp/chunk_deal_id32.log`, whose own two rows read 2.10 and 2.08 s, a sum of 4.18). The
+corrected shares above are what that log and `/tmp/chunk_deal_id256.log` support. (A phase table's
+`total` column is a per-rank maximum, so a row read off it is the straggler's; over the four ranks the
+two rows mean 2.07 and 2.10 s at 32768 and 5.10 and 5.12 s at 262144. The `2.069` and `5.097` s the
+older text called the indexer's row are rank 0's `sync` column — 2.0691 and 5.0972 — which is one of the
+two columns the rule below says to read apart, and the arms are quoted against that same 2.069 s.)
+Across this leg the one row is most of the growth and every other row is flat, read off the `total`
+column of both tables: `attn` goes 6.75 → 9.83 s, of which `compress_kv` is 3.04 of the 3.80 s the
+instrumented chunk gains, while `moe.routed` reads 21.48 → 21.77 s and `attn.sparse` 2.11 → 2.16 s, and
+`hc_post`, `hc_mixes`, `hc_pre`, `engram` and `norm` are unmoved — while the chunk goes 27.39 → 31.34 s.
 
 **Read the tap's two time columns apart or it will mislead you**, the same rule the phase table above
 needs. A wrapper that drains the GPU before each call records the *enqueue* in `body` and the GPU
