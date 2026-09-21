@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import math
 import os
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 import torch.nn as nn
@@ -1108,7 +1108,11 @@ class Indexer(nn.Module):
         # over every index head of its own rows. `forward` is the one place that decides, by not
         # carrying a world into its banded branch, so a band reaches the loop below with nothing to
         # reduce rather than with a reduce it then declines to issue.
-        pipe = _ReducePipeline.build(None if tp is None else tp.reduce, q.device)
+        # The reduce is bound to `discrete` here and not at the call below, because the pipeline holds
+        # the closure rather than the site: a score's top-k reads the sum, so this message stays fp32
+        # whatever the activation wire is set to, and `tp.py` says why the two kinds differ.
+        pipe = _ReducePipeline.build(None if tp is None else partial(tp.reduce, discrete=True),
+                                     q.device)
         for q0 in range(0, seqlen, q_tile):
             q1 = min(q0 + q_tile, seqlen)
             q_tile_t = q[:, q0:q1]
@@ -1166,7 +1170,7 @@ class Indexer(nn.Module):
                     # score is complete for exactly these rows, so the top-k below is the unsharded
                     # top-k and no collective happens at any tile.
                     if tp is not None:
-                        score = tp.reduce(score)
+                        score = tp.reduce(score, discrete=True)
                     flush(score, k0, k1)
             if pipe is not None:
                 for due in pipe.drain():
@@ -1250,9 +1254,10 @@ class Indexer(nn.Module):
                 score = torch.einsum("bqhd,bqmd->bqhm", q_tile_t, gathered)
                 score = (score.relu_() * weights_t.unsqueeze(-1)).sum(dim=2)
                 # As in `_stream_prefix`: `tp` is the world on the head split and None on a row band,
-                # whose score is whole for its own rows and needs no collective before the top-k.
+                # whose score is whole for its own rows and needs no collective before the top-k. The
+                # reduce is `discrete`, as it is there and for the same reason.
                 if tp is not None:
-                    score = tp.reduce(score)
+                    score = tp.reduce(score, discrete=True)
                 # a padded block names position -1 and a query cannot see past its own group count;
                 # both are the same `-inf` the prefix path masks with
                 score = score.masked_fill((tile < 0) | (tile >= lens_t), -torch.inf)

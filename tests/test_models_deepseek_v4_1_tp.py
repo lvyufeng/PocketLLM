@@ -49,10 +49,12 @@ from src.models.deepseek_v4_1.loader import V41Checkpoint, load_backbone
 from src.models.deepseek_v4_1.modules import RoutedExperts
 from src.models.deepseek_v4_1.tp import (
     INDEXER_ROW_SPLIT_ENV,
+    REDUCE_BITS_ENV,
     ShardPlan,
     attach_tp,
     make_all_gather,
     make_all_reduce,
+    reduce_bits,
     split_names,
 )
 from tests.test_models_deepseek_v4_1_loader import (
@@ -121,7 +123,12 @@ class _MessageBoard:
         self._slots: list[torch.Tensor | None] = [None] * world
 
     def reduce_for(self, rank: int):
-        def collective(tensor: torch.Tensor) -> torch.Tensor:
+        def collective(tensor: torch.Tensor, *, discrete: bool = False) -> torch.Tensor:
+            # The board *is* the fp32 arm: it sums in fp32 and rounds once at the end, which is what
+            # `make_all_reduce` does when `reduce_bits` says 32 -- the shipped default. So `discrete`
+            # is accepted because every site passes it and ignored because the two arms are the same
+            # wire here. The dtype the variable selects is `make_all_reduce`'s own business and is
+            # covered by the tests at the end of this file, not by a stand-in for a process group.
             self._slots[rank] = tensor.detach().float()
             self._barrier.wait()
             total = torch.stack(list(self._slots)).sum(dim=0)
@@ -1332,3 +1339,103 @@ def test_a_batched_pass_resolves_the_whole_batch_before_it_stages_any_of_it() ->
         "a buffer was taken for a row that moved nothing, or two staging rows shared one -- either "
         "way a slot's copy is not a whole staging old when it is waited on"
     )
+
+
+# -- the collective's wire, which is a dtype and not a split ---------------------------------------
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """`torch.distributed.all_reduce` recorded instead of performed, and doubling what it is handed.
+
+    The closure imports `torch.distributed` inside itself, so patching the function on the module is
+    enough and no process group has to exist -- which is the reason the closure is a closure. What is
+    recorded is the **wire** dtype, and that is what the tests below are about: the activation a site
+    hands over and the tensor it gets back are bf16 either way, and neither one moves.
+
+    Doubling rather than summing is deliberate. The point of `REDUCE_BITS_ENV` is that the wire dtype
+    is the only thing it changes, and a stub that summed would let a test pass on a path that
+    converted the *answer* -- which is exactly the failure `reduce`'s `narrow.to(tensor.dtype)` at the
+    end is written to avoid.
+    """
+    import torch.distributed as dist
+
+    seen: list[torch.dtype] = []
+
+    def fake_all_reduce(tensor, *args, **kwargs):
+        seen.append(tensor.dtype)
+        tensor.mul_(2)
+
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [
+        (None, torch.float32),
+        ("32", torch.float32),
+        ("16", torch.float16),
+        # the three that have to read as unset rather than as some third dtype: an empty string, a
+        # width the flag was never meant to take, and the *name* of the dtype that also halves the
+        # bytes. fp16 and bf16 are not interchangeable on this wire -- fp16 is the one whose mantissa
+        # a score survives -- so a spelling that silently picks one of them would be a second default.
+        ("", torch.float32),
+        ("8", torch.float32),
+        ("bf16", torch.float32),
+    ],
+)
+def test_the_activation_wire_is_fp32_except_at_16(monkeypatch, wire, env_value, expected) -> None:
+    """The shipped wire is fp32 and stays the default, so the control column is unchanged."""
+    if env_value is None:
+        monkeypatch.delenv(REDUCE_BITS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(REDUCE_BITS_ENV, env_value)
+    assert reduce_bits() == (16 if expected is torch.float16 else 32)
+
+    reduce = make_all_reduce(2)
+    reduce(torch.ones(4, dtype=torch.bfloat16))
+    assert wire == [expected]
+
+
+def test_a_discrete_message_is_fp32_whatever_the_activation_wire_is(monkeypatch, wire) -> None:
+    """A score a top-k reads is a different message and moves the selection when it is rounded.
+
+    That is why `tp.py` gives it an argument of its own rather than the same variable as the
+    activation tail: the two are equal in price and unequal in what a wrong value costs, so the
+    indexer's two score sites are pinned and the `wo_b`/MoE joins are not.
+    """
+    monkeypatch.setenv(REDUCE_BITS_ENV, "16")
+    reduce = make_all_reduce(2)
+    reduce(torch.ones(4, dtype=torch.bfloat16), discrete=True)
+    assert wire == [torch.float32]
+
+
+def test_the_no_message_setting_reaches_no_collective(monkeypatch, wire) -> None:
+    """`0` is a control column and not a configuration.
+
+    It returns each rank's own partial, so the answer is wrong and only a timing taken against it
+    means anything -- which is the point: it is what separates "the collective is the bytes" from
+    "the collective is the wait", with no other change in the run.
+    """
+    monkeypatch.setenv(REDUCE_BITS_ENV, "0")
+    reduce = make_all_reduce(2)
+    x = torch.arange(4, dtype=torch.float32)
+    assert torch.equal(reduce(x), x)
+    assert wire == []
+
+
+def test_the_wire_is_read_per_message_so_one_run_can_hold_both_arms(monkeypatch, wire) -> None:
+    """Read at the call and not at `make_all_reduce`, which is what lets one load hold both arms.
+
+    A probe that had to reload the 457.8 GiB bank between arms would pay two minutes a switch and
+    could not A-B-A-B at all; a probe that toggled the variable and saw the old dtype would report
+    the second arm as the first's number under a different name. That is the failure this asserts
+    against, one `getenv` at a time.
+    """
+    reduce = make_all_reduce(2)
+    monkeypatch.setenv(REDUCE_BITS_ENV, "32")
+    reduce(torch.ones(4, dtype=torch.float16))
+    monkeypatch.setenv(REDUCE_BITS_ENV, "16")
+    reduce(torch.ones(4, dtype=torch.float16))
+    assert wire == [torch.float32, torch.float16]
