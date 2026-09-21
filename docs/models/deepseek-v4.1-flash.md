@@ -216,6 +216,11 @@ and **1.49× / 1.42× on the tree that ships**, for `topk` arena rows a card ins
 `ceil(topk / world)` and about half a gigabyte of peak at 32768 tokens. `--expert-deal sorted` is the
 opt-in alternative and is what the tables below were measured on ([the
 deal, priced](../performance/deepseek_v4_1_flash_device_experts.md#the-deal-is-a-choice-and-dealing-ids-instead-of-positions-balances-the-staged-set)). The device path's cost is [its own page](../performance/deepseek_v4_1_flash_device_experts.md).
+`DEEPSEEK_V41_INDEXER_ROW_SPLIT=1` is the one knob that reaches the attention's indexer rather than the
+experts: it shards that module by query rows instead of by index head, so each rank sums all 32 heads
+of its own rows and the indexer's per-key-tile score collective is not needed — behind a flag, default
+off, priced at **0.914× on a 256K prefill** and gated on a greedy chain that is identical at 4096,
+32768 and 262144 tokens, on [the chunked-prefill page](../performance/deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context).
 
 ### The config schema
 
