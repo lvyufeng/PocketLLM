@@ -259,6 +259,67 @@ expert call's own intermediates: a wider pool means more draws hit and fewer row
 `_chunk_bounds` cuts the same 4096-token forward into **fewer and bigger** chunks. That is also the
 whole of why it is faster, which is why the memory and the speedup are one finding and not two.
 
+**That lever was read A-B-A-B afterwards, and it is real, larger than the single reading, and located
+somewhere else.** Four processes — pool 148 twice, then 288 twice — at `--at 32768 --chunk 4096
+--max-seq-len 41024` with `DEEPSEEK_V41_EXPERT_DEAL=id`, one 4096-token chunk a process, rank 0
+(`/tmp/probe_v41_chunk_profile_host.py`, `/tmp/chunk_ctl_{a1,a2,b1,b2}.pt.r0`):
+
+| column (s) | 148, p1 | 148, p2 | 288, p1 | 288, p2 | floor | lever |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `quiet` — the same width at 36864, taps off | 27.923 | 27.559 | 25.436 | 25.537 | 0.364 | **−2.254 (−8.1%)** |
+| the tapped chunk at 32768 | 35.522 | 35.748 | 34.758 | 34.498 | 0.260 | −1.007 (−2.9%) |
+| `moe` | 26.445 | 26.695 | 25.593 | 25.446 | 0.250 | −1.051 |
+| — `moe.routed` | 21.384 | 21.163 | 21.792 | 21.315 | 0.477 | **+0.280 (+1.3%)** |
+| —— `routed.resolve` | 6.877 | 6.764 | 7.190 | 6.990 | 0.200 | +0.269 |
+| —— `routed.stage` | 6.839 | 6.756 | 6.900 | 6.890 | 0.083 | +0.097 |
+| —— `routed.upload` | 3.843 | 3.851 | 3.832 | 3.825 | 0.008 | −0.018 |
+| `attn` | 6.776 | 6.776 | 6.908 | 6.783 | 0.125 | +0.069 |
+
+Two processes of the *same* setting differ by 0.364 s on `quiet` — **1.3% of its own value** — so the
+−8.1% is **6.2× the floor** and the lever stands. It also sizes the working rule that a single-run
+`quiet` or `moe.routed` move under ~10% is not an effect: on this evidence that threshold is
+conservative by most of an order of magnitude, since `moe.routed`'s own floor is 2.2% and `quiet`'s is
+1.3%. Two repeats bound a spread from below, so read the floor column as a floor.
+
+**And the faster chunk is not a staging win.** `staged` is 2178 rows in both 148 arms against 2174 in
+both 288 arms — 0.2% — and `routed.upload` moves 3.843 → 3.832 s, which is the same bytes: a wider
+pool did **not** make more draws hit. The routed sub-phases net **+0.11 s against the wider pool**, the
+wrong sign, while the ~1.0 s that does appear sits in the `moe` block's own body, the part its three
+children do not cover. So the mechanism is a per-layer issue/wait effect at the MoE boundary rather
+than the row-hit accounting proposed above, and the accounting is still the right way to size the
+memory — it is the memory *explanation* that the phases do not support. This is a second reading of the
+same lever on a later tree, not a re-measurement of the table above; its own memory column reproduces
+the arithmetic anyway, 16118 MiB allocated at 148 rows against 18631 at 288 — +2513 MiB, against the
+2512 the row size predicts.
+
+The second proposed mechanism does not survive either, and here the source is what says so rather than
+a further run. `_issue_chunk` is called **40 times, once a layer, in every arm** — and
+`_forward_chunked` calls it once per bound `_chunk_bounds` returns, so 40 calls over 40 layers means
+the whole 4096-row batch is **one bound** at either width. One is the floor, so at this chunk there is
+nothing left for a wider pool to consolidate: the "fewer and bigger chunks" above cannot happen at
+32768 rather than merely not having happened. It did split on the tree the phase table above was read
+on, where the same row counted 158 calls — about four bounds a layer — which is a second reason to
+read that column as a property of the tree and not of the pool.
+
+The 0.2% is the more interesting number, because the pool *is* the thing it should move. `pool_lru` is
+**one LRU arena a card shared by all forty layers** (the same `arena_rows` the memory arithmetic
+sizes), so 148 rows is about **3.7 rows a layer** and 288 about 7.2, against the ~54 rows a layer this
+chunk stages in both. Both widths are therefore far inside the region where a cyclic sweep of the
+layer's working set thrashes the cache, where least-recently-used is the worst replacement policy there
+is and capacity buys almost nothing until it spans the whole working set: 140 more rows bought **4 of
+2178 misses**. That is what makes the earlier paragraph's causal chain a *memory* sized one and not an
+effect one — the ~1.83 GiB is real and `_chunk_bounds`' rule is real, but the pool is not the lever
+they are attached to, and buying more rows is not a way to buy fewer staged rows. On a 22528 MiB card
+that matters: the +2513 MiB bought −8.1% of a chunk and no misses, which is the trade the 256K
+configuration declines for a reason other than the OOM below.
+
+The token column separates by setting and by nothing else. All four ranks print one top-8 a process,
+both 148 processes print `[455, 1, 223, 8077, 764, 330, 343, 334]` and both 288 processes print
+`[455, 1, 223, 8077, 330, 334, 764, 343]`, so the two same-setting pairs are exact repeats of one
+another and the wider pool permutes the **5th–8th** ids without changing the set. `topk` on the logits,
+so it is the logits that moved, and if anything the floor here is *stronger* than the indexer probe's:
+there two arms with no knob between them disagreed, and here they do not.
+
 At 262144 the wider pool does not finish. The p288 leg runs its first chunk at 57.62–58.81 s and peaks
 at 20442 MiB — against p148's 16573 at the same chunk — and then dies in the **second** chunk on all
 four ranks:
@@ -314,7 +375,7 @@ own fewer MoE layers.
 | `attn` | 12.85 | 12.85 | 12.82 | 12.85 | 40 | 19.6% |
 | — `attn.sparse` | 8.05 | 8.01 | 8.26 | 7.97 | 40 | |
 | — `attn.compress_kv` | 2.12 | 2.14 | 2.12 | 2.14 | 38 | |
-| — `attn.indexer` | 2.09 | 2.12 | 2.09 | 2.12 | 8 | |
+| —— `attn.indexer` | 2.09 | 2.12 | 2.09 | 2.12 | 8 | |
 | — `attn.window` | 0.42 | 0.40 | 0.43 | 0.37 | 40 | |
 | `hc_post` | 0.96 | 0.95 | 0.96 | 0.96 | 80 | 1.5% |
 | `hc_mixes` | 0.40 | 0.40 | 0.40 | 0.40 | 80 | 0.6% |
@@ -397,13 +458,17 @@ the slot wait is now nothing rather than reduced.
 
 **Attention is 22.6% of a chunk and the score pass is most of it.** `attn.sparse` is 8.05 s over 40
 calls — 201 ms a layer, 14.1% of the quiet chunk — and 40 calls makes it a measurement. The rest of
-the attention is the compressed path, `attn.compress_kv` 2.12 s over 38 calls and `attn.indexer`
-2.09 s over 8, and those two are the only rows of the table with a context term: the warm-up's eight
+the attention is the compressed path, `attn.compress_kv` 2.12 s over 38 calls, and `attn.indexer`
+2.09 s over 8 is **inside** it rather than beside it: `_compress_kv` calls `_compress_topk_idxs` calls
+`Indexer.forward`, so those eight calls are a subset of the 38 and the 30 ms between the two rows is
+the pooling, the rotary, the fp4 quantize and the cache write. The nesting is visible in the numbers
+as a constant offset, and it is the contained row that carries the context term: the warm-up's eight
 chunks, whose caches run from 0 to 28672 tokens, average 1.59 s and 1.57 s where the chunk sitting at
-32768 pays 2.12 and 2.09. Every other row of the two tables agrees to a few percent — `attn.sparse`
-reads 7.95 against 8.05, because its index row is the same width wherever in the prompt the chunk is.
-**Over a 262144-token prefill it is the compressed path that gets more expensive per chunk and the
-score pass that stays flat**, and the score pass is the one the sparse-attention work targets.
+32768 pays 2.12 and 2.09 — the same 0.02–0.03 s part of it in both. Every other row of the two tables
+agrees to a few percent — `attn.sparse` reads 7.95 against 8.05, because its index row is the same
+width wherever in the prompt the chunk is. **Over a 262144-token prefill it is the compressed path that gets more
+expensive per chunk and the score pass that stays flat**, and the score pass is the one the
+sparse-attention work targets.
 
 **And the ceiling the width runs into costs almost nothing.** The Hyper-Connections arithmetic that
 stops a chunk at 8192 tokens — `hc_post` 0.96 s, `hc_mixes` 0.40, `hc_pre` 0.29 over 80, 80 and 81
@@ -432,26 +497,45 @@ not the one to attack before the copies, but it is the row that says how much of
 process's Python, though not its loops: `_split` and the per-row `tolist()` are 3 µs of the 9.3 and
 the rest is the pool.
 
-**That ordering is the 32768 one and it does not survive to 256K.** `attn.indexer` and
-`attn.compress_kv` are the only rows of this table with a context term, and across the leg they take
-the pair from 11.6% of a chunk to 32.7%, which leaves them and `moe.routed`'s 20.5 s as the two largest
-things in a 256K chunk — no other row reaches 10 s.
-[Below](#the-one-row-that-grows-with-context) is what is inside them and which of their levers are
-still open.
+**That ordering is the 32768 one and it does not survive to 256K.** `attn.compress_kv` is the only row
+of this table with a context term — `attn.indexer` is *inside* it and not a second cost beside it, see
+below — and across the leg it goes from 7.7% of a chunk to 16.4%, which leaves it and `moe.routed`'s
+21.8 s as the two largest things in a 256K chunk — no other row reaches 10 s.
+[Below](#the-one-row-that-grows-with-context) is what is inside that one row and which of its levers
+are still open.
 
 ### The one row that grows with context
 
-`attn.indexer` is **2.069 s at 32768 and 5.097 s at 262144** (2.46x), 8 calls at both lengths, and
-`attn.compress_kv` on the same path reads 2.10 and 5.13 s. Those two chunks are this tree's — the three
-prefill kernels and the `id` deal are both in — so the quiet chunk is **27.39 s at 32768 and 31.34 s at
-262144**, and the pair is **3.19 s of the first (11.6%) against 10.24 s of the second (32.7%)**. Both
-fit the ship: 27.39 s at 32768 is the sweep's 57.04 s through the three kernels and the `id` deal, and
-31.34 s at 262144 sits 5% above that leg's own last chunk of 29.82 s. Those
-are the two denominators used below; the table above's 56.96 s is the same chunk on the branch without
-the three kernels, and its `attn.sparse` row of 8.05 s is that tree's score pass rather than this one's
-2.05 s. Across this leg the pair is the *whole* of the growth: every other row of the two phase tables
-is flat or lower over it — `moe.routed` 21.5 → 20.5 s, `attn.sparse` 2.05 → 2.02 s, the routed taps'
-bodies within 2% — while the chunk goes 27.39 → 31.34 s.
+`attn.compress_kv` is **2.10 s at 32768 and 5.14 s at 262144** (2.45x) over 38 calls at both lengths,
+and the row nested under it — `attn.indexer`, 2.08 and 5.11 s over 8 of those 38 — is **inside** it
+rather than beside it: `Attention._compress_kv` calls `_compress_topk_idxs`, and `_compress_topk_idxs`
+is what calls `Indexer.forward`. Only 8 of the 38 calls reach the indexer, because a compressor emits a
+new row only every `compress_ratio` positions, and on those 8 the child is 99% of the parent: the
+0.02–0.03 s between the two rows is the pooling, the rotary, the fp4 quantize and the cache write, the
+same gap in both chunks and in every warm-up chunk. **So the context term is one row and its magnitude
+is `compress_kv`'s**, and the quiet chunk is **27.39 s at 32768 and 31.34 s at 262144**, with the row
+**2.10 s of the first (7.7%) against 5.14 s of the second (16.4%)**. Both chunks are this tree's — the
+three prefill kernels and the `id` deal are both in — and both fit the ship: 27.39 s at 32768 is the
+sweep's 57.04 s through the three kernels and the `id` deal, and 31.34 s at 262144 sits 5% above that
+leg's own last chunk of 29.82 s. Those are the two denominators used below; the table above's 56.96 s is
+the same chunk on the branch without the three kernels, and its `attn.sparse` row of 8.05 s is that
+tree's score pass rather than this one's 2.05 s.
+
+**The pair this section first gave — 3.19 s against 10.24 s, 11.6% to 32.7% — added a parent row to the
+child nested inside it, so it counted the indexer's 2.46x twice.** Neither half is a row of either
+table. The 262144 one is a sum of two columns and not exactly the sum of the `total` columns either —
+5.14 + 5.11 reads 10.25 against the 10.24 it was written with, so one of the two came off a per-rank
+column rather than the maximum — and the 32768 one does not reproduce from the artifact this section
+cites at all (`/tmp/chunk_deal_id32.log`, whose own two rows read 2.10 and 2.08 s, a sum of 4.18). The
+corrected shares above are what that log and `/tmp/chunk_deal_id256.log` support. (A phase table's
+`total` column is a per-rank maximum, so a row read off it is the straggler's; over the four ranks the
+two rows mean 2.07 and 2.10 s at 32768 and 5.10 and 5.12 s at 262144. The `2.069` and `5.097` s the
+older text called the indexer's row are rank 0's `sync` column — 2.0691 and 5.0972 — which is one of the
+two columns the rule below says to read apart, and the arms are quoted against that same 2.069 s.)
+Across this leg the one row is most of the growth and every other row is flat, read off the `total`
+column of both tables: `attn` goes 6.75 → 9.83 s, of which `compress_kv` is 3.04 of the 3.80 s the
+instrumented chunk gains, while `moe.routed` reads 21.48 → 21.77 s and `attn.sparse` 2.11 → 2.16 s, and
+`hc_post`, `hc_mixes`, `hc_pre`, `engram` and `norm` are unmoved — while the chunk goes 27.39 → 31.34 s.
 
 **Read the tap's two time columns apart or it will mislead you**, the same rule the phase table above
 needs. A wrapper that drains the GPU before each call records the *enqueue* in `body` and the GPU
@@ -529,11 +613,58 @@ one at 262144, and **nothing in it scales with context**: flat to 2.4%, 1.99 ms 
 2.04. An earlier reading here — that 2.084 s "would be more than the entire row at 32768", so
 something inside the candidate path must grow with the width — compared an instrumented 262144 number
 against an *uninstrumented* 32768 row and landed on the answer it was looking for: the candidate
-path's own cost at 32768 is 2.035 s. The L2 hypothesis that reading bought is therefore **untested
-and unsupported**: the gather out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5 MiB
-of L2) against 68 MiB at 262144 (outside it) predicts a per-iteration cost materially lower when the
-index fits, and the 2.4% between 2.035 and 2.084 s — 0.049 s over 1024 of them — is the whole of what
-that difference is worth.
+path's own cost at 32768 is 2.035 s. The L2 hypothesis that reading bought was **unsupported and, at
+that point, untested**: the gather out of an `index_k` that is 4 MiB at 32768 (inside this card's 5.5
+MiB of L2) against 68 MiB at 262144 (outside it) predicts a per-iteration cost materially lower when
+the index fits, and the 2.4% between 2.035 and 2.084 s — 0.049 s over 1024 of them — is the whole of
+what that difference is worth.
+
+**The capacity question is now answered by a direct sweep, and the answer is no.** A synthetic
+c-iteration — the same geometry, an index built from block ids the way the loop builds it, no
+collective and no ranks — prices the pieces at both widths (`/tmp/bench_indexer_cand_tile.py`,
+30 iterations, one RTX 2080 Ti):
+
+| µs a c-iteration | width 36864 (`index_k` 9.0 MiB) | width 266240 (65.0 MiB) |
+| --- | ---: | ---: |
+| gather, scattered | 666.9 | 684.6 |
+| einsum over the gathered tile | 690.3 | 703.0 |
+| mask | 65.8 | 72.6 |
+| merge (cat + topk + gather) | 135.8 | 136.9 |
+| amax/amin boolean read | 71.9 | 76.8 |
+| **whole** | **1612.4** | **1577.1** |
+
+**A 7.2x change in the width — from under twice this card's 5.5 MiB of L2 to twelve times it — moves
+the whole tile by 2.2%**, so the gather is neither capacity- nor residency-bound: 667 against 685 µs
+is the access pattern's own price, and the same 64 MiB of gathered rows either way. The einsum costs
+the same from a contiguous `[1, q, m, d]` copy as from the gathered tile (690.2 against 689.8 µs at
+36864, 616.9 against 618.0 at 266240), so the halves are independent and neither is a layout artifact
+of the other. That leaves the 1612 µs against the in-situ **1988 µs** a c-iteration (2.035 s over 1024)
+as the collective's 202 µs plus ~175 µs of enqueue the synthetic loop does not pay.
+
+**The einsum's 690 µs is the shape, not the bytes.** `out[q, h, m] = sum_d Q[q, h, d] K[q, m, d]` has
+`h` as one operand's only free dimension and `m` as the other's, so it is 512 batches of
+`[8, 128] @ [128, 512]` — `M` = the model's 8 index heads — and the same 0.537 GFLOP as a single
+`[4096, 128] @ [128, 512]` GEMM costs less than a sixth as much: the batched-to-wide ratio is 6.51,
+6.27, 6.53 and 6.15 on four readings of `/tmp/bench_indexer_cand_score.py`, and the ratio is the part
+that survives this box's clock bins, so that is the claim — the absolutes in those readings move
+together by 25% between an allocation-warm and a warm card (`--preheat` tags a bin; without it a
+table here is a reading of the card's state rather than of the shape). `M` cannot be raised — each
+query gathers its own rows, so there
+is no operand shared across the batch — and transposing the pairing to put the 8 on `N` buys nothing
+(672.8 µs against 652.7 at batch 512's shape). Its 64 MiB of input in 690 µs is 97 GB/s, *below* the
+gather's own 201 GB/s,
+which is the same statement from the bandwidth side: this half is not waiting on memory.
+
+**What that prices.** The shipped pair is 1357 µs a c-iteration and moves ~192 MiB (gather read plus
+write, einsum read); a fused gather-and-dot would read the 64 MiB scattered and write 4 MiB, and at the
+gather's own measured 201 GB/s that is **~350 µs** — so the fusion's ceiling is a **~1.0 s** cut of the
+2.035 s row, and the row is 1024 tiles at both lengths, so the same second is on the 32768 chunk as on
+the 262144 one. Nothing is implemented: the number is a bound built from the two measured rates, and
+the arithmetic would have to be kept in bf16-input, fp32-accumulate to land on the same `k` values.
+Note *values* rather than bytes: this level cannot be bit-identical by construction, and the
+candidate stream's own section below measures why. The in-tree precedent for one pass over
+gather-score-select is `src/kernels/ops.py`'s `_decode_sparse_attn_kernel`, which already fuses
+exactly that for decode.
 
 **Four levers, and what gates each — and each one owns a different regime.** The first two are the
 collective, one on its price and one on its scheduling; the third is the retile, below; and the fourth
@@ -632,7 +763,77 @@ default needs a chunk-level demonstration this box has not given. The retile is 
 there, and the same lever at 262144 is 0.198 s of a 5.10 s row, **3.9%**, because that path does not
 grow with the width.
 
-**The fourth lever removes the collective rather than hiding it — and the collective turns out not to
+**The candidate stream's own early-out is the fourth lever, and it ships off by default.**
+`_TopKStream.push` returns without merging when `amax(tile) < amin(held)` and the buffer is already at
+width `k`, which is the test the prefix level wants: there a 4096-key tile is narrowed into a 512-wide
+buffer and most tiles of most query tiles are below the running k-th. This level builds its stream with
+`k = min(index_topk, width)` — 512, which is exactly its own `span` — so the buffer holds the top-k's
+own width from its *first* push and the running k-th value sits inside the incoming tiles rather than
+above them. The guard is live, but the test is a device→host read on every push and a hit is worth one
+merge; that is why the default now answers `False` (`INDEXER_CAND_SKIP_TEST`), and it is also what a
+capture already builds — `_TopKStream` refuses that read inside one — so the eager path is being made
+to agree with the recorded one rather than to differ from it.
+
+`/tmp/bench_indexer_cand_overlap.py` prices the read on the real fabric, four ranks, both cache widths,
+A-B-A-B with the read as one factor and the prefix path's depth-1 lookahead as the other (µs a
+c-iteration, 255 pushes a stream):
+
+| µs a c-iteration | width 16384 | width 131072 |
+| --- | ---: | ---: |
+| serial, read on (what shipped) | 1523.7 | 1543.2 |
+| serial, read off | **1350.1** | **1381.3** |
+| lookahead depth 1, read on | 1583.2 | 1609.8 |
+| lookahead depth 1, read off | **1200.2** | **1233.5** |
+
+Every arm is elementwise identical to every other arm and every arm reports `reads 255 skips 0
+merges 255`. Two things are in that table. The read is 173.6 and 161.9 µs of the shipped tile — 11.4%
+and 10.5% — and with it gone the depth-1 lookahead, which *costs* 3.9% against the same read-on serial
+arm, becomes a **21% saving**. They are the same effect: the read drains the compute stream at every
+push, and that is precisely what stops `_ReducePipeline` from deferring this path's collective, so
+dropping the read is the precondition for the overlap here as well as its own 11%.
+
+In situ the same knob is worth less than the fabric says, and the instrument is
+`/tmp/probe_cand_skip_inproc.py --at 8192 --chunk 4096 --arms 0 1 1 0`: one process, the state reset
+between arms, `INDEXER_REDUCE_DEPTH` held at 0 so this stays one lever, and `_TopKStream.push` wrapped
+to count pushes and early-outs per path. The A-B-A-B order is what makes the column readable — the two
+`skip 0` arms are the determinism floor, and a `1`-versus-`0` difference means nothing until they
+agree.
+
+| arm | `INDEXER_CAND_SKIP_TEST` | chunk s | `stream_candidates` | cand push/skip | logit max\|δ\| vs arm 0 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 25.08 | 1.102 | 896/0 | 0 |
+| 1 | 1 | — | 1.284 | 896/1 | 1.695 |
+| 2 | 1 | — | 1.236 | 896/1 | 2.206 |
+| 3 | 0 | — | 1.137 | 896/0 | 1.695 |
+
+**The timing agrees in sign with the fabric and the parity column does not survive its own floor.**
+`stream_candidates` is 1.102 and 1.137 s with the read gone against 1.284 and 1.236 s with it, a
+~0.14 s move of a ~1.12 s row on a 25.08 s chunk — 0.56% of the wall — and the guard fires **once in
+896 pushes**, so the test is not dead here, it is merely worth one merge. The logits, which were meant
+to be the exactness evidence, cannot carry it: arms 0 and 3 are the same setting with no knob between
+them and they disagree by 1.695, exactly what arm 1 came back with, while arm 2 came back 2.206 — so
+every pairwise comparison among the four differs and the column attributes nothing to either setting.
+The leading explanation is the prefill MoE epilogue's plain `atomicAdd`
+(`moe_fp4_grouped_w2_wmma_scatter_kernel`, `src/csrc/cuda_kernel_impl.cu`) — the deterministic-reduce
+default covers the single-token and multi-slot paths only, so the grouped prefill path accumulates
+its routed output in whatever order the blocks reach the accumulator — which is why
+`/tmp/probe_v41_prefill_moe_order.py` exists to price it. The exactness rests instead on the argument,
+on `tests/test_models_deepseek_v4_1_attention.py`'s two streams, and on
+`/tmp/check_cand_guard_equiv.py`'s six trials at this level's geometry.
+
+**What the argument is, and how far it reaches.** Every value held is *strictly* above every value in
+the tile, so the k largest of the union are the k the buffer already has: the merge would return the
+same multiset, and the skip is exact rather than a tie-break. It is exact in values and no further —
+*which* member of an equal-valued group gets named is `torch.topk`'s choice, so a change that removes
+merges can move a named position among entries the level scored identically, and only at the pushes
+where the skip would have fired. The same freedom is already in the shipped code across any change of
+tiling: at this level's real arithmetic — `relu(q·k)` times a weight, summed over the 8 heads, left in
+bf16 — the k-th value is shared by 23 entries of a 12288-candidate union in the sample checked, so the
+boundary is routinely an equal group. Nothing here can be bit-identical by construction, and the
+selection is value-exact.
+
+
+**The fifth lever removes the collective rather than hiding it — and the collective turns out not to
 be what it collects.** The level-one collective exists because of how the score is laid out:
 `Indexer.forward` computes `einsum("bqhd,btd->bqht", q, index_k)` and then multiplies by `weights` and
 sums over the **32 index heads**, so a rank holding 8 of them holds a *partial* score and every key tile
@@ -722,7 +923,7 @@ so the absolute seconds carry the host's drift — the same 4096 off-arm prefix 
 and 0.118 s in the next while arm-on's moves 0.053 → 0.075 — and only a ratio across a pair is quotable.
 The parity below does not carry that caveat, because it compares payloads rather than clocks.
 
-**The third lever and the fourth do not add, and the reason is arithmetic rather than interaction.**
+**The third lever and the fifth do not add, and the reason is arithmetic rather than interaction.**
 `INDEXER_CAND_TILE` 64 → 256 and the row band act on the same rows, so the retile was re-run against
 the row split in the same sitting (`/tmp/run_rs_retile.sh`, one process an arm, a fresh head-split
 reference reading 2.000 s prefix / 9.988 s candidates against a 211.1 s prefill): the row split alone
@@ -732,7 +933,7 @@ the 0.90x the same lever reads on the whole `attn.indexer` row without a band �
 not: that row is 4.7% of a 32768-token prefill before the row split and 1.2% after, so the 0.284 s it
 buys is 0.14% of the wall and under this box's own spread (the two row-split sittings' prefix rows
 agree to 0.25%, 0.806 against 0.808, while their whole-prefill columns differ by 1.5 s). **The two
-compose on the row and are invisible on the wall**, which is the same statement as the fourth lever's
+compose on the row and are invisible on the wall**, which is the same statement as the fifth lever's
 own 91.6%: there is no second 0.9x waiting behind this one at 32768. What the sitting also settles is
 that the retile costs no numerics — the two row-split payloads are bit-identical, every layer's digest
 differing 0 on all eight index sources, `real-pick-count differs 0`, reorder 0, and the last step's

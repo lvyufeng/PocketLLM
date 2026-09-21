@@ -475,6 +475,21 @@ INDEXER_MIN_KEY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_MIN_KEY_TILE", "1024"
 # (`q_tile * blocks * block_size * index_head_dim`) rather than by the score alone.
 INDEXER_CAND_QUERY_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_QUERY_TILE", "512"))
 INDEXER_CAND_TILE = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_TILE", "64"))
+# Whether the candidate level's top-k stream keeps `_TopKStream.push`'s early-out. It is **off**,
+# which is the answer a capture already gets -- `_TopKStream` refuses that read inside one, so this
+# makes the eager path agree with the captured one rather than differ from it. The reason is the
+# geometry: the stream is built with `k = min(index_topk, width)`, which is exactly this tiling's
+# `span`, so the field being narrowed is already the top-k's own width and the running k-th value sits
+# inside every incoming tile rather than above it. The guard is still *live*, but a hit is worth one
+# merge and the test costs a device->host synchronization on every push: 0 hits in 255 synthetic
+# pushes at 174 us of a 1524 us c-iteration on the fabric
+# (`/tmp/bench_indexer_cand_overlap.py`, four ranks, both cache widths), and 1 hit in 896 pushes
+# against 0.14 s of a 1.12 s `stream_candidates` row in situ
+# (`/tmp/probe_cand_skip_inproc.py --at 8192 --chunk 4096 --arms 0 1 1 0`, both brackets agreeing in
+# sign). The read also drains the compute stream every c-iteration, which is what hides the
+# collective `_ReducePipeline` would defer on this path. Setting this to 1 restores the tested
+# branch, which is what the guard is for.
+INDEXER_CAND_SKIP_TEST = int(os.getenv("DEEPSEEK_V41_INDEXER_CAND_SKIP_TEST", "0"))
 # A key tile's collective is a blocking `all_reduce` on the compute stream, and a `[2048, 4096]` tile
 # is 5.4 ms of wire against 4.4 ms of arithmetic on this fabric -- so the loop spends most of its time
 # waiting for the wire with the SMs idle. Deferring the join by `depth` tiles puts that wire under the
@@ -527,7 +542,13 @@ class _TopKStream:
     touching the buffer when `amax(tile) < amin(held)`. That test reads one boolean to the host and is
     therefore a synchronization; it is worth it because on a long prefill most key tiles of most query
     tiles are below the running k-th while the merge is the expensive part. It is skipped until the
-    buffer is saturated, because before that `amin(held)` is not yet the k-th value.
+    buffer is saturated, because before that `amin(held)` is not yet the k-th value. How often it can
+    pay is a property of the caller's geometry rather than of the test: the prefix level narrows a
+    4096-key tile into a 512-wide buffer, while `_stream_candidates` builds its stream with an `k`
+    equal to its own tile width -- there a real 4096-token chunk gave **1 hit in 896 pushes**, and one
+    hit in 896 is a merge saved against a synchronization paid on every push. See
+    `INDEXER_CAND_SKIP_TEST` for the reading and for why the candidate level answers the question with
+    `False`.
 
     **The skip is exact, not a tie-break, and that is what lets a capture drop it.** Every value held
     is above every value in the tile, so the k largest of the union are the k that `held` already has:
@@ -1193,7 +1214,12 @@ class Indexer(nn.Module):
                 candidates[:, q0:q1].unsqueeze(-1) * block_size,
                 torch.arange(block_size, dtype=torch.int32, device=q.device),
             ).flatten(-2)
-            positions = _TopKStream(k)
+            # `host_branch=None` leaves the decision to `_TopKStream`, which is what the shipped code
+            # did; `False` is this level's own answer -- see `INDEXER_CAND_SKIP_TEST`, which is also
+            # what a capture builds, so the eager path matches the recorded one instead of paying for
+            # a test whose hits are worth less than its read. The knob is read here rather than at the
+            # top of the loop so that a probe can set it between arms.
+            positions = _TopKStream(k, host_branch=None if INDEXER_CAND_SKIP_TEST else False)
             for c0 in range(0, keys.size(-1), span):
                 c1 = min(c0 + span, keys.size(-1))
                 tile = keys[:, :, c0:c1]

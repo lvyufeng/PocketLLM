@@ -5084,14 +5084,20 @@ void QwenEngine::free_slot(uint64_t request_id) {
 BatchPrefillResult QwenEngine::batch_prefill(
     const std::vector<BatchedRequest*>& requests, int token_budget) {
 
-    // Requests still run one at a time: the saturation sweep
+    // Requests still run one at a time. The saturation sweep
     // (bench_qwen_prefill_saturation) measured 1890 tok/s at a 4096-token chunk
     // against 1330 at 512 on TP4, so a single chunk of a few thousand rows
-    // already feeds the GEMMs and merging prompts into one variable-length
-    // forward would buy ~1.06x at 2048. What that sweep does not fix is a long
-    // prompt holding the device: with `token_budget` set, each request advances
-    // by at most that many tokens per call, so the scheduler regains control
-    // between chunks and can interleave decode.
+    // already feeds the GEMMs, and merging prompts into one variable-length
+    // forward would buy ~1.06x at a 2048-token prompt. That figure is specific
+    // to long prompts, and the serving ladder does not run long prompts: a
+    // prefill call costs ~200 ms before it costs anything per token, which is
+    // 15% of a call at 2048 tokens but half of one at the ~325 the ladder sends,
+    // where the same merge is worth ~2x on TTFT and on prefill TFLOP/s. The
+    // measurements are in docs/performance/serving_throughput_scaling.md. What
+    // the budget does fix is a long prompt holding the device: with
+    // `token_budget` set, each request advances by at most that many tokens per
+    // call, so the scheduler regains control between chunks and can interleave
+    // decode.
     BatchPrefillResult result;
     result.results.reserve(requests.size());
     result.incomplete.reserve(requests.size());

@@ -64,6 +64,15 @@ The engine sources at `645e36b` are the ones the numbers come from. The two
 `QWEN_PHASE_PROFILE` unset both return immediately, so the serving numbers are
 unaffected by them.
 
+The `prefill` sweep and the four ladder rows it is checked against were re-run
+after this page was first written, on master at `4fc72a1`. Nothing on the serving
+path changed in between — the only `cpp_engine/` diff across that range is those
+same `+20` lines in `main.cpp` — and the re-run reproduces the page's own
+intercept to 1%, 511.7 ms against the 517 ms recorded here. It is added data, not
+a correction, except where it contradicts the `~1.06x` in
+`qwen_engine.cpp:5091`; see
+[What one prefill call costs](#what-one-prefill-call-costs).
+
 ### Reproduction
 
 The driver is `scripts/run_serving_sweep.sh`, which fixes the arguments every
@@ -75,10 +84,16 @@ export POCKET_SWEEP_CKPT=/mnt/data1/modelscope/Qwen/Qwen3.8-27B
 scripts/run_serving_sweep.sh ladder      # L1 ... L112, then L16x64, L48x192
 scripts/run_serving_sweep.sh limit       # L120, L128, L128c1024
 scripts/run_serving_sweep.sh ab          # the replicate-rows A/B, interleaved
+scripts/run_serving_sweep.sh prefill     # one call's fixed cost vs its per-token cost
 # one point on its own, which is `L32` in the ladder table:
 #   point <tag> <slots> <concurrency> <prompts> <in> <out> <rate> <ctx> [K=V ...]
 scripts/run_serving_sweep.sh point L32 32 32 32 512 512 inf 2048
 ```
+
+`prefill` is [What one prefill call costs](#what-one-prefill-call-costs):
+nine one-call length points and two arms that hold the prompt fixed while the
+budget cuts it into 1/2/4/8 calls. The four wave points the decomposition is
+checked against are `ladder`'s `L1`, `L4`, `L16` and `L32`.
 
 It exports `POCKET_ASCEND_IPC_ALLREDUCE=1` and
 `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` for every point, and wraps each run in
@@ -346,11 +361,102 @@ That is the whole of the TTFT scaling. The prefill GEMMs never see more than one
 prompt's rows, and the 325-token prefill runs at 325/0.411 = 791 tokens/s
 against a weight-read floor of 11.7 ms a pass.
 
+### What one prefill call costs
+
+The slope `c` above is one number, but it is the sum of two: a cost that does not
+depend on the prompt at all, and a cost that does. Holding the prompt fixed and
+varying the **number of calls** the server makes separates them, because a
+reduced `--prefill-token-budget` turns one prompt into several passes through the
+same 64-layer stack:
+
+| prompt | budget | calls | TTFT p50 | ms a call |
+| ---: | ---: | ---: | ---: | ---: |
+| 3703 tok | 4096 | 1 | 2425.2 ms | — |
+| 3703 tok | 2048 | 2 | 2614.1 ms | 189 |
+| 3703 tok | 1024 | 4 | 2915.7 ms | 164 |
+| 3703 tok | 512 | 8 | 3771.8 ms | 192 |
+| 1242 tok | 2048 | 1 | 889.3 ms | — |
+| 1242 tok | 1024 | 2 | 1122.1 ms | 233 |
+| 1242 tok | 512 | 3 | 1345.8 ms | 228 |
+| 1242 tok | 256 | 5 | 1868.4 ms | 245 |
+
+Total tokens are constant within each arm, so **a call is worth 164-245 ms
+whatever is in it**. A joint least squares over all eight points reads
+
+```text
+TTFT = 204.2 ms x n_calls + 577.4 us x prompt_tokens + 27.7
+```
+
+A one-call length sweep agrees from the other side. Nine single-slot runs at a
+budget above the prompt, so every point is exactly one call, over 67, 115, 219,
+320, 421, 629, 1242, 2474 and 3703 real tokens (the engine's own
+`prompt_tokens=`, not the harness's nominal length) fit
+
+```text
+TTFT = 205.7 ms + 599.1 us x prompt_tokens
+```
+
+with every residual inside ±81 ms, and the same fit without the 115-token point
+reads 190.7 ms + 604.9 us. The two fits put the fixed term at 204.2 and 205.7 ms
+from disjoint data.
+
+Two measurements already on this page land on the same number without being
+asked to. The ladder's own slope `c` is 407-422 ms a request, against the model's
+390.5 ms for the 322.6-token mean prompt `L16` actually sent; and `pf128` against
+`L16` adds two calls to each of 16 requests for 6195.4 ms of mean TTFT. That
+second one is worth working through, because the bimodal structure above says the
+mean is not the increment: the first request waits for its own prefill and the
+other fifteen wait for the whole wave, so a per-call cost `k` moves the mean by
+`k x (32 x 15/16 + 2 x 1/16) = 30.1 k`. The measured 6195.4 ms is therefore
+**205.7 ms a call**.
+
+**So a 325-token prefill costs 411 ms and 204 ms of it — half — is paid before
+the first token-dependent FLOP.** Every estimate of that fixed term here —
+204.2, 205.7, 190.7, 205.7, and the 164-245 ms the individual arms span — comes
+from one of four different manipulations of the same server.
+
+It is not the collectives, which is the other thing a fixed per-call cost could
+have been. Setting `POCKET_ASCEND_IPC_ALLREDUCE_SKIP=1`, which makes the IPC
+all-reduce a no-op and returns wrong tokens, moves the server's prefill for a
+1242-token prompt from 881.2 ms to 885.2 ms — 0.5%, inside the spread — across
+the 129 collectives a pass the caller issues. The 276.8 ms the profiler
+attributes to `tp_all_reduce` is latency the ranks absorb, not serialized work.
+
+### What merging would and would not buy
+
+A merged forward pays the fixed term once and the per-token term once per token;
+the serial loop pays both once per request. `L16`'s sixteen prompts are 5162 real
+tokens, ten at 320 and six at 327:
+
+| | prefill | TTFT p50 |
+| --- | ---: | ---: |
+| `L16` today, 16 serial calls | 16 x (204.2 + 0.5774 x 322.6) = 6248 ms | 6640 ms measured |
+| merged, one 5162-row forward | 204.2 + 5162 x 0.5774 = 3185 ms | ~3310 ms |
+| merged, at the steeper one-call slope 0.5991 | 204.2 + 5162 x 0.5991 = 3300 ms | ~3420 ms |
+
+**That is 1.9-2.0x, not the ~1.06x the engine's comment quotes.** The two slopes
+are the joint call-count fit's and the one-call length fit's; both are measured
+to 3703 rows and the merged call is 5162, so the table's exposure is that
+extrapolation and not the decomposition.
+
+The comment is not wrong, it answers a different question. The saturation sweep
+that produced it merges prompts into a chunk that is *already* 2048 or 4096
+tokens, where the fixed term is 204/(204 + 0.5774 x 2048) = 15% of a call and
+merging sixteen of them is worth 1.16x. The ladder sends 322-token prompts,
+where the same term is 52% of a call. The smaller the prompt, the larger the
+share of it that is the fixed cost, and the ladder is on the small end.
+
+In FLOP terms the fixed term is what separates the delivered rate from the
+marginal one. 51.244 GFLOP a token over a 577.4 us slope is **88.8 TFLOP/s of
+884.7, 10.0% of the Cube**, against 40.5 TFLOP/s, 4.6%, delivered on a 325-token
+prompt. Merging recovers that 2.2x — the same 2x as the TTFT figure, because it
+is the same term.
+
 ### The levers that were tried against it
 
 **A smaller prefill token budget makes TTFT worse, not better.** The budget
 documents itself as the thing that stops "a long prompt holding the device"
-(`qwen_engine.cpp:5092`), but it also caps how far each request advances per
+(`qwen_engine.cpp:5097`), but it also caps how far each request advances per
 call, so a 128-token budget turns every ~325-token prompt into three passes:
 
 | run | budget | TTFT mean | TTFT P99 | TPOT | tok/s | goodput |
@@ -552,15 +658,20 @@ In order of what the measurements support, and none of it done here:
    slot by a constant element stride rather than through a block table. Exposing
    the knob without teaching those kernels the translation would produce a
    server that starts and answers wrongly, which is worse than the hang above.
-2. **Merge the admission wave into one prefill forward.** It is the only finding
-   on this page that moves TTFT and prefill TFLOPS together — both are bounded by
-   the same one-request-at-a-time loop in `batch_prefill`. The engine's own
-   comment cites a saturation sweep that measured 1890 tok/s at a 4096-token
-   chunk against 1330 at 512 — a chunk of one or two prompts, not a question
-   about several; the cost of *not* merging them is the linear
-   TTFT above. The obstacle is real and is named in the code: the linear-attention
-   layers carry a per-sequence state, so a merged forward needs a segmented
-   recurrence, and the 16 full-attention layers need a block-diagonal mask.
+2. **Merge the admission wave into one prefill forward, and expect ~2x rather
+   than the ~1.06x the engine's comment quotes.** It is the only finding on this
+   page that moves TTFT and prefill TFLOPS together — both are bounded by the
+   same one-request-at-a-time loop in `batch_prefill`, and the term that merging
+   removes is 204 of the 411 ms a 325-token prompt costs. At `L16` that is
+   6640 ms of TTFT to ~3.3-3.4 s and 40.5 to ~80 TFLOP/s on four cards. The
+   `~1.06x` in that comment is the same arithmetic at 2048 tokens, where the
+   fixed term is 15% of a call instead of 52%; it is the ladder's short prompts,
+   not the sweep's, that the merge is worth doing for. The obstacle is real and
+   is named in the code: the linear-attention layers carry a per-sequence state,
+   so a merged forward needs a segmented recurrence, and the 16 full-attention
+   layers need a block-diagonal mask — without which a 5162-row forward would
+   spend 16x on the dense attention matrix what sixteen 322-row forwards spend in
+   total.
 3. **Make the row-step rate rather than the FLOP rate the target, and stop at
    96.** At 96 slots the step is 471.00 ms for 203.82 row-steps/s and 4.04 ms of
    new row each; 129 collectives a step are 12% of it and none of it amortizes

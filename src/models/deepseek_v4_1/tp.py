@@ -109,9 +109,22 @@ def make_all_reduce(world: int):
     summed rather than inheriting a decision. `world=1` returns `None`, which is what makes the
     unsharded configuration the same code path as the control.
 
-    fp32 in, fp32 out, `SUM`. Summing four bf16 partials in bf16 would cost about a bit per partial
-    for no measurable saving on a 20 KiB message, and would put a rounding difference into the
-    parity check that is not the sharding's.
+    fp32 on the wire, the caller's dtype on either side of it: the closure upcasts to fp32, sums in
+    fp32 and casts the answer back to `tensor.dtype` before returning. On the indexer's level-one
+    collective both sides are bf16, because the partial is an `einsum` of the bf16 query tile against
+    the bf16 key cache times a bf16 `weights` -- so that message travels at 33.6 MB where the tensor
+    it carries is 16.8 MB.
+
+    That upcast is a measured price and not an oversight. A `[2048, 4096]` level-one tile is 5469.8
+    us at fp32 against 2877.5 us at bf16 on this fabric -- 32 MiB of wire at 6.1 GB/s against 16 MiB
+    at 5.8 GB/s -- which over a chunk's tile counts is 0.469 s at 32768 and 2.001 s at 262144 of
+    fp32 wire against 0.267 and 1.073 in half the bytes. Halving it is closed on the picked ids
+    rather than on size: NCCL sums in the wire dtype, the score's O(600) values carry 8 mantissa bits
+    there, and `INDEXER_REDUCE_BITS=16` moves the selection on all eight indexer layers against a
+    baseline that reproduces to the digit. If the dtype moves at all it should move to fp16 -- the
+    same 2 bytes with 10 mantissa bits -- which is a different function and so its own parity run.
+    Measurements and both gates: `docs/performance/deepseek_v4_1_flash_chunked_prefill.md`, "Two
+    levers, and what gates each".
     """
     if world <= 1:
         return None
