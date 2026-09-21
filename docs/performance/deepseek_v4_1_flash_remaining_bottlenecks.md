@@ -589,6 +589,36 @@ before quoting either number.
   2.381 to 1.551, the row from 5.677 to 4.758, and the chunk from 29.74 to 29.14 s. So the model
   behind the 1.79 s is confirmed, and the overlap is a lever on a cost measured from both ends.
   Re-run it as a *price*, not as a candidate. `/tmp/chunk_indexer_steps_262144_fp16.log`.
+- **Narrowing the two wholesale stream braces in the expert staging.** `_upload` orders a card's whole
+  copy batch behind that card's whole compute stream — `stream.wait_stream(torch.cuda.current_stream(device))`
+  at `device_experts.py:1184` — and `_issue_chunk` orders the GEMM behind the whole copy stream
+  (`:1563`), so the two are mutually exclusive at every layer boundary by construction and the copies
+  cannot start until the layer's compute has ended. A ceiling cut — `torch.cuda.Stream.wait_stream`
+  no-op'd for the duration of exactly one call of each, nothing else changed — moves a 4096-token
+  chunk at the 256K configuration's own pool width from **24.20 s to 24.05 s over three chunks an
+  arm**, **0.6%**, and cutting `_upload` alone buys nothing at all — **1.0007×**, a hundredth of a
+  percent the *wrong* way, inside the same scatter. That 0.6% is the ceiling any careful per-row
+  narrowing could reach, and it is spent: the H2D being *serialized* behind compute is not the same
+  thing as its being *exposed*, which is what the arms measure. Read them as a ceiling and not as a
+  proposal — arm B hands a row out for layer L while layer L-1's kernels may still be reading it, and
+  arm C's GEMM may read rows its own cards have not finished writing. Three arms, three chunks each:
+  A **24.20 s** mean / 24.10 best / 0.15 s spread, B 24.21 / 23.88 / 0.53, C 24.05 / 23.83 / 0.38,
+  over a nine-chunk sequence whose own chunk-to-chunk spread is **0.58 s** — so the 0.15 s between A
+  and C is inside the instrument's scatter — with arm A's mean landing on the heavy instrument's own
+  quiet width for the same chunk (24.18 s), which is what says these arms are on the same clock as the
+  phase tables. Every arm's logits are finite, and
+  the arms rotate in a Latin square rather than a plain A,B,C rotation because `attn` grows with
+  position: replicate `r` starts at offset `r`, so each arm visits each position class once and the
+  three are matched in mean context length instead of arm A owning the cheap early chunks. The cut is
+  blanket and not selective, and two things about it have to be read with the number: it also silences
+  `_fill`'s own brace (`:1078`, unreachable at `hot_rows=0`) and `_issue_chunk`'s per-card loop
+  (`:1326`), and all arms pay a Python closure a call whose price is not measured. **It does not price
+  `_take_buffer`'s host `synchronize()`**, which is a different mechanism at a per-row cadence and is
+  still open below. A null result needs its intervention proved live, and this one is: a counting stub
+  on the real `_upload`, one fresh stub an arm, reads **0** cut calls on the control and **1** on each
+  cut arm, then goes on to die at `KeyError: 0` in `self._events[card][buffer].record(stream)` — the
+  statement *after* the brace — which is what says the wrap ran on the shipped method and not on a
+  fixture. `/tmp/probe_v41_upload_brace_abab.py`, `/tmp/upload_brace_abab.log`.
 
 ## Reproducing
 
@@ -649,6 +679,14 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 python /tmp/probe_v41_stage_micro.py
 DEEPSEEK_V41_RESIDENT_EXPERTS=1 python /tmp/probe_v41_stage_contend.py --tag solo
 for i in 0 1 2 3; do DEEPSEEK_V41_RESIDENT_EXPERTS=1 \
   python /tmp/probe_v41_stage_contend.py --tag "q$i" --offset "$i" & done; wait
+
+# the brace ceiling above: one load, nine 4096-token chunks from 16384, each with both wholesale
+# `wait_stream` braces cut or not, arms rotated in a Latin square so each visits each position class
+# once. Its per-arm delta line prints `(baseline - mean) * chunk / baseline` where the delta is
+# `(baseline - mean)` seconds a chunk; the `x` factor beside it is the number to read.
+PYTHONPATH=/mnt/data1/dsv4_inference CUDA_HOME=/usr/local/cuda-12.4 \
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 \
+    /tmp/probe_v41_upload_brace_abab.py --at 16384 --chunk 4096 --replicates 3
 ```
 
 `torch.distributed.run` sets `OMP_NUM_THREADS=1` for every worker unless the environment already has
