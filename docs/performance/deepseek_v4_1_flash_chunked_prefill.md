@@ -283,15 +283,35 @@ conservative by most of an order of magnitude, since `moe.routed`'s own floor is
 
 **And the faster chunk is not a staging win.** `staged` is 2178 rows in both 148 arms against 2174 in
 both 288 arms — 0.2% — and `routed.upload` moves 3.843 → 3.832 s, which is the same bytes: a wider
-pool did **not** make more draws hit. `_issue_chunk` is called 40 times, once a layer, in every arm, so
-`_chunk_bounds` did not cut the forward into fewer pieces either. The routed sub-phases net **+0.11 s
-against the wider pool**, the wrong sign, while the ~1.0 s that does appear sits in the `moe` block's
-own body, the part its three children do not cover. So the mechanism is a per-layer issue/wait effect
-at the MoE boundary rather than the row-hit accounting proposed above, and the accounting is still the
-right way to size the memory — it is the memory *explanation* that the phases do not support. This is a
-second reading of the same lever on a later tree, not a re-measurement of the table above; its own
-memory column reproduces the arithmetic anyway, 16118 MiB allocated at 148 rows against 18631 at 288 —
-+2513 MiB, against the 2512 the row size predicts.
+pool did **not** make more draws hit. The routed sub-phases net **+0.11 s against the wider pool**, the
+wrong sign, while the ~1.0 s that does appear sits in the `moe` block's own body, the part its three
+children do not cover. So the mechanism is a per-layer issue/wait effect at the MoE boundary rather
+than the row-hit accounting proposed above, and the accounting is still the right way to size the
+memory — it is the memory *explanation* that the phases do not support. This is a second reading of the
+same lever on a later tree, not a re-measurement of the table above; its own memory column reproduces
+the arithmetic anyway, 16118 MiB allocated at 148 rows against 18631 at 288 — +2513 MiB, against the
+2512 the row size predicts.
+
+The second proposed mechanism does not survive either, and here the source is what says so rather than
+a further run. `_issue_chunk` is called **40 times, once a layer, in every arm** — and
+`_forward_chunked` calls it once per bound `_chunk_bounds` returns, so 40 calls over 40 layers means
+the whole 4096-row batch is **one bound** at either width. One is the floor, so at this chunk there is
+nothing left for a wider pool to consolidate: the "fewer and bigger chunks" above cannot happen at
+32768 rather than merely not having happened. It did split on the tree the phase table above was read
+on, where the same row counted 158 calls — about four bounds a layer — which is a second reason to
+read that column as a property of the tree and not of the pool.
+
+The 0.2% is the more interesting number, because the pool *is* the thing it should move. `pool_lru` is
+**one LRU arena a card shared by all forty layers** (the same `arena_rows` the memory arithmetic
+sizes), so 148 rows is about **3.7 rows a layer** and 288 about 7.2, against the ~54 rows a layer this
+chunk stages in both. Both widths are therefore far inside the region where a cyclic sweep of the
+layer's working set thrashes the cache, where least-recently-used is the worst replacement policy there
+is and capacity buys almost nothing until it spans the whole working set: 140 more rows bought **4 of
+2178 misses**. That is what makes the earlier paragraph's causal chain a *memory* sized one and not an
+effect one — the ~1.83 GiB is real and `_chunk_bounds`' rule is real, but the pool is not the lever
+they are attached to, and buying more rows is not a way to buy fewer staged rows. On a 22528 MiB card
+that matters: the +2513 MiB bought −8.1% of a chunk and no misses, which is the trade the 256K
+configuration declines for a reason other than the OOM below.
 
 The token column separates by setting and by nothing else. All four ranks print one top-8 a process,
 both 148 processes print `[455, 1, 223, 8077, 764, 330, 343, 334]` and both 288 processes print
