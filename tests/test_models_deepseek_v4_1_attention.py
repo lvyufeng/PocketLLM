@@ -583,6 +583,66 @@ def test_the_early_out_changes_no_result(monkeypatch) -> None:
     assert torch.equal(skip_values.sort(dim=-1).values, values.topk(k, dim=-1).values.sort(dim=-1).values)
 
 
+def test_the_candidates_stream_skips_only_on_a_below_the_buffer_tile(monkeypatch) -> None:
+    """The same equivalence at the *candidate* level's geometry, where the skip is rare, not routine.
+
+    The test above feeds falling values, so the skip is available on every push after the first. That
+    is the prefix level's shape -- a 4096-key tile narrowed into a 512-wide buffer -- and it is the
+    shape the skip was written for. `_stream_candidates` builds its stream with
+    `k = min(index_topk, width)`, which is exactly this tiling's `span`: the field being narrowed is
+    already the top-k's own width, so the running k-th value is drawn from the same distribution as
+    the tile's entries and sits inside the range of a fresh tile rather than above it. Measured in
+    situ over a real 4096-token chunk that comes to **1 hit in 896 pushes**
+    (`/tmp/probe_cand_skip_inproc.py`), against a device->host synchronization on every one of them.
+
+    One hit in 896 is the state worth pinning, because it is the state the level spends its time in
+    and it is the one the prefix test never reaches: a buffer saturated with a wall of high scores,
+    and a tile whose largest value falls below the buffer's smallest. The data below is built to
+    reach it rather than drawn until it appears -- `HIGH` for the tiles that fill the buffer, `LOW` for
+    the one that cannot contribute -- because a draw would make the number of hits a property of the
+    seed. It is left in bf16, and the second query carries `-inf` where the mask would put it, since
+    both are what this level's scores actually look like and both are what a tie could hide behind.
+    """
+    torch.manual_seed(0)
+    span, k = 32, 32          # `k == span` is what `min(index_topk, width)` comes to on this level
+    tiles, queries, high = 6, 2, 1.0
+    values = torch.empty(1, queries, tiles * span)
+    values[..., : (tiles - 1) * span] = high + torch.rand(1, queries, (tiles - 1) * span) * 0.25
+    values[..., (tiles - 1) * span:] = torch.rand(1, queries, span) * 0.25
+    values = values.to(torch.bfloat16)
+    # the mask, on the query that is not the constructed hit: a hole in every tile the buffer holds,
+    # so that `amin(held)` is `-inf` there and the skip is correctly unavailable
+    values[0, 1].masked_fill_(torch.rand(tiles * span) < 0.5, -torch.inf)
+    keys = torch.arange(tiles * span, dtype=torch.int32).expand(1, queries, tiles * span).contiguous()
+
+    skipped: list[int] = []
+    original = _TopKStream.push
+
+    def counting(self, values, keys):
+        before = self.values
+        original(self, values, keys)
+        if before is not None and self.values is before:
+            skipped.append(1)
+
+    monkeypatch.setattr(_TopKStream, "push", counting)
+
+    with_skip, without = _TopKStream(k, host_branch=True), _TopKStream(k, host_branch=False)
+    _push_tiles(with_skip, values, keys, span)
+    _push_tiles(without, values, keys, span)
+
+    assert bool((values == -torch.inf).any()), "the mask was not exercised"
+    assert skipped, "the skip was never taken, so this compares the merge against itself"
+    skip_values, skip_keys = with_skip.result()
+    merge_values, merge_keys = without.result()
+    # sorted for the reason the test above gives: `topk(sorted=False)` fixes the multiset, not the
+    # column order, and the skip leaves one of the two streams in the order the tiles arrived
+    assert torch.equal(skip_values.sort(dim=-1).values, merge_values.sort(dim=-1).values)
+    assert torch.equal(skip_keys.sort(dim=-1).values, merge_keys.sort(dim=-1).values)
+    flattened = values.reshape(1, queries, -1)
+    assert torch.equal(skip_values.sort(dim=-1).values,
+                       flattened.topk(k, dim=-1).values.sort(dim=-1).values)
+
+
 @CUDA
 def test_a_stream_built_inside_a_capture_does_not_read_the_card() -> None:
     """`push`'s early-out reads a boolean back to the host, and a capture refuses that read.
