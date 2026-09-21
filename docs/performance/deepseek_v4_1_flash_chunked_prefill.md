@@ -504,6 +504,162 @@ below — and across the leg it goes from 7.7% of a chunk to 16.4%, which leaves
 [Below](#the-one-row-that-grows-with-context) is what is inside that one row and which of its levers
 are still open.
 
+### The wire, and how much of a collective is bytes
+
+The indexer's collective owns the section below because it is the one that grows with context. The
+other one is not a row of any table here: `tp.make_all_reduce` wraps **every** cross-rank sum in the
+model — `Attention`'s `wo_b` at the end of a block's attention half and `MoE`'s join at the end of the
+other, one `[1, 4096, 5120]` sum each a layer — and no tap sees it, because the fp32 upcast, the ring
+and the cast back to bf16 all happen inside one closure with no name of its own. What it costs in situ
+is a device-profile number rather than a tap: the same chunk's card timeline
+(`/tmp/chunk_nccl_attr.log`) puts all 1152 of its `ncclDevKernel_AllReduce_Sum_f32_RING_LL` calls
+together at **5.96 s** over a 26.04 s chunk, while the bytes those calls carry are worth **1.59 s**
+sent one message at a time on an idle device. A ring kernel waits on its peer from inside itself, so
+its duration is the bytes plus however long the last rank took to arrive — and the two are separable,
+because the collective the model calls has a dtype: `DEEPSEEK_V41_REDUCE_BITS` picks it (`32`, the
+shipped fp32; `16`, the same sum in half the bytes) and `0` is a control column that sends **no message
+at all** and returns each rank's own partial. That is a wrong answer by construction and it is kept
+because it is a true floor under the row: with the tails gone the ranks still meet at the indexer's
+tiles, which stay fp32 under every arm — the two score sites pass `discrete=True`, so this knob does not
+reopen [the gate the indexer's own wire dtype has below](#the-one-row-that-grows-with-context).
+
+**The instrument, and what one chunk's wire is.** `/tmp/probe_v41_reduce_bits.py` loads once and runs
+every arm in one process, interleaved `32, 16, 16, 32` with the two controls last, under no graph (a
+decode graph would bake the wire dtype at capture), with the wire itself recorded by wrapping
+`dist.all_reduce` — the dtype a collective is actually handed is the one fact an arm's name asserts and
+no timer can show. Rank 0's census, one 4096-token chunk an arm:
+
+| arm | the 80 tail messages | the indexer's tiles | the rest | a chunk, at the closure's rate |
+| --- | --- | --- | --- | ---: |
+| `32` fp32 | 40 + 40 x `1x4096x5120` **fp32** | 1024 `1x512x512` + 42 `1x2048x4096` **fp32** | 6 + 2 | **1.59 s** |
+| `16` fp16 | 40 + 40 x `1x4096x5120` **fp16** | 1024 `1x512x512` + 50 `1x2048x4096` **fp32** | 6 + 2 | **1.10 s** |
+| `0` none | *absent* | 1024 `1x512x512` + 62 `1x2048x4096` **fp32** | 6 + 2 | **0.58 s** |
+
+The tiles that stay fp32 under `16` are the `discrete` pin seen from outside, and they are why the
+control's census is **1.01 s** below the fp32 arm's rather than the full **1.59 s**: the 80 tails go,
+worth 1.13 s on the wire, but the indexer's tiles are not on this knob and the control is 16384 tokens
+further into the prompt, which is 20 more prefix tiles and 0.11 s of the difference back. Each arm is
+one chunk further into the prompt than the last,
+so the prefix tile count differs between the rows (42 / 50 / 62) for a reason that has nothing to do with
+the arm — the same sawtooth the width curve shows, one step for every 4096 tokens. The rate is measured
+in the same process, before any arm, one shape at a time, with an event pair around a whole rep loop
+rather than around a call, because a message this size is issued while the previous one is still in
+flight:
+
+| message | where | fp32 | fp16 | none | reps |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `1x4096x5120` | both ends of a block | **14.094 ms** | 7.346 (1.92x) | 0.002 | 27 |
+| `1x2048x4096` | an indexer prefix tile | 5.672 | 2.943 (1.93x) | 0.001 | 67 |
+| `1x512x512` | an indexer candidate tile | 0.203 | 0.156 (1.30x) | 0.001 | 200 |
+| `1x1x5120` | a decode step | 0.158 | 0.142 (1.11x) | 0.001 | 200 |
+
+The two ends halve exactly and the small messages do not: 80 MB at 5.7 GB/s is bandwidth and 1 MB is
+latency, which is the same curve the indexer's own price model is built on. All four ranks agree to 2%
+on every row. A second sitting of the same table reads 14.407 / 7.446 and 5.769 / 2.992, so the rate is a
+property of this fabric and not of the load.
+
+**Six arms, and what halving the wire buys.** The two fp32 arms bracket the two fp16 ones and the
+controls close the sequence, rank 0:
+
+| arm | bits | at | a chunk | staged rows | `attn.window` | `compress_kv` | `moe.routed` | `routed.drain` |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 32 | 32784 | 24.91 s | 2215 | 5.28 | 1.60 | 16.94 | 4.88 |
+| 1 | 16 | 36880 | 24.16 s | 2091 | 4.76 | 1.65 | 16.81 | 4.96 |
+| 2 | 16 | 40976 | 23.69 s | 2042 | 4.29 | 1.70 | 16.83 | 5.07 |
+| 3 | 32 | 45072 | 24.98 s | 2159 | 5.08 | 1.75 | 17.17 | 4.84 |
+| 4 | 0 | 49168 | 22.15 s | 2260 | 0.95 | 3.28 | 17.35 | 5.32 |
+| 5 | 0 | 53264 | 21.38 s | 1691 | 0.96 | 3.17 | 16.71 | 5.75 |
+
+The fp32 pair reads 24.91 and 24.98 — **0.07 s apart** — and the fp16 pair 24.16 and 23.69. **The same
+six arms on a second load, 48 tokens further into the prompt, put the fp16 pair almost exactly where
+the first one did and move both fp32 arms:**
+
+| arm | bits | first load | second load | staged rows, 1st / 2nd |
+| ---: | ---: | ---: | ---: | ---: |
+| 1st | 32 | **24.91 s** | **24.55 s** | 2215 / 2225 |
+| 2nd | 16 | 24.16 | 24.19 | 2091 / 2087 |
+| 3rd | 16 | 23.69 | 23.68 | 2042 / 2023 |
+| 4th | 32 | 24.98 | 24.32 | 2159 / 2159 |
+| 5th | 0 | 22.15 | 22.04 | 2260 / 2255 |
+| 6th | 0 | 21.38 | 20.85 | 1691 / 1702 |
+
+Grouped by dtype — the design's own bracket, since the two fp32 arms sit outside the two fp16 ones —
+the first load reads **24.95 s fp32, 23.92 fp16, 21.76 control** and the second **24.44, 23.93, 21.44**.
+The fp16 arms repeat across loads to **0.03 s and 0.01 s**; the fp32 arms — the same chunk, the same code
+path, a position 48 tokens different — move **0.36 and 0.66 s**. That is the first thing to know about
+this lever: the arm that pays the longer wait is the arm whose wall moves between loads, so the fp32
+bracket and not the fp16 arm is the uncertain quantity, and a half-second estimate sits inside a
+0.4 s wobble of exactly the quantity it is measured against. Halving the wire is worth **1.03 s, 4.1%,
+on the first load and 0.50 s, 2.0%, on the second**, and across the four cross-pairs inside each load
+the bracket is 0.76–1.29 s and 0.13–0.87 s, so the honest reading is *somewhere between a tenth of a
+second and 1.3 s*, which is a lever no larger than this instrument. Removing the same messages sits far
+outside that: **3.18 s and 2.99 s, 12.8% and 12.2%, on both loads**, with cross-pair brackets of
+2.76–3.60 and 2.28–3.71 s.
+
+Two corrections belong on those numbers before they are read as bytes. First, an arm's routing is not
+the fp32 arm's — a different wire is a different sum and so a different set of experts — and this one
+reproduces too: the fp16 arms stage **121 and 137 fewer rows** a chunk and the controls 212 and 214
+fewer, which at the width curve's 1.465 ms a row is 0.18–0.20 s and 0.31 s. That rate transfers to this
+run: the two control arms are 569 and 553 rows apart and 0.77 and 1.19 s apart on the wall against the
+0.83 and 0.81 s their rows predict. Second, the arms are successive chunks and a chunk's own cost rises
+with context — the compressed row grows ~0.05 s a chunk here — so the five chunks the arms span carry
+about 0.27 s of drift that makes the fp16 and control arms look *worse*, not better. Both corrections
+move the same way, and what they leave separates the two dtypes cleanly. The 80 tails are **1.13 s** of
+wire at fp32 and **0.59 s** at fp16, so halving them is worth 0.54 s of bytes; the control's measured
+**3.0 s** is **2.6x and 2.8x** that on the two loads, while the fp16 arms' 1.03 s and 0.50 s are **1.9x
+and 0.9x** it — one load saying the whole of the halving is bytes, the other saying half of it is.
+Removing the messages buys back three times what the bytes cost; halving them buys back about what the
+bytes cost and no more. A shorter message is a shorter wait for the last rank, and no message is no
+wait at all.
+
+**And the phase taps say where the wait was, which is not where the bytes were.** The row that collapses
+under the control is `attn.window`, 5.28 → 0.95 s, and the rows that rise to replace it are the
+compressed path's: `compress_kv` 1.60 → 3.28 and the indexer nested inside it 1.59 → 3.27, while the
+MoE that owns the join moves **not at all** — `moe.routed` reads a 17.06 s mean on the fp32 arms and
+17.03 on the controls, and `routed.drain`, the tap over the join itself, reads 4.86 and 5.01 against
+5.32 and 5.75. This probe's `attn.sparse` and `attn.compressor` taps read 0.00 on all six arms — the
+sparse score pass is inside `attn.window` here, and this column is not the 22-tap table's — so read the
+4.3 s as *where the drain collected the wait* rather than as the window build getting faster:
+`attn.window` is the first tap after the previous block's `MoE` join, so with no join to wait for it is
+cheap, and the two indexer rows take that wait on instead. Their own work did not grow: the control's
+census carries 20 more prefix tiles than the fp32 arm's because it is 16384 tokens further into the
+prompt, and 20 tiles of that shape are 0.11 s against the 1.6 s the two rows gain. The second load
+repeats the whole shape of it — `attn.window` 5.15 and 4.96 → 0.97 and 0.96, `compress_kv` 1.61 and
+1.76 → 3.83 and 3.23, `moe` 16.79 and 16.85 → 16.77 and 16.17, `routed.drain` 4.93 and 4.87 → 5.26 and
+5.74 — and the wall still closes
+on the columns — 17.13 + 6.92 + 0.57 + 0.22 + 0.03 = 24.87 against the 24.95 the two fp32 arms read —
+but a tap's columns are a collection point and never a partition of the work. **So the row is mostly
+rendezvous. The 80 tails are 1.13 s of wire and cost 3.0 s in situ; halving them buys about what their
+bytes are worth and no more; and what the ring spends the rest of its 5.96 s on is not the tails at all.
+Arithmetic puts that remainder at the indexer's 1066 tiles — 5.96 s less the 3.0 s the tails were worth
+— whose own bytes are 0.45 s a chunk, so the small messages are almost pure meeting. No message in this
+model is worth much.**
+
+**The knob is off by default and the parity is why.** Armed at 4096 tokens from position 0 on a reset
+state, the same chunk three times — fp32, fp32, fp16: `max` logit **26.0514, 26.2554, 26.4634** and
+top-8 `[223, 271, 1, 201, 16, 262, 270, 4588]` against `[..., 16, 262, 4189, 270]` and
+`[223, 271, 201, 1, 262, 16, 14, 4114]`. The tree does not reproduce **itself** at this span — two
+identical fp32 arms move the max logit 0.204 (0.78%) and swap two of the eight — and it is the same
+freedom memory records for this path, the prefill MoE's unordered `atomicAdd`. The fp16 arm's 0.411
+(1.58%) is one such difference among others rather than a wire-specific one, and the three arms
+reproduce to the digit across the two sittings (both times 26.051 / 26.255 / 26.463), so the freedom is
+a property of the arm rather than of the sitting. A 4096-token span therefore cannot gate this knob, and
+the density of the deviation is not measured here. That is the whole of the reason
+`DEEPSEEK_V41_REDUCE_BITS` ships at `32`, and a service should adopt it with its own end-to-end
+acceptance rather than inherit a wire dtype from a performance branch. The probe carries a decode series
+too — the head of each load rather than its tail, because the control may only run last — and it is the
+one measurement here that does not resolve. Four steps an arm it reads fp16 at 382.2 and 359.2 ms a step
+against fp32's 473.9 and 368.0, and sixteen steps an arm, on the second load, fp16 at **351.1 and
+337.9** against fp32's **394.4 and 347.5**: ranges that contain each other, under a trend of −15 ms an
+arm — over 16 tokens of context, so warm-up and not the prompt — that has to be fitted out before the
+dtype separates at all. That fit's fp32 penalty is **+26 ms, −7%** at sixteen steps and **+50 ms, −12%**
+at four, so the estimate halves with the series while length and load move together and neither figure
+is worth quoting. The closure table says why: its row for a decode message is `1x1x5120` at 0.157 ms, and
+the fp16 reading of the same row is 0.142 ms in one load and 0.167 in the other — a tenth of a
+millisecond wide and inverted on its second reading, and 80 messages of that shape are 1.2 ms of a
+350 ms step. A decode step is not the instrument for this lever; it agrees in direction with the chunk
+and settles nothing.
+
 ### The one row that grows with context
 
 `attn.compress_kv` is **2.10 s at 32768 and 5.14 s at 262144** (2.45x) over 38 calls at both lengths,

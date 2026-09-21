@@ -507,6 +507,20 @@ predicted at, against 0.93 s predicted**, with the candidate path's half of the 
 [the row that grows with context](deepseek_v4_1_flash_chunked_prefill.md#the-one-row-that-grows-with-context)
 takes it apart and names what gates each.
 
+**A different wire, and a different answer.** The two ends of a block — `Attention`'s `wo_b` and
+`MoE`'s join — go through that same `make_all_reduce`, and *that* one is on a knob of its own,
+`DEEPSEEK_V41_REDUCE_BITS`, whose `discrete` pin holds the indexer's two score sites at fp32 whatever
+the variable says: it is the activation wire rather than the score wire, so the gate above does not
+reach it. Six interleaved arms in one load price it — the fp32 pair at 24.91 and 24.98 s a 4096-token
+chunk, fp16 at 24.16 and 23.69, and a control that sends no message at all at 22.15 and 21.38 — and a
+second load repeats the shape while moving the fp32 pair further than it moves fp16. Pooled over both
+loads, halving the 80 tail messages is worth **0.5–1.0 s of a 25 s chunk** — inside the wobble of the
+fp32 arms it is measured against — and removing them **3.0 s**, against the 1.13 s those bytes are
+worth. The gap is the point: a collective here is **mostly the ring waiting for the last rank**, not
+the bytes, and the phase taps show the wait moving rather than disappearing. Read
+[the wire, and how much of a collective is bytes](deepseek_v4_1_flash_chunked_prefill.md#the-wire-and-how-much-of-a-collective-is-bytes)
+before quoting either number.
+
 ## Falsified, so do not re-run these
 
 - **Cross-layer `_stage` overlap.** The in-situ/replay gap is a one-time pool warm-up and not a
