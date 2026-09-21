@@ -120,6 +120,7 @@ nav:
       - Serving latency metrics: guides/latency_metrics.md
       - Native engine API: guides/pocketllm_api.md
       - PyPI release: guides/pypi_release.md
+      - CUDA extension builds: guides/cuda_extension_builds.md
       - Ascend SoC generations: guides/ascend_soc_generations.md
   - Performance:
       - Overview: performance/index.md
