@@ -41,9 +41,17 @@ from __future__ import annotations
 import pytest
 import torch
 
+from src.models.deepseek_v4_1 import attention as attention_module
 from src.models.deepseek_v4_1.attention import AttentionStack, get_window_topk_idxs
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.decode_pos import Pos
+
+# Every activation below is drawn at `attention_module.LINEAR_DTYPE` rather than at a literal. What
+# these tests compare is where the forward boundaries fell, so the width has to be one both orderings
+# can be run at rather than a number this file picked: a literal that disagrees with the tree's own
+# `Linear` does not exercise a chunk boundary, it dies inside `F.linear` naming two c10 dtypes and
+# nothing else. Reading the constant also keeps the file honest about which property it is testing --
+# none of these tests is about the width.
 
 # The same toy geometry `test_models_deepseek_v4_1_attention.py` uses, for the same reasons: two KV
 # sources, three index sources, one layer owning both published caches, and ratios that run both
@@ -183,7 +191,7 @@ def test_chunked_prefill_leaves_the_caches_a_one_shot_prefill_leaves() -> None:
     forward boundaries fell. Both the output stream and every cache are compared.
     """
     _, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     whole, _ = _build()
     reference = _run(whole, x, N_TOKENS)
@@ -210,7 +218,7 @@ def test_a_chunk_of_one_token_is_the_decode_path_and_not_the_continuation_one() 
     capture path's arithmetic.
     """
     _, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     whole, _ = _build()
     reference = _run(whole, x, N_TOKENS)
@@ -231,7 +239,7 @@ def test_the_ring_holds_the_last_window_positions_after_a_chunked_prompt() -> No
     slot arithmetic have to agree on, and they are two different expressions over the same ring.
     """
     _, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     whole, _ = _build()
     _run(whole, x, N_TOKENS)
@@ -256,7 +264,7 @@ def test_the_compressor_closes_a_group_a_chunk_boundary_cut_in_half() -> None:
     the six latents the one-shot forward produced, in the same columns.
     """
     _, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
     # 5 cuts a group with the earlier half in the previous chunk and the later half in this one; 3 and
     # 9 cut one that the chunk containing the *later* half then closes on its own; 7 does both kinds
     # of cut in one prompt.
@@ -353,7 +361,7 @@ def test_every_chunk_width_leaves_the_same_compressed_cache(chunk: int) -> None:
     cut a group and the widths that do not fail under different edits.
     """
     _, cfg = _build()
-    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=torch.bfloat16)
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
 
     whole, _ = _build()
     reference = _run(whole, x, N_TOKENS)

@@ -279,8 +279,9 @@ class V41Backend(BackendBase):
         dtype = getattr(args, "dtype", None)
         if dtype is not None and str(dtype).lower() not in _DTYPE_ALIASES:
             raise UnsupportedFeatureError(
-                "DeepSeek-V4.1-Flash is served in bfloat16; "
-                f"dtype={dtype!r} is not supported"
+                "DeepSeek-V4.1-Flash chooses its own weight widths -- fp16 for the dense stack "
+                "and the checkpoint's own quantized bytes for the routed banks -- so dtype is "
+                f"not a knob here; dtype={dtype!r} is not supported"
             )
         for name, value in (
             ("attention_window", getattr(args, "attention_window", 0)),

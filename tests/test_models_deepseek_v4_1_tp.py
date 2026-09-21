@@ -43,6 +43,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from src.models.deepseek_v4_1 import modules as modules_module
 from src.models.deepseek_v4_1.config import V41TextConfig
 from src.models.deepseek_v4_1.loader import V41Checkpoint, load_backbone
 from src.models.deepseek_v4_1.modules import RoutedExperts
@@ -628,7 +629,12 @@ def test_the_ffn_completes_the_routed_partial_only_when_the_store_was_dealt_out(
     ffns = [shard.model.layers[layer].ffn for shard in trees.shards]
     stores = [ffn.routed for ffn in ffns]
 
-    x = torch.randn(3, trees.cfg.dim, dtype=torch.bfloat16, generator=torch.Generator().manual_seed(3))
+    # The activation's width is the tree's, which is what the store under test expanded its experts
+    # to; a literal here would be a second opinion about the dense width and the ffn would refuse the
+    # call by name rather than exercise the partial.
+    x = torch.randn(
+        3, trees.cfg.dim, dtype=modules_module.LINEAR_DTYPE, generator=torch.Generator().manual_seed(3)
+    )
     # The inner `no_grad` is not redundant with the outer one: grad mode is thread-local, and the
     # board runs each rank on a thread of its own, which starts with it enabled. `load_backbone`
     # fills the tree inside `inference_mode`, so a parameter there is an inference tensor and a
@@ -641,8 +647,9 @@ def test_the_ffn_completes_the_routed_partial_only_when_the_store_was_dealt_out(
         want = whole_ffn(x).clone()
 
     # the routed term is a factor of two apart between the two cases, against a difference between
-    # two bf16 roundings of one value; anything in between is a margin, not a coincidence
-    bound = 4 * torch.finfo(torch.bfloat16).eps
+    # two roundings of one value at the activation's width; anything in between is a margin, not a
+    # coincidence
+    bound = 4 * torch.finfo(x.dtype).eps
     for dealt in (False, True):
         for ffn, store in zip(ffns, stores):
             ffn.routed = _DealtRoutedExperts(store, WORLD, dealt)

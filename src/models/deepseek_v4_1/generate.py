@@ -327,7 +327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         help="dequantized experts one layer keeps on the host")
     parser.add_argument("--expert-device", default=os.environ.get(EXPERT_DEVICE_ENV), metavar="DEVICE",
                         help="put the routed experts on DEVICE (e.g. cuda) across --expert-world "
-                             "cards instead of the host, which never expands fp4 to bf16; falls "
+                             "cards instead of the host, which never expands fp4 to a dense "
+                             "weight; falls "
                              "back to the host path if the build does not work. "
                              f"Default: ${EXPERT_DEVICE_ENV} if set")
     parser.add_argument("--expert-world", type=int, default=None,

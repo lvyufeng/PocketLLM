@@ -301,7 +301,7 @@ def test_a_backend_option_out_of_range_is_refused(tmp_path, options, message):
     "overrides, message",
     [
         ({"model_format": "gguf"}, "safetensors shards only"),
-        ({"dtype": "float16"}, "bfloat16"),
+        ({"dtype": "float16"}, "dtype is not a knob"),
         ({"attention_window": 4096}, "attention_window"),
         ({"speculative_method": "mtp"}, "speculative decoding"),
         ({"max_batch_size": 2}, "max_batch_size must be 1"),

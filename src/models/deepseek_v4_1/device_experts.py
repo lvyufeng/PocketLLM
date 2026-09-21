@@ -1,9 +1,9 @@
 """One layer's routed experts on the cards, fed the packed fp4 straight out of the shards.
 
 `CheckpointRoutedExperts` in `loader.py` is the correctness path and it is also the whole cost of a
-host token: it expands each miss to bf16 on the CPU, measured at 0.122 s per expert, so a step that
-misses all 240 of a token's experts is 29 s and the 119 of 240 a warm step still misses is 14.5 s.
-This class is the same subject on the other side of PCIe. It never builds a bf16 expert matrix
+host token: it expands each miss to a dense weight on the CPU, measured at 0.122 s per expert, so a
+step that misses all 240 of a token's experts is 29 s and the 119 of 240 a warm step still misses is
+14.5 s. This class is the same subject on the other side of PCIe. It never builds a dense expert
 anywhere -- `moe_single_token_fp4_forward` consumes the checkpoint's own `[E, N, K/2]` uint8 weights
 and `[E, N, K/32]` E8M0 scales and dequantizes inside the kernel -- so what crosses the link is the
 17.9 MiB the checkpoint stores rather than the 67.5 MiB an expansion would be, and what the host runs
