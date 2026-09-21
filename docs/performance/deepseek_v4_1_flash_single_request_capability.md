@@ -261,22 +261,26 @@ bash /tmp/run_cap_e2e3.sh
   `sorted` deal, which is one flag away from the default rather than the default; the `id` deal is
   1.400× on the same 262144 length and is what a bare command line makes.
 
-## These rates are the launcher's, and the launcher is the only path that runs this checkpoint
+## These rates are the launcher's, and the native route is still closed to this checkpoint
 
-Every number on this page comes out of `src/cli/generate_v41.py`, one request at a time. Nothing in
-`cpp_engine/` or `pocketllm/` can open `/mnt/data3/DeepSeek-V4.1-Flash` — not slowly, and not with a
-flag — so a service deployment is not gated on the two columns above and is gated on a runtime that
-does not exist yet. Three separate things would each stop it, and the first is reachable by name:
+Every number on this page comes out of `src/cli/generate_v41.py`, one request at a time. That is a
+choice rather than the only possibility: [`pocketllm serve --backend v41`](deepseek_v4_1_flash_served_gate.md)
+serves this checkpoint over the same `src/models/deepseek_v4_1` runtime and takes its own readings of
+the two columns. What these numbers still have no counterpart in, and what no flag opens, is
+`cpp_engine/`: nothing under it can load `/mnt/data3/DeepSeek-V4.1-Flash`, so a *native-engine*
+deployment is gated on a runtime that does not exist. Three separate things would each stop it, and
+the first is reachable by name:
 
 - **The architecture key has no factory.** The checkpoint's `config.json` declares
   `model_type: deepseek_v41`, and `detect_architecture` returns that string — verified with the built
   native module, `detect_architecture("/mnt/data3/DeepSeek-V4.1-Flash") == "deepseek_v41"` against
   `registered_architectures() == ["deepseek_v4", "qwen3_5"]`. `create_engine` looks its factory up by
   that key, so `cpp_engine --serve --ckpt /mnt/data3/DeepSeek-V4.1-Flash` throws "no engine registered
-  for architecture 'deepseek_v41'" rather than starting. The Python server stops one step earlier, on
-  `pocketllm/backends/cpp_backend.py`'s `_ENGINE_KIND_BY_ARCHITECTURE`, which carries the same two
-  keys and raises `UnsupportedFeatureError` for anything else. The `deepseek_v4` engine that is
-  registered is the 43-layer, 4096-hidden, 256-expert, top-8-index-head model that
+  for architecture 'deepseek_v41'" rather than starting. The Python server's **native** adapter stops
+  one step earlier, on `pocketllm/backends/cpp_backend.py`'s `_ENGINE_KIND_BY_ARCHITECTURE`, which
+  carries the same two keys and raises `UnsupportedFeatureError` for anything else — a different
+  adapter, `--backend v41`, is the route that does not go through that map at all. The `deepseek_v4`
+  engine that is registered is the 43-layer, 4096-hidden, 256-expert, top-8-index-head model that
   `/mnt/data3/DeepSeek-V4-Flash-0731` detects as, which is a different architecture rather than an
   older copy of this one.
 - **Its config has no dimensions where the loader looks for them.** V4.1-Flash's `config.json` is the
@@ -291,10 +295,13 @@ does not exist yet. Three separate things would each stop it, and the first is r
   the 475.24 GiB total, and the engine has no code path for that lookup
   ([inventory](../models/deepseek-v4.1-flash.md#tensor-inventory-verified-from-the-shard-headers)).
 
-A fourth gap is the one this page's subject lives in: `prefill_chunk` is plumbed through
-`src/models/deepseek_v4_1/generate.py` and `generate_v41.py` and nowhere else, so the 4096-token chunk
-these rates are built on — and with it a 262144-token context at a 22 GiB card — has no counterpart in
-either server. The serving prerequisite is therefore not a faster step; it is a runtime for this
-geometry, and the [device experts page](../performance/deepseek_v4_1_flash_device_experts.md) and
-[the model page](../models/deepseek-v4.1-flash.md) already record the same boundary from their own
-sides.
+A fourth gap was the one this page's subject lived in, and that one has closed. `prefill_chunk` used
+to be plumbed through `src/models/deepseek_v4_1/generate.py` and `generate_v41.py` and nowhere else,
+so the 4096-token chunk these rates are built on — and with it a 262144-token context at a 22 GiB
+card — had no counterpart in either server; `--backend v41` now takes it as
+`--backend-option prefill_chunk=4096`, and [the served gate page](deepseek_v4_1_flash_served_gate.md)
+measures that configuration rather than arguing for it. What the three bullets above describe was
+never a slower step but a missing runtime for this geometry, and there is now a Python one, running
+this same module. The native one is what remains open, and
+[the device experts page](deepseek_v4_1_flash_device_experts.md) records the same boundary from its own
+side.
