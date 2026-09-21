@@ -3413,19 +3413,51 @@ torch::Tensor moe_multi_token_fp4_forward_cuda(
         // grouping is built here, on the device: `slot_tokens` is a CUDA tensor at both call sites
         // -- at the on-device one (`gpu_prefill_backend`) reading it back to build the CSR in
         // Python would be the D2H sync this path exists to avoid -- and a stable sort by token
-        // followed by the counts' prefix sum is three ATen ops on `pairs` elements with no host
-        // round trip and no added synchronization. A stable sort keeps each row's pairs in
-        // ascending pair index inside its group, which is the order the scan adds them in, so the
-        // two kernels agree bit for bit rather than almost. `DEEPSEEK_MOE_CSR_REDUCE=0` turns it
-        // off and takes the scan below; the two are bit-identical, so that is a knob for a
-        // measurement or a bisect and not a correctness switch.
+        // followed by the group boundaries' prefix sum is a few ATen ops on `pairs` elements with
+        // no host round trip. A stable sort keeps each row's pairs in ascending pair index inside
+        // its group, which is the order the scan adds them in, so the two kernels agree bit for
+        // bit rather than almost. `DEEPSEEK_MOE_CSR_REDUCE=0` turns it off and takes the scan
+        // below; the two are bit-identical, so that is a knob for a measurement or a bisect and
+        // not a correctness switch.
+        //
+        // The boundaries come from `searchsorted` over the sorted tokens, and the op that does not
+        // belong in this block is `at::bincount`. `_bincount_cuda` computes its `nbins` as
+        // `self.max().item<input_t>() + 1` and bounds-checks `*self.min().cpu()`, so it is two
+        // blocking device-to-host reads -- two stream drains -- for an answer the sort in the line
+        // above already holds. At the call's own geometry, with a queue of known width laid in front
+        // of it, the construction is 43.3 ms of host time a call against 0.32 ms for `searchsorted`
+        // over the same `pairs` elements, with the wall unchanged at 42.8 ms either way
+        // (`/tmp/bench_issue_kernel.py`): the same device work, and no longer a host standing still
+        // for it. In the model it is 4.61 s of `_issue_chunk`'s 40 calls a chunk against 0.74 s, and
+        // the chunk's wall moves by **+0.27 s of 26.75** -- inside the ~2.3 s a single chunk
+        // scatters by (`/tmp/probe_v41_csr_abab.py`, 16 chunks an arm on a mirrored period). So the
+        // stall was real and was being absorbed by the rest of the chunk's serial path rather than
+        // paid at the wall: this removes a drain, which is what any overlap that would put the GEMM
+        // behind it needs, and it is not a chunk's worth of wall time. `searchsorted`'s leftmost
+        // insertion index of a token into the sorted tokens *is* that token's group start, i.e. the
+        // counts' exclusive prefix sum, so `row_ptr` comes out bit-identical -- and the two
+        // constructions and the scan reduce are bit-identical end to end on random routing, which is
+        // what the bench's parity section checks. `DEEPSEEK_MOE_CSR_BINCOUNT=1` restores the
+        // `bincount` construction to re-check that in process, and it is a bisect knob rather than
+        // a switch between two behaviours.
         if (env_int_default("DEEPSEEK_MOE_CSR_REDUCE", 1) != 0 &&
             static_cast<int64_t>(pairs) * tokens >= kCsrMinWork) {
             auto sorted = at::sort(slot_tokens, /*stable=*/true, /*dim=*/-1, /*descending=*/false);
             auto row_pair = std::get<1>(sorted).to(torch::kInt32);
-            auto counts = at::bincount(slot_tokens.to(torch::kLong), {}, tokens);
             auto row_ptr = at::zeros({tokens + 1}, slot_tokens.options());
-            row_ptr.narrow(0, 1, tokens).copy_(counts.cumsum(0, torch::kInt32));
+            if (env_int_default("DEEPSEEK_MOE_CSR_BINCOUNT", 0) != 0) {
+                auto counts = at::bincount(slot_tokens.to(torch::kLong), {}, tokens);
+                row_ptr.narrow(0, 1, tokens).copy_(counts.cumsum(0, torch::kInt32));
+            } else {
+                row_ptr.narrow(0, 0, tokens).copy_(at::searchsorted(
+                    std::get<0>(sorted), at::arange(static_cast<int64_t>(tokens),
+                                                    slot_tokens.options()),
+                    /*out_int32=*/true, /*right=*/false));
+                // The last token's group ends at the end of the pair list, which is `pairs` and not
+                // `row_ptr[tokens - 1]`: `pairs` pairs cover `tokens` tokens and every one of them
+                // names a token, so the counts sum to `pairs`.
+                row_ptr.narrow(0, tokens, 1).fill_(pairs);
+            }
             moe_multi_reduce_csr_kernel<<<reduce_grid, gemm_block, 0, at::cuda::getCurrentCUDAStream()>>>(
                 partials.data_ptr<float>(),
                 row_ptr.data_ptr<int32_t>(),
