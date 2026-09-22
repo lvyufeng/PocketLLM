@@ -4,10 +4,12 @@
 
 **Partially heterogeneous.** PocketLLM can open the released checkpoint, derive
 the expert layout from the shards' own headers, run the full 48-layer text
-backbone on the host, and **run the routed experts on a card out of a
-host-resident bank** — but there is no device path for the attention, the dense
-stack or the KV cache, and no server adapter. Nothing on this page is an
-end-to-end throughput claim, because nothing here runs end to end on a device.
+backbone on the host, and **run one decoder layer's attention and its routed
+experts on a card** — attention out of the released FP8 projection against a
+per-layer KV cache, experts out of a host-resident bank. What is missing is the
+stack that would join them: no device dense stack, no model loop, no 256k
+serving, and no CUDA kernel behind any of it. Nothing on this page is an
+end-to-end throughput claim, because nothing here runs a request on a device.
 
 What exists:
 
@@ -19,8 +21,9 @@ What exists:
 | Full 48-layer backbone on the release, on the host | Implemented and verified: 2.09 nats/token on an English passage against a uniform floor of 11.94, with grammatical greedy continuations |
 | Host-resident expert bank (149.81 GiB, one shared segment) | Implemented; fills from the release in 12.0 min at 213 MiB/s |
 | Device (CUDA) routed experts, one token, out of the bank | Implemented and verified against the host reference |
-| Device attention, dense stack, KV cache | Not implemented |
-| Decode at more than one token, grouped prefill | Not implemented — the kernel exists, the routing into it does not |
+| Device attention, both families, with a KV cache | Implemented in torch and verified against the host reference; **not a kernel** |
+| Device dense stack, the model loop, 256k | Not implemented — the layers exist, the stack that runs them does not |
+| Decode at more than one token, grouped prefill | Attention only: the cache serves a stream of chunks, and no other layer has a cache |
 | OpenAI-compatible serving | Not implemented |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
@@ -115,6 +118,7 @@ release, and the first two pieces of the device path.
 | `weights.py` | The bridge from the shards into `layers.py`, including experts that stay packed until selected |
 | `bank.py` | The routed experts resident in host memory, one shared segment, filled once per boot |
 | `device_experts.py` | One layer's routed experts computed on a card, staged from the bank as they are drawn |
+| `device_attention.py` | One layer's attention on a card, both families, against a per-layer KV cache |
 
 The routed experts are never expanded. A layer's 256 experts are 3.2 GiB dense
 and the model's would be 4.7 TB; `MimoV2Mxfp4Experts` holds the checkpoint's own
@@ -179,15 +183,100 @@ parts in a thousand of the output's peak, and worse where the summed output is s
 and the hidden is not, which is cancellation and not something a tolerance fixes. The
 end-to-end cost of it is a property of the whole backbone and belongs to a run of it.
 
+## Attention on the card
+
+`device_attention.py` runs one layer's attention on a device out of the released
+weights, for both families, against a per-layer cache. It is the same arithmetic as
+`layers.py` and it is diffed against it: on the release, in float32, an entire
+attention block agrees with the host reference to **2e-6 of the output's peak**, which
+is the reassociation of the same float32 sums and nothing else.
+
+Four things about it are the model and not the code.
+
+**The projection is cut, not reordered.** The fused `qkv_proj` is stored as four
+tensor-parallel shards of `[q | k | v]`, so the device runs the linear in the stored
+row order and cuts the *output* with `split_fused_qkv`. Reordering the weight is the
+same answer for 2x the bytes and one more place to get the layout wrong —
+`fused_qkv_row_order` exists for a kernel that wants three contiguous matrices, and a
+test holds the two readings to the same permutation.
+
+**The value scale is applied before the cache.** A cached value has already been
+scaled by 0.707; scaling it again after the read is a plausible-looking constant
+error in every windowed layer.
+
+**The sink is a column, not a bias.** It takes part in the row maximum and in the
+denominator, so a sink that wins takes the row and a sink that loses is invisible —
+which is *not* what an additive logit bias does, since a bias cancels in a softmax
+and would change nothing at any value. The tests falsify the additive reading
+explicitly.
+
+**The window is 128 keys, and only a window.** A global layer at 256k reads 256k
+keys a token and a windowed layer reads 128, which is why the cache gives a windowed
+layer a 128-slot ring and a global layer the whole context. That difference is
+asserted rather than described: the same 100 keys are rewritten in both layers' caches
+and only the global layer's decode step changes, by a margin, while the windowed
+layer's is bit-identical.
+
+The attention itself is two implementations of one softmax, chosen by size, because
+the two costs are not the same cost. A single pass materialises the scores — and pays
+a *launch* a block when it is written as a loop, sixty-five blocks of a few
+microseconds each being a millisecond of nothing — so a decode step, which is one
+query, takes it. A prefill chunk takes the online block loop, which holds no
+`[queries, keys]` tensor and costs 256k the memory 128 costs. The block loop's bounds
+are what make a window affordable: a key block is answered by a slice of the query
+rows found with two binary searches, so a cacheless 4096-token chunk with a
+window of 128 evaluates **about a quarter** of the pairs a dense pass would — a
+block plus a window a block, against the whole chunk — and the loop reports both
+counts.
+
+The single pass has a second measurement in it, and it is the kind that only shows up
+in a profile. Folding the 64 query heads into `[kv_heads, groups, ...]` batches and
+broadcasting one key head is what the block loop does and is right there; in a single
+piece, where the *keys* are long, it is a batch dimension of one expanded over
+sixteen, which cuBLAS materialises — 162 ms for a 65k-key decode where four per-head
+gemms are 5.8 ms. The fold is the cheaper of the two below about a thousand keys,
+which is a window, and the per-head walk above it, which is a global layer.
+
+One bug in here is worth naming because nothing else in the file could have caught it.
+The online softmax's running maximum was initialised from the sink by expanding a
+`[heads, 1]` tensor over `queries` and calling `contiguous()` — which, for a single
+query, is *already contiguous* and returns the sink itself. The running maximum then
+wrote the row maximum back into the layer's own parameter, so the call that did it was
+correct and the next call was wrong, by an amount that decays with how much the sink
+still matters. It is why the last test in the attention file calls twice and compares
+the parameter with itself.
+
 ## Validated performance
 
-**None end to end.** There is no device path for the attention, the dense stack or
-the KV cache, so nothing here runs a request. The only device numbers are the ones in
-the table above — one layer's experts, staged from the bank and computed — and the
-bank's own fill and pin. The host reference is not a performance artifact either: it
-is float32 on the CPU with no KV cache, so every decode step re-runs the whole prefix
-and re-reads every selected expert, and it exists to be the oracle a kernel port is
-diffed against.
+**None end to end.** There is no device path for the dense stack or the model loop, so
+nothing here runs a request, and the host reference is not a performance artifact
+either: it is float32 on the CPU with no KV cache, so every decode step re-runs the
+whole prefix, and it exists to be the oracle a kernel port is diffed against.
+
+What is measured is one layer at a time, on the release, bf16, warm cache, best of
+three: `tests/bench_mimo_v2_attention.py`. Layer 2 is windowed, layer 5 is global.
+
+| | Windowed (39 layers) | Global (9 layers) |
+| --- | ---: | ---: |
+| Prefill, 1024-token chunk, 8k context | 38.4 ms (26.6k tok/s) | 131.0 ms (7.8k tok/s) |
+| Decode, 4k context | 1.93 ms | 2.71 ms |
+| Decode, 64k context | 1.93 ms | 5.09 ms |
+| Weights on the card | 180 MiB | 170 MiB |
+
+A windowed layer's decode step does not grow with the context at all, which is the
+ring; a global layer's grows with it and is close to the bandwidth a token's keys
+cost. Summed over the model with the measured per-layer numbers, one token's attention
+is **100 ms at 4k context and 122 ms at 64k**, and a 1024-token chunk's is **2.2 ms a
+token at 4k and 8.5 ms at 64k** — so the attention is not what a token waits for. A
+layer's experts are: 15.58 ms of staging against 1.9 to 5.1 ms of attention, forty-seven
+times over.
+
+The forward-looking arithmetic is therefore short. Decode is 733 ms of expert staging
+plus about 100 ms of attention; sharding the experts four ways takes the staging to
+1.2 GiB a rank a token, which is the one lever the numbers point at. Prefill is the
+other shape: a chunk's experts are 8 experts a token and 102 MiB of DMA, so a hundred
+tokens a second is 10 GiB/s of host-to-device traffic before anything else is counted,
+and that is why nothing here claims a prefill number.
 
 ## Correctness and precision
 
@@ -219,14 +308,20 @@ experts stay packed, a dequantized-expert cache does not change the arithmetic,
 and restricting a layer to the experts its router selected does not change its
 output.
 
-**The device path against the host reference.** Three checks, and they answer
+**The device path against the host reference.** Four checks, and they answer
 different questions. `tests/test_models_mimo_v2_bank.py` reads every expert of the
 miniature back out of the segment byte for byte and runs the same property on the
 release's layout — including the shard that stores `10, 11, 8, 9`, which is the one
 a bank cannot get wrong quietly. `tests/test_models_mimo_v2_device_experts.py`
 reproduces the kernel's *own* arithmetic on the host, int8 activations included, to
 `4e-7`; that is what separates "the quantisation costs this much" from "we read the
-wrong expert", and a wrong expert is 14 to 250 percent off rather than 1e-6. And
+wrong expert", and a wrong expert is 14 to 250 percent off rather than 1e-6.
+`tests/test_models_mimo_v2_device_attention.py` holds the attention to `layers.py`'s
+own attention function — the reference is the oracle, not a second copy of the same
+idea — and then holds the cache to what a cache is: a chunked prefill against a
+one-shot one, a decode step against the same token inside the full prefix, a ring that
+returns the newest window in time order, and a windowed layer that does not move when
+keys outside its window are rewritten while a global layer does. And
 `scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer backbone on the
 release and greedily decodes, which is the one check that a shape or an offset error
 cannot pass.
@@ -237,11 +332,15 @@ cannot pass.
 # the checkpoint's own config, read through the schema
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
-# parity, layout, the host bridge, the bank and the device experts
+# parity, layout, the host bridge, the bank, the device experts and the attention
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
     tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
-    tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py -q
+    tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py \
+    tests/test_models_mimo_v2_device_attention.py -q
+
+# what one layer's attention costs, both families, prefill and decode
+python tests/bench_mimo_v2_attention.py
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -258,16 +357,21 @@ golden holds and how it was captured.
 
 ## Known limitations
 
-- **No end-to-end device path.** The routed experts run on a card; the attention,
-  the dense stack and the KV cache do not, so no request runs on a device and no
-  throughput number on this page describes one.
-- **Decode only, one token.** The multi-token and grouped-prefill kernels exist in
-  `src/csrc` but nothing routes into them, and a prefill is what the 100 tps target
-  is about.
+- **No end-to-end device path.** One layer's attention and its routed experts run on
+  a card; the dense stack and the loop that would run forty-eight of those layers do
+  not, so no request runs on a device and no throughput number on this page describes
+  one. Neither piece is a CUDA kernel either: both are torch, and both are baselines
+  with the shapes the kernels have to beat.
+- **One rank, one sequence.** The attention is single-rank with no tensor parallelism,
+  while the checkpoint's fused projection is stored in four shards — so a rank that
+  did not de-interleave would read a quarter of every head. Expert parallelism is not
+  implemented either, which is the measurement the expert table is about.
+- **Prefill is not routed.** The multi-token and grouped-prefill kernels exist in
+  `src/csrc` but nothing routes into them, so a chunk's experts are drawn eight at a
+  time; a prefill is what the 100 tps target is about.
 - **No KV cache in the host reference.** Re-running the prefix is deliberate for a
-  reference, and it makes long-context work on the host quadratically expensive.
-  256k context is a target of the device path, not something the reference
-  demonstrates.
+  reference, and it makes long-context work on the host quadratically expensive. 256k
+  context is a target of the device path, not something the reference demonstrates.
 - **No serving.** No OpenAI-compatible adapter, no batching, no prefix caching.
 - **MTP and DFlash are not executed.** The 3-layer MTP module and the 5-layer
   DFlash drafter are located and described but no speculative path uses them.
@@ -276,14 +380,16 @@ golden holds and how it was captured.
 
 ## Evidence and related notes
 
-- `src/models/mimo_v2/` — the host reference and the first two pieces of the device
-  path.
+- `src/models/mimo_v2/` — the host reference and the three pieces of the device path:
+  the bank, the routed experts, and the attention.
 - `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
   which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
   and what parity means at fixture scale.
 - `tests/test_models_mimo_v2_loader.py`, `tests/test_models_mimo_v2_real_weights.py`
   — the checkpoint's layout and the host bridge, on the release.
-- `src/models/mimo_v2/bank.py`, `src/models/mimo_v2/device_experts.py` — the
-  heterogeneous path, and the measurements in this page.
+- `src/models/mimo_v2/bank.py`, `src/models/mimo_v2/device_experts.py`,
+  `src/models/mimo_v2/device_attention.py` — the device path, and the measurements in
+  this page.
+- `tests/bench_mimo_v2_attention.py` — where the attention table comes from.
 - The support matrix in [models/README.md](README.md).
