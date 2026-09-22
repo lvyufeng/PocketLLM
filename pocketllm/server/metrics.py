@@ -137,6 +137,16 @@ class Metrics:
         with self._lock:
             self._counters[name] += float(value)
 
+    def set_counter(self, name: str, value: float) -> None:
+        """Publish a counter's absolute value rather than incrementing it.
+
+        For a counter a backend owns end to end: it already keeps the running total, and the
+        exporter's job is to copy it out at scrape time.  Adding it instead would square the count
+        over two scrapes of the same value.
+        """
+        with self._lock:
+            self._counters[name] = float(value)
+
     def set(self, name: str, value: float) -> None:
         with self._lock:
             self._gauges[name] = float(value)
@@ -176,12 +186,16 @@ class Metrics:
                 name: (list(item.increments), item.sum_seconds, item.count)
                 for name, item in self._histograms.items()
             }
+        # `.17g` and not `:g`: these are counts and byte totals, and the default six significant
+        # digits render a 4 GiB budget as `4.29497e+09` -- a number that is still a valid float but no
+        # longer the value. Seventeen digits is exact for every float64 and still prints `7.0` as `7`,
+        # so the integer series read the way they always did.
         for name, value in sorted(counters.items()):
             lines.append(f"# TYPE {self.prefix}_{name} counter")
-            lines.append(f"{self.prefix}_{name} {value:g}")
+            lines.append(f"{self.prefix}_{name} {value:.17g}")
         for name, value in sorted(gauges.items()):
             lines.append(f"# TYPE {self.prefix}_{name} gauge")
-            lines.append(f"{self.prefix}_{name} {value:g}")
+            lines.append(f"{self.prefix}_{name} {value:.17g}")
         for name in sorted(histograms):
             bounds, help_text = HISTOGRAMS[name]
             increments, total, count = histograms[name]
