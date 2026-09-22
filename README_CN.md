@@ -10,6 +10,34 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 
 > **项目状态：** 研究和工程软件。下面的数字来自特定 checkpoint、硬件和测试口径，不代表通用性能保证。
 
+## News
+
+- **[2026/09] DeepSeek-V4.1-Flash 端到端可服务。** `pocketllm serve --backend v41` 把发布的
+  475 GiB checkpoint 跑成四个进程、四张 22 GiB 卡，其中 457.8 GiB routed expert 是 pinned 在
+  host 内存而不是常驻卡上。runtime 最长接受 262,144 token 上下文；260,244-token prompt 实测
+  prefill 150.3–152.0 tok/s、decode 3.48–3.54 tok/s。跨请求 prefix caching 也在同一批落地：
+  已经服务过的前缀，重发时只 forward 尾部。
+  [模型页](docs/models/deepseek-v4.1-flash.md) ·
+  [Run record](docs/performance/deepseek_v4_1_flash_served_gate.md)
+- **[2026/09] Qwen3.8-27B-FP8 有了原生 OpenAI 兼容 server** —— health 与 model discovery、
+  流式与非流式 chat/completions、逐 token logprobs、stop sequence 截断、非法字段拒绝，以及并发
+  scheduler 准入，全部在真实 checkpoint 上验证过。[模型页](docs/models/qwen3.8-27b-fp8.md)
+- **[2026/08] Qwen3.8-27B 接上两个外部投机 drafter。**
+  [DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) 在前，
+  [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) 在后：512-token
+  fixture 上全请求 2.78×、decode 3.02×，逐 token 完全一致。两者都是 opt-in，因为收益取决于
+  acceptance rate，而上游公布的 2.67–3.43× 是 decode 延迟比而非全请求比。
+- **[2026/08] Qwen3.8-27B-FP8 上 C++/CUDA runtime** —— TP4 下的 FP8 E4M3 Safetensors 文本生成，
+  512-token prompt 上 prefill 864.54 tok/s、decode 43.22 tok/s，另有 256K 上下文路径，以及一个
+  跨请求保持 prefix state 的常驻 TP4 worker。
+- **[2026/07] GLM-5.2 文本生成** —— 走共用的 GGUF raw-block 路径，入口与其它 GGUF 模型相同的
+  `src.cli.generate_glm`。
+- **[2026/06] MiniMax-M2.7 on GGUF `UD-IQ1_M`** —— full-model 256-token prefill 约 104.9–107
+  tok/s，融合 RMSNorm 后 43 层 decode benchmark 10.32 tok/s。
+- **[2026/05] DeepSeek-V4-Flash** —— 项目起步时的那个 checkpoint：FP4/FP8 Safetensors 与
+  GGUF Q2/IQ2/IQ1 generation，32K–64K 下 C++ FP4 prefill 约 401 tok/s。
+  [模型页](docs/models/deepseek-v4.md)
+
 ## PocketLLM 提供什么
 
 - **模型专用推理路径：** 支持 hybrid attention、MLA、GQA、Gated DeltaNet、dense MLP 和 routed MoE 层。
