@@ -38,6 +38,34 @@ Two of those models are served end to end over the OpenAI-compatible API:
     guarantee. Read [Benchmarking and reporting rules](guides/benchmarking.md)
     before comparing any two results.
 
+## News
+
+- **[2026/09] DeepSeek-V4.1-Flash is served end to end.** `pocketllm serve --backend v41` runs the
+  released 475 GiB checkpoint as four processes on four 22 GiB cards, with the 457.8 GiB of routed
+  experts pinned in host memory rather than resident on the device. The runtime accepts up to
+  262,144 tokens of context; a 260,244-token prompt measures 150.3–152.0 tok/s of prefill and
+  3.48–3.54 tok/s of decode. Cross-request prefix caching landed in the same batch, so a prompt
+  whose prefix has already been served forwards only its tail.
+  [Model page](models/deepseek-v4.1-flash.md) ·
+  [Run record](performance/deepseek_v4_1_flash_served_gate.md)
+- **[2026/09] Qwen3.8-27B-FP8 gained a native OpenAI-compatible server** — health and model
+  discovery, streaming and non-streaming chat and completions, per-token log probabilities,
+  stop-sequence truncation, request-field refusals and concurrent scheduler admission, all verified
+  against a real checkpoint. [Model page](models/qwen3.8-27b-fp8.md)
+- **[2026/08] Two external speculative drafters for Qwen3.8-27B.** DSpark came first and
+  [DFlash2](models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) after it, measuring
+  2.78× full-request and 3.02× decode on a 512-token fixture with exact token parity in every case.
+  Both are opt-in, because their gains are acceptance-dependent.
+- **[2026/08] Qwen3.8-27B-FP8 on the C++/CUDA runtime** — FP8 E4M3 Safetensors text generation at
+  TP4, 864.54 tok/s of prefill and 43.22 tok/s of decode on a 512-token prompt, with a 256K context
+  path and a persistent TP4 worker that keeps prefix state alive across requests.
+- **[2026/07] GLM-5.2 text generation** through the shared GGUF raw-block path.
+- **[2026/06] MiniMax-M2.7 on GGUF `UD-IQ1_M`** — ~104.9–107 tok/s full-model 256-token prefill, and
+  a 43-layer decode benchmark at 10.32 tok/s after fused RMSNorm.
+- **[2026/05] DeepSeek-V4-Flash**, the checkpoint this project started on — FP4/FP8 Safetensors and
+  GGUF Q2/IQ2/IQ1 generation, ~401 tok/s of C++ FP4 prefill at 32K–64K.
+  [Model page](models/deepseek-v4.md)
+
 ## What PocketLLM provides
 
 <div class="grid cards" markdown>
