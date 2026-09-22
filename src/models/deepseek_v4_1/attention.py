@@ -73,24 +73,28 @@ SCALE_DTYPE = torch.float8_e8m0fnu
 # inventing a weight-quantization pass over random parameters. Where the reference's dtype choice
 # *is* structural -- the compressor's fp32 softmax pooling -- the code below keeps it.
 #
-# fp16 rather than bf16, because sm_75 has no bf16 tensor core: cuBLAS answers a bf16 GEMM with the
-# fp32 SIMT kernel `magma_sgemmEx_kernel<float, __nv_bfloat16, __nv_bfloat16>` at 6.4-7.5 TFLOP/s,
-# where the identical shapes in fp16 take `turing_fp16_s1688gemm_fp16_256x128_ldg8_f2f` at 47-58.
-# The projections this applies to are stored fp8 with E8M0 block scales, so their weight is formed in
-# fp32 and narrowed to whichever carrier either way -- and fp16 is the wider container of the two,
-# carrying 11 significand bits to bf16's 8. Everything else in the stack (the compressor's `wkv`,
-# the indexer's `wk`, the router, the embedding) is bf16 in the checkpoint, and bf16-to-fp16 is
-# lossless for values in fp16's exponent range, which measured inputs are: the largest input arriving
-# at any site the change carries is 100, 0.153 % of fp16's largest finite. Decode is not traded away
-# for this -- at one row there is no GEMM left, only a matvec whose cost is the weight bytes it
-# reads, and both widths are two bytes -- so it is a prefill lever. The per-site lever, the parity
-# diff and the decode arm are recorded in `docs/performance/v41_dense_gemm_dtype.md`.
-LINEAR_DTYPE = torch.float16
+# bf16, and the reason is the *activations* rather than the weights. fp16 is 8x faster for this
+# tree's GEMM shapes on this card -- sm_75 answers a bf16 GEMM with the fp32 SIMT kernel
+# `magma_sgemmEx_kernel<float, __nv_bfloat16, __nv_bfloat16>` at 6.4-7.5 TFLOP/s where the identical
+# shapes in fp16 take `turing_fp16_s1688gemm_fp16_256x128` at 47-58 -- but the width that has to hold
+# a value is the width of whatever is carried *in* it, and this model's own prompts do not stay under
+# fp16's largest finite, 65504. On the prompt the chat renderer builds,
+# `[0, 128803, 671, 6102, 294, 8760, 344, 128804, 128822]`, the Hyper-Connections residual stream
+# reaches 2.04e+06 and the input to a layer's norm reaches 4.57e+05 -- 31x and 7x the ceiling, by
+# layer 30 of 40. The width is a property of that stream rather than a defect in the prompt: the same
+# sequence with the leading begin-of-sentence token removed stays under 200 everywhere, so one token
+# of a 9-token prompt moves the arithmetic by four orders of magnitude, and bf16's 3.4e+38 holds
+# either case. Narrowed to fp16 the same forward has 415 non-finite sites of 956 and all-NaN logits,
+# which is a wrong answer rather than a slow one. The fp16 headroom this constant was chosen on (the
+# largest carried input 100, the largest anywhere 202.5) was metered on a chunk of *prose*; that
+# chunk's numbers are the numbers of the no-BOS sequence above. See
+# `docs/performance/v41_dense_gemm_dtype.md`.
+LINEAR_DTYPE = torch.bfloat16
 # The KV-side caches. Not an independent knob: every sparse-attention entry point in
 # `src/csrc/cuda_kernel_impl.cu` dispatches on `q.scalar_type()` and reads its `kv` at that same
 # dtype, so a cache at a different width from the projections filling it is silent corruption rather
 # than an error. It is a separate name only because it also sizes three persistent buffers.
-CACHE_DTYPE = torch.float16
+CACHE_DTYPE = torch.bfloat16
 
 
 class RMSNorm(nn.Module):

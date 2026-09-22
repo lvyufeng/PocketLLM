@@ -234,7 +234,8 @@ def _pin_dense_dtype(dtype: torch.dtype) -> dict[str, torch.dtype]:
     storage its `Linear` wraps, and the pieces that are not `Linear` -- `Engram.q_weight`,
     `k_weight`, the indexer's projections, `ParallelHead` -- are written `torch.bfloat16` in
     `model.py` itself. So there is no width to build the reference at other than the one it
-    declares, and this tree's dense stack is fp16 in production.
+    declares, and this tree's dense stack is bf16 in production -- the same width, for a reason of
+    its own that the page below records.
 
     Two widths cannot be compared exactly, which is what this file does. The weights are not why:
     every weight the reference holds is bf16, and bf16's 8 significand bits fit inside fp16's 11, so
@@ -244,11 +245,13 @@ def _pin_dense_dtype(dtype: torch.dtype) -> dict[str, torch.dtype]:
     That is arithmetic and not a defect, and it is why the comparison in this file is run at the
     reference's width.
 
-    The shipping width's own evidence is elsewhere and is not a tie-break this file can make: the
+    The dense width's own evidence is elsewhere and is not a tie-break this file can make: the
     same harness run at fp16 against the same bf16 reference reads a max|logit diff| of at most
     0.116 of the logit scale with the bf16 run as a zero control, recorded in
     `docs/performance/v41_dense_gemm_dtype.md` and reproduced by `probe_v41_dense_dtype_abab.py` on
-    the real checkpoint.
+    the real checkpoint. That arm is withdrawn as a shipping default on the same page -- fp16 has no
+    room for the activations the chat renderer's own prompt reaches -- so the comparison here is at
+    the reference's width for a second reason and not only because the reference is built there.
 
     Three modules and not one: `attention.py` and `modules.py` each hold the name, and `loader.py`
     binds it a third time (`from ...attention import LINEAR_DTYPE`), so a build that moved only the

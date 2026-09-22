@@ -308,6 +308,46 @@ def test_the_token_tile_leaves_the_hyper_connections_unchanged(monkeypatch) -> N
     assert all(torch.equal(a, b) for a, b in zip(wider[0], whole[0]))
 
 
+def test_the_hyper_connections_stream_is_carried_wider_than_fp16s_ceiling() -> None:
+    """The one constraint on the stream's width, stated as the range the released model reaches.
+
+    `LINEAR_DTYPE` is a single width for the dense stack, and on this card fp16 is the faster of the
+    two: sm_75 has no bf16 tensor core, so the same GEMM shapes run at 47-58 TFLOP/s in fp16 against
+    6.4-7.5 on the fp32 SIMT path a bf16 operand lands on. The width is still not free, because the
+    Hyper-Connections stream is *carried* at it rather than only multiplied at it, and fp16's largest
+    finite is 65504.
+
+    The magnitudes below are the released model's, read from a forward over the prompt the chat
+    renderer builds, `[0, 128803, 671, 6102, 294, 8760, 344, 128804, 128822]`: a site-by-site trace
+    of that forward at bf16 peaks at **2.038e+06** on the stream `hc_post` writes and **4.567e+05** on
+    the collapsed copy a layer's norm reads, both by layer 30 of 40. At fp16 the same forward has 415
+    non-finite sites of 956 and every logit is NaN -- eight begin-of-sentence tokens out of a model
+    that answers `The capital of France is **Paris**.` at bf16. The same sequence *without* its
+    leading BOS stays under 200 at every site, which is where the fp16 headroom measurement came from
+    and why it read as safe: it metered a chunk of prose, and prose is the no-BOS case.
+
+    So this pins the invariant rather than the two constants: a stream at the magnitude the model
+    actually produces must survive the collapse and the expansion. Drawn at `LINEAR_DTYPE`, it fails
+    at fp16 on `hc_post`'s expansion -- `tensor([inf, -inf, nan, ...], dtype=torch.float16)`, the
+    collapse narrowing to a finite `4.57e+05` and the returned expansion not -- and passes at bf16,
+    whatever either constant is set to."""
+
+    block = _fill(Block(_cfg(**_BLOCK_FIELDS), 0, 1, 16))
+    x = torch.randn(1, 4, block.hc_mult, DIM, dtype=modules_module.LINEAR_DTYPE)
+    residual = (x / x.abs().amax() * 2.038e6).to(modules_module.LINEAR_DTYPE)
+    assert float(residual.abs().max()) > 65504, "the stream must start past fp16's ceiling"
+    sub = torch.randn(1, 4, DIM, dtype=modules_module.LINEAR_DTYPE)
+    pre_mix = torch.randn(1, 4, block.hc_mult).softmax(-1)
+    post = torch.randn(1, 4, block.hc_mult).softmax(-1)
+    comb = torch.randn(1, 4, block.hc_mult, block.hc_mult).softmax(-1)
+
+    expanded = block.hc_post(sub, residual, post, comb)
+    collapsed = block.hc_pre(residual, pre_mix)
+    assert expanded.dtype == collapsed.dtype == modules_module.LINEAR_DTYPE
+    assert torch.isfinite(expanded).all(), "hc_post's stream is the widest tensor in the block"
+    assert torch.isfinite(collapsed).all(), "a collapse of finite copies is bounded by their max"
+
+
 def test_a_masked_engram_position_passes_the_stream_through_untouched() -> None:
     """The mask is what keeps an image token, which takes no part in an n-gram, out of the memory."""
     layout = EngramLayout.from_config({**_cfg().__dict__, **_ENGRAM_FIELDS})
