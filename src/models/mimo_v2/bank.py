@@ -536,6 +536,18 @@ class MimoV2ExpertBank:
         """What `pin()` did, or `None` if it has not been called."""
         return self._pin
 
+    def pin_if_enabled(self) -> PinResult | None:
+        """`pin()` when this run wants the mapping pinned, and nothing when it does not.
+
+        The gate belongs to the bank and not to its callers, so a device path that reads the
+        bank can ask once and honour `POCKETLLM_MIMO_PIN_RESIDENT_EXPERTS=0` without knowing
+        the variable's name. `None` is "not asked to", which is not the same answer as a
+        failed registration -- that comes back as a `PinResult` with `ok` false.
+        """
+        if not pin_enabled():
+            return None
+        return self.pin()
+
     @property
     def resident_bytes(self) -> int:
         """The segment's bytes, header and padding included."""

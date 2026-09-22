@@ -98,13 +98,15 @@ class MmapExpertSource:
 
 
 class MimoV2DeviceExperts:
-    """One layer's routed experts, computed on one card out of a host-resident source.
+    """A card's routed experts, computed out of a host-resident source.
 
     The arena is shared across layers on purpose. A layer at decode width holds eight
     experts, so one layer's own arena would be 102 MiB and forty-seven of them 4.8 GiB of a
     22 GiB card for state that is read once per layer per token; one arena, refilled by
     whichever layer is running, is safe because the layers run one at a time and each call
-    drains the kernel it launched before it returns.
+    drains the kernel it launched before it returns. Which layer is being served is
+    therefore a property of the *call* and not of the module -- `layer_id` is a
+    constructor argument only so a single-layer caller can set it once.
 
     `slots` is what makes the copies overlap the kernels. Two slots is the smallest number
     that lets a layer's staging start while the previous layer's kernel is still running,
@@ -114,7 +116,7 @@ class MimoV2DeviceExperts:
     def __init__(
         self,
         source: MimoV2ExpertSource,
-        layer_id: int,
+        layer_id: int | None = None,
         *,
         device: torch.device | str = "cuda",
         top_k: int,
@@ -124,7 +126,7 @@ class MimoV2DeviceExperts:
         arena_rows: int | None = None,
     ) -> None:
         self.source = source
-        self.layer_id = int(layer_id)
+        self.layer_id = None if layer_id is None else int(layer_id)
         self.device = torch.device(device)
         self.top_k = int(top_k)
         self.dim = int(dim)
@@ -210,8 +212,8 @@ class MimoV2DeviceExperts:
             self._pending[slot] = False
         return slot
 
-    def _stage(self, slot: int, experts: Sequence[int]) -> None:
-        """Copy `experts` into the slot's arena rows, on the copy stream.
+    def _stage(self, slot: int, layer_id: int, experts: Sequence[int]) -> None:
+        """Copy `layer_id`'s `experts` into the slot's arena rows, on the copy stream.
 
         Ordered behind the compute stream because the rows are the previous call's inputs
         **and** ahead of it because the kernel about to read them is on the other stream.
@@ -227,7 +229,7 @@ class MimoV2DeviceExperts:
             self._copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self._copy_stream):
                 for row, expert in enumerate(experts):
-                    views = self.source.expert_views(self.layer_id, int(expert))
+                    views = self.source.expert_views(layer_id, int(expert))
                     for (proj, kind), target in arena.items():
                         target[row].copy_(
                             views[(proj, kind)].view(torch.uint8), non_blocking=True
@@ -243,6 +245,8 @@ class MimoV2DeviceExperts:
         hidden: torch.Tensor,
         indices: torch.Tensor,
         weights: torch.Tensor,
+        *,
+        layer_id: int | None = None,
     ) -> torch.Tensor:
         """One token's routed-expert output, `[1, dim]`, in float32.
 
@@ -253,6 +257,10 @@ class MimoV2DeviceExperts:
         That is also why the weights can be passed through unchanged: they follow the same
         order, which is the draw order and not the id order.
 
+        `layer_id` names whose experts to draw, and defaults to the one the module was built
+        with. A whole-model caller leaves it unset at construction and passes it here, which
+        is what lets forty-seven layers share one arena.
+
         One token, and deliberately: the kernel is the single-token one, whose arithmetic is
         a per-row int8 activation quantisation. A batch goes through
         `moe_multi_token_fp4_forward`, which is defined to agree with this one bit for bit
@@ -260,6 +268,12 @@ class MimoV2DeviceExperts:
         """
         if hidden.dim() != 2 or hidden.shape[0] != 1:
             raise ValueError(f"the single-token path takes [1, dim], got {tuple(hidden.shape)}")
+        layer = self.layer_id if layer_id is None else int(layer_id)
+        if layer is None:
+            raise ValueError(
+                "no layer was named: this arena holds whichever layer's experts were last "
+                "staged, and it has no way to know a caller forgot to say which"
+            )
         indices = indices.reshape(-1)
         weights = weights.reshape(-1)
         if indices.numel() != weights.numel():
@@ -272,7 +286,7 @@ class MimoV2DeviceExperts:
             )
 
         slot = self._take_slots(indices.numel())
-        self._stage(slot, indices.tolist())
+        self._stage(slot, layer, indices.tolist())
         arena = self._arenas[slot]
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(self._copy_events[slot])
