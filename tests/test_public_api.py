@@ -84,6 +84,35 @@ def test_engine_args_and_sampling_aliases():
     assert params.n == 2
 
 
+def test_an_absent_max_tokens_is_not_invented_here():
+    """No cap is a value of its own, and both spellings of absence land on it.
+
+    A number invented at parse time is what truncated streamed answers at 256 tokens, so
+    ``None`` has to survive parsing and reach the backend that knows its own context.
+    """
+    for body in (
+        {"messages": []},
+        {"max_tokens": None},
+        {"max_completion_tokens": None},
+        {"max_tokens": None, "max_completion_tokens": None},
+    ):
+        assert SamplingParams.from_openai(body).max_tokens is None
+    assert SamplingParams.from_openai({"max_tokens": 5}).max_tokens == 5
+    # The current spelling wins over the deprecated one when both are present.
+    assert SamplingParams.from_openai({"max_tokens": 5, "max_completion_tokens": 9}).max_tokens == 9
+
+
+def test_token_budget_resolves_an_absent_cap_against_the_context():
+    """An absent cap is every position the prompt leaves; a named one is untouchable."""
+    assert SamplingParams().token_budget(1000) == 1000
+    assert SamplingParams(max_tokens=7).token_budget(1000) == 7
+    # A prompt that already fills the context leaves nothing to derive from.  One token and
+    # no fewer hands the refusal to the caller's length check rather than reporting a
+    # generation that produced nothing at all.
+    assert SamplingParams().token_budget(0) == 1
+    assert SamplingParams().token_budget(-5) == 1
+
+
 def test_invalid_public_options_fail_early():
     with pytest.raises(ConfigurationError):
         EngineArgs(model="x", backend="bad")

@@ -758,6 +758,87 @@ def test_without_any_eos_generation_ends_on_the_token_budget() -> None:
     backend.close()
 
 
+def test_without_a_budget_the_native_engine_gets_all_the_prompt_leaves() -> None:
+    """No ``max_tokens`` reaches native generate() as this engine's own context minus the prompt.
+
+    The engine is built with that same number (8192 when nothing was configured), so a budget
+    derived from it is one the engine can actually run, and the answer then ends at EOS or when
+    the context runs out -- not at a length invented before the context was known.
+    """
+    backend, engine = make_backend()
+    request = GenerationRequest(prompt_tokens=[1, 2, 3], request_id="req-open-ended")
+
+    result = backend.generate([request])[0]
+
+    assert engine.calls == [("generate", [1, 2, 3], 8189)]
+    assert result.finish_reason == "length"
+    backend.close()
+
+
+def test_a_stepped_request_without_a_budget_runs_to_the_context() -> None:
+    """The stepped path resolves an absent budget against the same configured context."""
+    backend = CppBackend(
+        EngineArgs(
+            model="model",
+            backend="cpp",
+            max_model_len=8,
+            # A known EOS puts the request on the stepped path; the fake never emits it.
+            backend_options={"eos_token_id": 99},
+        ),
+        engine=FakeEngine(),
+        tokenizer=FakeTokenizer(),
+    )
+    try:
+        result = backend.generate(
+            [GenerationRequest(prompt_tokens=[1, 2, 3], request_id="req-open-ended")]
+        )[0]
+        # Eight positions, three of them the prompt.
+        assert result.token_ids == [10, 11, 12, 13, 14]
+        assert result.finish_reason == "length"
+    finally:
+        backend.close()
+
+
+def test_a_batched_request_without_a_budget_asks_for_all_the_prompt_leaves() -> None:
+    """The batched path derives the same number, so one rule covers all three."""
+    submitted: list[object] = []
+
+    class NativeSamplingParams:
+        pass
+
+    class NativeModule:
+        QwenBatchSamplingParams = NativeSamplingParams
+
+    class NativeResult:
+        error = ""
+        generated_tokens = [10]
+        finish_reason = "length"
+        prompt_tokens = 3
+        completion_tokens = 1
+        total_seconds = 0.1
+        ttft_seconds = 0.05
+
+    class Scheduler:
+        def submit_request(self, prompt_ids, sampling, callback):
+            submitted.append(sampling)
+            return 1
+
+        def poll_result(self, request_id, timeout_ms):
+            return NativeResult()
+
+    backend, _ = make_backend()
+    backend._native = NativeModule()
+    backend._scheduler = Scheduler()
+    backend._batching_enabled = True
+    try:
+        backend.generate([GenerationRequest(prompt_tokens=[1, 2, 3], request_id="req-open-ended")])
+    finally:
+        backend.close()
+
+    assert len(submitted) == 1
+    assert submitted[0].max_new_tokens == 8189
+
+
 def test_invalid_eos_override_is_rejected() -> None:
     with pytest.raises(ConfigurationError, match="eos_token_id"):
         CppBackend(

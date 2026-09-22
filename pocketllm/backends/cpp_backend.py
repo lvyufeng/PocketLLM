@@ -427,7 +427,7 @@ class CppBackend(BackendBase):
         options.nccl_id_path = str(self.args.backend_options.get("nccl_id_path", ""))
 
         layer_count = 0  # auto-detect from checkpoint
-        max_context = self.args.max_model_len or 8192
+        max_context = self._context_tokens()
 
         return cls(self.args.checkpoint_dir, options, layer_count, max_context)
 
@@ -488,7 +488,7 @@ class CppBackend(BackendBase):
         }.items():
             if hasattr(options, name):
                 setattr(options, name, value)
-        engine = cls(self.args.checkpoint_dir, options, 0, self.args.max_model_len or 8192)
+        engine = cls(self.args.checkpoint_dir, options, 0, self._context_tokens())
         # warmup_tp() builds the command channel and forces the NCCL
         # communicator up.  Both ranks must do it before any rank issues a
         # collective, and a worker cannot enter run_worker_loop() without it.
@@ -522,6 +522,14 @@ class CppBackend(BackendBase):
         details = dict(status.details)
         details.update({"model": self.args.checkpoint_dir})
         return HealthStatus(status.status, status.backend, status.ready, status.message, details)
+
+    def _context_tokens(self) -> int:
+        """The positions this engine's caches hold, exactly as the native engine was built.
+
+        The native engine is constructed with this same number, so a budget derived from it is a
+        budget the engine can actually run.
+        """
+        return self.args.max_model_len or 8192
 
     def _prompt_ids(self, request: GenerationRequest) -> list[int]:
         if request.prompt_tokens is not None:
@@ -614,18 +622,23 @@ class CppBackend(BackendBase):
         first token measured from ``started``.  TTFT is observable only here: the
         loop is what learns when prefill produced a token, so reporting 0.0 as
         this path used to made every serial timing comparison degenerate.
+
+        The budget is the caller's, or -- when the caller named none -- everything
+        the prompt leaves of the engine's context, so an answer ends at EOS or
+        when there is no room left for another token.
         """
         result = self._tp_prefill(prompt_ids)
         ttft = time.perf_counter() - started
         token_ids: list[int] = []
-        for index in range(request.sampling_params.max_tokens):
+        budget = request.sampling_params.token_budget(self._context_tokens() - len(prompt_ids))
+        for index in range(budget):
             self._ensure_open()
             self._check_cancelled(request.request_id)
             token = self._native_token(result)
             if self._is_eos(token):
                 return token_ids, True, ttft
             token_ids.append(token)
-            if index + 1 < request.sampling_params.max_tokens:
+            if index + 1 < budget:
                 result = self._tp_decode_step(token)
         return token_ids, False, ttft
 
@@ -674,7 +687,10 @@ class CppBackend(BackendBase):
                         )
                     else:
                         raw = self._engine_or_raise().generate(
-                            prompt_ids, request.sampling_params.max_tokens
+                            prompt_ids,
+                            request.sampling_params.token_budget(
+                                self._context_tokens() - len(prompt_ids)
+                            ),
                         )
                         token_ids = [self._native_token(item) for item in raw]
                         hit_eos = False
@@ -723,7 +739,11 @@ class CppBackend(BackendBase):
 
                 # Create native sampling params
                 sampling = self._native.QwenBatchSamplingParams()
-                sampling.max_new_tokens = request.sampling_params.max_tokens
+                # A caller who named no budget gets everything the prompt leaves, which is the
+                # same rule the stepped path resolves at its own top.
+                sampling.max_new_tokens = request.sampling_params.token_budget(
+                    self._context_tokens() - len(prompt_ids)
+                )
                 sampling.temperature = request.sampling_params.temperature or 0.0
                 sampling.top_p = request.sampling_params.top_p or 1.0
                 sampling.top_k = request.sampling_params.top_k or 20
@@ -802,7 +822,7 @@ class CppBackend(BackendBase):
     def _stream_native(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         self._check_sampling(request.sampling_params)
         prompt_ids = self._prompt_ids(request)
-        max_tokens = request.sampling_params.max_tokens
+        max_tokens = request.sampling_params.token_budget(self._context_tokens() - len(prompt_ids))
         self._engine_or_raise()
         # Do not reset() here.  QwenEngine::reset() clears the prefix cache, so
         # calling it per request would disable configured prefix reuse.  prefill()

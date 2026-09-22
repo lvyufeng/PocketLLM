@@ -737,7 +737,10 @@ class V41Backend(BackendBase):
             "op": "generate",
             "request_id": request.request_id,
             "prompt_ids": [int(token) for token in prompt_ids],
-            "max_new_tokens": int(params.max_tokens),
+            # An absent budget is resolved here and not at parse time, because the number of
+            # positions a request may fill is a property of these caches: everything the prompt
+            # leaves of `_max_seq_len`. The answer then ends at EOS or when the caches are full.
+            "max_new_tokens": params.token_budget(self._max_seq_len - len(prompt_ids)),
             "temperature": float(params.temperature),
             "top_k": None if params.top_k is None else int(params.top_k),
             "seed": None if params.seed is None else int(params.seed),
@@ -747,7 +750,12 @@ class V41Backend(BackendBase):
         }
 
     def _validate_length(self, prompt_ids: Sequence[int], payload: Mapping[str, Any]) -> None:
-        """Refuse a request this run's caches cannot hold, before any rank is told about it."""
+        """Refuse a request this run's caches cannot hold, before any rank is told about it.
+
+        This is also what refuses a prompt that already fills the caches: the budget above is
+        derived from what the prompt leaves, and it is floored, so such a prompt arrives here with
+        a request that does not fit rather than with a budget of zero.
+        """
         wanted = len(prompt_ids) + int(payload["max_new_tokens"])
         if wanted <= self._max_seq_len:
             return

@@ -808,6 +808,34 @@ def test_cancelling_a_request_that_is_not_running_is_a_no_op(tmp_path):
 # ---------------------------------------------------------------------------- length
 
 
+def test_an_absent_budget_is_everything_the_prompt_leaves(tmp_path, loop):
+    """No ``max_tokens`` resolves against this backend's own caches, not against a default.
+
+    A number invented before the context is known is what cut streamed answers short, so the
+    resolution belongs here, where ``_max_seq_len`` is.
+    """
+    stub = loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path), max_model_len=64)
+    request = GenerationRequest(request_id="r1", prompt_tokens=[4, 5, 6])
+
+    backend.generate([request])
+
+    assert stub.calls[0]["prompt_ids"] == [4, 5, 6]
+    assert stub.calls[0]["max_new_tokens"] == 61
+
+
+def test_a_prompt_that_fills_the_caches_is_refused_without_a_budget_too(tmp_path, loop):
+    """The floor under an absent budget hands an over-long prompt to the length check, not a zero."""
+    stub = loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path), max_model_len=8)
+    request = GenerationRequest(request_id="r1", prompt_tokens=list(range(9)))
+
+    with pytest.raises(ConfigurationError, match="attention caches were sized at 8"):
+        backend.generate([request])
+
+    assert stub.calls == []
+
+
 def test_a_request_the_caches_cannot_hold_is_refused_before_any_rank_is_told(tmp_path, loop):
     stub = loop(tokens=[11])
     backend, _ = _build(_checkpoint(tmp_path), max_model_len=16)

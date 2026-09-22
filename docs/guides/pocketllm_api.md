@@ -172,7 +172,7 @@ than trusted.
 | --- | --- | --- |
 | `messages` | chat | The conversation, rendered by the checkpoint's own chat template (see [Request normalization](#request-normalization)). |
 | `prompt` | completions | Tokenized and prefilled unchanged. |
-| `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. |
+| `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. A body carrying neither — or carrying `null` for either, which clients do send — asks for no cap: the answer runs until EOS or the context limit, resolved against the engine's own context the way vLLM (`max_model_len - input_length`) and SGLang resolve an absent cap. A backend that sizes its own caches — v41 — refuses a request whose prompt and budget together do not fit them, as a 400 before any work starts. |
 | `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
 | `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
