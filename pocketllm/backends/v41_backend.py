@@ -50,6 +50,7 @@ from pocketllm.api import (
     Usage,
 )
 
+from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
 from .base import BackendBase
 
 
@@ -265,6 +266,7 @@ class V41Backend(BackendBase):
         self._request_lock = threading.RLock()
         self._expert_device: str | None = None
         self._details: dict[str, Any] = {}
+        self._bell: Bell | None = None
 
     # ------------------------------------------------------------------ construction
 
@@ -397,6 +399,27 @@ class V41Backend(BackendBase):
             )
         self._rank = int(dist.get_rank())
         self._world = int(dist.get_world_size())
+        self._open_bell()
+
+    def _open_bell(self) -> None:
+        """Open this rank's end of the idle doorbell.
+
+        Here rather than beside the broadcast it serves, because here is what makes it reliable:
+        this runs at the top of ``_load`` on every rank, the barrier that closes the load runs
+        after it, and rank 0's first ring runs after that -- so no rank ever rings a socket that
+        has not been bound, and neither end has to retry or wait. `work_bell` has the rest.
+        """
+        if self._bell is not None or self._world <= 1:
+            return
+        # The group's own rendezvous port names the doorbell, so it is the same string on every
+        # rank without a message, and different for a second engine on the same host.
+        port = os.environ.get("MASTER_PORT", "")
+        if self._rank == 0:
+            self._bell = BellRinger([bell_path(port, rank) for rank in range(1, self._world)])
+        else:
+            bell = WorkerBell(bell_path(port, self._rank))
+            bell.bind()
+            self._bell = bell
 
     def _load(self) -> None:
         import torch
@@ -981,9 +1004,24 @@ class V41Backend(BackendBase):
 
         Both messages this backend sends travel this way -- a request and the shutdown below -- so
         the workers are one loop reading one shape of message rather than a loop with a side channel.
+
+        The doorbell ahead of the collective is what keeps that loop off the device. A non-root
+        ``broadcast_object_list`` waits *inside* a device-side NCCL poll kernel, which holds a core
+        and pins the card at 100% utilization for as long as no request is in flight -- a worker
+        parked there is not idle, it is busy waiting for work. Ringing first means the wait happens
+        on the host instead: an idle service costs a sleeping ``recv`` per rank and nothing on the
+        cards, and the collective is entered only once rank 0 has something to put in it. The ring
+        is counted, not latched, so a worker that has not yet reached this call for one message
+        still consumes the rings in order.
         """
         import torch.distributed as dist
 
+        bell = self._bell
+        if bell is not None:
+            if self._rank == 0:
+                bell.ring()
+            else:
+                bell.wait()
         box = [payload]
         dist.broadcast_object_list(box, src=0)
         return box[0]
@@ -1030,6 +1068,10 @@ class V41Backend(BackendBase):
             except Exception:
                 # A peer that already left is not this rank's problem, and close() must not raise.
                 pass
+        # After the shutdown, never before: a worker parked on its bell reads that socket closing
+        # as the end of the group, and it has to be handed the shutdown it was sent first.
+        if self._bell is not None:
+            self._bell.close()
         super().close()
 
 
