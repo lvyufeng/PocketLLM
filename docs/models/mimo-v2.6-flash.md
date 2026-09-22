@@ -2,21 +2,28 @@
 
 ## Runtime status
 
-**Heterogeneous, one rank, one sequence.** PocketLLM opens the released
+**Heterogeneous, four ranks, one sequence.** PocketLLM opens the released
 checkpoint, derives the expert layout from the shards' own headers, runs the full
-48-layer text backbone on the host as a reference, and **runs that same backbone
-on one RTX 2080 Ti**: the dense stack and the attention out of the released FP8
-weights, the routed experts out of a host-resident bank, one token a step through
-a KV cache, to logits. A token costs **610 ms** — 1.64 tokens a second — of which
+48-layer text backbone on the host as a reference, and **runs that same backbone on
+one RTX 2080 Ti**: the dense stack and the attention out of the released FP8
+weights, the routed experts out of a host-resident bank, one token a step through a
+KV cache, to logits. A token costs **610 ms** — 1.64 tokens a second — of which
 74% is the expert copy, and the argmax agrees with the float32 host reference at
 full depth.
+
+**And the same model on four cards**, with the experts dealt out: a rank owns a
+quarter of them, the router stays replicated, and a routed layer's partial is summed
+with one 16 KiB all-reduce. A token is then **275 ms — 3.63 tokens a second**, four
+ranks produce byte-identical logits, and the decode is the same nine tokens the
+one-rank run gives. What the ranks do *not* divide is the attention, which is
+replicated on all four and is the next stage's work.
 
 What that is not: a prefill. The routed path has only the single-token kernel, so
 a prompt is fed one token at a time and a chunk of tokens has no path at all. Every
 number below is a decode number, and the one prefill-shaped number in this page is
-a floor rather than a prefill. There is no tensor or expert parallelism, no 256k
-run, and no CUDA kernel behind the attention or the dense linears — those are
-torch, and they are the baselines the kernels have to beat.
+a floor rather than a prefill. There is no tensor parallelism, no 256k run, and no
+CUDA kernel behind the attention or the dense linears — those are torch, and they
+are the baselines the kernels have to beat.
 
 What exists:
 
@@ -31,6 +38,7 @@ What exists:
 | Device attention, both families, with a KV cache | Implemented in torch and verified against the host reference; **not a kernel** |
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
+| Expert parallelism over four ranks | Implemented and verified: 3.63 tok/s, 275 ms a token, four ranks byte-identical and the same tokens as one rank |
 | Decode at more than one token, grouped prefill | Attention only: the cache serves a stream of chunks, and the routed path is single-token |
 | 256k context | Not run — the cache is sized for it and nothing has executed at that length |
 | OpenAI-compatible serving | Not implemented |
@@ -181,7 +189,7 @@ which is 10 to 11 ms, and the link is then within 20% of what a PCIe 3.0 x16 slo
 does. That is what sets the shape of the rest: forty-seven draws of 102 MiB is
 **4.68 GiB for one token**, no arrangement of the same bytes gets under the link's
 rate, and the only lever that moves it is not copying them — which is what the
-next stage's expert parallelism is for.
+expert-parallel stage below is for, and what its own section measures.
 
 The kernel's arithmetic is not the float32 reference's, and the whole difference is
 the activation quantisation: it takes int8 activations, one scale a row, and
@@ -367,6 +375,98 @@ against the host's; what would have caught it sooner is the test that now exists
 which asserts the row's shape and then that `greedy` reproduces a loop written out
 by hand.
 
+## The experts dealt out over the cards
+
+One rank's 610 ms token is 74% expert copy, and the copy is a per-token quantity: eight
+experts a layer, 12.75 MiB each, 4.68 GiB a token. Four ranks that each own a quarter of
+the experts move a quarter of the bytes, which is what `ep.py` is — and it is the one
+change in this page that turned out not to be worth what the arithmetic predicted, in a way
+worth recording.
+
+**The router is replicated and there is no dispatch.** Every rank runs the same gate over
+the same hidden state and draws the same eight experts, so nothing about *which* experts
+are needed crosses the fabric. That is affordable because the gate is a `[1, 4096] x
+[4096, 256]` matmul and because `gate_and_route` is one function every rank runs in the
+same dtype on the same bytes: the draw is a deterministic function of the row, so every
+rank agrees on it without being told. A path that had to guess would need the ids on the
+wire and the shape of the design would change.
+
+**One collective a routed layer, and it is the layer's output.** The kernel sums a weighted
+set of drawn rows, so a rank holding a subset of the draw holds a *partial* sum and the
+layer's answer is the sum of the partials: one `all_reduce` of `[1, 4096]` fp32, sixteen
+kilobytes, forty-seven times a token. Back to back on this fabric that message is **128 µs**,
+which over a token is **6 ms** — a fifth of a percent of the token, and the reason a
+per-layer collective is affordable at all here where V4.1's 80 MiB activation tiles are not.
+
+**The deal is where the measurement corrected the arithmetic.** `sorted` gives sorted
+position `p` to rank `p % world`, so a top-8 draw over four ranks is exactly 2, 2, 2, 2;
+`id` gives `expert % world`, which partitions the *experts* over the ranks and is what a
+chunked prefill wants (a chunk draws nearly every expert, and only `id` stops a rank from
+staging all of them). On decode, `sorted` — now the default — is **21% faster**:
+
+| Deal | Decode step | Staged a step, by rank | Arena |
+| --- | ---: | --- | ---: |
+| `sorted` (default) | **275.2 ms** — 3.63 tok/s | 1198.5, 1198.5, 1198.5, 1198.5 MiB | 51 MiB |
+| `id` | 348.6 ms — 2.87 tok/s | 1285.6, 1253.8, 1175.1, 1079.5 MiB | 204 MiB |
+
+The whole of that 73 ms is the imbalance, not the bytes: the two deals stage the same
+bytes *in total* over a token — 47 x 8 experts either way — but a per-layer collective
+charges **every** rank the *widest* draw's work, and the widest of four ranks under `id` is
+3.4 experts on average where `sorted` is exactly 2. 47 x (3.4 - 2) x 12.75 MiB is 0.84 GiB,
+which at 10.4 GiB/s is 81 ms — the measured 73, to the round of the estimate. A deal that
+is worse per rank can be better in lockstep, and the numbers are the only way to know which.
+
+The 2, 2, 2, 2 split also halves what the arena has to hold: under `sorted` a rank can only
+ever be dealt `ceil(top_k / world)` rows, so the arena is 51 MiB a slot against 204. And
+under `id` a rank of four owns nothing in **10% of top-8 draws** — `(3/4)^8` — which is not
+a corner case: the rank has to arrive at the collective with a zero, which is why the empty
+share is a value and not a skipped call.
+
+**What the four ranks agree on.** The multi-rank run gathers every rank's last logits after
+the first decode step and compares them bit for bit — all four are byte-identical, which is
+the collective's own check: a rank that staged a row it did not own, dropped one it did or
+summed a partial twice disagrees here. Then the four greedy continuations, which are the
+same nine ids, and the same nine the one-rank run produces on the same prompt:
+
+```
+14925 227 60096 72653 86162 85033 145420 54575 145959
+```
+
+Adding a rank changes the order the eight partial sums are added in and so the last bits of
+every logit; nine tokens of agreement and identical argmax at every step is what that costs
+here, and the one-rank comparison in the tests is the check that it stays that way.
+
+**And the token is no longer copy-bound.** A per-layer profile on eight routed layers of
+the release, four ranks, CUDA events on the stream each span belongs to, under the `id`
+deal:
+
+| Span | ms a routed layer | What it is |
+| --- | ---: | --- |
+| Attention | 1.5 | the replicated torch attention, and what is left of it |
+| Router | 0.5 | the gate and the top-k, whose result the host needs |
+| Expert copy | 2.4 | 25.5 MiB, at the link's own 10.4 GiB/s |
+| Expert kernel | 0.4 | two experts instead of eight |
+| The collective | **1.6 in situ** | against **0.128 back to back** |
+| The rest | 0.8 | the norms, the adds, the head, the host's own issue |
+
+Read the last two rows together: the same message costs **1.6 ms inside a layer and 0.128 ms
+in a loop**, a factor of twelve, and the twelve is the *lockstep* rather than the message. A
+collective is a barrier, four ranks' per-layer host work is not equal, and every rank pays
+the slowest one's time; the `id` deal doubles that by making the copy itself unequal. It is
+why the imbalance above is worth 21%, and it is the measurement that redraws the next
+stage's target: the step is now attention plus copy plus a lockstep, and 48 x 5.7 ms is the
+275 the `sorted` arm measures.
+
+The whole-model phase totals behind that table, at 8 prompt tokens and 8 decode steps:
+
+| | `sorted` (default) | `id` |
+| --- | ---: | ---: |
+| Decode step | **275.2 ms** | 348.6 ms |
+| Prefill-shaped pass, 8 tokens | 3.80 tok/s | 2.96 tok/s |
+| Attention, all 48 layers | 65-88 ms | 72-81 ms |
+| FFN and staging | 171-198 ms | 254-264 ms |
+| Experts staged a step | 94.0 | 84.7-100.8 |
+
 ## Validated performance
 
 **One token, on one card, and a floor.** The number above — 610 ms a token — is the
@@ -395,23 +495,33 @@ is **100 ms at 4k context and 122 ms at 64k** — against 64 ms measured for the
 48-layer stack at a short context, which is the same sum and a shorter prefix.
 
 The token's other 580 ms is the copy, and the copy is a per-token quantity because
-the routed path is a draw a token. Sharding the experts across four ranks is the one
-lever the numbers point at: **4.68 GiB a token becomes 1.17 GiB a rank**, which at
-the 10.4 GiB/s the link sustains is about 113 ms, and 113 plus the 64 the attention
-costs is **5.6 tokens a second** with nothing else changed. Sharding the dense stack
-as tensor parallelism with it divides the attention's reads by four and puts a token
-at about 130 ms, which is 7.7 a second — so the target's 5 is reachable by parallel
-work alone, and the attention kernel this page keeps saying is missing is what buys
-the margin above it.
+the routed path is a draw a token. Sharding the experts across four ranks was the one
+lever the numbers pointed at, and it was taken: **4.68 GiB a token becomes 1.17 GiB a
+rank**, and the token went from 644 to 275 ms. It did not go to the 5.6 tokens a second
+that dividing the bytes by four predicted, and the reason is measured rather than argued
+— a per-layer collective in this pipeline costs 1.6 ms and not the 0.128 the message
+costs alone, because it is a barrier and the four ranks are not equally fast a layer.
+That is also the answer to the obvious next move: tensor parallelism for the attention
+would divide its 65-88 ms by four and add a collective a layer to do it, and at 1.6 ms a
+collective the trade is upside down. The attention's next step is a kernel, not a split —
+the same conclusion the dense stack reached on one rank, for a different reason.
+
+What *is* left in the 275 ms, per routed layer, is the copy (2.4 ms, at the link's
+ceiling), the attention (1.5 ms, replicated four times over) and the router (0.5 ms): the
+two things worth their own stage are the attention kernel and the 10% the lockstep takes
+back. Prefill is where the second half of the target lives and it is untouched.
 
 Prefill is the other shape, and its arithmetic is not per token. A chunk of a few
 thousand tokens draws nearly every expert of every layer — 4096 tokens at top-8 is
 32768 draws over 256 experts — so a chunk's traffic is **about 153 GiB for the whole
 layer stack no matter the chunk size**, and it is not paid again by the next chunk.
 At 10.4 GiB/s that is 14.7 s a chunk, which is 35 tokens a second at a 512-token
-chunk and **279 at 4096**. So the prefill target is a matter of chunking and of the
-multi-token kernel that has to exist to compute a chunk at all — not of the link,
-which the experts are already as close to as storage allows.
+chunk and **279 at 4096** — and with the experts dealt out, a quarter of that a rank.
+So the prefill target is a matter of chunking and of the multi-token kernel that has to
+exist to compute a chunk at all — not of the link, which the experts are already as close
+to as storage allows. It is also the one place the `id` deal has to come back: under
+`sorted` a chunk's sorted positions reach every rank, so the rank stages the whole expert
+set instead of its own quarter.
 
 ## Correctness and precision
 
@@ -443,7 +553,7 @@ experts stay packed, a dequantized-expert cache does not change the arithmetic,
 and restricting a layer to the experts its router selected does not change its
 output.
 
-**The device path against the host reference.** Five checks, and they answer
+**The device path against the host reference.** Six checks, and they answer
 different questions. `tests/test_models_mimo_v2_bank.py` reads every expert of the
 miniature back out of the segment byte for byte and runs the same property on the
 release's layout — including the shard that stores `10, 11, 8, 9`, which is the one
@@ -471,18 +581,33 @@ row. And `scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer bac
 on the release and greedily decodes, which is the one check that a shape or an offset
 error cannot pass.
 
+**The deal, and the shares of a draw.** `tests/test_models_mimo_v2_ep.py` is sixteen
+tests and needs no process group, because the property the deal has to have is
+arithmetic and not communication: **four ranks' partials, summed in one process, are the
+one-rank answer**, and they are summed for both deals over the same draw and the same
+hidden state. A deal that dropped a drawing, double-counted one or paired a weight with
+the wrong expert cannot pass it. It also pins what makes the two deals different — a
+top-8 draw over four ranks is 2, 2, 2, 2 under `sorted` and can be 8, 0, 0, 0 under
+`id` — the empty rank's zero, the arena width each deal needs, and that four modules
+stage the draw's bytes once between them and not four times over. What it cannot test is
+the collective: `make_all_reduce` is a closure around `dist.all_reduce` with nothing in
+it to get wrong, and whether four *processes* agree is what the multi-rank run's
+byte-for-byte logit comparison answers.
+
 ## Reproduction
 
 ```bash
 # the checkpoint's own config, read through the schema
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
-# parity, layout, the host bridge, the bank, the device experts, the attention and the model
+# parity, layout, the host bridge, the bank, the device experts, the attention, the model
+# and the deal
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
     tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
     tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py \
-    tests/test_models_mimo_v2_device_attention.py tests/test_models_mimo_v2_device_model.py -q
+    tests/test_models_mimo_v2_device_attention.py tests/test_models_mimo_v2_device_model.py \
+    tests/test_models_mimo_v2_ep.py -q
 
 # what one layer's attention costs, both families, prefill and decode
 python tests/bench_mimo_v2_attention.py
@@ -490,14 +615,29 @@ python tests/bench_mimo_v2_attention.py
 # what a whole token costs on one card, and how much of it is the expert copy
 python tests/bench_mimo_v2_model.py
 
+# the same token on four cards, the experts dealt out -- and the four-rank agreement check
+# `--deal id` is the other deal; the flag sets POCKETLLM_MIMO_EXPERT_DEAL
+torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8
+torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8 --deal id
+
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
 ```
 
+The four-rank run takes about two and a half minutes of wall clock: 84 s to build the
+model (four processes mapping the release at once), then 31 s of page registration per
+rank, both of which happen concurrently, and then the measured region. A rank that
+dies leaves rank 0 blocked in its final `all_gather` — the gathers are participated in
+by every rank and printed on one, precisely so that a run fails rather than hangs when
+it can — and the process to kill is the rank's `python`, not the `torchrun` wrapper.
+
 The bank is 149.81 GiB of `/dev/shm` and takes twelve minutes to fill the first
-time; a run after that attaches in 0.07 s. `rm -rf
+time; a run after that attaches in 0.07 s, and four ranks attach to the *same*
+segment rather than filling four. `rm -rf
 /dev/shm/pocketllm_mimo_experts_*` is how the memory goes back, and the next
-`open_expert_bank` refills it.
+`open_expert_bank` refills it. Four ranks that each register the whole mapping take
+31 s apiece and do it concurrently, which is 31 s and not 124: the pages are the
+same pages and the driver counts them once.
 
 The oracle fixture lives outside this repository (a checkout without it skips the
 parity tests); `tests/test_models_mimo_v2_layer_parity.py` documents what the
@@ -510,15 +650,19 @@ golden holds and how it was captured.
   columns in this page are that same loop, and the 279 tokens a second the link could
   sustain at a 4096-token chunk is arithmetic rather than a measurement. Prefill is
   what the 100 tps target is about and it is the next stage's work.
-- **One rank, one sequence, no batching.** No tensor parallelism, no expert
-  parallelism, no batching. The checkpoint's fused projection is stored in four shards,
-  so a rank that did not de-interleave would read a quarter of every head — and the
-  experts are drawn eight a token by whoever is running that token, which is the whole
-  of the 4.68 GiB.
+- **No tensor parallelism, no batching, and the attention is replicated.** The experts
+  are divided over four ranks and everything else is not: the router, the attention, the
+  embedding, the head and the dense layer each run four times over. The checkpoint's fused
+  projection is stored in four shards, so a rank that did not de-interleave would read a
+  quarter of every head. Measured, splitting the attention is now the wrong trade — a
+  collective a layer costs 1.6 ms against the 0.4 ms a quarter of the attention's reads
+  would save — so what is missing there is a kernel, not a rank.
+- **One sequence, one request, no batching.** A second request would have to wait; the
+  KV cache, the expert arena and the collectives are all single-sequence.
 - **The attention and the dense linears are torch, not kernels.** They are baselines
-  with the shapes the kernels have to beat: 64 ms a token for all 48 layers, and the
-  single-pass decode path loses a factor of twenty-eight to a batch dimension of one
-  until the key count passes a window.
+  with the shapes the kernels have to beat: 65-88 ms a token for all 48 layers on four
+  ranks, and the single-pass decode path loses a factor of twenty-eight to a batch
+  dimension of one until the key count passes a window.
 - **No 256k run.** The cache is sized for it and the attention's bounds are derived
   from a position rather than from a mask, so nothing in the path is per-context — but
   nothing has executed at that length, and at 262144 a global layer's decode step reads
@@ -543,8 +687,8 @@ golden holds and how it was captured.
 
 ## Evidence and related notes
 
-- `src/models/mimo_v2/` — the host reference and the four pieces of the device path:
-  the bank, the routed experts, the attention, and the model.
+- `src/models/mimo_v2/` — the host reference and the five pieces of the device path:
+  the bank, the routed experts, the attention, the model, and the deal over the ranks.
 - `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
   which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
@@ -552,8 +696,13 @@ golden holds and how it was captured.
 - `tests/test_models_mimo_v2_loader.py`, `tests/test_models_mimo_v2_real_weights.py`
   — the checkpoint's layout and the host bridge, on the release.
 - `src/models/mimo_v2/bank.py`, `src/models/mimo_v2/device_experts.py`,
-  `src/models/mimo_v2/device_attention.py`, `src/models/mimo_v2/device_model.py` —
-  the device path, and the measurements in this page.
-- `tests/bench_mimo_v2_attention.py`, `tests/bench_mimo_v2_model.py` — where the
-  attention table and the token table come from.
+  `src/models/mimo_v2/device_attention.py`, `src/models/mimo_v2/device_model.py`,
+  `src/models/mimo_v2/ep.py` — the device path, and the measurements in this page.
+  `ep.py` carries the two deals and the arithmetic that picks one; it is the only file
+  in the tree whose *default* was set by a four-rank measurement.
+- `tests/bench_mimo_v2_attention.py`, `tests/bench_mimo_v2_model.py`,
+  `tests/bench_mimo_v2_ep.py` — where the attention table, the one-rank token table
+  and the four-rank table come from.
+- `src/models/deepseek_v4_1/tp.py` — the same collectives and the same
+  injected-closure shape for the other heterogeneous path in this tree.
 - The support matrix in [models/README.md](README.md).
