@@ -152,7 +152,7 @@ nav:
       - DeepSeek-V4.1-Flash MoE reduction: performance/deepseek_v4_1_flash_moe_reduce_csr.md
       - DeepSeek-V4.1-Flash single-request capability: performance/deepseek_v4_1_flash_single_request_capability.md
       - DeepSeek-V4.1-Flash behind the server: performance/deepseek_v4_1_flash_served_gate.md
-      - DeepSeek-V4.1-Flash dense stack in fp16: performance/v41_dense_gemm_dtype.md
+      - DeepSeek-V4.1-Flash dense stack in fp16, withdrawn: performance/v41_dense_gemm_dtype.md
       - Serving latency baseline: performance/serving_latency_baseline.md
       - Serving latency with IPC all-reduce: performance/serving_latency_optimized.md
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md

@@ -1,4 +1,18 @@
-# DeepSeek-V4.1-Flash: the dense stack in fp16, and why sm_75 forces it
+# DeepSeek-V4.1-Flash: the dense stack in fp16, measured and withdrawn
+
+> **The width is not shipped.** `LINEAR_DTYPE` and `CACHE_DTYPE` are **bf16** in this tree. fp16 is a
+> real 4.34× lever on the dense calls of a 4096-token chunk, and everything below measures it, but
+> the width cannot hold what this model's own prompts carry: on the prompt the chat renderer builds,
+> `[0, 128803, 671, 6102, 294, 8760, 344, 128804, 128822]`, the Hyper-Connections residual stream
+> reaches **2.04e+06** at bf16 and the input to a layer's norm **4.57e+05** — 31× and 7× fp16's
+> largest finite, 65504. Narrowed to fp16 that forward has **415 non-finite sites of 956**, all-NaN
+> logits and eight begin-of-sentence tokens where bf16 answers `The capital of France is
+> **Paris**.` The section that missed it is **Headroom** below, and the mistake was the chunk it
+> metered rather than the arithmetic: the probe tokenizes *prose*, which behaves like this prompt
+> with its leading BOS removed — the same sequence without that token stays under 200 at every site
+> at both widths. Evidence: `/tmp/probe_v41_nan_site.py` (the site trace) and
+> `/tmp/cherry_bos_bf16.sh` (the same two prompts on both widths), with `LINEAR_DTYPE` back at bf16
+> by `fix/v41-dense-stack-carrier`.
 
 [The remaining-bottlenecks page](deepseek_v4_1_flash_remaining_bottlenecks.md) left the tree's dense
 arithmetic where it started: every projection, the embedding, the router and the shared expert at
@@ -7,7 +21,8 @@ this card that is the expensive choice rather than the safe one. **sm_75 has no 
 so cuBLAS does not answer a bf16 GEMM with a tensor-core kernel at all — it falls through to the fp32
 SIMT path — and fp16 at the identical shapes runs 6.3–9.2× faster. Setting `LINEAR_DTYPE` and
 `CACHE_DTYPE` to `torch.float16` is worth **1.92 s a rank on a 4096-token chunk over the 716 dense
-calls that chunk makes, 4.34×**, and it moves nothing else: the same tree at bf16 (the patch with the
+calls that chunk makes, 4.34×** — on a chunk of prose, which is the scope the measurement has and the
+reason it was withdrawn — and it moves nothing else: the same tree at bf16 (the patch with the
 two constants flipped back) produces **bit-identical logits**, `max |diff| = 0.000e+00` on eight
 position/rank pairs, while on a real prompt the fp16 arm keeps the argmax on the same token at every
 position measured and the top-8 losing at most one member — a claim this page scopes to the prefill
@@ -66,6 +81,49 @@ fp16 trades exponent range for mantissa width — 65504 is the largest finite fp
   those is **100** — 0.153 % of fp16's largest finite;
 - the sites with the widest inputs are the ones that stay fp32 anyway: the Hyper Connections mixing
   projection at 266 and its own residual stream, and the router at 14.4.
+
+**This is the section that was wrong, and the fault is the chunk rather than the arithmetic.**
+`probe_v41_chunk_scaling.prose(...)` tokenizes prose with `add_special_tokens=False`, so the metered
+chunk is the *no-BOS* case, and every number above is a no-BOS number. The model's own serving path
+does not produce that case: `encode_messages` embeds a leading `<｜begin▁of▁sentence｜>` and tokenizes
+with `add_special_tokens=False`, so the first token of every chat prompt is id 0. On that prompt the
+same `x.abs().max()` measurement reads **2.04e+06** — the largest tensor in the forward is the Hyper
+Connections mixing projection's own fp32 `F.linear (24, 20480)` output at site 879 of 956 — with
+**4.57e+05** arriving at layer 30's `attn_norm`, both past 65504 by the time the stack is
+three-quarters done. The same sequence with the leading BOS removed reads **200** and **63** at its
+two widest sites, which is the number the table above is really reporting: one token of a nine-token
+prompt moves this arithmetic by four orders of magnitude, and it is the token every chat prompt
+starts with.
+
+The failure is a trace rather than an inference. At fp16, site by site
+(`/tmp/probe_v41_nan_site.py`, 956 sites in execution order, run on both widths):
+
+```
+  536 bare F.linear (576, 5120)     fp16  in 24.39    out 3.289       finite
+  538 bare F.linear (5120, 576)     fp16  in 14.77    out 3.338       finite
+  539 layers.21.ffn.shared_experts  fp16  in 24.39    out 3.338       finite
+  540 layers.21.ffn                 fp16  in 24.39    out 1.356e+04   finite
+  541 bare F.linear (24, 20480)     fp32  in inf      out nan         <-- first non-finite
+  542 layers.22.attn_norm           fp16  in inf      out nan
+```
+
+The last site holding a value over the ceiling is the Hyper Connections mixing projection's output at
+**7.152e+04**, which reads a stream of **5.309e+04**; the site after it is the *same* projection one
+layer down, whose input is already `inf`. Nothing writes that stream between them except layer 21's
+own `hc_post`, so the overflow is the expansion's sum: `post * x` with the FFN's 1.356e+04 plus the
+mixed residual whose copies stand at 5.3e+04, all fp32 in the arithmetic and narrowed to fp16 by the
+return. Everything downstream of 541 is a consequence — 415 of the 956 sites are non-finite, 1 of
+them carries an `inf` (the site that received it) and the other 414 carry the NaNs an `inf` produces
+— and `argmax` over all-NaN logits returns 0 eight times, which the serving adapter faithfully
+reports as eight special tokens.
+
+At bf16 the same instrument reads **every one of the 956 sites finite, 0 carrying inf**, the mixing
+projection peaking at **2.038e+06** and the final norm reading 3.297e+05: the values are the model's
+own, and bf16's 3.4e38 holds them. So the defect is the carrier and not a runaway, and the fix is the
+two constants back to bf16 — the width of the *weights* is what buys the 4.34×, but the width of the
+*activations* is what has to hold the stream, and at these geometries the weights are fp8 formed in
+fp32 either way. `tests/test_models_deepseek_v4_1_modules.py` pins the invariant at the measured
+magnitude (2.038e+06 through `hc_post`, 4.567e+05 through `hc_pre`), and it fails at fp16.
 
 ## The lever, per site
 
