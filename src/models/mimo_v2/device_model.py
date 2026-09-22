@@ -11,8 +11,8 @@ What it is not is fast, and the first measurement says why. A decode step draws 
 experts a layer out of the bank, which is 102 MiB of host-to-device traffic a layer and
 **4.68 GiB a token**; at the 10.4 GiB/s the pinned link sustains that is 450 ms of a
 610 ms token, and the attention, at 64 ms, is nowhere in it. That is a property of
-running every expert of every layer on one rank, and it is what the expert-parallel
-stage is for.
+running every expert of every layer on one rank, and dealing the experts out is what the
+`ep` argument is for: on four ranks a token is 275 ms and the copy is a fifth of it.
 
 Three details of the assembly are the model's and are easy to get wrong:
 
@@ -24,6 +24,15 @@ Three details of the assembly are the model's and are easy to get wrong:
   position and nothing else -- there is no mask tensor to build at 256k.
 * A layer's residual is added in the hidden dtype on both sides. The routed sum leaves
   the kernel in float32 and is rounded once, where the reference rounds it once.
+
+**Across ranks, the experts are dealt and everything else is replicated.** `ep.py` holds
+the deal; this file holds the one place the deal becomes an answer, which is `mlp` summing
+this rank's share of the routed experts before the residual. The attention, the router,
+the embedding, the head and the dense layer are the same on every rank -- so a four-rank
+run does four times the attention work to divide the copy by four, and the copy is the
+larger half. That is a stage's boundary and not a design: the dense stack is what the
+tensor-parallel stage is for, and until it lands the honest description of a four-rank
+decode is *the expert traffic, divided*.
 
 A decode step is the only step this file can run. The expert kernel is the single-token
 one, so a chunk of tokens has to go through the grouped-prefill kernel, which is not
@@ -42,6 +51,7 @@ import torch.nn.functional as F
 from src.models.mimo_v2.config import MimoV2TextConfig
 from src.models.mimo_v2.device_attention import MimoV2DeviceAttention, MimoV2KVCache
 from src.models.mimo_v2.device_experts import MimoV2DeviceExperts, MimoV2ExpertSource
+from src.models.mimo_v2.ep import EpGroup
 from src.models.mimo_v2.layers import gate_and_route, rms_norm, swiglu_mlp
 
 __all__ = [
@@ -59,6 +69,11 @@ class MimoV2DeviceLayer:
     forty-seven of them at 102 MiB would be 4.8 GiB of a 22 GiB card for state that is
     read once a layer a token -- which is why `experts` is handed in rather than built
     here.
+
+    `ep` is how the draw's experts are shared out over the ranks. `None` is one rank
+    holding the whole draw; a group of more than one makes the kernel's output a summand,
+    and the sum happens here because this is where the reference's arithmetic is: the
+    routed sum is completed in fp32 and rounded once, on the way into the residual.
     """
 
     def __init__(
@@ -69,6 +84,7 @@ class MimoV2DeviceLayer:
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         experts: MimoV2DeviceExperts | None = None,
+        ep: EpGroup | None = None,
         block: int = 1024,
         budget: int = 1 << 25,
     ) -> None:
@@ -77,6 +93,7 @@ class MimoV2DeviceLayer:
         self.layer_idx = int(layer_idx)
         self.device = torch.device(device)
         self.dtype = dtype
+        self.ep = ep
         self.shape = self.config.attention(self.layer_idx)
         self.kind = self.config.ffn_kind(self.layer_idx)
 
@@ -162,6 +179,11 @@ class MimoV2DeviceLayer:
             )
         indices, weights = self.route(hidden)
         out = self.experts.forward(hidden, indices[0], weights[0], layer_id=self.layer_idx)
+        # The world's sum, from this rank's share: the kernel's output is a partial as soon as
+        # the draw is dealt out, and the reference's own rounding point is here -- once, in
+        # float32, before the residual. `EpGroup` refuses to exist without a way to sum.
+        if self.ep is not None and self.ep.partial:
+            out = self.ep.reduce(out)
         return out.to(hidden.dtype)
 
     def forward(
@@ -196,6 +218,11 @@ class MimoV2DeviceModel:
     through PyTorch's own pinned ring instead of reading its pages in place. `pin=False`
     says not to, which is what a test that builds many models over one 149.81 GiB mapping
     wants; the result is kept on `pin_result` so a caller can report what the driver said.
+
+    `ep` deals the routed experts over the ranks. `deal` is which shape of deal that is and
+    defaults to the environment's, `ep.py`'s `POCKETLLM_MIMO_EXPERT_DEAL`; it is a parameter
+    as well as a variable so a test can hold still what a process-wide variable would make
+    depend on the order tests ran in.
     """
 
     def __init__(
@@ -206,6 +233,8 @@ class MimoV2DeviceModel:
         dtype: torch.dtype = torch.bfloat16,
         layers: Sequence[int] | None = None,
         expert_source: MimoV2ExpertSource | None = None,
+        ep: EpGroup | None = None,
+        deal: str | None = None,
         slots: int = 2,
         block: int = 1024,
         budget: int = 1 << 25,
@@ -215,6 +244,7 @@ class MimoV2DeviceModel:
         self.config: MimoV2TextConfig = checkpoint.layer
         self.device = torch.device(device)
         self.dtype = dtype
+        self.ep = ep
         self.layers_in_model = list(range(self.config.num_hidden_layers))
         wanted = self.layers_in_model if layers is None else [int(i) for i in layers]
 
@@ -258,6 +288,9 @@ class MimoV2DeviceModel:
                 inter_dim=self.config.resolved_moe_intermediate_size,
                 device=self.device,
                 slots=slots,
+                world=1 if ep is None else ep.world,
+                rank=0 if ep is None else ep.rank,
+                deal=deal,
             )
         self.layers = [
             MimoV2DeviceLayer(
@@ -266,6 +299,7 @@ class MimoV2DeviceModel:
                 device=self.device,
                 dtype=dtype,
                 experts=self.experts,
+                ep=ep,
                 block=block,
                 budget=budget,
             )

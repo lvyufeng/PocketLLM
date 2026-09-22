@@ -40,6 +40,19 @@ per-slot event records and what `_take_slots` waits on. Without that wait the ne
 layer's copies could start writing a row a kernel launched two calls ago is still
 reading, and the two are on the copy stream and the compute stream respectively, so
 the wait on the compute stream inside the staging pass is what covers it.
+
+One rank's share, and not the world's
+-------------------------------------
+
+When the experts are dealt out over several ranks this module computes **this rank's share of the
+draw and nothing else**, which is a partial sum and not the layer's output. The deal and the
+collective are `ep.py`'s; what belongs here is only the selection -- which of the draw's `top_k`
+positions this rank stages, stages being the one second of the step that costs the link.
+
+That split is deliberate. A module that returned the summed answer would have to own a process
+group, and a caller that handed it the wrong group would get a plausible tensor with a quarter of
+the arithmetic in it. A module that returns a summand cannot: the sum is the model's, and it is
+taken in fp32 before the residual is rounded, once, where the reference rounds it once.
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ from typing import Protocol, Sequence
 import torch
 
 from src.kernels.cuda_loader import load_cuda_kernel
+from src.models.mimo_v2.ep import deal_rule, owned_positions, rows_per_card
 
 __all__ = [
     "MimoV2DeviceExperts",
@@ -111,6 +125,11 @@ class MimoV2DeviceExperts:
     `slots` is what makes the copies overlap the kernels. Two slots is the smallest number
     that lets a layer's staging start while the previous layer's kernel is still running,
     and it is what bounds how far the host may run ahead of the card.
+
+    `world` and `rank` are the deal: which of the draw's experts this instance stages and
+    computes. The width of the arena follows from the deal rather than from `top_k` -- a
+    `sorted` deal over four ranks can only ever be handed two of a top-8 draw, and the
+    rows that saves are rows of expert bytes. See `ep.py` for what the two deals cost.
     """
 
     def __init__(
@@ -124,6 +143,9 @@ class MimoV2DeviceExperts:
         inter_dim: int,
         slots: int = 2,
         arena_rows: int | None = None,
+        world: int = 1,
+        rank: int = 0,
+        deal: str | None = None,
     ) -> None:
         self.source = source
         self.layer_id = None if layer_id is None else int(layer_id)
@@ -132,14 +154,23 @@ class MimoV2DeviceExperts:
         self.dim = int(dim)
         self.inter_dim = int(inter_dim)
         self.slots = max(1, int(slots))
+        self.world = int(world)
+        self.rank = int(rank)
+        if self.world < 1:
+            raise ValueError(f"world must be at least 1, got {self.world}")
+        if not 0 <= self.rank < self.world:
+            raise ValueError(f"rank {self.rank} is not a rank of a world of {self.world}")
+        self.deal = deal_rule() if deal is None else str(deal)
         # A decode call draws exactly `top_k` experts, so that is the arena width unless a
         # caller asks for more -- which is what a grouped prefill will do, and what makes
-        # this a parameter rather than a constant.
-        self.arena_rows = int(arena_rows or self.top_k)
-        if self.arena_rows < self.top_k:
+        # this a parameter rather than a constant. A deal that bounds what one rank can be
+        # dealt narrows it further, and that is the width that gets allocated.
+        required = rows_per_card(self.deal, self.top_k, self.world)
+        self.arena_rows = required if arena_rows is None else int(arena_rows)
+        if self.arena_rows < required:
             raise ValueError(
-                f"an arena of {self.arena_rows} rows cannot hold the {self.top_k} experts one "
-                f"token draws"
+                f"an arena of {self.arena_rows} rows cannot hold the {required} experts a "
+                f"`{self.deal}` deal can hand rank {self.rank} of {self.world}"
             )
         if self.dim % 32 or self.inter_dim % 32:
             raise ValueError(
@@ -248,18 +279,25 @@ class MimoV2DeviceExperts:
         *,
         layer_id: int | None = None,
     ) -> torch.Tensor:
-        """One token's routed-expert output, `[1, dim]`, in float32.
+        """This rank's share of one token's routed output, `[1, dim]`, in float32.
 
         `indices` is `[top_k]` int64 of global expert ids and `weights` is `[top_k]` float32,
-        both as `gate_and_route` leaves them. The kernel is handed `arange(top_k)` instead of
-        the ids, because the arena holds the drawn experts in draw order and the id has
-        already been spent -- the row that holds expert 137 is whatever row the draw gave it.
-        That is also why the weights can be passed through unchanged: they follow the same
-        order, which is the draw order and not the id order.
+        both as `gate_and_route` leaves them. The kernel is handed `arange(rows)` instead of
+        the ids, because the arena holds the staged experts in the order they were staged
+        and the id has already been spent -- the row that holds expert 137 is whatever row
+        the draw gave it. That is also why the weights can be passed through unchanged: they
+        follow the same order, which is the draw order and not the id order.
 
         `layer_id` names whose experts to draw, and defaults to the one the module was built
         with. A whole-model caller leaves it unset at construction and passes it here, which
         is what lets forty-seven layers share one arena.
+
+        **A partial when the world is more than one.** The kernel sums a weighted set of
+        rows, so a rank that staged some of a draw's experts holds the part of the sum that
+        those experts contribute, and the layer's answer is the sum over ranks. Rank's whose
+        deal gave it nothing returns zeros -- correctly, and it is not a corner: under the
+        `id` deal a rank of four owns nothing in 10% of top-8 draws, and the collective is
+        unconditional, so the zero has to be a value and not a skipped call.
 
         One token, and deliberately: the kernel is the single-token one, whose arithmetic is
         a per-row int8 activation quantisation. A batch goes through
@@ -280,21 +318,33 @@ class MimoV2DeviceExperts:
             raise ValueError(
                 f"{indices.numel()} indices and {weights.numel()} weights is not a routing"
             )
-        if indices.numel() > self.arena_rows:
+        if indices.numel() > self.top_k:
             raise ValueError(
-                f"a draw of {indices.numel()} experts does not fit an arena of {self.arena_rows}"
+                f"a draw of {indices.numel()} experts is wider than the {self.top_k} this "
+                f"module was built for"
             )
 
-        slot = self._take_slots(indices.numel())
-        self._stage(slot, layer, indices.tolist())
+        drawn = indices.tolist()
+        mine = owned_positions(drawn, rank=self.rank, world=self.world, deal=self.deal)
+        if len(mine) > self.arena_rows:
+            raise ValueError(
+                f"the deal handed this rank {len(mine)} of the draw's {len(drawn)} experts and "
+                f"the arena holds {self.arena_rows}"
+            )
+        if not mine:
+            return torch.zeros((1, self.dim), dtype=torch.float32, device=self.device)
+
+        slot = self._take_slots(len(mine))
+        self._stage(slot, layer, [drawn[position] for position in mine])
         arena = self._arenas[slot]
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(self._copy_events[slot])
-        rows = torch.arange(indices.numel(), dtype=torch.int64, device=self.device)
+        rows = torch.arange(len(mine), dtype=torch.int64, device=self.device)
+        picked = torch.tensor(mine, dtype=torch.int64, device=weights.device)
         out = self._kernel.moe_single_token_fp4_forward(
             hidden.to(self.device),
             rows,
-            weights.to(self.device, dtype=torch.float32),
+            weights.index_select(0, picked).to(self.device, dtype=torch.float32),
             arena[("gate_proj", "weight")],
             arena[("gate_proj", "weight_scale")],
             arena[("down_proj", "weight")],
