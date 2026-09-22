@@ -136,6 +136,34 @@ def _error_status(exc: BaseException) -> tuple[int, str]:
     return 500, "server_error"
 
 
+def _publish_backend_metrics(server: "PocketLLMHTTPServer") -> None:
+    """Fold the backend's own metric values into the exporter, before rendering.
+
+    Some numbers belong to the engine rather than to the request path -- a prompt cache's occupancy,
+    its hit count -- and the HTTP layer never sees them: a request reports what it *used*, not what
+    the engine is holding. ``BackendBase.metrics`` is the channel, and it hands over absolute values
+    from the engine's own running totals, so they are set rather than added.
+
+    The type comes from the name: ``_total`` is Prometheus's suffix for a counter and everything else
+    is a gauge. That convention is the whole dispatch, and it is why the engine spells its counters
+    with the suffix.
+    """
+    collector = getattr(server.backend, "metrics", None)
+    if collector is None:
+        return
+    try:
+        values = collector()
+    except Exception:
+        # A metrics scrape must not fail a request path or a scrape itself: an engine that cannot
+        # report is an engine whose series are absent, which a scraper reads as no data.
+        return
+    for name, value in (values or {}).items():
+        if str(name).endswith("_total"):
+            server.metrics.set_counter(str(name), float(value))
+        else:
+            server.metrics.set(str(name), float(value))
+
+
 class PocketLLMHTTPServer(ThreadingHTTPServer):
     def __init__(self, address, handler_class, backend: EngineBackend, model: str, metrics: Metrics | None = None):
         super().__init__(address, handler_class)
@@ -196,6 +224,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self._send_json(200 if health.ready else 503, health.as_dict())
             return
         if path == "/metrics":
+            _publish_backend_metrics(server)
             data = server.metrics.render().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")

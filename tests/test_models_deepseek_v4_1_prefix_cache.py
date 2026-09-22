@@ -11,8 +11,9 @@ tokens safe to answer from the first request's leftovers.
 The arms below are cut at every split point of a twelve-token prompt rather than at a few, because
 the anchoring rules have no privileged length: an odd cut lands inside a compressor group, a cut at
 the window lands on the ring's own boundary, and `N_TOKENS - 1` leaves a one-token tail, which is not
-a continuation at all but the decode path -- the case an exact repeat of a prompt degenerates to, and
-the one `lookup`'s clamp to `len(ids) - 1` exists to produce.
+a continuation at all but the decode path -- the case a request one token longer than a stored prefix
+degenerates to. What the store does with a request that is *exactly* a stored prefix is the other
+thing this file has to say, and it is not a forward: see `Entry.logits`.
 
 The store's own rules are tested apart from the model, on a payload that is a few tensors: which
 anchor wins, what a miss falls back to, what the budget evicts, and what a sliced snapshot carries.
@@ -114,14 +115,13 @@ def test_every_split_point_resumes_to_the_same_state(cut: int) -> None:
 
 
 def test_a_one_token_tail_is_the_decode_path_and_not_the_continuation_one() -> None:
-    """An exact repeat of a prompt forwards one token, and it is not a chunk of one.
+    """A request one token longer than a stored prefix forwards exactly one token, on the decode path.
 
-    `lookup` clamps a matched length to `len(ids) - 1`, because a forward is always needed for the
-    logits the first new token comes from; for a prompt the store already holds exactly, that is a
-    single query at a position past zero, which `_is_continuation` sends to the *decode* bodies. The
-    chunked-prefill file pins that a one-token forward at a position past zero is the decode path and
-    equals the one-shot's last row; this says the same row comes out of a restored prefix, which is
-    the shape a repeated prompt actually takes in the served path.
+    The one-token tail is not a chunk of one: it is a single query at a position past zero, which
+    `_is_continuation` sends to the *decode* bodies. The chunked-prefill file pins that a one-token
+    forward at a position past zero is the decode path and equals the one-shot's last row; this says
+    the same row comes out of a restored prefix, which is the shape the chat loop's next turn actually
+    takes -- the prompt is the stored prefix plus one more token.
     """
     _, cfg = _build()
     x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
@@ -143,6 +143,101 @@ def test_a_snapshot_at_the_head_anchor_is_a_chunk_boundary_like_any_other() -> N
     the arm here is a cut at exactly one chunk, which is the shape the anchor forces.
     """
     _resumed_against_one_shot(N_TOKENS // 2, chunk=N_TOKENS // 2)
+
+
+def test_a_chunk_ending_at_the_head_anchor_carries_the_row_that_position_holds() -> None:
+    """Why a head anchor's entry can hold the row its own length samples from, and not just caches.
+
+    The head snapshot is taken right after a forward *of* `ids[:p_head]` -- one chunk ending there,
+    which is what the anchor is -- and attention is causal, so the row that forward ends on is the row
+    the whole prompt still carries at `p_head - 1`. That is the row a request of exactly `p_head`
+    tokens ends on and draws its first new token from, which is what lets such a request be a lookup
+    and a sample rather than a forward that recomputes a row the anchor had already produced. See
+    `Entry.logits`; the arm here is that row against a one-shot prefill of the *whole* prompt, so what
+    it would catch is the anchor's row coming from a forward that saw more than its own prefix.
+    """
+    _, cfg = _build()
+    p_head = N_TOKENS // 2
+    x = torch.randn(1, N_TOKENS, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
+
+    whole, _ = _build()
+    reference = _run(whole, x, N_TOKENS)
+
+    head, _ = _build()
+    head.reset_state(1)
+    row = head(x[:, :p_head], 0)[:, -1]
+
+    assert torch.equal(row, reference[:, p_head - 1]), (
+        "the head chunk's last row is not the row the prompt carries at that position"
+    )
+
+
+def test_a_snapshot_exactly_the_prompt_cannot_be_resumed_with_a_forward() -> None:
+    """Why an anchor the prompt's own length carries the distribution and not just the caches.
+
+    The obvious rule for an exact repeat is to restore the state the prompt left and forward its last
+    token again at its own position, and the reason it is wrong is worth a test rather than a
+    comment: for the ring and for the Engram hash cache it is idempotent -- both are pure functions of
+    the position -- but the compressor is a *recurrence*. The row a group leaves behind is built from
+    every position in it, so a replay at a position that *closes* its group emits that row from one
+    token where the row belongs to `ratio` of them; and a replay in the *middle* of a group adds a
+    position the restored state has already counted. Either way the row a later query reads is wrong,
+    which is a divergence no correct answer can be tolerant of.
+
+    The two arms below are the controlled pair. From the same restored snapshot, the continuation a
+    correct resume runs -- the next token at its own position -- is exact, and the replay is not, so
+    what differs is the replay and not the restore. (`test_every_split_point_resumes_to_the_same_state`
+    pins the continuation arm at every cut, and `test_a_one_token_tail_is_the_decode_path_and_not_the
+    _continuation_one` pins that the one forward the replay *is* has the same arithmetic as the prefill
+    query it is compared against.) The damage is one compressor row, and the buffer set says so: layer
+    2 closes a ratio-2 group at the last prompt token, so `layers.2.compress_kv_cache` and the
+    `k_cache` cut from its latent carry the wrong row; every layer's attention at that position read
+    it, so each ring keeps a different row for it; and the difference in layer 2's output is what
+    layers 4 and 5 see as input, which is why their own compressed row for the position differs too.
+
+    The test asserts the divergence, so it fails if the compressor ever becomes position-addressed and
+    the cheap rule becomes sound. What the store does instead is keep the last row of logits beside
+    the snapshot -- see `Entry.logits` -- which makes an exact repeat cost no forward at all.
+    """
+    _, cfg = _build()
+    total = N_TOKENS + 1
+    x = torch.randn(1, total, cfg.dim, dtype=attention_module.LINEAR_DTYPE)
+
+    whole, _ = _build()
+    reference = _run(whole, x, total)
+
+    stack, _ = _build()
+    stack.reset_state(1)
+    for c0 in range(0, N_TOKENS, 5):
+        stack(x[:, c0 : min(c0 + 5, N_TOKENS)], c0)
+    saved = snapshot_rows(stack, N_TOKENS, MAX_SEQ_LEN)
+
+    def restored() -> None:
+        stack.reset_state(1)
+        restore_rows(stack, saved)
+
+    restored()
+    resumed = stack(x[:, N_TOKENS:], N_TOKENS)
+    assert torch.equal(resumed[:, -1], reference[:, N_TOKENS]), (
+        "the continuation is not exact, so the arm below would be measuring the restore"
+    )
+
+    restored()
+    replayed = stack(x[:, N_TOKENS - 1 : N_TOKENS], N_TOKENS - 1)
+    assert not torch.equal(replayed[:, -1], reference[:, N_TOKENS - 1])
+    ours, theirs = _states(stack, N_TOKENS), _states(whole, N_TOKENS)
+    assert {name for name in ours if not torch.equal(ours[name], theirs[name])} == {
+        "layers.0.window_kv_cache",
+        "layers.1.window_kv_cache",
+        "layers.2.window_kv_cache",
+        "layers.3.window_kv_cache",
+        "layers.4.window_kv_cache",
+        "layers.5.window_kv_cache",
+        "layers.2.compress_kv_cache",
+        "layers.2.indexer.k_cache",
+        "layers.4.compress_kv_cache",
+        "layers.4.indexer.k_cache",
+    }
 
 
 def test_a_row_limited_snapshot_holds_the_rows_a_prefix_has_written() -> None:
@@ -199,32 +294,48 @@ def test_a_whole_snapshot_is_the_buffers_themselves() -> None:
 PROMPT = list(range(200))
 
 
+# What every entry costs on top of its caches: the distribution at its own last position, which the
+# store keeps so that a request whose prompt *is* the entry forwards nothing. Four floats here and
+# 129280 on the real head, and the store counts them in its budget either way, so the payload sizes
+# below are not on their own the length of an entry.
+LOGITS = torch.arange(16, dtype=torch.float32)
+LOGITS_BYTES = LOGITS.numel() * LOGITS.element_size()
+
+
 def _payload(nbytes: int) -> dict[str, torch.Tensor]:
     """A stand-in for a snapshot: the store counts bytes and never looks inside."""
     return {"fill": torch.zeros(max(nbytes // 4, 1), dtype=torch.float32)}
 
 
-def _cache(budget: int = 1 << 20, min_tokens: int = BLOCK_TOKENS) -> PrefixCache:
-    return PrefixCache(budget_bytes=budget, max_seq_len=1024, min_tokens=min_tokens)
+def _cache(budget: int = 1 << 20, min_tokens: int = BLOCK_TOKENS, head: int = 0) -> PrefixCache:
+    return PrefixCache(
+        budget_bytes=budget, max_seq_len=1024, min_tokens=min_tokens, head_tokens=head
+    )
 
 
-def test_an_exact_repeat_is_clamped_by_one_token() -> None:
-    """The store holds the prompt's own length, and the request forwards one token anyway."""
+def test_an_exact_repeat_hands_back_the_entry_and_its_own_last_row() -> None:
+    """The store holds the prompt's own length, and the request forwards nothing for it.
+
+    `lookup` deliberately does not clamp the match to `len(ids) - 1`: the row the first new token
+    comes from was computed when the anchor was taken and rides with the entry, so an exact repeat is
+    a restore and a sample. The one-token forward that clamp used to produce is unsound -- see
+    `test_a_snapshot_exactly_the_prompt_cannot_be_resumed_with_a_forward`.
+    """
     ids = PROMPT[:130]
     cache = _cache()
-    cache.store(ids, 130, _payload(64))
+    entry = cache.store(ids, 130, _payload(64), LOGITS)
     hit = cache.lookup(ids)
     assert hit is not None
-    length, entry = hit
-    assert entry.length == 130
-    assert length == 129
+    length, found = hit
+    assert length == 130 and found is entry
+    assert torch.equal(found.logits, LOGITS)
     assert cache.stats()["reused_tokens"] == 130
 
 
 def test_a_longer_prompt_hits_the_anchor_whole() -> None:
     """The conversational case: the next turn is the previous prompt plus an answer plus a question."""
     cache = _cache()
-    cache.store(PROMPT, 130, _payload(64))
+    cache.store(PROMPT, 130, _payload(64), LOGITS)
     hit = cache.lookup(PROMPT + [1, 2, 3])
     assert hit is not None and hit[0] == 130
 
@@ -235,8 +346,8 @@ def test_the_head_anchor_and_the_end_anchor_serve_different_tails() -> None:
     first = header + list(range(1000, 1100))
     second = header + list(range(2000, 2100))
     cache = _cache()
-    cache.store(first, BLOCK_TOKENS, _payload(64))
-    cache.store(first, 164, _payload(64))
+    cache.store(first, BLOCK_TOKENS, _payload(64), LOGITS)
+    cache.store(first, 164, _payload(64), LOGITS)
 
     assert cache.lookup(first + [7])[0] == 164
     assert cache.lookup(second + [7])[0] == BLOCK_TOKENS
@@ -245,8 +356,8 @@ def test_the_head_anchor_and_the_end_anchor_serve_different_tails() -> None:
 def test_the_longest_anchor_wins_and_a_miss_falls_back() -> None:
     """A length whose key does not match is skipped and the walk continues below it."""
     cache = _cache()
-    cache.store(PROMPT, 66, _payload(64))
-    cache.store(PROMPT, 130, _payload(64))
+    cache.store(PROMPT, 66, _payload(64), LOGITS)
+    cache.store(PROMPT, 130, _payload(64), LOGITS)
     assert cache.lookup(PROMPT)[0] == 130
 
     diverged = list(range(129)) + [999]
@@ -256,7 +367,7 @@ def test_the_longest_anchor_wins_and_a_miss_falls_back() -> None:
 def test_a_length_that_did_not_hash_alike_is_a_miss() -> None:
     """Same length, different tokens: the key is the tokens, so this is not a hit."""
     cache = _cache()
-    cache.store(PROMPT, 130, _payload(64))
+    cache.store(PROMPT, 130, _payload(64), LOGITS)
     assert cache.lookup(list(range(129)) + [999] + [5]) is None
     assert cache.stats()["misses"] == 1
 
@@ -265,7 +376,7 @@ def test_a_length_that_is_not_on_a_block_boundary_is_keyed_all_the_same() -> Non
     """The chain answers every multiple of the block from its own list, and a tail with one hash."""
     cache = _cache()
     for length in (64, 66, 128, 130):
-        assert cache.store(PROMPT, length, _payload(64)) is not None
+        assert cache.store(PROMPT, length, _payload(64), LOGITS) is not None
     assert cache.lengths() == [130, 128, 66, 64]
     assert cache.lookup(PROMPT)[0] == 130
 
@@ -273,43 +384,48 @@ def test_a_length_that_is_not_on_a_block_boundary_is_keyed_all_the_same() -> Non
 def test_a_length_below_the_floor_or_past_the_prompt_is_not_taken() -> None:
     """A refused store is not an error -- the next request just pays for the prompt again."""
     cache = _cache(min_tokens=64)
-    assert cache.store(PROMPT, 63, _payload(64)) is None
-    assert cache.store(PROMPT[:10], 11, _payload(64)) is None
-    assert cache.store(PROMPT, 1025, _payload(64)) is None
+    assert cache.store(PROMPT, 63, _payload(64), LOGITS) is None
+    assert cache.store(PROMPT[:10], 11, _payload(64), LOGITS) is None
+    assert cache.store(PROMPT, 1025, _payload(64), LOGITS) is None
     assert len(cache) == 0
 
 
 def test_an_entry_that_does_not_fit_the_budget_on_its_own_is_not_taken() -> None:
     """A budget the store cannot honour for this entry is a budget it does not overshoot."""
     cache = _cache(budget=100)
-    assert cache.store(PROMPT, 64, _payload(128)) is None
+    assert cache.store(PROMPT, 64, _payload(128), LOGITS) is None
     assert len(cache) == 0 and cache.bytes == 0
 
 
 def test_eviction_takes_the_least_recently_used_and_holds_the_budget() -> None:
-    """Four 64-byte anchors into a 200-byte budget: the one touched last survives."""
-    cache = _cache(budget=200, min_tokens=1)
-    for length in (32, 64, 96):
-        cache.store(PROMPT, length, _payload(64))
-    assert cache.lookup(PROMPT)[0] == 96  # touches the newest, which is then the most recent
-    cache.store(PROMPT, 128, _payload(64))
+    """Four anchors into a budget that holds three: the one touched last survives.
 
-    assert cache.bytes == 192
+    Each entry is its 64-byte payload plus the logits row, so three of them are 288 bytes and the
+    fourth does not fit. The lookup before the last store is what makes the difference: it is what
+    keeps 96 off the front of the eviction queue.
+    """
+    cache = _cache(budget=3 * (64 + LOGITS_BYTES), min_tokens=1)
+    for length in (32, 64, 96):
+        cache.store(PROMPT, length, _payload(64), LOGITS)
+    assert cache.lookup(PROMPT)[0] == 96  # touches the newest, which is then the most recent
+    cache.store(PROMPT, 128, _payload(64), LOGITS)
+
+    assert cache.bytes == 3 * (64 + LOGITS_BYTES)
     assert cache.lengths() == [128, 96, 64]
 
 
 def test_a_second_store_of_the_same_prefix_replaces_rather_than_grows() -> None:
     """A chat loop resends its history; the store holds one copy of it, not one per turn."""
     cache = _cache()
-    cache.store(PROMPT, 64, _payload(64))
-    second = cache.store(PROMPT, 64, _payload(64))
-    assert len(cache) == 1 and cache.bytes == 64
+    cache.store(PROMPT, 64, _payload(64), LOGITS)
+    second = cache.store(PROMPT, 64, _payload(64), LOGITS)
+    assert len(cache) == 1 and cache.bytes == 64 + LOGITS_BYTES
     assert cache.lookup(PROMPT)[1] is second
 
 
 def test_a_cleared_store_holds_nothing() -> None:
     cache = _cache()
-    cache.store(PROMPT, 64, _payload(64))
+    cache.store(PROMPT, 64, _payload(64), LOGITS)
     cache.clear()
     assert len(cache) == 0 and cache.bytes == 0 and cache.lookup(PROMPT) is None
 

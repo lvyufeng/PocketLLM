@@ -19,7 +19,10 @@ is everything the adapter itself decides:
   reaches a client;
 * that the loop's own decode figure travels with the result, and that when the loop unwinds on a
   stop string -- where no ``Generation`` comes back at all -- the wall minus the first token's wait
-  is what is left of it.
+  is what is left of it;
+* that the prompt store is this rank's and lasts the process, that the CLI switch is the one off
+  switch over it, that what the loop reused reaches ``usage.prompt_tokens_details``, and that its
+  counters are published under the request lock rather than walked from the scrape thread.
 
 The encoder is written into a temporary checkpoint directory as a real file, because that is what
 the adapter reads: the format belongs to the checkpoint, so the loader has to find
@@ -50,7 +53,12 @@ from pocketllm.api import (
     SamplingParams,
     UnsupportedFeatureError,
 )
-from pocketllm.backends.v41_backend import V41Backend, _identified, _split_running
+from pocketllm.backends.v41_backend import (
+    DEFAULT_PREFIX_CACHE_HEAD_TOKENS,
+    V41Backend,
+    _identified,
+    _split_running,
+)
 
 
 # ---------------------------------------------------------------------------- stand-ins
@@ -137,10 +145,17 @@ class ByteLevelTokenizer:
 
 
 class FakeBuffer:
-    """A named buffer: only ``device`` is read, so this is not a tensor."""
+    """A named buffer: ``device`` and a shape are all the adapter reads, so this is not a tensor."""
 
-    def __init__(self, device) -> None:
+    def __init__(self, device, shape=(1,)) -> None:
         self.device = device
+        self.shape = tuple(shape)
+
+    def numel(self) -> int:
+        total = 1
+        for size in self.shape:
+            total *= size
+        return total
 
 
 class FakeModel:
@@ -172,6 +187,7 @@ class ScriptedGenerate:
         *,
         stopped="eos",
         decode_seconds=0.4,
+        cached_tokens=0,
         before_token=None,
         failure=None,
         driver=None,
@@ -179,6 +195,7 @@ class ScriptedGenerate:
         self.tokens = list(tokens)
         self.stopped = stopped
         self.decode_seconds = decode_seconds
+        self.cached_tokens = cached_tokens
         self.before_token = before_token
         self.failure = failure
         self.driver = driver
@@ -197,6 +214,7 @@ class ScriptedGenerate:
         on_token=None,
         graphs=False,
         prefill_chunk=None,
+        prefix_cache=None,
     ):
         from src.models.deepseek_v4_1.generate import Generation
 
@@ -210,6 +228,7 @@ class ScriptedGenerate:
             "seed": seed,
             "graphs": graphs,
             "prefill_chunk": prefill_chunk,
+            "prefix_cache": prefix_cache,
         })
         if self.failure is not None:
             raise self.failure
@@ -222,6 +241,7 @@ class ScriptedGenerate:
             tokens=list(self.tokens),
             prompt_tokens=len(list(prompt_ids)),
             stopped=self.stopped,
+            cached_tokens=self.cached_tokens,
             driver=self.driver,
             decode_seconds=self.decode_seconds,
         )
@@ -267,6 +287,14 @@ def _request(request_id="r1", **metadata) -> GenerationRequest:
     )
 
 
+def _request_with_tokens(prompt_tokens, request_id="r1") -> GenerationRequest:
+    return GenerationRequest(
+        request_id=request_id,
+        prompt_tokens=list(prompt_tokens),
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+
+
 def _checkpoint(tmp_path, *, encoder: bool = True):
     """A checkpoint directory: the adapter reads the encoder out of it by path."""
     if encoder:
@@ -291,7 +319,7 @@ def test_capabilities_describe_a_serialized_single_request_service(tmp_path):
     assert capabilities.supports_batch is False
     assert capabilities.supports_streaming is True
     assert capabilities.supports_cancellation is True
-    assert capabilities.supports_prefix_caching is False
+    assert capabilities.supports_prefix_caching is True
     assert capabilities.supports_logprobs is False
     assert "encoding/encoding.py" in capabilities.details["prompt_format"]
 
@@ -327,11 +355,44 @@ def test_an_unknown_backend_option_is_refused_with_the_known_set(tmp_path):
         ({"expert_deal": "random"}, "'sorted' or 'id'"),
         ({"prefill_chunk": 0}, "must be >= 1"),
         ({"threads": 0}, "must be >= 1"),
+        ({"prefix_cache_head_tokens": -1}, "must not be negative"),
+        ({"prefix_cache_bytes": "4 gig"}, "must be a byte count"),
+        ({"prefix_cache_bytes": -1}, "must not be negative"),
     ],
 )
 def test_a_backend_option_out_of_range_is_refused(tmp_path, options, message):
     with pytest.raises(ConfigurationError, match=message):
         _build(_checkpoint(tmp_path), backend_options=options)
+
+
+@pytest.mark.parametrize(
+    "written, expected",
+    [
+        ("4g", 4 << 30),
+        ("512m", 512 << 20),
+        (1 << 20, 1 << 20),
+        ("2048", 2048),
+    ],
+)
+def test_a_byte_budget_is_read_the_way_a_launch_script_writes_it(tmp_path, written, expected):
+    """A budget is the one option whose plain value cannot be read at a glance: 4294967296 vs 4g."""
+    backend, _ = _build(_checkpoint(tmp_path), backend_options={"prefix_cache_bytes": written})
+    assert backend._options.prefix_cache_bytes == expected
+
+
+def test_the_cli_switch_is_the_off_switch_and_a_zero_budget_is_how_it_is_spelled(tmp_path):
+    """``--no-enable-prefix-caching`` is one switch over three options; it folds to a zero budget."""
+    backend, _ = _build(_checkpoint(tmp_path), enable_prefix_caching=False)
+    assert backend._options.prefix_cache_bytes == 0
+    assert backend._options.prefix_cache_head_tokens == 0
+    assert backend.capabilities.supports_prefix_caching is False
+
+    # ... and the same representation covers the option written out by hand.
+    backend, _ = _build(
+        _checkpoint(tmp_path),
+        backend_options={"prefix_cache_bytes": 0, "prefix_cache_head_tokens": 0},
+    )
+    assert backend.capabilities.supports_prefix_caching is False
 
 
 @pytest.mark.parametrize(
@@ -965,6 +1026,109 @@ def test_a_stream_that_is_abandoned_stops_the_producer(tmp_path, loop):
     # at its next token and lets the lock go.
     assert backend.active_request_count() == 0
     assert backend.cancel("r1") is False
+
+
+# ---------------------------------------------------------------------------- the prefix store
+
+
+def test_the_loop_is_handed_this_ranks_store_and_keeps_it_across_requests(tmp_path, loop):
+    stub = loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path), backend_options={"prefix_cache_bytes": "1m"})
+
+    backend.generate([_request("r1")])
+    backend.generate([_request("r2")])
+
+    first, second = (call["prefix_cache"] for call in stub.calls)
+    assert first is backend._prefix_cache
+    # The same store, not one per request: what the first request left is what the second reads.
+    assert first is second
+    assert first.budget_bytes == 1 << 20
+    # The head anchor is on by default, at the length the adapter's constant names.
+    assert first.head_tokens == DEFAULT_PREFIX_CACHE_HEAD_TOKENS
+    assert first.max_seq_len == backend._max_seq_len
+    assert backend.capabilities.details["prefix_cache_bytes"] == 1 << 20
+
+
+def test_a_run_with_the_cli_switch_off_has_no_store_to_hand_over(tmp_path, loop):
+    stub = loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path), enable_prefix_caching=False)
+
+    backend.generate([_request("r1")])
+
+    assert stub.calls[0]["prefix_cache"] is None
+    assert backend._prefix_cache is None
+    assert backend.metrics() == {}
+
+
+def test_the_reuse_the_loop_reports_travels_on_the_usage(tmp_path, loop):
+    """``cached_tokens`` is a count of prompt tokens the store answered, not a discount on them."""
+    loop(tokens=[11], cached_tokens=64)
+    backend, _ = _build(_checkpoint(tmp_path))
+
+    usage = backend.generate([_request_with_tokens(list(range(256)))])[0].usage
+
+    assert usage.prompt_tokens == 256
+    assert usage.cached_tokens == 64
+    assert usage.total_tokens == 256 + 1
+    assert usage.as_dict()["prompt_tokens_details"] == {"cached_tokens": 64}
+
+
+def test_a_cold_request_carries_no_prompt_token_details(tmp_path, loop):
+    """The field is emitted only when it is nonzero, so a cold body is byte-identical to before."""
+    loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path))
+
+    usage = backend.generate([_request_with_tokens([4, 5, 6])])[0].usage
+
+    assert usage.cached_tokens == 0
+    assert "prompt_tokens_details" not in usage.as_dict()
+
+
+def test_the_stores_counters_are_read_from_the_snapshot_and_not_walked_at_scrape_time(tmp_path, loop):
+    """``stats()`` walks the index, and a walk concurrent with a ``store`` is a ``dictionary changed
+    size``: the adapter publishes under the request lock and the scrape thread reads that."""
+    import torch
+
+    loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path))
+    backend.generate([_request("r1")])
+
+    names = {
+        "prefix_cache_hits_total",
+        "prefix_cache_misses_total",
+        "prefix_cache_reused_tokens_total",
+        "prefix_cache_entries",
+        "prefix_cache_bytes",
+        "prefix_cache_budget_bytes",
+    }
+    assert set(backend.metrics()) == names
+    assert backend.metrics()["prefix_cache_budget_bytes"] == backend._options.prefix_cache_bytes
+
+    # One entry and one hit, made behind the adapter's back: the scrape still reads the last
+    # request's snapshot, which is the whole point of publishing rather than walking.
+    ids = list(range(64))
+    backend._prefix_cache.store(ids, 64, {"window_kv_cache": torch.zeros(4)}, torch.zeros(4))
+    assert backend._prefix_cache.lookup(ids) is not None
+    assert backend.metrics()["prefix_cache_hits_total"] == 0
+
+    backend.generate([_request("r2")])
+
+    values = backend.metrics()
+    assert values["prefix_cache_hits_total"] == 1
+    assert values["prefix_cache_entries"] == 1
+    assert values["prefix_cache_reused_tokens_total"] == 64
+    assert values["prefix_cache_bytes"] > 0
+
+
+def test_only_the_rank_with_an_exporter_publishes_the_stores_counters(tmp_path, loop):
+    """Every rank holds a store -- each restores its own caches -- but a worker has no exporter."""
+    loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path))
+    backend._rank = 3
+    backend.generate([_request("r1")])
+
+    assert backend._prefix_cache is not None
+    assert backend.metrics() == {}
 
 
 # ---------------------------------------------------------------------------- multi-rank

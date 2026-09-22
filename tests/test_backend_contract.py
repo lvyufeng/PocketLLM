@@ -406,6 +406,23 @@ def test_metrics_exposition_is_a_prometheus_histogram():
         assert _metric_value(text, f"{family}_sum") == 0.0
 
 
+def test_a_byte_gauge_is_exported_as_the_number_it_is():
+    """A 4 GiB budget is nine digits, and the default six significant digits round it.
+
+    The exposition is parsed by a float reader either way, so this is not a syntax question: it is
+    that `4294967296` came out `4.29497e+09`, and a reader comparing occupancy against the budget
+    would be comparing a rounded number with a rounded number.
+    """
+    metrics = Metrics()
+    metrics.set("prefix_cache_budget_bytes", 4 << 30)
+    metrics.set_counter("prefix_cache_reused_tokens_total", 5354)
+    text = metrics.render()
+    assert _metric_value(text, "prefix_cache_budget_bytes") == 4294967296.0
+    assert "pocketllm_prefix_cache_budget_bytes 4294967296" in text
+    # An integral value still prints without a decimal point, as it did before.
+    assert "pocketllm_prefix_cache_reused_tokens_total 5354" in text
+
+
 def test_metrics_counters_and_gauges_carry_their_prometheus_type():
     metrics = Metrics()
     metrics.inc("requests_total")
@@ -488,6 +505,124 @@ def test_non_streaming_records_no_per_token_latency():
         assert _metric_value(text, "ttft_seconds_count") == 0.0
         assert _metric_value(text, "inter_token_latency_seconds_count") == 0.0
         assert _metric_value(text, "request_time_per_output_token_seconds_count") == 0.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------- engine metrics
+
+
+class MetricsBackend(ContractBackend):
+    """An engine that holds numbers *between* requests and reports their absolute values.
+
+    A prompt cache's occupancy and running hit count are the case: no request owns a share of them,
+    so they cannot ride on a ``GenerationResult`` the way ``usage`` does.
+    """
+
+    def __init__(self, values=None, boom: bool = False):
+        super().__init__()
+        self.values = dict(values or {})
+        self._boom = boom
+
+    def metrics(self):
+        if self._boom:
+            raise RuntimeError("the engine cannot report")
+        return dict(self.values)
+
+
+def test_the_engines_own_values_reach_the_exposition():
+    backend = MetricsBackend({
+        "prefix_cache_reused_tokens_total": 64,
+        "prefix_cache_entries": 2,
+        "prefix_cache_bytes": 4096,
+    })
+    server, base = _server(backend=backend)
+    try:
+        text = _metrics(base)
+        assert _metric_value(text, "prefix_cache_reused_tokens_total") == 64.0
+        assert _metric_value(text, "prefix_cache_entries") == 2.0
+        assert _metric_value(text, "prefix_cache_bytes") == 4096.0
+        # The type follows the name: `_total` is Prometheus's suffix for a counter, and the engine
+        # spells its counters that way so that nothing else has to be declared here.
+        assert "# TYPE pocketllm_prefix_cache_reused_tokens_total counter\n" in text
+        assert "# TYPE pocketllm_prefix_cache_entries gauge\n" in text
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_backend_owned_counter_is_set_and_not_added():
+    """The engine already keeps the running total; adding it again would square it per scrape."""
+    backend = MetricsBackend({"requests_answered_total": 7})
+    server, base = _server(backend=backend)
+    try:
+        assert _metric_value(_metrics(base), "requests_answered_total") == 7.0
+        assert _metric_value(_metrics(base), "requests_answered_total") == 7.0
+
+        # ... and a value that moves is read again on the next scrape, which is the whole reason
+        # this is a pull at scrape time rather than a push from the request path.
+        backend.values["requests_answered_total"] = 9
+        assert _metric_value(_metrics(base), "requests_answered_total") == 9.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_an_engine_that_cannot_report_leaves_the_scrape_standing():
+    """A missing series is how a scraper reads "no data"; a 500 on /metrics is how it reads "down"."""
+    server, base = _server(backend=MetricsBackend(boom=True))
+    try:
+        # Counted by the server rather than the engine, so the assertion is about the scrape standing
+        # and not about which families exist yet -- a counter is created on first use.
+        _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        assert _metric_value(_metrics(base), "requests_total") == 1.0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_backend_with_nothing_to_add_contributes_no_series():
+    """``BackendBase.metrics`` is empty, and an empty mapping adds nothing to the exposition."""
+    server, base = _server()
+    try:
+        assert "pocketllm_prefix_cache_entries" not in _metrics(base)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---------------------------------------------------------------------------- reused prompt tokens
+
+
+def test_a_reused_prompt_reports_its_cached_tokens():
+    class CachingBackend(ContractBackend):
+        def generate(self, requests):
+            return [GenerationResult(
+                request_id=req.request_id,
+                token_ids=[11],
+                text="ok",
+                usage=Usage(6, 1, cached_tokens=5),
+            ) for req in requests]
+
+    server, base = _server(backend=CachingBackend())
+    try:
+        chat = _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        # A subset of `prompt_tokens`, in OpenAI's own spelling and not a discount on it.
+        assert chat["usage"]["prompt_tokens"] == 6
+        assert chat["usage"]["prompt_tokens_details"] == {"cached_tokens": 5}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_cold_response_carries_no_prompt_token_details():
+    """Emitted only when nonzero, so a backend that reuses nothing -- or does not report it -- keeps
+    the response body byte-identical to the one this server returned before the field existed."""
+    server, base = _server()
+    try:
+        chat = _post(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})
+        assert "prompt_tokens_details" not in chat["usage"]
     finally:
         server.shutdown()
         server.server_close()

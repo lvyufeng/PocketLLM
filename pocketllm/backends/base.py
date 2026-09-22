@@ -96,6 +96,22 @@ class BackendBase:
         with self._state_lock:
             return len(self._active_requests)
 
+    def metrics(self) -> dict[str, float]:
+        """Metric values the engine owns, as ``name -> value``, for the server's exporter.
+
+        Request-scoped numbers reach ``/metrics`` through :class:`~pocketllm.api.GenerationResult`,
+        which the HTTP layer already reads. What does not is anything the engine holds *between*
+        requests -- a prompt cache's occupancy and its running hit count, say -- because no request
+        owns a share of it. This is that channel, and it is deliberately a plain mapping: an adapter
+        publishes values, the server decides how to export them, and no backend imports the
+        exporter. Absolute values, not deltas: the backend is the one keeping the total.
+
+        Empty by default, which is what an engine with nothing to add returns and what the server
+        reads as "no backend-owned series". Names must be valid Prometheus metric suffixes and are
+        flat, matching the rest of this server's spelling.
+        """
+        return {}
+
     def _check_cancelled(self, request_id: str) -> None:
         if self._is_cancelled(request_id):
             raise RequestCancelledError(f"request {request_id} was cancelled")
