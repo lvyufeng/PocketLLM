@@ -2,14 +2,21 @@
 
 ## Runtime status
 
-**Partially heterogeneous.** PocketLLM can open the released checkpoint, derive
-the expert layout from the shards' own headers, run the full 48-layer text
-backbone on the host, and **run one decoder layer's attention and its routed
-experts on a card** — attention out of the released FP8 projection against a
-per-layer KV cache, experts out of a host-resident bank. What is missing is the
-stack that would join them: no device dense stack, no model loop, no 256k
-serving, and no CUDA kernel behind any of it. Nothing on this page is an
-end-to-end throughput claim, because nothing here runs a request on a device.
+**Heterogeneous, one rank, one sequence.** PocketLLM opens the released
+checkpoint, derives the expert layout from the shards' own headers, runs the full
+48-layer text backbone on the host as a reference, and **runs that same backbone
+on one RTX 2080 Ti**: the dense stack and the attention out of the released FP8
+weights, the routed experts out of a host-resident bank, one token a step through
+a KV cache, to logits. A token costs **610 ms** — 1.64 tokens a second — of which
+74% is the expert copy, and the argmax agrees with the float32 host reference at
+full depth.
+
+What that is not: a prefill. The routed path has only the single-token kernel, so
+a prompt is fed one token at a time and a chunk of tokens has no path at all. Every
+number below is a decode number, and the one prefill-shaped number in this page is
+a floor rather than a prefill. There is no tensor or expert parallelism, no 256k
+run, and no CUDA kernel behind the attention or the dense linears — those are
+torch, and they are the baselines the kernels have to beat.
 
 What exists:
 
@@ -22,8 +29,10 @@ What exists:
 | Host-resident expert bank (149.81 GiB, one shared segment) | Implemented; fills from the release in 12.0 min at 213 MiB/s |
 | Device (CUDA) routed experts, one token, out of the bank | Implemented and verified against the host reference |
 | Device attention, both families, with a KV cache | Implemented in torch and verified against the host reference; **not a kernel** |
-| Device dense stack, the model loop, 256k | Not implemented — the layers exist, the stack that runs them does not |
-| Decode at more than one token, grouped prefill | Attention only: the cache serves a stream of chunks, and no other layer has a cache |
+| Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
+| End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
+| Decode at more than one token, grouped prefill | Attention only: the cache serves a stream of chunks, and the routed path is single-token |
+| 256k context | Not run — the cache is sized for it and nothing has executed at that length |
 | OpenAI-compatible serving | Not implemented |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
@@ -107,7 +116,7 @@ test that only compares shapes passes on all three readings.
 ## Implemented execution path
 
 `src/models/mimo_v2/` is the whole text model: a host reference that runs on the
-release, and the first two pieces of the device path.
+release, and the device path built next to it.
 
 | Module | What it is |
 | --- | --- |
@@ -119,6 +128,7 @@ release, and the first two pieces of the device path.
 | `bank.py` | The routed experts resident in host memory, one shared segment, filled once per boot |
 | `device_experts.py` | One layer's routed experts computed on a card, staged from the bank as they are drawn |
 | `device_attention.py` | One layer's attention on a card, both families, against a per-layer KV cache |
+| `device_model.py` | The backbone on a card: embedding, forty-eight layers, final norm, head, one token a step |
 
 The routed experts are never expanded. A layer's 256 experts are 3.2 GiB dense
 and the model's would be 4.7 TB; `MimoV2Mxfp4Experts` holds the checkpoint's own
@@ -165,13 +175,13 @@ One layer's decode draw, on the release:
 | Kernel | 1.28 ms |
 | Draw, staged and computed | 15.58 ms |
 
-That is what sets the shape of the rest. 47 layers × 15.58 ms is **733 ms of expert
-staging a token** — 1.4 tokens a second — and 91% of it is the copy. The bank is the
-right place for the bytes; what is wrong is that one rank draws all eight experts of
-every layer. Sharding the experts across four ranks so each stages its own quarter
-takes the traffic to 1.2 GiB a rank a token, and that is what the next stage has to
-do — the arithmetic is already per-rank by construction, so it is a matter of
-routing and a combine.
+The 7.02 GiB/s above is the *pageable* reading, and it is what the pin exists to
+delete: with the bank registered in place the same draw stages at 10.4 GiB/s,
+which is 10 to 11 ms, and the link is then within 20% of what a PCIe 3.0 x16 slot
+does. That is what sets the shape of the rest: forty-seven draws of 102 MiB is
+**4.68 GiB for one token**, no arrangement of the same bytes gets under the link's
+rate, and the only lever that moves it is not copying them — which is what the
+next stage's expert parallelism is for.
 
 The kernel's arithmetic is not the float32 reference's, and the whole difference is
 the activation quantisation: it takes int8 activations, one scale a row, and
@@ -246,14 +256,129 @@ correct and the next call was wrong, by an amount that decays with how much the 
 still matters. It is why the last test in the attention file calls twice and compares
 the parameter with itself.
 
+## The whole model on one card
+
+`device_model.py` is the assembly: the embedding, forty-eight layers of two adds
+each, the final norm and the head, with a KV cache and one token per step. Layer 0
+is the dense layer — global attention and a 16,384-wide FFN — and the other
+forty-seven draw their experts. Three things in it are the reference's and are easy
+to get wrong in a way that still runs: the embedding is **not** scaled by
+`sqrt(hidden)`, the head is **not** tied to the embedding, and a layer's residual
+is added in the hidden dtype on both sides, with the routed sum rounded once where
+the kernel leaves it in float32.
+
+The head is the one tensor the model keeps in float32 while everything else runs
+bf16. Its weights are bf16 in the checkpoint either way, so what the cast buys is
+*resolution*: the head's output is what a sampler reads, and a bfloat16 logit at a
+magnitude of twenty is quantised to 0.125 — which is exactly the size of the margin
+the third greedy step below turns on. Two and a half gibibytes of head and about two
+milliseconds a token is a cheap price for logits that are not on a grid.
+
+The one that is this stage's own is the arena. Forty-seven layers at 102 MiB each
+would be 4.8 GiB of a 22 GiB card for state that is read once a layer a token, so
+the arena is **one object shared by every routed layer** and the layer a draw
+belongs to is a property of the call rather than of the module. A model that
+forgot to pass it would stage layer 1's experts while computing layer 2 — the
+right shape, the right id range, the wrong numbers, and no error anywhere. The
+test that catches it makes the source's codes depend on the layer, so the
+comparison against the host is what fails.
+
+The bank is asked to pin itself on construction (`MimoV2ExpertBank.pin_if_enabled`,
+which honours `POCKETLLM_MIMO_PIN_RESIDENT_EXPERTS=0`). That is what makes the
+staging copies legal sources: without the registration a `non_blocking` copy from
+the segment goes through PyTorch's own pinned ring and **pays for the bytes
+twice**. Registering 149.81 GiB takes 21 to 27 s and is idempotent, so the
+forty-seven layers pay it once.
+
+A token on the release, bf16, eight-token context, warm cache, the first token
+discarded — `tests/bench_mimo_v2_model.py`:
+
+| | Decode, 8-token context | The same loop over a prompt |
+| --- | ---: | ---: |
+| Wall | 610.0 ms | 609.0 ms |
+| Attention, all 48 layers | 63.6 ms | 62.8 ms |
+| FFN and expert staging | 532.9 ms | 532.6 ms |
+| Experts drawn, staged | 376, 4794 MiB | 376, 4794 MiB |
+| The copy, at the measured 10.4 GiB/s | 450.2 ms | 450.2 ms |
+| **The copy, as a share of the token** | **73.8%** | **73.9%** |
+
+376 experts is exactly 47 × 8, which is what the model says it draws, and the
+4794 MiB that carries is 4.68 GiB of host-to-device traffic for **one token**. The
+attention is 64 ms of the 610 and the rest is the copy: the split columns are
+CUDA events around every layer's attention and FFN, so the wait for a slot's
+experts lands in the FFN column, which is where it belongs.
+
+The card holds 12.9 GiB for the whole model — 11.4 GiB of weights, 204 MiB of
+arena, 5.1 MiB of cache at a short context — and builds in 33 s from the release's
+mmap. Eight gibibytes of a 22 GiB card are free, which is the room the next stage's
+wider arena has to live in.
+
+This is the first place where the port can be asked what it actually predicts, and
+the answer is the host's. Feeding `The capital of France is Paris, and the capital
+of Japan is` to the forty-eight layers on the card puts `' Tokyo'` at rank 0 with a
+logit of **19.625**, against **19.63** recorded for the float32 host reference
+earlier in this page — the same token, and a two-thousandth of a logit apart.
+
+On a chat-templated prompt, three greedy steps of the same weights on two very
+different machines — float32 on 44 CPU cores, bfloat16 on one card, 163 s a step
+against 0.65 s:
+
+| Step | Host, first three | Card, first three | Host's top-8 set | Card's top-8 set |
+| ---: | --- | --- | --- | --- |
+| 0 | `<think>` 46.223 | `<think>` 45.414 | same eight | same eight |
+| 1 | `The` 26.247 | `The` 25.981 | same eight | same eight |
+| 2 | ` user` 24.230 | ` user` 23.750 | same eight | same eight |
+
+Identical tokens at every step and, at every step, the *same eight candidates* —
+with the ordering inside the set free from rank four down, where the host's
+`<|im_end|>`, `</think>` and `The` are 19.263, 19.119 and 19.117 and the card's are
+`The`, `</think>` and `<|im_end|>` at 20.029, 18.953 and 18.665. The top logit
+carries 0.8 of a logit of disagreement on 46, which is the bfloat16 storage and the
+kernel's int8 activations accumulating over 48 layers; the two-layer test below
+measures the same quantity at the start of the stack, 2.8e-3 to 7.9e-3 on a stream
+whose peak is 0.55.
+
+Greedily, the card then answers the question:
+
+```
+<think>The user is asking about the capital of France.</think>The capital of France
+is **Paris**. 🇫🇷<|im_end|>
+```
+
+which is a reasoning block, a turn, a bolded answer and an emoji.
+
+Two honest notes about what this is not. The prompt columns above are the same
+single-token loop run over a prompt, so they are a **floor** and not a prefill —
+prefill needs the multi-token kernel, which nothing routes into yet. And the
+agreement above is an agreement about the *top* of a distribution: a token whose
+candidates are a tenth of a logit apart is a token the two machines are free to
+disagree on, and the third step's margin was 0.125 on the card against 0.463 on the
+host. That is what 0.8 of a logit of disagreement does to a near-tie, and it is why
+a serving path wants a sampler rather than an `argmax`.
+
+One bug in here is worth naming, because it is the shape of failure this stage
+creates. `MimoV2DeviceModel.step` returned a squeezed `[vocab]` row, and the
+generation loop indexed it with `[-1]` — which took the row's *last logit* instead
+of the row. `argmax` of a scalar is 0, so from the second token on the loop fed
+itself token zero: the model ran at full speed, drew eight experts a layer per step,
+and printed `'!'` twenty-three times. Nothing about that is slow and nothing about
+it errors, and the fix is one character. What caught it was comparing a continuation
+against the host's; what would have caught it sooner is the test that now exists,
+which asserts the row's shape and then that `greedy` reproduces a loop written out
+by hand.
+
 ## Validated performance
 
-**None end to end.** There is no device path for the dense stack or the model loop, so
-nothing here runs a request, and the host reference is not a performance artifact
-either: it is float32 on the CPU with no KV cache, so every decode step re-runs the
-whole prefix, and it exists to be the oracle a kernel port is diffed against.
+**One token, on one card, and a floor.** The number above — 610 ms a token — is the
+whole model on the release, and it is not a prefill: the single-token expert kernel
+is the only routed path there is, so a prompt is fed a token at a time. There is no
+batching, no tensor parallelism, and no CUDA kernel behind the attention or the
+dense linears. The host reference is not a performance artifact either: it is
+float32 on the CPU with no KV cache, so every decode step re-runs the whole prefix —
+37 s a token against the card's 0.61 s, which is the ratio a reference is supposed
+to have.
 
-What is measured is one layer at a time, on the release, bf16, warm cache, best of
+What is measured one layer at a time, on the release, bf16, warm cache, best of
 three: `tests/bench_mimo_v2_attention.py`. Layer 2 is windowed, layer 5 is global.
 
 | | Windowed (39 layers) | Global (9 layers) |
@@ -266,17 +391,27 @@ three: `tests/bench_mimo_v2_attention.py`. Layer 2 is windowed, layer 5 is globa
 A windowed layer's decode step does not grow with the context at all, which is the
 ring; a global layer's grows with it and is close to the bandwidth a token's keys
 cost. Summed over the model with the measured per-layer numbers, one token's attention
-is **100 ms at 4k context and 122 ms at 64k**, and a 1024-token chunk's is **2.2 ms a
-token at 4k and 8.5 ms at 64k** — so the attention is not what a token waits for. A
-layer's experts are: 15.58 ms of staging against 1.9 to 5.1 ms of attention, forty-seven
-times over.
+is **100 ms at 4k context and 122 ms at 64k** — against 64 ms measured for the whole
+48-layer stack at a short context, which is the same sum and a shorter prefix.
 
-The forward-looking arithmetic is therefore short. Decode is 733 ms of expert staging
-plus about 100 ms of attention; sharding the experts four ways takes the staging to
-1.2 GiB a rank a token, which is the one lever the numbers point at. Prefill is the
-other shape: a chunk's experts are 8 experts a token and 102 MiB of DMA, so a hundred
-tokens a second is 10 GiB/s of host-to-device traffic before anything else is counted,
-and that is why nothing here claims a prefill number.
+The token's other 580 ms is the copy, and the copy is a per-token quantity because
+the routed path is a draw a token. Sharding the experts across four ranks is the one
+lever the numbers point at: **4.68 GiB a token becomes 1.17 GiB a rank**, which at
+the 10.4 GiB/s the link sustains is about 113 ms, and 113 plus the 64 the attention
+costs is **5.6 tokens a second** with nothing else changed. Sharding the dense stack
+as tensor parallelism with it divides the attention's reads by four and puts a token
+at about 130 ms, which is 7.7 a second — so the target's 5 is reachable by parallel
+work alone, and the attention kernel this page keeps saying is missing is what buys
+the margin above it.
+
+Prefill is the other shape, and its arithmetic is not per token. A chunk of a few
+thousand tokens draws nearly every expert of every layer — 4096 tokens at top-8 is
+32768 draws over 256 experts — so a chunk's traffic is **about 153 GiB for the whole
+layer stack no matter the chunk size**, and it is not paid again by the next chunk.
+At 10.4 GiB/s that is 14.7 s a chunk, which is 35 tokens a second at a 512-token
+chunk and **279 at 4096**. So the prefill target is a matter of chunking and of the
+multi-token kernel that has to exist to compute a chunk at all — not of the link,
+which the experts are already as close to as storage allows.
 
 ## Correctness and precision
 
@@ -308,7 +443,7 @@ experts stay packed, a dequantized-expert cache does not change the arithmetic,
 and restricting a layer to the experts its router selected does not change its
 output.
 
-**The device path against the host reference.** Four checks, and they answer
+**The device path against the host reference.** Five checks, and they answer
 different questions. `tests/test_models_mimo_v2_bank.py` reads every expert of the
 miniature back out of the segment byte for byte and runs the same property on the
 release's layout — including the shard that stores `10, 11, 8, 9`, which is the one
@@ -321,10 +456,20 @@ own attention function — the reference is the oracle, not a second copy of the
 idea — and then holds the cache to what a cache is: a chunked prefill against a
 one-shot one, a decode step against the same token inside the full prefix, a ring that
 returns the newest window in time order, and a windowed layer that does not move when
-keys outside its window are rewritten while a global layer does. And
-`scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer backbone on the
-release and greedily decodes, which is the one check that a shape or an offset error
-cannot pass.
+keys outside its window are rewritten while a global layer does.
+`tests/test_models_mimo_v2_device_model.py` is the assembly, on a miniature of the
+release's own shape whose experts are packed fp4 at scale one — so the codes the
+kernel reads and the dense tensors the host reads are the same numbers and a
+disagreement is a bug rather than a rounding. It pins the two adds, the unscaled
+embedding, the untied head, a stack that says when it is truncated, a cache that
+reproduces the prefix it stands for to 1.7e-6, the router's draw by name, and the one
+arena serving two routed layers whose layer ids travel with the call. Its release half
+is two real layers — layer 0 global and dense, layer 1 windowed and routed — against
+the host in float32, fed a token at a time through the cache: 2.8e-3 to 7.9e-3 on a
+stream whose peak is 0.55, a logit error of a percent, and the same argmax on every
+row. And `scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer backbone
+on the release and greedily decodes, which is the one check that a shape or an offset
+error cannot pass.
 
 ## Reproduction
 
@@ -332,15 +477,18 @@ cannot pass.
 # the checkpoint's own config, read through the schema
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
-# parity, layout, the host bridge, the bank, the device experts and the attention
+# parity, layout, the host bridge, the bank, the device experts, the attention and the model
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
     tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
     tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py \
-    tests/test_models_mimo_v2_device_attention.py -q
+    tests/test_models_mimo_v2_device_attention.py tests/test_models_mimo_v2_device_model.py -q
 
 # what one layer's attention costs, both families, prefill and decode
 python tests/bench_mimo_v2_attention.py
+
+# what a whole token costs on one card, and how much of it is the expert copy
+python tests/bench_mimo_v2_model.py
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -357,22 +505,37 @@ golden holds and how it was captured.
 
 ## Known limitations
 
-- **No end-to-end device path.** One layer's attention and its routed experts run on
-  a card; the dense stack and the loop that would run forty-eight of those layers do
-  not, so no request runs on a device and no throughput number on this page describes
-  one. Neither piece is a CUDA kernel either: both are torch, and both are baselines
-  with the shapes the kernels have to beat.
-- **One rank, one sequence.** The attention is single-rank with no tensor parallelism,
-  while the checkpoint's fused projection is stored in four shards — so a rank that
-  did not de-interleave would read a quarter of every head. Expert parallelism is not
-  implemented either, which is the measurement the expert table is about.
-- **Prefill is not routed.** The multi-token and grouped-prefill kernels exist in
-  `src/csrc` but nothing routes into them, so a chunk's experts are drawn eight at a
-  time; a prefill is what the 100 tps target is about.
+- **No prefill.** The routed path has only the single-token kernel, so a prompt is
+  fed a token at a time and a chunk of tokens has no path at all. The prefill-shaped
+  columns in this page are that same loop, and the 279 tokens a second the link could
+  sustain at a 4096-token chunk is arithmetic rather than a measurement. Prefill is
+  what the 100 tps target is about and it is the next stage's work.
+- **One rank, one sequence, no batching.** No tensor parallelism, no expert
+  parallelism, no batching. The checkpoint's fused projection is stored in four shards,
+  so a rank that did not de-interleave would read a quarter of every head — and the
+  experts are drawn eight a token by whoever is running that token, which is the whole
+  of the 4.68 GiB.
+- **The attention and the dense linears are torch, not kernels.** They are baselines
+  with the shapes the kernels have to beat: 64 ms a token for all 48 layers, and the
+  single-pass decode path loses a factor of twenty-eight to a batch dimension of one
+  until the key count passes a window.
+- **No 256k run.** The cache is sized for it and the attention's bounds are derived
+  from a position rather than from a mask, so nothing in the path is per-context — but
+  nothing has executed at that length, and at 262144 a global layer's decode step reads
+  256k keys nine times over.
+- **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
+  tokens, with no temperature, top-p or repetition penalty. The checkpoint's
+  `generation_config.json` says `do_sample: false`, so this is its own default — but a
+  sampling path is what a serving stack would need, and the logit agreement above is
+  the reason a sampler matters: at a tenth-of-a-logit near-tie the card and the host
+  draw different tokens, which a distribution-aware sampler absorbs and `argmax` does
+  not.
 - **No KV cache in the host reference.** Re-running the prefix is deliberate for a
-  reference, and it makes long-context work on the host quadratically expensive. 256k
-  context is a target of the device path, not something the reference demonstrates.
-- **No serving.** No OpenAI-compatible adapter, no batching, no prefix caching.
+  reference — it is why its numbers can be trusted and why they are 37 s a token —
+  but it also means the host cannot be run at a long context to check the device's
+  cache at one.
+- **No serving.** No OpenAI-compatible adapter, no batching, no prefix caching. The
+  generation loop in `device_model.py` is greedy and single-request.
 - **MTP and DFlash are not executed.** The 3-layer MTP module and the 5-layer
   DFlash drafter are located and described but no speculative path uses them.
 - **Vision and audio are out of scope.** The vision tower and the audio encoders
@@ -380,8 +543,8 @@ golden holds and how it was captured.
 
 ## Evidence and related notes
 
-- `src/models/mimo_v2/` — the host reference and the three pieces of the device path:
-  the bank, the routed experts, and the attention.
+- `src/models/mimo_v2/` — the host reference and the four pieces of the device path:
+  the bank, the routed experts, the attention, and the model.
 - `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
   which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
@@ -389,7 +552,8 @@ golden holds and how it was captured.
 - `tests/test_models_mimo_v2_loader.py`, `tests/test_models_mimo_v2_real_weights.py`
   — the checkpoint's layout and the host bridge, on the release.
 - `src/models/mimo_v2/bank.py`, `src/models/mimo_v2/device_experts.py`,
-  `src/models/mimo_v2/device_attention.py` — the device path, and the measurements in
-  this page.
-- `tests/bench_mimo_v2_attention.py` — where the attention table comes from.
+  `src/models/mimo_v2/device_attention.py`, `src/models/mimo_v2/device_model.py` —
+  the device path, and the measurements in this page.
+- `tests/bench_mimo_v2_attention.py`, `tests/bench_mimo_v2_model.py` — where the
+  attention table and the token table come from.
 - The support matrix in [models/README.md](README.md).

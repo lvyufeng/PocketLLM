@@ -389,6 +389,37 @@ def test_the_environment_gates_default_the_way_the_module_documents(mini, monkey
     assert not bank_module.pin_enabled()
 
 
+def test_pinning_on_demand_honours_the_gate_and_reports_what_the_driver_said(mini, tmp_path, monkeypatch):
+    """The device path's one call: pin the source, or be told not to.
+
+    `None` and a failed registration are different answers, which is why this returns the
+    `PinResult` rather than a bool -- a driver that refuses the registration leaves a bank
+    that is correct and slower, and a caller that could not tell the two apart would either
+    abort a good run or ignore a bad one.
+    """
+    monkeypatch.delenv(bank_module.PIN_ENV, raising=False)
+    root_dir = str(tmp_path / "pin")
+    bank = bank_module.open_expert_bank(mini, root_dir=root_dir)
+    try:
+        result = bank.pin_if_enabled()
+        if result is None:  # pragma: no cover - the gate defaults on
+            pytest.fail("the gate defaults on and `pin_if_enabled` returned None")
+        assert result.bytes == bank.resident_bytes
+        assert bank.pin_result is result
+        # Idempotent: the second call is the first result, not a second registration.
+        assert bank.pin_if_enabled() is result
+    finally:
+        bank.close(unlink=True)
+
+    monkeypatch.setenv(bank_module.PIN_ENV, "0")
+    off = bank_module.open_expert_bank(mini, root_dir=root_dir)
+    try:
+        assert off.pin_if_enabled() is None
+        assert off.pin_result is None
+    finally:
+        off.close(unlink=True)
+
+
 # ---------------------------------------------------------------------------
 # The release
 # ---------------------------------------------------------------------------
