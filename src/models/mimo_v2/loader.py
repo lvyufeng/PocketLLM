@@ -459,16 +459,25 @@ class MimoV2Checkpoint:
         is the `pread` a bank wants per (shard, layer): 4 experts, 51 MiB, 3008
         reads for the whole checkpoint. Layers whose experts are not one run in
         that shard raise here rather than being read as a plausible superset.
+
+        The order **inside** the range is the shard's own, and it is not numeric:
+        safetensors sort their keys as strings, so `ep2` stores experts `10, 11, 8,
+        9` in that order. That is why the range is taken as the minimum and the
+        maximum of the runs rather than as the first and the last, and why a caller
+        that turns the range into per-expert offsets needs `expert_order` rather
+        than the ids.
         """
         files = self.layout.files
         runs = [run for run in self.layout.layer_runs(layer) if run.file_name == files[shard_index]]
         if not runs:
             raise KeyError(f"shard {shard_index} holds no experts of layer {layer}")
-        begin, end = runs[0].begin, runs[-1].end
+        begin = min(run.begin for run in runs)
+        end = max(run.end for run in runs)
         if sum(run.nbytes for run in runs) != end - begin:
             raise ValueError(
                 f"layer {layer}'s {len(runs)} experts are not one contiguous run in "
-                f"{runs[0].file_name}"
+                f"{runs[0].file_name}: they span {end - begin} bytes and are "
+                f"{sum(run.nbytes for run in runs)}"
             )
         return runs[0].file_name, begin, end
 
@@ -476,6 +485,19 @@ class MimoV2Checkpoint:
         """Which global expert ids one shard owns. Contiguous by construction."""
         lo = shard_index * self.layout.experts_per_shard
         return tuple(range(lo, lo + self.layout.experts_per_shard))
+
+    def expert_order(self, layer: int, shard_index: int) -> tuple[int, ...]:
+        """A shard's experts of one layer, in the order the file stores them.
+
+        `experts_of_shard` says which experts; this says in which order, and the two
+        are not the same list -- see `expert_region`. The stored order is read off
+        the file offsets, which is the only thing that knows it.
+        """
+        files = self.layout.files
+        runs = [run for run in self.layout.layer_runs(layer) if run.file_name == files[shard_index]]
+        if not runs:
+            raise KeyError(f"shard {shard_index} holds no experts of layer {layer}")
+        return tuple(run.expert for run in sorted(runs, key=lambda run: run.begin))
 
     def describe(self) -> str:
         return (

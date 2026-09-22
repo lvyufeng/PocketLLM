@@ -2,11 +2,12 @@
 
 ## Runtime status
 
-**Inspect only.** PocketLLM can open the released checkpoint, derive the expert
-layout from the shards' own headers, dequantize its three weight formats, and run
-the full 48-layer text backbone on the host — but there are **no device kernels
-and no server adapter for this checkpoint yet**. Nothing in this page is a
-performance claim about the GPU path, because there is no GPU path.
+**Partially heterogeneous.** PocketLLM can open the released checkpoint, derive
+the expert layout from the shards' own headers, run the full 48-layer text
+backbone on the host, and **run the routed experts on a card out of a
+host-resident bank** — but there is no device path for the attention, the dense
+stack or the KV cache, and no server adapter. Nothing on this page is an
+end-to-end throughput claim, because nothing here runs end to end on a device.
 
 What exists:
 
@@ -16,8 +17,10 @@ What exists:
 | Per-layer CPU parity against the checkpoint's own remote code | Implemented, 21 tests |
 | MXFP4 / FP8-block / BF16 dequantizers | Implemented as torch references |
 | Full 48-layer backbone on the release, on the host | Implemented and verified: 2.09 nats/token on an English passage against a uniform floor of 11.94, with grammatical greedy continuations |
-| KV cache for the host reference | Not implemented — the prefix is re-run every step |
-| Device (CUDA) kernels for any part of the model | Not implemented |
+| Host-resident expert bank (149.81 GiB, one shared segment) | Implemented; fills from the release in 12.0 min at 213 MiB/s |
+| Device (CUDA) routed experts, one token, out of the bank | Implemented and verified against the host reference |
+| Device attention, dense stack, KV cache | Not implemented |
+| Decode at more than one token, grouped prefill | Not implemented — the kernel exists, the routing into it does not |
 | OpenAI-compatible serving | Not implemented |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
@@ -100,8 +103,8 @@ test that only compares shapes passes on all three readings.
 
 ## Implemented execution path
 
-`src/models/mimo_v2/` is the whole text model, and it is a reference rather than a
-runtime:
+`src/models/mimo_v2/` is the whole text model: a host reference that runs on the
+release, and the first two pieces of the device path.
 
 | Module | What it is |
 | --- | --- |
@@ -110,17 +113,81 @@ runtime:
 | `quant.py` | The three storage layouts as torch references (E2M1 codebook, E8M0, MXFP4 unpack, FP8 block dequant) |
 | `loader.py` | Header-level access to the release: the expert map, byte ranges, dense tensors, MXFP4 views |
 | `weights.py` | The bridge from the shards into `layers.py`, including experts that stay packed until selected |
+| `bank.py` | The routed experts resident in host memory, one shared segment, filled once per boot |
+| `device_experts.py` | One layer's routed experts computed on a card, staged from the bank as they are drawn |
 
 The routed experts are never expanded. A layer's 256 experts are 3.2 GiB dense
 and the model's would be 4.7 TB; `MimoV2Mxfp4Experts` holds the checkpoint's own
 uint8 views and dequantizes the eight experts a token actually selects.
 
+## Heterogeneous execution
+
+The experts do not fit on the cards and never will: 47 routed layers hold
+47 × 256 experts of 12.75 MiB, which is **149.81 GiB**, and four RTX 2080 Ti hold
+88 GiB between them. The path taken here is the one DeepSeek-V4.1-Flash already
+takes — keep the experts in host memory, where all of them fit, and move only the
+ones a token draws to the card that computes them.
+
+`bank.py` is one POSIX shared-memory segment holding every routed layer's experts,
+filled once per boot of the host and read in place by the DMA engines. The layout
+a bank needs is already verified from the shards' own headers: shard `ep{N}` owns
+experts `4N..4N+3` of every routed layer and those four are one contiguous run, so
+a layer is 64 reads of 51 MiB and the checkpoint is 3008 reads. Measured on the
+release: **149.81 GiB in 12.0 minutes at 213 MiB/s**, and `cudaHostRegister` over
+the whole segment returns 0 in **9.0 s** — after which a `non_blocking` H2D reads
+the bank's own pages instead of staging through PyTorch's pinned ring.
+
+One trap is worth naming because it is silent: a shard stores its four experts in
+*name* order and not numeric order, so `ep2` holds `10, 11, 8, 9`. A bank that put
+expert `e` at `e * expert_bytes` would hand the device path four experts that are
+each the wrong one — real experts, right shapes, wrong numbers, no error anywhere.
+
+`device_experts.py` runs the drawn experts on the card. The kernel is
+`moe_single_token_fp4_forward` from `src/csrc`, which takes the released storage
+format directly — `[N, K/2]` E2M1 codes beside `[N, K/32]` E8M0 scales — so the
+expert arithmetic is shared with the V4.1 path rather than reimplemented, and no
+new CUDA was needed. What the kernel does not take directly is the checkpoint's
+arrangement: an expert is one 12.75 MiB record in `down, gate, up` order and the
+kernel wants three tensors in `w1, w2, w3`, so a draw is six copies an expert into
+an arena laid out the kernel's way, on a copy stream ordered against the compute
+stream in both directions.
+
+One layer's decode draw, on the release:
+
+| | Value |
+| --- | ---: |
+| Experts drawn, staged | 8, 102 MiB |
+| Staging | 14.18 ms (7.02 GiB/s) |
+| Kernel | 1.28 ms |
+| Draw, staged and computed | 15.58 ms |
+
+That is what sets the shape of the rest. 47 layers × 15.58 ms is **733 ms of expert
+staging a token** — 1.4 tokens a second — and 91% of it is the copy. The bank is the
+right place for the bytes; what is wrong is that one rank draws all eight experts of
+every layer. Sharding the experts across four ranks so each stages its own quarter
+takes the traffic to 1.2 GiB a rank a token, and that is what the next stage has to
+do — the arithmetic is already per-rank by construction, so it is a matter of
+routing and a combine.
+
+The kernel's arithmetic is not the float32 reference's, and the whole difference is
+the activation quantisation: it takes int8 activations, one scale a row, and
+accumulates in float32. Against a host emulation of that same quantisation the device
+output agrees to **4e-7**, which is float32 rounding — so the kernel is exact for its
+own arithmetic and every difference from the float32 reference is that quantisation
+rather than a bug. On a released layer with an ordinary draw the two agree to a few
+parts in a thousand of the output's peak, and worse where the summed output is small
+and the hidden is not, which is cancellation and not something a tolerance fixes. The
+end-to-end cost of it is a property of the whole backbone and belongs to a run of it.
+
 ## Validated performance
 
-None. There is no device path, and the host reference is not a performance
-artifact: it is float32 on the CPU with no KV cache, so every decode step re-runs
-the whole prefix and re-reads every selected expert from the checkpoint. It exists
-to be the oracle a kernel port is diffed against.
+**None end to end.** There is no device path for the attention, the dense stack or
+the KV cache, so nothing here runs a request. The only device numbers are the ones in
+the table above — one layer's experts, staged from the bank and computed — and the
+bank's own fill and pin. The host reference is not a performance artifact either: it
+is float32 on the CPU with no KV cache, so every decode step re-runs the whole prefix
+and re-reads every selected expert, and it exists to be the oracle a kernel port is
+diffed against.
 
 ## Correctness and precision
 
@@ -152,9 +219,17 @@ experts stay packed, a dequantized-expert cache does not change the arithmetic,
 and restricting a layer to the experts its router selected does not change its
 output.
 
-`scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer backbone on
-the release and greedily decodes, which is the one check that a shape or an offset
-error cannot pass.
+**The device path against the host reference.** Three checks, and they answer
+different questions. `tests/test_models_mimo_v2_bank.py` reads every expert of the
+miniature back out of the segment byte for byte and runs the same property on the
+release's layout — including the shard that stores `10, 11, 8, 9`, which is the one
+a bank cannot get wrong quietly. `tests/test_models_mimo_v2_device_experts.py`
+reproduces the kernel's *own* arithmetic on the host, int8 activations included, to
+`4e-7`; that is what separates "the quantisation costs this much" from "we read the
+wrong expert", and a wrong expert is 14 to 250 percent off rather than 1e-6. And
+`scripts/verify_mimo_v2_real_checkpoint.py` runs the whole 48-layer backbone on the
+release and greedily decodes, which is the one check that a shape or an offset error
+cannot pass.
 
 ## Reproduction
 
@@ -162,14 +237,20 @@ error cannot pass.
 # the checkpoint's own config, read through the schema
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
-# parity, layout and the host bridge
+# parity, layout, the host bridge, the bank and the device experts
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
-    tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py -q
+    tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
+    tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py -q
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
 ```
+
+The bank is 149.81 GiB of `/dev/shm` and takes twelve minutes to fill the first
+time; a run after that attaches in 0.07 s. `rm -rf
+/dev/shm/pocketllm_mimo_experts_*` is how the memory goes back, and the next
+`open_expert_bank` refills it.
 
 The oracle fixture lives outside this repository (a checkout without it skips the
 parity tests); `tests/test_models_mimo_v2_layer_parity.py` documents what the
@@ -177,8 +258,12 @@ golden holds and how it was captured.
 
 ## Known limitations
 
-- **No device path.** Nothing here is a kernel, and no performance number on this
-  page describes anything but the CPU reference.
+- **No end-to-end device path.** The routed experts run on a card; the attention,
+  the dense stack and the KV cache do not, so no request runs on a device and no
+  throughput number on this page describes one.
+- **Decode only, one token.** The multi-token and grouped-prefill kernels exist in
+  `src/csrc` but nothing routes into them, and a prefill is what the 100 tps target
+  is about.
 - **No KV cache in the host reference.** Re-running the prefix is deliberate for a
   reference, and it makes long-context work on the host quadratically expensive.
   256k context is a target of the device path, not something the reference
@@ -191,11 +276,14 @@ golden holds and how it was captured.
 
 ## Evidence and related notes
 
-- `src/models/mimo_v2/` — the reference implementation.
+- `src/models/mimo_v2/` — the host reference and the first two pieces of the device
+  path.
 - `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
   which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
   and what parity means at fixture scale.
 - `tests/test_models_mimo_v2_loader.py`, `tests/test_models_mimo_v2_real_weights.py`
   — the checkpoint's layout and the host bridge, on the release.
+- `src/models/mimo_v2/bank.py`, `src/models/mimo_v2/device_experts.py` — the
+  heterogeneous path, and the measurements in this page.
 - The support matrix in [models/README.md](README.md).

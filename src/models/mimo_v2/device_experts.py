@@ -1,0 +1,307 @@
+"""The routed experts, computed on the card, read out of host memory as they are drawn.
+
+This is the half of the heterogeneous path that does arithmetic, and the split it
+makes is the whole design: the experts' **bytes** live in the host bank, where all
+149.81 GiB of them fit, and the **compute** happens on the card, where one token's
+eight experts a layer do. A step therefore moves 8 x 12.75 MiB a layer instead of
+reading 256 of them from a disk, and it moves them into an arena laid out the way
+the kernel wants rather than the way the checkpoint stores them.
+
+The kernel is `moe_single_token_fp4_forward` from `src/csrc`, which takes the
+released storage format directly: `[N, K/2]` uint8 holding two E2M1 codes a byte
+and `[N, K/32]` uint8 of E8M0 scales beside them. That is the same format the
+DeepSeek-V4.1 checkpoint uses, so the expert arithmetic is shared with that path
+rather than reimplemented, and it is the reason this module needs no new CUDA.
+
+What it does *not* take directly is the checkpoint's own arrangement. A bank holds
+one expert as a contiguous 12.75 MiB record in file order -- `down_proj` then
+`gate_proj` then `up_proj`, each with its scale -- while the kernel wants three
+separate `[rows, N, K/2]` tensors named `w1`/`w2`/`w3`. So a drawn expert is copied
+into the arena row by row and tensor by tensor: six copies per expert, from six
+ranges of the bank that are nowhere near each other. That is why this is a loop of
+small copies and not one large one, and it is why the source has to be page-locked
+for the copies to be asynchronous -- a pageable source would make PyTorch stage
+every one of them through its own pinned ring, which is the copy the bank exists to
+delete.
+
+Ordering, which is the part that is easy to get subtly wrong
+------------------------------------------------------------
+
+There are two streams a call. The copy stream owns every H2D; the compute stream
+owns the kernel. A staging pass waits on the compute stream before it starts,
+because the arena rows it is about to overwrite are the ones the previous call's
+kernel read; and the kernel waits on the copy stream, because its inputs are the
+rows the copies are still writing. Neither wait is optional and neither is implied
+by anything else: they are on different streams, so nothing but these two orders
+them.
+
+A slot is only reused once its own kernel has been drained, which is what the
+per-slot event records and what `_take_slots` waits on. Without that wait the next
+layer's copies could start writing a row a kernel launched two calls ago is still
+reading, and the two are on the copy stream and the compute stream respectively, so
+the wait on the compute stream inside the staging pass is what covers it.
+"""
+
+from __future__ import annotations
+
+from typing import Protocol, Sequence
+
+import torch
+
+from src.kernels.cuda_loader import load_cuda_kernel
+
+__all__ = [
+    "MimoV2DeviceExperts",
+    "MimoV2ExpertSource",
+    "MmapExpertSource",
+    "SWIGLU_LIMIT",
+]
+
+#: MiMo-V2.6's experts are plain SwiGLU: the host reference clamps nothing, and the
+#: kernel's clamp is off at zero or below. Not a tuning constant -- a statement about the
+#: checkpoint, and one a future release that does clamp would have to change.
+SWIGLU_LIMIT = 0.0
+
+
+class MimoV2ExpertSource(Protocol):
+    """Where an expert's six tensors come from, as `uint8` views of memory that stays put.
+
+    Deliberately narrow. `MimoV2ExpertBank` is one implementation and `MmapExpertSource`
+    another, and a test can be a third -- what the staging loop needs is the six tensors in
+    the shapes the kernel declares, in an order the caller can name, not a bank.
+    """
+
+    def expert_views(self, layer_id: int, expert: int) -> dict[tuple[str, str], torch.Tensor]:
+        """One expert's six tensors, keyed `(projection, kind)`."""
+
+
+class MmapExpertSource:
+    """The checkpoint's own mapped views, for a run that has not filled a bank.
+
+    Correct and slower. The views are the shard's pages, so they are not page-locked, and a
+    `non_blocking` copy out of them stages through PyTorch's pinned ring -- the copy the
+    bank exists to delete -- but the bytes are the same bytes and the arithmetic is the
+    same arithmetic. That makes this the source a test can use on the release without
+    spending twelve minutes filling 149.81 GiB, and the source a host without a bank falls
+    back to rather than failing.
+    """
+
+    def __init__(self, checkpoint: object) -> None:
+        self.checkpoint = checkpoint
+
+    def expert_views(self, layer_id: int, expert: int) -> dict[tuple[str, str], torch.Tensor]:
+        views = self.checkpoint.expert_arrays(layer_id, expert)
+        # `expert_arrays` builds its six views fresh on every call -- it is a handful of
+        # `from_numpy` wrappers and no copy -- so nothing is cached here. The staging loop
+        # draws any given expert once.
+        return views
+
+
+class MimoV2DeviceExperts:
+    """One layer's routed experts, computed on one card out of a host-resident source.
+
+    The arena is shared across layers on purpose. A layer at decode width holds eight
+    experts, so one layer's own arena would be 102 MiB and forty-seven of them 4.8 GiB of a
+    22 GiB card for state that is read once per layer per token; one arena, refilled by
+    whichever layer is running, is safe because the layers run one at a time and each call
+    drains the kernel it launched before it returns.
+
+    `slots` is what makes the copies overlap the kernels. Two slots is the smallest number
+    that lets a layer's staging start while the previous layer's kernel is still running,
+    and it is what bounds how far the host may run ahead of the card.
+    """
+
+    def __init__(
+        self,
+        source: MimoV2ExpertSource,
+        layer_id: int,
+        *,
+        device: torch.device | str = "cuda",
+        top_k: int,
+        dim: int,
+        inter_dim: int,
+        slots: int = 2,
+        arena_rows: int | None = None,
+    ) -> None:
+        self.source = source
+        self.layer_id = int(layer_id)
+        self.device = torch.device(device)
+        self.top_k = int(top_k)
+        self.dim = int(dim)
+        self.inter_dim = int(inter_dim)
+        self.slots = max(1, int(slots))
+        # A decode call draws exactly `top_k` experts, so that is the arena width unless a
+        # caller asks for more -- which is what a grouped prefill will do, and what makes
+        # this a parameter rather than a constant.
+        self.arena_rows = int(arena_rows or self.top_k)
+        if self.arena_rows < self.top_k:
+            raise ValueError(
+                f"an arena of {self.arena_rows} rows cannot hold the {self.top_k} experts one "
+                f"token draws"
+            )
+        if self.dim % 32 or self.inter_dim % 32:
+            raise ValueError(
+                f"the fp4 kernel needs dim and inter_dim divisible by 32, got {self.dim} and "
+                f"{self.inter_dim}"
+            )
+
+        self._kernel = load_cuda_kernel()
+        self._arenas = [self._allocate() for _ in range(self.slots)]
+        with torch.cuda.device(self.device):
+            self._events = [torch.cuda.Event() for _ in range(self.slots)]
+            self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
+            self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._pending: list[bool] = [False] * self.slots
+        self._next = 0
+        # Counters, because "how much did the bank save" is a question about the copies and
+        # not about the wall clock: `staged_experts` is the draws that cost an H2D.
+        self.staged_experts = 0
+        self.staged_bytes = 0
+
+    # -- allocation -------------------------------------------------------------------------
+
+    def _shapes(self) -> dict[tuple[str, str], tuple[int, ...]]:
+        return {
+            ("gate_proj", "weight"): (self.inter_dim, self.dim // 2),
+            ("gate_proj", "weight_scale"): (self.inter_dim, self.dim // 32),
+            ("down_proj", "weight"): (self.dim, self.inter_dim // 2),
+            ("down_proj", "weight_scale"): (self.dim, self.inter_dim // 32),
+            ("up_proj", "weight"): (self.inter_dim, self.dim // 2),
+            ("up_proj", "weight_scale"): (self.inter_dim, self.dim // 32),
+        }
+
+    def _allocate(self) -> dict[tuple[str, str], torch.Tensor]:
+        with torch.cuda.device(self.device):
+            return {
+                key: torch.empty((self.arena_rows,) + shape, dtype=torch.uint8, device=self.device)
+                for key, shape in self._shapes().items()
+            }
+
+    @property
+    def arena_bytes(self) -> int:
+        """Packed fp4 bytes one slot occupies on the card."""
+        return self.slots * self.arena_rows * sum(
+            shape[0] * shape[1] for shape in self._shapes().values()
+        )
+
+    @property
+    def expert_bytes(self) -> int:
+        """One expert's packed bytes, which is what one draw costs the PCIe link."""
+        return sum(shape[0] * shape[1] for shape in self._shapes().values())
+
+    # -- staging ----------------------------------------------------------------------------
+
+    def _take_slots(self, count: int) -> int:
+        """The first slot of `count` consecutive slots whose last kernel has been drained.
+
+        Rotating rather than searching is what keeps the copies and the kernels apart: with
+        two slots and one call in flight, `_next` names the slot the *previous* call used, so
+        the wait below is on a kernel that is a full layer behind and the host has that much
+        room to run ahead. Waiting on a slot's event is also what makes the overwrite safe --
+        the copies go to the copy stream, the event was recorded on the compute stream, and
+        the two are ordered by this wait and by nothing else.
+        """
+        if count > self.arena_rows:
+            raise ValueError(f"a call needs {count} arena rows and the arena holds {self.arena_rows}")
+        slot = self._next
+        self._next = (self._next + 1) % self.slots
+        if self._pending[slot]:
+            self._events[slot].synchronize()
+            self._pending[slot] = False
+        return slot
+
+    def _stage(self, slot: int, experts: Sequence[int]) -> None:
+        """Copy `experts` into the slot's arena rows, on the copy stream.
+
+        Ordered behind the compute stream because the rows are the previous call's inputs
+        **and** ahead of it because the kernel about to read them is on the other stream.
+        Both halves are load-bearing; see the module docstring.
+
+        Six copies an expert and not one: the source holds an expert as one record in
+        `down, gate, up` order and the kernel wants three tensors in `w1, w2, w3`, so
+        neither arrangement is a prefix of the other. The destination rows are contiguous
+        within each tensor, which is what lets the kernel read them as `[E, N, K/2]`.
+        """
+        arena = self._arenas[slot]
+        with torch.cuda.device(self.device):
+            self._copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._copy_stream):
+                for row, expert in enumerate(experts):
+                    views = self.source.expert_views(self.layer_id, int(expert))
+                    for (proj, kind), target in arena.items():
+                        target[row].copy_(
+                            views[(proj, kind)].view(torch.uint8), non_blocking=True
+                        )
+                self._copy_events[slot].record(self._copy_stream)
+        self.staged_experts += len(experts)
+        self.staged_bytes += len(experts) * self.expert_bytes
+
+    # -- the call ---------------------------------------------------------------------------
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """One token's routed-expert output, `[1, dim]`, in float32.
+
+        `indices` is `[top_k]` int64 of global expert ids and `weights` is `[top_k]` float32,
+        both as `gate_and_route` leaves them. The kernel is handed `arange(top_k)` instead of
+        the ids, because the arena holds the drawn experts in draw order and the id has
+        already been spent -- the row that holds expert 137 is whatever row the draw gave it.
+        That is also why the weights can be passed through unchanged: they follow the same
+        order, which is the draw order and not the id order.
+
+        One token, and deliberately: the kernel is the single-token one, whose arithmetic is
+        a per-row int8 activation quantisation. A batch goes through
+        `moe_multi_token_fp4_forward`, which is defined to agree with this one bit for bit
+        when fed one token at a time, and through the grouped prefill path for a chunk.
+        """
+        if hidden.dim() != 2 or hidden.shape[0] != 1:
+            raise ValueError(f"the single-token path takes [1, dim], got {tuple(hidden.shape)}")
+        indices = indices.reshape(-1)
+        weights = weights.reshape(-1)
+        if indices.numel() != weights.numel():
+            raise ValueError(
+                f"{indices.numel()} indices and {weights.numel()} weights is not a routing"
+            )
+        if indices.numel() > self.arena_rows:
+            raise ValueError(
+                f"a draw of {indices.numel()} experts does not fit an arena of {self.arena_rows}"
+            )
+
+        slot = self._take_slots(indices.numel())
+        self._stage(slot, indices.tolist())
+        arena = self._arenas[slot]
+        compute = torch.cuda.current_stream(self.device)
+        compute.wait_event(self._copy_events[slot])
+        rows = torch.arange(indices.numel(), dtype=torch.int64, device=self.device)
+        out = self._kernel.moe_single_token_fp4_forward(
+            hidden.to(self.device),
+            rows,
+            weights.to(self.device, dtype=torch.float32),
+            arena[("gate_proj", "weight")],
+            arena[("gate_proj", "weight_scale")],
+            arena[("down_proj", "weight")],
+            arena[("down_proj", "weight_scale")],
+            arena[("up_proj", "weight")],
+            arena[("up_proj", "weight_scale")],
+            0,
+            SWIGLU_LIMIT,
+        )
+        self._events[slot].record(compute)
+        self._pending[slot] = True
+        return out
+
+    def drain(self) -> None:
+        """Wait for every kernel this module has launched.
+
+        The arena holds no state between calls -- only bytes -- so there is nothing to
+        reconcile; what this is for is a caller that is about to read the host side, or to
+        tear the process down, and wants the copies it ordered to have happened.
+        """
+        for slot in range(self.slots):
+            if self._pending[slot]:
+                self._events[slot].synchronize()
+                self._pending[slot] = False
