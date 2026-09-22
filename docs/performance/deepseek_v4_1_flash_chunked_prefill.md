@@ -33,7 +33,7 @@ context](#the-one-row-that-grows-with-context).
 | GPUs | 4 x RTX 2080 Ti, 22528 MiB each, GPU0-GPU1 PHB and GPU2-GPU3 NV2, cross-pairs SYS |
 | CPU / RAM | 2 x Xeon E5-2696 v4, 88 hardware threads, 1007 GiB RAM |
 | Software | Python 3.11.14, torch 2.9.1+cu128, `deepseek` conda env |
-| Probes | `/tmp/probe_v41_chunk_scaling.py` (the sweep), `/tmp/probe_v41_chunk_profile.py` (one chunk, phase by phase), `/tmp/probe_v41_seed.py` (ten taps inside layer 0 and layer 1), `/tmp/diag_retention.sh` (the per-process retention diagnostic) |
+| Probes | `/tmp/probe_v41_chunk_scaling.py` (the sweep), `/tmp/probe_v41_chunk_profile.py` (one chunk, phase by phase), `/tmp/probe_v41_chunk_trace.py` (one chunk, device-side), `/tmp/probe_v41_seed.py` (ten taps inside layer 0 and layer 1), `/tmp/diag_retention.sh` (the per-process retention diagnostic) |
 
 ## Why a chunk and not a bigger card
 
@@ -615,6 +615,111 @@ below — and across the leg it goes from 7.7% of a chunk to 16.4%, which leaves
 21.8 s as the two largest things in a 256K chunk — no other row reaches 10 s.
 [Below](#the-one-row-that-grows-with-context) is what is inside that one row and which of its levers
 are still open.
+
+### How busy the card is
+
+Every table above is a tap, and a tap charges a phase for the time the *host* spent in it: the five
+phases read 99% of the wall because a wall made of `synchronize()` calls is what that instrument can
+see. What no tap here can answer is the other half of the question — **how much of a chunk the card
+was busy** — and the two answers point in opposite directions. A card that is 95% busy has no host-side
+lever left in it and the remaining work is kernels and bytes. A card that is 60% busy has 40% of its
+chunk in gaps, and each gap is a specific stall a timeline can name. A barrier cannot tell them apart,
+because the barrier is what creates the idleness it would have to measure.
+
+`/tmp/probe_v41_chunk_trace.py` asks the device instead: `torch.profiler` with CUPTI over **one**
+chunk, the chunks either side of it unprofiled so the instrument's price is read against their mean
+rather than assumed, and all four ranks reported because the layer split makes them four different
+measurements. It ran twice on the same tree, `3f2f306`, at the same arguments — `--at 32768 --chunk
+4096`, pool 148, the same eight warm-up chunks — under each deal.
+
+| one 4096-token chunk at 32768, pool 148 | r0 | r1 | r2 | r3 |
+| --- | ---: | ---: | ---: | ---: |
+| `id`, traced wall | 25.45 s | 25.43 | 25.38 | 25.40 |
+| `id`, the unprofiled pair | 24.66 | 24.88 | 24.64 | 24.91 |
+| `id`, what the trace cost | +0.79 | +0.54 | +0.74 | +0.49 |
+| `id`, **device busy / wall** | **0.775** | 0.797 | 0.772 | 0.798 |
+| `sorted`, traced wall | 38.19 | 38.12 | 38.17 | 38.14 |
+| `sorted`, the unprofiled pair | 35.78 | 35.79 | 36.17 | 35.98 |
+| `sorted`, what the trace cost | +2.42 | +2.34 | +2.01 | +2.15 |
+| `sorted`, **device busy / wall** | **0.846** | 0.859 | 0.847 | 0.858 |
+
+**A prefill chunk is four fifths busy, not ninety-five percent, and the deal is worth seven points of
+it.** 5.7 s of the `id` chunk is the card doing nothing at all, and the four ranks land within 2.5
+points of each other, so this is a property of the chunk rather than of one rank's share of the layers.
+The instrument is also cheap here for once: its price is 0.5–0.8 s under `id` — 2–3% of the chunk —
+against 2.0–2.4 s under `sorted`, which is the same CUPTI overhead counted against a wall that is
+smaller. **That is also what reconciles this table with the phase table above rather than
+contradicting it.** The `id` column there reads 32.08 s instrumented, but its own `taps off` row is
+24.18 s on the same tree and the same arguments, so the 7.9 s between them is the 22 taps' price and
+not a larger chunk; the trace's unprofiled pair agrees with that untapped wall to 2% (24.66 s), and
+the two runs are two days apart. Read against its own quiet row, as
+[Where a chunk's seconds go](#where-a-chunks-seconds-go) does throughout, and the phase table and the
+trace describe one chunk 24 s long.
+
+**The busy time is two streams that never touch, and the arithmetic is exact.** On `id` rank 0 the
+copy stream is busy 3,637.34 ms and the compute stream 16,098.43 ms, their mutual overlap is
+**0.000 ms**, and the union is 19,735.77 ms — which is the probe's own `device busy` for that rank to
+the millisecond. The same holds on the three other traces, `id` rank 2 (3,753.66 + 15,852.43 = 19,606.09)
+and `sorted` ranks 0 and 2 (16,842.94 + 15,485.92 = 32,328.85; 8,885.88 + 23,435.58 = 32,321.46). So the
+device-busy figure is not a sum of two overlapping engines; it is two disjoint ones, and the card never
+has both running. The copy stream's 21,195.57 ms of idle is 15,574.99 ms of it while the compute stream
+is running kernels — **the upload sits out three quarters of the compute and then runs entirely outside
+it.**
+
+**And the copies are at the wire, which this page had only asserted before.** Rank 0 moves 38.19 GiB of
+pinned H2D in 3,637.34 ms — **10.50 GiB/s** — and the `sorted` run moves 176.78 GiB in 16,842.94 ms,
+which is the same 10.50. A bare loop on the same card gets no more: 64 pinned copies of 5.62 MiB are
+10.52 GiB/s, one 512 MiB copy is 10.61, and 256 MiB copies back to back are 10.52
+(`/tmp/probe_h2d_ceiling.py`, `/tmp/pcie_load_probe.py`). The link is the reason: card 0 reports
+**`pcie.link.gen.current 3`, width 16, both idle and under load**, and Gen3 x16 is 15.75 GB/s usable =
+14.67 GiB/s, so 10.52 is **72% of it** — the usual efficiency of a pinned H2D stream and not a number
+with a lever under it. (`nvidia-smi` reports `gen.current 1` on cards 1–3, which is an idle power state
+and not the link in use; card 0 reads `3` in the same query, and the chunk uploads off all four ranks
+at the same rate.) **The only way to spend less on the copies is to move fewer bytes, which is what the
+deal does: 176.78 GiB becomes 38.19 GiB, and the class total falls 17,618.02 → 3,637.34 ms.**
+
+**The serialization is structural rather than a blocked host, and that is now measured rather than
+inferred.** Merging the two streams into one alternation — valid precisely because their overlap is
+zero — and reading the gap at every boundary: **`kernel -> copy` has a median of 1 µs over 1,479
+transitions, a p99 of 8 µs and a total of 2 ms**, while `copy -> kernel` has a median of 1 µs, a p99 of
+7.9 ms and a total of 0.32 s. The host has the next layer's copies enqueued within a microsecond of a
+kernel ending; it is not blocked there, and there is no stall at that boundary to remove. The 3.6 s
+sits where the code puts it, one stage of a two-buffer rotation behind the GEMM, so ordering the copies
+second costs exactly what ordering the GEMM second would — which is why the `#333` measurement recorded
+in [Reproducing](#reproducing) read **0.6%** off cutting both wholesale braces and why the trace's
+mechanism and that measurement agree instead of competing. Cutting `_take_buffer`'s wait is the same shape for the same reason: the trace's
+`cudaStreamSynchronize` is 8,538.27 ms over 401 calls and `cudaEventSynchronize` 6,995.37 ms over
+1,979, and the arm that skips the wait moves 0.35 s of a 36 s chunk.
+
+**What the card spends its busy time on is a different list from the host's, and on the shipping deal
+the top of it is invisible to every tap here.** Rank 0, `id`, of the 25.45 s traced wall: **`nccl`
+5,458.03 ms over 1,154 collectives (21.4%)**, pinned H2D 3,637.34 ms (14.3%), the MoE's 160
+`moe_multi_*` calls 4,153.56 ms (16.3%, of which `w1w3` 2,848.54 over 40 and `w2` 1,275.59), `aten`
+2,627.24 ms over 28,952 calls (10.3%), `attn.sparse` 1,945.92 ms over 40 (7.6%) and the rest of the
+GEMM 1,097.46 ms over 2,110 (4.3%) — and those six classes are the 19,735.77 ms of busy time with
+nothing left over. **The largest single item in a chunk under the deal that ships is the TP all-reduce**,
+which is exactly the closure [the section below](#the-wire-and-how-much-of-a-collective-is-bytes)
+opens because no phase tap can see it; on `sorted` the same rank's list is led by `memcpy` at 17,618.02
+ms of 38,193 (46.1%) and the collective is third at 4,451.62 (11.7%).
+
+**The deal decides which rank is the straggler, and the collective carries the difference.** Both runs
+issue **1,154** collectives on every rank, so the count is a property of the model and not of the
+deal — but under `sorted` they cost rank 2 **14,869.75 ms with a worst call of 922.84 ms** against rank
+0's 4,451.62, while under `id` the same 1,154 cost 5,644.41 (r2, worst 336.81) and 5,458.03 (r0, worst
+307.03). A ring all-reduce runs at the rate of its slowest member, so the ranks that wait are the two
+staging 5,055 and 5,184 rows — 91.94 GiB of H2D against the other pair's 176.78 — and **3.3x of the
+collective landing on the ranks that copy least is the copy-bound ranks' 17.6 s arriving through the
+ring**, which is the class split above read from the other end. The `sorted` deal is not a slower
+version of the `id` chunk; it is a chunk whose critical path runs through a different engine on each
+rank.
+
+**What is left is 5.7 s of the card doing nothing, and it is not a host stall.** The two candidate
+levers the trace leaves open, and neither is measured here: a third or fourth arena buffer rather than
+the two `--expert-buffers` defaults to, which would give the copies two stages of depth to hide in; and
+whatever the 5.7 s is spent on, which the host runtime list does not name — `cudaLaunchKernel` is 489.02
+ms over 33,075 calls on rank 0, so the launch path is not it. Both are priced against a `sorted`-deal
+page's habit of reading the copies as the block, and the trace says the copies are 3.6 s of a 25.4 s
+chunk and already at the wire.
 
 ### The wire, and how much of a collective is bytes
 
@@ -1350,6 +1455,26 @@ then measures `2 × --replicates` chunks forward from it, `--max-seq-len` is der
 the arms alternate rather than block so that neither one gets the cheap half of the position range.
 Arm B's worst wait is the `query()` and its wall is the reading: the wait is 96% unsatisfied and worth
 0.9903×.
+
+The device-side answer is a trace rather than a tap, and it is the same two-deal pair as the phase
+tables — one leg an arm, so a `sorted` figure and an `id` figure on the same tree differ by the deal:
+
+```bash
+# /tmp/chunk_trace.log: pool 148, the deal the p148 tables above are under.
+# /tmp/chunk_trace_id.log: the same run with the deal that ships; compare the two walls.
+for deal in sorted id; do
+    DEEPSEEK_V41_RESIDENT_EXPERTS=1 DEEPSEEK_V41_EXPERT_DEAL="$deal" \
+    torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_trace.py \
+        --at 32768 --chunk 4096 --pool-rows 148 --threads 22 --out "/tmp/chunk_trace_$deal"
+done
+```
+
+`--chunk` is traced and the two chunks either side of it are not, so the instrument's own price comes
+out as the difference between them rather than as an assumption, and the four `.r{0..3}.json` files are
+the chrome traces the reducers read: `/tmp/analyze_chunk_trace.py` for the per-stream and per-class
+ledger, `/tmp/overlap_chunk_trace.py` for the two streams' overlap, `/tmp/rounds_chunk_trace.py` for
+the boundary gaps. The PCIe roof is a fourth, `/tmp/pcie_load_probe.py`, which asks the link its
+generation while a copy loop holds it busy.
 
 The driver is the code, not the probe — this is the call the 256K number above is a forward of:
 
