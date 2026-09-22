@@ -22,6 +22,17 @@ the compressor state, and the forward that produced the snapshot started from th
 the rows a sliced snapshot does not carry are zeros on both sides. A restore therefore reconstructs
 the state a cold prefill of exactly `p` tokens leaves, not a state that is written over.
 
+**An exact repeat forwards nothing, and the entry says why.** A request whose prompt *is* a stored
+prefix -- the second turn of a chat that has not changed, a retry -- needs the distribution its first
+new token comes from and nothing else, and that row was already computed when the anchor was taken.
+So `Entry.logits` carries it, and the repeat is a restore and a sample. The rule that looks cheaper,
+restoring the state and forwarding the prompt's last token again at its own position, is *wrong*, for
+a reason worth stating: the ring and the Engram hash cache are pure functions of the position and
+would survive a replay, but the compressor is a recurrence over a group, so a replay re-emits the
+group's row from a state that has already counted the position or has already flushed it.
+`test_a_snapshot_exactly_the_prompt_cannot_be_resumed_with_a_forward` asserts the divergence that
+produces, so the shortcut cannot be reintroduced as an optimization.
+
 **Why the key is the tokens.** `thinking_mode`, `reasoning_effort`, tools and `response_format` all
 reach the model as tokens, so keying on the rendered prompt folds every one of them in for free: a
 different render is a different token stream and cannot false-hit. The key itself is a chain over
@@ -254,11 +265,19 @@ class Entry:
     so a request that restores it forwards the prompt from `length` on. `used` is the eviction clock
     and not a timestamp -- an `int` comparison that cannot be moved by the wall clock or by a
     monotonic one that wraps.
+
+    `logits` is the distribution at position `length - 1`, on the host in the dtype the head produced
+    it in -- fp32, 129280 wide, half a megabyte. It is not an optimization the caller may skip: a
+    request whose prompt is exactly `length` tokens has nothing left to forward, and the rule that
+    would let it forward one token anyway is the replay the module docstring calls out as unsound.
+    Every entry has one, including the head anchor, whose chunk is a forward *of* `ids[:p_head]` and
+    therefore already holds the row a prompt of exactly that length would sample from.
     """
 
     length: int
     key: bytes
     saved: dict[str, torch.Tensor]
+    logits: torch.Tensor
     nbytes: int
     used: int = 0
 
@@ -286,13 +305,17 @@ class PrefixCache:
         max_seq_len: int,
         tag: bytes = b"",
         min_tokens: int = BLOCK_TOKENS,
+        head_tokens: int = 0,
     ) -> None:
         if budget_bytes < 0:
             raise ValueError(f"budget_bytes is {budget_bytes}, which is negative")
+        if head_tokens < 0:
+            raise ValueError(f"head_tokens is {head_tokens}, which is negative")
         self._budget = int(budget_bytes)
         self._max_seq_len = int(max_seq_len)
         self._seed_bytes = _seed(tag)
         self._min_tokens = int(min_tokens)
+        self._head_tokens = int(head_tokens)
         self._by_length: dict[int, dict[bytes, Entry]] = {}
         self._bytes = 0
         self._clock = 0
@@ -305,6 +328,22 @@ class PrefixCache:
     @property
     def budget_bytes(self) -> int:
         return self._budget
+
+    @property
+    def max_seq_len(self) -> int:
+        return self._max_seq_len
+
+    @property
+    def head_tokens(self) -> int:
+        """The fixed-length anchor a prefill also stores, or 0 for an end anchor only.
+
+        Read by the prefill rather than by the store, because it is the prefill that has to put a
+        chunk boundary where the snapshot goes. It lives here because it is one of the three numbers
+        that describe an anchor -- with `min_tokens` and `max_seq_len`, both of which the store also
+        enforces -- and because a caller that configures the store is the caller that knows whether a
+        head anchor is worth an extra chunk.
+        """
+        return self._head_tokens
 
     @property
     def bytes(self) -> int:
@@ -321,12 +360,18 @@ class PrefixCache:
     def lookup(self, ids: Iterable[int]) -> tuple[int, Entry] | None:
         """The longest stored prefix of `ids`, as `(cached_len, entry)`; `None` if there is none.
 
-        `cached_len` is the entry's own length clamped to `len(ids) - 1`. The clamp is not defensive:
-        a forward is always needed for the logits the first new token comes from, so an exact repeat
-        forwards exactly one token rather than none, and that one token is the decode path at a
-        position past zero -- the case the chunked-prefill suite pins separately.
+        `cached_len` is the entry's own length, which is never more than `len(ids)`: the key is over
+        the first `length` tokens of the request, so a match is a statement about a prefix that is
+        already there. It may be *equal* to `len(ids)`, which is the exact repeat and is the reason
+        there is no clamp to `len(ids) - 1` here -- the caller takes `entry.logits` and forwards
+        nothing. See `Entry.logits` and the module docstring for why the one-token forward is not the
+        fallback.
+
+        Nothing is stored or cleared: `lookup` only reads the index and moves the eviction clock, so
+        a caller that abandons the hit (a forward that raises, a cancelled request) leaves the store
+        exactly as it found it.
         """
-        # A one-token prompt has no prefix to reuse: the clamp below would leave nothing to forward.
+        # A one-token prompt has no prefix to reuse: it is shorter than the floor, either way.
         if len(ids) < 2 or not self._by_length:
             return None
         limit = min(len(ids), self._max_seq_len)
@@ -342,11 +387,17 @@ class PrefixCache:
             self._hits += 1
             self._reused += length
             self._touch(entry)
-            return min(length, len(ids) - 1), entry
+            return length, entry
         self._misses += 1
         return None
 
-    def store(self, ids: Iterable[int], length: int, saved: dict[str, torch.Tensor]) -> Entry | None:
+    def store(
+        self,
+        ids: Iterable[int],
+        length: int,
+        saved: dict[str, torch.Tensor],
+        logits: torch.Tensor,
+    ) -> Entry | None:
         """Record `saved` as the state after the first `length` tokens of `ids`.
 
         Returns the entry, or `None` when it was not taken: shorter than the floor, longer than the
@@ -357,14 +408,19 @@ class PrefixCache:
         The floor exists because an entry costs the window ring whatever its length: 128 slots by 512
         by 40 layers is 5 MiB, and a store of a handful of tokens would spend it on the ring. It is a
         whole block by default, which is the smallest length the chain can key in one step.
+
+        `logits` is the entry's own last row and is taken as it is: the callers are the two forwards
+        that produced the state, and neither can be missing the row -- they sampled from it.
         """
         if length < self._min_tokens or length > len(ids) or length > self._max_seq_len:
             return None
+        row = logits.detach().reshape(-1).to("cpu", copy=True)
         nbytes = sum(tensor.numel() * tensor.element_size() for tensor in saved.values())
+        nbytes += row.numel() * row.element_size()
         if nbytes > self._budget:
             return None
         chain = prefix_hashes(ids[:length], self._seed_bytes)
-        entry = Entry(length, _key_at(ids, length, self._seed_bytes, chain), saved, nbytes)
+        entry = Entry(length, _key_at(ids, length, self._seed_bytes, chain), saved, row, nbytes)
         return self._admit(entry)
 
     def clear(self) -> None:
