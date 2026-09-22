@@ -152,7 +152,13 @@ class SamplingParams:
     behavior of both existing runtimes.
     """
 
-    max_tokens: int = 256
+    #: The generation budget, or ``None`` when the client asked for no cap of its own.
+    #:
+    #: ``None`` is not the same as a default: a number invented here truncates an answer the model
+    #: was still writing, and the caller never asked for that length. Both vLLM and SGLang read an
+    #: absent budget as "run until the model stops", resolved against their own context, and a
+    #: backend resolving this one is where that context is known.
+    max_tokens: int | None = None
     temperature: float = 0.0
     top_p: float | None = None
     top_k: int | None = None
@@ -170,7 +176,7 @@ class SamplingParams:
 
     def __post_init__(self) -> None:
         self.stop = _coerce_stop(self.stop)
-        if self.max_tokens < 1:
+        if self.max_tokens is not None and self.max_tokens < 1:
             raise ConfigurationError("max_tokens must be >= 1")
         if self.temperature < 0:
             raise ConfigurationError("temperature must be >= 0")
@@ -193,10 +199,36 @@ class SamplingParams:
     def greedy(self) -> bool:
         return self.temperature <= 1.0e-5
 
+    def token_budget(self, available: int) -> int:
+        """The number of tokens to generate, given the positions the model can still hold.
+
+        ``available`` is the caller's own context minus the prompt, so a caller reaches this having
+        already decided whether an explicit ``max_tokens`` fits: an explicit one is handed back
+        unchanged and the caller's length check keeps the last word on it.  An absent one resolves
+        to everything that is left, which is how both engines read an absent cap -- vLLM to
+        ``max_model_len - input_length``, SGLang to ``max_req_len - input_len - 1``, one position
+        reserved -- and the answer then ends at EOS or at the context limit, whichever comes first.
+
+        The floor of one is for the case where the prompt alone overruns the context: there is
+        nothing left to derive from, and asking for one token hands the refusal to the caller's own
+        length check instead of reporting a generation that produced nothing.
+        """
+        if self.max_tokens is None:
+            return max(1, int(available))
+        return int(self.max_tokens)
+
     @classmethod
     def from_openai(cls, body: Mapping[str, Any]) -> "SamplingParams":
         """Normalize OpenAI-compatible request fields into one typed object."""
-        max_tokens = body.get("max_tokens", body.get("max_completion_tokens", 256))
+        # ``max_completion_tokens`` is the current spelling and wins over the deprecated
+        # ``max_tokens``, which is OpenAI's rule for the pair and what vLLM and SGLang both
+        # implement.  A null for either key means the same as leaving it out -- clients do send
+        # ``"max_tokens": null`` for "no cap" -- so both spellings of absence have to land on None
+        # rather than on a number this function made up.
+        cap = body.get("max_completion_tokens")
+        if cap is None:
+            cap = body.get("max_tokens")
+        max_tokens = None if cap is None else int(cap)
         known = {
             "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k",
             "min_p", "seed", "repetition_penalty", "frequency_penalty",
@@ -204,7 +236,7 @@ class SamplingParams:
             "response_format",
         }
         return cls(
-            max_tokens=int(max_tokens),
+            max_tokens=max_tokens,
             temperature=float(body.get("temperature", 0.0) or 0.0),
             top_p=None if body.get("top_p") is None else float(body["top_p"]),
             top_k=None if body.get("top_k") is None else int(body["top_k"]),

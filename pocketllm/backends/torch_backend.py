@@ -30,6 +30,14 @@ from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 from .base import BackendBase
 
 
+#: What the legacy runtime generates when a request carries no budget of its own
+#: (``src/server/openai.py`` reads ``payload.get("max_tokens") or 512``).  This adapter has to name
+#: the number rather than leave the field absent, because the same field is what the legacy
+#: serving queue's admission check counts against its token budget; a missing one would be read
+#: there as zero and the request would be admitted on a promise the runtime does not keep.
+_LEGACY_DEFAULT_MAX_TOKENS = 512
+
+
 class TorchBackend(BackendBase):
     """Backend adapter over ``src.server`` and model generation functions.
 
@@ -228,6 +236,22 @@ class TorchBackend(BackendBase):
             return request.prompt or render_fallback_prompt(messages)
         return request.prompt or ""
 
+    def _budget(self, params: SamplingParams, prompt_ids: list[int]) -> int:
+        """Resolve the generation budget this adapter hands the legacy runtime.
+
+        A budget the caller named is theirs.  An absent one is resolved against the context this
+        adapter was configured with, the same rule the other backends apply, and only when no
+        context was configured does the legacy runtime's own default stand in for it -- reproducing
+        that default here rather than omitting the field is what keeps the serving queue's
+        admission check counting the same number generation will use.
+        """
+        if params.max_tokens is not None:
+            return int(params.max_tokens)
+        leftover = (self.args.max_model_len or 0) - len(prompt_ids)
+        if leftover > 0:
+            return params.token_budget(leftover)
+        return _LEGACY_DEFAULT_MAX_TOKENS
+
     def _payload(self, request: GenerationRequest, *, stream: bool) -> dict[str, Any]:
         params = request.sampling_params
         prompt_ids = self._prompt_ids(request)
@@ -238,7 +262,7 @@ class TorchBackend(BackendBase):
             "messages": self._messages(request) or [{"role": "user", "content": request.prompt or ""}],
             "thinking_mode": str(request.metadata.get("thinking_mode", "chat")),
             "reasoning_effort": request.metadata.get("reasoning_effort"),
-            "max_tokens": params.max_tokens,
+            "max_tokens": self._budget(params, prompt_ids),
             "temperature": params.temperature,
             "top_p": params.top_p,
             "top_k": params.top_k,

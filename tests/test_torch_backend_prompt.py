@@ -170,3 +170,41 @@ def test_streaming_uses_the_same_prompt_rendering():
     assert tokenizer.encoded[0] == encode_messages(messages, thinking_mode="chat")
     assert engine.payloads[-1]["_prompt_ids"] == [11, 12]
     backend.close()
+
+
+def test_a_request_without_a_budget_names_the_runtime_default():
+    """The legacy runtime's own 512 is written out rather than left off the payload.
+
+    The serving queue's admission check counts that same field against its token budget
+    (``src/server/engine.py``), so an absent one would be read there as zero and the request
+    would be admitted on a promise the runtime does not keep.
+    """
+    tokenizer = RecordingTokenizer()
+    backend, engine = _backend(tokenizer)
+    request = GenerationRequest(prompt="raw prompt", request_id="req-open-ended")
+
+    backend.generate([request])
+
+    assert engine.payloads[-1]["max_tokens"] == 512
+    backend.close()
+
+
+def test_a_budget_is_resolved_against_the_configured_context_first():
+    """With a context configured, an absent budget is what the prompt leaves, as in the others."""
+    tokenizer = RecordingTokenizer()
+    backend, engine = _backend(tokenizer)
+    backend.args.max_model_len = 1024
+
+    backend.generate([GenerationRequest(prompt_tokens=[7, 8], request_id="req-open-ended")])
+    backend.generate(
+        [
+            GenerationRequest(
+                prompt_tokens=[7, 8],
+                request_id="req-named",
+                sampling_params=SamplingParams(max_tokens=9),
+            )
+        ]
+    )
+
+    assert [payload["max_tokens"] for payload in engine.payloads] == [1022, 9]
+    backend.close()
