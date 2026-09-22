@@ -43,7 +43,12 @@ from src.models.mimo_v2.loader import (  # noqa: E402
     dense_weight_keys,
     layer_weight_keys,
 )
-from src.models.mimo_v2.quant import E2M1_LEVELS, dequant_fp8_block, dequant_mxfp4  # noqa: E402
+from src.models.mimo_v2.quant import (  # noqa: E402
+    E2M1_LEVELS,
+    QKV_SHARDS,
+    dequant_fp8_block,
+    dequant_mxfp4,
+)
 
 RELEASE = os.environ.get("POCKETLLM_MIMO_CHECKPOINT", "/mnt/data3/MiMo-V2.6-Flash-RL")
 HAS_RELEASE = os.path.isfile(os.path.join(RELEASE, "config.json"))
@@ -177,10 +182,6 @@ TINY = {
 }
 
 EXPERTS_PER_SHARD = 2
-#: The released global-attention anomaly, reproduced: a GA qkv weight needs one
-#: 128-row block here but the scale carries three rows, so two are unreachable.
-#: SWA layers are exact, as they are in the release.
-EXTRA_GA_SCALE_ROWS = 2
 #: A tile scale the whole miniature shares, so "was the scale applied" is checkable.
 TILE_SCALE = 0.02
 
@@ -194,8 +195,11 @@ def tiny_layer_tensors(layer: int, config) -> dict[str, torch.Tensor]:
     shape = config.attention(layer)
     root = f"model.layers.{layer}"
     rows, cols = shape.qkv_out, config.hidden_size
-    row_blocks = -(-rows // 128)
-    scale_rows = row_blocks + (EXTRA_GA_SCALE_ROWS if not shape.is_swa else 0)
+    # The released fused projection is quantised one tensor-parallel shard at a
+    # time, so its scale carries a tile row per shard rather than one per run of
+    # 128 rows of the whole weight. The two agree only when a shard is a whole
+    # number of tiles, which at this size no shard is.
+    scale_rows = QKV_SHARDS * -(-(rows // QKV_SHARDS) // 128)
     generator = torch.Generator().manual_seed(1000 + layer)
     tensors = {
         f"{root}.input_layernorm.weight": torch.ones(config.hidden_size),
@@ -456,31 +460,46 @@ def test_dense_tensor_dequantizes_fp8_and_passes_bf16_through(tiny):
     assert tiny.entry("model.layers.1.self_attn.o_proj.weight").dtype == "BF16"
 
 
-def test_the_extra_scale_rows_of_a_global_qkv_are_never_read(tmp_path):
+def test_a_global_qkv_scale_is_read_one_tile_row_per_shard(tmp_path):
     """The released 108-vs-106 anomaly, in miniature and made fatal.
 
-    The GA scale's unreachable rows hold NaN. A dequantizer that reads them returns
-    NaN, which is louder than a wrong number and cannot be mistaken for rounding.
+    Every scale row of a global layer's fused projection is given its own value,
+    so a reader that indexes the scale as one run of tiles over the whole weight
+    scales each shard's rows by the first shard's tile and lands on a number that
+    is none of the rows' own. A reader that indexes it per shard reproduces the
+    rows exactly.
     """
-    root = str(tmp_path / "anomalous")
+    root = str(tmp_path / "per_shard_scale")
     write_tiny_checkpoint(root)
     config = MimoV2Config.from_dict(TINY).text
-    rows = -(-config.attention(0).qkv_out // 128) + EXTRA_GA_SCALE_ROWS
+    rows = config.attention(0).qkv_out
+    shard_rows = rows // QKV_SHARDS
+    per_shard = torch.tensor([1.0, 2.0, 4.0, 8.0])
 
-    def poison_the_idle_rows(items):
+    def give_each_scale_row_its_own_value(items):
         out = []
         for name, tensor in items:
             if name == "model.layers.0.self_attn.qkv_proj.weight_scale_inv":
-                tensor = torch.full((rows, 1), TILE_SCALE)
-                tensor[-EXTRA_GA_SCALE_ROWS:] = float("nan")
+                tensor = per_shard.reshape(QKV_SHARDS, 1).expand(QKV_SHARDS, 1).clone()
             out.append((name, tensor))
         return out
 
-    rewrite_shard(root, "model_pp0_ep0_shard0.safetensors", poison_the_idle_rows)
+    rewrite_shard(root, "model_pp0_ep0_shard0.safetensors", give_each_scale_row_its_own_value)
     checkpoint = MimoV2Checkpoint(root)
-    assert checkpoint.entry("model.layers.0.self_attn.qkv_proj.weight_scale_inv").shape[0] == rows
+    assert checkpoint.entry(
+        "model.layers.0.self_attn.qkv_proj.weight_scale_inv"
+    ).shape[0] == QKV_SHARDS
+
+    codes = checkpoint.read("model.layers.0.self_attn.qkv_proj.weight", copy=False)
+    scale = checkpoint.read("model.layers.0.self_attn.qkv_proj.weight_scale_inv", copy=False)
+    bare = codes.view(torch.float8_e4m3fn).to(torch.float32)
+    want = torch.cat(
+        [bare[rank * shard_rows : (rank + 1) * shard_rows] * per_shard[rank]
+         for rank in range(QKV_SHARDS)]
+    )
     got = checkpoint.dense_tensor("model.layers.0.self_attn.qkv_proj.weight", torch.float32)
-    assert torch.isfinite(got).all(), "the dequantizer read a scale row the weight has no block for"
+    assert torch.equal(got, want), "a shard was scaled by another shard's tile"
+    assert not torch.equal(got, bare * per_shard[0]), "every shard got the first tile"
 
 
 def test_a_mxfp4_expert_weight_is_refused_by_the_dense_reader(tiny):
@@ -593,23 +612,46 @@ def test_the_released_fused_widths_differ_between_the_two_families(release):
 
 
 @needs_release
-def test_the_released_global_qkv_scale_has_two_rows_the_weight_has_no_blocks_for(release):
-    """106 blocks of weight, 108 rows of scale, and only 106 are reachable."""
+def test_the_released_global_qkv_scale_is_blocked_one_shard_at_a_time(release):
+    """106 tiles of weight, 108 rows of scale, and the extra rows are not spare.
+
+    108 is 4 x 27 and a global layer's projection is four shards of 3392 rows,
+    which is 26.5 tiles: the scale restarts at each shard boundary, so the last
+    row of each shard's share of it covers a half tile. The sliding-window layers
+    are 3712 rows in four shards of 29 whole tiles, so their scale is the same
+    either way, which is why only the global layers move.
+    """
     ga = release.entry("model.layers.0.self_attn.qkv_proj.weight")
     ga_scale = release.entry("model.layers.0.self_attn.qkv_proj.weight_scale_inv")
     assert ga.shape[0] // 128 == 106
     assert ga_scale.shape == (108, 32)
+    assert ga_scale.shape[0] == QKV_SHARDS * -(-(ga.shape[0] // QKV_SHARDS) // 128)
     swa = release.entry("model.layers.1.self_attn.qkv_proj.weight")
     swa_scale = release.entry("model.layers.1.self_attn.qkv_proj.weight_scale_inv")
     assert swa.shape[0] // 128 == swa_scale.shape[0] == 116, "the windowed family is exact"
+    assert swa_scale.shape[0] == QKV_SHARDS * -(-(swa.shape[0] // QKV_SHARDS) // 128)
 
     codes = release.read("model.layers.0.self_attn.qkv_proj.weight", copy=False)
     scale = release.read("model.layers.0.self_attn.qkv_proj.weight_scale_inv", copy=False)
-    poisoned = scale.clone()
-    poisoned[106:] = float("nan")
-    got = dequant_fp8_block(codes, poisoned, out_dtype=torch.float32)
-    assert torch.isfinite(got).all()
-    assert torch.equal(got, dequant_fp8_block(codes, scale, out_dtype=torch.float32))
+    per_shard = dequant_fp8_block(codes, scale, out_dtype=torch.float32, shards=QKV_SHARDS)
+    one_run = dequant_fp8_block(codes, scale, out_dtype=torch.float32)
+    shard_rows = codes.shape[0] // QKV_SHARDS
+    differs = (per_shard != one_run).any(dim=1).nonzero().flatten()
+    assert differs.numel() and int(differs.min()) == shard_rows, (
+        "the two blockings first disagree at the second shard's first row, where one "
+        "reads that shard's own tile and the other reads the first shard's last one"
+    )
+
+
+@needs_release
+def test_the_released_windowed_qkv_scale_reads_the_same_either_way(release):
+    """The windowed layers are the control: their shards are whole tiles."""
+    codes = release.read("model.layers.1.self_attn.qkv_proj.weight", copy=False)
+    scale = release.read("model.layers.1.self_attn.qkv_proj.weight_scale_inv", copy=False)
+    assert torch.equal(
+        dequant_fp8_block(codes, scale, out_dtype=torch.float32, shards=QKV_SHARDS),
+        dequant_fp8_block(codes, scale, out_dtype=torch.float32),
+    )
 
 
 @needs_release

@@ -14,8 +14,11 @@ The layouts, and the one detail in each that is easy to get backwards:
   one E8M0 byte per 32 input columns, read as `2 ** (byte - 127)`.
 * **FP8 E4M3 dense linears.** 128x128 tiles, one float32 `weight_scale_inv` per
   tile, and the exporter normalises each tile so that `w = w_fp8 * scale`. The
-  released global-attention `qkv_proj` carries two more scale rows than the weight
-  has row-blocks; see `loader.py`.
+  released global-attention `qkv_proj` was quantised one tensor-parallel shard at
+  a time, so its scale is blocked per shard and carries 108 rows for 106 tiles of
+  weight; pass `shards=QKV_SHARDS` for it. See `_dequant_fp8_block_sharded` for
+  what a reader that ignores this gets wrong, and `loader.py` for where it is
+  decided.
 * **BF16 everything else.** `o_proj`, the norms, the router, the embedding and the
   head, read at their stored dtype.
 """
@@ -28,6 +31,7 @@ import torch.nn.functional as F
 __all__ = [
     "E2M1_LEVELS",
     "E2M1_LEVELS_BY_NIBBLE",
+    "QKV_SHARDS",
     "dequant_fp8_block",
     "dequant_mxfp4",
     "e8m0_to_float",
@@ -49,6 +53,11 @@ E2M1_LEVELS_BY_NIBBLE = torch.tensor(E2M1_LEVELS, dtype=torch.float32)
 #: 128x128 is the released `weight_block_size`. Named here so a caller and the loader
 #: cannot disagree about which block size a scale was built with.
 FP8_BLOCK = (128, 128)
+
+#: How many tensor-parallel shards the released fused `qkv_proj` was quantised in.
+#: Its row order is four shards of `[q | k | v]`, and its FP8 scale is blocked
+#: inside each of those shares rather than across the whole projection.
+QKV_SHARDS = 4
 
 #: MXFP4's block: one E8M0 byte covers this many consecutive input columns.
 MXFP4_BLOCK = 32
@@ -113,6 +122,7 @@ def dequant_fp8_block(
     scale: torch.Tensor,
     block: tuple[int, int] = FP8_BLOCK,
     out_dtype: torch.dtype = torch.bfloat16,
+    shards: int = 1,
 ) -> torch.Tensor:
     """`w = w_fp8 * scale`, tile by tile, without materialising a broadcast scale.
 
@@ -120,11 +130,18 @@ def dequant_fp8_block(
     `rows x cols` float32 intermediate; the reshape below touches the same numbers
     in `rows x cols` worth of float32 once.
 
-    `scale` may have more rows than the weight has row-blocks. That is not a
-    tolerance, it is the released global-attention `qkv_proj`, whose scale carries
-    two extra rows that the reference's own loader never reads. Extra columns are
-    treated the same way, since the tile index that would use them does not exist.
+    `shards` is the number of tensor-parallel ranks the weight was exported for
+    when its scale was blocked inside each rank's share rather than across the
+    whole tensor -- see `_dequant_fp8_block_sharded`. For `shards=1` the scale is
+    blocked across the whole weight, and it may then carry more rows than the
+    weight has row-blocks: the released global-attention `qkv_proj` does, and its
+    scale is blocked per shard, so pass `shards=4` for it rather than relying on
+    the truncation below. Extra columns are dropped the same way, since the tile
+    index that would use them does not exist.
     """
+    if shards > 1:
+        return _dequant_fp8_block_sharded(codes, scale, block, out_dtype, shards)
+
     rows, cols = codes.shape
     block_rows, block_cols = block
     row_blocks = -(-rows // block_rows)
@@ -145,3 +162,57 @@ def dequant_fp8_block(
     tiles = codes.to(torch.float32).view(row_blocks, block_rows, col_blocks, block_cols)
     tiles = tiles * scale.to(torch.float32)[:, None, :, None]
     return tiles.view(padded_rows, padded_cols)[:rows, :cols].to(out_dtype)
+
+
+def _dequant_fp8_block_sharded(
+    codes: torch.Tensor,
+    scale: torch.Tensor,
+    block: tuple[int, int],
+    out_dtype: torch.dtype,
+    shards: int,
+) -> torch.Tensor:
+    """The same product, with the tiles blocked inside each shard rather than across.
+
+    A fused projection exported for `shards` ranks is quantised shard by shard, so
+    its scale is `shards` groups of `ceil(shard_rows / block_rows)` tile rows. When
+    the shard's row count happens to be a multiple of the tile the two blockings
+    coincide and nothing is at stake; when it is not, they do not, and the reader
+    that indexes the scale by `row // block_rows` reads the wrong tile for every
+    row past the end of the first shard.
+
+    The released global-attention `qkv_proj` is exactly that case: 13568 rows in
+    four shares of 3392, which is 26.5 tiles, against a scale of 4 x 27 = 108
+    rows. Reading it as 106 tiles shifts a shard's share by half a tile per
+    boundary, so the first 128 rows of each shard after the first -- the head of
+    that shard's query block -- are scaled by the previous shard's last tile,
+    which covers its small value block. The sliding-window layers are 3712 rows in
+    four shares of 29 whole tiles, which is why only the global layers move.
+    """
+    rows, cols = codes.shape
+    if rows % shards:
+        raise ValueError(f"{rows} rows do not divide into {shards} shards")
+    block_rows, block_cols = block
+    shard_rows = rows // shards
+    shard_tiles = -(-shard_rows // block_rows)
+    col_blocks = -(-cols // block_cols)
+    expected = (shard_tiles * shards, col_blocks)
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"block scale has {tuple(scale.shape)} rows/cols for a {tuple(codes.shape)} "
+            f"weight in {shards} shards of {block} blocks; {expected} needed"
+        )
+
+    padded_rows = shard_tiles * block_rows
+    padded_cols = col_blocks * block_cols
+    parts = []
+    for rank in range(shards):
+        share = codes[rank * shard_rows : (rank + 1) * shard_rows]
+        if (padded_rows, padded_cols) != (shard_rows, cols):
+            share = F.pad(share, (0, padded_cols - cols, 0, padded_rows - shard_rows))
+        tiles = share.to(torch.float32).view(
+            shard_tiles, block_rows, col_blocks, block_cols
+        )
+        scale_rows = scale[rank * shard_tiles : (rank + 1) * shard_tiles]
+        tiles = tiles * scale_rows.to(torch.float32)[:, None, :, None]
+        parts.append(tiles.view(padded_rows, padded_cols)[:shard_rows, :cols])
+    return torch.cat(parts, dim=0).to(out_dtype)

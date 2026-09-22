@@ -26,9 +26,14 @@ tensor is, not by a flag:
 And one anomaly, because a loader that gets it wrong reads a plausible tensor
 from the right place: on a **global-attention** layer `qkv_proj.weight_scale_inv`
 has 108 rows for a weight with 106 row-blocks, while every sliding-window layer
-matches exactly. The trailing rows are unreachable in the reference's own loader
-(it maps q/k/v to blocks 0..95 / 96..101 / 102..105 and never reads 106 or 107),
-which is the `scale[: ceil(rows / 128)]` slice below.
+matches exactly. The 108 is 4 x 27 and the 106 is 106: the projection is stored
+as four tensor-parallel shards of `[q | k | v]` and was quantised one shard at a
+time, so its tiles restart at every 3392-row shard boundary. That is a multiple
+of 128 on a sliding-window layer (3712 = 29 tiles) and is not on a global one
+(3392 = 26.5 tiles), which is why only the global layers show it. Reading the
+scale as one run of 106 tiles instead pulls each shard's first 128 rows -- the
+head of its query block -- onto the previous shard's last tile, which covers its
+small value block, so `dense_tensor` passes `QKV_SHARDS` for that weight.
 """
 
 from __future__ import annotations
@@ -46,10 +51,11 @@ import torch.nn.functional as F
 
 from src.loader.safetensors import SAFETENSORS_DTYPES, MmapSafetensors, TensorEntry
 from src.models.mimo_v2.config import MimoV2Config, MimoV2TextConfig
-from src.models.mimo_v2.quant import FP8_BLOCK, dequant_fp8_block
+from src.models.mimo_v2.quant import FP8_BLOCK, QKV_SHARDS, dequant_fp8_block
 
 __all__ = [
     "EXPERT_PROJECTIONS",
+    "FUSED_QKV_SUFFIX",
     "MimoV2Checkpoint",
     "MimoV2ExpertLayout",
     "checkpoint_name",
@@ -58,6 +64,10 @@ __all__ = [
     "layer_weight_keys",
     "shard_of_expert",
 ]
+
+#: The tail of the one FP8 weight whose scale is blocked per tensor-parallel
+#: shard. Everything else in the checkpoint is blocked across the whole tensor.
+FUSED_QKV_SUFFIX = "self_attn.qkv_proj.weight"
 
 #: The three routed projections, in the order a shard stores one expert's bytes.
 #: `gate`/`up` are the two halves of the SwiGLU and `down` is its output
@@ -413,7 +423,8 @@ class MimoV2Checkpoint:
                 raise ValueError(f"{key} is FP8 but {scale_key} is not in the checkpoint")
             codes = self.read(key, copy=False)
             scale = self.read(scale_key, copy=False)
-            return dequant_fp8_block(codes, scale, FP8_BLOCK, dtype).to(device)
+            shards = QKV_SHARDS if key.endswith(FUSED_QKV_SUFFIX) else 1
+            return dequant_fp8_block(codes, scale, FP8_BLOCK, dtype, shards).to(device)
         if entry.dtype == "U8" and "experts" in key:
             raise ValueError(
                 f"{key} is a packed MXFP4 expert weight; pass it to the expert path "

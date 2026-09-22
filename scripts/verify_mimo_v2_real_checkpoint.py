@@ -15,6 +15,12 @@ routed expert is dequantized from the packed checkpoint on the step that selects
 it, and the whole thing is float32 on CPU. That is the point of a reference -- the
 device path is what gets optimized, and it is diffed against this.
 
+What it catches that nothing else does is the pair of reading errors named in
+`docs/models/mimo-v2.6-flash.md`: the fused `qkv_proj`'s row order, and the fact
+that its FP8 scale restarts at every tensor-parallel shard instead of running
+across the whole weight. Both reading errors produce finite logits of the right
+shape and a continuation that simply is not English.
+
     python scripts/verify_mimo_v2_real_checkpoint.py
     python scripts/verify_mimo_v2_real_checkpoint.py --layers 2 --tokens 4
 

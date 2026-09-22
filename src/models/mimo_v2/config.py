@@ -129,6 +129,11 @@ _DEFAULT_TOPK_METHOD = "noaux_tc"
 _SCORING_FUNCS = ("sigmoid",)
 _TOPK_METHODS = ("noaux_tc",)
 _PROJECTION_LAYOUTS = ("split", "fused_qkv")
+#: What a fused projection's row order is when the file does not say. The released
+#: weights are stored as four tensor-parallel shards of `[q | k | v]`; see
+#: `layers.split_fused_qkv` for the measurement that rules the alternative out.
+_DEFAULT_FUSED_QKV_ROW_LAYOUT = "tp4_interleaved"
+_QKV_ROW_LAYOUTS = ("contiguous", "tp4_interleaved", "tp4_interleaved_vk")
 _ACTIVATIONS = ("silu", "gelu", "gelu_pytorch_tanh", "gelu_new", "relu", "sigmoid", "tanh")
 
 
@@ -185,6 +190,10 @@ class MimoV2AttentionShape:
     #: applies nothing -- a real value, not an unstated field.
     value_scale: float | None
     projection_layout: str
+    #: Row order of the released fused `qkv_proj`. See
+    #: `layers.split_fused_qkv`: the projection is one tensor, so a wrong reading
+    #: is shape-correct and only shows up in the logits.
+    qkv_row_layout: str = "contiguous"
 
     @property
     def family(self) -> str:
@@ -245,6 +254,10 @@ class MimoV2TextConfig:
     partial_rotary_factor: float = _DEFAULT_PARTIAL_ROTARY_FACTOR
     attention_value_scale: float | None = None
     attention_projection_layout: str | None = None
+    #: Row order of the fused `qkv_proj`, or absent to take the one the projection
+    #: layout implies -- see `resolved_qkv_row_layout`. It is a field only so a
+    #: fixture whose fused weight was built in the other order can say so.
+    attention_qkv_row_layout: str | None = None
     add_full_attention_sink_bias: bool = False
     add_swa_attention_sink_bias: bool = False
     sliding_window: int | None = None
@@ -397,6 +410,23 @@ class MimoV2TextConfig:
         return self.attention_projection_layout or _DEFAULT_PROJECTION_LAYOUT
 
     @property
+    def resolved_qkv_row_layout(self) -> str:
+        """Row order of the fused projection, which its layout decides.
+
+        A split projection has separate `q_proj`/`k_proj`/`v_proj` tensors and no
+        row order to get wrong. A fused one is stored as four tensor-parallel
+        shards of `[q | k | v]` -- the order the serving stack's loader requires,
+        and the order the released weights are measured to be in -- so the row
+        order is a consequence of the layout rather than a separate field. See
+        `layers.split_fused_qkv`.
+        """
+        if self.attention_qkv_row_layout is not None:
+            return self.attention_qkv_row_layout
+        if self.resolved_projection_layout == "fused_qkv":
+            return _DEFAULT_FUSED_QKV_ROW_LAYOUT
+        return "contiguous"
+
+    @property
     def resolved_norm_topk_prob(self) -> bool:
         """Absent means unsaid, and unsaid means the reference's `True`."""
         return _DEFAULT_NORM_TOP_K_PROB if self.norm_topk_prob is None else bool(self.norm_topk_prob)
@@ -504,6 +534,7 @@ class MimoV2TextConfig:
             has_sink=has_sink,
             value_scale=None if self.attention_value_scale is None else float(self.attention_value_scale),
             projection_layout=self.resolved_projection_layout,
+            qkv_row_layout=self.resolved_qkv_row_layout,
         )
 
     def ffn_kind(self, layer_idx: int) -> str:
@@ -665,6 +696,11 @@ class MimoV2TextConfig:
             self.resolved_projection_layout in _PROJECTION_LAYOUTS,
             f"attention_projection_layout is {self.resolved_projection_layout!r}, not one of "
             f"{list(_PROJECTION_LAYOUTS)}",
+        )
+        want(
+            self.resolved_qkv_row_layout in _QKV_ROW_LAYOUTS,
+            f"the fused qkv row layout is {self.resolved_qkv_row_layout!r}, not one of "
+            f"{list(_QKV_ROW_LAYOUTS)}",
         )
         if self.attention_value_scale is not None:
             want(self.attention_value_scale > 0, f"attention_value_scale is {self.attention_value_scale}")

@@ -15,7 +15,7 @@ What exists:
 | Checkpoint headers, expert layout, dense-key inventory | Implemented and tested against the release |
 | Per-layer CPU parity against the checkpoint's own remote code | Implemented, 21 tests |
 | MXFP4 / FP8-block / BF16 dequantizers | Implemented as torch references |
-| Full 48-layer backbone on the release, on the host, greedy | Implemented; decodes text, slowly |
+| Full 48-layer backbone on the release, on the host | Implemented and verified: 2.09 nats/token on an English passage against a uniform floor of 11.94, with grammatical greedy continuations |
 | KV cache for the host reference | Not implemented — the prefix is re-run every step |
 | Device (CUDA) kernels for any part of the model | Not implemented |
 | OpenAI-compatible serving | Not implemented |
@@ -40,6 +40,7 @@ What exists:
 | Attention value scale | 0.707 |
 | Attention sink bias | Sliding-window family only, per query head |
 | Fused `qkv_proj` width | 13,568 global / 14,848 sliding-window |
+| Fused `qkv_proj` row order | Four tensor-parallel shards of `[q \| k \| v]` |
 | `o_proj` width | 8192 → 4096 |
 | Dense layer | Layer 0 only, FFN intermediate 16,384 |
 | Routed layers | 47, 256 experts, top-8, `moe_intermediate_size` 2048 |
@@ -49,6 +50,30 @@ The two attention families are not a tuning difference: the fused projection's
 output width, the KV head count and the RoPE base all change with the pattern, and
 a reader that derives one width and reuses it gets a plausible tensor of the wrong
 shape.
+
+The fused projection's *row order* is not in the config and is the same kind of
+trap. Its output is one tensor holding query, key and value concatenated, and
+every candidate order has the right shape, so a wrong one reads a plausible
+tensor from the right place and only shows up in the logits — the release's own
+`modeling_mimo_v2.py` splits it as one run of `[q | k | v]`, which is *not* how
+the released weights are stored. They are four tensor-parallel shards of
+`[q | k | v]`, which is the order the serving stack requires (its loader refuses
+to run at any attention tensor-parallel size but 4) and the order the weights
+measure: the row-magnitude profile turns over once every 3392 rows on a global
+layer and every 3712 on a windowed one, exactly one quarter of the tensor each,
+and the low stretch is the layer's value block.
+
+The FP8 scale of that projection follows the same sharding. On a global-attention
+layer `self_attn.qkv_proj.weight_scale_inv` has **108 rows** for a weight with 106
+row-blocks of 128, while every sliding-window layer matches exactly (116 for
+116). The 108 is 4 × 27: the projection was quantised one shard at a time, so its
+tiles restart at every shard boundary rather than running across the whole
+weight. A global layer's shard is 3392 rows — 26.5 tiles, which is why the two
+readings disagree — and a sliding-window layer's is 3712, exactly 29, which is
+why only the global layers move. Reading the scale as one run of 106 tiles pulls
+each shard's first 128 rows, the head of its query block, onto the previous
+shard's last tile, which covers its small value block. `loader.py` passes
+`QKV_SHARDS` for this one weight; nothing else in the checkpoint is affected.
 
 ### Weight formats
 
@@ -63,12 +88,15 @@ experts `4N..4N+3` for all 47 routed layers, every non-expert tensor is in `ep0`
 and one expert is a single contiguous 12.75 MiB run in the order
 `down_proj.weight, down_proj.weight_scale, gate_proj.*, up_proj.*`.
 
-One released anomaly is worth naming: on a global-attention layer
-`self_attn.qkv_proj.weight_scale_inv` has **108 rows** for a weight with 106
-row-blocks of 128, while every sliding-window layer matches exactly. The trailing
-two rows are unreachable — the checkpoint's own loader maps q/k/v to blocks
-0..95 / 96..101 / 102..105 — and the rule this repository applies is
-`scale[: ceil(rows / 128)]`.
+Both fused-projection traps above were found the same way, by disbelieving a
+plausible number. With the row order read contiguously — the release's own
+reading — the backbone assigns an English passage **13.51** nats/token, worse
+than the 11.94 a uniform distribution over the vocabulary costs. Reading the rows
+as four shards but leaving the scale as one run of tiles gives **10.10**: better
+than the floor and still not a language model. Both together give **2.09**, and
+`The capital of France is Paris, and the capital of Japan is` puts `' Tokyo'` at
+rank 0 with a logit of 19.63. Neither fix is visible in a tensor's shape, and a
+test that only compares shapes passes on all three readings.
 
 ## Implemented execution path
 
@@ -136,8 +164,8 @@ python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
 # parity, layout and the host bridge
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
-    tests/test_models_mimo_v2_layer_parity.py tests/test_models_mimo_v2_loader.py \
-    tests/test_models_mimo_v2_real_weights.py -q
+    tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
+    tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py -q
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -164,6 +192,8 @@ golden holds and how it was captured.
 ## Evidence and related notes
 
 - `src/models/mimo_v2/` — the reference implementation.
+- `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
+  which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
   and what parity means at fixture scale.
 - `tests/test_models_mimo_v2_loader.py`, `tests/test_models_mimo_v2_real_weights.py`
