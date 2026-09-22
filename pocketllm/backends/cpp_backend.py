@@ -31,7 +31,7 @@ from pocketllm.api import (
 )
 from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 
-from .base import BackendBase
+from .base import BackendBase, settled_text
 
 
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
@@ -820,21 +820,30 @@ class CppBackend(BackendBase):
             token = self._native_token(result)
             if self._is_eos(token):
                 # Stop before another decode_step. EOS is counted as a generated
-                # step but is not emitted as visible text.
+                # step but is not emitted as visible text -- and what the running
+                # decode was still holding is emitted here, because nothing is
+                # coming that could settle it.
                 yield TokenEvent(
                     request.request_id,
+                    text=self._final_tail(generated, previous_text),
                     finish_reason="stop",
                     usage=Usage(len(prompt_ids), len(generated) + 1),
                 )
                 return
             generated.append(token)
-            decoded = self._decode(generated)
-            # Decode the complete sequence so BPE/UTF-8 token boundaries are handled
-            # by the tokenizer. Emit only the newly visible suffix when possible.
+            # Decode the complete sequence so BPE token boundaries are handled by the
+            # tokenizer, then hold back a tail that is still half a character: the
+            # decode renders that as U+FFFD until the next token completes it, and a
+            # stream cannot take a character back. Emit only the newly visible suffix
+            # when possible. The last token of a bounded generation has nothing after
+            # it to settle its tail, and this stream ends where the unstreamed decode
+            # ends, so the tail goes out with it rather than being dropped.
+            last = index + 1 == max_tokens
+            decoded = self._decode(generated) if last else settled_text(self._decode(generated))
             text = decoded[len(previous_text):] if decoded.startswith(previous_text) else decoded
             previous_text = decoded
             event = TokenEvent(request.request_id, token_id=token, text=text)
-            if index + 1 == max_tokens:
+            if last:
                 event.finish_reason = "length"
                 event.usage = Usage(len(prompt_ids), len(generated))
             yield event
@@ -842,6 +851,17 @@ class CppBackend(BackendBase):
                 self._ensure_open()
                 self._check_cancelled(request.request_id)
                 result = self._tp_decode_step(token)
+
+    def _final_tail(self, generated: list[int], previous_text: str) -> str:
+        """What the running decode held back, once there is no longer a token to settle it.
+
+        The tail was withheld because it could still have become a character; the generation is
+        over, so it is what it is. Sending it is what keeps a stream of a generation equal to the
+        generation: `generate` decodes the same ids and has the replacement character in the same
+        place. It is empty in the ordinary case, where the last token ended on a character boundary.
+        """
+        final = self._decode(generated)
+        return final[len(previous_text):] if final.startswith(previous_text) else ""
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         # A primitive lock can span generator yields even when AsyncLLM resumes

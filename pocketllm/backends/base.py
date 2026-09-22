@@ -17,6 +17,28 @@ from pocketllm.api import (
 )
 
 
+#: What a byte-level tokenizer's decode puts where a token ended inside a character.
+_REPLACEMENT = "�"
+
+
+def settled_text(decoded: str) -> str:
+    r"""``decoded`` without the trailing run of replacement characters.
+
+    A byte-level tokenizer decodes ids to bytes and then decodes *those* to text with
+    ``errors="replace"``, so a token that ends in the middle of a multi-byte character renders as
+    U+FFFD until the token that finishes it arrives: the emoji in ``你好！😊`` is one token and the
+    character before it is not, and ``decode([30594, 1175, 28927])`` is ``你好！�``. A stream
+    that sent that has sent a character the model never produced, and a stream cannot take a
+    character back. Holding the tail until it settles costs at most one token of latency and sends
+    what the unstreamed decode sends.
+
+    Only a *trailing* run is held back. A replacement character anywhere else is real -- the bytes
+    there really were invalid -- and the unstreamed decode has it in the same place, so a stream
+    that dropped it would disagree with the answer it is a stream of.
+    """
+    return decoded.rstrip(_REPLACEMENT)
+
+
 class BackendBase:
     """Small common implementation for lifecycle and cancellation bookkeeping.
 

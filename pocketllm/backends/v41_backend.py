@@ -51,7 +51,7 @@ from pocketllm.api import (
 )
 
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
-from .base import BackendBase
+from .base import BackendBase, settled_text
 
 
 DEFAULT_MAX_SEQ_LEN = 8192
@@ -127,6 +127,25 @@ def _split_running(text: str, thinking: bool) -> tuple[str, str]:
     if index < 0:
         return text, ""
     return text[:index], text[index + len(THINKING_END):]
+
+
+def _identified(tool_calls: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The checkpoint's tool calls, each named with the ``id`` OpenAI's schema requires.
+
+    The checkpoint's ``tool_calls_to_openai_format`` leaves the id out, because the calls it reads
+    are read out of a *prompt*, where the id was the client's to write. A call this backend reports
+    has no such history: a client that validates the response against OpenAI's typed models rejects
+    a call without an id, and a client that echoes the call back -- which is how a tool result is
+    attributed to the call it answers -- has nothing to name it by. So one is minted here, once per
+    reported call.
+
+    Not the streaming index: a message's calls are identified, a delta's are also *numbered*, and
+    only the stream that sends them as deltas knows that numbering.
+    """
+    return [
+        dict(call) if call.get("id") else {"id": f"call_{os.urandom(12).hex()}", **call}
+        for call in tool_calls
+    ]
 
 
 class _AbortGeneration(Exception):
@@ -659,6 +678,22 @@ class V41Backend(BackendBase):
         boundary -- a client is then sent the marker's first characters as reasoning and cannot have
         them back, which is a boundary of the format rather than of this diff. A client that needs
         the exact split can send the same request without ``stream``.
+
+        What is sent is the *answer*, which is two things the running decode is not. A tail that is
+        still half a character is withheld until the character arrives, so no client is sent the
+        replacement character a byte-level decode puts there. And the answer stops where a
+        tool-call block opens, so the markup of a call is not sent as prose; the call itself cannot
+        be read out of a text -- the checkpoint's parser wants the end-of-sentence token, which is
+        stripped from everything a client sees -- so it is read out of the finished tokens and
+        travels on the last event, as OpenAI's own stream sends it.
+
+        The last event is also where the stream and the answer are reconciled. Holding a fragment
+        back means the running text can be shorter than the answer -- for a token of latency, or for
+        a whole generation, when the fragment never resolved -- so what the finished reading of the
+        generation has past what was sent goes out there. That is nothing in the ordinary case,
+        where the loop's tokens and the events are the same tokens read the same way; it is what
+        keeps the total a client received equal to the answer, for a generation that settled a
+        character the running decode was still holding when the loop stopped.
         """
         self._ensure_loaded()
         self._begin_request(request.request_id)
@@ -697,6 +732,8 @@ class V41Backend(BackendBase):
 
             threading.Thread(target=run, name="pocketllm-v41-stream", daemon=True).start()
 
+            from src.encoding.deepseek_v4_1 import cut_tool_calls
+
             token_ids: list[int] = []
             previous_reasoning = ""
             previous_content = ""
@@ -706,7 +743,12 @@ class V41Backend(BackendBase):
                 if token is None:
                     break
                 token_ids.append(int(token))
-                reasoning, content = _split_running(self._decode(token_ids), thinking)
+                # Both readings of the running text happen here, and each is the reason a client
+                # sees the answer rather than the machinery around it: the decode's unfinished tail
+                # is held back rather than sent as a replacement character, and the answer stops
+                # where the tool-call block opens instead of carrying its markup.
+                reasoning, content = _split_running(settled_text(self._decode(token_ids)), thinking)
+                content = cut_tool_calls(content)
                 yield TokenEvent(
                     request_id=request.request_id,
                     token_id=int(token),
@@ -721,10 +763,36 @@ class V41Backend(BackendBase):
             result = outcome[0] if outcome else RuntimeError("the v41 stream ended without a result")
             if isinstance(result, BaseException):
                 raise result
+            metadata: dict[str, Any] = {}
+            # The loop's own reading of the finished generation, which is the only one that can
+            # read a tool call back into OpenAI's shape: it wants the end-of-sentence token that
+            # `_decode` strips, so it runs on the tokens and not on the text streamed above. The
+            # block those tokens hold was already withheld from that text.
+            if result.metadata.get("tool_calls"):
+                metadata["tool_calls"] = [
+                    {"index": index, **call}
+                    for index, call in enumerate(result.metadata["tool_calls"])
+                ]
+            # And what the running text still owed it. The stream decodes as it goes, so anything its
+            # decode was holding when the loop stopped was never sent -- and the finished reading of
+            # the generation is the authority on whether any of it was the answer. It says nothing is
+            # owed when it does not continue what was already sent, which is how a stop string's
+            # answer, cut out of a longer running text, stays cut. A fragment of the tag is not owed
+            # either: the finished answer is cut at the same place the stream's was, so it does not
+            # continue it. What can be owed is a character the loop's last tokens settled, and the
+            # ordinary case is that there is nothing -- this is the line that keeps a client's total
+            # equal to the answer rather than one character short of it.
+            tail = (
+                result.text[len(previous_content):]
+                if result.text.startswith(previous_content)
+                else ""
+            )
             yield TokenEvent(
                 request_id=request.request_id,
+                text=tail,
                 finish_reason=result.finish_reason,
                 usage=result.usage,
+                metadata=metadata,
             )
         finally:
             # Only the loop reads this flag, and it reads it on the thread that is blocked here:
@@ -926,21 +994,43 @@ class V41Backend(BackendBase):
         tokens past it are ones the loop had already produced while the text it was matching had
         not caught up. Re-parsing them would report reasoning and tool calls the client is not
         being sent, so that text is read tolerantly and nothing else is consulted.
-        """
-        from src.encoding.deepseek_v4_1 import parse_strict, split_completion
 
+        Neither reading returns the text it was given. V4.1's tool-call block is plain text and a
+        *generation*, not a message: it can stop inside the block, on a fragment of its tag, in which
+        case the tag's first characters are all the text says about what was coming. So the cut is
+        applied here rather than by the caller that knows about streaming, and the character a
+        decode ended in the middle of is dropped here rather than by the stream that would have to
+        hold it back. Both are what a client is entitled to: the answer, and only the answer.
+        """
+        from src.encoding.deepseek_v4_1 import cut_tool_calls, parse_strict, split_completion
+
+        structured = None
         if not authoritative and token_ids:
-            parsed = parse_strict(
+            structured = parse_strict(
                 self._checkpoint,
                 self._decode(token_ids, skip_special_tokens=False),
                 thinking_mode=thinking_mode,
             )
-            if parsed is not None:
-                return parsed
-        # Never fall back to a fresh decode of the tokens. An empty answer is a real answer -- a
-        # stop string can sit at the very first character -- and decoding them again would put back
-        # exactly the text the marker had already cut off.
-        return split_completion(text, thinking_mode=thinking_mode)
+        if structured is None:
+            # Never fall back to a fresh decode of the tokens. An empty answer is a real answer -- a
+            # stop string can sit at the very first character -- and decoding them again would put
+            # back exactly the text the marker had already cut off.
+            structured = split_completion(text, thinking_mode=thinking_mode)
+        # The block is markup in *every* reading of the text, so the cut belongs to the reading
+        # rather than to the stream. The parser keeps its own content clear of it, but the tolerant
+        # split does not know to stop where the block opens -- and that is the path a generation cut
+        # by ``max_tokens`` takes, so without this a truncated call's half-written tag would be
+        # reported as the answer's last characters. It also keeps every reading's content equal to
+        # what a stream sends, which is what the stream's own held-back tail is diffed against.
+        structured["content"] = settled_text(cut_tool_calls(structured["content"]))
+        # And the same for the character the generation stopped in the middle of: a decode that ends
+        # inside a character ends in the replacement character, which is not something the model
+        # wrote and not something a client should be handed -- and a stream, which holds that tail
+        # back as it arrives, has already promised as much.
+        reasoning = structured.get("reasoning_content")
+        if isinstance(reasoning, str):
+            structured["reasoning_content"] = settled_text(reasoning)
+        return structured
 
     def _result(
         self,
@@ -974,15 +1064,23 @@ class V41Backend(BackendBase):
             "rank0_only": True,
             "reasoning_content": structured["reasoning_content"],
         }
-        if structured["tool_calls"]:
-            metadata["tool_calls"] = structured["tool_calls"]
+        tool_calls = structured["tool_calls"]
+        if tool_calls:
+            metadata["tool_calls"] = _identified(tool_calls)
+        # A call is *why* this generation ended, which is OpenAI's own reading of the same answer: a
+        # client that keys on the reason rather than reading the field would otherwise see "stop" on
+        # a response that carries a call. Only "stop" is rewritten -- a generation cut by
+        # ``max_tokens`` never reached its end-of-sentence token for the parser to read a call from.
+        finish_reason = {"eos": "stop", "length": "length", "max_seq_len": "length"}.get(
+            stopped, "stop"
+        )
+        if tool_calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
         return GenerationResult(
             request_id=request_id,
             token_ids=token_ids,
             text=structured["content"],
-            finish_reason={"eos": "stop", "length": "length", "max_seq_len": "length"}.get(
-                stopped, "stop"
-            ),
+            finish_reason=finish_reason,
             usage=Usage(prompt_tokens=len(payload["prompt_ids"]), completion_tokens=len(token_ids)),
             timings=TimingMetrics(
                 # The loop's decode figure excludes the prompt's forward but not the bookkeeping
