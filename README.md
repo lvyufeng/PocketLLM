@@ -9,7 +9,9 @@
 
 PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running large language models on consumer multi-GPU systems. It combines model-specific kernels, low-bit formats, tensor/expert parallelism, CPU/GPU placement, and reproducible single-request benchmarks.
 
-The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, and Qwen3.8-27B-FP8. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
+The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, Qwen3.8-27B and DeepSeek-V4.1-Flash. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
+
+Two of those models are served end to end over the OpenAI-compatible API: **Qwen3.8-27B-FP8** through the native C++ runtime, and **DeepSeek-V4.1-Flash** through `pocketllm serve --backend v41`. Both paths are validated with real checkpoints on the same four cards.
 
 > **Status:** research and engineering software. The numbers below are measurements from specific checkpoints and hardware configurations, not general performance guarantees.
 
@@ -119,12 +121,13 @@ pocketllm serve \
 **PocketLLM excels at:**
 - ✅ Single-request low-latency inference on consumer GPUs (RTX 2080 Ti, 3090, 4090)
 - ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4)
+- ✅ Checkpoints far larger than the aggregate VRAM: DeepSeek-V4.1-Flash's 475 GiB across 4×22 GiB cards
 - ✅ TP4 inference without NVLink (PCIe-only multi-GPU systems)
 - ✅ Research and experimentation with model-specific kernel optimization
 
 **Consider alternatives like vLLM or SGLang if you need:**
 - ❌ High-throughput serving with dynamic batching (PocketLLM batching is sequential)
-- ❌ Broad model support (PocketLLM focuses on 4 models with deep optimization)
+- ❌ Broad model support (PocketLLM focuses on 5 models with deep optimization)
 - ❌ Production features (advanced scheduling, monitoring, multi-LoRA)
 - ❌ Multimodal inputs (images/video are not yet supported)
 
@@ -135,22 +138,39 @@ pocketllm serve \
 - **Consumer-GPU parallelism:** TP4/NCCL execution on PCIe-connected GPUs, with CPU/NUMA expert placement for checkpoints that do not fit in device memory.
 - **Separate prefill and decode dispatch:** large-row kernels are optimized independently from single-token latency paths.
 - **Native C++/CUDA runtime:** the `cpp_engine/` path supports DeepSeek-V4 GGUF/Safetensors flows, Qwen3.8 FP8 Safetensors text generation, and the validated Qwen OpenAI-compatible text server.
+- **A host-PyTorch adapter for a checkpoint the cards cannot hold:** `--backend v41` runs DeepSeek-V4.1-Flash as four processes, one a card, over a memory-mapped checkpoint — the dense tree and the packed FP4 experts execute on the GPUs while the routed experts read from a pinned host bank.
 - **Inspection and validation tools:** GGUF architecture/spec reports, Safetensors audits, tensor-shape checks, numerical parity tests, and real-checkpoint benchmarks.
 
 ## Supported models at a glance
 
 | Model | Checkpoint / format | Runtime status | Validated path | Reference result on 4×RTX 2080 Ti |
 | --- | --- | --- | --- | --- |
+| [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend v41`: host PyTorch over a mapped checkpoint, dense tree and packed FP4 experts on the cards, one process a rank | Served TP4: **150.3–152.0 tok/s prefill** at a 260,244-token prompt (137–141 at 1,364) and **3.48–3.54 tok/s decode**, one request at a time |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and OpenAI server** | C++/CUDA TP4, GPU-resident FP8 | Served TP4: 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **Validated text generation** | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and server** | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
+
+The Qwen3.8-27B line covers three checkpoints over the same text architecture — the validated FP8 runtime above, an [NVFP4](docs/models/qwen3.8-27b-nvfp4.md) variant, and the [official BF16](docs/models/qwen3.8-27b-bf16.md) release, which is audited but not run. See the [support matrix](docs/models/README.md) for the exact status of each.
 
 The model pages separate architecture specifications from what PocketLLM currently implements. `inspect`, `smoke`, and a benchmark are not automatically equivalent to a production serving guarantee.
 
 ## Performance highlights
 
 All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/guides/benchmarking.md) before comparing results.
+
+### DeepSeek-V4.1-Flash v41 runtime (served)
+
+The released 475.24 GiB checkpoint runs over four ranks, one process a card, with the 457.8 GiB of routed experts pinned in host memory rather than resident on the cards; the dense tree and the packed FP4 experts both execute on the GPUs. The longest leg the runtime accepts — a 260,244-token prompt over `pocketllm serve --backend v41`, three back-to-back requests, 64 greedy tokens each:
+
+- **150.3, 152.0 and 152.0 tok/s of prefill**, against 137–141 tok/s at a 1,364-token prompt. The long prompt is the *faster* of the two, because a short one is dominated by fixed per-process cost.
+- **3.53, 3.48 and 3.54 tok/s of decode**, 253–262 ms a step.
+
+Against the reference launcher's own 262,144-token row (103.54 tok/s at 3.88) that is 1.45–1.47× on prefill, 0.90–0.91× on decode, and 1,730.0 s of wall against 2,555.4 s. Two qualifications travel with it: the two prompts are not the same text — the served leg is repeated filler and the reference row is a chapter template — so part of the prefill margin may be the prompt rather than the runtime, and the decode half is the half that does not travel, since the same service reads 4.45–4.53 tok/s at 1,364 prompt tokens.
+
+At a 1,364-token prompt on the short-context configuration (`--max-model-len 2048`, 288 expert pool rows), prefill is 137.5, 140.8 and 138.3 tok/s and decode 4.45–4.53 tok/s; the first request reads 108.0 because it pays the capture pass. These are cold-prompt numbers, taken before cross-request prefix caching landed — a repeat of a prompt already served now forwards only its tail.
+
+What this runtime does not have is batching, continuous batching, or an MTP layer. The three DSpark draft layers are 7.39 GiB the loader deliberately leaves in the shards, so there is no speculative decoding here, and requests are serialized rather than batched. There is also no numeric oracle: the reference stack needs `torch>=2.10.0` and `tilelang==0.1.8` and neither is available on this host, so the acceptance evidence is generated text rather than a logit comparison.
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
@@ -164,6 +184,8 @@ One serial sweep of the engine defaults on master `cfad866`, with 128 generated 
 Per rank the engine accounts for 6.86 GiB of resident FP8 weights and scales, plus 1.00 GiB of KV data and 1.01 GiB of chunk workspace at 65,536 tokens; `nvidia-smi` peaks a further 3.4–3.5 GiB in CUDA context, cuBLAS workspaces and NCCL buffers, which is constant across prompt lengths. Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
 
 The prefill figures for the 64- and 512-token prompts measure short-prompt latency, not steady-state throughput: both complete in 0.55–0.59 s because a fixed per-process cost dominates at that size. Above 4,096 tokens prefill runs at a marginal 1,670 tok/s up to 32,768 and 1,285 tok/s beyond it.
+
+The same runtime is what serves Qwen3.8 over the OpenAI API, and it is the one model here with two optional external speculative drafters: [DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) and [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding), mutually exclusive with each other and with the native MTP path. DFlash2 with its opt-in flags measures 2.78× full-request and 3.02× decode on a 512-token fixture, and 1.33× aggregate over eight GSM8K prompts, with exact token parity in every case. Both drafters are default-off because their gains are acceptance-dependent, and upstream's published 2.67–3.43× band is a decode-latency ratio rather than a full-request one. A persistent TP4 worker also keeps prefix state alive across requests, so a client whose next prompt extends or compresses the previous one pays only for the difference.
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -185,7 +207,7 @@ PocketLLM has two complementary execution families:
 1. **GPU-resident and low-bit execution** keeps local weights or expert blocks on device when the aggregate memory budget permits it.
 2. **Heterogeneous execution** keeps routed experts in CPU/NUMA memory and stages only the active quantized blocks needed by the current token or prefill chunk.
 
-The runtime is intentionally model-specific. DeepSeek-V4 uses MLA/indexing and routed-expert scheduling; MiniMax-M2.7 and GLM-5.2 use GGUF raw-block paths; Qwen3.8 uses Safetensors FP8 online unpacking plus hybrid linear/full attention. Raw quantized weights are not expanded to a full FP32 copy in the intended hot paths.
+The runtime is intentionally model-specific. DeepSeek-V4 uses MLA/indexing and routed-expert scheduling; DeepSeek-V4.1-Flash uses a causal encoder-decoder with CSA2 shared-KV attention over a checkpoint whose 268.95 GiB of routed experts and 189.13 GiB of Engram tables stay in host memory or on disk; MiniMax-M2.7 and GLM-5.2 use GGUF raw-block paths; Qwen3.8 uses Safetensors FP8 online unpacking plus hybrid linear/full attention. Raw quantized weights are not expanded to a full FP32 copy in the intended hot paths.
 
 ## Quick start
 
@@ -283,6 +305,23 @@ bash scripts/run_cpp_serve_tp4.sh
 
 This starts rank 0 as the OpenAI-compatible server and ranks 1–3 as NCCL workers.
 
+### Run DeepSeek-V4.1-Flash OpenAI serving
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --backend v41 \
+  --tensor-parallel-size 4 \
+  --max-model-len 32768 \
+  --port 8000 \
+  --backend-option expert_pool_rows=148 \
+  --backend-option prefill_chunk=4096 \
+  --backend-option decode_graphs=true \
+  --backend-option threads=22
+```
+
+The CLI's own supervisor starts one process a rank — rank 0 binds the listener, ranks 1–3 are NCCL workers — and all four must report ready before the server answers. Startup is not quick: with `DEEPSEEK_V41_RESIDENT_EXPERTS=1` each rank pins its share of the 457.8 GiB expert bank, about 100 s a rank, and the 48 shards load in another 130 s. The same flags take `--max-model-len 262144`, which is the longest context the runtime accepts and the configuration the long-context numbers above were measured on.
+
 ### Run a GGUF model through the shared raw-block CLI
 
 ```bash
@@ -377,10 +416,14 @@ content as the files below.
 - [Getting started](docs/getting-started.md)
 - [Model support matrix](docs/models/README.md)
 - [Benchmarking and reporting rules](docs/guides/benchmarking.md)
+- [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md)
+- [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
-- [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
+- [Serving V4.1 behind the OpenAI server](docs/performance/deepseek_v4_1_flash_served_gate.md)
+- [What one V4.1 request costs](docs/performance/deepseek_v4_1_flash_single_request_capability.md)
+- [Cross-request prefix caching on V4.1](docs/architecture/v41_prefix_cache.md)
 - [DSpark speculative decoding](docs/performance/dspark.md)
 - [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
 - [MiniMax decode bottleneck analysis](docs/performance/minimax_decode_bottleneck_analysis.md)
@@ -393,6 +436,7 @@ content as the files below.
 - [x] Qwen3.8-27B-FP8 C++ TP4 text runtime.
 - [x] Generalize the C++ model dispatch and binary naming without breaking existing scripts.
 - [x] Qwen OpenAI-compatible text serving adapter.
+- [x] DeepSeek-V4.1-Flash TP4 text generation behind the OpenAI server, with cross-request prefix caching.
 - [ ] CUDA Graph and persistent decode dispatch where measured beneficial.
 - [ ] More model-specific benchmark fixtures and automated regression dashboards.
 
@@ -400,6 +444,9 @@ content as the files below.
 
 - Performance is highly sensitive to GPU model, PCIe topology, NUMA placement, driver/runtime versions, and checkpoint variant.
 - GGUF expert staging can dominate decode on PCIe-only systems; a high prefill number does not imply high decode TPS.
+- DeepSeek-V4.1-Flash serves one request at a time: `--backend v41` takes a single request lock and reports `supports_batch=False`, so there is no continuous batching, no chunked prefill, and no paged KV pool. A later request that shares a prefix with one already served does reuse it, but that changes how much a request costs, not how many run at once.
+- DeepSeek-V4.1-Flash has no speculative decoding on this path. The checkpoint carries three MTP layers and a DSpark draft head, and the loader deliberately leaves all of it in the shards.
+- DeepSeek-V4.1-Flash is validated by generated text, not by a logit comparison. The reference stack needs `torch>=2.10.0` and `tilelang==0.1.8` and neither is available here, so no numeric oracle exists for a V4.1 forward pass.
 - DeepSeek-V4 DSpark's current C++ verify path is sequential and should not be presented as a speedup claim. Qwen DSpark is a separate external drafter with one eight-row target verification and model-specific parity/performance data.
 - Qwen DFlash2 wall-clock speedup is acceptance-dependent and prefill-capped: the synthetic fixtures accept the full eight-row block while GSM8K accepts 2.9–4.4, and shared prefill limits the 8,192-token case to 1.95x even with zero decode time. Upstream's 2.67–3.43x is a decode-latency ratio, not a full-request wall ratio.
 - The Qwen runtime currently supports the text checkpoint path only. Vision inputs and multimodal serving are not implemented.

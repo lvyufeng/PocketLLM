@@ -4,7 +4,9 @@
 
 PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包含 C++/CUDA 与 PyTorch runtime。它结合模型专用 kernel、低 bit 格式、tensor/expert parallel、CPU/GPU placement，以及面向单请求的可复现实测 benchmark。
 
-项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2 和 Qwen3.8-27B-FP8 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
+项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2、Qwen3.8-27B 和 DeepSeek-V4.1-Flash 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
+
+其中两个模型已经通过 OpenAI 兼容 API 端到端服务：**Qwen3.8-27B-FP8** 走原生 C++ runtime，**DeepSeek-V4.1-Flash** 走 `pocketllm serve --backend v41`。两条路径都在同样四张卡上用真实 checkpoint 做过验证。
 
 > **项目状态：** 研究和工程软件。下面的数字来自特定 checkpoint、硬件和测试口径，不代表通用性能保证。
 
@@ -15,22 +17,39 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 - **消费级 GPU 并行：** 支持 PCIe 多卡上的 TP4/NCCL；对放不进显存的 checkpoint，支持 CPU/NUMA expert placement。
 - **Prefill/decode 分离：** 大 batch kernel 与单 token latency 路径独立调度、独立优化。
 - **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径、Qwen3.8 FP8 Safetensors 文本生成，以及已验证的 Qwen OpenAI 兼容文本 server。
+- **为“放不进显存的 checkpoint”准备的 host-PyTorch adapter：** `--backend v41` 用四个进程（每卡一个）在 memory-mapped checkpoint 上运行 DeepSeek-V4.1-Flash —— dense tree 和 packed FP4 expert 在 GPU 上执行，routed expert 从 pinned host bank 读取。
 - **检查和验证工具：** GGUF 架构/spec 报告、Safetensors audit、tensor shape 检查、数值 parity 测试和真实 checkpoint benchmark。
 
 ## 支持模型一览
 
 | 模型 | Checkpoint / 格式 | Runtime 状态 | 已验证路径 | 4×RTX 2080 Ti 代表结果 |
 | --- | --- | --- | --- | --- |
+| [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 expert | **已验证 OpenAI server 后的 TP4 文本生成** | `pocketllm serve --backend v41`：host PyTorch 跑 mapped checkpoint，dense tree 与 packed FP4 expert 在卡上，一 rank 一进程 | Served TP4：260,244 token prompt 下 **prefill 150.3–152.0 tok/s**（1,364 token 时 137–141），**decode 3.48–3.54 tok/s**，同时只跑一个请求 |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime 与 OpenAI server** | C++/CUDA TP4、GPU-resident FP8 | Served TP4：512-token prompt 下 prefill 864.54 tok/s、decode 43.22 tok/s（生成 128 token） |
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8；GGUF Q2/IQ2/IQ1 | **已验证 generation** | PyTorch 异构、C++/CUDA、GGUF TP4 | C++ FP4：32K–64K prefill 约 401 tok/s；decode 约 3.7 tok/s |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **已验证 TP4 generation** | Raw-block CUDA、GGUF TP4 | Full-model 256-token prefill 约 104.9–107 tok/s；43-layer decode benchmark 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **已验证文本生成** | Raw-block CUDA、GGUF TP4 | prefill 约 0.79 tok/s；decode 约 0.66 tok/s |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime** | C++/CUDA TP4、GPU-resident FP8 | 512-token prompt：prefill 864.54 tok/s、decode 43.22 tok/s（生成 128 token） |
+
+Qwen3.8-27B 一行覆盖同一文本架构下的三个 checkpoint：上面已验证的 FP8 runtime、[NVFP4](docs/models/qwen3.8-27b-nvfp4.md) 变体，以及[官方 BF16](docs/models/qwen3.8-27b-bf16.md) 发布版（已审计但未运行）。每个的确切状态见[支持矩阵](docs/models/README.md)。
 
 模型页面会把“模型架构规格”和“PocketLLM 当前实际实现能力”分开。`inspect`、`smoke` 和 benchmark 也不自动等于 production serving 保证。
 
 ## 性能摘要
 
 本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/guides/benchmarking.md)。
+
+### DeepSeek-V4.1-Flash v41 runtime（served）
+
+发布的 475.24 GiB checkpoint 跑在四个 rank 上，一卡一进程，457.8 GiB routed expert 是 pinned 在 host 内存里而不是常驻卡上；dense tree 和 packed FP4 expert 都在 GPU 上执行。下面是 runtime 能接受的最长一条腿 —— 260,244 token prompt，走 `pocketllm serve --backend v41`，连续三个请求，每个生成 64 个 greedy token：
+
+- **prefill 150.3、152.0、152.0 tok/s**，而 1,364-token prompt 上是 137–141 tok/s。长 prompt 反而*更快*，因为短 prompt 由固定的 per-process 开销主导。
+- **decode 3.53、3.48、3.54 tok/s**，每步 253–262 ms。
+
+对照参考 launcher 自己的 262,144-token 那一行（103.54 tok/s、3.88 tok/s），这是 prefill 1.45–1.47×、decode 0.90–0.91×，wall 1,730.0 s 对 2,555.4 s。有两点限定必须一起看：两个 prompt 不是同一段文本 —— served 那条腿是重复的填充文本，参考行是章节模板 —— 所以 prefill 的差距里有一部分可能来自 prompt 而非 runtime；而 decode 那一半是不成立的，因为同一个服务在 1,364 prompt token 上读到的是 4.45–4.53 tok/s。
+
+在短上下文配置上（`--max-model-len 2048`、288 个 expert pool row）、1,364-token prompt 下，prefill 为 137.5、140.8、138.3 tok/s，decode 为 4.45–4.53 tok/s；第一个请求读到 108.0，因为它要付 capture pass 的代价。这些是冷 prompt 数字，取自跨请求 prefix caching 落地之前 —— 现在重发一个已经服务过的 prompt 只会 forward 它的尾部。
+
+这个 runtime 没有的东西是 batching、continuous batching 和 MTP 层。三个 DSpark draft 层共 7.39 GiB，loader 有意把它们留在 shard 里，所以这里没有 speculative decoding，请求是串行而非批量执行。也没有数值 oracle：参考栈需要 `torch>=2.10.0` 和 `tilelang==0.1.8`，本机两者都没有，因此验收证据是生成的文本而不是 logit 对比。
 
 ### Qwen3.8-27B-FP8 C++ runtime
 
@@ -44,6 +63,8 @@ master `cfad866` 上按引擎默认值做的一轮串行 sweep，每次生成 12
 每 rank 的引擎计数为 6.86 GiB 常驻 FP8 权重与 scale，加上 65,536 token 时的 1.00 GiB KV 数据和 1.01 GiB chunk workspace；`nvidia-smi` 在此之上还要多出 3.4–3.5 GiB（CUDA context、cuBLAS workspace、NCCL buffer），且该差值不随 prompt 长度变化。四个 TP rank 的生成 token 序列一致。原生 OpenAI 兼容 server 已验证 text 请求；图像和视频输入仍不支持。
 
 64 和 512 token 两行的 prefill 反映的是短 prompt 延迟而非稳态吞吐：两者都在 0.55–0.59 s 内完成，因为该规模下固定进程开销占主导。4,096 token 以上，prefill 到 32,768 的边际吞吐为 1,670 tok/s，之后再为 1,285 tok/s。
+
+通过 OpenAI API 服务 Qwen3.8 的正是同一个 runtime，它也是这里唯一一个带有两个可选外部 speculative drafter 的模型：[DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) 和 [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding)，两者互斥，且都与原生 MTP 路径互斥。DFlash2 在其 opt-in 开关全开时，512-token fixture 上实测 full-request 2.78×、decode 3.02×，八个 GSM8K prompt 上聚合 1.33×，且每种情况下 token 完全一致。两个 drafter 都默认关闭，因为收益依赖接受率，而上游公布的 2.67–3.43× 是 decode 延迟比而非 full-request 比。另外还有一个常驻 TP4 worker 会在请求之间保留 prefix state，因此下一个 prompt 是上一个的追加或压缩的客户端只需为增量付费。
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -65,7 +86,7 @@ PocketLLM 包含两类互补执行方式：
 1. **GPU-resident 与低 bit 执行：** 在总显存预算允许时，让本地权重或 expert block 常驻 GPU。
 2. **异构执行：** 将 routed experts 放在 CPU/NUMA 内存，只把当前 token 或 prefill chunk 激活的量化 block 搬到 GPU。
 
-Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention。设计上的热路径不会将完整量化权重展开成 FP32 副本。
+Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；DeepSeek-V4.1-Flash 使用 causal encoder-decoder 与 CSA2 shared-KV attention，其 checkpoint 的 268.95 GiB routed expert 和 189.13 GiB Engram 表留在 host 内存或磁盘上；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention。设计上的热路径不会将完整量化权重展开成 FP32 副本。
 
 ## 快速开始
 
@@ -105,6 +126,23 @@ bash scripts/run_cpp_serve_tp4.sh
 ```
 
 该命令让 rank 0 运行 OpenAI 兼容服务，rank 1–3 运行 NCCL worker。
+
+### 运行 DeepSeek-V4.1-Flash OpenAI serving
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --backend v41 \
+  --tensor-parallel-size 4 \
+  --max-model-len 32768 \
+  --port 8000 \
+  --backend-option expert_pool_rows=148 \
+  --backend-option prefill_chunk=4096 \
+  --backend-option decode_graphs=true \
+  --backend-option threads=22
+```
+
+CLI 自带的 supervisor 会一 rank 起一个进程 —— rank 0 绑定 listener，rank 1–3 是 NCCL worker —— 四个都报告 ready 之后 server 才会应答。启动不算快：开了 `DEEPSEEK_V41_RESIDENT_EXPERTS=1` 后，每个 rank 要 pin 自己在 457.8 GiB expert bank 中的份额，约 100 s 一个 rank，48 个 shard 再花约 130 s 加载。同样的 flag 配 `--max-model-len 262144` 就是 runtime 能接受的最长上下文，也是上面长上下文数字的测量配置。
 
 ### 通过共享 raw-block CLI 运行 GGUF 模型
 
@@ -195,10 +233,14 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - [快速开始](docs/getting-started.md)
 - [模型支持矩阵](docs/models/README.md)
 - [Benchmark 口径](docs/guides/benchmarking.md)
+- [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md)
+- [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
-- [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
+- [在 OpenAI server 后服务 V4.1](docs/performance/deepseek_v4_1_flash_served_gate.md)
+- [一个 V4.1 请求的代价](docs/performance/deepseek_v4_1_flash_single_request_capability.md)
+- [V4.1 的跨请求 prefix caching](docs/architecture/v41_prefix_cache.md)
 - [DSpark speculative decoding](docs/performance/dspark.md)
 - [FlashMemory 1M context](docs/performance/flashmemory_1m_context.md)
 - [MiniMax decode bottleneck 分析](docs/performance/minimax_decode_bottleneck_analysis.md)
@@ -211,6 +253,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - [x] Qwen3.8-27B-FP8 C++ TP4 文本 runtime。
 - [ ] 在不破坏现有脚本的前提下，统一 C++ model dispatch 和 binary 命名。
 - [x] Qwen OpenAI 兼容文本 serving adapter。
+- [x] OpenAI server 后的 DeepSeek-V4.1-Flash TP4 文本生成，以及跨请求 prefix caching。
 - [ ] 在实测有收益时接入 CUDA Graph 和 persistent decode dispatch。
 - [ ] 增加更多模型 benchmark fixture 和自动化 regression dashboard。
 
@@ -218,6 +261,9 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 
 - 性能高度依赖 GPU 型号、PCIe 拓扑、NUMA placement、驱动/runtime 版本和 checkpoint 变体。
 - PCIe 系统上的 GGUF expert staging 可能主导 decode；prefill TPS 高不代表 decode TPS 高。
+- DeepSeek-V4.1-Flash 一次只服务一个请求：`--backend v41` 持有一把请求锁并报告 `supports_batch=False`，因此没有 continuous batching、没有 chunked prefill、也没有 paged KV pool。后续请求如果与已服务过的请求共享 prefix，确实会复用它，但这改变的是一个请求的代价，而不是同时能跑几个。
+- DeepSeek-V4.1-Flash 在这条路径上没有 speculative decoding。checkpoint 带有三个 MTP 层和一个 DSpark draft head，loader 有意把它们全部留在 shard 里。
+- DeepSeek-V4.1-Flash 的验证依据是生成的文本，而不是 logit 对比。参考栈需要 `torch>=2.10.0` 和 `tilelang==0.1.8`，本机都没有，因此对 V4.1 的 forward pass 不存在数值 oracle。
 - DSpark 当前 C++ verify path 是 sequential，不应宣称为加速路径；multi-token verify 有独立的数值漂移策略。
 - Qwen runtime 当前只支持 text checkpoint 路径，视觉输入和多模态 serving 尚未实现。
 - 部分实验优化在真实端到端测试出现回归后被保留为 opt-in 或关闭；具体见模型页和历史分析文档。

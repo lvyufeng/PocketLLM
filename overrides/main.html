@@ -4,13 +4,18 @@
   Material renders `{% block announce %}` through its own `md-banner` markup, and
   only when the block is non-empty, so a blank override is the same as having none.
 
-  The link points at the pinned old-hardware roadmap rather than at a release, so
-  the banner does not go stale between releases. `theme.features` carries
-  `announce.dismiss`, which is Material's own close button — it remembers the
-  dismissal in localStorage and needs no script of ours.
+  A banner is HTML, not a page, so these are absolute site URLs rather than the
+  relative links the Markdown uses, and `<strong>` rather than `**`. The model
+  pages are stable targets and the roadmap issue is pinned, so the banner does
+  not go stale between releases. `theme.features` carries `announce.dismiss`,
+  which is Material's own close button — it remembers the dismissal in
+  localStorage and needs no script of ours.
 #}
 {% block announce %}
-  <p>Running on 2080&nbsp;Ti-class hardware? The
-  <a href="https://github.com/lvyufeng/PocketLLM/issues/151">old-hardware roadmap</a>
-  is the ordered work queue.</p>
+  <p><strong>DeepSeek-V4.1-Flash</strong> and <strong>Qwen3.8-27B-FP8</strong> are served end to
+  end behind the OpenAI-compatible API — a 475&nbsp;GiB checkpoint and a 27&nbsp;billion-parameter
+  one, both validated on 4×RTX&nbsp;2080&nbsp;Ti:
+  <a href="https://lvyufeng.github.io/PocketLLM/models/deepseek-v4.1-flash/">V4.1</a> ·
+  <a href="https://lvyufeng.github.io/PocketLLM/models/qwen3.8-27b-fp8/">Qwen3.8</a> ·
+  <a href="https://github.com/lvyufeng/PocketLLM/issues/151">old-hardware roadmap</a></p>
 {% endblock %}

@@ -45,7 +45,8 @@ pip install -e . --no-build-isolation
 ## Build the C++/CUDA engine
 
 The Python install already builds the `pocketllm_cpp` module. To build the
-standalone engine — the executable the Qwen and DeepSeek-V4 server paths launch:
+standalone engine — the executable the C++ Qwen and DeepSeek-V4 server paths
+launch. The `v41` backend is a Python runtime and does not use it:
 
 ```bash
 cmake -S cpp_engine -B build/cpp_engine -DCMAKE_BUILD_TYPE=Release
@@ -105,11 +106,32 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "pocketllm", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
+DeepSeek-V4.1-Flash runs on the host-PyTorch `v41` backend instead, over a
+checkpoint far larger than the aggregate VRAM. Startup pins a 457.8 GiB expert
+bank in host memory and takes roughly four minutes before the server answers:
+
+```bash
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
+  --model /path/to/DeepSeek-V4.1-Flash \
+  --backend v41 \
+  --tensor-parallel-size 4 \
+  --max-model-len 32768 \
+  --port 8000 \
+  --backend-option expert_pool_rows=148 \
+  --backend-option prefill_chunk=4096 \
+  --backend-option decode_graphs=true \
+  --backend-option threads=22
+```
+
+Raise `--max-model-len` to `262144` for the longest context the runtime accepts.
+The adapter takes one request lock, so requests are served one at a time.
+
 ## Pick your path
 
 | If you are running | Start here |
 | --- | --- |
 | DeepSeek-V4 | [DeepSeek-V4](models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
+| DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](performance/deepseek_v4_1_flash_served_gate.md) |
 | MiniMax-M2.7 | [MiniMax-M2.7](models/minimax-m2.7.md) |
 | GLM-5.2 | [GLM-5.2](models/glm-5.2.md) |
 | Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) |

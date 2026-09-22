@@ -204,7 +204,10 @@ section works through:
 
 - **Not batched.** `capabilities.supports_batch` is `False` and the scheduler is one mutable KV state
   serialized at the backend boundary: a second request waits for the first. There is no continuous
-  batching, no prefix caching and no logprobs.
+  batching and no logprobs. Prefix caching landed after these runs — a prompt whose prefix has been
+  served before forwards only its tail, which is what a nonzero
+  `usage.prompt_tokens_details.cached_tokens` on a response reports — but that changes what a request
+  costs, not how many run at once.
 - **Not speculative.** The three DSpark draft layers are 7.39 GiB the loader leaves in the shards.
 - **Not interruptible inside a prompt.** Cancellation is a per-step collective between the ranks, so a
   cancel lands after the prompt's forward rather than during it; this is what the capability's
