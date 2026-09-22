@@ -114,6 +114,7 @@ nav:
       - Qwen3.8-27B-NVFP4: models/qwen3.8-27b-nvfp4.md
       - Qwen3.8-27B-BF16: models/qwen3.8-27b-bf16.md
       - DeepSeek-V4.1-Flash: models/deepseek-v4.1-flash.md
+      - MiMo-V2.6-Flash: models/mimo-v2.6-flash.md
   - Guides:
       - Overview: guides/index.md
       - Benchmarking and reporting: guides/benchmarking.md

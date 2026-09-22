@@ -170,6 +170,22 @@ class MmapSafetensors:
         # An unsharded checkpoint has no index at all; `save_file` writes one file and nothing else.
         if os.path.exists(os.path.join(self.root, "model.safetensors")):
             return ["model.safetensors"]
+        # Or a checkpoint that ships one file per rank: MiMo-V2.6 writes
+        # `model_pp0_ep<N>_shard0.safetensors` per expert-parallel rank plus a
+        # `model_mtp.safetensors`, and its index names all 65 of them -- but the
+        # same names come out of the directory, so a release that dropped the index
+        # is still readable. Subdirectories are deliberately not searched: a
+        # checkpoint's side artifacts (`dflash/`, `audio_tokenizer/`) are separate
+        # models with their own tensor namespaces, and flattening them in would let
+        # one of them supply a name the text model is missing.
+        shards = sorted(
+            name
+            for name in os.listdir(self.root)
+            if name.endswith(".safetensors")
+            and os.path.isfile(os.path.join(self.root, name))
+        )
+        if shards:
+            return shards
         raise FileNotFoundError(f"no safetensors checkpoint at {self.root}")
 
     def _index_headers(self) -> None:
