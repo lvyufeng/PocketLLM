@@ -158,6 +158,63 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
+def split_fused_qkv(
+    qkv: torch.Tensor,
+    shape: MimoV2AttentionShape,
+    layout: str = "contiguous",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cut the released fused `qkv_proj` output into query, key and value.
+
+    The fused projection is one tensor, and the release does not say in which
+    order its rows are stored. Two readings are in play:
+
+    * ``"contiguous"`` -- ``[q | k | v]``, which is what the release's own
+      ``MiMoV2Attention`` does with ``split([q_size, k_size, v_size])``.
+    * ``"tp4_interleaved"`` -- four equal groups of ``[q_i | k_i | v_i]``, which
+      is the only layout for which the serving stack's loader is correct: it
+      takes a *contiguous* quarter of the stored tensor and hands it to a
+      parameter whose own layout is ``[q_rank | k_rank | v_rank]``, and it
+      refuses to run at any attention tensor-parallel size other than 4. The
+      release's fused projection is measured to be stored this way: the tensor's
+      row-magnitude profile turns over at exactly one quarter of its length and
+      again every quarter after that, which no other partition produces.
+    * ``"tp4_interleaved_vk"`` -- the same, with the value section stored before
+      the key section inside each group. The two are distinguished only by which
+      of the two sections the profile's low band falls in.
+
+    The readings differ only in the row permutation, so all of them produce
+    tensors of the right shape and a wrong choice is silent until the logits are
+    read.
+    """
+    q_size, k_size, v_size = shape.q_size, shape.k_size, shape.v_size
+    if layout == "contiguous":
+        query, key, value = qkv.split([q_size, k_size, v_size], dim=-1)
+        return query, key, value
+    if layout not in ("tp4_interleaved", "tp4_interleaved_vk"):
+        raise ValueError(f"unknown qkv row layout {layout!r}")
+
+    groups = 4
+    q_head, k_head, v_head = q_size // groups, k_size // groups, v_size // groups
+    stride = q_head + k_head + v_head
+    if qkv.shape[-1] != stride * groups:
+        raise ValueError(
+            f"fused qkv has {qkv.shape[-1]} rows, which is not {groups} groups of "
+            f"{stride} rows for the {layout} layout"
+        )
+    parts = [qkv[..., i * stride : (i + 1) * stride] for i in range(groups)]
+    query = torch.cat([p[..., :q_head] for p in parts], dim=-1)
+    rest = (
+        (("k", 0, k_head), ("v", k_head, k_head + v_head))
+        if layout == "tp4_interleaved"
+        else (("v", 0, v_head), ("k", v_head, v_head + k_head))
+    )
+    cut = {
+        name: torch.cat([p[..., lo + q_head : hi + q_head] for p in parts], dim=-1)
+        for name, lo, hi in rest
+    }
+    return query, cut["k"], cut["v"]
+
+
 def attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -543,7 +600,7 @@ class MimoV2DecoderLayer:
 
         input_shape = hidden_states.shape[:-1]
         qkv = F.linear(hidden_states, self.weights.qkv_proj)
-        query, key, value = qkv.split([shape.q_size, shape.k_size, shape.v_size], dim=-1)
+        query, key, value = split_fused_qkv(qkv, shape, shape.qkv_row_layout)
 
         heads = shape.num_q_heads
         kv_heads = shape.num_kv_heads

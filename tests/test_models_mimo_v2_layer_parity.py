@@ -60,8 +60,19 @@ def golden():
 
 @pytest.fixture(scope="module")
 def config(golden):
-    """The port's config, built from the same kwargs the reference was built from."""
-    return MimoV2TextConfig.from_dict(golden["config_kwargs"])
+    """The port's config, built from the same kwargs the reference was built from.
+
+    With one override. The fixture's fused `qkv_proj` holds `[q | k | v]` in one
+    run, because that is what the reference's own `split([q_size, k_size,
+    v_size])` reads; the released checkpoint stores the same projection as four
+    tensor-parallel shards of `[q | k | v]`, which is the layout a real read has
+    to use and which `test_models_mimo_v2_qkv_layout.py` pins separately. What is
+    under test here is the layer arithmetic given q, k and v, so the fixture keeps
+    the order the reference can read.
+    """
+    kwargs = dict(golden["config_kwargs"])
+    kwargs.setdefault("attention_qkv_row_layout", "contiguous")
+    return MimoV2TextConfig.from_dict(kwargs)
 
 
 @pytest.fixture(scope="module")
