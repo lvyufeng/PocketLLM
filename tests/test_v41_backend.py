@@ -32,6 +32,7 @@ has been run against the released encoder or a real tokenizer, and the four-card
 
 from __future__ import annotations
 
+import importlib
 import threading
 
 import pytest
@@ -831,6 +832,99 @@ def test_a_worker_rank_has_no_one_to_broadcast_a_shutdown_to(tmp_path):
     backend.close()
 
     assert sent == []
+
+
+# ---------------------------------------------------------------------------- the idle doorbell
+
+
+class RecordingBell:
+    """Stands in for either end: the order of these three calls is the whole assertion."""
+
+    def __init__(self, order: list[str]) -> None:
+        self.order = order
+
+    def ring(self) -> None:
+        self.order.append("ring")
+
+    def wait(self) -> None:
+        self.order.append("wait")
+
+    def close(self) -> None:
+        self.order.append("close")
+
+
+def test_the_broadcast_rings_before_it_enters_the_collective(tmp_path, monkeypatch):
+    """Ringing first is what keeps the workers' wait off the device, so the order is the point."""
+    import torch.distributed as dist
+
+    order: list[str] = []
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda box, src: order.append("broadcast"))
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4)
+    backend._world, backend._rank = 4, 0
+    backend._bell = RecordingBell(order)
+
+    assert backend._broadcast({"op": "generate"}) == {"op": "generate"}
+    assert order == ["ring", "broadcast"]
+
+
+def test_a_worker_rank_waits_on_the_bell_before_the_collective(tmp_path, monkeypatch):
+    import torch.distributed as dist
+
+    order: list[str] = []
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda box, src: order.append("broadcast"))
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4)
+    backend._world, backend._rank = 4, 1
+    backend._bell = RecordingBell(order)
+
+    assert backend._broadcast({"op": "generate"}) == {"op": "generate"}
+    assert order == ["wait", "broadcast"]
+
+
+def test_each_rank_opens_the_end_of_the_doorbell_it_needs(tmp_path, monkeypatch):
+    """Rank 0 rings the ranks below it; a rank below it owns the socket that gets rung."""
+    module = importlib.import_module("pocketllm.backends.v41_backend")
+    opened: list[str] = []
+
+    class FakeWorkerBell:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def bind(self) -> None:
+            opened.append(f"bind {self.path}")
+
+    monkeypatch.setattr(module, "WorkerBell", FakeWorkerBell)
+    monkeypatch.setattr(module, "BellRinger", lambda paths: opened.append(f"ring {list(paths)}"))
+    monkeypatch.setattr(module, "bell_path", lambda port, rank: f"/tmp/bell-{port}-r{rank}")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4)
+
+    backend._world, backend._rank = 4, 0
+    backend._open_bell()
+    assert opened == ["ring ['/tmp/bell-29500-r1', '/tmp/bell-29500-r2', '/tmp/bell-29500-r3']"]
+
+    opened.clear()
+    backend._world, backend._rank, backend._bell = 4, 2, None
+    backend._open_bell()
+    assert opened == ["bind /tmp/bell-29500-r2"]
+
+    # A single process has no peer to ring or be rung by, so it opens nothing.
+    opened.clear()
+    backend._world, backend._bell = 1, None
+    backend._open_bell()
+    assert opened == []
+
+
+def test_close_closes_the_doorbell_after_the_shutdown_is_sent(tmp_path):
+    """A worker reads this socket closing as the end of the group, so it has to come second."""
+    order: list[str] = []
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4)
+    backend._world, backend._rank = 4, 0
+    backend._bell = RecordingBell(order)
+    backend._broadcast = lambda payload: order.append("broadcast")
+
+    backend.close()
+
+    assert order == ["broadcast", "close"]
 
 
 def test_run_worker_refuses_the_single_process_and_rank_zero_cases(tmp_path, monkeypatch):
