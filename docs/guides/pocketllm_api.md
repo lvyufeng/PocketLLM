@@ -493,9 +493,11 @@ and it reports `supports_batch=False`: one mutable KV state, serialized at the b
 
 Capabilities reported by the C++ adapter follow the linked device backend. An Ascend build advertises
 only the speculative methods it implements, since the external DSpark and DFlash2 drafters are
-CUDA-only. The V4.1 adapter similarly advertises no logprobs and no prefix caching, and its
-`cancellation` detail names the mechanism rather than promising a latency: a cancellation is a
-per-step collective between the ranks and cannot interrupt a prompt's forward.
+CUDA-only. The V4.1 adapter advertises no logprobs — a request asking for them is refused rather than
+served without them — while prefix caching follows `prefix_cache_bytes`, which defaults to 4 GiB a
+rank and can be set to zero to turn the reuse off. Its `cancellation` detail names the mechanism
+rather than promising a latency: a cancellation is a per-step collective between the ranks and cannot
+interrupt a prompt's forward.
 
 ## Request normalization
 
