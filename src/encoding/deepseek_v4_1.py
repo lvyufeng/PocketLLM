@@ -47,6 +47,14 @@ ENCODER_FILENAME = "encoding.py"
 #: is why it survives `skip_special_tokens` and can be found in the user-visible text.
 THINKING_END = "</think>"
 
+#: The marker that opens a tool-call block. Also plain text, for the same reason. The checkpoint
+#: composes it itself, as ``f"\n\n<{dsml_token}{tool_calls_block_name}"``, and its parser matches on
+#: exactly this -- two newlines, then the tag, without the closing ``>`` -- so a reader that stops
+#: here stops where the parser starts reading. Written out rather than read off the loaded encoder
+#: because the readers below run on a text that may be truncated at any character, and a comparison
+#: that cannot fail is worth more there than a name that cannot be wrong.
+TOOL_CALLS_START = "\n\n<｜DSML｜ calls"
+
 #: OpenAI's effort names mapped onto V4.1's 1-100 budget. Three of these are the checkpoint's own
 #: aliases and are passed through under their own names; `minimal` and `medium` are this package's
 #: reading of the public scale, and both keep the property that matters -- a client that asks for
@@ -193,6 +201,33 @@ def split_completion(text: str, *, thinking_mode: str = "chat") -> dict[str, Any
     }
 
 
+def cut_tool_calls(text: str) -> str:
+    r"""``text`` up to the tool-call block that opens in it, and none of the block itself.
+
+    A tool call is not part of the answer. The checkpoint's parser reads the block into OpenAI's
+    ``tool_calls`` field and stops its reading of the content where the block opens, so the same
+    characters cannot also be the answer -- and a client shown them is shown the format instead of
+    the reply. This is that cut, made on a text that is still growing: a stream has to decide before
+    it knows whether the generation will turn out to be well formed at all, and the parser, which
+    insists that it is, cannot be asked.
+
+    The tail is held back while it could still *become* the tag, which is what a running decode
+    costs. ``\n\n<`` at the end of the text is three characters the answer may not contain and a
+    stream cannot take back, so a trailing fragment of the tag is withheld with it; the next token
+    either completes the tag -- and the cut was the right one -- or breaks it, and the held-back
+    characters go out then. Both branches leave the cut where it was or move it forward, which is
+    what lets a caller diff this against what it has already sent.
+    """
+    index = text.find(TOOL_CALLS_START)
+    if index >= 0:
+        return text[:index]
+    # Longest first: the fragment that reaches furthest back into the tag is the one to hold.
+    for size in range(min(len(TOOL_CALLS_START) - 1, len(text)), 0, -1):
+        if TOOL_CALLS_START.startswith(text[-size:]):
+            return text[: len(text) - size]
+    return text
+
+
 def parse_strict(checkpoint_dir: str, text: str, *, thinking_mode: str = "chat") -> dict[str, Any] | None:
     """The checkpoint's own parse of a completion, or ``None`` when it will not accept it.
 
@@ -237,6 +272,8 @@ __all__ = [
     "ENCODER_FILENAME",
     "EncoderUnavailableError",
     "THINKING_END",
+    "TOOL_CALLS_START",
+    "cut_tool_calls",
     "encode_messages",
     "encoder_path",
     "load_encoder",

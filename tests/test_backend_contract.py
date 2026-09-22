@@ -14,7 +14,7 @@ from pocketllm.api import (
     UnsupportedFeatureError,
     Usage,
 )
-from pocketllm.backends.base import BackendBase
+from pocketllm.backends.base import BackendBase, settled_text
 from pocketllm.server.metrics import HISTOGRAMS, Metrics
 from pocketllm.server.openai import OpenAIHandler, PocketLLMHTTPServer
 
@@ -491,3 +491,29 @@ def test_non_streaming_records_no_per_token_latency():
     finally:
         server.shutdown()
         server.server_close()
+
+
+# ---------------------------------------------------------------------------- decode tails
+
+
+def test_a_half_character_at_the_end_of_a_decode_is_held_back():
+    """A byte-level decode renders a character a token ended inside as U+FFFD until the next token
+    finishes it. What a stream must not send is the replacement character, so the tail waits."""
+    assert settled_text("你好！�") == "你好！"
+    assert settled_text("你好！😊") == "你好！😊"
+    assert settled_text("�") == ""
+    assert settled_text("你好！��") == "你好！"
+
+
+def test_a_replacement_character_inside_a_decode_is_left_where_it_is():
+    """Only the tail can be a character still arriving. One anywhere else is a byte sequence that
+    really was invalid, and the unstreamed decode has it in the same place -- dropping it would
+    make the stream disagree with the answer it is a stream of."""
+    assert settled_text("你�好") == "你�好"
+    assert settled_text("a�b�") == "a�b"
+
+
+def test_a_decode_with_nothing_to_settle_is_returned_unchanged():
+    assert settled_text("") == ""
+    assert settled_text("answer") == "answer"
+    assert settled_text("line\n") == "line\n"

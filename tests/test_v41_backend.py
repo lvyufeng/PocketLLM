@@ -13,6 +13,10 @@ is everything the adapter itself decides:
   tokens the loop had already produced past it;
 * that a thinking-mode stream is split as it arrives, each half diffed against what was already
   sent rather than re-sent;
+* that a stream sends the *answer*: the tool-call block V4.1 writes as plain text is withheld from
+  the content and reported as a call on the last event, and a decode tail that is still half a
+  character is held back and then sent, so neither the format's markup nor a replacement character
+  reaches a client;
 * that the loop's own decode figure travels with the result, and that when the loop unwinds on a
   stop string -- where no ``Generation`` comes back at all -- the wall minus the first token's wait
   is what is left of it.
@@ -33,6 +37,7 @@ has been run against the released encoder or a real tokenizer, and the four-card
 from __future__ import annotations
 
 import importlib
+import re
 import threading
 
 import pytest
@@ -45,7 +50,7 @@ from pocketllm.api import (
     SamplingParams,
     UnsupportedFeatureError,
 )
-from pocketllm.backends.v41_backend import V41Backend, _split_running
+from pocketllm.backends.v41_backend import V41Backend, _identified, _split_running
 
 
 # ---------------------------------------------------------------------------- stand-ins
@@ -70,7 +75,9 @@ def parse_message_from_completion_text(text, thinking_mode):
         reasoning, content = "", body
     calls = []
     if "<tool>" in content:
-        calls.append({"id": "call_1", "type": "function",
+        # No ``id``, because the released ``tool_calls_to_openai_format`` puts none there: the
+        # calls it reads are read out of a prompt, where the id was the client's to write.
+        calls.append({"type": "function",
                       "function": {"name": "weather", "arguments": "{}"}})
     return {"role": "assistant", "reasoning_content": reasoning,
             "content": content, "tool_calls": calls}
@@ -98,6 +105,35 @@ class FakeTokenizer:
             for token in ids
         )
         return "".join(pieces)
+
+
+class ByteLevelTokenizer:
+    """Ids to text through *bytes*, the way a byte-level tokenizer's decode works.
+
+    The fake exists for a failure a string table cannot show: a token whose bytes end in the middle
+    of a character decodes to U+FFFD until the token that finishes the character arrives, because
+    the decode is ``bytes(tokens).decode("utf-8", errors="replace")``. ``pieces`` maps an id to the
+    bytes it holds, or to text that is encoded to them.
+    """
+
+    def __init__(self, pieces=None, eos_token_id=1) -> None:
+        self.pieces: dict[int, bytes] = {0: b"<s>", 1: b"<e>"}
+        for token, piece in (pieces or {}).items():
+            self.pieces[token] = piece.encode("utf-8") if isinstance(piece, str) else bytes(piece)
+        self.eos_token_id = eos_token_id
+        self.special_ids = {0, 1}
+
+    def __call__(self, text, add_special_tokens=True):
+        return {"input_ids": [7]}
+
+    def decode(self, ids, skip_special_tokens=True):
+        payload = b"".join(
+            b""
+            if skip_special_tokens and token in self.special_ids
+            else self.pieces.get(token, b"")
+            for token in ids
+        )
+        return payload.decode("utf-8", errors="replace")
 
 
 class FakeBuffer:
@@ -549,6 +585,67 @@ def test_a_thinking_generation_is_split_by_the_checkpoints_parser(tmp_path, loop
     assert result.metadata["tool_calls"][0]["function"]["name"] == "weather"
 
 
+def test_a_reported_call_is_named_with_an_id_the_checkpoint_does_not_supply(tmp_path, loop):
+    """A call the checkpoint reads out of a *prompt* carries no id, because the client wrote it. A
+    call this backend reports has no such history, and a client that validates the response against
+    OpenAI's typed models -- or echoes the call back to attribute a tool result to it -- needs one.
+    """
+    tokenizer = FakeTokenizer(pieces={11: "answer", 12: "<tool>", 1: "<e>"})
+    loop(tokens=[11, 12, 1])
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=2)
+    )
+
+    result = backend.generate([request])[0]
+
+    call = result.metadata["tool_calls"][0]
+    assert re.fullmatch(r"call_[0-9a-f]{24}", call["id"])
+    # Minted around the checkpoint's call, not instead of it.
+    assert call["type"] == "function"
+    assert call["function"] == {"name": "weather", "arguments": "{}"}
+
+
+def test_a_generation_that_ended_on_a_call_says_so(tmp_path, loop):
+    """OpenAI's own reading of the same answer: a client that keys on the reason rather than
+    reading the field would otherwise see "stop" on a response that carries a call."""
+    tokenizer = FakeTokenizer(pieces={11: "answer", 12: "<tool>", 1: "<e>"})
+    loop(tokens=[11, 12, 1], stopped="eos")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=2)
+    )
+
+    result = backend.generate([request])[0]
+
+    assert result.finish_reason == "tool_calls"
+    assert result.metadata["stopped"] == "eos"
+
+
+def test_a_generation_cut_by_max_tokens_is_still_a_length_finish(tmp_path, loop):
+    """The other reading of the same rule: a cut generation never reached its end-of-sentence token
+    for the parser to read a call from, so the cut is what ended it and the reason says so."""
+    tokenizer = FakeTokenizer(pieces={11: "answer", 12: "<tool>"})
+    loop(tokens=[11, 12], stopped="length")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=2)
+    )
+
+    result = backend.generate([request])[0]
+
+    assert result.finish_reason == "length"
+    assert "tool_calls" not in result.metadata  # the tolerant split invents no calls
+
+
+def test_an_id_the_checkpoint_did_supply_is_not_replaced():
+    """The minting is a fallback, not a rewrite: a call that arrives named keeps its name."""
+    named = [{"id": "call_abc", "type": "function", "function": {"name": "t", "arguments": "{}"}}]
+    assert _identified(named) == named
+    # And the calls it does name are copies, so a caller cannot reshape the result's own metadata.
+    assert _identified(named)[0] is not named[0]
+
+
 def test_a_generation_the_parser_refuses_falls_back_to_the_tolerant_split(tmp_path, loop):
     """A ``max_tokens`` cut is the ordinary case, so a refusal is not an error to report."""
     tokenizer = FakeTokenizer(pieces={11: "why", 12: "</think>", 13: "half"})
@@ -755,6 +852,90 @@ def test_a_chat_stream_sends_every_token_as_content(tmp_path, loop):
     assert all(not event.metadata for event in events if event.token_id is not None)
 
 
+def test_a_stream_withholds_the_tool_call_block_and_reports_the_call_at_the_end(tmp_path, loop):
+    """The block V4.1 writes is text, so a stream of the running decode would send its markup as
+    prose -- which is what a client saw before this. The call it describes cannot be read out of
+    that text either, because the checkpoint's parser wants the end-of-sentence token that the
+    decode strips, so it travels on the last event instead, numbered from zero the way OpenAI's own
+    stream numbers a delta's calls."""
+    block = {12: "\n", 13: "\n<", 14: "｜DSML｜ calls><tool>"}
+    tokenizer = FakeTokenizer(pieces={11: "answer", 1: "<e>", **block})
+    loop(tokens=[11, 12, 13, 14, 1], stopped="eos")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=4)
+    )
+
+    events = _drain(backend, request)
+
+    tokens = [event for event in events if event.token_id is not None]
+    # The answer, and only the answer: the block is four characters into the running text past it.
+    assert [event.text for event in tokens] == ["answer", "", "", "", ""]
+    assert all("DSML" not in event.text for event in events)
+    assert all(not event.metadata for event in tokens)
+    last = events[-1]
+    call = last.metadata["tool_calls"][0]
+    assert call["index"] == 0
+    assert call["function"]["name"] == "weather"
+    assert re.fullmatch(r"call_[0-9a-f]{24}", call["id"])
+    # A call is why this generation ended, and the reason says so.
+    assert last.finish_reason == "tool_calls"
+
+
+def test_a_half_a_character_at_the_end_of_a_running_decode_is_held_back(tmp_path, loop):
+    """A byte-level decode renders a token that ends inside a character as U+FFFD until the token
+    that finishes the character arrives, and a stream cannot take a character back -- so the tail
+    waits one token, and the client is sent what the unstreamed decode would have sent."""
+    tokenizer = ByteLevelTokenizer(pieces={11: "你好", 12: "！", 13: b"\xf0\x9f", 14: b"\x98\x8a"})
+    loop(tokens=[11, 12, 13, 14], stopped="length")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=4)
+    )
+
+    events = _drain(backend, request)
+
+    tokens = [event for event in events if event.token_id is not None]
+    assert [event.text for event in tokens] == ["你好", "！", "", "😊"]
+    assert all("�" not in event.text for event in events)
+
+
+def test_a_stream_sends_what_the_cut_held_back_once_the_tag_is_ruled_out(tmp_path, loop):
+    """What the hold-back costs and what pays for it: at a running text ending in ``\\n\\n<`` the
+    next token could still open a block, and the fragment cannot be sent and then recalled -- so it
+    waits, and the next token releases it when it turns out not to be the tag."""
+    tokenizer = FakeTokenizer(pieces={11: "ab", 12: "\n", 13: "\n", 14: "x"})
+    loop(tokens=[11, 12, 13, 14], stopped="length")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=4)
+    )
+
+    events = _drain(backend, request)
+
+    tokens = [event for event in events if event.token_id is not None]
+    assert [event.text for event in tokens] == ["ab", "", "", "\n\nx"]
+    assert "".join(event.text for event in events) == "ab\n\nx"
+
+
+def test_a_generation_that_ended_on_a_fragment_of_the_tag_does_not_send_the_fragment(
+    tmp_path, loop
+):
+    """The other side of the same hold-back, and the reason the finished reading is what settles it:
+    a generation cut inside the block never says what was coming, and its fragment is not owed to a
+    client -- an unfinished tool call is not prose a reader can use."""
+    tokenizer = FakeTokenizer(pieces={11: "ab", 12: "\n", 13: "\n", 14: "<"})
+    loop(tokens=[11, 12, 13, 14], stopped="length")
+    backend, _ = _build(_checkpoint(tmp_path), tokenizer=tokenizer, max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4], sampling_params=SamplingParams(max_tokens=4)
+    )
+
+    events = _drain(backend, request)
+
+    assert "".join(event.text for event in events) == "ab"
+
+
 def test_a_stream_reports_a_failed_loop_in_band_rather_than_truncating(tmp_path, loop):
     """The HTTP layer turns this into an error event; swallowing it would end the stream as a
     short answer and a 200."""
@@ -787,7 +968,6 @@ def test_a_stream_that_is_abandoned_stops_the_producer(tmp_path, loop):
 
 
 # ---------------------------------------------------------------------------- multi-rank
-
 
 def test_the_flag_lives_on_the_card_the_attention_caches_are_on(tmp_path):
     """Read the way ``generate._cache_device`` reads it: nothing promises this process's current

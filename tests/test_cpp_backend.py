@@ -24,6 +24,25 @@ class FakeTokenizer:
         return "".join(f"<{token}>" for token in token_ids)
 
 
+class ByteLevelTokenizer:
+    """The other kind of tokenizer: pieces are bytes, and a decode renders what it has.
+
+    A prefix that ends inside a multi-byte character is decoded with ``errors="replace"``, which is
+    where U+FFFD comes from. This is the tokenizer the held-back tail exists for.
+    """
+
+    def __init__(self, pieces: dict[int, bytes]) -> None:
+        self._pieces = pieces
+
+    def encode(self, text: str) -> list[int]:
+        return [1]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return b"".join(self._pieces[token] for token in token_ids).decode(
+            "utf-8", errors="replace"
+        )
+
+
 class TemplateTokenizer(FakeTokenizer):
     chat_template = "{{ messages }}"
 
@@ -543,6 +562,57 @@ def test_stream_text_deltas_use_cumulative_tokenizer_decode() -> None:
     events = list(backend.stream(request))
 
     assert [event.text for event in events] == ["a", "b", "a"]
+    backend.close()
+
+
+def test_stream_holds_back_a_character_a_token_ended_inside() -> None:
+    """The stream sends the answer, and the replacement character a byte-level decode puts where a
+    character is still arriving is not part of it. The tail goes out with the token that finishes
+    the character, and the whole stream is the decode of the whole generation."""
+    tokenizer = ByteLevelTokenizer(
+        pieces={10: b"\xe4\xbd", 11: b"\xa0\xe5", 12: b"\xa5\xbd", 13: b"!"}
+    )
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=tokenizer,
+    )
+    request = GenerationRequest(
+        prompt_tokens=[1],
+        request_id="req-half-character",
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    events = list(backend.stream(request))
+
+    assert [event.text for event in events] == ["", "你", "好", "!"]
+    assert "".join(event.text for event in events) == "你好!"
+    assert not any("�" in event.text for event in events)
+    backend.close()
+
+
+def test_a_stream_that_ends_on_eos_sends_what_its_decode_was_holding() -> None:
+    """No token is coming to settle the tail, so the stream would end one character short of the
+    decode ``generate`` reports for the same ids. EOS itself is still not emitted."""
+    tokenizer = ByteLevelTokenizer(pieces={10: b"\xe4\xbd", 11: b"\xa0"})
+    backend = CppBackend(
+        EngineArgs(model="model", backend="cpp", backend_options={"eos_token_id": 11}),
+        engine=FakeEngine(),
+        tokenizer=tokenizer,
+    )
+    request = GenerationRequest(
+        prompt_tokens=[1],
+        request_id="req-eos-tail",
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    events = list(backend.stream(request))
+
+    assert [event.token_id for event in events] == [10, None]
+    assert [event.text for event in events] == ["", "�"]
+    assert events[-1].finish_reason == "stop"
+    # The same ids through an unstreamed decode, which is what the stream has to agree with.
+    assert "".join(event.text for event in events) == tokenizer.decode([10])
     backend.close()
 
 
