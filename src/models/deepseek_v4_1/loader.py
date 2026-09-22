@@ -753,6 +753,24 @@ class LoadedBackbone:
         if self.hash_ids is not None:
             self.hash_ids.reset()
 
+    def snapshot_prefix(self, limit: int) -> torch.Tensor | None:
+        """The first `limit` rows of the Engram hash cache, on the host, or `None` without a front end.
+
+        `None` is a real answer and not an error: a config with no Engram layers has no hash cache,
+        and a caller assembling a prefix snapshot takes whatever this returns and carries it beside
+        the tree's own, which is what `prefix_cache.HASH_CACHE`'s key is for.
+        """
+        if self.hash_ids is None:
+            return None
+        return self.hash_ids.cache[:, : int(limit)].detach().to("cpu", copy=True)
+
+    def restore_prefix(self, saved: torch.Tensor | None) -> None:
+        """`snapshot_prefix` put back, into the cache that is there and never into a new one."""
+        if saved is None or self.hash_ids is None:
+            return
+        cache = self.hash_ids.cache
+        cache[:, : saved.shape[1]].copy_(saved)
+
 
 def load_backbone(
     config: V41TextConfig,

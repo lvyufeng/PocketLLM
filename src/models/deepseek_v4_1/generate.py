@@ -32,6 +32,8 @@ from typing import Callable, Sequence
 
 import torch
 
+from .prefix_cache import HASH_CACHE, restore_rows, snapshot_rows
+
 __all__ = ["Generation", "generate", "main"]
 
 # The environment spellings of the two device-path flags, so that the machine remembers the
@@ -49,6 +51,14 @@ class Generation:
     prompt_tokens: int = 0
     stopped: str = "length"
     """`eos`, `length` (max_new_tokens reached), or `max_seq_len` (the model's context is full)."""
+
+    cached_tokens: int = 0
+    """How many of `prompt_tokens` came out of the prefix store instead of being forward-passed.
+
+    Zero without a store, and zero for a prompt with no stored prefix. Read by the serving layer for
+    `usage.prompt_tokens_details` and by a probe for what a repeat actually reused -- the two callers
+    disagree about nothing here, because the number is a count of tokens and not a guess at one.
+    """
 
     driver: object | None = None
     """The `graphs.DecodeGraphs` a `graphs=True` run built, so a caller can report what it cost.
@@ -96,6 +106,7 @@ def generate(
     on_token: Callable[[int, torch.Tensor], None] | None = None,
     graphs: bool = False,
     prefill_chunk: int | None = None,
+    prefix_cache=None,
 ) -> Generation:
     """Prefill `prompt_ids`, then decode up to `max_new_tokens` more.
 
@@ -124,6 +135,15 @@ def generate(
     reaches the graphs as a tensor -- and a `max_new_tokens` of at least one, since the recording is
     a decode step and there is nothing to record a decode step for otherwise.
 
+    `prefix_cache` is a `prefix_cache.PrefixCache` the caller keeps across requests, or `None` for no
+    reuse. With one, the prompt is looked up first: a stored prefix of it is restored instead of
+    forward-passed, and a prompt that *is* one costs no forward at all. The prompt's caches are then
+    kept on the host -- keyed by the tokens that produced them, sliced to the rows those tokens wrote
+    -- along with a fixed-length head anchor the store was configured with, so that a later
+    conversation sharing a rendered header reuses it too. `Generation.cached_tokens` reports how much
+    of the prompt was reused. A store is not a correctness boundary: everything it returns is a
+    snapshot of a forward this loop already ran, and a miss is a cold prefill.
+
     Each token comes from the logits this returns, not from `Backbone.forward`'s `output_ids`, which
     the model samples by its own config `temperature` -- a field the released schema does not carry,
     so it is always the 1.0 default, a softmax and a Gumbel draw over the whole vocabulary. That draw
@@ -143,30 +163,109 @@ def generate(
     loop = _decode_graphs if graphs and max_new_tokens > 0 else _decode
     try:
         return loop(
-            front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk
+            front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token,
+            prefill_chunk, prefix_cache,
         )
     finally:
         if saved_temperature is not None:
             model.temperature = saved_temperature
 
 
-def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None) -> Generation:
+def _restore(front, model, saved: dict[str, torch.Tensor]) -> None:
+    """Put a stored prefix back: the tree's caches, then the Engram hash slice beside them."""
+    restore_rows(model, saved)
+    front.restore_prefix(saved.get(HASH_CACHE))
+
+
+def _keep(front, cache, model, ids, length: int, logits: torch.Tensor) -> None:
+    """Keep the state the forward that just ran leaves, keyed by the first `length` tokens of `ids`.
+
+    `logits` is that forward's row, which is what `Entry.logits` is for: an entry has to be able to
+    answer a request that *is* its prefix without one more forward. `cache.max_seq_len` is the width
+    the buffers were built at -- the store is constructed with it and `geometry_tag` keys on it -- and
+    it is what tells `snapshot_rows` how many positions a row of a grouped buffer stands for.
+
+    Nothing here fails loudly, and nothing here is a decision: a store that does not take the payload
+    -- no store, a length under its floor, a snapshot past its budget -- costs the next request a
+    forward it would have paid for anyway.
+    """
+    if cache is None:
+        return
+    saved = snapshot_rows(model, length, cache.max_seq_len)
+    hashes = front.snapshot_prefix(length)
+    if hashes is not None:
+        saved[HASH_CACHE] = hashes
+    cache.store(ids, length, saved, logits[0])
+
+
+def _prefill(front, cache, ids, chunk) -> tuple[int, int, torch.Tensor]:
+    """Bring the model to the end of `ids` and say what of the prompt it did not have to run.
+
+    Returns `(cached_len, position, logits)`: how much of the prompt came out of the store, where the
+    next forward goes, and the row the first new token is picked from. `position` is `len(ids)` in all
+    three cases below -- a prompt answered out of the store was forwarded once already, by the request
+    that stored it -- and the only caller that reads it is the graph path, whose position has to be a
+    tensor by then.
+
+    The store is what tells the three apart. A prompt with no stored prefix is forwarded whole, as it
+    always was. A prompt that starts with one is forwarded from the prefix's end, which is a chunk
+    boundary and not a different body -- `tests/test_models_deepseek_v4_1_chunked_prefill.py` pins
+    every boundary bit-equal to a one-shot prefill. A prompt that *is* a stored prefix is not
+    forwarded at all: the row its first new token comes from is the one the anchor kept, and the state
+    is still restored, because the decode steps after it read the caches. Forwarding the prompt's last
+    token again to recompute that row is the shortcut `prefix_cache` documents as unsound.
+
+    `reset_state` runs before the restore rather than after a hit test: a sliced snapshot leaves the
+    rows it does not carry as whatever the last request left there, so the reset is what makes a
+    restore a reconstruction. It runs on a miss too, which is where it has always run.
+
+    `Entry.logits[None]` is a row on the host and stays there. The two things that read the row -- the
+    sampler and the streaming hook -- are indifferent to where it lives, and a sampler is *not*: a
+    `torch.Generator("cpu")` against a card tensor is an error, so the host row is the safer of the
+    two on a path where `temperature > 0` is reachable.
+    """
+    model = getattr(front, "model", front)
+    hit = None if cache is None else cache.lookup(ids)
+    front.reset_state(1)
+    if hit is not None:
+        cached_len, entry = hit
+        _restore(front, model, entry.saved)
+        if cached_len == len(ids):
+            return cached_len, cached_len, entry.logits[None]
+        _, logits, _ = front(torch.tensor([ids[cached_len:]]), cached_len, chunk=chunk)
+        _keep(front, cache, model, ids, len(ids), logits)
+        return cached_len, len(ids), logits
+
+    # A cold prompt also takes the head anchor, which is a fixed length rather than a position in this
+    # prompt: the snapshot has to be taken at a forward boundary, so the first chunk ends there and
+    # the rest is a continuation. That boundary is the whole cost of the anchor, and it is paid on a
+    # miss only -- a resume above never runs this branch.
+    start = 0
+    head = 0 if cache is None else cache.head_tokens
+    if head and len(ids) > head:
+        _, row, _ = front(torch.tensor([ids[:head]]), 0, chunk=chunk)
+        _keep(front, cache, model, ids, head, row)
+        start = head
+    _, logits, _ = front(torch.tensor([ids[start:]]), start, chunk=chunk)
+    _keep(front, cache, model, ids, len(ids), logits)
+    return 0, len(ids), logits
+
+
+def _decode(front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None, prefix_cache=None) -> Generation:
     """The loop, with the model's own sampling already taken out of the picture."""
     generator = None
     if seed is not None:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    front.reset_state(1)
-    position = 0
     limit = getattr(getattr(front, "model", front), "max_seq_len", None)
-    result = Generation(prompt_tokens=len(ids))
+    cached_len, position, logits = _prefill(front, prefix_cache, ids, prefill_chunk)
+    result = Generation(prompt_tokens=len(ids), cached_tokens=cached_len)
 
-    # The prompt is one forward. Its last row is the distribution the first new token comes from,
-    # so the first new token costs no extra forward. `decode_seconds` starts after it, so splitting
-    # the forward into chunks moves work between the two numbers rather than into either of them.
-    _, logits, _ = front(torch.tensor([ids]), position, chunk=prefill_chunk)
-    position += len(ids)
-
+    # The prompt is one forward, or none for a stored prefix, and its last row is the distribution the
+    # first new token comes from either way -- so the first new token costs no extra forward.
+    # `decode_seconds` starts after it, so splitting the forward into chunks moves work between the two
+    # numbers rather than into either of them. A resume's forward is inside `_prefill`, and so is the
+    # head chunk a cold prompt pays for its head anchor.
     started = time.perf_counter()
     try:
         while len(result.tokens) < max_new_tokens:
@@ -207,7 +306,8 @@ def _cache_device(model) -> torch.device:
 
 
 def _decode_graphs(
-    front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None
+    front, ids, max_new_tokens, temperature, top_k, eos_token_id, seed, on_token, prefill_chunk=None,
+    prefix_cache=None,
 ) -> Generation:
     """`_decode` with every block replayed from a captured graph, split around the expert call.
 
@@ -226,6 +326,12 @@ def _decode_graphs(
     dropped and the step is run once more, this time by the graphs it just recorded, and it is
     *that* step the loop goes on from. One extra step out of a generation, all of it before the
     first token is picked from a graphed forward.
+
+    A stored prefix changes the position and not the shape of any of that: the prompt is eager here
+    whatever it was, eager prefill bodies are the only ones a graph may not hold, and a prefix that
+    was answered without a forward leaves the caches a resume would have. The one thing to keep is
+    that the store is written before the capture: `capture_pass` moves the caches, and the snapshot
+    a store keeps has to be the prefill's.
     """
     from .decode_pos import Pos
     from .graphs import DecodeGraphs
@@ -235,19 +341,14 @@ def _decode_graphs(
     if seed is not None:
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    front.reset_state(1)
     limit = getattr(model, "max_seq_len", None)
-    result = Generation(prompt_tokens=len(ids))
+    cached_len, position, logits = _prefill(front, prefix_cache, ids, prefill_chunk)
+    result = Generation(prompt_tokens=len(ids), cached_tokens=cached_len)
 
-    # The prompt is one eager forward, before any graph exists: prefill branches on the position
-    # being zero and is a different body from the one a graph holds, so a layer handed a graph here
-    # would record the wrong one. Chunked it is still eager and still before the capture, and the
-    # caches it leaves behind are the caches the capture records from.
-    _, logits, _ = front(torch.tensor([ids]), 0, chunk=prefill_chunk)
-
-    # The prefill's last row is the distribution the first new token comes from, so it is picked
-    # before anything is captured -- and a generation that stops on it never builds a graph at all.
-    if limit is not None and len(ids) >= limit:
+    # The prefill's last row is the distribution the first new token comes from -- whatever produced
+    # it -- so it is picked before anything is captured, and a generation that stops on it never
+    # builds a graph at all.
+    if limit is not None and position >= limit:
         result.stopped = "max_seq_len"
         return result
     token = _pick(logits[0], temperature, top_k, generator)
@@ -258,7 +359,7 @@ def _decode_graphs(
         result.stopped = "eos"
         return result
 
-    pos = Pos.device(len(ids), _cache_device(model))
+    pos = Pos.device(position, _cache_device(model))
     driver = DecodeGraphs(model)
     result.driver = driver
 

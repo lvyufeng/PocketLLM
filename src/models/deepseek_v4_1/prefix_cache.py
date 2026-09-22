@@ -60,6 +60,7 @@ __all__ = [
     "CACHE_NAMES",
     "Entry",
     "GROUPED_AXES",
+    "HASH_CACHE",
     "PrefixCache",
     "extend_hash",
     "prefix_hashes",
@@ -79,6 +80,14 @@ CACHE_NAMES = ("window_kv_cache", "compress_kv_cache", "k_cache", "kv_state", "s
 # partition has to be by name: `window_kv_cache`'s second axis is 128 slots, which read off its own
 # width would look like a ratio of `max_seq_len // 128`.
 GROUPED_AXES = ("compress_kv_cache", "k_cache")
+
+# The Engram hash cache rides in a snapshot under its own key. It is a plain attribute of
+# `EngramHashIds` rather than a registered buffer, so `named_buffers` never sees it and the tree
+# cannot supply it -- but a continuation's first token reads the previous `max_ngram_size - 1`
+# positions through it, and `reset` fills it with `DEAD`, so a restore that left it out would answer
+# the first new token with a truncated n-gram. The spelling carries a dot and cannot collide with a
+# buffer name.
+HASH_CACHE = "engram.hash_cache"
 
 # The block the hash chain steps by. vLLM uses the same size for the same reason: it is what a
 # `by_length` index is walked in, so the chain for a candidate length is usually already computed and
@@ -226,14 +235,19 @@ def restore_rows(model: torch.nn.Module, saved: dict[str, torch.Tensor]) -> None
     one would leave every graph writing to memory nothing reads -- a wrong answer that still looks
     like a number, and one that only shows up as a divergence several steps later.
 
+    The walk is over the tree's buffers and not over the snapshot's keys, so a snapshot that carries
+    something the tree does not -- `HASH_CACHE`, which is restored by whoever took it -- is passed
+    over rather than looked up.
+
     A sliced snapshot fills the leading rows and leaves the rest alone, which is exact only because
     the caller reset first: `Attention.reset_state` zeroes the three position tables and refills the
     compressor state, and the forward that produced the snapshot started from that same reset, so the
     rows it did not carry were zeros on both sides.
     """
-    by_name = dict(model.named_buffers())
-    for name, value in saved.items():
-        buffer = by_name[name]
+    for name, buffer in model.named_buffers():
+        value = saved.get(name)
+        if value is None:
+            continue
         if value.shape == buffer.shape:
             buffer.copy_(value)
         else:

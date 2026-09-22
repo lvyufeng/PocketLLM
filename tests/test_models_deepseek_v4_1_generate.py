@@ -13,7 +13,10 @@ abandoned mid-step with a driver it will never return to anybody.
 callback and the failure inside the step.
 
 `Pos` and the model are the only things faked. The loop, the pick, the capture ordering and the
-release are the released code.
+release are the released code, and so is the prefix store: `PrefixCache` needs no card either, so the
+tests below drive the loop against the real one. What that buys is the assertion a fake could not
+make -- that the key `_prefill` stores under and the key it looks up are the same key -- and what it
+costs is a `min_tokens` small enough for `PROMPT`'s three tokens to clear.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import torch
 
 from src.models.deepseek_v4_1 import generate as generate_module
 from src.models.deepseek_v4_1 import graphs as graphs_module
+from src.models.deepseek_v4_1 import prefix_cache as prefix_cache_module
 from src.models.deepseek_v4_1.generate import generate
 
 DIM = 8
@@ -54,21 +58,57 @@ class FakeGraphs:
 
 
 class FakeBackbone:
-    """A backbone with just the surface the loop touches: a call, a reset, a limit, and a cache."""
+    """A backbone with the surface the loop touches: a call, a reset, a cache, and the two prefix
+    hooks `LoadedBackbone` answers with the Engram hash slices that ride beside the tree's buffers."""
 
     def __init__(self, *, max_seq_len=64) -> None:
         self.max_seq_len = max_seq_len
         self.decode_graph_installed = False
         # `_cache_device` reads the position's card off a buffer, so the name is the interface.
         self._buffers = {"layers.0.window_kv_cache": torch.zeros(1)}
+        # `(tokens, position, chunk)` per forward, in order: how a test says which forwards a prompt
+        # cost, and the whole of the claim a stored prefix makes.
+        self.calls: list[tuple[list[int], int, object]] = []
+        # The Engram slices the store handed back, and the tree's buffer as it stood when the second
+        # half of a restore ran -- see `restore_prefix`.
+        self.restored: list[torch.Tensor] = []
+        self.buffer_at_restore: list[float] = []
 
     def named_buffers(self):
         return list(self._buffers.items())
 
     def reset_state(self, batch: int) -> None:
         self.reset_batch = batch
+        # The real one zeroes the position tables. A marker no forward writes is what lets a test
+        # tell a buffer a restore reached from one the reset overwrote after it.
+        self._buffers["layers.0.window_kv_cache"].fill_(-1.0)
+
+    def snapshot_prefix(self, limit: int):
+        """The hash slice a prefill keeps, one row per position.
+
+        `None` is the other answer a backbone gives here -- a config with no Engram layers, which is
+        `LoadedBackbone.snapshot_prefix`'s documented case and `tests/test_models_deepseek_v4_1_loader.py`'s
+        subject -- and a prefill that gets it stores the tree's buffers alone.
+        """
+        return torch.arange(int(limit), dtype=torch.float32).reshape(1, -1)
+
+    def restore_prefix(self, saved) -> None:
+        """Recorded rather than applied: what a test reads here is the *tree's* buffer.
+
+        `_restore` writes the tree's buffers first and reaches this second, and `_prefill` resets
+        before either, so a buffer already holding the snapshot when this runs is the ordering
+        `_prefill` documents. One still holding the reset's marker means the reset came after the
+        restore, which is a hit whose first new token reads caches that are half the last request's.
+        """
+        self.restored.append(saved)
+        self.buffer_at_restore.append(float(self._buffers["layers.0.window_kv_cache"].item()))
 
     def __call__(self, tokens, position, chunk=None):
+        ids = [int(token) for token in tokens.reshape(-1).tolist()]
+        self.calls.append((ids, position, chunk))
+        # `position + width` is a value no other call produces, so a buffer that ends up holding it
+        # is a buffer this forward -- and not a restore -- wrote.
+        self._buffers["layers.0.window_kv_cache"].fill_(float(position + len(ids)))
         width = tokens.shape[-1]
         # One row of logits per token: the prefill's last row is the first pick, and the loop's own
         # count is `len(result.tokens)` against `max_new_tokens`, so the shape only has to line up.
@@ -81,6 +121,19 @@ def _loop(monkeypatch):
     FakeGraphs.built = []
     monkeypatch.setattr(graphs_module, "DecodeGraphs", FakeGraphs)
     return FakeBackbone()
+
+
+def _cache(head_tokens: int = 0) -> prefix_cache_module.PrefixCache:
+    """A real store over a prompt short enough to reason about.
+
+    `min_tokens=1` because the store's default floor is a whole hash block -- 64 tokens, the length
+    the chain can key in one step -- and `PROMPT` is three; the floor's own behavior is
+    `tests/test_models_deepseek_v4_1_prefix_cache.py`'s. The budget is a megabyte because a toy
+    payload is a handful of bytes and the eviction walk is not what these tests are about.
+    """
+    return prefix_cache_module.PrefixCache(
+        budget_bytes=1 << 20, max_seq_len=64, min_tokens=1, head_tokens=head_tokens
+    )
 
 
 def test_an_unwinding_callback_leaves_the_model_without_its_graphs(monkeypatch) -> None:
@@ -167,3 +220,101 @@ def test_the_eager_loop_builds_no_graph_at_all(monkeypatch) -> None:
     assert result.driver is None
     assert result.tokens == [0, 0]
     assert result.stopped == "length"
+
+
+def test_a_cold_prompt_is_forwarded_whole_and_a_repeat_of_it_is_not(monkeypatch) -> None:
+    """The two ends of the store's contract: a miss costs exactly what it always cost, and a prompt
+    that *is* a stored prefix costs no prompt forward at all.
+
+    The trailing `([0], 3, None)` in both lists is the loop's own step, not a prompt: `_decode` picks
+    a token and then forwards it to have a distribution for the next one, whether or not the pick's
+    row came out of a forward. What the repeat is missing is the three-token call.
+    """
+    back = _loop(monkeypatch)
+    cache = _cache()
+
+    first = generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+    assert back.calls == [(PROMPT, 0, None), ([0], 3, None)]
+    assert first.cached_tokens == 0, "a cold prompt reported reuse it did not have"
+    assert cache.lengths() == [3], "the prefill did not keep the state it just built"
+
+    back.calls.clear()
+    second = generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+    assert back.calls == [([0], 3, None)], "the repeat forwarded the prompt again"
+    assert second.cached_tokens == 3
+    assert second.tokens == [0]
+    assert second.prompt_tokens == 3
+
+
+def test_a_longer_prompt_resumes_from_the_stored_end_and_forwards_only_the_tail(monkeypatch) -> None:
+    """The conversational case: turn N's prompt is turn N-1's plus more, so the shared part is the
+    length the store was keyed at and the forward starts there rather than at zero.
+
+    `position=3` is the load-bearing half of the assertion. A tail forwarded at zero would run the
+    prefill bodies over one token and produce a row for the wrong position entirely.
+    """
+    back = _loop(monkeypatch)
+    cache = _cache()
+    generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+
+    back.calls.clear()
+    longer = PROMPT + [9]
+    result = generate(back, longer, max_new_tokens=1, prefix_cache=cache)
+
+    assert back.calls == [([9], 3, None), ([0], 4, None)]
+    assert result.cached_tokens == 3
+    assert result.prompt_tokens == 4
+
+
+def test_the_head_anchor_costs_one_chunk_on_a_miss_and_resumes_the_next_prompt(
+    monkeypatch,
+) -> None:
+    """A head anchor is a snapshot at a fixed length, so the cold prefill has to *end* a chunk there.
+
+    That boundary is the anchor's whole cost and it is paid once, on the miss: the second prompt below
+    shares only the first two tokens -- a different render of the same header, which is what the
+    anchor is for -- and it resumes at 2 rather than forwarding both. Note that it does not resume at
+    3: the store holds that length too, but for this prompt it is a different key.
+    """
+    back = _loop(monkeypatch)
+    cache = _cache(head_tokens=2)
+
+    cold = generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+    assert back.calls == [([1, 2], 0, None), ([3], 2, None), ([0], 3, None)]
+    assert cold.cached_tokens == 0
+    assert cache.lengths() == [3, 2]
+
+    back.calls.clear()
+    other = generate(back, [1, 2, 99], max_new_tokens=1, prefix_cache=cache)
+
+    assert back.calls == [([99], 2, None), ([0], 3, None)]
+    assert other.cached_tokens == 2
+    assert other.prompt_tokens == 3
+
+
+def test_a_resume_restores_the_tree_and_the_hash_slice_after_the_reset(monkeypatch) -> None:
+    """What a hit puts back, and in what order: the reset, then the tree's buffers, then the Engram
+    slice that is not one of them.
+
+    The buffer is read inside `restore_prefix`, which `_restore` reaches second, so `3.0` is the
+    snapshot having already landed -- `-1.0` would be the reset running after the restore, and `99.0`
+    the restore never running at all. The cold run's value comes from the prefill's own forward at
+    position 0, so the two numbers agreeing is the round trip and not a coincidence.
+
+    The hash slice is the other half: `snapshot_rows` cannot carry `EngramHashIds.cache` because it is
+    not a registered buffer, so it travels under `HASH_CACHE` and is `restore_prefix`'s to put back.
+    A continuation's first token reads the previous `max_ngram_size - 1` positions through it.
+    """
+    back = _loop(monkeypatch)
+    cache = _cache()
+
+    generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+    assert back.buffer_at_restore == [], "a cold prefill restored something"
+
+    generate(back, PROMPT, max_new_tokens=1, prefix_cache=cache)
+
+    assert back.buffer_at_restore == [3.0], "the restore did not precede the hash slice"
+    assert len(back.restored) == 1
+    assert torch.equal(back.restored[0], torch.arange(3, dtype=torch.float32).reshape(1, -1)), (
+        "the store handed back a hash slice that is not the one the prefill kept"
+    )
