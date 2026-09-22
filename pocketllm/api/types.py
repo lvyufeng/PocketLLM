@@ -242,17 +242,28 @@ class SamplingParams:
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    #: How many of ``prompt_tokens`` a backend answered out of a prompt cache instead of running.
+    #:
+    #: A subset of ``prompt_tokens`` and not a discount on it, which is OpenAI's own reading of the
+    #: number: a client that bills per token still bills the prompt, and one that wants to know what
+    #: caching bought it reads this. Zero means either that nothing was reused or that this backend
+    #: does not report reuse, so it is only ever emitted when it is nonzero -- a cold response stays
+    #: byte-identical to the one the API returned before the field existed.
+    cached_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def as_dict(self) -> dict[str, int]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        body: dict[str, Any] = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
         }
+        if self.cached_tokens:
+            body["prompt_tokens_details"] = {"cached_tokens": self.cached_tokens}
+        return body
 
 
 @dataclass(slots=True)

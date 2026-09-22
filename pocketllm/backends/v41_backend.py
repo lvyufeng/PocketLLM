@@ -14,6 +14,15 @@ mutable KV/indexer/Engram state to the end of the generation, so two requests ca
 and ``capabilities.supports_batch`` is False. Requests serialize on one lock, which is the boundary
 :class:`~pocketllm.backends.base.BackendBase` documents as the price of a request-unaware cache.
 
+That same reset is why every request forward-passes its whole prompt: the caches are wiped at the top
+of the loop, so a chat loop that resends its history pays for the history again on every turn.
+``prefix_cache`` holds each prompt's state on the host keyed by the prompt's own tokens, so a later
+request restores the longest prefix it shares with one already served and forwards only the rest --
+vLLM's block-hash match and SGLang's longest-prefix rule, over whole-prompt anchors rather than pages.
+Every rank builds the same store and reads it the same way, so the reuse is agreed on without a
+collective. ``--enable-prefix-caching`` (on by default) is the switch, and it was a silent no-op on
+this path until the store existed.
+
 Tensor parallelism is the launcher's: one process a rank, ``dist.init_process_group("nccl")`` off
 the standard environment that :class:`~pocketllm.supervisor.TensorParallelSupervisor` sets, and
 ``load_backbone(world=world, rank=rank)``. A rank computes the same logits as its peers, so the
@@ -75,6 +84,26 @@ The 4.0-4.2x prefill and 1.305-1.399x decode this is the default of are in
 
 DEFAULT_EXPERT_BUFFERS = 2
 
+DEFAULT_PREFIX_CACHE_BYTES = 4 << 30
+"""Host memory a rank's prefix store may hold, when prefix caching is on.
+
+A stored prefix is ~4232 bytes a token plus 5.0 MiB, so 4 GiB is roughly a million tokens a rank: a
+262144-token entry is 1.036 GiB, which leaves room for the handful of long conversations a local
+service actually holds. It is ordinary pageable memory and deliberately *not* ``/dev/shm``, which the
+resident expert bank already holds at 91%; four ranks at this size is 16 GiB.
+"""
+
+DEFAULT_PREFIX_CACHE_HEAD_TOKENS = 1024
+"""The fixed-length anchor a prefill also stores, or 0 for the prompt's end alone.
+
+The head anchor is for a *different* conversation with the same rendered header -- the same system
+message, tools JSON and effort prefix -- which the end anchor cannot serve because the two prompts
+diverge before it. It costs the cold prefill one chunk boundary, since a position's ring can only be
+observed at a forward boundary, and it is paid on a miss only: a resumed prefill skips it.
+"""
+
+_UNITS = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
 _IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
 """``backend_options`` keys a launch always carries that this backend has no use for.
 
@@ -98,6 +127,8 @@ _KNOWN_OPTIONS = frozenset({
     "expert_pool_rows",
     "expert_world",
     "prefill_chunk",
+    "prefix_cache_bytes",
+    "prefix_cache_head_tokens",
     "progress",
     "resident_engram",
     "resident_experts",
@@ -200,11 +231,36 @@ class _Options:
     resident_engram: bool = False
     resident_experts: bool | None = None
     prefill_chunk: int | None = None
+    prefix_cache_bytes: int = DEFAULT_PREFIX_CACHE_BYTES
+    prefix_cache_head_tokens: int = DEFAULT_PREFIX_CACHE_HEAD_TOKENS
     decode_graphs: bool = False
     cancel_collective: bool = True
     threads: int | None = None
     skip_special_tokens: bool = True
     progress: bool = True
+
+
+def _byte_size(value: Any, name: str) -> int:
+    """A byte count, as an integer or as a ``<n>[kmg]`` string.
+
+    ``--backend-option`` carries strings either way, and a byte budget is the one option here whose
+    plain value cannot be read at a glance in a launch script: ``4294967296`` against ``4g``. Binary
+    multiples, because that is what the constants above are.
+    """
+    text = str(value).strip().lower()
+    factor = _UNITS.get(text[-1:], 1) if text else 1
+    if factor > 1:
+        text = text[:-1]
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"backend option {name!r} must be a byte count, optionally suffixed k/m/g "
+            f"(got {value!r})"
+        ) from exc
+    if count < 0:
+        raise ConfigurationError(f"backend option {name!r} must not be negative (got {value!r})")
+    return count * factor
 
 
 def _options_from(args: Any) -> _Options:
@@ -239,6 +295,17 @@ def _options_from(args: Any) -> _Options:
         options.threads = int(options.threads)
         if options.threads < 1:
             raise ConfigurationError("backend option 'threads' must be >= 1")
+    options.prefix_cache_bytes = _byte_size(options.prefix_cache_bytes, "prefix_cache_bytes")
+    options.prefix_cache_head_tokens = int(options.prefix_cache_head_tokens)
+    if options.prefix_cache_head_tokens < 0:
+        raise ConfigurationError("backend option 'prefix_cache_head_tokens' must not be negative")
+    if not bool(getattr(args, "enable_prefix_caching", True)):
+        # ``--enable-prefix-caching`` is the CLI's switch and it was a no-op on this path until the
+        # store existed. The two options above are the *shape* of the store, not a second switch, so
+        # the CLI is what turns it off and a zero budget is how the rest of this file spells "off" --
+        # one representation, and `capabilities` reads it like any other run's.
+        options.prefix_cache_bytes = 0
+        options.prefix_cache_head_tokens = 0
     return options
 
 
@@ -286,6 +353,11 @@ class V41Backend(BackendBase):
         self._expert_device: str | None = None
         self._details: dict[str, Any] = {}
         self._bell: Bell | None = None
+        self._prefix_cache: Any = None
+        # What `prefix_cache.stats()` last said, in the exporter's spelling. Rebound whole at the end
+        # of every request rather than mutated, so a scrape reads one request's worth of state or the
+        # request before it and never a half-updated dict -- see `cache_metrics`.
+        self._cache_metrics: dict[str, float] = {}
 
     # ------------------------------------------------------------------ construction
 
@@ -381,12 +453,15 @@ class V41Backend(BackendBase):
 
     def _ensure_loaded(self) -> None:
         self._ensure_open()
-        if self._front is not None:
-            return
         with self._load_lock:
-            if self._front is not None:
-                return
-            self._load()
+            if self._front is None:
+                self._load()
+            # Here rather than inside `_load`, and under the same lock, for one reason: every path
+            # that ends with a loaded `_front` passes through this method, including the two injected
+            # ones -- a caller's own `front`, a caller's own `loader` -- and `_load` returns early on
+            # the loader's. The lock is what keeps it a single store: the build is idempotent but not
+            # atomic, and a second one would replace a store that the first is already serving from.
+            self._ensure_prefix_cache()
 
     def _init_distributed(self) -> None:
         if self._world <= 1:
@@ -541,6 +616,48 @@ class V41Backend(BackendBase):
             torch.distributed.barrier()
         self._ready = True
 
+    def _ensure_prefix_cache(self) -> None:
+        """Build this rank's prefix store, now that the tree's shapes are known.
+
+        One store per rank and not a shared one: every rank runs the identical loop over the same
+        prompt ids, so each has to be able to restore the state the same request left, and a rank
+        cannot read another's card memory. The budget is the same on all four, the store is a pure
+        function of the request sequence, and so the ranks agree on what a request reuses without a
+        collective -- which is what keeps the per-step collectives from desynchronizing.
+
+        A zero budget is the off switch -- ``--no-enable-prefix-caching``, or an explicit
+        ``prefix_cache_bytes=0`` -- and it leaves ``_prefix_cache`` at ``None``, which ``generate``
+        reads as "forward the prompt". There is no second code path behind that.
+
+        The tag keys the store's hash chain to this run's geometry: a snapshot cannot outlive the
+        process, so what it catches is a *different* geometry -- another world size, another
+        ``max_seq_len`` -- reading these bytes.
+        """
+        if self._prefix_cache is not None:
+            return
+        budget = int(self._options.prefix_cache_bytes)
+        if budget <= 0:
+            return
+        from src.models.deepseek_v4_1.prefix_cache import PrefixCache, geometry_tag
+
+        # `LoadedBackbone` wraps the tree rather than being an `nn.Module`, and the buffers the
+        # geometry is read off are the tree's -- the same `getattr` `generate` takes.
+        model = getattr(self._front, "model", self._front)
+        self._prefix_cache = PrefixCache(
+            budget_bytes=budget,
+            max_seq_len=self._max_seq_len,
+            tag=geometry_tag(model, self._world, self._max_seq_len),
+            head_tokens=int(self._options.prefix_cache_head_tokens),
+        )
+        self._details.update({
+            "prefix_cache_bytes": budget,
+            "prefix_cache_head_tokens": int(self._options.prefix_cache_head_tokens),
+        })
+        self._say(
+            f"prefix cache {budget} bytes a rank, head anchor "
+            f"{int(self._options.prefix_cache_head_tokens)} tokens"
+        )
+
     def _say(self, message: str) -> None:
         if not self._options.progress:
             return
@@ -558,7 +675,7 @@ class V41Backend(BackendBase):
             supports_streaming=True,
             supports_cancellation=True,
             supports_logprobs=False,
-            supports_prefix_caching=False,
+            supports_prefix_caching=self._options.prefix_cache_bytes > 0,
             details={
                 "execution": "src/models/deepseek_v4_1 PyTorch runtime",
                 "scheduler": "one mutable KV state, serialized at the backend boundary",
@@ -838,6 +955,7 @@ class V41Backend(BackendBase):
                 on_token=hook,
                 graphs=self._options.decode_graphs,
                 prefill_chunk=self._prefill_chunk,
+                prefix_cache=self._prefix_cache,
             )
         except _AbortGeneration as abort:
             if abort.reason == "cancel":
@@ -846,11 +964,16 @@ class V41Backend(BackendBase):
                 ) from None
             # No `Generation` came back, so the loop's own decode figure is gone with it; the wall
             # and the first token's timing are not, and `_result` falls back to those. The text is
-            # the answer here -- see `_structured` -- so it is read as one.
+            # the answer here -- see `_structured` -- so it is read as one. The reuse count went with
+            # it too, and this path reports none rather than a guess.
             return self._result(
                 request_id, payload, abort.token_ids, abort.text, "stop", None, marks,
                 authoritative=True,
             )
+        finally:
+            # Under the request lock, like the run itself, so the counters are the state of the store
+            # between requests rather than of one mid-prefill.
+            self._publish_cache_metrics()
         self._release_graphs(generation.driver)
         return self._result(
             request_id,
@@ -860,7 +983,50 @@ class V41Backend(BackendBase):
             generation.stopped,
             generation.decode_seconds,
             marks,
+            cached_tokens=generation.cached_tokens,
         )
+
+    def _publish_cache_metrics(self) -> None:
+        """Hand the store's counters to the exporter, in the names ``/metrics`` reads.
+
+        The store owns these numbers and no request owns a share of them -- hits and misses are
+        cumulative over the process -- so they travel as whole values rather than as per-request
+        deltas the HTTP layer would have to accumulate. ``_cache_metrics`` is what ``metrics()``
+        returns, and the server sets them at scrape time; that is the only writer, so there is
+        nothing to double-count.
+
+        The ``_total`` suffix is Prometheus's convention for a counter and is the whole of the type
+        dispatch at the other end -- a name without it is a gauge. ``budget_bytes`` is here rather
+        than only in ``capabilities`` because it is what makes ``bytes`` readable as a fraction.
+        """
+        cache = self._prefix_cache
+        if cache is None:
+            return
+        stats = cache.stats()
+        self._cache_metrics = {
+            "prefix_cache_hits_total": stats["hits"],
+            "prefix_cache_misses_total": stats["misses"],
+            "prefix_cache_reused_tokens_total": stats["reused_tokens"],
+            "prefix_cache_entries": stats["entries"],
+            "prefix_cache_bytes": stats["bytes"],
+            "prefix_cache_budget_bytes": stats["budget_bytes"],
+        }
+
+    def metrics(self) -> dict[str, float]:
+        """The backend-owned metric values this rank's exporter has to publish.
+
+        Read from the HTTP thread while a request may be mid-prefill, which is why it hands back the
+        snapshot `_publish_cache_metrics` rebound rather than asking the store: ``stats()`` walks the
+        store's index, and a walk concurrent with a `store` is a ``dictionary changed size``. The
+        price is that a scrape during a request reports the state the *last* request left, which is
+        a counter lagging by at most one generation.
+
+        Rank 0 only: the workers hold a store of their own, because each rank restores its own
+        caches, and there is no exporter on a worker to read it.
+        """
+        if self._rank:
+            return {}
+        return dict(self._cache_metrics)
 
     @staticmethod
     def _release_graphs(driver: Any) -> None:
@@ -1043,6 +1209,7 @@ class V41Backend(BackendBase):
         marks: _Marks | None,
         *,
         authoritative: bool = False,
+        cached_tokens: int = 0,
     ) -> GenerationResult:
         structured = self._structured(
             token_ids, text, str(payload.get("thinking_mode") or "chat"), authoritative=authoritative
@@ -1081,7 +1248,14 @@ class V41Backend(BackendBase):
             token_ids=token_ids,
             text=structured["content"],
             finish_reason=finish_reason,
-            usage=Usage(prompt_tokens=len(payload["prompt_ids"]), completion_tokens=len(token_ids)),
+            usage=Usage(
+                prompt_tokens=len(payload["prompt_ids"]),
+                completion_tokens=len(token_ids),
+                # How much of that prompt the store answered instead of the cards. It is a subset of
+                # `prompt_tokens`, not a discount on it: OpenAI's own `cached_tokens` counts the
+                # prompt tokens served from cache, which is exactly this.
+                cached_tokens=int(cached_tokens),
+            ),
             timings=TimingMetrics(
                 # The loop's decode figure excludes the prompt's forward but not the bookkeeping
                 # around the request, so this is the prefill plus that; `ttft_seconds` is the one
