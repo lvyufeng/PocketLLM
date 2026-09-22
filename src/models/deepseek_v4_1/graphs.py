@@ -63,12 +63,12 @@ import torch
 
 from src.models.deepseek_v4_1.decode_pos import Pos
 
-__all__ = ["CACHE_NAMES", "DecodeGraphs", "LayerGraphs", "Sink", "restore", "snapshot"]
+# The cache set and the walk over it live in `prefix_cache`, which uses the same names for the store
+# a request leaves behind for the next one; a capture pass is the other caller of that walk, and the
+# names are re-exported here because this module was where they were defined.
+from src.models.deepseek_v4_1.prefix_cache import CACHE_NAMES, restore, snapshot
 
-# Every buffer a decode step writes to and a later step reads. `named_buffers` matches by substring,
-# and none of these names contains another: `compress_kv_cache` has no `k_cache` in it and
-# `window_kv_cache` has no `k_cache` either, both because the character before the `k` is a `_`.
-CACHE_NAMES = ("window_kv_cache", "compress_kv_cache", "k_cache", "kv_state", "score_state")
+__all__ = ["CACHE_NAMES", "DecodeGraphs", "LayerGraphs", "Sink", "restore", "snapshot"]
 
 # How many real bodies run on a side stream before each recording. They are not a correctness
 # device -- the recorded body is what runs on replay -- they are what the caching allocator needs: a
@@ -76,27 +76,6 @@ CACHE_NAMES = ("window_kv_cache", "compress_kv_cache", "k_cache", "kv_state", "s
 # pool a block at a time. Measured as the right convention by `probe_graph_sweep.py
 # --align-extra 0`.
 CAPTURE_WARMUP = 2
-
-
-def snapshot(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Every cache buffer in the tree, cloned. Ours to hold; nothing reads it but `restore`."""
-    return {
-        name: buffer.clone()
-        for name, buffer in model.named_buffers()
-        if any(cache in name for cache in CACHE_NAMES) and buffer.numel()
-    }
-
-
-def restore(model: torch.nn.Module, saved: dict[str, torch.Tensor]) -> None:
-    """Copy a snapshot back, in place.
-
-    `copy_` and never a rebind: the recorded graphs hold raw pointers into these buffers, so
-    replacing one would leave every graph writing to memory nothing reads -- a wrong answer that
-    still looks like a number, and one that only shows up as a divergence several steps later.
-    """
-    by_name = dict(model.named_buffers())
-    for name, value in saved.items():
-        by_name[name].copy_(value)
 
 
 class Sink:
