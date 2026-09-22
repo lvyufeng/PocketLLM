@@ -683,7 +683,11 @@ inferred.** Merging the two streams into one alternation — valid precisely bec
 zero — and reading the gap at every boundary: **`kernel -> copy` has a median of 1 µs over 1,479
 transitions, a p99 of 8 µs and a total of 2 ms**, while `copy -> kernel` has a median of 1 µs, a p99 of
 7.9 ms and a total of 0.32 s. The host has the next layer's copies enqueued within a microsecond of a
-kernel ending; it is not blocked there, and there is no stall at that boundary to remove. The 3.6 s
+kernel ending; it is not blocked there, and there is no stall at that boundary to remove. **The host
+does wait, one layer up and not at a stream boundary**: the routing tensor's read-back is 3.750 s of
+one `synchronize()` a layer, and the arena rotation's wait is 3.5 s over the rows, both of which land
+in card-busy time rather than in the idle — [What the idle is](#what-the-idle-is) has both, and the
+gap between them and the idle is the point of that section. The 3.6 s
 sits where the code puts it, one stage of a two-buffer rotation behind the GEMM, so ordering the copies
 second costs exactly what ordering the GEMM second would — which is why the `#333` measurement recorded
 in [Reproducing](#reproducing) read **0.6%** off cutting both wholesale braces and why the trace's
@@ -713,13 +717,152 @@ ring**, which is the class split above read from the other end. The `sorted` dea
 version of the `id` chunk; it is a chunk whose critical path runs through a different engine on each
 rank.
 
-**What is left is 5.7 s of the card doing nothing, and it is not a host stall.** The two candidate
-levers the trace leaves open, and neither is measured here: a third or fourth arena buffer rather than
-the two `--expert-buffers` defaults to, which would give the copies two stages of depth to hide in; and
-whatever the 5.7 s is spent on, which the host runtime list does not name — `cudaLaunchKernel` is 489.02
-ms over 33,075 calls on rank 0, so the launch path is not it. Both are priced against a `sorted`-deal
-page's habit of reading the copies as the block, and the trace says the copies are 3.6 s of a 25.4 s
-chunk and already at the wire.
+**What is left is 5.5 to 5.8 s of the card doing nothing, and neither of the two levers this paragraph
+used to leave open is still open.** The arena depth is flat, at two samples: **four** buffers rather
+than the two `--expert-buffers` defaults to reads 24.21 and 24.00 s on the same 32768 chunk that reads
+24.28 s at two, and the two four-buffer runs are 0.21 s apart from each other — wider than the 0.07–0.28
+s by which they differ from the two-buffer run, so the lever is closed and not merely small. And the
+idle is attributed rather than inferred, at the layer level and at the frame level on all four ranks:
+[What the idle is](#what-the-idle-is) finds **99.2–99.3% of it inside `moe` and 96.5–97.0% inside
+`moe.routed`**, 79–80% of it inside neither a driver call nor a `cpu_op`, and under that a row loop
+whose largest named Python frame is `_split`'s sorted-key deal. `cudaLaunchKernel` is 489.02 ms over
+33,075 calls on rank 0, so the launch path is not it; the copies are 3.6 s of a 25.4 s chunk and
+already at the wire; and the two frames in the routed path that look expensive by inclusive time —
+`_route_ids` at 3.750 s over 40 calls and `_stage_misses` at 3.5 s over 163,840 — are waits that land
+in card-busy time, not in this idle.
+
+### What the idle is
+
+**The layer-level taps are cheap enough to trust, and they put the idle in one place on all four
+ranks.** `--phases` puts five NVTX parents around a block's work — `attn`, `attn.window`,
+`attn.sparse`, `attn.indexer`, `moe` — and names the four sub-steps of the routed path under `moe`;
+it costs **0.03 s**, the same chunk reading 24.31 s with the taps on against the 24.28 s it reads with
+no taps at all. Under the `id` deal:
+
+| rank | idle | `moe` | `moe.routed` | `attn` | driver | `cpu_op` | neither |
+|---|---|---|---|---|---|---|---|
+| 0 | 5,557.17 ms | 99.3% | 96.8% | 0.7% | 56.65 ms | 1,056.96 ms | 4,480.19 ms |
+| 1 | 5,593.94 ms | 99.2% | 96.5% | 0.8% | 62.67 ms | 1,095.70 ms | 4,477.95 ms |
+| 2 | 5,514.82 ms | 99.2% | 97.0% | 0.8% | 59.86 ms | 1,028.49 ms | 4,462.81 ms |
+| 3 | 5,770.70 ms | 99.2% | 96.6% | 0.8% | 65.57 ms | 1,162.50 ms | 4,584.49 ms |
+
+**The idle is inside the MoE on every rank, and no name under `moe.routed` accounts for it.** The four
+sub-steps the layer level does name come to 0.6–1.3 s of the 5.5–5.8 s — `routed.issue` 213.10–871.55
+ms, `routed.drain` 336.29–408.40, `routed.upload` 14.63–16.30 over 1,922–1,954 ranges, and
+`routed.route_ids` only **8.07–8.70 ms** — so the idle is in the per-row loop, which the layer level
+deliberately leaves unnamed. The attention half of the block is 0.7–0.8% of it on all four ranks, which
+is the same statement from the other side: whatever the card is waiting for, it is not the attention
+path.
+
+**The idle is the host outside both of that host's own instruments, and the gaps say so directly.** Of
+it, 56.65–65.57 ms is inside a driver call and 1,028.49–1,162.50 ms inside a `cpu_op`;
+**4,462.81–4,584.49 ms — 79 to 80% of the idle — is inside neither.** So this is not a driver block
+and it is not an aten call; the host is either running Python or in C that neither category records.
+The gap shape repeats on all four ranks: **at least seven of each rank's ten largest gaps are the
+same pair** — 8, 10, 10 and 7 of them on ranks 0 to 3 — a `Memcpy DtoH (Device -> Pinned)` of
+0.016–0.020 ms and then, **245–342 ms later**, a `Memcpy HtoD (Pinned -> Device)` of 0.510–0.551 ms.
+A rank's top ten also holds one such pair whose wait is short rather than long — 66, 91, 98 and
+141 ms — so the shape is the same on all four and only the size of the wait varies. The card goes
+idle at the end of one layer's uploads and stays there until the host has finished the row loop and
+put the next layer's copies on the stream. Inside that largest gap on each rank the driver is
+0.063–0.117 ms and `cpu_op` 13.908–18.619 ms, and **275.842–323.462 ms of it is neither.** The
+enqueue boundary is not the problem the previous paragraph cleared; this is where the host is.
+
+**The row-level tap prices that loop and cannot be read as a proportion, because the instrument is now
+the larger number.** `--phases-rows` adds a `record_function` per row, and it costs **6.37 s** — the
+same before chunk reads **30.65 s** against the 24.28 s it reads untapped and 24.31 s at the layer
+level. That is **38.9 µs a row** over 163,840 row-layers, against the 30.339 µs
+`bench_record_function.py` prices the two ranges a row adds at (`plain 0.077 µs a call, one range
+15.368 µs, two ranges 30.339 µs`). Its headline row — `row.resolve` 6,575.32 ms against
+`row.stage_misses` 1,663.53, 3.95:1 — is therefore a share of a pass 26% longer than the one it
+describes, and the ratio is worst exactly where the ranges nest, which is here: `row.resolve` wraps
+`row.stage_misses`, so it carries the instrument's entry and exit on every row the inner range does
+not. **Read the layer level's answer first and this table as a share**, which is what
+[Reproducing](#reproducing) and the probe's own docstring say to do with it.
+
+**The frame-level tap names what the layer level leaves unnamed, and the split it makes — host work
+against host waits — is the one a fix acts on.** `--profile-host` runs the *before* chunk under
+`cProfile`, model frames only, and reports each frame's own bytecode (`tottime`) beside its inclusive
+time (`cumtime`). `cProfile` cannot see inside a C function, so a frame whose `cumtime` is far larger
+than its `tottime` with nothing traced under it is a frame **waiting** in C, and the gap between a
+parent and its largest traced child is the C that parent called. Rank 0, the rows that carry the
+argument:
+
+| frame | `tottime`, four ranks (s) | `cumtime` (s) | calls |
+|---|---|---|---|
+| `_split` (897) | 0.844–1.033 | 2.570–3.003 | 163,840 |
+| ` <listcomp>` (918) | 0.550–0.950 | 0.550–0.950 | 163,840 |
+| ` deal_card` (318) | 0.133 | 0.133 | 983,040 |
+| ` <lambda>` (917) | 0.103 | 0.103 | 983,040 |
+| `_resolve_row` (1775) | 0.666–0.719 | 4.710–5.062 | 163,840 |
+| `_pool_row` (1762) | 0.147–0.608 | 0.649–1.375 | 239,865–249,477 |
+| ` pool_row` (449) | 0.226–0.665 | 0.502–0.768 | 239,865–249,477 |
+| `<listcomp>` (1802) | 0.177 | 0.177 | 163,840 |
+| `<listcomp>` (1657) | 0.345–0.397 | 5.076–5.406 | 40 |
+| `_stage_misses` (1831) | 0.056–0.061 | 3.420–3.542 | 163,840 |
+| `_route_ids` (1733) | 0.001 | 3.745–3.759 | **40** |
+| `<genexpr>` (1547) | 0.310–0.564 | 0.310–0.564 | 403,705–413,317 |
+| `_chunk_bounds` (1395) | 0.244–0.270 | 0.484–0.530 | 40 |
+| `_issue_chunk` (1481) | 0.349–0.589 | 0.879–1.182 | 40 |
+| `_drain_chunk` (1608) | 0.330–0.339 | 4.170–4.747 | 40 |
+| `_upload` (1154) | 0.178–0.186 | 0.806–0.852 | 1,852–1,917 |
+| `_stream_candidates` (1196) | 0.268–0.308 | 1.152–1.154 | 4 |
+| `forward` (modules.py:499) | 0.253–0.282 | 18.837–19.681 | 40 |
+| `get_window_topk_idxs` (attention.py:230) | 0.120–0.129 | 5.022–5.721 | 40 |
+
+The four ranks agree to within 0.2 s on `_split`, `_resolve_row`, `_stage_misses`, `_route_ids` and the
+layer-level rows; `pool_row` and `<genexpr>` at 1547 differ by rank because the pool's contents do, and
+they are the two rows here a rank-to-rank reading should not be taken from.
+
+**Read by shape, three of those rows are work and four are waits.** `_split`'s 3.003 s of inclusive
+time on rank 0 is 2.200 s of traced Python — its own bytecode 1.033, the comprehension at 918 0.931,
+`deal_card` 0.133, the sort key 0.103 — and **0.80 s inside the C `sorted`**, so it is the largest
+genuinely-Python frame in the pass and the one a rewrite would land on: 6.30 µs of its own bytecode a
+row on top of the comprehension's 5.68, and 983,040 `deal_card` calls for 163,840 six-element deals.
+`_stage_misses` is the opposite shape — 3.498 s inclusive on 0.057 s of its own bytecode, 163,840
+calls, and **no traced callee in the table at all**, so 98.4% of its inclusive time is C the profiler
+cannot attribute: it returns immediately unless the row is a miss, and when it is not it asks
+`_take_buffer` for the next arena slot, which waits on the event the last upload through that slot set.
+`_route_ids` is that shape at its extreme: **40 calls, 0.001 s of bytecode, 3.750 s inclusive** — 93.6
+ms a layer, the body being one `pinned.copy_(indices, non_blocking=True)` of the `[n, topk]` routing
+tensor, 96 KiB, microseconds at the wire, followed by one `synchronize()` of the gate's stream. **It is
+the host waiting for the card**, and the layer-level table says so from the other side: the
+`route_ids` range covers 8.07–8.70 ms of the idle while the frame it wraps costs 3.75 s of host time,
+so that wait lands in card-busy time and is not what the card is idle for. `get_window_topk_idxs` is
+the same shape outside the routed path — 5.291 s inclusive on 0.126 s of bytecode, 97.6% of it C — so
+host waits are not peculiar to the experts; they are simply not where the card waits, which is what the
+0.7–0.8% `attn` share above already said.
+
+**The wait is not the lever, and `#333` measured that from the other end.** An arm that skips
+`_take_buffer`'s wait moves 0.35 s of a 36 s chunk, against the 3.5 s the wait accounts for here,
+because skipping it does not remove the dependency — the host then blocks in the next thing that needs
+the same copy to have landed. The 3.5 s is the wait for the arena rotation, and only fewer or better
+ordered copies would take it out. What is left after the waits is the row walk's own Python, and that
+is the 79–80% of the idle inside neither a driver call nor an aten call.
+
+**The profiler's own price is measured twice, which is what lets the `tottime` column be read as ranks
+rather than as the instrument's.** Its total: the profiled before chunk reads **27.28 s** on all four
+ranks against the **24.26–24.32 s** the same process measures for the same shape of chunk with the
+profiler off, so ~3.0 s over the chunk, ~18 µs a row. Its distribution, from
+`/tmp/bench_cprofile_price.py`, the same trivial work with the profiler off and on: **a plain function
+call is charged 0.196 µs, a six-`int()` list comprehension 0.550, a four-element list comprehension
+0.147, and one `sorted(range(6), key=lambda)` 1.058.** The consequence is a ranking rule rather than a
+caveat — a row whose per-call tottime is *below* that charge is the instrument and a row whose
+per-call tottime is well above it survives. `deal_card` is 0.135 µs a call and `<lambda>` 0.105, both
+under a plain call's 0.196, so their 0.133 and 0.103 s are the instrument's and not the deal's;
+`_split` is 6.30 µs a call against ~1.06 for its shape and `_resolve_row` 4.10 against ~0.20, so those
+survive with at most a fifth and a twentieth of themselves taken off. **The large-call-count rows are
+where the charge lands, so the table's ordering is usable at the top and not in its tail.**
+
+**What a fix has to touch is one round trip with two ends, and the profile prices them separately.**
+The routing tensor is copied to pinned host memory once a layer and then walked a row at a time; the
+walk is `_split`'s 2.2 s of traced Python plus the pool's probes and 413k genexpr steps, and the round
+trip's ends are `_route_ids`' 3.750 s of waiting for the gate and `_stage_misses`' 3.5 s of waiting for
+the copies — both of which land in card-busy time, and neither of which the idle consists of. The idle
+is the residue after both: the 5.5–5.8 s the host spends walking rows with nothing queued behind it.
+That is also why the two candidate levers this section replaces both closed — there is no third stage
+of copy depth to add and no driver call to unblock, because the card is waiting on the host's Python
+and the host's Python is waiting on the deal.
 
 ### The wire, and how much of a collective is bytes
 
@@ -1471,10 +1614,70 @@ done
 
 `--chunk` is traced and the two chunks either side of it are not, so the instrument's own price comes
 out as the difference between them rather than as an assumption, and the four `.r{0..3}.json` files are
-the chrome traces the reducers read: `/tmp/analyze_chunk_trace.py` for the per-stream and per-class
-ledger, `/tmp/overlap_chunk_trace.py` for the two streams' overlap, `/tmp/rounds_chunk_trace.py` for
-the boundary gaps. The PCIe roof is a fourth, `/tmp/pcie_load_probe.py`, which asks the link its
-generation while a copy loop holds it busy.
+the chrome traces the reducers read: `/tmp/idle_chunk_trace.py` for the split of the card's idle into
+driver calls, `cpu_op` and neither, `/tmp/idle_phase_chunk_trace.py` for the same idle attributed to a
+phase's host span, `/tmp/gap_hist_chunk_trace.py` for the gap durations by bucket and
+`/tmp/gap_top_chunk_trace.py` for the largest of them with their two neighbours. `/tmp/analyze_chunk_trace.py`
+is the per-stream and per-class ledger, `/tmp/overlap_chunk_trace.py` the two streams' overlap and
+`/tmp/rounds_chunk_trace.py` the boundary gaps. The PCIe roof is a separate probe,
+`/tmp/pcie_load_probe.py`, which asks the link its generation while a copy loop holds it busy.
+
+Three more arms of the same probe price what the two above leave open. The arena depth is the same run
+at four buffers, twice, so the lever can be read against its own run-to-run spread rather than against
+a single sample:
+
+```bash
+# /tmp/chunk_trace_id_b4.log and /tmp/chunk_trace_id_b4r.log: the same command at --buffers 4,
+# repeated. Against them, /tmp/chunk_trace_id.log is the two-buffer default.
+for out in chunk_trace_id_b4 chunk_trace_id_b4r; do
+    DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_trace.py \
+        --at 32768 --chunk 4096 --pool-rows 148 --buffers 4 --threads 22 --out "/tmp/$out"
+done
+```
+
+The idle is attributed with the same probe's phase ranges. `--phases` turns on the five parents the
+phase tap already uses, so its names tile the chunk and a reducer can read a share off directly;
+`--phases-rows` adds the routed path's per-row methods, which is ~350k ranges a chunk and an
+instrument several times the price of the idle it is measuring:
+
+```bash
+# /tmp/chunk_trace_phases_id.log: --phases, which is the attribution that stands on its own.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_trace.py \
+    --at 32768 --chunk 4096 --pool-rows 148 --buffers 2 --threads 22 --phases \
+    --out /tmp/chunk_trace_phases_id
+
+# /tmp/chunk_trace_phases_rows.log: the same chunk with the per-row level on, read as a share.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_trace.py \
+    --at 32768 --chunk 4096 --pool-rows 148 --buffers 2 --threads 22 --phases-rows \
+    --out /tmp/chunk_trace_phases_rows
+```
+
+`--profile-host` is the arm that names host frames rather than timing them: it runs `cProfile` around
+the *before* chunk and prints the model's own frames by `tottime` and by `cumtime`. Its price is not a
+constant to be assumed — the chunk it profiles is one of the three the run brackets, so the unprofiled
+sibling the same process measured is its control:
+
+```bash
+# /tmp/chunk_trace_hostprof.log and /tmp/chunk_trace_hostprof2.log: the before chunk under cProfile,
+# the traced chunk without it. The second run is the one the tables above quote -- the first printed
+# its rows without a line number, which collides on the page's four comprehensions.
+DEEPSEEK_V41_RESIDENT_EXPERTS=1 torchrun --nproc_per_node=4 /tmp/probe_v41_chunk_trace.py \
+    --at 32768 --chunk 4096 --pool-rows 148 --buffers 2 --threads 22 --profile-host \
+    --out /tmp/chunk_trace_hostprof2
+```
+
+An instrument's price is not its call count, so the per-range figure the `--phases-rows` arm is read
+against comes from its own microbenchmark rather than from a profiler that would be measuring itself:
+
+```bash
+# /tmp/bench_record_function.py: `record_function` in eager Python, 200k iterations an arm.
+# plain 0.077 us a call, one range 15.368 us, two ranges 30.339 us.
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/bench_record_function.py
+
+# /tmp/bench_cprofile_price.py: cProfile's charge by shape, the same work with it off and on.
+# plain call 0.196 us, six-int() listcomp 0.550, four-element listcomp 0.147, keyed sort of six 1.058.
+/home/lvyufeng/miniconda3/envs/deepseek/bin/python /tmp/bench_cprofile_price.py
+```
 
 The driver is the code, not the probe — this is the call the 256K number above is a forward of:
 

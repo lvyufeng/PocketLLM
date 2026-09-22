@@ -176,6 +176,13 @@ which a one-row-deep pipeline cannot go below; a two-row pipeline would have to 
 while row `k`'s kernel ran, and it needs a third pinned arena to do it. That is the follow-on, and the
 measurement above is the bar it has to clear. The pinned pool is not it: swept at two, three and four
 arenas a layer, `_take_buffer` is 10-29 ms against a stage of 4-8 s, so `pinned_buffers` stays at 2.
+**That 10-29 ms is that configuration's reading of the wait and not of the rotation** -- the sweep was
+taken with no pool, so every row staged and the rotation's depth and the row count were the same
+number. On the shipping tree, where the pool answers most rows and the two disagree, the depth is worth
+at most the width of the measurement: the 4096-token chunk at 32768 reads **24.21 and 24.00 s** at four
+buffers against **24.28 s** at two, while the two four-buffer runs are 0.21 s apart from each other on
+that same chunk. See
+`docs/performance/deepseek_v4_1_flash_chunked_prefill.md`.
 
 Two things had to change for the pipeline to pay, and the first version of it did not. It measured
 **1.012x**, and the reason was the routing: `indices_row.tolist()` inside the row loop synchronizes
