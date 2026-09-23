@@ -48,7 +48,15 @@ nominal peak of 128.59 tok/s, while TPOT grows 3.0x.
   `cpp_engine/build-ascend/pocketllm_engine` built from that tree. Every ladder
   row, every
   `prefill` point, the concurrency-limit probes and `pf128` below were measured
-  under that ceiling at this commit. Three things on the page were not, and one
+  under that ceiling at this commit. The branch has since been rebased onto
+  `bf15be7` (master as of 2026-09-23), and **`cpp_engine/` is identical between
+  the two**: `git diff dc11490 origin/master -- cpp_engine/` is empty, because
+  the thirty-one commits in between are the Python V4.1 and MiMo-V2.6 backends,
+  their tests and the documentation around them. `scripts/bench_serving.py` is
+  unchanged over the same range too, so the binary and the harness this page
+  measured are the ones the rebased branch still builds, and nothing below is
+  re-measured for the rebase. Three things on the page were not measured at
+  either commit, and one
   of them is qualified where it is used: the `QWEN_ASCEND_REPLICATE_ROWS` A/B's
   concurrency-one pairs, whose planes are one row wide and inside both ceilings,
   so their comparison stands as measured; that A/B's `rep16` point, which is 16
