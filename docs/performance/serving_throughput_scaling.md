@@ -63,15 +63,15 @@ nominal peak of 128.59 tok/s, while TPOT grows 3.0x.
   rows wide and is therefore only compared against the `L16` it ran beside; and
   [serving_latency_optimized.md](serving_latency_optimized.md), whose figures are
   left as they are and named where they are compared.
-- **This branch adds one engine change on top of that range, and it moves TTFT.**
+- **The delivery fix moves TTFT; the rest of this page is the pre-change record.**
   `BatchScheduler::run_prefill_batch()` now issues one `batch_prefill` call a
   request and hands each row's token over before the next prompt starts
   (`batch_scheduler.cpp:372`), instead of calling it once for the whole wave and
-  delivering nothing until the last prompt is done. Everything on this page above
-  is the pre-change record and stands as the control arm: the change re-writes no
-  row's device work, so the prefill decomposition, the FLOP tables and the
-  concurrency limit are untouched by it. The ladder rows it moves are re-measured
-  against a same-day control in
+  delivering nothing until the last prompt is done. It re-writes no row's device
+  work, so the prefill decomposition, the FLOP tables and the concurrency limit
+  above are untouched by it, and every figure quoted on this page
+  stands as the control arm. The ladder rows it moves are re-measured against a
+  same-day control in
   [Handing each row its token when it is produced](#handing-each-row-its-token-when-it-is-produced),
   and `L8`, `L16` and `L32` reproduce this page's numbers to 0.4% on that control.
 - every ladder row: `--random-input-len 512 --random-output-len 512
@@ -908,8 +908,8 @@ it is a batching defect rather than a bandwidth one.**
 
 ## What this says to do next
 
-In order of what the measurements support. Item 2 is partly done on this branch —
-its handover half — and is marked there; the rest is not.
+In order of what the measurements support. Item 2's handover half is done and
+merged; its forward half is not, and item 2 is marked accordingly.
 
 1. **Size the KV pool by concurrency actually granted, not by worst-case
    context.** The arena reserves `max_context` for every slot, so at 112 slots it
@@ -938,7 +938,7 @@ its handover half — and is marked there; the rest is not.
    `~1.06x` in that comment is the same arithmetic at 2048 tokens, where the
    fixed term is 9% of a call instead of 40%; it is the ladder's short prompts,
    not the sweep's, that the merge is worth doing for. **The half of this that is
-   a handover rather than a forward is done** — the change in
+   a handover rather than a forward is done and merged** (#353) — the change in
    [Handing each row its token when it is produced](#handing-each-row-its-token-when-it-is-produced)
    is worth -42% mean TTFT at `L16` and touches no kernel, but it leaves the
    wave's own prefill exactly as long as it was, so the 1.6x above is still
