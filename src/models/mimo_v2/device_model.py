@@ -55,7 +55,7 @@ import torch.nn.functional as F
 from src.models.mimo_v2.config import MimoV2TextConfig
 from src.models.mimo_v2.device_attention import MimoV2DeviceAttention, MimoV2KVCache
 from src.models.mimo_v2.device_experts import MimoV2DeviceExperts, MimoV2ExpertSource
-from src.models.mimo_v2.ep import EpGroup
+from src.models.mimo_v2.ep import EpGroup, deal_rule
 from src.models.mimo_v2.layers import gate_and_route, rms_norm, swiglu_mlp
 
 __all__ = [
@@ -88,6 +88,7 @@ class MimoV2DeviceLayer:
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         experts: MimoV2DeviceExperts | None = None,
+        chunk_experts: MimoV2DeviceExperts | None = None,
         ep: EpGroup | None = None,
         block: int = 1024,
         budget: int = 1 << 25,
@@ -123,6 +124,14 @@ class MimoV2DeviceLayer:
         self.correction_bias = None
         self.mlp_gate_proj = self.mlp_up_proj = self.mlp_down_proj = None
         self.experts = None
+        #: The module a *chunk* goes through when it is not the module a step goes through.
+        #: The two deals are not interchangeable and they are not a preference: `id` partitions
+        #: the experts, so a chunk stages its quarter of them, and `sorted` partitions the
+        #: drawings, so a chunk reaches every expert and stages all of them four times over.
+        #: Only a decode step can be dealt by drawing, so a model that serves both keeps both
+        #: arenas -- the second one costs two rows a slot, which is 51 MiB, against a prefill
+        #: that would otherwise be refused or four times the bytes.
+        self.chunk_experts = chunk_experts
         if self.kind == "moe":
             if experts is None:
                 raise ValueError(
@@ -195,7 +204,8 @@ class MimoV2DeviceLayer:
         if hidden.shape[0] == 1:
             out = self.experts.forward(hidden, indices[0], weights[0], layer_id=self.layer_idx)
         else:
-            out = self.experts.forward_chunk(hidden, indices, weights, layer_id=self.layer_idx)
+            chunk = self.experts if self.chunk_experts is None else self.chunk_experts
+            out = chunk.forward_chunk(hidden, indices, weights, layer_id=self.layer_idx)
         # The world's sum, from this rank's share: the kernel's output is a partial as soon as
         # the draw is dealt out, and the reference's own rounding point is here -- once, in
         # float32, before the residual. `EpGroup` refuses to exist without a way to sum.
@@ -290,6 +300,7 @@ class MimoV2DeviceModel:
 
         routed = [i for i in wanted if self.config.ffn_kind(i) == "moe"]
         self.experts = None
+        self.chunk_experts = None
         self.pin_result = None
         if routed:
             if expert_source is None:
@@ -307,7 +318,7 @@ class MimoV2DeviceModel:
                 )
             if pinner is not None:
                 self.pin_result = pinner()
-            self.experts = MimoV2DeviceExperts(
+            routed_common = dict(
                 source=expert_source,
                 top_k=self.config.num_experts_per_tok,
                 dim=self.config.hidden_size,
@@ -316,10 +327,32 @@ class MimoV2DeviceModel:
                 slots=slots,
                 world=1 if ep is None else ep.world,
                 rank=0 if ep is None else ep.rank,
-                deal=deal,
                 n_experts=self.config.n_routed_experts,
-                chunk_rows=chunk_rows,
             )
+            # A chunk's deal when the step's is not the one a chunk can use: `id` partitions the
+            # experts and `sorted` partitions the drawings, so a model built for `sorted` decode
+            # has no module that can take a chunk at a world over one -- `forward_chunk` refuses
+            # rather than staging every expert on every rank.
+            #
+            # When there are two, the *step* module is built without a band, because a band is a
+            # chunk's arena: sixteen rows it would never fill is 408 MiB of a card that at 262144
+            # positions has two gigabytes free, and the module that steps holds one draw.
+            resolved = deal_rule() if deal is None else str(deal)
+            separate_chunk = (
+                chunk_rows is not None
+                and routed_common["world"] > 1
+                and resolved != "id"
+            )
+            self.experts = MimoV2DeviceExperts(
+                deal=deal,
+                chunk_rows=None if separate_chunk else chunk_rows,
+                **routed_common,
+            )
+            self.chunk_experts = None
+            if separate_chunk:
+                self.chunk_experts = MimoV2DeviceExperts(
+                    deal="id", chunk_rows=chunk_rows, **routed_common
+                )
         self.layers = [
             MimoV2DeviceLayer(
                 checkpoint,
@@ -327,6 +360,7 @@ class MimoV2DeviceModel:
                 device=self.device,
                 dtype=dtype,
                 experts=self.experts,
+                chunk_experts=self.chunk_experts,
                 ep=ep,
                 block=block,
                 budget=budget,
@@ -346,8 +380,10 @@ class MimoV2DeviceModel:
         return sum(
             tensor.numel() * tensor.element_size()
             for tensor in (self.embed_tokens, self.norm, self.lm_head)
-        ) + sum(layer.memory_bytes for layer in self.layers) + (
-            self.experts.arena_bytes if self.experts is not None else 0
+        ) + sum(layer.memory_bytes for layer in self.layers) + sum(
+            module.arena_bytes
+            for module in (self.experts, self.chunk_experts)
+            if module is not None
         )
 
     def cache(self, capacity: int, *, dtype: torch.dtype | None = None) -> MimoV2KVCache:
@@ -449,8 +485,9 @@ class MimoV2DeviceModel:
                 self.forward(piece, start_pos=start, cache=cache, final_norm=False)
                 continue
             logits = self.forward(piece, start_pos=start, cache=cache, rows=[-1])[-1]
-        if self.experts is not None:
-            self.experts.drain()
+        for module in (self.experts, self.chunk_experts):
+            if module is not None:
+                module.drain()
         return logits
 
     @torch.no_grad()
