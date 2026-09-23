@@ -162,7 +162,8 @@ because that tree is old.
 this checkpoint, on this hardware, at any row count.** The single-request record
 for Qwen3.8-27B on the same four 910B cards is **103.8 ms per decode step**
 (9.63 TPS) at the shipped configuration, **53.0–53.9 ms** (18.56–18.86 TPS) with
-the opt-in hand-written collective and its device-side wait, and **39.4–39.8 ms**
+the hand-written collective and its device-side wait — opt-in when that pair was
+measured, both the backend's defaults now — and **39.4–39.8 ms**
 (25.15–25.37 TPS) once the Cube's row replication is added on top — the fastest
 step measured anywhere on this checkpoint
 ([Ascend 910A single-request decode](ascend_single_request_tps.md)).

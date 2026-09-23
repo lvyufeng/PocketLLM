@@ -178,9 +178,11 @@ does not actually hold the taller write.
 
 ### 5.3 The device wait, which turns out to be correct
 
-The hand-written collective has a switch that moves the wait onto the device —
+The hand-written collective moves the wait onto the device —
 `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` enqueues a kernel that spins on the same peer stamps the host
-loop was reading, and returns without blocking. It measured 23.4 ms off a 77.1 ms step, 30% of it, at
+loop was reading, and returns without blocking. It is what ships now, with `=0` selecting the host
+poll; at the time of this measurement it was opt-in, which is how it was set below. It measured
+23.4 ms off a 77.1 ms step, 30% of it, at
 53.745 ms / 18.607 TPS. It was recorded as a bound rather than a candidate and withdrawn from the
 shipped path because **every one of ten device-wait runs failed the same reproducibility gate**, and
 that was read as the host round trip being not only the wait but also *the fence the arrival signal
@@ -248,14 +250,15 @@ for pair in 1 2 3 4 5 6; do
 done
 ```
 
-§5.3 is the same loop with the two arms being `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` and `=1`, on
-the hand-written collective (`POCKET_ASCEND_IPC_ALLREDUCE=1` below is a no-op now that the barrier
-is the default, and is left in so the loop states which collective the wait was measured on), and
-its token check is the plain single-request path with the same pair of overrides:
+§5.3 is the same loop with the two arms being `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` and `=1`. It
+was run while the device wait was opt-in; it is the backend's default now, so the `=1` arm is what an
+unset environment does and the `=0` arm is the one that needs stating. The loop spells both out, so
+it reproduces the original A/B either way, and its token check is the plain single-request path with
+the same pair of overrides:
 
 ```bash
 for arm in 0 1; do
-  env POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=${arm} \
+  env POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=${arm} \
       QWEN_ASCEND_DEVICES=0,1,2,3 \
       scripts/run_qwen_ascend_tp4.sh "The capital of France is" 32
 done

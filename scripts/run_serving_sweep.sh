@@ -2,11 +2,12 @@
 # Serving width sweep driver.
 #
 # Every point launches the native engine through `scripts/bench_serving.py` with
-# the device-side arrival wait on -- the hand-written collective it waits inside is
-# the shipped default and is not pinned here, so a point measures what a default
-# server runs. It scrapes the engine's /metrics for the whole run so the
-# server-side phase split survives the teardown. The artifacts of a point are four
-# files under $POCKET_SWEEP_DIR:
+# no environment the sweep sets on its own. Both of the backend's levers -- the
+# hand-written collective and the device-side arrival wait that runs inside it --
+# are the shipped defaults, so a point measures what a default server runs and a
+# K=V argument is the only way to move it. It scrapes the engine's /metrics for the
+# whole run so the server-side phase split survives the teardown. The artifacts of
+# a point are four files under $POCKET_SWEEP_DIR:
 #
 #   <tag>.json      the bench's own record (the only source for latency figures)
 #   <tag>.metrics   the last /metrics scrape (the only source for phase splits)
@@ -68,21 +69,16 @@ point() {
     fi
     local tag=$1 slots=$2 conc=$3 np=$4 inl=$5 outl=$6 rate=$7 ctx=$8
     shift 8
-    # The device-side arrival wait is still opt-in, so the sweep pins it: the ladder
-    # the page quotes was measured with it on. It is exported *before* the caller's
-    # K=V arguments below, and a repeated `export` of the same name replaces what an
-    # earlier one set, so the later one wins -- which is what lets a point ask for
-    # `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` and get it.
+    # Nothing is pinned here on purpose. Both of the backend's levers are the
+    # shipped defaults -- the hand-written collective, and the device-side arrival
+    # wait inside it -- so exporting either would hide a regression in the default
+    # behind the sweep's own environment. The two control arms are reached as K=V
+    # arguments: `POCKET_ASCEND_IPC_ALLREDUCE=0` for HCCL and
+    # `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` for the host poll.
     #
-    # The collective itself is not exported here at all. It is the shipped default
-    # now, so pinning it would hide a regression in the default behind the sweep's
-    # own environment, and `POCKET_ASCEND_IPC_ALLREDUCE=0` as a K=V argument is what
-    # reaches the HCCL arm.
-    export POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1
-
-    # Remaining arguments are exported for the run only, so a lever cannot leak
-    # into the next point of a sweep. They come after the default above, so they
-    # override it.
+    # The K=V arguments are exported for the run only, so a lever cannot leak into
+    # the next point of a sweep, and they are unset at the end of this function for
+    # the same reason.
     local kv
     for kv in "$@"; do
         export "$kv"
