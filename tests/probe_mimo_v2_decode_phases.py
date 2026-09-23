@@ -16,9 +16,20 @@ The instrument is event pairs on the compute stream and not kernel timings:
 * `host` is wall time spent inside `_stage` on the host, which is enqueue work and does not stall the
   card unless it outruns it.
 
+`--depth` asks the same question at the other end of the context, where a token's 275 ms is not the
+number any more. Filling a cache to 256k by *prefilling* costs 1 h 47 m at the release's own prefill
+rate, which is why the depth is reached by writing the cache directly: `fill` appends random states at
+every position of every layer, so the attention reads 256k keys and the layer loop is the layer loop.
+The cost is that the answer means nothing -- the logits are noise, and so are the experts the router
+draws. What survives is the *shape* of the step: the bytes the attention reads, the two experts a rank
+stages, the 16 KiB collective. That is the whole of what the timings below the header are, and the
+header itself reports the depth it was reached by rather than claiming a prompt. `--depth 4096` against
+a real 4096-token prefill is the check that filling measures what prefilling does.
+
 Usage:
 
     torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_phases.py --steps 8
+    torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_phases.py --steps 8 --depth 262144
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import EpGroup  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
+from tests.bench_mimo_v2_model import fill_cache  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
@@ -128,6 +140,13 @@ def main() -> int:
     parser.add_argument("--prompt", type=int, default=len(PROMPT_IDS))
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--slots", type=int, default=2)
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="positions to fill the cache with before measuring, instead of prefilling `--prompt`",
+    )
+    parser.add_argument("--warmup", type=int, default=2)
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -151,13 +170,28 @@ def main() -> int:
         flush=True,
     )
 
-    cache = model.cache(args.prompt + args.steps + 8)
-    prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
-    model.greedy(prompt_ids, max_tokens=1, cache=cache)
-    cache.reset()
-    logits = None
-    for position, token in enumerate(prompt_ids):
-        logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+    cache = model.cache(max(args.depth, args.prompt) + args.warmup + args.steps + 8)
+    if args.depth:
+        fill_cache(
+            cache,
+            model.config,
+            [layer.layer_idx for layer in model.layers],
+            args.depth,
+        )
+        print(f"[r{rank}] cache filled to {cache.written(model.layers[0].layer_idx)} positions", flush=True)
+        position = args.depth
+        logits = None
+        for _ in range(args.warmup):
+            logits = model.step(PROMPT_IDS[0], start_pos=position, cache=cache)[-1]
+            position += 1
+    else:
+        prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
+        model.greedy(prompt_ids, max_tokens=1, cache=cache)
+        cache.reset()
+        logits = None
+        for position, token in enumerate(prompt_ids):
+            logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+        position = len(prompt_ids)
     torch.cuda.synchronize()
     if world > 1:
         torch.distributed.barrier()
@@ -216,7 +250,7 @@ def main() -> int:
         torch.distributed.barrier()
     started = time.perf_counter()
     for step in range(args.steps):
-        logits = model.step(drawn[-1], start_pos=len(prompt_ids) + step, cache=cache)[-1]
+        logits = model.step(drawn[-1], start_pos=position + step, cache=cache)[-1]
         drawn.append(int(logits.argmax()))
     torch.cuda.synchronize()
     seconds = time.perf_counter() - started

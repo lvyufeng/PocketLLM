@@ -84,6 +84,57 @@ def h2d_rate(bank, layer: int, *, rounds: int = 16) -> tuple[float, float]:
     return rounds * size / elapsed / 2**30, size / 2**20
 
 
+def fill_cache(cache, config, layers, depth: int, *, chunk: int = 8192) -> None:
+    """Write `depth` positions into every layer's cache without running the model.
+
+    A cache that has been *appended to* is a cache whose `written` and whose `prefix` are the
+    ones a prefill would have left, and that is the whole of what the attention reads: it asks
+    for `prefix(layer, start_pos)` and never for a key's value. So a run that wants to measure a
+    decode step at 256k can have the cache without the 1 h 47 m the release's own prefill rate
+    would charge for reaching it.
+
+    What it cannot have is a *meaningful* step. The states are random and scaled so the scores
+    have the spread the layer's own `scaling` gives a real prefix -- a constant would be a
+    degenerate softmax that times differently -- but the logits are noise and so is the draw the
+    router makes. The cost of a step is the bytes the attention reads and the experts a rank
+    stages, and neither of those depends on which experts they are.
+
+    Two details that are about the clock and not the arithmetic. The states are drawn **on the
+    card**, because the same 29 GiB of float32 through the host's random number generator is
+    minutes of a probe that is meant to take seconds. And a **ring** is written with zeros until
+    its last chunk: a windowed layer's buffer is 128 slots, so appending 262144 positions to it
+    keeps 128 of them, and those are the ones the last chunk writes -- the other 8191 rows of
+    every chunk are overwritten before anything reads them.
+    """
+    generator = torch.Generator(device=cache.device).manual_seed(0)
+    starts = list(range(0, depth, chunk))
+    for start in starts:
+        width = min(chunk, depth - start)
+        last = start == starts[-1]
+        for layer in layers:
+            shape = config.attention(layer)
+            slots = cache.slots(layer)
+            if slots >= width or last:
+                key = torch.randn(
+                    (shape.num_kv_heads, width, shape.head_dim),
+                    generator=generator, dtype=torch.float32, device=cache.device,
+                ).to(cache.dtype)
+                value = torch.randn(
+                    (shape.num_kv_heads, width, shape.v_head_dim),
+                    generator=generator, dtype=torch.float32, device=cache.device,
+                ).to(cache.dtype)
+            else:
+                key = torch.zeros(
+                    (shape.num_kv_heads, width, shape.head_dim), dtype=cache.dtype,
+                    device=cache.device,
+                )
+                value = torch.zeros(
+                    (shape.num_kv_heads, width, shape.v_head_dim), dtype=cache.dtype,
+                    device=cache.device,
+                )
+            cache.append(layer, key * shape.scaling**0.5, value)
+
+
 class PhaseTimer:
     """Time every layer's attention and FFN on the compute stream, at event granularity.
 
