@@ -221,10 +221,6 @@ def main() -> int:
         print(f"[r0] drew {len(drawn)} tokens: {drawn}", flush=True)
     return 0
 
-    if rank == 0:
-        print(f"[r0] drew {len(drawn)} tokens: {drawn}", flush=True)
-    return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

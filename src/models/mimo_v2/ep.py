@@ -35,7 +35,8 @@ Two shapes of deal, because they pay in different places.
   -- which is what a prefill chunk does, 4096 tokens at top-8 being 32768 draws over 256 experts --
   stages a quarter of the bytes rather than all of them. Under `sorted` a chunk's sorted positions
   reach every rank, so the rank stages the whole expert set: the prefill's deal is `id`, and this
-  default is a decode default that the prefill stage will have to override per path.
+  default is a decode default that the prefill path overrides per module -- `owned_experts` is
+  where that share is computed and `MimoV2DeviceExperts.forward_chunk` is where it is spent.
 
 **The empty rank is why the deal is not a detail.** Under `id` with `top_k` 8 and a world of 4, a
 rank owns nothing `(3/4)^8` of the time -- 10% of the draws -- and it still has to arrive at the
@@ -63,6 +64,7 @@ __all__ = [
     "deal_card",
     "deal_rule",
     "make_all_reduce",
+    "owned_experts",
     "owned_positions",
     "rows_per_card",
 ]
@@ -135,6 +137,36 @@ def owned_positions(indices: Sequence[int], *, rank: int, world: int, deal: str)
         order = sorted(range(len(indices)), key=lambda position: indices[position])
         return [position for slot, position in enumerate(order) if slot % world == rank]
     return [position for position, expert in enumerate(indices) if expert % world == rank]
+
+
+def owned_experts(n_experts: int, *, rank: int, world: int, deal: str) -> list[int]:
+    """Every expert of the layer's set this rank can be dealt, ascending.
+
+    `owned_positions` answers the question for *one* drawing, which is what a decode step is. This
+    answers it for a chunk, and a chunk is a different question with a different answer, because a
+    chunk draws nearly every expert there is: 4096 tokens at top-8 is 32768 drawings over 256
+    experts, so "the experts this rank can be dealt" is not "the experts one draw reaches" but the
+    whole set the deal gives it a share of.
+
+    The two deals divide that set very differently, and this is where the prefill's arithmetic
+    lives. `id` gives a rank the experts congruent to it, a quarter of them at a world of four,
+    and that quarter *is* the prefill's win: a quarter of the bytes, a quarter of the arithmetic,
+    one collective to close it. `sorted` gives a rank a position within each drawing, which for
+    one token is exactly two experts and for a chunk of four thousand tokens is all of them: a
+    `sorted` chunk stages the whole set on every rank, so it costs one rank's copy four times over
+    and saves nothing. Not a wrong answer -- the partials still sum -- but the wrong deal, which
+    is why `MimoV2DeviceExperts.forward_chunk` refuses it rather than quietly paying it.
+    """
+    if world < 1:
+        raise ValueError(f"world must be at least 1, got {world}")
+    if not 0 <= rank < world:
+        raise ValueError(f"rank {rank} is not a rank of a world of {world}")
+    if deal == "id":
+        return [expert for expert in range(n_experts) if expert % world == rank]
+    if deal == "sorted":
+        # Every position of a chunk's drawings, and therefore every expert, on every rank.
+        return list(range(n_experts))
+    raise ValueError(f"{deal!r} is not a deal; {DEALS} are")
 
 
 def make_all_reduce(world: int) -> Callable[[torch.Tensor], torch.Tensor] | None:
