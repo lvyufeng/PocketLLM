@@ -744,6 +744,71 @@ step is 177.6 ms with the routed path at 38.0 and the rest of the layer at 139.6
 and 158.0 before. The routed path lost 39.4 ms to 47 removed round trips — 0.84 ms each, which is
 the price of the copy that was queued behind each one — and the attention lost the rest.
 
+## The host is the step
+
+The round trips were the first half of it, and after them the step is not waiting on anything: it
+is *working*. A step is a function call that returns, and then a wait; timed apart at 32768
+positions on four ranks — `tests/probe_mimo_v2_decode_host.py --depth 32768` — the call is **183.3
+ms** and the wait behind the queue is **6.1**, of 189.4 ms a token and 5.28 tokens a second, with
+all four ranks within a tenth of a millisecond of each other. The card is idle for most of a token,
+and everything below is the host catching up.
+
+What it is catching up on is launches and the dispatcher work around them. The profiler's own
+counting, over three steps of the same configuration and with the two cuts below *not* applied:
+**118,442 dispatcher ops — 39,481 a token, 822 a layer** — of which **16,860 are `cudaLaunchKernel`
+(5,620 a token, 117 a layer)** and 2,454 are `cudaMemcpyAsync` (818 a token). Below those sit
+`aten::copy_` 1,518 a token, `aten::to` 1,637, `aten::mul` 653, `aten::add` 509, `aten::cat` 480 and
+15,174 `aten::as_strided`, which are the views. Five thousand six hundred launches for one token's
+forty-eight layers is 117 a layer, and a layer's own arithmetic is a dozen kernels. The per-op
+*times* that come with that table are not quoted here: they are instrumented, and the same op
+weighted 32.9 ms a token in one process and 96.3 in the next.
+
+**Two of the dispatches were per-call work that does not have to be per-call**, and both are in the
+attention:
+
+* **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
+  concatenation to produce one row — and for a decode step it produces the row for position *p*,
+  which is the row it produced for *p−1* the token before. The model now builds one
+  `[capacity, rope_dim]` table a *family* (the nine global layers share a theta and the thirty-nine
+  windowed ones another, so two tables cover the stack; forty-eight of them would be 3.2 GiB at
+  128k positions against the 268 MiB the two cost) and the layer indexes it.
+* **The fused qkv cut.** `split_fused_qkv` builds `[q | k | v]` out of nineteen slices and six
+  concatenations; `qkv.index_select(-1, order)` is the same three tensors from one kernel, with
+  `order` from `fused_qkv_row_order`, which already existed for callers that wanted the *weight*
+  reordered. Both are exact permutations, and both are checked as permutations rather than as
+  logits.
+
+**What they are worth, measured against themselves.** Four configurations, interleaved, six steps
+an arm, two rounds, one process, best and mean of the two rounds in ms a token — the same run as
+the 183.3 ms above, later and on a busier box:
+
+| RoPE table | qkv gather | Best | Mean |
+| :---: | :---: | ---: | ---: |
+| off | off | 270.8 | 272.6 |
+| **on** | off | 263.2 | 263.8 |
+| off | **on** | 264.0 | 264.5 |
+| **on** | **on** | **253.5** | **254.5** |
+
+**6.4% of a decode token, and the arms are the shipped paths** — the probe turns the two features
+off by writing the attributes the layer reads, so what is measured is production code with a
+feature disabled and not a monkeypatched copy of it. The same measurement against monkeypatched
+equivalents, in an earlier and faster process, put the pair at 251.0 → 231.7. Nothing about the
+answer moves either way: `order` is checked to be a permutation of `range(qkv_out)` and the gather
+to be `torch.equal` to the split, the table to be `torch.equal` to the cos/sin the call would have
+built, and the released checkpoint draws the same nine tokens on the same prompt before and after —
+`[14925, 227, 60096, 72653, 86162, 85033, 145420, 54575, 145959]`, identical on all four ranks in
+both revisions.
+
+**Read that table as a comparison and not as a rate.** The two processes that produced this stage's
+numbers had the same configuration at 194 ms and at 252 ms an afternoon apart — the box carries
+other work, and a step this host-bound inherits all of it — and the run above has its own first arm
+at 189.4 against the 253.5 to 270.8 the arms after it took. That is why the arms are interleaved
+and why the four rows come from one process: a single A-B across two processes said the same patch
+was worth 28 ms in one pair and 0.8 ms in the next.
+
+The remaining 117 launches a layer are not free and are not addressed. What they are is the next
+stage, and what it takes is fewer, larger kernels rather than fewer round trips.
+
 
 ## A served endpoint
 

@@ -61,10 +61,10 @@ def fused_qkv_row_order(shape: MimoV2AttentionShape, dtype: torch.dtype = torch.
 
     Exists for callers that want the weight itself reordered -- a kernel that wants
     three contiguous matrices, or a single-rank path that wants to skip the
-    four-way split per call. The attention below does not need it: it runs the
-    projection in the stored row order and cuts the output, which is the same
-    arithmetic with the permutation applied to 1 row of activations instead of
-    `qkv_out` rows of weights.
+    four-way split per call. `MimoV2DeviceAttention` uses it as a gather on the one
+    row of activations instead: `qkv.index_select(-1, order)` is the same three
+    tensors `split_fused_qkv` builds, from one kernel rather than the nineteen
+    slices and six concatenations it takes.
 
     The permutation is the one `split_fused_qkv` implies, read off the same
     description rather than derived a second time: shard `i` holds
@@ -74,7 +74,7 @@ def fused_qkv_row_order(shape: MimoV2AttentionShape, dtype: torch.dtype = torch.
     groups = 4
     if shape.qkv_row_layout == "contiguous":
         return torch.arange(shape.qkv_out, dtype=dtype)
-    if shape.qkv_row_layout != "tp4_interleaved":
+    if shape.qkv_row_layout not in ("tp4_interleaved", "tp4_interleaved_vk"):
         raise ValueError(
             f"no row order is known for {shape.qkv_row_layout!r}; the released checkpoint's "
             f"fused projection is 'tp4_interleaved'"
@@ -83,8 +83,16 @@ def fused_qkv_row_order(shape: MimoV2AttentionShape, dtype: torch.dtype = torch.
     k_head = shape.k_size // groups
     v_head = shape.v_size // groups
     stride = q_head + k_head + v_head
+    # Where each of the three sections sits inside a group, in the canonical `[q | k | v]` order
+    # the name promises. `tp4_interleaved_vk` stores the value section first, so its key section
+    # is at `q_head + v_head` and the widths are not interchangeable.
+    sections = (
+        ((0, q_head), (q_head, k_head), (q_head + k_head, v_head))
+        if shape.qkv_row_layout == "tp4_interleaved"
+        else ((0, q_head), (q_head + v_head, k_head), (q_head, v_head))
+    )
     rows = []
-    for lo, width in ((0, q_head), (q_head, k_head), (q_head + k_head, v_head)):
+    for lo, width in sections:
         for group in range(groups):
             base = group * stride + lo
             rows.append(torch.arange(base, base + width, dtype=dtype))
@@ -719,6 +727,50 @@ class MimoV2DeviceAttention:
         self._inv_freq = build_rope_inv_freq(
             self.shape.rope_dim, self.shape.rope_theta, device=self.device
         )
+        #: The permutation `split_fused_qkv` implies, as an index, or `None` for the layout that
+        #: needs no permutation. One `index_select` builds the three tensors the split builds out
+        #: of nineteen slices and six concatenations, and a decode step makes forty-eight of them
+        #: a token, on a host that is the whole of the step's cost.
+        self._qkv_order = (
+            None
+            if self.shape.qkv_row_layout == "contiguous"
+            else fused_qkv_row_order(self.shape, dtype=torch.int64).to(self.device)
+        )
+        #: A `[capacity, rope_dim]` cos/sin table this layer shares with the rest of its family,
+        #: or `None` to build the table per call. See `share_rope_table`.
+        self._rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    @property
+    def rope_key(self) -> tuple[int, float]:
+        """What two layers have to agree on to share one RoPE table.
+
+        The windowed layers use a different theta from the global ones, which is the whole of the
+        difference between the two families' tables; the dimension is in the key because a config
+        that changed `partial_rotary_factor` halfway down the stack would otherwise index a table
+        built for another width.
+        """
+        return (int(self.shape.rope_dim), float(self.shape.rope_theta))
+
+    def build_rope_table(self, capacity: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """`[capacity, rope_dim]` cos and sin for every absolute position below `capacity`.
+
+        Float32, which is what `build_rope_cos_sin` returns anyway, so a lookup hands back the
+        same bits the call would have computed.
+        """
+        positions = torch.arange(int(capacity), device=self.device)
+        cos, sin = build_rope_cos_sin(self._inv_freq, positions.reshape(1, -1))
+        return cos.reshape(-1, self.shape.rope_dim), sin.reshape(-1, self.shape.rope_dim)
+
+    def share_rope_table(self, table: tuple[torch.Tensor, torch.Tensor]) -> None:
+        """Take a `[capacity, rope_dim]` table built by another layer of the same family.
+
+        **Why a table at all.** `build_rope_cos_sin` is an outer product, two transcendental
+        kernels and a concatenation, to produce one row of numbers -- and for a decode step the row
+        it produces for position p is the row it produced last token. It is about half of what
+        this and `_qkv_order` are worth together, which is 6.4% of a decode token on four ranks;
+        the measurement is in `docs/models/mimo-v2.6-flash.md`, "The host is the step".
+        """
+        self._rope_table = table
 
     @property
     def memory_bytes(self) -> int:
@@ -728,8 +780,26 @@ class MimoV2DeviceAttention:
             if tensor is not None
         )
 
-    def rope(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """This layer's family's cos/sin for absolute `positions`, `[1, n, rope_dim]`."""
+    def rope(
+        self,
+        positions: torch.Tensor,
+        *,
+        within: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """This layer's family's cos/sin for absolute `positions`, `[1, n, rope_dim]`.
+
+        `within` is one past the highest position the caller promises to ask for, and it is what
+        lets a shared table be used without reading a position back to the host:
+        `int(positions[-1])` would be a device sync, and a decode step would make forty-eight of
+        them. Without a table, or with one that does not reach `within`, the table is built the
+        long way -- so a caller that passes no `within` still gets the right answer, just not the
+        cheap one.
+        """
+        if within is not None and self._rope_table is not None:
+            cos, sin = self._rope_table
+            if within <= cos.shape[0]:
+                index = positions.reshape(-1).to(self.device)
+                return cos[index].unsqueeze(0), sin[index].unsqueeze(0)
         return build_rope_cos_sin(self._inv_freq, positions.reshape(1, -1).to(self.device))
 
     def forward(
@@ -776,9 +846,14 @@ class MimoV2DeviceAttention:
                 )
         shape = self.shape
 
-        cos, sin = self.rope(positions)
+        cos, sin = self.rope(positions, within=start_pos + sequence)
         qkv = F.linear(flat, self.qkv_proj)
-        query, key, value = split_fused_qkv(qkv, shape, shape.qkv_row_layout)
+        if self._qkv_order is None:
+            query, key, value = split_fused_qkv(qkv, shape, shape.qkv_row_layout)
+        else:
+            query, key, value = qkv.index_select(-1, self._qkv_order).split(
+                [shape.q_size, shape.k_size, shape.v_size], dim=-1
+            )
 
         heads, kv_heads = shape.num_q_heads, shape.num_kv_heads
         query = query.view(sequence, heads, shape.head_dim).transpose(0, 1)

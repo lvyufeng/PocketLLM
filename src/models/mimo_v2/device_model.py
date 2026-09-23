@@ -387,7 +387,13 @@ class MimoV2DeviceModel:
         )
 
     def cache(self, capacity: int, *, dtype: torch.dtype | None = None) -> MimoV2KVCache:
-        """A cache sized for this model's layers, on this model's device."""
+        """A cache sized for this model's layers, on this model's device.
+
+        It is also where the RoPE tables are sized: `capacity` is the highest position this model
+        will be asked for, so it is the one place that knows how long the tables have to be and
+        the last one before a token needs them.
+        """
+        self.share_rope_tables(capacity)
         return MimoV2KVCache(
             self.config,
             capacity,
@@ -395,6 +401,23 @@ class MimoV2DeviceModel:
             device=self.device,
             dtype=dtype or self.dtype,
         )
+
+    def share_rope_tables(self, capacity: int) -> int:
+        """Give every attention layer a cos/sin table for `capacity` positions.
+
+        One table a *family* and not one a layer: the nine global layers share a theta and the
+        thirty-nine windowed ones another, so two tables cover the stack. Forty-eight of them
+        would be 3.2 GiB at 128k positions against the 268 MiB the two cost, and the tables are
+        identical rows of the same two functions.
+        """
+        tables: dict[tuple[int, float], tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer in self.layers:
+            attention = layer.attention
+            key = attention.rope_key
+            if key not in tables:
+                tables[key] = attention.build_rope_table(capacity)
+            attention.share_rope_table(tables[key])
+        return len(tables)
 
     @torch.no_grad()
     def forward(

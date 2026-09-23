@@ -29,6 +29,11 @@ Usage:
     torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --deal sorted
     python tests/bench_mimo_v2_ep.py                      # world 1: the control column
 
+`--depth` is the same decode step at a context too long to prefill: the cache is written directly
+at `depth` positions and the prompt is skipped, so a 256k step costs minutes rather than hours. The
+step it measures is the same step -- the bytes read, the experts staged, the collective -- and the
+logits it produces are not an answer. See `bench_mimo_v2_model.fill_cache`.
+
 The checkpoint is the default asset path; without it the script exits 0 and says so.
 """
 
@@ -47,7 +52,7 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import DEAL_ENV, EpGroup  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
-from tests.bench_mimo_v2_model import PhaseTimer, h2d_rate  # noqa: E402
+from tests.bench_mimo_v2_model import PhaseTimer, fill_cache, h2d_rate  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 
@@ -65,6 +70,13 @@ def main() -> int:
     parser.add_argument("--slots", type=int, default=2, help="expert arena slots")
     parser.add_argument("--deal", default=None, help="`id` or `sorted`; the environment's by default")
     parser.add_argument("--no-pin", action="store_true", help="leave the bank pageable")
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="positions to fill the cache with instead of prefilling `--prompt`",
+    )
+    parser.add_argument("--warmup", type=int, default=2, help="decode steps before the measured ones")
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -118,7 +130,9 @@ def main() -> int:
         flush=True,
     )
 
-    cache = model.cache(args.prompt + args.steps + 8)
+    counters = model.experts
+    depth = int(args.depth or 0)
+    cache = model.cache(max(depth, args.prompt) + args.warmup + args.steps + 8)
 
     # A discarded pass: the first token pays the CUDA context, the first staging and whatever the
     # driver does once. Its routing is also what warms the collective, so the measured region is
@@ -128,20 +142,46 @@ def main() -> int:
     if world > 1:
         torch.distributed.barrier()
 
-    prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
-    cache.reset()
-    counters = model.experts
-    mark = (counters.staged_experts, counters.staged_bytes)
+    if depth:
+        # A depth reached without a prompt: the cache is filled directly, because prefilling to
+        # 256k is 1 h 47 m at the release's own rate. The step measured below is then the same
+        # step -- the same bytes read, the same two experts a rank staged, the same collective --
+        # over logits that mean nothing and a draw that is noise. `fill_cache` says what that
+        # does and does not preserve; what it does not is any claim about an answer.
+        # `reset` and not a fresh cache: the discard pass above already appended to this one, and
+        # the fill appends rather than writes in place, so the depth it asks for is a depth *past*
+        # whatever the discarded prompt left behind.
+        cache.reset()
+        fill_cache(cache, model.config, [layer.layer_idx for layer in model.layers], depth)
+        position = depth
+        logits = None
+        for _ in range(args.warmup):
+            logits = model.step(PROMPT_IDS[0], start_pos=position, cache=cache)[-1]
+            position += 1
+        torch.cuda.synchronize()
+        if world > 1:
+            torch.distributed.barrier()
+        print(
+            f"{tag} cache at {depth} positions after {args.warmup} warm steps, "
+            f"{cache.memory_bytes / 2**30:.2f} GiB of cache",
+            flush=True,
+        )
+        prompt_ids = []
+        prefill_s = prefill_bytes = 0.0
+    else:
+        prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
+        cache.reset()
+        mark = (counters.staged_experts, counters.staged_bytes)
 
-    if world > 1:
-        torch.distributed.barrier()
-    started = time.perf_counter()
-    for position, token in enumerate(prompt_ids):
-        logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
-    torch.cuda.synchronize()
-    prefill_s = time.perf_counter() - started
-    prefill_experts = counters.staged_experts - mark[0]
-    prefill_bytes = counters.staged_bytes - mark[1]
+        if world > 1:
+            torch.distributed.barrier()
+        started = time.perf_counter()
+        for position, token in enumerate(prompt_ids):
+            logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+        torch.cuda.synchronize()
+        prefill_s = time.perf_counter() - started
+        prefill_bytes = counters.staged_bytes - mark[1]
+        position = len(prompt_ids)
 
     drawn = [int(logits.argmax())]
     first = logits.clone()
@@ -151,7 +191,7 @@ def main() -> int:
         torch.distributed.barrier()
     started = time.perf_counter()
     for step in range(args.steps):
-        logits = model.step(drawn[-1], start_pos=len(prompt_ids) + step, cache=cache)[-1]
+        logits = model.step(drawn[-1], start_pos=position + step, cache=cache)[-1]
         drawn.append(int(logits.argmax()))
     torch.cuda.synchronize()
     decode_s = time.perf_counter() - started
@@ -163,21 +203,24 @@ def main() -> int:
     # row, so dividing the loop's seconds by the tokens it produced would report a token that the
     # timed region never computed. What the loop did is `steps` tokens, and that is the rate.
     steps = args.steps
-    print(
-        f"{tag} prefill {len(prompt_ids)} tokens in {prefill_s:.3f}s = "
-        f"{len(prompt_ids) / prefill_s:.2f} tok/s",
-        flush=True,
-    )
+    if not depth:
+        print(
+            f"{tag} prefill {len(prompt_ids)} tokens in {prefill_s:.3f}s = "
+            f"{len(prompt_ids) / prefill_s:.2f} tok/s",
+            flush=True,
+        )
     print(
         f"{tag} decode  {steps} steps in {decode_s:.3f}s = {steps / decode_s:.2f} tok/s "
-        f"({decode_s / steps * 1e3:.1f} ms/token), {decode_experts / steps:.1f} experts a step",
+        f"({decode_s / steps * 1e3:.1f} ms/token), {decode_experts / steps:.1f} experts a step"
+        + (f" at {depth} positions" if depth else ""),
         flush=True,
     )
-    print(
-        f"{tag} staged  {decode_bytes / steps / 2**20:.1f} MiB a step, "
-        f"{prefill_bytes / max(1, len(prompt_ids)) / 2**20:.1f} MiB a prompt token",
-        flush=True,
-    )
+    if not depth:
+        print(
+            f"{tag} staged  {decode_bytes / steps / 2**20:.1f} MiB a step, "
+            f"{prefill_bytes / max(1, len(prompt_ids)) / 2**20:.1f} MiB a prompt token",
+            flush=True,
+        )
     print(
         f"{tag} phases  attention {phases['attn'] / steps:.1f} ms a step, "
         f"FFN and staging {phases['mlp'] / steps:.1f} ms a step",

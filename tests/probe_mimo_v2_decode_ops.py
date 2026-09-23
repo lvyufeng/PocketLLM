@@ -35,6 +35,7 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import EpGroup  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
+from tests.bench_mimo_v2_model import fill_cache  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
@@ -48,6 +49,13 @@ def main() -> int:
     parser.add_argument("--prompt", type=int, default=len(PROMPT_IDS))
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--top", type=int, default=30)
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="positions to fill the cache with instead of prefilling `--prompt`",
+    )
+    parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument(
         "--stub-experts",
         action="store_true",
@@ -79,25 +87,36 @@ def main() -> int:
         experts_module.forward = stubbed
     torch.cuda.synchronize()
 
-    cache = model.cache(args.prompt + args.steps + 8)
+    depth = int(args.depth or 0)
+    cache = model.cache(max(depth, args.prompt) + args.warmup + args.steps * 3 + 8)
     prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
-    model.greedy(prompt_ids, max_tokens=1, cache=cache)
+    model.greedy(prompt_ids[:1] if depth else prompt_ids, max_tokens=1, cache=cache)
     cache.reset()
-    logits = None
-    for position, token in enumerate(prompt_ids):
-        logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+    if depth:
+        fill_cache(cache, model.config, [layer.layer_idx for layer in model.layers], depth)
+        position = depth
+        logits = None
+        for _ in range(args.warmup):
+            logits = model.step(PROMPT_IDS[0], start_pos=position, cache=cache)[-1]
+            position += 1
+        print(f"[r{rank}] cache at {depth} positions", flush=True)
+    else:
+        logits = None
+        for position, token in enumerate(prompt_ids):
+            logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+        position = len(prompt_ids)
     torch.cuda.synchronize()
 
     drawn = [int(logits.argmax())]
     for step in range(args.steps):
-        logits = model.step(drawn[-1], start_pos=len(prompt_ids) + step, cache=cache)[-1]
+        logits = model.step(drawn[-1], start_pos=position + step, cache=cache)[-1]
         drawn.append(int(logits.argmax()))
 
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for step in range(args.steps):
-            logits = model.step(drawn[-1], start_pos=len(prompt_ids) + step, cache=cache)[-1]
+            logits = model.step(drawn[-1], start_pos=position + step, cache=cache)[-1]
             drawn.append(int(logits.argmax()))
         torch.cuda.synchronize()
 
