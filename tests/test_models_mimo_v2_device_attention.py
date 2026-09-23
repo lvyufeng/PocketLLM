@@ -30,6 +30,7 @@ from src.models.mimo_v2.device_attention import (  # noqa: E402
     FOLD_KEYS,
     MimoV2DeviceAttention,
     MimoV2KVCache,
+    attention,
     blocked_attention,
     fused_qkv_row_order,
     single_pass_attention,
@@ -583,3 +584,74 @@ def test_a_call_that_is_wrong_does_not_poison_the_next_one(release):
     two = device.forward(hidden[0, :1].cuda(), start_pos=0)["attn_out_post_o"]
     assert torch.equal(one, two)
     assert one.shape == (1, release.layer.hidden_size)
+
+
+@needs_cuda
+def test_a_narrower_row_step_is_the_same_answer_to_a_rounding():
+    """The tile a long-context chunk can afford is bought in rows, and rows are not a re-derivation.
+
+    A prefill at 256k passes the score budget on its first key block and then runs a loop whose
+    tile is `kv_heads x groups x rows x block` -- a product whose width is the chunk, which makes
+    the chunk a memory bound as well as a speed one. The fix is to step the rows, and this is the
+    test that says the fix is arithmetic rather than an approximation: a row still sees its own
+    key blocks in the same order with the same running maximum, and the only thing the step changes
+    is the row count of a gemm, which is a summation order inside a dot product.
+
+    A rounding and not an identity, and the bound below is the measured one rather than a hope:
+    the whole-slice loop and the narrowest step differ by 4.5e-08 at this size, against the 1e-5
+    the block loop and the single pass are already held to. Anything that moved by a *tolerance*
+    would show up here as a much larger number, so this is the assertion that separates the two.
+    """
+    torch.manual_seed(11)
+    heads, kv_heads, queries, keys, dim, vdim = 8, 2, 37, 211, 16, 8
+    query = torch.randn(heads, queries, dim, device="cuda") * 0.5
+    key = torch.randn(kv_heads, keys, dim, device="cuda") * 0.5
+    value = torch.randn(kv_heads, keys, vdim, device="cuda") * 0.5
+    sink = torch.randn(heads, device="cuda")
+    lower, upper = chunk_bounds(queries, keys, 64)
+
+    whole, _ = blocked_attention(query, key, value, lower, upper, scaling=0.5, sink=sink, block=16)
+    for step in (1, 3, 8, 36):
+        split, stats = blocked_attention(
+            query, key, value, lower, upper, scaling=0.5, sink=sink, block=16, row_step=step
+        )
+        assert torch.allclose(whole, split, atol=1e-6), (step, (whole - split).abs().max().item())
+        assert stats.blocks and stats.full_pairs == heads * queries * keys
+
+    # And the bounds still decide which keys a row sees, so a narrow step is not narrow *keys*:
+    # dropping the window changes the answer, which is what makes the above a comparison.
+    narrower, _ = blocked_attention(
+        query, key, value, lower, upper, scaling=0.5, sink=sink, block=16, row_step=3
+    )
+    open_lower, open_upper = full_bounds(queries, keys)
+    unwindowed, _ = blocked_attention(
+        query, key, value, open_lower, open_upper, scaling=0.5, sink=sink, block=16, row_step=3
+    )
+    assert not torch.allclose(narrower, unwindowed)
+
+
+@needs_cuda
+def test_the_call_bounds_its_tile_and_not_only_its_total():
+    """`attention` hands the loop a row budget, so a chunk width is a memory knob and not a wall.
+
+    The two bounds are different questions. `budget` decides whether the whole grid fits at once,
+    and a 256k prefill answers it "no" however it is chopped. `tile_budget` decides how much of the
+    grid the loop holds at a time, and that one has an answer at any chunk width -- which is what
+    lets a 2048-token chunk keep running at 262144 positions instead of being refused by a card
+    with two gigabytes free. The tile only moves where the gemm's rows end, so every
+    budget below is the same answer to a rounding.
+    """
+    torch.manual_seed(12)
+    heads, kv_heads, queries, keys, dim, vdim = 8, 2, 64, 4096, 16, 8
+    query = torch.randn(heads, queries, dim, device="cuda") * 0.5
+    key = torch.randn(kv_heads, keys, dim, device="cuda") * 0.5
+    value = torch.randn(kv_heads, keys, vdim, device="cuda") * 0.5
+    lower, upper = full_bounds(queries, keys)
+
+    reference, _ = blocked_attention(query, key, value, lower, upper, scaling=0.5)
+    for tile in (1 << 12, 1 << 16, 1 << 23):
+        wide, _ = attention(query, key, value, lower, upper, scaling=0.5, tile_budget=tile)
+        assert torch.allclose(reference, wide, atol=1e-6), (
+            tile,
+            (reference - wide).abs().max().item(),
+        )

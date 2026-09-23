@@ -49,8 +49,10 @@ __all__ = [
     "MimoV2KVCache",
     "attention",
     "blocked_attention",
+    "DEFAULT_TILE_SCORES",
     "fused_qkv_row_order",
     "single_pass_attention",
+    "tile_step",
 ]
 
 
@@ -110,8 +112,17 @@ class AttentionStats:
         return self.full_pairs / self.pairs if self.pairs else 0.0
 
 
-def _check_bounds(query, key, value, lower, upper, sink):
-    """The checks both attention paths make, and the geometry they both fold with."""
+def _check_bounds(query, key, value, lower, upper, sink, *, validate: bool = True):
+    """The checks both attention paths make, and the geometry they both fold with.
+
+    **The last two checks read the bounds back to the host, and that is a device sync.** They are
+    worth it for a caller that hands in bounds it computed somewhere else, which is every direct
+    caller and every test; they are not worth it for the model, which derives its bounds from
+    `prefix_len` and `sequence` two functions above and has already established both facts about
+    them in Python -- so `validate=False` skips exactly those two and keeps every shape check.
+    Measured on a four-rank decode: 48 layers x 2 round trips are 96 of the 145
+    `cudaStreamSynchronize` calls a token makes, and a token is 235 ms.
+    """
     if query.dim() != 3 or key.dim() != 3 or value.dim() != 3:
         raise ValueError("attention takes [heads, sequence, width] tensors")
     heads, queries, head_dim = query.shape
@@ -127,13 +138,14 @@ def _check_bounds(query, key, value, lower, upper, sink):
         raise ValueError(f"query width {head_dim} and key width {key.shape[-1]} differ")
     if lower.shape != (queries,) or upper.shape != (queries,):
         raise ValueError("the bounds are one entry a query")
-    if keys and int(upper.max()) >= keys:
-        raise ValueError(
-            f"a query is allowed key {int(upper.max())} of {keys}; the bounds index the "
-            f"concatenated key tensor, not the chunk"
-        )
-    if bool((upper < lower).any()):
-        raise ValueError("a query's upper bound is below its lower bound")
+    if validate:
+        if keys and int(upper.max()) >= keys:
+            raise ValueError(
+                f"a query is allowed key {int(upper.max())} of {keys}; the bounds index the "
+                f"concatenated key tensor, not the chunk"
+            )
+        if bool((upper < lower).any()):
+            raise ValueError("a query's upper bound is below its lower bound")
     if not keys and sink is None:
         raise ValueError("an empty key tensor leaves nothing to attend to and no sink to absorb it")
     return heads, queries, head_dim, kv_heads, keys, heads // kv_heads
@@ -176,6 +188,7 @@ def single_pass_attention(
     *,
     scaling: float,
     sink: torch.Tensor | None = None,
+    validate: bool = True,
 ) -> tuple[torch.Tensor, AttentionStats]:
     """The same softmax as `blocked_attention`, materialised in one piece.
 
@@ -191,9 +204,12 @@ def single_pass_attention(
     maximum taken over the extended row. What neither does that the loop does is skip:
     a masked entry is computed and then discarded, so the pair count reported is the
     dense one.
+
+    `validate` is `_check_bounds`'s two value checks; see there for why a caller that
+    built its own bounds turns them off.
     """
     heads, queries, head_dim, kv_heads, keys, groups = _check_bounds(
-        query, key, value, lower, upper, sink
+        query, key, value, lower, upper, sink, validate=validate
     )
     width = value.shape[-1]
 
@@ -251,6 +267,8 @@ def blocked_attention(
     scaling: float,
     sink: torch.Tensor | None = None,
     block: int = 1024,
+    row_step: int | None = None,
+    validate: bool = True,
 ) -> tuple[torch.Tensor, AttentionStats]:
     """Softmax attention where query `i` sees keys `lower[i] .. upper[i]`, inclusive.
 
@@ -276,11 +294,25 @@ def blocked_attention(
     the reference's concatenated column without the column: with the running maximum
     started at the sink, `exp(sink - max)` is exactly one whenever the sink still
     dominates.
+
+    **`row_step` is the memory bound and `block` is not.** The score tile is
+    `[kv_heads, groups, rows_in_slice, block]` float32 and its width is the *chunk*, so a
+    commit at 256k wants a chunk that fits and a chunk is what a caller has: 2048 rows at a
+    thousand keys is 536 MiB of float32 before the exponentials, and three widths of it are
+    live at once. Splitting the *rows* is what bounds that, and it is arithmetic rather than
+    an approximation: a row still sees its own key blocks in the same order with the same
+    running maximum, and the only thing that changes is the row count of a gemm -- which is
+    a summation order inside a dot product, so the answer moves by a rounding and not by a
+    tolerance. Measured against the whole-slice loop at `[8 heads, 2 kv, 37 rows, 211 keys]`
+    the largest difference any step below made was 4.5e-08 on outputs of order 0.05.
+    `None` keeps the whole slice, which is what every caller but a long-context prefill
+    wants.
     """
     heads, queries, head_dim, kv_heads, keys, groups = _check_bounds(
-        query, key, value, lower, upper, sink
+        query, key, value, lower, upper, sink, validate=validate
     )
     width = value.shape[-1]
+    span = queries if row_step is None else max(1, min(int(row_step), queries))
 
     flat_out = torch.zeros((heads, queries, width), dtype=torch.float32, device=query.device)
     if sink is None:
@@ -303,50 +335,105 @@ def blocked_attention(
 
     seen_blocks = 0
     pairs = 0
-    for start in range(0, keys, block):
+    # The query rows that can see any key in [start, stop) are `upper >= start` and
+    # `lower <= stop - 1`, and both bounds are sorted, so they are two searches. **Both are taken
+    # for every block at once and read back once**, because a search per block per bound is a
+    # device-to-host round trip and a round trip here stalls the pipeline on the very kernel that
+    # is being queued next: a 64k chunk against a 1k block is 128 of them a layer, and one
+    # `searchsorted` over the block starts is the same two answers in one read.
+    starts = torch.arange(0, keys, block, device=query.device)
+    stops = torch.clamp(starts + block, max=keys)
+    edges = torch.stack(
+        [
+            torch.searchsorted(upper, starts),
+            torch.searchsorted(lower, stops - 1, right=True),
+        ]
+    ).tolist()
+    for index, start in enumerate(range(0, keys, block)):
         stop = min(start + block, keys)
-        # The query rows that can see any key in [start, stop): `upper >= start` and
-        # `lower <= stop - 1`. Both bounds are sorted, so these are two searches.
-        first = int(torch.searchsorted(upper, torch.tensor(start, device=query.device)))
-        last = int(
-            torch.searchsorted(lower, torch.tensor(stop - 1, device=query.device), right=True)
-        )
+        first, last = edges[0][index], edges[1][index]
         if last <= first:
             continue
         seen_blocks += 1
         pairs += heads * (last - first) * (stop - start)
 
-        rows_q = folded_query[:, :, first:last]
+        rows_q_all = folded_query[:, :, first:last]
         block_k = key[:, start:stop].to(torch.float32)
-        # [kv_heads, groups, rows, head_dim] x [kv_heads, 1, head_dim, block]
-        scores = torch.matmul(rows_q, block_k.transpose(1, 2).unsqueeze(1)) * scaling
-
+        block_v = value[:, start:stop].to(torch.float32)
         positions = torch.arange(start, stop, device=query.device)
-        visible = (positions.unsqueeze(0) >= lower[first:last].unsqueeze(1)) & (
-            positions.unsqueeze(0) <= upper[first:last].unsqueeze(1)
-        )
-        scores = scores.masked_fill(~visible.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        block_max = scores.amax(dim=-1)
-        previous = running_max[:, :, first:last]
-        merged = torch.maximum(previous, block_max)
-        # A row whose every key in this block is masked has a `-inf` maximum, and
-        # `exp(-inf - -inf)` is a nan rather than a zero. Such a row keeps its
-        # running state instead: the substitution only ever feeds the exponentials.
-        infinite = torch.isinf(merged)
-        finite = torch.where(infinite, torch.zeros_like(merged), merged)
-        alpha = torch.exp(previous - finite).masked_fill(infinite, 1.0)
-        probs = torch.exp(scores - finite.unsqueeze(-1))
-        probs = torch.where(infinite.unsqueeze(-1), torch.zeros_like(probs), probs)
+        # The row slices of this key block, which are disjoint and cover it exactly. The key and
+        # value conversions above are hoisted out of the loop and not repeated per slice, so a
+        # narrower step costs the tile and nothing else.
+        for lo in range(first, last, span):
+            hi = min(lo + span, last)
+            rows_q = rows_q_all[:, :, lo - first : hi - first]
+            # [kv_heads, groups, rows, head_dim] x [kv_heads, 1, head_dim, block]
+            scores = torch.matmul(rows_q, block_k.transpose(1, 2).unsqueeze(1)) * scaling
 
-        running_sum[:, :, first:last] = running_sum[:, :, first:last] * alpha + probs.sum(dim=-1)
-        out[:, :, first:last] = out[:, :, first:last] * alpha.unsqueeze(-1) + torch.matmul(
-            probs, value[:, start:stop].to(torch.float32).unsqueeze(1)
-        )
-        running_max[:, :, first:last] = merged
+            visible = (positions.unsqueeze(0) >= lower[lo:hi].unsqueeze(1)) & (
+                positions.unsqueeze(0) <= upper[lo:hi].unsqueeze(1)
+            )
+            scores = scores.masked_fill(~visible.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+            block_max = scores.amax(dim=-1)
+            previous = running_max[:, :, lo:hi]
+            merged = torch.maximum(previous, block_max)
+            # A row whose every key in this block is masked has a `-inf` maximum, and
+            # `exp(-inf - -inf)` is a nan rather than a zero. Such a row keeps its
+            # running state instead: the substitution only ever feeds the exponentials.
+            infinite = torch.isinf(merged)
+            finite = torch.where(infinite, torch.zeros_like(merged), merged)
+            alpha = torch.exp(previous - finite).masked_fill(infinite, 1.0)
+            probs = torch.exp(scores - finite.unsqueeze(-1))
+            probs = torch.where(infinite.unsqueeze(-1), torch.zeros_like(probs), probs)
+
+            running_sum[:, :, lo:hi] = running_sum[:, :, lo:hi] * alpha + probs.sum(dim=-1)
+            out[:, :, lo:hi] = out[:, :, lo:hi] * alpha.unsqueeze(-1) + torch.matmul(
+                probs, block_v.unsqueeze(1)
+            )
+            running_max[:, :, lo:hi] = merged
 
     flat_out = flat_out / flat_sum.unsqueeze(-1)
     return flat_out.to(query.dtype), AttentionStats("blocked", seen_blocks, pairs, heads * queries * keys)
+
+
+#: Scores the block loop's tile may hold when the caller does not name one. A count and not a
+#: byte count, so it reads in the same units as `attention`'s `budget`: 2**26 of them is 256 MiB
+#: of float32 scores and about half a gibibyte with their exponentials alive beside them, which
+#: fits on a card holding a 256k cache.
+#:
+#: **A constant, and not the card's free memory.** That was tried and removed, and the reason is
+#: the lockstep rather than the memory: `mem_get_info` is read per *rank*, four ranks of a layer
+#: therefore pick four different steps and do four different amounts of work, and every routed
+#: layer's `all_reduce` charges all four of them the slowest one's time. Measured on a 256k prompt:
+#: the four ranks' attention columns spread **19.47 to 25.47 ms a token** where the run at this
+#: fixed step spread 15.03 to 15.53, and the prompt took **8246.7 s against 5424.9** -- 52% slower
+#: for a tile that was supposed to be a memory bound and not a schedule.
+#:
+#: The width is measured in the same place and in the same direction: 2**23, which is 128 rows a
+#: step here, took **6446.8 s** and 19.36 ms of attention a token on that prompt. So this is wide
+#: deliberately and not by default -- a narrow step pays for its masks and its launches once per
+#: step, and the memory it saves is memory the run's own cache has already spoken for.
+#:
+#: A step that is a constant is the same step on every rank, and it is also the only kind a CUDA
+#: graph could capture. It is not a determinism knob in the other direction either: `tile_step`'s
+#: split is a rounding order and not an approximation, so two runs that pick different steps
+#: produce the same answer and different timings.
+DEFAULT_TILE_SCORES = 1 << 26
+
+
+def tile_step(kv_heads: int, groups: int, block: int, scores: int) -> int:
+    """The query rows one key block may be scored against at once, for a tile of `scores` scores.
+
+    `scores` is a count and not a byte count, in the same units as `attention`'s `budget`, so the
+    two knobs read alike. The tile `blocked_attention` holds is `kv_heads x groups x rows x block`,
+    so the row that many scores buy is `scores / (kv_heads * groups * block)` and never less than
+    one -- a caller can make the tile too small to be a tile, and the loop then takes a row at a
+    time, which is slow and still correct.
+    """
+    per_row = max(1, int(kv_heads) * int(groups) * int(block))
+    return max(1, int(scores) // per_row)
 
 
 def attention(
@@ -360,6 +447,8 @@ def attention(
     sink: torch.Tensor | None = None,
     block: int = 1024,
     budget: int = 1 << 25,
+    tile_budget: int | None = None,
+    validate: bool = True,
 ) -> tuple[torch.Tensor, AttentionStats]:
     """One piece, or a block loop, whichever the scores can afford.
 
@@ -371,11 +460,36 @@ def attention(
     decides is that a decode step is one query against up to 256k keys, which is a
     single gemm and no loop worth writing, and a prefill chunk is thousands of queries
     against the same keys, which is a grid nothing should materialise at once.
+
+    `tile_budget` bounds the *tile* the block loop holds at one time, which `budget`
+    does not: a prefill chunk passes `budget` on its very first key block and then runs
+    a loop whose tile is `kv_heads x groups x rows x block`, a number that grows with the
+    chunk and is the one thing at 256k that a card can run out of. It defaults to
+    `DEFAULT_TILE_SCORES` and **not** to the card's free memory, which was tried and
+    removed; the constant's own comment has the measurement and the reason, and it is a
+    schedule and not a memory bound. The row count of a call is the caller's and the
+    block is the loop's, so the price of staying under the budget is a narrower *step*
+    and not a narrower chunk -- see `blocked_attention`, where the split costs a
+    rounding-order difference and nothing else.
     """
     if query.shape[0] * query.shape[1] * key.shape[1] <= budget:
-        return single_pass_attention(query, key, value, lower, upper, scaling=scaling, sink=sink)
+        return single_pass_attention(
+            query, key, value, lower, upper, scaling=scaling, sink=sink, validate=validate
+        )
+    kv_heads = key.shape[0]
+    groups = query.shape[0] // kv_heads
+    scores = DEFAULT_TILE_SCORES if tile_budget is None else int(tile_budget)
     return blocked_attention(
-        query, key, value, lower, upper, scaling=scaling, sink=sink, block=block
+        query,
+        key,
+        value,
+        lower,
+        upper,
+        scaling=scaling,
+        sink=sink,
+        block=block,
+        row_step=tile_step(kv_heads, groups, block, scores),
+        validate=validate,
     )
 
 
@@ -501,6 +615,13 @@ class MimoV2KVCache:
         The ring is unrolled here rather than in the attention, so a caller gets a
         contiguous tensor and never has to know the buffer wrapped. `upto` is a
         position and not an index: it is what a chunk's `start_pos` is.
+
+        A ring that has not wrapped is not unrolled but *sliced*, because the unrolling is
+        an `index_select` and an `index_select` is a copy: at 256k a global layer's prefix
+        is 400 MiB of keys and 267 MiB of values, and the caller concatenates the chunk
+        onto it -- so a copy here is a copy over and above the one the caller is about to
+        make, taken at the shallowest moment of the card's headroom. Unwrapped, the wanted
+        indices are `arange(0, upto)` and the slice is the same tensor for nothing.
         """
         if layer not in self._key:
             raise KeyError(f"layer {layer} is not in this cache; it holds {sorted(self._key)}")
@@ -511,6 +632,10 @@ class MimoV2KVCache:
             )
         slots = self._slots[layer]
         start = max(0, upto - slots)
+        if start == 0:
+            # Nothing has been overwritten yet, so time order is slot order and the prefix is a
+            # window onto the buffer rather than a rearrangement of it.
+            return self._key[layer][:, :upto], self._value[layer][:, :upto], upto
         wanted = torch.arange(start, upto, device=self.device) % slots
         return (
             self._key[layer].index_select(1, wanted),
@@ -551,6 +676,7 @@ class MimoV2DeviceAttention:
         dtype: torch.dtype = torch.bfloat16,
         block: int = 1024,
         budget: int = 1 << 25,
+        tile_budget: int | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.layer_idx = int(layer_idx)
@@ -560,6 +686,10 @@ class MimoV2DeviceAttention:
         self.dtype = dtype
         self.block = int(block)
         self.budget = int(budget)
+        #: Scores the block loop's tile may hold, or `None` for `DEFAULT_TILE_SCORES`. It is a
+        #: constant because a per-rank step makes the four ranks of a lockstep do four different
+        #: amounts of work; the constant's comment has the measurement.
+        self.tile_budget = None if tile_budget is None else int(tile_budget)
         if self.shape.projection_layout != "fused_qkv":
             raise NotImplementedError(
                 f"layer {self.layer_idx}: the released checkpoint's fused qkv layout is the "
@@ -690,6 +820,12 @@ class MimoV2DeviceAttention:
         else:
             lower = (upper - int(shape.sliding_window) + 1).clamp_min(0)
 
+        # The two bounds a low-level caller has to be checked against are known here, in Python,
+        # and not on the card: `upper` runs from `prefix_len` to `prefix_len + sequence - 1` and
+        # the key tensor is exactly `prefix_len + sequence` long, and `lower` is either zero or
+        # `upper` clamped down from below. So the value checks have nothing to find, and asking
+        # them anyway is two device-to-host round trips a layer -- 96 of a decode token's 145
+        # `cudaStreamSynchronize` calls, each one stalling the host on the kernel it queued last.
         attn_output, stats = attention(
             query.to(torch.float32),
             all_key,
@@ -700,6 +836,8 @@ class MimoV2DeviceAttention:
             sink=self.sink,
             block=self.block,
             budget=self.budget,
+            tile_budget=self.tile_budget,
+            validate=False,
         )
         self.last_stats = stats
         if cache is not None:

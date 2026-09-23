@@ -91,6 +91,7 @@ class MimoV2DeviceLayer:
         ep: EpGroup | None = None,
         block: int = 1024,
         budget: int = 1 << 25,
+        tile_budget: int | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.config: MimoV2TextConfig = checkpoint.layer
@@ -102,7 +103,13 @@ class MimoV2DeviceLayer:
         self.kind = self.config.ffn_kind(self.layer_idx)
 
         self.attention = MimoV2DeviceAttention(
-            checkpoint, self.layer_idx, self.device, dtype, block=block, budget=budget
+            checkpoint,
+            self.layer_idx,
+            self.device,
+            dtype,
+            block=block,
+            budget=budget,
+            tile_budget=tile_budget,
         )
         root = f"model.layers.{self.layer_idx}"
         self.input_layernorm = checkpoint.dense_tensor(
@@ -257,6 +264,7 @@ class MimoV2DeviceModel:
         budget: int = 1 << 25,
         pin: bool | None = None,
         chunk_rows: int | None = None,
+        tile_budget: int | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.config: MimoV2TextConfig = checkpoint.layer
@@ -300,7 +308,7 @@ class MimoV2DeviceModel:
             if pinner is not None:
                 self.pin_result = pinner()
             self.experts = MimoV2DeviceExperts(
-                expert_source,
+                source=expert_source,
                 top_k=self.config.num_experts_per_tok,
                 dim=self.config.hidden_size,
                 inter_dim=self.config.resolved_moe_intermediate_size,
@@ -322,6 +330,7 @@ class MimoV2DeviceModel:
                 ep=ep,
                 block=block,
                 budget=budget,
+                tile_budget=tile_budget,
             )
             for layer_idx in wanted
         ]
@@ -359,14 +368,25 @@ class MimoV2DeviceModel:
         start_pos: int = 0,
         cache: MimoV2KVCache | None = None,
         final_norm: bool = True,
+        rows: Sequence[int] | None = None,
     ) -> torch.Tensor:
-        """Token ids to logits, `[sequence, vocab]`, at the positions `start_pos` onwards."""
+        """Token ids to logits, `[sequence, vocab]`, at the positions `start_pos` onwards.
+
+        `rows` selects which of the sequence's rows are carried through the final norm and the
+        head, and is applied *after* the layers and not before them: a chunk's rows attend to
+        each other, so a caller that wants one row's logits still has to run every row through
+        the stack. Slicing here rather than at the head's output is the whole of the saving --
+        `[2048, 152576]` float32 is 1.16 GiB and one row of it is 0.6 MiB, and the norm is
+        per-row, so the row that leaves is the same row to the bit.
+        """
         ids = input_ids.reshape(-1).to(self.device)
         hidden = F.embedding(ids, self.embed_tokens)
         for layer in self.layers:
             hidden = layer.forward(hidden, start_pos=start_pos, cache=cache)
         if not final_norm:
             return hidden
+        if rows is not None:
+            hidden = hidden[list(rows)]
         hidden = rms_norm(hidden, self.norm, self.config.layernorm_epsilon)
         return F.linear(hidden.to(self.lm_head.dtype), self.lm_head)
 
@@ -421,10 +441,17 @@ class MimoV2DeviceModel:
         logits = None
         for start in range(0, len(ids), chunk):
             piece = torch.tensor(ids[start : start + chunk], dtype=torch.int64)
-            logits = self.forward(piece, start_pos=start, cache=cache)
+            if start + piece.shape[0] < len(ids):
+                # Every chunk but the last leaves through the stack alone. Asking for its logits
+                # would build `[chunk, vocab]` -- 1.16 GiB at 2048 rows -- which is the same
+                # `[sequence, vocab]` the docstring above refuses for the whole prompt, arriving
+                # one chunk at a time and twice over once the head's arithmetic is counted.
+                self.forward(piece, start_pos=start, cache=cache, final_norm=False)
+                continue
+            logits = self.forward(piece, start_pos=start, cache=cache, rows=[-1])[-1]
         if self.experts is not None:
             self.experts.drain()
-        return logits[-1]
+        return logits
 
     @torch.no_grad()
     def greedy(

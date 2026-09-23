@@ -268,6 +268,17 @@ class MimoV2DeviceExperts:
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
             self._copy_stream = torch.cuda.Stream(device=self.device)
         self._pending: list[bool] = [False] * self.slots
+        # The draw's bookkeeping, staged through a pinned pair rather than built on the card.
+        # `mine` is a list of positions on the host and the kernel wants them as a device tensor;
+        # the obvious `torch.tensor(mine, device=...)` is a *pageable* H2D, which is synchronous
+        # and therefore a host wait per layer -- forty-seven of them a token, on a path whose
+        # whole problem is that the host is in it. A pinned source and a non-blocking copy are
+        # ordered by the stream instead, and the width is `top_k` because a deal's share of a
+        # drawing is at most all of it.
+        with torch.cuda.device(self.device):
+            self._picked_host = torch.zeros(self.top_k, dtype=torch.int64, pin_memory=True)
+            self._picked_device = torch.zeros(self.top_k, dtype=torch.int64, device=self.device)
+            self._rows = torch.arange(self.top_k, dtype=torch.int64, device=self.device)
         self._next = 0
         # Counters, because "how much did the bank save" is a question about the copies and
         # not about the wall clock: `staged_experts` is the draws that cost an H2D.
@@ -308,22 +319,25 @@ class MimoV2DeviceExperts:
     # -- staging ----------------------------------------------------------------------------
 
     def _take_slots(self, count: int) -> int:
-        """The first slot of `count` consecutive slots whose last kernel has been drained.
+        """The next slot, with the overwrite ordered behind the kernel that still reads it.
 
         Rotating rather than searching is what keeps the copies and the kernels apart: with
         two slots and one call in flight, `_next` names the slot the *previous* call used, so
-        the wait below is on a kernel that is a full layer behind and the host has that much
-        room to run ahead. Waiting on a slot's event is also what makes the overwrite safe --
-        the copies go to the copy stream, the event was recorded on the compute stream, and
-        the two are ordered by this wait and by nothing else.
+        the copy that overwrites it is ordered behind a kernel that is a full layer behind.
+
+        **Ordered by the copy stream and not by the host.** The overwrite is safe because
+        `_stage` makes the copy stream wait on the compute stream's tail, which at that moment
+        already holds the kernel that read the slot two layers ago -- so the host does not have
+        to wait for anything, and a host that waits is a host that has stopped issuing. That
+        matters here more than it looks: this arena is one of forty-seven in a layer loop, so
+        the wait this dropped was one a layer and forty-seven a token, on a path whose whole
+        problem is that the host is in it. `drain` is where a caller that genuinely needs the
+        kernels to have happened says so.
         """
         if count > self.arena_rows:
             raise ValueError(f"a call needs {count} arena rows and the arena holds {self.arena_rows}")
         slot = self._next
         self._next = (self._next + 1) % self.slots
-        if self._pending[slot]:
-            self._events[slot].synchronize()
-            self._pending[slot] = False
         return slot
 
     def _stage(self, slot: int, layer_id: int, experts: Sequence[int]) -> None:
@@ -422,8 +436,11 @@ class MimoV2DeviceExperts:
         arena = self._arenas[slot]
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(self._copy_events[slot])
-        rows = torch.arange(len(mine), dtype=torch.int64, device=self.device)
-        picked = torch.tensor(mine, dtype=torch.int64, device=weights.device)
+        self._picked_host[: len(mine)] = torch.tensor(mine, dtype=torch.int64)
+        picked = self._picked_device[: len(mine)].copy_(
+            self._picked_host[: len(mine)], non_blocking=True
+        )
+        rows = self._rows[: len(mine)]
         out = self._kernel.moe_single_token_fp4_forward(
             hidden.to(self.device),
             rows,
