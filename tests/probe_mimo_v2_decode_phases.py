@@ -174,7 +174,6 @@ def main() -> int:
     if args.depth:
         fill_cache(
             cache,
-            model.config,
             [layer.layer_idx for layer in model.layers],
             args.depth,
         )

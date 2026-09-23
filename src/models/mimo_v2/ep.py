@@ -44,6 +44,17 @@ collective with a zero, because the collective is unconditional. Under `sorted` 
 happen. Neither is a corner to be excused: the first is one draw in ten and the second is most of
 the bytes a chunk moves.
 
+**The second job this module has is the attention.** A decode step at a long context is a host
+bound step, and the largest single thing on the host is the attention: at 262144 keys the nine
+global layers are 12.5 ms a layer, and a quarter of a layer -- sixteen of its sixty-four query
+heads, with the one key head and the value head they attend to -- is 3.0 ms. The checkpoint is
+already partitioned that way (`quant.QKV_SHARDS`, four groups of `[q | k | v]`), so the split costs
+no arithmetic agreement and no weight remapping: `attention_shards` decides how many pieces, and
+the pieces are joined by `make_all_gather`, which is the reason the split is exact rather than
+merely close. Four is also the number of ranks here, which is a coincidence of this machine and not
+of the design -- a world of two replicates the attention and deals the experts, which is correct
+and is what the prefill test uses.
+
 `world=1` is not a special case anywhere. No rank divides anything by a deal, `make_all_reduce`
 returns `None`, and a partial is the whole. That is the control column, and it is free.
 """
@@ -58,11 +69,15 @@ from typing import Callable, Sequence
 import torch
 
 __all__ = [
+    "ATTENTION_SHARDS",
     "DEALS",
     "DEAL_ENV",
     "EpGroup",
+    "SHARDS_ENV",
+    "attention_shards",
     "deal_card",
     "deal_rule",
+    "make_all_gather",
     "make_all_reduce",
     "owned_experts",
     "owned_positions",
@@ -197,6 +212,98 @@ def make_all_reduce(world: int) -> Callable[[torch.Tensor], torch.Tensor] | None
     return reduce
 
 
+#: How many ranks the attention is split over, when it is split at all. Four is the
+#: checkpoint's own number and not a choice: the fused `qkv_proj` is stored as four shards of
+#: `[q | k | v]` (`quant.QKV_SHARDS`) and `fused_qkv_row_order` refuses any other reading, so a
+#: rank of four takes one contiguous quarter of the projection's rows and the query heads, key
+#: heads and value heads that go with it -- see `attention_shards`.
+ATTENTION_SHARDS = 4
+
+#: Turns the split off, for the A/B and for a host where it turns out not to pay. Unset means the
+#: checkpoint's own four at a world of four; `1` means the whole attention on every rank, which is
+#: what this model did before the split existed. See `attention_shards`.
+SHARDS_ENV = "POCKETLLM_MIMO_ATTENTION_SHARDS"
+
+
+def attention_shards(world: int) -> int:
+    """How many pieces to cut the attention into at this world size: one, four, or one.
+
+    A world of four is the checkpoint's own partition and gets it. A world of one is the control
+    column and needs nothing. Anything else -- two, three -- has no partition the weights admit,
+    so the attention stays whole and replicated and the experts are dealt as usual: correct, and
+    the same shape of run this module had before the attention could be split at all. A world that
+    *could* be split and is not is a slower run, not a wrong one, which is why this answers with a
+    number rather than raising.
+
+    `SHARDS_ENV` can hold the answer back to one, which is the only value it may ask for besides
+    four: one is an arm of an A/B and four is the default, and any other number is not a partition
+    this checkpoint admits, so it is ignored rather than refused.
+
+    **The knob moves the clock and not the answer.** A share's projection is the whole's rows for
+    that share bit for bit, and the shares' outputs are concatenated rather than projected and
+    summed, so the joined answer is the whole path's answer -- exactly, for every chunk of queries
+    and for a decode step of a global layer past `FOLD_KEYS` keys. The one place it is not exact is
+    a decode step of a *windowed* layer, whose folded path is batched over the key heads and whose
+    output gemm cuBLAS therefore tiles differently for a share's two heads than for the layer's
+    eight: measured on layer 1 of the release, `1.2e-07` of a `5.1e-01` peak in `pre_o`, the last
+    bit of a float32. `probe_mimo_v2_split_tokens.py` is what says no *token* moves: at 8192 tokens
+    of context, on a released prompt and on a drawn one, the greedy streams and the prefill's
+    logits are identical with the split and without it.
+    """
+    if world < 1:
+        raise ValueError(f"world must be at least 1, got {world}")
+    if world != ATTENTION_SHARDS:
+        return 1
+    asked = os.environ.get(SHARDS_ENV, "").strip()
+    return 1 if asked == "1" else ATTENTION_SHARDS
+
+
+def make_all_gather(world: int) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """`dist.all_gather_into_tensor` as a closure, the attention's own way of joining its rank.
+
+    A split attention produces `[rows, o_in / world]` a rank -- its own query heads' output, before
+    the projection that mixes them -- and the layer's answer is those pieces *concatenated*, not
+    summed: `o_proj` reads all `o_in` of its input at once, so the pieces have to be back in one
+    tensor before it runs. The head-major layout wants rank `r`'s piece at columns
+    `[r * o_in / world, (r + 1) * o_in / world)`, which is the concatenation along the *last* axis.
+
+    **`all_gather_into_tensor` joins along the first.** It takes a buffer of `world * rows` rows and
+    hands rank `r` the rows `[r * rows, (r + 1) * rows)`, so a caller that allocates the output it
+    wants (`[rows, world * width]`) gets a *silent* scramble for any `rows` over one: the pieces are
+    all there, each in the wrong place, and the output is the same size and made of the same
+    numbers. It is exact for a decode step, where `rows` is one and the flat layout happens to be
+    the concatenation, which is the worst possible failure mode for this bug -- a longer prompt
+    prefill is where it goes wrong and a token-at-a-time run never sees it. Hence the transpose
+    below, which is not an optimisation of the join but the join.
+
+    **Gathered rather than reduced, and that is an exactness argument.** The other way to join them
+    is to let each rank run its own quarter of `o_proj` and sum the four partials in fp32, which is
+    how the routed experts' split is joined. It is not the same number: each rank's partial is
+    rounded to bfloat16 before it is summed, so the answer rounds four times where the whole path
+    rounds once. Measured on layer 0 of the release at 32768 keys, the reduced join is 7.5e-3 of
+    the attention output's own peak and the gathered one is `0.00e+00` -- bit for bit the whole
+    path's answer. The two cost the same on the wire: sixteen kilobytes a token either way, a
+    `[1, 4096]` float32 reduction against a `[1, 8192]` bfloat16 gather.
+
+    `world=1` returns `None`, which is the identity and not a collective.
+    """
+    if world <= 1:
+        return None
+
+    def gather(part: torch.Tensor) -> torch.Tensor:
+        import torch.distributed as dist
+
+        if part.dim() != 2:
+            raise ValueError(f"a gathered piece is [rows, width], got {tuple(part.shape)}")
+        part = part.contiguous()
+        rows, width = part.shape
+        flat = torch.empty((world * rows, width), dtype=part.dtype, device=part.device)
+        dist.all_gather_into_tensor(flat, part)
+        return flat.view(world, rows, width).transpose(0, 1).reshape(rows, world * width)
+
+    return gather
+
+
 @dataclass
 class EpGroup:
     """Which rank this process is, and how a partial becomes the answer.
@@ -212,6 +319,7 @@ class EpGroup:
     world: int = 1
     rank: int = 0
     reduce: Callable[[torch.Tensor], torch.Tensor] | None = None
+    gather: Callable[[torch.Tensor], torch.Tensor] | None = None
     device: torch.device | None = None
 
     def __post_init__(self) -> None:
@@ -232,6 +340,27 @@ class EpGroup:
     def partial(self) -> bool:
         """Whether one rank's output is a summand rather than the sum."""
         return self.world > 1
+
+    @property
+    def attention_shards(self) -> int:
+        """How many pieces this group's attention is cut into. See `attention_shards`.
+
+        A group that holds no way to join the pieces does not split the attention -- which is what a
+        caller that injects its own collectives, or its own arithmetic in place of them, gets: the
+        model keeps the whole attention on every rank, which is what it did before the split
+        existed. Splitting is not something a group can be *told* to do and then fail to finish.
+        """
+        return attention_shards(self.world) if self.gather is not None else 1
+
+    @property
+    def attention_shard(self) -> int:
+        """Which piece this rank computes, or zero for a group whose attention is not cut.
+
+        A rank is a piece index only when the attention is actually cut: the piece and the count
+        come from this one rule so that a caller cannot take one without the other, which would be
+        a rank asking for the fourth quarter of a tensor that was never divided.
+        """
+        return self.rank if self.attention_shards > 1 else 0
 
     @classmethod
     def from_env(cls, *, device: torch.device | str | None = None, timeout_hours: float = 2.0):
@@ -268,4 +397,10 @@ class EpGroup:
         # group's rank agree; a caller that named a card explicitly keeps it.
         if device is None:
             device = torch.device("cuda", local_rank)
-        return cls(world=world, rank=rank, reduce=make_all_reduce(world), device=device)
+        return cls(
+            world=world,
+            rank=rank,
+            reduce=make_all_reduce(world),
+            gather=make_all_gather(attention_shards(world)),
+            device=device,
+        )

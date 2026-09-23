@@ -655,3 +655,99 @@ def test_the_call_bounds_its_tile_and_not_only_its_total():
             tile,
             (reference - wide).abs().max().item(),
         )
+
+
+# ---------------------------------------------------------------------------
+# The split over the ranks
+# ---------------------------------------------------------------------------
+
+
+@needs_release_cuda
+@pytest.mark.parametrize("layer_idx", (SWA_LAYER, GA_LAYER))
+def test_a_share_reads_the_whole_projection_rows_it_owns(release, layer_idx):
+    """A share's fused `qkv_proj` is the whole's rows for that share, bit for bit.
+
+    This is the one reading the split cannot get wrong quietly. `quant.QKV_SHARDS` records that the
+    released projection was quantised a tensor-parallel shard at a time, so the FP8 scale restarts
+    inside each share; a reader that dequantized a share with a whole-tensor scale -- or that asked
+    for the wrong window of rows -- would produce a plausible projection of the right shape whose
+    numbers are wrong from the first shard boundary on. The check is on the *product* and not on the
+    weights, because the two readings agree on the weights and differ on the rows they scale.
+    """
+    shape = release.layer.attention(layer_idx)
+    whole = MimoV2DeviceAttention(release, layer_idx, "cuda", torch.bfloat16)
+    torch.manual_seed(5)
+    hidden = torch.randn(4, release.layer.hidden_size, device="cuda", dtype=torch.bfloat16)
+    reference = torch.nn.functional.linear(hidden, whole.qkv_proj)
+
+    shares = [
+        MimoV2DeviceAttention(
+            release, layer_idx, "cuda", torch.bfloat16, shard=rank, shards=4, gather=lambda x: x
+        )
+        for rank in range(4)
+    ]
+    joined = torch.cat(
+        [torch.nn.functional.linear(hidden, share.qkv_proj) for share in shares], dim=-1
+    )
+    assert torch.equal(joined, reference), (joined - reference).abs().max().item()
+    assert shares[0].shape.num_q_heads == shape.num_q_heads // 4
+    assert shares[0].shape.num_kv_heads == shape.num_kv_heads // 4
+    assert shares[0].shape.o_in * 4 == shape.o_in
+    # The share's stored order is `[q | k | v]` already, so a share pays no permutation where the
+    # whole layer pays one -- see `group_qkv_order`.
+    assert shares[0]._qkv_order is None
+
+
+@needs_release_cuda
+@pytest.mark.parametrize("layer_idx", (SWA_LAYER, GA_LAYER))
+@pytest.mark.parametrize("rows,keys", ((512, 8192), (512, 129)))
+def test_the_four_shares_are_the_whole_attention(release, layer_idx, rows, keys):
+    """Four shares over the key heads, joined along the head axis, are the whole layer.
+
+    The join is a concatenation and not a sum (`ep.make_all_gather` is the collective), and the
+    shares are run against the *whole's own* cache, filled once and sliced -- so the comparison is
+    of the head split and of nothing else. A chunk of rows comes out exact; a decode step's
+    windowed layer can differ by the last bit of a float32, because the folded path's output gemm
+    is batched over the key heads and cuBLAS tiles a batch of two differently from a batch of
+    eight. That is a property of the library and not of the split, and it is why the tolerance
+    below is a float32 ULP and not zero -- `probe_mimo_v2_split_tokens.py` is what says no token
+    moves.
+    """
+    shape = release.layer.attention(layer_idx)
+    whole = MimoV2DeviceAttention(release, layer_idx, "cuda", torch.bfloat16)
+    torch.manual_seed(6)
+    full_key = torch.randn(shape.num_kv_heads, keys, shape.head_dim, device="cuda")
+    full_value = torch.randn(shape.num_kv_heads, keys, shape.v_head_dim, device="cuda")
+    cache = cache_for(release, layer_idx, keys + rows + 8, dtype=torch.bfloat16)
+    cache.append(
+        layer_idx, full_key.to(torch.bfloat16), full_value.to(torch.bfloat16)
+    )
+    hidden = torch.randn(
+        (rows, release.layer.hidden_size), device="cuda", dtype=torch.bfloat16
+    )
+    want = whole.forward(hidden, start_pos=keys, cache=cache)
+
+    pieces = []
+    for rank in range(4):
+        share = MimoV2DeviceAttention(
+            release, layer_idx, "cuda", torch.bfloat16, shard=rank, shards=4, gather=lambda x: x
+        )
+        own = cache_for(release, layer_idx, keys + rows + 8, dtype=torch.bfloat16, shard=rank,
+                        shards=4)
+        kv = shape.num_kv_heads // 4
+        own.append(
+            layer_idx,
+            full_key[rank * kv : (rank + 1) * kv].to(torch.bfloat16),
+            full_value[rank * kv : (rank + 1) * kv].to(torch.bfloat16),
+        )
+        pieces.append(share.attention_output(hidden, start_pos=keys, cache=own)[0])
+
+    joined = torch.cat(pieces, dim=-1)
+    assert joined.shape == want["attn_out_pre_o"].shape
+    off = (joined.float() - want["attn_out_pre_o"].float()).abs().max().item()
+    peak = want["attn_out_pre_o"].float().abs().max().item()
+    assert off <= peak * 2.0**-23 * 2, (off, peak)
+    # And the join is a *join*: the pieces are each a quarter of the width and a permutation of
+    # them is not the answer, so the test above is not passing on symmetry.
+    reordered = torch.cat(pieces[1:] + pieces[:1], dim=-1)
+    assert not torch.equal(reordered, want["attn_out_pre_o"])

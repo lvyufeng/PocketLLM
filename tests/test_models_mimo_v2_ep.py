@@ -19,7 +19,11 @@ another `MimoV2DeviceExperts` and the sum is four additions rather than a fabric
 What this does *not* test is the collective. `make_all_reduce` is a closure around
 `dist.all_reduce` and there is nothing in it to get wrong; whether four processes on four cards
 still agree is what the multi-rank bench and the four-rank decode comparison answer, and neither
-is something a single-process test can stand in for.
+is something a single-process test can stand in for. `make_all_gather` is the other one, and it
+*does* have something to get wrong: the primitive joins along the first axis where the attention
+wants the last, and a caller that allocates the shape it wants gets a silent scramble for any
+`rows` over one. So the collective is faked here -- one function that writes the layout the real
+one writes -- and the only question asked of it is where each rank's piece ended up.
 """
 
 from __future__ import annotations
@@ -347,3 +351,44 @@ def test_a_layer_sums_four_shares_into_the_answer_one_rank_gives():
     for part in parts:
         assert part.shape == reference.shape
     assert delta(sum(parts), reference) < 1e-5
+
+
+def test_the_join_writes_each_rank_down_its_own_columns(monkeypatch):
+    """`all_gather_into_tensor` joins along the first axis; the attention wants the last.
+
+    A caller that allocates the tensor it wants -- `[rows, world * width]` -- hands the collective a
+    buffer it reads as `world * rows` rows, and for any `rows` over one every piece lands in the
+    wrong place: the same numbers, a different tensor, no error and no shape mismatch. A decode step
+    is where it hides, because `rows` is one there and the flat layout happens to be the
+    concatenation; a prompt prefill is where it goes wrong, and it took a layer-0 comparison to see
+    it at all.
+
+    The collective is faked here rather than skipped: one function that writes the layout the real
+    one writes, so the question -- which columns did rank `r`'s piece come out in -- is the real
+    one, and it is answerable without a fabric or a second card.
+    """
+    import torch.distributed as dist
+
+    from src.models.mimo_v2.ep import make_all_gather
+
+    world, rows, width = 4, 3, 2
+
+    def fake_all_gather_into_tensor(out, part, *args, **kwargs):
+        flat, source = out.reshape(-1), part.reshape(-1)
+        assert flat.numel() == world * source.numel(), (flat.numel(), source.numel())
+        for rank in range(world):
+            flat[rank * source.numel() : (rank + 1) * source.numel()] = source + rank
+
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather_into_tensor)
+    gather = make_all_gather(world)
+    part = torch.arange(rows * width, dtype=torch.float32).reshape(rows, width)
+    joined = gather(part)
+    assert joined.shape == (rows, world * width)
+    for rank in range(world):
+        assert torch.equal(joined[:, rank * width : (rank + 1) * width], part + rank), rank
+
+
+def test_a_single_rank_joins_nothing():
+    from src.models.mimo_v2.ep import make_all_gather
+
+    assert make_all_gather(1) is None

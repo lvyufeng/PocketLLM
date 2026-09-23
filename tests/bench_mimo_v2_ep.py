@@ -152,7 +152,7 @@ def main() -> int:
         # the fill appends rather than writes in place, so the depth it asks for is a depth *past*
         # whatever the discarded prompt left behind.
         cache.reset()
-        fill_cache(cache, model.config, [layer.layer_idx for layer in model.layers], depth)
+        fill_cache(cache, [layer.layer_idx for layer in model.layers], depth)
         position = depth
         logits = None
         for _ in range(args.warmup):

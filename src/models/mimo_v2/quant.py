@@ -123,6 +123,7 @@ def dequant_fp8_block(
     block: tuple[int, int] = FP8_BLOCK,
     out_dtype: torch.dtype = torch.bfloat16,
     shards: int = 1,
+    shard: int | None = None,
 ) -> torch.Tensor:
     """`w = w_fp8 * scale`, tile by tile, without materialising a broadcast scale.
 
@@ -138,9 +139,18 @@ def dequant_fp8_block(
     scale is blocked per shard, so pass `shards=4` for it rather than relying on
     the truncation below. Extra columns are dropped the same way, since the tile
     index that would use them does not exist.
+
+    `shard` asks for **one** of those shares rather than all of them, which is what
+    a rank that is only going to compute its own share wants: the same numbers,
+    arrived at without materialising the other three quarters of a
+    `[13568, 4096]` weight to throw them away.
     """
     if shards > 1:
-        return _dequant_fp8_block_sharded(codes, scale, block, out_dtype, shards)
+        return _dequant_fp8_block_sharded(codes, scale, block, out_dtype, shards, shard)
+    if shard is not None:
+        raise ValueError(
+            f"shard={shard} of a weight that is not quantised in shares; pass shards as well"
+        )
 
     rows, cols = codes.shape
     block_rows, block_cols = block
@@ -170,6 +180,7 @@ def _dequant_fp8_block_sharded(
     block: tuple[int, int],
     out_dtype: torch.dtype,
     shards: int,
+    shard: int | None = None,
 ) -> torch.Tensor:
     """The same product, with the tiles blocked inside each shard rather than across.
 
@@ -187,10 +198,17 @@ def _dequant_fp8_block_sharded(
     that shard's query block -- are scaled by the previous shard's last tile,
     which covers its small value block. The sliding-window layers are 3712 rows in
     four shares of 29 whole tiles, which is why only the global layers move.
+
+    `shard` computes one share and returns it alone. Each share's tiles are read
+    from its own rows of the scale and its own rows of the weight, so the share is
+    the same tensor a full read would have produced for those rows -- the loop is
+    the same loop with three of its four iterations left out.
     """
     rows, cols = codes.shape
     if rows % shards:
         raise ValueError(f"{rows} rows do not divide into {shards} shards")
+    if shard is not None and not 0 <= shard < shards:
+        raise ValueError(f"shard {shard} is not a share of {shards}")
     block_rows, block_cols = block
     shard_rows = rows // shards
     shard_tiles = -(-shard_rows // block_rows)
@@ -205,7 +223,7 @@ def _dequant_fp8_block_sharded(
     padded_rows = shard_tiles * block_rows
     padded_cols = col_blocks * block_cols
     parts = []
-    for rank in range(shards):
+    for rank in range(shards) if shard is None else (shard,):
         share = codes[rank * shard_rows : (rank + 1) * shard_rows]
         if (padded_rows, padded_cols) != (shard_rows, cols):
             share = F.pad(share, (0, padded_cols - cols, 0, padded_rows - shard_rows))
@@ -215,4 +233,6 @@ def _dequant_fp8_block_sharded(
         scale_rows = scale[rank * shard_tiles : (rank + 1) * shard_tiles]
         tiles = tiles * scale_rows.to(torch.float32)[:, None, :, None]
         parts.append(tiles.view(padded_rows, padded_cols)[:shard_rows, :cols])
+    if shard is not None:
+        return parts[0].to(out_dtype)
     return torch.cat(parts, dim=0).to(out_dtype)

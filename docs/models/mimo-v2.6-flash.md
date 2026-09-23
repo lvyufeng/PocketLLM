@@ -15,8 +15,9 @@ full depth.
 quarter of them, the router stays replicated, and a routed layer's partial is summed
 with one 16 KiB all-reduce. A token is then **275 ms — 3.63 tokens a second**, four
 ranks produce byte-identical logits, and the decode is the same nine tokens the
-one-rank run gives. What the ranks do *not* divide is the attention, which is
-replicated on all four and is the next stage's work. That 275 is this stage's number and not
+one-rank run gives. The attention was still replicated at that point, on all four ranks; it
+is divided now, along the checkpoint's own four-way partition, and the section on it is
+below. That 275 is this stage's number and not
 the page's: two device-to-host round trips a layer that nothing needed were 58 ms of it, and the
 step is **177.6 ms — 5.63 tokens a second** below.
 
@@ -36,10 +37,13 @@ its score block, `[kv_heads, groups, rows, block]` float32, whose width is the *
 and which is 1 GiB at 4096 rows; the chunk's rows are now split into steps sized to a
 fixed tile budget, which is a rounding-order difference and not an approximation. With
 that, a **262144-token prompt runs end to end on four ranks at a 2048-token chunk** —
-48.32 tokens a second, 18.45 GiB on the card, 2.4 GiB free, the four ranks' last row
-byte-identical — and a 64k prompt runs at **104.4 tokens a second at a 4096-token
-chunk**, against 95.5 at 2048 and 3.0 fed one token at a time. The bound is also what
-makes the 256k row below a real run rather than a cache that was sized for one.
+104.04 tokens a second, 10.21 GiB on the card, the four ranks' last row byte-identical —
+and a 64k prompt runs at **104.4 tokens a second at a 4096-token chunk**, against 95.5 at
+2048 and 3.0 fed one token at a time. The bound is also what makes the 256k row below a
+real run rather than a cache that was sized for one. The 256k rate is the attention split's
+and not this stage's: the same prompt with the attention replicated on every rank is
+**48.37 tokens a second** and 18.71 GiB on the card, and the two arms are a table apart in
+the 256k section below.
 
 **Decode is 5.6 tokens a second at a short context** on four ranks, which is the same
 step that measured 3.63 before — the difference is two device-to-host round trips a
@@ -63,10 +67,11 @@ not idle — it is at a different collective. A four-rank served run is in this 
 own section.
 
 What that is not: a kernel, batching, or a sampler worth shipping. The attention and
-the dense linears are still torch; the served path is one request, one sequence, four
-replicated attentions; and at 256k a decode step is 448 ms because the attention reads
-256k keys nine times over. What *is* gone from the earlier list is 256k and serving
-themselves — both have run, and the numbers are below.
+the dense linears are still torch; the served path is one request, one sequence; and a
+256k decode step is 399.2 ms, most of it the attention reading a quarter of a million keys
+nine times over — once a rank, since this stage divides that work along the checkpoint's
+own four-way partition, which takes the same step to 281.2. What *is* gone from the earlier
+list is 256k, serving and the replicated attention; the numbers are below.
 
 What exists:
 
@@ -82,8 +87,9 @@ What exists:
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
+| Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
-| 256k context | Verified and measured: a 262144-token prompt through four ranks at 48.32 tok/s, four-identical last row, 18.45 GiB on the card against 22 |
+| 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -549,7 +555,9 @@ see the probe in the evidence below. A collective is a barrier, four ranks' per-
 work is not equal, and every rank pays the slowest one's time; the `id` deal doubles that by
 making the copy itself unequal. It is why the imbalance above is worth 21%, and it is the
 measurement that redraws the next stage's target: the step is now attention plus copy plus a
-lockstep, and 48 x 5.7 ms is the 275 the `sorted` arm measures.
+lockstep, and 48 x 5.7 ms is the 275 the `sorted` arm measures. The attention row was the one
+that did not have to be replicated, and it no longer is: at this depth the split below takes
+**49 ms off the whole step, 1.02 ms a routed layer**, which is most of that row.
 
 The whole-model phase totals behind that table, at 8 prompt tokens and 8 decode steps:
 
@@ -671,44 +679,53 @@ The cache is per layer and the arithmetic is per family: a global layer's buffer
 context, so the nine of them at 262144 positions with four key heads of 192 and 128 are 5.65 GiB,
 and a windowed layer's is a 128-slot ring whose thirty-nine are 0.6 GiB between them. On the
 release, four ranks, a 2048-token chunk, a 408 MiB arena at a band of 16 experts and 64 experts a
-rank, a 262144-token prompt through it end to end — **18.45 GiB allocated and 2.4 GiB free of
-the card's 22**:
+rank, a 262144-token prompt through it end to end — and then the same prompt again, back to back on
+the same cards, with the attention divided four ways instead of replicated on every rank:
 
-| | Value |
-| --- | ---: |
-| Prompt | 262,144 tokens, 128 calls of 2048 |
-| Wall | 5424.9 s |
-| Rate | **48.32 tokens a second** |
-| Attention, all 48 layers | 15.0–15.5 ms a token |
-| FFN and staging | 5.1–5.6 ms a token |
-| Expert copy | 1.7 ms a token — 8.4% of the token, 18.6 MiB a token |
-| On the card | 18.45 GiB allocated, 2.42 GiB free |
-| The four ranks' last row | byte-identical, `0.0` between rank 0 and every other |
-| The first tokens at that depth, by rank | the same three on all four |
+| | Replicated | **Split four ways** |
+| --- | ---: | ---: |
+| Prompt | 262,144 tokens, 128 calls of 2048 | the same prompt, the same 128 calls |
+| Wall | 5419.3 s | **2519.6 s** |
+| Rate | 48.37 tokens a second | **104.04 tokens a second** |
+| Attention, all 48 layers | 15.45 ms a token | **4.38 ms a token** |
+| FFN and staging | 5.19 ms a token | 5.20 ms a token |
+| Expert copy | 1.7 ms a token — 8.4% of the token, 18.6 MiB | 1.8 — 18.2% |
+| On the card | 18.71 GiB allocated, 2.04 GiB free | **10.21 GiB allocated** |
+| The four ranks' last row | byte-identical, `0.0` between rank 0 and every other | byte-identical, `0.0` |
+| The first tokens at that depth, by rank | the same three on all four | the same three |
 
-**The attention is the whole of the difference.** At 64k a token costs 5.1 ms of attention and
-5.3 of everything else; at 256k the attention is 15.1 against the same 5.4, and the copy's share
-falls from 17% to 8% not because the copy got cheaper but because the token got three times more
-expensive. That is the shape of the requirement: a global layer's decode reads 256k keys and a
-global layer's prefill attends to everything below it, so the cost of a token at depth `p` is
-linear in `p` and no arrangement of the experts changes it. What a longer context costs here is
-attention, and what would move it is a kernel — a flash-style pass that does not materialise the
-score tile, or tensor cores in a dtype the parity tests still accept — and not another rank. It is
-also the one number the tile budget moved in the *good* direction without changing the work: the
-same prompt under the narrower 2²³ step cost 19.4 ms of attention a token and 6446.8 s of wall,
-and the 2²⁶ default is 15.1 and 5424.9 s for the same arithmetic.
+**The attention was the whole of the difference, and a rank is now the whole of the fix.** At 64k a
+token costs 5.1 ms of attention and 5.3 of everything else; at 256k the attention is 15.45 against
+the same 5.19, and the copy's share falls from 17% to 8% not because the copy got cheaper but
+because the token got three times more expensive. That is the shape of the requirement: a global
+layer's decode reads 256k keys and a global layer's prefill attends to everything below it, so the
+cost of a token at depth `p` is linear in `p` and no arrangement of the experts changes it. What a
+longer context costs here is attention, and this paragraph used to conclude "what would move it is a
+kernel — a flash-style pass that does not materialise the score tile, or tensor cores in a dtype the
+parity tests still accept — and not another rank." **A rank moved it**: the attention column is
+15.45 → 4.38, the wall is 2.15× shorter and the rate is past the hundred a second this was written
+against, because the four ranks were each computing all sixty-four query heads over the same quarter
+of a million keys and now each computes a quarter of them from the checkpoint's own partition. The
+second half of that sentence still stands on its own: the tile budget moved the same number in the
+*good* direction without changing the work — the same prompt under the narrower 2²³ step cost 19.4 ms
+of attention a token and 6446.8 s of wall, and the 2²⁶ default is 15.45 and 5419.3 s for the same
+arithmetic. And the split leaves the kernel where it was: 4.38 ms of the 9.6 a token is still a
+score tile materialised in torch, and a `swa` layer's is a 128-key ring that costs the same at every
+depth, which is a kernel's job and not a rank's.
 
-**And a decode token at 256k is 448 ms.** Two steps at that depth, timed: 447.9 ms a token —
-2.23 tokens a second — of which the attention is 190.7 to 209.1 ms and the FFN and staging 231.5
-to 250.2, with the same 18.47 GiB on the card. For contrast, the same step at eight tokens of
-context is 177.6 ms with 139.6 of it outside the routed path; at 256k the attention has grown from
-"whatever a short prefix costs" to a fifth of a second because nine global layers each read a
-quarter of a million keys. **The expert path grows too**, and that is the less obvious half: a
-token draws the same 47 × 8 experts whatever the context, so the bytes are the same 1198 MiB a
-rank — but the path is a lockstep rather than a copy, four ranks whose bytes are equal and whose
-times are not, so what a deeper context adds to it is the waiting rather than the traffic. A
-client at 256k should expect two tokens a second after a first token that costs the
-prompt.
+**And a decode token at 256k.** Two steps at that depth, timed at the end of each of those runs:
+**399.2 ms a token replicated — 2.50 tokens a second — against 281.2 ms and 3.56 split**, of which
+the attention is **161.8 to 163.3 ms replicated and 48.2 split** and the FFN and staging 228.2 to
+230.3 against 226.0, with 18.48 GiB on the card against **10.21**. The same replicated pair read
+447.9 ms and 2.23 tokens a second on an earlier afternoon, which is the size of the drift this box
+has between runs; the two arms here are ten minutes apart and read 399.2 and 281.2. The FFN column
+is the number to look at now: it does not move under the split, and it is 226 ms of the 281. For
+contrast, the same step at eight tokens of context is 177.6 ms with 139.6 of it outside the routed
+path. **The expert path is what grows next**, and that is the less obvious half: a token draws the
+same 47 × 8 experts whatever the context, so the bytes are the same 1198 MiB a rank — but the path
+is a lockstep rather than a copy, four ranks whose bytes are equal and whose times are not, so what
+a deeper context adds to it is the waiting rather than the traffic. A client at 256k should expect
+three and a half tokens a second after a first token that costs the prompt.
 
 ## The round trips a decode token pays
 
@@ -810,6 +827,176 @@ The remaining 117 launches a layer are not free and are not addressed. What they
 stage, and what it takes is fewer, larger kernels rather than fewer round trips.
 
 
+## The attention split over the ranks
+
+The experts were the first thing the four ranks divided; the attention was not divided at all. Every
+rank computed all sixty-four query heads over the same quarter of a million keys, four times over, and
+at 256k that replication is **15.45 ms of every prefill token and most of a decode step**. This stage
+divides it, along the checkpoint's own partition: the prompt at that depth goes from **48.37 to
+104.04 tokens a second**, and a decode step from **323.8 to 205.6 ms**.
+
+**The partition is the checkpoint's and not this repository's.** `quant.QKV_SHARDS` is four, and it is a
+fact about the released file: the fused `qkv_proj` is stored as four groups of `[q | k | v]` with the
+FP8 block scale blocked *inside each share*, and `fused_qkv_row_order` refuses any other reading. Group
+`g` holds query heads `[16g, 16g + 16)` together with the key heads those query heads attend to — one
+for a global layer, which is 64 query heads over 4, and two for a windowed one, which is 64 over 8. So a
+rank of four takes one contiguous quarter of the projection's rows, and the query, key and value heads
+that go with it follow from the geometry rather than from a choice: `num_key_value_groups` is unchanged
+at both families, which is the whole reason a share is the same arithmetic on fewer heads and not a
+different attention. Nothing is remapped and nothing has to be agreed — the weights were already on the
+card in this shape before this stage existed.
+
+**The join is a gather and not a reduce, and that is an exactness argument.** `o_proj` reads all of
+`o_in` at once, so the four shares' `pre_o` have to be back in one tensor before it runs: the answer is
+the *concatenation* of the quarters, each rank's own heads in their own columns. The other way was
+measured on a released layer at 32768 keys — each rank running its own quarter of `o_proj` and the four
+partials added in fp32, which is how the routed experts' split is joined — and it lands **2.9e-3 to
+7.5e-3 of the attention output's own peak** away from the whole path, because each partial is rounded to
+bfloat16 before it is summed and the answer therefore rounds four times where the whole path rounds
+once. The concatenation is `0.00e+00`. It costs nothing to prefer, either: a `[1, 8192]` bfloat16
+gather and a `[1, 4096]` float32 reduction are the same sixteen kilobytes a token.
+
+**`all_gather_into_tensor` joins along the first axis; the attention wants the last.** That is the trap
+this stage turned on. The primitive takes a buffer of `world · rows` rows and hands rank `r` the rows
+`[r · rows, (r + 1) · rows)`, so a caller that allocates the `[rows, world · width]` it wants — the
+obvious thing to write — gets a **silent scramble** for any `rows` over one: every piece present, each
+in the wrong place, the same size, made of the same numbers, no error and no shape mismatch. It is
+*exact* at `rows == 1`, where the flat layout happens to be the concatenation, and `rows == 1` is every
+decode step, which is the worst possible failure mode for this bug. The first version of this stage
+passed its decode comparison and its token comparison and was wrong: layer 0 on a 512-row chunk
+differed by 1.9e-01, and the search for it ruled out the share's weight read, the q/k/v cut, the
+probabilities and the per-key-head matmuls — each exact to 1e-07 — before the collective's own layout
+was the answer. `make_all_gather` transposes, and `test_the_join_writes_each_rank_down_its_own_columns`
+fakes the collective to ask which columns each rank's piece came out in: a question answerable without a
+fabric or a second card, and the one the real primitive cannot be asked.
+
+**Two geometries, and a caller has to be told which one it is asking about.** A share's `pre_o` is
+its own heads' output and the join turns it into the *layer's* width, so a module that keeps one
+`shape` has to pick which lie to tell: a caller that asks what the layer produces once the pieces are
+joined wants 4096 columns and a caller that asks what this rank holds wants 1024. `full_shape` is the
+layer's, `shape` is the share's, and `MimoV2KVCache.shape(layer)` answers with whichever one the cache
+was built to hold — which is not bookkeeping. `append` checks the key heads it is handed against its
+own, so a filler that read the layer's geometry while filling a rank's share is refused at the first
+token, which is the good outcome and is how the cache's own accessor came to exist.
+
+**The budgets are divided too, and that is a choice with a price.** A share's single-pass test is
+`heads · queries · keys` and its tile is `kv_heads · groups · rows · block`; a share's heads are a
+quarter of the layer's and its `num_key_value_groups` is not, so both quantities are a quarter of the
+whole's at a share of four. Dividing `budget` and `DEFAULT_TILE_SCORES` by `shards` therefore makes a
+share step through *the same number of steps* the whole layer does, at a quarter of the width each —
+which is what the four-rank chunk path's `0.00e+00` rests on, because the block loop's step size is the
+order its float32 accumulates in. It is not the fastest arrangement: an undivided budget would let a
+share take rows four times further a step and so pay a quarter of the launches for the same work. What
+it would not do is agree with the whole path bit for bit, and a split is worth less without that than
+with it.
+
+**The one arithmetic that is not bit-exact is a windowed layer's decode step.** Below `FOLD_KEYS` keys
+the attention takes its folded path, which batches the head loop, and cuBLAS tiles that gemm by the
+batch size it is handed: a share has two key heads where the layer has eight, so the same arithmetic
+comes out one float32 ULP apart — **1.19e-07 of a 5.10e-01 peak** in `pre_o`, the last bit of a bfloat16
+after the projection. A global layer past `FOLD_KEYS` keys, and any chunk of queries in either family,
+are exact. That is why the probe's tolerance is half a bfloat16 ULP and no looser, and why the token
+probe exists beside it: a token stream is the coarsest observable there is, so a stream that agrees says
+little, and `probe_mimo_v2_split_tokens.py` prints the top-2 logit margin beside it so that the
+agreement has a size. On the release at 8192 tokens of context, with the split and without, on a real
+prompt and on a drawn one: the same prefill logits to the last digit (`|sum|` 4.740900e+05, peak
+2.903074e+01, margin 1.025631e+01, argmax 8374) and the same greedy stream.
+
+**What it is worth, layer by layer.** `tests/probe_mimo_v2_attention_split.py --layers 0 1`, one card,
+the whole attention against one share of it, one cache and one hidden state a row, six timed rounds
+after an untimed one:
+
+| Layer | Family | Rows | Keys | Whole ms | Share ms | Gain |
+| ---: | :---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | global | 1 | 1024 | 2.437 | 1.400 | 1.74× |
+| 0 | global | 1 | 32768 | 2.478 | 1.416 | 1.75× |
+| 0 | global | 1 | 262144 | 15.660 | 3.367 | **4.65×** |
+| 0 | global | 512 | 262144 | 1595.934 | 394.924 | **4.04×** |
+| 1 | windowed | 1 | 32768 | 1.582 | 1.551 | 1.02× |
+| 1 | windowed | 512 | 262144 | 14.539 | 3.946 | **3.68×** |
+
+A share's arithmetic is a quarter of the layer's and its wall is not: 1.74× and not 4× at a short
+prefix, because a call has a floor that does not divide. The deep rows are where the split pays, and the
+reason is the same fact as everywhere else in this document — a global layer's cost is linear in the
+keys it reads, so at 262144 a share is doing a quarter of a great deal and the floor is lost in it. The
+windowed row is the other half of the story. **A windowed layer's decode step gains nothing at all** —
+1.02×, and that is not a defect: its ring cache is 128 slots however deep the context is, so there is
+nothing there to divide. Its *chunk* path gains the full 3.68×, and a chunk path is what a prefill
+spends.
+
+**And the step, which is what decode is.** `tests/probe_mimo_v2_decode_host.py`, four ranks, four
+processes an arm in an A-B-A-B order — whole, split, whole, split — so that a drift across the quarter
+hour shows up as the two arms of one configuration disagreeing rather than as a gap. Every figure is
+one process's own reading, six timed steps after two warm-up steps:
+
+| Depth | Split | Arm 1 | Arm 2 | tok/s | Cache |
+| ---: | :---: | ---: | ---: | ---: | ---: |
+| 32768 | off | 227.9 ms | 224.5 ms | 4.39 / 4.45 | 0.74 GiB |
+| 32768 | **on** | **177.3 ms** | **176.6 ms** | **5.64 / 5.66** | **0.18 GiB** |
+| 262144 | off | 306.0 ms | 341.5 ms | 3.27 / 2.93 | 5.66 GiB |
+| 262144 | **on** | **202.0 ms** | **209.2 ms** | **4.95 / 4.78** | **1.41 GiB** |
+
+**The arms do not overlap at either depth.** At 32768 the two whole arms are 227.9 and 224.5 and the
+two split arms 177.3 and 176.6: a **49 ms gap against a 3.4 ms spread**, 226.2 against 177.0 and 1.28×
+the tokens. At 262144 the whole pair disagrees with itself by 35.5 ms — this box carries other work —
+and the split pair by 7.2, and arm against arm the gap is 104 and 132 ms. That gap is what the layer
+table above predicts: nine global layers × (15.660 − 3.367) = **110.6 ms**, so the in-process layer
+measurement and the two-process step measurement agree, which is the reason both were taken. A step at
+262144 is therefore **205.6 ms against a mean 323.8, 1.58× the tokens**, and the earlier two-process
+pair — one whole arm at 305.6 against one split arm at 232.0 — reads the same direction with a smaller
+gap, which is what a single A-B across two processes is worth on this box.
+
+**And the prompt, which was the half that was short.** The same question asked the way the requirement
+asks it: `tests/bench_mimo_v2_prefill.py --tokens 262144 --chunk 2048 --band 16`, four ranks, the
+attention replicated in one arm and divided in the other, run back to back on the same cards.
+
+| 262,144 tokens through a 2048-token chunk | Replicated | **Split four ways** |
+| --- | ---: | ---: |
+| Wall | 5419.3 s | **2519.6 s** |
+| Rate | 48.37 tok/s | **104.04 tok/s** |
+| Attention, all 48 layers | 15.45 ms a token | **4.38 ms a token** |
+| FFN and staging | 5.19 ms a token | 5.20 ms a token |
+| Expert copy | 1.7 ms a token — 8.4% of the token | 1.8 — 18.2% |
+| On the card | 18.71 GiB allocated, 2.04 GiB free | **10.21 GiB allocated** |
+| The four ranks' last row | byte-identical, `0.0` between rank 0 and every other | byte-identical, `0.0` |
+| The first tokens at that depth | `[8374, 4021, 95012]` on all four | the same three |
+
+**2.15×, and the attention column is 3.5× of it.** The two arms are the same prompt, the same weights,
+the same deal and the same 128 chunks, and their last rows are byte-identical to each other as well as
+to their own ranks — so what the table measures is the split. What it also shows is the ceiling: the
+copy's *share* of a token more than doubles, 8.4% to 18.2%, without the copy getting any more expensive
+— a token is 2.15× shorter and its bytes are the same 18.6 MiB — and the FFN and staging column does
+not move at all. The split is not a licence to keep splitting: at a 2048-token chunk the attention was
+15.45 ms of a 20.7 ms token and is now 4.38 of a 9.6 ms one, so the term it fixed is no longer the
+term that is left. And it is the goal's own number: the bar this page was written against is a 256k
+prefill above a hundred tokens a second, **48.37 does not reach it and 104.04 does**.
+
+The same two runs finish with a two-step decode at that depth, and those are the numbers a client
+feels: **399.2 ms a token replicated against 281.2 split — 2.50 against 3.56 tokens a second** — with
+the attention 161.8 to 163.3 ms replicated against 48.2 and the FFN and staging 228.2 to 230.3 against
+226.0. The same step in the probe above reads 323.8 and 205.6, and the two are two configurations
+rather than a disagreement: the served run keeps both arenas and carries the state a real prefill left
+behind, and this page records both instead of picking one. Whichever is read, the column that did not
+move is the FFN and staging one, and it is the larger of the two terms now.
+
+**And the cache goes with it, for free.** A rank that attends over a quarter of the key heads has to
+keep a quarter of them, so the same split that buys the step also divides the KV cache: **5.66 GiB of
+global layers at 262144 positions become 1.41**, and 0.74 becomes 0.18 at 32768 — a quarter, exactly,
+and the only thing in this document that reduces what a 256k context costs on the card. End to end at
+256k that is **18.71 GiB allocated against 10.21**, which is the largest single thing the split gives
+away for nothing, and it is not a trade: the bytes the attention reads *are* the bytes a rank has to
+keep, so the two requirements pull the same way.
+
+**The knob and the control.** `attention_shards(world)` answers four at a world of four and one
+anywhere else, because four is the count the weights admit and a world of two or three has no such
+partition — those runs keep the whole attention on every rank and deal the experts as before, which is
+correct and slower rather than wrong. `POCKETLLM_MIMO_ATTENTION_SHARDS=1` holds it back to one, which is
+the A/B's control arm and is what this model did before the stage existed. A group that was handed no
+way to join the pieces does not cut them either: `EpGroup.attention_shards` reads the `gather` it was
+built with, so a caller that injects its own collectives — or its own arithmetic in place of them, which
+is how the single-card tests check the deal — keeps a whole attention rather than a rank asking for the
+fourth quarter of a tensor nobody divided.
+
 ## A served endpoint
 
 `pocketllm/backends/mimo_backend.py` is the adapter: an OpenAI-compatible server over these four
@@ -861,6 +1048,13 @@ needs the experts partitioned and a decode step is 21% faster when the drawings 
 rank. The pair costs 51 MiB of a card that has 2.4 GiB free at 256k, and the dispatch between
 them is the row count of the call.
 
+`mimo_kv_cache_bytes` is the other one: 6,065,356,800 is the whole 5.65 GiB a 262144-token cache
+takes when every rank holds all of it, and the served path is what the attention split changes
+without being asked — `EpGroup.from_env()` answers four at a world of four, so a served run at
+that width holds **a quarter of the key heads a rank** and reports a quarter of those bytes,
+1.41 GiB. The knob that holds it back is `POCKETLLM_MIMO_ATTENTION_SHARDS=1`, and there is no
+reason to set it on this machine.
+
 
 
 ## Validated performance
@@ -888,7 +1082,9 @@ A windowed layer's decode step does not grow with the context at all, which is t
 ring; a global layer's grows with it and is close to the bandwidth a token's keys
 cost. Summed over the model with the measured per-layer numbers, one token's attention
 is **100 ms at 4k context and 122 ms at 64k** — against 64 ms measured for the whole
-48-layer stack at a short context, which is the same sum and a shorter prefix.
+48-layer stack at a short context, which is the same sum and a shorter prefix. Both sums
+are of the *replicated* path, and both are what the attention split below divides four ways
+at the deep end: the same sum at 262144 keys is 202.7 ms whole against 90.8 ms split.
 
 The token's other 580 ms is the copy, and the copy is a per-token quantity because
 the routed path is a draw a token. Sharding the experts across four ranks was the one
@@ -902,10 +1098,22 @@ would divide its 65-88 ms by four and add a collective a layer to do it, and at 
 collective the trade is upside down. The attention's next step is a kernel, not a split —
 the same conclusion the dense stack reached on one rank, for a different reason.
 
+**Read that paragraph against the attention-split section below, because the split was
+taken and it paid.** The arithmetic was wrong in one term: 1.6 ms is what a *routed*
+layer's all-reduce costs, where the message is 16 KiB and the four ranks are waiting on
+each other's experts, and an attention join is the same 16 KiB with nothing waiting behind
+it — measured on its own the message is **78.7 µs**, and the split is worth 4.04× on a
+262144-key chunk and 4.65× on a decode step. If anything should have been revised at the
+time it was the phrase *65-88 ms*: at 262144 keys the attention is 202.7 ms over the whole
+stack, and a quarter of it is worth far more than a collective.
+
 What *is* left in the 275 ms, per routed layer, is the copy (2.4 ms, at the link's
-ceiling), the attention (1.5 ms, replicated four times over) and the router (0.5 ms): the
-two things worth their own stage are the attention kernel and the 10% the lockstep takes
-back. Prefill is where the second half of the target lives and it is untouched.
+ceiling), the attention (1.5 ms) and the router (0.5 ms): the thing worth its own stage is
+the attention kernel, and the split makes that sharper rather than blunter. A windowed
+layer's decode step is 1.551 ms over a 128-slot ring and stays 1.551 after the split,
+because that cost is launches and dispatch and not heads — and it is thirty-nine of the
+forty-eight layers. Prefill was where the second half of the target lived, and the split is
+what met it: 104.04 tokens a second at 262144.
 
 Prefill is the other shape, and it was the second half of the target. Before the stage was run,
 the arithmetic in this paragraph said a chunk's traffic is "about 153 GiB for the whole layer
@@ -1000,6 +1208,18 @@ the collective: `make_all_reduce` is a closure around `dist.all_reduce` with not
 it to get wrong, and whether four *processes* agree is what the multi-rank run's
 byte-for-byte logit comparison answers.
 
+**The split, against the attention it splits.** Two tests, and they are the two ways a split
+attention can be wrong. `test_the_four_shares_are_the_whole_attention` runs the four shares over
+their own key heads, joins them, and holds the result to the whole layer's — one float32 ULP for a
+windowed layer's folded decode step, exact for a chunk — and then asserts that a *permutation* of the
+pieces is not the answer, so it cannot pass on symmetry. And
+`test_the_join_writes_each_rank_down_its_own_columns` fakes `all_gather_into_tensor` to ask which
+columns each rank's piece came out in, because the real one joins along the first axis where the
+attention wants the last and a caller that allocates the shape it wants is silently scrambled for
+every `rows` over one. `probe_mimo_v2_attention_split.py` then asks the same question of the real
+four-rank collective and the released weights, and `probe_mimo_v2_split_tokens.py` asks it of a token
+stream: the same greedy tokens, with the split and without, on a real prompt and on a drawn one.
+
 **A chunk against the same rows one at a time.** `tests/test_models_mimo_v2_prefill.py` is
 seventeen tests over the prefill, and the one that matters is the layout's: a chunk of six
 rows through the grouped kernel against six single-token calls, on the same arena source,
@@ -1052,7 +1272,9 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8 --deal id
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
     --tokens 4096 --chunk 256,512,1024,2048,4096 --floor 16 --band 0
 
-# 256k, four ranks, a 2048-token chunk: 1 h 47 m of prefill after a five-minute build
+# 256k, four ranks, a 2048-token chunk: 1 h 47 m of prefill after a five-minute build,
+# or 42 minutes with the attention split. `POCKETLLM_MIMO_ATTENTION_SHARDS=1` is the control
+# arm, and the two together are the A/B the 256k section is made of.
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
     --tokens 262144 --chunk 2048 --band 16 --floor 0 --decode 2
 
@@ -1064,6 +1286,22 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 # what a four-rank decode step is made of, without a profiler in the way, and with one
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_arms.py --steps 8 --prompt 8
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt 8
+
+# the step's cost at a depth, without the prompt that reaches it: `--depth` fills the cache
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_host.py --depth 262144
+
+# the attention split against the whole attention, bit for bit: one card joins its own
+# shares with `torch.cat`, four ranks go through the real all-gather
+python tests/probe_mimo_v2_attention_split.py
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_attention_split.py --rows 1,512
+
+# no token moves: the same greedy stream with the split and without, from two processes
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_split_tokens.py --depth 8192 --tokens 16 \
+    --random-prompt --out /tmp/tokens_split.txt
+POCKETLLM_MIMO_ATTENTION_SHARDS=1 torchrun --nproc_per_node=4 \
+    tests/probe_mimo_v2_split_tokens.py --depth 8192 --tokens 16 --random-prompt \
+    --out /tmp/tokens_whole.txt
+diff /tmp/tokens_split.txt /tmp/tokens_whole.txt
 
 # the served endpoint: chat, completions, streaming, cancel and metrics on four ranks
 pocketllm serve --backend mimo --model /mnt/data3/MiMo-V2.6-Flash-RL \
@@ -1111,32 +1349,44 @@ golden holds and how it was captured.
   hours where 2048 finished in under two. A fixed step does not explain that on its own — a wider
   chunk pays more of the attention, which at 256k is 15.1 ms of every token — and the honest
   statement is that the width was swept at 64k and at a 32k prompt against a 256k cache, and not at
-  256k depth itself. Sweep `--chunk` per context; the served configuration is 2048.
+  256k depth itself. Sweep `--chunk` per context; the served configuration is 2048. **Every one of
+  those widths was measured with the attention replicated**, and the split below makes the attention
+  3.5× cheaper a token, so the 256k width is worth sweeping again before the 2048 default is trusted.
 - **A prefill and a decode want different deals, and the deal is per module.** A chunk needs
   the experts partitioned (`id`) and a decode step is 21% faster when the *drawings* are
   (`sorted`, the default). A serving run keeps **both arenas** — 51 MiB for the decode deal and
   408 MiB for the chunk deal at a band of 16 — and dispatches on the row count of the call, which
   is two stores of a rank's share where one would do and 51 MiB of a card that has 2.4 GiB free at
   256k. The alternative is one deal and a lost 21% on decode or no prefill at all.
-- **No tensor parallelism, no batching, and the attention is replicated.** The experts
-  are divided over four ranks and everything else is not: the router, the attention, the
-  embedding, the head and the dense layer each run four times over. The checkpoint's fused
-  projection is stored in four shards, so a rank that did not de-interleave would read a
-  quarter of every head. Measured, splitting the attention is now the wrong trade — a
-  collective a layer costs 1.6 ms against the 0.4 ms a quarter of the attention's reads
-  would save — so what is missing there is a kernel, not a rank.
+- **The attention is split and nothing else is.** The experts are dealt over four ranks and the
+  attention is divided along the checkpoint's own four-way `qkv_proj` partition, joined by an
+  exact all-gather. What is left replicated is the router, the embedding, the head and the dense
+  linears — and the last of those is 250 MiB of weights read off the card a token, against a
+  collective a layer to divide it, which is why nobody has paid for one. A world that is not four
+  keeps the whole attention on every rank, because four is the count the weights admit; a world
+  that is four and wants the control arm sets `POCKETLLM_MIMO_ATTENTION_SHARDS=1`.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
   one at a time and the second blocks on a lock.
 - **The attention and the dense linears are torch, not kernels.** They are baselines
-  with the shapes the kernels have to beat: 62.2 ms a token for all 48 layers on four
-  ranks at 64k and 190.7 to 209.1 ms at 256k, and the single-pass decode path loses a factor of
-  twenty-eight to a batch dimension of one until the key count passes a window.
-- **256k runs, and it is slow.** A 262144-token prompt goes through at 48.32 tokens a second and
-  a decode step at that depth is 448 ms. Nothing in the path is per-context — the attention's
-  bounds are derived from a position rather than from a mask — but the attention's cost *is*
-  linear in the context, and at 256k it is 15.1 ms of a prefill token and 200 ms of a decode
-  one. That is where the next kernel goes.
+  with the shapes the kernels have to beat, and the split moved the baseline without moving the
+  conclusion: the attention is 202.7 ms a token for all 48 layers on four ranks at 262144 keys
+  replicated and 90.8 ms split — nine global layers at 15.660 and 3.367, thirty-nine windowed ones
+  at 1.582 and 1.551, the layer sums this page measures. The windowed pair is the one to look at:
+  a 128-slot ring costs the same whatever the context is, so a *chunk* of it gains 3.68× from the
+  split and a *decode step* gains nothing at all, and thirty-nine of the forty-eight layers are
+  that shape. What is left there is launches and dispatch — the single-pass decode path loses a
+  factor of twenty-eight to a batch dimension of one until the key count passes a window — and a
+  kernel is the only thing that reaches it.
+- **256k runs, and the decode at that depth is still short of the target.** A 262144-token prompt
+  goes through at **104.04 tokens a second**, which is past the hundred this page was written
+  against, and a decode step at that depth is **281.2 ms in the served configuration — 3.56 tokens a
+  second — against 399.2 replicated**, or 205.6 against 323.8 in the step probe. Five a second is
+  the number this was aiming at and neither arm reaches it. What is left is not the attention, which
+  the split took from 162 to 48 ms a token, and not the copy, whose bytes are already the draw's
+  minimum: it is the FFN and staging column, 226 ms of the 281, and the host's own per-layer work
+  inside it — 117 launches a layer, the same at eight tokens of context as at a quarter of a
+  million. That is the next stage, and it is a kernel rather than a rank.
 - **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
   tokens, with no temperature, top-p or repetition penalty. The checkpoint's
   `generation_config.json` says `do_sample: false`, so this is its own default — but a
@@ -1184,6 +1434,13 @@ golden holds and how it was captured.
   from the 139.6 the rest of a layer does. It is deliberately the only arm: an arm that also
   zeroed the attention was tried and removed, because the residual stream then stops moving,
   every layer routes on the same row, and the subtraction is between two different models.
+- `tests/probe_mimo_v2_attention_split.py` — the attention split against the whole attention
+  bit for bit, one card and four ranks: a share's projection rows, the joined output, and the
+  per-layer whole-against-share timings the split's table is made of. It is also where the one
+  inexact row is nailed down to a batched `cuBLAS` tiling and not to the split.
+- `tests/probe_mimo_v2_split_tokens.py` — the token stream, real prompt and drawn prompt, with
+  the split and without, printing the top-2 logit margin beside the tokens because a stream that
+  agrees says very little on its own.
 - `tests/probe_mimo_v2_decode_ops.py`, `tests/probe_mimo_v2_decode_phases.py`,
   `tests/probe_mimo_v2_decode_timeline.py` — the profiler's own tables, the per-phase split, and
   the busy union of the device's intervals. The ops probe's first table is the one that found the
