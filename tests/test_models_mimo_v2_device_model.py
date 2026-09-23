@@ -413,10 +413,17 @@ def test_the_routed_stack_agrees_with_the_reference_within_its_quantization():
 
 
 @needs_cuda
-def test_a_chunk_through_a_routed_layer_is_refused_rather_than_answered_one_token_at_a_time():
+def test_a_chunk_through_a_layer_without_a_band_is_refused_rather_than_squeezed_into_a_draw():
+    """A chunk is a real path now, and the arena it needs is not the one a draw uses.
+
+    The model does not refuse a chunk: `prefill` is what serves one, and `mlp` sends a multi-row
+    call to `forward_chunk`. What refuses is the experts module, when it was built with an arena
+    one token's draw wide -- and it says which construction would hold the chunk rather than
+    answering it one row at a time, which is the behaviour this pins.
+    """
     config = tiny_config(routed=(0, 1))
     fixture = Fixture(config, source=SyntheticSource(), layers=[1])
-    with pytest.raises(ValueError, match="runs one token"):
+    with pytest.raises(ValueError, match="without a chunk band"):
         fixture.model.forward(torch.tensor([1, 2]), start_pos=0, cache=fixture.model.cache(8))
 
 

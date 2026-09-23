@@ -34,11 +34,15 @@ larger half. That is a stage's boundary and not a design: the dense stack is wha
 tensor-parallel stage is for, and until it lands the honest description of a four-rank
 decode is *the expert traffic, divided*.
 
-A decode step is the only step this file can run. The expert kernel is the single-token
-one, so a chunk of tokens has to go through the grouped-prefill kernel, which is not
-routed into yet -- a prefill here would draw every token's experts one at a time and
-cost a token per token. The cache is what makes the *decode* a stream rather than a
-re-run of the prefix.
+A step is one row and a prefill is a chunk, and the two are different paths through the
+same layers. The attention does not care: it takes `[sequence, hidden]`, reads the prefix
+out of the cache and bounds each row's keys by its position, so a chunk is one call with
+the rows attending to each other. The routed experts do care, and `mlp` dispatches on the
+row count -- one row is a draw of eight experts and the single-token kernel, many rows are
+many draws and `moe_multi_token_fp4_forward`, whose pairs are grouped by expert rather than
+by drawing. `prefill` is the chunked entry point; without a chunk band the experts module
+refuses a chunk instead of drawing every token's experts one at a time, which is correct and
+is not a prefill.
 """
 
 from __future__ import annotations
@@ -164,6 +168,14 @@ class MimoV2DeviceLayer:
         )[:2]
 
     def mlp(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The FFN of one row or of a chunk: dense, or a draw's experts, or a chunk's.
+
+        The routed path has two shapes and the row count is the whole of the choice. One row
+        is a decode step: one draw of `top_k`, an arena two rows wide and the single-token
+        kernel. More than one row is a chunk: every row's own draw, the arena holding this
+        rank's share of the layer's experts, and the grouped kernel. They are the same
+        arithmetic, so this is a dispatch and not a decision about results.
+        """
         if self.kind == "dense":
             return swiglu_mlp(
                 hidden,
@@ -172,13 +184,11 @@ class MimoV2DeviceLayer:
                 self.mlp_down_proj,
                 self.config.hidden_act,
             )
-        if hidden.shape[0] != 1:
-            raise ValueError(
-                f"the routed path runs one token: {hidden.shape[0]} rows would draw every "
-                f"token's experts one at a time, which is the grouped-prefill kernel's job"
-            )
         indices, weights = self.route(hidden)
-        out = self.experts.forward(hidden, indices[0], weights[0], layer_id=self.layer_idx)
+        if hidden.shape[0] == 1:
+            out = self.experts.forward(hidden, indices[0], weights[0], layer_id=self.layer_idx)
+        else:
+            out = self.experts.forward_chunk(hidden, indices, weights, layer_id=self.layer_idx)
         # The world's sum, from this rank's share: the kernel's output is a partial as soon as
         # the draw is dealt out, and the reference's own rounding point is here -- once, in
         # float32, before the residual. `EpGroup` refuses to exist without a way to sum.
@@ -223,6 +233,13 @@ class MimoV2DeviceModel:
     defaults to the environment's, `ep.py`'s `POCKETLLM_MIMO_EXPERT_DEAL`; it is a parameter
     as well as a variable so a test can hold still what a process-wide variable would make
     depend on the order tests ran in.
+
+    `chunk_rows` is the prefill: without it this model is a decode model, and a prompt is fed
+    through `greedy` one token at a time. With it, `prefill` runs a chunk of tokens through
+    the grouped expert kernel, and the width of the arena is that many of this rank's share of
+    the experts. The two paths want different deals -- a chunk needs the experts partitioned,
+    which is `id` -- so a model that is asked to prefill and built with `sorted` at a world
+    over one is refused by the experts module rather than served slowly.
     """
 
     def __init__(
@@ -239,6 +256,7 @@ class MimoV2DeviceModel:
         block: int = 1024,
         budget: int = 1 << 25,
         pin: bool | None = None,
+        chunk_rows: int | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.config: MimoV2TextConfig = checkpoint.layer
@@ -291,6 +309,8 @@ class MimoV2DeviceModel:
                 world=1 if ep is None else ep.world,
                 rank=0 if ep is None else ep.rank,
                 deal=deal,
+                n_experts=self.config.n_routed_experts,
+                chunk_rows=chunk_rows,
             )
         self.layers = [
             MimoV2DeviceLayer(
@@ -369,6 +389,44 @@ class MimoV2DeviceModel:
         )
 
     @torch.no_grad()
+    def prefill(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        cache: MimoV2KVCache | None = None,
+        chunk: int = 512,
+    ) -> torch.Tensor:
+        """A prompt through the chunked path: `[vocab]` logits for its last row.
+
+        The prompt is one sequence and the cache is the prefix, so this is `forward` in
+        chunks rather than a second implementation of it -- but it is `forward` in chunks
+        for a reason that is not performance: one call over a whole prompt builds
+        `[sequence, vocab]` of logits, which is 61 GB at 256k on a card that has 22, so a
+        caller cannot ask for a long prompt's logits and get them. The rows of a chunk
+        attend to each other and to the prefix the cache holds, and only the last chunk's
+        last row leaves.
+
+        `chunk` is the caller's because it trades host work for memory and nothing else: the
+        bytes a chunk moves are the experts a chunk draws, so a chunk wide enough to draw
+        most of the layer's experts is amortising the *per-call* work of the layer and not
+        the copy, and a chunk too wide for the arena is banded rather than refused. The
+        arithmetic is the same at every width.
+        """
+        ids = [int(token) for token in prompt_ids]
+        if not ids:
+            raise ValueError("a prompt with no tokens has no logits to start from")
+        if chunk <= 0:
+            raise ValueError(f"a chunk of {chunk} tokens is not a chunk")
+        cache = cache if cache is not None else self.cache(len(ids) + 8)
+        logits = None
+        for start in range(0, len(ids), chunk):
+            piece = torch.tensor(ids[start : start + chunk], dtype=torch.int64)
+            logits = self.forward(piece, start_pos=start, cache=cache)
+        if self.experts is not None:
+            self.experts.drain()
+        return logits[-1]
+
+    @torch.no_grad()
     def greedy(
         self,
         prompt_ids: Sequence[int],
@@ -378,8 +436,10 @@ class MimoV2DeviceModel:
     ) -> list[int]:
         """Decode `max_tokens` tokens greedily, one at a time, through the cache.
 
-        One at a time is the only shape this path has: the prompt goes through the expert
-        kernel a token at a time too, which is correct and is not a prefill.
+        One at a time is this loop's shape: the prompt goes through the expert kernel a token
+        at a time too, because `greedy` is the reference-shaped path and a token a time is
+        what its arithmetic is. A caller that wants the prompt chunked wants `prefill`, which
+        is the same layers over a chunk and is what a serving loop runs.
 
         The loop stops at the config's own end-of-turn tokens, and it returns the one it
         stopped on. Turning a finished turn back into the model produces a continuation of

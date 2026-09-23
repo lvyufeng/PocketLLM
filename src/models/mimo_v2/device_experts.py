@@ -53,6 +53,25 @@ That split is deliberate. A module that returned the summed answer would have to
 group, and a caller that handed it the wrong group would get a plausible tensor with a quarter of
 the arithmetic in it. A module that returns a summand cannot: the sum is the model's, and it is
 taken in fp32 before the residual is rounded, once, where the reference rounds it once.
+
+A chunk is the other shape of the same question
+-----------------------------------------------
+
+`forward` is one token: a draw of `top_k` experts, an arena `ceil(top_k / world)` rows wide, and a
+kernel whose arithmetic is a per-row activation quantisation. `forward_chunk` is a chunk of tokens,
+and it is a different question in one respect that matters -- a chunk's drawings name nearly every
+expert the layer has, so what is selected is no longer "which positions of this draw" but "which
+experts of the quarter this rank owns", and the layout the kernel wants is pairs grouped by expert
+rather than one row a drawing. That is what `moe_multi_token_fp4_forward` is for, and the arithmetic
+of the two is the same arithmetic on the same arena bytes -- not bit for bit, because the grouped
+kernel tiles K in two stages of shared memory where the single-token one tiles it in one, so it costs
+about 1e-7 of the answer's own peak and not zero. It is a regrouping and not a second answer.
+
+So this file has two entry points and they are not interchangeable. A chunk under a deal that
+partitions draws rather than experts would stage every expert on every rank, and a single token
+under a chunk-sized arena would allocate 816 MiB a slot to read two experts out of it. The deal is
+`ep.py`'s to define and the caller's to choose; `forward_chunk` refuses the one that would work and
+be pointless, and the module's docstrings say which configuration is which.
 """
 
 from __future__ import annotations
@@ -62,7 +81,7 @@ from typing import Protocol, Sequence
 import torch
 
 from src.kernels.cuda_loader import load_cuda_kernel
-from src.models.mimo_v2.ep import deal_rule, owned_positions, rows_per_card
+from src.models.mimo_v2.ep import deal_rule, owned_experts, owned_positions, rows_per_card
 
 __all__ = [
     "MimoV2DeviceExperts",
@@ -130,6 +149,13 @@ class MimoV2DeviceExperts:
     computes. The width of the arena follows from the deal rather than from `top_k` -- a
     `sorted` deal over four ranks can only ever be handed two of a top-8 draw, and the
     rows that saves are rows of expert bytes. See `ep.py` for what the two deals cost.
+
+    `n_experts` and `chunk_rows` are the chunk path, and both are needed as soon as a
+    caller wants one: a chunk holds a *share* of the layer's experts rather than a draw,
+    which is a quarter of them at a world of four and all of them on one rank, and
+    `chunk_rows` is how many of that share one kernel call stages -- `0` for all of it in
+    one call, a smaller number for bands. Without them the arena is one draw wide and
+    `forward_chunk` says so rather than reading a chunk out of two rows.
     """
 
     def __init__(
@@ -146,6 +172,8 @@ class MimoV2DeviceExperts:
         world: int = 1,
         rank: int = 0,
         deal: str | None = None,
+        n_experts: int | None = None,
+        chunk_rows: int | None = None,
     ) -> None:
         self.source = source
         self.layer_id = None if layer_id is None else int(layer_id)
@@ -172,6 +200,52 @@ class MimoV2DeviceExperts:
                 f"an arena of {self.arena_rows} rows cannot hold the {required} experts a "
                 f"`{self.deal}` deal can hand rank {self.rank} of {self.world}"
             )
+        # The chunk path, when a caller asks for one. `chunk_rows` is how many of this rank's
+        # share one kernel call holds -- its band -- and `None` means the module is a decode
+        # module: the arena is then one token's draw wide and a chunk has nowhere to live.
+        # `0` is the whole share in one band, which is what a chunk-size bands' worth of rows
+        # buys and what the default serving configuration uses. See `forward_chunk`.
+        self.n_experts = None if n_experts is None else int(n_experts)
+        self.chunk_rows: int | None = None
+        self.n_local = 0
+        self._owned_rows: tuple[int, ...] | None = None
+        self._row_of_local: torch.Tensor | None = None
+        self._slot_ids: torch.Tensor | None = None
+        self.chunks = 0
+        if chunk_rows is not None:
+            if self.n_experts is None:
+                raise ValueError(
+                    "a chunk band holds a share of the experts, so the module has to be told "
+                    "how many the layer routes to: pass `n_experts`"
+                )
+            owned = owned_experts(
+                self.n_experts, rank=self.rank, world=self.world, deal=self.deal
+            )
+            if not owned:
+                raise ValueError(
+                    f"a world of {self.world} over {self.n_experts} experts leaves rank "
+                    f"{self.rank} nothing under the `{self.deal}` deal"
+                )
+            self._owned_rows = tuple(owned)
+            self.n_local = len(owned)
+            self.chunk_rows = self.n_local if int(chunk_rows) <= 0 else int(chunk_rows)
+            self.chunk_rows = min(self.chunk_rows, self.n_local)
+            self.arena_rows = max(self.arena_rows, self.chunk_rows)
+            with torch.cuda.device(self.device):
+                # The whole table once: which arena row holds an expert this rank owns, and a
+                # sentinel for the ones it does not. A chunk's routing is then one gather, and
+                # the sentinel needs no branch -- every unowned pair sorts to the end.
+                table = torch.full(
+                    (self.n_experts,), self.n_local, dtype=torch.int32, device=self.device
+                )
+                table[torch.tensor(owned, dtype=torch.int64, device=self.device)] = torch.arange(
+                    self.n_local, dtype=torch.int32, device=self.device
+                )
+                self._row_of_local = table
+                self._slot_ids = torch.arange(
+                    self.n_local + 1, dtype=torch.int32, device=self.device
+                )
+
         if self.dim % 32 or self.inter_dim % 32:
             raise ValueError(
                 f"the fp4 kernel needs dim and inter_dim divisible by 32, got {self.dim} and "
@@ -179,6 +253,15 @@ class MimoV2DeviceExperts:
             )
 
         self._kernel = load_cuda_kernel()
+        if self._kernel is None:
+            # `load_cuda_kernel` returns None both when nothing is built and when the build does
+            # not match this interpreter, and it swallows the reason. This path has no fallback
+            # -- the expert arithmetic *is* the extension -- so the failure has to be here and
+            # not an `AttributeError` on a `None` a hundred calls later.
+            raise RuntimeError(
+                "the `cuda_kernel` extension did not load: build it, or run under the "
+                "interpreter it was built for (`scripts/build_extensions.sh` names one)"
+            )
         self._arenas = [self._allocate() for _ in range(self.slots)]
         with torch.cuda.device(self.device):
             self._events = [torch.cuda.Event() for _ in range(self.slots)]
@@ -356,6 +439,153 @@ class MimoV2DeviceExperts:
         )
         self._events[slot].record(compute)
         self._pending[slot] = True
+        return out
+
+    # -- a chunk ----------------------------------------------------------------------------
+
+    def forward_chunk(
+        self,
+        hidden: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        *,
+        layer_id: int | None = None,
+    ) -> torch.Tensor:
+        """This rank's share of a chunk's routed output, `[rows, dim]`, in float32.
+
+        `indices` is `[rows, top_k]` int64 and `weights` `[rows, top_k]` float32, as
+        `gate_and_route` leaves a chunk of tokens, and every column of every row is one drawing.
+        The sibling `forward` takes one row and one drawing list; this takes a chunk, and the
+        difference is not the batch -- the kernel has always been batched -- but the *layout*.
+        A chunk's drawings name nearly every expert the layer routes to, so what this rank
+        computes is the subset of the chunk's pairs whose expert it owns, and the kernel wants
+        those pairs grouped by expert with one arena row a group.
+
+        **The layout.** The three tensors are built on the card, from `indices` alone:
+
+        * `_row_of_local`, one int32 an expert, maps a global id to the row that holds it, or to
+          the sentinel `len(owned)` for an expert this rank does not hold. One gather turns the
+          chunk's `[rows, top_k]` of ids into slots, and the sentinel needs no branch: a stable
+          sort by slot puts every unowned pair behind every owned one, so the pairs this call
+          computes are a prefix of the sorted order and their count is the last band bound.
+        * The pairs in that prefix, in slot order, are `slot_tokens` -- the row of the chunk
+          each belongs to -- and `pair_weights`, this rank's share of the pair's own routing
+          weight. Slot order and not encounter order, so that two runs of the same routing hand
+          the kernel the same layout; the sort is stable, so each slot's pairs arrive in the
+          order the chunk produced them.
+        * `slot_starts` is `searchsorted` of the sorted slots against `0..len(owned)`, which is
+          the counts' exclusive prefix sum in one op and no host round trip. It is deliberately
+          not `bincount`: `_bincount_cuda` bounds-checks with two blocking device-to-host reads,
+          and this is a drain the chunk path cannot afford. V4.1 replaced the same call for the
+          same reason.
+
+        **The bands.** One kernel call stages its whole working set in the arena and sums the
+        chunk's rows at once, so the arena has to be as wide as the experts one call holds --
+        `chunk_rows`. A rank that owns more than that is computed in bands of that width, one
+        call each, summed in `[rows, dim]` float32. The bands are slices of the one sorted pair
+        list, so a band costs no layout work: band `b` owns slots `[b*chunk_rows, (b+1)*chunk_rows)`
+        and its pairs are the contiguous run between those two prefix sums. A band whose experts
+        the chunk never drew is skipped, which is what makes a narrow band cheap at a small chunk
+        and why the width is a knob rather than a constant -- it trades arena bytes for call
+        count, and the calls of adjacent bands overlap the way the layers do, on the slots.
+
+        **One host read a call.** `slot_starts` lives on the card, but the band boundaries have to
+        become Python integers before the pairs can be sliced with them, so `starts` at the band
+        edges is gathered into one small tensor and read back once -- one synchronisation a layer,
+        and the ownership count comes out of the same read rather than a second one. That is the
+        decode path's own price, which pulls the whole draw across with `indices.tolist()` every
+        layer, and nothing else here touches the host: the staged experts are the rank's own
+        quarter, known at construction, and no routing id crosses the bus.
+
+        **A partial when the world is more than one**, exactly as `forward` is.
+        """
+        if self._row_of_local is None:
+            raise ValueError(
+                "this module was built without a chunk band (`chunk_rows`), so its arena is "
+                "one token's draw wide and a chunk has nowhere to live; build it with "
+                "`chunk_rows=0` for the whole share in one band"
+            )
+        if self.world > 1 and self.deal != "id":
+            raise ValueError(
+                f"a chunk is the `id` deal's: under `{self.deal}` a chunk's drawings reach "
+                f"every one of the {self.n_experts} experts on every rank, so each rank would "
+                f"stage them all and the deal would save nothing. Build the module with "
+                f'`deal="id"`'
+            )
+        layer = self.layer_id if layer_id is None else int(layer_id)
+        if layer is None:
+            raise ValueError(
+                "no layer was named: this arena holds whichever layer's experts were last "
+                "staged, and it has no way to know a caller forgot to say which"
+            )
+        if hidden.dim() != 2:
+            raise ValueError(f"a chunk is [rows, dim], got {tuple(hidden.shape)}")
+        rows = int(hidden.shape[0])
+        if rows == 0:
+            return torch.empty((0, self.dim), dtype=torch.float32, device=self.device)
+        indices = indices.reshape(rows, -1)
+        weights = weights.reshape(rows, -1).to(torch.float32)
+        if indices.shape != weights.shape:
+            raise ValueError(f"{tuple(indices.shape)} indices and {tuple(weights.shape)} weights")
+        width = int(indices.shape[1])
+        if width > self.top_k:
+            raise ValueError(
+                f"a draw of {width} experts is wider than the {self.top_k} this module was "
+                f"built for"
+            )
+
+        flat_index = indices.reshape(-1)
+        slots = self._row_of_local[flat_index]
+        # The whole list is sorted and not a prefix of it: how many pairs this rank owns is
+        # `starts[n_local]`, which the band bounds already carry, and a count of its own would be
+        # a second device-wide read of an answer the next line has. One read a call is the budget
+        # here, so `slots < n_local` is never reduced on the host.
+        take = torch.argsort(slots, stable=True)
+        slot_of_pair = slots.index_select(0, take)
+        token_of_pair = (
+            torch.arange(rows * width, dtype=torch.int32, device=self.device) // width
+        ).index_select(0, take)
+        weight_of_pair = weights.reshape(-1).index_select(0, take)
+        starts = torch.searchsorted(slot_of_pair, self._slot_ids).to(torch.int32)
+
+        band = self.chunk_rows
+        edges = list(range(0, self.n_local, band)) + [self.n_local]
+        bounds = starts[edges].tolist()
+        if bounds[-1] == 0:
+            return torch.zeros((rows, self.dim), dtype=torch.float32, device=self.device)
+        source = hidden.to(self.device)
+        if not source.is_contiguous():
+            source = source.contiguous()
+        out = None
+        for index, (lo, hi) in enumerate(zip(edges, edges[1:])):
+            first, last = bounds[index], bounds[index + 1]
+            if first == last:
+                continue
+            slot = self._take_slots(hi - lo)
+            self._stage(slot, layer, self._owned_rows[lo:hi])
+            arena = self._arenas[slot]
+            compute = torch.cuda.current_stream(self.device)
+            compute.wait_event(self._copy_events[slot])
+            partial = self._kernel.moe_multi_token_fp4_forward(
+                source,
+                torch.arange(hi - lo, dtype=torch.int32, device=self.device),
+                (starts[lo : hi + 1] - first).to(torch.int32),
+                token_of_pair[first:last],
+                weight_of_pair[first:last],
+                arena[("gate_proj", "weight")],
+                arena[("gate_proj", "weight_scale")],
+                arena[("down_proj", "weight")],
+                arena[("down_proj", "weight_scale")],
+                arena[("up_proj", "weight")],
+                arena[("up_proj", "weight_scale")],
+                SWIGLU_LIMIT,
+            )
+            self._events[slot].record(compute)
+            self._pending[slot] = True
+            out = partial if out is None else out.add_(partial)
+        self.chunks += 1
+        if out is None:
+            return torch.zeros((rows, self.dim), dtype=torch.float32, device=self.device)
         return out
 
     def drain(self) -> None:

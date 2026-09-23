@@ -18,12 +18,21 @@ ranks produce byte-identical logits, and the decode is the same nine tokens the
 one-rank run gives. What the ranks do *not* divide is the attention, which is
 replicated on all four and is the next stage's work.
 
-What that is not: a prefill. The routed path has only the single-token kernel, so
-a prompt is fed one token at a time and a chunk of tokens has no path at all. Every
-number below is a decode number, and the one prefill-shaped number in this page is
-a floor rather than a prefill. There is no tensor parallelism, no 256k run, and no
-CUDA kernel behind the attention or the dense linears — those are torch, and they
-are the baselines the kernels have to beat.
+**A prompt is a chunk now, and not a token loop.** `forward_chunk` takes a chunk of
+tokens through `moe_multi_token_fp4_forward` — the kernel the V4.1 path already called
+and this one did not — whose arena holds a rank's *share* of a layer's experts and
+whose pairs are the chunk's drawings grouped by expert, and `prefill` runs a prompt in
+chunks of the caller's width. On four ranks a 4096-token prompt goes through at **134
+tokens a second at a 1024-token chunk and 174 at 2048**, against **2.93** for the same
+prompt fed one token at a time: 46 and 59 times the rate on the same weights, with the
+four ranks byte-identical on the prompt's last row. The width is the knob, and what
+caps it is the attention's block loop rather than the link — a 4096-token chunk runs
+out of card.
+
+What that is not: 256k, serving, or a fast attention. The chunk path is a prompt
+through the same torch attention, which is 1.7 to 2 ms a token of the prefill and
+replicated on every rank; the cache is sized for 256k and nothing has run there; and
+there is no OpenAI-compatible adapter, no batching and no sampler.
 
 What exists:
 
@@ -39,7 +48,7 @@ What exists:
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
 | Expert parallelism over four ranks | Implemented and verified: 3.63 tok/s, 275 ms a token, four ranks byte-identical and the same tokens as one rank |
-| Decode at more than one token, grouped prefill | Attention only: the cache serves a stream of chunks, and the routed path is single-token |
+| Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
 | 256k context | Not run — the cache is sized for it and nothing has executed at that length |
 | OpenAI-compatible serving | Not implemented |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -134,9 +143,9 @@ release, and the device path built next to it.
 | `loader.py` | Header-level access to the release: the expert map, byte ranges, dense tensors, MXFP4 views |
 | `weights.py` | The bridge from the shards into `layers.py`, including experts that stay packed until selected |
 | `bank.py` | The routed experts resident in host memory, one shared segment, filled once per boot |
-| `device_experts.py` | One layer's routed experts computed on a card, staged from the bank as they are drawn |
+| `device_experts.py` | One layer's routed experts computed on a card, staged from the bank as they are drawn: one token's draw, or a chunk's pairs grouped by expert |
 | `device_attention.py` | One layer's attention on a card, both families, against a per-layer KV cache |
-| `device_model.py` | The backbone on a card: embedding, forty-eight layers, final norm, head, one token a step |
+| `device_model.py` | The backbone on a card: embedding, forty-eight layers, final norm, head, a token a step and a prompt a chunk |
 
 The routed experts are never expanded. A layer's 256 experts are 3.2 GiB dense
 and the model's would be 4.7 TB; `MimoV2Mxfp4Experts` holds the checkpoint's own
@@ -356,8 +365,9 @@ is **Paris**. 🇫🇷<|im_end|>
 which is a reasoning block, a turn, a bolded answer and an emoji.
 
 Two honest notes about what this is not. The prompt columns above are the same
-single-token loop run over a prompt, so they are a **floor** and not a prefill —
-prefill needs the multi-token kernel, which nothing routes into yet. And the
+single-token loop run over a prompt, so on this stage's page they are a **floor** and not a
+prefill — the grouped kernel that makes a chunk a chunk arrives with the prefill stage, and
+that is what the section on the prompt as chunks measures. And the
 agreement above is an agreement about the *top* of a distribution: a token whose
 candidates are a tenth of a logit apart is a token the two machines are free to
 disagree on, and the third step's margin was 0.125 on the card against 0.463 on the
@@ -467,12 +477,105 @@ The whole-model phase totals behind that table, at 8 prompt tokens and 8 decode 
 | FFN and staging | 171-198 ms | 254-264 ms |
 | Experts staged a step | 94.0 | 84.7-100.8 |
 
+## The prompt as chunks
+
+A prefill is not a decode step repeated, which is why `device_experts.py` has two entry
+points and why they are not two spellings of one call. `forward` takes one row and one draw
+of `top_k`; `forward_chunk` takes a chunk and every row's own drawing. The difference is not
+the batch — the kernel has always been batched, and a single-token call is a batch of one —
+but the **layout**. A draw of eight names eight experts out of a quarter of them, so the
+arena holds the draw and the kernel reads one row a drawing. A chunk of four thousand tokens
+draws nearly every expert there is, so what a rank computes is the subset of the chunk's
+*pairs* whose expert it owns, and the kernel wants those grouped by expert with an arena row
+a group. That kernel is `moe_multi_token_fp4_forward`.
+
+**The layout is built on the card, from the routing alone.** A table maps a global expert id
+to the row that holds it — or to a sentinel, for the ones this rank does not hold — and one
+stable sort by that row puts every pair the rank does not own behind every pair it does.
+`searchsorted` of the sorted rows against `0..n` is then the counts' exclusive prefix sum in
+one op: deliberately not `bincount`, whose CUDA implementation bounds-checks with two
+blocking device-to-host reads, and V4.1 replaced the same call for the same reason. What is
+left is one host read a layer, for the band boundaries, and that is the decode path's own
+price — it pulls the whole draw across with `indices.tolist()` every layer.
+
+**The deal has to change with the shape.** `id` partitions the *experts*, so a rank of four
+stages a quarter of the layer's 256 and computes a quarter of the pairs. `sorted` partitions
+a *drawing*: over one token that is exactly two experts a rank, and over a chunk a rank's
+positions reach every expert there is, so every rank stages all 256 and computes its own
+quarter of the pairs anyway — the same arithmetic for four times the copy. `forward_chunk`
+refuses `sorted` at a world over one rather than serving it slowly, which is why the prefill
+build names `deal="id"` while decode keeps the `sorted` default that is 21% faster there.
+The deal is per *module* and not per call, so a serving run that has to do both chooses, and
+the choice costs the decode step the 21%.
+
+**A band is how the arena stays bounded.** One kernel call stages its whole working set, so
+the arena has to be as wide as the experts one call holds. A rank that owns more than that is
+computed in bands of that width, one call each, summed in float32 — and the bands cost no
+layout work, because they are slices of the one sorted pair list: band `b` owns slots
+`[b·w, (b+1)·w)` and its pairs are the contiguous run between two prefix sums. A band whose
+experts the chunk never drew is skipped, which is what stops a narrow band from being a way
+to do *more* work rather than a way to spend less memory. The width trades arena bytes for
+call count and the calls of adjacent bands overlap the way layers do, on the slots.
+
+A 4096-token prompt through four ranks on the release, experts out of the bank,
+`tests/bench_mimo_v2_prefill.py --band 0`:
+
+| Chunk | tok/s | Calls | MiB/token | The copy | Copy, share of a token | Attention | FFN and staging |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| one token | 2.93 | 4096 | 1207 | 111 ms | 33% | — | — |
+| 256 | 56.3 | 16 | 149.8 | 13.8 ms | 78% | 1.63 ms | 16.01 ms |
+| 512 | 93.2 | 8 | 74.9 | 6.9 ms | 65% | 1.67 ms | 8.94 ms |
+| 1024 | **134.7** | 4 | 37.5 | 3.7 ms | 49% | 1.90 ms | 5.40 ms |
+| 2048 | **174.6** | 2 | 18.7 | 1.7 ms | 30% | 1.95 ms | 3.64 ms |
+| 4096 | — | 1 | — | — | — | — | did not fit |
+
+The shape of that table is one fact. A chunk's bytes are a cost per **call** and not per
+token: a rank's share of a layer is 816 MiB whatever the chunk width, so a wider chunk pays
+the same bytes for more tokens and `MiB/token` falls as `1/chunk` until the whole layer stack
+is 47 × 816 MiB = 37.5 GiB a call. The attention's per-token cost does not fall — 1.63 to
+1.95 ms a token across the whole range, and *rising*, because a wider chunk attends to more
+keys — and neither does the host's share of the layer. So the rate is the copy amortised and
+everything else a constant, and the crossing point where the copy stops being the majority is
+around a 1024-token chunk.
+
+The band trades the same two quantities in the other direction. The same run at `--band 16` —
+a quarter of a rank's share a call, four calls a layer, and an arena of 408 MiB instead of
+1632 — measures **111.2 tokens a second at a 1024-token chunk and 137.3 at 2048**, 17% and
+21% below the one-band numbers, for 1.2 GiB less card. What the narrower band costs is not
+bytes but calls: four bands of 16 experts move exactly what one band of 64 moves, and pay four
+kernel launches a layer instead of one, four slot waits, and three extra `[rows, dim]` float32
+accumulations of the partials — 201 MiB a layer, 9.4 GiB a chunk at this width, which is 0.9 s
+of the measured 6.4 s the wider band saves, so the rest of it is the calls themselves.
+
+The floor row is the same prompt fed one token at a time, which is what the single-token
+kernel can do: 2.93 tokens a second, 1207 MiB a token on rank 0 — 1108, 1287, 1208 and 1192
+across the four, since a rank's draws are its own — and the same 47 draws a layer that a decode
+step makes. That is the path a prefill used to be, and the grouped kernel is **46 to 60 times**
+it on the same weights.
+
+**There is a ceiling and it is not the link.** A 4096-token chunk does not fit: the attention's
+block loop materialises `[kv_heads, groups, rows, block]` float32 of scores, and a *global*
+layer's late key blocks are visible to the whole chunk, so its tile is 4 × 16 × 4096 × 1024 × 4
+bytes — 1 GiB, on a card that is already holding 14.3 GiB of weights and 1.6 GiB of arena.
+A windowed layer does not do this: its query slice is a block plus a window, so its tile is
+fixed. The nine global layers are what caps the chunk width, and the fix is in that loop
+rather than in the expert path — a smaller block, a tile that is not float32, or a two-sided
+tiling — which is why the ceiling is recorded here rather than worked around.
+
+**What the four ranks agree on.** The prefill's last row, gathered from all four after the
+widest chunk, is byte-identical — `0.0` between rank 0 and every other — and each rank staged
+18.7 MiB a token, the same number, because under `id` the shares differ in *which* experts
+they are and not in how many. The one-rank comparison in the tests is the check that it stays
+that way: a chunk is the same answer as the same rows one at a time to **3.0e-7** of the
+logits' own peak on two released layers, and takes the same token at every position.
+
+
 ## Validated performance
 
 **One token, on one card, and a floor.** The number above — 610 ms a token — is the
-whole model on the release, and it is not a prefill: the single-token expert kernel
-is the only routed path there is, so a prompt is fed a token at a time. There is no
-batching, no tensor parallelism, and no CUDA kernel behind the attention or the
+whole model on the release, and it is a *decode* number: the single-token expert kernel is
+what a step uses, and a prompt fed through this path is a prompt fed a token at a time. There
+is no batching, no tensor parallelism, and no CUDA kernel behind the attention or the
 dense linears. The host reference is not a performance artifact either: it is
 float32 on the CPU with no KV cache, so every decode step re-runs the whole prefix —
 37 s a token against the card's 0.61 s, which is the ratio a reference is supposed
@@ -511,17 +614,23 @@ ceiling), the attention (1.5 ms, replicated four times over) and the router (0.5
 two things worth their own stage are the attention kernel and the 10% the lockstep takes
 back. Prefill is where the second half of the target lives and it is untouched.
 
-Prefill is the other shape, and its arithmetic is not per token. A chunk of a few
-thousand tokens draws nearly every expert of every layer — 4096 tokens at top-8 is
-32768 draws over 256 experts — so a chunk's traffic is **about 153 GiB for the whole
-layer stack no matter the chunk size**, and it is not paid again by the next chunk.
-At 10.4 GiB/s that is 14.7 s a chunk, which is 35 tokens a second at a 512-token
-chunk and **279 at 4096** — and with the experts dealt out, a quarter of that a rank.
-So the prefill target is a matter of chunking and of the multi-token kernel that has to
-exist to compute a chunk at all — not of the link, which the experts are already as close
-to as storage allows. It is also the one place the `id` deal has to come back: under
-`sorted` a chunk's sorted positions reach every rank, so the rank stages the whole expert
-set instead of its own quarter.
+Prefill is the other shape, and it was the second half of the target. Before the stage was run,
+the arithmetic in this paragraph said a chunk's traffic is "about 153 GiB for the whole layer
+stack no matter the chunk size" — one rank's 256 experts of 47 layers, 14.7 s at the link's
+10.4 GiB/s, and the prefill's rate was read off that alone: 35 tokens a second at a 512-token
+chunk and 279 at 4096 on one rank, four times that with the bytes dealt over four. The measured
+answer is **93 tokens a second at 512, 134 at 1024 and 174 at 2048** on four ranks, and the
+widest chunk this card holds is 2048.
+
+The byte estimate was right and the extrapolation from it was not, in a way worth recording.
+The per-chunk bytes really are a constant (a rank's whole share of every layer is 37.5 GiB
+whether the chunk is 256 tokens or 2048), so the copy a token falls as the chunk grows — 149.8
+MiB a token at 256 down to 18.7 at 2048 — but the things a token also pays that are *not* the
+copy do not fall: the expert kernel and the layer's host work are 3.64 ms a token at 2048 of
+which the copy is 1.7, and the attention rises with the width, 1.63 ms a token at 256 to 1.95
+at 2048. A rate extrapolated from the copy alone therefore over-predicts the wider chunks the
+most, and the truth is a curve that flattens just under 200 tokens a second — until the
+attention's score tile runs out of card, which is what 4096 does.
 
 ## Correctness and precision
 
@@ -594,20 +703,41 @@ the collective: `make_all_reduce` is a closure around `dist.all_reduce` with not
 it to get wrong, and whether four *processes* agree is what the multi-rank run's
 byte-for-byte logit comparison answers.
 
+**A chunk against the same rows one at a time.** `tests/test_models_mimo_v2_prefill.py` is
+seventeen tests over the prefill, and the one that matters is the layout's: a chunk of six
+rows through the grouped kernel against six single-token calls, on the same arena source,
+must give the same answer — a `pair_weights` that followed the wrong pair, a slot that held
+the wrong expert or a band that summed twice shows up there as a large disagreement rather
+than a small one. They agree to **6e-8 of the answer's own peak**, which is not zero: the
+grouped kernel tiles K over two stages of shared memory where the single-token one tiles it
+in one, and reduces a token's pairs in its own pass, so the float32 accumulation is
+reassociated. Everything else in the file is derived from that: the bands, whose one-expert
+width is *bit-identical* to one band (a top-k names distinct experts, so a token's pairs in
+slot order are already in ascending expert order and the adds are the same adds); the four
+shares of a dealt chunk summing to the one-rank answer; the rank that owns none of a chunk's
+experts returning a zero rather than an empty tensor, since the collective is unconditional
+and cannot be skipped; and a dealt chunk staging a quarter of the experts, once between the
+four ranks. The model half covers `mlp`'s dispatch on the row count, `prefill`'s chunking
+(one row out, whatever the width, and a decode step after it landing where one pass over the
+whole stream lands), the `sorted`-deal refusal at a world over one, and a chunked prompt
+taking the same token as a token-at-a-time one. Its release half is two real layers — one
+dense, one routed — with the chunk path over a chunk of three: **3.0e-7 of the logits' own
+peak of 17.45**, and the same argmax at all six positions.
+
 ## Reproduction
 
 ```bash
 # the checkpoint's own config, read through the schema
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
-# parity, layout, the host bridge, the bank, the device experts, the attention, the model
-# and the deal
+# parity, layout, the host bridge, the bank, the device experts, the attention, the model,
+# the deal and the prefill
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
     tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
     tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py \
     tests/test_models_mimo_v2_device_attention.py tests/test_models_mimo_v2_device_model.py \
-    tests/test_models_mimo_v2_ep.py -q
+    tests/test_models_mimo_v2_ep.py tests/test_models_mimo_v2_prefill.py -q
 
 # what one layer's attention costs, both families, prefill and decode
 python tests/bench_mimo_v2_attention.py
@@ -619,6 +749,10 @@ python tests/bench_mimo_v2_model.py
 # `--deal id` is the other deal; the flag sets POCKETLLM_MIMO_EXPERT_DEAL
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8 --deal id
+
+# a prompt as chunks, four ranks, the chunk width swept and the token-at-a-time floor
+torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
+    --tokens 4096 --chunk 256,512,1024,2048,4096 --floor 16 --band 0
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -645,11 +779,19 @@ golden holds and how it was captured.
 
 ## Known limitations
 
-- **No prefill.** The routed path has only the single-token kernel, so a prompt is
-  fed a token at a time and a chunk of tokens has no path at all. The prefill-shaped
-  columns in this page are that same loop, and the 279 tokens a second the link could
-  sustain at a 4096-token chunk is arithmetic rather than a measurement. Prefill is
-  what the 100 tps target is about and it is the next stage's work.
+- **A chunk's width is capped by the attention's score tile, not by the link.** The block
+  loop materialises `[kv_heads, groups, rows, block]` float32 of scores and a global layer's
+  late key blocks are visible to the whole chunk, so a 4096-token chunk needs a 1 GiB tile on
+  a card already holding 14.3 GiB of weights and 1.6 GiB of arena, and does not fit. 2048 is
+  the widest this card holds, the prefill's rate flattens under 200 tokens a second before
+  that, and a smaller block, a narrower score tile or a two-sided tiling against the query
+  rows is what would move the ceiling. The nine global layers are the whole of it; a windowed
+  layer's tile is fixed, because its query slice is a block plus a window.
+- **A prefill and a decode want different deals, and the deal is per module.** A chunk needs
+  the experts partitioned (`id`) and a decode step is 21% faster when the *drawings* are
+  (`sorted`, the default). A serving run that has to do both picks one: `id` costs the decode
+  step 73 ms a token, and `sorted` at a world over one cannot prefill at all — the chunk path
+  refuses it rather than staging all 256 experts on every rank.
 - **No tensor parallelism, no batching, and the attention is replicated.** The experts
   are divided over four ranks and everything else is not: the router, the attention, the
   embedding, the head and the dense layer each run four times over. The checkpoint's fused
@@ -687,8 +829,8 @@ golden holds and how it was captured.
 
 ## Evidence and related notes
 
-- `src/models/mimo_v2/` — the host reference and the five pieces of the device path:
-  the bank, the routed experts, the attention, the model, and the deal over the ranks.
+- `src/models/mimo_v2/` — the host reference and the pieces of the device path: the bank,
+  the routed experts, the attention, the model, the deal over the ranks and the chunk path.
 - `tests/test_models_mimo_v2_qkv_layout.py` — the fused projection's row order,
   which the config does not carry and which no shape check can catch.
 - `tests/test_models_mimo_v2_layer_parity.py` — the oracle fixture, its contents,
@@ -701,8 +843,12 @@ golden holds and how it was captured.
   `ep.py` carries the two deals and the arithmetic that picks one; it is the only file
   in the tree whose *default* was set by a four-rank measurement.
 - `tests/bench_mimo_v2_attention.py`, `tests/bench_mimo_v2_model.py`,
-  `tests/bench_mimo_v2_ep.py` — where the attention table, the one-rank token table
-  and the four-rank table come from.
+  `tests/bench_mimo_v2_ep.py`, `tests/bench_mimo_v2_prefill.py` — where the attention table,
+  the one-rank token table, the four-rank table and the chunk-width table come from.
+- `src/models/mimo_v2/device_experts.py:forward_chunk` — the chunk layout, why `bincount` is
+  not in it, and what the bands are; `src/models/deepseek_v4_1/device_experts.py:_issue_chunk`
+  is the same call in the other heterogeneous path in this tree, with the 3.04x/3.69x
+  batched-against-per-row measurement that made it a swap there.
 - `src/models/deepseek_v4_1/tp.py` — the same collectives and the same
   injected-closure shape for the other heterogeneous path in this tree.
 - The support matrix in [models/README.md](README.md).
