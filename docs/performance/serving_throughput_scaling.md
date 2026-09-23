@@ -63,6 +63,17 @@ nominal peak of 128.59 tok/s, while TPOT grows 3.0x.
   rows wide and is therefore only compared against the `L16` it ran beside; and
   [serving_latency_optimized.md](serving_latency_optimized.md), whose figures are
   left as they are and named where they are compared.
+- **This branch adds one engine change on top of that range, and it moves TTFT.**
+  `BatchScheduler::run_prefill_batch()` now issues one `batch_prefill` call a
+  request and hands each row's token over before the next prompt starts
+  (`batch_scheduler.cpp:372`), instead of calling it once for the whole wave and
+  delivering nothing until the last prompt is done. Everything on this page above
+  is the pre-change record and stands as the control arm: the change re-writes no
+  row's device work, so the prefill decomposition, the FLOP tables and the
+  concurrency limit are untouched by it. The ladder rows it moves are re-measured
+  against a same-day control in
+  [Handing each row its token when it is produced](#handing-each-row-its-token-when-it-is-produced),
+  and `L8`, `L16` and `L32` reproduce this page's numbers to 0.4% on that control.
 - every ladder row: `--random-input-len 512 --random-output-len 512
   --num-warmups 0 --request-rate inf --prefill-token-budget 4096
   --max-context 2048`, with `--max-batch-size` equal to the client's
@@ -578,7 +589,10 @@ tokens, ten at 320 and six at 327:
 | merged, one 5162-row forward | 131.4 + 5162 x 0.6374 - 7.2 = 3414 ms | one decode step later |
 | merged, at the one-call slope 0.6274 | 142.6 + 5162 x 0.6274 = 3381 ms | one decode step later |
 
-The measured column is the check. The serial model's own last request is
+The measured column is the check, and the delivery fix below does not touch it:
+the 16th request is handed its token at 5235.2 ms after it against 5249.0 before,
+because what that fix removes is the wait the *other* fifteen were doing. The
+serial model's own last request is
 15 x 329.8 + 410.9 = 5358 ms, against 5264.8 ms measured, so the per-request
 prefill the model uses reproduces the wave to 2% — the first request's TTFT is
 410.9 ms against its 329.8 ms of modelled prefill plus one decode step. The
@@ -629,6 +643,83 @@ reduction, at the same throughput (105.21 against 106.37 tok/s) and the best
 goodput among the full-batch runs. It costs nothing but a slot count below the
 offered concurrency, which is the opposite of what a throughput-first
 configuration does.
+
+### Handing each row its token when it is produced
+
+The wave is serial, but the *handover* was serialized with it, and nothing about
+the handover is expensive. `batch_prefill` is a loop over requests
+(`qwen_engine.cpp:5163`), and each iteration ends in `prefill_bounded`, which
+ranks the prompt's last position and returns `step.result.top_token`. That token
+exists from that moment. What did not exist was a delivery: `run_prefill_batch`
+gathered the whole wave, called the engine **once**, and only then updated every
+request's state and called `deliver_tokens` — so the token request 0 produced at
+410 ms sat inside a `BatchPrefillResult` until request 15 had finished too.
+
+Making that loop the scheduler's is the whole change: one `batch_prefill` call a
+request, with the state update and the token callback in between
+(`batch_scheduler.cpp:372`). The engine still runs its prompts one at a time, in
+the same order, at the same budget, so no row's device work moves; what changes is
+when its caller hears about it. Three interleaved pairs, control and treatment
+alternating at each width:
+
+| run | TTFT mean | change | TTFT p50 | change | TTFT p99 | change | last row | tok/s | e2el |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `L8` control | 2421.1 ms | — | 2707.8 ms | — | 2710.0 ms | — | 2710.1 ms | 74.94 | 12679.5 ms |
+| `L8` treatment | 1575.6 ms | **-34.9%** | 1581.3 ms | -41.6% | 2677.3 ms | -1.2% | 2699.6 ms | 74.45 | 12826.1 ms |
+| `L16` control | 4943.7 ms | — | 5245.3 ms | — | 5248.9 ms | — | 5249.0 ms | 110.18 | 16090.5 ms |
+| `L16` treatment | 2847.4 ms | **-42.4%** | 2852.6 ms | -45.6% | 5187.5 ms | -1.2% | 5235.2 ms | 110.72 | 16244.0 ms |
+| `L32` control | 10004.3 ms | — | 10313.2 ms | — | 10321.0 ms | — | 10321.2 ms | 128.75 | 28799.3 ms |
+| `L32` treatment | 5386.9 ms | **-46.2%** | 5396.8 ms | -47.7% | 10210.1 ms | -1.1% | 10307.8 ms | 125.67 | 28731.6 ms |
+
+The bimodal distribution the page opened with becomes a ramp, which is what the
+fix is:
+
+```text
+L8 control    [412, 2707, 2707, 2707, 2708, 2709, 2709, 2710]
+L8 treatment  [413,  784, 1103, 1422, 1740, 2062, 2381, 2700]
+L32 treatment [412, 772, 1090, 1407, ... , 9675, 9992, 10308]
+```
+
+The control's fifteen rows all latch on the moment the wave's prefill ends. The
+treatment's each latch one per-prompt prefill after the one before — the `L32`
+successive differences are 360 then 317-321 ms, against the 319.8 ms per-prompt
+prefill this page solved for at 32 slots. The first row is unchanged (413 against
+412) and so is the last (2700 against 2710): **the wave still takes the same time,
+and only the order of the departures changed.**
+
+Nothing is slower for it. The second token of every row lands at the same absolute
+time in both arms, and so does every token after it:
+
+| run | token 1, p50 | token 2, p50 | first gap, p50 | every later gap, p50 |
+| --- | ---: | ---: | ---: | ---: |
+| `L8` control | 2707.8 ms | 2793.3 ms | 84.8 ms | 81.9 ms |
+| `L8` treatment | 1581.3 ms | 2784.4 ms | 883.4 ms | 82.9 ms |
+| `L16` control | 5245.3 ms | 5345.2 ms | 99.1 ms | 90.9 ms |
+| `L16` treatment | 2852.6 ms | 5339.3 ms | 2169.1 ms | 91.1 ms |
+| `L32` control | 10313.2 ms | 10484.0 ms | 170.1 ms | 152.2 ms |
+| `L32` treatment | 5396.8 ms | 10480.5 ms | 4770.5 ms | 152.2 ms |
+
+The engine's own histogram agrees from the other side: the reported prefill
+interval a request falls from 2006.5 to 1159.4 ms at `L8`, 4502.5 to 2408.4 at
+`L16` and 9554.6 to 4939.5 at `L32`, while the queue term behind it does not move
+(346.8 against 348.2 ms at `L8`, 346.2 against 345.3 at `L32`).
+
+**TPOT rises by 9% to 27% and that is the metric, not the step.** The control
+charges a row its whole wait for the wave to the *second* token: token 1 and
+token 2 are 84.8 ms apart because token 1 was held back to the moment decode
+started. Delivered honestly, the same row's first two tokens are 883.4 ms apart,
+and `(e2el - ttft)/(n-1)` reads that gap out. The gap *after* the first is
+identical in both arms — 81.9 against 82.9 ms, 90.9 against 91.1, 152.2 against
+152.2 — so the decode step is untouched and nothing had its steadier cadence taken
+away. The whole of the TPOT difference is a first-token wait that the control was
+hiding inside a first-token delay.
+
+**This does not do what a merge would.** The wave's own prefill is still N serial
+calls; the treatment removes the handover, not the loop, and step 2 below is
+still worth its 1.6x on the wave. What it does is stop the wave's last prompt from
+billing every other prompt for its own duration. `L16x64`, which holds a wave
+down to the slot count, gets its 64% a different way and the two compose: it is a
+client-side setting, this is the engine delivering what it already computed.
 
 ## The TPOT lever at concurrency one
 
@@ -817,7 +908,8 @@ it is a batching defect rather than a bandwidth one.**
 
 ## What this says to do next
 
-In order of what the measurements support, and none of it done here:
+In order of what the measurements support. Item 2 is partly done on this branch —
+its handover half — and is marked there; the rest is not.
 
 1. **Size the KV pool by concurrency actually granted, not by worst-case
    context.** The arena reserves `max_context` for every slot, so at 112 slots it
@@ -839,13 +931,18 @@ In order of what the measurements support, and none of it done here:
    server that starts and answers wrongly, which is worse than the hang above.
 2. **Merge the admission wave into one prefill forward, and expect 1.6x rather
    than the ~1.06x the engine's comment quotes.** It is the only finding on this
-   page that moves TTFT and prefill TFLOPS together — both are bounded by the
+   page that moves TTFT and prefill TFLOPS *together* — both are bounded by the
    same one-request-at-a-time loop in `batch_prefill`, and the term that merging
    removes is 131 of the 331 ms a 325-token prompt costs. At `L16` that is
    5385 ms of wave prefill to 3414 ms, and 49 to ~78 TFLOP/s on four cards. The
    `~1.06x` in that comment is the same arithmetic at 2048 tokens, where the
    fixed term is 9% of a call instead of 40%; it is the ladder's short prompts,
-   not the sweep's, that the merge is worth doing for. The obstacle is real and
+   not the sweep's, that the merge is worth doing for. **The half of this that is
+   a handover rather than a forward is done** — the change in
+   [Handing each row its token when it is produced](#handing-each-row-its-token-when-it-is-produced)
+   is worth -42% mean TTFT at `L16` and touches no kernel, but it leaves the
+   wave's own prefill exactly as long as it was, so the 1.6x above is still
+   entirely unclaimed. The obstacle to claiming it is real and
    is named in the code: the linear-attention layers carry a per-sequence state,
    so a merged forward needs a segmented recurrence, and the 16 full-attention
    layers need a block-diagonal mask — without which a 5162-row forward would
