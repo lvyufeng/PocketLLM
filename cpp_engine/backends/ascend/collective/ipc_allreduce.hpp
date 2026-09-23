@@ -46,8 +46,27 @@
 // behind the compute that produces them and the reduce is ordered behind the
 // pushes, so the caller sees the result exactly as it would from `HcclAllReduce`.
 //
-// Everything here is opt-in. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it, and any
-// call outside the configured envelope falls back to HCCL rather than failing.
+// This is the shipped collective on this backend. It is on unless
+// `POCKET_ASCEND_IPC_ALLREDUCE` says `0`, `false`, `FALSE`, `off` or `OFF`, and
+// any call outside the configured envelope falls back to HCCL rather than
+// failing. So an off switch and a size ceiling, not an on switch.
+//
+// It used to be opt-in, and the reason recorded for that was a reproducibility
+// gate: a batched path that is not run-to-run reproducible is a rare bad token in
+// production rather than an error, which is worse than a slow one. That reason has
+// since been discharged. The gate failures were the RoPE table aliasing the
+// `Intermediate` workspace slot, not this barrier; with the table on its own slot
+// the gate is failed 0 times in 22 interleaved runs across both arms
+// (docs/performance/ascend_rope_table_workspace_aliasing.md). The size ceiling was
+// then raised to 512 x 5120 so the barrier reaches the serving ladder's planes at
+// all, which is where the 1.53x it is worth lives
+// (docs/performance/serving_throughput_scaling.md). Leaving it opt-in after that
+// would have shipped a measured win to nobody.
+//
+// The `atoi` reading that the on switch used to take is gone with it: under it
+// `POCKET_ASCEND_IPC_ALLREDUCE=true` parsed as 0 and meant *disabled*, the
+// opposite of what it says. Harmless while every document and script spelled it
+// `=1`, and not something to keep once the variable governs the default.
 //
 // What justified building it took arms that are not the shipped configuration, so
 // they are listed here rather than left to be found in the source. All default off
@@ -86,10 +105,11 @@
 
 namespace pocket {
 
-// Whether this call would use the hand-written collective: the feature is on, the
-// world is larger than one, and the plane is within the size ceiling. A pure
-// function of the arguments and the environment, so every rank answers it the
-// same way -- which is what keeps the decision from desynchronising the group.
+// Whether this call would use the hand-written collective: the feature is not
+// switched off, the world is larger than one, and the plane is within the size
+// ceiling. A pure function of the arguments and the environment, so every rank
+// answers it the same way -- which is what keeps the decision from desynchronising
+// the group.
 bool ascend_ipc_allreduce_f16_applies(int world, int count);
 
 // All-reduce `count` FP16 elements in place across `world` ranks, one process per

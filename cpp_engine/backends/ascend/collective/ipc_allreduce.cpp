@@ -415,9 +415,25 @@ void report_stats() {
     s.reported_poll_iters = s.poll_iters;
 }
 
-bool env_flag(const char* name) {
+// The main switch, and an opt-*out*: this barrier is the shipped collective on
+// this backend, so only an explicit off disables it. Unset and empty mean on.
+//
+// The spelling of "off" matches `qwen_env_enabled_default` in
+// `cpp_engine/engine/qwen_engine.cpp`, which is where the opt-out convention is
+// written down. It is mirrored here rather than shared because it reads an
+// environment variable and nothing else, and a header for that would be the only
+// dependency from `backends/ascend/` into `engine/`.
+//
+// This replaces an `atoi(value) != 0` reading, under which `=true` parsed as 0 and
+// therefore meant *disabled* -- the opposite of what it says. Every document and
+// script spelled the switch `=1`, so nothing was relying on it, but the wrong
+// answer was one ill-spelled environment variable away.
+bool enabled_unless_disabled(const char* name) {
     const char* value = std::getenv(name);
-    return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+    if (value == nullptr || *value == '\0') return true;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "OFF") != 0;
 }
 
 void check_acl(aclError err, const char* what) {
@@ -745,7 +761,10 @@ IpcState& state_for(const std::string& id_path, int world, int rank, int device,
 }  // namespace
 
 bool ascend_ipc_allreduce_f16_applies(int world, int count) {
-    if (!env_flag("POCKET_ASCEND_IPC_ALLREDUCE")) return false;
+    // Default on, so an ordinary `pocketllm serve` gets it. See the history on
+    // `enabled_unless_disabled` above and the header comment in ipc_allreduce.hpp
+    // for why the opt-in that used to be here was lifted.
+    if (!enabled_unless_disabled("POCKET_ASCEND_IPC_ALLREDUCE")) return false;
     if (world <= 1 || world > kMaxWorld) return false;
     if (count <= 0) return false;
     // One gate, not two. A second `count > kDefaultMaxElements` test used to sit

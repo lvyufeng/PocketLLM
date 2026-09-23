@@ -814,6 +814,19 @@ if(POCKET_BACKEND STREQUAL "ascend")
     set_target_properties(bench_qwen_ascend_ipc_exchange PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()
 
+# That barrier became the shipped collective, which moves the switch from "a
+# measurement is wrong if this is misread" to "every step of a served request takes
+# a different path if this is misread". The predicate is a pure function of its two
+# arguments and the environment, so it is pinned here with no NPU and no peers --
+# including the spellings, because the `atoi` reading this replaced made `=true`
+# mean *disabled*.
+if(POCKET_BACKEND STREQUAL "ascend")
+    add_executable(test_ipc_allreduce_envelope tests/test_ipc_allreduce_envelope.cpp)
+    target_include_directories(test_ipc_allreduce_envelope PRIVATE backends/ascend/collective)
+    target_link_libraries(test_ipc_allreduce_envelope PRIVATE pocket_cpp_core)
+    set_target_properties(test_ipc_allreduce_envelope PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+endif()
+
 # The decode target is a question about a physical limit: one decode step re-reads
 # every resident weight, so it is worth knowing what this part's memory actually
 # sustains rather than inferring it from a GEMV that may simply be inefficient.
