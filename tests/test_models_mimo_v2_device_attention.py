@@ -380,6 +380,107 @@ def test_a_cache_does_not_answer_for_a_layer_it_does_not_hold(release):
         )
 
 
+@needs_release_cuda
+def test_appending_first_is_the_concatenation_it_replaces(release):
+    """What the early append is for: the same bytes, in the same order, and no copy of the prefix.
+
+    Two caches of one layer, the same chunk appended to each -- one through `append_and_span`, one
+    through the `prefix` and `cat` it replaces -- and the two readings have to be the same tensor,
+    element for element, over a prefix that is read again by each call.
+    """
+    shape = release.layer.attention(GA_LAYER)
+    early = MimoV2KVCache(release.layer, 4096, [GA_LAYER], device="cuda", dtype=torch.float32)
+    late = MimoV2KVCache(release.layer, 4096, [GA_LAYER], device="cuda", dtype=torch.float32)
+
+    start = 0
+    for size in (1, 5, 32):
+        key = torch.randn(shape.num_kv_heads, size, shape.head_dim, device="cuda")
+        value = torch.randn(shape.num_kv_heads, size, shape.v_head_dim, device="cuda")
+        span = early.append_and_span(GA_LAYER, key, value, start_pos=start)
+        assert span is not None, "a global buffer that has not wrapped is a span"
+        prefix_key, prefix_value, prefix_len = late.prefix(GA_LAYER, start)
+        late.append(GA_LAYER, key, value)
+        want_key = torch.cat([prefix_key, key], dim=1) if prefix_len else key
+        want_value = torch.cat([prefix_value, value], dim=1) if prefix_len else value
+        assert torch.equal(span[0], want_key)
+        assert torch.equal(span[1], want_value)
+        # The width is the whole span and not the chunk, which is what the caller's bounds are
+        # computed from.
+        assert span[0].shape[1] == span[1].shape[1] == start + size
+        assert early.written(GA_LAYER) == late.written(GA_LAYER) == start + size
+        start += size
+
+
+@needs_release_cuda
+def test_a_wrapped_ring_is_not_a_span_and_is_not_appended(release):
+    """A ring's prefix is its last `slots`, so the span is a rearrangement and the caller's `cat` stands.
+
+    Nothing is appended on the way to that answer either: the caller that is told `None` appends
+    after its attention, and a cache that had already written would hold the chunk twice.
+    """
+    window = release.layer.attention(SWA_LAYER).sliding_window
+    shape = release.layer.attention(SWA_LAYER)
+    cache = MimoV2KVCache(release.layer, 4096, [SWA_LAYER], device="cuda", dtype=torch.float32)
+    key = torch.zeros(shape.num_kv_heads, window, shape.head_dim, device="cuda")
+    value = torch.zeros(shape.num_kv_heads, window, shape.v_head_dim, device="cuda")
+
+    # A span that fits the buffer is a span, and it is the ring's whole width.
+    span = cache.append_and_span(SWA_LAYER, key, value, start_pos=0)
+    assert span is not None and span[0].shape[1] == window
+    assert cache.written(SWA_LAYER) == window
+
+    # The next one does not fit: the ring holds the last `window` positions and the span would be
+    # the newest of them rearranged onto the front.
+    assert cache.append_and_span(SWA_LAYER, key, value, start_pos=window) is None
+    assert cache.written(SWA_LAYER) == window
+    with pytest.raises(ValueError, match="has not appended"):
+        cache.append_and_span(SWA_LAYER, key, value, start_pos=window + 1)
+
+
+@needs_release_cuda
+@pytest.mark.parametrize("layer_idx", (SWA_LAYER, GA_LAYER))
+@pytest.mark.parametrize("rows,budget", ((1, None), (24, None), (24, 1)))
+def test_the_span_path_is_the_same_attention_as_the_concatenation(release, layer_idx, rows, budget):
+    """The step's answer must not depend on which spell of one span the cache took.
+
+    Both caches hold the same prefix and are handed the same chunk; one appends first and reads the
+    span back, the other is told there is no span and reads its prefix the old way. The two answers
+    have to agree to the bit, because the bytes the attention is given are the same bytes -- and
+    `budget=1` puts the second one through the block loop, whose key slices are the other place a
+    view's stride could reach the arithmetic.
+    """
+    kwargs = {} if budget is None else {"budget": budget}
+    attention = MimoV2DeviceAttention(release, layer_idx, "cuda", torch.float32, **kwargs)
+    torch.manual_seed(11)
+    prefix = 33
+    hidden = torch.randn(1, prefix + rows, release.layer.hidden_size) * 0.5
+
+    early = cache_for(release, layer_idx, prefix + 4096, dtype=torch.float32)
+    late = cache_for(release, layer_idx, prefix + 4096, dtype=torch.float32)
+    attention.forward(hidden[0, :prefix].cuda(), start_pos=0, cache=early)
+    attention.forward(hidden[0, :prefix].cuda(), start_pos=0, cache=late)
+
+    took_the_span = []
+    inner = early.append_and_span
+
+    def recording(*args, **kwargs):
+        span = inner(*args, **kwargs)
+        took_the_span.append(span is not None)
+        return span
+
+    early.append_and_span = recording
+    late.append_and_span = lambda *args, **kwargs: None  # the spelling before the cache could
+    got = attention.forward(
+        hidden[0, prefix : prefix + rows].cuda(), start_pos=prefix, cache=early
+    )["attn_out_post_o"]
+    want = attention.forward(
+        hidden[0, prefix : prefix + rows].cuda(), start_pos=prefix, cache=late
+    )["attn_out_post_o"]
+    assert took_the_span == [True], "the arm this compares against has to have taken the span"
+    assert torch.equal(got, want), (got - want).abs().max().item()
+    assert early.written(layer_idx) == late.written(layer_idx) == prefix + rows
+
+
 # ---------------------------------------------------------------------------
 # The released layer
 # ---------------------------------------------------------------------------

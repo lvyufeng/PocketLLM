@@ -70,8 +70,10 @@ What that is not: a kernel, batching, or a sampler worth shipping. The attention
 the dense linears are still torch; the served path is one request, one sequence; and a
 256k decode step is 323.8 ms, most of it the attention reading a quarter of a million keys
 nine times over — once a rank, since this stage divides that work along the checkpoint's
-own four-way partition, which takes the same step to 205.6. What *is* gone from the earlier
-list is 256k, serving and the replicated attention; the numbers are below.
+own four-way partition, which takes the same step to **197.2 ms and 5.07 tokens a second**,
+past the five a second this page was written against. What *is* gone from the earlier
+list is 256k, serving, the replicated attention and the attention's own copy of its prefix;
+the numbers are below.
 
 What exists:
 
@@ -89,7 +91,7 @@ What exists:
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
-| 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split |
+| 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **197.2 ms — 5.07 tokens a second**, 38.8 of it the attention and 99.9 the expert copy |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -734,10 +736,48 @@ does not move under the split, and it is 226 ms of the 281. For contrast, the sa
 tokens of context is 177.6 ms with 139.6 of it outside the routed path. **The expert path is what
 grows next**, and that is the less obvious half: a token draws the same 47 × 8 experts whatever the
 context, so the bytes are the same 1198 MiB a rank — but the path is a lockstep rather than a copy,
-four ranks whose bytes are equal and
-whose times are not, so what a deeper context adds to it is the waiting rather than the traffic. A
-client at 256k should expect four and a half tokens a second after a first token that costs the
-prompt.
+four ranks whose bytes are equal and whose times are not, so what a deeper context adds to it is the
+waiting rather than the traffic. A client at 256k should expect **five tokens a second** after a
+first token that costs the prompt, and the two paragraphs below are what that five is made of.
+
+**And that step is the copy plus everything else, in series.** `probe_mimo_v2_decode_phases.py` at
+that depth, four ranks: **copy stall 99.9 ms** of a 204.7 ms token, attention 45.3, expert kernel
+12.5 to 13.0 in 47 calls, collective 3.8 to 13.9, router 4.7 to 12.5, and 27.6 ms of dense linears,
+the head, the sampler and the host — the router's own event pair is recorded after a call that blocks
+the host on the layer's earlier work, so its number is the largest that is double-counted rather than
+a cost of its own. The stall is the part of the H2D the kernel *waited* for, and it is 1198.5 MiB at
+**12.0 GiB/s**: a PCIe 3.0 x16 link at essentially its rate, which makes the bytes the floor and the
+*schedule* the only thing that decides whether they are paid or hidden. Two cuts were measured
+against it.
+
+**The attention's own copy of the prefix is gone.** `MimoV2KVCache.append_and_span` hands the attention
+the span it is about to read — `[0, start_pos + n)`, the prefix with this call's own keys on the end of
+it — as a view of the cache buffer whenever nothing has wrapped, so the `torch.cat` that used to build
+it, **160 MiB of keys and values a global layer a token** (read and written, 2.8 GiB a token over the
+nine of them) with the attention split over four ranks, is never made.
+`probe_mimo_v2_decode_prefix.py`, the two arms interleaved at 262144 and four steps each:
+**197.2 ms a token against 202.3** — 5.07 against 4.94 a second — with the attention column **38.8
+against 44.3**, and the two rounds differing by 3.9 and 6.3 ms in the same direction. (The split's own
+A/B above measured 205.6 for the same configuration before this cut existed, which is the 3 ms of
+drift between two processes on this box rather than a disagreement.) It is exact by construction: the
+buffer *is* the span in slot order while nothing has wrapped, so the view is the concatenation's own
+bytes in the concatenation's own order, and the tests compare the two spellings of it on released
+layers with `torch.equal`. A ring is not a span — its prefix is the last `slots`, which is a
+rearrangement — so a windowed layer past its window reads as it always did, and that is also the arm
+the probe compares against: a cache whose method answers `None` is the code that ran before this.
+
+**And the copy cannot be predicted, so it cannot be prefetched.** The one thing a rank knows early
+about layer `L` is what it staged for layer `L` of the *previous* token — the same rows of the same
+arena — so the question is whether that prediction is worth acting on. `probe_mimo_v2_expert_reuse.py`,
+32 greedy steps of a real 8192-token prompt on four ranks: a row holds the expert it held a step
+earlier **nine to thirteen and a half times in a hundred** — 0.18 to 0.27 of a rank's two, with 76 to
+84% of the 1457 (layer, step) pairs keeping neither row — and the rank's whole *set* repeats in **1.9
+to 2.4%** of the draws. So a prefetch issued from that prediction would be right about one row in
+eight and wrong on the rest, spending a link that is already the floor on bytes the next step does not
+read; against the ~3% a re-draw of the same expert would score if the 256 were balanced, it is three
+to four times better than nothing and no schedule at all. The draws of this router are that
+scattered, and it is the same fact that makes a wider batch no better — a chunk's or a draft's tokens
+draw nearly disjoint experts, so staging them together is one copy either way.
 
 ## The round trips a decode token pays
 
@@ -845,7 +885,8 @@ The experts were the first thing the four ranks divided; the attention was not d
 rank computed all sixty-four query heads over the same quarter of a million keys, four times over, and
 at 256k that replication is **15.45 ms of every prefill token and most of a decode step**. This stage
 divides it, along the checkpoint's own partition: the prompt at that depth goes from **48.37 to
-104.04 tokens a second**, and a decode step from **323.8 to 205.6 ms**.
+104.04 tokens a second**, and a decode step from **323.8 to 205.6 ms** — 197.2 after the prefix cut
+described further down this page, which is why every split number here is the split stage's own.
 
 **The partition is the checkpoint's and not this repository's.** `quant.QKV_SHARDS` is four, and it is a
 fact about the released file: the fused `qkv_proj` is stored as four groups of `[q | k | v]` with the
@@ -1315,6 +1356,15 @@ torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt
 # the step's cost at a depth, without the prompt that reaches it: `--depth` fills the cache
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_host.py --depth 262144
 
+# where that step's 204.7 ms goes: the copy the kernel waited for, the attention, the kernel
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_phases.py --steps 8 --depth 262144
+
+# the attention's copy of its own prefix, span against `cat`, the two arms interleaved
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_prefix.py --depth 262144 --steps 4
+
+# whether the previous token's draw predicts this one's: a real prompt, a real greedy stream
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_expert_reuse.py --depth 8192 --tokens 32
+
 # the attention split against the whole attention, bit for bit: one card joins its own
 # shares with `torch.cat`, four ranks go through the real all-gather
 python tests/probe_mimo_v2_attention_split.py
@@ -1396,30 +1446,28 @@ golden holds and how it was captured.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
   one at a time and the second blocks on a lock.
-- **The attention and the dense linears are torch, not kernels.** They are baselines
-  with the shapes the kernels have to beat, and the split moved the baseline without moving the
-  conclusion: the attention is 202.7 ms a token for all 48 layers on four ranks at 262144 keys
-  replicated and 90.8 ms split — nine global layers at 15.660 and 3.367, thirty-nine windowed ones
-  at 1.582 and 1.551, the layer sums this page measures. The windowed pair is the one to look at:
-  a 128-slot ring costs the same whatever the context is, so a *chunk* of it gains 3.68× from the
-  split and a *decode step* gains nothing at all, and thirty-nine of the forty-eight layers are
-  that shape. What is left there is launches and dispatch — the single-pass decode path loses a
-  factor of twenty-eight to a batch dimension of one until the key count passes a window — and a
-  kernel is the only thing that reaches it.
-- **256k runs, and the decode at that depth is still short of the target.** A 262144-token prompt
-  goes through at **104.04 tokens a second**, which is past the hundred this page was written
-  against, and a decode step at that depth is **205.6 ms — 4.86 tokens a second — against 323.8
+- **The attention and the dense linears are torch, not kernels.** They are baselines with the
+  shapes the kernels have to beat, and the split moved the baseline without moving the conclusion:
+  at 262144 on four ranks the attention is **38.8 ms of a 197.2 ms decode step** — a fifth of a
+  token, and 44.3 before the prefix copy above went — and the thirty-nine windowed layers are why,
+  because a 128-slot ring's decode step costs what a global layer's does: what is left there is
+  launches and dispatch and not keys. `probe_mimo_v2_attention_split.py`'s per-layer table is the
+  split's *ratios* (4.65× on a global layer's decode step at that depth, 3.68× on a windowed layer's
+  chunk) and its absolute milliseconds are three to four times the in-situ column, taken with one
+  layer and one card in the loop rather than in the model; the ratios are what the split's claims
+  rest on. A kernel is the only thing that reaches the dispatch, and it is the next stage.
+- **256k runs, and the decode at that depth is at the target rather than past it.** A 262144-token
+  prompt goes through at **104.04 tokens a second**, which is past the hundred this page was written
+  against, and a decode step at that depth is **197.2 ms — 5.07 tokens a second — against 323.8
   replicated**, in the step probe that measures the deal a served run's step is built with. Five a
-  second is the number this was aiming at and neither arm reaches it, though the served split arm is
-  2.7% away rather than the 36% a *chunk-only* build would suggest: a prefill bench's `--decode`
-  column went through the `id` module and read 281.2, which is a measurement of the wrong deal. It
-  takes `--deal` now, defaults to the served build, and warms its steps; the deal's own size is still
-  the interleaved probe's to state.
-  What is left is not the attention, which the split took from 162 to 48 ms a token, and not the
-  copy, whose bytes are already the draw's minimum: it is the FFN and staging column, 226 ms of the
-  281, and the host's own per-layer work inside it — 117 launches a layer, the same at eight tokens
-  of context as at a quarter of a million. That is the next stage, and it is a kernel rather than a
-  rank.
+  second was the number this was aiming at and the margin over it is 1.4%, which is small because the
+  step is a copy at the link's rate plus everything else in series and both are at their floors: the
+  copy is 99.9 ms of the 197.2 — 1198.5 MiB a token at 12.0 GiB/s, which is a PCIe 3.0 x16 link at
+  essentially its rate — and hiding it behind the layer's other 97 ms needs a prediction, while
+  staging fewer bytes needs fewer experts than the draw's `top_k / world`. What is left to take off
+  the step is therefore the dispatch, and the attention is 39 of its 48 layers. A prefill bench's
+  `--decode` column read 281.2 for this depth before there was a flag, which is a different deal's
+  number; it takes `--deal` now and defaults to the served build.
 - **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
   tokens, with no temperature, top-p or repetition penalty. The checkpoint's
   `generation_config.json` says `do_sample: false`, so this is its own default — but a
@@ -1478,7 +1526,18 @@ golden holds and how it was captured.
   `tests/probe_mimo_v2_decode_timeline.py` — the profiler's own tables, the per-phase split, and
   the busy union of the device's intervals. The ops probe's first table is the one that found the
   145 `cudaStreamSynchronize` calls; the timeline probe reads `prof.events()` rather than
-  exporting a chrome trace, because a 13 MB trace of this step is truncated JSON.
+  exporting a chrome trace, because a 13 MB trace of this step is truncated JSON. The phases probe
+  is what separates the expert copy the kernel *waited* for from the copy it hid, and its two arms
+  are what the decode step's decomposition above is made of.
+- `tests/probe_mimo_v2_decode_prefix.py` — the attention's read of its own span, as a view of the
+  cache buffer against the `cat` it replaces, the two arms interleaved and four steps each at
+  262144: 197.2 ms a token against 202.3, the attention column 38.8 against 44.3. The `cat` arm is
+  the shipped method answering `None`, which is what a wrapped ring answers, so neither arm is a
+  patch of the arithmetic.
+- `tests/probe_mimo_v2_expert_reuse.py` — whether a token's draw predicts the next one's, per
+  layer and per rank, on 8192 tokens of a real document tokenized by the checkpoint's own tokenizer
+  and 32 greedy steps of it. It is the measurement that closes the prefetch: a row keeps its expert
+  nine to thirteen and a half times in a hundred, and the rank's whole set repeats in 1.9 to 2.4%.
 - `tests/probe_mimo_v2_allreduce.py` — the 16 KiB all-reduce on its own, with and without a kernel
   between the messages, at three message sizes, and under `NCCL_P2P_DISABLE=1`. It is where the
   intra-layer **1.6 ms** against the bare **0.126 ms** comes from, and what it says about the
