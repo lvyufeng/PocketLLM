@@ -6,11 +6,15 @@ how many streams the engine actually runs at once, what raising that number
 costs in latency, where the throughput curve stops paying, and what the resulting
 decode and prefill steps are worth in TFLOP/s against the card's peak.
 
-It is a **run record of the opt-in configuration**. Every timing below was taken
-with `POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, which
-is not the shipped path — `ipc_allreduce.hpp:49` documents both as opt-in and the
-engine prints a WARNING for the device-side wait at startup. The shipped
-configuration is the [baseline page](serving_latency_baseline.md)'s.
+It is a **run record of the shipped configuration**. Every timing below was taken
+with the hand-written IPC all-reduce and its device-side arrival wait on, unless
+its own section says otherwise — the one exception is the phase profile, which
+predates this build and is the HCCL arm's. The
+collective is the backend's default as of this revision, so the arm that reaches
+the [baseline page](serving_latency_baseline.md)'s HCCL numbers is
+`POCKET_ASCEND_IPC_ALLREDUCE=0`; only the device-side wait is still opt-in, as
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, and the engine still prints a WARNING for
+it at startup.
 
 Headline: **112 concurrent streams is where this configuration stops.** At
 `--max-context 2048` the KV arena stops fitting one rank at 120 slots, the rank
@@ -130,8 +134,13 @@ nine one-call length points and two arms that hold the prompt fixed while the
 budget cuts it into 1/2/4/8 calls. The four wave points the decomposition is
 checked against are `ladder`'s `L1`, `L4`, `L16` and `L32`.
 
-It exports `POCKET_ASCEND_IPC_ALLREDUCE=1` and
-`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` for every point, and wraps each run in
+It exports `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` for every point and leaves
+`POCKET_ASCEND_IPC_ALLREDUCE` alone, so a point runs the shipped collective and
+measures the default a server gets rather than the sweep's own environment. The
+control arm is `POCKET_ASCEND_IPC_ALLREDUCE=0`, passed as one of `point`'s
+trailing `K=V` arguments: those are exported after the sweep's own default, so
+they win over it, and a point turns the device-side wait off the same way. Each
+run is wrapped in
 `scripts/_serving_metrics_scrape.py`, which polls the engine's `/metrics` while
 the bench is alive. That scrape is the only source of the queue / prefill /
 decode split, because `bench_serving.py`'s record carries no server-side series.
@@ -229,7 +238,7 @@ among the single waves it is `L4`'s 0.413.
 
 **The budget is met at a lower offered concurrency, not by a lower slot count.**
 [serving_latency_optimized.md](serving_latency_optimized.md) clears it — 0.564 of
-0.589 req/s — with the same opt-in stack and the same nominal 512-token prompts, at 24
+0.589 req/s — with the same collective stack and the same nominal 512-token prompts, at 24
 prompts, `--request-rate 2` and `--max-concurrency 8`. Its peak concurrency was
 11 and it measured 70.29 tok/s at 99.49 ms TPOT, against `L8`'s 74.50 tok/s at
 84.35 ms and `L16`'s 106.37 at 100.39. The two configurations no longer meet at
@@ -242,6 +251,36 @@ as they are**; re-running that configuration is a measurement this page does not
 carry. The distinction that matters for capacity planning is still **concurrency
 offered at once** versus **concurrency sustained**, and this page measures the
 first.
+
+### Which half of the stack the table's rows are
+
+The eleven rows above are the **pair**: the hand-written collective *and* its
+device-side arrival wait. Only the first of those is the backend's default now, so
+the two anchors were re-measured in three interleaved arms — `POCKET_ASCEND_IPC_ALLREDUCE=0`
+(the HCCL arm the ladder replaced), unset (the shipped default), and unset with
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` (the pair the table quotes) — three rounds
+each, the arms rotating inside every round so host drift lands in all three.
+
+| arm | **`L16`** | | | **`L112`** | | |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| | TPOT ms | std | tok/s | TPOT ms | std | tok/s |
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` | 178.89 | 0.68 | 71.50 | 871.99 | 7.88 | 94.70 |
+| unset — the shipped default | 138.40 | 0.20 | 91.65 | 680.48 | 12.51 | 117.73 |
+| unset + `..._DEVWAIT=1` — the table's rows | 113.38 | 0.43 | 110.41 | 632.90 | 1.33 | 126.96 |
+
+**Which collective ran is read from the rank-0 log, not inferred from the step
+time.** With `POCKET_ASCEND_IPC_ALLREDUCE_STATS=1` the default arm prints 596
+`[ipc_allreduce] calls=` lines over a 16-row point of this shape and the control
+arm prints none, so the 40 ms between them is the barrier and not the host.
+
+So the default flip is worth **1.29x at 16 rows and 1.28x at 112**, and the
+device-side wait is worth the remainder of the spread above — 1.22x and 1.08x —
+which is the part left to the follow-on that flips it in turn. The ratios are the
+figure to carry: this session's absolute numbers sit above the table's (its `L16`
+and `L112` are 100.39 and 472.97 ms) because the host was slower for the whole
+three-arm run, and the stack the table was taken on reproduces the same
+1.57x/1.38x against HCCL here that the 1.53x/1.45x above records. Every number in
+this subsection is read from the `--json-out` artifact of its point.
 
 ## Maximum concurrency: the KV pool, not the flag
 
@@ -541,11 +580,11 @@ first token-dependent FLOP.** Every estimate of that fixed term here — 131.4 a
 one of three different manipulations of the same server.
 
 **It is the collectives.** A forward pass issues 129 of them whatever the prompt's
-width, and the barrier the engine ships for them is not the one it could use.
-Ceiling raised past the prompt against the shipped default, one call, one slot,
-TTFT p50 over six requests:
+width, and for most of this page's history the barrier the engine shipped for them
+was the slower of the two available. Ceiling raised past the prompt, one call, one
+slot, TTFT p50 over six requests:
 
-| rows | plane | default, on HCCL | hand-written | change |
+| rows | plane | `POCKET_ASCEND_IPC_ALLREDUCE=0`, on HCCL | hand-written | change |
 | ---: | ---: | ---: | ---: | ---: |
 | 67 | 686 KB | 165.0 ms | 145.2 ms | -12.0% |
 | 219 | 2.24 MB | 369.6 ms | 257.0 ms | -30.5% |
@@ -811,13 +850,14 @@ That is why the row-step rate is flat from 48 slots on while TPOT is not —
 the step time and paid for out of nothing. The FLOPs available would allow far
 more, and the distance between them is the 129 round trips.
 
-Those shares are the **shipped** barrier's, and the profile is the only place on
-this page that measures it. The profiled runs are `--batch-decode` invocations of
-`run_qwen_ascend_tp4.sh`, which exports neither `POCKET_ASCEND_IPC_ALLREDUCE` nor
-its DEVWAIT, so every collective in them is HCCL and the element ceiling this
-revision raises is not on their path at all — with the switch unset the ceiling
-is never consulted. The ladder's numbers are the opt-in stack's; the profile's
-12.01% is what the shipped configuration pays for the same 129 calls.
+Those shares are the **HCCL arm's**, and the profile is the only place on this page
+that measures it. The profiled runs are `--batch-decode` invocations of
+`run_qwen_ascend_tp4.sh` taken before this revision, when exporting neither
+`POCKET_ASCEND_IPC_ALLREDUCE` nor its DEVWAIT reached HCCL; the same command now
+reaches the hand-written barrier, so `POCKET_ASCEND_IPC_ALLREDUCE=0` is what
+reproduces them, and they are not re-run here. The ladder's numbers are the
+barrier's, so its step carries the smaller collective share; the profile's 12.01%
+is what the same 129 calls cost a step when they are HCCL's.
 
 Prefill sits on the other side of the ridge and is equally far from its ceiling.
 A 325-token prompt costs 331 ms of a single call — the fits above are that
@@ -857,12 +897,14 @@ it is a batching defect rather than a bandwidth one.**
   and [ascend_gated_delta_slice.md](ascend_gated_delta_slice.md) chased to zero
   spread on the single-request path, and it says that the batched HTTP path has
   not had the same treatment.
-- **Both switches are opt-in.** Every number here is the IPC collective with the
-  device-side wait, and the engine says at startup that the device-side wait is
-  not the shipped path. The ladder is therefore a ladder of this stack, and the
-  concurrency ceiling it finds is a ceiling of this stack's memory budget; the
-  shipped path's KV pool is the same size, so the ceiling should transfer, but it
-  was not re-measured there.
+- **One switch is still opt-in, and it is the device-side wait.** Every number
+  here is the IPC collective with that wait, and the engine says at startup that
+  the wait is not the shipped path — the collective itself became the default in
+  the revision this page belongs to, so an unset environment reproduces every row
+  below. The wait changes where the arrival poll runs, not how much memory the
+  arena has, so the concurrency ceiling this page finds is the shipped
+  configuration's: the KV pool is sized by slots and context, and this switch
+  leaves both alone.
 - **112 is a measurement, not a specification.** The failing rank is the one with
   27 MB less HBM on this host, and 268 MiB is all that separated a working run
   from a hung one. Treat the number as "this host, this checkpoint, ctx 2048" and
@@ -950,13 +992,15 @@ merged; its forward half is not, and item 2 is marked accordingly.
    total.
 3. **Make the row-step rate rather than the FLOP rate the target, and stop at
    48.** At 48 slots the step is 212.42 ms for 225.96 row-steps/s and 3.55 ms of
-   new row each; 129 collectives a step are 12% of the shipped step and none of
-   it amortizes with width. Going 48 -> 112 more than doubles TPOT, 212.42 to
-   472.97 ms, for 4.8% more row-steps/s and 0.8% more tokens. If the step rate is
-   the target rather than the latency, the lever is those 129 round trips, and
-   the ceiling this revision raises is a first step at it: the same TPOT points on
-   the hand-written barrier instead of HCCL are worth 1.53x at 16 rows and 1.45x
-   at 112.
+   new row each; 129 collectives a step are 12.01% of the *HCCL* step above and
+   none of it amortizes with width. Going 48 -> 112 more than doubles TPOT,
+   212.42 to 472.97 ms, for 4.8% more row-steps/s and 0.8% more tokens. If the
+   step rate is the target rather than the latency, the lever is those 129 round
+   trips, and the choice of barrier is no longer part of it: the hand-written one
+   is worth 1.53x at 16 rows and 1.45x at 112 against HCCL, and as of this
+   revision it is what an unset environment runs. What is left is the count —
+   reducing 129 fixed-latency round trips, which needs a fused
+   all-reduce-plus-GEMM or a different TP layout rather than a cheaper call.
 4. **Default the operating point to a slot count below the offered concurrency.**
    `L16x64` gets 64% less TTFT than `L16` at the same throughput and the best
    goodput among the full-batch runs. This is a configuration change and not an

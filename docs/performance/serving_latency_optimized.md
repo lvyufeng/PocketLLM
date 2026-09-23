@@ -2,13 +2,17 @@
 
 This record measures the same workload as
 [serving_latency_baseline.md](serving_latency_baseline.md) with two optimizations
-enabled: the hand-written IPC all-reduce (`POCKET_ASCEND_IPC_ALLREDUCE=1`) and
-the device-side arrival wait (`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`). Both are
-documented in [Ascend 910A single-request decode](ascend_single_request_tps.md).
+enabled: the hand-written IPC all-reduce (now the backend's default, then selected
+with `POCKET_ASCEND_IPC_ALLREDUCE=1`) and the device-side arrival wait
+(`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`). Both are documented in
+[Ascend 910A single-request decode](ascend_single_request_tps.md).
 
-**Neither switch is the shipped default, and the server says so at startup.** All
-of `ipc_allreduce.hpp`'s levers are opt-in, and the engine prints a warning for
-the device-side wait:
+**One of the two switches is now the shipped default, and the server says so at
+startup for the other one.** The hand-written collective is what an unset
+environment runs, so the page's first lever is no longer a lever — it is the
+default, and `POCKET_ASCEND_IPC_ALLREDUCE=0` is what reaches this page's
+[baseline](serving_latency_baseline.md). The device-side wait is still opt-in, and
+the engine prints a warning for it:
 
 ```
 [ipc_allreduce] WARNING: DEVWAIT is on. The arrival wait runs on the device
@@ -16,9 +20,10 @@ instead of the host. It computes the all-reduce and its tokens are meaningful;
 it is not the shipped path, so its step time is not the shipped step time.
 ```
 
-So this page records **what the lever is worth**, not what the server does out of
-the box. The baseline page is the default-configuration number; this one is the
-opt-in one, and the two differ by exactly the environment below.
+The run below was taken before the flip and is left as it was measured; read the
+collective as the default rather than as an opt-in, and the wait as the one opt-in
+that remains. `serving_throughput_scaling.md` is where the flip's own measurement
+lives.
 
 ## Scope
 
@@ -29,7 +34,9 @@ The measured path:
 - OpenAI `/v1/chat/completions`, streaming SSE
 - `--no-kv-paged`, `max_context` 8192, batch width 8, prefill budget 4096
 - commit `4fc72a1` (master as of 2026-09-19), binary `cpp_engine/build-ascend/pocketllm_engine`
-- **`POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`**
+- **`POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`** —
+  the first was required at the time of the run and is the default now, so only
+  the second has to be exported to reproduce it
 - `QWEN_ASCEND_REPLICATE_ROWS` at its default of 1, i.e. the Cube's row
   replication is **off** — see [the ladder](#the-same-levers-inside-the-engine)
 
@@ -43,7 +50,7 @@ environment variables.
 
 ```bash
 source scripts/ascend_env.sh     # without it an ACL binary hangs before aclInit returns
-export POCKET_ASCEND_IPC_ALLREDUCE=1
+export POCKET_ASCEND_IPC_ALLREDUCE=1        # the default now; kept as it was run
 export POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1
 python scripts/bench_serving.py \
     --ckpt /mnt/data1/modelscope/Qwen/Qwen3.8-27B \
@@ -140,8 +147,9 @@ ranks during decode. A decode step issues **129** of them — 64 `ar.mlp`, 48
 reducing the same 5120-element fp16 plane, 10240 B. One per-call saving is
 therefore multiplied by 129.
 
-1. **`POCKET_ASCEND_IPC_ALLREDUCE=1`** replaces `HcclAllReduce` with a hand-written
-   copy-and-barrier that reads peer buffers directly and synchronizes with an
+1. **The hand-written IPC all-reduce**, which replaced `HcclAllReduce` as the
+   backend's default (`POCKET_ASCEND_IPC_ALLREDUCE=0` is the way back to it). It
+   is a copy-and-barrier that reads peer buffers directly and synchronizes with an
    arrival signal carried in the payload itself. The empty-loop cost drops from
    `HcclAllReduce`'s 0.4810 ms to 0.26 ms per call.
 
@@ -158,8 +166,8 @@ rows=1, with the TP4 launcher and one process per rank
 
 | collective | `step_ms` | decode TPS |
 | --- | ---: | ---: |
-| `HcclAllReduce` (shipped) | 103.8 | 9.63 |
-| IPC all-reduce, host poll | 76.6-77.1 | 12.96-13.06 |
+| `HcclAllReduce` (the `POCKET_ASCEND_IPC_ALLREDUCE=0` arm) | 103.8 | 9.63 |
+| IPC all-reduce, host poll (shipped since the flip) | 76.6-77.1 | 12.96-13.06 |
 | IPC all-reduce + device wait | **53.2-53.6** | **18.66-18.79** |
 
 23.4 ms of the intermediate 77.1 ms step is the host's round trip through the

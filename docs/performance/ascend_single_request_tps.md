@@ -17,18 +17,21 @@ the engine runs behind. The three ordering primitives AscendCL offers across tha
 usable here — an imported notify cannot be waited on and a cross-process event cannot be created —
 but a barrier that reads its arrival signal out of the payload itself is, and it prices a complete
 all-reduce at **0.26 ms against `HcclAllReduce`'s 0.4810** in an empty loop (§5.4). That barrier is
-now built as a kernel-level replacement for the collective (`POCKET_ASCEND_IPC_ALLREDUCE=1`) and it
+now built as a kernel-level replacement for the collective (the backend's default since the flip;
+`POCKET_ASCEND_IPC_ALLREDUCE=0` selects HCCL instead) and it
 has been measured inside the engine against the shipped path **interleaved run for run**, so the two
 arms share a session: rows=1 goes from **106.33 ms / 9.408 TPS to 77.32 ms / 12.935 TPS**, +37.7%
-(§5.5.4). It ships opt-in, and the reason this page gave for that — the launcher's hard gate,
+(§5.5.4). It shipped opt-in, and the reason this page gave for that — the launcher's hard gate,
 `batch_repeat_mismatches`, failed by **both** arms, 3 of 36 runs under HCCL and 8 of 36 under the
 replacement — is retracted. Those failures were the partial-RoPE table aliasing a pooled workspace
 buffer with a kernel the host had already queued, which is a separate defect with a separate fix and
 nothing to do with the collective. With it fixed the gate is failed 0 times in 22 runs across both
-arms. The replacement stays opt-in here only because flipping a default is its own change: the
-device-side wait of §5.5.3 also passes the gate once the table has its own slot, and takes rows=1 to
+arms, and the switch that was waiting on it has been flipped: **the hand-written collective is the
+backend's default**, and `POCKET_ASCEND_IPC_ALLREDUCE=0` is the way back to HCCL. The device-side
+wait of §5.5.3 also passes the gate once the table has its own slot, and takes rows=1 to
 **53.0-53.9 ms and 18.56-18.86 TPS** — 18.6 TPS on a single request at the shipped row count, with
-the tokens the reference produces.
+the tokens the reference produces. That one stays opt-in, because flipping a default is its own change
+and it is not this one.
 
 What those same pairs do not leave in doubt is the step. Half of the saving came from deleting a
 bracket rather than from the barrier: the first integration kept the engine's `begin`/`end` pair
@@ -352,10 +355,11 @@ when the same barrier is put where the collective actually is.
 ### 5.5 The same barrier inside the engine
 
 The barrier is now `cpp_engine/backends/ascend/collective/ipc_allreduce.{hpp,cpp}`, reached through
-`tp_all_reduce_sum_f16_inplace`. `POCKET_ASCEND_IPC_ALLREDUCE=1` selects it for any call with world > 1
-and a plane of at most `kDefaultMaxElements` FP16 elements; a call outside that envelope falls through
-to HCCL unchanged, and every rank evaluates the same predicate on the same arguments, so the choice
-cannot desynchronise the group. That ceiling was 40 960 when this section was written, chosen by a
+`tp_all_reduce_sum_f16_inplace`. It is the default for any call with world > 1
+and a plane of at most `kDefaultMaxElements` FP16 elements, and `POCKET_ASCEND_IPC_ALLREDUCE=0` turns
+it off; a call outside that envelope falls through to HCCL unchanged, and every rank evaluates the
+same predicate on the same arguments, so the choice cannot desynchronise the group. That ceiling was
+40 960 when this section was written, chosen by a
 sweep §5.5.4 then re-tested and could not separate the sizes between, and it has since been re-derived
 from the other end: [serving_throughput_scaling.md](serving_throughput_scaling.md)
 measures the two barriers against each other as whole-prefill TTFT, finds the hand-written one
@@ -365,14 +369,31 @@ which is a change to what a serving run does and not only to what a diagnostic c
 Everything in this section was measured under the old ceiling and none of it moves: §5.5.1-5.5.4 are
 all rows=1 steps, where both ceilings admit the hand-written path.
 
+**The fall-through is a run that still ends in the reference's tokens.** The predicate is covered
+device-free by `cpp_engine/tests/test_ipc_allreduce_envelope.cpp`; what that cannot show is the
+envelope doing its job inside a decode. Two interleaved pairs at 16 rows, `POCKET_ASCEND_IPC_ALLREDUCE_STATS=1`
+on both arms, one arm at the shipped ceiling and one with `..._MAX_ELEMENTS=4096` so that a 81 920-element
+plane is over it:
+
+| arm | barrier calls in `rank0.log` | `step_ms` | gate |
+|---|---:|---:|---|
+| shipped ceiling | 697 | 104.03, 104.14 | 0 mismatches, 48 of 48 agreed |
+| `..._MAX_ELEMENTS=4096` | **0** | 139.78, 143.54 | 0 mismatches, 48 of 48 agreed |
+
+The refused arm's step is the HCCL step, its four runs produce **one identical token stream**
+(md5-equal across all four `ref_step` logs), and its seed line is `seed_mismatches=0`. So an
+environment that lowers the ceiling does not corrupt a batched decode, it moves it to the other
+collective — which is the property the default depends on, since the ceiling is the only thing
+keeping a plane the barrier was not measured for off it.
+
 #### 5.5.1 The bracket cost more than the collective saved
 
 The first engine integration wrapped the new collective in the same `begin_nccl_collective()` /
 `end_nccl_collective()` bracket the HCCL path uses, and that is the version that was measured first:
 
-| arm | `step_ms` | decode TPS | vs the shipped default |
+| arm | `step_ms` | decode TPS | vs the arm it replaced |
 |---|---|---|---|
-| HCCL, bracketed (the shipped default) | 105.783 | 9.45333 | — |
+| HCCL, bracketed (the shipped default when these ran) | 105.783 | 9.45333 | — |
 | hand-written, bracketed | 91.5055 | 10.9283 | +15.6% |
 | hand-written, bracket removed | **78.593** | **12.7238** | **+34.6%** |
 
@@ -519,15 +540,18 @@ have. The first three clauses were true and the last one does not follow from th
 the RoPE table's workspace aliasing, which lands on the same comparison; the device wait did not lack
 a fence, it changed the window. The paragraph above has the re-measurement.
 
-At rows=16 the replacement is not in the picture at all: 16 rows x 5120 is 81 920 elements, twice the
-ceiling §5.5.4 re-tests, so a batched decode falls back to HCCL and the rows=16 arm is HCCL against
-itself. An earlier revision of this page quoted +33% here (141.184 ms / 113.327 TPS becoming
+At rows=16 the replacement was not in the picture when these runs were taken: 16 rows x 5120 is 81 920
+elements, twice the 40 960-element ceiling then in force, so a batched decode fell back to HCCL and the
+rows=16 arm was HCCL against itself. The ceiling has since been raised to 512 rows
+([serving_throughput_scaling.md](serving_throughput_scaling.md)), so that plane is on the replacement
+now; the retraction is unaffected either way, since it is about the RoPE table and not the collective.
+An earlier revision of this page quoted +33% here (141.184 ms / 113.327 TPS becoming
 106.365 ms / 150.425 TPS). That measurement was taken with the ceiling at 1 Mi elements, i.e. before
 the reproducibility sweep, and with `QWEN_BATCH_VERIFY=0`, so it is a timing number from a
-configuration that did not gate. It is retracted rather than corrected: with the shipped ceiling there
-is nothing to measure, and the ceiling itself is a default rather than a bound (§5.5.4), so re-raising
-it to re-measure would be choosing a configuration to produce a number rather than measuring the
-shipped one.
+configuration that did not gate. It is retracted rather than corrected: under the ceiling in force
+when it was taken there was nothing to measure, and the ceiling itself is a default rather than a
+bound (§5.5.4), so re-raising it to re-measure would be choosing a configuration to produce a number
+rather than measuring the shipped one.
 
 #### 5.5.4 The reproducibility gate, and which arm it actually separates
 
@@ -564,8 +588,8 @@ per rank on devices 0-3, the two arms alternating run for run:
 
 | arm | `batch_repeat_mismatches` failures | runs | step | decode TPS |
 |---|---|---|---|---|
-| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL, the shipped default) | 3 | 36 | 106.33 ms | 9.408 |
-| `POCKET_ASCEND_IPC_ALLREDUCE=1` (hand-written) | 8 | 36 | 77.32 ms | 12.935 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` (HCCL; the shipped default when these ran) | 3 | 36 | 106.33 ms | 9.408 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=1` (hand-written; the default since the flip) | 8 | 36 | 77.32 ms | 12.935 |
 
 **HCCL fails this gate too.** The point estimates are 8.3% against 22.2% and the rates are still not
 separated (Fisher two-tailed p = 0.19), so this gate neither rejects the replacement nor validates it.
@@ -730,11 +754,13 @@ them is load-bearing, and they are kept because each closes off a real hazard fo
   measured deviation wider and cost 6.4 ms of a 77 ms step, and it was removed.
 
 **What this leaves.** The replacement is worth 29.0 ms of a 106.3 ms step, +37.5%, and this section
-gives no reason to prefer HCCL's reproducibility to its own. It still ships opt-in
-(`POCKET_ASCEND_IPC_ALLREDUCE=1`, default off), because a batched path that is not run-to-run
-reproducible is exactly the kind of defect that shows up in production as a rare bad token rather
-than as an error, and because the one number that would settle it — the two arms' true rates, at
-matched configurations and a sample large enough to separate them — is not in hand.
+gives no reason to prefer HCCL's reproducibility to its own. It shipped opt-in for the reason above —
+a batched path that is not run-to-run reproducible is exactly the kind of defect that shows up in
+production as a rare bad token rather than as an error, and the one number that would settle it, the
+two arms' true rates at matched configurations, was not in hand. That reason is discharged rather
+than answered: the rate was the RoPE table's workspace race and not the collective, 0 of 22 failures
+with it fixed, so the switch has been flipped and **the hand-written collective is the backend's
+default**. `POCKET_ASCEND_IPC_ALLREDUCE=0` is the way back to HCCL.
 
 Two controls could not be run and are named so the gap is visible. `QWEN_TP_WORLD=1` — no collective
 in the program — cannot host this checkpoint at all: one 32 GB card OOMs on
@@ -998,10 +1024,12 @@ The broadcast is the single-row form's arithmetic, to the figures the measuremen
 Three further things are not established, and are named so they are not read as done. The
 `full_attention` and `attn_resid_norm` deltas above are a single session's, on a step that has 112
 attention calls in it, and the interaction between a 1.2 MB larger workspace and the attention
-kernels' own allocations is not separated from noise. The HCCL row in §6.3 is the shipped default and
-is measured at both widths — 9.63 and 9.76 TPS, +1.3% — so the lever is nearly free there but nearly
+kernels' own allocations is not separated from noise. The HCCL row in §6.3 is the arm
+`POCKET_ASCEND_IPC_ALLREDUCE=0` reaches and is measured at both widths — 9.63 and 9.76 TPS, +1.3% —
+so the lever is nearly free there but nearly
 worthless too: a 103.8 ms step leaves the ~20 ms the tile buys buried in the collective. The 34.8%
-§6.3 reports is this lever on top of the hand-written path, not on the default. And the fused versus
+§6.3 reports is this lever on top of the hand-written path, which the flip has since made the
+default, and not on the HCCL arm. And the fused versus
 unfused `mlp.gate_up` choice the engine makes from the checkpoint's own layout is not swept against
 `QWEN_ASCEND_REPLICATE_ROWS`; only the layout this checkpoint selects (fused, 8704) is measured
 here.
@@ -1010,7 +1038,7 @@ here.
 
 | lever | measured size | state |
 |---|---|---|
-| Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | built; opt-in with `POCKET_ASCEND_IPC_ALLREDUCE=1`. The gate failures this row used to cite (3 of 36 HCCL, 8 of 36 hand-written) were a workspace race elsewhere and are 0 of 22 with it fixed, so the gate no longer argues either way |
+| Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | taken; the backend's default since the flip, with `POCKET_ASCEND_IPC_ALLREDUCE=0` as the way back to HCCL. The gate failures this row used to cite (3 of 36 HCCL, 8 of 36 hand-written) were a workspace race elsewhere and are 0 of 22 with it fixed, so the gate no longer argues either way |
 | The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | recovered: the device-side form is 30% faster, 53.0-53.9 ms and 18.56-18.86 TPS, and passes the gate 10 of 10 once the RoPE table has its own workspace slot (§5.5.3) |
 | ~~The arrival signal has no release ordering~~ | **retracted**: the 10-of-10 rate that exposed it was the RoPE table's workspace aliasing, and it goes to 0 of 10 without the barrier changing at all (§5.5.3, §5.5.4) | withdrawn |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
@@ -1030,10 +1058,12 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=0 QWEN_BATCH_PROMPT_LEN=32 \
 ```
 
 The §5.5 A/B is the same launcher with the hand-written collective on one arm and off the other,
-`QWEN_BATCH_VERIFY=3` so that both arms are gated:
+`QWEN_BATCH_VERIFY=3` so that both arms are gated. The `=1` arm is what an unset environment runs
+now that the collective is the default, and it is spelled out here because the measurement names
+both arms:
 
 ```bash
-# HCCL arm, then the hand-written collective
+# HCCL arm, then the hand-written collective (the default since the flip)
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE=0 scripts/run_qwen_ascend_tp4.sh "" 8
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
@@ -1041,7 +1071,9 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
 ```
 
 The §5.5.3/§5.5.4 device wait is the same again with `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, and its
-dose-response rows add `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`:
+dose-response rows add `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`. The collective is named there because
+the wait stacks on it; only the wait changes anything now, and the wait is the switch that is still
+opt-in:
 
 ```bash
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
@@ -1052,7 +1084,9 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
 ```
 
 The §6 A/B is the plain single-request path on both arms — 5-token prompt, 8 new tokens — with the
-row replication on one arm and off the other, interleaved and repeated:
+row replication on one arm and off the other, interleaved and repeated. It was measured on the
+hand-written collective, which the `POCKET_ASCEND_IPC_ALLREDUCE=1` below now spells out only to pin
+it; unset would run the same arm:
 
 ```bash
 # §6.3, three interleaved pairs against the same build

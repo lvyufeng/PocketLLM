@@ -233,8 +233,10 @@ QWEN_ASCEND_ROPE_WS=shared scripts/run_qwen_ascend_tp4.sh "The capital of France
 ```
 
 The gate re-run of §5.1 is the launcher's batched path with the verifier on. `POCKET_ASCEND_IPC_ALLREDUCE`
-is on `master` and opt-in — `1` runs the hand-written collective, unset runs the HCCL arm, which is
-the shipped default:
+was opt-in when this gate was run and is the backend's default now — `1` runs the hand-written
+collective, which is also what an unset environment does today, and `0` selects the HCCL arm that
+used to be the shipped default. The loop spells both arms out, so it reproduces the original A/B
+either way, and the gate's answer is the same one on both sides of the flip:
 
 ```bash
 for pair in 1 2 3 4 5 6; do
@@ -247,8 +249,9 @@ done
 ```
 
 §5.3 is the same loop with the two arms being `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` and `=1`, on
-the hand-written collective, and its token check is the plain single-request path with the same pair
-of overrides:
+the hand-written collective (`POCKET_ASCEND_IPC_ALLREDUCE=1` below is a no-op now that the barrier
+is the default, and is left in so the loop states which collective the wait was measured on), and
+its token check is the plain single-request path with the same pair of overrides:
 
 ```bash
 for arm in 0 1; do
