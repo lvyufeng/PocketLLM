@@ -768,11 +768,7 @@ class MimoV2KVCache:
         """
         if layer not in self._key:
             raise KeyError(f"layer {layer} is not in this cache; it holds {sorted(self._key)}")
-        if upto > self._written[layer]:
-            raise ValueError(
-                f"layer {layer} has {self._written[layer]} positions cached and {upto} were asked "
-                f"for; a chunk cannot read positions it has not appended"
-            )
+        self._check_readable(layer, upto)
         slots = self._slots[layer]
         start = max(0, upto - slots)
         if start == 0:
@@ -785,6 +781,44 @@ class MimoV2KVCache:
             self._value[layer].index_select(1, wanted),
             upto - start,
         )
+
+    def append_and_span(
+        self, layer: int, key: torch.Tensor, value: torch.Tensor, *, start_pos: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Append a chunk and hand back the span an attention is about to read, if it is a view.
+
+        The span is `[0, start_pos + n)`: the prefix below the chunk with the chunk's own keys on
+        the end of it, which is what a caller would build with a `cat` of `prefix(layer,
+        start_pos)` and its own `key`. While nothing has wrapped, the buffer *is* that span in
+        slot order -- the chunk's keys land at slots `[start_pos, start_pos + n)`, which is where
+        the concatenation would have put them -- so appending first and reading back is the same
+        bytes in the same order with no copy of the prefix at all. At 262144 with the attention
+        split over four ranks a global layer's prefix is 160 MiB of keys and values, nine layers,
+        read *and* written every token; it was 640 MiB a layer before the split.
+
+        `None` says the buffer is not that span in order and the caller should read its prefix
+        before appending as it always has: a ring that has wrapped holds the *last* `slots`
+        positions, so the span would be a rearrangement (an `index_select`, a copy) and the bounds
+        would have to be rebased onto a shorter key tensor, which is where the arithmetic moves.
+        Nothing is appended in that case, and the caller's own append still has to happen.
+
+        The read is checked here for the reason `prefix` checks it: a span that starts above what
+        the cache has written would otherwise be answered with the zeros the buffer was allocated
+        with.
+        """
+        self._check_readable(layer, start_pos)
+        upto = start_pos + key.shape[1]
+        if upto > self._slots[layer]:
+            return None
+        self.append(layer, key, value)
+        return self._key[layer][:, :upto], self._value[layer][:, :upto]
+
+    def _check_readable(self, layer: int, upto: int) -> None:
+        if upto > self._written[layer]:
+            raise ValueError(
+                f"layer {layer} has {self._written[layer]} positions cached and {upto} were asked "
+                f"for; a chunk cannot read positions it has not appended"
+            )
 
     def reset(self) -> None:
         """Forget every position without giving the memory back."""
@@ -1079,16 +1113,32 @@ class MimoV2DeviceAttention:
         else:
             key, value = key.to(self.dtype), value.to(self.dtype)
 
-        prefix_key = prefix_value = None
-        prefix_len = 0
-        if cache is not None:
-            prefix_key, prefix_value, prefix_len = cache.prefix(self.layer_idx, start_pos)
-
-        if prefix_len:
-            all_key = torch.cat([prefix_key, key], dim=1)
-            all_value = torch.cat([prefix_value, value], dim=1)
+        # The attention reads one span, `[0, prefix_len + sequence)`: the prefix below this chunk
+        # with the chunk's own keys on the end of it. Where the cache's buffer *is* that span in
+        # order -- nothing has wrapped -- the chunk is appended first and the span read back as a
+        # view of the buffer, which is the same bytes the concatenation below would build and is
+        # not a copy of the whole prefix: at 262144 a global layer's prefix is 160 MiB of keys and
+        # values with the attention split over four ranks, read and written every token. A ring
+        # that has wrapped is read before its append as it always was; `append_and_span` says
+        # which of the two this call is and has the reason.
+        span = (
+            None
+            if cache is None
+            else cache.append_and_span(self.layer_idx, key, value, start_pos=start_pos)
+        )
+        if span is not None:
+            all_key, all_value = span
+            prefix_len = start_pos
         else:
-            all_key, all_value = key, value
+            prefix_key = prefix_value = None
+            prefix_len = 0
+            if cache is not None:
+                prefix_key, prefix_value, prefix_len = cache.prefix(self.layer_idx, start_pos)
+            if prefix_len:
+                all_key = torch.cat([prefix_key, key], dim=1)
+                all_value = torch.cat([prefix_value, value], dim=1)
+            else:
+                all_key, all_value = key, value
 
         rows = torch.arange(sequence, device=self.device)
         upper = prefix_len + rows
@@ -1117,7 +1167,7 @@ class MimoV2DeviceAttention:
             validate=False,
         )
         self.last_stats = stats
-        if cache is not None:
+        if cache is not None and span is None:
             cache.append(self.layer_idx, key, value)
 
         pre_o = attn_output.transpose(0, 1).reshape(sequence, shape.o_in).contiguous()
