@@ -228,7 +228,7 @@ first.
 
 `--max-batch-size` is the concurrency ceiling — the engine logs it and the
 scheduler admits only while `slot_to_request_.size() < max_batch_size_`
-(`batch_scheduler.cpp:288`). Raising it is not free, and the failure when it is
+(`batch_scheduler.cpp:264`). Raising it is not free, and the failure when it is
 raised too far is the worst kind:
 
 | run | slots | ctx | engine | client | what happened |
