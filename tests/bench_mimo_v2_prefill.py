@@ -67,12 +67,36 @@ def prompt_of(tokens: int) -> list[int]:
     return (PROMPT_IDS * (tokens // len(PROMPT_IDS) + 1))[:tokens]
 
 
+def score_tile_bytes(model, rows: int, block: int = 1024) -> int:
+    """What a global layer's score tile would cost at `rows` a chunk, were the chunk its width.
+
+    The tile `blocked_attention` holds is `[kv_heads, groups, step, block]` float32, where `step` is
+    what `attention`'s `tile_budget` buys and not what the caller asked for -- so this is the number
+    the *tile budget* retires, quoted to say how large it was before. It is not a bound on a chunk:
+    the layer concatenates its prefix key and value to the chunk's, and at 256k that pair is larger
+    than any tile the loop holds. `block` is `attention`'s own default, which is what the model
+    calls it with.
+
+    A windowed layer is not asked: its keys are its window, so the tile is `rows x 128` and never
+    the thing that misses. The largest global layer is the one to quote.
+    """
+    shapes = [model.config.attention(layer) for layer in model.config.global_layer_indices]
+    shape = max(shapes, key=lambda item: item.num_kv_heads * item.num_key_value_groups)
+    return shape.num_kv_heads * shape.num_key_value_groups * rows * block * 4
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--checkpoint", default=os.environ.get("POCKETLLM_MIMO_CHECKPOINT", DEFAULT_CHECKPOINT)
     )
     parser.add_argument("--tokens", type=int, default=512, help="prompt tokens")
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=0,
+        help="positions the KV cache holds; 0 sizes it to the prompt, which is the default",
+    )
     parser.add_argument(
         "--chunk",
         default="512",
@@ -88,6 +112,18 @@ def main() -> int:
         "--floor", type=int, default=64, help="tokens to also feed one at a time; 0 skips it"
     )
     parser.add_argument("--slots", type=int, default=2, help="expert arena slots")
+    parser.add_argument(
+        "--tile",
+        type=int,
+        default=0,
+        help="scores the block loop's tile may hold; 0 uses the model's own constant",
+    )
+    parser.add_argument(
+        "--decode",
+        type=int,
+        default=0,
+        help="decode steps to run after the prompt is in the cache, timed",
+    )
     parser.add_argument("--no-pin", action="store_true", help="leave the bank pageable")
     args = parser.parse_args()
     args.chunk = sorted({int(part) for part in str(args.chunk).split(",") if part.strip()})
@@ -115,6 +151,7 @@ def main() -> int:
         deal="id",
         chunk_rows=args.band,
         pin=not args.no_pin,
+        tile_budget=args.tile or None,
     )
     torch.cuda.synchronize()
     experts = model.experts
@@ -148,10 +185,19 @@ def main() -> int:
     # The cache holds the whole prompt's keys and values: nine layers of it at full length and
     # thirty-nine rings of the sliding window. A prefill that does not fit here is a memory
     # question and not a speed one, and this reports where it landed.
-    cache = model.cache(len(ids) + 8)
+    #
+    # `--capacity` sizes it apart from the prompt, which is how the *memory state* of a long
+    # context is reached without paying for the prefill that gets there: the cache is the
+    # allocation that grows with the context and nothing else in the path is, so a 32k prompt
+    # against a 256k cache is the same allocator and the same headroom as a 256k one at the
+    # moment the first chunk is answered. It is a diagnostic for what the memory state costs
+    # and not a substitute for the run.
+    cache = model.cache(args.capacity or len(ids) + 8)
+    free_before = torch.cuda.mem_get_info()[0]
     print(
         f"{tag} cache: {cache.memory_bytes / 2**30:.2f} GiB over {len(cache)} layers for "
-        f"{len(ids)} tokens",
+        f"{cache.context_capacity} tokens; {torch.cuda.memory_allocated() / 2**30:.2f} GiB "
+        f"allocated, {free_before / 2**30:.2f} GiB free on the card",
         flush=True,
     )
 
@@ -169,6 +215,10 @@ def main() -> int:
     # single-token path can do. `--floor` caps how many tokens of it are paid for, because the
     # rate is what is being compared and not the prompt.
     floor_logits = None
+    # Bound before either pass runs, because a sweep whose every width was refused leaves both
+    # unset and the answer check below reads `logits` unconditionally. A run that measured
+    # nothing still has to report that it measured nothing.
+    logits = None
     if args.floor:
         floor_ids = ids[: min(args.floor, len(ids))]
         cache.reset()
@@ -200,9 +250,10 @@ def main() -> int:
     #
     # A row is printed as it is measured and not at the end, because a width can run out of
     # card and a table that never printed is a run with no numbers in it. The block loop's
-    # score tile is `groups x rows x block` float32, and a global layer's late key blocks see
-    # the whole chunk, so this is the one place in the path where the row count is a memory
-    # bound and not only a speed one.
+    # score tile is `groups x rows x block` float32 and a global layer's late key blocks see
+    # the whole chunk, so the row count used to be a memory bound and not only a speed one --
+    # the tile budget is what retired it, and the OOM handler below quotes the exception
+    # rather than blaming the tile for whatever allocation actually missed.
     print()
     print(
         f"{'chunk':>7} {'tokens':>7} {'seconds':>9} {'tok/s':>8} {'calls':>6} {'MiB/token':>10} "
@@ -238,14 +289,31 @@ def main() -> int:
         try:
             logits = model.prefill(ids, cache=cache, chunk=width)
             torch.cuda.synchronize()
-        except torch.cuda.OutOfMemoryError:
+        except torch.cuda.OutOfMemoryError as exc:
             # Reported and not raised: the card's ceiling is a result of this bench, and the
             # widths that do fit are worth the table even when a wider one does not. No barrier
             # of its own -- the next width's is the sync, and one rank skipping a barrier the
             # others also skip is exactly what keeps the counts equal.
+            #
+            # The exception is quoted and the site is printed, because the tile is *one* tensor in
+            # a chunk and not the whole of it: at 256k the prefix the layer concatenates is an
+            # order of magnitude larger, so a line naming the tile as the cause would be a guess
+            # dressed as a finding. The tile budget's own number goes beside it as what a chunk no
+            # longer scales, and the last frame says which allocation actually missed.
+            site = "<no frame>"
+            traced = exc.__traceback__
+            while traced is not None:
+                site = f"{os.path.basename(traced.tb_frame.f_code.co_filename)}:{traced.tb_lineno}"
+                traced = traced.tb_next
             print(
-                f"{width:>7} {'--':>7} did not fit: the block loop's score tile is "
-                f"`groups x rows x block` float32, 1 GiB at {width} rows a chunk",
+                f"[r{rank}] {width:>7} {'--':>7} did not fit at {site}: "
+                f"{str(exc).splitlines()[0]}",
+                flush=True,
+            )
+            print(
+                f"[r{rank}]            the tile the block loop holds is bounded by "
+                f"`attention`'s tile budget; uncapped by the chunk it would be "
+                f"{score_tile_bytes(model, width) / 2**20:.0f} MiB at {width} rows",
                 flush=True,
             )
             torch.cuda.empty_cache()
@@ -285,6 +353,14 @@ def main() -> int:
     if world > 1:
         import torch.distributed as dist
 
+        if logits is None:
+            # Every width was refused, so there is no row to compare and no share to report.
+            # The barrier is still owed: the ranks that skipped their blocks all arrive here.
+            if rank == 0:
+                print("\n[r0] no width fit, so there is no last row to compare", flush=True)
+            dist.barrier()
+            return 0
+
         gathered = [torch.empty_like(logits) for _ in range(world)]
         dist.all_gather(gathered, logits.contiguous())
         disagree = float((gathered[1] - gathered[0]).abs().max())
@@ -302,6 +378,49 @@ def main() -> int:
             if rank == 0:
                 print(f"[r0] MiB a token by rank, one at a time: {share}", flush=True)
         dist.barrier()
+
+    # What a step at this depth costs, which is the other half of a long context: the prompt in
+    # the cache is what every later token reads, and a global layer's read grows with it. The
+    # steps are timed the way the decode benches time them, one token a step, and the phases are
+    # the same event pairs -- so "prefill is linear in the prompt and decode is linear in the
+    # depth" is a measurement here and not a claim.
+    if args.decode and rows and rows[-1][0] != 1:
+        # No re-prefill: the last width's pass left the whole prompt in the cache, and that cache
+        # is what a step at this depth reads.
+        drawn = [int(logits.argmax())]
+        timer = PhaseTimer(model)
+        if world > 1:
+            torch.distributed.barrier()
+        started = time.perf_counter()
+        for step in range(args.decode):
+            logits = model.step(
+                drawn[-1], start_pos=len(ids) + step, cache=cache
+            )[-1]
+            drawn.append(int(logits.argmax()))
+        torch.cuda.synchronize()
+        seconds = time.perf_counter() - started
+        phases = timer.read()
+        token_ms = seconds / args.decode * 1e3
+        print(
+            f"\n{tag} decode at {len(ids)} tokens of context: {args.decode} steps in "
+            f"{seconds:.3f}s = {args.decode / seconds:.2f} tok/s ({token_ms:.1f} ms a token)",
+            flush=True,
+        )
+        print(
+            f"{tag} at that depth: attention {phases['attn'] / args.decode:.1f} ms a token, "
+            f"FFN and staging {phases['mlp'] / args.decode:.1f} ms a token, "
+            f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated",
+            flush=True,
+        )
+        if world > 1:
+            gathered = [None] * world
+            dist.all_gather_object(gathered, drawn[:4])
+            if rank == 0:
+                print(f"[r0] the first tokens at that depth, by rank: {gathered}", flush=True)
+        if rank == 0:
+            print(f"[r0] drew {drawn}", flush=True)
+        if world > 1:
+            dist.barrier()
 
     if rank == 0:
         print(f"[r0] last row draws token {int(logits.argmax())}")

@@ -16,7 +16,9 @@ quarter of them, the router stays replicated, and a routed layer's partial is su
 with one 16 KiB all-reduce. A token is then **275 ms — 3.63 tokens a second**, four
 ranks produce byte-identical logits, and the decode is the same nine tokens the
 one-rank run gives. What the ranks do *not* divide is the attention, which is
-replicated on all four and is the next stage's work.
+replicated on all four and is the next stage's work. That 275 is this stage's number and not
+the page's: two device-to-host round trips a layer that nothing needed were 58 ms of it, and the
+step is **177.6 ms — 5.63 tokens a second** below.
 
 **A prompt is a chunk now, and not a token loop.** `forward_chunk` takes a chunk of
 tokens through `moe_multi_token_fp4_forward` — the kernel the V4.1 path already called
@@ -26,13 +28,36 @@ chunks of the caller's width. On four ranks a 4096-token prompt goes through at 
 tokens a second at a 1024-token chunk and 174 at 2048**, against **2.93** for the same
 prompt fed one token at a time: 46 and 59 times the rate on the same weights, with the
 four ranks byte-identical on the prompt's last row. The width is the knob, and what
-caps it is the attention's block loop rather than the link — a 4096-token chunk runs
-out of card.
+capped it was the attention's block loop rather than the link — a 4096-token chunk ran
+out of card, and the next paragraph is what removed that.
 
-What that is not: 256k, serving, or a fast attention. The chunk path is a prompt
-through the same torch attention, which is 1.7 to 2 ms a token of the prefill and
-replicated on every rank; the cache is sized for 256k and nothing has run there; and
-there is no OpenAI-compatible adapter, no batching and no sampler.
+**The width that ran out of card now fits, and 256k runs.** The block loop's tile was
+its score block, `[kv_heads, groups, rows, block]` float32, whose width is the *chunk*
+and which is 1 GiB at 4096 rows; the chunk's rows are now split into steps sized to a
+fixed tile budget, which is a rounding-order difference and not an approximation. With
+that, a **262144-token prompt runs end to end on four ranks at a 2048-token chunk** —
+48.32 tokens a second, 18.45 GiB on the card, 2.4 GiB free, the four ranks' last row
+byte-identical — and a 64k prompt runs at **104.4 tokens a second at a 4096-token
+chunk**, against 95.5 at 2048 and 3.0 fed one token at a time. The bound is also what
+makes the 256k row below a real run rather than a cache that was sized for one.
+
+**Decode is 5.6 tokens a second at a short context** on four ranks, which is the same
+step that measured 3.63 before — the difference is two device-to-host round trips a
+layer that were pure validation. `_check_bounds` reads `upper.max()` and
+`(upper < lower).any()` back to the host to check the caller's bounds, and the model
+builds those bounds itself two functions above it, in Python, where both facts are
+already known. 48 layers × 2 round trips were **96 of a token's 145
+`cudaStreamSynchronize` calls**, each one stalling the host on the kernel it had just
+queued; the block loop's two `searchsorted`s per key block were another 128 a layer at
+64k. Removing the first and batching the second is 3.63 to **5.63 tokens a second** at
+eight tokens of context, and the decode's own `attn` column is **91.9 to 62.2 ms a token**
+at 64k.
+
+What that is not: a kernel, batching, or a sampler worth shipping. The attention and
+the dense linears are still torch; there is one request, one sequence and four
+replicated attentions; and at 256k a decode step is 448 ms because the attention reads
+256k keys nine times over. What *is* gone from the earlier list is 256k itself — it has
+run, and the numbers are below.
 
 What exists:
 
@@ -47,9 +72,9 @@ What exists:
 | Device attention, both families, with a KV cache | Implemented in torch and verified against the host reference; **not a kernel** |
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
-| Expert parallelism over four ranks | Implemented and verified: 3.63 tok/s, 275 ms a token, four ranks byte-identical and the same tokens as one rank |
+| Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
-| 256k context | Not run — the cache is sized for it and nothing has executed at that length |
+| 256k context | Verified and measured: a 262144-token prompt through four ranks at 48.32 tok/s, four-identical last row, 18.45 GiB on the card against 22 |
 | OpenAI-compatible serving | Not implemented |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
@@ -254,7 +279,54 @@ are what make a window affordable: a key block is answered by a slice of the que
 rows found with two binary searches, so a cacheless 4096-token chunk with a
 window of 128 evaluates **about a quarter** of the pairs a dense pass would — a
 block plus a window a block, against the whole chunk — and the loop reports both
-counts.
+counts. Those two searches are taken for **every block at once** and read back once,
+because one per block per bound is a device-to-host round trip and a round trip here
+stalls the pipeline on whatever was queued behind it: a 64k chunk against a 1k block is
+128 of them a layer. What that is worth depends on what the host has to do while it
+waits, and on a prefill it is **half a percent** — 690.3 s to 686.1 s for a 64k prompt
+at a 2048-token chunk — because the host is behind the device there anyway. On a decode
+step, where 96 of a token's 145 round trips came from the same kind of check, it is
+29.7 ms a token at 64k; see the decode section below.
+
+**The loop's tile is the chunk's width, and it is the thing at 256k that runs out of
+card.** `blocked_attention` materialises `[kv_heads, groups, rows, block]` float32 of
+scores, `rows` is the query slice of a key block, and a global layer's late key blocks
+are visible to the whole chunk — so the tile is 1 GiB at 4096 rows on a card holding
+14.3 GiB of weights, 5.65 GiB of 256k cache and a 408 MiB arena. The bound is now
+`row_step`: the *rows* of a slice are split into steps sized to a fixed budget of
+**2²⁶ scores**, which is 256 MiB of float32 with about as much again alive as their
+exponentials, and which at the release's `[4 kv, 16 groups, 1024 block]` is **1024 rows a
+step**. Splitting is not free — a slice rebuilds a mask and launches two smaller gemms,
+and the split cost **9%** of a 64k prefill when the budget was 32 MiB — but it is what
+makes a 4096-token chunk fit where a 1 GiB tile did not, and the budget is wide enough
+that a 64k prompt's attention runs four steps against a chunk of 4096.
+
+**The budget is a constant and not the card's free memory, and that was measured.**
+Reading `mem_get_info` at every block-loop attention is the obvious design — the same
+chunk needs a 32 MiB tile against a 128-key window and a 256 MiB one against a 256k
+cache — and it is the wrong one, because the reading is **per rank**. Four ranks of a
+lockstep layer then pick four different steps, do four different amounts of work, and
+every routed layer's `all_reduce` charges all four of them the slowest one's time. A
+256k prompt under a free-memory budget measured **8246.7 s** with the four ranks'
+attention columns spread 19.47 to 25.47 ms a token; the same prompt under a constant
+step took **5424.9 s** with the columns spread 15.03 to 15.53. Fifty-two percent for a
+"memory" bound that was really a schedule — and the constant fixes the spread as well
+as the mean, because a step every rank agrees on is a step no rank is charged for
+missing. A constant is also the only kind of step a CUDA graph could capture.
+
+The narrower constant is worse in the same direction, which is why the comment on
+`DEFAULT_TILE_SCORES` records 2²³ as an intermediate: the same 256k prompt under a
+2²³ step — 128 rows a step — took **6446.8 s** at 19.36 ms of attention a token, so the
+budget buys what it spends and a step of a thousand rows is the one this hardware
+wants.
+
+The split is arithmetic and not an approximation: a row sees its own key blocks in the
+same order with the same running maximum, and what changes is the row count of a gemm,
+which is a summation order inside a dot product. Measured against the whole-slice loop
+at `[8 heads, 2 kv, 37 rows, 211 keys]`, the largest difference any step below the
+whole made was **4.5e-08** on outputs of order 0.05, and the two tests that hold it are
+`test_a_narrower_row_step_is_the_same_answer_to_a_rounding` and
+`test_the_call_bounds_its_tile_and_not_only_its_total`.
 
 The single pass has a second measurement in it, and it is the kind that only shows up
 in a profile. Folding the 64 query heads into `[kv_heads, groups, ...]` batches and
@@ -460,12 +532,14 @@ deal:
 | The rest | 0.8 | the norms, the adds, the head, the host's own issue |
 
 Read the last two rows together: the same message costs **1.6 ms inside a layer and 0.128 ms
-in a loop**, a factor of twelve, and the twelve is the *lockstep* rather than the message. A
-collective is a barrier, four ranks' per-layer host work is not equal, and every rank pays
-the slowest one's time; the `id` deal doubles that by making the copy itself unequal. It is
-why the imbalance above is worth 21%, and it is the measurement that redraws the next
-stage's target: the step is now attention plus copy plus a lockstep, and 48 x 5.7 ms is the
-275 the `sorted` arm measures.
+in a loop**, a factor of twelve, and the twelve is the *lockstep* rather than the message.
+Re-measured on its own, the message is 0.126 ms and is latency rather than bandwidth —
+sixteen times the bytes cost the same 80 µs — so there is nothing in the transport to fix;
+see the probe in the evidence below. A collective is a barrier, four ranks' per-layer host
+work is not equal, and every rank pays the slowest one's time; the `id` deal doubles that by
+making the copy itself unequal. It is why the imbalance above is worth 21%, and it is the
+measurement that redraws the next stage's target: the step is now attention plus copy plus a
+lockstep, and 48 x 5.7 ms is the 275 the `sorted` arm measures.
 
 The whole-model phase totals behind that table, at 8 prompt tokens and 8 decode steps:
 
@@ -553,14 +627,26 @@ across the four, since a rank's draws are its own — and the same 47 draws a la
 step makes. That is the path a prefill used to be, and the grouped kernel is **46 to 60 times**
 it on the same weights.
 
-**There is a ceiling and it is not the link.** A 4096-token chunk does not fit: the attention's
-block loop materialises `[kv_heads, groups, rows, block]` float32 of scores, and a *global*
-layer's late key blocks are visible to the whole chunk, so its tile is 4 × 16 × 4096 × 1024 × 4
-bytes — 1 GiB, on a card that is already holding 14.3 GiB of weights and 1.6 GiB of arena.
-A windowed layer does not do this: its query slice is a block plus a window, so its tile is
-fixed. The nine global layers are what caps the chunk width, and the fix is in that loop
-rather than in the expert path — a smaller block, a tile that is not float32, or a two-sided
-tiling — which is why the ceiling is recorded here rather than worked around.
+**There was a ceiling and it was not the link.** A 4096-token chunk used to not fit: the
+attention's block loop materialises `[kv_heads, groups, rows, block]` float32 of scores, and a
+*global* layer's late key blocks are visible to the whole chunk, so its tile was 4 × 16 × 4096 ×
+1024 × 4 bytes — 1 GiB, on a card that is already holding 14.3 GiB of weights and 1.6 GiB of
+arena. A windowed layer never did this: its query slice is a block plus a window, so its tile is
+fixed. The nine global layers were what capped the chunk width, and the fix went into that loop
+rather than into the expert path: the tile's rows are now a step sized to a fixed budget, and the
+chunk is no longer the unit that has to fit. The ceiling moved with it and did not disappear — the
+*whole layer* has to fit, and at 256k the numbers in the next section are what that costs.
+
+**And the width is not monotone.** At a 64k prompt a 4096-token chunk beats a 2048-token one,
+104.4 against 95.5 tokens a second, which is the copy amortised and nothing else. At **256k it
+reverses**: the same prompt at a 4096-token chunk did not finish in four hours where 2048 finished
+in under two. The tile is part of it and not all of it — the constant budget gives a 4096-row chunk
+twice the steps of a 2048-row one for the same total rows, so the wider chunk pays more masks and
+more gemms — but the attention's cost at 256k depth is 15.1 ms of every prefill token where at 32k
+it is 3.6, and a wider chunk attends to more keys per token in exactly the way that number
+describes. What is recorded is the measurement and not a model of it: the run below is a
+2048-token chunk, the width was swept at 64k and at a 32k prompt against a 256k cache, and it was
+not swept at 256k depth because a sweep there is two hours an arm.
 
 **What the four ranks agree on.** The prefill's last row, gathered from all four after the
 widest chunk, is byte-identical — `0.0` between rank 0 and every other — and each rank staged
@@ -568,6 +654,85 @@ widest chunk, is byte-identical — `0.0` between rank 0 and every other — and
 they are and not in how many. The one-rank comparison in the tests is the check that it stays
 that way: a chunk is the same answer as the same rows one at a time to **3.0e-7** of the
 logits' own peak on two released layers, and takes the same token at every position.
+
+## 256k, and what a token at that depth costs
+
+The cache is per layer and the arithmetic is per family: a global layer's buffer is the whole
+context, so the nine of them at 262144 positions with four key heads of 192 and 128 are 5.65 GiB,
+and a windowed layer's is a 128-slot ring whose thirty-nine are 0.6 GiB between them. On the
+release, four ranks, a 2048-token chunk, a 408 MiB arena at a band of 16 experts and 64 experts a
+rank, a 262144-token prompt through it end to end — **18.45 GiB allocated and 2.4 GiB free of
+the card's 22**:
+
+| | Value |
+| --- | ---: |
+| Prompt | 262,144 tokens, 128 calls of 2048 |
+| Wall | 5424.9 s |
+| Rate | **48.32 tokens a second** |
+| Attention, all 48 layers | 15.0–15.5 ms a token |
+| FFN and staging | 5.1–5.6 ms a token |
+| Expert copy | 1.7 ms a token — 8.4% of the token, 18.6 MiB a token |
+| On the card | 18.45 GiB allocated, 2.42 GiB free |
+| The four ranks' last row | byte-identical, `0.0` between rank 0 and every other |
+| The first tokens at that depth, by rank | the same three on all four |
+
+**The attention is the whole of the difference.** At 64k a token costs 5.1 ms of attention and
+5.3 of everything else; at 256k the attention is 15.1 against the same 5.4, and the copy's share
+falls from 17% to 8% not because the copy got cheaper but because the token got three times more
+expensive. That is the shape of the requirement: a global layer's decode reads 256k keys and a
+global layer's prefill attends to everything below it, so the cost of a token at depth `p` is
+linear in `p` and no arrangement of the experts changes it. What a longer context costs here is
+attention, and what would move it is a kernel — a flash-style pass that does not materialise the
+score tile, or tensor cores in a dtype the parity tests still accept — and not another rank. It is
+also the one number the tile budget moved in the *good* direction without changing the work: the
+same prompt under the narrower 2²³ step cost 19.4 ms of attention a token and 6446.8 s of wall,
+and the 2²⁶ default is 15.1 and 5424.9 s for the same arithmetic.
+
+**And a decode token at 256k is 448 ms.** Two steps at that depth, timed: 447.9 ms a token —
+2.23 tokens a second — of which the attention is 190.7 to 209.1 ms and the FFN and staging 231.5
+to 250.2, with the same 18.47 GiB on the card. For contrast, the same step at eight tokens of
+context is 177.6 ms with 139.6 of it outside the routed path; at 256k the attention has grown from
+"whatever a short prefix costs" to a fifth of a second because nine global layers each read a
+quarter of a million keys. **The expert path grows too**, and that is the less obvious half: a
+token draws the same 47 × 8 experts whatever the context, so the bytes are the same 1198 MiB a
+rank — but the path is a lockstep rather than a copy, four ranks whose bytes are equal and whose
+times are not, so what a deeper context adds to it is the waiting rather than the traffic. A
+client at 256k should expect two tokens a second after a first token that costs the
+prompt.
+
+## The round trips a decode token pays
+
+A four-rank decode step at eight tokens of context is **177.6 ms — 5.63 tokens a second**, up
+from 235.4 ms and 4.25 before this stage, and none of that 58 ms is arithmetic: it is host round
+trips that were checked, twice a layer, for facts the caller already knew.
+
+The profiler's own tables say where they were. Per step, on the release at four ranks:
+**5,263 `cudaLaunchKernel` calls, 145 `cudaStreamSynchronize` calls at 777 µs each — 112.7 ms of
+the host's 325.2 — and 1,521 `aten::copy_`**. The syncs are the ones that matter, because a sync
+is not a cost that overlaps: the host stops until the device has drained everything queued,
+including the expert copy it just launched.
+
+| Source | Round trips a step | What it was for |
+| --- | ---: | --- |
+| `_check_bounds`' value checks, two a layer | 96 | `int(upper.max()) >= keys` and `bool((upper < lower).any())` |
+| `indices.tolist()`, one a routed layer | 47 | the draw, which the host stages from |
+| `sample_token`'s row, one a step | 1 | the logits the sampler reads |
+| **Total** | **145** | |
+
+The first row is the one that went. `_check_bounds` is the low-level API's own guard, and it is
+worth its round trips for a caller that hands in bounds computed somewhere else — which is every
+test and every direct caller. The *model* is not such a caller: it derives `upper` from
+`prefix_len + torch.arange(sequence)` and knows the key tensor is `prefix_len + sequence` long,
+and it derives `lower` from `upper` or from zero. Both facts are Python integers two functions
+above the check. So `attention` and both paths under it take `validate`, the model passes
+`False`, and the two round trips a layer become two comparisons in an `if`. The third row stays,
+because the sampler genuinely needs the row, and the second stays, because the host stages the
+draw and cannot stage a number it has not read.
+
+Where the 58 ms landed is measurable and it is not evenly spread: at eight tokens of context the
+step is 177.6 ms with the routed path at 38.0 and the rest of the layer at 139.6, against 77.4
+and 158.0 before. The routed path lost 39.4 ms to 47 removed round trips — 0.84 ms each, which is
+the price of the copy that was queued behind each one — and the attention lost the rest.
 
 
 ## Validated performance
@@ -620,7 +785,8 @@ stack no matter the chunk size" — one rank's 256 experts of 47 layers, 14.7 s 
 10.4 GiB/s, and the prefill's rate was read off that alone: 35 tokens a second at a 512-token
 chunk and 279 at 4096 on one rank, four times that with the bytes dealt over four. The measured
 answer is **93 tokens a second at 512, 134 at 1024 and 174 at 2048** on four ranks, and the
-widest chunk this card holds is 2048.
+widest chunk this card held *at that stage* was 2048 — the tile's row budget is what raised
+that, and the widths at and above 2048 are in the width section above.
 
 The byte estimate was right and the extrapolation from it was not, in a way worth recording.
 The per-chunk bytes really are a constant (a rank's whole share of every layer is 37.5 GiB
@@ -629,8 +795,11 @@ MiB a token at 256 down to 18.7 at 2048 — but the things a token also pays tha
 copy do not fall: the expert kernel and the layer's host work are 3.64 ms a token at 2048 of
 which the copy is 1.7, and the attention rises with the width, 1.63 ms a token at 256 to 1.95
 at 2048. A rate extrapolated from the copy alone therefore over-predicts the wider chunks the
-most, and the truth is a curve that flattens just under 200 tokens a second — until the
-attention's score tile runs out of card, which is what 4096 does.
+most, and the truth is a curve that flattens just under 200 tokens a second. The width past
+2048 was not a curve at all at that stage: a 4096-token chunk was refused by the attention's
+score tile before the rate could be measured, which is the bound the tile budget then removed
+— and removed in both directions, since 4096 turns out to be the faster width at 64k and the
+slower one at 256k.
 
 ## Correctness and precision
 
@@ -754,6 +923,19 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_ep.py --steps 8 --deal id
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
     --tokens 4096 --chunk 256,512,1024,2048,4096 --floor 16 --band 0
 
+# 256k, four ranks, a 2048-token chunk: 1 h 47 m of prefill after a five-minute build
+torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
+    --tokens 262144 --chunk 2048 --band 16 --floor 0 --decode 2
+
+# the same memory state without the prompt that reaches it -- `--capacity` sizes the cache
+# apart from the prompt, which is how the tile's own step is measured in minutes
+torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
+    --tokens 32768 --capacity 262144 --chunk 4096 --band 16 --floor 0
+
+# what a four-rank decode step is made of, without a profiler in the way, and with one
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_arms.py --steps 8 --prompt 8
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt 8
+
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
 ```
@@ -779,17 +961,25 @@ golden holds and how it was captured.
 
 ## Known limitations
 
-- **A chunk's width is capped by the attention's score tile, not by the link.** The block
-  loop materialises `[kv_heads, groups, rows, block]` float32 of scores and a global layer's
-  late key blocks are visible to the whole chunk, so a 4096-token chunk needs a 1 GiB tile on
-  a card already holding 14.3 GiB of weights and 1.6 GiB of arena, and does not fit. 2048 is
-  the widest this card holds, the prefill's rate flattens under 200 tokens a second before
-  that, and a smaller block, a narrower score tile or a two-sided tiling against the query
-  rows is what would move the ceiling. The nine global layers are the whole of it; a windowed
-  layer's tile is fixed, because its query slice is a block plus a window.
+- **A chunk's width is capped by the attention's score tile, and the tile's step is a constant.**
+  The block loop materialises `[kv_heads, groups, rows, block]` float32 of scores and a global
+  layer's late key blocks are visible to the whole chunk; that used to cap a chunk at 2048 tokens,
+  and the rows of a slice are now stepped against a fixed 2²⁶-score budget so it no longer does.
+  What the constant costs is that it cannot be right at both ends of the context range: it buys a
+  64k prompt two steps and a 2048-row chunk at 256k the same two, where a per-rank reading of free
+  memory bought a better step on each card and made the four ranks disagree — 28% of a 256k prompt.
+  A smaller `block`, a tile that is not float32, or a two-sided tiling would move all of it; the nine
+  global layers are the whole of it, and a windowed layer's tile is fixed because its query slice is
+  a block plus a window.
+- **The width that is fastest is not monotone in the context, and the tile is why.** 4096-token
+  chunks are the best at 64k (104.4 against 95.5 at 2048) and did not finish a 256k prompt in four
+  hours where 2048 finished in under two. A fixed step does not explain that on its own — a wider
+  chunk pays more of the attention, which at 256k is 15.1 ms of every token — and the honest
+  statement is that the width was swept at 64k and at a 32k prompt against a 256k cache, and not at
+  256k depth itself. Sweep `--chunk` per context; the narrow widths were swept at 64k.
 - **A prefill and a decode want different deals, and the deal is per module.** A chunk needs
   the experts partitioned (`id`) and a decode step is 21% faster when the *drawings* are
-  (`sorted`, the default). A serving run that has to do both picks one: `id` costs the decode
+  (`sorted`, the default). A run that has to do both picks one: `id` costs the decode
   step 73 ms a token, and `sorted` at a world over one cannot prefill at all — the chunk path
   refuses it rather than staging all 256 experts on every rank.
 - **No tensor parallelism, no batching, and the attention is replicated.** The experts
@@ -802,13 +992,14 @@ golden holds and how it was captured.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence.
 - **The attention and the dense linears are torch, not kernels.** They are baselines
-  with the shapes the kernels have to beat: 65-88 ms a token for all 48 layers on four
-  ranks, and the single-pass decode path loses a factor of twenty-eight to a batch
-  dimension of one until the key count passes a window.
-- **No 256k run.** The cache is sized for it and the attention's bounds are derived
-  from a position rather than from a mask, so nothing in the path is per-context — but
-  nothing has executed at that length, and at 262144 a global layer's decode step reads
-  256k keys nine times over.
+  with the shapes the kernels have to beat: 62.2 ms a token for all 48 layers on four
+  ranks at 64k and 190.7 to 209.1 ms at 256k, and the single-pass decode path loses a factor of
+  twenty-eight to a batch dimension of one until the key count passes a window.
+- **256k runs, and it is slow.** A 262144-token prompt goes through at 48.32 tokens a second and
+  a decode step at that depth is 448 ms. Nothing in the path is per-context — the attention's
+  bounds are derived from a position rather than from a mask — but the attention's cost *is*
+  linear in the context, and at 256k it is 15.1 ms of a prefill token and 200 ms of a decode
+  one. That is where the next kernel goes.
 - **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
   tokens, with no temperature, top-p or repetition penalty. The checkpoint's
   `generation_config.json` says `do_sample: false`, so this is its own default — but a
@@ -844,7 +1035,34 @@ golden holds and how it was captured.
   in the tree whose *default* was set by a four-rank measurement.
 - `tests/bench_mimo_v2_attention.py`, `tests/bench_mimo_v2_model.py`,
   `tests/bench_mimo_v2_ep.py`, `tests/bench_mimo_v2_prefill.py` — where the attention table,
-  the one-rank token table, the four-rank table and the chunk-width table come from.
+  the one-rank token table, the four-rank table, the chunk-width table and the 256k numbers come
+  from. `bench_mimo_v2_prefill.py`'s `--capacity` sizes the KV cache apart from the prompt, which
+  is how the tile's step in a long context is measured in minutes instead of hours.
+- `tests/probe_mimo_v2_decode_arms.py` — a decode step with the routed experts replaced by the
+  zero an empty rank returns, which is what separates the 38.0 ms a routed path costs *in situ*
+  from the 139.6 the rest of a layer does. It is deliberately the only arm: an arm that also
+  zeroed the attention was tried and removed, because the residual stream then stops moving,
+  every layer routes on the same row, and the subtraction is between two different models.
+- `tests/probe_mimo_v2_decode_ops.py`, `tests/probe_mimo_v2_decode_phases.py`,
+  `tests/probe_mimo_v2_decode_timeline.py` — the profiler's own tables, the per-phase split, and
+  the busy union of the device's intervals. The ops probe's first table is the one that found the
+  145 `cudaStreamSynchronize` calls; the timeline probe reads `prof.events()` rather than
+  exporting a chrome trace, because a 13 MB trace of this step is truncated JSON.
+- `tests/probe_mimo_v2_allreduce.py` — the 16 KiB all-reduce on its own, with and without a kernel
+  between the messages, at three message sizes, and under `NCCL_P2P_DISABLE=1`. It is where the
+  intra-layer **1.6 ms** against the bare **0.126 ms** comes from, and what it says about the
+  message itself is that it is latency and not bandwidth: 16 KiB costs **78.7 µs** and 256 KiB —
+  sixteen times the bytes — costs **80.1 µs**, while 16 MiB costs 2759.7 µs at 6.08 GB/s, which is
+  PCIe's own number and not a ring. Disabling the peers' P2P paths makes the same 16 KiB message
+  *faster* (93.3 µs a message in a chain, against 125.8), so the hop was already the host's shared
+  memory and the twelve-times gap is the lockstep's and not the transport's.
+- `tests/bench_mimo_v2_staging_copy.py` — `_stage` writes one expert as six `copy_` calls because
+  the arena holds `w1, w2, w3` separately and the bank holds an expert as one record, and a draw is
+  therefore twelve copies of about 2 MiB. This moves the same 25.5 MiB as twelve, six, three, two
+  and one copy, and the answer is that the split is free: **2.477 ms against 2.371, 1.04x, and
+  0.106 ms of a copy that is 2.4** — all five at 10.05 to 10.50 GiB/s, which is the link's own
+  rate. A row-per-piece arena is therefore not worth the layout work, and the copy stall the decode
+  profile reports is the link and not the launch count.
 - `src/models/mimo_v2/device_experts.py:forward_chunk` — the chunk layout, why `bincount` is
   not in it, and what the bands are; `src/models/deepseek_v4_1/device_experts.py:_issue_chunk`
   is the same call in the other heterogeneous path in this tree, with the 3.04x/3.69x
