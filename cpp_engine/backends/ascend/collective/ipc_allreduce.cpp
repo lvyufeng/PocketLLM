@@ -117,6 +117,32 @@ double now_ms() {
         .count();
 }
 
+// An opt-*out* switch: on unless an explicit off spelling is set, and on when the
+// variable is unset or empty.
+//
+// The spelling of "off" matches `qwen_env_enabled_default` in
+// `cpp_engine/engine/qwen_engine.cpp`, which is where the opt-out convention is
+// written down. It is mirrored here rather than shared because it reads an
+// environment variable and nothing else, and a header for that would be the only
+// dependency from `backends/ascend/` into `engine/`.
+//
+// This replaces an `atoi(value) != 0` reading, under which `=true` parsed as 0 and
+// therefore meant *disabled* -- the opposite of what it says. Every document and
+// script spelled the switch `=1`, so nothing was relying on it, but the wrong
+// answer was one ill-spelled environment variable away.
+//
+// Two variables are read this way, and they are the two that select the shipped
+// path: `POCKET_ASCEND_IPC_ALLREDUCE` -- this barrier against HCCL -- and
+// `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` -- the device-side arrival wait against the
+// host poll. Everything else in this file is a diagnostic and opts *in*.
+bool enabled_unless_disabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') return true;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "OFF") != 0;
+}
+
 // Where the collective's host time goes. `tp_all_reduce` in the engine's host
 // profile is wall time on the issuing thread, which for this path is the sum of
 // the three terms below -- but only in aggregate and only from outside the call.
@@ -213,14 +239,19 @@ int settle_us() {
     return us;
 }
 
-// `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` moves the arrival wait off the host and
-// onto the device. The host poll blocks inside `memcpy_d2h` for the whole
-// rendezvous, so nothing can be enqueued behind it and the device runs dry; this
-// enqueues `qwen_ipc_arrive_wait_kernel` instead and returns, leaving stream order
-// to carry the dependency.
+// `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` selects where the arrival wait runs, and on
+// this backend it is the shipped answer: the wait is a kernel on the caller's
+// stream unless the variable says `0`. The host poll is still here, and `=0` is the
+// way to it.
 //
-// It was written as a candidate, withdrawn as a wrong-result arm, and is a candidate
-// again. The rate it was withdrawn on -- ten interleaved pairs, ten gate failures
+// The host poll blocks inside `memcpy_d2h` for the whole rendezvous, so nothing can
+// be enqueued behind it and the device runs dry; the device arm enqueues
+// `qwen_ipc_arrive_wait_kernel` instead and returns, leaving stream order to carry
+// the dependency. At 129 collectives a decode step that is 23.4 ms of a 77.1 ms
+// step, which is what `NOPOLL` prices as the ceiling on deleting a host wait.
+//
+// It was written as a candidate, withdrawn as a wrong-result arm, and is shipped
+// now. The rate it was withdrawn on -- ten interleaved pairs, ten gate failures
 // against the host poll's none -- was the partial-RoPE table aliasing a
 // WorkspacePool slot, a defect with a fix of its own and nothing to do with the
 // arrival wait. Interleaved on that fix it takes the step from 76.10-77.66 to
@@ -230,14 +261,20 @@ int settle_us() {
 // build with that race on a dose-response, but it is sorting on the table's upload
 // window rather than on anything the barrier does.
 //
-// It stays default off because flipping a default is its own change, not because of
-// its answer. The kernel it launches is bounded, and the host reads its status word
-// to keep a lost peer a reported failure rather than a hung device.
+// What makes it shippable rather than merely fast is that its failure mode is
+// bounded twice over. The kernel spins a fixed number of iterations and then gives
+// up, so it cannot hang the device; it records how many peers were missing in a
+// status word it writes on failure and only on failure; and the host reads that word
+// every `kStatusCheckEvery` calls and raises it as an error, so a lost peer is
+// reported inside the step it killed. See the status check at the end of
+// ascend_ipc_allreduce_f16_inplace, and `..._DEADLINE_MS`, which bounds the device
+// spin from the same value it bounds the host poll with.
 bool devwait_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT");
-        return value != nullptr && *value != '\0' && std::atoi(value) != 0;
-    }();
+    // Cached, like the diagnostic switches and unlike `ascend_ipc_allreduce_f16_applies`:
+    // this one is read inside the collective's hot path and the environment does not
+    // change under a running process.
+    static const bool enabled =
+        enabled_unless_disabled("POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT");
     return enabled;
 }
 
@@ -245,6 +282,12 @@ bool devwait_enabled() {
 // costs a drain of the default stream, which is the host wait this switch exists to
 // delete, so reading it per call would defeat the change; 32 calls is a fraction of
 // a decode step's 129, so a dead group is still reported inside the step it killed.
+//
+// This is the shipped failure detector now that the device wait is the shipped wait,
+// and it is what keeps "the kernel is bounded" from meaning "a dead peer costs one
+// bound per collective and nothing says so". The word it reads is sticky: the kernel
+// never clears it, and the host clears it only after reading a zero, so a failure on
+// any of the 31 calls in between is still there when this one looks.
 constexpr long long kStatusCheckEvery = 32;
 
 // `POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM` moves this collective off the caller's
@@ -340,25 +383,6 @@ void warn_diagnostics() {
                          "step time.\n");
             std::fflush(stderr);
         }
-        if (devwait_enabled()) {
-            // Not the note this used to be, in either direction. It was written as
-            // "computes the right answer, so a step time from it is a step time",
-            // then as loudly as NOPOLL on ten gate failures in ten interleaved pairs.
-            // Those were the RoPE table's workspace aliasing and are 0 of 5 on the
-            // fix, at 18.56-18.86 TPS. Kept here because it is still not the shipped
-            // path. See devwait_enabled.
-            std::fprintf(stderr,
-                         "[ipc_allreduce] WARNING: DEVWAIT is on. The arrival wait runs "
-                         "on the device instead of the host. It computes the "
-                         "all-reduce and its tokens are meaningful; it is not the "
-                         "shipped path, so its step time is not the shipped step "
-                         "time.%s\n",
-                         settle_us() > 0
-                             ? " SETTLE_US is also on, which charges the wait an extra "
-                               "delay it does not need."
-                             : "");
-            std::fflush(stderr);
-        }
         return true;
     }();
     (void)done;
@@ -413,27 +437,6 @@ void report_stats() {
     s.reported_reduce_ms = s.reduce_ms;
     s.reported_prologue_ms = s.prologue_ms;
     s.reported_poll_iters = s.poll_iters;
-}
-
-// The main switch, and an opt-*out*: this barrier is the shipped collective on
-// this backend, so only an explicit off disables it. Unset and empty mean on.
-//
-// The spelling of "off" matches `qwen_env_enabled_default` in
-// `cpp_engine/engine/qwen_engine.cpp`, which is where the opt-out convention is
-// written down. It is mirrored here rather than shared because it reads an
-// environment variable and nothing else, and a header for that would be the only
-// dependency from `backends/ascend/` into `engine/`.
-//
-// This replaces an `atoi(value) != 0` reading, under which `=true` parsed as 0 and
-// therefore meant *disabled* -- the opposite of what it says. Every document and
-// script spelled the switch `=1`, so nothing was relying on it, but the wrong
-// answer was one ill-spelled environment variable away.
-bool enabled_unless_disabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || *value == '\0') return true;
-    return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
-           std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0 &&
-           std::strcmp(value, "OFF") != 0;
 }
 
 void check_acl(aclError err, const char* what) {
@@ -834,8 +837,9 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // engine executes them in order -- the stamp cannot be *sent* before the plane
     // has been. That is the whole of what this ordering buys, and it is less than it
     // reads like: it does not make the plane *readable* at the peer when the stamp
-    // is. `..._DEVWAIT` is the measurement that separates those two, and the host
-    // poll's round trip below is what covers the gap. See 5.5.3 and 5.5.4.
+    // is. The shipped wait below does not depend on it being readable -- it waits for
+    // the same stamps the peer sends -- and the host poll, which `..._DEVWAIT=0`
+    // selects, is what covers the gap by accident of being slow. See 5.5.3 and 5.5.4.
     for (int j = 0; j < world; ++j) {
         if (j == rank) continue;
         check_acl(aclrtMemcpyAsync(state.remote[static_cast<size_t>(set * world + j)],
@@ -851,7 +855,9 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     }
     const double t1 = timing ? now_ms() : 0.0;
 
-    // The barrier. Every rank's stamp for this round sits in one contiguous block of
+    // The barrier. Both arms are below -- the device wait first, then the host poll
+    // that `..._DEVWAIT=0` selects -- and this much is shared. Every rank's stamp for
+    // this round sits in one contiguous block of
     // `world * kStampStride` words, so a poll iteration costs one D2H of 256 bytes
     // rather than one per peer. The stamps inside it are `kStampStride` words apart
     // and only every stride-th word is a stamp; the rest is padding that exists so no
@@ -871,14 +877,15 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // round trip the bracket below is removed to avoid -- but it is buying the wait,
     // not wasting it. See docs/performance/ascend_single_request_tps.md 5.5.3.
     //
-    // The whole loop is `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT`'s to replace. The
-    // drain above is not only buying the wait, it is also what the device is idle
-    // for: the host is inside the runtime until every peer has arrived, so nothing
-    // is enqueued behind this call and the 25 ms `NOPOLL` prices is host time the
-    // device could have been given work across. The stamps are in GM that this rank
-    // and its peers both address, and every rank's wait is the same length (5.5.3),
-    // so the wait is a condition the device can test for itself. The device branch
-    // below enqueues that test instead of running it here.
+    // The host-poll loop further down is what `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0`
+    // selects; the device branch is the default. The drain that poll pays for is not
+    // only buying the wait, it is also what the device is idle for: the host is
+    // inside the runtime until every peer has arrived, so nothing is enqueued behind
+    // this call and the 25 ms `NOPOLL` prices is host time the device could have been
+    // given work across. The stamps are in GM that this rank and its peers both
+    // address, and every rank's wait is the same length (5.5.3), so the wait is a
+    // condition the device can test for itself -- which is why the device branch is
+    // the shipped one.
     //
     // This is not `ASYNCPOLL` returning under a new name, and the earlier loss does
     // not predict this one. ASYNCPOLL skipped the drain and repeated a read that was
@@ -990,20 +997,27 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     }
     const double t3 = timing ? now_ms() : 0.0;
 
-    // `DEVWAIT` put the wait out of this thread's reach, so the only way a peer that
-    // never arrives becomes a reported failure is for the host to read the latch the
-    // kernel writes. Reading it drains the default stream, which is the one thing this
-    // arm exists to stop doing, so it happens every `kStatusCheckEvery` calls rather
-    // than every call: one drain in 32 is a thirty-second of the cost of the drain per
-    // call it replaces, and the kernel never clears the latch itself, so a failure in
-    // the other 31 calls is still there when this one looks. See qwen_ipc_arrive_wait.cpp.
+    // The device wait put the wait out of this thread's reach, so the only way a peer
+    // that never arrives becomes a reported failure is for the host to read the latch
+    // the kernel writes. This is the shipped failure detector, not a diagnostic one:
+    // the kernel is bounded and this is what turns its bound into an error the caller
+    // sees. Reading the latch drains the default stream, which is the one thing the
+    // device arm exists to stop doing, so it happens every `kStatusCheckEvery` calls
+    // rather than every call: one drain in 32 is a thirty-second of the cost of the
+    // drain per call it replaces, and the kernel never clears the latch itself, so a
+    // failure in the other 31 calls is still there when this one looks. See
+    // qwen_ipc_arrive_wait.cpp.
     //
     // The read is `memcpy_d2h`, which is a blocking copy and therefore ordered only
     // against the default stream. That is the stream this collective is on whenever
     // the caller passes none, which is what the engine does at all 129 decode sites,
-    // so the drain is real and the latch is read after the wait it belongs to. With
-    // `..._RSTREAM` on it would not be, and this word could be read stale -- which is
-    // why the two switches are not meant to be combined. Neither is on by default.
+    // so the drain is real and the latch is read after the wait it belongs to.
+    // `..._RSTREAM` substitutes a stream of its own, but it drains that stream at the
+    // end of every call and this runs after that, so it is covered too. A caller
+    // passing a non-default stream of its own would not be, and nothing in the engine
+    // does: a zero read stale there costs detection latency rather than detection,
+    // because the latch is sticky and a group that is actually dead rewrites it on
+    // every call.
     double status_check_ms = 0.0;
     if (devwait_enabled()) {
         const double t_check = timing ? now_ms() : 0.0;

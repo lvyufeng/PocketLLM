@@ -9,12 +9,12 @@ decode and prefill steps are worth in TFLOP/s against the card's peak.
 It is a **run record of the shipped configuration**. Every timing below was taken
 with the hand-written IPC all-reduce and its device-side arrival wait on, unless
 its own section says otherwise — the one exception is the phase profile, which
-predates this build and is the HCCL arm's. The
-collective is the backend's default as of this revision, so the arm that reaches
-the [baseline page](serving_latency_baseline.md)'s HCCL numbers is
-`POCKET_ASCEND_IPC_ALLREDUCE=0`; only the device-side wait is still opt-in, as
-`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, and the engine still prints a WARNING for
-it at startup.
+predates this build and is the HCCL arm's. Both levers are the backend's default
+as of this revision and neither prints a startup warning, so an unset environment
+runs everything below: the arm that reaches the
+[baseline page](serving_latency_baseline.md)'s HCCL numbers is
+`POCKET_ASCEND_IPC_ALLREDUCE=0`, and `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0`
+reaches the host poll the device-side wait replaced.
 
 Headline: **112 concurrent streams is where this configuration stops.** At
 `--max-context 2048` the KV arena stops fitting one rank at 120 slots, the rank
@@ -134,13 +134,13 @@ nine one-call length points and two arms that hold the prompt fixed while the
 budget cuts it into 1/2/4/8 calls. The four wave points the decomposition is
 checked against are `ladder`'s `L1`, `L4`, `L16` and `L32`.
 
-It exports `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` for every point and leaves
-`POCKET_ASCEND_IPC_ALLREDUCE` alone, so a point runs the shipped collective and
-measures the default a server gets rather than the sweep's own environment. The
-control arm is `POCKET_ASCEND_IPC_ALLREDUCE=0`, passed as one of `point`'s
-trailing `K=V` arguments: those are exported after the sweep's own default, so
-they win over it, and a point turns the device-side wait off the same way. Each
-run is wrapped in
+It pins nothing: both of the backend's levers are the shipped defaults now, so a
+point runs the default a server gets and a trailing `K=V` argument is the only
+thing that can move it. The control arms are spelled that way —
+`POCKET_ASCEND_IPC_ALLREDUCE=0` for HCCL and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` for the host poll — and a `K=V` argument
+is exported for its own run and unset after it, so a lever cannot leak into the
+next point of a sweep. Each run is wrapped in
 `scripts/_serving_metrics_scrape.py`, which polls the engine's `/metrics` while
 the bench is alive. That scrape is the only source of the queue / prefill /
 decode split, because `bench_serving.py`'s record carries no server-side series.
@@ -255,32 +255,48 @@ first.
 ### Which half of the stack the table's rows are
 
 The eleven rows above are the **pair**: the hand-written collective *and* its
-device-side arrival wait. Only the first of those is the backend's default now, so
-the two anchors were re-measured in three interleaved arms — `POCKET_ASCEND_IPC_ALLREDUCE=0`
-(the HCCL arm the ladder replaced), unset (the shipped default), and unset with
-`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1` (the pair the table quotes) — three rounds
-each, the arms rotating inside every round so host drift lands in all three.
+device-side arrival wait. Both are the backend's default now — the collective
+flipped first and the wait in the revision this subsection belongs to — so the two
+anchors were re-measured in three interleaved arms, named by what they select
+rather than by what had to be exported to reach them: `POCKET_ASCEND_IPC_ALLREDUCE=0`
+(the HCCL arm the ladder replaced), `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` (the
+host poll the wait replaced), and unset (the shipped pair, which is what the table
+above records). Three rounds each, the arms rotating inside every round so host
+drift lands in all three.
 
 | arm | **`L16`** | | | **`L112`** | | |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | | TPOT ms | std | tok/s | TPOT ms | std | tok/s |
-| `POCKET_ASCEND_IPC_ALLREDUCE=0` | 178.89 | 0.68 | 71.50 | 871.99 | 7.88 | 94.70 |
-| unset — the shipped default | 138.40 | 0.20 | 91.65 | 680.48 | 12.51 | 117.73 |
-| unset + `..._DEVWAIT=1` — the table's rows | 113.38 | 0.43 | 110.41 | 632.90 | 1.33 | 126.96 |
+| `POCKET_ASCEND_IPC_ALLREDUCE=0` — HCCL | 175.78 | 0.66 | 73.54 | 869.34 | 7.09 | 94.68 |
+| `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` — host poll | 139.42 | 1.38 | 91.39 | 677.85 | 7.13 | 117.75 |
+| unset — the shipped pair, and the table's rows | **114.71** | 1.61 | 108.73 | **633.81** | 2.25 | 126.74 |
 
-**Which collective ran is read from the rank-0 log, not inferred from the step
-time.** With `POCKET_ASCEND_IPC_ALLREDUCE_STATS=1` the default arm prints 596
-`[ipc_allreduce] calls=` lines over a 16-row point of this shape and the control
-arm prints none, so the 40 ms between them is the barrier and not the host.
+`std` is the spread of the three rounds' means, and `tok/s` their mean. **Which
+collective and which wait ran is read from the rank-0 log, not inferred from the
+step time.** With `POCKET_ASCEND_IPC_ALLREDUCE_STATS=1`, over a 16-row point of
+this shape, the HCCL arm prints no `[ipc_allreduce] calls=` line at all, the host
+poll prints 596 of them with `poll_iters=1.00`, and the shipped arm prints the same
+596 with `poll_iters=0.00` — the device branch never enters the host loop. So the
+40 ms between the first two arms is the barrier and not the host, and the 25 ms
+between the last two is the round trip and not something else. The `..._DEVWAIT`
+arm has no startup warning any more; the counter is what names it.
 
-So the default flip is worth **1.29x at 16 rows and 1.28x at 112**, and the
-device-side wait is worth the remainder of the spread above — 1.22x and 1.08x —
-which is the part left to the follow-on that flips it in turn. The ratios are the
-figure to carry: this session's absolute numbers sit above the table's (its `L16`
-and `L112` are 100.39 and 472.97 ms) because the host was slower for the whole
-three-arm run, and the stack the table was taken on reproduces the same
-1.57x/1.38x against HCCL here that the 1.53x/1.45x above records. Every number in
-this subsection is read from the `--json-out` artifact of its point.
+The ratios are the figure to carry, because this session's absolute numbers sit
+above the table's: **the collective is worth 1.26x at 16 rows and 1.28x at 112**
+against HCCL, and **the device-side wait is worth a further 1.22x and 1.07x** on
+top of the collective — so the pair the table above quotes is **1.53x and 1.37x**
+against the HCCL arm a default server ran two revisions ago. The table's own `L16`
+and `L112` are 100.39 and 472.97 ms, which is the host being faster for its whole
+run rather than a different stack: the previous revision's three-arm measurement,
+taken before this flip with the middle arm spelled `..._DEVWAIT=0` and the third
+`..._DEVWAIT=1`, reads 178.89 / 138.40 / 113.38 ms at `L16` and 871.99 / 680.48 /
+632.90 at `L112`, and the same three arms here reproduce it to within 1.8% on every
+cell of both widths — the largest gap being the HCCL arm's `L16`. Every number in
+this subsection is
+read from the `--json-out` artifact of its point. Two of the eighteen points lost
+one request each to a `ConnectionResetError` about a second in — one on the HCCL
+arm and one on the host-poll arm, none on the shipped arm — so their TPOT is taken
+over the 111 successes rather than 112.
 
 ## Maximum concurrency: the KV pool, not the flag
 
@@ -897,13 +913,14 @@ it is a batching defect rather than a bandwidth one.**
   and [ascend_gated_delta_slice.md](ascend_gated_delta_slice.md) chased to zero
   spread on the single-request path, and it says that the batched HTTP path has
   not had the same treatment.
-- **One switch is still opt-in, and it is the device-side wait.** Every number
-  here is the IPC collective with that wait, and the engine says at startup that
-  the wait is not the shipped path — the collective itself became the default in
-  the revision this page belongs to, so an unset environment reproduces every row
-  below. The wait changes where the arrival poll runs, not how much memory the
+- **Neither switch is opt-in any more.** Every number here is the IPC collective
+  with its device-side wait, and both are now the backend's default — the
+  collective flipped first and the wait in the revision this page's three-arm
+  table measures — so an unset environment reproduces every row below and the
+  engine says nothing at startup. The wait changes where the arrival poll runs,
+  not how much memory the
   arena has, so the concurrency ceiling this page finds is the shipped
-  configuration's: the KV pool is sized by slots and context, and this switch
+  configuration's: the KV pool is sized by slots and context, and the wait
   leaves both alone.
 - **112 is a measurement, not a specification.** The failing rank is the one with
   27 MB less HBM on this host, and 268 MiB is all that separated a working run

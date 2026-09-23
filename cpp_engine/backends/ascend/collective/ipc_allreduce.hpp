@@ -46,10 +46,22 @@
 // behind the compute that produces them and the reduce is ordered behind the
 // pushes, so the caller sees the result exactly as it would from `HcclAllReduce`.
 //
-// This is the shipped collective on this backend. It is on unless
-// `POCKET_ASCEND_IPC_ALLREDUCE` says `0`, `false`, `FALSE`, `off` or `OFF`, and
-// any call outside the configured envelope falls back to HCCL rather than
-// failing. So an off switch and a size ceiling, not an on switch.
+// This is the shipped collective on this backend, and the arrival wait it runs is the
+// shipped wait. It is on unless `POCKET_ASCEND_IPC_ALLREDUCE` says `0`, `false`,
+// `FALSE`, `off` or `OFF`, and any call outside the configured envelope falls back to
+// HCCL rather than failing. So an off switch and a size ceiling, not an on switch.
+//
+// The wait itself runs on the device -- a kernel on the caller's stream spins on
+// the peer stamps -- unless `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT` says `0`, which
+// selects the host poll. The host poll blocks inside `memcpy_d2h` for the whole
+// rendezvous, so nothing is enqueued behind it and the device runs dry; deleting
+// that round trip is 23.4 ms of a 77.1 ms step at 129 collectives a decode step. It
+// defaults to the device for the same reason the barrier defaults on: it is
+// measured, and its failure mode is bounded twice over -- the kernel spins a fixed
+// number of iterations and gives up, and the host reads the word it writes on
+// failure every 32 calls and raises it as an error. `..._DEADLINE_MS` bounds both
+// from one value. docs/performance/ascend_single_request_tps.md 5.5.3-5.5.4 has the
+// measurement and docs/performance/serving_throughput_scaling.md the serving ladder.
 //
 // It used to be opt-in, and the reason recorded for that was a reproducibility
 // gate: a batched path that is not run-to-run reproducible is a rare bad token in
@@ -80,21 +92,17 @@
 //     barrier costs by deleting parts of it.
 //   * `..._POLL_SLEEP_US`, `..._SETTLE_US` and `..._RSTREAM` compute the right
 //     answer and pay host or device time the shipped path does not, so a token
-//     from one of them is meaningful and a step time from one is a bound.
-//   * `..._DEVWAIT` moves the arrival wait onto a kernel on the caller's stream. It
-//     computes that wait correctly, and it is a candidate again: it was withdrawn as
-//     a wrong-result arm on ten gate failures out of ten interleaved pairs, and those
-//     failures were elsewhere. On the fix they are 0 of 5 against the host poll's
-//     0 of 5, at 76.10-77.66 -> 53.02-53.88 ms and 12.88-13.14 -> 18.56-18.86 TPS,
-//     with the same 32 tokens out of all four runs. It stays default **off** because
-//     flipping a default is its own change rather than because of its answer. The
-//     kernel is bounded and the host reads its status word every 32 calls, so a lost
-//     peer is still reported rather than waited out; `..._DEADLINE_MS` bounds the
-//     device spin from the same value it bounds the host poll with.
+//     from one of them is meaningful and a step time from one is a bound. SETTLE_US
+//     and RSTREAM both compose with the device wait, which is the default.
 //   * `..._DEADLINE_MS` and `..._MAX_ELEMENTS` change when the barrier gives up and
 //     which calls take this path at all.
 //
-// The numbers they produced are in docs/performance/ascend_single_request_tps.md
+// `..._DEVWAIT` used to be on that list -- an arm that computed the wait correctly
+// but was not what shipped. It is what ships now, so the two spellings have swapped
+// places: `=0` is the arm that is off the shipped path, and it is not a run anyone
+// needs to be warned about.
+//
+// The numbers these produced are in docs/performance/ascend_single_request_tps.md
 // 5.5.3 and 5.5.4; a process with one of them set says so on stderr before its
 // first collective. One earlier switch, `..._ASYNCPOLL`, was measured and removed
 // -- the blocking stamp read is faster -- and the .cpp carries why.

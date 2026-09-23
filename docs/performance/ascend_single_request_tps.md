@@ -30,8 +30,12 @@ arms, and the switch that was waiting on it has been flipped: **the hand-written
 backend's default**, and `POCKET_ASCEND_IPC_ALLREDUCE=0` is the way back to HCCL. The device-side
 wait of §5.5.3 also passes the gate once the table has its own slot, and takes rows=1 to
 **53.0-53.9 ms and 18.56-18.86 TPS** — 18.6 TPS on a single request at the shipped row count, with
-the tokens the reference produces. That one stays opt-in, because flipping a default is its own change
-and it is not this one.
+the tokens the reference produces. That one was left opt-in by this flip, because flipping a default
+is its own change and it was not this one. It has since been flipped in turn, on
+its own three-arm serving ladder — 1.22x clear of the host poll at 16 rows and
+1.08x at 112 — so it is the backend's default too now, and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` is what reaches the host poll
+([serving concurrency](serving_throughput_scaling.md)).
 
 What those same pairs do not leave in doubt is the step. Half of the saving came from deleting a
 bracket rather than from the barrier: the first integration kept the engine's `begin`/`end` pair
@@ -501,7 +505,7 @@ of §5.5.4's pairs:
 
 | arm | `step_ms` | decode TPS | `wait_ms` per call | poll iterations | gate |
 |---|---|---|---|---|---|
-| host poll (shipped) | 77.117 (76.551-77.648) | 12.968 | 0.285 | 1.00-1.31 | 0 of 10 |
+| host poll (the arm shipped then; `..._DEVWAIT=0` now) | 77.117 (76.551-77.648) | 12.968 | 0.285 | 1.00-1.31 | 0 of 10 |
 | device wait | 53.745 (53.069-54.247) | 18.607 | 0.130 | — | **10 of 10** |
 
 23.4 ms of a 77.1 ms step, 30.3% of it, is the host's round trip through the runtime, and it is device
@@ -528,8 +532,10 @@ pairs of poll against device wait, the gate of §5.5.4 on both arms:
 
 and the same 32 tokens come out of all four runs made for it — poll twice, device wait twice — which
 are the reference's own: `11751 13 198 760 6511 314 9564 369 19241 ...`. So the 26.4 ms is recovered
-rather than bounded, at the shipped row count, and the switch is the shape it should ship in once the
-workspace fix is in the same tree.
+rather than bounded, at the shipped row count, and the switch is the shape it ships in
+now that the workspace fix is in the same tree — the flip itself is measured on the
+serving ladder in [serving concurrency](serving_throughput_scaling.md), and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` is the way back to the host poll.
 
 **It was read as a bound rather than a candidate, and that reading is retracted.** What used to stand
 here: every one of those ten device-wait runs fails the launcher's reproducibility gate, §5.5.4 has
@@ -661,7 +667,7 @@ put the failure rate on a dose-response:
 | post-arrival delay | `batch_repeat_mismatches` failures | runs | `step_ms` | decode TPS |
 |---|---|---|---|---|
 | none, device wait | 10 | 10 | 53.7 | 18.61 |
-| none, host poll — the shipped arm | 0 | 10 | 77.1 | 12.97 |
+| none, host poll — the shipped arm then | 0 | 10 | 77.1 | 12.97 |
 | 20 us | 2 | 4 | 84.3-85.3 | 11.7-12.0 |
 | 100 us | 1 | 4 | 94.7-95.4 | 10.5-10.6 |
 | 500 us | 0 | 4 | 145.5-146.6 | 6.8-6.9 |
@@ -1039,7 +1045,7 @@ here.
 | lever | measured size | state |
 |---|---|---|
 | Replace the 129 collectives with the hand-written one | 29.0 ms of 106.3, i.e. 9.41 -> **12.94 TPS**, interleaved (§5.5.4) | taken; the backend's default since the flip, with `POCKET_ASCEND_IPC_ALLREDUCE=0` as the way back to HCCL. The gate failures this row used to cite (3 of 36 HCCL, 8 of 36 hand-written) were a workspace race elsewhere and are 0 of 22 with it fixed, so the gate no longer argues either way |
-| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | recovered: the device-side form is 30% faster, 53.0-53.9 ms and 18.56-18.86 TPS, and passes the gate 10 of 10 once the RoPE table has its own workspace slot (§5.5.3) |
+| The poll the hand-written collective still does | 26.4 of the 27.6 ms it costs over the collective-free floor (§5.5.3); 23.4 of a 77.1 ms step as the host round trip, measured against a device-side wait on the same stamps | taken; the device-side form is 30% faster, 53.0-53.9 ms and 18.56-18.86 TPS, and passes the gate 10 of 10 once the RoPE table has its own workspace slot (§5.5.3), and its own three-arm ladder put it 1.22x/1.08x clear of the host poll at 16 and 112 serving rows, so it is the backend's default in turn, with `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` as the way back ([serving concurrency](serving_throughput_scaling.md)) |
 | ~~The arrival signal has no release ordering~~ | **retracted**: the 10-of-10 rate that exposed it was the RoPE table's workspace aliasing, and it goes to 0 of 10 without the barrier changing at all (§5.5.3, §5.5.4) | withdrawn |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
 | The 42.3 ms of non-collective per-layer work | 133.8 of the 136.7 ms step saving, i.e. 13.05 -> **17.59 TPS**, interleaved (§6.3, §6.4) | taken for the one-row activations; opt-in with `QWEN_ASCEND_REPLICATE_ROWS=16`. What is left of the 42.3 ms is not priced here |
@@ -1070,18 +1076,21 @@ QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE=1 scripts/run_qwen_ascend_tp4.sh "" 8
 ```
 
-The §5.5.3/§5.5.4 device wait is the same again with `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`, and its
-dose-response rows add `POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`. The collective is named there because
-the wait stacks on it; only the wait changes anything now, and the wait is the switch that is still
-opt-in:
+The §5.5.3/§5.5.4 device wait is the same again, and its dose-response rows add
+`POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US`. The collective is named there because the wait stacks on
+it. It was opt-in when these rows were measured and is the backend's default now, so unset runs
+the pair and only the `=0` arm needs spelling out:
 
 ```bash
 QWEN_BATCH_ROWS=1 QWEN_BATCH_VERIFY=3 QWEN_BATCH_PROMPT_LEN=32 \
   POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_STATS=1 \
   POCKET_ASCEND_IPC_ALLREDUCE_DEADLINE_MS=3000 \
-  POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1 [POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US=100] \
+  POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0 [POCKET_ASCEND_IPC_ALLREDUCE_SETTLE_US=100] \
   scripts/run_qwen_ascend_tp4.sh "" 8
 ```
+
+The `=0` spelling is the host-poll arm those rows compare against; dropping it runs the device wait
+those rows measure. Everything else on the line is a diagnostic and is still opt-in.
 
 The §6 A/B is the plain single-request path on both arms — 5-token prompt, 8 new tokens — with the
 row replication on one arm and off the other, interleaved and repeated. It was measured on the

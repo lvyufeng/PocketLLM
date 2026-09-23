@@ -2,28 +2,20 @@
 
 This record measures the same workload as
 [serving_latency_baseline.md](serving_latency_baseline.md) with two optimizations
-enabled: the hand-written IPC all-reduce (now the backend's default, then selected
-with `POCKET_ASCEND_IPC_ALLREDUCE=1`) and the device-side arrival wait
-(`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`). Both are documented in
+enabled: the hand-written IPC all-reduce and the device-side arrival wait, then
+selected with `POCKET_ASCEND_IPC_ALLREDUCE=1` and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`. Both are documented in
 [Ascend 910A single-request decode](ascend_single_request_tps.md).
 
-**One of the two switches is now the shipped default, and the server says so at
-startup for the other one.** The hand-written collective is what an unset
-environment runs, so the page's first lever is no longer a lever — it is the
-default, and `POCKET_ASCEND_IPC_ALLREDUCE=0` is what reaches this page's
-[baseline](serving_latency_baseline.md). The device-side wait is still opt-in, and
-the engine prints a warning for it:
-
-```
-[ipc_allreduce] WARNING: DEVWAIT is on. The arrival wait runs on the device
-instead of the host. It computes the all-reduce and its tokens are meaningful;
-it is not the shipped path, so its step time is not the shipped step time.
-```
-
-The run below was taken before the flip and is left as it was measured; read the
-collective as the default rather than as an opt-in, and the wait as the one opt-in
-that remains. `serving_throughput_scaling.md` is where the flip's own measurement
-lives.
+**Both switches have since become the shipped defaults, and neither prints
+anything at startup.** The run below was taken before either flip and is left as
+it was measured, so its two exports are the record of the configuration it ran
+under rather than something a reader has to set. An unset environment runs both
+levers; `POCKET_ASCEND_IPC_ALLREDUCE=0` is what reaches this page's
+[baseline](serving_latency_baseline.md); and
+`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` reaches the host poll the device-side wait
+replaced. `serving_throughput_scaling.md` is where the second flip's own
+measurement lives, and it is the one that carries the split between the two.
 
 ## Scope
 
@@ -35,8 +27,8 @@ The measured path:
 - `--no-kv-paged`, `max_context` 8192, batch width 8, prefill budget 4096
 - commit `4fc72a1` (master as of 2026-09-19), binary `cpp_engine/build-ascend/pocketllm_engine`
 - **`POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`** —
-  the first was required at the time of the run and is the default now, so only
-  the second has to be exported to reproduce it
+  both were required at the time of the run and both are the defaults now, so an
+  unset environment reproduces this record and neither export is needed
 - `QWEN_ASCEND_REPLICATE_ROWS` at its default of 1, i.e. the Cube's row
   replication is **off** — see [the ladder](#the-same-levers-inside-the-engine)
 
@@ -51,7 +43,7 @@ environment variables.
 ```bash
 source scripts/ascend_env.sh     # without it an ACL binary hangs before aclInit returns
 export POCKET_ASCEND_IPC_ALLREDUCE=1        # the default now; kept as it was run
-export POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1
+export POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1   # the default now too
 python scripts/bench_serving.py \
     --ckpt /mnt/data1/modelscope/Qwen/Qwen3.8-27B \
     --binary cpp_engine/build-ascend/pocketllm_engine \
@@ -153,10 +145,11 @@ therefore multiplied by 129.
    arrival signal carried in the payload itself. The empty-loop cost drops from
    `HcclAllReduce`'s 0.4810 ms to 0.26 ms per call.
 
-2. **`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`** moves the arrival poll off the host
-   and into a kernel-side busy-wait (`qwen_ipc_arrive_wait_kernel`), eliminating
-   the host round trip per collective. This stacks with the hand-written barrier
-   rather than replacing it.
+2. **The device-side arrival wait** (`POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT`, written
+   `=1` when this run was taken and the default now) moves the arrival poll off the
+   host and into a kernel-side busy-wait (`qwen_ipc_arrive_wait_kernel`),
+   eliminating the host round trip per collective. This stacks with the hand-written
+   barrier rather than replacing it; `=0` is the way back to the host poll.
 
 ### The same levers inside the engine
 
@@ -167,8 +160,8 @@ rows=1, with the TP4 launcher and one process per rank
 | collective | `step_ms` | decode TPS |
 | --- | ---: | ---: |
 | `HcclAllReduce` (the `POCKET_ASCEND_IPC_ALLREDUCE=0` arm) | 103.8 | 9.63 |
-| IPC all-reduce, host poll (shipped since the flip) | 76.6-77.1 | 12.96-13.06 |
-| IPC all-reduce + device wait | **53.2-53.6** | **18.66-18.79** |
+| IPC all-reduce, host poll (the `..._DEVWAIT=0` arm) | 76.6-77.1 | 12.96-13.06 |
+| IPC all-reduce + device wait — the shipped pair | **53.2-53.6** | **18.66-18.79** |
 
 23.4 ms of the intermediate 77.1 ms step is the host's round trip through the
 runtime, which is what the device-side wait removes. The serving numbers above

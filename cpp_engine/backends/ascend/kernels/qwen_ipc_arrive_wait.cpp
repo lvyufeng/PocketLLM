@@ -48,8 +48,11 @@
 // the gate is failed 0 times in 22 interleaved runs across both arms, this arm
 // included, and interleaved against the host poll it takes the step from 76.10-77.66
 // to 53.02-53.88 ms and the decode from 12.88-13.14 to 18.56-18.86 TPS with the same
-// 32 tokens out of all four runs -- the reference's sequence. It is default off
-// because flipping a default is its own change, not because of its answer.
+// 32 tokens out of all four runs -- the reference's sequence. It was left opt-in by
+// the collective's own default flip, because flipping a default is its own change
+// and that one was not this; it has since been flipped in turn, so this kernel is
+// what an unset environment runs and `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0` is the
+// way back to the host poll.
 //
 // The earlier claim that the shipped host-poll path had the same defect at a lower
 // rate (8 of 36) is withdrawn with it: that rate was the same workspace race.
