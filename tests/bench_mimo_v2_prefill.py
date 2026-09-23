@@ -27,14 +27,26 @@ What the numbers are made of:
 
 And the verification, which is why this is worth running with four ranks: the ranks must agree on
 the prefill's last row bit for bit -- they hold the same sum -- and each rank's staged bytes must be
-its own share. `--deal` is not a knob here: a chunk under a deal that partitions drawings rather
-than experts is refused by the experts module, because it would stage every expert on every rank.
+its own share.
+
+`--deal` is the *step's* deal and not the chunk's, and it is the difference between this table and a
+served run. A chunk can only go through a deal that partitions *experts* (`id`), so a model built
+with `--deal sorted` -- which is what `pocketllm serve` builds -- keeps two modules and routes the
+chunks to the `id` one; the prefill rows are identical either way, and the `--decode` rows are not:
+under `id` a step runs through the prefill's own module, which the step probe measures at 41 to 53%
+slower. `--deal id` builds that single-module model, which is the right thing for a prefill-only run
+and the wrong number for a step. The `--decode` steps are warmed (`--warmup`) and the warm-up is
+printed on its own, because the window otherwise opens on whatever the prompt's last chunk left
+behind; the deal's own price is not read off this column but off the interleaved step probe, and the
+two arms here are two processes.
 
 Usage:
 
     python tests/bench_mimo_v2_prefill.py --tokens 512 --chunk 512
     torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py --tokens 2048 --chunk 2048
     torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py --tokens 8192 --chunk 4096 --band 0
+    torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
+        --tokens 262144 --chunk 2048 --band 16 --floor 0 --decode 2
 
 The checkpoint is the default asset path; without it the script exits 0 and says so.
 """
@@ -124,7 +136,20 @@ def main() -> int:
         default=0,
         help="decode steps to run after the prompt is in the cache, timed",
     )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="decode steps run and dropped before `--decode` ones are timed: the first steps after "
+             "a prompt are the prompt's own tail, and they are reported on their own",
+    )
     parser.add_argument("--no-pin", action="store_true", help="leave the bank pageable")
+    parser.add_argument(
+        "--deal",
+        default="sorted",
+        help="the *step's* deal: `sorted` is what `pocketllm serve` builds, and `id` is the "
+             "chunk-only configuration, which leaves a step through the prefill's module",
+    )
     args = parser.parse_args()
     args.chunk = sorted({int(part) for part in str(args.chunk).split(",") if part.strip()})
 
@@ -146,20 +171,31 @@ def main() -> int:
         expert_source=bank,
         ep=ep,
         slots=args.slots,
-        # The prefill's deal, and the one a chunk has to have: `id` partitions the experts, so a
-        # rank stages its quarter of them. The `sorted` decode default would stage all of them.
-        deal="id",
+        # The deal a *step* takes, which is the one a served run's decode goes through. It is not
+        # the deal a chunk can use -- `id` partitions the experts and `sorted` partitions the
+        # drawings -- so a world over one with `sorted` here builds the second module too, and the
+        # prefill below goes through that one. `--deal id` builds a single module, which is what a
+        # prefill-only run wants and is *not* what a step in a served run costs.
+        deal=args.deal,
         chunk_rows=args.band,
         pin=not args.no_pin,
         tile_budget=args.tile or None,
     )
     torch.cuda.synchronize()
-    experts = model.experts
+    # The module a *chunk* runs on, and the one the counters below are read from: a two-module
+    # model routes a chunk to `chunk_experts`, so a counter read off `model.experts` reports that
+    # the prefill moved nothing.
+    experts = model.experts if model.chunk_experts is None else model.chunk_experts
     print(
         f"{tag} world {world}, {len(model.layers)} layers in {time.perf_counter() - started:.1f}s, "
         f"{model.memory_bytes / 2**20:.0f} MiB on the card, "
-        f"{experts.arena_bytes / 2**20:.0f} MiB arena, {experts.n_local} experts a rank in bands "
-        f"of {experts.chunk_rows}",
+        f"{experts.arena_bytes / 2**20:.0f} MiB chunk arena, {experts.n_local} experts a rank in "
+        f"bands of {experts.chunk_rows} under a `{experts.deal}` chunk deal"
+        + (
+            f"; a `{model.experts.deal}` step arena of {model.experts.arena_bytes / 2**20:.0f} MiB"
+            if model.chunk_experts is not None
+            else f", and no separate step module: a step here goes through that"
+        ),
         flush=True,
     )
     if model.pin_result is not None:
@@ -389,10 +425,31 @@ def main() -> int:
         # is what a step at this depth reads.
         drawn = [int(logits.argmax())]
         timer = PhaseTimer(model)
+        # And the first of those steps is not one of them. This window starts the instant the
+        # prompt's last chunk returns, so what it times first is whatever the prefill left
+        # behind -- `bench_mimo_v2_ep.py` and the step probe both discard a first pass for exactly
+        # that reason, and this bench was the one that did not -- and the warm-up steps are timed
+        # on their own and reported beside the table, because a client waits for them and because
+        # they are the only place that tail is visible. They are not a correction to the deal's
+        # price, which is a per-step quantity and is the interleaved probe's to state: two runs of
+        # this command at 8192 tokens of context read 246.4 ms a token under `sorted` and 274.2
+        # under `id` in the first pair and 199.2 against 259.7 in the second, which is the spread
+        # this box has between processes.
         if world > 1:
             torch.distributed.barrier()
         started = time.perf_counter()
-        for step in range(args.decode):
+        for step in range(args.warmup):
+            logits = model.step(
+                drawn[-1], start_pos=len(ids) + step, cache=cache
+            )[-1]
+            drawn.append(int(logits.argmax()))
+        torch.cuda.synchronize()
+        cold_s = time.perf_counter() - started
+        timer.read()  # the warm-up's phases are not a token's, and they are timed above
+        if world > 1:
+            torch.distributed.barrier()
+        started = time.perf_counter()
+        for step in range(args.warmup, args.warmup + args.decode):
             logits = model.step(
                 drawn[-1], start_pos=len(ids) + step, cache=cache
             )[-1]
@@ -402,14 +459,16 @@ def main() -> int:
         phases = timer.read()
         token_ms = seconds / args.decode * 1e3
         print(
-            f"\n{tag} decode at {len(ids)} tokens of context: {args.decode} steps in "
-            f"{seconds:.3f}s = {args.decode / seconds:.2f} tok/s ({token_ms:.1f} ms a token)",
+            f"\n{tag} decode at {len(ids)} tokens of context: {args.warmup} warm-up steps in "
+            f"{cold_s:.3f}s, then {args.decode} in {seconds:.3f}s = {args.decode / seconds:.2f} "
+            f"tok/s ({token_ms:.1f} ms a token)",
             flush=True,
         )
         print(
             f"{tag} at that depth: attention {phases['attn'] / args.decode:.1f} ms a token, "
             f"FFN and staging {phases['mlp'] / args.decode:.1f} ms a token, "
-            f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated",
+            f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated "
+            f"({cold_s / max(args.warmup, 1) * 1e3:.1f} ms a warm-up step)",
             flush=True,
         )
         if world > 1:

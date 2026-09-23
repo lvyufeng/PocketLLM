@@ -92,8 +92,9 @@ DEALS = ("sorted", "id")
 def deal_rule() -> str:
     """Which deal a module makes unless its constructor is told. `sorted` by default.
 
-    The default is the *decode* deal, because decode is the only path that exists: it is 21% faster
-    than `id` on four cards and the reason is in the module docstring. `id` is the prefill deal, and
+    The default is the *decode* deal, because decode is the only path that exists: it is 27% faster
+    than `id` on four cards where the attention is replicated, and 41 to 53% where it is split, and
+    the reason is in the module docstring. `id` is the prefill deal, and
     a prefill stage will have to say so -- a variable a run does not set must not be able to change
     what a run computes, but this one does change it, so the prefill path names its deal and does
     not inherit this one.

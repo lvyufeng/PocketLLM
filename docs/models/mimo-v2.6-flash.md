@@ -68,9 +68,9 @@ own section.
 
 What that is not: a kernel, batching, or a sampler worth shipping. The attention and
 the dense linears are still torch; the served path is one request, one sequence; and a
-256k decode step is 399.2 ms, most of it the attention reading a quarter of a million keys
+256k decode step is 323.8 ms, most of it the attention reading a quarter of a million keys
 nine times over — once a rank, since this stage divides that work along the checkpoint's
-own four-way partition, which takes the same step to 281.2. What *is* gone from the earlier
+own four-way partition, which takes the same step to 205.6. What *is* gone from the earlier
 list is 256k, serving and the replicated attention; the numbers are below.
 
 What exists:
@@ -500,7 +500,10 @@ per-layer collective is affordable at all here where V4.1's 80 MiB activation ti
 position `p` to rank `p % world`, so a top-8 draw over four ranks is exactly 2, 2, 2, 2;
 `id` gives `expert % world`, which partitions the *experts* over the ranks and is what a
 chunked prefill wants (a chunk draws nearly every expert, and only `id` stops a rank from
-staging all of them). On decode, `sorted` — now the default — is **21% faster**:
+staging all of them). On decode, `sorted` — now the default — is the faster one, and it is worth
+more than the 27% this table shows once the attention is not in the way: on the split arm the same
+comparison measures **179.0 against 253.2 ms at eight tokens of context and 177.0 against 270.8 at
+32768** — 41% and 53% — which is what a step built on the chunk's deal costs:
 
 | Deal | Decode step | Staged a step, by rank | Arena |
 | --- | ---: | --- | ---: |
@@ -596,9 +599,11 @@ a *drawing*: over one token that is exactly two experts a rank, and over a chunk
 positions reach every expert there is, so every rank stages all 256 and computes its own
 quarter of the pairs anyway — the same arithmetic for four times the copy. `forward_chunk`
 refuses `sorted` at a world over one rather than serving it slowly, which is why the prefill
-build names `deal="id"` while decode keeps the `sorted` default that is 21% faster there.
-The deal is per *module* and not per call, so a serving run that has to do both chooses, and
-the choice costs the decode step the 21%.
+build names `deal="id"` while decode keeps the `sorted` default that is 27% faster there.
+The deal is per *module* and not per call, so a serving run that has to do both keeps two —
+and a run that keeps one pays the difference on whichever half it built for: 41 to 53% on a
+step, measured, which is why `bench_mimo_v2_prefill.py` builds the served pair by default and
+`--deal id` is the explicitly chunk-only build.
 
 **A band is how the arena stays bounded.** One kernel call stages its whole working set, so
 the arena has to be as wide as the experts one call holds. A rank that owns more than that is
@@ -713,19 +718,26 @@ arithmetic. And the split leaves the kernel where it was: 4.38 ms of the 9.6 a t
 score tile materialised in torch, and a `swa` layer's is a 128-key ring that costs the same at every
 depth, which is a kernel's job and not a rank's.
 
-**And a decode token at 256k.** Two steps at that depth, timed at the end of each of those runs:
-**399.2 ms a token replicated — 2.50 tokens a second — against 281.2 ms and 3.56 split**, of which
-the attention is **161.8 to 163.3 ms replicated and 48.2 split** and the FFN and staging 228.2 to
-230.3 against 226.0, with 18.48 GiB on the card against **10.21**. The same replicated pair read
-447.9 ms and 2.23 tokens a second on an earlier afternoon, which is the size of the drift this box
-has between runs; the two arms here are ten minutes apart and read 399.2 and 281.2. The FFN column
-is the number to look at now: it does not move under the split, and it is 226 ms of the 281. For
-contrast, the same step at eight tokens of context is 177.6 ms with 139.6 of it outside the routed
-path. **The expert path is what grows next**, and that is the less obvious half: a token draws the
-same 47 × 8 experts whatever the context, so the bytes are the same 1198 MiB a rank — but the path
-is a lockstep rather than a copy, four ranks whose bytes are equal and whose times are not, so what
-a deeper context adds to it is the waiting rather than the traffic. A client at 256k should expect
-three and a half tokens a second after a first token that costs the prompt.
+**And a decode token at 256k.** Two numbers, and they differ by a deal. A *served* run's step at that
+depth is the probe's, `sorted` with both arenas: **323.8 ms a token replicated — 3.09 tokens a second
+— against 205.6 and 4.86 split**. A prefill bench's `--decode` column is not that: `id` is the only
+deal a chunk can use, so a bench that builds one module measures its steps through the prefill's own,
+and the pair it reported at this depth is **399.2 ms replicated against 281.2 split** — two steps and
+no warm-up, from before there was a flag. `bench_mimo_v2_prefill.py --deal` now names the *step's*
+deal and defaults to `sorted`, which is what `pocketllm serve` builds, and the flag's own A/B at 8192
+tokens of context reads **199.2 ms a token, 5.02 a second, against 259.7 and 3.85 under `id`**: 23%,
+where the interleaved step probe measures 41 to 53% at the depths it covers, because two arms in two
+processes are not an A/B on this box and the probe's own docstring says so. Of the 281.2 the attention
+is **161.8 to 163.3 ms replicated and 48.2 split** and the FFN and staging 228.2 to 230.3 against
+226.0, with 18.48 GiB on the card against **10.21**. The FFN column is the number to look at now: it
+does not move under the split, and it is 226 ms of the 281. For contrast, the same step at eight
+tokens of context is 177.6 ms with 139.6 of it outside the routed path. **The expert path is what
+grows next**, and that is the less obvious half: a token draws the same 47 × 8 experts whatever the
+context, so the bytes are the same 1198 MiB a rank — but the path is a lockstep rather than a copy,
+four ranks whose bytes are equal and
+whose times are not, so what a deeper context adds to it is the waiting rather than the traffic. A
+client at 256k should expect four and a half tokens a second after a first token that costs the
+prompt.
 
 ## The round trips a decode token pays
 
@@ -971,13 +983,22 @@ not move at all. The split is not a licence to keep splitting: at a 2048-token c
 term that is left. And it is the goal's own number: the bar this page was written against is a 256k
 prefill above a hundred tokens a second, **48.37 does not reach it and 104.04 does**.
 
-The same two runs finish with a two-step decode at that depth, and those are the numbers a client
-feels: **399.2 ms a token replicated against 281.2 split — 2.50 against 3.56 tokens a second** — with
-the attention 161.8 to 163.3 ms replicated against 48.2 and the FFN and staging 228.2 to 230.3 against
-226.0. The same step in the probe above reads 323.8 and 205.6, and the two are two configurations
-rather than a disagreement: the served run keeps both arenas and carries the state a real prefill left
-behind, and this page records both instead of picking one. Whichever is read, the column that did not
-move is the FFN and staging one, and it is the larger of the two terms now.
+The same two runs finish with a two-step decode at that depth, and that number is **not** a served
+run's. The bench built the model with `deal="id"` — there was no flag, and `id` is the only deal a
+chunk can use — so its steps went through the prefill's own module, and the deal is worth more than
+anything else on this page at that depth. Under the deal a *step* is built with, `sorted`, which is
+what `pocketllm serve` builds and what the probe above measures, the same depth costs **205.6 ms
+against a mean 323.8**; the bench's own decode column read **281.2 ms split and 399.2 replicated**,
+which is the same two configurations through the `id` module. Measured directly,
+`probe_mimo_v2_decode_host.py` with `POCKETLLM_MIMO_EXPERT_DEAL=id`: **295.7 ms at 262144 against
+205.6**, and **270.8 against 177.0 at 32768** — 41 to 53%, so what looked like a hundred milliseconds
+of disagreement between two benches was one deal, and not the attention, the arena, or the state a
+prefill leaves behind. The column takes `--deal` now and defaults to the served one, and the flag's
+own A/B at 8192 tokens of context reads **199.2 against 259.7** — 23%, where the warmed and
+interleaved probe reads 41% at an eighth of that depth, because two arms in two processes are not an
+A/B and the bench's steps follow a prompt that has just ended. The FFN and staging column does not
+move under the split and it is 226 ms of the 281; the `id` deal's own column is where the rest of that
+difference sits.
 
 **And the cache goes with it, for free.** A rank that attends over a quarter of the key heads has to
 keep a quarter of them, so the same split that buys the step also divides the KV cache: **5.66 GiB of
@@ -1043,7 +1064,8 @@ deterministic and the logits are the same sum on every rank.
 The arena byte count is the one to read twice: 53,477,376 is 51 MiB, which is the *decode*
 arena — two rows a slot — and the second arena a served model keeps is the `id` chunk arena at
 408 MiB. A model that serves both has to, because the two deals are not interchangeable: a chunk
-needs the experts partitioned and a decode step is 21% faster when the drawings are, and
+needs the experts partitioned and a decode step is 27% faster when the drawings are — 41 to 53%
+on a step whose attention is split, measured — and
 `forward_chunk` refuses `sorted` at a world over one rather than staging all 256 experts on every
 rank. The pair costs 51 MiB of a card that has 2.4 GiB free at 256k, and the dispatch between
 them is the row count of the call.
@@ -1274,7 +1296,10 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 
 # 256k, four ranks, a 2048-token chunk: 1 h 47 m of prefill after a five-minute build,
 # or 42 minutes with the attention split. `POCKETLLM_MIMO_ATTENTION_SHARDS=1` is the control
-# arm, and the two together are the A/B the 256k section is made of.
+# arm, and the two together are the A/B the 256k section is made of. The model is built with
+# the deal a *step* takes -- `--deal` defaults to the served one -- so the `--decode` rows are
+# the served configuration's and the chunk rows are the same either way; `--deal id` is the
+# single-module, prefill-only build.
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
     --tokens 262144 --chunk 2048 --band 16 --floor 0 --decode 2
 
@@ -1353,11 +1378,14 @@ golden holds and how it was captured.
   those widths was measured with the attention replicated**, and the split below makes the attention
   3.5× cheaper a token, so the 256k width is worth sweeping again before the 2048 default is trusted.
 - **A prefill and a decode want different deals, and the deal is per module.** A chunk needs
-  the experts partitioned (`id`) and a decode step is 21% faster when the *drawings* are
-  (`sorted`, the default). A serving run keeps **both arenas** — 51 MiB for the decode deal and
+  the experts partitioned (`id`) and a decode step is faster when the *drawings* are (`sorted`,
+  the default): 27% on the replicated attention this page first measured it on, and **41 to 53%
+  once the attention is split** — 179.0 against 253.2 ms at eight tokens of context and 177.0
+  against 270.8 at 32768. A serving run keeps **both arenas** — 51 MiB for the decode deal and
   408 MiB for the chunk deal at a band of 16 — and dispatches on the row count of the call, which
   is two stores of a rank's share where one would do and 51 MiB of a card that has 2.4 GiB free at
-  256k. The alternative is one deal and a lost 21% on decode or no prefill at all.
+  256k. The alternative is one deal and that much off either a step or a prefill, and it is why
+  `bench_mimo_v2_prefill.py` builds the served pair by default.
 - **The attention is split and nothing else is.** The experts are dealt over four ranks and the
   attention is divided along the checkpoint's own four-way `qkv_proj` partition, joined by an
   exact all-gather. What is left replicated is the router, the embedding, the head and the dense
@@ -1380,13 +1408,18 @@ golden holds and how it was captured.
   kernel is the only thing that reaches it.
 - **256k runs, and the decode at that depth is still short of the target.** A 262144-token prompt
   goes through at **104.04 tokens a second**, which is past the hundred this page was written
-  against, and a decode step at that depth is **281.2 ms in the served configuration — 3.56 tokens a
-  second — against 399.2 replicated**, or 205.6 against 323.8 in the step probe. Five a second is
-  the number this was aiming at and neither arm reaches it. What is left is not the attention, which
-  the split took from 162 to 48 ms a token, and not the copy, whose bytes are already the draw's
-  minimum: it is the FFN and staging column, 226 ms of the 281, and the host's own per-layer work
-  inside it — 117 launches a layer, the same at eight tokens of context as at a quarter of a
-  million. That is the next stage, and it is a kernel rather than a rank.
+  against, and a decode step at that depth is **205.6 ms — 4.86 tokens a second — against 323.8
+  replicated**, in the step probe that measures the deal a served run's step is built with. Five a
+  second is the number this was aiming at and neither arm reaches it, though the served split arm is
+  2.7% away rather than the 36% a *chunk-only* build would suggest: a prefill bench's `--decode`
+  column went through the `id` module and read 281.2, which is a measurement of the wrong deal. It
+  takes `--deal` now, defaults to the served build, and warms its steps; the deal's own size is still
+  the interleaved probe's to state.
+  What is left is not the attention, which the split took from 162 to 48 ms a token, and not the
+  copy, whose bytes are already the draw's minimum: it is the FFN and staging column, 226 ms of the
+  281, and the host's own per-layer work inside it — 117 launches a layer, the same at eight tokens
+  of context as at a quarter of a million. That is the next stage, and it is a kernel rather than a
+  rank.
 - **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
   tokens, with no temperature, top-p or repetition penalty. The checkpoint's
   `generation_config.json` says `do_sample: false`, so this is its own default — but a
