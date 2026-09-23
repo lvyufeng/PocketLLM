@@ -369,6 +369,21 @@ bool BatchScheduler::run_prefill_batch() {
         return false;
     }
 
+    // One engine call per request, and the token a call produces is delivered
+    // before the next request's prefill starts.
+    //
+    // A single `batch_prefill(prefill_batch, ...)` runs the prompts back to back
+    // inside one blocking call, so the row `i` token is sampled at roughly
+    // `i` prompt-lengths into the wave and then held until the last row
+    // finishes. That makes every request in a wave report the wave's total
+    // prefill time as its TTFT -- on the width ladder all fifteen rows behind
+    // the first report the same value to within a millisecond -- which is a
+    // property of when the scheduler hands the token over, not of when the
+    // engine produced it. Splitting the call fixes the handover and changes
+    // nothing else: `batch_prefill` already issues one `worker_command_prefill`
+    // and one bounded forward per request, so the same work happens in the same
+    // order and the rows it does not cover simply wait their turn.
+    //
     // Advance each prompt by at most prefill_token_budget_ tokens so a long
     // prompt cannot hold the device for its whole length while running decodes
     // stall behind it.
@@ -377,108 +392,109 @@ bool BatchScheduler::run_prefill_batch() {
     // caller's token callback is arbitrary code; running it under queue_mutex_
     // would let a slow consumer block admission and completion for every other
     // request, and would deadlock outright if it called cancel_request().
-    std::vector<std::pair<SchedulerRequest*, int>> emitted;
-    try {
-        auto result = engine_->batch_prefill(prefill_batch, prefill_token_budget_);
-        if (result.results.size() != prefill_batch.size() ||
-            result.incomplete.size() != prefill_batch.size()) {
-            throw std::runtime_error(
-                "batch_prefill returned " + std::to_string(result.results.size()) +
-                " result rows and " + std::to_string(result.incomplete.size()) +
-                " completion flags for " + std::to_string(prefill_batch.size()) +
-                " requests");
-        }
+    for (size_t i = 0; i < prefill_batch.size(); ++i) {
+        auto* batch_req = prefill_batch[i];
+        SchedulerRequest* req = prefill_requests[i];
+        std::vector<std::pair<SchedulerRequest*, int>> emitted;
+        try {
+            std::vector<BatchedRequest*> single{batch_req};
+            auto result = engine_->batch_prefill(single, prefill_token_budget_);
+            if (result.results.size() != 1 || result.incomplete.size() != 1) {
+                throw std::runtime_error(
+                    "batch_prefill returned " +
+                    std::to_string(result.results.size()) + " result rows and " +
+                    std::to_string(result.incomplete.size()) +
+                    " completion flags for one request");
+            }
 
-        // Update request states
-        {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            for (size_t i = 0; i < prefill_batch.size(); ++i) {
-                auto* req = prefill_requests[i];
-                if (i >= result.results.size()) continue;
+            req->prefilled_tokens = batch_req->seq_len;
+            if (result.incomplete[0]) {
+                // Interior logits predict the next prompt token, which the
+                // prompt already supplies. Emitting it would inject a token
+                // the caller never asked for, so this row just waits for its
+                // next chunk. It has no token to hand over, so skip the
+                // delivery below rather than anything in it.
+                continue;
+            }
 
-                req->prefilled_tokens = prefill_batch[i]->seq_len;
-                const bool complete =
-                    i < result.incomplete.size() && !result.incomplete[i];
-                if (!complete) {
-                    // Interior logits predict the next prompt token, which the
-                    // prompt already supplies. Emitting it would inject a token
-                    // the caller never asked for, so this row just waits for its
-                    // next chunk.
+            req->prefill_complete = true;
+            req->last_token = result.results[0].top_token;
+            req->generated_tokens.push_back(req->last_token);
+            // The token sampled from the prompt is generation token number
+            // one, so it carries the first log-probability entry. Recorded
+            // here rather than at the streaming callback below for the same
+            // reason the token is: an entry appended later than its token
+            // would be indexed against the wrong position.
+            //
+            // `prefill_bounded` ranks the prompt's last position exactly
+            // once, and only a complete row's ranking is a prediction for
+            // the token being appended; an incomplete row returned the last
+            // chunk's interior logits and has already been skipped above.
+            if (req->sampling.logprobs_n > 0) {
+                req->logprobs.push_back(result.results[0].logprob);
+            }
+            req->seq_len = req->prefilled_tokens;
+
+            // Apply token constraint if present
+            if (req->constraint) {
+                if (!req->constraint->accept_token(req->last_token)) {
+                    req->error = "constraint violation";
+                    req->finished = true;
                     continue;
                 }
-
-                req->prefill_complete = true;
-                req->last_token = result.results[i].top_token;
-                req->generated_tokens.push_back(req->last_token);
-                // The token sampled from the prompt is generation token number
-                // one, so it carries the first log-probability entry. Recorded
-                // here rather than at the streaming callback below for the same
-                // reason the token is: an entry appended later than its token
-                // would be indexed against the wrong position.
-                //
-                // `prefill_bounded` ranks the prompt's last position exactly
-                // once, and only a complete row's ranking is a prediction for
-                // the token being appended; an incomplete row returned the last
-                // chunk's interior logits and has already been skipped above.
-                if (req->sampling.logprobs_n > 0) {
-                    req->logprobs.push_back(result.results[i].logprob);
-                }
-                req->seq_len = req->prefilled_tokens;
-
-                // Apply token constraint if present
-                if (req->constraint) {
-                    if (!req->constraint->accept_token(req->last_token)) {
-                        req->error = "constraint violation";
-                        req->finished = true;
-                        continue;
-                    }
-                    if (req->constraint->is_complete()) {
-                        // The terminal grammar token is a real output token. Keep
-                        // it in the stream and distinguish grammar completion from
-                        // an ordinary stop token, which is intentionally hidden.
-                        req->finished = true;
-                        req->constraint_completed = true;
-                    }
-                }
-
-                // batch_prefill flags a prompt whose very first predicted token
-                // is a stop token; such a request must never reach the decode
-                // batch or be exposed to a streaming caller.
-                const bool stopped = prefill_batch[i]->finished;
-                if (stopped) {
+                if (req->constraint->is_complete()) {
+                    // The terminal grammar token is a real output token. Keep
+                    // it in the stream and distinguish grammar completion from
+                    // an ordinary stop token, which is intentionally hidden.
                     req->finished = true;
-                    req->stopped_on_token = true;
-                }
-                // The token sampled from prefill is generation token number one.
-                // Without this check max_new_tokens=1 ran one decode step and
-                // returned two tokens because the length cap existed only in the
-                // decode path.
-                if (req->generated_tokens.size() >=
-                    static_cast<size_t>(req->sampling.max_new_tokens)) {
-                    req->finished = true;
-                }
-                if (req->token_callback && req->error.empty() &&
-                    (!stopped || req->constraint_completed)) {
-                    emitted.emplace_back(req, req->last_token);
-                }
-
-                // Record TTFT
-                if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
-                    req->first_token_time = std::chrono::steady_clock::now();
+                    req->constraint_completed = true;
                 }
             }
-        }
-    } catch (const std::exception& e) {
-        const std::string message = std::string("prefill failed: ") + e.what();
-        std::cerr << "BatchScheduler: " << message << std::endl;
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (SchedulerRequest* req : prefill_requests) {
-            req->error = message;
-            req->finished = true;
-        }
-    }
 
-    deliver_tokens(emitted);
+            // batch_prefill flags a prompt whose very first predicted token
+            // is a stop token; such a request must never reach the decode
+            // batch or be exposed to a streaming caller.
+            const bool stopped = batch_req->finished;
+            if (stopped) {
+                req->finished = true;
+                req->stopped_on_token = true;
+            }
+            // The token sampled from prefill is generation token number one.
+            // Without this check max_new_tokens=1 ran one decode step and
+            // returned two tokens because the length cap existed only in the
+            // decode path.
+            if (req->generated_tokens.size() >=
+                static_cast<size_t>(req->sampling.max_new_tokens)) {
+                req->finished = true;
+            }
+            if (req->token_callback && req->error.empty() &&
+                (!stopped || req->constraint_completed)) {
+                emitted.emplace_back(req, req->last_token);
+            }
+
+            // Record TTFT
+            if (req->first_token_time == std::chrono::steady_clock::time_point{}) {
+                req->first_token_time = std::chrono::steady_clock::now();
+            }
+        } catch (const std::exception& e) {
+            // The rows before this one already ran and may already have handed
+            // a token to their caller, so only this row and the ones behind it
+            // are failed; a row that never ran is as broken as the one that
+            // threw, and leaving it live would repeat the same failure forever.
+            const std::string message = std::string("prefill failed: ") + e.what();
+            std::cerr << "BatchScheduler: " << message << std::endl;
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (size_t rest = i; rest < prefill_requests.size(); ++rest) {
+                prefill_requests[rest]->error = message;
+                prefill_requests[rest]->finished = true;
+            }
+            break;
+        }
+
+        // Outside the lock, and before the next request takes the device.
+        deliver_tokens(emitted);
+    }
 
     // Clean up temporary batch requests
     for (auto* batch_req : prefill_batch) {

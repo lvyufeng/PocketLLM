@@ -5098,6 +5098,14 @@ BatchPrefillResult QwenEngine::batch_prefill(
     // `token_budget` set, each request advances by at most that many tokens per
     // call, so the scheduler regains control between chunks and can interleave
     // decode.
+    //
+    // The vector signature is what a merge would need, and it is also what lets
+    // this be called with one request: BatchScheduler::run_prefill_batch() now
+    // issues one call per request so that a row's token reaches its caller as
+    // soon as that row is ranked, rather than when the last prompt in the wave
+    // happens to finish. Nothing here changes for a single-element call -- the
+    // per-call ranking width below degenerates to that request's own -- and the
+    // prompts still run in the caller's order either way.
     BatchPrefillResult result;
     result.results.reserve(requests.size());
     result.incomplete.reserve(requests.size());
