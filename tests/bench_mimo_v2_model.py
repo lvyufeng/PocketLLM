@@ -84,7 +84,7 @@ def h2d_rate(bank, layer: int, *, rounds: int = 16) -> tuple[float, float]:
     return rounds * size / elapsed / 2**30, size / 2**20
 
 
-def fill_cache(cache, config, layers, depth: int, *, chunk: int = 8192) -> None:
+def fill_cache(cache, layers, depth: int, *, chunk: int = 8192) -> None:
     """Write `depth` positions into every layer's cache without running the model.
 
     A cache that has been *appended to* is a cache whose `written` and whose `prefix` are the
@@ -99,6 +99,9 @@ def fill_cache(cache, config, layers, depth: int, *, chunk: int = 8192) -> None:
     router makes. The cost of a step is the bytes the attention reads and the experts a rank
     stages, and neither of those depends on which experts they are.
 
+    The shape of a layer's fill is the *cache's* and not the config's, because a rank whose
+    attention is split over the ranks holds a fraction of the layer's key heads.
+
     Two details that are about the clock and not the arithmetic. The states are drawn **on the
     card**, because the same 29 GiB of float32 through the host's random number generator is
     minutes of a probe that is meant to take seconds. And a **ring** is written with zeros until
@@ -112,7 +115,9 @@ def fill_cache(cache, config, layers, depth: int, *, chunk: int = 8192) -> None:
         width = min(chunk, depth - start)
         last = start == starts[-1]
         for layer in layers:
-            shape = config.attention(layer)
+            # The *cache's* geometry and not the config's: a rank whose attention is split holds a
+            # fraction of the layer's key heads, and the cache is what knows how many.
+            shape = cache.shape(layer)
             slots = cache.slots(layer)
             if slots >= width or last:
                 key = torch.randn(

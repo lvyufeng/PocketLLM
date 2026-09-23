@@ -29,8 +29,8 @@ That is not a tuning choice but what the two families read: a windowed layer at
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, replace
+from typing import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +42,7 @@ from src.models.mimo_v2.layers import (
     build_rope_inv_freq,
     split_fused_qkv,
 )
+from src.models.mimo_v2.quant import QKV_SHARDS
 
 __all__ = [
     "AttentionStats",
@@ -51,6 +52,8 @@ __all__ = [
     "blocked_attention",
     "DEFAULT_TILE_SCORES",
     "fused_qkv_row_order",
+    "group_qkv_order",
+    "shard_shape",
     "single_pass_attention",
     "tile_step",
 ]
@@ -97,6 +100,116 @@ def fused_qkv_row_order(shape: MimoV2AttentionShape, dtype: torch.dtype = torch.
             base = group * stride + lo
             rows.append(torch.arange(base, base + width, dtype=dtype))
     return torch.cat(rows)
+
+
+def shard_shape(
+    shape: MimoV2AttentionShape, shard: int, shards: int
+) -> MimoV2AttentionShape:
+    """One share's geometry: a quarter of the query heads, the key heads and the widths.
+
+    The checkpoint's fused projection is stored as `shards` groups of `[q | k | v]` -- that is
+    what `tp4_interleaved` says and what `quant.QKV_SHARDS` records -- so a share is a contiguous
+    quarter of the projection's rows, and the query heads, key heads and value heads those rows
+    hold go with it. The division is exact for both families of the released checkpoint:
+
+    * a global layer is 64 query heads over 4 key heads, so 16 query heads share one key head and
+      a quarter is 16 query heads with 1 key head -- the groups line up with the key heads;
+    * a sliding-window layer is 64 over 8, so 16 query heads span 2 key heads and a quarter is 16
+      with 2 -- still no group boundary is crossed.
+
+    `num_key_value_groups` is unchanged and that is the whole reason the split is a split: a
+    share's 16 query heads divide over its own key heads exactly as the layer's 64 divide over its
+    4, so the score computation, the softmax and the sink are the same arithmetic on fewer heads.
+
+    `o_in` becomes *this share's* width -- the rows of `pre_o` a share produces -- and the layer's
+    own `o_in` is what the projection after the join reads. `qkv_row_layout` becomes `"contiguous"`
+    because inside a group the three sections are stored in that order; the permutation out of a
+    group's stored order is `group_qkv_order`'s, and it is the identity for `tp4_interleaved`.
+    """
+    if shards < 1:
+        raise ValueError(f"shards must be at least 1, got {shards}")
+    if not 0 <= shard < shards:
+        raise ValueError(f"shard {shard} is not a share of {shards}")
+    if shards == 1:
+        return shape
+    for name in ("num_q_heads", "num_kv_heads", "q_size", "k_size", "v_size"):
+        if getattr(shape, name) % shards:
+            raise ValueError(
+                f"layer {shape.layer_idx} ({shape.family}): {name} is "
+                f"{getattr(shape, name)} and does not divide into {shards} shares"
+            )
+    heads = shape.num_q_heads // shards
+    return replace(
+        shape,
+        num_q_heads=heads,
+        num_kv_heads=shape.num_kv_heads // shards,
+        q_size=shape.q_size // shards,
+        k_size=shape.k_size // shards,
+        v_size=shape.v_size // shards,
+        qkv_out=(shape.q_size + shape.k_size + shape.v_size) // shards,
+        o_in=heads * shape.v_head_dim,
+        qkv_row_layout="contiguous",
+    )
+
+
+def group_qkv_order(
+    shape: MimoV2AttentionShape, shard: int, shards: int, dtype: torch.dtype = torch.int64
+) -> torch.Tensor | None:
+    """The permutation from a share's stored `qkv` rows into that share's `[q | k | v]`.
+
+    `None` when there is nothing to permute, which is the case a caller should hope for: the
+    forward then takes `split_fused_qkv`'s three-way cut and pays no gather at all, where a
+    permutation is an `index_select` of the whole fused row once a layer.
+
+    Three cases, and they are the three the checkpoint and its readers make:
+
+    * **whole, `contiguous`** -- nothing to do.
+    * **whole, `tp4_interleaved`** -- the layer's own permutation, `fused_qkv_row_order`, applied to
+      the activations. This is the released reading and the reason the helper exists.
+    * **a share of `tp4_interleaved`** -- the identity. A group *is* `[q | k | v]` contiguously, so
+      the quarter of the projection this rank holds is already in the order the split wants, and
+      the four-way permutation the whole tensor needs is exactly what a share does not.
+    * **a share of `tp4_interleaved_vk`** -- the key and value sections swap inside the group:
+      `[q | v | k]` stored, `[q | k | v]` wanted.
+    """
+    if shards == 1:
+        order = fused_qkv_row_order(shape, dtype)
+        return None if bool(torch.equal(order, torch.arange(shape.qkv_out, dtype=dtype))) else order
+    if shape.qkv_row_layout == "contiguous":
+        raise ValueError(
+            f"layer {shape.layer_idx}: a `contiguous` fused projection is not stored in shares "
+            f"and cannot be read as one; its first quarter is all query and no key"
+        )
+    if shape.qkv_row_layout not in ("tp4_interleaved", "tp4_interleaved_vk"):
+        raise ValueError(f"no share order is known for {shape.qkv_row_layout!r}")
+    q_head = shape.q_size // shards
+    k_head = shape.k_size // shards
+    v_head = shape.v_size // shards
+    if shape.qkv_row_layout == "tp4_interleaved":
+        return None
+    rows = (
+        list(range(q_head))
+        + list(range(q_head + v_head, q_head + v_head + k_head))
+        + list(range(q_head, q_head + v_head))
+    )
+    return torch.tensor(rows, dtype=dtype)
+
+
+def _qkv_weight(
+    checkpoint, layer: "MimoV2DeviceAttention", key: str, dtype: torch.dtype
+) -> torch.Tensor:
+    """The fused `qkv_proj`, whole or this rank's share of it.
+
+    A share is read *as* a share rather than read whole and sliced, because the weight is FP8 with
+    its scale blocked inside each share (`quant._dequant_fp8_block_sharded`): asking the loader for
+    one share dequantizes a quarter of the rows and moves a quarter of the bytes, and the rows it
+    produces are the rows a full read would have produced for them.
+    """
+    if layer.shards == 1:
+        return checkpoint.dense_tensor(key, dtype, layer.device)
+    return checkpoint.dense_tensor(
+        key, dtype, layer.device, shard=layer.shard, shards=layer.shards
+    )
 
 
 @dataclass(frozen=True)
@@ -514,6 +627,11 @@ class MimoV2KVCache:
 
     A global layer's buffer is the context and is appended under a hard limit, since
     there is no window to make an overwrite harmless.
+
+    `shards`/`shard` hold a *share* of the key and value heads, which is what a rank of a split
+    attention needs and nothing else: the heads a rank attends over are the heads it has to keep,
+    so a four-way split divides the cache by four -- 5.65 GiB of global layers at 256k becoming
+    1.4 -- and every rank's `prefix` is the same number of *positions* over its own heads.
     """
 
     def __init__(
@@ -523,11 +641,16 @@ class MimoV2KVCache:
         layers: Sequence[int] | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        *,
+        shards: int = 1,
+        shard: int = 0,
     ) -> None:
         self.config = config
         self.capacity = int(capacity)
         self.device = torch.device(device)
         self.dtype = dtype
+        self.shards = int(shards)
+        self.shard = int(shard)
         self.layers = tuple(range(config.num_hidden_layers)) if layers is None else tuple(layers)
         if not self.layers:
             raise ValueError("a cache with no layers holds nothing")
@@ -538,7 +661,7 @@ class MimoV2KVCache:
         self._value: dict[int, torch.Tensor] = {}
         self._written: dict[int, int] = {}
         for layer in self.layers:
-            shape = config.attention(layer)
+            shape = shard_shape(config.attention(layer), self.shard, self.shards)
             slots = self.capacity if shape.sliding_window is None else min(
                 int(shape.sliding_window), self.capacity
             )
@@ -573,6 +696,18 @@ class MimoV2KVCache:
 
     def slots(self, layer: int) -> int:
         return self._slots[layer]
+
+    def shape(self, layer: int) -> MimoV2AttentionShape:
+        """What this cache holds for `layer`: its geometry, or this rank's *share* of it.
+
+        The cache is the authority on this and a caller that fills or reads a cache has to ask it
+        rather than the config: when the attention is split over the ranks, a rank's buffer holds
+        `1 / shards` of the layer's key and value heads, and a caller that wrote the layer's own
+        count would be refused by `append` -- which is the good outcome, and what the check is for.
+        """
+        if layer not in self._shapes:
+            raise KeyError(f"this cache holds no layer {layer}; it holds {sorted(self._shapes)}")
+        return self._shapes[layer]
 
     def written(self, layer: int) -> int:
         """Positions appended so far, whether or not the ring still holds them."""
@@ -685,19 +820,50 @@ class MimoV2DeviceAttention:
         block: int = 1024,
         budget: int = 1 << 25,
         tile_budget: int | None = None,
+        *,
+        shard: int = 0,
+        shards: int = 1,
+        gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.layer_idx = int(layer_idx)
         self.config: MimoV2TextConfig = checkpoint.layer
-        self.shape: MimoV2AttentionShape = self.config.attention(self.layer_idx)
+        #: The layer's own geometry, and the geometry *this rank* computes. `shards=1` is the
+        #: whole layer and is the control; `shards=4` is one share of the checkpoint's own
+        #: partition. `MimoV2AttentionShape`, `group_qkv_order` and `ep.attention_shards` are
+        #: where the split is defined.
+        self.full_shape: MimoV2AttentionShape = self.config.attention(self.layer_idx)
+        self.shard = int(shard)
+        self.shards = int(shards)
+        if self.shards < 1 or not 0 <= self.shard < self.shards:
+            raise ValueError(
+                f"shard {shard} is not a share of {shards} for layer {self.layer_idx}"
+            )
+        self.gather = gather
+        if self.shards > 1 and gather is None:
+            raise ValueError(
+                f"layer {self.layer_idx} is split over {self.shards} ranks and has no way to "
+                f"join them; `ep.make_all_gather` is one"
+            )
+        self.shape = shard_shape(self.full_shape, self.shard, self.shards)
         self.device = torch.device(device)
         self.dtype = dtype
         self.block = int(block)
-        self.budget = int(budget)
-        #: Scores the block loop's tile may hold, or `None` for `DEFAULT_TILE_SCORES`. It is a
-        #: constant because a per-rank step makes the four ranks of a lockstep do four different
-        #: amounts of work; the constant's comment has the measurement.
-        self.tile_budget = None if tile_budget is None else int(tile_budget)
+        #: Scores a single pass may materialise, and the block loop's tile, both **this share's**.
+        #: The whole layer's counts are `shards` times these, so dividing them here is what makes a
+        #: split call take the same steps as an unshapen one: the single-pass test is
+        #: `heads * queries * keys` and the tile is `kv_heads * groups * rows * block`, and both
+        #: are a quarter of the whole's at a share of four -- so a quarter of the budget is the
+        #: same step, and it is what makes a four-rank prefill agree with a one-rank one.
+        self.budget = int(budget) // self.shards
+        #: Scores the block loop's tile may hold, or `None` for `DEFAULT_TILE_SCORES // shards`. It
+        #: is a constant because a per-rank step makes the four ranks of a lockstep do four
+        #: different amounts of work; the constant's comment has the measurement.
+        self.tile_budget = (
+            DEFAULT_TILE_SCORES // self.shards
+            if tile_budget is None
+            else int(tile_budget) // self.shards
+        )
         if self.shape.projection_layout != "fused_qkv":
             raise NotImplementedError(
                 f"layer {self.layer_idx}: the released checkpoint's fused qkv layout is the "
@@ -705,7 +871,11 @@ class MimoV2DeviceAttention:
             )
 
         root = f"model.layers.{self.layer_idx}.self_attn"
-        self.qkv_proj = checkpoint.dense_tensor(f"{root}.qkv_proj.weight", dtype, self.device)
+        self.qkv_proj = _qkv_weight(checkpoint, self, f"{root}.qkv_proj.weight", dtype)
+        #: The projection that mixes the heads back together, **whole on every rank**: the split
+        #: is joined by concatenating the shares' `pre_o`, not by summing projected partials, and
+        #: the join's own comment says why. So this tensor is the one weight a split attention
+        #: does not divide and the one GEMM it does not divide either.
         self.o_proj = checkpoint.dense_tensor(f"{root}.o_proj.weight", dtype, self.device)
         sink_key = f"{root}.attention_sink_bias"
         self.sink = (
@@ -723,19 +893,22 @@ class MimoV2DeviceAttention:
                 f"layer {self.layer_idx} ({self.shape.family}) is meant to carry a sink and the "
                 f"checkpoint has no {sink_key}"
             )
+        if self.sink is not None and self.shards > 1:
+            self.sink = self.sink[
+                self.shard * self.shape.num_q_heads : (self.shard + 1) * self.shape.num_q_heads
+            ]
 
         self._inv_freq = build_rope_inv_freq(
             self.shape.rope_dim, self.shape.rope_theta, device=self.device
         )
-        #: The permutation `split_fused_qkv` implies, as an index, or `None` for the layout that
-        #: needs no permutation. One `index_select` builds the three tensors the split builds out
+        #: The permutation `split_fused_qkv` implies, as an index, or `None` for the layouts that
+        #: need no permutation. One `index_select` builds the three tensors the split builds out
         #: of nineteen slices and six concatenations, and a decode step makes forty-eight of them
-        #: a token, on a host that is the whole of the step's cost.
-        self._qkv_order = (
-            None
-            if self.shape.qkv_row_layout == "contiguous"
-            else fused_qkv_row_order(self.shape, dtype=torch.int64).to(self.device)
-        )
+        #: a token, on a host that is the whole of the step's cost. A *share* of the checkpoint's
+        #: partition is already in `[q | k | v]` order and takes the plain split.
+        self._qkv_order = group_qkv_order(self.full_shape, self.shard, self.shards)
+        if self._qkv_order is not None:
+            self._qkv_order = self._qkv_order.to(self.device)
         #: A `[capacity, rope_dim]` cos/sin table this layer shares with the rest of its family,
         #: or `None` to build the table per call. See `share_rope_table`.
         self._rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -810,13 +983,42 @@ class MimoV2DeviceAttention:
         positions: torch.Tensor | None = None,
         cache: MimoV2KVCache | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Attention for one chunk of one sequence.
+        """Attention for one chunk of one sequence, joined and projected.
 
-        `start_pos` is the absolute position of the chunk's first token and is what
-        the cache reads and the RoPE table is built from. `positions`, when given, is
-        the chunk's absolute positions and must be contiguous from `start_pos` -- a
-        decode step passes one position and a prefill passes a run, and anything else
-        is a different feature rather than a different call.
+        The split is a two-line thing around `attention_output`: a share produces its own heads'
+        output and the four shares are concatenated, and the projection that mixes the heads runs
+        on the whole of it. Nothing else about the layer is sharded and nothing else needs to be.
+        """
+        pre_o, qkv = self.attention_output(
+            hidden_states, start_pos=start_pos, positions=positions, cache=cache
+        )
+        if self.gather is not None:
+            pre_o = self.gather(pre_o)
+            if pre_o.shape[-1] != self.full_shape.o_in:
+                raise ValueError(
+                    f"the gathered attention output is {pre_o.shape[-1]} wide and this layer's "
+                    f"projection reads {self.full_shape.o_in}"
+                )
+        post_o = F.linear(pre_o.to(self.o_proj.dtype), self.o_proj)
+        return {
+            "qkv_raw": qkv,
+            "attn_out_pre_o": pre_o,
+            "attn_out_post_o": post_o,
+        }
+
+    def attention_output(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        start_pos: int = 0,
+        positions: torch.Tensor | None = None,
+        cache: MimoV2KVCache | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """**This share's** attention output, `[sequence, o_in / shards]`, and the fused qkv.
+
+        `attn_out_pre_o` before the join: the query heads this rank holds, attended, with the
+        projection that mixes heads not yet applied. A caller with `shards == 1` gets the whole
+        layer's `pre_o` and the dictionary `forward` returns is exactly what it always was.
         """
         if hidden_states.dim() == 2:
             flat = hidden_states
@@ -919,9 +1121,4 @@ class MimoV2DeviceAttention:
             cache.append(self.layer_idx, key, value)
 
         pre_o = attn_output.transpose(0, 1).reshape(sequence, shape.o_in).contiguous()
-        post_o = F.linear(pre_o.to(self.o_proj.dtype), self.o_proj)
-        return {
-            "qkv_raw": qkv,
-            "attn_out_pre_o": pre_o,
-            "attn_out_post_o": post_o,
-        }
+        return pre_o, qkv

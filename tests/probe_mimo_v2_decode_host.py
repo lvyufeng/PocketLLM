@@ -79,7 +79,7 @@ def main() -> int:
     if world > 1:
         torch.distributed.barrier()
     cache.reset()
-    fill_cache(cache, model.config, [layer.layer_idx for layer in model.layers], depth)
+    fill_cache(cache, [layer.layer_idx for layer in model.layers], depth)
     torch.cuda.synchronize()
     if world > 1:
         torch.distributed.barrier()

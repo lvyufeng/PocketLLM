@@ -100,9 +100,20 @@ class MimoV2DeviceLayer:
         self.device = torch.device(device)
         self.dtype = dtype
         self.ep = ep
+        #: The layer's own geometry, whichever way the attention is cut. `self.attention.shape` is
+        #: the *share* this rank computes once the attention is split; a caller asking what comes out
+        #: of the layer wants this one, and a caller asking which quarter of the projection this rank
+        #: holds wants that one. `shards=1` makes them the same object's numbers.
         self.shape = self.config.attention(self.layer_idx)
         self.kind = self.config.ffn_kind(self.layer_idx)
 
+        #: How the attention is cut, answered by the group rather than chosen here: a group that
+        #: cannot join the pieces does not cut them (`EpGroup.attention_shards`), so a world of two,
+        #: or a caller that injects a collective of its own, keeps the whole attention on every rank
+        #: -- which is what this layer did before the split existed. A group that does not cut them
+        #: is not handed a `gather` either: the join is the width of the pieces, and applying it to a
+        #: piece that is already the whole output would double the tensor.
+        shards = 1 if ep is None else ep.attention_shards
         self.attention = MimoV2DeviceAttention(
             checkpoint,
             self.layer_idx,
@@ -111,6 +122,9 @@ class MimoV2DeviceLayer:
             block=block,
             budget=budget,
             tile_budget=tile_budget,
+            shard=0 if ep is None else ep.attention_shard,
+            shards=shards,
+            gather=ep.gather if ep is not None and shards > 1 else None,
         )
         root = f"model.layers.{self.layer_idx}"
         self.input_layernorm = checkpoint.dense_tensor(
@@ -394,12 +408,19 @@ class MimoV2DeviceModel:
         the last one before a token needs them.
         """
         self.share_rope_tables(capacity)
+        # The cache holds a *share* of the key and value heads once the attention is cut, so it asks
+        # the group the same way the layers do -- the rule is `EpGroup.attention_shards` and is not
+        # restated here, because a cache that disagreed with its attention would be off by a quarter
+        # of the heads at the first token and would look like a model bug.
+        shards = 1 if self.ep is None else self.ep.attention_shards
         return MimoV2KVCache(
             self.config,
             capacity,
             [layer.layer_idx for layer in self.layers],
             device=self.device,
             dtype=dtype or self.dtype,
+            shard=0 if self.ep is None else self.ep.attention_shard,
+            shards=shards,
         )
 
     def share_rope_tables(self, capacity: int) -> int:

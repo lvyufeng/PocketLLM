@@ -93,7 +93,7 @@ def main() -> int:
     model.greedy(prompt_ids[:1] if depth else prompt_ids, max_tokens=1, cache=cache)
     cache.reset()
     if depth:
-        fill_cache(cache, model.config, [layer.layer_idx for layer in model.layers], depth)
+        fill_cache(cache, [layer.layer_idx for layer in model.layers], depth)
         position = depth
         logits = None
         for _ in range(args.warmup):

@@ -407,12 +407,22 @@ class MimoV2Checkpoint:
         key: str,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cpu",
+        *,
+        shard: int | None = None,
+        shards: int = QKV_SHARDS,
     ) -> torch.Tensor:
         """One backbone tensor at a compute dtype, dequantizing FP8 block weights.
 
         A tensor stored as FP8 E4M3 is returned as `w_fp8 * scale` at `dtype`; MXFP4
         codes are refused, because expanding them is exactly what this repository
         does not do.
+
+        `shard` reads **one** of the fused projection's `shards` shares, which is what a
+        rank that computes its own share wants: the same rows, produced without the other
+        three quarters ever being materialised. The shares are the row blocks the weight
+        was quantised in, not an equal division of rows in general -- see
+        `quant._dequant_fp8_block_sharded`. Every other weight in the checkpoint is whole,
+        and asking for a shard of one is refused rather than silently sliced.
         """
         entry = self.entry(key)
         if entry.dtype == "F8_E4M3":
@@ -423,12 +433,22 @@ class MimoV2Checkpoint:
                 raise ValueError(f"{key} is FP8 but {scale_key} is not in the checkpoint")
             codes = self.read(key, copy=False)
             scale = self.read(scale_key, copy=False)
-            shards = QKV_SHARDS if key.endswith(FUSED_QKV_SUFFIX) else 1
-            return dequant_fp8_block(codes, scale, FP8_BLOCK, dtype, shards).to(device)
+            share = QKV_SHARDS if key.endswith(FUSED_QKV_SUFFIX) else 1
+            if shard is not None and share == 1:
+                raise ValueError(
+                    f"{key} is not a fused projection quantised in shares; it is one tensor"
+                )
+            return dequant_fp8_block(
+                codes, scale, FP8_BLOCK, dtype, share, shard=shard
+            ).to(device)
         if entry.dtype == "U8" and "experts" in key:
             raise ValueError(
                 f"{key} is a packed MXFP4 expert weight; pass it to the expert path "
                 f"instead of expanding it"
+            )
+        if shard is not None:
+            raise ValueError(
+                f"{key} is stored whole and not in shares; read it and slice the rows"
             )
         return self.read(key, dtype, device, copy=False)
 
