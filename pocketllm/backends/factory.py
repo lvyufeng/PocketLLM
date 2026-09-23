@@ -15,12 +15,14 @@ from typing import Any, Iterator
 from pocketllm.api import BackendUnavailableError, EngineArgs, UnsupportedFeatureError
 
 from .cpp_backend import CppBackend
+from .mimo_backend import MimoBackend
 from .torch_backend import TorchBackend
 from .v41_backend import V41Backend
 
 
 _QWEN35_TYPES = {"qwen3_5", "qwen3_5_text"}
 _V41_TYPES = {"deepseek_v41", "deepseek_v41_text"}
+_MIMO_TYPES = {"mimo_v2", "mimo_v2_text"}
 
 
 def _config_path(path: str, explicit: str | None = None) -> Path:
@@ -86,6 +88,34 @@ def _is_v41_config(config: dict[str, Any]) -> bool:
 def _looks_like_v41(path: str, config_path: str | None = None) -> bool:
     config = _read_config(path, config_path)
     return config is not None and _is_v41_config(config)
+
+
+def _is_mimo_config(config: dict[str, Any]) -> bool:
+    """Whether a config describes MiMo-V2.6-Flash.
+
+    Unlike V4.1's, this checkpoint's text stack is not nested: ``model_type`` and
+    ``architectures`` are at the root and describe the language model, with the vision and audio
+    towers under their own keys. The nested walk is here anyway because a wrapper config is still
+    the architecture, and a MiMo release under someone else's multimodal wrapper should not stop
+    being a MiMo release.
+    """
+
+    def is_mimo(value: Any) -> bool:
+        return str(value or "").lower() in _MIMO_TYPES
+
+    if is_mimo(config.get("model_type")):
+        return True
+    architectures = config.get("architectures", ())
+    if isinstance(architectures, (list, tuple)):
+        if any("mimov2" in str(item).lower() for item in architectures):
+            return True
+    nested = config.get("text_encoder_config") or config.get("text_config")
+    return isinstance(nested, dict) and _is_mimo_config(nested)
+
+
+def _looks_like_mimo(path: str, config_path: str | None = None) -> bool:
+    config = _read_config(path, config_path)
+    return config is not None and _is_mimo_config(config)
 
 
 def _checkpoint_has_gguf(path: str) -> bool:
@@ -158,6 +188,35 @@ def _reject_unsupported_v41_checkpoint(args: EngineArgs) -> None:
         )
 
 
+def _mimo_model_supported(args: EngineArgs) -> bool:
+    """Whether the requested checkpoint is one the MiMo adapter can read."""
+    if args.model_format == "gguf":
+        return False
+    if args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir):
+        return False
+    return _looks_like_mimo(args.checkpoint_dir, args.config_path)
+
+
+def _reject_unsupported_mimo_checkpoint(args: EngineArgs) -> None:
+    """Fail fast for checkpoints the MiMo adapter provably cannot serve.
+
+    A missing or unreadable path is left alone: the adapter reports the
+    unreadable checkpoint itself.
+    """
+    if args.model_format == "gguf" or (
+        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
+    ):
+        raise UnsupportedFeatureError(
+            "backend='mimo' reads the checkpoint's safetensors shards only; "
+            "a GGUF checkpoint must use backend='torch'"
+        )
+    config = _read_config(args.checkpoint_dir, args.config_path)
+    if config is not None and not _is_mimo_config(config):
+        raise UnsupportedFeatureError(
+            "backend='mimo' serves MiMo-V2.6-Flash checkpoints only"
+        )
+
+
 def select_backend(args: EngineArgs) -> str:
     """Select a backend without silently changing an explicit user choice."""
     if args.backend != "auto":
@@ -165,12 +224,16 @@ def select_backend(args: EngineArgs) -> str:
             _reject_unsupported_cpp_checkpoint(args)
         elif args.backend == "v41":
             _reject_unsupported_v41_checkpoint(args)
+        elif args.backend == "mimo":
+            _reject_unsupported_mimo_checkpoint(args)
         return args.backend
-    # V4.1 before the native adapter: the two read different architectures, and
-    # the adapter's own runtime is the only thing that can serve a V4.1
-    # checkpoint at all -- the native one has no factory for it and rejects it.
+    # The architecture-specific adapters before the native one, and the native one before the
+    # generic torch runtime: each reads a checkpoint the others cannot, and the order is the
+    # specificity of the reader.
     if _v41_model_supported(args):
         return "v41"
+    if _mimo_model_supported(args):
+        return "mimo"
     if CppBackend.native_available() and _cpp_model_supported(args):
         return "cpp"
     return "torch"
@@ -212,6 +275,30 @@ def create_backend(args: EngineArgs, **injected: Any):
             return _supervise_rank_zero(
                 args,
                 worker_script=_v41_worker_script(),
+                build=build,
+                torch_rendezvous=True,
+            )
+        return construct(args)
+    if selected == "mimo":
+        def construct(resolved: EngineArgs) -> MimoBackend:
+            return MimoBackend(
+                resolved,
+                loader=injected.get("loader"),
+                tokenizer=injected.get("tokenizer"),
+            )
+
+        if _needs_supervision(args, injected):
+            def build(resolved: EngineArgs) -> MimoBackend:
+                # Rank 0 loads inside the rendezvous window, for the reason the V4.1 build does:
+                # the group is read at load time and the environment that names it belongs to
+                # this process only while this call is on the stack.
+                backend = construct(resolved)
+                backend.prepare()
+                return backend
+
+            return _supervise_rank_zero(
+                args,
+                worker_script=_mimo_worker_script(),
                 build=build,
                 torch_rendezvous=True,
             )
@@ -418,6 +505,59 @@ args = EngineArgs(
 backend = CppBackend(args)
 print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
 backend.run_worker(on_ready=None)
+"""
+
+
+def _mimo_worker_script() -> str:
+    """Generate Python code for a MiMo worker rank (actual TP ranks 1, 2, ...).
+
+    Rank 0 stays in the parent process.  Like the V4.1 worker, this one joins the process group
+    and attaches the expert bank inside ``run_worker`` rather than at construction, so readiness is
+    announced from there -- the bank attach ends in a barrier rank 0 is already waiting at, and
+    "constructed" is not a state worth announcing.
+    """
+    return """
+import os
+import json
+from pocketllm import EngineArgs
+from pocketllm.backends.mimo_backend import MimoBackend
+
+# Get the actual rank assigned by the supervisor. Rank 0 belongs to the
+# parent process; child TP ranks start at 1.
+actual_rank = int(os.environ.get("TP_RANK", "0"))
+
+tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
+checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
+nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
+max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
+kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
+backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
+# Fields rank 0 resolved; a default here would desynchronize the collectives.
+shared_args = json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}"))
+tokenizer_path = os.environ.get("POCKETLLM_TOKENIZER_PATH") or None
+
+# Add NCCL ID to backend options
+backend_options["nccl_id_path"] = nccl_id_path
+
+# Create EngineArgs for this worker rank
+args = EngineArgs(
+    model=checkpoint,
+    backend="mimo",
+    tensor_parallel_size=tp_size,
+    tensor_parallel_rank=actual_rank,
+    max_model_len=max_model_len,
+    kv_cache_dtype=kv_cache_dtype,
+    backend_options=backend_options,
+    tokenizer_path=tokenizer_path,
+    **shared_args,
+)
+
+# Construct and enter the worker loop.  The group is joined, the bank attached and the tree
+# built inside run_worker, so readiness is announced from there.
+backend = MimoBackend(args)
+backend.run_worker(
+    on_ready=lambda: print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
+)
 """
 
 

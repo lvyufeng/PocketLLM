@@ -412,13 +412,18 @@ def test_the_layer_routes_a_chunk_by_its_row_count():
 
 
 @needs_cuda
-def test_a_sorted_deal_cannot_be_asked_to_prefill_at_a_world_over_one():
-    """The deal is a property of the module and not of the call, so the refusal is the module's.
+def test_a_sorted_model_keeps_a_second_arena_for_its_chunks():
+    """The two deals are not interchangeable, so a model that serves both holds both arenas.
 
-    A four-rank run that wants to decode with `sorted` and prefill at all has to be built with
-    `id`, and the error says so. `EpGroup` holds the collective and nothing else; the deal is
-    the experts module's, and a caller who got the two out of step learns it here rather than
-    from a prefill that is four times its copy.
+    A step's draw is eight experts of 256 and `sorted` deals it two apiece; a chunk reaches
+    nearly every expert, so its deal has to partition the *experts*, which is `id`. A four-rank
+    run that wants a step under one deal and a prompt under the other therefore cannot be built
+    with one module -- and building it with one is not a slow answer but a refused one, since
+    `forward_chunk` will not stage every expert on every rank.
+
+    What this pins is the pair and the dispatch: the second arena exists, it is `id`, and the
+    *step* still goes through the first module. A chunk path that quietly replaced the step's
+    arena would be a decode regression that no prefill number would show.
     """
     config = tiny_config(routed=(0, 1))
     source = SyntheticSource()
@@ -435,9 +440,33 @@ def test_a_sorted_deal_cannot_be_asked_to_prefill_at_a_world_over_one():
         deal="sorted",
         chunk_rows=0,
     )
-    ids = torch.tensor([3, 17, 42], dtype=torch.int64)
-    with pytest.raises(ValueError, match="id"):
-        model.prefill(ids.tolist(), chunk=3)
+    assert model.experts.deal == "sorted"
+    assert model.chunk_experts is not None, "a sorted model at a world over one holds no chunk arena"
+    assert model.chunk_experts.deal == "id"
+
+    hidden = config.hidden_size
+    row = torch.randn(1, hidden, device=DEVICE)
+    assert model.layers[0].mlp(row).shape == row.shape
+
+    ids = [3, 17, 42]
+    logits = model.prefill(ids, chunk=3)
+    assert logits.shape[-1] == model.vocab_size
+
+    # One arena when one deal serves both: a model built for `id` has nothing to grow, and a
+    # second module there would be 51 MiB of card spent on a copy of the first.
+    single = MimoV2DeviceModel(
+        fixture.checkpoint,
+        device=DEVICE,
+        dtype=torch.float32,
+        layers=[1],
+        expert_source=source,
+        pin=False,
+        ep=group,
+        deal="id",
+        chunk_rows=0,
+    )
+    assert single.chunk_experts is None
+    assert single.experts.deal == "id"
 
 
 def banded(fixture: Fixture, **kwargs) -> MimoV2DeviceModel:

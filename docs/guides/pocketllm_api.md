@@ -499,6 +499,25 @@ rank and can be set to zero to turn the reuse off. Its `cancellation` detail nam
 rather than promising a latency: a cancellation is a per-step collective between the ranks and cannot
 interrupt a prompt's forward.
 
+`backend="mimo"` is the adapter for MiMo-V2.6-Flash. `--backend mimo` names it, and `auto` reaches it
+too — the checkpoint's `model_type` is `mimo_v2`, which the factory recognizes the way it recognizes
+`deepseek_v41`, so a MiMo release gets this adapter from either. What it runs is
+[MiMo-V2.6-Flash](../models/mimo-v2.6-flash.md)'s runtime: `src/models/mimo_v2` over the release,
+the routed experts in host memory, one process a rank under `--tensor-parallel-size`, and it reports
+`supports_batch=False`. Two things about it are not the other adapters':
+
+- **Rank 0 cannot start a request without telling the workers.** Every routed layer closes with an
+  `all_reduce`, so a rank that is not running the request its peers are running is at a *different*
+  collective and NCCL answers that by hanging. The adapter broadcasts each request — prompt ids,
+  budget, sampler, seed — before it runs it, and a cancel is a per-step `broadcast` of one flag for
+  the same reason. A rank that decided to stop on its own would leave three peers inside a layer.
+- **`max_model_len` is the KV cache.** A MiMo deployment sizes one cache at startup (32768
+  positions by default) and every request is clamped to what is left of it; a prompt that fills it
+  is refused before any work starts, with the number and the flag to raise. Its
+  `--backend-option`s are `prefill_chunk` (tokens a prefill call, default 2048), `chunk_rows`
+  (experts a grouped expert call, which trades arena bytes for call count), `slots`, `deal` and
+  `pin`, and an unknown option is a `ConfigurationError` rather than a silent default.
+
 ## Request normalization
 
 `pocketllm.protocol` holds the request normalization shared by the unified server and the legacy

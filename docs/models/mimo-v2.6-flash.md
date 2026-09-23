@@ -53,11 +53,20 @@ queued; the block loop's two `searchsorted`s per key block were another 128 a la
 eight tokens of context, and the decode's own `attn` column is **91.9 to 62.2 ms a token**
 at 64k.
 
+**And it is a service.** `pocketllm serve --backend mimo` is an OpenAI-compatible
+endpoint on the same four ranks: `/health`, `/ready`, `/v1/models`, chat completions,
+`/v1/completions`, SSE streaming, a cancel that reaches a running loop through a
+collective the ranks agree on, and `/metrics` carrying the arena and the deal. Rank 0
+hands every request to the workers over a broadcast before it runs it, because every
+routed layer closes with an all-reduce and a rank that was not told about a request is
+not idle — it is at a different collective. A four-rank served run is in this page's
+own section.
+
 What that is not: a kernel, batching, or a sampler worth shipping. The attention and
-the dense linears are still torch; there is one request, one sequence and four
+the dense linears are still torch; the served path is one request, one sequence, four
 replicated attentions; and at 256k a decode step is 448 ms because the attention reads
-256k keys nine times over. What *is* gone from the earlier list is 256k itself — it has
-run, and the numbers are below.
+256k keys nine times over. What *is* gone from the earlier list is 256k and serving
+themselves — both have run, and the numbers are below.
 
 What exists:
 
@@ -75,7 +84,8 @@ What exists:
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
 | 256k context | Verified and measured: a 262144-token prompt through four ranks at 48.32 tok/s, four-identical last row, 18.45 GiB on the card against 22 |
-| OpenAI-compatible serving | Not implemented |
+| OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
+| Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
 
@@ -735,6 +745,59 @@ and 158.0 before. The routed path lost 39.4 ms to 47 removed round trips — 0.8
 the price of the copy that was queued behind each one — and the attention lost the rest.
 
 
+## A served endpoint
+
+`pocketllm/backends/mimo_backend.py` is the adapter: an OpenAI-compatible server over these four
+ranks, one request at a time, one sequence, with the sampler and the stop conditions the HTTP
+layer already parses. `pocketllm serve --backend mimo --model <checkpoint>
+--tensor-parallel-size 4 --max-model-len 262144 --backend-option prefill_chunk=2048
+--backend-option chunk_rows=16` puts `/health`, `/ready`, `/v1/models`, `/v1/chat/completions`,
+`/v1/completions`, SSE streaming, `DELETE /v1/requests/{id}` and `/metrics` in front of it.
+
+**The deadlock is the design constraint and not a bug in it.** Every routed layer closes with an
+all-reduce at the same point in every rank's program, so the ranks are only ever concurrent by
+being *symmetric*: a rank that is not running the request its peers are running is not idle, it is
+at a different collective, and NCCL answers a mismatch by hanging. Rank 0 therefore may not begin
+a generation it has not told the workers about — one `broadcast_object_list` a request, carrying
+the prompt ids, the budget, the sampler and the seed — and a worker's whole loop is that
+broadcast, one payload a request. It is also why a cancel has to be agreed rather than acted on:
+`_step_sync` is a `broadcast` of one int a step, and a rank that stopped on its own flag would
+leave three peers inside a layer's all-reduce. **A stop string rides the same broadcast**, and
+that is not a detail: the marker is found on rank 0 and nowhere else, so an implementation that
+raised out of the token callback -- which is the obvious one and the single-rank one -- would
+unwind rank 0 while its peers were still in a layer. The streamer records the hit instead and the
+per-step sync folds it into the flag it was already sending, so every rank leaves at the same
+token boundary, one step later, with the same text already cut and sent.
+
+The payload is the whole request and not a hint at it, because the workers have to *reproduce*
+it: the same ids, the same budget, the same sampler, the same seed. They are not given the prompt
+text — tokenization is rank 0's, and a rank that tokenized it itself would be a second renderer
+that could disagree — and they do not need to be told what rank 0 drew, because greedy is
+deterministic and the logits are the same sum on every rank.
+
+**What was exercised on the release, four ranks, a 262144-token `--max-model-len`:**
+
+| | Result |
+| --- | --- |
+| `/health`, `/ready`, `/v1/models` | ready on both routes; the model id the launcher named |
+| `POST /v1/chat/completions` | "The capital of France is Paris." — `finish_reason: stop`, 19 prompt and 19 completion tokens, 8.4 s |
+| `stream: true` | token deltas, a final chunk carrying `usage`, then `data: [DONE]` |
+| `stream: true` with `stop: ["Paris"]` | the stream ends at the marker, `finish_reason: "stop"`, 17 completion tokens, and the text stops at "… is " — the four ranks agreed the stop rather than rank 0 leaving them |
+| `POST /v1/completions` | " Paris. It is located in the north-central part of the country…" — `finish_reason: length`, 5 prompt and 24 completion tokens |
+| A 5721-token prompt | three chunks of 2048, 43.0 s, a correct answer |
+| `DELETE /v1/requests/{id}` mid-stream | `{"cancelled": true}` and `finish_reason: "cancelled"` on the stream, with the server still ready afterwards |
+| `/metrics` | `mimo_arena_bytes 53477376`, `mimo_experts_local 64`, `mimo_experts_per_call 16`, `mimo_kv_cache_bytes 6065356800`, `mimo_world 4` |
+
+The arena byte count is the one to read twice: 53,477,376 is 51 MiB, which is the *decode*
+arena — two rows a slot — and the second arena a served model keeps is the `id` chunk arena at
+408 MiB. A model that serves both has to, because the two deals are not interchangeable: a chunk
+needs the experts partitioned and a decode step is 21% faster when the drawings are, and
+`forward_chunk` refuses `sorted` at a world over one rather than staging all 256 experts on every
+rank. The pair costs 51 MiB of a card that has 2.4 GiB free at 256k, and the dispatch between
+them is the row count of the call.
+
+
+
 ## Validated performance
 
 **One token, on one card, and a floor.** The number above — 610 ms a token — is the
@@ -900,13 +963,14 @@ peak of 17.45**, and the same argmax at all six positions.
 python -m src.models.mimo_v2.config /mnt/data3/MiMo-V2.6-Flash-RL
 
 # parity, layout, the host bridge, the bank, the device experts, the attention, the model,
-# the deal and the prefill
+# the deal, the prefill and the served adapter
 python -m pytest tests/test_models_mimo_v2_config.py tests/test_models_mimo_v2_quant.py \
     tests/test_models_mimo_v2_qkv_layout.py tests/test_models_mimo_v2_layer_parity.py \
     tests/test_models_mimo_v2_loader.py tests/test_models_mimo_v2_real_weights.py \
     tests/test_models_mimo_v2_bank.py tests/test_models_mimo_v2_device_experts.py \
     tests/test_models_mimo_v2_device_attention.py tests/test_models_mimo_v2_device_model.py \
     tests/test_models_mimo_v2_ep.py tests/test_models_mimo_v2_prefill.py -q
+python -m pytest tests/test_mimo_serving.py -q
 
 # what one layer's attention costs, both families, prefill and decode
 python tests/bench_mimo_v2_attention.py
@@ -935,6 +999,12 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 # what a four-rank decode step is made of, without a profiler in the way, and with one
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_arms.py --steps 8 --prompt 8
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt 8
+
+# the served endpoint: chat, completions, streaming, cancel and metrics on four ranks
+pocketllm serve --backend mimo --model /mnt/data3/MiMo-V2.6-Flash-RL \
+    --tensor-parallel-size 4 --max-model-len 262144 --host 0.0.0.0 --port 8300 \
+    --served-model-name mimo-v2.6-flash \
+    --backend-option prefill_chunk=2048 --backend-option chunk_rows=16
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -976,12 +1046,13 @@ golden holds and how it was captured.
   hours where 2048 finished in under two. A fixed step does not explain that on its own — a wider
   chunk pays more of the attention, which at 256k is 15.1 ms of every token — and the honest
   statement is that the width was swept at 64k and at a 32k prompt against a 256k cache, and not at
-  256k depth itself. Sweep `--chunk` per context; the narrow widths were swept at 64k.
+  256k depth itself. Sweep `--chunk` per context; the served configuration is 2048.
 - **A prefill and a decode want different deals, and the deal is per module.** A chunk needs
   the experts partitioned (`id`) and a decode step is 21% faster when the *drawings* are
-  (`sorted`, the default). A run that has to do both picks one: `id` costs the decode
-  step 73 ms a token, and `sorted` at a world over one cannot prefill at all — the chunk path
-  refuses it rather than staging all 256 experts on every rank.
+  (`sorted`, the default). A serving run keeps **both arenas** — 51 MiB for the decode deal and
+  408 MiB for the chunk deal at a band of 16 — and dispatches on the row count of the call, which
+  is two stores of a rank's share where one would do and 51 MiB of a card that has 2.4 GiB free at
+  256k. The alternative is one deal and a lost 21% on decode or no prefill at all.
 - **No tensor parallelism, no batching, and the attention is replicated.** The experts
   are divided over four ranks and everything else is not: the router, the attention, the
   embedding, the head and the dense layer each run four times over. The checkpoint's fused
@@ -990,7 +1061,8 @@ golden holds and how it was captured.
   collective a layer costs 1.6 ms against the 0.4 ms a quarter of the attention's reads
   would save — so what is missing there is a kernel, not a rank.
 - **One sequence, one request, no batching.** A second request would have to wait; the
-  KV cache, the expert arena and the collectives are all single-sequence.
+  KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
+  one at a time and the second blocks on a lock.
 - **The attention and the dense linears are torch, not kernels.** They are baselines
   with the shapes the kernels have to beat: 62.2 ms a token for all 48 layers on four
   ranks at 64k and 190.7 to 209.1 ms at 256k, and the single-pass decode path loses a factor of
@@ -1011,8 +1083,12 @@ golden holds and how it was captured.
   reference — it is why its numbers can be trusted and why they are 37 s a token —
   but it also means the host cannot be run at a long context to check the device's
   cache at one.
-- **No serving.** No OpenAI-compatible adapter, no batching, no prefix caching. The
-  generation loop in `device_model.py` is greedy and single-request.
+- **Serving is one request, one sequence, no prefix cache and no scheduler.** The adapter is an
+  OpenAI-compatible schema over the single-sequence loop in `src/models/mimo_v2/generate.py`, with
+  a cancel that is agreed across the ranks and a stop string that is agreed for the same reason. A
+  second request waits on a lock rather than being scheduled, a repeated prefix is prefilled again,
+  and a cancelled request's KV cache is reset rather than reused. What that buys is a deployment;
+  what it does not is concurrency.
 - **MTP and DFlash are not executed.** The 3-layer MTP module and the 5-layer
   DFlash drafter are located and described but no speculative path uses them.
 - **Vision and audio are out of scope.** The vision tower and the audio encoders
@@ -1063,6 +1139,13 @@ golden holds and how it was captured.
   0.106 ms of a copy that is 2.4** — all five at 10.05 to 10.50 GiB/s, which is the link's own
   rate. A row-per-piece arena is therefore not worth the layout work, and the copy stall the decode
   profile reports is the link and not the launch count.
+- `tests/test_mimo_serving.py` — the adapter without a checkpoint or a process group: the
+  payload rank 0 broadcasts, asserted key for key and not as a subset, that only rank 0
+  dispatches, and that a worker runs what it was sent.
+- `pocketllm/backends/mimo_backend.py` — the served adapter, the one broadcast a request that
+  keeps the ranks symmetric, and the cancel and the stop string that have to be collectives;
+  `src/models/mimo_v2/generate.py` is the prompt-and-answer loop it drives, kept out of the adapter
+  so two adapters cannot disagree about what `max_new_tokens` means.
 - `src/models/mimo_v2/device_experts.py:forward_chunk` — the chunk layout, why `bincount` is
   not in it, and what the bands are; `src/models/deepseek_v4_1/device_experts.py:_issue_chunk`
   is the same call in the other heterogeneous path in this tree, with the 3.04x/3.69x
