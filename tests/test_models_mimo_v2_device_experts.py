@@ -27,6 +27,7 @@ torch = pytest.importorskip("torch")
 from src.models.mimo_v2.device_experts import (  # noqa: E402
     MimoV2DeviceExperts,
     MmapExpertSource,
+    _Residents,
 )
 from src.models.mimo_v2.layers import gate_and_route  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
@@ -251,6 +252,123 @@ def test_the_source_is_asked_for_each_drawn_expert_exactly_once():
     assert source.draws == [(3, 3), (3, 1)]
     assert experts.staged_experts == TOP_K
     assert experts.staged_bytes == TOP_K * experts.expert_bytes
+
+
+# ---------------------------------------------------------------------------
+# The resident set
+#
+# The set exists because the copies are the step's floor: a token stages `top_k / world` experts a
+# layer and the layers are a chain, so a decode step at a world of four moves 1198.5 MiB a rank and
+# the link needs the time it needs. Holding a layer's hottest experts on the card removes their
+# copies, and the claim that makes the whole thing safe is an equality rather than a tolerance.
+# ---------------------------------------------------------------------------
+
+
+@needs_cuda
+def test_a_resident_set_answers_a_draw_the_bytes_the_staging_row_would_have():
+    """Residency changes the traffic and not the answer, so the two builds agree to the bit.
+
+    `_stage` writes the same six views into whichever row it was handed and the kernel is given
+    rows, so a resident expert is the same values summed in the same order as a copied one. That
+    is why `torch.equal` is the whole claim and why the policy can be scored, or changed, without
+    a correctness argument -- and it is checked here at every draw, including the ones that come
+    after the set has filled and started refusing.
+    """
+    torch.manual_seed(2)
+    hidden = torch.randn(1, DIM) * 0.4
+    draws = (
+        ([0, 1], [0.6, 0.4]),
+        ([2, 1], [0.3, 0.7]),
+        ([1, 0], [0.5, 0.5]),
+        ([3, 1], [0.9, 0.1]),
+        ([1, 2], [0.2, 0.8]),
+        ([4, 1], [0.4, 0.6]),
+    )
+    out: dict[int, list[torch.Tensor]] = {}
+    for rows in (0, 2):
+        experts = device_experts(SyntheticSource(), resident_rows=rows, resident_layers=2)
+        got = []
+        for indices, weights in draws:
+            got.append(
+                experts.forward(
+                    hidden.cuda(),
+                    torch.tensor(indices, dtype=torch.int64, device="cuda"),
+                    torch.tensor(weights, device="cuda"),
+                ).cpu()
+            )
+            experts.drain()
+        out[rows] = got
+    for index in range(len(draws)):
+        assert torch.equal(out[0][index], out[2][index]), f"draw {index} moved"
+    assert out[2][0].abs().sum() > 0
+
+
+@needs_cuda
+def test_a_held_expert_is_not_asked_of_the_source_a_second_time():
+    """The copy is what the set buys, so the source is the instrument: it is asked once an expert.
+
+    A draw the set holds never reaches `_stage`, which is the only thing that asks the source. So
+    the second draw of the same pair is free and the counters say so -- `staged_experts` counts the
+    copies and not the draws, and the admits are the only copies a run of repeats makes.
+    """
+    source = SyntheticSource()
+    experts = device_experts(source, resident_rows=TOP_K, resident_layers=1)
+    hidden = torch.randn(1, DIM) * 0.4
+    indices = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    weights = torch.tensor([0.5, 0.5], device="cuda")
+    for _ in range(4):
+        experts.forward(hidden.cuda(), indices, weights)
+        experts.drain()
+
+    assert source.draws == [(3, 0), (3, 1)], "a held expert was copied again"
+    assert experts.staged_experts == TOP_K, "a held draw was billed for a copy"
+    assert experts.resident_hits == 3 * TOP_K
+    report = experts.resident_report()
+    assert report["held"] == TOP_K and report["swaps"] == 0
+    assert report["hit_rate"] == 0.75, "the two admits should be a quarter of the eight draws"
+
+
+@needs_cuda
+def test_a_resident_set_and_a_chunk_band_do_not_share_an_arena():
+    with pytest.raises(ValueError, match="do not share an arena"):
+        device_experts(
+            SyntheticSource(), resident_rows=2, chunk_rows=2, n_experts=N_EXPERTS
+        )
+
+
+def test_a_resident_row_is_a_block_a_layer_and_a_row_a_slot():
+    """The row a layer holds is claimed on its first draw, and a layer id is not an offset.
+
+    A model built for a subset of the layers still names them by their absolute index, so a row
+    computed as `layer_id * rows` walks off the end of the region as soon as any layer is left
+    out -- and the row it lands on is a staging row, which is a wrong answer rather than a crash.
+    """
+    held = _Residents(rows=2, layers=2)
+    held.take(47, 7)
+    held.take(3, 7)
+    assert held.row(47, 0) == 0 and held.row(47, 1) == 1
+    assert held.row(3, 0) == 2 and held.row(3, 1) == 3
+    assert len(held.ids) == 2, "the third layer's block should still be unclaimed"
+    with pytest.raises(ValueError, match="built for 2 layers"):
+        held.take(11, 7)
+
+
+def test_the_coldest_resident_leaves_only_for_a_strictly_hotter_draw():
+    """An unfilled row is taken, a tie is refused, and the coldest leaves for a hotter challenger.
+
+    Refusing a tie is what stops the set thrashing on noise, and it is why this can be a running
+    policy rather than a periodic rebuild: there is no calibration prompt and no eviction burst.
+    """
+    held = _Residents(rows=2, layers=1)
+    assert held.take(0, 10) == (0, True)
+    assert held.take(0, 11) == (1, True)
+    assert held.take(0, 12) is None, "a tie evicted the incumbent"
+    assert held.take(0, 12) == (0, True), "a strictly hotter draw did not take the coldest row"
+    assert held.ids[0] == [12, 11]
+    assert held.swaps == 1
+    assert held.take(0, 11) == (1, False)
+    assert (held.hits, held.misses, held.admits) == (1, 4, 3)
+    assert held.held == 2
 
 
 # ---------------------------------------------------------------------------

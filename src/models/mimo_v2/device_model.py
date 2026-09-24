@@ -307,6 +307,16 @@ class MimoV2DeviceModel:
     the experts. The two paths want different deals -- a chunk needs the experts partitioned,
     which is `id` -- so a model that is asked to prefill and built with `sorted` at a world
     over one is refused by the experts module rather than served slowly.
+
+    `resident_rows` is the decode path's only lever on the bytes, and the bytes are the floor.
+    A token copies `top_k / world` experts a layer -- 1198.5 MiB a rank at a world of four --
+    and the layers are a chain, so each layer's copy waits on the one before and the hundred
+    milliseconds the link needs is a hundred milliseconds of the step no host work can hide.
+    Holding the hottest `resident_rows` experts of every routed layer on the card removes their
+    copies from the chain; which experts those are is learned as the draws arrive, because the
+    device has to be told and every sentinel was computed on the same layer. The cost is
+    `resident_rows` experts of arena a layer, and it is the reason this is a parameter: at a
+    short context there is room for a dozen a layer and at 262144 there is not.
     """
 
     def __init__(
@@ -325,6 +335,7 @@ class MimoV2DeviceModel:
         pin: bool | None = None,
         chunk_rows: int | None = None,
         tile_budget: int | None = None,
+        resident_rows: int = 0,
     ) -> None:
         self.checkpoint = checkpoint
         self.config: MimoV2TextConfig = checkpoint.layer
@@ -393,9 +404,20 @@ class MimoV2DeviceModel:
                 and routed_common["world"] > 1
                 and resolved != "id"
             )
+            # The step module's own arena width. It is a *decode* module when a chunk has a
+            # module of its own to go to -- either because the step never takes a chunk, or
+            # because a second arena was built for one -- and a decode module is the only kind
+            # that can hold a resident set, since a chunk's arena is its share of the layer's
+            # experts rather than a draw's hottest few.
+            step_chunk_rows = None if separate_chunk else chunk_rows
             self.experts = MimoV2DeviceExperts(
                 deal=deal,
-                chunk_rows=None if separate_chunk else chunk_rows,
+                chunk_rows=step_chunk_rows,
+                # The resident region is one block of rows a routed layer in the arena, so the
+                # module has to be told how many layers will draw from it -- exactly the routed
+                # ones, because a block is claimed by the first draw a layer makes.
+                resident_rows=resident_rows if step_chunk_rows is None else 0,
+                resident_layers=len(routed) if resident_rows else 1,
                 **routed_common,
             )
             self.chunk_experts = None
