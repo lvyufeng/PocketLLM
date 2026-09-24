@@ -852,3 +852,55 @@ def test_the_four_shares_are_the_whole_attention(release, layer_idx, rows, keys)
     # them is not the answer, so the test above is not passing on symmetry.
     reordered = torch.cat(pieces[1:] + pieces[:1], dim=-1)
     assert not torch.equal(reordered, want["attn_out_pre_o"])
+
+
+@needs_release_cuda
+@pytest.mark.parametrize("layer_idx", (SWA_LAYER, GA_LAYER))
+def test_a_decode_step_is_the_chunk_path_it_replaced(release, layer_idx):
+    """The one-row path has to be the chunk path's answer and not merely a good one.
+
+    `MimoV2DeviceAttention.decode_output` exists because a decode step is 48 of a token's calls and
+    the chunk path pays for a visibility mask and a set of rope broadcast axes that one row has no
+    use for: the mask is a slice, because `upper` is `keys - 1` for a single query, and the rope's
+    axes are an `unsqueeze` that a `[heads, head_dim]` tensor does not need. Dropping both is exact
+    -- `exp(-inf - max)` is zero, and the row maximum over the masked block is the row maximum over
+    the visible one -- and *exact* is the claim this test holds it to: not a tolerance, equality.
+
+    Both families run because both have a case the other does not. A windowed layer wraps its
+    128-slot ring at step 128 and reads a `prefix`-and-`cat` span from then on, and its `lower` is
+    the clamp rather than the zero; the global layer never wraps at this length and its whole span
+    is visible. And the windowed layer is the one that carries a sink, which is the softmax's one
+    extra term.
+
+    The steps go past the ring on purpose, and past `FOLD_KEYS` never: above it `decode_foldable`
+    hands the call back to `attention_output` and there is nothing here to compare.
+    """
+    steps = 136
+    hidden_size = release.layer.hidden_size
+    device = MimoV2DeviceAttention(release, layer_idx, "cuda", torch.bfloat16)
+    device.build_rope_table(steps + 8)
+    device.share_rope_table(device.build_rope_table(steps + 8))
+
+    torch.manual_seed(17)
+    hidden = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def walk(chunk_path: bool):
+        """`steps` decode steps from position 0, the two arms of a switch, one cache each."""
+        was = MimoV2DeviceAttention.decode_foldable
+        MimoV2DeviceAttention.decode_foldable = lambda self, start_pos, cache: not chunk_path
+        try:
+            cache = cache_for(release, layer_idx, steps + 8, dtype=torch.bfloat16)
+            rows = []
+            for position in range(steps):
+                out = device.forward(hidden.unsqueeze(0), start_pos=position, cache=cache)
+                rows.append(out["attn_out_post_o"].clone())
+            return torch.cat(rows, dim=0)
+        finally:
+            MimoV2DeviceAttention.decode_foldable = was
+
+    fast = walk(chunk_path=False)
+    slow = walk(chunk_path=True)
+    assert fast.shape == slow.shape == (steps, hidden_size)
+    # Not `allclose`: the two are the same kernels on the same numbers in the same order.
+    assert torch.equal(fast, slow), (fast.float() - slow.float()).abs().max().item()
+    assert device.last_stats.path in ("decode", "single")
