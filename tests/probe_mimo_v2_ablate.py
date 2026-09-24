@@ -55,8 +55,9 @@ The stubs, and what each one deletes:
     all         every one of the above at once, which is the floor of the loop, the embedding, the
                 head and the sampler with the layers reduced to two adds.
 
-And the arms that add rather than delete, because they restore a path rather than remove one. Each
-is priced as a difference of two *shipped* builds, which is the only difference this box can read:
+And the arms that are not deletions. Three of them restore a path the shipped build does not take
+and are each priced as a difference of two *shipped* builds, which is the only difference this box
+can read:
 
     chunk-decode  forces every decode step through `attention_output`'s chunk path by answering
                   `decode_foldable` false, which is what the model did before `decode_output`
@@ -65,7 +66,15 @@ is priced as a difference of two *shipped* builds, which is the only difference 
                   model before the arm was written.
     pyrouter      as above: the router off the card and back in Python.
     pyrope        as above: the rotation off the card and back in `rope_rows`.
-    nosync        hands `forward` a *host* indices tensor holding the last draw it took, so the                  `tolist` inside it returns without touching the stream. The experts staged are
+    inference-mode
+                  the step run under `torch.inference_mode` rather than `torch.no_grad`, which is
+                  the same promise about autograd with less bookkeeping on every dispatch. It is
+                  exact and it is not a deletion, which makes it the only arm here that a shipped
+                  build can simply adopt -- and it is the one arm that goes quiet once the shipped
+                  build has adopted it, since a second `inference_mode` costs nothing. Read it
+                  against the `shipped` column's own decorator, not as a claim about the mode.
+    nosync        hands `forward` a *host* indices tensor holding the last draw it took, so the
+                  `tolist` inside it returns without touching the stream. The experts staged are
                   then the previous draw's, so the arithmetic is wrong; what the arm prices is the
                   device-to-host round trip a layer, which is 47 syncs a token. A CPU indices
                   tensor is what makes this work at all -- the shipped path passes `rows` and not
@@ -114,6 +123,7 @@ ARMS = (
     "pyrouter",
     "rope",
     "pyrope",
+    "inference-mode",
     "norms",
     "reduce",
     "experts",
@@ -239,6 +249,7 @@ def install(model, arm: str) -> callable:
     stub_rope = arm in ("rope", "all")
     stub_pyrouter = arm == "pyrouter"
     stub_pyrope = arm == "pyrope"
+    stub_inference_mode = arm == "inference-mode"
     stub_norms = arm in ("norms", "all")
     stub_reduce = arm in ("reduce", "all")
     stub_experts = arm in ("experts", "all")
@@ -337,6 +348,13 @@ def install(model, arm: str) -> callable:
         for layer in model.layers:
             if hasattr(layer.attention, "_rope_ops"):
                 set_(layer.attention, "_rope_ops", None)
+
+    if stub_inference_mode:
+        # The one arm that changes nothing about the arithmetic: the step is already under
+        # `torch.no_grad`, and `torch.inference_mode` is the same promise with less bookkeeping on
+        # every one of its dispatches. A trivial `torch.add` on this box is 15.9 us under `no_grad`
+        # and 9.8 under `inference_mode`, and a decode step is several thousand of those.
+        set_(model, "step", torch.inference_mode()(model.step))
 
     for module in (model.experts, model.chunk_experts):
         if module is None:
