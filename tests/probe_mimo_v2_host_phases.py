@@ -31,7 +31,15 @@ honest total is `probe_mimo_v2_decode_host.py`'s, and this one is read for its s
 Usage:
 
     torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --steps 8
-    torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --steps 8 --depth 32768
+    torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --steps 8 --depth 4096 --fill
+    torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --steps 8 --depth 4096 \
+        --resident-rows 16
+
+`--depth` prefills a real document by default, because at a non-zero `--resident-rows` a written
+cache is not the same step: its draws repeat, the resident set answers far more of them, and the
+`expert wrapper` line comes out smaller than it would over a prompt. `--fill` writes the positions
+instead, which is seconds against minutes and is the arm the region table in the model page was taken
+at -- with `--resident-rows 0` it is faithful, because every draw is staged either way.
 """
 
 from __future__ import annotations
@@ -49,7 +57,7 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import EpGroup  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
-from tests.bench_mimo_v2_model import fill_cache  # noqa: E402
+from tests.bench_mimo_v2_model import fill_cache, tokenize  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
@@ -165,8 +173,33 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint", default=os.environ.get("POCKETLLM_MIMO_CHECKPOINT", DEFAULT_CHECKPOINT)
     )
-    parser.add_argument("--depth", type=int, default=0, help="context the cache is filled to")
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="prefill this many tokens of a real document before the measured steps",
+    )
+    parser.add_argument(
+        "--fill",
+        action="store_true",
+        help="write the positions into the cache instead of prefilling them. Seconds instead of "
+        "minutes, and faithful while `--resident-rows` is 0 -- every draw is staged either way, so "
+        "the routing changes the answer and not the bytes. With a resident set it is not: the "
+        "written prefix's draws repeat, the set answers almost all of them, and the `expert "
+        "wrapper` line below comes out smaller than the same line over a prompt",
+    )
     parser.add_argument("--prompt", type=int, default=len(PROMPT_IDS))
+    parser.add_argument("--chunk", type=int, default=2048, help="width a prefill chunk goes at")
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=0,
+        help="the band a chunk's arena holds, which is what builds the second expert module a "
+        "prefill needs",
+    )
+    parser.add_argument(
+        "--prompt-file", default="docs/models/mimo-v2.6-flash.md", help="the document to tokenize"
+    )
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--resident-rows", type=int, default=0)
@@ -209,6 +242,7 @@ def main() -> int:
         deal=args.deal,
         chunk_rows=args.chunk,
         resident_rows=args.resident_rows,
+        chunk_rows=args.chunk_rows,
     )
     torch.cuda.synchronize()
     experts = model.experts
@@ -229,7 +263,14 @@ def main() -> int:
     # model's.
     cache = model.cache(max(args.depth, args.prompt) + args.warmup + 2 * args.steps + 8)
     if args.depth:
-        fill_cache(cache, [layer.layer_idx for layer in model.layers], args.depth)
+        # The tables are one a family and every `cache()` call re-shares them at *its* capacity,
+        # so the run's own capacity is what has to be live or every deep step takes the chunk path.
+        model.share_rope_tables(max(args.depth, args.prompt) + args.warmup + 2 * args.steps + 8)
+        if args.fill:
+            fill_cache(cache, [layer.layer_idx for layer in model.layers], args.depth)
+        else:
+            ids = tokenize(args.checkpoint, args.depth, args.prompt_file)
+            model.prefill(ids, cache=cache, chunk=args.chunk)
         position = args.depth
         # No prompt was fed, so there is no logits row to continue from: `arm` takes `None` and
         # feeds the first prompt id for its warmup steps, which is what the `--depth` branch wants

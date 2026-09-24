@@ -56,32 +56,10 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import EpGroup, owned_positions  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
+from tests.bench_mimo_v2_model import tokenize  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
-
-
-def tokenize(path: str, checkpoint: str, want: int) -> list[int]:
-    """`want` tokens of a real document, or `PROMPT_IDS` repeated if there is no tokenizer.
-
-    A drawn prompt would be the wrong instrument here: the draws of a random id stream are the
-    model's answer to noise, and two consecutive tokens of noise have no reason to route alike.
-    """
-    text = None
-    if path and os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-    if text is None:
-        return (PROMPT_IDS * (want // len(PROMPT_IDS) + 1))[:want]
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        return (PROMPT_IDS * (want // len(PROMPT_IDS) + 1))[:want]
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
-    ids = tokenizer(text)["input_ids"]
-    if len(ids) < want:
-        ids = (ids * (want // len(ids) + 1))[:want]
-    return list(ids[:want])
 
 
 def main() -> int:
@@ -115,7 +93,7 @@ def main() -> int:
         flush=True,
     )
 
-    prompt = tokenize(args.prompt_file, args.checkpoint, args.depth)
+    prompt = tokenize(args.checkpoint, args.depth, args.prompt_file)
     logits = model.prefill(prompt, cache=cache, chunk=args.chunk)
     torch.cuda.synchronize()
     if ep.world > 1:

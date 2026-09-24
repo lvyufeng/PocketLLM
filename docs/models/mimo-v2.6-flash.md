@@ -19,7 +19,8 @@ one-rank run gives. The attention was still replicated at that point, on all fou
 is divided now, along the checkpoint's own four-way partition, and the section on it is
 below. That 275 is this stage's number and not
 the page's: two device-to-host round trips a layer that nothing needed were 58 ms of it, and the
-step is **177.6 ms — 5.63 tokens a second** below.
+step is **177.6 ms — 5.63 tokens a second** at the stage that removed them and
+**156.3 ms — 6.40** at the one below.
 
 **A prompt is a chunk now, and not a token loop.** `forward_chunk` takes a chunk of
 tokens through `moe_multi_token_fp4_forward` — the kernel the V4.1 path already called
@@ -57,6 +58,28 @@ queued; the block loop's two `searchsorted`s per key block were another 128 a la
 eight tokens of context, and the decode's own `attn` column is **91.9 to 62.2 ms a token**
 at 64k.
 
+**Four kernels and a resident set: 156.3 ms — 6.40 tokens a second — and 117.3 ms, 8.53, with the
+experts held.** The step's softmax, its rotation and its norms are each one kernel now instead of
+eighteen, ten and two dispatches, which is what the sections below measure one at a time, and the
+two families' hop across `FOLD_KEYS` stops sending a one-row step down a chunk's path. Together they
+are **21.3 ms of a short-context token** — the served four-rank step, a real prompt, one process a
+card, the slowest rank: **156.3 ms and 6.40 tokens a second** where the round-trips stage above read
+177.6 and 5.63, and at 4096 positions **147.6 and 6.78**. None of it moves the answer: the rotation
+is elementwise and `torch.equal` to the reference over the released geometry, and the attention's
+bound is one bfloat16 step on 0.061% of a step's elements, which the release's own nine tokens do not
+see.
+
+**And the larger lever is not a kernel.** A decode step's floor is the copy — 1198.5 MiB a rank,
+47 layers of the two experts the deal leaves it, at a PCIe 3.0 link's own rate — and
+`resident_rows=N` keeps each routed layer's hottest `N` experts on the card instead. At sixteen rows
+a layer, which is 9.36 GiB, a short-context step is **117.3 ms and 8.53 tokens a second** — 1.33× the
+shipped configuration — and it is exact, because a resident row holds the bytes a staging row would
+have and the kernel is handed rows. It is off by default for a reason that is memory and not
+performance: sixteen rows and a 262144-token cache do not fit on one 22 GiB card together, and eight
+rows — the width that does fit there — buy 3%, because a copy at that depth has more of the step to
+land behind. The section below has the table and the one instrument that has to be read carefully for
+it.
+
 **And it is a service.** `pocketllm serve --backend mimo` is an OpenAI-compatible
 endpoint on the same four ranks: `/health`, `/ready`, `/v1/models`, chat completions,
 `/v1/completions`, SSE streaming, a cancel that reaches a running loop through a
@@ -66,14 +89,15 @@ routed layer closes with an all-reduce and a rank that was not told about a requ
 not idle — it is at a different collective. A four-rank served run is in this page's
 own section.
 
-What that is not: a kernel, batching, or a sampler worth shipping. The attention and
-the dense linears are still torch; the served path is one request, one sequence; and a
-256k decode step is 323.8 ms, most of it the attention reading a quarter of a million keys
-nine times over — once a rank, since this stage divides that work along the checkpoint's
-own four-way partition, which takes the same step to **197.2 ms and 5.07 tokens a second**,
-past the five a second this page was written against. What *is* gone from the earlier
-list is 256k, serving, the replicated attention and the attention's own copy of its prefix;
-the numbers are below.
+What that is not: batching, or a sampler worth shipping. The attention and the dense linears are
+still torch — the decode step's rotation, softmax and norms are kernels and the rest is not, and above
+`DECODE_KEYS` a global layer's span stops folding and the chunk path takes the call — and the served
+path is one request, one sequence. At 256k a step reads a quarter of a million keys once a rank,
+since this stage divides that work along the checkpoint's own four-way partition, and it is
+**180.0 ms — 5.56 tokens a second**, against 323.8 ms and 3.09 replicated — past the five a
+second this page was written against. What *is* gone from the earlier list is 256k, serving, the
+replicated attention and the attention's own copy of its prefix; the numbers are below, and the four
+kernels and the resident set that come after them are below that.
 
 What exists:
 
@@ -95,9 +119,12 @@ What exists:
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
-| 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **197.2 ms — 5.07 tokens a second**, 38.8 of it the attention and 99.9 the expert copy |
+| 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **180.0 ms — 5.56 tokens a second**, and 174.3 with the eight resident rows a 262144-token cache leaves room for |
 | The model's entry points under `inference_mode` instead of `no_grad` | Implemented and held to `torch.equal` step by step: **7.8 ms of a decode token at 16 resident rows**, where a trivial `torch.add` is 15.9 us under one mode and 9.8 under the other |
-| Decode at 4096 tokens of context | Measured: **96.5 to 107.3 ms a token — 9.3 to 10.4 tokens a second** on four ranks, three bare runs of 120 steps at 87.5% resident hits, the card **86-90% busy**. The region table reads 112.2 ms on the host and 36.7 of it the attention. The two collectives are **6.6** of it — 6.3 the all-reduce, 0.5 the all-gather — priced with the draw held |
+| Decode at a short context | Measured, four ranks, one process a card, the slowest rank, a greedy chain off drawn prompt ids: **156.3 ms — 6.40 tokens a second** as shipped, against 177.6 ms and 5.63 before the four kernels; **117.3 ms — 8.53** at sixteen resident rows a layer |
+| Decode at 4096 tokens of context | Measured over a prefilled 4096-token document: **147.6 ms — 6.78 tokens a second** at sixteen resident rows, 49.25 experts staged a step and 47.6% of the draws answered on the card. The fills the region tables come from read 96.5 to 107.3 ms at that width, which is what a written prefix's repeated draws are worth |
+| The experts kept on the card | Implemented and exact — `torch.equal` on 24 steps of a greedy chain, all four ranks. **117.3 ms against 156.3** at a short context with sixteen rows a layer, which is 1.33x; off by default because 9.36 GiB and a 262144-token cache do not fit on one 22 GiB card, and at that depth eight rows do and buy **174.3 against 180.0** |
+| The collectives, priced on the step | **6.6 ms of a 4096-key step** — 6.3 the all-reduce and 0.5 the all-gather — measured with the router's draw held, against the **52 ms** the device table's own `ncclDevKernel` rows would have you read |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -735,7 +762,9 @@ depth, which is a kernel's job and not a rank's.
 
 **And a decode token at 256k.** Two numbers, and they differ by a deal. A *served* run's step at that
 depth is the probe's, `sorted` with both arenas: **323.8 ms a token replicated — 3.09 tokens a second
-— against 205.6 and 4.86 split**. A prefill bench's `--decode` column is not that: `id` is the only
+— against 205.6 and 4.86 split** at the stage those arms were taken at, and **180.0 ms and 5.56** over
+a real 262144-token prompt once the decode step's softmax, rotation and norms were one kernel each.
+A prefill bench's `--decode` column is not that: `id` is the only
 deal a chunk can use, so a bench that builds one module measures its steps through the prefill's own,
 and the pair it reported at this depth is **399.2 ms replicated against 281.2 split** — two steps and
 no warm-up, from before there was a flag. `bench_mimo_v2_prefill.py --deal` now names the *step's*
@@ -746,22 +775,26 @@ processes are not an A/B on this box and the probe's own docstring says so. Of t
 is **161.8 to 163.3 ms replicated and 48.2 split** and the FFN and staging 228.2 to 230.3 against
 226.0, with 18.48 GiB on the card against **10.21**. The FFN column is the number to look at now: it
 does not move under the split, and it is 226 ms of the 281. For contrast, the same step at eight
-tokens of context is 177.6 ms with 139.6 of it outside the routed path. **The expert path is what
+tokens of context is 156.3 ms with 139.6 of it outside the routed path. **The expert path is what
 grows next**, and that is the less obvious half: a token draws the same 47 × 8 experts whatever the
 context, so the bytes are the same 1198 MiB a rank — but the path is a lockstep rather than a copy,
 four ranks whose bytes are equal and whose times are not, so what a deeper context adds to it is the
-waiting rather than the traffic. A client at 256k should expect **five tokens a second** after a
-first token that costs the prompt, and the two paragraphs below are what that five is made of.
+waiting rather than the traffic. A client at 256k should expect **five and a half tokens a second**
+after a first token that costs the prompt, and the two paragraphs below are what that is made of.
 
 **And that step is the copy plus everything else, in series.** `probe_mimo_v2_decode_phases.py` at
-that depth, four ranks: **copy stall 99.9 ms** of a 204.7 ms token, attention 45.3, expert kernel
-12.5 to 13.0 in 47 calls, collective 3.8 to 13.9, router 4.7 to 12.5, and 27.6 ms of dense linears,
-the head, the sampler and the host — the router's own event pair is recorded after a call that blocks
-the host on the layer's earlier work, so its number is the largest that is double-counted rather than
-a cost of its own. The stall is the part of the H2D the kernel *waited* for, and it is 1198.5 MiB at
-**12.0 GiB/s**: a PCIe 3.0 x16 link at essentially its rate, which makes the bytes the floor and the
-*schedule* the only thing that decides whether they are paid or hidden. Two cuts were measured
-against it.
+that depth, four ranks, at the stage before the four kernels: **copy stall 99.9 ms** of a 204.7 ms
+token, attention 45.3, expert kernel 12.5 to 13.0 in 47 calls, collective 3.8 to 13.9, router 4.7 to
+12.5, and 27.6 ms of dense linears, the head, the sampler and the host — the router's own event pair
+is recorded after a call that blocks the host on the layer's earlier work, so its number is the
+largest that is double-counted rather than a cost of its own. The stall is the part of the H2D the
+kernel *waited* for, and it is 1198.5 MiB at **12.0 GiB/s**: a PCIe 3.0 x16 link at essentially its
+rate, which makes the bytes the floor and the *schedule* the only thing that decides whether they are
+paid or hidden. It is the copy and not the token that the four kernels left alone, so the 99.9 is also
+what the copy is of the **180.0** the same configuration reads now — 56% of the step, against 49%.
+Read that 99.9 as an event window and not as a serial cost: the section on the resident set measures
+the same copy by removing bytes and prices its marginal at a fraction of the link. Two cuts were
+measured against it.
 
 **The attention's own copy of the prefix is gone.** `MimoV2KVCache.append_and_span` hands the attention
 the span it is about to read — `[0, start_pos + n)`, the prefix with this call's own keys on the end of
@@ -770,7 +803,9 @@ it, **160 MiB of keys and values a global layer a token** (read and written, 2.8
 nine of them) with the attention split over four ranks, is never made.
 `probe_mimo_v2_decode_prefix.py`, the two arms interleaved at 262144 and four steps each:
 **197.2 ms a token against 202.3** — 5.07 against 4.94 a second — with the attention column **38.8
-against 44.3**, and the two rounds differing by 3.9 and 6.3 ms in the same direction. (The split's own
+against 44.3**, and the two rounds differing by 3.9 and 6.3 ms in the same direction. Both arms are the
+split stage's, before the four kernels came; what they measure is a difference between two spellings
+of the same span and not the step, which is **180.0** at this depth now. (The split's own
 A/B above measured 205.6 for the same configuration before this cut existed, which is the 3 ms of
 drift between two processes on this box rather than a disagreement.) It is exact by construction: the
 buffer *is* the span in slot order while nothing has wrapped, so the view is the concatenation's own
@@ -935,15 +970,26 @@ the attention:
   at 4096; the staged-expert and resident counts are printed beside every arm for the reason the
   fused attention's probe prints them.
 
-**At 4096 keys a token is 96.5 to 107.3 ms — 9.3 to 10.4 tokens a second — and the attention is
-not what stands between it and ten.** The region table is `probe_mimo_v2_host_phases.py --depth
-4096 --resident-rows 16 --steps 10`, one run: **112.2 ms on the host and 6.1 ms behind it**, of the
-host 36.7 ms the attention (43 before the fold above), **48.1 the expert wrapper**, 9.9 the router,
-5.4 the collective, 5.3 the norms and 0.6 outside a layer. That probe puts a `perf_counter` pair
-around every one of a token's regions, and a token this host-bound pays for its own instrument:
+**At 4096 keys the step is 96.5 to 107.3 ms over a written cache and 147.6 over a prompt, and the
+difference is the copy and not the attention.** The region table is `probe_mimo_v2_host_phases.py
+--depth 4096 --resident-rows 16 --steps 10 --fill`, one run: **112.2 ms on the host and 6.1 ms behind
+it**,
+of the host 36.7 ms the attention (43 before the fold above), **48.1 the expert wrapper**, 9.9 the
+router, 5.4 the collective, 5.3 the norms and 0.6 outside a layer. That probe puts a `perf_counter`
+pair around every one of a token's regions, and a token this host-bound pays for its own instrument:
 three bare runs of the same step — `120` steps at the same depth and the same sixteen resident rows,
 with nothing wrapped — read **107.3, 97.3 and 96.5 ms**, at **87.5% resident hits** and 11.76 experts
 staged a step in the last two. The bare number is the token; the table is read for its shares.
+
+**Those four are written-cache runs, and at sixteen resident rows a written cache is not a prompt.**
+The router's answer to random states barely changes from step to step, so the set answers 87.5% of
+the draws where over a real document it answers 47.6, and the step that comes out of it is the
+*cheaper* one: `probe_mimo_v2_decode_token.py --depth 4096 --resident-rows 16` over a prefilled
+4096-token document reads **147.6 ms — 6.78 tokens a second**, 49.25 experts staged a step against
+11.76. The 46 ms between the two is the 37.5 experts the set no longer answers, at the link's own
+1.2 ms each — `probe_mimo_v2_decode_prefix.py`'s 197.2 ms at 262144 is a written-cache run too, but
+at `--resident-rows 0` that is the faithful case, because every draw is staged either way. Read a
+host-bound number at this depth against the hit rate it was taken at, or it is not this step's.
 
 **The step is no longer host-bound at this depth, and the terms left are not the attention.** The
 card is **86 to 90% busy** through those steps, and the queue behind a step is 0.2 ms — so the two
@@ -953,7 +999,10 @@ largest single bracket is **9.3 ms** in 47 gaps of **197.8 µs** between the dra
 the next copy — the Python between `indices.tolist()` and `_stage` — and the rest is **2083
 `cudaLaunchKernel` calls a step at 9.2 µs each, 19.2 ms of host**, arriving as gaps of 5 to 20 µs
 between twenty-five hundred ops. Fewer, larger kernels is the term; that is the same conclusion the
-short-context table reached, one order of magnitude further along.
+short-context table reached, one order of magnitude further along. It is the written cache's step the
+decomposition is of, and the conclusion is the one that transfers: the 46 ms a prompt adds to it are
+experts the host *stages* and the device *waits for*, so they lengthen the step without lengthening
+the host's own work inside it.
 
 **And the two collectives are 6.6 ms of it, not 52.** The device table bills
 `ncclDevKernel_AllReduce` and `ncclDevKernel_AllGather` at ~550 µs a call, 47 and 48 calls a step.
@@ -1009,6 +1058,88 @@ The remaining 117 launches a layer are not free and are not addressed. What they
 stage, and what it takes is fewer, larger kernels rather than fewer round trips.
 
 
+## The experts kept on the card
+
+A four-rank decode step moves 1198.5 MiB a rank over PCIe — 47 layers of the two experts the
+`sorted` deal leaves it — and the layers are a chain, so each layer's copy waits on the one before.
+The link sustains about 10.4 GiB/s, so at a short context that chain is a floor under the step that no
+host work can hide: stubbing every other region and keeping the copies, the ordering and the kernel
+(`probe_mimo_v2_ablate.py --arms copyfloor`, eight positions) still measures **134.1 ms** of the
+token. Residency is the only lever on that number rather than an optimization of it — and how much
+of the number a copy is *worth* turns out to depend on the depth, which is the last paragraph of this
+section and the reason the shipped default is what it is.
+
+`resident_rows=N` gives each routed layer a block of `N` arena rows that are never overwritten and
+fills them with the experts the layer keeps drawing. The policy is least-frequently-used and
+continuous: a miss is compared against the coldest resident and takes its row only when it has been
+drawn *strictly* more often, so a tie never evicts, and the set converges on the marginal hot set
+without the two things a periodic rebuild would cost — a calibration pass whose statistics belong to
+its own prompt, and a batch of evictions every refresh that is itself a burst of copies.
+
+**It is exact for any policy, which is why it can be this simple.** A resident row holds the bytes
+the staging row would have held and the kernel is handed rows, so the arithmetic and the order of
+the sum are the same whether an expert was copied or not: residency changes the traffic and not the
+answer. `probe_mimo_v2_resident_ab.py`'s two arms differ only in `experts._residents` being set or
+cleared — a resident row and a staging row are disjoint ranges of one arena, so clearing it *is* the
+shipped path — and 24 steps of a greedy chain are `torch.equal` on every logit, on all four ranks.
+
+**The hit rate is a property of the prefix, though, and not of the width.** Over a cache written by
+`fill_cache` the router's draws barely change from step to step, so the set answers **83 to 87%** of
+them and the step comes out *cheaper* than a real one. That is the one place in this page's
+instruments where a filled cache is not a stand-in for a prompt: with `--resident-rows 0` it is
+faithful — every draw is staged either way, so the routing changes the answer and not the bytes, and
+the two agree to 0.2 ms at eight positions and 1.6 at 262144 (178.4 written against 180.0 prefilled)
+— and with a resident set it is not. So every residency
+number below is taken either over a document the model prefilled or over its own greedy chain, which
+is what `tests/probe_mimo_v2_decode_token.py` does by default — no row in the table is a written
+cache, and the 96.5 to 107.3 ms row that was is in the host section above with that said of it.
+
+On the release, four ranks, one process a card, a real greedy chain, the *slowest* rank — every
+routed layer closes with a barrier, so the slowest rank is the step:
+
+| Context | `--resident-rows` | ms a token | tok/s | Staged a step | Answered off the card |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 0 — what is shipped | **156.3** | 6.40 | 94.00 | — |
+| 8 | 16 | **117.3** | **8.53** | 27.09 | 71.2% |
+| 4096 | 16 | **147.6** | 6.78 | 49.25 | 47.6% |
+| 262144 | 0 — what is shipped | **180.0** | 5.56 | 94.00 | — |
+| 262144 | 8 | **174.3** | 5.74 | 63.68 | 32.3% |
+| 262144 | 16 | — | | | does not fit |
+
+The width is card memory and nothing else. Sixteen rows a layer is **9.36 GiB**; a 262144-token KV
+cache is 5.65 GiB of a 22 GiB card, and the two do not fit together — sixteen rows at that depth is
+an out-of-memory and eight is not, while at 4096 sixteen fits and twenty-two does not. That is why
+the default is **0** and why `--backend-option resident_rows=N` is a deployment's decision rather
+than a constant: a served run at a short context is the one that should pay for it.
+
+**And at 256k eight rows buy 3%.** The set answers **32.3%** of the draws — 1819 of 5640 — and
+removes **30.3 of a step's 94 copies**: 386 MiB, which at the link's 10.4 GiB/s is 37 ms of traffic,
+and the step falls **5.7 ms**, to 174.3. A copy removed here is worth **0.19 ms**; at eight positions
+sixteen rows remove 66.9 copies and the step falls 39 ms, which is **0.58 ms** a copy against the
+link's own 1.23. Both are short of the link, so the copy is partly hidden in both arms and more so
+here — but the two arms differ in their row count as well as their depth, so what the table supports
+is the 0.19 and not a trend in depth. The 0.19 is also the opposite of the reading the phase
+decomposition above invites, where 99.9 ms of the step is "the copy the kernel waited for": the two
+disagree because one of them *removes bytes and times the step* while the other attributes an event
+window to them, and for this question the arm that removes the bytes is the one to read. Where the
+removed 31 ms of step went is not measured here. Two candidates: the attention, which is the only
+thing at this depth with room to hide anything, and the resident policy's own host work — a
+comparison on every miss and a comparison on every eviction, 47 layers a step.
+
+What bounds the hit rate is the router's own marginal — **36.6 to 118.2 effective experts of 256** a
+layer on a real document, from `probe_mimo_v2_expert_residency.py`. Sixteen rows out of a hundred-odd
+is not the fraction the arithmetic would give, because the draws are not uniform, and the same skew
+is why a wider set keeps paying rather than saturating.
+
+What this does not do is take the copy away. A rank that answers 47.6% of its draws still stages
+49.25 experts a step — 628 MiB, 60 ms of the token at the link's rate — and that is the floor the
+million-token prompt of the 256k section lives against. Residency moves the floor; it does not
+remove it. And how much of the floor is *paid* is a property of the step around it rather than of the
+bytes: a copy removed is worth 0.58 ms of step at eight positions and 0.19 at 262144, against the
+link's own 1.23. The set is therefore a short-context lever twice over — it is the deployment with
+card memory to spare and the step with a copy-bound budget.
+
+
 ## The attention split over the ranks
 
 The experts were the first thing the four ranks divided; the attention was not divided at all. Every
@@ -1016,7 +1147,8 @@ rank computed all sixty-four query heads over the same quarter of a million keys
 at 256k that replication is **15.45 ms of every prefill token and most of a decode step**. This stage
 divides it, along the checkpoint's own partition: the prompt at that depth goes from **48.37 to
 104.04 tokens a second**, and a decode step from **323.8 to 205.6 ms** — 197.2 after the prefix cut
-described further down this page, which is why every split number here is the split stage's own.
+described further down this page and **180.0** once the decode step's softmax, rotation and norms were
+one kernel each, which is why every split number here is the split stage's own.
 
 **The partition is the checkpoint's and not this repository's.** `quant.QKV_SHARDS` is four, and it is a
 fact about the released file: the fused `qkv_proj` is stored as four groups of `[q | k | v]` with the
@@ -1199,8 +1331,12 @@ fourth quarter of a tensor nobody divided.
 ranks, one request at a time, one sequence, with the sampler and the stop conditions the HTTP
 layer already parses. `pocketllm serve --backend mimo --model <checkpoint>
 --tensor-parallel-size 4 --max-model-len 262144 --backend-option prefill_chunk=2048
---backend-option chunk_rows=16` puts `/health`, `/ready`, `/v1/models`, `/v1/chat/completions`,
+--backend-option chunk_rows=16 --backend-option resident_rows=16` puts `/health`, `/ready`,
+`/v1/models`, `/v1/chat/completions`,
 `/v1/completions`, SSE streaming, `DELETE /v1/requests/{id}` and `/metrics` in front of it.
+`resident_rows` is the one option here that is a deployment's and not a constant — sixteen rows a
+routed layer is 9.36 GiB, which a short-context run has and a 262144-token one does not — and its
+default is 0, so a launcher that wants the 1.33× has to ask for it.
 
 **The deadlock is the design constraint and not a bug in it.** Every routed layer closes with an
 all-reduce at the same point in every rank's program, so the ranks are only ever concurrent by
@@ -1483,6 +1619,31 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
     --tokens 32768 --capacity 262144 --chunk 4096 --band 16 --floor 0
 
+# the bare loop, which is the token and not the instrument: a real prompt by default, all four
+# ranks' own steps, and the staged-expert and resident-hit counters beside the clock
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_token.py --steps 120
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_token.py --depth 4096 --resident-rows 16
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_token.py --depth 262144 --steps 60
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_token.py --depth 262144 --steps 60 \
+    --resident-rows 8
+# `--fill` writes the prefix instead of prefilling it: seconds against 35 minutes, and an upper
+# bound on the rate rather than the rate, which is what the probe's own line says
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_token.py --depth 262144 --fill \
+    --resident-rows 8 --steps 120
+
+# what the host is doing, by region -- read for its shares, since the wrappers are inside the number.
+# `--fill` is the written cache the 112.2 ms table is of; without it the same `--depth` prefills a
+# real document, which at sixteen resident rows is a dearer step
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --depth 4096 --resident-rows 16 --fill
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_host_phases.py --depth 4096 --resident-rows 16
+
+# what a region costs the step, by deleting it: `copyfloor` is the floor under a token
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_ablate.py --arms copyfloor --steps 8
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_ablate.py --arms pyrope --resident-rows 16
+
+# is the resident set free of the bytes it removes, and what does it buy -- `off, on, off, on`
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_resident_ab.py --resident-rows 16 --steps 8
+
 # what a four-rank decode step is made of, without a profiler in the way, and with one
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_arms.py --steps 8 --prompt 8
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt 8
@@ -1521,11 +1682,15 @@ POCKETLLM_MIMO_ATTENTION_SHARDS=1 torchrun --nproc_per_node=4 \
     --out /tmp/tokens_whole.txt
 diff /tmp/tokens_split.txt /tmp/tokens_whole.txt
 
-# the served endpoint: chat, completions, streaming, cancel and metrics on four ranks
+# the served endpoint: chat, completions, streaming, cancel and metrics on four ranks.
+# `resident_rows` is a deployment's decision and not a constant -- 16 rows a layer is 9.36 GiB, so it
+# is what a short-context run should pay for and what a 262144-token one cannot: 8 fits there, 16
+# does not, and 0 is what the default build is
 pocketllm serve --backend mimo --model /mnt/data3/MiMo-V2.6-Flash-RL \
     --tensor-parallel-size 4 --max-model-len 262144 --host 0.0.0.0 --port 8300 \
     --served-model-name mimo-v2.6-flash \
-    --backend-option prefill_chunk=2048 --backend-option chunk_rows=16
+    --backend-option prefill_chunk=2048 --backend-option chunk_rows=16 \
+    --backend-option resident_rows=16
 
 # the whole backbone on the release, decoded on the CPU
 python scripts/verify_mimo_v2_real_checkpoint.py --tokens 8
@@ -1586,6 +1751,21 @@ golden holds and how it was captured.
   collective a layer to divide it, which is why nobody has paid for one. A world that is not four
   keeps the whole attention on every rank, because four is the count the weights admit; a world
   that is four and wants the control arm sets `POCKETLLM_MIMO_ATTENTION_SHARDS=1`.
+- **The resident expert set is off by default, and the reason is memory and not performance.**
+  `resident_rows=N` keeps each routed layer's hottest `N` experts on the card and removes their
+  copies outright — at sixteen rows a layer a short-context step is **117.3 ms against 156.3**, 1.33×,
+  and it is exact for any policy, because a resident row holds the bytes a staging row would have and
+  the kernel is handed rows. What it costs is 0.585 GiB a row over the 47 routed layers, so sixteen is
+  **9.36 GiB** against a 262144-token KV cache's 5.65 on a 22 GiB card, and the two do not fit
+  together: sixteen rows at that depth is an out-of-memory and eight is not, while at 4096 sixteen
+  fits and twenty-two does not. The hit rate is the *prefix's* and not the set's — 71.2% over a
+  short real prompt, 47.6% at 4096, 32.3% at 262144 with the eight rows that fit there — so the same
+  sixteen rows are worth 1.33× at eight positions and less as the context scatters the draws, and the
+  marginal they converge on is 36.6 to 118.2 effective experts of 256 a layer on a real document. What
+  a removed copy is worth also falls with depth — 0.58 ms of step at eight positions against the
+  link's 1.23, and 0.19 at 262144 — so the eight rows that fit at 256k buy 3%. It is a deployment's
+  decision and not a constant, which is why the default is 0 and `--backend-option resident_rows=N`
+  exists, and it is a short-context one.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
   one at a time and the second blocks on a lock.
@@ -1598,8 +1778,10 @@ golden holds and how it was captured.
   linears are torch at every depth. They are each
   baselines with the shapes a kernel has to beat, and the split moved the baseline without moving
   the conclusion:
-  at 262144 on four ranks the attention is **38.8 ms of a 197.2 ms decode step** — a fifth of a
-  token, and 44.3 before the prefix copy above went — and the thirty-nine windowed layers are why,
+  at 262144 on four ranks the attention is **38.8 ms of a 197.2 ms decode step** at the stage the
+  region table was taken at — a fifth of a token, and 44.3 before the prefix copy above went, and
+  163.3 replicated at the 8192-token reading of the same table — and the thirty-nine windowed layers
+  are why,
   because a 128-slot ring's decode step costs what a global layer's does: what is left there is
   launches and dispatch and not keys. `probe_mimo_v2_attention_split.py`'s per-layer table is the
   split's *ratios* (4.65× on a global layer's decode step at that depth, 3.68× on a windowed layer's
@@ -1608,16 +1790,23 @@ golden holds and how it was captured.
   rest on. A kernel is the only thing that reaches the dispatch, and it is the next stage.
 - **256k runs, and the decode at that depth is at the target rather than past it.** A 262144-token
   prompt goes through at **104.04 tokens a second**, which is past the hundred this page was written
-  against, and a decode step at that depth is **197.2 ms — 5.07 tokens a second — against 323.8
-  replicated**, in the step probe that measures the deal a served run's step is built with. Five a
-  second was the number this was aiming at and the margin over it is 1.4%, which is small because the
-  step is a copy at the link's rate plus everything else in series and both are at their floors: the
-  copy is 99.9 ms of the 197.2 — 1198.5 MiB a token at 12.0 GiB/s, which is a PCIe 3.0 x16 link at
-  essentially its rate — and hiding it behind the layer's other 97 ms needs a prediction, while
-  staging fewer bytes needs fewer experts than the draw's `top_k / world`. What is left to take off
-  the step is therefore the dispatch, and the attention is 39 of its 48 layers. A prefill bench's
-  `--decode` column read 281.2 for this depth before there was a flag, which is a different deal's
-  number; it takes `--deal` now and defaults to the served build.
+  against, and a decode step at that depth is **180.0 ms — 5.56 tokens a second — against 323.8
+  replicated**, in the step probe that measures the deal a served run's step is built with, over a
+  real 262144-token prompt and sixty steps of the greedy stream it continues. Five a second was the
+  number this was aiming at and the margin over it is 11%; the step is also **17.2 ms shorter than
+  the 197.2** the same configuration measured before the decode step's softmax, rotation and norms
+  became one kernel each instead of eighteen, ten and two dispatches, which is the same bank of
+  dispatches the short-context step pays. The step is a copy at the link's rate plus everything else
+  in series, and both are near their floors: the copy is 99.9 ms of the 180.0 — 1198.5 MiB a token at
+  12.0 GiB/s, which is a PCIe 3.0 x16 link at essentially its rate, though the arm two sections up
+  that removes copies prices their marginal at 0.19 ms of step here rather than the link's 1.23 — and
+  hiding what is left of it behind the layer's other 80 ms needs a prediction the router does not
+  offer, while staging fewer bytes needs
+  either fewer experts than the draw's `top_k / world` or a resident set that a 262144-token cache
+  leaves room for eight rows of and not sixteen. What is left to take off the step is therefore the
+  dispatch, and the attention is 39 of its 48 layers. A prefill bench's `--decode` column read 281.2
+  for this depth before there was a flag, which is a different deal's number; it takes `--deal` now
+  and defaults to the served build.
 - **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
   tokens, with no temperature, top-p or repetition penalty. The checkpoint's
   `generation_config.json` says `do_sample: false`, so this is its own default — but a
@@ -1668,6 +1857,33 @@ golden holds and how it was captured.
   may differ at all — with the tests that bound the bound (a span of one key is the widened value
   row to the bit, a wrapped ring's view reads as its copy, and 3072 keys fit in a block's 48 KiB
   where 3073 do not).
+- `tests/probe_mimo_v2_decode_token.py` — the token, with nothing in the loop that measures it: one
+  `perf_counter` pair around `--steps` calls and one `synchronize` after them, and no region wrapped.
+  It is the number the others are checked against, and it prints the two facts a rate cannot be read
+  without — the experts a step staged and the share of the draws the resident set answered — plus all
+  four ranks' own steps, because a step is a chain of barriers and the slowest rank is the step.
+  `--depth` prefills a real document through `model.prefill`; `--fill` writes the cache instead and
+  says so in its own line, because a written cache's draws repeat and its rate is an upper bound.
+- `tests/probe_mimo_v2_host_phases.py` — the host's own time, split by the module that asked for it,
+  with `perf_counter` and no CUDA events, and the probe's own overhead printed beside the total so a
+  host-bound step's reading is read as shares and not as a rate. It is where the region table above,
+  the 36.7 ms the attention costs the host and the 48.1 the expert wrapper does come from. `--depth`
+  prefills a real document and `--fill` writes the positions instead, because the two are not the same
+  step once a resident set is on: the written cache's draws repeat, the set answers more of them, and
+  the wrapper's line comes out smaller than a prompt's.
+- `tests/probe_mimo_v2_resident_ab.py` — the resident set's exactness, as an A/B inside one process:
+  the two arms differ only in `experts._residents` being set or cleared, which *is* the shipped path,
+  because a resident row and a staging row are disjoint ranges of one arena. It replays a fixed chain
+  a round at a time, `off, on, off, on`, so the round's own drift lands on both arms, and 24 steps are
+  `torch.equal` on every logit on all four ranks.
+- `tests/probe_mimo_v2_ablate.py`, `tests/probe_mimo_v2_stage_ab.py` — what a region costs the *step*,
+  by deleting it and timing rather than by timing it: the `copyfloor` arm keeps the copies, the
+  ordering and the kernel and stubs everything else, which is where the 134.1 ms floor under a token
+  comes from, and the `pyrope` arm hands the rotation back to the eager path with nothing else moved.
+- `tests/probe_mimo_v2_router_ab.py`, `tests/probe_mimo_v2_decode_host.py`,
+  `tests/probe_mimo_v2_expert_path.py`, `tests/probe_mimo_v2_expert_residency.py` — the router on the
+  card against the host, the call-against-wait split, the wrapper's own interior, and the marginal
+  the hit rate is bounded by (36.6 to 118.2 effective experts of 256 a layer on a real document).
 - `tests/probe_mimo_v2_attention_ab.py` — what the fused attention is worth on the token, as an
   A/B of two shipped paths (`_decode_ops` set and cleared) on a *fixed* replayed chain, timed twice
   and interleaved: free-running, and with the draws recorded off one replay and handed to both arms
@@ -1713,7 +1929,8 @@ golden holds and how it was captured.
   time, and the paired arm is what prices a collective.
 - `tests/probe_mimo_v2_decode_prefix.py` — the attention's read of its own span, as a view of the
   cache buffer against the `cat` it replaces, the two arms interleaved and four steps each at
-  262144: 197.2 ms a token against 202.3, the attention column 38.8 against 44.3. The `cat` arm is
+  262144: 197.2 ms a token against 202.3 — the split stage's pair, the four kernels having moved the
+  step since — the attention column 38.8 against 44.3. The `cat` arm is
   the shipped method answering `None`, which is what a wrapped ring answers, so neither arm is a
   patch of the arithmetic.
 - `tests/probe_mimo_v2_expert_reuse.py` — whether a token's draw predicts the next one's, per
