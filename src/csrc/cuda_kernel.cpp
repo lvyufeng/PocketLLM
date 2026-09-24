@@ -128,6 +128,16 @@ torch::Tensor moe_single_token_int8_forward_cuda(
     int64_t experts_start_idx,
     double swiglu_limit);
 
+std::vector<torch::Tensor> mimo_noaux_tc_route(
+    const torch::Tensor& hidden_states,
+    const torch::Tensor& weight,
+    const torch::Tensor& correction_bias,
+    int64_t top_k,
+    int64_t n_group,
+    int64_t topk_group,
+    bool norm_topk_prob,
+    double routed_scaling_factor);
+
 torch::Tensor moe_single_token_fp4_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& indices,
@@ -2228,6 +2238,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
+    m.def("mimo_noaux_tc_route", &mimo_noaux_tc_route,
+          "MiMo-V2.6's `noaux_tc` router, the reference's arithmetic without the Python layer",
+          pybind11::arg("hidden_states"), pybind11::arg("weight"),
+          pybind11::arg("correction_bias"), pybind11::arg("top_k"),
+          pybind11::arg("n_group"), pybind11::arg("topk_group"),
+          pybind11::arg("norm_topk_prob"), pybind11::arg("routed_scaling_factor"));
     m.def("moe_multi_token_fp4_forward", &moe_multi_token_fp4_forward, "small-batch top-k MoE FP4 forward, active experts only (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
     m.def("qwen4_exp_moe_prefill_bf16_forward", &qwen4_exp_moe_prefill_bf16_forward, "Qwen4-Exp raw BF16 grouped prefill MoE forward (CUDA)");

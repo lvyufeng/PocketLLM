@@ -88,6 +88,7 @@ What exists:
 | Device attention, both families, with a KV cache | Implemented in torch and verified against the host reference; **not a kernel** |
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
+| Router reached from C++ instead of from Python | Implemented and held to `torch.equal` against `layers.gate_and_route`, over both groupings: **190.2 us a call against 498.5** and 8.9 ms of a token's host time against 23.4 |
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
@@ -546,7 +547,7 @@ deal:
 | Span | ms a routed layer | What it is |
 | --- | ---: | --- |
 | Attention | 1.5 | the replicated torch attention, and what is left of it |
-| Router | 0.5 | the gate and the top-k, whose result the host needs |
+| Router | 0.5 → **0.2** | the gate and the top-k, whose result the host needs. The 0.5 is the reference's Python dispatches; reached from C++ it is 0.19 ms a layer, measured |
 | Expert copy | 2.4 | 25.5 MiB, at the link's own 10.4 GiB/s |
 | Expert kernel | 0.4 | two experts instead of eight |
 | The collective | **1.6 in situ** | against **0.128 back to back** |

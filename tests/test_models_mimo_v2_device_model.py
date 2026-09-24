@@ -37,6 +37,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn.functional as F  # noqa: E402
 
+from src.kernels.cuda_loader import load_cuda_kernel  # noqa: E402
 from src.models.mimo_v2.config import MimoV2TextConfig  # noqa: E402
 from src.models.mimo_v2.device_experts import MmapExpertSource  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
@@ -278,7 +279,7 @@ class Fixture:
             device=DEVICE,
             dtype=dtype,
             layers=layers,
-            expert_source=source,
+            expert_source=self.source,
             pin=pin,
         )
 
@@ -441,6 +442,53 @@ def test_a_routed_layer_draws_the_experts_the_router_chose():
     fixture = Fixture(config, source=source, layers=[1])
     fixture.model.forward(torch.tensor([7]), start_pos=0, cache=fixture.model.cache(8))
     assert source.draws == [(1, 0), (1, 1)]
+
+
+@needs_cuda
+def test_a_routed_layer_holds_the_transcription_when_the_extension_is_built():
+    """The dispatch, which is one attribute and therefore exactly the thing that can go wrong.
+
+    `route` answers the same either way -- `tests/test_models_mimo_v2_device_router.py` is that
+    equality, over both groupings and both the k and the k=1 -- so a layer that quietly kept the
+    Python path while the extension was built would cost what it always cost with nothing to
+    explain it. The dense layer is checked for the opposite: it routes to nobody and has no gate.
+    """
+    kernel = load_cuda_kernel()
+    if kernel is None:
+        pytest.skip("the `cuda_kernel` extension is not built for this interpreter")
+    fixture = Fixture(tiny_config())
+    routed = [layer for layer in fixture.model.layers if layer.kind == "moe"]
+    dense = [layer for layer in fixture.model.layers if layer.kind == "dense"]
+    assert routed and dense, "the fixture draws no line between the two kinds of layer"
+    for layer in routed:
+        assert layer._route_ops is kernel
+    for layer in dense:
+        assert layer._route_ops is None and layer.gate is None
+
+
+@needs_cuda
+def test_the_layer_with_the_kernel_taken_away_falls_back_to_the_reference():
+    """`_route_ops = None` is the whole of the fallback, and it is a path and not a dead branch.
+
+    Every routed layer on a build without the extension takes it, so it has to answer -- and it is
+    the reference the transcription was written from, so it has to answer the same. When the
+    extension is absent both sides take the fallback and the equality is a tautology; the point of
+    the test is the build that has the extension.
+    """
+    fixture = Fixture(tiny_config())
+    hidden = torch.randn(1, HIDDEN, device=DEVICE, dtype=torch.float32)
+    for layer in fixture.model.layers:
+        if layer.kind != "moe":
+            continue
+        on_the_card = layer.route(hidden)
+        held = layer._route_ops
+        layer._route_ops = None
+        try:
+            on_the_host = layer.route(hidden)
+        finally:
+            layer._route_ops = held
+        assert torch.equal(on_the_card[0], on_the_host[0]), "the fallback chose other experts"
+        assert torch.equal(on_the_card[1], on_the_host[1]), "the fallback weighted them differently"
 
 
 @needs_cuda
