@@ -1,63 +1,40 @@
 # MiniMax-M2.7
 
-## Runtime status
+A 62-layer MoE text model with GQA and 256 routed experts, shipped as a `UD-IQ1_M` sharded GGUF
+bundle. PocketLLM validates the bundle's schema, keeps each rank's routed-expert partition on device,
+and runs raw-block CUDA greedy generation at TP4.
 
-**Validated TP4 generation.** PocketLLM can load the real `UD-IQ1_M` sharded GGUF bundle, validate its model schema, keep each rank's routed-expert partition on device, and run raw-block CUDA greedy generation.
+- **Backend**: the shared GGUF CLI (`src.cli.generate_gguf`); no OpenAI-compatible adapter
+- **Parallelism**: TP4 expert parallelism
+- **Context**: 196,608 tokens in the config — a full-length request does not fit the 4×22 GiB baseline
+  with an FP16 KV cache
+- **Validated on**: 4×RTX 2080 Ti 22 GiB, real `UD-IQ1_M` checkpoint
 
-The shared `src.cli.generate_gguf` entrypoint accepts token IDs. MiniMax tokenizer helpers are implemented and tested, but there is no dedicated OpenAI-compatible server adapter.
-
-## Model specification
-
-The validated checkpoint reports:
+## Overview
 
 | Field | Value |
 | --- | ---: |
 | Architecture | `minimax-m2` |
 | Layers | 62 |
-| Hidden size | 3072 |
+| Hidden size | 3,072 |
+| Query heads / KV heads / head dim | 48 / 8 / 128 |
+| Routed experts / active | 256 / top-8 |
+| Expert intermediate size | 1,536 |
 | Vocabulary | 200,064 |
-| Context length | 196,608 |
-| Query heads | 48 |
-| KV heads | 8 |
-| Head dimension | 128 |
-| Routed experts | 256 |
-| Active experts | top-8 |
-| Expert intermediate size | 1536 |
 | GGUF tensors | 809 |
 
-`UD-IQ1_M` uses `iq2_xxs` for all three routed-expert matrices, `q5_k` for attention projections, `q4_k` for embedding/output, and floating-point router/norm/bias tensors.
+The quantization is per-tensor: `iq2_xxs` for all three routed-expert matrices, `q5_k` for the
+attention projections, `q4_k` for the embedding and output, and floating-point router, norm and bias
+tensors.
 
-## Implemented execution path
+Two dispatches matter, because prefill and decode take different paths:
 
-- Raw GGUF block loading with rank-local expert ranges.
-- TP4 expert parallelism and NCCL reduction.
-- IQ2_XXS DP4A grouped MoE paths for w1/w3 and w2.
-- Q4_K/Q5_K INT8 MMA prefill path based on the vendored llama.cpp MMQ machinery.
-- Separate decode path: the Q4/Q5 MMA hook only runs for `rows > 1`.
-- Fused CUDA RMSNorm for decode.
-- Fused half-split RoPE and MiniMax-specific GQA handling on Turing.
+- **Prefill** uses Q4_K/Q5_K INT8 MMA kernels, based on the vendored llama.cpp MMQ machinery. This is
+  the change that moved full-model prefill from about 49.7 to about 105 tok/s.
+- **Decode** stays on the IQ2_XXS DP4A grouped MoE paths for w1/w3 and w2, with a fused CUDA RMSNorm
+  and a fused half-split RoPE. The MMA hook only runs for more than one row, so decode never sees it.
 
-## Validated performance
-
-Hardware: 4×RTX 2080 Ti 22 GiB, TP4, real `UD-IQ1_M` checkpoint.
-
-| Measurement | Before | Current measured result | Notes |
-| --- | ---: | ---: | --- |
-| Full-model 256-token prefill | 49.7 tok/s | ~104.9–107 tok/s | Q4_K/Q5_K MMA enabled, all 62 layers |
-| 43-layer decode benchmark | 5.76 tok/s | 10.32 tok/s | Fused RMSNorm milestone; not a 62-layer TPS claim |
-| Per-layer decode in that 43-layer run | 3.84 ms | 2.33 ms | Same profile point as 10.32 tok/s |
-| GPU memory | ~16 GiB/card | ~16 GiB/card | MMA path did not materially change memory |
-
-Earlier MoE work moved 256-token prefill from 12.24 tok/s on the float path to approximately 49 tok/s through IQ2 DP4A; Q4/Q5 MMA then produced the approximately 2.1× full-model improvement above. The 10.32 tok/s decode number was measured with a 43-layer debug limit, whereas the RoPE milestone also has a separate 62-layer result (7.55 tok/s versus 5.38 baseline). These are sequential optimization milestones with different layer scopes, not one directly comparable benchmark suite.
-
-## Correctness and precision
-
-- IQ2 DP4A MoE paths maintained exact token parity with their measured float baseline.
-- Fused RMSNorm maintained the same generated sequence as its baseline.
-- The Q4_K/Q5_K MMA path quantizes activations to INT8. Against the float dequant path, representative projection error was `max_abs≈0.06`, `mean_abs≈0.01`, and `p99_rel≈0.15` for `|y|>0.1`.
-- The first generated token matched the float baseline in the measured run. Later tokens can diverge through KV-cache rounding; this is disclosed behavior, not an exact-sequence claim.
-
-## Reproduction
+## Run it
 
 ```bash
 PYTHONPATH=$PWD torchrun --standalone --nproc-per-node=4 \
@@ -67,6 +44,9 @@ PYTHONPATH=$PWD torchrun --standalone --nproc-per-node=4 \
   --max-new-tokens 32 \
   --prewarm
 ```
+
+The shared CLI is token-ID oriented; MiniMax tokenizer and chat-framing helpers exist and are tested,
+but the generation entrypoint takes prompt token IDs rather than a text prompt.
 
 Inspect and validate the bundle:
 
@@ -78,28 +58,53 @@ PYTHONPATH=$PWD python -m src.cli.inspect_gguf \
   --capability-report --placement-report
 ```
 
-Isolated Q4/Q5 prefill kernel benchmark:
+## What is supported
 
-```bash
-PYTHONPATH=$PWD python tests/bench_q4k_q5k_mma_prefill.py
-```
+| Capability | State |
+| --- | --- |
+| Bundle schema validation and rank-local expert ranges | Supported |
+| TP4 expert parallelism with NCCL reduction | Supported |
+| IQ2_XXS DP4A grouped MoE (w1/w3 and w2) | Supported |
+| Q4_K/Q5_K INT8 MMA prefill | Supported, on by default |
+| Separate decode path (MMA hook only for `rows > 1`) | Supported |
+| Fused decode RMSNorm, half-split RoPE, Turing GQA handling | Supported |
+| Text prompts through the shared CLI | **Not wired** — the entrypoint takes token IDs |
+| OpenAI-compatible serving | **Not wired** |
+| 196,608-token context | **Not claimed** — the KV cache for a full-length request does not fit the baseline |
 
-The isolated benchmark is useful for kernel A/B work, but model-level TPS should come from the generation command.
+## Performance
+
+4×RTX 2080 Ti 22 GiB, TP4, real `UD-IQ1_M` checkpoint.
+
+| Measurement | Before | Current | Notes |
+| --- | ---: | ---: | --- |
+| Full-model 256-token prefill | 49.7 tok/s | **~104.9–107 tok/s** | Q4_K/Q5_K MMA enabled, all 62 layers |
+| 43-layer decode benchmark | 5.76 tok/s | **10.32 tok/s** | Fused-RMSNorm milestone; **not** a 62-layer TPS claim |
+| Per-layer decode in that 43-layer run | 3.84 ms | 2.33 ms | Same profile point as 10.32 tok/s |
+| GPU memory | ~16 GiB/card | ~16 GiB/card | The MMA path did not materially change memory |
+
+Read the decode column with its scope: the 10.32 tok/s figure was measured with a 43-layer debug
+limit, while the RoPE milestone has a separate 62-layer result (7.55 versus 5.38 tok/s baseline).
+These are sequential optimization milestones at different layer scopes, not one comparable suite.
+Earlier MoE work moved 256-token prefill from 12.24 tok/s on the float path to about 49 tok/s through
+IQ2 DP4A, which is the "before" column above.
 
 ## Known limitations
 
-- The advertised 196,608-token context would require a large FP16 KV cache; the checkpoint's context metadata does not imply that every full-length request fits the 4×22 GiB baseline.
-- Text-in/text-out MiniMax chat framing is implemented in encoding helpers, but the shared generation CLI is token-ID oriented.
-- OpenAI-compatible serving is not wired.
-- INT8 activation quantization in the MMA prefill path can alter later greedy tokens through KV-cache state.
+- **The advertised 196,608-token context does not imply a full-length request fits.** An FP16 KV cache
+  at that depth exceeds the 4×22 GiB baseline.
+- **The generation CLI is token-ID oriented.** Chat framing helpers exist but the text-in path through
+  the shared CLI is not wired.
+- **OpenAI-compatible serving is not wired**, so this model is CLI-only.
+- **INT8 activation quantization in the MMA prefill path can alter later greedy tokens** through
+  KV-cache state. The first generated token matched the float baseline in the measured run; later
+  tokens can diverge, and that is disclosed behaviour rather than an exact-sequence claim.
+- **The isolated kernel benchmark is not a model-level number.** Take TPS from the generation command.
 
-## Evidence and related notes
+## Where the detail is
 
-- [MiniMax decode bottleneck analysis](../performance/minimax_decode_bottleneck_analysis.md)
-- `src/models/minimax_m2/spec.py`
-- `src/models/minimax_m2/architecture.py`
-- `tests/test_minimax_m2_spec.py`
-- `tests/test_encoding_minimax_m2.py`
-- `tests/test_q4k_q5k_mma.py`
-- `tests/test_minimax_iq2xxs_w2_dp4a.py`
-- [Benchmark reporting rules](../guides/benchmarking.md)
+- [Design and measurements](../architecture/minimax_m2_7_design.md) — the kernels, the decode profile,
+  the scope each milestone was measured at, and the parity evidence.
+- [MiniMax decode bottleneck analysis](../performance/minimax_decode_bottleneck_analysis.md).
+- [Benchmarking rules](../guides/benchmarking.md) — required before any MiniMax number is quoted.
+- The support matrix in [models/README.md](README.md).

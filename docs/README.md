@@ -63,7 +63,7 @@ Three of those models are served end to end over the OpenAI-compatible API:
   stop-sequence truncation, request-field refusals and concurrent scheduler admission, all verified
   against a real checkpoint. [Model page](models/qwen3.8-27b-fp8.md)
 - **[2026/08] Two external speculative drafters for Qwen3.8-27B.** DSpark came first and
-  [DFlash2](models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) after it, measuring
+  [DFlash2](architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) after it, measuring
   2.78× full-request and 3.02× decode on a 512-token fixture with exact token parity in every case.
   Both are opt-in, because their gains are acceptance-dependent.
 - **[2026/08] Qwen3.8-27B-FP8 on the C++/CUDA runtime** — FP8 E4M3 Safetensors text generation at

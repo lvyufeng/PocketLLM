@@ -29,8 +29,8 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
   流式与非流式 chat/completions、逐 token logprobs、stop sequence 截断、非法字段拒绝，以及并发
   scheduler 准入，全部在真实 checkpoint 上验证过。[模型页](docs/models/qwen3.8-27b-fp8.md)
 - **[2026/08] Qwen3.8-27B 接上两个外部投机 drafter。**
-  [DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) 在前，
-  [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) 在后：512-token
+  [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) 在前，
+  [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) 在后：512-token
   fixture 上全请求 2.78×、decode 3.02×，逐 token 完全一致。两者都是 opt-in，因为收益取决于
   acceptance rate，而上游公布的 2.67–3.43× 是 decode 延迟比而非全请求比。
 - **[2026/08] Qwen3.8-27B-FP8 上 C++/CUDA runtime** —— TP4 下的 FP8 E4M3 Safetensors 文本生成，
@@ -112,7 +112,7 @@ master `cfad866` 上按引擎默认值做的一轮串行 sweep，每次生成 12
 
 64 和 512 token 两行的 prefill 反映的是短 prompt 延迟而非稳态吞吐：两者都在 0.55–0.59 s 内完成，因为该规模下固定进程开销占主导。4,096 token 以上，prefill 到 32,768 的边际吞吐为 1,670 tok/s，之后再为 1,285 tok/s。
 
-通过 OpenAI API 服务 Qwen3.8 的正是同一个 runtime，它也是这里唯一一个带有两个可选外部 speculative drafter 的模型：[DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) 和 [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding)，两者互斥，且都与原生 MTP 路径互斥。DFlash2 在其 opt-in 开关全开时，512-token fixture 上实测 full-request 2.78×、decode 3.02×，八个 GSM8K prompt 上聚合 1.33×，且每种情况下 token 完全一致。两个 drafter 都默认关闭，因为收益依赖接受率，而上游公布的 2.67–3.43× 是 decode 延迟比而非 full-request 比。另外还有一个常驻 TP4 worker 会在请求之间保留 prefix state，因此下一个 prompt 是上一个的追加或压缩的客户端只需为增量付费。
+通过 OpenAI API 服务 Qwen3.8 的正是同一个 runtime，它也是这里唯一一个带有两个可选外部 speculative drafter 的模型：[DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) 和 [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding)，两者互斥，且都与原生 MTP 路径互斥。DFlash2 在其 opt-in 开关全开时，512-token fixture 上实测 full-request 2.78×、decode 3.02×，八个 GSM8K prompt 上聚合 1.33×，且每种情况下 token 完全一致。两个 drafter 都默认关闭，因为收益依赖接受率，而上游公布的 2.67–3.43× 是 decode 延迟比而非 full-request 比。另外还有一个常驻 TP4 worker 会在请求之间保留 prefix state，因此下一个 prompt 是上一个的追加或压缩的客户端只需为增量付费。
 
 ### DeepSeek-V4 C++ FP4 runtime
 
