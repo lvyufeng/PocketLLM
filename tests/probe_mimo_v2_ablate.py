@@ -77,6 +77,7 @@ PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
 #: The arms, in the order they are printed. `shipped` is the arm every other one is subtracted from.
 ARMS = (
     "shipped",
+    "copyfloor",
     "nosync",
     "chunk-decode",
     "stage",
@@ -102,6 +103,85 @@ def install(model, arm: str) -> callable:
         return lambda: None
 
     import src.models.mimo_v2.device_model as device_model_module
+
+    if arm == "copyfloor":
+        # Everything that is not the expert copy: the attention is a zero of the right shape down
+        # the cache, the norms and the reduce are identity, and the draw is the one cached on the
+        # host so nothing waits on it. What is left is the copies, their ordering and the kernel,
+        # which is the floor a token cannot go under while the experts come over PCIe.
+        patch = []
+        module = model.experts
+        was_forward = module.forward
+        held = {}
+
+        def cached_draw(hidden, indices, weights, *, layer_id=None, _was=was_forward, _h=held):
+            key = int(layer_id)
+            if key not in _h:
+                _h[key] = indices.tolist()
+            return _was(hidden, torch.tensor(_h[key], dtype=torch.int64), weights, layer_id=layer_id)
+
+        patch.append((module, "forward", was_forward))
+        module.forward = cached_draw
+
+        def no_append(cache, layer, key, value):  # noqa: ANN001
+            slots = cache._slots[layer]
+            start = cache._written[layer]
+            count = key.shape[1]
+            if count > slots:
+                start += count - slots
+            cache._written[layer] = start + count
+            return cache._written[layer]
+
+        # The cache is advanced through the real `append`, on zeros, so the arm leaves the
+        # sequence where the next arm expects it. That leaves the append's own dispatches in the
+        # floor, which makes this an over-estimate and not the other way round.
+        del no_append
+        for layer in model.layers:
+            kept = layer.attention.forward
+
+            def nothing(hidden, _layer=layer, *, start_pos=0, cache=None, **kwargs):  # noqa: ANN001, ANN003
+                shape = cache.shape(_layer.layer_idx)
+                rows = hidden.shape[0]
+                cache.append(
+                    _layer.layer_idx,
+                    torch.zeros(
+                        (shape.num_kv_heads, rows, shape.head_dim),
+                        dtype=cache.dtype,
+                        device=hidden.device,
+                    ),
+                    torch.zeros(
+                        (shape.num_kv_heads, rows, shape.v_head_dim),
+                        dtype=cache.dtype,
+                        device=hidden.device,
+                    ),
+                )
+                return {"attn_out_post_o": torch.zeros_like(hidden)}
+
+            patch.append((layer.attention, "forward", kept))
+            layer.attention.forward = nothing
+            if layer.kind != "dense":
+                real = layer.route
+                bag = {}
+
+                def pick(hidden, _real=real, _bag=bag):  # noqa: ANN001
+                    if "out" not in _bag:
+                        _bag["out"] = _real(hidden)
+                    return _bag["out"][0].clone(), _bag["out"][1].clone()
+
+                patch.append((layer, "route", real))
+                layer.route = pick
+
+        patch.append((device_model_module, "normalise", device_model_module.normalise))
+        device_model_module.normalise = lambda hidden, weight, eps: hidden
+        if model.ep is not None and model.ep.reduce is not None:
+            patch.append((model.ep, "reduce", model.ep.reduce))
+            model.ep.reduce = lambda out: out
+
+        def restore_copyfloor() -> None:
+            for owner, attribute, was in reversed(patch):
+                setattr(owner, attribute, was)
+
+        return restore_copyfloor
 
     if arm == "nosync":
         module = model.experts

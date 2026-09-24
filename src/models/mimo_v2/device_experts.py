@@ -130,6 +130,124 @@ class MmapExpertSource:
         return views
 
 
+class _Residents:
+    """Which of a layer's experts are on the card, learned from the draws as they arrive.
+
+    The router's marginal distribution is heavily skewed -- an effective expert count of 36.6 to
+    118.2 of 256 on a real document, measured by `probe_mimo_v2_expert_residency.py` -- so a small
+    set of a layer's hottest experts answers a large share of its draws, and an expert held on the
+    card is an expert not copied over PCIe. That is the entire value: the copy is 1198.5 MiB a rank
+    a token and it is a strictly serial chain of 47 layers, so the bytes are the step's floor and
+    nothing else in this file can move it.
+
+    **The policy is least-frequently-used over the run, and it is continuous.** A draw that misses
+    is compared against the coldest resident and takes its slot when it has been drawn more often;
+    a slot the layer has not filled yet is always taken. That converges on the marginal hot set
+    without the two things a periodic rebuild would cost -- a calibration pass whose statistics
+    belong to *its* prompt, and a batch of evictions every refresh that is itself a burst of
+    copies.
+
+    **It is exact for any policy and that is why this one can be this simple.** A resident row
+    holds the same bytes the staging row would have held and the kernel is handed rows, so the
+    arithmetic and the order of the sum are the same whether an expert was copied or not:
+    residency changes the traffic and not the answer, in either direction and at any moment. So
+    the policy is a performance question with no correctness constraint on it, and the tests that
+    hold it to the shipped path do not have to know which experts happened to be resident.
+
+    Host-side and not on the card on purpose. The count is over draws, and the draw is already on
+    the host -- `forward` reads it back a layer to know which experts to copy -- so a table here
+    costs nothing that is not already paid.
+    """
+
+    def __init__(self, rows: int, layers: int) -> None:
+        self.rows = int(rows)
+        #: How many layers may hold a set. A capacity and not a count: a layer's block is claimed
+        #: on its first draw, which is what makes a model built for a *subset* of the layers
+        #: correct. The layers of such a model are named by their absolute index -- `layers=[2, 5]`
+        #: strides the arena by the gap between them -- so an offset computed as `layer_id *
+        #: resident_rows` walks off the end of the region as soon as any layer is left out.
+        self.layers = int(layers)
+        # A layer's resident expert ids in slot order, `-1` for a slot not yet filled, and the two
+        # tables a draw is answered out of: the slot an expert occupies, so a hit is a lookup and
+        # not a scan, and how often it has been drawn.
+        self.ids: list[list[int]] = []
+        self.slot: list[dict[int, int]] = []
+        self.counts: list[dict[int, int]] = []
+        self.block: dict[int, int] = {}
+        self.hits = 0
+        self.misses = 0
+        self.admits = 0
+        self.swaps = 0
+
+    def position(self, layer: int) -> int:
+        """The block of resident rows `layer` owns, claimed on its first draw."""
+        index = self.block.get(layer)
+        if index is None:
+            if len(self.ids) >= self.layers:
+                raise ValueError(
+                    f"layer {layer} draws from a resident set built for {self.layers} layers"
+                )
+            index = len(self.ids)
+            self.block[layer] = index
+            self.ids.append([-1] * self.rows)
+            self.slot.append({})
+            self.counts.append({})
+        return index
+
+    def row(self, layer: int, slot: int) -> int:
+        """The arena row a layer's resident slot is: a block a layer and a row a slot."""
+        return self.block[layer] * self.rows + slot
+
+    def take(self, layer: int, expert: int) -> tuple[int, bool] | None:
+        """`(slot, needs filling)` for a draw, or `None` to stage it in the slot's own rows.
+
+        A draw the set already holds is `(slot, False)` and is the whole of what the set buys: no
+        copy. A draw that missed is offered a slot -- `(slot, True)`, the copy is what filling it
+        costs -- or refused, which is the ordinary staging path.
+
+        The offer is least-frequently-used: an unfilled slot is taken outright, and otherwise the
+        coldest resident is compared and the incumbent only leaves when the challenger has been
+        drawn *strictly* more often, so a tie never evicts and the set cannot thrash on noise.
+        """
+        block = self.position(layer)
+        table = self.counts[block]
+        table[expert] = table.get(expert, 0) + 1
+        slot = self.slot[block].get(expert)
+        if slot is not None:
+            self.hits += 1
+            return slot, False
+        self.misses += 1
+        ids = self.ids[block]
+        for index, held in enumerate(ids):
+            if held < 0:
+                self.admits += 1
+                return self._place(block, expert, index), True
+        coldest = min(range(self.rows), key=lambda index: table.get(ids[index], 0))
+        if table.get(expert, 0) <= table.get(ids[coldest], 0):
+            return None
+        self.admits += 1
+        self.swaps += 1
+        return self._place(block, expert, coldest), True
+
+    def _place(self, block: int, expert: int, slot: int) -> int:
+        evicted = self.ids[block][slot]
+        if evicted >= 0:
+            del self.slot[block][evicted]
+        self.ids[block][slot] = expert
+        self.slot[block][expert] = slot
+        return slot
+
+    @property
+    def held(self) -> int:
+        """How many rows of the resident region actually hold an expert."""
+        return sum(1 for ids in self.ids for expert in ids if expert >= 0)
+
+    @property
+    def drawn(self) -> int:
+        """How many draws the set has been asked about, hits and misses together."""
+        return self.hits + self.misses
+
+
 class MimoV2DeviceExperts:
     """A card's routed experts, computed out of a host-resident source.
 
@@ -156,6 +274,14 @@ class MimoV2DeviceExperts:
     `chunk_rows` is how many of that share one kernel call stages -- `0` for all of it in
     one call, a smaller number for bands. Without them the arena is one draw wide and
     `forward_chunk` says so rather than reading a chunk out of two rows.
+
+    `resident_rows` is the one lever on the bytes and it is not an optimization of the
+    copy -- it is the only way the copy gets smaller. A token moves `top_k / world` experts
+    a layer over PCIe, which at a world of four is 1198.5 MiB a rank, and the link sustains
+    about 11.7 GiB/s: a hundred milliseconds a token that no amount of host work can hide,
+    because the layers are a chain and each one's copy waits on the one before. Holding the
+    `resident_rows` hottest experts of a layer on the card is what shrinks the chain, and
+    the arena carries them as rows that are never overwritten -- see `_residents`.
     """
 
     def __init__(
@@ -174,6 +300,8 @@ class MimoV2DeviceExperts:
         deal: str | None = None,
         n_experts: int | None = None,
         chunk_rows: int | None = None,
+        resident_rows: int = 0,
+        resident_layers: int = 1,
     ) -> None:
         self.source = source
         self.layer_id = None if layer_id is None else int(layer_id)
@@ -262,7 +390,23 @@ class MimoV2DeviceExperts:
                 "the `cuda_kernel` extension did not load: build it, or run under the "
                 "interpreter it was built for (`scripts/build_extensions.sh` names one)"
             )
-        self._arenas = [self._allocate() for _ in range(self.slots)]
+        #: How many of a layer's experts are held on the card, and how many layers there are to
+        #: hold them for. The two together are the arena's resident region, which is one block of
+        #: `resident_layers * resident_rows` rows in front of the slots' own rows -- one
+        #: allocation and not two, because the kernel takes one tensor and indexes its first axis,
+        #: so a resident row and a staging row have to be rows of the same tensor for one call to
+        #: read both. `_residents` is the policy that decides which experts those rows hold.
+        self.resident_rows = int(resident_rows)
+        self.resident_layers = int(resident_layers)
+        if self.resident_rows and self.chunk_rows is not None:
+            raise ValueError(
+                "a chunk's arena is its share of the layer's experts and a resident set is a "
+                "draw's hottest few; the two do not share an arena"
+            )
+        self._residents = (
+            _Residents(self.resident_rows, self.resident_layers) if self.resident_rows else None
+        )
+        self._arena, self._arenas, self._staging_base = self._allocate()
         with torch.cuda.device(self.device):
             self._events = [torch.cuda.Event() for _ in range(self.slots)]
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
@@ -278,7 +422,11 @@ class MimoV2DeviceExperts:
         with torch.cuda.device(self.device):
             self._picked_host = torch.zeros(self.top_k, dtype=torch.int64, pin_memory=True)
             self._picked_device = torch.zeros(self.top_k, dtype=torch.int64, device=self.device)
-            self._rows = torch.arange(self.top_k, dtype=torch.int64, device=self.device)
+            # Which arena row each of this call's positions reads. Without a resident set it is
+            # `arange`, which is what this used to be; with one it is a different row a position
+            # and has to be built per call, so it has a pinned source of its own either way.
+            self._row_host = torch.zeros(self.top_k, dtype=torch.int64, pin_memory=True)
+            self._row_device = torch.zeros(self.top_k, dtype=torch.int64, device=self.device)
         self._next = 0
         # Counters, because "how much did the bank save" is a question about the copies and
         # not about the wall clock: `staged_experts` is the draws that cost an H2D.
@@ -297,19 +445,74 @@ class MimoV2DeviceExperts:
             ("up_proj", "weight_scale"): (self.inter_dim, self.dim // 32),
         }
 
-    def _allocate(self) -> dict[tuple[str, str], torch.Tensor]:
+    @property
+    def resident_bytes(self) -> int:
+        """What the resident set costs the card: one expert a row, kept for the whole run."""
+        return self.resident_rows * self.resident_layers * self.expert_bytes
+
+    @property
+    def resident_hits(self) -> int:
+        """Draws this rank answered out of the resident region, so draws that cost no copy."""
+        return 0 if self._residents is None else self._residents.hits
+
+    def resident_report(self) -> dict[str, float]:
+        """The set's own numbers, for a probe: it is a policy and a policy has to be scored.
+
+        `hit_rate` is the share of this rank's draws that were already on the card, which is the
+        share of `staged_bytes` the set removed; `swaps` is how much of the region's traffic went
+        into holding the set up to date rather than into a slot.
+        """
+        if self._residents is None:
+            return {"rows": 0, "layers": 0, "held": 0, "hits": 0, "swaps": 0, "hit_rate": 0.0}
+        drawn = self._residents.drawn
+        return {
+            "rows": float(self.resident_rows),
+            "layers": float(len(self._residents.ids)),
+            "held": float(self._residents.held),
+            "hits": float(self._residents.hits),
+            "swaps": float(self._residents.swaps),
+            "hit_rate": 0.0 if not drawn else self._residents.hits / drawn,
+        }
+
+    def _allocate(
+        self,
+    ) -> tuple[dict[tuple[str, str], torch.Tensor], list[dict], list[int]]:
+        """The arena, as `(the allocation, the per-slot views, each slot's first row)`.
+
+        Without a resident set this is one tensor a slot, which is what it always was. With one,
+        the resident region has to be a *single* allocation shared by the slots -- the kernel reads
+        one tensor and a row is an index into its first axis -- so the allocation is one tensor of
+        `resident_layers * resident_rows + slots * arena_rows` rows and the slots are row ranges
+        of it. The rows a slot owns start after the resident region, which is what `_staging_base`
+        carries into `_stage` and `forward`.
+        """
+        resident = self.resident_rows * self.resident_layers
         with torch.cuda.device(self.device):
-            return {
-                key: torch.empty((self.arena_rows,) + shape, dtype=torch.uint8, device=self.device)
+            if not resident:
+                arenas = [
+                    {
+                        key: torch.empty(
+                            (self.arena_rows,) + shape, dtype=torch.uint8, device=self.device
+                        )
+                        for key, shape in self._shapes().items()
+                    }
+                    for _ in range(self.slots)
+                ]
+                return arenas[0], arenas, [0] * self.slots
+            rows = resident + self.slots * self.arena_rows
+            arena = {
+                key: torch.empty((rows,) + shape, dtype=torch.uint8, device=self.device)
                 for key, shape in self._shapes().items()
             }
+            base = [resident + slot * self.arena_rows for slot in range(self.slots)]
+            return arena, [arena] * self.slots, base
 
     @property
     def arena_bytes(self) -> int:
-        """Packed fp4 bytes one slot occupies on the card."""
-        return self.slots * self.arena_rows * sum(
-            shape[0] * shape[1] for shape in self._shapes().values()
-        )
+        """Packed fp4 bytes the arena occupies on the card, resident rows and slots together."""
+        return (
+            self.slots * self.arena_rows + self.resident_rows * self.resident_layers
+        ) * sum(shape[0] * shape[1] for shape in self._shapes().values())
 
     @property
     def expert_bytes(self) -> int:
@@ -340,7 +543,13 @@ class MimoV2DeviceExperts:
         self._next = (self._next + 1) % self.slots
         return slot
 
-    def _stage(self, slot: int, layer_id: int, experts: Sequence[int]) -> None:
+    def _stage(
+        self,
+        slot: int,
+        layer_id: int,
+        experts: Sequence[int],
+        rows: Sequence[int] | None = None,
+    ) -> None:
         """Copy `layer_id`'s `experts` into the slot's arena rows, on the copy stream.
 
         Ordered behind the compute stream because the rows are the previous call's inputs
@@ -351,12 +560,20 @@ class MimoV2DeviceExperts:
         `down, gate, up` order and the kernel wants three tensors in `w1, w2, w3`, so
         neither arrangement is a prefix of the other. The destination rows are contiguous
         within each tensor, which is what lets the kernel read them as `[E, N, K/2]`.
+
+        `rows` is where they go, and it exists for the resident set: a row of this call's
+        arena is either one of the slot's own -- `_staging_base[slot]` plus the position --
+        or a resident row, when the expert is one the layer already holds and the copy is
+        what an eviction into it costs. Without a resident set the two are the same list and
+        the rows are the slot's own.
         """
         arena = self._arenas[slot]
+        base = self._staging_base[slot]
         with torch.cuda.device(self.device):
             self._copy_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self._copy_stream):
-                for row, expert in enumerate(experts):
+                for index, expert in enumerate(experts):
+                    row = base + index if rows is None else rows[index]
                     views = self.source.expert_views(layer_id, int(expert))
                     for (proj, kind), target in arena.items():
                         target[row].copy_(
@@ -432,7 +649,42 @@ class MimoV2DeviceExperts:
             return torch.zeros((1, self.dim), dtype=torch.float32, device=self.device)
 
         slot = self._take_slots(len(mine))
-        self._stage(slot, layer, [drawn[position] for position in mine])
+        stage = self._staging_base[slot]
+        rows: list[int] = []
+        staged: list[int] = []
+        staged_rows: list[int] = []
+        next_staging = 0
+        for position in mine:
+            expert = drawn[position]
+            row = None
+            fill = True
+            if self._residents is not None:
+                # A held expert is a row this call does not copy, which is the whole of what the
+                # resident set buys. A draw the set does not hold may be admitted -- into a free
+                # slot, or into the coldest one when it has been drawn more often -- and *that*
+                # row has to be filled, which is why an admitted expert is listed with the staged
+                # ones: it is a copy either way, into the resident region instead of a slot.
+                taken = self._residents.take(layer, expert)
+                if taken is not None:
+                    row = self._residents.row(layer, taken[0])
+                    fill = taken[1]
+            if row is None:
+                row = stage + next_staging
+                next_staging += 1
+                fill = True
+            if fill:
+                staged.append(expert)
+                staged_rows.append(row)
+            rows.append(row)
+        if staged:
+            self._stage(slot, layer, staged, rows=staged_rows)
+        else:
+            # Nothing to copy, and the kernel still has to wait on this slot's event -- but the
+            # event it would wait on is the one a *previous* call recorded for the same slot, and
+            # that copy is long done. Recording a fresh one on the copy stream makes the wait an
+            # edge on an empty stream instead of a stale edge on a real one.
+            with torch.cuda.device(self.device):
+                self._copy_events[slot].record(self._copy_stream)
         arena = self._arenas[slot]
         compute = torch.cuda.current_stream(self.device)
         compute.wait_event(self._copy_events[slot])
@@ -440,10 +692,13 @@ class MimoV2DeviceExperts:
         picked = self._picked_device[: len(mine)].copy_(
             self._picked_host[: len(mine)], non_blocking=True
         )
-        rows = self._rows[: len(mine)]
+        self._row_host[: len(mine)] = torch.tensor(rows, dtype=torch.int64)
+        row_index = self._row_device[: len(mine)].copy_(
+            self._row_host[: len(mine)], non_blocking=True
+        )
         out = self._kernel.moe_single_token_fp4_forward(
             hidden.to(self.device),
-            rows,
+            row_index,
             weights.index_select(0, picked).to(self.device, dtype=torch.float32),
             arena[("gate_proj", "weight")],
             arena[("gate_proj", "weight_scale")],

@@ -97,6 +97,23 @@ because the cache is 5.65 GiB of it.
 DEFAULT_EXPERT_SLOTS = 2
 """Expert arena slots: one call in flight while the next one's copy lands."""
 
+DEFAULT_RESIDENT_ROWS = 0
+"""Experts of each routed layer the card keeps, which is the one lever the decode step has on bytes.
+
+A decode token stages ``top_k / world`` experts a layer -- 94 copies, 1198.5 MiB a rank, at a world
+of four -- and the layers are a chain, so the copy chain is a floor under the step that no host work
+can hide. Holding a layer's hottest ``resident_rows`` experts on the card removes their copies, and
+the set is learned from the draws as they arrive rather than calibrated, because a resident row holds
+the bytes a staging row would have held: the answer is identical under *any* policy, which is what
+makes the policy a performance question with no correctness constraint on it.
+
+It is off by default because it is card memory and the amount that fits is a function of the
+context. A routed layer costs ``resident_rows`` experts -- 12.75 MiB each at the released
+dimensions -- so eight rows is 4.78 GiB of a 22 GiB card: free at a short context and impossible at
+262144, where the cache alone is 5.65 GiB. A deployment that serves short prompts should turn it on
+and pay for the rows; see ``docs/models/mimo_v2_6_flash.md`` for what it measured.
+"""
+
 _KNOWN_OPTIONS = frozenset({
     "chunk_rows",
     "deal",
@@ -105,6 +122,7 @@ _KNOWN_OPTIONS = frozenset({
     "expert_rows",
     "pin",
     "prefill_chunk",
+    "resident_rows",
     "slots",
 })
 
@@ -136,8 +154,9 @@ class _Options:
 
     Every one of these changes what the run does, which is why an unknown key is refused rather
     than ignored: ``chunk_rows`` is the arena a card pays for, ``deal`` is which deal the experts
-    are divided by, ``prefill_chunk`` is the width a prompt goes through at, and ``slots`` is how
-    many calls the pipeline keeps in flight.
+    are divided by, ``prefill_chunk`` is the width a prompt goes through at, ``slots`` is how
+    many calls the pipeline keeps in flight, and ``resident_rows`` is how many of a routed
+    layer's experts the card keeps instead of copying a token.
     """
 
     chunk_rows: int | None = DEFAULT_EXPERT_ROWS
@@ -145,6 +164,7 @@ class _Options:
     device: str | None = None
     pin: bool = True
     prefill_chunk: int = DEFAULT_PREFILL_CHUNK
+    resident_rows: int = DEFAULT_RESIDENT_ROWS
     slots: int = DEFAULT_EXPERT_SLOTS
 
     @classmethod
@@ -162,6 +182,7 @@ class _Options:
         deal = values.pop("deal", values.pop("expert_deal", "sorted"))
         prefill = int(values.pop("prefill_chunk", DEFAULT_PREFILL_CHUNK))
         slots = int(values.pop("slots", DEFAULT_EXPERT_SLOTS))
+        resident = int(values.pop("resident_rows", DEFAULT_RESIDENT_ROWS))
         pin = _flag(values.pop("pin", True), "pin")
         if rows is not None and int(rows) < 0:
             raise ConfigurationError(f"chunk_rows is an expert count and {rows!r} is not one")
@@ -169,6 +190,8 @@ class _Options:
             raise ConfigurationError(f"prefill_chunk is a token count and {prefill} is not one")
         if slots < 1:
             raise ConfigurationError(f"slots is a slot count and {slots} is not one")
+        if resident < 0:
+            raise ConfigurationError(f"resident_rows is an expert count and {resident!r} is not one")
         if deal is not None and str(deal) not in {"id", "sorted"}:
             raise ConfigurationError(f"deal is `id` or `sorted`, got {deal!r}")
         return cls(
@@ -177,6 +200,7 @@ class _Options:
             device=values.pop("device", None),
             pin=pin,
             prefill_chunk=prefill,
+            resident_rows=resident,
             slots=slots,
         )
 
@@ -285,6 +309,7 @@ class MimoBackend(BackendBase):
             deal=options.deal,
             chunk_rows=options.chunk_rows,
             pin=options.pin,
+            resident_rows=options.resident_rows,
         )
         # One cache for the life of the process, sized to the context the launcher asked for and
         # reset per request. It is 5.65 GiB at 262144 and allocating it per request would both
@@ -301,10 +326,18 @@ class MimoBackend(BackendBase):
         cache = getattr(self._cache, "memory_bytes", None)
 
         def describe(module) -> str:
+            kept = (
+                ""
+                if not module.resident_rows
+                else (
+                    f", the hottest {module.resident_rows} experts a routed layer resident "
+                    f"({module.resident_bytes / 2**30:.2f} GiB)"
+                )
+            )
             if module.chunk_rows is None:
                 return (
                     f"one draw a step under the `{module.deal}` deal, "
-                    f"{module.arena_bytes / 2**20:.0f} MiB arena a slot"
+                    f"{module.arena_bytes / 2**20:.0f} MiB arena a slot{kept}"
                 )
             return (
                 f"{module.n_local} experts a rank in bands of {module.chunk_rows}, "

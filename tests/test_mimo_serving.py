@@ -39,6 +39,7 @@ from pocketllm.backends import factory
 from pocketllm.backends.mimo_backend import (
     DEFAULT_EXPERT_ROWS,
     DEFAULT_PREFILL_CHUNK,
+    DEFAULT_RESIDENT_ROWS,
     MimoBackend,
     _hold_back,
     _Options,
@@ -170,15 +171,18 @@ def test_the_launcher_levers_are_resolved_and_an_unknown_one_is_refused():
                 "expert_rows": 8,
                 "prefill_chunk": 512,
                 "pin": "false",
+                "resident_rows": 12,
                 "slots": 3,
             },
         )
     )
     assert (options.chunk_rows, options.deal) == (8, "id")
     assert (options.prefill_chunk, options.slots, options.pin) == (512, 3, False)
+    assert options.resident_rows == 12
     defaults = _Options.from_args(EngineArgs(model="x", backend="mimo"))
     assert defaults.chunk_rows == DEFAULT_EXPERT_ROWS
     assert defaults.prefill_chunk == DEFAULT_PREFILL_CHUNK and defaults.pin
+    assert defaults.resident_rows == DEFAULT_RESIDENT_ROWS == 0
     with pytest.raises(ConfigurationError, match="no option"):
         _Options.from_args(
             EngineArgs(model="x", backend="mimo", backend_options={"expert_deals": "id"})
@@ -194,6 +198,10 @@ def test_the_launcher_levers_are_resolved_and_an_unknown_one_is_refused():
     with pytest.raises(ConfigurationError, match="pin"):
         _Options.from_args(
             EngineArgs(model="x", backend="mimo", backend_options={"pin": "maybe"})
+        )
+    with pytest.raises(ConfigurationError, match="resident_rows"):
+        _Options.from_args(
+            EngineArgs(model="x", backend="mimo", backend_options={"resident_rows": -1})
         )
 
 

@@ -158,6 +158,7 @@ def main() -> int:
     parser.add_argument("--prompt", type=int, default=len(PROMPT_IDS))
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--resident-rows", type=int, default=0)
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -169,12 +170,18 @@ def main() -> int:
     device = ep.device if ep.device is not None else torch.device("cuda:0")
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep)
+    model = MimoV2DeviceModel(
+        checkpoint,
+        device=device,
+        expert_source=bank,
+        ep=ep,
+        resident_rows=args.resident_rows,
+    )
     torch.cuda.synchronize()
     experts = model.experts
     print(
         f"[r{rank}] world {world} deal `{experts.deal}`, attention in "
-        f"{ep.attention_shards} share(s)",
+        f"{ep.attention_shards} share(s), {experts.resident_rows} resident rows a layer",
         flush=True,
     )
 
