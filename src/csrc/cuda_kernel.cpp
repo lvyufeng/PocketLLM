@@ -134,6 +134,13 @@ torch::Tensor mimo_rope_rows(
     const torch::Tensor& sin,
     int64_t rope_dim);
 
+torch::Tensor mimo_decode_attention(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& sink,
+    double scaling);
+
 std::vector<torch::Tensor> mimo_noaux_tc_route(
     const torch::Tensor& hidden_states,
     const torch::Tensor& weight,
@@ -2244,6 +2251,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_single_token_int8_forward", &moe_single_token_int8_forward, "single-token top-k MoE int8 forward (CUDA)");
     m.def("moe_single_token_int8_forward_v2", &moe_single_token_int8_forward_v2, "single-token top-k MoE int8 forward with compact buffer + slot map (CUDA)");
     m.def("moe_single_token_fp4_forward", &moe_single_token_fp4_forward, "single-token top-k MoE FP4 (e2m1fn_x2 + e8m0 block) forward (CUDA)");
+    m.def("mimo_decode_attention", &mimo_decode_attention,
+          "MiMo-V2.6's decode-step attention: the span's scores, its softmax with the sink column, "
+          "and the values mixed, for one row",
+          pybind11::arg("query"), pybind11::arg("key"), pybind11::arg("value"),
+          pybind11::arg("sink"), pybind11::arg("scaling"));
     m.def("mimo_noaux_tc_route", &mimo_noaux_tc_route,
           "MiMo-V2.6's `noaux_tc` router, the reference's arithmetic without the Python layer",
           pybind11::arg("hidden_states"), pybind11::arg("weight"),
