@@ -140,6 +140,32 @@ def fill_cache(cache, layers, depth: int, *, chunk: int = 8192) -> None:
             cache.append(layer, key * shape.scaling**0.5, value)
 
 
+def tokenize(checkpoint: str, want: int, path: str) -> list[int]:
+    """`want` tokens of a real document, or `PROMPT_IDS` repeated if there is no tokenizer.
+
+    A drawn prompt is the wrong instrument for anything the router decides. `fill_cache` is the
+    extreme of it -- random states, whose draws repeat, so a resident set answers almost all of
+    them -- and a random id stream is the same mistake one step milder: two consecutive tokens of
+    noise have no reason to route alike. A real document's tokens do, and the difference is the
+    quantity every residency number is measured on.
+    """
+    text = None
+    if path and os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    if text is None:
+        return (PROMPT_IDS * (want // len(PROMPT_IDS) + 1))[:want]
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        return (PROMPT_IDS * (want // len(PROMPT_IDS) + 1))[:want]
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    ids = tokenizer(text)["input_ids"]
+    if len(ids) < want:
+        ids = (ids * (want // len(ids) + 1))[:want]
+    return list(ids[:want])
+
+
 class PhaseTimer:
     """Time every layer's attention and FFN on the compute stream, at event granularity.
 

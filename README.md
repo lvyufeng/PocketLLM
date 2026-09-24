@@ -21,9 +21,11 @@ Three of those models are served end to end over the OpenAI-compatible API: **Qw
   release as four processes on four cards, with the 149.81 GiB of routed experts in a host bank and
   the 48-layer backbone on the GPUs. The nine global layers' attention is divided along the
   checkpoint's own four-way `qkv_proj` partition and joined by an all-gather, so a
-  **262,144-token prompt reaches 104.04 tok/s of prefill** and a decode step at that depth is
-  **197.2 ms — 5.07 tok/s**, 5.63 at a short context, with the four ranks byte-identical.
-  [Model page](docs/models/mimo-v2.6-flash.md)
+  **262,144-token prompt reaches 104.04 tok/s of prefill**, a decode step at that depth is
+  **180.0 ms — 5.56 tok/s**, and a short-context step — the softmax, the rotation and the
+  norms each one kernel instead of eighteen, ten and two dispatches — is **156.3 ms and 6.40 tok/s**,
+  **117.3 and 8.53** with each routed layer's hottest experts kept on the card. The four ranks are
+  byte-identical throughout. [Model page](docs/models/mimo-v2.6-flash.md)
 - **[2026/09] DeepSeek-V4.1-Flash is served end to end.** `pocketllm serve --backend v41` runs the
   released 475 GiB checkpoint as four processes on four 22 GiB cards, with the 457.8 GiB of routed
   experts pinned in host memory rather than resident on the device. The runtime accepts up to
@@ -185,7 +187,7 @@ pocketllm serve \
 | Model | Checkpoint / format | Runtime status | Validated path | Reference result on 4×RTX 2080 Ti |
 | --- | --- | --- | --- | --- |
 | [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend v41`: host PyTorch over a mapped checkpoint, dense tree and packed FP4 experts on the cards, one process a rank | Served TP4: **150.3–152.0 tok/s prefill** at a 260,244-token prompt (137–141 at 1,364) and **3.48–3.54 tok/s decode**, one request at a time |
-| [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts, BF16 attention output | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend mimo`: the 48-layer backbone on the cards, routed experts out of a 149.81 GiB host bank, attention split along the checkpoint's own four-way `qkv_proj` partition | Served TP4: **104.04 tok/s prefill at a 262,144-token prompt** (48.37 with the attention replicated) and **5.07 tok/s decode** at that depth, 5.63 at a short context, one request at a time |
+| [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts, BF16 attention output | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend mimo`: the 48-layer backbone on the cards, routed experts out of a 149.81 GiB host bank, attention split along the checkpoint's own four-way `qkv_proj` partition | Served TP4: **104.04 tok/s prefill at a 262,144-token prompt** (48.37 with the attention replicated) and **5.56 tok/s decode** at that depth, **6.40 tok/s at a short context** and 8.53 with each routed layer's hottest experts kept on the card, one request at a time |
 | [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and OpenAI server** | C++/CUDA TP4, GPU-resident FP8 | Served TP4: 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
@@ -217,10 +219,11 @@ What this runtime does not have is batching, continuous batching, or an MTP laye
 The release runs as four processes, one a card, with the 149.81 GiB of routed MXFP4 experts in a single `/dev/shm` segment that every rank attaches to; the 48-layer backbone — nine global-attention layers and thirty-nine sliding-window layers over a 128-slot ring — executes on the cards, and each layer's experts are dealt out over the ranks. The deal is the call's row count: a decode step draws `top_k / world` experts a rank, and a prefill chunk needs the experts themselves partitioned.
 
 - **262,144-token prompt: 104.04 tok/s of prefill** through 2048-token chunks, 10.21 GiB on the card, the four ranks' last row byte-identical.
-- **Decode at that depth: 197.2 ms a step, 5.07 tok/s**; at a short context the same step is 177.6 ms, 5.63 tok/s. One card, for contrast, is 610 ms a token, 1.64 tok/s.
+- **Decode at that depth: 180.0 ms a step, 5.56 tok/s**; at a short context the same step is **156.3 ms, 6.40 tok/s** — 177.6 and 5.63 before the decode step's softmax, its rotation and its norms each became one kernel instead of eighteen, ten and two dispatches. One card, for contrast, is 610 ms a token, 1.64 tok/s.
+- **The larger lever is not a kernel.** A step's floor is the expert copy — 1198.5 MiB a rank, 47 layers of the two experts the deal leaves it, at a PCIe 3.0 link's own rate — and `--backend-option resident_rows=16` keeps each routed layer's hottest sixteen experts on the card instead, for **117.3 ms and 8.53 tok/s**, exact to `torch.equal` on 24 steps of a greedy chain. It is off by default because 9.36 GiB and a 262144-token cache do not fit on one 22 GiB card, and it is a short-context lever for a second reason: a copy removed is worth 0.58 ms of step at eight positions and 0.19 at 262144, so the eight rows that do fit at that depth buy 3%.
 - The prefill rate is the attention split's: the same prompt with the attention replicated on every rank is **48.37 tok/s** and 18.71 GiB on the card. A 64k prompt runs at 104.4 tok/s with a 4096-token chunk.
 
-What is left in the step is a copy and a schedule. **99.9 ms of it is the expert H2D the kernel waited for** — 1198.5 MiB at 12.0 GiB/s, a PCIe 3.0 x16 link at essentially its rate — against 38.8 ms of attention, 12.5 of expert kernel in 47 calls, and roughly 10 of collectives. Prefetching that copy from the previous token's draw was measured and closed: a rank's rows hold the expert they held a step earlier 9–13.5% of the time, and the whole set repeats in 1.9–2.4% of draws.
+What is left in the step is a copy and a schedule. **99.9 ms of it is the expert H2D the kernel waited for** — 1198.5 MiB at 12.0 GiB/s, a PCIe 3.0 x16 link at essentially its rate — against 38.8 ms of attention, 12.5 of expert kernel in 47 calls, and roughly 10 of collectives; an arm that *removes* copies rather than attributing a window to them prices one at 0.19 ms of step there against the link's 1.23, so the bytes at that depth are partly overlapped. Prefetching the copy from the previous token's draw was measured and closed: a rank's rows hold the expert they held a step earlier 9–13.5% of the time, and the whole set repeats in 1.9–2.4% of draws.
 
 There is no batching and no speculative decoding here, and the attention and dense linears are torch rather than kernels.
 
@@ -384,10 +387,13 @@ python -m pocketllm serve \
   --max-model-len 262144 \
   --port 8000 \
   --backend-option prefill_chunk=2048 \
-  --backend-option chunk_rows=16
+  --backend-option chunk_rows=16 \
+  --backend-option resident_rows=16   # 9.36 GiB of experts held on the card; 0 at a long context
 ```
 
 Same supervisor, same four processes. The first start fills the 149.81 GiB expert bank into `/dev/shm` from the release, which takes about 12 minutes at 213 MiB/s; a later run attaches to the existing segment in 0.07 s, and every rank attaches to the same one. The routed experts come out of that bank, so the cards hold only the dense weights, the attention and the two expert arenas — **10.21 GiB a card at a 262144-token context**. `rm -rf /dev/shm/pocketllm_mimo_experts_*` gives the memory back.
+
+`resident_rows` is the one option that is a deployment's decision rather than a constant: it keeps each routed layer's hottest `N` experts resident, which is **117.3 ms a step against 156.3** at a short context, at 0.585 GiB a row over the 47 routed layers. Sixteen rows and a 262144-token cache do not fit on one 22 GiB card, eight do and are worth 3% there, and the shipped default is 0.
 
 ### Run a GGUF model through the shared raw-block CLI
 
@@ -515,7 +521,7 @@ content as the files below.
 - GGUF expert staging can dominate decode on PCIe-only systems; a high prefill number does not imply high decode TPS.
 - DeepSeek-V4.1-Flash serves one request at a time: `--backend v41` takes a single request lock and reports `supports_batch=False`, so there is no continuous batching, no chunked prefill, and no paged KV pool. A later request that shares a prefix with one already served does reuse it, but that changes how much a request costs, not how many run at once.
 - MiMo-V2.6-Flash serves one request at a time for a stronger reason: every routed layer closes with an all-reduce at the same point in every rank's program, so a rank that is not running the request its peers are running is not idle but at a different collective, and NCCL answers a mismatch by hanging. Rank 0 therefore broadcasts the whole request before it starts, and a cancel or a stop string has to be agreed between the ranks rather than acted on by one.
-- MiMo-V2.6-Flash's attention and dense linears are torch, not kernels, and its decode step is bounded below by the expert copy: 99.9 ms of a 197.2 ms step at 256k is the H2D the kernel waited for, at a PCIe 3.0 link's ceiling. The one schedule that would hide it needs a prediction the router does not offer — prefetching from the previous token's draw was measured at a 9–13.5% row hit rate.
+- MiMo-V2.6-Flash's attention and dense linears are torch above 16384 keys, not kernels, and its decode step is bounded below by the expert copy: 99.9 ms of a 180.0 ms step at 256k is the H2D the kernel waited for, at a PCIe 3.0 link's ceiling — though an arm that removes copies prices one at 0.19 ms of step there, so part of that traffic is overlapped. The one schedule that would hide the rest needs a prediction the router does not offer: prefetching from the previous token's draw was measured at a 9–13.5% row hit rate. The one that removes copies outright, `resident_rows`, costs 0.585 GiB a row a routed layer, which a 262144-token cache has room for eight of and buys 3%.
 - DeepSeek-V4.1-Flash has no speculative decoding on this path. The checkpoint carries three MTP layers and a DSpark draft head, and the loader deliberately leaves all of it in the shards.
 - DeepSeek-V4.1-Flash is validated by generated text, not by a logit comparison. The reference stack needs `torch>=2.10.0` and `tilelang==0.1.8` and neither is available here, so no numeric oracle exists for a V4.1 forward pass.
 - DeepSeek-V4 DSpark's current C++ verify path is sequential and should not be presented as a speedup claim. Qwen DSpark is a separate external drafter with one eight-row target verification and model-specific parity/performance data.
