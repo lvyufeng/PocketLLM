@@ -39,8 +39,8 @@ Three of those models are served end to end over the OpenAI-compatible API: **Qw
   stop-sequence truncation, request-field refusals and concurrent scheduler admission, all verified
   against a real checkpoint. [Model page](docs/models/qwen3.8-27b-fp8.md)
 - **[2026/08] Two external speculative drafters for Qwen3.8-27B.**
-  [DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) came first and
-  [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) after it,
+  [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) came first and
+  [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) after it,
   measuring 2.78× full-request and 3.02× decode on a 512-token fixture with exact token parity in
   every case. Both are opt-in, because their gains are acceptance-dependent and upstream's
   published 2.67–3.43× band is a decode-latency ratio rather than a full-request one.
@@ -240,7 +240,7 @@ Per rank the engine accounts for 6.86 GiB of resident FP8 weights and scales, pl
 
 The prefill figures for the 64- and 512-token prompts measure short-prompt latency, not steady-state throughput: both complete in 0.55–0.59 s because a fixed per-process cost dominates at that size. Above 4,096 tokens prefill runs at a marginal 1,670 tok/s up to 32,768 and 1,285 tok/s beyond it.
 
-The same runtime is what serves Qwen3.8 over the OpenAI API, and it is the one model here with two optional external speculative drafters: [DSpark](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) and [DFlash2](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding), mutually exclusive with each other and with the native MTP path. DFlash2 with its opt-in flags measures 2.78× full-request and 3.02× decode on a 512-token fixture, and 1.33× aggregate over eight GSM8K prompts, with exact token parity in every case. Both drafters are default-off because their gains are acceptance-dependent, and upstream's published 2.67–3.43× band is a decode-latency ratio rather than a full-request one. A persistent TP4 worker also keeps prefix state alive across requests, so a client whose next prompt extends or compresses the previous one pays only for the difference.
+The same runtime is what serves Qwen3.8 over the OpenAI API, and it is the one model here with two optional external speculative drafters: [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) and [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding), mutually exclusive with each other and with the native MTP path. DFlash2 with its opt-in flags measures 2.78× full-request and 3.02× decode on a 512-token fixture, and 1.33× aggregate over eight GSM8K prompts, with exact token parity in every case. Both drafters are default-off because their gains are acceptance-dependent, and upstream's published 2.67–3.43× band is a decode-latency ratio rather than a full-request one. A persistent TP4 worker also keeps prefix state alive across requests, so a client whose next prompt extends or compresses the previous one pays only for the difference.
 
 ### DeepSeek-V4 C++ FP4 runtime
 
@@ -462,9 +462,9 @@ python scripts/verify_cpp_qwen_openai.py \\
 
 The harness checks health, model discovery, non-streaming and streaming chat and text completions, fixed-sampling validation, request-field refusals, stop-sequence truncation, multiple choices, per-token log probabilities, and concurrent scheduler admission.
 
-External Qwen DSpark is available as an opt-in with `--qwen-dspark /path/to/Qwen3.8-27B-DSpark`; it cannot be combined with native MTP. The real five-layer drafter proposes seven tokens and verifies eight target rows at once. It remains default-off because measured gains are acceptance-dependent. See the [Qwen model page](docs/models/qwen3.8-27b-fp8.md#external-dspark-speculative-decoding) for real 512/8K/32K results and the prefix/cold-parity command.
+External Qwen DSpark is available as an opt-in with `--qwen-dspark /path/to/Qwen3.8-27B-DSpark`; it cannot be combined with native MTP. The real five-layer drafter proposes seven tokens and verifies eight target rows at once. It remains default-off because measured gains are acceptance-dependent. See the [Qwen speculative-decoding design notes](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) for real 512/8K/32K results and the prefix/cold-parity command.
 
-External Qwen DFlash2 is a second opt-in drafter, `--qwen-dflash2 /path/to/Qwen3.8-27B-DFlash2`, mutually exclusive with both DSpark and native MTP. With its four opt-in flags enabled it measures 2.78x full-request and 3.02x decode on a 512-token fixture, and 1.33x aggregate on eight GSM8K prompts, with exact token parity in every case. Decode-phase speedup falls inside upstream's published 2.67–3.43x band. See the [Qwen model page](docs/models/qwen3.8-27b-fp8.md#external-dflash2-speculative-decoding) for the full table, the FP32-residual numerical requirement, and the reproduction commands.
+External Qwen DFlash2 is a second opt-in drafter, `--qwen-dflash2 /path/to/Qwen3.8-27B-DFlash2`, mutually exclusive with both DSpark and native MTP. With its four opt-in flags enabled it measures 2.78x full-request and 3.02x decode on a 512-token fixture, and 1.33x aggregate on eight GSM8K prompts, with exact token parity in every case. Decode-phase speedup falls inside upstream's published 2.67–3.43x band. See the [Qwen speculative-decoding design notes](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) for the full table, the FP32-residual numerical requirement, and the reproduction commands.
 
 For a single-concurrency client whose next request extends or compresses the previous one, keep one TP4 process group alive with the persistent token-ID worker. Rank 0 reads `<max_new_tokens> token0 token1 ...` lines and reports exact prefix accounting; the worker reuses live state for appends and device snapshots for branches:
 

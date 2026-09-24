@@ -293,7 +293,7 @@ the first is reachable by name:
 - **Engram is not in the engine at all.** The string `engram` does not appear anywhere under
   `cpp_engine/`. The checkpoint carries 12 `engram.*` tensors on its two engram layers, 189.13 GiB of
   the 475.24 GiB total, and the engine has no code path for that lookup
-  ([inventory](../models/deepseek-v4.1-flash.md#tensor-inventory-verified-from-the-shard-headers)).
+  ([inventory](../architecture/deepseek_v4_1_flash_design.md#tensor-inventory-verified-from-the-shard-headers)).
 
 A fourth gap was the one this page's subject lived in, and that one has closed. `prefill_chunk` used
 to be plumbed through `src/models/deepseek_v4_1/generate.py` and `generate_v41.py` and nowhere else,

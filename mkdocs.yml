@@ -159,6 +159,14 @@ nav:
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md
   - Architecture:
       - Overview: architecture/index.md
+      - MiMo-V2.6-Flash design and measurements: architecture/mimo_v2_6_flash_design.md
+      - DeepSeek-V4.1-Flash design and measurements: architecture/deepseek_v4_1_flash_design.md
+      - Qwen3.8-27B-FP8 design and measurements: architecture/qwen3_8_27b_fp8_design.md
+      - Qwen3.8-27B-NVFP4 design and measurements: architecture/qwen3_8_27b_nvfp4_design.md
+      - Qwen3.8-27B BF16 design and measurements: architecture/qwen3_8_27b_bf16_design.md
+      - DeepSeek-V4-Flash design and measurements: architecture/deepseek_v4_design.md
+      - GLM-5.2 design and measurements: architecture/glm_5_2_design.md
+      - MiniMax-M2.7 design and measurements: architecture/minimax_m2_7_design.md
       - Backend unification design: architecture/backend_unification_design.md
       - Cross-request prefix caching on V4.1: architecture/v41_prefix_cache.md
       - C++ engine multi-backend plan: architecture/cpp_engine_multi_backend_plan.md
