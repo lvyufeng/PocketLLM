@@ -826,6 +826,30 @@ class MimoV2KVCache:
             self._written[layer] = 0
 
 
+def rope_rows(
+    states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    dim: int,
+) -> torch.Tensor:
+    """`apply_partial_rope` with the head and sequence axes already folded away.
+
+    `layers.apply_partial_rope` takes `[batch, heads, seq, head_dim]` and `[batch, seq, dim]`, so a
+    decode step's single row is a `[1, heads, 1, head_dim]` with an `unsqueeze` on the cosine for
+    the head axis and another pair of `unsqueeze`s to build the visibility of that broadcast. This
+    is the same eight operations on `[heads, head_dim]` against a `[dim]` cosine: the split, the
+    half swap, two multiplies and an add are elementwise and broadcast the same numbers, so the
+    result is the same bits in the same order, which is why a decode step can use it and a chunk
+    cannot. `fused_qkv_row_order`'s comment is the same argument about `index_select` against
+    `split_fused_qkv`.
+    """
+    rope = states[..., :dim]
+    rest = states[..., dim:]
+    half = dim // 2
+    rotated = torch.cat((-rope[..., half:], rope[..., :half]), dim=-1)
+    return torch.cat([(rope * cos) + (rotated * sin), rest], dim=-1)
+
+
 class MimoV2DeviceAttention:
     """One layer's attention on a card: the released weights, both families.
 
@@ -1040,6 +1064,135 @@ class MimoV2DeviceAttention:
             "attn_out_post_o": post_o,
         }
 
+    def decode_foldable(self, start_pos: int, cache: "MimoV2KVCache") -> bool:
+        """Whether `decode_output` can carry this step, or `attention_output` has to.
+
+        Two conditions and both are about the shape of the answer rather than its value. One row
+        means the visibility mask is a slice, so the only thing that could push the call back to
+        `single_pass_attention` is the fold, and the fold is the cheaper of the two products only
+        below `FOLD_KEYS` -- which is a property of how many keys the step will read, and the step
+        reads `min(start_pos, slots) + 1` of them. So a windowed layer always qualifies, its ring
+        being 128 slots, and a global layer qualifies below a context of `FOLD_KEYS`.
+        """
+        keys = min(int(start_pos), cache.slots(self.layer_idx)) + 1
+        return keys <= FOLD_KEYS
+
+    def decode_output(
+        self,
+        flat: torch.Tensor,
+        *,
+        start_pos: int,
+        cache: "MimoV2KVCache",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One row's `attention_output`: the same arithmetic, none of a chunk's shapes.
+
+        The caller has already checked that this is one row, that the cosine table reaches the
+        position and that the span folds -- `decode_foldable`. What is left is what a decode step
+        pays for 48 times a token that it does not need:
+
+        * **The visibility mask is a slice.** `upper` is `prefix_len + rows`, so for one query it
+          is `keys - 1` and the upper half of `single_pass_attention`'s two comparisons is
+          vacuously true; `lower` is either zero or a clamp of a constant, so the mask is a suffix
+          of the key tensor and `masked_fill` has nothing to mask. The `arange`, both comparisons,
+          the `&`, the two `unsqueeze`s and the `masked_fill` go, and the softmax reads the span:
+          `exp(-inf - max)` is zero and `amax` over the masked block is `amax` over the visible
+          one, so dropping them is not an approximation.
+        * **The rope's broadcast axes are not there.** `apply_partial_rope` takes
+          `[batch, heads, seq, head_dim]` against `[batch, seq, dim]` and a single row pays for the
+          `unsqueeze`s that builds that. `rope_rows` is the same operations on `[heads, head_dim]`.
+
+        Neither of these is a fused kernel; both are the same kernels on smaller shapes, and the
+        measurement they came from is `docs/models/mimo-v2.6-flash.md`, "The host is the step".
+        """
+        shape = self.shape
+        heads, kv_heads = shape.num_q_heads, shape.num_kv_heads
+        head_dim, v_head_dim = shape.head_dim, shape.v_head_dim
+        groups = heads // kv_heads
+
+        # The cosine for one position, as `[1, dim]` rather than `rope()`'s `[1, 1, dim]`: the
+        # row-wise rope broadcasts it over the head axis itself, which is one `unsqueeze` less and
+        # one `unsqueeze` fewer to read. The table is float32 and holds the same bits `rope()`
+        # would have built, which is what `build_rope_table` says.
+        cos = self._rope_table[0][start_pos : start_pos + 1]
+        sin = self._rope_table[1][start_pos : start_pos + 1]
+
+        qkv = F.linear(flat, self.qkv_proj)
+        if self._qkv_order is None:
+            query, key, value = split_fused_qkv(qkv, shape, shape.qkv_row_layout)
+        else:
+            query, key, value = qkv.index_select(-1, self._qkv_order).split(
+                [shape.q_size, shape.k_size, shape.v_size], dim=-1
+            )
+        query = rope_rows(query.view(heads, head_dim), cos, sin, shape.rope_dim)
+        key = rope_rows(key.view(kv_heads, head_dim), cos, sin, shape.rope_dim)
+        value = value.view(kv_heads, v_head_dim)
+        if shape.value_scale is not None:
+            value = value * shape.value_scale
+
+        # The cache's own branch, kept here rather than folded into one cast: a cache at another
+        # width than the layer is a case the release does not produce and the chunk path still
+        # distinguishes, so this reads the same way there.
+        if cache.dtype != key.dtype:
+            key, value = key.to(cache.dtype), value.to(cache.dtype)
+        else:
+            key, value = key.to(self.dtype), value.to(self.dtype)
+        key = key.unsqueeze(1)
+        value = value.unsqueeze(1)
+
+        span = cache.append_and_span(self.layer_idx, key, value, start_pos=start_pos)
+        if span is not None:
+            all_key, all_value = span
+            prefix_len = start_pos
+        else:
+            prefix_key, prefix_value, prefix_len = cache.prefix(self.layer_idx, start_pos)
+            if prefix_len:
+                all_key = torch.cat([prefix_key, key], dim=1)
+                all_value = torch.cat([prefix_value, value], dim=1)
+            else:
+                all_key, all_value = key, value
+            cache.append(self.layer_idx, key, value)
+
+        # One row, so the bounds are `upper = prefix_len` and `lower` a clamp of it, and everything
+        # above `lower` is visible: the window is a slice of the span. `prefix_len` and not
+        # `start_pos` is what the slice is relative to, and that is the whole of the difference a
+        # wrapped ring makes -- a ring holds its *last* `slots` positions, so the span begins at
+        # position `start_pos - slots` and the window is measured from the end of the span, not
+        # from the start of the sequence.
+        if shape.sliding_window is not None:
+            lower = max(0, prefix_len - int(shape.sliding_window) + 1)
+            if lower:
+                all_key = all_key[:, lower:]
+                all_value = all_value[:, lower:]
+
+        scores = (
+            torch.matmul(
+                query.to(torch.float32).view(kv_heads, groups, 1, head_dim),
+                all_key.to(torch.float32).transpose(1, 2).unsqueeze(1),
+            )
+            * shape.scaling
+        )
+        column = (
+            None
+            if self.sink is None
+            else self.sink.view(kv_heads, groups, 1, 1).to(torch.float32)
+        )
+        running_max = (
+            scores.amax(dim=-1, keepdim=True)
+            if column is None
+            else torch.maximum(scores.amax(dim=-1, keepdim=True), column)
+        )
+        probabilities = torch.exp(scores - running_max)
+        denominator = probabilities.sum(dim=-1, keepdim=True)
+        if column is not None:
+            denominator = denominator + torch.exp(column - running_max)
+        probabilities = probabilities / denominator
+        # `[kv_heads, groups, 1, v_head_dim]` flattens to the head order the caller's `pre_o`
+        # wants, which is the reshape `attention_output` takes after its transpose.
+        out = torch.matmul(probabilities, all_value.to(torch.float32).unsqueeze(1))
+        keys = all_key.shape[1]
+        self.last_stats = AttentionStats("decode", 1, heads * keys, heads * keys)
+        return out.view(1, shape.o_in).to(query.dtype), qkv
+
     def attention_output(
         self,
         hidden_states: torch.Tensor,
@@ -1064,6 +1217,21 @@ class MimoV2DeviceAttention:
                 f"{tuple(hidden_states.shape)}"
             )
         sequence = flat.shape[0]
+        # A decode step is one row, and one row is exactly where this function's visibility mask
+        # and `apply_partial_rope`'s broadcast axes have nothing left to do; `decode_output` says
+        # what it drops and why dropping it is the same arithmetic. It stands aside for a caller
+        # that brought its own `positions` -- the checks just below are part of the contract and
+        # are not worth duplicating -- and for a step that has grown past `FOLD_KEYS` keys, where
+        # the fold is the wrong of the two products.
+        if (
+            sequence == 1
+            and positions is None
+            and cache is not None
+            and self._rope_table is not None
+            and start_pos < self._rope_table[0].shape[0]
+            and self.decode_foldable(start_pos, cache)
+        ):
+            return self.decode_output(flat, start_pos=start_pos, cache=cache)
         if positions is None:
             positions = torch.arange(start_pos, start_pos + sequence, device=self.device)
         else:
