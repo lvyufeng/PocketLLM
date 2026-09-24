@@ -35,6 +35,7 @@ from typing import Callable, Sequence
 import torch
 import torch.nn.functional as F
 
+from src.kernels.cuda_loader import load_cuda_kernel
 from src.models.mimo_v2.config import MimoV2AttentionShape, MimoV2TextConfig
 from src.models.mimo_v2.layers import (
     apply_partial_rope,
@@ -970,6 +971,32 @@ class MimoV2DeviceAttention:
         #: A `[capacity, rope_dim]` cos/sin table this layer shares with the rest of its family,
         #: or `None` to build the table per call. See `share_rope_table`.
         self._rope_table: tuple[torch.Tensor, torch.Tensor] | None = None
+        #: The decode step's rotation as one C++ call, or `None` when the extension was not built
+        #: -- in which case `rotate` takes `rope_rows`, which is the reference and stays it.
+        ops = load_cuda_kernel()
+        self._rope_ops = ops if (ops is not None and hasattr(ops, "mimo_rope_rows")) else None
+
+    def rotate(
+        self,
+        states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        dim: int,
+    ) -> torch.Tensor:
+        """One decode row's partial rotation, through the kernel when it is built.
+
+        `rope_rows` is ten eager dispatches for a split, a half swap, two multiplies and an add,
+        and a decode step makes it thirty-two times a token -- twice a layer. The kernel is the
+        same arithmetic in the same order rather than a fused approximation of it, and
+        `test_models_mimo_v2_rope_kernel.py` holds it to `rope_rows` with `torch.equal` over the
+        released geometry, both of the families' dtypes and a set of shapes the release does not
+        have. It is 10.7 us of host time a call against 135.4, which is 1.0 ms of a token against
+        13.0 -- and what that is worth *on the token* is not the 13.0, which is why the ablate
+        probe carries a `pyrope` arm rather than trusting this paragraph.
+        """
+        if self._rope_ops is None:
+            return rope_rows(states, cos, sin, dim)
+        return self._rope_ops.mimo_rope_rows(states, cos, sin, dim)
 
     @property
     def rope_key(self) -> tuple[int, float]:
@@ -1123,8 +1150,8 @@ class MimoV2DeviceAttention:
             query, key, value = qkv.index_select(-1, self._qkv_order).split(
                 [shape.q_size, shape.k_size, shape.v_size], dim=-1
             )
-        query = rope_rows(query.view(heads, head_dim), cos, sin, shape.rope_dim)
-        key = rope_rows(key.view(kv_heads, head_dim), cos, sin, shape.rope_dim)
+        query = self.rotate(query.view(heads, head_dim), cos, sin, shape.rope_dim)
+        key = self.rotate(key.view(kv_heads, head_dim), cos, sin, shape.rope_dim)
         value = value.view(kv_heads, v_head_dim)
         if shape.value_scale is not None:
             value = value * shape.value_scale
