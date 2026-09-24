@@ -885,7 +885,13 @@ the attention:
   the fraction of those that landed on a rounding boundary: 11 of 136 steps on the windowed layer,
   0.061% of a step's elements, each by at most one bfloat16 step, and none at all on the global
   layer. `tests/test_models_mimo_v2_decode_attention_kernel.py` carries the bound and the arithmetic
-  that bounds it.
+  that bounds it. And nothing about what the model *says* moves with it: the released checkpoint
+  draws `[14925, 227, 60096, 72653, 86162, 85033, 145420, 54575, 145959]` — this page's own nine
+  tokens, from `tests/bench_mimo_v2_ep.py --steps 9` — with the kernel in, identical on all four
+  ranks and identical to the revision before it, so the bound is a bound on logits and not a change
+  in the answer. It is a bound rather than an equality and a long enough run would eventually move a
+  token; what is measured here is that the movement is below one bfloat16 step at the layer's output
+  and has not reached a draw.
 
   On the token it is **15 ms of a step at sixteen resident rows**, and reading it took an
   instrument of its own because the two arms are not bit-identical: a last bit that moves is a draw
