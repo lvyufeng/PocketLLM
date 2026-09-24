@@ -172,9 +172,13 @@ The row above is the same A/B re-measured on the fixed tree; the full sweep — 
 three collectives, and the 128-token repeats — is
 [section 6.3 of the single-request page](ascend_single_request_tps.md#63-what-it-is-worth-1305---1759-tps-at-rows1).
 
-`QWEN_ASCEND_REPLICATE_ROWS` is on `master`, shipped off by default, and `QWEN_ASCEND_REPLICATE_CHECK`
-is the opt-in that makes every replicated projection refuse to launch if its destination activation
-does not actually hold the taller write.
+`QWEN_ASCEND_REPLICATE_ROWS` is on `master` and is the shipped default at 16; a decode step
+projects sixteen rows where it used to project one, and `=1` — or `=0`, which this one variable
+reads as off rather than as absent — is the way back to the one-row path.
+`QWEN_ASCEND_REPLICATE_CHECK` is the opt-in that makes every replicated projection refuse to
+launch if its destination activation does not actually hold the taller write. All of the
+measurements above were taken while the replication was opt-in, so their control arm is the
+`=1` spelling and their default arm is what an unset environment runs today.
 
 ### 5.3 The device wait, which turns out to be correct
 

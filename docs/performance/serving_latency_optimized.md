@@ -17,6 +17,16 @@ levers; `POCKET_ASCEND_IPC_ALLREDUCE=0` is what reaches this page's
 replaced. `serving_throughput_scaling.md` is where the second flip's own
 measurement lives, and it is the one that carries the split between the two.
 
+**A third lever has flipped since, and it moves this page's own comparison.**
+`QWEN_ASCEND_REPLICATE_ROWS` is the Cube's row replication, and it shipped off
+when this run was taken: the scope bullet below is accurate about the run rather
+than about the backend. It is 16 by default now, so the stacked configuration a
+reader reaches by doing nothing is 53.2-53.6 ms at rows=1 and not the 39.4-39.8 ms
+the engine-internal page records — and at concurrency one over HTTP the lever is
+worth 25% on its own, which is measured against this page's control arm in
+[serving_throughput_scaling.md](serving_throughput_scaling.md#the-tpot-lever-at-concurrency-one).
+Every figure on this page is left as measured.
+
 ## Scope
 
 The measured path:
@@ -29,8 +39,10 @@ The measured path:
 - **`POCKET_ASCEND_IPC_ALLREDUCE=1 POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=1`** —
   both were required at the time of the run and both are the defaults now, so an
   unset environment reproduces this record and neither export is needed
-- `QWEN_ASCEND_REPLICATE_ROWS` at its default of 1, i.e. the Cube's row
-  replication is **off** — see [the ladder](#the-same-levers-inside-the-engine)
+- `QWEN_ASCEND_REPLICATE_ROWS` at its default of 1 **as it was then**, i.e. the
+  Cube's row replication is **off** in this run — see
+  [the ladder](#the-same-levers-inside-the-engine). It is 16 now, so a server
+  started the ordinary way is faster than this page's treatment arm
 
 The engine sources are identical to the baseline record's: `git diff 0de9d41
 4fc72a1 -- src pocketllm cpp_engine scripts tests` is empty, and only `docs/` and
@@ -171,9 +183,11 @@ confirm that the engine-internal improvement survives at batch width 8 over HTTP
 this checkpoint is a third lever, and this run does not have it.** Those numbers
 are the two switches above *plus* `QWEN_ASCEND_REPLICATE_ROWS=16`, which fills the
 Cube's sixteen-row M tile from a decode step's single activation row by
-broadcasting it. That variable defaults to 1, i.e. off, and it was not set here —
-so 53.2-53.6 ms, not 39.4-39.8 ms, is the engine-internal counterpart of the TPOT
-on this page.
+broadcasting it. That variable defaulted to 1 — off — when this run was taken and
+was not set here, so 53.2-53.6 ms, not 39.4-39.8 ms, is the engine-internal
+counterpart of the TPOT on this page. **It is 16 by default now**, so a server
+started the ordinary way does get the 39.4-39.8 ms step and beats both arms of the
+comparison above by the third lever's own size on top of them.
 
 All configurations in that table emit the reference's own tokens, so the lever is
 not paid for with accuracy.

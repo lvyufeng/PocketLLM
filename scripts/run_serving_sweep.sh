@@ -2,11 +2,12 @@
 # Serving width sweep driver.
 #
 # Every point launches the native engine through `scripts/bench_serving.py` with
-# no environment the sweep sets on its own. Both of the backend's levers -- the
-# hand-written collective and the device-side arrival wait that runs inside it --
-# are the shipped defaults, so a point measures what a default server runs and a
-# K=V argument is the only way to move it. It scrapes the engine's /metrics for the
-# whole run so the server-side phase split survives the teardown. The artifacts of
+# no environment the sweep sets on its own. All three of the backend's levers --
+# the hand-written collective, the device-side arrival wait that runs inside it,
+# and the Cube's row replication -- are the shipped defaults, so a point measures
+# what a default server runs and a K=V argument is the only way to move it. It
+# scrapes the engine's /metrics for the whole run so the server-side phase split
+# survives the teardown. The artifacts of
 # a point are four files under $POCKET_SWEEP_DIR:
 #
 #   <tag>.json      the bench's own record (the only source for latency figures)
@@ -28,6 +29,7 @@
 #   run_serving_sweep.sh ladder   # slots == prompts, one wave: the width ladder
 #   run_serving_sweep.sh limit    # where the KV pool stops fitting a rank
 #   run_serving_sweep.sh ab       # interleaved replicate-rows A/B at concurrency 1
+#   run_serving_sweep.sh repwidth # the same A/B at 16 and 112 rows
 #   run_serving_sweep.sh prefill  # one call's fixed cost vs its per-token cost
 #
 # `slots` is --max-batch-size, which is the concurrency ceiling: the scheduler
@@ -140,11 +142,30 @@ limit() {
 
 # Interleaved A/B for QWEN_ASCEND_REPLICATE_ROWS at concurrency 1, alternating
 # control and lever so host drift lands in both arms. One pair is not a series.
+#
+# The lever is the shipped default now, so the arm that has to name itself is the
+# control: an unset variable runs 16. `=1` is the spelling of off, and `=0` works
+# too because the engine takes a zero as off rather than as absent -- this is the
+# one variable where a zero is not read the way every other integer knob here
+# reads it.
 ab() {
     local i
-    for i in 1 2 3; do
-        point "ctl1_r$i" 1 1 1 512 512 inf 8192
-        point "rep1_r$i" 1 1 1 512 512 inf 8192 QWEN_ASCEND_REPLICATE_ROWS=16
+    for i in 1 2 3 4 5 6 7 8 9; do
+        point "ctl1_r$i" 1 1 1 512 512 inf 8192 QWEN_ASCEND_REPLICATE_ROWS=1
+        point "rep1_r$i" 1 1 1 512 512 inf 8192
+    done
+}
+
+# The width half of the same A/B: the lever is worth what it is worth at
+# concurrency one and has to be worth nothing at a full wave, which is what the
+# mechanism says (the M tile is already full of real rows) and what a default
+# flip has to show before it can move every server. 16 and 112 are the page's
+# anchors. Interleaved, one pair each.
+repwidth() {
+    local w
+    for w in 16 112; do
+        point "ctl${w}" "$w" "$w" "$w" 512 512 inf 2048 QWEN_ASCEND_REPLICATE_ROWS=1
+        point "rep${w}" "$w" "$w" "$w" 512 512 inf 2048
     done
 }
 
@@ -179,10 +200,11 @@ prefill() {
 }
 
 case "${1:-}" in
-    point)  shift; point "$@" ;;
-    ladder) ladder ;;
-    limit)  limit ;;
-    ab)     ab ;;
-    prefill) prefill ;;
-    *)      sed -nE 's/^# ?//p' "$0" | sed -n '1,40p'; exit 2 ;;
+    point)    shift; point "$@" ;;
+    ladder)   ladder ;;
+    limit)    limit ;;
+    ab)       ab ;;
+    repwidth) repwidth ;;
+    prefill)  prefill ;;
+    *)        sed -nE 's/^# ?//p' "$0" | sed -n '1,40p'; exit 2 ;;
 esac

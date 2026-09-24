@@ -363,9 +363,23 @@ void allocate(QwenDeviceTensor& tensor, size_t bytes,
 // outputs comes back equal to the one the caller wanted.
 //
 // Read once, like every other layer policy here, so one process cannot change
-// the kernel sequence midway through a request. `1` is off.
+// the kernel sequence midway through a request.
+//
+// Sixteen ships and the off-spellings are the way back to one. That split is
+// forced by the value being a count rather than a switch -- a projection is
+// issued for one row or for sixteen of them and nothing between -- and it puts
+// `0` in the off set, which is the one thing the shared integer parser cannot
+// express: it reads a zero as absent, returns the fallback, and the fallback is
+// now sixteen, so `=0` would turn the lever back on. Asking
+// `qwen_env_enabled_default` first takes `0`, `false` and `off` the same way
+// every other opt-out in this file takes them, and only then reads the count.
+// `=1` reaches the one-row path because the count it reads is one, not through a
+// case of its own.
 int ascend_replicate_rows() {
-    static const int rows = qwen_env_int("QWEN_ASCEND_REPLICATE_ROWS", 1);
+    static const int rows = [] {
+        if (!qwen_env_enabled_default("QWEN_ASCEND_REPLICATE_ROWS")) return 1;
+        return qwen_env_int("QWEN_ASCEND_REPLICATE_ROWS", 16);
+    }();
     return rows;
 }
 

@@ -16,6 +16,14 @@ runs everything below: the arm that reaches the
 `POCKET_ASCEND_IPC_ALLREDUCE=0`, and `POCKET_ASCEND_IPC_ALLREDUCE_DEVWAIT=0`
 reaches the host poll the device-side wait replaced.
 
+A third lever, `QWEN_ASCEND_REPLICATE_ROWS`, became a default after the ladder was
+measured, and it is the one to know about when reading the table: every ladder row
+here has the Cube's row replication **off**, which now takes
+`QWEN_ASCEND_REPLICATE_ROWS=1` to name, and a server started today runs it at 16.
+It is worth 25% of TPOT to a single stream and nothing to a wave, measured in
+[The TPOT lever at concurrency one](#the-tpot-lever-at-concurrency-one) below; the
+chapters that follow are the off state.
+
 Headline: **112 concurrent streams is where this configuration stops.** At
 `--max-context 2048` the KV arena stops fitting one rank at 120 slots, the rank
 exits during `device_malloc`, and the server keeps accepting requests while it
@@ -59,12 +67,18 @@ nominal peak of 128.59 tok/s, while TPOT grows 3.0x.
   their tests and the documentation around them. `scripts/bench_serving.py` is
   unchanged over the same range too, so the binary and the harness this page
   measured are the ones the rebased branch still builds, and nothing below is
-  re-measured for the rebase. Three things on the page were not measured at
-  either commit, and one
-  of them is qualified where it is used: the `QWEN_ASCEND_REPLICATE_ROWS` A/B's
-  concurrency-one pairs, whose planes are one row wide and inside both ceilings,
-  so their comparison stands as measured; that A/B's `rep16` point, which is 16
-  rows wide and is therefore only compared against the `L16` it ran beside; and
+  re-measured for the rebase. The `QWEN_ASCEND_REPLICATE_ROWS` A/B was the third,
+  and it has since been re-run on its own tree: the nine concurrency-one pairs
+  and both width pairs
+  [below](#the-tpot-lever-at-concurrency-one) were taken at `f0461ae` (master as
+  of 2026-09-24) with `QWEN_ASCEND_REPLICATE_ROWS` at its new default, and the
+  `rep16` point that this bullet used to have to qualify is one of them. Those
+  twenty-two runs are the only figures on this page from that tree, and the tree
+  difference between it and this page's own is not empty
+  (`git diff bf15be7 f0461ae -- cpp_engine/` lists seven files), so unlike the
+  rebase above this one is a stated boundary rather than an argued identity. The
+  concurrency pairs are one row wide and inside both ceilings, so they compare to
+  the earlier sessions' as measured; and
   [serving_latency_optimized.md](serving_latency_optimized.md), whose figures are
   left as they are and named where they are compared.
 - **The delivery fix moves TTFT; the rest of this page is the pre-change record.**
@@ -122,7 +136,8 @@ source scripts/ascend_env.sh     # without it an ACL binary hangs before aclInit
 export POCKET_SWEEP_CKPT=/mnt/data1/modelscope/Qwen/Qwen3.8-27B
 scripts/run_serving_sweep.sh ladder      # L1 ... L112, then L16x64, L48x192
 scripts/run_serving_sweep.sh limit       # L120, L128, L128c1024
-scripts/run_serving_sweep.sh ab          # the replicate-rows A/B, interleaved
+scripts/run_serving_sweep.sh ab          # the replicate-rows A/B at concurrency 1
+scripts/run_serving_sweep.sh repwidth    # the same A/B at 16 and 112 rows
 scripts/run_serving_sweep.sh prefill     # one call's fixed cost vs its per-token cost
 # one point on its own, which is `L32` in the ladder table:
 #   point <tag> <slots> <concurrency> <prompts> <in> <out> <rate> <ctx> [K=V ...]
@@ -227,8 +242,8 @@ record reaches, and it is paid for out of nothing but the crossing measured unde
 elements, inside both ceilings — so its 54.40 ms against the 54.31 ms recorded
 before is a cross-check between the two runs rather than a result of the change.
 It sits inside the control band of the `QWEN_ASCEND_REPLICATE_ROWS` A/B further
-down (54.05-54.85 ms), so the ladder's floor reproduces an independently measured
-arm.
+down (53.90-54.85 ms across that A/B's twenty-one pairs), so the ladder's floor
+reproduces an independently measured arm.
 
 Goodput is a **rate**, not a count, against `ttft:2000 tpot:200 e2el:30000`. The
 200 ms TPOT budget is cleared to 16 slots and not past them: `L16` is 100.39 ms
@@ -826,31 +841,72 @@ client-side setting, this is the engine delivering what it already computed.
 broadcasting a decode step's single activation row, and
 [ascend_single_request_tps.md](ascend_single_request_tps.md) records 53.2-53.6 ms
 falling to 39.4-39.8 ms inside the engine. It had never been measured over HTTP.
-Three interleaved pairs, control and lever alternating, at `--max-concurrency 1`
-and `--max-batch-size 1`:
+**The flip has since made it the shipped default**, so every pair below names the
+control — `QWEN_ASCEND_REPLICATE_ROWS=1` — and an unset environment is the lever.
+Both arms of each pair ran under `--max-concurrency 1` and `--max-batch-size 1`,
+512 prompt tokens, 8192 context, on the `f0461ae` tree, against the binary the
+flip ships in (`4e851111e6b280a22e0e3dbea2100f1b`); the engine's default column of
+this page's other tables is now the lever's.
+
+Nine interleaved pairs, control and lever alternating, `scripts/run_serving_sweep.sh ab`:
 
 | pair | control TPOT | replicate TPOT | change | control tok/s | replicate tok/s | change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 54.85 ms | 40.87 ms | -25.5% | 16.91 | 21.01 | +24.3% |
-| 2 | 54.05 ms | 40.33 ms | -25.4% | 17.17 | 22.47 | +30.9% |
-| 3 | 54.33 ms | 40.78 ms | -24.9% | 17.04 | 21.09 | +23.8% |
+| 1 | 53.90 ms | 40.21 ms | -25.4% | 17.42 | 22.90 | +31.4% |
+| 2 | 54.64 ms | 40.20 ms | -26.4% | 17.18 | 22.89 | +33.3% |
+| 3 | 53.98 ms | 40.21 ms | -25.5% | 17.40 | 22.88 | +31.5% |
+| 4 | 54.10 ms | 40.21 ms | -25.7% | 17.36 | 21.85 | +25.8% |
+| 5 | 53.90 ms | 41.68 ms | -22.7% | 17.42 | 22.14 | +27.1% |
+| 6 | 54.01 ms | 40.09 ms | -25.8% | 17.38 | 22.92 | +31.8% |
+| 7 | 53.97 ms | 39.94 ms | -26.0% | 17.40 | 22.99 | +32.1% |
+| 8 | 54.19 ms | 39.84 ms | -26.5% | 17.32 | 23.06 | +33.1% |
+| 9 | 53.97 ms | 40.36 ms | -25.2% | 17.39 | 21.78 | +25.2% |
 
-The control spans 54.05-54.85 ms and the lever 40.33-40.87 ms across the three
-pairs, so the arms do not overlap and every pair moves the same 25%. TTFT is
-unmoved (495.8-513.4 ms in both arms) — the lever is in the decode step, and at
-concurrency one the decode step is the whole of the run between the first token
-and the last.
+The control is a 0.74 ms band across all nine — 53.90-54.64 ms — and the lever a
+0.37 ms one, 39.84-40.21 ms, with pair 5's 41.68 ms the only arm outside it. The
+mean is **-25.5%**, eight of the nine move 25.2-26.5%, and every one of the
+eighteen runs passed. TTFT is unmoved (413.6-431.4 ms in both arms) — the lever is
+in the decode step, and at concurrency one the decode step is the whole of the run
+between the first token and the last.
+
+Two earlier sessions on the pre-rewrite binary read the same thing: three pairs at
+54.05-54.85 ms against 40.33-40.87, and nine more at 53.95-54.59 against
+39.91-40.56. Those eighteen controls plus these nine make twenty-one pairs whose
+control never left 53.90-54.85 ms, which is also where the ladder's own `L1`
+sits — an independently measured arm, and this page's floor. That session's ninth
+pair was its one wide reading, `rep1_r6` at 44.98 ms against a lever band of
+39.91-40.56, and it is left in rather than dropped: a pair takes about thirty
+seconds and the engine is reloaded between arms, so a single arm reading 12% slow
+is most consistent with something else holding the host for those three minutes,
+and the honest statement of the lever is the band rather than a mean. The
+pre-rewrite sessions are not the shipping build, so they are quoted here as
+reproduction and not as the record.
 
 **At 16 rows the same lever does nothing**, which is what the mechanism predicts:
 the M tile is already full of real rows, so a broadcast row adds no work. The
-`rep16` run is from the earlier revision — it is at `645e36b`, above the old
-ceiling and below the new one — and it reads 152.36 ms and 72.86 tok/s against
-that revision's `L16` of 153.65 ms and 74.22 tok/s, a difference inside the
-ladder's own spread. Compared against the re-measured `L16` it would look like a
-52% loss, and that difference is the ceiling, not the lever: `rep16`'s decode
-planes are 16 rows wide, so under the old ceiling they went to HCCL while the
-current `L16` keeps them on the hand-written barrier. **The arm is not re-run
-here**, so its only valid comparison is against the `L16` it was measured beside.
+earlier `rep16` reading of 152.36 ms against that revision's `L16` of 153.65 ms
+could only be compared against the `L16` it was measured beside — it is at
+`645e36b`, and its 16-row decode planes went to HCCL under the old ceiling while
+the current `L16` keeps them on the hand-written barrier. Both arms are
+re-measured here, on the shipping build, interleaved, at the page's two anchors:
+
+| rows | control (`=1`) TPOT | replicate TPOT | change | control tok/s | replicate tok/s | change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 117.17 ms | 112.46 ms | -4.0% | 105.90 | 110.85 | +4.7% |
+| 112 | 639.31 ms | 635.45 ms | -0.6% | 126.80 | 127.01 | +0.2% |
+
+The 16-row pair lands inside the ladder's own spread, which is where a 4% reading
+on a metric whose within-run std is 15 ms belongs, and the 112-row pair is a
+wash. The mechanism says the same: at 16 rows the tile is full of real rows, and
+above that the planes are past the barrier's 512-row envelope and take the same
+HCCL path in both arms. So the flip is worth 25% to a single stream and costs
+nothing to a wave — the two rows a default server actually runs at are unmoved.
+The 112-row pair is also the one that had to be re-run: the first attempt died at
+startup, and the plan that would have read it as a ceiling result was wrong. A
+duplicate sweep had been left holding the same four devices and the same port,
+and each engine loads 13.45 GB of weights, so the failure was two model loads
+colliding rather than anything the lever does. It is recorded because the
+tempting reading was the wrong one.
 
 ## Where the FLOPs go
 
@@ -944,7 +1000,10 @@ it is a batching defect rather than a bandwidth one.**
   be a function of the prompt alone. It is not. Seven control runs of the identical
   command produce two different completions — 494 generated characters (77 tokens)
   and 795 (122 tokens) — and so does the replicate arm, so the divergence is not
-  attributable to the lever under test. It is visible in the ladder too: the
+  attributable to the lever under test. The eighteen concurrency-one pairs of the
+  two nine-pair sessions split 3 of 18 controls and 6 of 18 lever arms emitting
+  the 77-token completion, spread across both arms' bands rather than clustered
+  at one end. It is visible in the ladder too: the
   512-token output cap is never reached but the generated length varies from 57 to
   130 tokens for prompts drawn from the same fixed-length distribution. The
   engine-side bench agrees from the other direction: at a 512-token prompt both
@@ -957,15 +1016,20 @@ it is a batching defect rather than a bandwidth one.**
   and [ascend_gated_delta_slice.md](ascend_gated_delta_slice.md) chased to zero
   spread on the single-request path, and it says that the batched HTTP path has
   not had the same treatment.
-- **Neither switch is opt-in any more.** Every number here is the IPC collective
-  with its device-side wait, and both are now the backend's default — the
-  collective flipped first and the wait in the revision this page's three-arm
+- **None of the three switches is opt-in any more.** Every number here is the IPC
+  collective with its device-side wait, and both are now the backend's default —
+  the collective flipped first and the wait in the revision this page's three-arm
   table measures — so an unset environment reproduces every row below and the
   engine says nothing at startup. The wait changes where the arrival poll runs,
   not how much memory the
   arena has, so the concurrency ceiling this page finds is the shipped
   configuration's: the KV pool is sized by slots and context, and the wait
-  leaves both alone.
+  leaves both alone. `QWEN_ASCEND_REPLICATE_ROWS` is the third, and unlike the
+  other two it is a count rather than a switch, so it widens the decode step's
+  activation planes and does move the arena — which is why every ladder row here
+  has it off, the spelling of which is `=1` today and was simply an unset
+  environment at the time, the exception being the two width pairs
+  [above](#the-tpot-lever-at-concurrency-one) that measure the difference.
 - **112 is a measurement, not a specification.** The failing rank is the one with
   27 MB less HBM on this host, and 268 MiB is all that separated a working run
   from a hung one. Treat the number as "this host, this checkpoint, ctx 2048" and
@@ -981,11 +1045,11 @@ it is a batching defect rather than a bandwidth one.**
   and decode rates to move by roughly 325/512 on the token side and not at all on
   the time side.
 - **One pair is not a series.** The ladder is one run a width; the repeatability
-  it has is the `L16`/`rep16` pair, which matched to 1.8% in throughput and 0.8%
-  in TPOT — both of them at `645e36b`, and `rep16` has no counterpart under the
-  raised ceiling — and the `L1`/`ctl1_r*` match against the A/B's control arm.
-  The replicate A/B was run interleaved three times for exactly this reason and is
-  the only lever on this page quoted with its spread.
+  it has is the `L1`/`ctl1_r*` match against the A/B's control arm. The replicate
+  A/B was run interleaved twenty-one times over three sessions — three pairs on
+  one binary and nine on each of two others — and is the only lever on this page
+  quoted with its spread. Its two width pairs are one run an arm, so they carry
+  this page's usual single-run caveat rather than a band.
 - **The two runs that lost a rank are excluded from every mean on this page.**
   `L120` and `L128` appear only in the concurrency-limit table, as pass/fail
   counts. Their latency figures are what one surviving request reads, not what
@@ -999,12 +1063,15 @@ it is a batching defect rather than a bandwidth one.**
   prefill sweep and the limit probes has a `pocket_request_prefill_time_seconds_count`
   equal to the number of requests the bench completed — 1, 4, 8, 16, 32, 48, 64,
   96, 112, 16x64, 48x192 on the ladder and 4 of 4 at every prefill point. The
-  `QWEN_ASCEND_REPLICATE_ROWS` A/B arms predate the flag and are the one place it
-  still bites: `rep16` recorded 15 of its 16 requests, `rep1` and the `ctl1_*`
-  controls 0 of 1. An earlier revision of this page read the whole ladder from
-  artifacts of that kind, with `L4` at 3 of its 4 and `L1` at 0 of its 1. The
-  figures the A/B is quoted for are the bench's own record rather than the
-  scrape, so nothing in that table moves.
+  `QWEN_ASCEND_REPLICATE_ROWS` A/B's earliest arms predate the flag and are the
+  one place it still bites: `rep16` recorded 15 of its 16 requests and `rep1` and
+  the `ctl1_*` controls 0 of 1. Its re-run does not: all twenty-two artifacts of
+  the nine pairs and the two width pairs carry a count equal to the requests the
+  bench completed — 1 on every concurrency-one arm, 16 on `ctl16`/`rep16` and 112
+  on `ctl112`/`rep112`. An earlier revision of this page read the whole ladder
+  from artifacts of that kind, with `L4` at 3 of its 4 and `L1` at 0 of its 1. The
+  figures the A/B is quoted for are the bench's own record rather than the scrape,
+  so nothing in either table moves.
 - **No claim about other checkpoints.** 48 of the 64 layers are linear attention,
   and the gated-delta recurrence is what the prefill profile spends 11.7% of its
   time in. A stack without that recurrence would move.

@@ -905,6 +905,15 @@ The cost is workspace, and it is small because only one-row activations grow: `a
 is 1825704 at the default and 3094824 at 16, +1.2 MB, against 13.45 GB of resident weights per card.
 `gpu_memory_used_bytes` moves by the same 4 MB over four ranks.
 
+**16 is the shipped default now, and `1` is the way off.** The lever was opt-in when everything above
+was measured, so the arms there are spelled `=1` and `=16` and neither is what an unset environment
+does. It is a count rather than a switch — a projection is issued for one row or for sixteen and
+nothing between — so `QWEN_ASCEND_REPLICATE_ROWS=1` is the control arm's spelling and `=0` reaches
+the same place, because this is the one variable in the engine where a zero is read as off rather
+than as absent (§6.5 has the parser's own note). The flip is measured on the serving path in
+[serving_throughput_scaling.md](serving_throughput_scaling.md#the-tpot-lever-at-concurrency-one):
+25% at concurrency one, and nothing at a full 16-row wave.
+
 **The accuracy question, since this is the width that exposed one.** An earlier revision of this
 page could not show that `QWEN_ASCEND_REPLICATE_ROWS=16` generated what the default generated: three
 runs produced three different first tokens where widths 2, 4 and 8 were stable. That was not the
@@ -1049,7 +1058,7 @@ here.
 | ~~The arrival signal has no release ordering~~ | **retracted**: the 10-of-10 rate that exposed it was the RoPE table's workspace aliasing, and it goes to 0 of 10 without the barrier changing at all (§5.5.3, §5.5.4) | withdrawn |
 | The status read the device wait still does | 0.32 ms of step a read at one row and 0.29 at 16, so the three fewer reads a step that 128 makes over 32 are worth **18.754 -> 19.101 TPS** at a concurrency of one and 199.39 -> 201.55 at 16 rows, three interleaved rounds each | taken; the interval is one a decode step since the default moved off 32, with `POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY` as the diagnostic. It is a blocking D2H copy that drains the stream, so it is not free, but it is still read and a lost peer is reported within a step ([serving concurrency](serving_throughput_scaling.md#the-status-read-the-device-wait-still-does)) |
 | The bracket that was eating half of it | 12.9 ms of a 91.5 ms step, 0.100 ms/call (§5.5.1) | removed; the predicate that scopes it is now part of the contract |
-| The 42.3 ms of non-collective per-layer work | 133.8 of the 136.7 ms step saving, i.e. 13.05 -> **17.59 TPS**, interleaved (§6.3, §6.4) | taken for the one-row activations; opt-in with `QWEN_ASCEND_REPLICATE_ROWS=16`. What is left of the 42.3 ms is not priced here |
+| The 42.3 ms of non-collective per-layer work | 133.8 of the 136.7 ms step saving, i.e. 13.05 -> **17.59 TPS**, interleaved (§6.3, §6.4) | taken for the one-row activations; **the shipped default since the flip**, with `QWEN_ASCEND_REPLICATE_ROWS=1` — or `=0`, which this one variable reads as off — as the way back to the one-row path. What is left of the 42.3 ms is not priced here |
 | MTP / speculative decoding | **-2.2x** | measured, ruled out on this checkpoint (§4.1) |
 | Verifier placement | 0.08%, noise | retracted (§4.2) |
 | The row axis | 1.17x the time for 6.8x the throughput | already the shipped answer, rows=16+ |
@@ -1113,6 +1122,27 @@ done
 QWEN_ASCEND_REPLICATE_ROWS=16 QWEN_ASCEND_REPLICATE_CHECK=1 \
   POCKET_ASCEND_IPC_ALLREDUCE=1 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
 ```
+
+Both `rep` arms in that loop name themselves because the variable was off when the pairs were taken.
+Unset is the `=16` arm now, so re-running the loop as written still measures the lever — it just no
+longer measures a default. The `POCKET_ASCEND_IPC_ALLREDUCE=1` in both blocks is the same thing: it
+pins the arm the pairs were measured on, and unset would run it.
+
+The flip was gated the same way: the check on, the default arm unset against both spellings of off.
+
+```bash
+# the flip's gate: unset runs 16, and both `=0` and `=1` reach the one-row path
+env QWEN_ASCEND_REPLICATE_CHECK=1 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+env QWEN_ASCEND_REPLICATE_ROWS=0 QWEN_ASCEND_REPLICATE_CHECK=1 \
+    scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+env QWEN_ASCEND_REPLICATE_ROWS=1 QWEN_ASCEND_REPLICATE_CHECK=1 \
+    scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+```
+
+All three exit `qwen_ascend_tp4_status=0` and all three emit one identical token sequence, and the
+three workspace peaks separate the arms the way the variable says they should — 3094824 B for the
+unset run against 1825704 B for both spellings of off, so `0` reaches the one-row path rather than
+silently running the fallback the shared integer parser would have returned.
 
 The MTP A/B of §4.1 is the same launcher without `QWEN_BATCH_ROWS`, plus `--qwen-mtp-tokens 3` on
 one arm:
