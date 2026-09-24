@@ -83,7 +83,19 @@ def main() -> int:
     parser.add_argument("--depth", type=int, default=8192, help="prompt tokens to prefill")
     parser.add_argument("--tokens", type=int, default=128, help="steps to count draws over")
     parser.add_argument("--chunk", type=int, default=2048, help="prefill chunk")
+    parser.add_argument(
+        "--deal",
+        default="sorted",
+        help="`sorted` (the served decode deal) or `id`; `id` cannot hold a set and a chunk band "
+        "at once, so its arm prefills a row at a time",
+    )
     parser.add_argument("--prompt-file", default="docs/models/mimo-v2.6-flash.md")
+    parser.add_argument(
+        "--resident-rows",
+        type=int,
+        default=0,
+        help="also run the real thing: a set of this width, reporting what it actually hit",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -95,8 +107,18 @@ def main() -> int:
     device = ep.device if ep.device is not None else torch.device("cuda", ep.rank)
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
+    # A set and a chunk band want the same rows, so an `id` arm gives up the band and prefills a
+    # row at a time. That is the cost of measuring the deal `id` gives a set, and it is paid once.
+    band = None if args.deal == "id" else args.chunk
+    step = 1 if band is None else args.chunk
     model = MimoV2DeviceModel(
-        checkpoint, device=device, expert_source=bank, ep=ep, chunk_rows=args.chunk
+        checkpoint,
+        device=device,
+        expert_source=bank,
+        ep=ep,
+        deal=args.deal,
+        chunk_rows=band,
+        resident_rows=args.resident_rows,
     )
     torch.cuda.synchronize()
     experts = model.experts
@@ -112,7 +134,7 @@ def main() -> int:
     prompt = tokenize(args.prompt_file, args.checkpoint, args.depth)
     position = len(prompt)
     cache = model.cache(args.depth + args.tokens + 8)
-    logits = model.prefill(prompt, cache=cache, chunk=args.chunk)
+    logits = model.prefill(prompt, cache=cache, chunk=step)
     torch.cuda.synchronize()
     if ep.world > 1:
         torch.distributed.barrier()
@@ -133,6 +155,10 @@ def main() -> int:
         return forward
 
     experts.forward = capturing(experts.forward)
+    # The set's own counters, taken before the decode loop so that the rate below is the rate a
+    # *decode* draw saw. A prefill through the same module is thousands of draws over a short
+    # context and it would otherwise be most of the denominator.
+    before = experts.resident_report() if args.resident_rows else None
     for _ in range(args.tokens):
         logits = model.step(int(logits.argmax()), start_pos=position, cache=cache)[-1]
         position += 1
@@ -168,6 +194,16 @@ def main() -> int:
             row = counts[layer]
             total = sum(row)
             effective.append(1.0 / sum((value / total) ** 2 for value in row))
+        if before is not None:
+            report = experts.resident_report()
+            hits = report["hits"] - before["hits"]
+            drawn = report["drawn"] - before["drawn"]
+            print(
+                f"[r0] the set at {args.resident_rows} rows a layer, over the {args.tokens} "
+                f"decode steps: hit {100 * hits / max(drawn, 1):.1f}% of this rank's {drawn:.0f} "
+                f"draws, {report['held']:.0f} rows held, {report['swaps']:.0f} swaps",
+                flush=True,
+            )
         effective.sort()
         print(
             f"[r0] effective experts a layer (1/Sum p^2): min {effective[0]:.1f}, "

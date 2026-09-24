@@ -82,6 +82,13 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--resident-rows", type=int, default=16)
     parser.add_argument("--chain", type=int, default=0, help="tokens in the replayed chain")
+    parser.add_argument(
+        "--deal",
+        default="sorted",
+        help="the decode deal; `id` gives each rank a fixed 64 experts a layer, which is the set a "
+        "resident set fits best -- and a `id` model has no chunk arena, so the prompt is a row at "
+        "a time",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -94,7 +101,15 @@ def main() -> int:
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
     rows = args.resident_rows
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep, resident_rows=rows)
+    model = MimoV2DeviceModel(
+        checkpoint,
+        device=device,
+        expert_source=bank,
+        ep=ep,
+        deal=args.deal,
+        chunk_rows=None,
+        resident_rows=rows,
+    )
     torch.cuda.synchronize()
     module = model.experts
     if module.resident_rows != rows:
