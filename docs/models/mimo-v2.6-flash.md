@@ -91,10 +91,12 @@ What exists:
 | Router reached from C++ instead of from Python | Implemented and held to `torch.equal` against `layers.gate_and_route`, over both groupings: **190.2 us a call against 498.5** and 8.9 ms of a token's host time against 23.4 |
 | Decode-step rotation reached from C++ instead of from Python | Implemented and held to `torch.equal` against `device_attention.rope_rows`, over the released geometry, both of its families' dtypes and shapes the release does not have: **10.7 us a call against 135.4**, and **17.2 ms of a decode token at 20 resident rows** against 9.2 at 16 |
 | Decode-step attention reached from C++ instead of from Python | Implemented and held to a *bound* against `decode_output`'s own torch block, which is the only place in this path where the answer is not the reference's to the bit: the float32 arithmetic agrees to **3.1e-7 relative** and the bfloat16 answer moves by at most one bfloat16 step where that crosses a rounding boundary. **14 us of host a call against 367-763**, and **15 ms of a decode token at 16 resident rows** — 9.3 to 10.9 tok/s, measured with the draws held |
+| A one-row step folding past `FOLD_KEYS` | Implemented and measured on the same layers in one process: a sinkless family's step folds to `DECODE_KEYS`, worth **0.828 ms of host a global layer at 4096 keys against 1.498** — **113.7 ms a token against 128.3** at the best round, the nine global layers' own column 7.45 against 13.48, the thirty-nine windowed ones unmoved |
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
 | 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **197.2 ms — 5.07 tokens a second**, 38.8 of it the attention and 99.9 the expert copy |
+| Decode at 4096 tokens of context | Measured: **118.3 ms a token — 8.45 tokens a second** on four ranks, 112.2 of it on the host and 6.1 behind, and 36.7 ms of it the attention. The best single step read 113.7 ms — **8.79**. It is not ten: see below |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -356,6 +358,13 @@ piece, where the *keys* are long, it is a batch dimension of one expanded over
 sixteen, which cuBLAS materialises — 162 ms for a 65k-key decode where four per-head
 gemms are 5.8 ms. The fold is the cheaper of the two below about a thousand keys,
 which is a window, and the per-head walk above it, which is a global layer.
+
+That bound is the *chunk's*, though, and not a decode step's: the copy it pays is the
+query's batch dimension expanded over the groups, `groups * head_dim * keys * 4` bytes,
+and a step with one row has nothing to expand. So `FOLD_KEYS` is where
+`single_pass_attention` stops folding and `DECODE_KEYS` is where a *one-row* step does,
+and the span in between — a global layer's step from 1025 keys to 16384 — is the fold's
+either way. What that is worth at 4096 is under **The host is the step** below.
 
 One bug in here is worth naming because nothing else in the file could have caught it.
 The online softmax's running maximum was initialised from the sink by expanding a
@@ -909,6 +918,32 @@ the attention:
   with the queue unchanged; the three measurements agree on 11 to 16 ms and disagree on the absolute
   level for the reason the next paragraph gives.
 
+* **The fold, past where a chunk stops folding.** `FOLD_KEYS` was read as a bound on a decode step
+  too, so above 1024 keys a global layer's step fell all the way back to `attention_output` — the
+  rope's broadcast axes, the visibility mask, the bounds and the transposes — for a one-row product
+  whose fold pays none of that. `decode_foldable` now answers for the *step*: a sinkless family
+  folds to `DECODE_KEYS`, and the sink clause keeps the windowed family where it was measured, which
+  costs the release nothing because a 128-slot ring never reaches the bound. And the step is the
+  layer's whole span at 4096: **0.828 ms of host a global layer on the fold against 1.498** on the
+  chunk path. On the token, `tests/probe_mimo_v2_attention_depth.py` interleaves four arms — two
+  caches, and the bound on and off — and reads the same layers both ways: **113.7 against 128.3 ms a
+  token** at the best round, the nine global layers' own column **7.45 against 13.48 ms**, and the
+  thirty-nine windowed ones unmoved at 26.3 against 26.1 because the bound is not theirs. Two of the
+  four arms are one configuration — at eight positions the bound is not in question — so the gap
+  between them is the run's own null, and it reads **−2.9 ms** against the **9.9** the bound is worth
+  at 4096; the staged-expert and resident counts are printed beside every arm for the reason the
+  fused attention's probe prints them.
+
+**At 4096 keys a token is 118.3 ms — 8.45 tokens a second — and the attention is not what stands
+between it and ten.** `probe_mimo_v2_host_phases.py --depth 4096 --resident-rows 16 --steps 10`,
+one run: **112.2 ms on the host and 6.1 ms behind it**, of the host 36.7 ms the attention (43 before
+the fold above), **48.1 the expert wrapper**, 9.9 the router, 5.4 the collective, 5.3 the norms and
+0.6 outside a layer. Ten tokens a second is 100 ms, so what is missing is one copy-sized term: the
+wrapper's two children are only 4.8 ms of staging copy and 3.8 of kernel, and the other 39.5 ms is
+the wrapper's own — a term that no launch count addresses and that the 256k section's copy floor
+does. The fold bound moved the attention, which was the smaller of the two, and the token went from
+128.3 to 113.7 in the same process; the other is where the next ten would have to come from.
+
 * **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
   concatenation to produce one row — and for a decode step it produces the row for position *p*,
   which is the row it produced for *p−1* the token before. The model now builds one
@@ -1017,12 +1052,16 @@ share take rows four times further a step and so pay a quarter of the launches f
 it would not do is agree with the whole path bit for bit, and a split is worth less without that than
 with it.
 
-**The one arithmetic that is not bit-exact is a windowed layer's decode step.** Below `FOLD_KEYS` keys
-the attention takes its folded path, which batches the head loop, and cuBLAS tiles that gemm by the
-batch size it is handed: a share has two key heads where the layer has eight, so the same arithmetic
-comes out one float32 ULP apart — **1.19e-07 of a 5.10e-01 peak** in `pre_o`, the last bit of a bfloat16
-after the projection. A global layer past `FOLD_KEYS` keys, and any chunk of queries in either family,
-are exact. That is why the probe's tolerance is half a bfloat16 ULP and no looser, and why the token
+**The one arithmetic that is not bit-exact is a one-row folded step.** Below `FOLD_KEYS` keys, and for
+a sinkless family all the way to `DECODE_KEYS`, the attention takes its folded path, which batches the
+head loop, and cuBLAS tiles that gemm by the batch size it is handed: a share has two key heads where
+the layer has eight, so the same arithmetic comes out one float32 ULP apart — **1.19e-07 of a 5.10e-01
+peak** in `pre_o`, the last bit of a bfloat16 after the projection. A chunk of queries in either family,
+and a one-row step past `DECODE_KEYS`, are exact. So is a global layer's step from 1025 keys to 16384,
+which now folds: `probe_mimo_v2_attention_split.py --layers 0 --rows 1` joins a four-way share to the
+whole attention at **`0.00e+00`** on both `pre_o` and `post_o` at 1025, 2049 and 4097 keys, where the
+same layer's two-key step is 3.58e-07 of 3.11e+00 in `pre_o` like any other fold — the exactness there
+is cuBLAS's tiling of the longer product and not something the fold is owed. That is why the probe's tolerance is half a bfloat16 ULP and no looser, and why the token
 probe exists beside it: a token stream is the coarsest observable there is, so a stream that agrees says
 little, and `probe_mimo_v2_split_tokens.py` prints the top-2 logit margin beside it so that the
 agreement has a size. On the release at 8192 tokens of context, with the split and without, on a real
@@ -1439,6 +1478,10 @@ torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_prefix.py --depth 262144 
 # whether the previous token's draw predicts this one's: a real prompt, a real greedy stream
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_expert_reuse.py --depth 8192 --tokens 32
 
+# a decode step at depth, layer by layer and by family, and the fold bound on and off on the
+# same layers in one process: the null is the fourth arm
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_attention_depth.py --depth 4096 --rounds 4 --steps 5
+
 # the attention split against the whole attention, bit for bit: one card joins its own
 # shares with `torch.cat`, four ranks go through the real all-gather
 python tests/probe_mimo_v2_attention_split.py
@@ -1520,10 +1563,13 @@ golden holds and how it was captured.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
   one at a time and the second blocks on a lock.
-- **At depth the attention and the dense linears are still torch.** Above `FOLD_KEYS` a decode
+- **At depth the attention and the dense linears are still torch.** Above `DECODE_KEYS` a decode
   step's span stops folding and the chunk path takes the call, so `mimo_decode_attention` — the
   one-row path's softmax, which is every windowed layer and every global layer below 1024 keys —
-  is not what a 262144-key step runs; the dense linears are torch at every depth. They are each
+  is not what a 262144-key step runs; from 1025 keys to 16384 the fold carries a global layer's
+  step on the torch block instead, which is **0.828 ms of host a layer at 4096 keys against 1.498**
+  for the chunk path it replaced, and above 3072 the kernel would not fit a block anyway. The dense
+  linears are torch at every depth. They are each
   baselines with the shapes a kernel has to beat, and the split moved the baseline without moving
   the conclusion:
   at 262144 on four ranks the attention is **38.8 ms of a 197.2 ms decode step** — a fifth of a
@@ -1602,6 +1648,19 @@ golden holds and how it was captured.
   so the copies leave the difference. That second arm is the one to read, and the probe prints the
   staged-expert and resident-hit counts beside the clock because a last bit that moves is a draw
   that can move, and a moved draw is 34 ms of a token.
+- `tests/probe_mimo_v2_attention_depth.py` — the same question one layer down the stack: a decode
+  step at depth, layer by layer and by family, with four arms in one process (two caches, and the
+  fold bound on and off) because this box has read the same configuration 10 to 15 ms apart between
+  processes. Its two caches are one `--depth` cache and one `--prompt` cache, both live in the same
+  round, and every delta is between the same layers on two arms rather than between two runs. It
+  prints the arm that is two arms' worth of null (`short` against `short-nofold`, which at eight
+  positions are one configuration), the staged-expert and resident counts beside each arm's clock,
+  and the branch each arm actually took per family — because a lever that was never pulled and a
+  lever worth nothing print the same column of zeros. That last line has already earned itself once:
+  the RoPE tables are shared per family and `cache()` re-shares them on every call, so four caches
+  leave the *last* one's capacity live for the whole stack, and every 4096-position step silently
+  took `attention_output`'s chunk path — reading the fold bound as worth −0.17 ms — until the
+  capacity was set for the run and the tally showed `decode` where it belonged.
 - `tests/probe_mimo_v2_decode_arms.py` — a decode step with the routed experts replaced by the
   zero an empty rank returns, which is what separates the 38.0 ms a routed path costs *in situ*
   from the 139.6 the rest of a layer does. It is deliberately the only arm: an arm that also
