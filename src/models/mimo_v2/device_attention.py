@@ -975,6 +975,15 @@ class MimoV2DeviceAttention:
         #: -- in which case `rotate` takes `rope_rows`, which is the reference and stays it.
         ops = load_cuda_kernel()
         self._rope_ops = ops if (ops is not None and hasattr(ops, "mimo_rope_rows")) else None
+        #: The decode step's attention as one C++ call, or `None` when the extension was not built
+        #: -- in which case `decode_output` takes the torch block below it, which is the reference
+        #: and stays the reference. The same lookup as the rotation's above, an op further in it.
+        self._decode_ops = (
+            ops if (ops is not None and hasattr(ops, "mimo_decode_attention")) else None
+        )
+        #: The stand-in for a family with no sink, which is a tensor rather than a `None` because
+        #: a pybind signature with an optional tensor is a second registration for one kernel.
+        self._no_sink = torch.empty(0, device=self.device, dtype=torch.float32)
 
     def rotate(
         self,
@@ -1191,6 +1200,30 @@ class MimoV2DeviceAttention:
                 all_key = all_key[:, lower:]
                 all_value = all_value[:, lower:]
 
+        keys = all_key.shape[1]
+        self.last_stats = AttentionStats("decode", 1, heads * keys, heads * keys)
+
+        # The one block of this model that is a kernel rather than torch, and the one place where
+        # the trade is visible: `mimo_decode_attention` is the same products on the same widened
+        # values, but it walks the key span a warp at a time, so its softmax sum and its two dot
+        # products round in an order of their own and a decode step is no longer bit-identical to
+        # the chunk path `attention_output` takes. It is worth the trade because the block is
+        # eighteen dispatches a layer and forty-eight layers a token: measured at sixteen resident
+        # rows, 19.1 ms of a token's host. `tests/test_models_mimo_v2_decode_attention_kernel.py`
+        # carries the bound, and every test of this file's arithmetic that is not this one still
+        # runs the torch path below, which is the reference and stays the reference.
+        if self._decode_ops is not None:
+            return (
+                self._decode_ops.mimo_decode_attention(
+                    query,
+                    all_key,
+                    all_value,
+                    self.sink if self.sink is not None else self._no_sink,
+                    float(shape.scaling),
+                ),
+                qkv,
+            )
+
         scores = (
             torch.matmul(
                 query.to(torch.float32).view(kv_heads, groups, 1, head_dim),
@@ -1216,8 +1249,6 @@ class MimoV2DeviceAttention:
         # `[kv_heads, groups, 1, v_head_dim]` flattens to the head order the caller's `pre_o`
         # wants, which is the reshape `attention_output` takes after its transpose.
         out = torch.matmul(probabilities, all_value.to(torch.float32).unsqueeze(1))
-        keys = all_key.shape[1]
-        self.last_stats = AttentionStats("decode", 1, heads * keys, heads * keys)
         return out.view(1, shape.o_in).to(query.dtype), qkv
 
     def attention_output(
