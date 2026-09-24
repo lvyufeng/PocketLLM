@@ -132,20 +132,31 @@ def arm(
 ) -> tuple[float, float, int, object]:
     """`steps` measured steps after `warmup`, split into the host's time and the wait behind it."""
     step_position = position
-    for _ in range(warmup):
+
+    def advance() -> None:
+        """One step, fed from the last logits -- or from the first prompt id while there is none.
+
+        `logits is None` is the `--depth` case: the cache was filled directly and there is no row
+        to continue from, so the chain starts at whatever the probe is told to feed. The first
+        iteration of *either* loop has to be able to be that one, which is why this is a closure
+        and not a guard on the warmup loop alone.
+        """
+        nonlocal logits, step_position
         feed = PROMPT_IDS[0] if logits is None else int(logits.argmax())
         logits = model.step(feed, start_pos=step_position, cache=cache)[-1]
         step_position += 1
+
+    for _ in range(warmup):
+        advance()
     torch.cuda.synchronize()
     host = tail = 0.0
     for _ in range(steps):
         started = time.perf_counter()
-        logits = model.step(int(logits.argmax()), start_pos=step_position, cache=cache)[-1]
+        advance()
         queued = time.perf_counter()
         torch.cuda.synchronize()
         host += (queued - started) * 1e3
         tail += (time.perf_counter() - queued) * 1e3
-        step_position += 1
     return host / steps, tail / steps, step_position, logits
 
 
@@ -220,6 +231,10 @@ def main() -> int:
     if args.depth:
         fill_cache(cache, [layer.layer_idx for layer in model.layers], args.depth)
         position = args.depth
+        # No prompt was fed, so there is no logits row to continue from: `arm` takes `None` and
+        # feeds the first prompt id for its warmup steps, which is what the `--depth` branch wants
+        # and what the other `--depth` probes in `tests/` do.
+        logits = None
     else:
         prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
         model.greedy(prompt_ids, max_tokens=1, cache=cache)
