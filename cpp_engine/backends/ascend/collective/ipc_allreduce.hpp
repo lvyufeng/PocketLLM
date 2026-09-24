@@ -59,8 +59,9 @@
 // defaults to the device for the same reason the barrier defaults on: it is
 // measured, and its failure mode is bounded twice over -- the kernel spins a fixed
 // number of iterations and gives up, and the host reads the word it writes on
-// failure every 32 calls and raises it as an error. `..._DEADLINE_MS` bounds both
-// from one value. docs/performance/ascend_single_request_tps.md 5.5.3-5.5.4 has the
+// failure every `STATUS_EVERY` calls -- 128, one decode step -- and raises it as
+// an error. `..._DEADLINE_MS` bounds both from one value.
+// docs/performance/ascend_single_request_tps.md 5.5.3-5.5.4 has the
 // measurement and docs/performance/serving_throughput_scaling.md the serving ladder.
 //
 // It used to be opt-in, and the reason recorded for that was a reproducibility
@@ -96,6 +97,13 @@
 //     and RSTREAM both compose with the device wait, which is the default.
 //   * `..._DEADLINE_MS` and `..._MAX_ELEMENTS` change when the barrier gives up and
 //     which calls take this path at all.
+//   * `..._STATUS_EVERY` sets the interval, in collectives, between two host reads
+//     of the device arrival wait's status word -- 128 by default, which at 129
+//     collectives a decode step is one check a step. `0` stops reading
+//     it at all, which is wrong by construction because a peer that never arrives
+//     then stops being reported, and exists only to price the read in one run: the
+//     word is in device memory and reading it is a blocking copy, so it drains the
+//     default stream, which is the host wait the device arm was built to delete.
 //
 // `..._DEVWAIT` used to be on that list -- an arm that computed the wait correctly
 // but was not what shipped. It is what ships now, so the two spellings have swapped
@@ -119,6 +127,17 @@ namespace pocket {
 // answers it the same way -- which is what keeps the decision from desynchronising
 // the group.
 bool ascend_ipc_allreduce_f16_applies(int world, int count);
+
+// The interval, in collectives, between two host reads of the device arrival wait's
+// status word -- `POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY`, 128 by default.
+//
+// Exposed for the same reason the predicate above is: it is a pure function of the
+// environment with no ACL behind it, so a host-only test can pin its readings. What
+// that test has to pin is the one reading that is not a spelling but a meaning --
+// `0` is the interval, not "unset" -- because the alternative reading silently turns
+// the off arm into the default arm, which is the trap `..._MAX_ELEMENTS` was already
+// bitten by in the other direction.
+long long ascend_ipc_status_check_every();
 
 // All-reduce `count` FP16 elements in place across `world` ranks, one process per
 // rank, rendezvousing through `id_path`'s directory. Every rank must call it in

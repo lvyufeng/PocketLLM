@@ -94,7 +94,7 @@ extern "C" __global__ __aicore__ void qwen_ipc_arrive_wait_kernel(
     // Written on failure and only on failure, so the host does not have to read it
     // after every call to be sure of seeing one. A successful wait leaves whatever
     // was there alone; the host zeroes the word when it reads a zero back. See
-    // kStatusCheckEvery in ipc_allreduce.cpp.
+    // ascend_ipc_status_check_every() in ipc_allreduce.cpp.
     AscendC::GlobalTensor<uint32_t> status;
     status.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(status_gm), 1);
     if (world <= 1 || rank >= world) {
@@ -128,7 +128,7 @@ extern "C" __global__ __aicore__ void qwen_ipc_arrive_wait_kernel(
     // Hand the count back rather than a boolean so the host can say how many are
     // missing, the same way the host-side poll reports `pending` of `world - 1`.
     // Never zero: this write is the only record of the failure, and the host may be
-    // kStatusCheckEvery calls away from reading it.
+    // `ascend_ipc_status_check_every()` calls away from reading it.
     uint32_t missing = 0;
     for (uint32_t k = 0; k < world; ++k) {
         if (k == rank) {
