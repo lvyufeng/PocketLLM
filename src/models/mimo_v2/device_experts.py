@@ -463,13 +463,22 @@ class MimoV2DeviceExperts:
         into holding the set up to date rather than into a slot.
         """
         if self._residents is None:
-            return {"rows": 0, "layers": 0, "held": 0, "hits": 0, "swaps": 0, "hit_rate": 0.0}
+            return {
+                "rows": 0,
+                "layers": 0,
+                "held": 0,
+                "hits": 0,
+                "drawn": 0,
+                "swaps": 0,
+                "hit_rate": 0.0,
+            }
         drawn = self._residents.drawn
         return {
             "rows": float(self.resident_rows),
             "layers": float(len(self._residents.ids)),
             "held": float(self._residents.held),
             "hits": float(self._residents.hits),
+            "drawn": float(drawn),
             "swaps": float(self._residents.swaps),
             "hit_rate": 0.0 if not drawn else self._residents.hits / drawn,
         }

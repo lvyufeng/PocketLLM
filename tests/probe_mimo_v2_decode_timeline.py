@@ -155,6 +155,24 @@ def main() -> int:
             f"{len(spans)} intervals",
             flush=True,
         )
+        # What the busy time is made of. The union above says the card is 72% busy; this says
+        # busy with *what*, which is the other half of the question and the one a kernel answers.
+        # The intervals overlap across streams, so this column sums to more than `busy` -- a
+        # memcpy that ran under a kernel is counted in both, and that is the point: it says which
+        # work exists, not which work is on the critical path.
+        by_name: dict[str, list[float]] = {}
+        for start, end, name in spans:
+            by_name.setdefault(name, []).append(end - start)
+        ranked = sorted(
+            ((sum(sizes), len(sizes), name) for name, sizes in by_name.items()), reverse=True
+        )
+        print(
+            f"\ncard time by interval name, the largest {args.top} of {len(ranked)}, "
+            f"summed over {args.steps} step(s):"
+        )
+        print(f"{'ms total':>9} {'intervals':>10} {'us each':>9}  name")
+        for total, count, name in ranked[: args.top]:
+            print(f"{total / 1e3:9.2f} {count:10d} {total / count:9.1f}  {name[:60]}")
 
     # Every gap between the end of one interval and the start of the next that begins after it. A
     # gap's bracket is the kernel that finished and the kernel that waited, which is what names the

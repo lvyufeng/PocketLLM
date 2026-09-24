@@ -56,6 +56,7 @@ def main() -> int:
         help="positions to fill the cache with instead of prefilling `--prompt`",
     )
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--resident-rows", type=int, default=0)
     parser.add_argument(
         "--stub-experts",
         action="store_true",
@@ -73,7 +74,9 @@ def main() -> int:
 
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep)
+    model = MimoV2DeviceModel(
+        checkpoint, device=device, expert_source=bank, ep=ep, resident_rows=args.resident_rows
+    )
     if args.stub_experts:
         experts_module = model.experts
 

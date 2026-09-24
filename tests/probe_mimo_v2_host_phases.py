@@ -160,6 +160,19 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--resident-rows", type=int, default=0)
     parser.add_argument(
+        "--deal",
+        default="sorted",
+        help="the decode deal: `sorted` (the served one) or `id`, which gives each rank a fixed "
+        "64 experts a layer and is the set a resident set fits best",
+    )
+    parser.add_argument(
+        "--chunk",
+        type=int,
+        default=None,
+        help="the chunk arena's width; `id` refuses a chunk band on the stepping module, so an "
+        "`id` arm that wants one pays for a second arena or does without",
+    )
+    parser.add_argument(
         "--python-router",
         action="store_true",
         help="route through `layers.gate_and_route` instead of the C++ transcription, which is "
@@ -182,6 +195,8 @@ def main() -> int:
         device=device,
         expert_source=bank,
         ep=ep,
+        deal=args.deal,
+        chunk_rows=args.chunk,
         resident_rows=args.resident_rows,
     )
     torch.cuda.synchronize()
