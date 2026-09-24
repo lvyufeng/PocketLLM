@@ -16,13 +16,30 @@ so the collectives stay symmetric.
 
 The stubs, and what each one deletes:
 
+    copies      every region but the copy: the draws are the router's own and the copies, the
+                ordering and the kernel are the shipped ones, so this is the floor a token cannot
+                go under while the experts come over PCIe. With a resident set the copy it prices
+                is the miss, which is the point of the pair below it.
+    copyfloor   the same, with the draw *cached*: a repeated draw is a resident hit, so the only
+                copies left are the admits. What it measures is the step if every draw were held.
     stage       `_stage`: the six copies a row. The kernel still runs, on stale arena rows.
     attention   `MimoV2DeviceAttention.forward`: the qkv projection, the RoPE, the softmax, the
                 gather and the output projection. The cache still advances, on zeros, so the next
                 step's bounds are the ones it would have had -- which is why this arm does *not*
                 price the append, and `kv` does.
     kv          `MimoV2KVCache.append`'s two `index_copy_`, with the write cursor still advanced.
-    router      `route`: the gate linear, the correction bias, the three `topk` and the draw.
+    router      `route`, deleted: the gate linear, the correction bias, the three `topk` and the draw.
+                The stub caches the first draw and returns it, so it is *not* the router's price
+                alone -- the expert path then stages the same two experts every layer and the resident
+                set hits every layer, which is `copyfloor`'s saving on top of the router's. Use
+                `pyrouter` for the router's own price and `tests/probe_mimo_v2_router_ab.py` for the
+                one call's.
+    pyrouter    `route` still called and still returned, but from `layers.gate_and_route` rather than
+                from the C++ transcription: `_route_ops = None` on every routed layer. This is the
+                one arm that is a difference of two *shipped* paths, the draw is a real draw, and
+                nothing downstream of the router knows which of the two answered it -- so `shipped`
+                minus this arm is exactly what the transcription buys. It prices 0 when the extension
+                is not built, which the line the probe prints above the table will say.
     norms       the two `rms_norm` a layer -- `device_model.normalise`, which is where they are
                 called from the layer.
     reduce      `ep.reduce`, the layer's `all_reduce` of the expert partial.
@@ -30,14 +47,15 @@ The stubs, and what each one deletes:
     all         every one of the above at once, which is the floor of the loop, the embedding, the
                 head and the sampler with the layers reduced to two adds.
 
-And one arm that adds rather than deletes, because it is the only one that can be priced as a
-difference of two *shipped* builds:
+And two arms that add rather than delete, because they restore a path rather than remove one. Each
+is priced as a difference of two *shipped* builds, which is the only difference this box can read:
 
     chunk-decode  forces every decode step through `attention_output`'s chunk path by answering
                   `decode_foldable` false, which is what the model did before `decode_output`
                   existed. `shipped` minus this arm is what the lean decode attention is worth,
                   and it is exact: the two arms are bit-identical, checked over 25 steps of a real
                   model before the arm was written.
+    pyrouter      as above: the router off the card and back in Python.
     nosync        hands `forward` a *host* indices tensor holding the last draw it took, so the
                   `tolist` inside it returns without touching the stream. The experts staged are
                   then the previous draw's, so the arithmetic is wrong; what the arm prices is the
@@ -77,6 +95,7 @@ PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
 #: The arms, in the order they are printed. `shipped` is the arm every other one is subtracted from.
 ARMS = (
     "shipped",
+    "copies",
     "copyfloor",
     "nosync",
     "chunk-decode",
@@ -84,6 +103,7 @@ ARMS = (
     "attention",
     "kv",
     "router",
+    "pyrouter",
     "norms",
     "reduce",
     "experts",
@@ -104,38 +124,34 @@ def install(model, arm: str) -> callable:
 
     import src.models.mimo_v2.device_model as device_model_module
 
-    if arm == "copyfloor":
+    if arm in ("copies", "copyfloor"):
         # Everything that is not the expert copy: the attention is a zero of the right shape down
-        # the cache, the norms and the reduce are identity, and the draw is the one cached on the
-        # host so nothing waits on it. What is left is the copies, their ordering and the kernel,
-        # which is the floor a token cannot go under while the experts come over PCIe.
+        # the cache, the norms and the reduce are identity, and the draw is taken from the real
+        # router. What is left is the copies, their ordering and the kernel, which is the floor a
+        # token cannot go under while the experts come over PCIe.
+        #
+        # `copyfloor` goes one step further and *caches* the draw, which is what makes it readable
+        # as a floor: with a resident set a repeated draw is a resident hit, so the arm's own
+        # copies are the admits and nothing else, and the number is what the step would be if every
+        # draw were held. The two arms differ in exactly that, and the difference is the copies.
         patch = []
         module = model.experts
         was_forward = module.forward
-        held = {}
 
-        def cached_draw(hidden, indices, weights, *, layer_id=None, _was=was_forward, _h=held):
-            key = int(layer_id)
-            if key not in _h:
-                _h[key] = indices.tolist()
-            return _was(hidden, torch.tensor(_h[key], dtype=torch.int64), weights, layer_id=layer_id)
+        if arm == "copyfloor":
+            held = {}
 
-        patch.append((module, "forward", was_forward))
-        module.forward = cached_draw
+            def cached_draw(hidden, indices, weights, *, layer_id=None, _was=was_forward, _h=held):
+                key = int(layer_id)
+                if key not in _h:
+                    _h[key] = indices.tolist()
+                return _was(
+                    hidden, torch.tensor(_h[key], dtype=torch.int64), weights, layer_id=layer_id
+                )
 
-        def no_append(cache, layer, key, value):  # noqa: ANN001
-            slots = cache._slots[layer]
-            start = cache._written[layer]
-            count = key.shape[1]
-            if count > slots:
-                start += count - slots
-            cache._written[layer] = start + count
-            return cache._written[layer]
+            patch.append((module, "forward", was_forward))
+            module.forward = cached_draw
 
-        # The cache is advanced through the real `append`, on zeros, so the arm leaves the
-        # sequence where the next arm expects it. That leaves the append's own dispatches in the
-        # floor, which makes this an over-estimate and not the other way round.
-        del no_append
         for layer in model.layers:
             kept = layer.attention.forward
 
@@ -159,17 +175,6 @@ def install(model, arm: str) -> callable:
 
             patch.append((layer.attention, "forward", kept))
             layer.attention.forward = nothing
-            if layer.kind != "dense":
-                real = layer.route
-                bag = {}
-
-                def pick(hidden, _real=real, _bag=bag):  # noqa: ANN001
-                    if "out" not in _bag:
-                        _bag["out"] = _real(hidden)
-                    return _bag["out"][0].clone(), _bag["out"][1].clone()
-
-                patch.append((layer, "route", real))
-                layer.route = pick
 
         patch.append((device_model_module, "normalise", device_model_module.normalise))
         device_model_module.normalise = lambda hidden, weight, eps: hidden
@@ -221,6 +226,7 @@ def install(model, arm: str) -> callable:
     stub_attention = arm in ("attention", "all")
     stub_kv = arm in ("kv", "all")
     stub_router = arm in ("router", "all")
+    stub_pyrouter = arm == "pyrouter"
     stub_norms = arm in ("norms", "all")
     stub_reduce = arm in ("reduce", "all")
     stub_experts = arm in ("experts", "all")
@@ -277,6 +283,11 @@ def install(model, arm: str) -> callable:
                 return indices.clone(), weights.clone()
 
             set_(layer, "route", no_route)
+        if stub_pyrouter and layer.kind != "dense":
+            # `_route_ops = None` is the whole arm: `route` then takes its own fallback, which is
+            # the reference the transcription was checked against and the path this model took
+            # before the extension existed. Nothing else about the layer changes.
+            set_(layer, "_route_ops", None)
 
     if stub_norms:
         set_(device_model_module, "normalise", lambda hidden, weight, eps: hidden)
@@ -335,6 +346,7 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--arms", default=",".join(ARMS))
+    parser.add_argument("--resident-rows", type=int, default=0)
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -347,8 +359,18 @@ def main() -> int:
     device = ep.device if ep.device is not None else torch.device("cuda:0")
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep)
+    model = MimoV2DeviceModel(
+        checkpoint, device=device, expert_source=bank, ep=ep, resident_rows=args.resident_rows
+    )
     torch.cuda.synchronize()
+
+    routed = [layer for layer in model.layers if layer.kind == "moe"]
+    on_card = sum(1 for layer in routed if layer._route_ops is not None)
+    print(
+        f"[r{rank}] router: {on_card} of {len(routed)} routed layers route through the C++ "
+        f"transcription, {len(routed) - on_card} through `layers.gate_and_route`",
+        flush=True,
+    )
 
     span = max(args.prompt, 8) + 2 * (args.warmup + args.steps) * (args.rounds + 1) * len(arms) + 16
     cache = model.cache(span)

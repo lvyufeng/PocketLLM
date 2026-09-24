@@ -52,6 +52,7 @@ from typing import Sequence
 import torch
 import torch.nn.functional as F
 
+from src.kernels.cuda_loader import load_cuda_kernel
 from src.models.mimo_v2.config import MimoV2TextConfig
 from src.models.mimo_v2.device_attention import MimoV2DeviceAttention, MimoV2KVCache
 from src.models.mimo_v2.device_experts import MimoV2DeviceExperts, MimoV2ExpertSource
@@ -172,6 +173,7 @@ class MimoV2DeviceLayer:
 
         self.gate = None
         self.correction_bias = None
+        self._route_ops = None
         self.mlp_gate_proj = self.mlp_up_proj = self.mlp_down_proj = None
         self.experts = None
         #: The module a *chunk* goes through when it is not the module a step goes through.
@@ -194,6 +196,19 @@ class MimoV2DeviceLayer:
             if bias_key not in checkpoint:
                 raise ValueError(f"layer {self.layer_idx} routes by `noaux_tc` and holds no {bias_key}")
             self.correction_bias = checkpoint.dense_tensor(bias_key, torch.float32, self.device)
+            #: The router as one C++ call, or `None` for a config the transcription does not
+            #: cover -- in which case `route` takes the reference path, which is the one that
+            #: refuses a scoring function or a `topk` method this checkpoint does not use.
+            ops = load_cuda_kernel()
+            self._route_ops = (
+                ops
+                if (
+                    ops is not None
+                    and self.config.scoring_func == "sigmoid"
+                    and self.config.topk_method == "noaux_tc"
+                )
+                else None
+            )
         else:
             for name in ("gate_proj", "up_proj", "down_proj"):
                 setattr(
@@ -219,19 +234,47 @@ class MimoV2DeviceLayer:
         )
 
     def route(self, hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """The reference's router, on the device: `(topk_idx, topk_weight)`."""
-        return gate_and_route(
+        """The reference's router, on the device: `(topk_idx, topk_weight)`.
+
+        The call is `layers.gate_and_route`'s arithmetic -- the same ATen operations in the same
+        order, which is why the two agree to the bit and not to a tolerance -- reached from C++
+        rather than from Python. That is the whole of the difference, and it is most of what the
+        router costs, because the router is two dozen small operations on one row and what those
+        cost is the asking and not the arithmetic.
+
+        `tests/probe_mimo_v2_router_ab.py` measures one call: 498.5 us from Python against 190.2 us
+        from C++, which at forty-seven routed layers is 23.4 ms of a token's host time against 8.9.
+        `tests/probe_mimo_v2_host_phases.py --python-router` measures the same thing inside a real
+        step, where the region reads 23.0 ms against 9.2. Neither is the token: at sixteen resident
+        rows the card is the limit and the step's own host has slack, so the token does not move
+        yet. What this buys is the fourteen milliseconds of headroom that the device-side work is
+        about to need. See `src/csrc/mimo_decode_ops.cpp` for the transcription -- including the one
+        operation it skips and why the released configuration cannot see it -- and
+        `tests/test_models_mimo_v2_device_router.py` for the equality.
+        """
+        if self._route_ops is None:
+            return gate_and_route(
+                hidden,
+                self.gate,
+                self.correction_bias,
+                top_k=self.config.num_experts_per_tok,
+                n_group=self.config.n_group,
+                topk_group=self.config.topk_group,
+                norm_topk_prob=self.config.resolved_norm_topk_prob,
+                routed_scaling_factor=self.config.resolved_routed_scaling_factor,
+                scoring_func=self.config.scoring_func,
+                topk_method=self.config.topk_method,
+            )[:2]
+        return self._route_ops.mimo_noaux_tc_route(
             hidden,
             self.gate,
             self.correction_bias,
-            top_k=self.config.num_experts_per_tok,
-            n_group=self.config.n_group,
-            topk_group=self.config.topk_group,
-            norm_topk_prob=self.config.resolved_norm_topk_prob,
-            routed_scaling_factor=self.config.resolved_routed_scaling_factor,
-            scoring_func=self.config.scoring_func,
-            topk_method=self.config.topk_method,
-        )[:2]
+            self.config.num_experts_per_tok,
+            self.config.n_group,
+            self.config.topk_group,
+            self.config.resolved_norm_topk_prob,
+            self.config.resolved_routed_scaling_factor,
+        )
 
     def mlp(self, hidden: torch.Tensor) -> torch.Tensor:
         """The FFN of one row or of a chunk: dense, or a draw's experts, or a chunk's.

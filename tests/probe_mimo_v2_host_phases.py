@@ -159,6 +159,13 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--resident-rows", type=int, default=0)
+    parser.add_argument(
+        "--python-router",
+        action="store_true",
+        help="route through `layers.gate_and_route` instead of the C++ transcription, which is "
+        "the arm the `router` line below is read against -- the same process, one attribution "
+        "apart, is the only form of this comparison this box can read",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -179,13 +186,22 @@ def main() -> int:
     )
     torch.cuda.synchronize()
     experts = model.experts
+    if args.python_router:
+        for layer in model.layers:
+            if layer.kind == "moe":
+                layer._route_ops = None
     print(
         f"[r{rank}] world {world} deal `{experts.deal}`, attention in "
-        f"{ep.attention_shards} share(s), {experts.resident_rows} resident rows a layer",
+        f"{ep.attention_shards} share(s), {experts.resident_rows} resident rows a layer, "
+        f"router on the {'card' if not args.python_router else 'host'}",
         flush=True,
     )
 
-    cache = model.cache(max(args.depth, args.prompt) + args.warmup + args.steps + 8)
+    # Two `arm` runs of `args.steps` -- the bare-cost one and the metered one -- plus the warmup
+    # inside each. The cache has to hold all of them: `--steps` was raised past 5 once and the
+    # probe died mid-run on `appending 1 at 28 runs past it`, which is this arithmetic and not the
+    # model's.
+    cache = model.cache(max(args.depth, args.prompt) + args.warmup + 2 * args.steps + 8)
     if args.depth:
         fill_cache(cache, [layer.layer_idx for layer in model.layers], args.depth)
         position = args.depth

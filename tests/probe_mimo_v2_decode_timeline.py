@@ -68,6 +68,13 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--top", type=int, default=20)
     parser.add_argument(
+        "--resident-rows",
+        type=int,
+        default=0,
+        help="hold this many of each routed layer's hottest experts on the card; the gaps this "
+        "probe prints are not the same shape with the copies thinned out",
+    )
+    parser.add_argument(
         "--stub-experts",
         action="store_true",
         help="replace the routed experts with the zero an empty rank returns",
@@ -84,7 +91,13 @@ def main() -> int:
 
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep)
+    model = MimoV2DeviceModel(
+        checkpoint,
+        device=device,
+        expert_source=bank,
+        ep=ep,
+        resident_rows=args.resident_rows,
+    )
     if args.stub_experts:
         experts = model.experts
 
