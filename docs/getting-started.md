@@ -126,12 +126,34 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
 Raise `--max-model-len` to `262144` for the longest context the runtime accepts.
 The adapter takes one request lock, so requests are served one at a time.
 
+MiMo-V2.6-Flash is the other four-rank heterogeneous path. Its routed experts live in a host bank
+rather than in device memory, and the first start fills that bank — 149.81 GiB, about 12 minutes;
+later starts attach to the existing segment:
+
+```bash
+python -m pocketllm serve \
+  --backend mimo \
+  --model /path/to/MiMo-V2.6-Flash \
+  --tensor-parallel-size 4 \
+  --max-model-len 262144 \
+  --port 8000 \
+  --backend-option prefill_chunk=2048 \
+  --backend-option chunk_rows=16
+```
+
+It is one request at a time too, and for a firmer reason: every routed layer closes with an
+all-reduce that every rank has to reach, so the ranks run the request as a symmetric group and rank
+0 broadcasts the whole request before it starts generating. See the
+[MiMo-V2.6-Flash model page](models/mimo-v2.6-flash.md) for the numbers and the memory that bank
+takes.
+
 ## Pick your path
 
 | If you are running | Start here |
 | --- | --- |
 | DeepSeek-V4 | [DeepSeek-V4](models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
 | DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](performance/deepseek_v4_1_flash_served_gate.md) |
+| MiMo-V2.6-Flash | [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) |
 | MiniMax-M2.7 | [MiniMax-M2.7](models/minimax-m2.7.md) |
 | GLM-5.2 | [GLM-5.2](models/glm-5.2.md) |
 | Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) |

@@ -22,14 +22,15 @@ kernels, low-bit formats, tensor and expert parallelism, CPU/GPU placement, and
 reproducible single-request benchmarks.
 
 The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now covers DeepSeek-V4,
-MiniMax-M2.7, GLM-5.2, Qwen3.8-27B and DeepSeek-V4.1-Flash. It is **not** a
-single universal backend: each model has a runtime matched to its architecture
+MiniMax-M2.7, GLM-5.2, Qwen3.8-27B, DeepSeek-V4.1-Flash and MiMo-V2.6-Flash. It is
+**not** a single universal backend: each model has a runtime matched to its architecture
 and checkpoint format, and it does not trade away per-hardware kernel
 optimization for portability.
 
-Two of those models are served end to end over the OpenAI-compatible API:
-**Qwen3.8-27B-FP8** through the native C++ runtime, and
-**DeepSeek-V4.1-Flash** through `pocketllm serve --backend v41`.
+Three of those models are served end to end over the OpenAI-compatible API:
+**Qwen3.8-27B-FP8** through the native C++ runtime,
+**DeepSeek-V4.1-Flash** through `pocketllm serve --backend v41`, and
+**MiMo-V2.6-Flash** through `pocketllm serve --backend mimo`.
 
 !!! warning "Status"
 
@@ -40,6 +41,12 @@ Two of those models are served end to end over the OpenAI-compatible API:
 
 ## News
 
+- **[2026/09] MiMo-V2.6-Flash is served end to end.** `pocketllm serve --backend mimo` runs the
+  release as four processes on four cards, with the 149.81 GiB of routed experts in a host bank and
+  the 48-layer backbone on the GPUs. The attention is divided along the checkpoint's own four-way
+  `qkv_proj` partition and joined by an all-gather, so a **262,144-token prompt reaches 104.04 tok/s
+  of prefill** and a decode step at that depth is **197.2 ms — 5.07 tok/s**, with the four ranks
+  byte-identical. [Model page](models/mimo-v2.6-flash.md)
 - **[2026/09] DeepSeek-V4.1-Flash is served end to end.** `pocketllm serve --backend v41` runs the
   released 475 GiB checkpoint as four processes on four 22 GiB cards, with the 457.8 GiB of routed
   experts pinned in host memory rather than resident on the device. The runtime accepts up to
@@ -134,6 +141,7 @@ PocketLLM score.
 | Model | Checkpoint / format | Validated path | Reference result |
 | --- | --- | --- | --- |
 | [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | `pocketllm serve --backend v41`, host PyTorch, TP4 | Served: 150.3–152.0 tok/s prefill at a 260,244-token prompt, 3.48–3.54 tok/s decode, one request at a time |
+| [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts | `pocketllm serve --backend mimo`, 48 layers on the cards, experts out of a 149.81 GiB host bank, TP4 | Served: 104.04 tok/s prefill at a 262,144-token prompt, 5.07 tok/s decode at that depth, one request at a time |
 | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill, 43.22 tok/s decode on a 512-token prompt |
 | [DeepSeek-V4-Flash](models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | Raw-block CUDA, GGUF TP4 | 256-token prefill ~104.9–107 tok/s; 43-layer decode benchmark 10.32 tok/s |
