@@ -97,11 +97,17 @@ def instrument(*, with_gather: bool = True) -> dict[str, list[float]]:
         took = time.perf_counter()
         tally["split"].append(took - now)
 
-        query = rope_rows(query.view(heads, head_dim), cos, sin, shape.rope_dim)
+        # `rotate` and not `rope_rows`, because the copy has to pay what the shipped step pays: the
+        # reference is a switch a layer can be handed back to, and a probe that always took it would
+        # attribute the whole of the kernel's saving to the rest of the attention. On a build
+        # without the dispatch the method is not there and the reference is what the layer uses too.
+        rotate = getattr(self, "rotate", None) or rope_rows
+
+        query = rotate(query.view(heads, head_dim), cos, sin, shape.rope_dim)
         now = time.perf_counter()
         tally["rope q"].append(now - took)
 
-        key = rope_rows(key.view(kv_heads, head_dim), cos, sin, shape.rope_dim)
+        key = rotate(key.view(kv_heads, head_dim), cos, sin, shape.rope_dim)
         took = time.perf_counter()
         tally["rope k"].append(took - now)
 
