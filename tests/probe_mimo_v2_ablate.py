@@ -40,9 +40,14 @@ The stubs, and what each one deletes:
                 nothing downstream of the router knows which of the two answered it -- so `shipped`
                 minus this arm is exactly what the transcription buys. It prices 0 when the extension
                 is not built, which the line the probe prints above the table will say.
-    rope        `attention.rope_rows`, both calls: the split, the half swap, the two multiplies
-                and the add, on the query and on the key. The unrotated row comes back instead, so
-                the attention is wrong; what is priced is the rotation's own dispatch.
+    rope        `attention.rotate`, both calls: the rotation of the query and of the key. The
+                unrotated row comes back instead, so the attention is wrong; what is priced is the
+                rotation's own work, whichever way this build dispatches it -- and on a build with
+                no `rotate` to patch it is `rope_rows` that is stubbed.
+    pyrope      the rotation through `rope_rows` rather than through the kernel, which is a
+                *restore*: `shipped` minus this is what `mimo_rope_rows` is worth. It prices 0 on
+                a build whose layers carry no rotation switch, which is a build without the
+                kernel -- the same shape `pyrouter` has at line 41.
     norms       the two `rms_norm` a layer -- `device_model.normalise`, which is where they are
                 called from the layer.
     reduce      `ep.reduce`, the layer's `all_reduce` of the expert partial.
@@ -50,7 +55,7 @@ The stubs, and what each one deletes:
     all         every one of the above at once, which is the floor of the loop, the embedding, the
                 head and the sampler with the layers reduced to two adds.
 
-And two arms that add rather than delete, because they restore a path rather than remove one. Each
+And the arms that add rather than delete, because they restore a path rather than remove one. Each
 is priced as a difference of two *shipped* builds, which is the only difference this box can read:
 
     chunk-decode  forces every decode step through `attention_output`'s chunk path by answering
@@ -59,8 +64,8 @@ is priced as a difference of two *shipped* builds, which is the only difference 
                   and it is exact: the two arms are bit-identical, checked over 25 steps of a real
                   model before the arm was written.
     pyrouter      as above: the router off the card and back in Python.
-    nosync        hands `forward` a *host* indices tensor holding the last draw it took, so the
-                  `tolist` inside it returns without touching the stream. The experts staged are
+    pyrope        as above: the rotation off the card and back in `rope_rows`.
+    nosync        hands `forward` a *host* indices tensor holding the last draw it took, so the                  `tolist` inside it returns without touching the stream. The experts staged are
                   then the previous draw's, so the arithmetic is wrong; what the arm prices is the
                   device-to-host round trip a layer, which is 47 syncs a token. A CPU indices
                   tensor is what makes this work at all -- the shipped path passes `rows` and not
@@ -108,6 +113,7 @@ ARMS = (
     "router",
     "pyrouter",
     "rope",
+    "pyrope",
     "norms",
     "reduce",
     "experts",
@@ -232,6 +238,7 @@ def install(model, arm: str) -> callable:
     stub_router = arm in ("router", "all")
     stub_rope = arm in ("rope", "all")
     stub_pyrouter = arm == "pyrouter"
+    stub_pyrope = arm == "pyrope"
     stub_norms = arm in ("norms", "all")
     stub_reduce = arm in ("reduce", "all")
     stub_experts = arm in ("experts", "all")
@@ -302,9 +309,34 @@ def install(model, arm: str) -> callable:
 
         # The rotation is skipped and the unrotated row is handed back, which is the wrong answer
         # in exactly the way the arm is supposed to be: the shape, the dtype and the cache
-        # bookkeeping are the shipped ones, so what the arm prices is the eight operations
-        # `rope_rows` is made of and not a shorter attention.
-        set_(attention_module, "rope_rows", lambda states, cos, sin, dim: states)
+        # bookkeeping are the shipped ones, so what the arm prices is the rotation itself and not a
+        # shorter attention.
+        #
+        # Which switch that is depends on the build, and both are covered rather than one being
+        # assumed: a layer that can rotate through the kernel reaches it through `rotate`, so
+        # patching the reference would price zero, and a build without the dispatch has the
+        # reference as its only path. An arm that quietly prices zero is worse than one that
+        # raises, so neither case is left to `getattr` failing.
+        for layer in model.layers:
+            if hasattr(layer.attention, "_rope_ops"):
+                set_(layer.attention, "_rope_ops", None)
+        if hasattr(attention_module.MimoV2DeviceAttention, "rotate"):
+            set_(
+                attention_module.MimoV2DeviceAttention,
+                "rotate",
+                lambda self, states, cos, sin, dim: states,
+            )
+        else:
+            set_(attention_module, "rope_rows", lambda states, cos, sin, dim: states)
+
+    if stub_pyrope:
+        # `_rope_ops = None` is the whole arm and it is the *positive* one: the layer then rotates
+        # through `rope_rows`, which is the reference and is what the model did before the kernel
+        # existed. `shipped` minus this is what the kernel buys, on a step where nothing else moved.
+        # A build whose layers carry no switch has nothing to hand back, and the arm prices 0 there.
+        for layer in model.layers:
+            if hasattr(layer.attention, "_rope_ops"):
+                set_(layer.attention, "_rope_ops", None)
 
     for module in (model.experts, model.chunk_experts):
         if module is None:
@@ -385,6 +417,19 @@ def main() -> int:
         f"transcription, {len(routed) - on_card} through `layers.gate_and_route`",
         flush=True,
     )
+    if all(hasattr(layer.attention, "_rope_ops") for layer in model.layers):
+        rotated = sum(1 for layer in model.layers if layer.attention._rope_ops is not None)
+        print(
+            f"[r{rank}] rope: {rotated} of {len(model.layers)} layers rotate through "
+            f"`mimo_rope_rows`, {len(model.layers) - rotated} through `rope_rows`",
+            flush=True,
+        )
+    else:
+        print(
+            f"[r{rank}] rope: no layer carries a rotation switch, so all {len(model.layers)} "
+            f"rotate through `rope_rows` and the `pyrope` arm prices 0",
+            flush=True,
+        )
 
     span = max(args.prompt, 8) + 2 * (args.warmup + args.steps) * (args.rounds + 1) * len(arms) + 16
     cache = model.cache(span)
