@@ -278,7 +278,30 @@ def _check_bounds(query, key, value, lower, upper, sink, *, validate: bool = Tru
 #: sixteen is not a batch dimension to cuBLAS, it is a copy: at 65k keys the folded
 #: product is 162 ms and four per-head gemms are 5.8 ms. Below it the fold is the
 #: cheaper of the two, because the loop pays a launch a head and a window is 128 keys.
+#:
+#: **That is the `single_pass_attention` bound and it is a property of a *chunk*.** The
+#: measurement is `queries` wide, and the copy the fold pays is the query's batch
+#: dimension expanded over the groups -- `groups * head_dim * keys * 4` bytes. A decode
+#: step is one row, where the same number is a rounding of nothing, and `decode_foldable`
+#: below says which spans a one-row step is allowed to fold: see `DECODE_KEYS`.
 FOLD_KEYS = 1024
+
+#: The span a *one-row* step folds, for a family with no sink. Past `FOLD_KEYS` a decode
+#: step used to fall all the way back to `attention_output` -- the rope's broadcast axes,
+#: the visibility mask, the bounds, the transposes -- and at 4096 keys that is 1.498 ms of
+#: host a global layer against 0.828 on the fold, nine layers a token. Measured in situ, by
+#: `tests/probe_mimo_v2_attention_depth.py`, which reads the same nine layers both ways in
+#: one process: 13.48 ms against 7.45 for the family, where the thirty-nine windowed layers
+#: -- which the bound does not govern, their ring being 128 slots -- read 26.1 against 26.3.
+#:
+#: The number is where the equality was measured and not where a curve turns: over 16400
+#: rows of a global layer at 31 steps past the release's own geometry, the fold and the
+#: chunk path's per-head loop are `torch.equal` on the layer's output, the whole way, and
+#: the same walk with a sink of `-inf` restores the equality for a windowed layer. A
+#: sink-bearing family is therefore left where it is -- which costs the release nothing,
+#: because the family that carries a sink is the windowed one and its span is the ring,
+#: so it never reaches this bound at all.
+DECODE_KEYS = 16384
 
 
 def _probabilities(scores: torch.Tensor, visible: torch.Tensor, column: torch.Tensor | None):
@@ -1103,15 +1126,28 @@ class MimoV2DeviceAttention:
     def decode_foldable(self, start_pos: int, cache: "MimoV2KVCache") -> bool:
         """Whether `decode_output` can carry this step, or `attention_output` has to.
 
-        Two conditions and both are about the shape of the answer rather than its value. One row
-        means the visibility mask is a slice, so the only thing that could push the call back to
-        `single_pass_attention` is the fold, and the fold is the cheaper of the two products only
-        below `FOLD_KEYS` -- which is a property of how many keys the step will read, and the step
-        reads `min(start_pos, slots) + 1` of them. So a windowed layer always qualifies, its ring
-        being 128 slots, and a global layer qualifies below a context of `FOLD_KEYS`.
+        The step reads `min(start_pos, slots) + 1` keys, and which of the two products that span
+        wants is `FOLD_KEYS` -- below it the fold, above it `single_pass_attention`'s per-head
+        loop. What `FOLD_KEYS` is really a bound on is a *chunk*: the fold's cost above it is the
+        query's batch dimension expanded over the groups, which is `groups * head_dim * keys * 4`
+        bytes of nothing for a step that has one row. So a one-row step keeps folding past it, up
+        to `DECODE_KEYS`, and the two paths were measured to be the same bits there -- see that
+        constant for the walk and for why a family with a sink is left where it is.
+
+        What that is worth: at 4096 keys a global layer's one-row step is 0.828 ms of host on the
+        fold against 1.498 on the chunk path -- the rope's broadcast axes, the visibility mask, the
+        bounds and the transposes -- and nine of the forty-eight layers are global. It also decides
+        which layers the kernel reaches at depth: `decode_output` is where the kernel is called
+        from, so a span this answers false for is a span the kernel never sees.
+
+        A windowed layer always qualifies in practice, its ring being 128 slots, whatever this
+        says; the `sink` clause is what keeps a family that carries one on the path it was
+        measured on rather than on the claim.
         """
         keys = min(int(start_pos), cache.slots(self.layer_idx)) + 1
-        return keys <= FOLD_KEYS
+        if keys <= FOLD_KEYS:
+            return True
+        return self.sink is None and keys <= DECODE_KEYS
 
     def decode_output(
         self,
@@ -1212,7 +1248,12 @@ class MimoV2DeviceAttention:
         # rows, 19.1 ms of a token's host. `tests/test_models_mimo_v2_decode_attention_kernel.py`
         # carries the bound, and every test of this file's arithmetic that is not this one still
         # runs the torch path below, which is the reference and stays the reference.
-        if self._decode_ops is not None:
+        # The kernel takes the spans `FOLD_KEYS` admits, which is the range it was measured over
+        # -- its own shared-memory bound is 3072 keys, and above `FOLD_KEYS` the span is a global
+        # layer's anyway, where the kernel's cost is keys' worth of device time that a step whose
+        # queue is six milliseconds deep does not have to spare and the fold is a fifth of a
+        # millisecond of host. Above the fold the torch block below is what answers.
+        if self._decode_ops is not None and keys <= FOLD_KEYS:
             return (
                 self._decode_ops.mimo_decode_attention(
                     query,

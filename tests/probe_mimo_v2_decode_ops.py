@@ -58,6 +58,14 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--resident-rows", type=int, default=0)
     parser.add_argument(
+        "--resident-rows",
+        type=int,
+        default=0,
+        help="hold this many of each routed layer's hottest experts on the card; the op mix is "
+        "not the same one with the copies thinned out, and the in-situ step this page quotes is "
+        "at sixteen",
+    )
+    parser.add_argument(
         "--stub-experts",
         action="store_true",
         help="replace the routed experts with the zero an empty rank returns",

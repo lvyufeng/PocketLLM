@@ -27,6 +27,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from src.models.mimo_v2.device_attention import (  # noqa: E402
+    DECODE_KEYS,
     FOLD_KEYS,
     MimoV2DeviceAttention,
     MimoV2KVCache,
@@ -854,6 +855,154 @@ def test_the_four_shares_are_the_whole_attention(release, layer_idx, rows, keys)
     assert not torch.equal(reordered, want["attn_out_pre_o"])
 
 
+class _Wide:
+    """A cache that reports a span, which is all `decode_foldable` reads off one."""
+
+    def __init__(self, slots: int) -> None:
+        self._slots = slots
+
+    def slots(self, layer: int) -> int:  # noqa: ARG002
+        return self._slots
+
+
+@needs_release_cuda
+def test_the_one_row_bound_is_the_fold_s_own_and_not_the_chunk_s(release):
+    """`FOLD_KEYS` is `single_pass_attention`'s bound; a one-row step is not bound by it.
+
+    Above `FOLD_KEYS` the fold pays the query's batch dimension expanded over the groups --
+    `groups * head_dim * keys * 4` bytes -- which for a chunk is a copy and for one row is a
+    rounding of nothing. So the decode path's bound is `DECODE_KEYS`, and it is the *sink-less*
+    family's: the family that carries a sink is the windowed one, whose span is its ring, and the
+    released stack has no global layer with a sink at all.
+
+    The numbers here are the release's own two families and a cache wide enough for both, because
+    a windowed layer's real cache is 128 slots and would never reach either bound.
+    """
+    windowed = MimoV2DeviceAttention(release, SWA_LAYER, "cuda", torch.bfloat16)
+    global_ = MimoV2DeviceAttention(release, GA_LAYER, "cuda", torch.bfloat16)
+    assert windowed.sink is not None and global_.sink is None, "the two families of the release"
+
+    wide = _Wide(DECODE_KEYS * 4)
+    assert global_.decode_foldable(0, wide), "a short span folds"
+    assert global_.decode_foldable(FOLD_KEYS, wide), "and so does the last span below the bound"
+    assert global_.decode_foldable(FOLD_KEYS + 1, wide), "which is the change: this used to be false"
+    assert global_.decode_foldable(DECODE_KEYS - 1, wide), "up to the bound the walk covers"
+    assert not global_.decode_foldable(DECODE_KEYS, wide), "and not past it"
+    assert not windowed.decode_foldable(FOLD_KEYS + 1, wide), "a sink keeps its family where it was"
+
+    # And through a real cache the clause above is unreachable: `decode_foldable` reads
+    # `min(start_pos, slots)`, a windowed layer's slots are 128, so a windowed step's span is 129
+    # whatever the context and the sink never meets `DECODE_KEYS` at all. Which is the whole reason
+    # the release is unaffected by it -- 39 of its 48 layers carry a sink and all 39 are windowed.
+    assert windowed.decode_foldable(1 << 20, cache_for(release, SWA_LAYER, 300))
+    assert global_.decode_foldable(FOLD_KEYS + 1, cache_for(release, GA_LAYER, 4096))
+
+
+@needs_release_cuda
+def test_a_sinkless_one_row_step_past_the_fold_is_the_chunk_path_to_the_bit(release):
+    """The walk that `DECODE_KEYS` rests on: 1300 steps of a global layer, two paths, equality.
+
+    This is the load-bearing test of that bound. `decode_foldable` now lets a one-row step past
+    `FOLD_KEYS` fold, which means a global layer's decode takes `decode_output` where it used to
+    take `attention_output`'s chunk path -- and those are two different products, a batched `bmm`
+    over the groups against a loop over the key heads. Equality is what makes the change a
+    *dispatch* rather than a new tolerance, and it is not obvious: it holds because the released
+    stack splits the attention four ways, so a global layer has one key head and the fold's batch
+    is a batch and not a broadcast.
+
+    The kernel is cleared in both arms on purpose. With it in, the arm below `FOLD_KEYS` is the
+    kernel's and is held to a bound, not an equality -- that file is
+    `test_models_mimo_v2_decode_attention_kernel.py`, and this test is about the fold.
+    """
+    steps = 1300
+    device = MimoV2DeviceAttention(release, GA_LAYER, "cuda", torch.bfloat16)
+    device.share_rope_table(device.build_rope_table(steps + 8))
+    torch.manual_seed(41)
+    hidden = torch.randn(release.layer.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def walk(lean: bool):
+        was_fold = MimoV2DeviceAttention.decode_foldable
+        was_ops = device._decode_ops
+        MimoV2DeviceAttention.decode_foldable = lambda self, start_pos, cache: lean
+        device._decode_ops = None
+        try:
+            cache = cache_for(release, GA_LAYER, steps + 8, dtype=torch.bfloat16)
+            rows, paths = [], set()
+            for position in range(steps):
+                out = device.forward(hidden.unsqueeze(0), start_pos=position, cache=cache)
+                rows.append(out["attn_out_post_o"].clone())
+                paths.add(device.last_stats.path)
+            return torch.cat(rows, dim=0), paths
+        finally:
+            MimoV2DeviceAttention.decode_foldable = was_fold
+            device._decode_ops = was_ops
+
+    lean, lean_paths = walk(True)
+    chunk, chunk_paths = walk(False)
+    assert lean_paths == {"decode"} and chunk_paths == {"single"}, (lean_paths, chunk_paths)
+    assert lean.shape == chunk.shape == (steps, release.layer.hidden_size)
+    assert torch.equal(lean, chunk), (lean.float() - chunk.float()).abs().max().item()
+
+
+@needs_release_cuda
+def test_a_sink_is_where_the_one_row_path_and_the_chunk_path_stop_agreeing(release):
+    """The other half of the same walk, and the reason `decode_foldable` has a sink clause.
+
+    A windowed layer's span is its ring, so the two paths are the same 128 keys -- but they are not
+    the same *sum*: the chunk path's `single_pass_attention` folds the span and the sink into one
+    reduction while `decode_output` sums the span, adds the sink's exponential, and only then
+    divides. Past the ring's wrap that lands on a bfloat16 boundary on about a tenth of the rows.
+
+    The measurement is the counterfactual that names the cause: with the sink taken out of the
+    picture -- `-inf` contributes `exp(-inf - max)`, which is exactly zero -- the two paths are
+    `torch.equal` over the same walk. So the difference is the sink's and not the span's, which is
+    why `decode_foldable` keeps a family that carries one on the path it was measured on. The
+    magnitude is a bfloat16 step at the peak, which is why nothing else had to change.
+    """
+    steps = 1300
+    device = MimoV2DeviceAttention(release, SWA_LAYER, "cuda", torch.bfloat16)
+    device.share_rope_table(device.build_rope_table(steps + 8))
+    torch.manual_seed(31)
+    hidden = torch.randn(release.layer.hidden_size, device="cuda", dtype=torch.bfloat16) * 0.25
+    real_sink = device.sink
+
+    def walk(lean: bool, sink):
+        was_fold = MimoV2DeviceAttention.decode_foldable
+        was_ops = device._decode_ops
+        device.sink = sink
+        MimoV2DeviceAttention.decode_foldable = lambda self, start_pos, cache: lean
+        device._decode_ops = None
+        try:
+            cache = cache_for(release, SWA_LAYER, steps + 8, dtype=torch.bfloat16)
+            rows = []
+            for position in range(steps):
+                out = device.forward(hidden.unsqueeze(0), start_pos=position, cache=cache)
+                rows.append(out["attn_out_post_o"].clone())
+            return torch.cat(rows, dim=0)
+        finally:
+            MimoV2DeviceAttention.decode_foldable = was_fold
+            device._decode_ops = was_ops
+            device.sink = real_sink
+
+    neutral = torch.full_like(real_sink, float("-inf"))
+    chunk = walk(False, real_sink)
+    lean = walk(True, real_sink)
+    chunk_neutral = walk(False, neutral)
+    lean_neutral = walk(True, neutral)
+
+    # The counterfactual first, because it is the one that names the cause: the same walk with the
+    # sink's exponential exactly zero. Both arms neutral is both arms the same path.
+    assert torch.equal(
+        lean_neutral, chunk_neutral
+    ), (lean_neutral.float() - chunk_neutral.float()).abs().max().item()
+
+    peak = chunk.float().abs().max().item()
+    delta = (lean.float() - chunk.float()).abs()
+    differing = int((lean != chunk).any(dim=-1).sum().item())
+    assert differing > 0, "the divergence this test exists for has gone; is the bound still needed?"
+    assert delta.max().item() <= peak * 2.0**-8, (delta.max().item(), peak, differing)
+
+
 @needs_release_cuda
 @pytest.mark.parametrize("layer_idx", (SWA_LAYER, GA_LAYER))
 def test_a_decode_step_is_the_chunk_path_it_replaced(release, layer_idx):
@@ -872,8 +1021,9 @@ def test_a_decode_step_is_the_chunk_path_it_replaced(release, layer_idx):
     is visible. And the windowed layer is the one that carries a sink, which is the softmax's one
     extra term.
 
-    The steps go past the ring on purpose, and past `FOLD_KEYS` never: above it `decode_foldable`
-    hands the call back to `attention_output` and there is nothing here to compare.
+    The steps go past the ring on purpose, and past `FOLD_KEYS` never -- which for these two layers
+    is the same thing, because the windowed one's span is its ring and the global one's is 136
+    keys. What a step past `FOLD_KEYS` does is a claim of its own and has a test of its own below.
     """
     steps = 136
     hidden_size = release.layer.hidden_size
