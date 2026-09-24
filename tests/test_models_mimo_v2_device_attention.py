@@ -878,16 +878,22 @@ def test_a_decode_step_is_the_chunk_path_it_replaced(release, layer_idx):
     steps = 136
     hidden_size = release.layer.hidden_size
     device = MimoV2DeviceAttention(release, layer_idx, "cuda", torch.bfloat16)
-    device.build_rope_table(steps + 8)
     device.share_rope_table(device.build_rope_table(steps + 8))
 
     torch.manual_seed(17)
     hidden = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16) * 0.25
 
+    # Both arms take the torch block below the kernel's dispatch on purpose: this test is about
+    # `decode_output`'s arithmetic against the chunk path's, and the kernel that shares that switch
+    # is a bound rather than an equality. With `_decode_ops` taken away here, the claim below is the
+    # one this test has always made and it stays `torch.equal`;
+    # `test_models_mimo_v2_decode_attention_kernel.py` carries the kernel and its bound.
     def walk(chunk_path: bool):
         """`steps` decode steps from position 0, the two arms of a switch, one cache each."""
-        was = MimoV2DeviceAttention.decode_foldable
+        was_fold = MimoV2DeviceAttention.decode_foldable
+        was_ops = device._decode_ops
         MimoV2DeviceAttention.decode_foldable = lambda self, start_pos, cache: not chunk_path
+        device._decode_ops = None
         try:
             cache = cache_for(release, layer_idx, steps + 8, dtype=torch.bfloat16)
             rows = []
@@ -896,11 +902,14 @@ def test_a_decode_step_is_the_chunk_path_it_replaced(release, layer_idx):
                 rows.append(out["attn_out_post_o"].clone())
             return torch.cat(rows, dim=0)
         finally:
-            MimoV2DeviceAttention.decode_foldable = was
+            MimoV2DeviceAttention.decode_foldable = was_fold
+            device._decode_ops = was_ops
 
+    # The claim this test has always made, with the kernel out of the way: the one-row path is the
+    # chunk path's answer and not merely a good one. Not `allclose` -- the two are the same kernels
+    # on the same numbers in the same order.
     fast = walk(chunk_path=False)
     slow = walk(chunk_path=True)
     assert fast.shape == slow.shape == (steps, hidden_size)
-    # Not `allclose`: the two are the same kernels on the same numbers in the same order.
     assert torch.equal(fast, slow), (fast.float() - slow.float()).abs().max().item()
     assert device.last_stats.path in ("decode", "single")

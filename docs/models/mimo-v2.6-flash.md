@@ -90,6 +90,7 @@ What exists:
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
 | Router reached from C++ instead of from Python | Implemented and held to `torch.equal` against `layers.gate_and_route`, over both groupings: **190.2 us a call against 498.5** and 8.9 ms of a token's host time against 23.4 |
 | Decode-step rotation reached from C++ instead of from Python | Implemented and held to `torch.equal` against `device_attention.rope_rows`, over the released geometry, both of its families' dtypes and shapes the release does not have: **10.7 us a call against 135.4**, and **17.2 ms of a decode token at 20 resident rows** against 9.2 at 16 |
+| Decode-step attention reached from C++ instead of from Python | Implemented and held to a *bound* against `decode_output`'s own torch block, which is the only place in this path where the answer is not the reference's to the bit: the float32 arithmetic agrees to **3.1e-7 relative** and the bfloat16 answer moves by at most one bfloat16 step where that crosses a rounding boundary. **14 us of host a call against 367-763**, and **15 ms of a decode token at 16 resident rows** — 9.3 to 10.9 tok/s, measured with the draws held |
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
@@ -835,8 +836,8 @@ forty-eight layers is 117 a layer, and a layer's own arithmetic is a dozen kerne
 *times* that come with that table are not quoted here: they are instrumented, and the same op
 weighted 32.9 ms a token in one process and 96.3 in the next.
 
-**Three of the dispatches were per-call work that does not have to be per-call**, and all three are
-in the attention:
+**Four of the dispatches were per-call work that does not have to be per-call**, and all four are in
+the attention:
 
 * **The decode step's rotation.** `rope_rows` is `apply_partial_rope` with the head and sequence
   axes folded away — a split, a half swap, two multiplies and an add — and a decode step calls it
@@ -862,6 +863,42 @@ in the attention:
   dispatches lands inside a wait. Which is the shape of this whole exercise — the price of a host
   region is not its own wall time but how much of it the device was going to make it wait for
   anyway.
+
+* **The decode step's softmax.** After the rotation, the attention's host time is 33.9 ms of a
+  token and this block is 19.1 of it — `scores` 6.9, `softmax` 6.6, `out` 4.8 and the final `view`
+  0.8, from `tests/probe_mimo_v2_attention_path.py` at sixteen resident rows. It is two `matmul`s
+  around a masked softmax with a sink column, on tensors at most `[16, 192]` and a key span at most
+  `FOLD_KEYS`, which is eighteen eager dispatches a layer against a dispatch's own 15.9 us.
+  `mimo_decode_attention` is that block as one kernel: one warp a (kv_head, group), the query in
+  registers and the span walked once, **14.0 us of host a call against 367 to 763**.
+
+  **This is the one kernel in this path that is not bit-exact, and the trade is the point of it.**
+  `mimo_rope_rows` could be exact because it is elementwise; a softmax over a span has a summation
+  order, the reference's `sum` is a `torch` reduction whose tree shape is torch's, its two matmuls
+  are cuBLAS's blocking of the same products, and the kernel walks the span a warp at a time. What
+  is *not* given up is what the difference is made of: the products are not approximated (a span of
+  one key, where the softmax is the identity, is `torch.equal` to the widened value row), the
+  exponentials go through `double` because `--use_fast_math` is on for this translation unit and
+  would otherwise turn `expf` into `__expf`, and the sum is accumulated in `double` because a
+  thousand keys against a float32 accumulator is 1.8e-6 relative. Measured at the op over 136
+  steps of both families, the float32 the kernel produces agrees with the reference's to **3.1e-7
+  relative** — a hundred-and-twentieth of a bfloat16 step — and what reaches the bfloat16 answer is
+  the fraction of those that landed on a rounding boundary: 11 of 136 steps on the windowed layer,
+  0.061% of a step's elements, each by at most one bfloat16 step, and none at all on the global
+  layer. `tests/test_models_mimo_v2_decode_attention_kernel.py` carries the bound and the arithmetic
+  that bounds it.
+
+  On the token it is **15 ms of a step at sixteen resident rows**, and reading it took an
+  instrument of its own because the two arms are not bit-identical: a last bit that moves is a draw
+  that can move, and a moved draw is a different number of experts over PCIe — 34 ms of the token
+  on its own. `tests/probe_mimo_v2_attention_ab.py` interleaves the two arms in one process and
+  replays a *fixed* chain into both, and it times them twice: free-running, where the draws are the
+  model's own and the difference is the kernel plus however many copies its last bits moved, and
+  held, where the draws are recorded off one replay and handed to both arms, so the copies are the
+  same and what is left is the dispatch. Two runs of the held pair read **108.0 → 91.9 ms** and
+  **107.4 → 92.9 ms a step** — 9.26 to 10.88 tok/s and 9.31 to 10.77 — with all of it on the host
+  and the queue behind it unchanged at 4.5 ms. The free pair read −19.9 and −19.1 ms, which is the
+  same measurement with the copy-volume difference left in it.
 
 * **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
   concatenation to produce one row — and for a decode step it produces the row for position *p*,
@@ -1474,8 +1511,12 @@ golden holds and how it was captured.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
   one at a time and the second blocks on a lock.
-- **The attention and the dense linears are torch, not kernels.** They are baselines with the
-  shapes the kernels have to beat, and the split moved the baseline without moving the conclusion:
+- **At depth the attention and the dense linears are still torch.** Above `FOLD_KEYS` a decode
+  step's span stops folding and the chunk path takes the call, so `mimo_decode_attention` — the
+  one-row path's softmax, which is every windowed layer and every global layer below 1024 keys —
+  is not what a 262144-key step runs; the dense linears are torch at every depth. They are each
+  baselines with the shapes a kernel has to beat, and the split moved the baseline without moving
+  the conclusion:
   at 262144 on four ranks the attention is **38.8 ms of a 197.2 ms decode step** — a fifth of a
   token, and 44.3 before the prefix copy above went — and the thirty-nine windowed layers are why,
   because a 128-slot ring's decode step costs what a global layer's does: what is left there is
@@ -1538,6 +1579,20 @@ golden holds and how it was captured.
   the one-rank token table, the four-rank table, the chunk-width table and the 256k numbers come
   from. `bench_mimo_v2_prefill.py`'s `--capacity` sizes the KV cache apart from the prompt, which
   is how the tile's step in a long context is measured in minutes instead of hours.
+- `tests/test_models_mimo_v2_rope_kernel.py`, `tests/test_models_mimo_v2_decode_attention_kernel.py`
+  — the two decode-step kernels, and the different thing each one has to be held to: the rotation
+  is elementwise, so it is `torch.equal` over the released geometry, both dtypes and shapes the
+  release does not have, and the attention is a summation order, so it is a bound — the float32
+  agreement, the bfloat16 step a differing element may be, and the share of a step's elements that
+  may differ at all — with the tests that bound the bound (a span of one key is the widened value
+  row to the bit, a wrapped ring's view reads as its copy, and 3072 keys fit in a block's 48 KiB
+  where 3073 do not).
+- `tests/probe_mimo_v2_attention_ab.py` — what the fused attention is worth on the token, as an
+  A/B of two shipped paths (`_decode_ops` set and cleared) on a *fixed* replayed chain, timed twice
+  and interleaved: free-running, and with the draws recorded off one replay and handed to both arms
+  so the copies leave the difference. That second arm is the one to read, and the probe prints the
+  staged-expert and resident-hit counts beside the clock because a last bit that moves is a draw
+  that can move, and a moved draw is 34 ms of a token.
 - `tests/probe_mimo_v2_decode_arms.py` — a decode step with the routed experts replaced by the
   zero an empty rank returns, which is what separates the 38.0 ms a routed path costs *in situ*
   from the 139.6 the rest of a layer does. It is deliberately the only arm: an arm that also

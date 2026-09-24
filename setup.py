@@ -209,6 +209,7 @@ if TORCH_AVAILABLE:
                 "src/csrc/minimax_rope_kernel.cu",
                 "src/csrc/mimo_decode_ops.cpp",
                 "src/csrc/mimo_rope_kernel.cu",
+                "src/csrc/mimo_decode_attention.cu",
                 "src/csrc/llama_mmq/gguf_mma_wrapper.cu",
                 "src/csrc/qwen4_exp_moe.cu",
                 "src/csrc/qwen4_exp_gated_delta.cu",
