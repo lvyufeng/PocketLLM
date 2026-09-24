@@ -591,6 +591,63 @@ def test_the_memory_accounting_covers_the_layers_the_arena_and_the_head():
 
 
 @needs_cuda
+def test_the_inference_mode_is_the_step_under_no_grad():
+    """`inference_mode` buys dispatch time and no arithmetic, which is the whole reason it is here.
+
+    The model's four entry points are `torch.inference_mode` rather than `torch.no_grad`. The two
+    are the same promise about autograd -- nothing on this path has a backward pass -- and they are
+    not the same amount of work per dispatch: `inference_mode` skips the version-counter bump and
+    the view tracking that `no_grad` still pays. A trivial `torch.add` on this box is 15.9 us under
+    one and 9.8 under the other, and a decode step is several thousand of them.
+
+    That is only worth having if it is free, so the test is the arithmetic rather than the clock:
+    six steps from the same cache, run once through each mode, `torch.equal` at every position. The
+    undecorated function is reached through `__wrapped__`, which is how `functools.wraps` records
+    what a decorator was applied to, and the ambient mode at that call is then the only one that
+    applies. The first assertion is the one that keeps the rest honest -- a decorator that had gone
+    missing would make both arms the same call and the equality vacuous.
+    """
+    config = tiny_config(routed=(0, 0))
+    fixture = Fixture(config)
+    prompt = [3, 17, 41, 5]
+    raw = MimoV2DeviceModel.forward.__wrapped__
+
+    def walk(forward):
+        """Six steps from one cache, and whether the mode was in force for each of them.
+
+        The flag has to be read at the call and not afterwards: a tensor that leaves an
+        `inference_mode` block becomes ordinary as soon as anything outside touches it -- a
+        `clone` here, a `stack` there -- so a `is_inference()` on the assembled stack is always
+        false and would be an assertion about the test rather than about the model.
+        """
+        cache = fixture.model.cache(len(prompt) + 12)
+        rows, in_mode = [], []
+        logits = None
+        for position, token in enumerate(prompt):
+            logits = forward(fixture.model, torch.tensor([token]), start_pos=position, cache=cache)
+            in_mode.append(logits.is_inference())
+        for step in range(6):
+            rows.append(logits.clone())
+            logits = forward(
+                fixture.model,
+                torch.tensor([int(logits.argmax())]),
+                start_pos=len(prompt) + step,
+                cache=cache,
+            )
+            in_mode.append(logits.is_inference())
+        return torch.stack(rows), in_mode
+
+    mode, decorated = walk(MimoV2DeviceModel.forward)
+    with torch.no_grad():
+        plain, undecorated = walk(raw)
+    # The first pair is the one that keeps the second honest: a decorator that had gone missing
+    # would make both arms the same call and the equality below vacuous.
+    assert all(decorated), "the entry point is not running under `inference_mode`"
+    assert not any(undecorated)
+    assert torch.equal(mode, plain), delta(mode, plain)
+
+
+@needs_cuda
 def test_a_step_returns_a_row_and_greedy_feeds_that_row_back():
     """The decode loop's one job, and the one way it fails quietly.
 
