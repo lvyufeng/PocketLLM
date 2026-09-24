@@ -299,6 +299,68 @@ def delta(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# The norms
+# ---------------------------------------------------------------------------
+
+
+@needs_cuda
+def test_a_fused_norm_is_the_reference_norm():
+    """`normalise` is `layers.rms_norm`'s tensor, not an approximation of it, at bfloat16.
+
+    The two paths are the same arithmetic -- a float32 reduction of the squares, a float32 `rsqrt`,
+    a cast to the input width, and the multiply by the weight in that width -- and the place they
+    *could* differ is where the cast falls relative to the weight. The reference's docstring is
+    explicit that the cast comes first, so `normalise` is a fused kernel with no weight at all and
+    the multiply taken in Python afterwards. This is the test that says that is not a story: nine
+    seeds, equality, no tolerance.
+
+    The seeds are not padding. The two mechanisms are separable and the split is what found the
+    fix: with a weight of one the two agreed before it and with a random weight they did not, which
+    says the difference was in the multiply and nowhere else.
+
+    `float32` is the case with a real tolerance, and it is small and is the reduction's: the fused
+    kernel sums the squares in another order, which is the same freedom every matmul in this model
+    already takes, and the model runs bfloat16 anyway. The last two cases are the ones that must
+    *not* take the fast path -- a host tensor, and a weight of another width from the input -- and
+    they are checked against the reference for equality rather than against a number.
+    """
+    from src.models.mimo_v2.device_model import normalise
+
+    torch.manual_seed(3)
+    width = 4096
+    for dtype in (torch.bfloat16, torch.float32):
+        for seed in range(9):
+            torch.manual_seed(seed)
+            weight = torch.randn(width, device="cuda", dtype=dtype) * 0.7 + 1.0
+            hidden = torch.randn(4, width, device="cuda", dtype=dtype) * 3.0
+            want = rms_norm(hidden, weight, 1e-6)
+            got = normalise(hidden, weight, 1e-6)
+            assert got.dtype == want.dtype
+            if dtype is torch.bfloat16:
+                assert torch.equal(got, want), seed
+            else:
+                peak = float(want.abs().max())
+                assert float((got - want).abs().max()) <= peak * 2.0**-20, (
+                    seed,
+                    float((got - want).abs().max()),
+                    peak,
+                )
+    # An fp32 weight against a bf16 input is the case `F.rms_norm` cannot dispatch, and the
+    # reference is what comes back rather than an error or a silent upcast.
+    bf16_hidden = torch.randn(1, width, device="cuda", dtype=torch.bfloat16)
+    fp32_weight = torch.randn(width, device="cuda", dtype=torch.float32)
+    assert torch.equal(
+        normalise(bf16_hidden, fp32_weight, 1e-6), rms_norm(bf16_hidden, fp32_weight, 1e-6)
+    )
+    # On the host the reference runs, because that is what a host caller is asking for.
+    cpu_hidden = torch.randn(2, width)
+    cpu_weight = torch.randn(width)
+    assert torch.equal(
+        normalise(cpu_hidden, cpu_weight, 1e-6), rms_norm(cpu_hidden, cpu_weight, 1e-6)
+    )
+
+
+# ---------------------------------------------------------------------------
 # The assembly
 # ---------------------------------------------------------------------------
 

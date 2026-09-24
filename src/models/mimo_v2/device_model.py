@@ -61,7 +61,43 @@ from src.models.mimo_v2.layers import gate_and_route, rms_norm, swiglu_mlp
 __all__ = [
     "MimoV2DeviceLayer",
     "MimoV2DeviceModel",
+    "normalise",
 ]
+
+
+def normalise(hidden: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """`layers.rms_norm` on the card, through the release's fused kernel, bit for bit.
+
+    `layers.rms_norm` is the reference and stays the reference: it is six tensor operations -- an
+    upcast, a square, a mean, an `rsqrt`, a downcast and a multiply -- because that is readable and
+    because the reference has nothing to be fast for. On a card it is a decode token's biggest
+    single Python chain after the attention, and 48 layers pay it twice.
+
+    **The weight is passed as `None` and multiplied afterwards, and that is the whole trick.** The
+    reference's own docstring is explicit that the cast to the input width happens *before* the
+    weight is applied, and `F.rms_norm` applies its weight in float32 and casts once at the end --
+    so handing it the weight buys a fused kernel whose rounding point is not the reference's, and
+    measured, that is one to two bfloat16 ulps (`test_a_fused_norm_is_the_reference_norm` used to
+    hold it to a bound and now holds it to equality). Without a weight there is nothing to round
+    late: the fused kernel produces exactly the float32 `x * rsqrt(mean(x^2) + eps)` the reference
+    produces before its cast, and the multiply by a bfloat16 weight in bfloat16 is the reference's
+    own last step.
+
+    Measured on this box, a `[1, 4096]` bfloat16 row: 27 us against the reference chain's 112, and
+    the two are the same tensor. The nine seeds in the test are the evidence; the ones with a
+    weight of one are what isolated the cause, since they agreed before the fix and a random weight
+    did not. In float32 the two differ in the last bits of the reduction and not in the arithmetic
+    -- a few ulps, which is the same freedom every matmul in this model already takes.
+
+    A host caller and a weight of another width from the input get the reference, because a host
+    caller is asking for the reference and `F.rms_norm` will not dispatch across widths.
+    """
+    if not hidden.is_cuda or weight.dtype != hidden.dtype:
+        return rms_norm(hidden, weight, eps)
+    normalised = torch.nn.functional.rms_norm(
+        hidden, (hidden.shape[-1],), None, eps
+    )
+    return normalised * weight
 
 
 class MimoV2DeviceLayer:
@@ -236,14 +272,14 @@ class MimoV2DeviceLayer:
     ) -> torch.Tensor:
         """`[sequence, hidden]` in, `[sequence, hidden]` out, the reference's two adds."""
         residual = hidden
-        normed = rms_norm(hidden, self.input_layernorm, self.config.layernorm_epsilon)
+        normed = normalise(hidden, self.input_layernorm, self.config.layernorm_epsilon)
         attended = self.attention.forward(normed, start_pos=start_pos, cache=cache)[
             "attn_out_post_o"
         ]
         hidden = residual + attended
 
         residual = hidden
-        normed = rms_norm(hidden, self.post_attention_layernorm, self.config.layernorm_epsilon)
+        normed = normalise(hidden, self.post_attention_layernorm, self.config.layernorm_epsilon)
         return residual + self.mlp(normed)
 
 
@@ -467,7 +503,7 @@ class MimoV2DeviceModel:
             return hidden
         if rows is not None:
             hidden = hidden[list(rows)]
-        hidden = rms_norm(hidden, self.norm, self.config.layernorm_epsilon)
+        hidden = normalise(hidden, self.norm, self.config.layernorm_epsilon)
         return F.linear(hidden.to(self.lm_head.dtype), self.lm_head)
 
     @torch.no_grad()
