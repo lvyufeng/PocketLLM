@@ -128,6 +128,12 @@ torch::Tensor moe_single_token_int8_forward_cuda(
     int64_t experts_start_idx,
     double swiglu_limit);
 
+torch::Tensor mimo_rope_rows(
+    const torch::Tensor& states,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    int64_t rope_dim);
+
 std::vector<torch::Tensor> mimo_noaux_tc_route(
     const torch::Tensor& hidden_states,
     const torch::Tensor& weight,
@@ -2244,6 +2250,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("correction_bias"), pybind11::arg("top_k"),
           pybind11::arg("n_group"), pybind11::arg("topk_group"),
           pybind11::arg("norm_topk_prob"), pybind11::arg("routed_scaling_factor"));
+    m.def("mimo_rope_rows", &mimo_rope_rows,
+          "MiMo-V2.6's decode-step rotation, the reference's arithmetic in one kernel",
+          pybind11::arg("states"), pybind11::arg("cos"), pybind11::arg("sin"),
+          pybind11::arg("rope_dim"));
     m.def("moe_multi_token_fp4_forward", &moe_multi_token_fp4_forward, "small-batch top-k MoE FP4 forward, active experts only (CUDA)");
     m.def("moe_prefill_int8_grouped_forward", &moe_prefill_int8_grouped_forward, "prefill MoE grouped int8 forward (CUDA)");
     m.def("qwen4_exp_moe_prefill_bf16_forward", &qwen4_exp_moe_prefill_bf16_forward, "Qwen4-Exp raw BF16 grouped prefill MoE forward (CUDA)");

@@ -89,6 +89,7 @@ What exists:
 | Device dense stack and the model loop | Implemented: 48 layers, a KV cache, greedy decode, on one card |
 | End-to-end device decode on the release | Verified against the host reference at full depth and measured: 1.64 tok/s, 610 ms a token |
 | Router reached from C++ instead of from Python | Implemented and held to `torch.equal` against `layers.gate_and_route`, over both groupings: **190.2 us a call against 498.5** and 8.9 ms of a token's host time against 23.4 |
+| Decode-step rotation reached from C++ instead of from Python | Implemented and held to `torch.equal` against `device_attention.rope_rows`, over the released geometry, both of its families' dtypes and shapes the release does not have: **10.7 us a call against 135.4**, and **17.2 ms of a decode token at 20 resident rows** against 9.2 at 16 |
 | Expert parallelism over four ranks | Implemented and verified: 5.63 tok/s, 177.6 ms a token at a short context, four ranks byte-identical and the same tokens as one rank |
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
@@ -833,8 +834,33 @@ forty-eight layers is 117 a layer, and a layer's own arithmetic is a dozen kerne
 *times* that come with that table are not quoted here: they are instrumented, and the same op
 weighted 32.9 ms a token in one process and 96.3 in the next.
 
-**Two of the dispatches were per-call work that does not have to be per-call**, and both are in the
-attention:
+**Three of the dispatches were per-call work that does not have to be per-call**, and all three are
+in the attention:
+
+* **The decode step's rotation.** `rope_rows` is `apply_partial_rope` with the head and sequence
+  axes folded away — a split, a half swap, two multiplies and an add — and a decode step calls it
+  thirty-two times a token, on the query and on the key of every layer. Eight operations is ten
+  eager dispatches, and ten dispatches is **135.4 us of host time a call**: 13.0 ms of a token's
+  host for an elementwise rotate. `mimo_rope_rows` is the same arithmetic in one kernel and it is
+  **10.7 us**, and the two things that make it safe to drop in are both about rounding rather than
+  about speed. The products round *separately* — the row is bfloat16 and the cosine is float32, so
+  `rope * cos` rounds once in float32 and the addition rounds again — which `__fmul_rn` and
+  `__fadd_rn` keep and `--use_fast_math` would otherwise be free to contract into an fma; and the
+  half swap is a *sign flip* (`cat(-x2, x1)` summed against `sin` is `p1 + (-p2)`) and not a
+  subtraction. The kernel returns float32 because the reference's `torch.cat` promotes the
+  unrotated tail, and it is held to `torch.equal` over the released geometry, both families'
+  dtypes and a set of shapes the release does not have.
+
+  Of the three, this is the one whose saving reaches the token and it took a second measurement to
+  see it. Twelve and a half milliseconds of host time is 8% of a step, and at twenty resident rows
+  `probe_mimo_v2_ablate.py`'s `pyrope` arm — the same step with each layer handed back to
+  `rope_rows`, nothing else moved and the two arms bit-identical — reads **128.8 ms against 146.0**,
+  so the kernel is **17.2 ms** of a token there and 8.96 tok/s against 7.76. At sixteen resident rows
+  the same arm reads 116.2 against 125.4, **9.2 ms**: a smaller set of resident experts means more
+  misses, means the device is further behind, means the host runs further ahead and the same bank of
+  dispatches lands inside a wait. Which is the shape of this whole exercise — the price of a host
+  region is not its own wall time but how much of it the device was going to make it wait for
+  anyway.
 
 * **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
   concatenation to produce one row — and for a decode step it produces the row for position *p*,
