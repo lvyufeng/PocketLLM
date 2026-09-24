@@ -898,7 +898,11 @@ the attention:
   same and what is left is the dispatch. Two runs of the held pair read **108.0 → 91.9 ms** and
   **107.4 → 92.9 ms a step** — 9.26 to 10.88 tok/s and 9.31 to 10.77 — with all of it on the host
   and the queue behind it unchanged at 4.5 ms. The free pair read −19.9 and −19.1 ms, which is the
-  same measurement with the copy-volume difference left in it.
+  same measurement with the copy-volume difference left in it. An arm on the other instrument — the
+  `torchattn` restore arm this page's tables come from, `--steps 10 --warmup 3 --rounds 5 --arms
+  shipped,torchattn` — reads **116.8 against 128.1 ms a token**, **11.3 ms** of it, all on the host,
+  with the queue unchanged; the three measurements agree on 11 to 16 ms and disagree on the absolute
+  level for the reason the next paragraph gives.
 
 * **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
   concatenation to produce one row — and for a decode step it produces the row for position *p*,

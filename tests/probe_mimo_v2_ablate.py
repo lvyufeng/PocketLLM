@@ -55,15 +55,24 @@ The stubs, and what each one deletes:
     all         every one of the above at once, which is the floor of the loop, the embedding, the
                 head and the sampler with the layers reduced to two adds.
 
-And the arms that are not deletions. Three of them restore a path the shipped build does not take
-and are each priced as a difference of two *shipped* builds, which is the only difference this box
-can read:
+And the arms that add rather than delete, because they restore a path rather than remove one. Each
+is priced as a difference of two *shipped* builds, which is the only difference this box can read:
 
     chunk-decode  forces every decode step through `attention_output`'s chunk path by answering
                   `decode_foldable` false, which is what the model did before `decode_output`
                   existed. `shipped` minus this arm is what the lean decode attention is worth,
                   and it is exact: the two arms are bit-identical, checked over 25 steps of a real
                   model before the arm was written.
+    torchattn     `_decode_ops = None` on every attention module, so `decode_output` takes the
+                  torch softmax block `mimo_decode_attention` replaced. This one is *not* exact --
+                  the kernel is held to a bound against the block rather than to an equality -- so
+                  read the hit rate beside the arm before reading its price: a moved draw is a
+                  different number of experts over PCIe. `probe_mimo_v2_attention_ab.py` is the
+                  same two arms with the draws held, which is the clean measurement; this arm is
+                  the same price on the instrument the token table's numbers come from. Measured at
+                  sixteen resident rows: `--steps 10 --warmup 3 --rounds 5 --arms
+                  shipped,torchattn` reads **116.8 and 128.1 ms a token**, so **11.3 ms** with all
+                  of it on the host (111.6 against 123.0) and the queue unchanged.
     pyrouter      as above: the router off the card and back in Python.
     pyrope        as above: the rotation off the card and back in `rope_rows`.
     inference-mode
@@ -116,6 +125,7 @@ ARMS = (
     "copyfloor",
     "nosync",
     "chunk-decode",
+    "torchattn",
     "stage",
     "attention",
     "kv",
@@ -224,6 +234,30 @@ def install(model, arm: str) -> callable:
 
         module.forward = nosync_forward
         return lambda: setattr(module, "forward", was)
+
+    if arm == "torchattn":
+        # `_decode_ops = None` is the whole arm: `decode_output` takes the torch block the kernel
+        # replaced and the rest of the layer is the shipped path, so this is a difference of two
+        # shipped builds. **The two are not bit-identical** -- the kernel is held to a bound and
+        # not to an equality -- so this arm prices the kernel *plus* whatever the last bits it
+        # moved did to the draws, and a moved draw is a different number of experts over PCIe. The
+        # printed hit rate beside the arm is the size of that term;
+        # `probe_mimo_v2_attention_ab.py` is the same two arms with the draws recorded off one
+        # replay and handed to both, which is the clean price.
+        from src.models.mimo_v2.device_attention import MimoV2DeviceAttention
+
+        kept: list[tuple[object, object]] = []
+        for layer in model.layers:
+            attention = layer.attention
+            if isinstance(attention, MimoV2DeviceAttention):
+                kept.append((attention, attention._decode_ops))
+                attention._decode_ops = None
+
+        def unreach() -> None:
+            for attention, ops in kept:
+                attention._decode_ops = ops
+
+        return unreach
 
     if arm == "chunk-decode":
         from src.models.mimo_v2.device_attention import MimoV2DeviceAttention
