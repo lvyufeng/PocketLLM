@@ -13,6 +13,12 @@ printed largest first with the kernels that bracket them, which is the question 
 
     torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_timeline.py --steps 2
 
+`--depth` is the same measurement over a prefix the prompt cannot reach, which is where the
+question changes shape: at eight positions the card is behind the host and the host is the step,
+and at 4096 the host spends 112 ms a token of which only six are the queue. Whether the *card* is
+busy through those 112 ms is what says whether the remaining work is the host's Python or the
+device's, and it is the one thing a wall clock around `model.step` cannot answer.
+
 The checkpoint is the default asset path; without it the script exits 0 and says so.
 """
 
@@ -30,6 +36,7 @@ from src.models.mimo_v2.bank import open_expert_bank  # noqa: E402
 from src.models.mimo_v2.device_model import MimoV2DeviceModel  # noqa: E402
 from src.models.mimo_v2.ep import EpGroup  # noqa: E402
 from src.models.mimo_v2.loader import MimoV2Checkpoint  # noqa: E402
+from tests.bench_mimo_v2_model import fill_cache  # noqa: E402
 
 DEFAULT_CHECKPOINT = "/mnt/data3/MiMo-V2.6-Flash-RL"
 PROMPT_IDS = [8374, 4021, 95012, 1288, 77431, 5502, 19904, 61783]
@@ -67,6 +74,15 @@ def main() -> int:
     parser.add_argument("--prompt", type=int, default=8)
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--top", type=int, default=20)
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        help="fill the cache to this many positions with `bench_mimo_v2_model.fill_cache` "
+        "instead of feeding a prompt, which is the answer at a depth a prompt cannot reach in a "
+        "probe's lifetime: the question the section below asks -- whether the card is idle while "
+        "the host is busy -- is not the same question at 8 positions and at 4096",
+    )
     parser.add_argument(
         "--resident-rows",
         type=int,
@@ -109,15 +125,24 @@ def main() -> int:
         experts.forward = stubbed
     torch.cuda.synchronize()
 
-    cache = model.cache(args.prompt + args.steps + 8)
+    cache = model.cache(max(args.depth, args.prompt) + 2 * args.steps + 16)
     prompt_ids = (PROMPT_IDS * (args.prompt // len(PROMPT_IDS) + 1))[: args.prompt]
-    for position, token in enumerate(prompt_ids):
-        logits = model.forward(torch.tensor([token]), start_pos=position, cache=cache)[-1]
+    if args.depth:
+        # `--depth` is the same step over a prefix that means nothing: the cache is filled
+        # directly, which is what makes a 4096-position step seconds instead of minutes. Its own
+        # `position` is the depth, and the prompt is not fed at all.
+        fill_cache(cache, [layer.layer_idx for layer in model.layers], args.depth)
+        position = args.depth
+    else:
+        for index, token in enumerate(prompt_ids):
+            logits = model.forward(torch.tensor([token]), start_pos=index, cache=cache)[-1]
+        position = len(prompt_ids)
+    logits = model.step(prompt_ids[0], start_pos=position, cache=cache)[-1]
     torch.cuda.synchronize()
 
     drawn = [int(logits.argmax())]
-    for _ in range(2):
-        logits = model.step(drawn[-1], start_pos=len(prompt_ids) + _, cache=cache)[-1]
+    for offset in range(2):
+        logits = model.step(drawn[-1], start_pos=position + 1 + offset, cache=cache)[-1]
         drawn.append(int(logits.argmax()))
     torch.cuda.synchronize()
 
@@ -125,7 +150,7 @@ def main() -> int:
 
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for step in range(args.steps):
-            logits = model.step(drawn[-1], start_pos=len(prompt_ids) + step, cache=cache)[-1]
+            logits = model.step(drawn[-1], start_pos=position + 3 + step, cache=cache)[-1]
             drawn.append(int(logits.argmax()))
         torch.cuda.synchronize()
 

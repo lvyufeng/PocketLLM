@@ -96,7 +96,7 @@ What exists:
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
 | 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **197.2 ms — 5.07 tokens a second**, 38.8 of it the attention and 99.9 the expert copy |
-| Decode at 4096 tokens of context | Measured: **118.3 ms a token — 8.45 tokens a second** on four ranks, 112.2 of it on the host and 6.1 behind, and 36.7 ms of it the attention. The best single step read 113.7 ms — **8.79**. It is not ten: see below |
+| Decode at 4096 tokens of context | Measured: **96.5 to 107.3 ms a token — 9.3 to 10.4 tokens a second** on four ranks, three bare runs of 120 steps at 87.5% resident hits, the card **86-90% busy**. The region table reads 112.2 ms on the host and 36.7 of it the attention. The two collectives are **6.6** of it — 6.3 the all-reduce, 0.5 the all-gather — priced with the draw held |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
@@ -934,15 +934,35 @@ the attention:
   at 4096; the staged-expert and resident counts are printed beside every arm for the reason the
   fused attention's probe prints them.
 
-**At 4096 keys a token is 118.3 ms — 8.45 tokens a second — and the attention is not what stands
-between it and ten.** `probe_mimo_v2_host_phases.py --depth 4096 --resident-rows 16 --steps 10`,
-one run: **112.2 ms on the host and 6.1 ms behind it**, of the host 36.7 ms the attention (43 before
-the fold above), **48.1 the expert wrapper**, 9.9 the router, 5.4 the collective, 5.3 the norms and
-0.6 outside a layer. Ten tokens a second is 100 ms, so what is missing is one copy-sized term: the
-wrapper's two children are only 4.8 ms of staging copy and 3.8 of kernel, and the other 39.5 ms is
-the wrapper's own — a term that no launch count addresses and that the 256k section's copy floor
-does. The fold bound moved the attention, which was the smaller of the two, and the token went from
-128.3 to 113.7 in the same process; the other is where the next ten would have to come from.
+**At 4096 keys a token is 96.5 to 107.3 ms — 9.3 to 10.4 tokens a second — and the attention is
+not what stands between it and ten.** The region table is `probe_mimo_v2_host_phases.py --depth
+4096 --resident-rows 16 --steps 10`, one run: **112.2 ms on the host and 6.1 ms behind it**, of the
+host 36.7 ms the attention (43 before the fold above), **48.1 the expert wrapper**, 9.9 the router,
+5.4 the collective, 5.3 the norms and 0.6 outside a layer. That probe puts a `perf_counter` pair
+around every one of a token's regions, and a token this host-bound pays for its own instrument:
+three bare runs of the same step — `120` steps at the same depth and the same sixteen resident rows,
+with nothing wrapped — read **107.3, 97.3 and 96.5 ms**, at **87.5% resident hits** and 11.76 experts
+staged a step in the last two. The bare number is the token; the table is read for its shares.
+
+**The step is no longer host-bound at this depth, and the terms left are not the attention.** The
+card is **86 to 90% busy** through those steps, and the queue behind a step is 0.2 ms — so the two
+sides are running level, and the card's own idle is the room that is left: **24.3 ms of a 151.1 ms
+step** under `probe_mimo_v2_decode_timeline.py --depth 4096 --resident-rows 16`, of which the
+largest single bracket is **9.3 ms** in 47 gaps of **197.8 µs** between the draw's `Memcpy DtoH` and
+the next copy — the Python between `indices.tolist()` and `_stage` — and the rest is **2083
+`cudaLaunchKernel` calls a step at 9.2 µs each, 19.2 ms of host**, arriving as gaps of 5 to 20 µs
+between twenty-five hundred ops. Fewer, larger kernels is the term; that is the same conclusion the
+short-context table reached, one order of magnitude further along.
+
+**And the two collectives are 6.6 ms of it, not 52.** The device table bills
+`ncclDevKernel_AllReduce` and `ncclDevKernel_AllGather` at ~550 µs a call, 47 and 48 calls a step.
+A spin is billed as work, so the table cannot price a collective and the arm has to: with the
+router's draw **held** — recorded off one replay and fed to both arms, which is what keeps the
+copies from moving instead of the collective — the same process at 4096 reads shipped **87.5**,
+`ep.reduce` stubbed **81.2**, `ep.gather` stubbed **87.0**, both **80.9**. So the all-reduce is
+**6.3 ms** (134 µs a call, which is the lockstep price this page's all-reduce section measured) and
+the all-gather is **0.5**. Three quarters of what the profiler attributed to NCCL is the ranks
+waiting, and the third of a token it looked like is not there.
 
 * **The RoPE table.** `build_rope_cos_sin` is an outer product, two transcendental kernels and a
   concatenation to produce one row — and for a decode step it produces the row for position *p*,
@@ -1466,6 +1486,11 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_arms.py --steps 8 --prompt 8
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --steps 3 --prompt 8
 
+# the same two at 4096 keys, where the card's duty cycle and the op mix are different questions:
+# and the bare loop, which is the token and not the instrument
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_ops.py --depth 4096 --resident-rows 16
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_timeline.py --depth 4096 --resident-rows 16
+
 # the step's cost at a depth, without the prompt that reaches it: `--depth` fills the cache
 torchrun --nproc_per_node=4 tests/probe_mimo_v2_decode_host.py --depth 262144
 
@@ -1679,7 +1704,12 @@ golden holds and how it was captured.
   145 `cudaStreamSynchronize` calls; the timeline probe reads `prof.events()` rather than
   exporting a chrome trace, because a 13 MB trace of this step is truncated JSON. The phases probe
   is what separates the expert copy the kernel *waited* for from the copy it hid, and its two arms
-  are what the decode step's decomposition above is made of.
+  are what the decode step's decomposition above is made of. Both carry `--depth` and
+  `--resident-rows` now, because the op mix and the gaps are not the same at 8 positions and at
+  4096: the timeline's largest bracket there is the 197.8 µs the host spends between the draw's
+  `tolist` and the next copy, forty-seven times a token, which is a term that does not exist at
+  eight. **Read the timeline's NCCL kernels as gaps and not as work** — a spin is billed as device
+  time, and the paired arm is what prices a collective.
 - `tests/probe_mimo_v2_decode_prefix.py` — the attention's read of its own span, as a view of the
   cache buffer against the `cat` it replaces, the two arms interleaved and four steps each at
   262144: 197.2 ms a token against 202.3, the attention column 38.8 against 44.3. The `cat` arm is
