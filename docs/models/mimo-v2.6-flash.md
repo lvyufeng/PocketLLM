@@ -94,6 +94,7 @@ What exists:
 | Attention parallelism over the same ranks | Implemented and verified: the checkpoint's own four-way `qkv_proj` partition, joined by an all-gather held to `0.00e+00` against the whole path — **2.15x end to end on a 262144-token prompt**, 4.65x on a decode step at that depth, the KV cache divided the same way |
 | Chunked prefill, grouped multi-token expert kernel | Implemented and verified: 134 tok/s at a 1024-token chunk and 174 at 2048 on four ranks, 46-59x the token-at-a-time loop, four ranks byte-identical |
 | 256k context | Verified and measured: a 262144-token prompt through four ranks at **104.04 tok/s**, four-identical last row, 10.21 GiB on the card against 22 — the same prompt with the attention replicated is 48.37, so 2.15x of it is the split. A decode step at that depth is **197.2 ms — 5.07 tokens a second**, 38.8 of it the attention and 99.9 the expert copy |
+| The model's entry points under `inference_mode` instead of `no_grad` | Implemented and held to `torch.equal` step by step: **7.8 ms of a decode token at 16 resident rows**, where a trivial `torch.add` is 15.9 us under one mode and 9.8 under the other |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
 | Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |

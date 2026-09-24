@@ -541,7 +541,15 @@ class MimoV2DeviceModel:
             attention.share_rope_table(tables[key])
         return len(tables)
 
-    @torch.no_grad()
+    # `inference_mode` and not `no_grad`, on all four entry points. They are the same promise about
+    # autograd and they are not the same amount of work: a decode step is several thousand eager
+    # dispatches, and `inference_mode` drops the version-counter bump and the view tracking on each
+    # one. A trivial `torch.add` on this box is 15.9 us under `no_grad`, 9.8 under `inference_mode`
+    # and a `matmul` 31.9 against 22.1, and on a real step at sixteen resident rows the arm in
+    # `probe_mimo_v2_ablate.py` reads **7.8 ms** of a token. It changes no arithmetic -- the same
+    # kernels on the same values -- so the two modes are held to `torch.equal` rather than to a
+    # tolerance, and nothing here saves a tensor for a backward pass that does not exist.
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -571,7 +579,7 @@ class MimoV2DeviceModel:
         hidden = normalise(hidden, self.norm, self.config.layernorm_epsilon)
         return F.linear(hidden.to(self.lm_head.dtype), self.lm_head)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(
         self,
         token_id: int,
@@ -589,7 +597,7 @@ class MimoV2DeviceModel:
             torch.tensor([int(token_id)], dtype=torch.int64), start_pos=start_pos, cache=cache
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def prefill(
         self,
         prompt_ids: Sequence[int],
@@ -635,7 +643,7 @@ class MimoV2DeviceModel:
                 module.drain()
         return logits
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def greedy(
         self,
         prompt_ids: Sequence[int],
