@@ -73,6 +73,13 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--mode", default="default", help="inductor mode: default, reduce-overhead")
     parser.add_argument("--fullgraph", action="store_true")
+    parser.add_argument(
+        "--resident-rows",
+        type=int,
+        default=0,
+        help="held experts a routed layer; the step compiled here is the one the set leaves, and "
+        "the set is built before the first compiled call so its counters are not part of the graph",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.checkpoint):
@@ -84,7 +91,13 @@ def main() -> int:
     device = ep.device if ep.device is not None else torch.device("cuda:0")
     checkpoint = MimoV2Checkpoint(args.checkpoint)
     bank = open_expert_bank(checkpoint)
-    model = MimoV2DeviceModel(checkpoint, device=device, expert_source=bank, ep=ep)
+    model = MimoV2DeviceModel(
+        checkpoint,
+        device=device,
+        expert_source=bank,
+        ep=ep,
+        resident_rows=args.resident_rows,
+    )
     torch.cuda.synchronize()
 
     span = max(args.prompt, 8) + 2 * (args.warmup + args.steps) * (args.rounds + 2) + 16

@@ -40,6 +40,9 @@ The stubs, and what each one deletes:
                 nothing downstream of the router knows which of the two answered it -- so `shipped`
                 minus this arm is exactly what the transcription buys. It prices 0 when the extension
                 is not built, which the line the probe prints above the table will say.
+    rope        `attention.rope_rows`, both calls: the split, the half swap, the two multiplies
+                and the add, on the query and on the key. The unrotated row comes back instead, so
+                the attention is wrong; what is priced is the rotation's own dispatch.
     norms       the two `rms_norm` a layer -- `device_model.normalise`, which is where they are
                 called from the layer.
     reduce      `ep.reduce`, the layer's `all_reduce` of the expert partial.
@@ -104,6 +107,7 @@ ARMS = (
     "kv",
     "router",
     "pyrouter",
+    "rope",
     "norms",
     "reduce",
     "experts",
@@ -226,6 +230,7 @@ def install(model, arm: str) -> callable:
     stub_attention = arm in ("attention", "all")
     stub_kv = arm in ("kv", "all")
     stub_router = arm in ("router", "all")
+    stub_rope = arm in ("rope", "all")
     stub_pyrouter = arm == "pyrouter"
     stub_norms = arm in ("norms", "all")
     stub_reduce = arm in ("reduce", "all")
@@ -291,6 +296,15 @@ def install(model, arm: str) -> callable:
 
     if stub_norms:
         set_(device_model_module, "normalise", lambda hidden, weight, eps: hidden)
+
+    if stub_rope:
+        import src.models.mimo_v2.device_attention as attention_module
+
+        # The rotation is skipped and the unrotated row is handed back, which is the wrong answer
+        # in exactly the way the arm is supposed to be: the shape, the dtype and the cache
+        # bookkeeping are the shipped ones, so what the arm prices is the eight operations
+        # `rope_rows` is made of and not a shorter attention.
+        set_(attention_module, "rope_rows", lambda states, cos, sin, dim: states)
 
     for module in (model.experts, model.chunk_experts):
         if module is None:
