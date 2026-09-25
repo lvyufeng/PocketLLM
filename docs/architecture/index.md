@@ -24,6 +24,7 @@ usually measured against. Two things are worth knowing before reading:
 | [MiniMax-M2.7: design and measurements](minimax_m2_7_design.md) | The per-model engineering record behind [the MiniMax-M2.7 model guide](../models/minimax-m2.7.md): the quantization layout, the IQ2_XXS and Q4_K/Q5_K kernels, the decode profile, and the layer scope each reading was taken at. |
 | [Backend unification design](backend_unification_design.md) | The original proposal for one engine over swappable device backends. |
 | [Cross-request prefix caching on V4.1](v41_prefix_cache.md) | How a served V4.1 request resumes a stored prefix instead of forwarding the prompt again: the buffers a snapshot is, the two anchors, the budget, and the metrics. |
+| [Cross-request prefix caching on MiMo-V2.6-Flash](mimo_v2_6_flash_prefix_cache.md) | The same store over this model's cache: a ring stored whole and a global layer cut to its written prefix, the write head as part of the state, and why a resumed prefill here is not bit-exact. |
 | [cpp_engine multi-backend refactor plan](cpp_engine_multi_backend_plan.md) | The refactor plan that followed it: `core/` / `engine/` / `backends/` layering without giving up per-hardware kernels. |
 | [PocketLLM refactor analysis (2026-09)](pocketllm_refactor_analysis_2026_09.md) | A vLLM/SGLang comparison that motivates the dual-backend design, against master `e59d5d3`. *(Chinese)* |
 | [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) | What is worth building for 2080 Ti (SM75) and Ascend 910A, and what is not. *(Chinese)* |

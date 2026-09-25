@@ -15,6 +15,19 @@ sequence here and two requests cannot share it. Requests serialize on one lock, 
 boundary :class:`~pocketllm.backends.base.BackendBase` documents as the price of a request-unaware
 cache.
 
+**What outlives a request is the prefix store, and it is per rank.** ``generate.py``'s loop resets the
+cache at the top, so a chat loop that resends its history pays for the history on every turn;
+``prefix_cache`` holds each prompt's state on the host keyed by the prompt's own tokens, so a later
+request restores the longest prefix it shares with one already served and forwards only the rest.
+Every rank builds the same store and reads it the same way -- the key is the tokens, the budget and
+the anchor lengths are launcher options, and each rank's own buffers are a quarter of the heads -- so
+the reuse is agreed on *without a collective*, which is the thing that matters here: a rank that
+resumed where its peers did not would enter a layer's all-reduce alone and hang. The one thing that
+makes this work at four ranks and not at one is that the decision has to be a function of the request
+and the options and of nothing local, and it is: the store's index is keyed by tokens, and the byte
+accounting that drives eviction is the same number on every rank because the split is even.
+``--enable-prefix-caching`` (on by default) is the switch.
+
 **The experts are dealt, and the deal is a property of the layer's shape.** A decode step's draw is
 eight experts of 256, so the ``sorted`` deal -- sorted position to rank -- gives each of four ranks
 exactly two of them and one all-reduce of a ``[1, 4096]`` fp32 partial closes the layer. A prompt is
@@ -58,7 +71,7 @@ from pocketllm.api import (
     Usage,
 )
 
-from .base import BackendBase, settled_text
+from .base import BackendBase, byte_size, settled_text
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the KV cache is sized at when ``--max-model-len`` is not given.
@@ -114,6 +127,33 @@ dimensions -- so eight rows is 4.78 GiB of a 22 GiB card: free at a short contex
 and pay for the rows; see ``docs/models/mimo_v2_6_flash.md`` for what it measured.
 """
 
+DEFAULT_PREFIX_CACHE_BYTES = 4 << 30
+"""Host memory a rank's prefix store may hold, when prefix caching is on.
+
+A stored prefix is 5760 bytes a token plus 6.1 MiB of rings, so 4 GiB is roughly seven hundred
+thousand tokens a rank: a 262144-token entry is 1.41 GiB, which leaves room for the handful of long
+conversations a local service actually holds. It is ordinary pageable memory and deliberately *not*
+``/dev/shm``, which the 149.81 GiB expert bank already owns at 91%; four ranks at this size is 16 GiB.
+
+Both figures are the served shape's: four ranks, with the attention split along the checkpoint's own
+partition, which is a quarter of the key heads a rank and therefore a quarter of these bytes. A rank
+that held the whole attention would pay 23040 bytes a token.
+
+The rings are why the constant per entry is not zero: all thirty-nine of them together are 6.1 MiB
+whatever the prompt is, because a windowed layer's buffer is `min(window, capacity)` slots and the
+prompt never changes that. It is also why the store's floor is a whole hash block -- an entry of
+eight tokens would spend the rings' six megabytes on eight tokens of prefix.
+"""
+
+DEFAULT_PREFIX_CACHE_HEAD_TOKENS = 1024
+"""The fixed-length anchor a prefill also stores, or 0 for the prompt's end alone.
+
+The head anchor is for a *different* conversation with the same rendered header -- the same system
+message, the same tools JSON -- which the end anchor cannot serve because the two prompts diverge
+before it. It costs the cold prefill one chunk boundary, since a position can only be observed at a
+forward boundary, and it is paid on a miss only: a resumed prefill skips it.
+"""
+
 _KNOWN_OPTIONS = frozenset({
     "chunk_rows",
     "deal",
@@ -122,6 +162,8 @@ _KNOWN_OPTIONS = frozenset({
     "expert_rows",
     "pin",
     "prefill_chunk",
+    "prefix_cache_bytes",
+    "prefix_cache_head_tokens",
     "resident_rows",
     "slots",
 })
@@ -155,8 +197,9 @@ class _Options:
     Every one of these changes what the run does, which is why an unknown key is refused rather
     than ignored: ``chunk_rows`` is the arena a card pays for, ``deal`` is which deal the experts
     are divided by, ``prefill_chunk`` is the width a prompt goes through at, ``slots`` is how
-    many calls the pipeline keeps in flight, and ``resident_rows`` is how many of a routed
-    layer's experts the card keeps instead of copying a token.
+    many calls the pipeline keeps in flight, ``resident_rows`` is how many of a routed layer's
+    experts the card keeps instead of copying a token, and the two ``prefix_cache_*`` keys are the
+    store's budget and the length of the head anchor.
     """
 
     chunk_rows: int | None = DEFAULT_EXPERT_ROWS
@@ -164,6 +207,8 @@ class _Options:
     device: str | None = None
     pin: bool = True
     prefill_chunk: int = DEFAULT_PREFILL_CHUNK
+    prefix_cache_bytes: int = DEFAULT_PREFIX_CACHE_BYTES
+    prefix_cache_head_tokens: int = DEFAULT_PREFIX_CACHE_HEAD_TOKENS
     resident_rows: int = DEFAULT_RESIDENT_ROWS
     slots: int = DEFAULT_EXPERT_SLOTS
 
@@ -183,6 +228,10 @@ class _Options:
         prefill = int(values.pop("prefill_chunk", DEFAULT_PREFILL_CHUNK))
         slots = int(values.pop("slots", DEFAULT_EXPERT_SLOTS))
         resident = int(values.pop("resident_rows", DEFAULT_RESIDENT_ROWS))
+        budget = byte_size(
+            values.pop("prefix_cache_bytes", DEFAULT_PREFIX_CACHE_BYTES), "prefix_cache_bytes"
+        )
+        head = int(values.pop("prefix_cache_head_tokens", DEFAULT_PREFIX_CACHE_HEAD_TOKENS))
         pin = _flag(values.pop("pin", True), "pin")
         if rows is not None and int(rows) < 0:
             raise ConfigurationError(f"chunk_rows is an expert count and {rows!r} is not one")
@@ -192,14 +241,26 @@ class _Options:
             raise ConfigurationError(f"slots is a slot count and {slots} is not one")
         if resident < 0:
             raise ConfigurationError(f"resident_rows is an expert count and {resident!r} is not one")
+        if head < 0:
+            raise ConfigurationError(f"prefix_cache_head_tokens is a count and {head!r} is not one")
         if deal is not None and str(deal) not in {"id", "sorted"}:
             raise ConfigurationError(f"deal is `id` or `sorted`, got {deal!r}")
+        if not bool(getattr(args, "enable_prefix_caching", True)):
+            # ``--enable-prefix-caching`` is the CLI's switch. The two options above are the *shape*
+            # of the store and not a second switch, so the CLI is what turns it off and a zero budget
+            # is how the rest of this file spells "off" -- one representation, and `capabilities`
+            # reads it like any other run's. This is the same pair of lines the V4.1 adapter has, and
+            # for the same reason: a launch's two spellings of "no prefix cache" have to agree.
+            budget = 0
+            head = 0
         return cls(
             chunk_rows=None if rows is None else int(rows),
             deal=None if deal is None else str(deal),
             device=values.pop("device", None),
             pin=pin,
             prefill_chunk=prefill,
+            prefix_cache_bytes=budget,
+            prefix_cache_head_tokens=head,
             resident_rows=resident,
             slots=slots,
         )
@@ -233,6 +294,11 @@ class MimoBackend(BackendBase):
         self._bank: Any = None
         self._model: Any = None
         self._cache: Any = None
+        self._prefix_cache: Any = None
+        # What `prefix_cache.stats()` last said, in the exporter's spelling. Rebound whole at the end
+        # of every request, because the HTTP thread reads it while a request may be mid-prefill and a
+        # `stats()` walk concurrent with a `store` is a `dictionary changed size`.
+        self._cache_metrics: dict[str, float] = {}
         self._ep: Any = None
         self._device: Any = None
         self._world = 1
@@ -246,6 +312,10 @@ class MimoBackend(BackendBase):
     def prepare(self) -> None:
         self._ensure_open()
         self._ensure_loaded()
+        # Here rather than inside `_load`, and for the reason the V4.1 adapter gives: every path that
+        # ends with a loaded model passes through `_ensure_loaded`, including the injected ones, and
+        # a store built in only one of them would be a switch that quietly does nothing on the others.
+        self._ensure_prefix_cache()
 
     def _init_distributed(self) -> None:
         """Join the group the launcher set, if there is one.
@@ -400,6 +470,54 @@ class MimoBackend(BackendBase):
         if self._world <= 1 or self._rank == 0:
             print(f"[mimo] {message}", flush=True)
 
+    def _ensure_prefix_cache(self) -> None:
+        """Build this rank's store, once, or leave it off and say why.
+
+        Idempotent and called from every path that is about to serve: ``prepare`` so the store exists
+        before the first request and ``capabilities`` can report it, and the two request funnels so a
+        caller that never prepared -- a test, an embedding application, the worker loop -- gets the
+        store rather than a silent `None`. A second build would replace a store the first is already
+        serving from, so the check-and-build is under the state lock.
+
+        **Every rank builds one, and that is not a choice.** A rank that resumed a prompt its peers
+        forward-passed would enter a layer's ``all_reduce`` alone, which NCCL answers by hanging.
+        Nothing is broadcast to keep them agreeing because nothing has to be: the store is keyed by
+        the prompt's own tokens, and the budget, the anchor lengths and the geometry tag are the same
+        on every rank -- the split attention is even, so a snapshot's byte count is the same number
+        everywhere and the eviction decisions are the same sequence.
+
+        A cache that does not describe its layers is a stand-in rather than a cache, and the store is
+        left off with the reason recorded in ``capabilities.details``: the payload is the buffers a
+        snapshot walks, and a store over a cache nobody can walk would report misses forever while
+        holding nothing, which is a run whose numbers mean something different from the ones a
+        deployment gets.
+        """
+        with self._state_lock:
+            if self._prefix_cache is not None:
+                return
+            budget = int(self._options.prefix_cache_bytes)
+            if budget <= 0 or self._cache is None:
+                return
+            if not hasattr(self._cache, "layers"):
+                self._details["prefix_cache"] = (
+                    "off: this run's cache describes no state to snapshot"
+                )
+                return
+            from src.models.mimo_v2.prefix_cache import PrefixCache, geometry_tag
+
+            head = int(self._options.prefix_cache_head_tokens)
+            self._prefix_cache = PrefixCache(
+                budget_bytes=budget,
+                max_seq_len=self._max_seq_len,
+                tag=geometry_tag(self._cache, self._world, self._max_seq_len),
+                head_tokens=head,
+            )
+            self._details.update({
+                "prefix_cache_bytes": budget,
+                "prefix_cache_head_tokens": head,
+            })
+            self._say(f"prefix cache {budget} bytes a rank, head anchor {head} tokens")
+
     # -------------------------------------------------------------------- contract
 
     @property
@@ -413,7 +531,10 @@ class MimoBackend(BackendBase):
             supports_streaming=True,
             supports_cancellation=True,
             supports_logprobs=False,
-            supports_prefix_caching=False,
+            # The store's existence rather than the option that would build one: a budget the
+            # launcher set on a cache that cannot be snapshotted is a run with no store, and a
+            # capability that reported it anyway is how a deployment sizes a budget it never gets.
+            supports_prefix_caching=self._prefix_cache is not None,
             details=dict(self._details),
         )
 
@@ -422,7 +543,11 @@ class MimoBackend(BackendBase):
 
         The expert bank's own counters and the draw's per-token weight are properties of the run
         rather than of a request: what a step costs is a function of the deal and the arena, and a
-        client reading a rate wants to know which one it was measured under.
+        client reading a rate wants to know which one it was measured under. The prefix store's
+        counters ride along for the same reason -- no request owns a share of a store that outlives
+        it -- and they are read from the snapshot the last request's end rebound rather than from the
+        store itself: the HTTP thread is not under the request lock, and a `stats()` walk concurrent
+        with a `store` is a `dictionary changed size`.
         """
         experts = getattr(self._model, "experts", None)
         if experts is None:
@@ -441,6 +566,31 @@ class MimoBackend(BackendBase):
             "mimo_experts_per_call": float(held.chunk_rows or 0),
             "mimo_kv_cache_bytes": float(self._cache.memory_bytes) if self._cache else 0.0,
             "mimo_world": float(self._world),
+            **self._cache_metrics,
+        }
+
+    def _publish_cache_metrics(self) -> None:
+        """Hand the store's counters to the exporter, in the names ``/metrics`` reads.
+
+        The store owns these numbers and no request owns a share of them -- hits and misses are
+        cumulative over the process -- so they travel as whole values rather than as per-request
+        deltas the HTTP layer would have to accumulate. The ``_total`` suffix is Prometheus's
+        convention for a counter and is the whole of the type dispatch at the other end: a name
+        without it is a gauge. ``budget_bytes`` is here rather than only in ``capabilities`` because
+        it is what makes ``bytes`` readable as a fraction, which is the one number that says whether
+        the store is the right size for the traffic.
+        """
+        cache = self._prefix_cache
+        if cache is None:
+            return
+        stats = cache.stats()
+        self._cache_metrics = {
+            "prefix_cache_hits_total": stats["hits"],
+            "prefix_cache_misses_total": stats["misses"],
+            "prefix_cache_reused_tokens_total": stats["reused_tokens"],
+            "prefix_cache_entries": stats["entries"],
+            "prefix_cache_bytes": stats["bytes"],
+            "prefix_cache_budget_bytes": stats["budget_bytes"],
         }
 
     # -------------------------------------------------------------------- requests
@@ -580,22 +730,30 @@ class MimoBackend(BackendBase):
         from src.models.mimo_v2.generate import generate
 
         self._ensure_loaded()
+        self._ensure_prefix_cache()
         params = request.sampling_params
         self._dispatch(request, prompt_ids, budget)
-        return generate(
-            self._model,
-            prompt_ids,
-            max_new_tokens=budget,
-            temperature=float(params.temperature),
-            top_k=params.top_k if params.top_k is None else int(params.top_k),
-            top_p=params.top_p,
-            seed=params.seed,
-            eos_token_id=self._eos_tokens(),
-            chunk=self._options.prefill_chunk,
-            cache=self._cache,
-            on_token=None if on_token is None else (lambda token, _logits: on_token(token)),
-            on_step=self._step_sync(request.request_id, stop),
-        )
+        try:
+            generation = generate(
+                self._model,
+                prompt_ids,
+                max_new_tokens=budget,
+                temperature=float(params.temperature),
+                top_k=params.top_k if params.top_k is None else int(params.top_k),
+                top_p=params.top_p,
+                seed=params.seed,
+                eos_token_id=self._eos_tokens(),
+                chunk=self._options.prefill_chunk,
+                cache=self._cache,
+                prefix_cache=self._prefix_cache,
+                on_token=None if on_token is None else (lambda token, _logits: on_token(token)),
+                on_step=self._step_sync(request.request_id, stop),
+            )
+        finally:
+            # Under the request lock, like the run itself, so the counters are the state of the store
+            # between requests rather than of one mid-prefill.
+            self._publish_cache_metrics()
+        return generation
 
     def _dispatch(
         self, request: GenerationRequest, prompt_ids: Sequence[int], budget: int
@@ -669,7 +827,9 @@ class MimoBackend(BackendBase):
             text=text,
             finish_reason=finish,
             usage=Usage(
-                prompt_tokens=len(prompt_ids), completion_tokens=len(generation.tokens)
+                prompt_tokens=len(prompt_ids),
+                completion_tokens=len(generation.tokens),
+                cached_tokens=int(getattr(generation, "cached_tokens", 0)),
             ),
             timings=TimingMetrics(
                 prefill_seconds=generation.prefill_seconds,
@@ -792,23 +952,36 @@ class MimoBackend(BackendBase):
         dist.barrier()
 
     def _run_payload(self, payload: Mapping[str, Any]) -> None:
-        """Run the same loop rank 0 is running, for the collective's sake and not for its answer."""
+        """Run the same loop rank 0 is running, for the collective's sake and not for its answer.
+
+        The store is this rank's own, built the same way from the same options and fed the same
+        requests, which is what makes the two loops agree about *how much* of the prompt to forward.
+        They have to: a rank that resumed a prompt its peers prefilled from zero would be inside a
+        different set of layers' collectives, and the two sides of an `all_reduce` that disagree
+        about when they enter it is not a wrong answer but a hang. Nothing is broadcast to enforce
+        it, because the store is a function of the request and the options and of nothing local.
+        """
         from src.models.mimo_v2.generate import generate
 
+        self._ensure_prefix_cache()
         prompt_ids = [int(token) for token in payload["prompt_ids"]]
-        generate(
-            self._model,
-            prompt_ids,
-            max_new_tokens=int(payload["max_new_tokens"]),
-            temperature=float(payload["temperature"]),
-            top_k=payload["top_k"],
-            top_p=payload["top_p"],
-            seed=payload["seed"],
-            eos_token_id=self._eos_tokens(),
-            chunk=self._options.prefill_chunk,
-            cache=self._cache,
-            on_step=self._step_sync(str(payload["request_id"])),
-        )
+        try:
+            generate(
+                self._model,
+                prompt_ids,
+                max_new_tokens=int(payload["max_new_tokens"]),
+                temperature=float(payload["temperature"]),
+                top_k=payload["top_k"],
+                top_p=payload["top_p"],
+                seed=payload["seed"],
+                eos_token_id=self._eos_tokens(),
+                chunk=self._options.prefill_chunk,
+                cache=self._cache,
+                prefix_cache=self._prefix_cache,
+                on_step=self._step_sync(str(payload["request_id"])),
+            )
+        finally:
+            self._publish_cache_metrics()
 
     def close(self) -> None:
         already_closed = self._closed
@@ -919,4 +1092,11 @@ def _hold_back(text: str, stops: Sequence[str]) -> str:
     return text[: len(text) - keep] if keep else text
 
 
-__all__ = ["MimoBackend", "DEFAULT_EXPERT_ROWS", "DEFAULT_MAX_SEQ_LEN", "DEFAULT_PREFILL_CHUNK"]
+__all__ = [
+    "MimoBackend",
+    "DEFAULT_EXPERT_ROWS",
+    "DEFAULT_MAX_SEQ_LEN",
+    "DEFAULT_PREFILL_CHUNK",
+    "DEFAULT_PREFIX_CACHE_BYTES",
+    "DEFAULT_PREFIX_CACHE_HEAD_TOKENS",
+]
