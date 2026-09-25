@@ -22,6 +22,13 @@ void Linear::forward(
             std::string("Qwen Ascend path is not implemented for ") +
             qwen_linear_kind_name(linear.kind));
     }
+    // The rotation is a CUDA kernel as well, and a folded weight read without it
+    // produces fluent nonsense rather than an error, so it fails here too.
+    if (linear.input_rotated) {
+        throw std::runtime_error(
+            "Qwen Ascend path is not implemented for a folded (rotated-frame) "
+            "weight");
+    }
     // One activation row against the weight shard, with the activation's batch
     // dimension broadcast over that row so the Cube's M tile is full.
     //
@@ -60,6 +67,14 @@ void Linear::forward(
                       : "FP16 activation/weight projection");
     return;
 #else
+    // The checkpoint's incoherence transform, when it folded this weight: the
+    // stored matrix is in a rotated frame and the activation has to be rotated
+    // into it. The engine owns the sign vectors and the buffer, and hands back
+    // the same buffer to a second consumer of the same activation -- one layer
+    // feeds five projections from one normalized hidden state.
+    if (linear.input_rotated) {
+        input = runtime.rotate_activation(input, rows, columns, site);
+    }
     if (linear.kind == QwenLinearKind::Fp8Block128) {
         if (rows == 1) {
             require_launch(qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
@@ -118,6 +133,20 @@ void Linear::forward(
                       blocks_per_row, linear.weight_global_factor),
                 "NVFP4 group-16 reference projection");
         }
+    } else if (linear.kind == QwenLinearKind::Ptq1_0) {
+        // The ternary pack is read where it lies: 128 three-valued weights and
+        // an fp16 block scale in 28 bytes, with no expansion to fp16 -- which is
+        // the whole point of the format, since the expanded form is ten times
+        // the bytes and does not fit beside a KV cache on one card. One row at a
+        // time takes the GEMV, which splits K across the block; anything wider
+        // takes the tiled GEMM.
+        require_launch(rows == 1
+            ? qwen_ptq1_0_matvec_f16_cuda(
+                  input, linear.weight.u8_data(), output, output_rows, columns)
+            : qwen_ptq1_0_matmul_rows_f16_cuda(
+                  input, linear.weight.u8_data(), output, rows, output_rows,
+                  columns, columns, output_rows),
+            "PTQ1_0 ternary projection");
     } else if (linear.kind == QwenLinearKind::DenseF16) {
         // The fused DeltaNet a/b matrix is only 24 rows per TP4 rank. At
         // verify width 8, tensor cores are ~5x faster than the generic

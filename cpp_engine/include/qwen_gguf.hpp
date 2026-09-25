@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gguf_reader.hpp"
+#include "qwen_hadamard.hpp"
 #include "qwen_weights.hpp"
 
 #include <optional>
@@ -44,6 +45,10 @@ public:
     // adds the one, so the loader takes it back out.
     bool folds_one_plus_norm_gamma() const override { return true; }
 
+    // Likewise for the gated-DeltaNet decay: the conversion writes
+    // `ssm_a = -exp(A_log)`, and the gates kernel takes `A_log`.
+    bool folds_negative_exp_a_log() const override { return true; }
+
     // A GGUF states a tensor's GGML type rather than the model's element type.
     // The map declares what the model holds -- a 16-bit element for every dense
     // tensor, fp8 or fp32 for the scale metadata that only an FP8 checkpoint
@@ -56,6 +61,14 @@ public:
     // See the definition; this is the one place where the file's row order is not
     // the model's.
     std::vector<uint64_t> row_order(const QwenSourceTensor& tensor) const override;
+
+    // The incoherence transform this file declares, or null when it declares
+    // none. Read from the file's own `prism.hadamard.*` block rather than
+    // assumed from the fact that it holds ternary weights: a ternary checkpoint
+    // without the block is one whose weights were quantized without the fold,
+    // and applying one to it anyway would be wrong in a way nothing downstream
+    // would catch.
+    const QwenHadamardSpec* hadamard() const override;
 
     const GGUFFile& file() const { return file_; }
 
@@ -73,6 +86,9 @@ private:
 
     GGUFFile file_;
     mutable std::optional<ValueHeads> value_heads_;
+    // Parsed on the first ask, refused on the first ask if it is malformed.
+    mutable std::optional<QwenHadamardSpec> hadamard_;
+    mutable bool hadamard_parsed_ = false;
 };
 
 // The GGUF spelling of a canonical Qwen tensor name, or an empty string when the

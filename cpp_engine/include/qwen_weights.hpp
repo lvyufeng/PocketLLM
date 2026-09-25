@@ -35,6 +35,11 @@ enum class QwenLinearKind {
     Ptq1_0,
 };
 
+// The incoherence transform a ternary container declares. Forward-declared
+// because the source interface answers with it and only the containers that
+// declare one have to know what it is.
+class QwenHadamardSpec;
+
 // One tensor as a checkpoint holds it, resolved from its canonical name.
 //
 // `shape` is spelled the way this file and the engine spell shapes -- [out, in],
@@ -121,14 +126,32 @@ public:
     // bakes the convention in because its kernels apply the weight directly; an
     // HF export stores gamma and lets the runtime add the one.
     virtual bool folds_one_plus_norm_gamma() const { return false; }
+
+    // True when the stored decay is already `-exp(A_log)`. Same reason as the
+    // norm fold: the fork's converter applies the exponential for a GGML graph,
+    // which multiplies by the decay, while the gates kernel here takes the log
+    // and applies `-exp` itself. An HF export stores `A_log` and needs no fold.
+    virtual bool folds_negative_exp_a_log() const { return false; }
+
+    // The incoherence transform this container declares, or null when it
+    // declares none -- which is every checkpoint that is not ternary, since a
+    // 1.75-bit weight is the reason to have one at all. The map reads it to give
+    // each linear the input transform its weight was folded against, and the
+    // engine reads it to rotate the activations that meet those weights.
+    virtual const QwenHadamardSpec* hadamard() const { return nullptr; }
 };
 
 // The HF safetensors directory, as a source. A directory is many files, so the
 // lookup opens the one the tensor is in and keeps it open.
 class SafeTensorsCheckpointSource : public QwenCheckpointSource {
 public:
+    // An index the caller owns and keeps alive. This is the spelling every
+    // caller written before the engine had a source uses.
     explicit SafeTensorsCheckpointSource(const SafeTensorsIndex& index)
-        : index_(index) {}
+        : owned_index_(), index_(index) {}
+    // A directory this source owns. The engine opens a checkpoint by path and
+    // has nowhere else to keep an index alive, so the reading is the source's.
+    explicit SafeTensorsCheckpointSource(const std::string& directory);
 
     QwenSourceTensor lookup(const std::string& canonical_name) const override;
     const uint8_t* data_of(const QwenSourceTensor& tensor) const override;
@@ -139,6 +162,8 @@ public:
     const SafeTensorsIndex& index() const { return index_; }
 
 private:
+    // Set only by the directory constructor; `index_` refers to it.
+    std::unique_ptr<SafeTensorsIndex> owned_index_;
     const SafeTensorsIndex& index_;
     // Shards stay open for the source's lifetime. The materializer reads through
     // a pointer into the mmap, and a shard closed at the end of the lookup would
@@ -146,6 +171,13 @@ private:
     // caller, which is the same thing SafetensorsWeightSource does.
     mutable std::map<std::string, std::unique_ptr<SafeTensorsShard>> shards_;
 };
+
+// The checkpoint a path names, as a source: a single-file GGUF, or an HF
+// safetensors directory. The extension is the whole of the choice -- a GGUF is
+// one file and a directory cannot be one -- and both containers answer the same
+// interface, which is what lets every caller above this line stay blind to
+// which of them it was handed.
+std::unique_ptr<QwenCheckpointSource> open_qwen_checkpoint(const std::string& path);
 
 struct QwenTensorRef {
     std::string name;
@@ -263,6 +295,10 @@ struct QwenDeviceTensor {
 
 struct QwenLinearRef {
     QwenLinearKind kind = QwenLinearKind::DenseF16;
+    // The canonical name, kept so that a consumer can ask the checkpoint's own
+    // declarations about this weight rather than matching on its place in the
+    // model.
+    std::string name;
     std::vector<uint64_t> logical_full_shape;
     std::vector<uint64_t> logical_local_shape;
     QwenShardRule rule = QwenShardRule::Replicated;
@@ -271,6 +307,17 @@ struct QwenLinearRef {
     QwenTensorRef scale;
     QwenTensorRef weight_global_scale;
     QwenTensorRef input_global_scale;
+    // The activation transform this weight's input goes through, as the
+    // container declared it. A weight that was folded is in a rotated frame, so
+    // its input has to be rotated into that frame; a weight that was not takes
+    // the activation as it is. Both false for every checkpoint that declares no
+    // transform, which is all of them but the ternary one.
+    //
+    // The transform is the whole of the activation-side story. A checkpoint
+    // whose value axis arrives in a different head order is normalized on the
+    // way in instead, by `QwenCheckpointSource::row_order`, so no reorder is
+    // declared here.
+    bool input_rotated = false;
     bool has_scale = false;
     bool has_weight_global_scale = false;
     bool has_input_global_scale = false;
@@ -460,7 +507,7 @@ void qwen_apply_norm_gamma_policy(const QwenTensorRef& ref, QwenHostTensor& host
 void qwen_apply_conv_weight_layout_policy(const QwenTensorRef& ref,
                                          QwenHostTensor& host);
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
-    const SafeTensorsIndex& index, const QwenLinearRef& ref);
+    const QwenCheckpointSource& source, const QwenLinearRef& ref);
 QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
@@ -468,7 +515,7 @@ QwenDeviceTensor qwen_upload_tensor(const QwenCheckpointSource& source,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
-    const SafeTensorsIndex& index, const QwenLinearRef& ref,
+    const QwenCheckpointSource& source, const QwenLinearRef& ref,
     float* weight_global_factor, float* input_global_scale,
     void* stream = nullptr);
 

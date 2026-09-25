@@ -22,6 +22,12 @@ struct DeviceLinear {
     // input_global_scale is calibration metadata the SM75 path does not apply.
     float weight_global_factor = 1.0f;
     float input_global_scale = 1.0f;
+    // The checkpoint folded this matrix into a rotated frame, so the activation
+    // has to be rotated into the same frame before the projection. Declared by
+    // the file rather than inferred from the kind: a ternary checkpoint is
+    // incoherent without it, and one artifact's list of folded tensors is not
+    // another's.
+    bool input_rotated = false;
 };
 
 struct DeviceLinearAttention {

@@ -517,6 +517,36 @@ bool convert_f32_to_f16(const float* x, uint16_t* y, int64_t count, cudaStream_t
     return cudaGetLastError() == cudaSuccess;
 }
 
+// The tail the two output widths share. Both kernels leave their result in fp32
+// in the workspace, so the fp16 entry point is the fp32 one plus a narrowing and
+// not a second kernel: exactly one of the two destination pointers is set. The
+// target head reads fp32 logits -- 152064 of them for this vocabulary -- and
+// rounding them to fp16 on the way out would put the sampler's own arithmetic on
+// a coarser grid than the accumulator it came from.
+bool store_result(const float* dst, float* d_y_f32, uint16_t* d_y_f16, int batch,
+                  int rows, int y_stride, cudaStream_t stream) {
+    if (y_stride == rows) {
+        if (d_y_f32 != nullptr) {
+            return cudaMemcpyAsync(d_y_f32, dst, (size_t) batch * rows * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+        }
+        return convert_f32_to_f16(dst, d_y_f16, (int64_t) batch * rows, stream);
+    }
+    for (int t = 0; t < batch; ++t) {
+        if (d_y_f32 != nullptr) {
+            if (cudaMemcpyAsync(d_y_f32 + (size_t) t * y_stride, dst + (size_t) t * rows,
+                                (size_t) rows * sizeof(float), cudaMemcpyDeviceToDevice,
+                                stream) != cudaSuccess) {
+                return false;
+            }
+        } else if (!convert_f32_to_f16(dst + (size_t) t * rows, d_y_f16 + (size_t) t * y_stride,
+                                       rows, stream)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool check_shape(int rows, int cols, int batch) {
     if (rows <= 0 || cols <= 0 || batch <= 0) {
         return false;
@@ -528,10 +558,9 @@ bool check_shape(int rows, int cols, int batch) {
 
 }  // namespace
 
-bool qwen_ptq1_0_matmul_rows_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
-                                      uint16_t* d_y_fp16, int batch, int rows, int cols,
-                                      int x_stride, int y_stride, void* stream_ptr) {
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+bool ptq1_0_matmul_rows(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+                        float* d_y_f32, uint16_t* d_y_f16, int batch, int rows,
+                        int cols, int x_stride, int y_stride, cudaStream_t stream) {
     if (!check_shape(rows, cols, batch)) return false;
     if (x_stride < cols || y_stride < rows) return false;
 
@@ -573,21 +602,27 @@ bool qwen_ptq1_0_matmul_rows_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d
         return false;
     }
 
-    if (y_stride == rows) {
-        return convert_f32_to_f16(dst, d_y_fp16, y_elements, stream);
-    }
-    for (int t = 0; t < batch; ++t) {
-        if (!convert_f32_to_f16(dst + (size_t) t * rows, d_y_fp16 + (size_t) t * y_stride, rows,
-                                stream)) {
-            return false;
-        }
-    }
-    return true;
+    return store_result(dst, d_y_f32, d_y_f16, batch, rows, y_stride, stream);
 }
 
-bool qwen_ptq1_0_matvec_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
-                                 uint16_t* d_y_fp16, int rows, int cols, void* stream_ptr) {
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+bool qwen_ptq1_0_matmul_rows_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+                                      uint16_t* d_y_fp16, int batch, int rows, int cols,
+                                      int x_stride, int y_stride, void* stream_ptr) {
+    return ptq1_0_matmul_rows(d_x_fp16, d_blocks, nullptr, d_y_fp16, batch, rows, cols,
+                              x_stride, y_stride,
+                              reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool qwen_ptq1_0_matmul_rows_f16_f32_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+                                          float* d_y_f32, int batch, int rows, int cols,
+                                          int x_stride, int y_stride, void* stream_ptr) {
+    return ptq1_0_matmul_rows(d_x_fp16, d_blocks, d_y_f32, nullptr, batch, rows, cols,
+                              x_stride, y_stride,
+                              reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool ptq1_0_matvec(const uint16_t* d_x_fp16, const uint8_t* d_blocks, float* d_y_f32,
+                   uint16_t* d_y_f16, int rows, int cols, cudaStream_t stream) {
     if (!check_shape(rows, cols, 1)) return false;
 
     const int blocks_per_row = cols / QK_PTQ1_0;
@@ -630,7 +665,7 @@ bool qwen_ptq1_0_matvec_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_bloc
         ptq1_0_decode_kernel<<<grid, block, smem, stream>>>(y_q, d_blocks, dst, blocks_per_row,
                                                            rows, 1);
         if (cudaGetLastError() != cudaSuccess) return false;
-        return convert_f32_to_f16(dst, d_y_fp16, rows, stream);
+        return store_result(dst, d_y_f32, d_y_f16, 1, rows, rows, stream);
     }
 
     ptq1_0_decode_kernel<<<grid, block, smem, stream>>>(y_q, d_blocks, part, blocks_per_row, rows,
@@ -638,7 +673,104 @@ bool qwen_ptq1_0_matvec_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_bloc
     if (cudaGetLastError() != cudaSuccess) return false;
     ptq1_0_decode_reduce_kernel<<<grid_blocks(rows, 256), 256, 0, stream>>>(part, dst, rows, split);
     if (cudaGetLastError() != cudaSuccess) return false;
-    return convert_f32_to_f16(dst, d_y_fp16, rows, stream);
+    return store_result(dst, d_y_f32, d_y_f16, 1, rows, rows, stream);
+}
+
+bool qwen_ptq1_0_matvec_f16_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+                                 uint16_t* d_y_fp16, int rows, int cols, void* stream_ptr) {
+    return ptq1_0_matvec(d_x_fp16, d_blocks, nullptr, d_y_fp16, rows, cols,
+                         reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+bool qwen_ptq1_0_matvec_f16_f32_cuda(const uint16_t* d_x_fp16, const uint8_t* d_blocks,
+                                     float* d_y_f32, int rows, int cols, void* stream_ptr) {
+    return ptq1_0_matvec(d_x_fp16, d_blocks, d_y_f32, nullptr, rows, cols,
+                         reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// ---------------------------------------------------------------------------
+// The embedding table, read where it lies.
+//
+// A row lookup against a ternary table is the same problem as a row against an
+// fp16 one, and the difference decides the memory budget: expanding the table at
+// load costs 5120 fp16 per row -- 2.4 GiB for a 248,320-token vocabulary, on a
+// card where the whole 27B model is 5.5 GiB -- while reading it as blocks costs
+// 1120 bytes per row actually looked up. The expanded table does not fit beside a
+// KV cache on one card; this is what lets it not have to.
+//
+// The value is exact: a trit is -1, 0 or 1 and the block scale is a finite fp16,
+// so the product is representable in fp16 without rounding, and the lookup
+// reproduces the reference bit for bit rather than nearly.
+// ---------------------------------------------------------------------------
+
+// The stage walk that decodes one weight of a block, from the format's own
+// definition: two qs stages of 16 and 8 bytes over weights 0..79 and 80..119,
+// then qh's eight weights with its two bytes interleaved by parity. The
+// arithmetic is uint8_t in the reference implementation, so the wrap below is
+// masked in rather than avoided.
+__device__ __forceinline__ int ptq1_0_trit_at(const block_ptq1_0* __restrict__ b,
+                                              int index) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t byte = 0;
+    int shift = 1;
+    if (index < 80) {
+        byte = b->qs[index % 16];
+        shift = pow3[index / 16];
+    } else if (index < 120) {
+        const int within = index - 80;
+        byte = b->qs[16 + within % 8];
+        shift = pow3[within / 8];
+    } else {
+        const int within = index - 120;
+        byte = b->qh[within % 2];
+        shift = pow3[within / 2];
+    }
+    const uint8_t q = static_cast<uint8_t>(byte * shift);
+    return ((q * 3) >> 8) - 1;
+}
+
+// One thread per weight: 128 threads for a block's 128 weights, one block per
+// (row, 128-weight run). Every thread reads the whole 28-byte block, which is one
+// cache line and the same line for all of them. A token this rank does not hold
+// gathers zeros, because the caller sums the ranks' rows.
+__global__ void ptq1_0_embedding_gather_kernel(
+        const uint8_t* __restrict__ table, const int* __restrict__ tokens,
+        uint16_t* __restrict__ output, int cols, int row_start, int row_count) {
+    const int row = blockIdx.y;
+    const int group = blockIdx.x;
+    const int index = threadIdx.x;
+    const long destination =
+        static_cast<long>(row) * cols + static_cast<long>(group) * QK_PTQ1_0 + index;
+    const int token = tokens[row];
+    if (token < row_start || token >= row_start + row_count) {
+        output[destination] = 0;
+        return;
+    }
+    const int groups_per_row = cols / QK_PTQ1_0;
+    const block_ptq1_0* block = reinterpret_cast<const block_ptq1_0*>(
+        table + (static_cast<size_t>(token - row_start) * groups_per_row + group) *
+                    sizeof(block_ptq1_0));
+    const float value = static_cast<float>(ptq1_0_trit_at(block, index)) *
+                        __half2float(block->d);
+    output[destination] = __half_as_ushort(__float2half(value));
+}
+
+bool qwen_embedding_ptq1_0_gather_f16_cuda(const uint8_t* d_table_blocks,
+                                           const int* d_tokens, uint16_t* d_out_fp16,
+                                           int count, int cols, int row_start,
+                                           int row_count, void* stream_ptr) {
+    if (d_table_blocks == nullptr || d_tokens == nullptr || d_out_fp16 == nullptr) {
+        return false;
+    }
+    if (count <= 0 || cols <= 0 || cols % QK_PTQ1_0 != 0 || row_start < 0 ||
+        row_count <= 0) {
+        return false;
+    }
+    const dim3 grid(cols / QK_PTQ1_0, count, 1);
+    ptq1_0_embedding_gather_kernel<<<grid, QK_PTQ1_0, 0,
+                                     reinterpret_cast<cudaStream_t>(stream_ptr)>>>(
+        d_table_blocks, d_tokens, d_out_fp16, cols, row_start, row_count);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 }  // namespace pocket

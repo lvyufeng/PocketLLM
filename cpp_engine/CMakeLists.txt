@@ -48,6 +48,7 @@ set(POCKET_CORE_SOURCES
     core/block_table.cpp
     core/qwen_weight_map.cpp
     core/qwen_gguf_source.cpp
+    core/qwen_hadamard.cpp
     core/tokenizer.cpp
     core/tensor.cpp
     core/sampler.cpp
@@ -153,6 +154,7 @@ if(POCKET_BACKEND STREQUAL "cuda")
         # rather than a directory-wide include, so no other translation unit can
         # pick up the fork's global macros by accident.
         backends/cuda/kernels/qwen_ternary_ops.cu
+        backends/cuda/kernels/qwen_hadamard_ops.cu
         backends/cuda/kernels/qwen_nvfp4_ops.cu
         backends/cuda/kernels/qwen_gqa_optimized.cu
         backends/cuda/kernels/qwen_gdn_flashqla.cu
@@ -966,6 +968,14 @@ set_target_properties(test_qwen_half_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${C
 add_executable(test_qwen_ternary_gemm tests/test_qwen_ternary_gemm.cpp)
 target_link_libraries(test_qwen_ternary_gemm PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_ternary_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_hadamard_ops tests/test_qwen_hadamard_ops.cpp)
+target_link_libraries(test_qwen_hadamard_ops PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_hadamard_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_ternary_engine tests/test_qwen_ternary_engine.cpp)
+target_link_libraries(test_qwen_ternary_engine PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ternary_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_batched_decode tests/test_qwen_batched_decode.cpp)
 target_link_libraries(test_qwen_batched_decode PRIVATE pocket_cpp_core)

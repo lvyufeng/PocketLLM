@@ -6,6 +6,10 @@
 
 #include "qwen_weights.hpp"
 
+#include "qwen_gguf.hpp"
+#include "qwen_hadamard.hpp"
+#include "weight_source.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -28,6 +32,12 @@ std::string shape_string(const std::vector<uint64_t>& shape) {
     }
     out << ']';
     return out.str();
+}
+
+bool has_suffix(const std::string& value, const char* suffix) {
+    const std::string tail(suffix);
+    return value.size() >= tail.size() &&
+           value.compare(value.size() - tail.size(), tail.size(), tail) == 0;
 }
 
 void require_tp(int world, int rank) {
@@ -169,6 +179,19 @@ size_t SafeTensorsCheckpointSource::tensor_count() const {
     return index_.weight_map().size();
 }
 
+SafeTensorsCheckpointSource::SafeTensorsCheckpointSource(
+    const std::string& directory)
+    : owned_index_(std::make_unique<SafeTensorsIndex>(directory)),
+      index_(*owned_index_) {}
+
+std::unique_ptr<QwenCheckpointSource> open_qwen_checkpoint(
+    const std::string& path) {
+    if (is_gguf_path(path)) {
+        return std::make_unique<QwenGgufSource>(path);
+    }
+    return std::make_unique<SafeTensorsCheckpointSource>(path);
+}
+
 SafeDType qwen_device_dtype(SafeDType storage_dtype) {
     // Every checkpoint BF16 tensor is materialized as IEEE FP16 before upload.
     // This applies equally to the official BF16 Qwen3.8 checkpoint and to the BF16
@@ -284,6 +307,12 @@ bool qwen_is_one_plus_norm_gamma(const std::string& name) {
            name == "mtp.norm.weight";
 }
 
+bool qwen_is_a_log(const std::string& name) {
+    static const std::string tail("linear_attn.A_log");
+    return name.size() >= tail.size() &&
+           name.compare(name.size() - tail.size(), tail.size(), tail) == 0;
+}
+
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
     // A directory is a source like any other; the wrapper exists so that a caller
@@ -376,10 +405,24 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
             // small gamma away.
             const bool fold = source.folds_one_plus_norm_gamma() &&
                               qwen_is_one_plus_norm_gamma(ref.name);
+            // The decay is the other baked-in convention, and it is inverted
+            // rather than offset: the file holds `-exp(A_log)`, which is
+            // negative everywhere and which the gates kernel would exponentiate
+            // a second time. Undoing it in fp32 before the narrowing keeps the
+            // log's dynamic range -- `-exp` squeezes a log down to a magnitude
+            // below 1, where fp16 still resolves it, but the recovery is exact
+            // only if it happens first.
+            const bool decay = source.folds_negative_exp_a_log() && qwen_is_a_log(ref.name);
             const float* values = reinterpret_cast<const float*>(src);
             uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
             for (uint64_t i = 0; i < elements; ++i) {
-                const float value = fold ? values[i] - 1.0f : values[i];
+                float value = fold ? values[i] - 1.0f : values[i];
+                if (decay) {
+                    if (!(value < 0.0f)) {
+                        throw std::runtime_error("Qwen A_log is not a negative exponential: " + ref.name);
+                    }
+                    value = std::log(-value);
+                }
                 halves[i] = qwen_float_to_fp16_bits(value);
             }
         } else {
@@ -445,6 +488,33 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
         copy_rows(ref.shard_start, rows, destination, local_row_bytes);
         return out;
     }
+    if (shard_dim == 1 && ref.full_shape.size() == 2 && info.ternary_blocks) {
+        // A packed column axis is not an element array: the columns are runs of
+        // 128-weight blocks, 28 bytes each, so the shard is a run of *blocks* and
+        // both of its ends have to land on a block boundary. A shard that started
+        // inside a block would take half of that block's scale with it and the
+        // two ranks would decode the same 28 bytes differently -- which is why
+        // this branch exists rather than the generic one below, whose column
+        // arithmetic counts elements.
+        //
+        // `local_shape[1]` is the packed width, where `shard_size` is in weights:
+        // the descriptor carries both, deliberately (see ternary_storage_shape).
+        const uint64_t rows = ref.full_shape[0];
+        const uint64_t source_cols = ref.full_shape[1];
+        const uint64_t local_cols = ref.local_shape[1];
+        if (ref.shard_start + ref.shard_size > source_cols ||
+            local_cols != ternary_row_bytes(ref.shard_size, ref.name)) {
+            throw std::runtime_error("Qwen dim-1 packed shard shape mismatch: " + ref.name);
+        }
+        const uint64_t source_row_bytes = ternary_row_bytes(source_cols, ref.name);
+        const uint64_t first_byte = ref.shard_start / 128 * (source_row_bytes / (source_cols / 128));
+        for (uint64_t row = 0; row < rows; ++row) {
+            std::memcpy(destination + row * local_cols,
+                        source_row(row) + first_byte,
+                        static_cast<size_t>(local_cols));
+        }
+        return out;
+    }
     if (shard_dim == 1 && ref.full_shape.size() == 2) {
         const uint64_t rows = ref.full_shape[0];
         const uint64_t source_cols = ref.full_shape[1];
@@ -464,7 +534,7 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
 }
 
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
-    const SafeTensorsIndex& index, const QwenLinearRef& ref) {
+    const QwenCheckpointSource& source, const QwenLinearRef& ref) {
     if (ref.kind != QwenLinearKind::NvFp4Group16 || !ref.has_scale ||
         !ref.has_weight_global_scale || !ref.has_input_global_scale ||
         ref.logical_local_shape.size() != 2) {
@@ -476,12 +546,12 @@ QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
         throw std::runtime_error(
             "Qwen NVFP4 logical local shape is not block64 aligned");
     }
-    const QwenHostTensor packed = qwen_materialize_host_tensor(index, ref.weight);
-    const QwenHostTensor scales = qwen_materialize_host_tensor(index, ref.scale);
+    const QwenHostTensor packed = qwen_materialize_host_tensor(source, ref.weight);
+    const QwenHostTensor scales = qwen_materialize_host_tensor(source, ref.scale);
     const QwenHostTensor weight_global =
-        qwen_materialize_host_tensor(index, ref.weight_global_scale);
+        qwen_materialize_host_tensor(source, ref.weight_global_scale);
     const QwenHostTensor input_global =
-        qwen_materialize_host_tensor(index, ref.input_global_scale);
+        qwen_materialize_host_tensor(source, ref.input_global_scale);
     const uint64_t expected_packed = rows * cols / 2;
     const uint64_t expected_scales = rows * cols / 16;
     if (packed.device_dtype != SafeDType::U8 ||
@@ -879,7 +949,23 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
     const std::string input_global_name = base + ".input_global_scale";
 
     QwenLinearRef result;
+    result.name = name;
     result.logical_full_shape = shape;
+    // How this weight's input arrives, from the container's own declaration. A
+    // checkpoint that declares no incoherence transform answers here with a false
+    // flag and every path below is then the identity.
+    //
+    // The rotation is the whole of it, and deliberately so: the one tensor whose
+    // value axis the file stores in a different head order -- the gated-DeltaNet
+    // output projection, the only folded matrix whose rotation axis is also its
+    // head axis -- is normalized by the loader, in
+    // `QwenGgufSource::row_order`, along with the six neighbours that carry the
+    // same axis. By the time the activation reaches this matrix the axis is in
+    // the order the recurrence and the matrix both use, so there is no
+    // activation-side reorder left to declare.
+    if (const QwenHadamardSpec* spec = source_.hadamard()) {
+        result.input_rotated = spec->folds(name);
+    }
     result.rule = rule;
     result.shard_dim = shard_dim;
     result.logical_local_shape = shape;

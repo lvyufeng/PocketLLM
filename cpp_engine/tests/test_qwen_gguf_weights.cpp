@@ -656,10 +656,17 @@ void check_two_sources(const pocket::QwenWeightMap& gguf_map,
         check(gate.read > 0.9, "ssm_beta agrees once the row order is read");
         check(gate.as_stored < 0.5, "ssm_beta disagrees as the file stores it");
 
-        // A_log: the GGUF stores -exp(A_log), the sibling stores A_log, so the
-        // comparison is in the log -- which is also what makes it an exact
-        // statement rather than a near one, since the file's value is a rounded
-        // exp of the sibling's and the log takes that rounding back out.
+        // A_log. The GGUF stores `-exp(A_log)` and the sibling stores `A_log`,
+        // and the loader undoes the exponential in fp32 before it narrows
+        // (`folds_negative_exp_a_log`), because the engine's gates kernel takes
+        // the log and applies the exponential itself. So the two containers
+        // materialize the same quantity and the comparison is direct.
+        //
+        // It is a correlation and not an equality: the two artifacts hold their
+        // own values of this tensor and differ on it at the percent level, as
+        // they do on the rest. What the arm pins is that undoing the exponential
+        // recovers the sibling's scale and sign; the negative control is the same
+        // values in the file's row order, which agree on nothing.
         const pocket::QwenHostTensor a_gguf = pocket::qwen_materialize_host_tensor(
             gguf_source, gguf_map.layers()[0].linear_attention.a_log);
         const pocket::QwenHostTensor a_sibling = pocket::qwen_materialize_host_tensor(
@@ -667,22 +674,26 @@ void check_two_sources(const pocket::QwenWeightMap& gguf_map,
         const std::vector<uint16_t> a_read = fp16_values(a_gguf);
         const std::vector<uint16_t> a_stored = rows_as_stored(a_gguf, value_head_order(0, 1));
         const std::vector<uint16_t> a_sibling_values = fp16_values(a_sibling);
-        std::vector<double> log_read;
-        std::vector<double> log_stored;
-        std::vector<double> log_sibling;
+        std::vector<double> a_read_values;
+        std::vector<double> a_stored_values;
+        std::vector<double> a_sibling_read;
+        double a_worst = 0.0;
         for (size_t i = 0; i < a_read.size(); ++i) {
             const double value = fp16_value(a_read[i]);
-            check(value < 0.0, "ssm_a is stored as -exp(A_log) and is negative");
-            log_read.push_back(std::log(-value));
-            log_stored.push_back(std::log(-fp16_value(a_stored[i])));
-            log_sibling.push_back(fp16_value(a_sibling_values[i]));
+            a_read_values.push_back(value);
+            a_stored_values.push_back(fp16_value(a_stored[i]));
+            a_sibling_read.push_back(fp16_value(a_sibling_values[i]));
+            a_worst = std::max(a_worst, std::abs(value - a_sibling_read.back()));
         }
-        const double a_read_cosine = centred_cosine(log_read, log_sibling);
-        const double a_stored_cosine = centred_cosine(log_stored, log_sibling);
-        std::cout << "[INFO] ssm_a log cosine read=" << a_read_cosine
-                  << " as stored=" << a_stored_cosine << "\n";
-        check(a_read_cosine > 0.99, "ssm_a is -exp(A_log) of the sibling's A_log");
+        const double a_read_cosine = centred_cosine(a_read_values, a_sibling_read);
+        const double a_stored_cosine = centred_cosine(a_stored_values, a_sibling_read);
+        std::cout << "[INFO] ssm_a cosine read=" << a_read_cosine
+                  << " as stored=" << a_stored_cosine << " worst=" << a_worst << "\n";
+        check(a_read_cosine > 0.99, "ssm_a materializes as the sibling's A_log");
         check(a_stored_cosine < 0.5, "ssm_a disagrees as the file stores it");
+        // Against magnitudes of order three, so this says "the same value to a
+        // few percent" rather than "the same bits".
+        check(a_worst < 0.1, "ssm_a matches the sibling at its own magnitude");
 
         const Ordered dt = compare_ordered(
             pocket::qwen_materialize_host_tensor(
