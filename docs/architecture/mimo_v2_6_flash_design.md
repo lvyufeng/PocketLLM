@@ -100,15 +100,29 @@ routed layer closes with an all-reduce and a rank that was not told about a requ
 not idle — it is at a different collective. A four-rank served run is in this page's
 own section.
 
+**And it reuses a prefix across requests.** The loop resets the cache at the top of every request, so
+a chat client that resends its history paid for that history on every turn — 12 s of four-rank
+prefill for a 2048-token prompt. The state a request leaves is now snapshotted to a rank's host
+memory, keyed by the prompt's own tokens, and the next request restores the longest prefix it shares
+with one already served and forwards the remainder. It is **5760 bytes a token plus 6.1 MiB** of
+attention state a rank, **4 GiB a rank** of budget, **on by default**, and it is agreed across the
+four ranks without a collective — the key is the prompt and the budget is a launcher option, so the
+same reuse happens everywhere and no rank walks into a layer's all-reduce alone. An exact repeat
+forwards nothing at all and samples the row the anchor already computed. A 4096-token prompt whose
+first 3072 tokens are already stored is **7.02 s against 23.90** for the same prompt with the store
+out of the way. The mechanism, the tolerances it is held to and its measurements are
+[on their own page](mimo_v2_6_flash_prefix_cache.md).
+
 What that is not: batching. The attention and the dense linears are
 still torch — the decode step's rotation, softmax and norms are kernels and the rest is not, and above
 `DECODE_KEYS` a global layer's span stops folding and the chunk path takes the call — and the served
-path is one request, one sequence. At 256k a step reads a quarter of a million keys once a rank,
+path is still one request, one sequence: a second request waits on a lock. What the store changes is
+what a request costs, not how many run at once. At 256k a step reads a quarter of a million keys once a rank,
 since this stage divides that work along the checkpoint's own four-way partition, and it is
 **180.0 ms — 5.56 tokens a second**, against 323.8 ms and 3.09 replicated — past the five a
 second this page was written against. What *is* gone from the earlier list is 256k, serving, the
-replicated attention and the attention's own copy of its prefix; the numbers are below, and the four
-kernels and the resident set that come after them are below that.
+replicated attention, the attention's own copy of its prefix and the repeated prompt; the numbers are
+below, and the four kernels and the resident set that come after them are below that.
 
 What exists:
 
@@ -137,7 +151,8 @@ What exists:
 | The experts kept on the card | Implemented and exact — `torch.equal` on 24 steps of a greedy chain, all four ranks. **117.3 ms against 156.3** at a short context with sixteen rows a layer, which is 1.33x; off by default because 9.36 GiB and a 262144-token cache do not fit on one 22 GiB card, and at that depth eight rows do and buy **174.3 against 180.0** |
 | The collectives, priced on the step | **6.6 ms of a 4096-key step** — 6.3 the all-reduce and 0.5 the all-gather — measured with the router's draw held, against the **52 ms** the device table's own `ncclDevKernel` rows would have you read |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
-| Batching, a scheduler, a prefix cache | Not implemented — one request at a time |
+| Batching, a scheduler | Not implemented — one request at a time |
+| Cross-request prefix caching | Implemented and served: the state after a prompt is snapshotted to a rank's host memory keyed by the prompt's own tokens, and a later request restores the longest prefix it shares and forwards only the rest. **4 GiB a rank, on by default**; the page is [here](mimo_v2_6_flash_prefix_cache.md) |
 | Sampling (`temperature`, `top_k`, `top_p`, `seed`) | Implemented and served; greedy unless a temperature is given, which is the checkpoint's own default. Repetition penalty, logit bias and grammar are absent |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
@@ -1694,6 +1709,15 @@ POCKETLLM_MIMO_ATTENTION_SHARDS=1 torchrun --nproc_per_node=4 \
     --out /tmp/tokens_whole.txt
 diff /tmp/tokens_split.txt /tmp/tokens_whole.txt
 
+# a chat turn with the previous turn's prefix already on the host: cold against warm on
+# one prompt, in one process, and the store, the restore and an exact repeat priced beside
+# them. The prompt is a real document through the checkpoint's own tokenizer, and the two
+# arms' final rows are held against each other -- they are not equal, and the line says by
+# how much, because a resume here is a chunk boundary and this model's chunked prefill is
+# not bit-exact. `--chunk-rows` is the served build's band; `--rounds 2` is the interleave
+torchrun --nproc_per_node=4 tests/probe_mimo_v2_prefix_cache.py \
+    --tokens 4096 --prefix 3072 --chunk 2048 --chunk-rows 16 --rounds 2 --budget 8
+
 # the served endpoint: chat, completions, streaming, cancel and metrics on four ranks.
 # `resident_rows` is a deployment's decision and not a constant -- 16 rows a layer is 9.36 GiB, so it
 # is what a short-context run should pay for and what a 262144-token one cannot: 8 fits there, 16
@@ -1780,7 +1804,8 @@ golden holds and how it was captured.
   exists, and it is a short-context one.
 - **One sequence, one request, no batching.** A second request would have to wait; the
   KV cache, the expert arena and the collectives are all single-sequence. The HTTP layer accepts
-  one at a time and the second blocks on a lock.
+  one at a time and the second blocks on a lock. What *does* carry across requests is the prefix
+  store below.
 - **At depth the attention and the dense linears are still torch.** Above `DECODE_KEYS` a decode
   step's span stops folding and the chunk path takes the call, so `mimo_decode_attention` — the
   one-row path's softmax, which is every windowed layer and every global layer below 1024 keys —
@@ -1835,12 +1860,16 @@ golden holds and how it was captured.
   reference — it is why its numbers can be trusted and why they are 37 s a token —
   but it also means the host cannot be run at a long context to check the device's
   cache at one.
-- **Serving is one request, one sequence, no prefix cache and no scheduler.** The adapter is an
-  OpenAI-compatible schema over the single-sequence loop in `src/models/mimo_v2/generate.py`, with
-  a cancel that is agreed across the ranks and a stop string that is agreed for the same reason. A
-  second request waits on a lock rather than being scheduled, a repeated prefix is prefilled again,
-  and a cancelled request's KV cache is reset rather than reused. What that buys is a deployment;
-  what it does not is concurrency.
+- **Serving is one request, one sequence and no scheduler, but it does reuse a prefix.** The adapter
+  is an OpenAI-compatible schema over the single-sequence loop in `src/models/mimo_v2/generate.py`,
+  with a cancel that is agreed across the ranks and a stop string that is agreed for the same reason.
+  A second request waits on a lock rather than being scheduled, and a cancelled request's KV cache is
+  reset — but a *repeated* prefix is no longer prefilled again: the loop snapshots the state a
+  request leaves into a host-resident store keyed by the prompt's own tokens, so the next request
+  restores the longest prefix it shares and forwards the remainder. That is the one thing that
+  survives a request here, it is per rank and agreed without a collective, and
+  [its own page](mimo_v2_6_flash_prefix_cache.md) is where the mechanism and its measurements are.
+  What it is not is concurrency.
 - **MTP and DFlash are not executed.** The 3-layer MTP module and the 5-layer
   DFlash drafter are located and described but no speculative path uses them.
 - **Vision and audio are out of scope.** The vision tower and the audio encoders

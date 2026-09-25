@@ -169,6 +169,7 @@ nav:
       - MiniMax-M2.7 design and measurements: architecture/minimax_m2_7_design.md
       - Backend unification design: architecture/backend_unification_design.md
       - Cross-request prefix caching on V4.1: architecture/v41_prefix_cache.md
+      - Cross-request prefix caching on MiMo-V2.6-Flash: architecture/mimo_v2_6_flash_prefix_cache.md
       - C++ engine multi-backend plan: architecture/cpp_engine_multi_backend_plan.md
       - Refactor analysis (2026-09): architecture/pocketllm_refactor_analysis_2026_09.md
       - Roadmap for old hardware: architecture/pocketllm_roadmap_old_hardware.md

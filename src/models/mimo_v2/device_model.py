@@ -604,6 +604,7 @@ class MimoV2DeviceModel:
         *,
         cache: MimoV2KVCache | None = None,
         chunk: int = 512,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """A prompt through the chunked path: `[vocab]` logits for its last row.
 
@@ -620,6 +621,12 @@ class MimoV2DeviceModel:
         most of the layer's experts is amortising the *per-call* work of the layer and not
         the copy, and a chunk too wide for the arena is banded rather than refused. The
         arithmetic is the same at every width.
+
+        `start_pos` is where the prompt starts in the sequence, and it is what a resumed request
+        passes: the cache already holds the first `start_pos` positions, so `prompt_ids` is the
+        *remainder* and every row of it goes through the stack at its own absolute position --
+        which is what the rotation, the attention bounds and the ring's slot arithmetic all read.
+        The default is zero, which is the cold prompt this call was written for.
         """
         ids = [int(token) for token in prompt_ids]
         if not ids:
@@ -635,9 +642,13 @@ class MimoV2DeviceModel:
                 # would build `[chunk, vocab]` -- 1.16 GiB at 2048 rows -- which is the same
                 # `[sequence, vocab]` the docstring above refuses for the whole prompt, arriving
                 # one chunk at a time and twice over once the head's arithmetic is counted.
-                self.forward(piece, start_pos=start, cache=cache, final_norm=False)
+                self.forward(
+                    piece, start_pos=start_pos + start, cache=cache, final_norm=False
+                )
                 continue
-            logits = self.forward(piece, start_pos=start, cache=cache, rows=[-1])[-1]
+            logits = self.forward(
+                piece, start_pos=start_pos + start, cache=cache, rows=[-1]
+            )[-1]
         for module in (self.experts, self.chunk_experts):
             if module is not None:
                 module.drain()

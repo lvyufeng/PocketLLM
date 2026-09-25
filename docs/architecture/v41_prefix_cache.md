@@ -15,8 +15,15 @@ The V4.1 caches are pre-allocated contiguous buffers — a 128-slot window ring 
 block-granular store would be a rewrite of the cache layout rather than a patch. The store is
 therefore a small set of **whole-prompt anchors**.
 
-The mechanism lives in `src/models/deepseek_v4_1/prefix_cache.py`;
-this page is the serving-level design — what is stored, how a request is resumed, what it costs, what
+The mechanism is split in two, and the split is recent. `src/models/prefix_cache.py` is the store as
+such — the token-chain key, the longest-prefix walk, the byte-budget LRU, and the logits row an exact
+repeat samples from — and it is model-agnostic, because the store never looks inside a snapshot.
+`src/models/deepseek_v4_1/prefix_cache.py` is this model's half: which buffers a snapshot carries, how
+a prefix cuts them, and how they go back. The MiMo-V2.6 runtime has the same pair over the same store
+([cross-request prefix caching on MiMo-V2.6-Flash](mimo_v2_6_flash_prefix_cache.md)), so everything
+below about the key and the match is true of both; what differs is what a snapshot is.
+
+This page is the serving-level design — what is stored, how a request is resumed, what it costs, what
 it deliberately does not do.
 
 ## What a stored prefix is

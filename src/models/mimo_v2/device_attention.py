@@ -844,6 +844,36 @@ class MimoV2KVCache:
                 f"for; a chunk cannot read positions it has not appended"
             )
 
+    def key_buffer(self, layer: int) -> torch.Tensor:
+        """`layer`'s whole key buffer, `[kv_heads, slots, head_dim]`, wrapped ring and all.
+
+        The buffer and not the prefix: a snapshot copies slots it may not need, because which
+        slots those are is a question about the ring and not about this accessor. The rule that
+        decides it is
+        :func:`src.models.mimo_v2.prefix_cache.snapshot_rows`'s, where the reasoning is.
+        """
+        if layer not in self._key:
+            raise KeyError(f"this cache holds no layer {layer}; it holds {sorted(self._key)}")
+        return self._key[layer]
+
+    def value_buffer(self, layer: int) -> torch.Tensor:
+        """`layer`'s whole value buffer, `[kv_heads, slots, v_head_dim]`. See `key_buffer`."""
+        if layer not in self._value:
+            raise KeyError(f"this cache holds no layer {layer}; it holds {sorted(self._value)}")
+        return self._value[layer]
+
+    def set_written(self, layer: int, positions: int) -> None:
+        """Move `layer`'s write head, which is what a restore of a stored prefix does.
+
+        The write head is state -- it is what `prefix` bounds a read by and where `append` puts
+        the next position -- and a restore that put back the buffers and left the head where the
+        *previous* request stopped would answer a continuation out of a span that the snapshot
+        never described. `reset` is this at zero, and nothing else writes it.
+        """
+        if layer not in self._written:
+            raise KeyError(f"this cache holds no layer {layer}; it holds {sorted(self._written)}")
+        self._written[layer] = int(positions)
+
     def reset(self) -> None:
         """Forget every position without giving the memory back."""
         for layer in self.layers:

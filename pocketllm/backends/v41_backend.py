@@ -60,7 +60,7 @@ from pocketllm.api import (
 )
 
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
-from .base import BackendBase, settled_text
+from .base import BackendBase, byte_size, settled_text
 
 
 DEFAULT_MAX_SEQ_LEN = 8192
@@ -101,8 +101,6 @@ message, tools JSON and effort prefix -- which the end anchor cannot serve becau
 diverge before it. It costs the cold prefill one chunk boundary, since a position's ring can only be
 observed at a forward boundary, and it is paid on a miss only: a resumed prefill skips it.
 """
-
-_UNITS = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
 
 _IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
 """``backend_options`` keys a launch always carries that this backend has no use for.
@@ -240,29 +238,6 @@ class _Options:
     progress: bool = True
 
 
-def _byte_size(value: Any, name: str) -> int:
-    """A byte count, as an integer or as a ``<n>[kmg]`` string.
-
-    ``--backend-option`` carries strings either way, and a byte budget is the one option here whose
-    plain value cannot be read at a glance in a launch script: ``4294967296`` against ``4g``. Binary
-    multiples, because that is what the constants above are.
-    """
-    text = str(value).strip().lower()
-    factor = _UNITS.get(text[-1:], 1) if text else 1
-    if factor > 1:
-        text = text[:-1]
-    try:
-        count = int(text)
-    except ValueError as exc:
-        raise ConfigurationError(
-            f"backend option {name!r} must be a byte count, optionally suffixed k/m/g "
-            f"(got {value!r})"
-        ) from exc
-    if count < 0:
-        raise ConfigurationError(f"backend option {name!r} must not be negative (got {value!r})")
-    return count * factor
-
-
 def _options_from(args: Any) -> _Options:
     raw = dict(getattr(args, "backend_options", None) or {})
     unknown = sorted(set(raw) - _KNOWN_OPTIONS - _IGNORED_OPTIONS)
@@ -295,7 +270,7 @@ def _options_from(args: Any) -> _Options:
         options.threads = int(options.threads)
         if options.threads < 1:
             raise ConfigurationError("backend option 'threads' must be >= 1")
-    options.prefix_cache_bytes = _byte_size(options.prefix_cache_bytes, "prefix_cache_bytes")
+    options.prefix_cache_bytes = byte_size(options.prefix_cache_bytes, "prefix_cache_bytes")
     options.prefix_cache_head_tokens = int(options.prefix_cache_head_tokens)
     if options.prefix_cache_head_tokens < 0:
         raise ConfigurationError("backend option 'prefix_cache_head_tokens' must not be negative")
