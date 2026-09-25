@@ -100,7 +100,7 @@ routed layer closes with an all-reduce and a rank that was not told about a requ
 not idle — it is at a different collective. A four-rank served run is in this page's
 own section.
 
-What that is not: batching, or a sampler worth shipping. The attention and the dense linears are
+What that is not: batching. The attention and the dense linears are
 still torch — the decode step's rotation, softmax and norms are kernels and the rest is not, and above
 `DECODE_KEYS` a global layer's span stops folding and the chunk path takes the call — and the served
 path is one request, one sequence. At 256k a step reads a quarter of a million keys once a rank,
@@ -137,7 +137,8 @@ What exists:
 | The experts kept on the card | Implemented and exact — `torch.equal` on 24 steps of a greedy chain, all four ranks. **117.3 ms against 156.3** at a short context with sixteen rows a layer, which is 1.33x; off by default because 9.36 GiB and a 262144-token cache do not fit on one 22 GiB card, and at that depth eight rows do and buy **174.3 against 180.0** |
 | The collectives, priced on the step | **6.6 ms of a 4096-key step** — 6.3 the all-reduce and 0.5 the all-gather — measured with the router's draw held, against the **52 ms** the device table's own `ncclDevKernel` rows would have you read |
 | OpenAI-compatible serving | Implemented and exercised on four ranks: chat, completions, streaming, cancel, metrics |
-| Batching, a scheduler, a sampler | Not implemented — one request at a time, `argmax` unless a temperature is given |
+| Batching, a scheduler, a prefix cache | Not implemented — one request at a time |
+| Sampling (`temperature`, `top_k`, `top_p`, `seed`) | Implemented and served; greedy unless a temperature is given, which is the checkpoint's own default. Repetition penalty, logit bias and grammar are absent |
 | MTP (3 layers) and the DFlash drafter | Located and described; not executed |
 | Vision tower, audio encoders | Out of scope |
 
@@ -1818,13 +1819,18 @@ golden holds and how it was captured.
   dispatch, and the attention is 39 of its 48 layers. A prefill bench's `--decode` column read 281.2
   for this depth before there was a flag, which is a different deal's number; it takes `--deal` now
   and defaults to the served build.
-- **Greedy only, and no sampler.** `argmax`, stopping at the config's own end-of-turn
-  tokens, with no temperature, top-p or repetition penalty. The checkpoint's
-  `generation_config.json` says `do_sample: false`, so this is its own default — but a
-  sampling path is what a serving stack would need, and the logit agreement above is
-  the reason a sampler matters: at a tenth-of-a-logit near-tie the card and the host
-  draw different tokens, which a distribution-aware sampler absorbs and `argmax` does
-  not.
+- **Greedy by default, and the sampler that was missing is here.** This section used to read "greedy
+  only, and no sampler" — `argmax`, stopping at the config's own end-of-turn tokens, with no
+  temperature, top-p or repetition penalty — and that was true of the loop it was written against.
+  `sample_token` in `src/models/mimo_v2/generate.py` now takes a `temperature`, a `top_k`, a `top_p`
+  and a `seed`, and the HTTP adapter passes all four through, so the served path draws from a
+  distribution when a request asks for one and is greedy when it does not. `top_k` is applied as a
+  cutoff on the row before the softmax and `top_p` as a nucleus over the sorted probabilities, both
+  off unless the request sets them. **Repetition penalty, logit bias and grammar are still absent.**
+  The checkpoint's `generation_config.json` says `do_sample: false`, so greedy remains its own
+  default — but the reason a sampler matters is unchanged: the logit agreement above is an agreement
+  about the *top* of a distribution, and at a tenth-of-a-logit near-tie the card and the host draw
+  different tokens, which a distribution-aware sampler absorbs and `argmax` does not.
 - **No KV cache in the host reference.** Re-running the prefix is deliberate for a
   reference — it is why its numbers can be trusted and why they are 37 s a token —
   but it also means the host cannot be run at a long context to check the device's
