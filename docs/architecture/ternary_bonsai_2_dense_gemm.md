@@ -153,6 +153,8 @@ The model-level number — this runtime, all 64 layers, the serving surface — 
 
 Two measured gaps, with the mechanism for each.
 
+Both gaps are tracked as [#406](https://github.com/lvyufeng/PocketLLM/issues/406).
+
 ### Decode: 119 GiB/s against a 526 GiB/s ceiling
 
 The big shapes reach 136–172 GiB/s, so the kernel is not thrashing and the aggregate is dragged down by the small
