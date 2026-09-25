@@ -220,6 +220,43 @@ bool qwen_fp8_e4m3_fp16scale_matvec_f16_cuda(
     int scale_stride,
     void* stream = nullptr);
 
+// PTQ1_0: the fork-private ternary packing, 128 weights in a 28-byte block, run
+// directly rather than expanded to fp16 -- which is the entire point of the
+// format, since the fp16 form of these weights is ten times the bytes and does
+// not fit on the card.
+//
+// `d_blocks` is [rows, cols/128] blocks of 28 bytes, laid out the way the GGUF
+// file holds them. `cols` must be a multiple of 128, which every Qwen3.5
+// projection is. Both entry points take and return fp16 activations, matching the
+// rest of this header; the ternary arithmetic is integer and accumulates in fp32
+// throughout.
+//
+// `x_stride` / `y_stride` are the row strides of the activation and the result;
+// pass `cols` / `rows` for packed rows. Scratch is owned by the implementation
+// and grows to a high-water mark, so these calls are not allocation-free, but are
+// allocation-stable once a shape has been seen.
+bool qwen_ptq1_0_matmul_rows_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_blocks,
+    uint16_t* d_y_fp16,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    void* stream = nullptr);
+
+// Decode: one activation row. The GEMV splits K when one thread per output
+// feature would not fill the card, and reduces the chunks in a fixed order so the
+// result does not depend on the schedule.
+bool qwen_ptq1_0_matvec_f16_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_blocks,
+    uint16_t* d_y_fp16,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 bool qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
     const uint16_t* d_x_fp16,
     const uint8_t* d_first_weight,
