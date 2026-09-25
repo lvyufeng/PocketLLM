@@ -9,14 +9,21 @@
 
 PocketLLM is an experimental C++/CUDA and PyTorch inference stack for running large language models on consumer multi-GPU systems. It combines model-specific kernels, low-bit formats, tensor/expert parallelism, CPU/GPU placement, and reproducible single-request benchmarks.
 
-The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, Qwen3.8-27B, DeepSeek-V4.1-Flash and MiMo-V2.6-Flash. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
+The project started with DeepSeek-V4 on 4×RTX 2080 Ti and now includes validated runtimes for DeepSeek-V4, MiniMax-M2.7, GLM-5.2, Qwen3.8-27B, DeepSeek-V4.1-Flash, MiMo-V2.6-Flash and Ternary-Bonsai-2-27B. PocketLLM is not a single universal backend: each model has a runtime matched to its architecture and checkpoint format.
 
-Three of those models are served end to end over the OpenAI-compatible API: **Qwen3.8-27B-FP8** through the native C++ runtime, **DeepSeek-V4.1-Flash** through `pocketllm serve --backend v41`, and **MiMo-V2.6-Flash** through `pocketllm serve --backend mimo`. All three paths are validated with real checkpoints on the same four cards.
+Four of those models are served end to end over the OpenAI-compatible API: **Qwen3.8-27B-FP8** through the native C++ runtime, **Ternary-Bonsai-2-27B** through the same runtime on **one** card, **DeepSeek-V4.1-Flash** through `pocketllm serve --backend v41`, and **MiMo-V2.6-Flash** through `pocketllm serve --backend mimo`. All four paths are validated with real checkpoints.
 
 > **Status:** research and engineering software. The numbers below are measurements from specific checkpoints and hardware configurations, not general performance guarantees.
 
 ## News
 
+- **[2026/09] Ternary-Bonsai-2-27B is served end to end on one card.** A 27B hybrid-attention model
+  — 48 Gated DeltaNet layers and 16 GQA layers over a dense MLP — released as a GGUF whose weights
+  are **1.75 bits each** (GGML type 143, 5.53 GiB) with a Hadamard rotation declared in the file.
+  `pocketllm serve` picks the native engine from the container's own `general.architecture`, so no
+  flag is needed: prefill is **636.0 tok/s at a 4,096-token prompt** and decode **25.9 tok/s**, the
+  same card's upstream reference measures 642.5 and 30.7, and 5.53 GiB of weights leaves room for a
+  **245,760-token context** (262,144 with an fp8 KV cache). [Model page](docs/models/ternary-bonsai-2-27b.md)
 - **[2026/09] MiMo-V2.6-Flash is served end to end.** `pocketllm serve --backend mimo` runs the
   release as four processes on four cards, with the 149.81 GiB of routed experts in a host bank and
   the 48-layer backbone on the GPUs. The nine global layers' attention is divided along the
@@ -160,14 +167,14 @@ pocketllm serve \
 
 **PocketLLM excels at:**
 - ✅ Single-request low-latency inference on consumer GPUs (RTX 2080 Ti, 3090, 4090)
-- ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4)
+- ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4, and a 1.75-bit ternary GGUF whose tensors are never upcast)
 - ✅ Checkpoints far larger than the aggregate VRAM: DeepSeek-V4.1-Flash's 475 GiB across 4×22 GiB cards
 - ✅ TP4 inference without NVLink (PCIe-only multi-GPU systems)
 - ✅ Research and experimentation with model-specific kernel optimization
 
 **Consider alternatives like vLLM or SGLang if you need:**
 - ❌ High-throughput serving with dynamic batching (PocketLLM batching is sequential)
-- ❌ Broad model support (PocketLLM focuses on 5 models with deep optimization)
+- ❌ Broad model support (PocketLLM focuses on a short list of checkpoints with deep optimization, not on covering every architecture)
 - ❌ Production features (advanced scheduling, monitoring, multi-LoRA)
 - ❌ Multimodal inputs (images/video are not yet supported)
 
@@ -177,7 +184,7 @@ pocketllm serve \
 - **Low-bit execution without unnecessary expansion:** FP4, FP8 E4M3, GGUF Q4/Q5/Q8, IQ1/IQ2/IQ3, and Q2 paths consume quantized blocks directly in the hot path where supported.
 - **Consumer-GPU parallelism:** TP4/NCCL execution on PCIe-connected GPUs, with CPU/NUMA expert placement for checkpoints that do not fit in device memory.
 - **Separate prefill and decode dispatch:** large-row kernels are optimized independently from single-token latency paths.
-- **Native C++/CUDA runtime:** the `cpp_engine/` path supports DeepSeek-V4 GGUF/Safetensors flows, Qwen3.8 FP8 Safetensors text generation, and the validated Qwen OpenAI-compatible text server.
+- **Native C++/CUDA runtime:** the `cpp_engine/` path supports DeepSeek-V4 GGUF/Safetensors flows, Qwen3.8 FP8 Safetensors text generation, a 1.75-bit ternary GGUF read as ternary end to end, and the validated OpenAI-compatible text server.
 - **A host-PyTorch adapter for a checkpoint the cards cannot hold:** `--backend v41` runs DeepSeek-V4.1-Flash as four processes, one a card, over a memory-mapped checkpoint — the dense tree and the packed FP4 experts execute on the GPUs while the routed experts read from a pinned host bank.
 - **A host-resident expert bank shared by four ranks:** `--backend mimo` keeps MiMo-V2.6-Flash's 149.81 GiB of MXFP4 experts in one `/dev/shm` segment that every rank attaches to, and deals the experts out per layer — by the drawing for a decode step, by the expert for a prefill chunk — so a rank stages two of a token's eight drawn experts rather than all eight.
 - **Inspection and validation tools:** GGUF architecture/spec reports, Safetensors audits, tensor-shape checks, numerical parity tests, and real-checkpoint benchmarks.
@@ -189,6 +196,7 @@ pocketllm serve \
 | [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend v41`: host PyTorch over a mapped checkpoint, dense tree and packed FP4 experts on the cards, one process a rank | Served TP4: **150.3–152.0 tok/s prefill** at a 260,244-token prompt (137–141 at 1,364) and **3.48–3.54 tok/s decode**, one request at a time |
 | [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts, BF16 attention output | **Validated TP4 text generation behind the OpenAI server** | `pocketllm serve --backend mimo`: the 48-layer backbone on the cards, routed experts out of a 149.81 GiB host bank, attention split along the checkpoint's own four-way `qkv_proj` partition | Served TP4: **104.04 tok/s prefill at a 262,144-token prompt** (48.37 with the attention replicated) and **5.56 tok/s decode** at that depth, **6.40 tok/s at a short context** and 8.53 with each routed layer's hottest experts kept on the card, one request at a time |
 | [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **Validated C++ text runtime and OpenAI server** | C++/CUDA TP4, GPU-resident FP8 | Served TP4: 864.54 tok/s prefill and 43.22 tok/s decode on a 512-token prompt, 128 tokens generated |
+| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` (GGML type 143), **1.75 bits a weight**, 5.53 GiB, Hadamard declared in the file | **Validated C++ text runtime and OpenAI server on one card** | `pocketllm serve` selects the native engine from the file's own `general.architecture`, no flag needed | Served on **1×**RTX 2080 Ti: **636.0 tok/s prefill** at a 4,096-token prompt and **25.9 tok/s decode** — the same card's upstream reference is 642.5 and 30.7 — with 245,760 tokens of context at a 22 GiB card's memory budget |
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | **Validated generation** | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **Validated TP4 generation** | Raw-block CUDA, GGUF TP4 | Full-model 256-token prefill: ~104.9–107 tok/s; 43-layer decode benchmark: 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **Validated text generation** | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
@@ -242,6 +250,24 @@ The prefill figures for the 64- and 512-token prompts measure short-prompt laten
 
 The same runtime is what serves Qwen3.8 over the OpenAI API, and it is the one model here with two optional external speculative drafters: [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) and [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding), mutually exclusive with each other and with the native MTP path. DFlash2 with its opt-in flags measures 2.78× full-request and 3.02× decode on a 512-token fixture, and 1.33× aggregate over eight GSM8K prompts, with exact token parity in every case. Both drafters are default-off because their gains are acceptance-dependent, and upstream's published 2.67–3.43× band is a decode-latency ratio rather than a full-request one. A persistent TP4 worker also keeps prefix state alive across requests, so a client whose next prompt extends or compresses the previous one pays only for the difference.
 
+### Ternary-Bonsai-2-27B ternary GGUF runtime (served, one card)
+
+The same engine that serves Qwen3.8 also serves this checkpoint, because it is the same architecture
+at the same shape — the difference is the container. One RTX 2080 Ti, the released `PTQ1_0` file,
+one request at a time, greedy:
+
+- 4,096-token prompt: **636.0 tok/s prefill** (6.44 s), 25.89 tok/s decode.
+- 8,192-token prompt: 639.1 tok/s prefill (12.82 s), 25.44 tok/s decode.
+- Upstream `llama-bench` on the same card and artifact: 642.5 tok/s prefill at 4,096 (615.2 at
+  8,192), 30.7 tok/s decode — so prefill is **level with the reference** and decode is 84% of it.
+
+**A prompt whose token count is not a whole number of 64-token tiles pays a one-off penalty of up to
+12 seconds** in its final partial tile, which is what an earlier measurement of this checkpoint
+recorded as a slow kernel: 4,097 tokens prefills in 18.11 s where 4,096 takes 6.44 s. The per-token
+rate is otherwise flat at 1.55 ms from 2,048 tokens to 22,378. It is measured and reproducible and
+the mechanism is not yet identified. Memory on the card is 5.53 GiB of weights and 6,566 MiB with the
+runtime, plus **64 KiB of KV a token**.
+
 ### DeepSeek-V4 C++ FP4 runtime
 
 - 32K prompt: approximately 402 tok/s prefill, approximately 11.2 GiB/rank.
@@ -262,7 +288,7 @@ PocketLLM has two complementary execution families:
 1. **GPU-resident and low-bit execution** keeps local weights or expert blocks on device when the aggregate memory budget permits it.
 2. **Heterogeneous execution** keeps routed experts in CPU/NUMA memory and stages only the active quantized blocks needed by the current token or prefill chunk.
 
-The runtime is intentionally model-specific. DeepSeek-V4 uses MLA/indexing and routed-expert scheduling; DeepSeek-V4.1-Flash uses a causal encoder-decoder with CSA2 shared-KV attention over a checkpoint whose 268.95 GiB of routed experts and 189.13 GiB of Engram tables stay in host memory or on disk; MiMo-V2.6-Flash uses a hybrid of global and sliding-window attention with a per-head sink over 149.81 GiB of MXFP4 experts in a shared host bank, with the attention divided along the checkpoint's own four-way partition; MiniMax-M2.7 and GLM-5.2 use GGUF raw-block paths; Qwen3.8 uses Safetensors FP8 online unpacking plus hybrid linear/full attention. Raw quantized weights are not expanded to a full FP32 copy in the intended hot paths.
+The runtime is intentionally model-specific. DeepSeek-V4 uses MLA/indexing and routed-expert scheduling; DeepSeek-V4.1-Flash uses a causal encoder-decoder with CSA2 shared-KV attention over a checkpoint whose 268.95 GiB of routed experts and 189.13 GiB of Engram tables stay in host memory or on disk; MiMo-V2.6-Flash uses a hybrid of global and sliding-window attention with a per-head sink over 149.81 GiB of MXFP4 experts in a shared host bank, with the attention divided along the checkpoint's own four-way partition; MiniMax-M2.7 and GLM-5.2 use GGUF raw-block paths; Qwen3.8 uses Safetensors FP8 online unpacking plus hybrid linear/full attention; Ternary-Bonsai-2-27B is the same hybrid attention in a 1.75-bit GGUF whose tensors are consumed as ternary, with the incoherence rotation the file declares applied to the activations. Raw quantized weights are not expanded to a full FP32 copy in the intended hot paths.
 
 ## Quick start
 
@@ -376,6 +402,23 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
 ```
 
 The CLI's own supervisor starts one process a rank — rank 0 binds the listener, ranks 1–3 are NCCL workers — and all four must report ready before the server answers. Startup is not quick: with `DEEPSEEK_V41_RESIDENT_EXPERTS=1` each rank pins its share of the 457.8 GiB expert bank, about 100 s a rank, and the 48 shards load in another 130 s. The same flags take `--max-model-len 262144`, which is the longest context the runtime accepts and the configuration the long-context numbers above were measured on.
+
+### Run Ternary-Bonsai-2-27B OpenAI serving
+
+```bash
+python -m pocketllm serve \
+  --model /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  --served-model-name bonsai \
+  --max-model-len 245760 \
+  --port 8000
+```
+
+No backend flag and no tensor-parallel flag: the checkpoint is one `.gguf` file, the adapter reads
+`general.architecture=qwen35` from its header and selects the native engine that claims that name,
+and the tokenizer, the special-token ids and the chat template come out of the same header. One card
+holds it, and `--max-model-len` is a memory decision as much as a context one at **64 KiB a token**
+of KV — 245,760 tokens is the largest FP16-KV context that fits in 22 GiB beside the 5.53 GiB of
+weights, and `--kv-cache-dtype fp8` halves the KV so the checkpoint's own 262,144 fits.
 
 ### Run MiMo-V2.6-Flash OpenAI serving
 
@@ -492,6 +535,7 @@ content as the files below.
 - [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md)
 - [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
+- [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
@@ -512,6 +556,7 @@ content as the files below.
 - [x] Qwen OpenAI-compatible text serving adapter.
 - [x] DeepSeek-V4.1-Flash TP4 text generation behind the OpenAI server, with cross-request prefix caching.
 - [x] MiMo-V2.6-Flash TP4 text generation behind the OpenAI server: a host-resident expert bank, the attention split along the checkpoint's own partition, 256k context.
+- [x] Ternary-Bonsai-2-27B: a 1.75-bit ternary GGUF served on **one** card, 636 tok/s of prefill and 245,760 tokens of context out of 5.53 GiB of weights.
 - [ ] CUDA Graph and persistent decode dispatch where measured beneficial.
 - [ ] More model-specific benchmark fixtures and automated regression dashboards.
 
@@ -527,6 +572,7 @@ content as the files below.
 - DeepSeek-V4 DSpark's current C++ verify path is sequential and should not be presented as a speedup claim. Qwen DSpark is a separate external drafter with one eight-row target verification and model-specific parity/performance data.
 - Qwen DFlash2 wall-clock speedup is acceptance-dependent and prefill-capped: the synthetic fixtures accept the full eight-row block while GSM8K accepts 2.9–4.4, and shared prefill limits the 8,192-token case to 1.95x even with zero decode time. Upstream's 2.67–3.43x is a decode-latency ratio, not a full-request wall ratio.
 - The Qwen runtime currently supports the text checkpoint path only. Vision inputs and multimodal serving are not implemented.
+- Ternary-Bonsai-2-27B has one measured and unexplained prefill cost: a prompt whose token count is not a whole number of 64-token tiles puts up to 12 seconds into its final partial tile, so a 4,097-token prompt takes 18.11 s where a 4,096-token one takes 6.44 s. Aligned, prefill is flat at 1.55 ms a token and level with the upstream reference. Its batch scheduler is off by default because it buys aggregate rate at the cost of per-request latency, its speculative decoding paths are unvalidated on this artifact, and its prefix reuse is a resume of the immediately preceding prompt rather than a store.
 - Some experimental optimizations are intentionally opt-in or disabled after real end-to-end regressions. See the model pages and historical notes for details.
 
 ## License

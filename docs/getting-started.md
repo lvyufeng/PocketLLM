@@ -147,6 +147,26 @@ all-reduce that every rank has to reach, so the ranks run the request as a symme
 [MiMo-V2.6-Flash model page](models/mimo-v2.6-flash.md) for the numbers and the memory that bank
 takes.
 
+**Ternary-Bonsai-2-27B** is the one that fits on a single card, and the only thing you have to pass
+is the file. It is a GGUF whose weights are 1.75 bits each, so a 27B model is 5.53 GiB and the same
+card still has room for a 245,760-token KV cache:
+
+```bash
+python -m pocketllm serve \
+  --model /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  --served-model-name bonsai \
+  --max-model-len 245760 \
+  --port 8000
+```
+
+No `--backend` and no `--tensor-parallel-size`: the adapter reads
+`general.architecture=qwen35` out of the container's own header and selects the native engine that
+claims that name, and the tokenizer, the special-token ids and the chat template come from the same
+header. `--max-model-len` is a memory decision here as much as a context one, at **64 KiB a token**;
+`--kv-cache-dtype fp8` halves the KV cache and is what makes the checkpoint's own 262,144 fit.
+[Model page](models/ternary-bonsai-2-27b.md) for the measured numbers and the one limitation worth
+reading before you benchmark it.
+
 ## Pick your path
 
 | If you are running | Start here |
@@ -154,6 +174,7 @@ takes.
 | DeepSeek-V4 | [DeepSeek-V4](models/deepseek-v4.md), or [GGUF Q2 on one GPU](models/deepseek-v4-gguf-q2-single-gpu.md) |
 | DeepSeek-V4.1-Flash | [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md), then [serving it behind the OpenAI server](performance/deepseek_v4_1_flash_served_gate.md) |
 | MiMo-V2.6-Flash | [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) |
+| Ternary-Bonsai-2-27B (**one card**) | [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) |
 | MiniMax-M2.7 | [MiniMax-M2.7](models/minimax-m2.7.md) |
 | GLM-5.2 | [GLM-5.2](models/glm-5.2.md) |
 | Qwen3.8-27B (FP8 / NVFP4 / BF16) | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) |
