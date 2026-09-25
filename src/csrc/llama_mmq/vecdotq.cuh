@@ -109,6 +109,12 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
+// PTQ1_0 is Q1_0 with the trits expanded to one signed byte each, so a 128-weight
+// block occupies 32 ints rather than 4 and two of them fill an MMQ_TILE_NE_K-wide
+// (32-int) rung.  The MMQ loader does the expansion, which is why the two ratios
+// differ by the expansion factor and not by the block length.
+#define VDR_PTQ1_0_Q8_1_MMQ 2
+
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 

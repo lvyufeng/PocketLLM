@@ -147,7 +147,14 @@ enum ggml_type {
     GGML_TYPE_MXFP4   = 39,
     GGML_TYPE_NVFP4   = 40,
     GGML_TYPE_Q1_0    = 41,
-    GGML_TYPE_COUNT   = 42,
+    // Fork-private ids from PrismML-Eng/llama.cpp's `prism` branch, read out of the
+    // released Ternary-Bonsai-2-27B GGUF header.  Upstream GGML assigns nothing near
+    // 142, so the enumeration has to be extended rather than aliased.  GGML_TYPE_COUNT
+    // is not referenced anywhere in the vendored tree; it is moved to keep the
+    // enumerators ordered, not because anything sizes an array by it.
+    GGML_TYPE_PQ2_0   = 142,
+    GGML_TYPE_PTQ1_0  = 143,
+    GGML_TYPE_COUNT   = 144,
 };
 
 // ---------------------------------------------------------------------------
@@ -196,3 +203,10 @@ struct ggml_cuda_type_traits;
 
 template <> struct ggml_cuda_type_traits<GGML_TYPE_Q4_K> { static constexpr int qk = QK_K; static constexpr int qr = QR4_K; static constexpr int qi = QI4_K; };
 template <> struct ggml_cuda_type_traits<GGML_TYPE_Q5_K> { static constexpr int qk = QK_K; static constexpr int qr = QR5_K; static constexpr int qi = QI5_K; };
+// qk is what the tile walk reads; qr/qi only have to stay consistent with it (the
+// block is 32 words of expanded trits, so 4 words per eight weights).
+template <> struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
+    static constexpr int qk = QK_PTQ1_0;
+    static constexpr int qr = QK_PTQ1_0 / 32;
+    static constexpr int qi = QK_PTQ1_0 / (4 * qr);
+};

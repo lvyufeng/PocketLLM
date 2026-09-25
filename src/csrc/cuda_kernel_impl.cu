@@ -8736,6 +8736,13 @@ torch::Tensor gguf_quant_gemm_forward_cuda(
     // Q4_K/Q5_K DP4A decode path (rows==1) is intentionally NOT wired up yet:
     // the Q5_K 5th-bit unpacking in the custom DP4A kernel needs fixing (see
     // gguf_mma_wrapper.cu). Decode keeps the float path. Prefill MMA (rows>1) is live.
+    //
+    // PTQ1_0 is different in kind: there is no float path for it at all, so decode
+    // dispatches here unconditionally rather than behind a gate. Falling through would
+    // read 1.75-bit trits as if they were fp32 or f16.
+    if (type_id == 143) {
+        return gguf_ptq1_0_dp4a_decode_forward_cuda(x, blocks, row_elems);
+    }
     c10::cuda::CUDAGuard device_guard(x.device());
     auto x_contig = x.contiguous();
     auto blocks_contig = blocks.contiguous();
@@ -8778,6 +8785,12 @@ torch::Tensor gguf_quant_gemm_prefill_forward_cuda(
     int64_t row_elems,
     int64_t type_id,
     const torch::Tensor& signed_grid) {
+    // PTQ1_0 prefill: the ternary loader expands each trit to a signed byte and the
+    // shared MMA dot runs on the result, so this is a tile-walk variant and not a
+    // second kernel.  Unconditional for the same reason the decode dispatch is.
+    if (type_id == 143) {
+        return gguf_ptq1_0_mma_prefill_forward_cuda(x, blocks, row_elems);
+    }
     // Dispatch to the MMA tensor-core path for Q4_K / Q5_K prefill when gated on.
     // rows > 1 so decode keeps the DP4A/float path. Falls through on any miss.
     if ((type_id == 3 || type_id == 4) && env_enabled_explicit("GGUF_Q4K_Q5K_MMA")) {

@@ -18,3 +18,16 @@ torch::Tensor gguf_q4k_q5k_dp4a_decode_forward_cuda(
         const torch::Tensor& blocks,
         int64_t row_elems,
         int64_t type_id);
+
+// Ternary-Bonsai-2-27B's PTQ1_0 (GGML type 143), both phases.  There is no float
+// fallback behind either one: the type's blocks are 1.75-bit packed trits, so a
+// generic path would either misread them or dequantize 5.5 GiB to fp32 a token.
+torch::Tensor gguf_ptq1_0_mma_prefill_forward_cuda(
+        const torch::Tensor& x,
+        const torch::Tensor& blocks,
+        int64_t row_elems);
+
+torch::Tensor gguf_ptq1_0_dp4a_decode_forward_cuda(
+        const torch::Tensor& x,
+        const torch::Tensor& blocks,
+        int64_t row_elems);

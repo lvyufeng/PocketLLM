@@ -175,6 +175,7 @@ nav:
       - Roadmap for old hardware: architecture/pocketllm_roadmap_old_hardware.md
       - New model roadmap: architecture/pocketllm_new_model_roadmap.md
       - Ternary-Bonsai-2-27B reference gate: architecture/ternary_bonsai_2_reference_gate.md
+      - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
       - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
       - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
       - Ascend 910A performance roadmap: architecture/ascend_performance_roadmap.md
