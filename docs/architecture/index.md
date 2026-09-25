@@ -28,6 +28,7 @@ usually measured against. Two things are worth knowing before reading:
 | [cpp_engine multi-backend refactor plan](cpp_engine_multi_backend_plan.md) | The refactor plan that followed it: `core/` / `engine/` / `backends/` layering without giving up per-hardware kernels. |
 | [PocketLLM refactor analysis (2026-09)](pocketllm_refactor_analysis_2026_09.md) | A vLLM/SGLang comparison that motivates the dual-backend design, against master `e59d5d3`. *(Chinese)* |
 | [Feature roadmap for old hardware](pocketllm_roadmap_old_hardware.md) | What is worth building for 2080 Ti (SM75) and Ascend 910A, and what is not. *(Chinese)* |
+| [New model support on the 2080 Ti](pocketllm_new_model_roadmap.md) | The checkpoint roadmap: why Ternary-Bonsai-2-27B, Xing4.0-29B-A4B and GLM-5.3-Flash in that order, what each one reuses and what it costs, and the gate each stage can fail at. |
 | [PocketLLM vs vLLM vs SGLang architecture analysis](vllm_sglang_architecture_analysis.md) | The current comparison: scheduling, paged KV, batching, and serving surface. *(Chinese)* |
 | [cpp_engine vs vLLM/SGLang comparison](vllm_sglang_comparison.md) | The earlier comparison, retained as the pre-Phase-1 baseline. |
 | [Ascend 910A performance roadmap](ascend_performance_roadmap.md) | Where the prefill and decode targets actually stand after measurement, and the ranked next steps — including why the decode target needs quantization rather than tuning. |
