@@ -430,6 +430,10 @@ expert staging 的 decode 是 0.54–0.66 tok/s（[GLM-5.2 模型页](../models/
 **PocketLLM 的核心竞争力（针对老硬件）**：
 
 1. **极致量化**: FP4/Q2 让 2080Ti 跑 70B
+   - 2026-09-25 的 Ternary-Bonsai-2-27B 是这条更强的例子：1.75 bit 的 GGUF `PTQ1_0`，
+     单卡 2080 Ti 上整个 27B 走 OpenAI 接口，权重 5.53 GiB，prefill 636 tok/s 与
+     上游 llama.cpp 的 642.5 tok/s 持平。见
+     [served runtime](bonsai_2_27b_design.md)
 2. **CPU Offloading**: vLLM/SGLang 都不支持——但 2026-09-15 的实测（见 2.1）表明，
    在 2080Ti 上让 70B 装得下的是量化而不是逐层 offload：TP2/TP4 零 offload 即可，
    而 TP1 的实测上限是 0.83 tok/s
