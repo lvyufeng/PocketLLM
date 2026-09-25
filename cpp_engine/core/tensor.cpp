@@ -14,6 +14,8 @@ std::string dtype_name(DType dtype) {
         case DType::Q2_K: return "q2_k";
         case DType::IQ2_XXS: return "iq2_xxs";
         case DType::IQ1_M: return "iq1_m";
+        case DType::PTQ1_0: return "ptq1_0";
+        case DType::PQ2_0: return "pq2_0";
         case DType::Unknown: return "unknown";
     }
     return "unknown";

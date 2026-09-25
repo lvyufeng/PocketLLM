@@ -139,6 +139,17 @@ void GGUFFile::parse() {
         info.dtype = ggml_type_to_dtype(info.ggml_type);
         info.offset = read_u64(cursor);
         info.nbytes = ggml_tensor_nbytes(info.ggml_type, info.shape);
+        // Refuse a type whose *geometry* is unknown here rather than recording a
+        // zero-byte tensor. Zero bytes is not a harmless placeholder: the bounds
+        // check below passes trivially, and every `nbytes`-driven reader
+        // downstream then walks a tensor it has no block size for. An unknown
+        // *dtype* is not the same condition -- `i32` (26) has a known geometry
+        // and no `DType`, and this reader has always carried it that way.
+        if (info.nbytes == 0 && tensor_element_count(info.shape) > 0) {
+            throw std::runtime_error("unsupported GGML type " +
+                                     std::to_string(info.ggml_type) + " for tensor " +
+                                     info.name);
+        }
         tensors_.push_back(std::move(info));
     }
 
@@ -353,13 +364,21 @@ std::string ggml_type_name(uint32_t ggml_type) {
     switch (ggml_type) {
         case 0: return "f32";
         case 1: return "f16";
-        case 32: return "bf16";
+        // 30 is BF16 in the GGML enumeration, and 32 is Q4_0_4_8. This table
+        // said 32 for years because no GGUF this engine reads carried a bf16
+        // tensor; the ternary checkpoint's 96 `ssm_alpha`/`ssm_beta` tensors are
+        // the first ones that do, and they are written as 30.
+        case 30: return "bf16";
         case 8: return "q8_0";
         case 10: return "q2_k";
         case 16: return "iq2_xxs";
         case 29: return "iq1_m";
         case 19: return "iq3_s";
         case 26: return "i32";
+        // The fork's ternary packs, named as the Python loader names them so the
+        // two sides of the ABI print the same string for the same bytes.
+        case 143: return "ptq1_0";
+        case 142: return "pq2_0";
         default: return "ggml_type_" + std::to_string(ggml_type);
     }
 }
@@ -368,11 +387,15 @@ DType ggml_type_to_dtype(uint32_t ggml_type) {
     switch (ggml_type) {
         case 0: return DType::F32;
         case 1: return DType::F16;
-        case 32: return DType::BF16;
+        case 30: return DType::BF16;
         case 8: return DType::Q8_0;
         case 10: return DType::Q2_K;
         case 16: return DType::IQ2_XXS;
         case 29: return DType::IQ1_M;
+        // The fork's ternary packs. These are file type ids, not upstream GGML
+        // ones: upstream assigns nothing near 142, so they cannot be aliased.
+        case 143: return DType::PTQ1_0;
+        case 142: return DType::PQ2_0;
         default: return DType::Unknown;
     }
 }
@@ -382,12 +405,18 @@ uint64_t ggml_tensor_nbytes(uint32_t ggml_type, const std::vector<uint64_t>& sha
     switch (ggml_type) {
         case 0: return elems * 4;
         case 1: return elems * 2;
-        case 32: return elems * 2;
+        case 30: return elems * 2;
         case 8: return block_count(elems, 32) * 34;
         case 10: return block_count(elems, 256) * 84;
         case 16: return block_count(elems, 256) * 66;
         case 29: return block_count(elems, 256) * 56;
         case 26: return elems * 4;
+        // 128 weights per block: 24 bytes of 5-trit stages, 2 bytes of
+        // parity-interleaved qh, then a half scale -- scale last, unlike the
+        // PQ2_0 block below. Both geometries are matched by the Python loader
+        // (`src/loader/gguf/ptq1_0.py`, `quant_types.GGUF_TERNARY_FILE_TYPE_IDS`).
+        case 143: return block_count(elems, 128) * 28;
+        case 142: return block_count(elems, 128) * 34;
         default: return 0;
     }
 }

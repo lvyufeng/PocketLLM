@@ -16,6 +16,13 @@ enum class DType {
     Q2_K,
     IQ2_XXS,
     IQ1_M,
+    // The fork-private ternary packs from PrismML-Eng/llama.cpp's `prism`
+    // branch: PTQ1_0 is 128 weights in 28 bytes and PQ2_0 128 in 34. Their
+    // geometry is here because a 1.75-bit packing does not divide a row, so
+    // nothing downstream can infer the byte count from a shape -- and a
+    // reader that cannot count their bytes cannot even address them.
+    PTQ1_0,
+    PQ2_0,
     Unknown,
 };
 
