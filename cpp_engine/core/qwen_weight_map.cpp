@@ -35,6 +35,48 @@ void require_tp(int world, int rank) {
     if (rank < 0 || rank >= world) throw std::runtime_error("Qwen TP rank is out of range");
 }
 
+// 128 three-valued weights in 28 bytes: 24 bytes of packed trits, two more for
+// the top of the range, and the fp16 block scale last.
+uint64_t ternary_row_bytes(uint64_t weights, const std::string& name) {
+    if (weights == 0 || weights % 128 != 0) {
+        throw std::runtime_error(
+            "a ternary row is not a whole number of 128-weight blocks: " + name);
+    }
+    return weights / 128 * 28;
+}
+
+// A ternary pack is not an element array, so a descriptor's storage shape is not
+// its logical shape: the row pitch is the type's -- 28 bytes per 128 weights --
+// and only the logical shape says how many weights there are. Both are carried,
+// and they are deliberately different numbers, exactly as an NVFP4 weight's are.
+//
+// The rewrite happens after the sharding arithmetic rather than before it,
+// because a shard is a range of *weights*: splitting the block count instead
+// would round a rank's share of a 128-weight block.
+void ternary_storage_shape(const QwenSourceTensor& info,
+                           std::vector<uint64_t>* local_shape) {
+    if (!info.ternary_blocks) return;
+    if (local_shape->size() != 2) {
+        throw std::runtime_error("a ternary weight must be a matrix: " + info.name);
+    }
+    const uint64_t width = (*local_shape)[1];
+    (*local_shape)[1] = ternary_row_bytes(width, info.name);
+}
+
+// The bytes a shape occupies in a container. For an element array that is the
+// shape multiplied out; for a block-packed one the last axis counts weights and
+// only the packing's own geometry turns those into bytes. Multiplying the shape
+// out anyway would overstate such a tensor by 128/28, which is the difference
+// between reporting what a checkpoint holds and what it would hold as elements.
+uint64_t storage_nbytes(SafeDType dtype, bool ternary,
+                        const std::vector<uint64_t>& shape,
+                        const std::string& name) {
+    if (!ternary) return safe_tensor_numel(shape) * safe_dtype_size(dtype);
+    if (shape.empty()) return 0;
+    const std::vector<uint64_t> rows(shape.begin(), shape.end() - 1);
+    return safe_tensor_numel(rows) * ternary_row_bytes(shape.back(), name);
+}
+
 void shard_range(uint64_t total, int world, int rank, uint64_t* start, uint64_t* size) {
     if (total == 0 || total % static_cast<uint64_t>(world) != 0) {
         throw std::runtime_error("Qwen tensor dimension is not divisible by TP world");
@@ -65,6 +107,68 @@ void validate_model_tp(const QwenConfig& config, int world) {
 
 }  // namespace
 
+SafeDType QwenCheckpointSource::device_dtype(SafeDType storage_dtype) const {
+    return qwen_device_dtype(storage_dtype);
+}
+
+namespace {
+
+// One open shard per file, for the source's lifetime. Without the cache every
+// lookup and every materialization re-parses a shard header, and the shard a
+// lookup opened would be closed before the materializer read its mmap.
+const SafeTensorsShard& open_shard(
+    std::map<std::string, std::unique_ptr<SafeTensorsShard>>& cache,
+    const SafeTensorsIndex& index, const std::string& shard_name) {
+    const auto found = cache.find(shard_name);
+    if (found != cache.end()) return *found->second;
+    auto opened = std::make_unique<SafeTensorsShard>(index.shard_path(shard_name));
+    const SafeTensorsShard& reference = *opened;
+    cache.emplace(shard_name, std::move(opened));
+    return reference;
+}
+
+}  // namespace
+
+QwenSourceTensor SafeTensorsCheckpointSource::lookup(
+    const std::string& canonical_name) const {
+    QwenSourceTensor out;
+    const std::string* shard_name = index_.shard_for_tensor(canonical_name);
+    if (shard_name == nullptr) return out;
+    const SafeTensorInfo* info =
+        open_shard(shards_, index_, *shard_name).find_tensor(canonical_name);
+    if (info == nullptr) return out;
+    out.name = canonical_name;
+    out.dtype = info->dtype;
+    out.shape = info->shape;
+    out.shard_name = *shard_name;
+    out.present = true;
+    return out;
+}
+
+const uint8_t* SafeTensorsCheckpointSource::data_of(
+    const QwenSourceTensor& tensor) const {
+    const SafeTensorsShard& shard = open_shard(shards_, index_, tensor.shard_name);
+    const SafeTensorInfo* info = shard.find_tensor(tensor.name);
+    if (info == nullptr) {
+        throw std::runtime_error("Qwen tensor vanished from its shard: " + tensor.name);
+    }
+    return shard.tensor_data(*info);
+}
+
+std::vector<std::string> SafeTensorsCheckpointSource::tensor_names() const {
+    std::vector<std::string> names;
+    names.reserve(index_.weight_map().size());
+    for (const auto& [name, shard] : index_.weight_map()) {
+        (void)shard;
+        names.push_back(name);
+    }
+    return names;
+}
+
+size_t SafeTensorsCheckpointSource::tensor_count() const {
+    return index_.weight_map().size();
+}
+
 SafeDType qwen_device_dtype(SafeDType storage_dtype) {
     // Every checkpoint BF16 tensor is materialized as IEEE FP16 before upload.
     // This applies equally to the official BF16 Qwen3.8 checkpoint and to the BF16
@@ -82,6 +186,43 @@ SafeDType qwen_device_dtype(SafeDType storage_dtype) {
     // A backend with native BF16 must not reuse this without re-deriving it; see
     // CLAUDE.md for why the Ascend product name cannot be used to make that call.
     return storage_dtype == SafeDType::BF16 ? SafeDType::F16 : storage_dtype;
+}
+
+uint16_t qwen_float_to_fp16_bits(float value) {
+    // The standard round-to-nearest-even narrowing, written out rather than
+    // pulled from a header: both backends compile this translation unit, and
+    // neither has a half type in common with the other.
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const int exponent = static_cast<int>((bits >> 23) & 0xffu) - 127 + 15;
+    uint32_t mantissa = bits & 0x007fffffu;
+    if (((bits >> 23) & 0xffu) == 0xffu) {
+        // Inf or NaN: keep a non-zero mantissa non-zero so a NaN stays a NaN.
+        return static_cast<uint16_t>(sign | 0x7c00u | (mantissa != 0 ? 0x200u : 0u));
+    }
+    if (exponent <= 0) {
+        if (exponent < -10) return static_cast<uint16_t>(sign);
+        mantissa |= 0x00800000u;
+        const int shift = 14 - exponent;
+        uint32_t half = mantissa >> shift;
+        const uint32_t remainder = mantissa & ((1u << shift) - 1u);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (half & 1u))) ++half;
+        return static_cast<uint16_t>(sign | half);
+    }
+    if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    uint32_t half = mantissa >> 13;
+    const uint32_t remainder = mantissa & 0x1fffu;
+    if (remainder > 0x1000u || (remainder == 0x1000u && (half & 1u))) {
+        ++half;
+        if (half == 0x400u) {
+            half = 0;
+            if (exponent + 1 >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+            return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent + 1) << 10));
+        }
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10) | half);
 }
 
 uint16_t qwen_bf16_to_fp16_bits(uint16_t bits) {
@@ -145,14 +286,22 @@ bool qwen_is_one_plus_norm_gamma(const std::string& name) {
 
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
                                             const QwenTensorRef& ref) {
+    // A directory is a source like any other; the wrapper exists so that a caller
+    // holding an index -- every caller written before the GGUF path -- keeps the
+    // signature it had.
+    const SafeTensorsCheckpointSource source(index);
+    return qwen_materialize_host_tensor(source, ref);
+}
+
+QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
+                                            const QwenTensorRef& ref) {
     if (!ref.found) throw std::runtime_error("cannot materialize an absent Qwen tensor: " + ref.name);
     if (ref.full_shape.empty() || ref.local_shape.empty()) {
         throw std::runtime_error("cannot materialize empty Qwen tensor shape: " + ref.name);
     }
-    SafeTensorsShard shard(index.shard_path(ref.shard_name));
-    const SafeTensorInfo* info = shard.find_tensor(ref.name);
-    if (info == nullptr) throw std::runtime_error("Qwen tensor missing while materializing: " + ref.name);
-    if (info->shape != ref.full_shape || info->dtype != ref.dtype) {
+    const QwenSourceTensor info = source.lookup(ref.name);
+    if (!info.present) throw std::runtime_error("Qwen tensor missing while materializing: " + ref.name);
+    if (info.shape != ref.full_shape || info.dtype != ref.dtype) {
         throw std::runtime_error("Qwen tensor metadata changed while materializing: " + ref.name);
     }
 
@@ -162,31 +311,97 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
     out.shape = ref.local_shape;
     const uint64_t output_numel = safe_tensor_numel(ref.local_shape);
     const uint64_t device_item_size = safe_dtype_size(ref.device_dtype);
-    out.bytes.resize(static_cast<size_t>(output_numel * device_item_size));
-    const uint64_t source_item_size = safe_dtype_size(ref.dtype);
-    if (source_item_size == 0 || device_item_size == 0) {
+    if (device_item_size == 0) {
         throw std::runtime_error("unsupported Qwen materialization dtype: " + ref.name);
     }
-
-    const uint8_t* source = shard.tensor_data(*info);
-    uint8_t* destination = out.bytes.data();
-    const uint64_t source_row_numel = safe_tensor_numel(
+    out.bytes.resize(static_cast<size_t>(output_numel * device_item_size));
+    // A block-packed tensor has no element size: its row pitch is the packing's,
+    // and the descriptor's row length counts weights rather than bytes. Both are
+    // per-row quantities and the rest of this function only walks rows, so the
+    // substitution is the whole of what the pack changes here.
+    const uint64_t logical_row_numel = safe_tensor_numel(
         std::vector<uint64_t>(ref.full_shape.begin() + 1, ref.full_shape.end()));
+    const uint64_t source_row_bytes =
+        info.ternary_blocks ? ternary_row_bytes(logical_row_numel, ref.name)
+                            : logical_row_numel * safe_dtype_size(ref.dtype);
     const uint64_t local_row_numel = safe_tensor_numel(
         std::vector<uint64_t>(ref.local_shape.begin() + 1, ref.local_shape.end()));
-    const uint64_t source_row_bytes = source_row_numel * source_item_size;
     const uint64_t local_row_bytes = local_row_numel * device_item_size;
 
+    // One element of the source in one element of the destination, for the
+    // tensors that are an element array. The block-packed ones never take this
+    // path: they are copied byte for byte, because 28 bytes of packed trits have
+    // no element to convert.
+    const uint64_t source_element_bytes = safe_dtype_size(ref.dtype);
+
+    const uint8_t* source_base = source.data_of(info);
+
+    // A container may hold a matrix's rows in a different order than the model
+    // does. The source answers with the storage row of each canonical row, and an
+    // empty answer is the identity -- which is every container but one, and that
+    // one is why this is a question the source is asked rather than an assumption
+    // the materializer makes. See QwenCheckpointSource::row_order.
+    const std::vector<uint64_t> row_order = source.row_order(info);
+    if (!row_order.empty() && row_order.size() != ref.full_shape[0]) {
+        throw std::runtime_error("Qwen row order does not match the tensor: " + ref.name);
+    }
+    auto source_row = [&](uint64_t canonical_row) -> const uint8_t* {
+        const uint64_t storage_row =
+            row_order.empty() ? canonical_row : row_order[canonical_row];
+        if (storage_row >= ref.full_shape[0]) {
+            throw std::runtime_error("Qwen row order leaves the tensor: " + ref.name);
+        }
+        return source_base + storage_row * source_row_bytes;
+    };
+
+    uint8_t* destination = out.bytes.data();
+
     auto copy_bytes = [&](const uint8_t* src, uint8_t* dst, uint64_t elements) {
-        if (ref.dtype == SafeDType::BF16) {
+        if (info.ternary_blocks) {
+            const uint64_t bytes = ternary_row_bytes(elements, ref.name);
+            std::memcpy(dst, src, static_cast<size_t>(bytes));
+        } else if (ref.dtype == SafeDType::BF16) {
             if (ref.device_dtype != SafeDType::F16) {
                 throw std::runtime_error("Qwen BF16 tensor has non-FP16 device dtype: " + ref.name);
             }
             qwen_convert_bf16_to_fp16(reinterpret_cast<const uint16_t*>(src),
                                       reinterpret_cast<uint16_t*>(dst),
                                       static_cast<size_t>(elements));
+        } else if (ref.dtype == SafeDType::F32) {
+            // A GGUF keeps its norms in fp32 where the kernels want fp16 gamma,
+            // and bakes the (1 + gamma) convention in on the way -- the kernels
+            // apply the weight directly. So the 1 is taken back out here, in
+            // fp32, *before* the narrowing: `1 + gamma` sits near one, where fp16
+            // resolves 2^-11, and subtracting after the cast would round the
+            // small gamma away.
+            const bool fold = source.folds_one_plus_norm_gamma() &&
+                              qwen_is_one_plus_norm_gamma(ref.name);
+            const float* values = reinterpret_cast<const float*>(src);
+            uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
+            for (uint64_t i = 0; i < elements; ++i) {
+                const float value = fold ? values[i] - 1.0f : values[i];
+                halves[i] = qwen_float_to_fp16_bits(value);
+            }
         } else {
-            std::memcpy(dst, src, static_cast<size_t>(elements * source_item_size));
+            std::memcpy(dst, src, static_cast<size_t>(elements * source_element_bytes));
+        }
+    };
+
+    // `rows` canonical rows starting at `first`, each one logical row long, into
+    // a destination whose rows are `destination_row_bytes` apart. A container
+    // with a row order can only be read a row at a time, because the storage rows
+    // a canonical range maps to are not a range; one without is copied in a
+    // single piece, so the ordinary path carries no per-row loop.
+    auto copy_rows = [&](uint64_t first, uint64_t rows, uint8_t* dst,
+                         uint64_t destination_row_bytes) {
+        if (row_order.empty()) {
+            copy_bytes(source_base + first * source_row_bytes, dst,
+                       rows * logical_row_numel);
+            return;
+        }
+        for (uint64_t row = 0; row < rows; ++row) {
+            copy_bytes(source_row(first + row), dst + row * destination_row_bytes,
+                       logical_row_numel);
         }
     };
 
@@ -198,14 +413,14 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
         }
         uint64_t output_row = 0;
         for (const auto& segment : ref.segments) {
-            const uint64_t source_row = segment.first;
+            const uint64_t segment_first = segment.first;
             const uint64_t rows = segment.second;
-            if (source_row + rows > ref.full_shape[0] || output_row + rows > ref.local_shape[0]) {
+            if (segment_first + rows > ref.full_shape[0] ||
+                output_row + rows > ref.local_shape[0]) {
                 throw std::runtime_error("Qwen packed tensor segment is out of bounds: " + ref.name);
             }
-            copy_bytes(source + source_row * source_row_bytes,
-                       destination + output_row * local_row_bytes,
-                       rows * source_row_numel);
+            copy_rows(segment_first, rows, destination + output_row * local_row_bytes,
+                      local_row_bytes);
             output_row += rows;
         }
         if (output_row != ref.local_shape[0]) {
@@ -216,7 +431,7 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
 
     const int shard_dim = ref.shard_dim;
     if (ref.rule == QwenShardRule::Replicated || ref.shard_size == 0) {
-        copy_bytes(source, destination, safe_tensor_numel(ref.full_shape));
+        copy_rows(0, ref.full_shape[0], destination, local_row_bytes);
         return out;
     }
     if (shard_dim < 0 || static_cast<size_t>(shard_dim) >= ref.full_shape.size()) {
@@ -227,8 +442,7 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
         if (ref.shard_start + rows > ref.full_shape[0] || ref.local_shape[0] != rows) {
             throw std::runtime_error("Qwen dim-0 shard shape mismatch: " + ref.name);
         }
-        copy_bytes(source + ref.shard_start * source_row_bytes, destination,
-                   rows * source_row_numel);
+        copy_rows(ref.shard_start, rows, destination, local_row_bytes);
         return out;
     }
     if (shard_dim == 1 && ref.full_shape.size() == 2) {
@@ -239,8 +453,8 @@ QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
             throw std::runtime_error("Qwen dim-1 shard shape mismatch: " + ref.name);
         }
         for (uint64_t row = 0; row < rows; ++row) {
-            const uint8_t* src = source + row * source_cols * source_item_size +
-                                 ref.shard_start * source_item_size;
+            const uint8_t* src = source_row(row) +
+                                 ref.shard_start * source_element_bytes;
             uint8_t* dst = destination + row * local_cols * device_item_size;
             copy_bytes(src, dst, local_cols);
         }
@@ -317,15 +531,14 @@ QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
 
 namespace {
 
-QwenTensorRef make_ref(const std::string& name, const std::string& shard_name,
-                       const SafeTensorInfo& info, QwenShardRule rule,
-                       int shard_dim, uint64_t start, uint64_t size,
-                       const std::vector<uint64_t>& local_shape) {
+QwenTensorRef make_ref(const QwenSourceTensor& info, SafeDType device_dtype,
+                       QwenShardRule rule, int shard_dim, uint64_t start,
+                       uint64_t size, const std::vector<uint64_t>& local_shape) {
     QwenTensorRef ref;
-    ref.name = name;
-    ref.shard_name = shard_name;
+    ref.name = info.name;
+    ref.shard_name = info.shard_name;
     ref.dtype = info.dtype;
-    ref.device_dtype = qwen_device_dtype(info.dtype);
+    ref.device_dtype = device_dtype;
     ref.full_shape = info.shape;
     ref.local_shape = local_shape;
     ref.rule = rule;
@@ -333,7 +546,13 @@ QwenTensorRef make_ref(const std::string& name, const std::string& shard_name,
     ref.shard_start = start;
     ref.shard_size = size;
     ref.nbytes = safe_tensor_numel(local_shape) * safe_dtype_size(info.dtype);
-    ref.device_nbytes = safe_tensor_numel(local_shape) * safe_dtype_size(ref.device_dtype);
+    ref.device_nbytes = safe_tensor_numel(local_shape) * safe_dtype_size(device_dtype);
+    // A block-packed tensor's local shape already counts bytes on its last axis,
+    // so `nbytes` above is right for it; the whole-tensor count is the one that
+    // has to be derived from the logical shape.
+    ref.full_nbytes = storage_nbytes(info.dtype, info.ternary_blocks, info.shape,
+                                     info.name);
+    ref.ternary_blocks = info.ternary_blocks;
     ref.found = true;
     return ref;
 }
@@ -359,13 +578,26 @@ const char* qwen_linear_kind_name(QwenLinearKind kind) {
         case QwenLinearKind::Fp8Block128: return "fp8_block128";
         case QwenLinearKind::Fp8Channel: return "fp8_channel";
         case QwenLinearKind::NvFp4Group16: return "nvfp4_group16";
+        case QwenLinearKind::Ptq1_0: return "ptq1_0";
     }
     return "unknown";
 }
 
-QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& config,
-                             int tp_world, int tp_rank)
-    : index_(index), config_(config), tp_world_(tp_world), tp_rank_(tp_rank) {
+QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index,
+                             const QwenConfig& config, int tp_world, int tp_rank)
+    : owned_source_(std::make_unique<SafeTensorsCheckpointSource>(index)),
+      source_(*owned_source_), config_(config), tp_world_(tp_world),
+      tp_rank_(tp_rank) {
+    build();
+}
+
+QwenWeightMap::QwenWeightMap(const QwenCheckpointSource& source,
+                             const QwenConfig& config, int tp_world, int tp_rank)
+    : source_(source), config_(config), tp_world_(tp_world), tp_rank_(tp_rank) {
+    build();
+}
+
+void QwenWeightMap::build() {
     require_tp(tp_world_, tp_rank_);
     validate_model_tp(config_, tp_world_);
     embed_tokens_ = require_tensor(
@@ -576,19 +808,20 @@ QwenWeightMap::QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& co
 QwenTensorRef QwenWeightMap::require_tensor(const std::string& name, SafeDType dtype,
                                             const std::vector<uint64_t>& shape,
                                             QwenShardRule rule, int shard_dim) const {
-    const std::string* shard_name = index_.shard_for_tensor(name);
-    if (shard_name == nullptr) throw std::runtime_error("Qwen tensor not in checkpoint index: " + name);
-    SafeTensorsShard shard(index_.shard_path(*shard_name));
-    const SafeTensorInfo* info = shard.find_tensor(name);
-    if (info == nullptr) throw std::runtime_error("Qwen tensor missing from shard header: " + name);
-    if (info->dtype != dtype) {
+    const QwenSourceTensor info = source_.lookup(name);
+    if (!info.present) {
+        throw std::runtime_error("Qwen tensor not in the checkpoint (" +
+                                 std::string(source_.format_name()) + "): " + name);
+    }
+    if (!source_.accepts_storage_dtype(dtype, info.dtype, info.ternary_blocks)) {
         throw std::runtime_error("unexpected dtype for " + name + " expected=" + safe_dtype_name(dtype) +
-                                 " actual=" + safe_dtype_name(info->dtype));
+                                 " actual=" + safe_dtype_name(info.dtype));
     }
-    if (info->shape != shape) {
+    if (info.shape != shape) {
         throw std::runtime_error("unexpected shape for " + name + " expected=" + shape_string(shape) +
-                                 " actual=" + shape_string(info->shape));
+                                 " actual=" + shape_string(info.shape));
     }
+    const SafeDType device_dtype = source_.device_dtype(info.dtype);
 
     std::vector<uint64_t> local_shape = shape;
     uint64_t start = 0;
@@ -602,27 +835,20 @@ QwenTensorRef QwenWeightMap::require_tensor(const std::string& name, SafeDType d
         const uint64_t segments[] = {key_dim, key_dim, value_dim};
         uint64_t source_offset = 0;
         uint64_t local_total = 0;
-        QwenTensorRef ref;
+        std::vector<std::pair<uint64_t, uint64_t>> offsets;
         for (uint64_t segment : segments) {
             uint64_t segment_start = 0;
             uint64_t segment_size = 0;
             shard_range(segment, tp_world_, tp_rank_, &segment_start, &segment_size);
-            ref.segments.emplace_back(source_offset + segment_start, segment_size);
+            offsets.emplace_back(source_offset + segment_start, segment_size);
             source_offset += segment;
             local_total += segment_size;
         }
         local_shape[0] = local_total;
         size = local_total;
-        ref = make_ref(name, *shard_name, *info, rule, shard_dim, 0, size, local_shape);
-        ref.segments.clear();
-        source_offset = 0;
-        for (uint64_t segment : segments) {
-            uint64_t segment_start = 0;
-            uint64_t segment_size = 0;
-            shard_range(segment, tp_world_, tp_rank_, &segment_start, &segment_size);
-            ref.segments.emplace_back(source_offset + segment_start, segment_size);
-            source_offset += segment;
-        }
+        ternary_storage_shape(info, &local_shape);
+        QwenTensorRef ref = make_ref(info, device_dtype, rule, shard_dim, 0, size, local_shape);
+        ref.segments = std::move(offsets);
         return ref;
     } else if (shard_dim >= 0) {
         if (static_cast<size_t>(shard_dim) >= shape.size()) throw std::runtime_error("invalid Qwen shard dimension");
@@ -631,7 +857,8 @@ QwenTensorRef QwenWeightMap::require_tensor(const std::string& name, SafeDType d
     } else {
         throw std::runtime_error("Qwen non-replicated tensor has no shard dimension: " + name);
     }
-    return make_ref(name, *shard_name, *info, rule, shard_dim, start, size, local_shape);
+    ternary_storage_shape(info, &local_shape);
+    return make_ref(info, device_dtype, rule, shard_dim, start, size, local_shape);
 }
 
 QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
@@ -695,10 +922,10 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
     (void)local_n;
     (void)local_k;
 
-    const std::string* packed_shard = index_.shard_for_tensor(packed_name);
-    const std::string* weight_shard = index_.shard_for_tensor(name);
-    if (packed_shard != nullptr) {
-        if (weight_shard != nullptr) {
+    const QwenSourceTensor packed_info = source_.lookup(packed_name);
+    const QwenSourceTensor weight_info = source_.lookup(name);
+    if (packed_info.present) {
+        if (weight_info.present) {
             throw std::runtime_error(
                 "ambiguous Qwen linear has both packed and dense weights: " + base);
         }
@@ -715,18 +942,15 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
                 "Qwen NVFP4 local packed K is not block64 aligned: " + base);
         }
 
-        const std::string* scale_shard = index_.shard_for_tensor(channel_scale_name);
-        if (scale_shard == nullptr) {
+        const QwenSourceTensor scale_info = source_.lookup(channel_scale_name);
+        if (!scale_info.present) {
             throw std::runtime_error(
-                "Qwen NVFP4 local scale not in checkpoint index: " +
+                "Qwen NVFP4 local scale not in the checkpoint: " +
                 channel_scale_name);
         }
-        SafeTensorsShard scale_file(index_.shard_path(*scale_shard));
-        const SafeTensorInfo* scale_info =
-            scale_file.find_tensor(channel_scale_name);
         const std::vector<uint64_t> scale_shape = {shape[0], shape[1] / 16};
-        if (scale_info == nullptr || scale_info->dtype != SafeDType::F8_E4M3 ||
-            scale_info->shape != scale_shape) {
+        if (scale_info.dtype != SafeDType::F8_E4M3 ||
+            scale_info.shape != scale_shape) {
             throw std::runtime_error(
                 "unexpected Qwen NVFP4 scale metadata for " +
                 channel_scale_name);
@@ -751,12 +975,13 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
             result.weight.nbytes = safe_tensor_numel(result.weight.local_shape);
             result.weight.device_nbytes = result.weight.nbytes;
             result.scale = make_ref(
-                channel_scale_name, *scale_shard, *scale_info, rule, 1,
+                scale_info, source_.device_dtype(scale_info.dtype), rule, 1,
                 logical_start / 16, logical_size / 16,
                 {shape[0], logical_size / 16});
         } else if (rule == QwenShardRule::Replicated) {
-            result.scale = make_ref(channel_scale_name, *scale_shard, *scale_info,
-                                    rule, -1, 0, 0, scale_shape);
+            result.scale = make_ref(scale_info,
+                                    source_.device_dtype(scale_info.dtype), rule,
+                                    -1, 0, 0, scale_shape);
         } else {
             result.scale = require_tensor(
                 channel_scale_name, SafeDType::F8_E4M3, scale_shape, rule, 0);
@@ -773,47 +998,55 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
         return result;
     }
 
-    if (weight_shard == nullptr) {
-        throw std::runtime_error("Qwen linear not in checkpoint index: " + name);
+    if (!weight_info.present) {
+        throw std::runtime_error("Qwen linear not in the checkpoint (" +
+                                 std::string(source_.format_name()) + "): " + name);
     }
-    SafeTensorsShard weight_file(index_.shard_path(*weight_shard));
-    const SafeTensorInfo* weight_info = weight_file.find_tensor(name);
-    if (weight_info == nullptr) {
-        throw std::runtime_error("Qwen linear missing from shard header: " + name);
+    if (weight_info.ternary_blocks) {
+        // The ternary pack carries its own scale per 128 weights, so there is no
+        // second tensor to find and nothing to check for one: the blocks are the
+        // whole weight. Requiring the dtype to be U8 rather than the weight's own
+        // float type is what keeps a probe from ever decoding one into a matrix.
+        if (source_.lookup(block_scale_name).present ||
+            source_.lookup(channel_scale_name).present) {
+            throw std::runtime_error(
+                "ternary Qwen linear unexpectedly has a separate scale: " + name);
+        }
+        result.kind = QwenLinearKind::Ptq1_0;
+        result.weight = require_tensor(name, SafeDType::U8, shape, rule, shard_dim);
+        return result;
     }
-    if (weight_info->dtype == SafeDType::BF16 ||
-        weight_info->dtype == SafeDType::F16) {
+    if (weight_info.dtype == SafeDType::BF16 ||
+        weight_info.dtype == SafeDType::F16) {
         result.kind = QwenLinearKind::DenseF16;
-        result.weight = require_tensor(name, weight_info->dtype, shape, rule,
+        result.weight = require_tensor(name, weight_info.dtype, shape, rule,
                                        shard_dim);
-        if (index_.shard_for_tensor(block_scale_name) != nullptr ||
-            index_.shard_for_tensor(channel_scale_name) != nullptr) {
+        if (source_.lookup(block_scale_name).present ||
+            source_.lookup(channel_scale_name).present) {
             throw std::runtime_error(
                 "dense Qwen linear unexpectedly has quantization scale: " + name);
         }
         return result;
     }
-    if (weight_info->dtype != SafeDType::F8_E4M3) {
+    if (weight_info.dtype != SafeDType::F8_E4M3) {
         throw std::runtime_error("unsupported Qwen linear dtype for " + name +
-                                 ": " + safe_dtype_name(weight_info->dtype));
+                                 ": " + safe_dtype_name(weight_info.dtype));
     }
     result.weight = require_tensor(name, SafeDType::F8_E4M3, shape, rule,
                                    shard_dim);
 
-    const std::string* block_shard = index_.shard_for_tensor(block_scale_name);
-    const std::string* channel_shard = index_.shard_for_tensor(channel_scale_name);
-    if ((block_shard != nullptr) == (channel_shard != nullptr)) {
+    const QwenSourceTensor block_scale_info = source_.lookup(block_scale_name);
+    const QwenSourceTensor channel_scale_info = source_.lookup(channel_scale_name);
+    if (block_scale_info.present == channel_scale_info.present) {
         throw std::runtime_error(
             "Qwen FP8 linear must have exactly one recognized scale: " + name);
     }
 
-    if (channel_shard != nullptr) {
+    if (channel_scale_info.present) {
         result.kind = QwenLinearKind::Fp8Channel;
-        SafeTensorsShard scale_file(index_.shard_path(*channel_shard));
-        const SafeTensorInfo* scale_info = scale_file.find_tensor(channel_scale_name);
         const std::vector<uint64_t> full_scale_shape = {shape[0], 1};
-        if (scale_info == nullptr || scale_info->dtype != SafeDType::BF16 ||
-            scale_info->shape != full_scale_shape) {
+        if (channel_scale_info.dtype != SafeDType::BF16 ||
+            channel_scale_info.shape != full_scale_shape) {
             throw std::runtime_error(
                 "unexpected Qwen FP8 channel scale metadata for " +
                 channel_scale_name);
@@ -836,34 +1069,32 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
                 local_rows += size;
             }
             result.scale = make_ref(
-                channel_scale_name, *channel_shard, *scale_info, rule, 0,
-                0, local_rows, {local_rows, 1});
+                channel_scale_info, source_.device_dtype(channel_scale_info.dtype),
+                rule, 0, 0, local_rows, {local_rows, 1});
             result.scale.segments = std::move(segments_out);
         } else if (rule == QwenShardRule::RowParallel ||
                    rule == QwenShardRule::Replicated) {
-            result.scale = make_ref(channel_scale_name, *channel_shard,
-                                    *scale_info, QwenShardRule::Replicated, -1,
-                                    0, 0, full_scale_shape);
+            result.scale = make_ref(
+                channel_scale_info, source_.device_dtype(channel_scale_info.dtype),
+                QwenShardRule::Replicated, -1, 0, 0, full_scale_shape);
         } else {
             uint64_t start = 0;
             uint64_t size = 0;
             shard_range(shape[0], tp_world_, tp_rank_, &start, &size);
-            result.scale = make_ref(channel_scale_name, *channel_shard,
-                                    *scale_info, rule, 0, start, size,
-                                    {size, 1});
+            result.scale = make_ref(
+                channel_scale_info, source_.device_dtype(channel_scale_info.dtype),
+                rule, 0, start, size, {size, 1});
         }
         result.has_scale = true;
         return result;
     }
 
     result.kind = QwenLinearKind::Fp8Block128;
-    SafeTensorsShard scale_file(index_.shard_path(*block_shard));
-    const SafeTensorInfo* scale_info = scale_file.find_tensor(block_scale_name);
     const std::vector<uint64_t> full_scale_shape = {
         ceil_div(shape[0], config_.fp8_block_size),
         ceil_div(shape[1], config_.fp8_block_size)};
-    if (scale_info == nullptr || scale_info->dtype != SafeDType::BF16 ||
-        scale_info->shape != full_scale_shape) {
+    if (block_scale_info.dtype != SafeDType::BF16 ||
+        block_scale_info.shape != full_scale_shape) {
         throw std::runtime_error(
             "unexpected Qwen FP8 block scale metadata for " + block_scale_name);
     }
@@ -872,8 +1103,9 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
     uint64_t scale_start = 0;
     uint64_t scale_size = 0;
     if (rule == QwenShardRule::Replicated) {
-        result.scale = make_ref(block_scale_name, *block_shard, *scale_info,
-                                rule, shard_dim, 0, 0, local_scale_shape);
+        result.scale = make_ref(
+            block_scale_info, source_.device_dtype(block_scale_info.dtype), rule,
+            shard_dim, 0, 0, local_scale_shape);
     } else if (rule == QwenShardRule::RowParallel) {
         shard_range(shape[1], tp_world_, tp_rank_, &scale_start, &scale_size);
         if (scale_start % config_.fp8_block_size != 0 ||
@@ -883,8 +1115,8 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
         }
         local_scale_shape[1] = scale_size / config_.fp8_block_size;
         result.scale = make_ref(
-            block_scale_name, *block_shard, *scale_info, rule, shard_dim,
-            scale_start / config_.fp8_block_size,
+            block_scale_info, source_.device_dtype(block_scale_info.dtype), rule,
+            shard_dim, scale_start / config_.fp8_block_size,
             scale_size / config_.fp8_block_size, local_scale_shape);
     } else if (rule == QwenShardRule::PackedQkvColumnParallel) {
         const uint64_t key_dim = config_.linear_attention.key_heads *
@@ -913,9 +1145,9 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
             local_rows += segment_size / config_.fp8_block_size;
         }
         local_scale_shape[0] = local_rows;
-        result.scale = make_ref(block_scale_name, *block_shard, *scale_info,
-                                rule, shard_dim, 0, local_rows,
-                                local_scale_shape);
+        result.scale = make_ref(
+            block_scale_info, source_.device_dtype(block_scale_info.dtype), rule,
+            shard_dim, 0, local_rows, local_scale_shape);
         result.scale.segments = std::move(scale_segments);
     } else {
         shard_range(shape[0], tp_world_, tp_rank_, &scale_start, &scale_size);
@@ -927,8 +1159,8 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
         }
         local_scale_shape[0] = scale_size / config_.fp8_block_size;
         result.scale = make_ref(
-            block_scale_name, *block_shard, *scale_info, rule, shard_dim,
-            scale_start / config_.fp8_block_size,
+            block_scale_info, source_.device_dtype(block_scale_info.dtype), rule,
+            shard_dim, scale_start / config_.fp8_block_size,
             scale_size / config_.fp8_block_size, local_scale_shape);
     }
     result.has_scale = true;
@@ -951,8 +1183,7 @@ void QwenWeightMap::claim(const QwenTensorRef& ref) {
         throw std::runtime_error("Qwen tensor is claimed twice by the weight map: " +
                                  ref.name);
     }
-    const uint64_t full_bytes =
-        safe_tensor_numel(ref.full_shape) * safe_dtype_size(ref.dtype);
+    const uint64_t full_bytes = ref.full_nbytes;
     checkpoint_text_bytes_ += full_bytes;
     if (ref.rule == QwenShardRule::Replicated || ref.shard_size == 0) {
         replicated_local_bytes_ += ref.nbytes;
@@ -987,6 +1218,9 @@ void QwenWeightMap::record_linear(const QwenLinearRef& ref) {
         case QwenLinearKind::NvFp4Group16:
             ++checkpoint_linear_kind_counts_.nvfp4_group16;
             break;
+        case QwenLinearKind::Ptq1_0:
+            ++checkpoint_linear_kind_counts_.ptq1_0;
+            break;
     }
 }
 
@@ -1010,14 +1244,13 @@ bool qwen_is_visual_tensor(const std::string& name) {
 
 QwenCoverage QwenWeightMap::coverage() const {
     QwenCoverage out;
-    out.index_tensors = index_.tensor_count();
+    out.index_tensors = source_.tensor_count();
     out.mapped_tensors = claimed_tensors_.size();
     out.checkpoint_text_bytes = checkpoint_text_bytes_;
     out.replicated_local_bytes = replicated_local_bytes_;
     out.sharded_local_bytes = sharded_local_bytes_;
 
-    for (const auto& [name, shard] : index_.weight_map()) {
-        (void)shard;
+    for (const std::string& name : source_.tensor_names()) {
         if (claimed_tensors_.count(name) != 0) continue;
         if (qwen_is_visual_tensor(name)) {
             ++out.visual_tensors;

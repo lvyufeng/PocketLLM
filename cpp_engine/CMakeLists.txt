@@ -47,6 +47,7 @@ set(POCKET_CORE_SOURCES
     core/block_pool.cpp
     core/block_table.cpp
     core/qwen_weight_map.cpp
+    core/qwen_gguf_source.cpp
     core/tokenizer.cpp
     core/tensor.cpp
     core/sampler.cpp
@@ -559,6 +560,10 @@ set_target_properties(test_gguf_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMA
 add_executable(test_gguf_iq1m_reader tests/test_gguf_iq1m_reader.cpp)
 target_link_libraries(test_gguf_iq1m_reader PRIVATE pocket_cpp_core)
 set_target_properties(test_gguf_iq1m_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_gguf_weights tests/test_qwen_gguf_weights.cpp)
+target_link_libraries(test_qwen_gguf_weights PRIVATE pocket_core)
+set_target_properties(test_qwen_gguf_weights PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_gguf_ternary_reader tests/test_gguf_ternary_reader.cpp)
 target_link_libraries(test_gguf_ternary_reader PRIVATE pocket_cpp_core)
