@@ -163,7 +163,7 @@ def _primary_shard_index(shards: list[GGUFShard]) -> int:
     return max(range(len(shards)), key=lambda i: shards[i].file.metadata_count)
 
 
-def read_gguf_bundle(path: str | Path) -> GGUFBundle:
+def read_gguf_bundle(path: str | Path, *, read_arrays: bool = False) -> GGUFBundle:
     paths = resolve_gguf_bundle(path)
     shards: list[GGUFShard] = []
     refs: list[GGUFTensorRef] = []
@@ -171,7 +171,7 @@ def read_gguf_bundle(path: str | Path) -> GGUFBundle:
     total_size = 0
 
     for shard_index, shard_path in enumerate(paths):
-        gguf = GGUFReader(shard_path).read()
+        gguf = GGUFReader(shard_path, read_arrays=read_arrays).read()
         shards.append(GGUFShard(shard_index, shard_path, gguf))
         total_size += int(gguf.size)
         for tensor in gguf.tensors:

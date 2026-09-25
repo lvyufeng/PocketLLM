@@ -126,8 +126,14 @@ def tensor_nbytes(type_id: int, dimensions: tuple[int, ...]) -> int | None:
 
 
 class GGUFReader:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, read_arrays: bool = False):
         self.path = os.path.abspath(path)
+        # Metadata arrays are skipped by default and described by GGUFArraySummary
+        # instead. That is the right default: a tokenizer's 150k-element string
+        # array is not something a caller wants materialised to read one header
+        # field. `read_arrays=True` materialises them, which is what the
+        # self-describing blocks like `prism.hadamard.*` need.
+        self.read_arrays = bool(read_arrays)
 
     def read(self) -> GGUFFile:
         with open(self.path, "rb") as f:
@@ -190,6 +196,8 @@ class GGUFReader:
         if type_name == "array":
             item_type = _read_struct(f, "<I")
             length = _read_struct(f, "<Q")
+            if self.read_arrays:
+                return _read_array(f, item_type, length)
             self._skip_array(f, item_type, length)
             item_name = _metadata_type(item_type)[0]
             return GGUFArraySummary(item_type, item_name, length)
@@ -216,6 +224,28 @@ def _metadata_type(type_id: int) -> tuple[str, str | None, int | None]:
         return _METADATA_TYPES[type_id]
     except KeyError as exc:
         raise ValueError(f"unsupported GGUF metadata type {type_id}") from exc
+
+
+def _read_array(f: BinaryIO, item_type: int, length: int) -> list[Any]:
+    """Materialise a metadata array, for callers that asked for one.
+
+    The same shapes `_skip_array` refuses are refused here, so a file that cannot be
+    skipped cannot be read either, and the two stay in step.
+    """
+    item_name, fmt, size = _metadata_type(item_type)
+    if item_name == "string":
+        return [_read_string(f) for _ in range(int(length))]
+    if item_name == "array":
+        raise ValueError("nested GGUF metadata arrays are not supported")
+    if fmt is None or size is None:
+        raise ValueError(f"unsupported GGUF array item type {item_type}")
+    count = int(length)
+    if count == 0:
+        return []
+    data = f.read(count * int(size))
+    if len(data) != count * int(size):
+        raise EOFError("unexpected end of GGUF metadata array")
+    return list(struct.unpack(f"<{count}{fmt[-1]}", data))
 
 
 def _read_struct(f: BinaryIO, fmt: str):
