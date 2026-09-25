@@ -19,8 +19,16 @@ This applies to commit messages, code comments, docstrings, and all `.md` files.
 ## Documentation layout
 
 **New documents go into the existing topic directory. Do not add a file at the top level of
-`docs/`.** The top level holds the two site entry points and nothing else — `docs/README.md`, which
-indexes the directories, and `docs/getting-started.md`, which the `mkdocs.yml` nav pins at that path.
+`docs/`.** The top level holds the three *site entry points* and nothing else:
+
+- `docs/README.md`, which indexes the directories,
+- `docs/getting-started.md`, which the `mkdocs.yml` nav pins at that path,
+- `docs/llms.txt`, the machine-readable index of every published page.
+
+`llms.txt` is not a document — it is a generated artifact of the nav, and it is the one file at that
+level nobody writes by hand. Regenerate it with `scripts/gen_llms_txt.py` whenever a nav entry
+changes, in the same commit. `mkdocs build --strict` fails when it is stale
+(`hooks/llms_txt_staleness.py`), and that build is the only check CI runs on a documentation change.
 
 | Directory | What belongs in it |
 |---|---|
@@ -35,7 +43,8 @@ indexes the directories, and `docs/getting-started.md`, which the `mkdocs.yml` n
 Filenames are lowercase `snake_case`. Every directory has an `index.md` listing its documents in a
 table, and `docs/README.md` indexes the directories — a new document that is not added to its
 directory's `index.md` is unreachable except by guessing a path, so **update the index in the same
-commit**. Relative links between directories need the `../` prefix; moving a file means fixing every
+commit**, and add the page to `mkdocs.yml`'s `nav` and re-run `scripts/gen_llms_txt.py` in the same
+one. Relative links between directories need the `../` prefix; moving a file means fixing every
 inbound reference in the same commit (source comments and test headers link here too, not just other
 Markdown).
 
@@ -51,7 +60,8 @@ looking untidy.
 | `src/` | Python/PyTorch implementation and kernel library. |
 | `pocketllm/` | The installed package: CLI, HTTP server, supervisor. Imports `pocketllm_cpp` when the native engine was built. |
 | `tests/` | pytest suite — see **Testing** below. |
-| `docs/` | Topic directories — `guides/`, `architecture/`, `performance/`, `models/`, `migration/`, `reports/`, `archive/` — indexed by `docs/README.md`. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>. New files go in a topic directory, never at the top level; see **Documentation layout** above. |
+| `hooks/` | MkDocs build-time checks, registered under `hooks:` in `mkdocs.yml`. One file: it fails the docs build when `docs/llms.txt` is stale. |
+| `docs/` | Topic directories — `guides/`, `architecture/`, `performance/`, `models/`, `migration/`, `reports/`, `archive/` — indexed by `docs/README.md`. Also the source of the published site: `mkdocs.yml` points `docs_dir` at it and `.github/workflows/pages.yml` builds it to <https://lvyufeng.github.io/PocketLLM/>, where `docs/llms.txt` is published as the machine-readable index. New files go in a topic directory, never at the top level; see **Documentation layout** above. |
 
 Two invariants the layout exists to protect:
 

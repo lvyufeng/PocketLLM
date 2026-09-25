@@ -7,12 +7,20 @@ name: Publish documentation
 # `--strict` promotes every MkDocs warning to an error. That is deliberate: it makes
 # this build the repository's link checker, so a document that links to a renamed file
 # fails here instead of shipping a 404.
+#
+# `hooks/` and the llms.txt generator are inputs to the build, not just to the site: the
+# `on_config` hook in hooks/llms_txt_staleness.py compares docs/llms.txt against the nav, and
+# scripts/gen_llms_txt.py defines what it should contain. A change to either can make that file
+# stale, so a push touching only them still has to build -- otherwise the guard has a blind spot
+# exactly where it is most likely to be needed.
 on:
   push:
     branches: [master]
     paths:
       - 'docs/**'
       - 'overrides/**'
+      - 'hooks/**'
+      - 'scripts/gen_llms_txt.py'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - '.github/workflows/pages.yml'
