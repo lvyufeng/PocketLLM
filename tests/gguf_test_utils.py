@@ -55,29 +55,44 @@ def write_gguf(
     metadata: dict[str, Any] | None = None,
     tensors: list[tuple[str, tuple[int, ...], int]] | None = None,
     alignment: int = 32,
+    payloads: dict[str, bytes] | None = None,
 ) -> None:
     """Write a tiny valid GGUF file for header-only tests.
 
     Tensor payloads are zero-filled and only sized according to GGML block
     metadata.  This helper intentionally implements the subset needed by the
-    spec/bundle tests, not a general GGUF writer.
+    spec/bundle tests, not a general GGUF writer.  Pass `payloads` to give a
+    named tensor real bytes instead of zeros; the length must match the type's
+    block arithmetic exactly, which is itself the assertion for a packing whose
+    rows are not byte-aligned.
     """
 
     metadata = dict(metadata or {})
     tensors = list(tensors or [])
+    payloads = dict(payloads or {})
     if alignment != 32:
         metadata.setdefault("general.alignment", alignment)
 
-    payloads: list[bytes] = []
+    payloads_out: list[bytes] = []
     offsets: list[int] = []
     cursor = 0
-    for _name, dims, type_id in tensors:
+    for name, dims, type_id in tensors:
         nbytes = tensor_nbytes(type_id, dims)
-        if nbytes is None:
-            raise ValueError(f"unknown test tensor type id {type_id}")
+        if nbytes is None and name not in payloads:
+            raise ValueError(f"unknown test tensor type id {type_id}: give an explicit payload")
+        if name in payloads:
+            given = payloads.pop(name)
+            if nbytes is not None and len(given) != nbytes:
+                raise ValueError(f"{name} payload is {len(given)} bytes, geometry says {nbytes}")
+            nbytes = len(given)
+            payload = given
+        else:
+            payload = b"\0" * nbytes
         offsets.append(cursor)
-        payloads.append(b"\0" * nbytes)
+        payloads_out.append(payload)
         cursor += nbytes
+    if payloads:
+        raise ValueError(f"payloads given for tensors not in the file: {sorted(payloads)}")
 
     buf = bytearray()
     buf.extend(GGUF_MAGIC)
@@ -100,7 +115,7 @@ def write_gguf(
     padded = align_up(len(buf), alignment)
     if padded > len(buf):
         buf.extend(b"\0" * (padded - len(buf)))
-    for payload in payloads:
+    for payload in payloads_out:
         buf.extend(payload)
 
     path.parent.mkdir(parents=True, exist_ok=True)

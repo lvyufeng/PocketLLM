@@ -12,6 +12,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from src.loader.gguf.quant_types import GGUF_TERNARY_TYPE_NAMES
 from src.loader.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
 
 
@@ -97,6 +98,12 @@ _DENSE_DTYPES = {
 # Mirrors GGML_QUANT_SIZES for the raw GGUF block formats supported by
 # runtime readers.  Q4_K/Q5_K are used by MiniMax dense tensors; keep them as
 # raw blocks in runtime and use reference dequant only in tests.
+#
+# The two ternary formats are here because their *geometry* is what makes their
+# bytes addressable at all -- a 1.75-bit packing does not divide a row, so
+# nothing downstream can infer nbytes from a shape.  Their presence here is not
+# a claim that a kernel consumes them: `read_tensor` refuses them by name below,
+# and `read_quantized_matrix_blocks` hands back raw blocks with no decode.
 _QUANT_BLOCK_META = {
     "q2_k": (256, 84),
     "q3_k": (256, 110),
@@ -108,7 +115,17 @@ _QUANT_BLOCK_META = {
     "q5_k": (256, 176),
     "q6_k": (256, 210),
     "iq4_xs": (256, 136),
+    "ptq1_0": (128, 28),
+    "pq2_0": (128, 34),
 }
+
+#: Block formats with geometry but no kernel.  Dequantizing one of these is the
+#: F16-upcast failure mode this loader is written to avoid, so it is refused by
+#: name rather than left to fall off the end of a dispatch chain.  The set comes
+#: from `quant_types` so that "which types are ternary" is answered in one place;
+#: the geometry above is a second statement of the same fact and the two are
+#: pinned against `reader.GGML_TYPES` by `tests/test_gguf_ternary_reader.py`.
+_TERNARY_BLOCK_META = GGUF_TERNARY_TYPE_NAMES
 
 
 def _quant_block_meta(type_name: str) -> tuple[int, int]:
@@ -295,6 +312,8 @@ class GGUFTensorDataReader:
 
     def read_tensor(self, name: str | GGUFTensorInfo) -> torch.Tensor:
         tensor = self._tensor(name)
+        if tensor.type_name in _TERNARY_BLOCK_META:
+            raise NotImplementedError(self._ternary_refusal(tensor))
         if tensor.type_name in _DENSE_DTYPES or tensor.type_name == "bf16":
             return self._read_dense_tensor(tensor)
         if tensor.type_name == "q8_0":
@@ -302,6 +321,16 @@ class GGUFTensorDataReader:
         if tensor.type_name in _QUANT_BLOCK_META and len(tensor.dimensions) == 2:
             return self._read_quantized_matrix(tensor, tensor.absolute_offset, int(tensor.dimensions[0]), int(tensor.dimensions[1]), tensor.type_name)
         raise NotImplementedError(f"payload decode for {tensor.name} ({tensor.type_name}) is not supported by read_tensor")
+
+    @staticmethod
+    def _ternary_refusal(tensor: GGUFTensorInfo) -> str:
+        return (
+            f"{tensor.name} is {tensor.type_name}: the raw blocks are addressable "
+            "(read_quantized_matrix_blocks) but no kernel consumes them yet, so this loader "
+            "refuses rather than dequantizing to f16 -- a silent upcast costs ten times the "
+            f"memory and makes a wrong kernel look right. The decoder lives in "
+            f"src/loader/gguf/{tensor.type_name}.py; the GEMM is #386"
+        )
 
     def read_tensor_rows(self, name: str | GGUFTensorInfo, row_start: int, row_count: int) -> torch.Tensor:
         tensor = self._tensor(name)
@@ -522,6 +551,8 @@ class GGUFTensorDataReader:
         of resident fp32/bf16 expansion.
         """
         tensor = self._tensor(name)
+        if tensor.type_name in _TERNARY_BLOCK_META:
+            raise NotImplementedError(self._ternary_refusal(tensor))
         if len(tensor.dimensions) != 2:
             raise ValueError(f"{tensor.name} is not a 2D quantized matrix tensor")
         rows = int(tensor.dimensions[1])
