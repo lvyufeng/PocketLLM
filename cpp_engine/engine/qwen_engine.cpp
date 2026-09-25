@@ -10,12 +10,14 @@
 #include "block_pool.hpp"
 #include "block_table.hpp"
 #include "qwen_ops.hpp"
+#include "qwen_hadamard.hpp"
 #include "qwen_dspark.hpp"
 #include "qwen_dflash2.hpp"
 #include "sampler_ops.hpp"
 #include "qwen_target_head.hpp"
 #include "tp_comm.hpp"
 #include "token_constraint.hpp"
+#include "weight_source.hpp"
 
 
 #include <algorithm>
@@ -223,14 +225,17 @@ LayerExecutionConfig kernel_options_to_layer_config(const QwenKernelOptions& opt
     return config;
 }
 
-QwenDeviceTensor upload(const SafeTensorsIndex& index, const QwenTensorRef& ref) {
-    return qwen_upload_tensor(index, ref);
+QwenDeviceTensor upload(const QwenCheckpointSource& checkpoint,
+                        const QwenTensorRef& ref) {
+    return qwen_upload_tensor(checkpoint, ref);
 }
 
-DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& ref) {
+DeviceLinear upload_linear(const QwenCheckpointSource& checkpoint,
+                           const QwenLinearRef& ref) {
     DeviceLinear output;
     output.kind = ref.kind;
     output.logical_shape = ref.logical_local_shape;
+    output.input_rotated = ref.input_rotated;
 #ifdef POCKET_BACKEND_ASCEND
     // NVFP4 repacks into the SM75 WMMA block layout, and only the CUDA kernels
     // read that layout. Reject the kind at load time so the Ascend build carries
@@ -243,12 +248,12 @@ DeviceLinear upload_linear(const SafeTensorsIndex& index, const QwenLinearRef& r
 #else
     if (ref.kind == QwenLinearKind::NvFp4Group16) {
         output.weight = qwen_upload_nvfp4_linear_cuda(
-            index, ref, &output.weight_global_factor,
+            checkpoint, ref, &output.weight_global_factor,
             &output.input_global_scale);
     } else {
 #endif
-        output.weight = upload(index, ref.weight);
-        if (ref.has_scale) output.scale = upload(index, ref.scale);
+        output.weight = upload(checkpoint, ref.weight);
+        if (ref.has_scale) output.scale = upload(checkpoint, ref.scale);
     }
     return output;
 }
@@ -671,6 +676,47 @@ struct QwenWorkspace {
     }
 };
 
+// The checkpoint's incoherence transform, as the runtime needs it: the block
+// size and one device sign vector per declared width. Nothing here knows the
+// model's head geometry -- the transform is over each block and the file's sign
+// list is what says which widths it covers.
+struct QwenRotationPlan {
+    bool active = false;
+    int block_size = 0;
+    // Width to fp32 sign vector. Small: the checkpoint declares three widths.
+    std::vector<std::pair<uint64_t, QwenDeviceTensor>> signs;
+
+    // The memo, and the reason it carries a generation.
+    //
+    // One normalized hidden state feeds five projections, so rotating per
+    // consumer would be five passes over the same bytes; at a 4096-token chunk
+    // that is tens of milliseconds per step, which is not a rounding error. The
+    // key is the activation's address, and an address repeats across steps, so a
+    // bare pointer key would return the *previous* step's rotation -- a wrong
+    // answer that runs. Every entry therefore also records the workspace
+    // generation it was built in, and a hit from another generation is a miss.
+    // The failure direction is the cheap one: a needless rotation.
+    struct Entry {
+        const uint16_t* source = nullptr;
+        uint64_t rows = 0;
+        uint64_t width = 0;
+        uint64_t generation = 0;
+        uint16_t* result = nullptr;
+    };
+    // Four activations per layer at the most, and the entries are reused rather
+    // than appended once the memo has warmed up.
+    static constexpr size_t kRotationMemoEntries = 8;
+    uint64_t generation = 1;
+    std::vector<Entry> memo;
+
+    const QwenDeviceTensor* signs_for(uint64_t width) const {
+        for (const auto& item : signs) {
+            if (item.first == width) return &item.second;
+        }
+        return nullptr;
+    }
+};
+
 }  // namespace
 
 #include "qwen_layer_components.inl"
@@ -694,7 +740,9 @@ QwenKvCacheDType parse_qwen_kv_cache_dtype(const std::string& value) {
 }
 
 struct QwenEngine::Impl {
-    SafeTensorsIndex& index;
+    // The container the engine loaded from, named apart from the per-layer
+    // weight structs the upload sites also call `source`.
+    const QwenCheckpointSource& checkpoint;
     QwenConfig& config;
     QwenEngineOptions options;
     LayerExecutionConfig layer_config;
@@ -713,6 +761,15 @@ struct QwenEngine::Impl {
     QwenDeviceTensor embed;
     QwenDeviceTensor final_norm;
     DeviceLinear lm_head;
+    // The checkpoint's incoherence transform, empty for every checkpoint that
+    // carries none -- which is every one but a ternary release.
+    QwenRotationPlan rotation;
+    // Whether the embedding table is stored in the rotated frame, so the rows it
+    // hands back are restored to the model's basis right after the lookup. Read
+    // from the file's own inverse list rather than assumed from the family: the
+    // transform is the same one either way, and applying it in the wrong place
+    // leaves a model that generates fluently and means nothing.
+    bool embed_takes_inverse = false;
     bool mtp_enabled = false;
     bool dspark_enabled = false;
     bool dflash2_enabled = false;
@@ -1361,10 +1418,10 @@ struct QwenEngine::Impl {
         if (nccl_comm_stream != nullptr) stream_destroy(nccl_comm_stream);
     }
 
-    Impl(SafeTensorsIndex& index_, QwenConfig& config_,
+    Impl(const QwenCheckpointSource& source_, QwenConfig& config_,
          const QwenWeightMap& map, const QwenEngineOptions& options_,
          int max_context_, int active_layers)
-        : index(index_), config(config_), options(options_),
+        : checkpoint(source_), config(config_), options(options_),
           layer_config(kernel_options_to_layer_config(options_.kernel)),
           max_context(max_context_) {
         // Phase 3.2: Initialize max_batch_size from options
@@ -1446,15 +1503,41 @@ struct QwenEngine::Impl {
                 : map.lm_head().kind == QwenLinearKind::Fp8Channel
                       ? "fp8_channel_online"
                       : qwen_linear_kind_name(map.lm_head().kind);
-        embed = upload(index, map.embed_tokens());
-        final_norm = upload(index, map.final_norm());
-        lm_head = upload_linear(index, map.lm_head());
+        embed = upload(checkpoint, map.embed_tokens());
+        final_norm = upload(checkpoint, map.final_norm());
+        lm_head = upload_linear(checkpoint, map.lm_head());
         count_active_linear(map.lm_head().kind);
         uploaded_weight_bytes += map.embed_tokens().device_nbytes +
                                  map.final_norm().device_nbytes;
         uploaded_weight_bytes += map.lm_head().weight.device_nbytes;
         if (map.lm_head().has_scale) {
             uploaded_scale_bytes += map.lm_head().scale.device_nbytes;
+        }
+        // The checkpoint's incoherence transform, if it declares one. The signs
+        // are read here, once, so that nothing on the hot path has to know they
+        // came out of metadata: a checkpoint that declares none leaves the plan
+        // inactive and every projection takes its ordinary path.
+        if (const QwenHadamardSpec* spec = checkpoint.hadamard()) {
+            rotation.active = true;
+            rotation.block_size = static_cast<int>(spec->block_size());
+            if (rotation.block_size <= 0) {
+                throw std::runtime_error(
+                    "the checkpoint's hadamard block declares no block size");
+            }
+            for (uint64_t width : spec->sign_widths()) {
+                const std::vector<int64_t>& values = spec->signs_for_width(width);
+                std::vector<float> host(values.begin(), values.end());
+                QwenDeviceTensor device;
+                allocate_float(device, host.size(), {width});
+                check_device(memcpy_h2d(device.data, host.data(),
+                                        host.size() * sizeof(float)),
+                             "Qwen hadamard sign upload");
+                rotation.signs.emplace_back(width, std::move(device));
+            }
+            embed_takes_inverse = spec->takes_inverse(map.embed_tokens().name);
+            telemetry.rotation_block_size = rotation.block_size;
+            telemetry.rotation_sign_widths = rotation.signs.size();
+            telemetry.embedding_rotated = embed_takes_inverse;
         }
         const size_t layer_limit = active_layers > 0
             ? std::min(static_cast<size_t>(active_layers), map.layers().size())
@@ -1620,11 +1703,11 @@ struct QwenEngine::Impl {
             }
 
             DeviceLayer destination;
-            destination.input_norm = upload(index, source.input_layernorm);
-            destination.post_norm = upload(index, source.post_attention_layernorm);
-            destination.gate = upload_linear(index, source.mlp.gate_proj);
-            destination.up = upload_linear(index, source.mlp.up_proj);
-            destination.down = upload_linear(index, source.mlp.down_proj);
+            destination.input_norm = upload(checkpoint, source.input_layernorm);
+            destination.post_norm = upload(checkpoint, source.post_attention_layernorm);
+            destination.gate = upload_linear(checkpoint, source.mlp.gate_proj);
+            destination.up = upload_linear(checkpoint, source.mlp.up_proj);
+            destination.down = upload_linear(checkpoint, source.mlp.down_proj);
             // Fuse gate and up projections for MLP (similar to linear-attention a/b).
             // Reduces MatMul calls from 2 to 1 per layer, saving 64 calls per token.
             if (layer_config.fuse_ab_projection) {
@@ -1632,15 +1715,15 @@ struct QwenEngine::Impl {
             }
             if (source.linear_attention.in_proj_qkv.weight.found) {
                 destination.linear.qkv =
-                    upload_linear(index, source.linear_attention.in_proj_qkv);
+                    upload_linear(checkpoint, source.linear_attention.in_proj_qkv);
                 destination.linear.z =
-                    upload_linear(index, source.linear_attention.in_proj_z);
+                    upload_linear(checkpoint, source.linear_attention.in_proj_z);
                 destination.linear.out =
-                    upload_linear(index, source.linear_attention.out_proj);
+                    upload_linear(checkpoint, source.linear_attention.out_proj);
                 destination.linear.a =
-                    upload_linear(index, source.linear_attention.in_proj_a);
+                    upload_linear(checkpoint, source.linear_attention.in_proj_a);
                 destination.linear.b =
-                    upload_linear(index, source.linear_attention.in_proj_b);
+                    upload_linear(checkpoint, source.linear_attention.in_proj_b);
                 // in_proj_a and in_proj_b are both BF16 [num_v_heads, hidden]
                 // and read the same activation, so a row-concat lets one GEMM
                 // replace two. Each alone is far too small to fill the device
@@ -1649,13 +1732,13 @@ struct QwenEngine::Impl {
                 destination.linear.ab = fuse_linear_rows(
                     destination.linear.a, destination.linear.b);
                 destination.linear.conv =
-                    upload(index, source.linear_attention.conv1d);
+                    upload(checkpoint, source.linear_attention.conv1d);
                 destination.linear.a_log =
-                    upload(index, source.linear_attention.a_log);
+                    upload(checkpoint, source.linear_attention.a_log);
                 destination.linear.dt_bias =
-                    upload(index, source.linear_attention.dt_bias);
+                    upload(checkpoint, source.linear_attention.dt_bias);
                 destination.linear.norm =
-                    upload(index, source.linear_attention.norm);
+                    upload(checkpoint, source.linear_attention.norm);
                 // Phase 3.4: The recurrent state carries the whole history of a
                 // linear-attention layer, so batched requests need one copy
                 // each. It is allocated as [slot, value_heads, k_dim, v_dim]
@@ -1684,16 +1767,16 @@ struct QwenEngine::Impl {
                 zero_tensor(destination.linear.state);
                 zero_tensor(destination.linear.conv_tail);
             } else {
-                destination.full.q = upload_linear(index, source.full_attention.q_proj);
-                destination.full.k = upload_linear(index, source.full_attention.k_proj);
-                destination.full.v = upload_linear(index, source.full_attention.v_proj);
+                destination.full.q = upload_linear(checkpoint, source.full_attention.q_proj);
+                destination.full.k = upload_linear(checkpoint, source.full_attention.k_proj);
+                destination.full.v = upload_linear(checkpoint, source.full_attention.v_proj);
                 if (fuse_kv_projection) {
                     destination.full.kv = fuse_linear_rows(
                         destination.full.k, destination.full.v);
                 }
-                destination.full.out = upload_linear(index, source.full_attention.o_proj);
-                destination.full.q_norm = upload(index, source.full_attention.q_norm);
-                destination.full.k_norm = upload(index, source.full_attention.k_norm);
+                destination.full.out = upload_linear(checkpoint, source.full_attention.o_proj);
+                destination.full.q_norm = upload(checkpoint, source.full_attention.q_norm);
+                destination.full.k_norm = upload(checkpoint, source.full_attention.k_norm);
 
                 // Phase 3.2: Multi-slot KV cache allocation
                 const int slot_count = options.max_batch_size;
@@ -1901,13 +1984,18 @@ struct QwenEngine::Impl {
                 *dspark_index, *dspark_config, options.tp_world, options.tp_rank);
             // The target embedding is vocab-sharded. QwenDSparkRuntime gathers
             // local rows then performs the same TP all-reduce as target prefill.
-            const QwenTargetHeadAdapter target_head{
+            QwenTargetHeadAdapter target_head{
                 lm_head.kind, &lm_head.weight,
                 lm_head.scale.data != nullptr ? &lm_head.scale : nullptr,
                 static_cast<int>(lm_head.logical_shape.at(0)),
                 static_cast<int>(lm_head.logical_shape.at(1)),
                 static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
                     options.tp_world};
+            // The draft's own head is this model's head, so it reads the same
+            // frame -- the transform is the engine's, and the adapter is what
+            // carries it across the module boundary.
+            target_head.input_rotated = lm_head.input_rotated;
+            target_head.transform = head_transform();
             dspark = std::make_unique<QwenDSparkRuntime>(
                 options.dspark_checkpoint, *dspark_config, *dspark_weights,
                 embed, target_head, options.tp_world, options.tp_rank,
@@ -1931,13 +2019,18 @@ struct QwenEngine::Impl {
                 SafeTensorsIndex::from_single_file(options.dflash2_checkpoint));
             dflash2_weights = std::make_unique<QwenDFlash2WeightMap>(
                 *dflash2_index, *dflash2_config, options.tp_world, options.tp_rank);
-            const QwenTargetHeadAdapter target_head{
+            QwenTargetHeadAdapter target_head{
                 lm_head.kind, &lm_head.weight,
                 lm_head.scale.data != nullptr ? &lm_head.scale : nullptr,
                 static_cast<int>(lm_head.logical_shape.at(0)),
                 static_cast<int>(lm_head.logical_shape.at(1)),
                 static_cast<uint64_t>(options.tp_rank) * config.vocab_size /
                     options.tp_world};
+            // The draft's own head is this model's head, so it reads the same
+            // frame -- the transform is the engine's, and the adapter is what
+            // carries it across the module boundary.
+            target_head.input_rotated = lm_head.input_rotated;
+            target_head.transform = head_transform();
             dflash2 = std::make_unique<QwenDFlash2Runtime>(
                 options.dflash2_checkpoint, *dflash2_config, *dflash2_weights,
                 embed, target_head, options.tp_world, options.tp_rank,
@@ -1960,22 +2053,22 @@ struct QwenEngine::Impl {
             }
             mtp_enabled = true;
             const QwenMtpWeights& source = map.mtp();
-            mtp_pre_fc_norm_embedding = upload(index, source.pre_fc_norm_embedding);
-            mtp_pre_fc_norm_hidden = upload(index, source.pre_fc_norm_hidden);
-            mtp_norm = upload(index, source.norm);
-            mtp_fc = upload_linear(index, source.fc);
+            mtp_pre_fc_norm_embedding = upload(checkpoint, source.pre_fc_norm_embedding);
+            mtp_pre_fc_norm_hidden = upload(checkpoint, source.pre_fc_norm_hidden);
+            mtp_norm = upload(checkpoint, source.norm);
+            mtp_fc = upload_linear(checkpoint, source.fc);
             const QwenLayerWeights& mtp_source = source.layer;
-            mtp_layer.input_norm = upload(index, mtp_source.input_layernorm);
-            mtp_layer.post_norm = upload(index, mtp_source.post_attention_layernorm);
-            mtp_layer.gate = upload_linear(index, mtp_source.mlp.gate_proj);
-            mtp_layer.up = upload_linear(index, mtp_source.mlp.up_proj);
-            mtp_layer.down = upload_linear(index, mtp_source.mlp.down_proj);
-            mtp_layer.full.q = upload_linear(index, mtp_source.full_attention.q_proj);
-            mtp_layer.full.k = upload_linear(index, mtp_source.full_attention.k_proj);
-            mtp_layer.full.v = upload_linear(index, mtp_source.full_attention.v_proj);
-            mtp_layer.full.out = upload_linear(index, mtp_source.full_attention.o_proj);
-            mtp_layer.full.q_norm = upload(index, mtp_source.full_attention.q_norm);
-            mtp_layer.full.k_norm = upload(index, mtp_source.full_attention.k_norm);
+            mtp_layer.input_norm = upload(checkpoint, mtp_source.input_layernorm);
+            mtp_layer.post_norm = upload(checkpoint, mtp_source.post_attention_layernorm);
+            mtp_layer.gate = upload_linear(checkpoint, mtp_source.mlp.gate_proj);
+            mtp_layer.up = upload_linear(checkpoint, mtp_source.mlp.up_proj);
+            mtp_layer.down = upload_linear(checkpoint, mtp_source.mlp.down_proj);
+            mtp_layer.full.q = upload_linear(checkpoint, mtp_source.full_attention.q_proj);
+            mtp_layer.full.k = upload_linear(checkpoint, mtp_source.full_attention.k_proj);
+            mtp_layer.full.v = upload_linear(checkpoint, mtp_source.full_attention.v_proj);
+            mtp_layer.full.out = upload_linear(checkpoint, mtp_source.full_attention.o_proj);
+            mtp_layer.full.q_norm = upload(checkpoint, mtp_source.full_attention.q_norm);
+            mtp_layer.full.k_norm = upload(checkpoint, mtp_source.full_attention.k_norm);
             uploaded_weight_bytes += source.pre_fc_norm_embedding.device_nbytes +
                 source.pre_fc_norm_hidden.device_nbytes + source.norm.device_nbytes +
                 mtp_source.input_layernorm.device_nbytes +
@@ -2906,6 +2999,9 @@ struct QwenEngine::Impl {
             case QwenLinearKind::NvFp4Group16:
                 ++active_linear_kinds.nvfp4_group16;
                 break;
+            case QwenLinearKind::Ptq1_0:
+                ++active_linear_kinds.ptq1_0;
+                break;
         }
         telemetry.active_linear_kinds = active_linear_kinds;
     }
@@ -3015,7 +3111,48 @@ struct QwenEngine::Impl {
                        "Qwen FP16 residual add");
     }
 
-    void begin_workspace() { workspace.begin(); }
+    // The embedding lookup, whichever way the table is stored.
+    //
+    // A ternary checkpoint quantizes its embedding like everything else, and the
+    // table is then read where it lies: expanding it to fp16 at load costs 2.4 GiB
+    // on a card where the 27B of weights is 5.5, which is the difference between a
+    // model that fits beside its KV cache and one that does not. Both paths write
+    // zeros for a token this rank does not hold, because the caller sums the
+    // ranks' rows.
+    void embedding_lookup(const int* tokens, uint16_t* output, int rows,
+                          const char* site) {
+        const int hidden_size = static_cast<int>(config.hidden_size);
+        const int vocab_start = static_cast<int>(weights_vocab_start());
+        const int vocab_rows = static_cast<int>(embed.shape[0]);
+#ifdef POCKET_BACKEND_ASCEND
+        // The Ascend backend is dense FP16 only, and a weight map that refused a
+        // ternary checkpoint never gets here with one.
+        require_launch(qwen_embedding_fp16_gather_f16(embed.f16_data(), tokens,
+                                                      output, rows, hidden_size,
+                                                      vocab_start, vocab_rows),
+                       site);
+#else
+        if (embed.device_dtype == SafeDType::U8) {
+            require_launch(qwen_embedding_ptq1_0_gather_f16_cuda(
+                               embed.u8_data(), tokens, output, rows,
+                               hidden_size, vocab_start, vocab_rows),
+                           site);
+        } else {
+            require_launch(qwen_embedding_fp16_gather_f16(
+                               embed.f16_data(), tokens, output, rows,
+                               hidden_size, vocab_start, vocab_rows),
+                           site);
+        }
+#endif
+    }
+
+    void begin_workspace() {
+        workspace.begin();
+        // The slots are handed out by cursor position, so the same address comes
+        // back around in the next layer holding different numbers. That is what
+        // the rotation memo's generation is for.
+        ++rotation.generation;
+    }
 
     QwenDeviceTensor& workspace_half(size_t elements,
                                      const std::vector<uint64_t>& shape) {
@@ -3025,6 +3162,143 @@ struct QwenEngine::Impl {
     QwenDeviceTensor& workspace_float(size_t elements,
                                       const std::vector<uint64_t>& shape) {
         return workspace.float_tensor(elements, shape);
+    }
+
+    // The activation a folded projection reads, rotated into the checkpoint's
+    // frame. The result lives in a workspace slot, which is why the memo records
+    // the generation rather than the buffer: the slot stays valid for the rest of
+    // the layer, and the entry stops being trusted at the next one.
+    //
+    // The transform is the only activation-side step there is: the one tensor the
+    // file might store in a different head order is mapped back by the loader
+    // (`QwenCheckpointSource::row_order`), so the feature axis arriving here is
+    // always the axis the folded matrix was written against.
+    //
+    // `site` names the projection in the error and in the profile, because a
+    // width the file does not declare is the one failure here that is silent
+    // otherwise -- the block would be left as it was and the projection would
+    // read the wrong frame.
+    const uint16_t* rotate_activation(const uint16_t* input, int rows, int columns,
+                                      const char* site) {
+#ifdef POCKET_BACKEND_ASCEND
+        // The transform is a CUDA kernel. Branching here rather than dropping the
+        // call would leave the symbol referenced from this object, and the Ascend
+        // link has no definition of it -- which is the same reason the Qwen
+        // Ascend path is dense FP16 only. Nothing reaches this: the weight map
+        // refuses a ternary checkpoint on this backend.
+        (void)input; (void)rows; (void)columns; (void)site;
+        throw std::runtime_error(
+            "the incoherence rotation is not implemented on the Ascend backend");
+#else
+        PhaseScope scope(this, std::string(rows == 1 ? "rot.d." : "rot.r.") + site);
+        if (!rotation.active) {
+            throw std::runtime_error(
+                std::string("Qwen projection ") + site +
+                " declares a folded weight, but the checkpoint's hadamard block "
+                "was not loaded");
+        }
+        if (rows <= 0 || columns <= 0) {
+            throw std::runtime_error(std::string("Qwen rotation of ") + site +
+                                     " has an empty extent");
+        }
+        const uint64_t width = static_cast<uint64_t>(columns);
+        if (width % static_cast<uint64_t>(rotation.block_size) != 0) {
+            throw std::runtime_error(
+                std::string("Qwen rotation of ") + site + " has width " +
+                std::to_string(width) + ", which is not a whole number of " +
+                std::to_string(rotation.block_size) + "-element blocks");
+        }
+        const QwenDeviceTensor* device_signs = rotation.signs_for(width);
+        if (device_signs == nullptr) {
+            throw std::runtime_error(
+                std::string("Qwen rotation of ") + site + " has width " +
+                std::to_string(width) +
+                ", which the checkpoint's hadamard block declares no sign "
+                "vector for");
+        }
+
+        for (const QwenRotationPlan::Entry& entry : rotation.memo) {
+            if (entry.source == input && entry.rows == static_cast<uint64_t>(rows) &&
+                entry.width == width && entry.generation == rotation.generation) {
+                return entry.result;
+            }
+        }
+
+        const std::vector<uint64_t> shape = {static_cast<uint64_t>(rows), width};
+        QwenDeviceTensor& scratch =
+            workspace_half(static_cast<size_t>(rows) * width, shape);
+        require_launch(qwen_hadamard_forward_f16_cuda(
+                           input, static_cast<const float*>(device_signs->data),
+                           scratch.f16_data(), rows, columns, rotation.block_size),
+                       "Qwen incoherence rotation");
+
+        // Reuse a stale entry when there is one, so the memo does not grow with
+        // the layer count. Overwriting a live entry is the fallback and costs a
+        // rotation, never a wrong answer: the result is the workspace slot, and
+        // the entry only decides whether the next caller rotates again.
+        QwenRotationPlan::Entry* target = nullptr;
+        for (QwenRotationPlan::Entry& entry : rotation.memo) {
+            if (entry.generation != rotation.generation) {
+                target = &entry;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            if (rotation.memo.size() < QwenRotationPlan::kRotationMemoEntries) {
+                rotation.memo.emplace_back();
+                target = &rotation.memo.back();
+            } else {
+                target = &rotation.memo.front();
+            }
+        }
+        target->source = input;
+        target->rows = static_cast<uint64_t>(rows);
+        target->width = width;
+        target->generation = rotation.generation;
+        target->result = scratch.f16_data();
+        return target->result;
+#endif
+    }
+
+    // The same transform, handed to the batched target head as a callback. The
+    // head has no runtime to ask, so this is the one place the two meet.
+    static const uint16_t* rotate_for_head(void* context, const uint16_t* input,
+                                           int rows, int width) {
+        Impl* self = static_cast<Impl*>(context);
+        return self->rotate_activation(input, rows, width, "lmhead");
+    }
+
+    QwenTargetHeadTransform head_transform() {
+        QwenTargetHeadTransform transform;
+        transform.forward = &Impl::rotate_for_head;
+        transform.context = this;
+        return transform;
+    }
+
+    // Restore the embedding rows to the model's basis. In place: each block reads
+    // exactly the 1024 elements it writes, into shared memory, before writing
+    // them, so no thread can see another's output.
+    void apply_embedding_inverse(uint16_t* rows, int row_count) {
+        if (!embed_takes_inverse) return;
+#ifdef POCKET_BACKEND_ASCEND
+        (void)rows; (void)row_count;
+        throw std::runtime_error(
+            "the incoherence rotation is not implemented on the Ascend backend");
+#else
+        PhaseScope scope(this, "embed.inv");
+        const uint64_t width = config.hidden_size;
+        const QwenDeviceTensor* device_signs = rotation.signs_for(width);
+        if (device_signs == nullptr) {
+            throw std::runtime_error(
+                "the checkpoint stores its embedding in the rotated frame but "
+                "declares no sign vector for width " + std::to_string(width));
+        }
+        require_launch(qwen_hadamard_inverse_f16_cuda(
+                           rows, static_cast<const float*>(device_signs->data),
+                           rows, row_count, static_cast<int>(width),
+                           rotation.block_size),
+                       "Qwen embedding inverse transform");
+#endif
     }
 
     bool sampling_enabled() const { return options.temperature > 1.0e-5f; }
@@ -3434,6 +3708,14 @@ struct QwenEngine::Impl {
         QwenDeviceTensor& local_logits = workspace_float(
             static_cast<size_t>(rows) * local_vocab,
             {static_cast<uint64_t>(rows), static_cast<uint64_t>(local_vocab)});
+        // A folded head weight reads the rotated activation. `normalized` stays
+        // in the model's own basis -- the draft seeds and the logprob path read
+        // it too -- so the rotation goes to a slot of its own.
+        const uint16_t* head_input = normalized.f16_data();
+        if (lm_head.input_rotated) {
+            head_input = rotate_activation(normalized.f16_data(), rows,
+                                           hidden_size, "lmhead");
+        }
         bool logits_ok = false;
 #ifdef POCKET_BACKEND_ASCEND
         // The cuBLAS row variant is an alternative implementation of the same
@@ -3448,7 +3730,7 @@ struct QwenEngine::Impl {
         {
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
             logits_ok = qwen_fp16_matmul_rows_f16_f32(
-                normalized.f16_data(), lm_head.weight.f16_data(),
+                head_input, lm_head.weight.f16_data(),
                 local_logits.f32_data(), rows, local_vocab, hidden_size,
                 hidden_size, local_vocab, hidden_size);
         }
@@ -3466,22 +3748,36 @@ struct QwenEngine::Impl {
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
             logits_ok = matvec_logits
                 ? qwen_fp16_matvec_rows_f16_f32_cuda(
-                      normalized.f16_data(), lm_head.weight.f16_data(),
+                      head_input, lm_head.weight.f16_data(),
                       local_logits.f32_data(), rows, local_vocab, hidden_size,
                       hidden_size, local_vocab, hidden_size)
                 : cublas_logits
                     ? qwen_fp16_matmul_rows_f16_f32_cublas_cuda(
-                          normalized.f16_data(), lm_head.weight.f16_data(),
+                          head_input, lm_head.weight.f16_data(),
                           local_logits.f32_data(), rows, local_vocab, hidden_size,
                           hidden_size, local_vocab, hidden_size)
                     : qwen_fp16_matmul_rows_f16_f32(
-                          normalized.f16_data(), lm_head.weight.f16_data(),
+                          head_input, lm_head.weight.f16_data(),
                           local_logits.f32_data(), rows, local_vocab, hidden_size,
                           hidden_size, local_vocab, hidden_size);
+        } else if (lm_head.kind == QwenLinearKind::Ptq1_0) {
+            // The head is ternary like most of the model, so the logits come out
+            // of the same block reader the layers use. It is the one weight whose
+            // output is read as numbers rather than fed forward, which is why
+            // this entry point returns fp32 where the layer one returns fp16.
+            PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
+            logits_ok = rows == 1
+                ? qwen_ptq1_0_matvec_f16_f32_cuda(
+                      head_input, lm_head.weight.u8_data(),
+                      local_logits.f32_data(), local_vocab, hidden_size)
+                : qwen_ptq1_0_matmul_rows_f16_f32_cuda(
+                      head_input, lm_head.weight.u8_data(),
+                      local_logits.f32_data(), rows, local_vocab, hidden_size,
+                      hidden_size, local_vocab);
         } else if (lm_head.kind == QwenLinearKind::Fp8Channel) {
             PhaseScope scope(this, rows == 1 ? "lmhead.d" : "lmhead.r");
             logits_ok = qwen_fp8_e4m3_channel_matmul_rows_f16_f32_cuda(
-                normalized.f16_data(), lm_head.weight.fp8_data(),
+                head_input, lm_head.weight.fp8_data(),
                 lm_head.scale.f16_data(), local_logits.f32_data(), rows,
                 local_vocab, hidden_size, hidden_size, local_vocab,
                 hidden_size);
@@ -3667,12 +3963,15 @@ struct QwenEngine::Impl {
         check_device(memcpy_h2d(d_tokens.data, tokens.data(), tokens.size() * sizeof(int)),
                      "Qwen MTP token upload");
         allocate_half(mtp_embedding, hidden_elements, hidden_shape);
-        require_launch(qwen_embedding_fp16_gather_f16(
-            embed.f16_data(), static_cast<int*>(d_tokens.data),
-            mtp_embedding.f16_data(), rows, hidden_size,
-            static_cast<int>(weights_vocab_start()),
-            static_cast<int>(embed.shape[0])), "Qwen MTP embedding lookup");
+        embedding_lookup(static_cast<int*>(d_tokens.data),
+                         mtp_embedding.f16_data(), rows,
+                         "Qwen MTP embedding lookup");
         all_reduce_half(mtp_embedding.f16_data(), rows * hidden_size, "mtp.emb");
+        // The table's rows are stored in the checkpoint's rotated frame; the
+        // model reads them in its own. After the collective rather than before
+        // it: the transform is linear either way, and this way it runs once, on
+        // the assembled activation, instead of on every rank's empty rows.
+        apply_embedding_inverse(mtp_embedding.f16_data(), rows);
 
         allocate_half(mtp_normalized_embedding, hidden_elements, hidden_shape);
         allocate_half(mtp_normalized_hidden, hidden_elements, hidden_shape);
@@ -4249,12 +4548,14 @@ struct QwenEngine::Impl {
             static_cast<uint64_t>(rows), static_cast<uint64_t>(hidden_size)};
         allocate_half(hidden_a, hidden_elements, hidden_shape);
         allocate_half(hidden_b, hidden_elements, hidden_shape);
-        require_launch(qwen_embedding_fp16_gather_f16(
-            embed.f16_data(), static_cast<int*>(d_tokens.data),
-            hidden_a.f16_data(), rows, hidden_size,
-            static_cast<int>(weights_vocab_start()),
-            static_cast<int>(embed.shape[0])), "Qwen FP16 embedding lookup");
+        embedding_lookup(static_cast<int*>(d_tokens.data), hidden_a.f16_data(),
+                         rows, "Qwen FP16 embedding lookup");
         all_reduce_half(hidden_a.f16_data(), rows * hidden_size, "hidden_a");
+        // The table's rows are stored in the checkpoint's rotated frame; the
+        // model reads them in its own. After the collective: the transform is
+        // linear either way, and here it runs once on the assembled activation
+        // instead of on every rank's slice.
+        apply_embedding_inverse(hidden_a.f16_data(), rows);
         uint16_t* hidden = hidden_a.f16_data();
         uint16_t* output = hidden_b.f16_data();
         const int dspark_tap_count = dspark_enabled
@@ -4576,13 +4877,12 @@ struct QwenEngine::Impl {
                      "Qwen batched decode token upload");
         allocate_half(hidden_a, hidden_elements, hidden_shape);
         allocate_half(hidden_b, hidden_elements, hidden_shape);
-        require_launch(qwen_embedding_fp16_gather_f16(
-            embed.f16_data(), static_cast<int*>(d_tokens.data),
-            hidden_a.f16_data(), rows, hidden_size,
-            static_cast<int>(weights_vocab_start()),
-            static_cast<int>(embed.shape[0])),
-            "Qwen batched decode embedding lookup");
+        embedding_lookup(static_cast<int*>(d_tokens.data), hidden_a.f16_data(),
+                         rows, "Qwen batched decode embedding lookup");
         all_reduce_half_rows(hidden_a.f16_data(), rows, hidden_size, "hidden_a");
+        // As in the single-sequence path: the lookup returns a row in the
+        // checkpoint's rotated frame, and the model reads it in its own.
+        apply_embedding_inverse(hidden_a.f16_data(), rows);
 
         uint16_t* hidden = hidden_a.f16_data();
         uint16_t* output = hidden_b.f16_data();
@@ -4631,12 +4931,29 @@ struct QwenEngine::Impl {
     }
 };
 
+namespace {
+
+// The checkpoint's configuration, read from whichever container the path names.
+// A GGUF states the model's own hyperparameters in its header; an HF export
+// states them in config.json, and the two agree because they describe the same
+// architecture.
+QwenConfig qwen_config_of(const std::string& ckpt_dir) {
+    return is_gguf_path(ckpt_dir) ? QwenConfig::from_gguf(ckpt_dir)
+                                  : QwenConfig::from_hf_config(ckpt_dir);
+}
+
+}  // namespace
+
 QwenEngine::QwenEngine(const std::string& ckpt_dir,
                        const QwenEngineOptions& options, int layer_count,
                        int max_context)
     : ckpt_dir_(ckpt_dir), options_(options),
-      config_(QwenConfig::from_hf_config(ckpt_dir)), index_(ckpt_dir),
-      weights_(index_, config_, options.tp_world, options.tp_rank) {
+      config_(qwen_config_of(ckpt_dir)),
+      // The source before the map that reads it, and the wrapper before the
+      // reference into it: `weights_` holds `source_`, so the two have to be
+      // constructed in that order and destroyed in the reverse.
+      owned_source_(open_qwen_checkpoint(ckpt_dir)), source_(*owned_source_),
+      weights_(source_, config_, options.tp_world, options.tp_rank) {
     // Load kernel options from environment variables (backward compatibility)
     options_.kernel.load_from_env();
 
@@ -4722,7 +5039,7 @@ QwenEngine::QwenEngine(const std::string& ckpt_dir,
         max_context_ > static_cast<int>(config_.max_position_embeddings)) {
         throw std::runtime_error("Qwen max context exceeds model configuration");
     }
-    impl_ = new Impl(index_, config_, weights_, options_, max_context_,
+    impl_ = new Impl(source_, config_, weights_, options_, max_context_,
                      active_layers_);
     resident_weight_bytes_ = impl_->uploaded_weight_bytes;
     resident_scale_bytes_ = impl_->uploaded_scale_bytes;

@@ -6,6 +6,7 @@
 #include "qwen_weights.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -222,6 +223,11 @@ struct QwenRuntimeTelemetry {
     std::string fp8_channel_decode_path = "unused";
     std::string fp8_channel_prefill_path = "unused";
     std::string target_head_path = "unknown";
+    // The checkpoint's incoherence transform, when it carries one. Zero block
+    // size means none, and then no activation is rotated at run time.
+    int rotation_block_size = 0;
+    size_t rotation_sign_widths = 0;
+    bool embedding_rotated = false;
     uint64_t host_global_metadata_bytes = 0;
     uint64_t nvfp4_q8_workspace_peak_bytes = 0;
     // Paged KV cache geometry. 0 blocks means the contiguous arena is in use.
@@ -508,7 +514,11 @@ private:
     std::string ckpt_dir_;
     QwenEngineOptions options_;
     QwenConfig config_;
-    SafeTensorsIndex index_;
+    // The checkpoint as a source, so that a single-file GGUF and an HF
+    // safetensors directory reach the same loader. The engine owns the wrapper
+    // because it opens a checkpoint by path and the map holds the reference.
+    std::unique_ptr<QwenCheckpointSource> owned_source_;
+    const QwenCheckpointSource& source_;
     QwenWeightMap weights_;
     int active_layers_ = 0;
     int max_context_ = 0;

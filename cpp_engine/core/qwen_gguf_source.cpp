@@ -294,6 +294,17 @@ const QwenGgufSource::ValueHeads& QwenGgufSource::value_heads() const {
     return *value_heads_;
 }
 
+const QwenHadamardSpec* QwenGgufSource::hadamard() const {
+    if (!hadamard_parsed_) {
+        // The file's own name list, so that a declared tensor the file does not
+        // hold is an error here rather than a rotation applied to a tensor that
+        // was never folded.
+        hadamard_ = QwenHadamardSpec::find(file_, tensor_names());
+        hadamard_parsed_ = true;
+    }
+    return hadamard_.has_value() ? &*hadamard_ : nullptr;
+}
+
 std::vector<uint64_t> QwenGgufSource::row_order(
     const QwenSourceTensor& tensor) const {
     // The gated-DeltaNet value axis does not arrive in the order the model uses.
@@ -307,13 +318,22 @@ std::vector<uint64_t> QwenGgufSource::row_order(
     // value channels, and `A_log`. The seventh, `out_proj`, is the one the
     // Hadamard fold also touches, and there the conversion deliberately keeps the
     // training order -- a column permutation on a rotation axis cannot be
-    // refolded -- which is the asymmetry `prism.hadamard.gdn_v_grouped` names and
-    // why the runtime permutes the *activation* before the transform instead.
+    // refolded. That asymmetry is what `prism.hadamard.gdn_v_grouped` records: it
+    // is set exactly when `out_proj` kept the training order, and it is the flag
+    // this remap is conditional on.
     //
     // So the file's rows are mapped back to the model's here, once, at load. The
     // table is `storage_row[canonical_row]`, and the swap is its own inverse as a
     // permutation of the head axis but not as an index map, so the direction
     // matters and is pinned by test_qwen_gguf_weights.
+    //
+    // Reading the flag rather than the tensor name is what keeps a file that was
+    // never permuted -- an upstream export, or any container with no Hadamard
+    // block -- out of this path: with nothing permuted there is nothing to map
+    // back, and the model's order is already the file's.
+    const QwenHadamardSpec* spec = hadamard();
+    if (spec == nullptr || !spec->gdn_v_grouped()) return {};
+
     const ValueHeads& heads = value_heads();
     const uint64_t rep = heads.value_heads / heads.key_heads;
     const uint64_t key_width = heads.key_heads * heads.key_head_dim;

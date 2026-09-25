@@ -304,12 +304,12 @@ QwenDeviceTensor qwen_upload_tensor(const QwenCheckpointSource& source,
 }
 
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
-    const SafeTensorsIndex& index, const QwenLinearRef& ref,
+    const QwenCheckpointSource& source, const QwenLinearRef& ref,
     float* weight_global_factor, float* input_global_scale, void* stream) {
     if (weight_global_factor == nullptr || input_global_scale == nullptr) {
         throw std::invalid_argument("null Qwen NVFP4 global metadata output");
     }
-    QwenNvfp4HostLinear host = qwen_materialize_nvfp4_host_linear(index, ref);
+    QwenNvfp4HostLinear host = qwen_materialize_nvfp4_host_linear(source, ref);
     QwenDeviceTensor device;
     device.device_dtype = SafeDType::U8;
     device.shape = host.logical_shape;

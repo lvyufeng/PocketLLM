@@ -257,6 +257,67 @@ bool qwen_ptq1_0_matvec_f16_cuda(
     int cols,
     void* stream = nullptr);
 
+// The same two, with fp32 results. The target head reads fp32 logits, and both
+// kernels already accumulate in fp32 -- the workspace holds the result in that
+// form and the fp16 entry points narrow it at the end -- so these are the samearithmetic with the narrowing removed rather than a second implementation.
+bool qwen_ptq1_0_matmul_rows_f16_f32_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_blocks,
+    float* d_y_f32,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
+    void* stream = nullptr);
+
+bool qwen_ptq1_0_matvec_f16_f32_cuda(
+    const uint16_t* d_x_fp16,
+    const uint8_t* d_blocks,
+    float* d_y_f32,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
+// The embedding lookup against a ternary table: one row per token, decoded from
+// the 28-byte blocks as they lie. Expanding a 248,320-row table to fp16 at load
+// costs 2.4 GiB, which does not fit beside a KV cache on one card; this reads
+// 1120 bytes per token looked up instead, and the value is exact either way,
+// because a trit times a finite fp16 scale has no rounding to do.
+//
+// `cols` is the width in weights (5120), not in blocks. A token outside
+// `[row_start, row_start + row_count)` gathers zeros, which is what makes the
+// caller's cross-rank sum correct rather than merely plausible.
+bool qwen_embedding_ptq1_0_gather_f16_cuda(
+    const uint8_t* d_table_blocks,
+    const int* d_tokens,
+    uint16_t* d_out_fp16,
+    int count,
+    int cols,
+    int row_start,
+    int row_count,
+    void* stream = nullptr);
+
+// The activation side of the incoherence transform a ternary checkpoint folds
+// its weights with. `block` is one Hadamard block, `width` the tensor's last
+// dimension and therefore a whole number of blocks, and `d_signs_fp32` the
+// width-long sign vector the file declares for it. The scale `1/sqrt(block)` is
+// the kernel's, not the caller's.
+//
+// Both directions are the same butterflies with the signs on opposite sides:
+// forward applies them to the input, inverse to the output, and which tensors
+// take which is a fact about the file. `d_x` and `d_y` may be the same buffer --
+// each block reads the 1024 elements it writes. The two are not interchangeable:
+// a model built with the wrong one runs and generates nonsense.
+bool qwen_hadamard_forward_f16_cuda(const uint16_t* d_x_fp16,
+                                    const float* d_signs_fp32,
+                                    uint16_t* d_y_fp16, int rows, int width,
+                                    int block, void* stream = nullptr);
+bool qwen_hadamard_inverse_f16_cuda(const uint16_t* d_x_fp16,
+                                    const float* d_signs_fp32,
+                                    uint16_t* d_y_fp16, int rows, int width,
+                                    int block, void* stream = nullptr);
+
 bool qwen_fp8_e4m3_fp16scale_matvec_dual_f16_cuda(
     const uint16_t* d_x_fp16,
     const uint8_t* d_first_weight,
