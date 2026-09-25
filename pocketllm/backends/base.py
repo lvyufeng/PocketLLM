@@ -8,6 +8,7 @@ from typing import Any
 
 from pocketllm.api import (
     BackendCapabilities,
+    ConfigurationError,
     GenerationRequest,
     GenerationResult,
     HealthStatus,
@@ -15,6 +16,36 @@ from pocketllm.api import (
     TensorParallelSupervisorError,
     TokenEvent,
 )
+
+
+#: What a byte count's suffix multiplies by. Binary multiples, because the constants that describe
+#: these budgets are written as shifts.
+_UNITS = {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
+
+def byte_size(value: Any, name: str) -> int:
+    """A byte count, as an integer or as a ``<n>[kmg]`` string.
+
+    ``--backend-option`` carries strings either way, and a byte budget is the one option whose plain
+    value cannot be read at a glance in a launch script: ``4294967296`` against ``4g``. It lives here
+    rather than in one adapter because two of them take a byte budget under the same option name and
+    a launch that parsed differently on one path than on the other would be a run measured under a
+    budget its launcher did not choose.
+    """
+    text = str(value).strip().lower()
+    factor = _UNITS.get(text[-1:], 1) if text else 1
+    if factor > 1:
+        text = text[:-1]
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"backend option {name!r} must be a byte count, optionally suffixed k/m/g "
+            f"(got {value!r})"
+        ) from exc
+    if count < 0:
+        raise ConfigurationError(f"backend option {name!r} must not be negative (got {value!r})")
+    return count * factor
 
 
 #: What a byte-level tokenizer's decode puts where a token ended inside a character.
