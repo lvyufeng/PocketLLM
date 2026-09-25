@@ -147,6 +147,11 @@ if(POCKET_BACKEND STREQUAL "cuda")
         backends/cuda/kernels/qwen_fp8_ops.cu
         backends/cuda/kernels/qwen_attention_ops.cu
         backends/cuda/kernels/qwen_half_ops.cu
+        # The one place this backend compiles vendored llama.cpp device code: the
+        # PTQ1_0 tile loader and MMA walk, under kernels/llama_mmq/. Per-file
+        # rather than a directory-wide include, so no other translation unit can
+        # pick up the fork's global macros by accident.
+        backends/cuda/kernels/qwen_ternary_ops.cu
         backends/cuda/kernels/qwen_nvfp4_ops.cu
         backends/cuda/kernels/qwen_gqa_optimized.cu
         backends/cuda/kernels/qwen_gdn_flashqla.cu
@@ -942,6 +947,10 @@ set_target_properties(test_qwen_gqa_attention PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 add_executable(test_qwen_half_ops tests/test_qwen_half_ops.cpp)
 target_link_libraries(test_qwen_half_ops PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_half_ops PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_qwen_ternary_gemm tests/test_qwen_ternary_gemm.cpp)
+target_link_libraries(test_qwen_ternary_gemm PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ternary_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_qwen_batched_decode tests/test_qwen_batched_decode.cpp)
 target_link_libraries(test_qwen_batched_decode PRIVATE pocket_cpp_core)
