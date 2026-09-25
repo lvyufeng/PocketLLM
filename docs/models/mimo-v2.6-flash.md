@@ -93,8 +93,9 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 | Chunked prefill with a grouped multi-token expert kernel | Supported |
 | 262,144-token context | Supported and measured |
 | Resident expert set (`resident_rows`) | Supported, off by default |
-| Batching, a scheduler | **Not implemented** — one request at a time |
-| Sampling beyond temperature | **Not implemented** — `argmax` unless a temperature is given |
+| Sampling (`temperature`, `top_k`, `top_p`, `seed`) | Supported; greedy unless a temperature is given, which is the checkpoint's own default |
+| Repetition penalty, logit bias, grammar | **Not implemented** |
+| Batching, a scheduler, a prefix cache | **Not implemented** — one request at a time |
 | MTP (3 layers) and the DFlash drafter | Present in the checkpoint, not executed |
 | Vision tower, audio encoders | Out of scope |
 
@@ -136,9 +137,6 @@ together. At that depth eight rows fit and buy 3%; at a short context sixteen fi
   running is not idle but at a *different* collective — and NCCL answers a mismatch by hanging.
   Rank 0 broadcasts each request to the workers before running it, and a cancel or a stop string has
   to be agreed across the ranks rather than acted on by one. A second request waits on a lock.
-- **No sampler.** `argmax`, stopping at the config's own end-of-turn tokens, with no top-p or
-  repetition penalty. `generation_config.json` says `do_sample: false`, so this is the checkpoint's
-  own default.
 - **The attention and the dense linears are torch above 16384 keys.** The decode step's rotation,
   softmax and norms are CUDA kernels; the rest of the attention, and every dense projection, are
   PyTorch at every depth.
