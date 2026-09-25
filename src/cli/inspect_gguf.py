@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 
 from src.loader.gguf.bundle import GGUFBundle, read_gguf_bundle
 from src.loader.mappings.deepseek_v4 import validate_ds4_tensor_mappings
+from src.loader.gguf.prism_hadamard import HadamardSpec, HadamardSpecError, has_hadamard_block, parse_hadamard_spec
 from src.loader.gguf.reader import GGUFArraySummary
 from src.components.moe.registry import detect_spec, known_architectures
 from src.components.moe.spec import CapabilityReport, SpecValidation
@@ -131,6 +132,30 @@ def _summarize_metadata_and_tensors(metadata, tensors) -> None:
         "glm-dsa.expert_feed_forward_length",
         "glm-dsa.expert_shared_count",
         "glm-dsa.nextn_predict_layers",
+        "qwen35.block_count",
+        "qwen35.embedding_length",
+        "qwen35.feed_forward_length",
+        "qwen35.context_length",
+        "qwen35.full_attention_interval",
+        "qwen35.attention.head_count",
+        "qwen35.attention.head_count_kv",
+        "qwen35.attention.key_length",
+        "qwen35.attention.value_length",
+        "qwen35.ssm.conv_kernel",
+        "qwen35.ssm.group_count",
+        "qwen35.ssm.inner_size",
+        "qwen35.ssm.state_size",
+        "qwen35.ssm.time_step_rank",
+        "prism.hadamard.version",
+        "prism.hadamard.transform",
+        "prism.hadamard.axis",
+        "prism.hadamard.block_size",
+        "prism.hadamard.sign_mode",
+        "prism.hadamard.gdn_v_grouped",
+        "prism.hadamard.sign_widths",
+        "prism.hadamard.sign_values",
+        "prism.hadamard.weight_names",
+        "prism.hadamard.inverse_weight_names",
     )
     for key in metadata_keys:
         if key in metadata:
@@ -164,6 +189,76 @@ def _summarize_metadata_and_tensors(metadata, tensors) -> None:
         print("\nunknown tensor types:")
         for type_name in unknown_types:
             print(f"  {type_name}")
+
+
+def _tensor_role(name: str) -> str:
+    """The layer-local suffix of a tensor name: `blk.7.ffn_gate.weight` -> `ffn_gate.weight`."""
+    parts = name.split(".")
+    if len(parts) > 2 and parts[0] == "blk":
+        return ".".join(parts[2:])
+    return name
+
+
+def _print_inventory(bundle: GGUFBundle) -> None:
+    """One row per distinct tensor suffix: how many, which types, and what they weigh.
+
+    The names in a checkpoint repeat layer to layer, so this is the whole tensor table
+    in a couple of dozen rows -- which is what an audit of a new architecture needs and
+    what a per-tensor listing buries.
+    """
+    groups: dict[str, list] = defaultdict(list)
+    for tensor in bundle.tensors:
+        groups[_tensor_role(tensor.name)].append(tensor)
+
+    print("\ntensor inventory:")
+    print(f"  {'suffix':34s} {'count':>5s} {'types':16s} {'bytes':>12s}")
+    ordered = sorted(groups.items(), key=lambda item: (-sum(t.nbytes or 0 for t in item[1]), item[0]))
+    for role, tensors in ordered:
+        types = ",".join(sorted({t.type_name for t in tensors}))
+        total = sum(t.nbytes or 0 for t in tensors)
+        print(f"  {role:34s} {len(tensors):5d} {types:16s} {_format_bytes(total):>12s}")
+
+
+def _print_hadamard_report(spec: HadamardSpec, bundle: GGUFBundle) -> int:
+    folded = set(spec.folded_names)
+    folded_bytes = sum(
+        tensor.nbytes or 0 for name, tensor in bundle.tensors_by_name.items() if name in folded
+    )
+    total_bytes = sum(tensor.nbytes or 0 for tensor in bundle.tensors)
+
+    print("\nprism.hadamard:")
+    print(f"  version: {spec.version}")
+    print(f"  transform: {spec.transform}")
+    print(f"  axis: {spec.axis}")
+    print(f"  block_size: {spec.block_size}")
+    print(f"  sign_mode: {spec.sign_mode}")
+    print(f"  gdn_v_grouped: {spec.gdn_v_grouped}")
+    print("  sign_widths:")
+    for width in spec.sign_widths:
+        signs = spec.signs_for_width(width)
+        print(f"    {width:6d}  {len(signs):6d} signs  +{sum(1 for s in signs if s > 0)} -{sum(1 for s in signs if s < 0)}")
+    print(f"  folded tensors: {len(spec.weight_names)}")
+    print(f"  inverse tensors: {len(spec.inverse_weight_names)} {list(spec.inverse_weight_names)}")
+    if total_bytes:
+        print(f"  folded bytes: {_format_bytes(folded_bytes)} of {_format_bytes(total_bytes)}")
+    print("  forward names (first 8):")
+    for name in spec.weight_names[:8]:
+        print(f"    {name}")
+    print("  ...")
+    return 0
+
+
+def _hadamard_status(bundle: GGUFBundle) -> int:
+    try:
+        spec = parse_hadamard_spec(bundle.metadata, known_tensor_names=bundle.tensors_by_name)
+    except HadamardSpecError as exc:
+        print("\nprism.hadamard: FAILED")
+        print(f"  - {exc}")
+        return 1
+    if spec is None:
+        print("\nprism.hadamard: absent, nothing to check")
+        return 0
+    return _print_hadamard_report(spec, bundle)
 
 
 def _print_tensors(bundle: GGUFBundle, limit: int, contains: str | None) -> None:
@@ -505,6 +600,12 @@ def main() -> int:
     parser.add_argument("--list-tensors", action="store_true")
     parser.add_argument("--contains", default=None, help="Only list tensors containing this substring")
     parser.add_argument("--limit", type=int, default=80)
+    parser.add_argument("--inventory", action="store_true", help="One row per distinct tensor suffix: count, types, bytes")
+    parser.add_argument(
+        "--hadamard-report",
+        action="store_true",
+        help="Decode and validate prism.hadamard.*; reads metadata arrays, so it is opt-in",
+    )
     parser.add_argument("--validate-ds4-q2", action="store_true")
     parser.add_argument("--validate-runtime-mapping", action="store_true")
     parser.add_argument("--config", default="configs/config_w8a8.json")
@@ -533,9 +634,13 @@ def main() -> int:
     if not os.path.exists(args.gguf_path):
         raise FileNotFoundError(args.gguf_path)
 
-    bundle = read_gguf_bundle(args.gguf_path)
+    # Materialising metadata arrays is opt-in everywhere else, and stays opt-in here:
+    # only the Hadamard report needs the sign vectors and the folded-name list.
+    bundle = read_gguf_bundle(args.gguf_path, read_arrays=args.hadamard_report)
     if args.summary or not (
         args.list_tensors
+        or args.inventory
+        or args.hadamard_report
         or args.spec_summary
         or args.validate_spec
         or args.capability_report
@@ -549,6 +654,10 @@ def main() -> int:
         _print_tensors(bundle, args.limit, args.contains)
 
     status = 0
+    if args.inventory:
+        _print_inventory(bundle)
+    if args.hadamard_report:
+        status = max(status, _hadamard_status(bundle))
     if args.validate_ds4_q2:
         status = max(status, _validate_ds4_q2(bundle if len(bundle.shards) > 1 else bundle.primary))
 
