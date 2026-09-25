@@ -436,7 +436,11 @@ def test_cpp_capabilities_match_phase_one_surface() -> None:
     # The served models come from the native engine registry rather than a
     # literal here, so a build that links a second engine reports it.
     assert capabilities.models == ("qwen3_5",)
-    assert capabilities.model_formats == ("safetensors",)
+    # Both formats, because the backend serves both: a safetensors directory, and
+    # the single-file GGUF export the Qwen3.5 path reads straight out of its own
+    # header. A capability list that under-reported formats would make
+    # `pocketllm serve` refuse a checkpoint this adapter can actually run.
+    assert capabilities.model_formats == ("safetensors", "gguf")
     assert capabilities.supports_streaming is True
     assert capabilities.supports_batch is False
 
