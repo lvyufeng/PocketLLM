@@ -1273,11 +1273,31 @@ __global__ void fp8_weight_fp16scale_to_half_tail_kernel(
     }
 }
 
+// One cached cuBLAS handle and dequantized weight per thread, grown to the
+// high-water mark. Both are released in `reset` for the reason spelled out at
+// the equivalent struct in qwen_ternary_ops.cu: a thread_local holding raw
+// device state leaks one copy per thread unless something runs at thread exit,
+// and a server that answers a connection on a fresh thread turns that into one
+// copy per request.
 struct Fp8F16CublasWorkspace {
     int device = -1;
     uint16_t* weight = nullptr;
     size_t weight_capacity = 0;
     cublasHandle_t handle = nullptr;
+
+    Fp8F16CublasWorkspace() = default;
+    Fp8F16CublasWorkspace(const Fp8F16CublasWorkspace&) = delete;
+    Fp8F16CublasWorkspace& operator=(const Fp8F16CublasWorkspace&) = delete;
+    ~Fp8F16CublasWorkspace() { reset(); }
+
+    void reset() {
+        if (weight != nullptr) cudaFree(weight);
+        if (handle != nullptr) cublasDestroy(handle);
+        weight = nullptr;
+        weight_capacity = 0;
+        handle = nullptr;
+        device = -1;
+    }
 };
 
 Fp8F16CublasWorkspace& fp8_f16_cublas_workspace() {
@@ -1291,9 +1311,7 @@ bool ensure_fp8_f16_cublas_workspace(
     int current_device = 0;
     if (cudaGetDevice(&current_device) != cudaSuccess) return false;
     if (workspace.device != -1 && workspace.device != current_device) {
-        cudaFree(workspace.weight);
-        if (workspace.handle != nullptr) cublasDestroy(workspace.handle);
-        workspace = {};
+        workspace.reset();
     }
     workspace.device = current_device;
     if (workspace.handle == nullptr) {
@@ -1301,7 +1319,7 @@ bool ensure_fp8_f16_cublas_workspace(
         (void)cublasSetMathMode(workspace.handle, CUBLAS_TENSOR_OP_MATH);
     }
     if (require_weight && workspace.weight_capacity < elements) {
-        cudaFree(workspace.weight);
+        if (workspace.weight != nullptr) cudaFree(workspace.weight);
         workspace.weight = nullptr;
         workspace.weight_capacity = 0;
         if (cudaMalloc(&workspace.weight, elements * sizeof(uint16_t)) !=

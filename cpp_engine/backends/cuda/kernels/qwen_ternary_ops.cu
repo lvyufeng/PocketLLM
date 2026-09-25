@@ -466,11 +466,34 @@ __global__ void f32_to_f16_kernel(const float* __restrict__ x, uint16_t* __restr
 // ---------------------------------------------------------------------------
 // Scratch. One cached buffer per thread, grown to the high-water mark, in the
 // style qwen_half_ops.cu uses for its cuBLAS workspace.
+//
+// The release in `reset` is not optional tidiness. A thread_local holding a raw
+// device pointer is a leak per thread, because a trivially destructible struct
+// has nothing to run when the thread goes away -- and the Python server answers
+// each connection on a fresh thread, so "one workspace per thread" becomes one
+// workspace per request. Measured on the ternary checkpoint, served: 430 MiB
+// retained per cold 4K-token prompt, taking the card from 7,078 to 12,392 MiB
+// over eight of them at a steady 430 MiB a prompt -- flat at 8,952 MiB once the
+// buffer is released. The buffer is a prefill chunk's activations, so its size
+// follows the prompt, and the symptom is a server that grows until the card is
+// full.
 // ---------------------------------------------------------------------------
 struct TernaryWorkspace {
     int device = -1;
     void* buffer = nullptr;
     size_t capacity = 0;
+
+    TernaryWorkspace() = default;
+    TernaryWorkspace(const TernaryWorkspace&) = delete;
+    TernaryWorkspace& operator=(const TernaryWorkspace&) = delete;
+    ~TernaryWorkspace() { reset(); }
+
+    void reset() {
+        if (buffer != nullptr) cudaFree(buffer);
+        buffer = nullptr;
+        capacity = 0;
+        device = -1;
+    }
 };
 
 TernaryWorkspace& ternary_workspace() {
@@ -482,12 +505,11 @@ bool ensure_ternary_workspace(TernaryWorkspace& workspace, size_t bytes) {
     int current_device = 0;
     if (cudaGetDevice(&current_device) != cudaSuccess) return false;
     if (workspace.device != -1 && workspace.device != current_device) {
-        cudaFree(workspace.buffer);
-        workspace = {};
+        workspace.reset();
     }
     workspace.device = current_device;
     if (workspace.capacity < bytes) {
-        cudaFree(workspace.buffer);
+        if (workspace.buffer != nullptr) cudaFree(workspace.buffer);
         workspace.buffer = nullptr;
         workspace.capacity = 0;
         if (cudaMalloc(&workspace.buffer, bytes) != cudaSuccess) return false;
