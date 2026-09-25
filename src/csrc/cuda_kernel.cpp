@@ -504,6 +504,18 @@ torch::Tensor gguf_q2k_gemm_dp4a_forward_cuda(
     const torch::Tensor& blocks,
     int64_t row_elems);
 
+// Ternary-Bonsai-2-27B's PTQ1_0 (type 143), defined in llama_mmq/gguf_mma_wrapper.cu
+// and also reachable through the gguf_quant_gemm dispatchers above by type id.
+torch::Tensor gguf_ptq1_0_mma_prefill_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& blocks,
+    int64_t row_elems);
+
+torch::Tensor gguf_ptq1_0_dp4a_decode_forward_cuda(
+    const torch::Tensor& x,
+    const torch::Tensor& blocks,
+    int64_t row_elems);
+
 torch::Tensor gguf_quant_gemm_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& blocks,
@@ -640,13 +652,20 @@ int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
     if (type_id == 6) return 98;    // iq3_xxs
     if (type_id == 7) return 136;   // iq4_xs
     if (type_id == 8) return 210;   // q6_k
+    if (type_id == 143) return 28;  // ptq1_0, the fork-private ternary block
     TORCH_CHECK(false, "unsupported GGUF quant type_id: ", type_id);
+}
+
+// Weights per block.  Everything here is a 256-group except the ternary pack, whose
+// group is half that -- so a caller's "blocks cover row_elems" test cannot assume 256.
+int64_t gguf_quant_block_elems_for_type(int64_t type_id) {
+    return type_id == 143 ? 128 : 256;
 }
 
 bool gguf_quant_type_supported(int64_t type_id) {
     return type_id == 0 || type_id == 1 || type_id == 2 || type_id == 3 ||
            type_id == 4 || type_id == 5 || type_id == 6 || type_id == 7 ||
-           type_id == 8;
+           type_id == 8 || type_id == 143;
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
@@ -806,7 +825,7 @@ torch::Tensor gguf_quant_gemm_forward(
     TORCH_CHECK(gguf_quant_type_supported(type_id), "unsupported GGUF quant type_id: ", type_id);
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
-    TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
+    TORCH_CHECK(blocks.size(1) * gguf_quant_block_elems_for_type(type_id) >= row_elems, "blocks do not cover row_elems");
     TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
     TORCH_CHECK(x.is_cuda() && blocks.is_cuda(), "x and blocks must be CUDA tensors");
     TORCH_CHECK(x.is_contiguous() && blocks.is_contiguous(), "x and blocks must be contiguous");
@@ -831,7 +850,7 @@ torch::Tensor gguf_quant_gemm_prefill_forward(
     TORCH_CHECK(gguf_quant_type_supported(type_id), "unsupported GGUF quant type_id: ", type_id);
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
     TORCH_CHECK(x.size(-1) == row_elems, "inner dimension mismatch");
-    TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
+    TORCH_CHECK(blocks.size(1) * gguf_quant_block_elems_for_type(type_id) >= row_elems, "blocks do not cover row_elems");
     TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
     TORCH_CHECK(x.is_cuda() && blocks.is_cuda(), "x and blocks must be CUDA tensors");
     TORCH_CHECK(x.is_contiguous() && blocks.is_contiguous(), "x and blocks must be contiguous");
@@ -908,7 +927,7 @@ torch::Tensor gguf_quant_embedding_forward(
     TORCH_CHECK(blocks.dim() == 3, "blocks must have shape [V, K_blocks, block_bytes]");
     TORCH_CHECK(type_id == 3 || type_id == 4, "gguf_quant_embedding_forward currently supports q4_k/q5_k selected-row dequant only");
     TORCH_CHECK(row_elems > 0, "row_elems must be positive");
-    TORCH_CHECK(blocks.size(1) * 256 >= row_elems, "blocks do not cover row_elems");
+    TORCH_CHECK(blocks.size(1) * gguf_quant_block_elems_for_type(type_id) >= row_elems, "blocks do not cover row_elems");
     TORCH_CHECK(blocks.size(2) == gguf_quant_block_bytes_for_type(type_id), "unexpected GGUF block size for type_id");
     TORCH_CHECK(token_ids.is_cuda() && blocks.is_cuda(), "token_ids and blocks must be CUDA tensors");
     TORCH_CHECK(token_ids.is_contiguous() && blocks.is_contiguous(), "token_ids and blocks must be contiguous");
@@ -2224,6 +2243,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_finalize_reduce_forward", &moe_finalize_reduce_forward, "finalize reduced MoE output with shared expert add and dtype cast (CUDA)");
     m.def("q8_0_gemm_forward", &q8_0_gemm_forward, "raw GGUF q8_0 GEMM forward (CUDA)");
     m.def("gguf_q2k_gemm_dp4a_forward", &gguf_q2k_gemm_dp4a_forward, "raw GGUF q2_k GEMM forward using Q8 activation + DP4A (CUDA)");
+    m.def("gguf_ptq1_0_mma_prefill_forward", &gguf_ptq1_0_mma_prefill_forward_cuda, "ternary PTQ1_0 prefill GEMM using INT8 MMA (CUDA)");
+    m.def("gguf_ptq1_0_dp4a_decode_forward", &gguf_ptq1_0_dp4a_decode_forward_cuda, "ternary PTQ1_0 decode GEMV using DP4A (CUDA)");
     m.def("gguf_quant_gemm_forward", &gguf_quant_gemm_forward, "raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");
     m.def("gguf_quant_gemm_prefill_forward", &gguf_quant_gemm_prefill_forward, "prefill-only raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");
     m.def("gguf_quant_gemm_pair_forward", &gguf_quant_gemm_pair_forward, "paired raw GGUF iq2_xxs/q2_k/iq1_m/q4_k/q5_k GEMM forward (CUDA)");

@@ -181,6 +181,31 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
+// PTQ1_0: fork-private ternary at group size 128.  Upstream TQ1_0's base-3 packing
+// with the scale group halved from 256 to 128, so a block is 128 weights in 28 bytes
+// (1.75 bits per weight).  The scale is *last* here, unlike every other fork block.
+// The stage walk and the qh parity that decode this are pinned by
+// src/loader/gguf/ptq1_0.py and tests/test_ptq1_0_layout.py on the Python side.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5]; // 24 B, 5 trits per byte -> 120 values
+    uint8_t qh[QK_PTQ1_0/64];                   //  2 B, 4 trits per byte ->   8 values
+    ggml_half d;                                // one scale for all 128 weights
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0/64 +
+              (QK_PTQ1_0 - 4*QK_PTQ1_0/64)/5, "wrong ptq1_0 block size/padding");
+
+// PQ2_0: the other fork-private pack, 2.125 bits per weight -- a 2-bit codec over
+// levels {-1,0,1,2} with one scale per 128 weights and the scale *first*.  Carried
+// here so the 28/34-byte geometries agree on both sides of the ABI; the kernels are
+// PTQ1_0 only for now.
+#define QK_PQ2_0 128
+typedef struct {
+    ggml_half d;                 // delta
+    uint8_t qs[QK_PQ2_0 / 4];    // 2 bits per element
+} block_pq2_0;
+static_assert(sizeof(block_pq2_0) == sizeof(ggml_half) + QK_PQ2_0 / 4, "wrong pq2_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

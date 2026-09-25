@@ -101,8 +101,19 @@ of the fork's fp32 bytes, not as a tolerance. What that leaves unclaimed is pari
 synthetic, because the model does not run yet, so "the transform is the fork's" is proven and "the model
 generates" is not.
 
-The ternary dense GEMM ([#386](https://github.com/lvyufeng/PocketLLM/issues/386)) is what remains before it
-does.
+The ternary dense GEMM ([#386](https://github.com/lvyufeng/PocketLLM/issues/386)) has run as well, and it is the
+stage's first uncomfortable number. Both phases are correct — bit-exact in bf16 against their own reference
+arithmetic over the released weights, with the packing pinned by the decoder's own round-trip — and the decode
+half is where the format pays: the dense projections of one forward pass **decode at 21.8 tok/s against 9.2 for
+the same shapes at FP8 width**, at a tenth of the bytes. Prefill is the other way round: **600 tok/s of dense
+projections at a 512-token prompt, 1.27× slower** than handing the same weights to cuBLAS as fp16, and both
+phases are behind what the gate measured the upstream *whole model* reaching on this card. The decode gap has a
+measured mechanism — a lane reads its own 28-byte block with seven 4-byte loads, and a reduction at that stride
+reaches 73 GiB/s of useful bytes where a dense one reaches 526 — so the fix is staged loads rather than a
+different unpack. [The measurement and both gaps](ternary_bonsai_2_dense_gemm.md) are written up in full.
+
+What remains before the model generates is the runtime wiring
+([#387](https://github.com/lvyufeng/PocketLLM/issues/387)), and the kernel work the two gaps above name.
 
 ## Stage 2 — Xing4.0-29B-A4B
 

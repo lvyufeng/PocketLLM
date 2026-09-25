@@ -71,6 +71,10 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_DS4;
         case GGML_TYPE_Q8_0:
             return MMQ_Q8_1_DS_LAYOUT_D4;
+        case GGML_TYPE_PTQ1_0:
+            // Unpacked to signed bytes, so the tile is a Q8_0 tile and the activations
+            // are plain int8 — one scale per 32, and no partial sum to fold in.
+            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_MXFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_NVFP4:
@@ -197,6 +201,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_PTQ1_0:  return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
@@ -242,6 +247,9 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
         case GGML_TYPE_Q5_0:    return MMQ_MMA_TILE_X_K_Q8_0;
         case GGML_TYPE_Q5_1:    return MMQ_MMA_TILE_X_K_Q8_1;
         case GGML_TYPE_Q8_0:    return MMQ_MMA_TILE_X_K_Q8_0;
+        // The loader expands each trit to one signed byte, which is exactly the
+        // Q8_0 tile: 128 weights = 32 words of qs and one scale per 32.
+        case GGML_TYPE_PTQ1_0:  return MMQ_MMA_TILE_X_K_Q8_0;
         // tile sizes are the same for Q8_1 and FP4 for blackwell
         case GGML_TYPE_MXFP4:   return MMQ_MMA_TILE_X_K_Q8_1;
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -391,6 +399,115 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + ksx] = bxi->d;
 #else
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    }
+}
+
+// PTQ1_0: the loader unpacks each 128-weight block into one signed byte per weight,
+// which turns it into an ordinary Q8_0 tile -- qs of 32 words and one scale per 32 --
+// so the shared MMA dot consumes it unchanged.  Ported from
+// PrismML-Eng/llama.cpp's ggml_cuda_mmq_load_tiles_ptq1_0, which is the only place
+// the packing's stage walk is spelled out in the fork's own code.
+template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_ptq1_0(
+    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int nwarps    = mmq_get_nwarps_device();
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_PTQ1_0, mmq_y);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+    // A 128-weight block expands to 32 words -- one signed byte per weight -- so two
+    // of them fill the 2*MMQ_TILE_NE_K words one row owns per K iteration.
+    constexpr int blocks_per_iter  = MMQ_ITER_K / QK_PTQ1_0;
+    constexpr int lanes_per_block  = 8;   // four qs words to lanes 0..3, two to 4,5, qh to 6
+    constexpr int threads_per_row  = blocks_per_iter * lanes_per_block;
+    constexpr int nrows            = warp_size / threads_per_row;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / lanes_per_block;
+    const int lane = txi % lanes_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i*stride + kbx;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        int * row = x_qs + i*MMQ_MMA_TILE_X_K_Q8_0 + kbx*(QK_PTQ1_0/4);
+#else
+        int * row = x_qs + i*(2*MMQ_TILE_NE_K + 1) + kbx*(QK_PTQ1_0/4);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+        // One word of qs is four bytes, and each byte carries five trits for five
+        // *different* weights: the stage walk of src/loader/gguf/ptq1_0.py.  Lanes 0..5
+        // take those 24 bytes, and lane 6 takes qh; lane 7 marches with them so the
+        // loop below is branch-free and only its store is masked.
+        const uint32_t packed = (uint32_t) get_int_b4(bxi->qs, lane < 7 ? lane : 6);
+        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);  // bytes 0,1 in 16-bit lanes
+        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);  // bytes 2,3
+        const bool     full_lane = lane < 6;
+        v_hi = full_lane ? v_hi : v_lo;   // lane 6 walks qh[0] and qh[1] in the two lanes
+        const int  dst_base   = lane < 4 ? lane : 16 + lane;  // lanes 4,5 -> words 20,21
+        const int  dst_stride = lane < 4 ? 4 : 2;
+        int q[5];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            // Multiplying the byte by three and keeping the high byte peels off one
+            // base-3 digit per iteration; the low byte carries into the next.  Both
+            // steps stay inside their 16-bit lane because 255*3 < 2^16.
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+            // {0,1,2} -> {-1,0,1}, one subtract per byte.
+            q[t] = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            if (full_lane) {
+                row[dst_base + t*dst_stride] = q[t];
+            }
+        }
+        if (lane == 6) {
+            // qh holds the last eight weights four-per-byte with the parity interleaved:
+            // qh[0] is weights 120,122,124,126 and qh[1] is 121,123,125,127.  q[t] is
+            // {qh0.t, qh1.t, qh0.t, qh1.t}, so one __byte_perm restores the order.
+            row[30] = __byte_perm(q[0], q[1], 0x5410);
+            row[31] = __byte_perm(q[2], q[3], 0x5410);
+        }
+    }
+
+    // The scale is one per 128 weights and the tile reads one per 32, so each is
+    // written four times: the tile's df slots 0..3 are block 0 and 4..7 are block 1,
+    // which is what k00 = 0 and k00 = MMQ_TILE_NE_K address.
+    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
+    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp           = warp_size / scale_entries_per_row;
+    const int ksx         = threadIdx.x % scale_entries_per_row;
+    const int scale_block = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps*rows_per_warp) {
+        int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/scale_entries_per_row;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i*stride + scale_block;
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + ksx] = __half2float(bxi->d);
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = __half2float(bxi->d);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
@@ -3269,6 +3386,16 @@ template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q1_0> {
     static constexpr int              vdr          = VDR_Q1_0_Q8_1_MMQ;
     static constexpr load_tiles_mmq_t load_tiles   = load_tiles_q1_0<mmq_y, need_check>;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
+};
+
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_PTQ1_0> {
+    static constexpr int              vdr          = VDR_PTQ1_0_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_ptq1_0<mmq_y, need_check>;
+    // Same dot as Q1_0 and for the same reason: the loader has already turned the
+    // trits into signed bytes, so nothing downstream needs to know they were ternary.
     static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q8_0_q8_1_mma<mmq_x, mmq_y, MMQ_Q8_1_DS_LAYOUT_D4>;
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
