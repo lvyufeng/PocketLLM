@@ -76,6 +76,10 @@ Four of those models are served end to end over the OpenAI-compatible API:
   [DFlash2](architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) after it, measuring
   2.78× full-request and 3.02× decode on a 512-token fixture with exact token parity in every case.
   Both are opt-in, because their gains are acceptance-dependent.
+
+<details markdown="1">
+<summary>More</summary>
+
 - **[2026/08] Qwen3.8-27B-FP8 on the C++/CUDA runtime** — FP8 E4M3 Safetensors text generation at
   TP4, 864.54 tok/s of prefill and 43.22 tok/s of decode on a 512-token prompt, with a 256K context
   path and a persistent TP4 worker that keeps prefix state alive across requests.
@@ -85,6 +89,11 @@ Four of those models are served end to end over the OpenAI-compatible API:
 - **[2026/05] DeepSeek-V4-Flash**, the checkpoint this project started on — FP4/FP8 Safetensors and
   GGUF Q2/IQ2/IQ1 generation, ~401 tok/s of C++ FP4 prefill at 32K–64K.
   [Model page](models/deepseek-v4.md)
+
+</details>
+
+The five visible entries are the same five the [repository README](https://github.com/lvyufeng/PocketLLM#news)
+points at, as one-liners; this list is the archive, and is where the numbers behind each entry live.
 
 ## What PocketLLM provides
 
@@ -147,23 +156,30 @@ Four of those models are served end to end over the OpenAI-compatible API:
 
 ## Measured on RTX 2080 Ti
 
-Real checkpoints, PCIe Gen3, no NVLink, single requests, TP4 where applicable and
-**one card where the checkpoint fits on one**. These are architecture-specific
-results and must not be averaged into one PocketLLM score.
+This table is an index, not the record. Each row's headline is one number from one configuration, and
+the thing to read is the model page it links to — which carries the conditions the number was taken
+under, the configuration that produced it, and a `## Known limitations` section saying what it does
+not cover. Nothing here may be averaged into a single PocketLLM score, and no two rows are directly
+comparable unless their checkpoint, prompt, runtime, warm state and measurement convention match; see
+[benchmarking and reporting rules](guides/benchmarking.md).
 
-| Model | Checkpoint / format | Validated path | Reference result |
+Real checkpoints, PCIe Gen3, no NVLink, single requests, TP4 where applicable and **one card where
+the checkpoint fits on one**.
+
+| Model | Checkpoint / format | Validated path | Headline result |
 | --- | --- | --- | --- |
-| [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | `pocketllm serve --backend v41`, host PyTorch, TP4 | Served: 150.3–152.0 tok/s prefill at a 260,244-token prompt, 3.48–3.54 tok/s decode, one request at a time |
-| [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts | `pocketllm serve --backend mimo`, 48 layers on the cards, experts out of a 149.81 GiB host bank, TP4 | Served: 104.04 tok/s prefill at a 262,144-token prompt, 5.56 tok/s decode at that depth, 6.40 tok/s at a short context and 8.53 with experts resident, one request at a time |
+| [DeepSeek-V4.1-Flash](models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 experts | `pocketllm serve --backend v41`, host PyTorch, TP4 | 150.3–152.0 tok/s prefill at a 260,244-token prompt, 3.48–3.54 tok/s decode, one request at a time |
+| [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts | `pocketllm serve --backend mimo`, 48 layers on the cards, experts out of a 149.81 GiB host bank, TP4 | 104.04 tok/s prefill at a 262,144-token prompt, 5.56 tok/s decode at that depth, 6.40 tok/s at a short context and 8.53 with experts resident |
 | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill, 43.22 tok/s decode on a 512-token prompt |
-| [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` (GGML type 143), 1.75 bits a weight, 5.53 GiB | `pocketllm serve`, native C++/CUDA, **one card**, no flag needed | Served on 1 card: **636.0 tok/s prefill** at a 4,096-token prompt and 25.9 tok/s decode, against the same card's upstream reference of 642.5 and 30.7 |
+| [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` (GGML type 143), 1.75 bits a weight, 5.53 GiB | `pocketllm serve`, native C++/CUDA, **one card**, no flag needed | **636.0 tok/s prefill** at a 4,096-token prompt and 25.9 tok/s decode, against the same card's upstream reference of 642.5 and 30.7 |
 | [DeepSeek-V4-Flash](models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | Raw-block CUDA, GGUF TP4 | 256-token prefill ~104.9–107 tok/s; 43-layer decode benchmark 10.32 tok/s |
 | [GLM-5.2](models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |
 
-The model pages separate architecture specifications from what PocketLLM actually
-implements. `inspect`, `smoke` and a benchmark are not automatically equivalent to
-a production serving guarantee.
+The [support matrix](models/README.md) is the same runtime status with the format and validation
+detail; the model pages separate architecture specifications from what PocketLLM actually implements.
+`inspect`, `smoke` and a benchmark are not automatically equivalent to a production serving
+guarantee.
 
 ## Documentation
 
