@@ -12,44 +12,13 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 
 ## News
 
-- **[2026/09] Ternary-Bonsai-2-27B 单卡端到端可服务。** 一个 27B 混合注意力模型 —— 48 层 Gated
-  DeltaNet + 16 层 GQA，dense MLP —— 发布成权重只有 **1.75 bit** 的 GGUF（GGML type 143，
-  5.53 GiB），文件里还声明了一个 Hadamard 旋转。`pocketllm serve` 直接从容器自带的
-  `general.architecture` 选中原生引擎，不需要任何 flag：4,096 token prompt 下 **prefill
-  636.0 tok/s**、**decode 25.9 tok/s**，同卡上游参考是 642.5 与 30.7；5.53 GiB 权重留出的余地
-  够 **245,760 token 上下文**（配 fp8 KV cache 可到 262,144）。
-  [模型页](docs/models/ternary-bonsai-2-27b.md)
-- **[2026/09] MiMo-V2.6-Flash 端到端可服务。** `pocketllm serve --backend mimo` 把发布版跑成四个
-  进程、四张卡：149.81 GiB routed expert 放在 host bank 里，48 层 backbone 在 GPU 上执行。九个
-  global 层的 attention 按 checkpoint 自带的四路 `qkv_proj` 划分切开、用 all-gather 拼回，于是
-  **262,144-token prompt 的 prefill 达到 104.04 tok/s**，该深度下 decode 一步
-  **197.2 ms —— 5.07 tok/s**，浅上下文 5.63，四个 rank 逐位一致。
-  [模型页](docs/models/mimo-v2.6-flash.md)
-- **[2026/09] DeepSeek-V4.1-Flash 端到端可服务。** `pocketllm serve --backend v41` 把发布的
-  475 GiB checkpoint 跑成四个进程、四张 22 GiB 卡，其中 457.8 GiB routed expert 是 pinned 在
-  host 内存而不是常驻卡上。runtime 最长接受 262,144 token 上下文；260,244-token prompt 实测
-  prefill 150.3–152.0 tok/s、decode 3.48–3.54 tok/s。跨请求 prefix caching 也在同一批落地：
-  已经服务过的前缀，重发时只 forward 尾部。
-  [模型页](docs/models/deepseek-v4.1-flash.md) ·
-  [Run record](docs/performance/deepseek_v4_1_flash_served_gate.md)
-- **[2026/09] Qwen3.8-27B-FP8 有了原生 OpenAI 兼容 server** —— health 与 model discovery、
-  流式与非流式 chat/completions、逐 token logprobs、stop sequence 截断、非法字段拒绝，以及并发
-  scheduler 准入，全部在真实 checkpoint 上验证过。[模型页](docs/models/qwen3.8-27b-fp8.md)
-- **[2026/08] Qwen3.8-27B 接上两个外部投机 drafter。**
-  [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) 在前，
-  [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding) 在后：512-token
-  fixture 上全请求 2.78×、decode 3.02×，逐 token 完全一致。两者都是 opt-in，因为收益取决于
-  acceptance rate，而上游公布的 2.67–3.43× 是 decode 延迟比而非全请求比。
-- **[2026/08] Qwen3.8-27B-FP8 上 C++/CUDA runtime** —— TP4 下的 FP8 E4M3 Safetensors 文本生成，
-  512-token prompt 上 prefill 864.54 tok/s、decode 43.22 tok/s，另有 256K 上下文路径，以及一个
-  跨请求保持 prefix state 的常驻 TP4 worker。
-- **[2026/07] GLM-5.2 文本生成** —— 走共用的 GGUF raw-block 路径，入口与其它 GGUF 模型相同的
-  `src.cli.generate_glm`。
-- **[2026/06] MiniMax-M2.7 on GGUF `UD-IQ1_M`** —— full-model 256-token prefill 约 104.9–107
-  tok/s，融合 RMSNorm 后 43 层 decode benchmark 10.32 tok/s。
-- **[2026/05] DeepSeek-V4-Flash** —— 项目起步时的那个 checkpoint：FP4/FP8 Safetensors 与
-  GGUF Q2/IQ2/IQ1 generation，32K–64K 下 C++ FP4 prefill 约 401 tok/s。
-  [模型页](docs/models/deepseek-v4.md)
+- [2026/09] [Ternary-Bonsai-2-27B 单卡端到端可服务](docs/models/ternary-bonsai-2-27b.md)
+- [2026/09] [MiMo-V2.6-Flash 四卡端到端可服务](docs/models/mimo-v2.6-flash.md)
+- [2026/09] [DeepSeek-V4.1-Flash 端到端可服务](docs/models/deepseek-v4.1-flash.md)
+- [2026/09] [Qwen3.8-27B-FP8 有了原生 OpenAI 兼容 server](docs/models/qwen3.8-27b-fp8.md)
+- [2026/08] [Qwen3.8-27B 接上两个外部投机 drafter](docs/models/qwen3.8-27b-fp8.md#optional-speculative-decoding)
+
+[更早的条目与每条的实测数字 →](https://lvyufeng.github.io/PocketLLM/#news)
 
 ## PocketLLM 提供什么
 
@@ -64,17 +33,22 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 
 ## 支持模型一览
 
-| 模型 | Checkpoint / 格式 | Runtime 状态 | 已验证路径 | 4×RTX 2080 Ti 代表结果 |
-| --- | --- | --- | --- | --- |
-| [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 expert | **已验证 OpenAI server 后的 TP4 文本生成** | `pocketllm serve --backend v41`：host PyTorch 跑 mapped checkpoint，dense tree 与 packed FP4 expert 在卡上，一 rank 一进程 | Served TP4：260,244 token prompt 下 **prefill 150.3–152.0 tok/s**（1,364 token 时 137–141），**decode 3.48–3.54 tok/s**，同时只跑一个请求 |
-| [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 expert，attention 输出 BF16 | **已验证 OpenAI server 后的 TP4 文本生成** | `pocketllm serve --backend mimo`：48 层 backbone 在卡上，routed expert 走 149.81 GiB host bank，attention 按 checkpoint 自带的四路 `qkv_proj` 划分切开 | Served TP4：262,144 token prompt 下 **prefill 104.04 tok/s**（attention 复制时 48.37），该深度 **decode 5.07 tok/s**，浅上下文 5.63，同时只跑一个请求 |
-| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime 与 OpenAI server** | C++/CUDA TP4、GPU-resident FP8 | Served TP4：512-token prompt 下 prefill 864.54 tok/s、decode 43.22 tok/s（生成 128 token） |
-| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0`（GGML type 143），**每个权重 1.75 bit**，5.53 GiB，Hadamard 写在文件里 | **已验证 C++ 文本 runtime 与 OpenAI server，单卡** | `pocketllm serve` 直接从文件自带的 `general.architecture` 选中原生引擎，无需 flag | **1×**RTX 2080 Ti：4,096-token prompt 下 **prefill 636.0 tok/s**、**decode 25.9 tok/s**（同卡上游参考为 642.5 / 30.7），245,760 token 上下文 |
-| [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8；GGUF Q2/IQ2/IQ1 | **已验证 generation** | PyTorch 异构、C++/CUDA、GGUF TP4 | C++ FP4：32K–64K prefill 约 401 tok/s；decode 约 3.7 tok/s |
-| [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **已验证 TP4 generation** | Raw-block CUDA、GGUF TP4 | Full-model 256-token prefill 约 104.9–107 tok/s；43-layer decode benchmark 10.32 tok/s |
-| [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **已验证文本生成** | Raw-block CUDA、GGUF TP4 | prefill 约 0.79 tok/s；decode 约 0.66 tok/s |
+每个模型都有与其架构和 checkpoint 格式匹配的 runtime，每个名字都链到它的模型页。表里的数字是该页
+的 headline，不是这里的独立 benchmark —— 记录是那一页，连同它的测量条件和 `## Known limitations`。
 
-Qwen3.8-27B 一行覆盖同一文本架构下的三个 checkpoint：上面已验证的 FP8 runtime、[NVFP4](docs/models/qwen3.8-27b-nvfp4.md) 变体，以及[官方 BF16](docs/models/qwen3.8-27b-bf16.md) 发布版（已审计但未运行）。每个的确切状态见[支持矩阵](docs/models/README.md)。
+| 模型 | 格式 | Runtime | 状态 | Headline |
+| --- | --- | --- | --- | --- |
+| [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 + FP4 | `--backend v41`，host PyTorch，TP4 | 文本 + OpenAI server | 260k prompt prefill 150–152 tok/s |
+| [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 + MXFP4 | `--backend mimo`，host expert bank，TP4 | 文本 + OpenAI server | 262k prompt prefill 104 tok/s |
+| [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | C++/CUDA，TP4 | 文本 + OpenAI server | prefill 865 tok/s，decode 43 tok/s |
+| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF ternary，1.75 bit/权重 | C++/CUDA，**单卡**，无需 flag | 文本 + OpenAI server | prefill 636 tok/s，decode 26 tok/s |
+| [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8，GGUF Q2 | PyTorch 与 C++/CUDA，TP4 | 文本 + server（C++/PyTorch） | C++ FP4 prefill 约 401 tok/s |
+| [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | Raw-block CUDA，TP4 | 文本，仅 CLI | 256-token prefill 约 105 tok/s |
+| [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | Raw-block CUDA，TP4 | 文本，仅 CLI | prefill 约 0.79 tok/s |
+
+[Qwen3.8-27B](docs/models/qwen3.8-27b-fp8.md) 一行还覆盖同一文本架构下的
+[NVFP4](docs/models/qwen3.8-27b-nvfp4.md) 和[官方 BF16](docs/models/qwen3.8-27b-bf16.md) 两个
+checkpoint；上面这张表的完整八列版本、带格式与验证细节，是[支持矩阵](docs/models/README.md)。
 
 模型页面会把“模型架构规格”和“PocketLLM 当前实际实现能力”分开。`inspect`、`smoke` 和 benchmark 也不自动等于 production serving 保证。
 
