@@ -1,0 +1,119 @@
+# PocketLLM
+
+> Inference engine for large language models on consumer GPUs with deep optimization for older hardware
+
+This is the index of every page the documentation site publishes. It is generated from `mkdocs.yml`
+by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script.
+
+## Pages
+
+- [Home](https://lvyufeng.github.io/PocketLLM/)
+- [Getting started](https://lvyufeng.github.io/PocketLLM/getting-started/)
+- [Changelog](https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md)
+
+## Model guides
+
+- [Support matrix](https://lvyufeng.github.io/PocketLLM/models/)
+- [DeepSeek-V4](https://lvyufeng.github.io/PocketLLM/models/deepseek-v4/)
+- [DeepSeek-V4 GGUF Q2 on one GPU](https://lvyufeng.github.io/PocketLLM/models/deepseek-v4-gguf-q2-single-gpu/)
+- [MiniMax-M2.7](https://lvyufeng.github.io/PocketLLM/models/minimax-m2.7/)
+- [GLM-5.2](https://lvyufeng.github.io/PocketLLM/models/glm-5.2/)
+- [Qwen3.8-27B-FP8](https://lvyufeng.github.io/PocketLLM/models/qwen3.8-27b-fp8/)
+- [Qwen3.8-27B-NVFP4](https://lvyufeng.github.io/PocketLLM/models/qwen3.8-27b-nvfp4/)
+- [Qwen3.8-27B-BF16](https://lvyufeng.github.io/PocketLLM/models/qwen3.8-27b-bf16/)
+- [DeepSeek-V4.1-Flash](https://lvyufeng.github.io/PocketLLM/models/deepseek-v4.1-flash/)
+- [MiMo-V2.6-Flash](https://lvyufeng.github.io/PocketLLM/models/mimo-v2.6-flash/)
+- [Ternary-Bonsai-2-27B](https://lvyufeng.github.io/PocketLLM/models/ternary-bonsai-2-27b/)
+
+## Guides
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/guides/)
+- [Benchmarking and reporting](https://lvyufeng.github.io/PocketLLM/guides/benchmarking/)
+- [Serving latency metrics](https://lvyufeng.github.io/PocketLLM/guides/latency_metrics/)
+- [Native engine API](https://lvyufeng.github.io/PocketLLM/guides/pocketllm_api/)
+- [PyPI release](https://lvyufeng.github.io/PocketLLM/guides/pypi_release/)
+- [CUDA extension builds](https://lvyufeng.github.io/PocketLLM/guides/cuda_extension_builds/)
+- [Ascend SoC generations](https://lvyufeng.github.io/PocketLLM/guides/ascend_soc_generations/)
+
+## Performance
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/performance/)
+- [DSpark speculative decoding](https://lvyufeng.github.io/PocketLLM/performance/dspark/)
+- [FlashMemory 1M context](https://lvyufeng.github.io/PocketLLM/performance/flashmemory_1m_context/)
+- [MiniMax decode bottleneck](https://lvyufeng.github.io/PocketLLM/performance/minimax_decode_bottleneck_analysis/)
+- [Qwen4-Exp expert placement](https://lvyufeng.github.io/PocketLLM/performance/qwen4_exp_performance/)
+- [CPU offload and prefetch ceiling](https://lvyufeng.github.io/PocketLLM/performance/cpu_offload_profile/)
+- [Qwen KV cache at 65K](https://lvyufeng.github.io/PocketLLM/performance/qwen_kv_cache_65k_tg512/)
+- [Qwen drafter acceptance](https://lvyufeng.github.io/PocketLLM/performance/qwen_drafter_acceptance/)
+- [OpenAI API concurrency validation](https://lvyufeng.github.io/PocketLLM/performance/cpp_openai_concurrency_validation/)
+- [OpenAI API tool-calling acceptance](https://lvyufeng.github.io/PocketLLM/performance/cpp_openai_tool_acceptance/)
+- [Ascend 910A attention](https://lvyufeng.github.io/PocketLLM/performance/ascend_attention_optimization/)
+- [Ascend 910A TP collective overlap](https://lvyufeng.github.io/PocketLLM/performance/ascend_tp_collective_overlap/)
+- [Ascend decode collectives and batch scaling](https://lvyufeng.github.io/PocketLLM/performance/ascend_decode_collective_ab/)
+- [Ascend 910A single-request decode](https://lvyufeng.github.io/PocketLLM/performance/ascend_single_request_tps/)
+- [Ascend gated-delta value-axis slice](https://lvyufeng.github.io/PocketLLM/performance/ascend_gated_delta_slice/)
+- [Ascend RoPE table workspace slot](https://lvyufeng.github.io/PocketLLM/performance/ascend_rope_table_workspace_aliasing/)
+- [DeepSeek-V4 PersistentEngine baseline](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_serial_baseline/)
+- [DeepSeek-V4.1 shard audit](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_shard_audit/)
+- [DeepSeek-V4.1-Flash host run](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_host_run/)
+- [DeepSeek-V4.1-Flash device experts](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_device_experts/)
+- [DeepSeek-V4.1-Flash remaining bottlenecks](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_remaining_bottlenecks/)
+- [DeepSeek-V4.1-Flash decode graph](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_decode_graph/)
+- [DeepSeek-V4.1-Flash graphed decode, live](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_decode_graph_live/)
+- [DeepSeek-V4.1-Flash chunked prefill](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_chunked_prefill/)
+- [DeepSeek-V4.1-Flash prefill stack](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_prefill_stack/)
+- [DeepSeek-V4.1-Flash MoE weight staging](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_moe_weight_staging/)
+- [DeepSeek-V4.1-Flash MoE reduction](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_moe_reduce_csr/)
+- [DeepSeek-V4.1-Flash single-request capability](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_single_request_capability/)
+- [DeepSeek-V4.1-Flash behind the server](https://lvyufeng.github.io/PocketLLM/performance/deepseek_v4_1_flash_served_gate/)
+- [DeepSeek-V4.1-Flash dense stack in fp16, withdrawn](https://lvyufeng.github.io/PocketLLM/performance/v41_dense_gemm_dtype/)
+- [Serving latency baseline](https://lvyufeng.github.io/PocketLLM/performance/serving_latency_baseline/)
+- [Serving latency with IPC all-reduce](https://lvyufeng.github.io/PocketLLM/performance/serving_latency_optimized/)
+- [Serving concurrency and throughput](https://lvyufeng.github.io/PocketLLM/performance/serving_throughput_scaling/)
+
+## Architecture
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/architecture/)
+- [MiMo-V2.6-Flash design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/mimo_v2_6_flash_design/)
+- [DeepSeek-V4.1-Flash design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/deepseek_v4_1_flash_design/)
+- [Qwen3.8-27B-FP8 design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/qwen3_8_27b_fp8_design/)
+- [Qwen3.8-27B-NVFP4 design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/qwen3_8_27b_nvfp4_design/)
+- [Qwen3.8-27B BF16 design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/qwen3_8_27b_bf16_design/)
+- [DeepSeek-V4-Flash design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/deepseek_v4_design/)
+- [GLM-5.2 design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/glm_5_2_design/)
+- [MiniMax-M2.7 design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/minimax_m2_7_design/)
+- [Backend unification design](https://lvyufeng.github.io/PocketLLM/architecture/backend_unification_design/)
+- [Cross-request prefix caching on V4.1](https://lvyufeng.github.io/PocketLLM/architecture/v41_prefix_cache/)
+- [Cross-request prefix caching on MiMo-V2.6-Flash](https://lvyufeng.github.io/PocketLLM/architecture/mimo_v2_6_flash_prefix_cache/)
+- [C++ engine multi-backend plan](https://lvyufeng.github.io/PocketLLM/architecture/cpp_engine_multi_backend_plan/)
+- [Refactor analysis (2026-09)](https://lvyufeng.github.io/PocketLLM/architecture/pocketllm_refactor_analysis_2026_09/)
+- [Roadmap for old hardware](https://lvyufeng.github.io/PocketLLM/architecture/pocketllm_roadmap_old_hardware/)
+- [New model roadmap](https://lvyufeng.github.io/PocketLLM/architecture/pocketllm_new_model_roadmap/)
+- [Ternary-Bonsai-2-27B reference gate](https://lvyufeng.github.io/PocketLLM/architecture/ternary_bonsai_2_reference_gate/)
+- [Ternary-Bonsai-2-27B dense GEMM](https://lvyufeng.github.io/PocketLLM/architecture/ternary_bonsai_2_dense_gemm/)
+- [Ternary-Bonsai-2-27B served runtime](https://lvyufeng.github.io/PocketLLM/architecture/bonsai_2_27b_design/)
+- [vLLM and SGLang architecture analysis](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_architecture_analysis/)
+- [vLLM and SGLang comparison (pre-Phase-1)](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_comparison/)
+- [Ascend 910A performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)
+
+## Migration
+
+- [The dsv4 to pocket rename](https://lvyufeng.github.io/PocketLLM/migration/dsv4-to-pocket-rename/)
+
+## Archive (Phase 2/3)
+
+- [Overview](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/)
+- [Phase 2 validation results](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase2_validation_results/)
+- [Backend auto-TP design](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/cpp_backend_auto_tp/)
+- [Phase 3.1 batching design](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/cpp_engine_batching_phase3_1/)
+- [Phase 3.1 progress report](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_1_progress_report/)
+- [Phase 3.1 completion summary](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_1_completion_summary/)
+- [Phase 3.2 implementation plan](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_2_implementation_plan/)
+- [Phase 3.2 completion summary](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_2_completion_summary/)
+- [Phase 3.3 implementation plan](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_3_implementation_plan/)
+- [Phase 3.3 completion summary](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_3_completion_summary/)
+- [Phase 3.4 completion summary](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_4_completion_summary/)
+- [Phase 3.5 auto-TP results](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_5_auto_tp_results/)
+- [Phase 3.5 benchmark guide](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_5_benchmark_guide/)
+- [Phase 3.5 performance report](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_5_performance_report/)
+- [Phase 3.5 validation results](https://lvyufeng.github.io/PocketLLM/archive/phase2-phase3/phase3_5_validation_results/)

@@ -201,6 +201,13 @@ nav:
       - Phase 3.5 validation results: archive/phase2-phase3/phase3_5_validation_results.md
   - Changelog: https://github.com/lvyufeng/PocketLLM/blob/master/CHANGELOG.md
 
+# MkDocs hooks. One, and it is a build-time check rather than a feature: it warns
+# when `docs/llms.txt` is out of date with the nav below, which `--strict` turns
+# into a failure. CI runs no pytest, so the docs build is the only check that
+# runs on a documentation change, and this is where that check has to live.
+hooks:
+  - hooks/llms_txt_staleness.py
+
 # The build is the link checker: `mkdocs build --strict` runs in CI and promotes
 # every warning below to a failure. Anything omitted from `nav` also fails, so no
 # document can be reachable only by guessing its filename.
