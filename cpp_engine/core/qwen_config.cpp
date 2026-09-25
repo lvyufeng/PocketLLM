@@ -1,8 +1,10 @@
 #include "qwen_config.hpp"
 
+#include "gguf_reader.hpp"
 #include "json_lite.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -138,6 +140,38 @@ std::string root_model_type(const JsonObject& root) {
     return optional_string(root, "model_type", "");
 }
 
+bool has_gguf_suffix(const std::string& path) {
+    static const std::string suffix = ".gguf";
+    if (path.size() < suffix.size()) return false;
+    return std::equal(suffix.rbegin(), suffix.rend(), path.rbegin(),
+                      [](char a, char b) {
+                          return std::tolower(static_cast<unsigned char>(a)) ==
+                                 std::tolower(static_cast<unsigned char>(b));
+                      });
+}
+
+std::string lowered(const std::string& value) {
+    std::string out = value;
+    std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return out;
+}
+
+// A required integer out of the GGUF header, named in the error the way the key
+// is so a missing key is a one-line fix rather than a hunt.
+uint64_t gguf_required_u64(const GGUFFile& file, const std::string& key) {
+    const std::optional<uint64_t> value = file.metadata_u64(key);
+    if (!value) throw std::runtime_error("GGUF config is missing key: " + key);
+    return *value;
+}
+
+double gguf_required_f64(const GGUFFile& file, const std::string& key) {
+    const std::optional<double> value = file.metadata_f64(key);
+    if (!value) throw std::runtime_error("GGUF config is missing key: " + key);
+    return *value;
+}
+
 void validate_positive(double value, const std::string& name) {
     if (!(value > 0.0) || !std::isfinite(value)) {
         throw std::runtime_error("invalid Qwen positive number: " + name);
@@ -210,33 +244,176 @@ QwenConfig QwenConfig::from_hf_config(const std::string& ckpt_dir) {
     cfg.eos_token_ids = parse_eos_token_ids(ckpt_dir, cfg.vocab_size);
 
     if (!cfg.is_qwen3_5()) throw std::runtime_error("config is not a Qwen3.5 text checkpoint");
-    if (cfg.hidden_size == 0 || cfg.num_hidden_layers == 0 || cfg.vocab_size == 0 || cfg.max_position_embeddings == 0) {
+    cfg.validate();
+    return cfg;
+}
+
+QwenConfig QwenConfig::from_gguf(const std::string& path) {
+    const GGUFFile file(path);
+    std::string declared = lowered(file.metadata_string("general.architecture").value_or(std::string()));
+    if (declared.empty()) {
+        throw std::runtime_error("GGUF config declares no general.architecture: " + path);
+    }
+    // The metadata keys are prefixed by the *declared* name, not by the
+    // canonical one: this file says `qwen35.`, and folding that to `qwen3_5`
+    // before building the keys would look for `qwen3_5.block_count`.
+    const auto key = [&declared](const char* suffix) { return declared + "." + suffix; };
+
+    QwenConfig cfg;
+    cfg.architecture = canonical_qwen_architecture(declared);
+    cfg.model_type = cfg.architecture;
+    // The vocabulary is not a metadata key -- it is the length of the token
+    // table, which the metadata array reader keeps as a value rather than as a
+    // count.
+    const auto tokens = file.metadata_array_length("tokenizer.ggml.tokens");
+    if (!tokens || *tokens == 0) {
+        throw std::runtime_error("GGUF config has no tokenizer.ggml.tokens table");
+    }
+    cfg.vocab_size = *tokens;
+
+    cfg.hidden_size = gguf_required_u64(file, key("embedding_length"));
+    cfg.num_hidden_layers = gguf_required_u64(file, key("block_count"));
+    cfg.max_position_embeddings = gguf_required_u64(file, key("context_length"));
+    // The released artifact carries no next-token-predictor branch, while the
+    // FP8 checkpoint this shares config with declares one; a GGUF header has no
+    // key for it either way, so the plain runtime is the only path here.
+    cfg.mtp_num_hidden_layers = 0;
+    cfg.mtp_use_dedicated_embeddings = false;
+    cfg.rms_norm_eps = gguf_required_f64(file, key("attention.layer_norm_rms_epsilon"));
+    cfg.rope_theta = gguf_required_f64(file, key("rope.freq_base"));
+
+    const uint64_t head_length = gguf_required_u64(file, key("attention.key_length"));
+    const uint64_t value_length = gguf_required_u64(file, key("attention.value_length"));
+    if (head_length != value_length) {
+        throw std::runtime_error(
+            "GGUF config declares different key and value head lengths; this runtime has one head_dim");
+    }
+    // config.json states the rotary fraction directly; the GGUF states the
+    // rotated width in absolute terms, so the fraction is the ratio. Deriving it
+    // rather than assuming 0.25 keeps a checkpoint that changes the ratio from
+    // silently rotating the wrong number of dimensions.
+    const uint64_t rotary_dims = gguf_required_u64(file, key("rope.dimension_count"));
+    if (rotary_dims == 0 || head_length == 0) {
+        throw std::runtime_error("GGUF config declares a zero rotary or head dimension");
+    }
+    cfg.partial_rotary_factor =
+        static_cast<double>(rotary_dims) / static_cast<double>(head_length);
+
+    cfg.linear_attention.key_heads = gguf_required_u64(file, key("ssm.group_count"));
+    cfg.linear_attention.key_head_dim = gguf_required_u64(file, key("ssm.state_size"));
+    cfg.linear_attention.value_head_dim = cfg.linear_attention.key_head_dim;
+    cfg.linear_attention.conv_kernel_dim = gguf_required_u64(file, key("ssm.conv_kernel"));
+    // The value head count is the time-step rank, and the file also states the
+    // product of the two as `ssm.inner_size`. Requiring them to agree is the one
+    // cheap cross-check that catches this mapping being off by a key.
+    const uint64_t value_heads = gguf_required_u64(file, key("ssm.time_step_rank"));
+    const uint64_t inner_size = gguf_required_u64(file, key("ssm.inner_size"));
+    if (value_heads * cfg.linear_attention.value_head_dim != inner_size) {
+        throw std::runtime_error(
+            "GGUF config's ssm.time_step_rank and ssm.inner_size disagree about the value width");
+    }
+    cfg.linear_attention.value_heads = value_heads;
+
+    cfg.full_attention.num_heads = gguf_required_u64(file, key("attention.head_count"));
+    cfg.full_attention.num_key_value_heads =
+        gguf_required_u64(file, key("attention.head_count_kv"));
+    cfg.full_attention.head_dim = head_length;
+
+    // config.json lists one type per layer; the GGUF states only the period at
+    // which a full-attention layer replaces a linear one. The published
+    // checkpoint's list is exactly that pattern -- its sixteen `full_attention`
+    // entries are layers 3, 7, ... 63 -- so the period reproduces it, and the
+    // period is what the file can be held to.
+    const uint64_t interval = gguf_required_u64(file, key("full_attention_interval"));
+    if (interval == 0 || cfg.num_hidden_layers == 0) {
+        throw std::runtime_error("GGUF config declares a zero full-attention interval");
+    }
+    cfg.layer_types.reserve(cfg.num_hidden_layers);
+    for (uint64_t layer = 0; layer < cfg.num_hidden_layers; ++layer) {
+        cfg.layer_types.push_back((layer % interval) == (interval - 1)
+                                      ? QwenLayerType::FullAttention
+                                      : QwenLayerType::LinearAttention);
+    }
+
+    // No key states whether the query projection carries a gate, and the file
+    // does not need one: the projection's own output width answers it, since a
+    // gated query is exactly twice the attention width and an ungated one is
+    // exactly once. Reading it off the first full-attention layer's tensor costs
+    // a header lookup and cannot drift from what the weights actually hold.
+    const uint64_t attention_dim = cfg.full_attention.num_heads * head_length;
+    {
+        const GGUFTensorInfo* q = nullptr;
+        for (uint64_t layer = 0; layer < cfg.num_hidden_layers && q == nullptr; ++layer) {
+            if (cfg.layer_types[layer] != QwenLayerType::FullAttention) continue;
+            q = file.find_tensor("blk." + std::to_string(layer) + ".attn_q.weight");
+        }
+        if (q == nullptr) {
+            throw std::runtime_error(
+                "GGUF config has no blk.*.attn_q.weight to read the query width from");
+        }
+        if (q->shape.size() != 2 || q->shape[1] % attention_dim != 0) {
+            throw std::runtime_error(
+                "GGUF config's attn_q.weight does not tile the declared head count");
+        }
+        const uint64_t factor = q->shape[1] / attention_dim;
+        if (factor != 1 && factor != 2) {
+            throw std::runtime_error(
+                "GGUF config's attn_q.weight is neither the attention width nor twice it");
+        }
+        cfg.full_attention.output_gate = factor == 2;
+    }
+
+    cfg.mlp.intermediate_size = gguf_required_u64(file, key("feed_forward_length"));
+
+    // Both stop tokens the checkpoint declares, in the order its own
+    // generation_config.json lists them: the end-of-turn token first, then the
+    // end-of-text one it also stops on.
+    const std::optional<uint64_t> eos = file.metadata_u64("tokenizer.ggml.eos_token_id");
+    const std::optional<uint64_t> bos = file.metadata_u64("tokenizer.ggml.bos_token_id");
+    if (eos) cfg.eos_token_ids.push_back(static_cast<int>(*eos));
+    if (bos && (!eos || *bos != *eos)) cfg.eos_token_ids.push_back(static_cast<int>(*bos));
+
+    if (!cfg.is_qwen3_5()) {
+        throw std::runtime_error("GGUF config is not a Qwen3.5 text checkpoint: " + path);
+    }
+    cfg.validate();
+    return cfg;
+}
+
+void QwenConfig::validate() const {
+    if (hidden_size == 0 || num_hidden_layers == 0 || vocab_size == 0 ||
+        max_position_embeddings == 0) {
         throw std::runtime_error("invalid zero-sized Qwen config");
     }
-    validate_positive(cfg.rms_norm_eps, "rms_norm_eps");
-    validate_positive(cfg.rope_theta, "rope_theta");
-    if (!(cfg.partial_rotary_factor > 0.0 && cfg.partial_rotary_factor <= 1.0)) {
+    if (mlp.intermediate_size == 0) {
+        throw std::runtime_error("missing Qwen dense MLP intermediate_size");
+    }
+    validate_positive(rms_norm_eps, "rms_norm_eps");
+    validate_positive(rope_theta, "rope_theta");
+    if (!(partial_rotary_factor > 0.0 && partial_rotary_factor <= 1.0)) {
         throw std::runtime_error("Qwen partial_rotary_factor must be in (0, 1]");
     }
-    if (cfg.linear_attention.key_heads == 0 || cfg.linear_attention.value_heads == 0 ||
-        cfg.linear_attention.key_head_dim == 0 || cfg.linear_attention.value_head_dim == 0 ||
-        cfg.linear_attention.conv_kernel_dim == 0) {
+    if (linear_attention.key_heads == 0 || linear_attention.value_heads == 0 ||
+        linear_attention.key_head_dim == 0 || linear_attention.value_head_dim == 0 ||
+        linear_attention.conv_kernel_dim == 0) {
         throw std::runtime_error("invalid Qwen linear-attention dimensions");
     }
-    if (cfg.full_attention.num_heads == 0 || cfg.full_attention.num_key_value_heads == 0 || cfg.full_attention.head_dim == 0) {
+    if (full_attention.num_heads == 0 || full_attention.num_key_value_heads == 0 || full_attention.head_dim == 0) {
         throw std::runtime_error("invalid Qwen full-attention dimensions");
     }
-    if (cfg.full_attention.num_heads % cfg.full_attention.num_key_value_heads != 0) {
+    if (full_attention.num_heads % full_attention.num_key_value_heads != 0) {
         throw std::runtime_error("Qwen attention heads must be divisible by key/value heads");
     }
-    if (cfg.partial_rotary_dim() == 0 || cfg.partial_rotary_dim() > cfg.full_attention.head_dim ||
-        (cfg.partial_rotary_dim() % 2) != 0) {
+    if (partial_rotary_dim() == 0 || partial_rotary_dim() > full_attention.head_dim ||
+        (partial_rotary_dim() % 2) != 0) {
         throw std::runtime_error("Qwen partial rotary dimension must be a positive even head dimension");
     }
-    if (cfg.linear_attention.value_heads % cfg.linear_attention.key_heads != 0) {
+    if (linear_attention.value_heads % linear_attention.key_heads != 0) {
         throw std::runtime_error("Qwen linear value heads must be divisible by key heads");
     }
-    return cfg;
+    if (layer_types.size() != num_hidden_layers) {
+        throw std::runtime_error("Qwen layer_types must contain one entry per layer");
+    }
 }
 
 bool QwenConfig::is_qwen3_5() const {
@@ -298,8 +475,26 @@ std::string QwenConfig::to_string() const {
     return out.str();
 }
 
-bool is_qwen3_5_checkpoint(const std::string& ckpt_dir) {
-    const JsonValue root_value = parse_json(read_file(ckpt_dir + "/config.json"));
+std::string gguf_declared_architecture(const std::string& path) {
+    const GGUFFile file(path);
+    return lowered(file.metadata_string("general.architecture").value_or(std::string()));
+}
+
+std::string canonical_qwen_architecture(const std::string& raw) {
+    if (raw == "qwen3_5_text") return "qwen3_5";
+    // llama.cpp's name for this family, which is what the ternary checkpoint's
+    // header declares. It is the same 64-block hybrid model field for field, so
+    // it has to reach the same engine key -- and its own file is the only place
+    // that spelling appears.
+    if (raw == "qwen35") return "qwen3_5";
+    return raw;
+}
+
+bool is_qwen3_5_checkpoint(const std::string& ckpt_path) {
+    if (has_gguf_suffix(ckpt_path)) {
+        return canonical_qwen_architecture(gguf_declared_architecture(ckpt_path)) == "qwen3_5";
+    }
+    const JsonValue root_value = parse_json(read_file(ckpt_path + "/config.json"));
     if (!root_value.is_object()) return false;
     const JsonObject& root = root_value.object();
     const std::string arch = root_model_type(root);

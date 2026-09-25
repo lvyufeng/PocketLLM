@@ -256,7 +256,15 @@ def test_the_loader_refuses_to_dequantize_a_ternary_tensor(tmp_path: Path, pack:
     # The decoder named is the pack's own: the two formats share nothing but the
     # group size, so pointing a reader at the other one is a real way to be wrong.
     assert f"src/loader/gguf/{pack}.py" in message
-    assert "#386" in message
+    # And the refusal has to say which of the two packs it is talking about. One
+    # has a GEMM that reads its blocks and one does not; a message that promises a
+    # kernel the format lacks is worse than no message.
+    if pack == "ptq1_0":
+        assert "gguf_quant_gemm_forward" in message
+        assert "no kernel reads them yet" not in message
+    else:
+        assert "no kernel reads them yet" in message
+        assert "gguf_quant_gemm_forward" not in message
 
 
 @pytest.mark.parametrize("pack", sorted(PACKS))

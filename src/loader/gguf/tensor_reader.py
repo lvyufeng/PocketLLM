@@ -119,13 +119,27 @@ _QUANT_BLOCK_META = {
     "pq2_0": (128, 34),
 }
 
-#: Block formats with geometry but no kernel.  Dequantizing one of these is the
-#: F16-upcast failure mode this loader is written to avoid, so it is refused by
-#: name rather than left to fall off the end of a dispatch chain.  The set comes
-#: from `quant_types` so that "which types are ternary" is answered in one place;
-#: the geometry above is a second statement of the same fact and the two are
-#: pinned against `reader.GGML_TYPES` by `tests/test_gguf_ternary_reader.py`.
+#: Block formats this loader will not dequantize.  Dequantizing one of these is
+#: the F16-upcast failure mode this loader is written to avoid, so it is refused
+#: by name rather than left to fall off the end of a dispatch chain.  The set
+#: comes from `quant_types` so that "which types are ternary" is answered in one
+#: place; the geometry above is a second statement of the same fact and the two
+#: are pinned against `reader.GGML_TYPES` by `tests/test_gguf_ternary_reader.py`.
+#:
+#: The refusal is about *this* entry point, not about the format: these two packs
+#: no longer stand in the same place.  `PTQ1_0` has a GEMM that reads its blocks
+#: out of `read_quantized_matrix_block_rows`, so its message says where the blocks
+#: go instead; `PQ2_0` has nothing, and its message says so.  Both still refuse
+#: here, because a caller that asked for a dense tensor wants one this format
+#: cannot honestly give.
 _TERNARY_BLOCK_META = GGUF_TERNARY_TYPE_NAMES
+
+#: Ternary packs a kernel consumes, and the name it is reached by.  `None` means
+#: the blocks are addressable and nothing reads them.
+_TERNARY_CONSUMERS: dict[str, str | None] = {
+    "ptq1_0": "gguf_quant_gemm_forward / gguf_quant_gemm_prefill_forward, file type id 143",
+    "pq2_0": None,
+}
 
 
 def _quant_block_meta(type_name: str) -> tuple[int, int]:
@@ -324,12 +338,17 @@ class GGUFTensorDataReader:
 
     @staticmethod
     def _ternary_refusal(tensor: GGUFTensorInfo) -> str:
+        consumer = _TERNARY_CONSUMERS.get(tensor.type_name)
+        if consumer is None:
+            kernel = "and no kernel reads them yet"
+        else:
+            kernel = f"and the sm_75 GEMM consumes them there ({consumer})"
         return (
             f"{tensor.name} is {tensor.type_name}: the raw blocks are addressable "
-            "(read_quantized_matrix_blocks) but no kernel consumes them yet, so this loader "
-            "refuses rather than dequantizing to f16 -- a silent upcast costs ten times the "
-            f"memory and makes a wrong kernel look right. The decoder lives in "
-            f"src/loader/gguf/{tensor.type_name}.py; the GEMM is #386"
+            f"(read_quantized_matrix_block_rows) {kernel} -- but this entry point returns a "
+            "dense tensor, so it refuses rather than dequantizing to f16: a silent upcast "
+            "costs ten times the memory and makes a wrong kernel look right. The decoder "
+            f"lives in src/loader/gguf/{tensor.type_name}.py"
         )
 
     def read_tensor_rows(self, name: str | GGUFTensorInfo, row_start: int, row_count: int) -> torch.Tensor:
