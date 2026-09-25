@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Raw-block runtime dispatch table: GGUF type name -> the compact type id the
+# GGUF kernels switch on.  Deliberately not the file's own GGML id -- `iq2_xxs`
+# is GGML type 16 and runtime type 0 -- because the kernels only ever see the
+# nine formats in here.
 GGUF_DENSE_TYPE_IDS = {
     "iq2_xxs": 0,
     "q2_k": 1,
@@ -13,3 +17,26 @@ GGUF_DENSE_TYPE_IDS = {
 }
 
 GGUF_DENSE_TYPE_NAMES = {value: key for key, value in GGUF_DENSE_TYPE_IDS.items()}
+
+# Fork-private ternary types from PrismML-Eng/llama.cpp's `prism` branch, as
+# GGML *file* ids: 143 is PTQ1_0 (128 weights per 28 bytes) and 142 is PQ2_0
+# (128 per 34).  The geometry is keyed the same way here as it is in
+# `reader.GGML_TYPES`, which is what a file's own header is read through.
+#
+# They are deliberately **absent** from `GGUF_DENSE_TYPE_IDS` above.  That map
+# is the raw-block runtime's dispatch table, so a name in it is a claim that a
+# kernel exists to consume the blocks; there is none yet, and the failure it
+# would produce is a silent F16 upcast -- ten times the memory and a wrong
+# kernel that looks right.  The loader addresses the bytes and refuses to
+# interpret them.  `src/loader/gguf/tensor_reader.py` carries the refusal and
+# says so in its message.
+GGUF_TERNARY_FILE_TYPE_IDS = {
+    "ptq1_0": 143,
+    "pq2_0": 142,
+}
+
+GGUF_TERNARY_TYPE_NAMES = frozenset(GGUF_TERNARY_FILE_TYPE_IDS)
+
+#: Every GGUF type whose blocks the loader can address by offset, whether or not
+#: anything downstream can consume them.
+GGUF_ADDRESSABLE_TYPE_NAMES = frozenset(GGUF_DENSE_TYPE_IDS) | GGUF_TERNARY_TYPE_NAMES

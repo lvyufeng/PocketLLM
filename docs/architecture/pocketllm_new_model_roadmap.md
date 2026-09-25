@@ -87,6 +87,14 @@ reference decodes at 30.7 tokens/s and prefills at 665 tokens/s on one card, and
 15,836 MiB with a quantized KV cache. It passes, and it also shows the reference spending only a third of
 the card's bandwidth per decode step, which is the number the kernel task has to beat.
 
+The loader task ([#384](https://github.com/lvyufeng/PocketLLM/issues/384)) has run since as well. Both packs
+read end to end: 851 tensors whose byte counts tile the file exactly, the type histogram the release ships
+(402 quantized / 353 F32 / 96 BF16), and decoded rows equal to the same rows of the checkpoint's own F16
+GGUF, bit for bit. The bytes are addressable and nothing runs them yet — the loader refuses a ternary tensor
+by name rather than upcasting it to F16, which is the failure mode the task existed to prevent. The Hadamard
+transform ([#385](https://github.com/lvyufeng/PocketLLM/issues/385)) and the GEMM
+([#386](https://github.com/lvyufeng/PocketLLM/issues/386)) are what remain before the model generates.
+
 ## Stage 2 — Xing4.0-29B-A4B
 
 `XingChen-AGI/Xing4.0-29B-A4B`, 2026-09-16, 58.1 GiB of safetensors with an official IQ4_NL GGUF at
