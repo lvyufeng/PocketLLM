@@ -138,8 +138,8 @@ added at scrape time from a snapshot the backend rebinds under the request lock.
 ## What it costs and what it saves
 
 `tests/probe_mimo_v2_prefix_cache.py`, four ranks on the released checkpoint, a real document through
-the checkpoint's own tokenizer, `--tokens 4096 --prefix 3072 --chunk 2048 --chunk-rows 16 --rounds 2`,
-the slowest rank:
+the checkpoint's own tokenizer,
+`--tokens 4096 --prefix 3072 --chunk 2048 --chunk-rows 16 --rounds 2 --budget 8`, the slowest rank:
 
 | | Result |
 | --- | ---: |
