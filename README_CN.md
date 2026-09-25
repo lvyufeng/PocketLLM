@@ -80,7 +80,7 @@ Qwen3.8-27B 一行覆盖同一文本架构下的三个 checkpoint：上面已验
 
 ## 性能摘要
 
-本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。比较前请先阅读 [Benchmark 口径](docs/guides/benchmarking.md)。
+本节数字除非特别说明，都来自同一台基线机器上的真实 checkpoint：4× NVIDIA RTX 2080 Ti、每卡 22 GiB、PCIe Gen3、无 NVLink、单请求执行、适用时使用 TP4。Qwen3.8 下的那组并发阶梯是例外 —— 它跑的是原生 batch scheduler。比较前请先阅读 [Benchmark 口径](docs/guides/benchmarking.md)。
 
 ### DeepSeek-V4.1-Flash v41 runtime（served）
 
@@ -119,6 +119,8 @@ master `cfad866` 上按引擎默认值做的一轮串行 sweep，每次生成 12
 每 rank 的引擎计数为 6.86 GiB 常驻 FP8 权重与 scale，加上 65,536 token 时的 1.00 GiB KV 数据和 1.01 GiB chunk workspace；`nvidia-smi` 在此之上还要多出 3.4–3.5 GiB（CUDA context、cuBLAS workspace、NCCL buffer），且该差值不随 prompt 长度变化。四个 TP rank 的生成 token 序列一致。原生 OpenAI 兼容 server 已验证 text 请求；图像和视频输入仍不支持。
 
 64 和 512 token 两行的 prefill 反映的是短 prompt 延迟而非稳态吞吐：两者都在 0.55–0.59 s 内完成，因为该规模下固定进程开销占主导。4,096 token 以上，prefill 到 32,768 的边际吞吐为 1,670 tok/s，之后再为 1,285 tok/s。
+
+这条 runtime 也做 batching，而且是这里唯一带完整 scheduler 的那个。请求由一个 scheduler 准入：从 paged KV block pool 里分配 block、在 token 预算下推进 prefill，整个活跃集合走一次 batched decode step。8 个并发的 128 词请求 1.561 s 跑完，串行跑同样 8 个要 7.300 s —— **4.68×**，聚合输出 163.95 tok/s，而串行平在 35.07；2 并发和 4 并发分别是 2.14× 和 3.61×。同样四张卡上与 vLLM 0.1.15 的 batch mode 相比，1/2/4/8 并发下 vLLM 的 wall time 分别是 PocketLLM 的 1.22×/1.34×/1.32×/1.17×。batching 在引擎自带的 OpenAI server 上默认开启，在 Python `--backend cpp` adapter 上要用 `--backend-option enable_batching=true` 打开；完整阶梯表、复现命令和注意事项（单请求那一档的 17% 里含有 slot 间 prompt prefix 复用的成分，只能当 smoke 上界看）见[并发验证记录](docs/performance/cpp_openai_concurrency_validation.md)。
 
 通过 OpenAI API 服务 Qwen3.8 的正是同一个 runtime，它也是这里唯一一个带有两个可选外部 speculative drafter 的模型：[DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) 和 [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding)，两者互斥，且都与原生 MTP 路径互斥。DFlash2 在其 opt-in 开关全开时，512-token fixture 上实测 full-request 2.78×、decode 3.02×，八个 GSM8K prompt 上聚合 1.33×，且每种情况下 token 完全一致。两个 drafter 都默认关闭，因为收益依赖接受率，而上游公布的 2.67–3.43× 是 decode 延迟比而非 full-request 比。另外还有一个常驻 TP4 worker 会在请求之间保留 prefix state，因此下一个 prompt 是上一个的追加或压缩的客户端只需为增量付费。
 
