@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 from pocketllm.api import BackendUnavailableError, EngineArgs, UnsupportedFeatureError
 
-from .cpp_backend import CppBackend
+from .cpp_backend import CppBackend, gguf_is_servable
 from .mimo_backend import MimoBackend
 from .torch_backend import TorchBackend
 from .v41_backend import V41Backend
@@ -132,11 +132,16 @@ def _checkpoint_has_gguf(path: str) -> bool:
 
 
 def _cpp_model_supported(args: EngineArgs) -> bool:
-    if args.model_format == "gguf":
-        return False
-    if args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir):
-        return False
+    if _requested_gguf(args):
+        return gguf_is_servable(args.checkpoint_dir)
     return _looks_like_qwen35(args.checkpoint_dir, args.config_path)
+
+
+def _requested_gguf(args: EngineArgs) -> bool:
+    """Whether the caller is pointing at a GGUF, by declaration or by shape."""
+    return args.model_format == "gguf" or (
+        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
+    )
 
 
 def _reject_unsupported_cpp_checkpoint(args: EngineArgs) -> None:
@@ -145,13 +150,21 @@ def _reject_unsupported_cpp_checkpoint(args: EngineArgs) -> None:
     A missing or unreadable path is left alone so injected engines and unusual
     layouts still reach the native loader, which reports the precise error.
     """
-    if args.model_format == "gguf" or (
-        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
-    ):
-        raise UnsupportedFeatureError(
-            "the native C++ adapter supports Qwen3.5 safetensors only; "
-            "GGUF checkpoints must use backend='torch'"
-        )
+    if _requested_gguf(args):
+        # The native reader opens one GGUF file and the registry routes it to the
+        # Qwen3.5 engine, so a GGUF is servable when both of those hold: one
+        # file, and `general.architecture` a name that engine claims. Anything
+        # else -- shards, a directory of two models, another architecture -- is
+        # refused here rather than at the loader, because the reason is about the
+        # checkpoint format and the refusal is what tells the caller which
+        # backend to ask for instead.
+        if not gguf_is_servable(args.checkpoint_dir):
+            raise UnsupportedFeatureError(
+                "the native C++ adapter serves the Qwen3.5 GGUF export, as a "
+                "single .gguf file declaring general.architecture=qwen35; "
+                "other GGUF checkpoints must use backend='torch'"
+            )
+        return
     config = _read_config(args.checkpoint_dir, args.config_path)
     if config is not None and not _is_qwen35_config(config):
         raise UnsupportedFeatureError(

@@ -76,6 +76,59 @@ def load_native_module() -> Any:
     )
 
 
+# Architectures whose GGUF export the native reader can open. The other engine
+# reads a safetensors index, so a single-file GGUF reaches Qwen3.5 only; the
+# registry canonicalizes the file's own ``general.architecture`` (``qwen35``)
+# onto this key, which is why the two spellings never have to meet.
+_GGUF_ARCHITECTURES = frozenset({"qwen3_5"})
+
+
+def gguf_checkpoint_file(path: str) -> str:
+    """The one GGUF file a checkpoint path names, or an empty string.
+
+    The native reader holds a whole checkpoint in one file, so a directory of
+    shards is not a layout it can open. A directory holding two models is not a
+    question a listing order should answer either -- naming the file is the
+    caller's decision -- so both answer empty and the caller refuses rather than
+    serving whichever file happened to sort first.
+    """
+    if not path:
+        return ""
+    try:
+        from src.loader.gguf.bundle import resolve_gguf_bundle
+
+        resolved = [str(item) for item in resolve_gguf_bundle(path)]
+    except Exception:
+        # An unreadable or absent path is not this function's error to report:
+        # the loader names it precisely when it opens the checkpoint.
+        return ""
+    return resolved[0] if len(resolved) == 1 else ""
+
+
+def gguf_is_servable(path: str) -> bool:
+    """Whether the native adapter can open the GGUF this checkpoint path names.
+
+    Both halves are read from the artifact: that there is exactly one file, and
+    that its architecture is one the registry routes to a reader that opens a
+    GGUF. Asking the registry rather than a name is what keeps this answer equal
+    to what ``create_engine`` will do with the same path.
+    """
+    file = gguf_checkpoint_file(path)
+    if not file:
+        return False
+    try:
+        native = load_native_module()
+    except BackendUnavailableError:
+        return False
+    detect = getattr(native, "detect_architecture", None)
+    if detect is None:
+        return False
+    try:
+        return str(detect(file)) in _GGUF_ARCHITECTURES
+    except Exception:
+        return False
+
+
 def _native_kv_cache_dtype(value: str) -> str:
     """Resolve the public ``auto`` value to the native Qwen default."""
     normalized = str(value or "auto").lower()
@@ -317,7 +370,7 @@ class CppBackend(BackendBase):
         return BackendCapabilities(
             name="cpp",
             models=self._registered_architectures(),
-            model_formats=("safetensors",),
+            model_formats=("safetensors", "gguf"),
             devices=(native_backend,) if native_backend else ("cuda", "ascend"),
             supports_batch=self._batching_enabled,  # Phase 3.4: dynamic based on scheduler
             supports_streaming=True,
@@ -344,6 +397,22 @@ class CppBackend(BackendBase):
         if not tokenizer_path:
             self._tokenizer_error = "no tokenizer_path and no checkpoint_dir"
             return None
+        # A GGUF carries its vocabulary, its special-token ids and its chat
+        # template in its own header, and the released ternary artifact is a GGUF
+        # with nothing beside it, so there is no directory for transformers to
+        # read. Both paths produce the same class, which is what lets the rest of
+        # this adapter stay unaware of which container it is serving. An explicit
+        # `tokenizer_path` still wins: a caller who names one wants that one.
+        gguf = "" if self.args.tokenizer_path else gguf_checkpoint_file(self.args.checkpoint_dir)
+        if gguf:
+            try:
+                from src.encoding.gguf_tokenizer import build_gguf_hf_tokenizer
+
+                tokenizer, _metadata = build_gguf_hf_tokenizer(gguf)
+                return tokenizer
+            except Exception as exc:
+                self._tokenizer_error = f"{type(exc).__name__}: {exc}"
+                return None
         try:
             from transformers import AutoTokenizer
 
@@ -394,6 +463,12 @@ class CppBackend(BackendBase):
             # all (token-only tests).  Keep the previous default rather than
             # failing on a path that never needed detecting.
             return "qwen"
+        # The registry reads a directory's config.json, and a GGUF states its
+        # architecture in its own header instead -- so a directory holding one
+        # names it through the file it holds, which is the same file the engine
+        # will open.
+        if not checkpoint.endswith(".gguf"):
+            checkpoint = gguf_checkpoint_file(checkpoint) or checkpoint
         try:
             architecture = str(detect(checkpoint))
         except Exception as exc:

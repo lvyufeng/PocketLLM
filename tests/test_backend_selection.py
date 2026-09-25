@@ -110,3 +110,65 @@ def test_explicit_v41_rejects_a_foreign_checkpoint(tmp_path):
     args = EngineArgs(model=str(tmp_path), backend="v41")
     with pytest.raises(UnsupportedFeatureError, match="DeepSeek-V4.1-Flash"):
         factory.select_backend(args)
+
+
+def _write_gguf_header(path, architecture: str) -> None:
+    """A GGUF with a header and no tensors: enough for the registry to classify.
+
+    ``detect_architecture`` reads one metadata field -- ``general.architecture``
+    -- so a file that declares only that is a checkpoint as far as the routing
+    question is concerned, and it costs a few bytes instead of 5.9 GiB.
+    """
+    import struct
+
+    key = b"general.architecture"
+    value = architecture.encode("utf-8")
+    blob = b"GGUF" + struct.pack("<IQQ", 3, 0, 1)
+    blob += struct.pack("<Q", len(key)) + key
+    blob += struct.pack("<I", 8)  # GGUF metadata type: string
+    blob += struct.pack("<Q", len(value)) + value
+    path.write_bytes(blob)
+
+
+def test_auto_selects_cpp_for_a_qwen35_gguf(tmp_path, monkeypatch):
+    _write_gguf_header(tmp_path / "model.gguf", "qwen35")
+    monkeypatch.setattr(factory.CppBackend, "native_available", staticmethod(lambda: True))
+    assert factory.select_backend(EngineArgs(model=str(tmp_path), backend="auto")) == "cpp"
+    # Named as a file rather than a directory, which is how the native CLI takes
+    # it, and the answer does not depend on which spelling the caller used.
+    assert (
+        factory.select_backend(
+            EngineArgs(model=str(tmp_path / "model.gguf"), backend="auto")
+        )
+        == "cpp"
+    )
+
+
+def test_explicit_cpp_accepts_a_qwen35_gguf(tmp_path):
+    _write_gguf_header(tmp_path / "model.gguf", "qwen35")
+    args = EngineArgs(model=str(tmp_path), backend="cpp")
+    assert factory.select_backend(args) == "cpp"
+
+
+def test_cpp_refuses_a_gguf_of_another_architecture(tmp_path):
+    _write_gguf_header(tmp_path / "model.gguf", "llama")
+    args = EngineArgs(model=str(tmp_path), backend="cpp")
+    with pytest.raises(UnsupportedFeatureError, match="GGUF"):
+        factory.select_backend(args)
+
+
+def test_cpp_refuses_a_directory_that_names_two_models(tmp_path):
+    # Two files, neither a shard of the other: serving either one would be a
+    # guess, so the refusal names the format instead of picking by sort order.
+    _write_gguf_header(tmp_path / "a.gguf", "qwen35")
+    _write_gguf_header(tmp_path / "b.gguf", "qwen35")
+    args = EngineArgs(model=str(tmp_path), backend="cpp")
+    with pytest.raises(UnsupportedFeatureError, match="GGUF"):
+        factory.select_backend(args)
+
+
+def test_gguf_checkpoint_file_reads_a_header():
+    from pocketllm.backends.cpp_backend import gguf_checkpoint_file
+
+    assert gguf_checkpoint_file("/nonexistent/model.gguf") == ""
+    assert gguf_checkpoint_file("") == ""
