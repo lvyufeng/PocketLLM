@@ -170,10 +170,11 @@ pocketllm serve \
 - ✅ Running large models on older hardware with aggressive quantization (GGUF IQ1/IQ2, FP4, and a 1.75-bit ternary GGUF whose tensors are never upcast)
 - ✅ Checkpoints far larger than the aggregate VRAM: DeepSeek-V4.1-Flash's 475 GiB across 4×22 GiB cards
 - ✅ TP4 inference without NVLink (PCIe-only multi-GPU systems)
+- ✅ Concurrent serving on the native C++ path: a scheduler with a paged KV block pool, a chunked-prefill admission budget and one batched decode step for the whole active set, measured at **4.68×** the serial wall time at eight concurrent requests ([validation record](docs/performance/cpp_openai_concurrency_validation.md))
 - ✅ Research and experimentation with model-specific kernel optimization
 
 **Consider alternatives like vLLM or SGLang if you need:**
-- ❌ High-throughput serving with dynamic batching (PocketLLM batching is sequential)
+- ❌ Batching on every backend. The native engine's own server runs it by default (`--max-batch-size`, 8) and the Python adapter exposes it behind `--backend-option enable_batching=true`, but `--backend v41` and `--backend mimo` serve one request at a time, and the batched decode step refuses MTP, DSpark and DFlash2 outright rather than interleave a single-sequence speculative context into a batch.
 - ❌ Broad model support (PocketLLM focuses on a short list of checkpoints with deep optimization, not on covering every architecture)
 - ❌ Production features (advanced scheduling, monitoring, multi-LoRA)
 - ❌ Multimodal inputs (images/video are not yet supported)
@@ -207,7 +208,7 @@ The model pages separate architecture specifications from what PocketLLM current
 
 ## Performance highlights
 
-All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. See [Benchmarking](docs/guides/benchmarking.md) before comparing results.
+All figures in this section use real checkpoints on the same baseline system unless noted otherwise: 4× NVIDIA RTX 2080 Ti 22 GiB, PCIe Gen3, no NVLink, single-request execution, TP4 where applicable. The concurrency ladder under Qwen3.8 is the exception — it drives the native batch scheduler instead. See [Benchmarking](docs/guides/benchmarking.md) before comparing results.
 
 ### DeepSeek-V4.1-Flash v41 runtime (served)
 
@@ -247,6 +248,8 @@ One serial sweep of the engine defaults on master `cfad866`, with 128 generated 
 Per rank the engine accounts for 6.86 GiB of resident FP8 weights and scales, plus 1.00 GiB of KV data and 1.01 GiB of chunk workspace at 65,536 tokens; `nvidia-smi` peaks a further 3.4–3.5 GiB in CUDA context, cuBLAS workspaces and NCCL buffers, which is constant across prompt lengths. Token sequences were identical across all four TP ranks. The native OpenAI-compatible server is validated for text requests; image and video inputs remain unsupported.
 
 The prefill figures for the 64- and 512-token prompts measure short-prompt latency, not steady-state throughput: both complete in 0.55–0.59 s because a fixed per-process cost dominates at that size. Above 4,096 tokens prefill runs at a marginal 1,670 tok/s up to 32,768 and 1,285 tok/s beyond it.
+
+This runtime also batches, and it is the one with a full scheduler behind it. Requests are admitted through a scheduler that allocates from a paged KV block pool, advances prefill under a token budget and runs the whole active set through one batched decode step. Eight concurrent 128-word requests finish in 1.561 s where serializing the same eight takes 7.300 s — **4.68×**, at 163.95 aggregate output tok/s against serial's flat 35.07 — and the 2- and 4-request levels are 2.14× and 3.61×. Head-to-head on the same four cards, vLLM 0.1.15 in batch mode takes 1.22×/1.34×/1.32×/1.17× PocketLLM's wall time at 1/2/4/8 concurrent. Batching is on by default in the engine's own OpenAI server and opt-in on the Python `--backend cpp` adapter; the ladder, the reference command and the caveats — the single-request arm's 17% also includes prompt-prefix reuse across the slots the batch allocates, so read it as a smoke bound — are in the [concurrency validation record](docs/performance/cpp_openai_concurrency_validation.md).
 
 The same runtime is what serves Qwen3.8 over the OpenAI API, and it is the one model here with two optional external speculative drafters: [DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) and [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding), mutually exclusive with each other and with the native MTP path. DFlash2 with its opt-in flags measures 2.78× full-request and 3.02× decode on a 512-token fixture, and 1.33× aggregate over eight GSM8K prompts, with exact token parity in every case. Both drafters are default-off because their gains are acceptance-dependent, and upstream's published 2.67–3.43× band is a decode-latency ratio rather than a full-request one. A persistent TP4 worker also keeps prefix state alive across requests, so a client whose next prompt extends or compresses the previous one pays only for the difference.
 
