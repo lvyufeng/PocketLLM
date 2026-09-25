@@ -14,6 +14,7 @@
 
 #include "gguf_reader.hpp"
 #include "json_lite.hpp"
+#include "qwen_config.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -64,12 +65,13 @@ std::string lowered(const std::string& value) {
 //
 // Qwen3.5 publishes `qwen3_5` at the config root and `qwen3_5_text` inside
 // text_config, and either can be the only one present depending on whether the
-// checkpoint is the multimodal wrapper or the text-only export. Both are the same
-// runtime, so both have to reach the same factory.
+// checkpoint is the multimodal wrapper or the text-only export. Its GGUF export
+// declares `qwen35`. All three are the same runtime, so all three have to reach
+// the same factory -- and the fold lives with the config reader rather than here,
+// so that a checkpoint's *name* and its *fields* can never disagree about which
+// engine it is.
 std::string canonical_architecture(const std::string& raw) {
-    const std::string arch = lowered(raw);
-    if (arch == "qwen3_5_text") return "qwen3_5";
-    return arch;
+    return canonical_qwen_architecture(lowered(raw));
 }
 
 std::string architecture_from_json_config(const std::string& ckpt_dir) {

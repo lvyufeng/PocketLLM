@@ -59,6 +59,11 @@ public:
     std::optional<std::string> metadata_string(const std::string& key) const;
     std::vector<uint64_t> metadata_u64_array(const std::string& key) const;
     std::vector<double> metadata_f64_array(const std::string& key) const;
+    // The length of an array-valued key without materialising it. A token table
+    // is 248,320 strings, so "how many are there" has to be answerable without
+    // copying them all out.
+    std::optional<uint64_t> metadata_array_length(const std::string& key) const;
+    std::optional<std::vector<std::string>> metadata_string_array(const std::string& key) const;
 
     // Raw mmap base, for CPU-side reads of tensor bytes only.
     // DO NOT cudaHostRegister this whole file-backed region: pinning an

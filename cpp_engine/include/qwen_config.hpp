@@ -72,11 +72,37 @@ struct QwenConfig {
     std::string layer_type_name(uint64_t layer) const;
     std::string to_string() const;
 
+    // Every invariant a QwenConfig has to satisfy, whichever way it was built.
+    // Shared rather than duplicated so the GGUF path cannot be the lax one: the
+    // two readers describe the same model, and a field that is required from
+    // config.json is required from a GGUF header too.
+    void validate() const;
+
     static QwenConfig from_hf_config(const std::string& ckpt_dir);
+
+    // The same model, read out of a single-file GGUF instead of an HF directory.
+    //
+    // The GGUF spelling of this architecture is `general.architecture = qwen35`,
+    // and its `qwen35.*` keys carry every field config.json does -- with three
+    // that have to be derived rather than read: the vocabulary size (from the
+    // token table's length), the rotary fraction (rope dimension over head
+    // dimension, since the file stores the rotated width in absolute terms), and
+    // the layer types (from `full_attention_interval`, the file having no
+    // layer_types list).
+    static QwenConfig from_gguf(const std::string& path);
 };
 
-// Read only config.json. This deliberately does not inspect tensor files, so it
-// can be used by CLI dispatch before constructing either the DeepSeek-V4 or Qwen engine.
-bool is_qwen3_5_checkpoint(const std::string& ckpt_dir);
+// Read only the checkpoint's own metadata -- config.json for an HF directory, the
+// header for a GGUF. This deliberately does not inspect tensor payloads, so it can
+// be used by CLI dispatch before constructing any engine.
+bool is_qwen3_5_checkpoint(const std::string& ckpt_path);
+
+// The architecture a GGUF declares, lowercased: `general.architecture`.
+std::string gguf_declared_architecture(const std::string& path);
+
+// Fold the spellings of one runtime onto one key. A checkpoint may be a GGUF
+// (`qwen35`) or an HF directory (`qwen3_5`, and `qwen3_5_text` inside the
+// multimodal wrapper's text_config), and all three name this engine.
+std::string canonical_qwen_architecture(const std::string& raw);
 
 }  // namespace pocket

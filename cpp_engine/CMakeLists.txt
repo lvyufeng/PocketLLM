@@ -873,6 +873,12 @@ add_executable(test_qwen_config tests/test_qwen_config.cpp)
 target_link_libraries(test_qwen_config PRIVATE pocket_core)
 set_target_properties(test_qwen_config PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
+# The same config out of a GGUF header, and held against the HF sibling's
+# config.json when both checkpoints are on the box. Device-agnostic too.
+add_executable(test_qwen_config_gguf tests/test_qwen_config_gguf.cpp)
+target_link_libraries(test_qwen_config_gguf PRIVATE pocket_core)
+set_target_properties(test_qwen_config_gguf PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
 add_executable(test_qwen_dspark tests/test_qwen_dspark.cpp)
 target_link_libraries(test_qwen_dspark PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_dspark PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

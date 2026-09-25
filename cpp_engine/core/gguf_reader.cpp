@@ -360,6 +360,27 @@ std::vector<double> GGUFFile::metadata_f64_array(const std::string& key) const {
     return {};
 }
 
+std::optional<uint64_t> GGUFFile::metadata_array_length(const std::string& key) const {
+    auto it = metadata_.find(key);
+    if (it == metadata_.end()) return std::nullopt;
+    std::optional<uint64_t> length;
+    std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (!std::is_same_v<T, std::string> && !std::is_same_v<T, bool> &&
+                      !std::is_arithmetic_v<T>) {
+            length = static_cast<uint64_t>(v.size());
+        }
+    }, it->second);
+    return length;
+}
+
+std::optional<std::vector<std::string>> GGUFFile::metadata_string_array(const std::string& key) const {
+    auto it = metadata_.find(key);
+    if (it == metadata_.end()) return std::nullopt;
+    if (auto* v = std::get_if<std::vector<std::string>>(&it->second)) return *v;
+    return std::nullopt;
+}
+
 std::string ggml_type_name(uint32_t ggml_type) {
     switch (ggml_type) {
         case 0: return "f32";
