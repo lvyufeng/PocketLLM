@@ -82,6 +82,11 @@ card reports 84.78 average over 14 thinking-mode benchmarks, 98.2% of the FP16 p
 for a conventional IQ2_XXS build at a larger size** — and IQ2_XXS is a quant this repository already has
 hand-written kernels for.
 
+[The gate measurement](ternary_bonsai_2_reference_gate.md) has run since this was written: the upstream
+reference decodes at 30.7 tokens/s and prefills at 665 tokens/s on one card, and 262144 contexts fit in
+15,836 MiB with a quantized KV cache. It passes, and it also shows the reference spending only a third of
+the card's bandwidth per decode step, which is the number the kernel task has to beat.
+
 ## Stage 2 — Xing4.0-29B-A4B
 
 `XingChen-AGI/Xing4.0-29B-A4B`, 2026-09-16, 58.1 GiB of safetensors with an official IQ4_NL GGUF at
@@ -169,6 +174,11 @@ The order is cost-of-reuse, and each stage has an explicit early gate rather tha
 | Bonsai | task 1/6 measures the upstream reference on this card | the ternary path is slower than the memory it saves → close the stage on the measurement |
 | Xing4.0 | task 1/5 reads the hyper-connection out of the reference code | it is not a port → re-scope or drop before any kernel is written |
 | GLM-5.3-Flash | task 1/5 identifies whether the linear layer is GDN | it is not → the stage grows a new attention kernel and the estimate changes |
+
+Stage 1's gate has run: [the reference measures 30.7 tokens/s of decode and 665 tokens/s of prefill on one
+card](ternary_bonsai_2_reference_gate.md), which is a pass on both the memory and the speed axis. That page also
+pins the block format, the Hadamard and the kernel question, so the tasks after it start from a measured artifact
+rather than from a model card.
 
 A stage that dies at its gate is a result, and it goes in this document rather than the issue tree being
 quietly pruned. That is the same convention the old-hardware roadmap follows: it records what was

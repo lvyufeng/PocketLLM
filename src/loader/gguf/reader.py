@@ -54,6 +54,13 @@ GGML_TYPES = {
     28: ("f64", 1, 8),
     29: ("iq1_m", 256, 56),
     30: ("bf16", 1, 2),
+    # Fork-private types from PrismML-Eng/llama.cpp's prism branch. Upstream GGML
+    # assigns nothing here, so without these two entries a ternary checkpoint reads
+    # as "unknown_143" with a zero block size, and `tensor_nbytes` returns None for
+    # every weight in the file. Knowing the geometry is not the same as being able
+    # to run the type: dispatch is still refused, on purpose. See ptq1_0.py.
+    142: ("pq2_0", 128, 34),
+    143: ("ptq1_0", 128, 28),
 }
 
 
