@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -27,6 +29,122 @@ enum class QwenLinearKind {
     Fp8Block128,
     Fp8Channel,
     NvFp4Group16,
+    // The fork-private ternary pack (GGML type 143): 128 three-valued weights in
+    // 28 bytes of packed trits plus an fp16 block scale, 1.75 bits per weight.
+    // The kernel reads the blocks; nothing expands them to a float matrix.
+    Ptq1_0,
+};
+
+// One tensor as a checkpoint holds it, resolved from its canonical name.
+//
+// `shape` is spelled the way this file and the engine spell shapes -- [out, in],
+// or [n] -- rather than the way any one container stores them, so a reader whose
+// format orders dimensions the other way says so in its own lookup instead of
+// making every caller remember. `dtype` is the storage dtype the map validates
+// against; the device dtype follows from it and the backend policy, as it does
+// for every other tensor here.
+struct QwenSourceTensor {
+    // The canonical name the lookup was asked for. Kept so that `data_of` can
+    // reach the bytes without a second argument: the two sources each have to
+    // re-find the tensor in whatever structure their container keeps, and one of
+    // them has only the name to find it by.
+    std::string name;
+    SafeDType dtype = SafeDType::Unknown;
+    std::vector<uint64_t> shape;
+    // Which file the bytes are in. A single-file checkpoint (GGUF) names itself
+    // here; a sharded one names the shard.
+    std::string shard_name;
+    // The storage is a ternary block pack rather than an element array, so a row
+    // is not `in * item_size` bytes wide and only the type's own geometry can
+    // count it.
+    bool ternary_blocks = false;
+    bool present = false;
+};
+
+// A checkpoint as the weight map needs it: one name lookup, the bytes behind a
+// hit, the full name list for coverage, and a format name for the errors.
+//
+// The map is written against this rather than against either container, which is
+// what lets one shape table, one TP sharding rule set and one coverage check
+// serve an HF safetensors directory and a single-file GGUF. The two readers
+// differ in exactly one more place -- whether the norm gamma arrives with the
+// (1 + gamma) convention already folded in -- and that is a question the source
+// answers about itself.
+class QwenCheckpointSource {
+public:
+    virtual ~QwenCheckpointSource() = default;
+
+    // `canonical_name` is the HF spelling; each source translates it itself.
+    virtual QwenSourceTensor lookup(const std::string& canonical_name) const = 0;
+
+    // Base of the tensor's storage, valid for as long as the source is.
+    virtual const uint8_t* data_of(const QwenSourceTensor& tensor) const = 0;
+
+    // Every tensor the checkpoint holds, in canonical spelling. A name the
+    // translation does not know comes back unchanged, so coverage reports it as
+    // unmapped rather than silently dropping it.
+    virtual std::vector<std::string> tensor_names() const = 0;
+    virtual size_t tensor_count() const = 0;
+    virtual const char* format_name() const = 0;
+
+    // What the backend keeps resident for a storage dtype. The default is the
+    // CUDA/SM75 policy; a source overrides it where its own container states the
+    // dtype differently from the model it holds.
+    virtual SafeDType device_dtype(SafeDType storage_dtype) const;
+
+    // Whether a tensor the map declared with `declared` may be stored as
+    // `actual` here. An HF directory stores exactly what a model's tensors are,
+    // so its answer is equality. A GGUF chooses a GGML type per tensor, and its
+    // declaration is about the *model* rather than about the file -- the widths
+    // it picks among are still a short list, which is what keeps this a check.
+    virtual bool accepts_storage_dtype(SafeDType declared, SafeDType actual,
+                                       bool ternary) const {
+        (void)ternary;
+        return declared == actual;
+    }
+
+    // The storage row each canonical row's bytes are in, or empty for the
+    // identity.
+    //
+    // A container can hold a matrix's rows in a different order than the model
+    // does -- a graph that broadcasts one axis wants that axis tiled where
+    // training grouped it, and the conversion is a place to do the swap. This is
+    // where a container says so, and the materializer reads through it: an entry
+    // is the row of the *file* that a row of the *model* is stored in. Empty for
+    // everything whose storage is already the model's order.
+    virtual std::vector<uint64_t> row_order(const QwenSourceTensor& tensor) const {
+        (void)tensor;
+        return {};
+    }
+
+    // True when the stored norm gamma is already `1 + gamma`. The released GGUF
+    // bakes the convention in because its kernels apply the weight directly; an
+    // HF export stores gamma and lets the runtime add the one.
+    virtual bool folds_one_plus_norm_gamma() const { return false; }
+};
+
+// The HF safetensors directory, as a source. A directory is many files, so the
+// lookup opens the one the tensor is in and keeps it open.
+class SafeTensorsCheckpointSource : public QwenCheckpointSource {
+public:
+    explicit SafeTensorsCheckpointSource(const SafeTensorsIndex& index)
+        : index_(index) {}
+
+    QwenSourceTensor lookup(const std::string& canonical_name) const override;
+    const uint8_t* data_of(const QwenSourceTensor& tensor) const override;
+    std::vector<std::string> tensor_names() const override;
+    size_t tensor_count() const override;
+    const char* format_name() const override { return "safetensors"; }
+
+    const SafeTensorsIndex& index() const { return index_; }
+
+private:
+    const SafeTensorsIndex& index_;
+    // Shards stay open for the source's lifetime. The materializer reads through
+    // a pointer into the mmap, and a shard closed at the end of the lookup would
+    // leave it dangling -- so the open handle is held here rather than by the
+    // caller, which is the same thing SafetensorsWeightSource does.
+    mutable std::map<std::string, std::unique_ptr<SafeTensorsShard>> shards_;
 };
 
 struct QwenTensorRef {
@@ -44,7 +162,18 @@ struct QwenTensorRef {
     uint64_t shard_size = 0;
     uint64_t nbytes = 0;
     uint64_t device_nbytes = 0;
+    // The whole tensor's bytes in the container, as against `nbytes`, which is
+    // this rank's share. The distinction matters for the coverage audit: it
+    // reports a checkpoint's size, and for a block-packed tensor that is the
+    // packing's, not the logical shape multiplied out.
+    uint64_t full_nbytes = 0;
     std::vector<std::pair<uint64_t, uint64_t>> segments;
+    // full_shape and local_shape are the *logical* shape for a block-packed
+    // tensor -- its rows count weights -- so bytes are not the shape multiplied
+    // out. A byte count that did that would overstate a ternary tensor by 128/28,
+    // which is the difference between reporting a checkpoint's size and reporting
+    // what it would have been as an element array.
+    bool ternary_blocks = false;
     bool found = false;
 };
 
@@ -96,6 +225,7 @@ struct QwenLinearKindCounts {
     uint64_t fp8_block128 = 0;
     uint64_t fp8_channel = 0;
     uint64_t nvfp4_group16 = 0;
+    uint64_t ptq1_0 = 0;
 };
 
 struct QwenDeviceTensor {
@@ -192,6 +322,14 @@ struct QwenMtpWeights {
 
 class QwenWeightMap {
 public:
+    // The checkpoint as a source: an HF directory, or a single-file GGUF. The
+    // shape table, the sharding rules and the coverage accounting below are the
+    // same for both, because they are statements about the architecture rather
+    // than about a container.
+    QwenWeightMap(const QwenCheckpointSource& source, const QwenConfig& config,
+                  int tp_world = 1, int tp_rank = 0);
+    // The HF directory, the spelling every caller written before the source
+    // existed uses. Wraps the index rather than duplicating the table.
     QwenWeightMap(const SafeTensorsIndex& index, const QwenConfig& config,
                   int tp_world = 1, int tp_rank = 0);
 
@@ -222,6 +360,12 @@ public:
     void require_full_coverage() const;
 
 private:
+    // The shape table both readers share, run once from whichever constructor
+    // was used. A member function rather than a delegating constructor because
+    // the safetensors spelling has to allocate its wrapper first, and a
+    // constructor cannot both fill a member and delegate.
+    void build();
+
     QwenTensorRef require_tensor(const std::string& name,
                                  SafeDType dtype,
                                  const std::vector<uint64_t>& shape,
@@ -235,7 +379,10 @@ private:
     void record_linear(const QwenLinearRef& ref);
     void claim(const QwenTensorRef& ref);
 
-    const SafeTensorsIndex& index_;
+    // Set only by the safetensors constructor, which has to wrap an index the
+    // caller owns; `source_` refers to it.
+    std::unique_ptr<QwenCheckpointSource> owned_source_;
+    const QwenCheckpointSource& source_;
     QwenConfig config_;
     int tp_world_ = 1;
     int tp_rank_ = 0;
@@ -269,6 +416,9 @@ bool qwen_is_visual_tensor(const std::string& name);
 // BF16 backend must supply its own policy here rather than inherit this one.
 SafeDType qwen_device_dtype(SafeDType storage_dtype);
 uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
+// Round-to-nearest-even FP32 -> FP16, for the norms a GGUF stores in fp32 where
+// the kernels want fp16 gamma.
+uint16_t qwen_float_to_fp16_bits(float value);
 void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count);
 
 // Materialize a local tensor from its mmap'd source shard. The output is ready
@@ -276,6 +426,12 @@ void qwen_convert_bf16_to_fp16(const uint16_t* src, uint16_t* dst, size_t count)
 // without expanding FP8 weights. Both supported backends want FP16 here, for
 // unrelated reasons; see qwen_device_dtype in core/qwen_weight_map.cpp.
 QwenHostTensor qwen_materialize_host_tensor(const SafeTensorsIndex& index,
+                                            const QwenTensorRef& ref);
+// The same, out of a source rather than a directory. A GGUF stores its norms in
+// fp32 with the (1 + gamma) convention folded in and its linears as ternary
+// blocks, so the source decides the device dtype and the fold; see
+// QwenCheckpointSource and qwen_device_dtype.
+QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
                                             const QwenTensorRef& ref);
 
 // True for the RMSNorm affine weights that the Qwen3.5 runtime applies as
@@ -306,6 +462,9 @@ void qwen_apply_conv_weight_layout_policy(const QwenTensorRef& ref,
 QwenNvfp4HostLinear qwen_materialize_nvfp4_host_linear(
     const SafeTensorsIndex& index, const QwenLinearRef& ref);
 QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
+                                         const QwenTensorRef& ref,
+                                         void* stream = nullptr);
+QwenDeviceTensor qwen_upload_tensor(const QwenCheckpointSource& source,
                                          const QwenTensorRef& ref,
                                          void* stream = nullptr);
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(

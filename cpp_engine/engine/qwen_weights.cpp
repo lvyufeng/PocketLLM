@@ -244,10 +244,13 @@ const uint8_t* QwenDeviceTensor::u8_data() const {
     return static_cast<const uint8_t*>(data);
 }
 
-QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
-                                        const QwenTensorRef& ref,
-                                        void* stream) {
-    QwenHostTensor host = qwen_materialize_host_tensor(index, ref);
+// One materialized host tensor to the device. The container is gone by this
+// point -- what is left is the backend policy, the allocation and the copy --
+// which is what lets the safetensors and GGUF uploads share it rather than
+// duplicate the Ascend path's synchronous-copy rule.
+QwenDeviceTensor qwen_upload_host_tensor(const QwenTensorRef& ref,
+                                             QwenHostTensor& host,
+                                             void* stream) {
     qwen_apply_norm_gamma_policy(ref, host);
     qwen_apply_conv_weight_layout_policy(ref, host);
     QwenDeviceTensor device;
@@ -281,6 +284,23 @@ QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
         throw std::runtime_error("failed to upload Qwen device tensor: " + ref.name);
     }
     return device;
+}
+
+QwenDeviceTensor qwen_upload_tensor(const SafeTensorsIndex& index,
+                                        const QwenTensorRef& ref,
+                                        void* stream) {
+    QwenHostTensor host = qwen_materialize_host_tensor(index, ref);
+    return qwen_upload_host_tensor(ref, host, stream);
+}
+
+QwenDeviceTensor qwen_upload_tensor(const QwenCheckpointSource& source,
+                                        const QwenTensorRef& ref,
+                                        void* stream) {
+    // The same upload, out of a source rather than a directory. Nothing above the
+    // materialization knows which container the bytes came from, which is what
+    // makes a GGUF a source rather than a second loader.
+    QwenHostTensor host = qwen_materialize_host_tensor(source, ref);
+    return qwen_upload_host_tensor(ref, host, stream);
 }
 
 QwenDeviceTensor qwen_upload_nvfp4_linear_cuda(
