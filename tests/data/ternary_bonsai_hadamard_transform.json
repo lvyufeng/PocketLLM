@@ -1,0 +1,117 @@
+{
+  "source": "/mnt/data1/llama_cpp_prism at 842b188, branch prism, via scripts/prism_hadamard_oracle.cpp and scripts/dump_prism_hadamard_oracle.py",
+  "note": "The fork's own composition of the three ops a folded weight's activation passes through -- the gated-DeltaNet permute, the sign multiply, the Walsh-Hadamard rotation -- applied to the checkpoint's real sign vectors at the three folded widths. The activation rows are synthetic; the signs are not. Each case states the sha256 of the fp32 little-endian input and output bytes, so the test compares digests and not a restatement of the arithmetic.",
+  "input": {
+    "generator": "numpy.random.default_rng(SEED + width).standard_normal((ROWS, width), dtype=float32)",
+    "seed": 20260925,
+    "rows": 2,
+    "note": "one seed per width, so the cases are independent; two rows catch a transform that mixes them"
+  },
+  "block_size": 1024,
+  "gdn_geometry": {
+    "value_heads": 48,
+    "groups": 16
+  },
+  "cases": [
+    {
+      "name": "forward_hidden",
+      "mode": "signs",
+      "width": 5120,
+      "tensor": "blk.0.ffn_gate.weight",
+      "x_sha256": "10b1c1664d2abde052b3178d2adb878f3198d4fe2947679754d0cae339c97f17",
+      "out_sha256": "26047bea365d4e1f7247e83e675ddb202e966a4670cd9e57c12e42599c9f6dce",
+      "out_rms": 0.9960036671319974,
+      "out_max_abs": 3.987501859664917,
+      "out_first8": [
+        -0.39619553089141846,
+        -0.8718283176422119,
+        -0.11070679128170013,
+        -0.1902635395526886,
+        -0.6791810989379883,
+        -0.28017333149909973,
+        -0.09721624851226807,
+        0.7477489113807678
+      ]
+    },
+    {
+      "name": "forward_mlp",
+      "mode": "signs",
+      "width": 17408,
+      "tensor": "blk.0.ffn_down.weight",
+      "x_sha256": "1eefe4e9f8694228b86941288a3fcd1080fb6d79ff86d8dea79a110c8018c540",
+      "out_sha256": "f7b68172a39838f2ff3dce62a4840e75c7db3af76b8acbcf1353357183e73ee3",
+      "out_rms": 1.0059541809967911,
+      "out_max_abs": 4.264776229858398,
+      "out_first8": [
+        -0.5148522853851318,
+        0.22963351011276245,
+        -0.07448451220989227,
+        2.398911952972412,
+        0.27198147773742676,
+        0.010333359241485596,
+        -0.35264235734939575,
+        0.0969424843788147
+      ]
+    },
+    {
+      "name": "forward_gdn",
+      "mode": "gdn",
+      "width": 6144,
+      "tensor": "blk.0.ssm_out.weight",
+      "x_sha256": "da8cb8e5d2cfd9e39b8bf955d9d035e85d2bc507df0ce0ad4cb0197937cc88ca",
+      "out_sha256": "bed628562e6a63e66380b729888443cd1b62649670f2bcdc1c3feaa4bd702096",
+      "out_rms": 0.9968874231026088,
+      "out_max_abs": 3.9182915687561035,
+      "out_first8": [
+        0.13859421014785767,
+        1.034167766571045,
+        -1.213716983795166,
+        0.9343209862709045,
+        -0.49895405769348145,
+        -1.6210356950759888,
+        0.08505651354789734,
+        -1.2658748626708984
+      ]
+    },
+    {
+      "name": "permute_gdn",
+      "mode": "permute",
+      "width": 6144,
+      "tensor": "blk.0.ssm_out.weight",
+      "x_sha256": "da8cb8e5d2cfd9e39b8bf955d9d035e85d2bc507df0ce0ad4cb0197937cc88ca",
+      "out_sha256": "12779c3107bb198ce672c6cde1fb1bb6314906deefdc54289e028a7183db5c8c",
+      "out_rms": 0.9968874228980947,
+      "out_max_abs": 4.092460632324219,
+      "out_first8": [
+        0.6205164194107056,
+        -0.8203827738761902,
+        0.6558098793029785,
+        -0.9127304553985596,
+        0.1384677141904831,
+        0.18455472588539124,
+        -0.21840828657150269,
+        -0.49395856261253357
+      ]
+    },
+    {
+      "name": "inverse_token_embd",
+      "mode": "inverse",
+      "width": 5120,
+      "tensor": "token_embd.weight",
+      "x_sha256": "10b1c1664d2abde052b3178d2adb878f3198d4fe2947679754d0cae339c97f17",
+      "out_sha256": "8070c4f5ab15e3abcda917a95bde4a9065728fed3981284aa983727d1c72355c",
+      "out_rms": 0.9960036671176806,
+      "out_max_abs": 3.769364595413208,
+      "out_first8": [
+        -0.5477775931358337,
+        0.8911367058753967,
+        0.6582472920417786,
+        -0.6667516827583313,
+        0.09073615074157715,
+        -0.996124804019928,
+        1.58552086353302,
+        0.7398710250854492
+      ]
+    }
+  ]
+}

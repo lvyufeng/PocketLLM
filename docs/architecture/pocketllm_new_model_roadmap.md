@@ -91,9 +91,18 @@ The loader task ([#384](https://github.com/lvyufeng/PocketLLM/issues/384)) has r
 read end to end: 851 tensors whose byte counts tile the file exactly, the type histogram the release ships
 (402 quantized / 353 F32 / 96 BF16), and decoded rows equal to the same rows of the checkpoint's own F16
 GGUF, bit for bit. The bytes are addressable and nothing runs them yet — the loader refuses a ternary tensor
-by name rather than upcasting it to F16, which is the failure mode the task existed to prevent. The Hadamard
-transform ([#385](https://github.com/lvyufeng/PocketLLM/issues/385)) and the GEMM
-([#386](https://github.com/lvyufeng/PocketLLM/issues/386)) are what remain before the model generates.
+by name rather than upcasting it to F16, which is the failure mode the task existed to prevent.
+
+The Hadamard transform ([#385](https://github.com/lvyufeng/PocketLLM/issues/385)) has run too, and it is the
+half of this stage that cannot fail loudly. `src/loader/gguf/prism_hadamard.py` now computes the rotation as
+well as parsing it, and every case in `tests/test_prism_hadamard_transform.py` is checked against
+`scripts/prism_hadamard_oracle.cpp` — the fork's own `ggml_permute`, `ggml_mul` and FWHT path — as a digest
+of the fork's fp32 bytes, not as a tolerance. What that leaves unclaimed is parity: the activations are
+synthetic, because the model does not run yet, so "the transform is the fork's" is proven and "the model
+generates" is not.
+
+The ternary dense GEMM ([#386](https://github.com/lvyufeng/PocketLLM/issues/386)) is what remains before it
+does.
 
 ## Stage 2 — Xing4.0-29B-A4B
 
