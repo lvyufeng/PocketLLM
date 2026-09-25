@@ -4,14 +4,21 @@
 
 PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包含 C++/CUDA 与 PyTorch runtime。它结合模型专用 kernel、低 bit 格式、tensor/expert parallel、CPU/GPU placement，以及面向单请求的可复现实测 benchmark。
 
-项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2、Qwen3.8-27B、DeepSeek-V4.1-Flash 和 MiMo-V2.6-Flash 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
+项目最初来自在 4×RTX 2080 Ti 上运行 DeepSeek-V4 的工程实践，目前已经包含 DeepSeek-V4、MiniMax-M2.7、GLM-5.2、Qwen3.8-27B、DeepSeek-V4.1-Flash、MiMo-V2.6-Flash 和 Ternary-Bonsai-2-27B 的已验证 runtime。PocketLLM 不是一个“所有模型共用同一后端”的框架：不同模型使用与其架构和 checkpoint 格式匹配的执行路径。
 
-其中三个模型已经通过 OpenAI 兼容 API 端到端服务：**Qwen3.8-27B-FP8** 走原生 C++ runtime，**DeepSeek-V4.1-Flash** 走 `pocketllm serve --backend v41`，**MiMo-V2.6-Flash** 走 `pocketllm serve --backend mimo`。三条路径都在同样四张卡上用真实 checkpoint 做过验证。
+其中四个模型已经通过 OpenAI 兼容 API 端到端服务：**Qwen3.8-27B-FP8** 走原生 C++ runtime，**Ternary-Bonsai-2-27B** 走同一个 runtime 且只用**一张**卡，**DeepSeek-V4.1-Flash** 走 `pocketllm serve --backend v41`，**MiMo-V2.6-Flash** 走 `pocketllm serve --backend mimo`。四条路径都在真实 checkpoint 上做过验证。
 
 > **项目状态：** 研究和工程软件。下面的数字来自特定 checkpoint、硬件和测试口径，不代表通用性能保证。
 
 ## News
 
+- **[2026/09] Ternary-Bonsai-2-27B 单卡端到端可服务。** 一个 27B 混合注意力模型 —— 48 层 Gated
+  DeltaNet + 16 层 GQA，dense MLP —— 发布成权重只有 **1.75 bit** 的 GGUF（GGML type 143，
+  5.53 GiB），文件里还声明了一个 Hadamard 旋转。`pocketllm serve` 直接从容器自带的
+  `general.architecture` 选中原生引擎，不需要任何 flag：4,096 token prompt 下 **prefill
+  636.0 tok/s**、**decode 25.9 tok/s**，同卡上游参考是 642.5 与 30.7；5.53 GiB 权重留出的余地
+  够 **245,760 token 上下文**（配 fp8 KV cache 可到 262,144）。
+  [模型页](docs/models/ternary-bonsai-2-27b.md)
 - **[2026/09] MiMo-V2.6-Flash 端到端可服务。** `pocketllm serve --backend mimo` 把发布版跑成四个
   进程、四张卡：149.81 GiB routed expert 放在 host bank 里，48 层 backbone 在 GPU 上执行。九个
   global 层的 attention 按 checkpoint 自带的四路 `qkv_proj` 划分切开、用 all-gather 拼回，于是
@@ -50,7 +57,7 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 - **避免不必要的低 bit 展开：** 在支持的热路径中直接消费 FP4、FP8 E4M3、GGUF Q4/Q5/Q8、IQ1/IQ2/IQ3、Q2 等量化 block。
 - **消费级 GPU 并行：** 支持 PCIe 多卡上的 TP4/NCCL；对放不进显存的 checkpoint，支持 CPU/NUMA expert placement。
 - **Prefill/decode 分离：** 大 batch kernel 与单 token latency 路径独立调度、独立优化。
-- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径、Qwen3.8 FP8 Safetensors 文本生成，以及已验证的 Qwen OpenAI 兼容文本 server。
+- **原生 C++/CUDA runtime：** `cpp_engine/` 当前支持 DeepSeek-V4 GGUF/Safetensors 路径、Qwen3.8 FP8 Safetensors 文本生成、端到端按 ternary 消费的 1.75 bit GGUF，以及已验证的 OpenAI 兼容文本 server。
 - **为“放不进显存的 checkpoint”准备的 host-PyTorch adapter：** `--backend v41` 用四个进程（每卡一个）在 memory-mapped checkpoint 上运行 DeepSeek-V4.1-Flash —— dense tree 和 packed FP4 expert 在 GPU 上执行，routed expert 从 pinned host bank 读取。
 - **四个 rank 共享的 host 常驻 expert bank：** `--backend mimo` 把 MiMo-V2.6-Flash 的 149.81 GiB MXFP4 expert 放在一个 `/dev/shm` 段里，每个 rank 都 attach 到同一份，并逐层把 expert 分出去 —— decode 一步按“抽取”分，prefill chunk 按“expert”分 —— 于是一个 rank 只需要 stage 一个 token 抽到的 8 个 expert 中的 2 个，而不是全部 8 个。
 - **检查和验证工具：** GGUF 架构/spec 报告、Safetensors audit、tensor shape 检查、数值 parity 测试和真实 checkpoint benchmark。
@@ -62,6 +69,7 @@ PocketLLM 是一个面向消费级多卡系统的大模型推理工程栈，包�
 | [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md) | Safetensors FP8 E4M3 dense + FP4 E2M1 expert | **已验证 OpenAI server 后的 TP4 文本生成** | `pocketllm serve --backend v41`：host PyTorch 跑 mapped checkpoint，dense tree 与 packed FP4 expert 在卡上，一 rank 一进程 | Served TP4：260,244 token prompt 下 **prefill 150.3–152.0 tok/s**（1,364 token 时 137–141），**decode 3.48–3.54 tok/s**，同时只跑一个请求 |
 | [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 expert，attention 输出 BF16 | **已验证 OpenAI server 后的 TP4 文本生成** | `pocketllm serve --backend mimo`：48 层 backbone 在卡上，routed expert 走 149.81 GiB host bank，attention 按 checkpoint 自带的四路 `qkv_proj` 划分切开 | Served TP4：262,144 token prompt 下 **prefill 104.04 tok/s**（attention 复制时 48.37），该深度 **decode 5.07 tok/s**，浅上下文 5.63，同时只跑一个请求 |
 | [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | **已验证 C++ 文本 runtime 与 OpenAI server** | C++/CUDA TP4、GPU-resident FP8 | Served TP4：512-token prompt 下 prefill 864.54 tok/s、decode 43.22 tok/s（生成 128 token） |
+| [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0`（GGML type 143），**每个权重 1.75 bit**，5.53 GiB，Hadamard 写在文件里 | **已验证 C++ 文本 runtime 与 OpenAI server，单卡** | `pocketllm serve` 直接从文件自带的 `general.architecture` 选中原生引擎，无需 flag | **1×**RTX 2080 Ti：4,096-token prompt 下 **prefill 636.0 tok/s**、**decode 25.9 tok/s**（同卡上游参考为 642.5 / 30.7），245,760 token 上下文 |
 | [DeepSeek-V4-Flash](docs/models/deepseek-v4.md) | Safetensors FP4/FP8；GGUF Q2/IQ2/IQ1 | **已验证 generation** | PyTorch 异构、C++/CUDA、GGUF TP4 | C++ FP4：32K–64K prefill 约 401 tok/s；decode 约 3.7 tok/s |
 | [MiniMax-M2.7](docs/models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | **已验证 TP4 generation** | Raw-block CUDA、GGUF TP4 | Full-model 256-token prefill 约 104.9–107 tok/s；43-layer decode benchmark 10.32 tok/s |
 | [GLM-5.2](docs/models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | **已验证文本生成** | Raw-block CUDA、GGUF TP4 | prefill 约 0.79 tok/s；decode 约 0.66 tok/s |
@@ -114,6 +122,21 @@ master `cfad866` 上按引擎默认值做的一轮串行 sweep，每次生成 12
 
 通过 OpenAI API 服务 Qwen3.8 的正是同一个 runtime，它也是这里唯一一个带有两个可选外部 speculative drafter 的模型：[DSpark](docs/architecture/qwen3_8_27b_fp8_design.md#external-dspark-speculative-decoding) 和 [DFlash2](docs/architecture/qwen3_8_27b_fp8_design.md#external-dflash2-speculative-decoding)，两者互斥，且都与原生 MTP 路径互斥。DFlash2 在其 opt-in 开关全开时，512-token fixture 上实测 full-request 2.78×、decode 3.02×，八个 GSM8K prompt 上聚合 1.33×，且每种情况下 token 完全一致。两个 drafter 都默认关闭，因为收益依赖接受率，而上游公布的 2.67–3.43× 是 decode 延迟比而非 full-request 比。另外还有一个常驻 TP4 worker 会在请求之间保留 prefix state，因此下一个 prompt 是上一个的追加或压缩的客户端只需为增量付费。
 
+### Ternary-Bonsai-2-27B ternary GGUF runtime（served，单卡）
+
+服务 Qwen3.8 的同一个引擎也服务这个 checkpoint，因为它就是同一架构、同一形状 —— 区别在容器。一张
+RTX 2080 Ti，发布的 `PTQ1_0` 文件，同时只跑一个请求，greedy：
+
+- 4,096-token prompt：**prefill 636.0 tok/s**（6.44 s），decode 25.89 tok/s。
+- 8,192-token prompt：prefill 639.1 tok/s（12.82 s），decode 25.44 tok/s。
+- 同卡同 artifact 的上游 `llama-bench`：4,096 时 prefill 642.5 tok/s（8,192 时 615.2），
+  decode 30.7 tok/s —— 也就是 **prefill 与上游持平**，decode 是其 84%。
+
+**prompt 的 token 数不是 64 的整数倍时，最后一个残缺 tile 会一次性多花最多 12 秒**，这正是这个
+checkpoint 早先那次测量被记成“内核慢”的原因：4,097 token 用 18.11 s，而 4,096 token 用 6.44 s。
+除此之外每个 token 的开销从 2,048 到 22,378 token 都平在 1.55 ms。这条代价可复现、但机制尚未查明。
+卡上内存是 5.53 GiB 权重、含 runtime 共 6,566 MiB，另有 **每 token 64 KiB 的 KV**。
+
 ### DeepSeek-V4 C++ FP4 runtime
 
 - 32K prompt：prefill 约 402 tok/s，约 11.2 GiB/rank。
@@ -134,7 +157,7 @@ PocketLLM 包含两类互补执行方式：
 1. **GPU-resident 与低 bit 执行：** 在总显存预算允许时，让本地权重或 expert block 常驻 GPU。
 2. **异构执行：** 将 routed experts 放在 CPU/NUMA 内存，只把当前 token 或 prefill chunk 激活的量化 block 搬到 GPU。
 
-Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；DeepSeek-V4.1-Flash 使用 causal encoder-decoder 与 CSA2 shared-KV attention，其 checkpoint 的 268.95 GiB routed expert 和 189.13 GiB Engram 表留在 host 内存或磁盘上；MiMo-V2.6-Flash 使用 global attention 与带 per-head sink 的滑窗 attention 的混合结构，149.81 GiB MXFP4 expert 放在共享 host bank 里，attention 按 checkpoint 自带的四路划分切开；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention。设计上的热路径不会将完整量化权重展开成 FP32 副本。
+Runtime 是模型专用的：DeepSeek-V4 使用 MLA/indexing 和 routed-expert 调度；DeepSeek-V4.1-Flash 使用 causal encoder-decoder 与 CSA2 shared-KV attention，其 checkpoint 的 268.95 GiB routed expert 和 189.13 GiB Engram 表留在 host 内存或磁盘上；MiMo-V2.6-Flash 使用 global attention 与带 per-head sink 的滑窗 attention 的混合结构，149.81 GiB MXFP4 expert 放在共享 host bank 里，attention 按 checkpoint 自带的四路划分切开；MiniMax-M2.7、GLM-5.2 使用 GGUF raw-block 路径；Qwen3.8 使用 Safetensors FP8 online unpacking 加 hybrid linear/full attention；Ternary-Bonsai-2-27B 是同一种 hybrid attention 装在一个 1.75 bit 的 GGUF 里，tensor 端到端按 ternary 消费，文件声明的 incoherence 旋转作用在激活上。设计上的热路径不会将完整量化权重展开成 FP32 副本。
 
 ## 快速开始
 
@@ -191,6 +214,23 @@ DEEPSEEK_V41_RESIDENT_EXPERTS=1 python -m pocketllm serve \
 ```
 
 CLI 自带的 supervisor 会一 rank 起一个进程 —— rank 0 绑定 listener，rank 1–3 是 NCCL worker —— 四个都报告 ready 之后 server 才会应答。启动不算快：开了 `DEEPSEEK_V41_RESIDENT_EXPERTS=1` 后，每个 rank 要 pin 自己在 457.8 GiB expert bank 中的份额，约 100 s 一个 rank，48 个 shard 再花约 130 s 加载。同样的 flag 配 `--max-model-len 262144` 就是 runtime 能接受的最长上下文，也是上面长上下文数字的测量配置。
+
+### 运行 Ternary-Bonsai-2-27B OpenAI serving
+
+```bash
+python -m pocketllm serve \
+  --model /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+  --served-model-name bonsai \
+  --max-model-len 245760 \
+  --port 8000
+```
+
+不需要 backend flag，也不需要 tensor parallel flag：checkpoint 就是一个 `.gguf` 文件，adapter 从
+它的 header 读出 `general.architecture=qwen35`，选中声明了该名字的原生引擎；tokenizer、special
+token id 和 chat template 也都来自同一个 header。一张卡装得下，而 `--max-model-len` 是内存决策
+而不只是上下文决策 —— KV 是**每 token 64 KiB**：245,760 token 是 22 GiB 卡在 5.53 GiB 权重旁边
+能放下的最大 FP16-KV 上下文，`--kv-cache-dtype fp8` 把 KV 减半，于是 checkpoint 自带的 262,144
+也放得下。
 
 ### 运行 MiMo-V2.6-Flash OpenAI serving
 
@@ -299,6 +339,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - [DeepSeek-V4.1-Flash](docs/models/deepseek-v4.1-flash.md)
 - [MiMo-V2.6-Flash](docs/models/mimo-v2.6-flash.md)
 - [Qwen3.8-27B-FP8](docs/models/qwen3.8-27b-fp8.md)
+- [Ternary-Bonsai-2-27B](docs/models/ternary-bonsai-2-27b.md)
 - [DeepSeek-V4](docs/models/deepseek-v4.md)
 - [MiniMax-M2.7](docs/models/minimax-m2.7.md)
 - [GLM-5.2](docs/models/glm-5.2.md)
@@ -319,6 +360,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - [x] Qwen OpenAI 兼容文本 serving adapter。
 - [x] OpenAI server 后的 DeepSeek-V4.1-Flash TP4 文本生成，以及跨请求 prefix caching。
 - [x] OpenAI server 后的 MiMo-V2.6-Flash TP4 文本生成：host 常驻 expert bank、按 checkpoint 自带划分切开的 attention、256k 上下文。
+- [x] Ternary-Bonsai-2-27B：1.75 bit ternary GGUF 在**单卡**上服务，5.53 GiB 权重换来 636 tok/s prefill 和 245,760 token 上下文。
 - [ ] 在实测有收益时接入 CUDA Graph 和 persistent decode dispatch。
 - [ ] 增加更多模型 benchmark fixture 和自动化 regression dashboard。
 
@@ -333,6 +375,7 @@ benchmark 会启动 rank 1–3 command worker，让 rank 0 在多轮请求间保
 - DeepSeek-V4.1-Flash 的验证依据是生成的文本，而不是 logit 对比。参考栈需要 `torch>=2.10.0` 和 `tilelang==0.1.8`，本机都没有，因此对 V4.1 的 forward pass 不存在数值 oracle。
 - DSpark 当前 C++ verify path 是 sequential，不应宣称为加速路径；multi-token verify 有独立的数值漂移策略。
 - Qwen runtime 当前只支持 text checkpoint 路径，视觉输入和多模态 serving 尚未实现。
+- Ternary-Bonsai-2-27B 有一条实测但未解释的 prefill 代价：prompt 的 token 数不是 64 的整数倍时，最后一个残缺 tile 会一次性多花最多 12 秒 —— 4,097 token 要 18.11 s，而 4,096 token 只要 6.44 s。对齐后 prefill 平在 1.55 ms/token，与上游参考持平。它的 batch scheduler 默认关闭，因为换来的是聚合吞吐而非单请求延迟；投机解码在该 artifact 上未验证；它的 prefix 复用是“复用上一个请求”，不是存储。
 - 部分实验优化在真实端到端测试出现回归后被保留为 opt-in 或关闭；具体见模型页和历史分析文档。
 
 ## License
