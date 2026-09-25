@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from src.loader.gguf.bundle import resolve_gguf_bundle
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
+    from transformers import PreTrainedTokenizerFast
 
 # GGUF ``tokenizer.ggml.pre`` values whose reference (llama.cpp) pre-tokenizer
 # is the llama3/CHATGLM4 split regex, NOT plain byte-level. GLM-4/GLM-5.2 use
@@ -30,17 +33,42 @@ _LLAMA3_STYLE_SPLIT_REGEX = (
     r"|\s+"
 )
 
+# Qwen's own split pattern, which llama.cpp selects for ``qwen35`` (its
+# ``LLAMA_VOCAB_PRE_TYPE_QWEN35``). It differs from the llama3-family one in two
+# places that decide real tokens: a word may contain combining marks, and digits
+# are split one at a time instead of in groups of three -- so a number is not
+# tokenized the way llama3 would tokenize it, and using the wrong one is silent.
+_QWEN35_PRE = frozenset({"qwen35"})
+
+_QWEN35_SPLIT_REGEX = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 
 def _pre_tokenizer_for(pre: str | None):
     """Pick the pre-tokenizer for a GGUF ``tokenizer.ggml.pre`` value.
 
     llama3/glm4-family models need a regex ``Split`` ahead of a
     ``use_regex=False`` ByteLevel so token boundaries (digits, whitespace,
-    contractions) match the reference tokenization. Every other value keeps
-    the plain ``ByteLevel(add_prefix_space=False)`` used historically, so
+    contractions) match the reference tokenization. Qwen needs the same shape
+    with its own pattern. Every other value keeps the plain
+    ``ByteLevel(add_prefix_space=False)`` used historically, so
     already-supported models (e.g. MiniMax-M2) are unaffected.
     """
 
+    if pre and str(pre) in _QWEN35_PRE:
+        return pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(Regex(_QWEN35_SPLIT_REGEX), behavior="isolated", invert=False),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
     if pre and str(pre) in _LLAMA3_STYLE_PRE:
         return pre_tokenizers.Sequence(
             [
@@ -249,6 +277,52 @@ def build_gguf_bpe_tokenizer(path: str | Path) -> tuple[Tokenizer, dict[str, Any
         ]
     )
     return tokenizer, metadata
+
+
+def build_gguf_hf_tokenizer(
+    path: str | Path,
+    *,
+    model_max_length: int = 0,
+) -> tuple[PreTrainedTokenizerFast, dict[str, Any]]:
+    """The vocabulary a GGUF carries, as the tokenizer class serving expects.
+
+    ``build_gguf_bpe_tokenizer`` returns the ``tokenizers`` object, which is
+    enough to turn text into ids. A serving path wants more than that: the chat
+    protocol renders the checkpoint's own Jinja template and the adapters read
+    the special-token ids and decode the generated ids back to text. A
+    safetensors checkpoint ships ``tokenizer.json`` plus a config and
+    ``AutoTokenizer`` assembles all of it; a GGUF ships the same facts in its
+    header, including the chat template, so this assembles the same class from
+    the file. Nothing is fetched and no companion directory is required, which
+    is the point: the released artifact is the whole checkpoint.
+    """
+
+    tokenizer, metadata = build_gguf_bpe_tokenizer(path)
+    # Imported here rather than at module scope: this module is the GGUF reader
+    # the encoding paths use, and nothing else in it needs transformers.
+    from transformers import PreTrainedTokenizerFast
+
+    tokens = metadata["tokenizer.ggml.tokens"]
+
+    def token_at(key: str, default: int) -> str | None:
+        index = metadata_int(metadata, key, default)
+        if 0 <= index < len(tokens):
+            return str(tokens[index])
+        return None
+
+    length = model_max_length or context_length_from_metadata(metadata)
+    return (
+        PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            eos_token=token_at("tokenizer.ggml.eos_token_id", -1),
+            bos_token=token_at("tokenizer.ggml.bos_token_id", -1),
+            pad_token=token_at("tokenizer.ggml.padding_token_id", -1),
+            unk_token=token_at("tokenizer.ggml.unknown_token_id", 0),
+            chat_template=metadata.get("tokenizer.chat_template") or None,
+            model_max_length=length if length > 0 else int(1e12),
+        ),
+        metadata,
+    )
 
 
 def parse_ids_csv(text: str) -> list[int]:
