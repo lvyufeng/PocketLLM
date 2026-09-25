@@ -143,9 +143,12 @@ what it computed before rotation. The rotation changes nothing about the functio
 that makes 1.75-bit weights able to represent that function at all.
 
 `prism.hadamard.gdn_v_grouped = true` adds one more step, for the 48 `ssm_out.weight` tensors only: the 6144-wide
-gated-DeltaNet output arrives tiled as `[head_dim 128, rep 3, group 16]` and the folded weight expects the grouped
-`[128, 16, 3]` order, so a reshape-and-permute runs before the signs. Getting this wrong permutes features within
-each head rather than scrambling the model, which is the kind of bug that shows up as a small quality loss.
+gated-DeltaNet output arrives tiled as `[head_dim 128, groups 16, rep 3]` and the folded weight expects the grouped
+`[128, rep 3, groups 16]` order, so a reshape-and-permute runs before the signs. (Those two orders come from the
+fork's own comment on the permute, `llama_hadamard_transform` in `llama-graph.h`;
+`tests/test_prism_hadamard_transform.py` pins our reading of them against the fork's `ggml_permute` itself, because
+the two orders are easy to state the wrong way round.) Getting this wrong permutes features within each head rather
+than scrambling the model, which is the kind of bug that shows up as a small quality loss.
 
 ### 3. `token_embd.weight` gets the *inverse*, and only it
 

@@ -11,7 +11,7 @@ The semantics, read out of ``PrismML-Eng/llama.cpp`` at ``842b188`` (branch ``pr
 and recorded in ``docs/architecture/ternary_bonsai_2_reference_gate.md``:
 
 * the weights in the file are **pre-rotated**, ``W' = W . R^-1`` for
-  ``R = (1/sqrt(N)) . H_N . diag(s)``, ``H_N[i][j] = (-1)^popcount(i ^ j)``;
+  ``R = (1/sqrt(N)) . H_N . diag(s)``, ``H_N[i][j] = (-1)^popcount(i AND j)``;
 * at run time the *activation* is rotated instead, as ``x |-> R x``: multiply by the
   signs and then apply the Walsh-Hadamard transform, blockwise along the last axis;
 * exactly one declared tensor, ``token_embd.weight``, takes the **inverse** instead,
@@ -19,16 +19,20 @@ and recorded in ``docs/architecture/ternary_bonsai_2_reference_gate.md``:
   be undone after the lookup: ``(1/sqrt(N)) . s * (H . z)`` -- the signs and ``H`` in
   the opposite order.
 
-Nothing here computes a transform.  It is the metadata contract the transform and the
-kernel are built against, and it is validated on construction: a block whose version,
-transform name, axis or sign bookkeeping is not the one that was read out of the fork
-raises rather than parses.
+This module holds both halves of that contract: the metadata, which is *what* the
+transform is and is validated rather than defaulted, and :class:`HadamardRotation`,
+which *computes* it.  They are one module because they define each other -- a
+sign-order or block-size change that lands in one and not the other produces a model
+that still runs and still generates, which is the failure this checkpoint is most
+exposed to.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Collection, Mapping
+
+import torch
 
 PREFIX = "prism.hadamard."
 
@@ -227,3 +231,187 @@ def parse_hadamard_spec(
         inverse_weight_names=inverse_weight_names,
         gdn_v_grouped=gdn_v_grouped,
     )
+
+
+# --------------------------------------------------------------------------- #
+# The transform
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class GdnGeometry:
+    """The gated-DeltaNet feature geometry the ``gdn_v_grouped`` permute needs.
+
+    Read out of the model's hyperparameters rather than out of ``prism.hadamard``:
+    ``value_heads`` is ``ssm.time_step_rank`` -- 48 for this checkpoint, the width of
+    the DeltaNet value output divided by its head -- and ``groups`` is
+    ``ssm.group_count``, 16.  The activation arrives with its feature axis in *tiled*
+    head order ``[head_dim, groups, rep]`` and the fold was computed in *grouped*
+    order ``[head_dim, rep, groups]``, where ``rep = value_heads / groups`` is 3.
+
+    Both orders multiply out to the same width, which is what makes a wrong geometry
+    quiet: the result is not short, not scaled, and not obviously wrong -- it has the
+    right features in the wrong places inside each head.  The fork's own comment on
+    the permute is the source for the two orders; see
+    ``docs/architecture/ternary_bonsai_2_reference_gate.md``.
+    """
+
+    value_heads: int
+    groups: int
+
+    def __post_init__(self) -> None:
+        if self.value_heads <= 0 or self.groups <= 0:
+            raise HadamardSpecError(f"gdn geometry must be positive, got {self!r}")
+        if self.value_heads % self.groups:
+            raise HadamardSpecError(
+                f"gdn value heads {self.value_heads} are not a multiple of {self.groups} groups"
+            )
+
+    @property
+    def rep(self) -> int:
+        return self.value_heads // self.groups
+
+    def head_dim(self, width: int) -> int:
+        if int(width) % self.value_heads:
+            raise HadamardSpecError(
+                f"gdn width {width} is not divisible by {self.value_heads} value heads"
+            )
+        return int(width) // self.value_heads
+
+
+#: This checkpoint's numbers, from ``qwen35.ssm.time_step_rank`` (48) and
+#: ``qwen35.ssm.group_count`` (16) in its own header.
+DEFAULT_GDN_GEOMETRY = GdnGeometry(value_heads=48, groups=16)
+
+
+def gdn_group_permute(x: torch.Tensor, geometry: GdnGeometry = DEFAULT_GDN_GEOMETRY) -> torch.Tensor:
+    """Reorder a gated-DeltaNet activation from tiled head order to grouped order.
+
+    ``[head_dim, groups, rep] -> [head_dim, rep, groups]``, in the fork's own axis
+    order, which makes this a transpose of the last-but-one and last dimensions of
+    the flat feature vector read as ``(rep, groups, head_dim)``.  It is its own
+    inverse -- the fork applies the same swap to the weight side at load.
+    """
+    width = int(x.shape[-1])
+    head_dim = geometry.head_dim(width)
+    lead = x.shape[:-1]
+    tiled = x.reshape(*lead, geometry.rep, geometry.groups, head_dim)
+    grouped = tiled.transpose(-3, -2).contiguous()
+    return grouped.reshape(*lead, width)
+
+
+def _hadamard_last(x: torch.Tensor) -> torch.Tensor:
+    """Unnormalized in-place butterfly along the last dimension, length a power of two.
+
+    The same radix-2 pass order the fork's FWHT kernel uses, so the two agree to the
+    last bit on fp32 input and not merely to within rounding.
+    """
+    n = int(x.shape[-1])
+    if n & (n - 1):
+        raise HadamardSpecError(f"hadamard block length {n} is not a power of two")
+    lead = x.shape[:-1]
+    step = 1
+    while step < n:
+        blocks = x.reshape(*lead, n // (2 * step), 2, step)
+        low, high = blocks[..., 0, :], blocks[..., 1, :]
+        x = torch.cat((low + high, low - high), dim=-1).reshape(*lead, n)
+        step *= 2
+    return x
+
+
+def walsh_hadamard_blocks(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """``(1/sqrt(N)) H x``, applied independently to each ``block_size`` run of the last axis.
+
+    ``H[i][j] = (-1)^popcount(i AND j)`` is the natural-order (Sylvester) Hadamard
+    matrix, which is what the butterfly computes.  The scale is applied to the input
+    before the butterflies rather than to the output after them: that is the fork's
+    order (``dst = src * scale`` then the passes) and it is the reason the two agree
+    bit for bit instead of nearly.
+    """
+    width = int(x.shape[-1])
+    if int(block_size) <= 0 or int(block_size) & (int(block_size) - 1):
+        raise HadamardSpecError(f"hadamard block size {block_size} is not a power of two")
+    if width % block_size:
+        raise HadamardSpecError(f"width {width} is not a multiple of block size {block_size}")
+    lead = x.shape[:-1]
+    blocks = x.reshape(*lead, width // int(block_size), int(block_size))
+    scale = 1.0 / float(int(block_size)) ** 0.5
+    blocks = _hadamard_last(blocks * scale)
+    return blocks.reshape(*lead, width)
+
+
+class HadamardRotation:
+    """The activation-side transform for a file that carries a ``prism.hadamard`` block.
+
+    Holds the spec and the sign vectors sliced out of it, per width, so the hot path
+    is a multiply, a butterfly and a transpose.  The dtype is a parameter and defaults
+    to fp32 because that is what the fork computes in -- the rotation of a 1x5120
+    decode row is cheap, and doing it in fp16 would put rounding error into the one
+    place the 1.75-bit weights cannot afford it.
+
+    The two directions are not each other's transpose-with-a-scale, and the file says
+    which tensors take which:
+
+    * ``forward`` -- ``(1/sqrt(N)) H (s * x)``, signs *then* ``H``.  Every folded
+      matrix weight takes this, including ``output.weight``.
+    * ``inverse`` -- ``(1/sqrt(N)) s * (H x)``, ``H`` *then* signs.  ``token_embd``'s
+      rows are indexed rather than multiplied, so its rotation is undone after the
+      lookup, and undoing it means the opposite order.
+    """
+
+    def __init__(
+        self,
+        spec: HadamardSpec,
+        *,
+        gdn: GdnGeometry | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.spec = spec
+        self.gdn = DEFAULT_GDN_GEOMETRY if gdn is None else gdn
+        self.device = device
+        self.dtype = dtype
+        self._signs: dict[int, torch.Tensor] = {}
+
+    @property
+    def block_size(self) -> int:
+        return self.spec.block_size
+
+    def signs_for(self, width: int) -> torch.Tensor:
+        """The declared sign vector for a folded width, materialized once."""
+        signs = self._signs.get(int(width))
+        if signs is None:
+            signs = torch.tensor(
+                self.spec.signs_for_width(int(width)), dtype=self.dtype, device=self.device
+            )
+            self._signs[int(width)] = signs
+        return signs
+
+    def _signs_for_activation(self, x: torch.Tensor) -> torch.Tensor:
+        return self.signs_for(int(x.shape[-1])).to(dtype=x.dtype, device=x.device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x |-> (1/sqrt(N)) H (s * x)``: the folded weights' activation transform."""
+        return walsh_hadamard_blocks(x * self._signs_for_activation(x), self.block_size)
+
+    def inverse(self, x: torch.Tensor) -> torch.Tensor:
+        """``z |-> (1/sqrt(N)) s * (H z)``: the token embedding's, applied after lookup."""
+        return walsh_hadamard_blocks(x, self.block_size) * self._signs_for_activation(x)
+
+    def apply(self, tensor_name: str, x: torch.Tensor) -> torch.Tensor:
+        """The pipeline a declared tensor sees, in the fork's order.
+
+        Permute first (only for the gated-DeltaNet output, and only when the block says
+        so), then the signs and the rotation -- or the inverse, alone, for a tensor the
+        block declares inverse.
+        """
+        if not self.spec.is_declared(tensor_name):
+            raise HadamardSpecError(
+                f"{tensor_name} is not declared in {KEY_WEIGHT_NAMES} or {KEY_INVERSE_WEIGHT_NAMES}; "
+                "a folded weight is a fact about the file, not something to infer from a name"
+            )
+        if self.spec.takes_inverse(tensor_name):
+            return self.inverse(x)
+        if self.spec.gdn_v_grouped and ".ssm_out." in tensor_name:
+            x = gdn_group_permute(x, self.gdn)
+        return self.forward(x)

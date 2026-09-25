@@ -8,9 +8,7 @@ checkpoint is included and skips when it is not on disk.
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 
 import pytest
 
@@ -22,8 +20,12 @@ from src.loader.gguf.prism_hadamard import (
     parse_hadamard_spec,
 )
 from src.loader.gguf.reader import GGUFArraySummary, GGUFReader
+from tests.hadamard_test_utils import (
+    load_hadamard_fixture as _load_fixture,
+    hadamard_metadata as _metadata,
+    unpack_signs as _unpack_signs,
+)
 
-FIXTURE_PATH = Path(__file__).parent / "data" / "ternary_bonsai_hadamard.json"
 CHECKPOINT_ENV = "POCKETLLM_BONSAI_GGUF"
 CHECKPOINT_DEFAULT = "/mnt/data2/Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf"
 
@@ -41,42 +43,6 @@ FOLDED_ROLE_COUNTS = {
     "attn_q.weight": 16,
     "attn_output.weight": 16,
 }
-
-
-def _load_fixture() -> dict:
-    with FIXTURE_PATH.open() as handle:
-        return json.load(handle)
-
-
-def _unpack_signs(blob: str, count: int) -> list[int]:
-    """Expand the fixture's bit-packed sign vector: one bit per entry, +1 when set."""
-    raw = bytes.fromhex(blob)
-    assert len(raw) * 8 >= count
-    return [1 if raw[i >> 3] >> (i & 7) & 1 else -1 for i in range(count)]
-
-
-def _metadata(raw: dict | None = None, **overrides) -> dict:
-    fixture = _load_fixture() if raw is None else dict(raw)
-    metadata = {
-        "prism.hadamard.version": fixture["version"],
-        "prism.hadamard.transform": fixture["transform"],
-        "prism.hadamard.axis": fixture["axis"],
-        "prism.hadamard.block_size": fixture["block_size"],
-        "prism.hadamard.sign_mode": fixture["sign_mode"],
-        "prism.hadamard.gdn_v_grouped": fixture["gdn_v_grouped"],
-        "prism.hadamard.sign_widths": list(fixture["sign_widths"]),
-        "prism.hadamard.sign_values": _unpack_signs(
-            fixture["sign_values_bits"], sum(fixture["sign_widths"])
-        ),
-        "prism.hadamard.weight_names": list(fixture["weight_names"]),
-        "prism.hadamard.inverse_weight_names": list(fixture["inverse_weight_names"]),
-    }
-    for key, value in overrides.items():
-        if value is None:
-            metadata.pop(key, None)
-        else:
-            metadata[key] = value
-    return metadata
 
 
 @pytest.fixture(scope="module")
