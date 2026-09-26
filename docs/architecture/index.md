@@ -1,7 +1,7 @@
 # Architecture
 
 How PocketLLM is put together, and how it compares to the serving stacks it is
-usually measured against. Two things are worth knowing before reading:
+usually measured against. Three things are worth knowing before reading:
 
 - The three design documents — [Backend unification design](backend_unification_design.md),
   [PocketLLM refactor analysis](pocketllm_refactor_analysis_2026_09.md) and the
@@ -9,8 +9,11 @@ usually measured against. Two things are worth knowing before reading:
   drafts of the same proposal at different points in time. Where they disagree,
   the newest one wins; none of them describes work that is fully complete.
 - [cpp_engine vs vLLM/SGLang](vllm_sglang_comparison.md) is a pre-Phase-1 baseline.
-  For the current comparison read
-  [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md).
+- There are three comparisons, and which one is current depends on the baseline. For the current
+  engines read
+  [Multi-backend and multi-model against vLLM 0.30 and SGLang 0.5.20](multi_backend_multi_model_2026_09.md);
+  [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md) compares against the local
+  2080 Ti fork, whose upstream base is vLLM 0.21.0, and its vLLM column is superseded there.
 
 | Document | What it covers |
 | --- | --- |
@@ -35,7 +38,8 @@ usually measured against. Two things are worth knowing before reading:
 | [Ternary-Bonsai-2-27B: the sm_75 dense GEMM](ternary_bonsai_2_dense_gemm.md) | Stage 5's two kernels — the prefill tile loader that expands trits to signed bytes and the decode GEMV — with their correctness evidence, their measured throughput against the FP8-width arm at the same shapes, and the two gaps the next task inherits: decode's strided 4-byte loads and prefill being slower than the cuBLAS arm it replaces. |
 | [Ternary-Bonsai-2-27B: the served runtime](bonsai_2_27b_design.md) | Stage 6's record behind [the model guide](../models/ternary-bonsai-2-27b.md): what serving needed (backend selection and the GGUF tokenizer), one card's memory breakdown, the prefill measurement that was wrong and why — a prompt that is not a whole number of 64-token tiles pays up to 12 seconds in its last partial tile, so the aligned rate is 636–647 tok/s, level with the upstream reference — the batching and prefix-resume probes, and the per-thread workspace leak the served path exposed. |
 | [GLM-5.3-Flash: the checkpoint audit](glm_5_3_flash_audit.md) | Stage 3's go/no-go: the linear layer written out as a forward pass, and the finding that it is Kimi Delta Attention rather than the Gated DeltaNet the issue tree assumed — the six gate-arithmetic differences a GDN port would get silently wrong, the 1412-tensor inventory behind the 320.76 B / 101.24 GiB figure, the three indexer knobs that are not in the released config, and the two of the task's premises that the artifacts do support. |
-| [PocketLLM vs vLLM vs SGLang architecture analysis](vllm_sglang_architecture_analysis.md) | The current comparison: scheduling, paged KV, batching, and serving surface. *(Chinese)* |
+| [PocketLLM vs vLLM vs SGLang architecture analysis](vllm_sglang_architecture_analysis.md) | The earlier comparison: scheduling, paged KV, batching, and serving surface. *(Chinese)* |
+| [Multi-backend and multi-model against vLLM 0.30 and SGLang 0.5.20](multi_backend_multi_model_2026_09.md) | The current comparison, on the two axes this repository keeps hitting: how a second hardware backend is added and what it costs, and how a second model is added and what it costs — plus the ranked list of what to do next, and the four upstream releases that made the earlier comparison's vLLM column stale. |
 | [cpp_engine vs vLLM/SGLang comparison](vllm_sglang_comparison.md) | The earlier comparison, retained as the pre-Phase-1 baseline. |
 | [Ascend 910A performance roadmap](ascend_performance_roadmap.md) | Where the prefill and decode targets actually stand after measurement, and the ranked next steps — including why the decode target needs quantization rather than tuning. |
 

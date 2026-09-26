@@ -102,6 +102,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Ternary-Bonsai-2-27B served runtime](https://lvyufeng.github.io/PocketLLM/architecture/bonsai_2_27b_design/)
 - [GLM-5.3-Flash checkpoint audit](https://lvyufeng.github.io/PocketLLM/architecture/glm_5_3_flash_audit/)
 - [vLLM and SGLang architecture analysis](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_architecture_analysis/)
+- [Multi-backend and multi-model (vLLM 0.30, SGLang 0.5.20)](https://lvyufeng.github.io/PocketLLM/architecture/multi_backend_multi_model_2026_09/)
 - [vLLM and SGLang comparison (pre-Phase-1)](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_comparison/)
 - [Ascend 910A performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)
 
