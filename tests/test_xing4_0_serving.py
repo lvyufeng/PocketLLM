@@ -290,6 +290,24 @@ def test_a_resumed_prompt_forwards_its_remainder_at_the_right_positions() -> Non
     assert model.forwards == [([7, 8], 6), ([11], 8)]
 
 
+def test_a_second_request_on_a_shared_cache_does_not_see_the_first_one() -> None:
+    """The bug this guards, which a served run found: the cache is not reset for you.
+
+    One cache serves every request, and `append` only ever *raises* its length, so
+    a prompt shorter than its predecessor's inherits every row past its own end and
+    attends to a conversation that has moved on.  The fake writes each token into
+    the cache as it goes, so what this asserts is that the second request's rows
+    are its own.
+    """
+    model = ScriptedModel(scripted=(11, 12, 13, 14))
+    cache = model.make_cache(64)
+    generate(model, [1, 2, 3, 4, 5, 6, 7, 8], max_new_tokens=1, eos_token_id=99, cache=cache)
+    assert cache[0].length == 8
+    generate(model, [21, 22], max_new_tokens=1, eos_token_id=99, cache=cache)
+    assert cache[0].length == 2, "the first request's six trailing rows are still a context"
+    assert cache[0].latent[0, :2, 0].tolist() == [21.0, 22.0]
+
+
 def test_a_prompt_the_store_has_never_seen_is_forwarded_whole() -> None:
     model = ScriptedModel(scripted=(11, 12, 13, 14))
     cache = model.make_cache(32)

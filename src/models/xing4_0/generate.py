@@ -219,6 +219,18 @@ def _resume(
     one-token forward at the boundary, which is what the request would have needed
     anyway to produce its first token.
     """
+    # Before anything else: a cache the caller shares between requests still holds
+    # the previous one's rows, and `append` only raises `length`.  A prompt shorter
+    # than its predecessor's would otherwise attend to text that is no longer in
+    # the conversation -- and would do it plausibly, which is why this is here
+    # rather than trusted to the caller.
+    for layer in cache if isinstance(cache, list) else [cache]:
+        reset = getattr(layer, "reset", None)
+        if reset is not None:
+            reset()
+        else:
+            layer.length = 0
+
     reused = 0
     if prefix_cache is not None:
         reused = int(prefix_cache.longest(ids))

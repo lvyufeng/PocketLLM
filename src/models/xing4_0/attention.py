@@ -215,6 +215,18 @@ class KVLatentCache:
     def view(self, length: int | None = None) -> torch.Tensor:
         return self.latent[:, : length if length is not None else self.length]
 
+    def reset(self) -> None:
+        """Forget the previous request without touching a byte of the buffer.
+
+        A service allocates one cache and reuses it, and the rows a request left
+        behind are *rows*: the next request overwrites the ones it fills and
+        inherits every row after them, so a prompt shorter than its predecessor's
+        attends to the predecessor's text.  Nothing is zeroed here -- the length
+        is what says how much of the buffer is a context, and the overwrite is
+        the next prefill's job.
+        """
+        self.length = 0
+
 
 class MLAAttention:
     """One attention layer.  No weights are loaded here."""
