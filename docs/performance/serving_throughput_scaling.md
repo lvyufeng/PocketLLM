@@ -329,9 +329,10 @@ every request and never produces a token — the client's only symptom is
 **The raised ceiling changes what the survivors say about it, and not the wall
 clock.** Both probes take 964 s, which is the client's timeout and not the
 engine's, and `L128` is unchanged at one success. But the hand-written barrier
-has a status latch the host reads once every 32 calls, and that read is the one
-place "a peer that never arrives" can become a reported failure
-(`ipc_allreduce.cpp:974-995`); prefill planes are on that barrier now, so rank 0's
+has a status latch the host reads once every 128 collectives — one read a decode
+step, see [below](#the-status-read-the-device-wait-still-does) — and that read is
+the one place "a peer that never arrives" can become a reported failure
+(`ipc_allreduce.cpp:1075-1104`); prefill planes are on that barrier now, so rank 0's
 schedule loop ends in
 
 ```
@@ -378,6 +379,49 @@ over-reservation in that one row. Summed over the eleven ladder points it is
 tokens that were never there. (Generation is the records' own `output_tokens`;
 the prompt term is the 325-token mean the engine logs, because these artifacts
 predate the harness recording `prompt_tokens`, which reads 0 in all of them.)
+
+### The status read the device wait still does
+
+The device wait moved the rendezvous off the host, but not the failure report. A
+peer that never arrives is discovered by `qwen_ipc_arrive_wait_ascend`'s spin
+bound, and the only way that becomes an error is for the host to read the latch
+the kernel writes. The read is a blocking `memcpy_d2h`, and a blocking copy drains
+the default stream — the same host round trip the device arm was built to delete,
+bought back at 1/N the price. `POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY` is N, and
+it was 32 until this revision.
+
+A decode step is 129 collectives, so 32 is four reads a step and 128 is one. Three
+interleaved rounds at each of two widths, every figure read from the run's own
+decode line:
+
+| arm | 16 rows tok/s | step ms | 1 row tok/s | step ms |
+| --- | ---: | ---: | ---: | ---: |
+| `..._STATUS_EVERY=0`, no read | 203.04 | 78.80 | 19.213 | 52.05 |
+| `..._STATUS_EVERY=32`, what shipped | 199.39 | 80.25 | 18.754 | 53.32 |
+| `..._STATUS_EVERY=128`, the default now | 201.55 | 79.38 | 19.101 | 52.35 |
+
+`=0` is wrong by construction — the kernel's spin bound then stops being reported
+at all — and exists only to price the read. A read costs about 0.3 ms of step
+time: the arms are 0.86 ms apart at 16 rows and 0.97 at one over the three extra
+reads a step that 32 makes, 0.29 and 0.32 ms each, and 128 then sits within 0.6 ms
+of the arm that never reads at both widths. That is 1.1% of the step at 16 rows
+and 1.8% at a concurrency of one, and it is the whole of what the interval is
+worth. What the longer one gives up is detection latency — a quarter of a step
+becomes a step — and the bound is still a bound: the latch is sticky and the host
+reads it within a step of the call that lost the peer.
+
+The gate is the one the collective and the wait passed, at the same shape: 16 rows,
+`QWEN_ASCEND_REPLICATE_ROWS=16`, `QWEN_BATCH_VERIFY=3`, the arms rotating inside
+each round. Across the eighteen runs `seed_mismatches` is 0 in all of them and
+`batch_repeat_mismatches` is 0 in seventeen — the exception is on the `=0` control
+arm, not on the shipped one. Three runs report `verify_mismatches=1`, and all
+three are the same near-tie: `row=10` at `step=0`, where the two leading logits
+are 0.0015 to 0.009 apart and the greedy token flips with run-to-run noise. Each
+of those three runs also reports `repeat_mismatches=1` from the single-row
+reference it is compared against, and by
+[the rule the gate is read with](ascend_decode_collective_ab.md)
+the quantity that matters is the difference between the two counts, not either
+one — so those trips are the reference's noise, on all three arms alike.
 
 ## Where the curve stops paying
 
@@ -1018,6 +1062,21 @@ merged; its forward half is not, and item 2 is marked accordingly.
    revision it is what an unset environment runs. What is left is the count —
    reducing 129 fixed-latency round trips, which needs a fused
    all-reduce-plus-GEMM or a different TP layout rather than a cheaper call.
+
+   The count is not only those 129. A decode step also issues the TP top-1
+   merge, and on this backend that merge all-gathers the candidate tokens and
+   logits to every rank and picks the winner on the host
+   (`tp_comm.cpp:434-467`). At 16 rows the profile attributes 6.98 ms a step to
+   it — 8.5% of that run's 82.00 ms step — and at one row it ranges from 1.1 to
+   6.8 ms across runs, host-side, on a step of 52 ms. It is width-flat for the
+   same reason the 129 are: the payload grows with `rows` and the two round
+   trips do not. The CUDA backend already ships the cheaper design — one packed
+   `uint64` Max reduction per row instead of two all-gathers
+   (`tp_comm.hpp:43-52`) — and the Ascend entry point for it forwards to the
+   host path today (`tp_comm.cpp:492-501`), where the comment already asks for
+   "an AscendC merge kernel once profiling shows this in the decode critical
+   path". The profile now shows it. Like the 129, it is a new kernel pair rather
+   than a cheaper call.
 4. **Default the operating point to a slot count below the offered concurrency.**
    `L16x64` gets 64% less TTFT than `L16` at the same throughput and the best
    goodput among the full-batch runs. This is a configuration change and not an

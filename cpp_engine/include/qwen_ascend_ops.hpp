@@ -160,8 +160,10 @@ bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink, int 
 // `d_status` is a one-word latch, not a result of this call: the kernel writes the
 // number of still-missing peers when it runs out of iterations and leaves the word
 // alone when the wait succeeds, so a failure survives until the host reads it --
-// which it does only every kStatusCheckEvery calls, to keep the read off the
-// per-call path. The caller must start it at zero and zero it after reading one.
+// which it does only every `ascend_ipc_status_check_every()` calls (128 by default,
+// set by `POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY` in ipc_allreduce.cpp), to keep
+// the read off the per-call path. The caller must start it at zero and zero it
+// after reading one.
 //
 // Returns false when the arguments are outside the geometry the kernel is
 // instantiated for, and the launch status otherwise -- it says nothing about

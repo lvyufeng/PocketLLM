@@ -1,10 +1,13 @@
 // Whether a call takes the hand-written Ascend collective or falls through to
-// HCCL, and what the environment is allowed to say about it.
+// HCCL, and what the environment is allowed to say about it -- plus the one
+// diagnostic that is a number rather than a switch, the interval between two host
+// reads of the device arrival wait's status word.
 //
-// Host-only: `ascend_ipc_allreduce_f16_applies()` reads the environment and does
-// arithmetic on its two arguments, so this needs no NPU, no checkpoint and no peer
-// processes. Nothing here calls ACL even though the binary links the Ascend core,
-// which is why it runs anywhere the backend builds.
+// Host-only: `ascend_ipc_allreduce_f16_applies()` and
+// `ascend_ipc_status_check_every()` read the environment and do arithmetic, so this
+// needs no NPU, no checkpoint and no peer processes. Nothing here calls ACL even
+// though the binary links the Ascend core, which is why it runs anywhere the
+// backend builds.
 //
 // It exists because the switch became a default. While it was opt-in, a wrong
 // reading of the variable cost a measurement; now the same mistake silently
@@ -163,6 +166,71 @@ void test_max_elements_override() {
     set_env(name.c_str(), nullptr);
 }
 
+void test_status_check_interval() {
+    std::cout << "the status-check interval is not a switch\n";
+
+    const std::string name = "POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY";
+    set_env(name.c_str(), nullptr);
+
+    // The shipped interval, and the reason it is 128 rather than a round number: a
+    // decode step is 129 collectives, so one check in 128 is one check a step.
+    check(pocket::ascend_ipc_status_check_every() == 128, "unset: 128");
+    set_env(name.c_str(), "");
+    check(pocket::ascend_ipc_status_check_every() == 128, "empty: 128");
+    set_env(name.c_str(), "128");
+    check(pocket::ascend_ipc_status_check_every() == 128, "128: 128");
+
+    // The case this group exists for. `0` is a reading, not an absence: it means
+    // "never look at the word", which is the arm that prices the read and is wrong
+    // by construction as a configuration. A parser that treated 0 as unset would
+    // answer 128 and quietly turn the control arm into the shipped arm -- which is
+    // exactly what `qwen_env_int` does to a QWEN_* knob set to 0, and why this one
+    // is read with `strtoll`.
+    set_env(name.c_str(), "0");
+    check(pocket::ascend_ipc_status_check_every() == 0, "0: 0, not the default");
+
+    set_env(name.c_str(), "1");
+    check(pocket::ascend_ipc_status_check_every() == 1, "1: 1, a check per call");
+    set_env(name.c_str(), "32");
+    check(pocket::ascend_ipc_status_check_every() == 32,
+          "32: 32, the interval this default replaced");
+
+    // Negatives mean something to `strtoll` and nothing here. Falling back is the
+    // safe direction of the two -- clamping to 0 would read a typo as "turn the
+    // detector off".
+    set_env(name.c_str(), "-1");
+    check(pocket::ascend_ipc_status_check_every() == 128, "-1: the default");
+    set_env(name.c_str(), "-9223372036854775808");
+    check(pocket::ascend_ipc_status_check_every() == 128,
+          "INT64_MIN: the default");
+
+    // No digits at all. `strtoll` answers 0 for both of these, and 0 is the one
+    // reading that disables the check, so a typo must not land on it.
+    set_env(name.c_str(), "true");
+    check(pocket::ascend_ipc_status_check_every() == 128, "true: the default");
+    set_env(name.c_str(), "off");
+    check(pocket::ascend_ipc_status_check_every() == 128,
+          "off: the default, negatives and words are refused, not clamped");
+
+    // Trailing text after the digits is read leniently, the way
+    // `..._MAX_ELEMENTS` reads it.
+    set_env(name.c_str(), "32x");
+    check(pocket::ascend_ipc_status_check_every() == 32, "32x: 32");
+    set_env(name.c_str(), " 64");
+    check(pocket::ascend_ipc_status_check_every() == 64,
+          "leading space: 64, `strtoll` skips it");
+
+    // The knob is read per call rather than cached at first use, so the process
+    // above has already driven nine readings. A cached reader would have answered
+    // the first one -- 128 -- for all of them, and this last case is what says so.
+    set_env(name.c_str(), "7");
+    check(pocket::ascend_ipc_status_check_every() == 7,
+          "7 after nine other readings: 7, nothing is cached");
+
+    set_env(name.c_str(), nullptr);
+    check(pocket::ascend_ipc_status_check_every() == 128, "back to unset: 128");
+}
+
 }  // namespace
 
 int main() {
@@ -172,13 +240,16 @@ int main() {
     // its unset case for a reason that has nothing to do with this code.
     set_env("POCKET_ASCEND_IPC_ALLREDUCE", nullptr);
     set_env("POCKET_ASCEND_IPC_ALLREDUCE_MAX_ELEMENTS", nullptr);
+    set_env("POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY", nullptr);
 
     test_switch_spellings();
     test_envelope();
     test_max_elements_override();
+    test_status_check_interval();
 
     set_env("POCKET_ASCEND_IPC_ALLREDUCE", nullptr);
     set_env("POCKET_ASCEND_IPC_ALLREDUCE_MAX_ELEMENTS", nullptr);
+    set_env("POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY", nullptr);
 
     std::cout << (failures == 0 ? "ipc all-reduce envelope: ok\n"
                                 : "ipc all-reduce envelope: FAILED\n");

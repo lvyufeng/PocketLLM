@@ -265,8 +265,9 @@ int settle_us() {
 // bounded twice over. The kernel spins a fixed number of iterations and then gives
 // up, so it cannot hang the device; it records how many peers were missing in a
 // status word it writes on failure and only on failure; and the host reads that word
-// every `kStatusCheckEvery` calls and raises it as an error, so a lost peer is
-// reported inside the step it killed. See the status check at the end of
+// every `ascend_ipc_status_check_every()` calls and raises it as an error, so a lost
+// peer is reported inside the step after the one that lost it rather than never. See
+// the status check at the end of
 // ascend_ipc_allreduce_f16_inplace, and `..._DEADLINE_MS`, which bounds the device
 // spin from the same value it bounds the host poll with.
 bool devwait_enabled() {
@@ -278,17 +279,47 @@ bool devwait_enabled() {
     return enabled;
 }
 
-// Collectives between two host reads of the device wait's status word. One read
-// costs a drain of the default stream, which is the host wait this switch exists to
-// delete, so reading it per call would defeat the change; 32 calls is a fraction of
-// a decode step's 129, so a dead group is still reported inside the step it killed.
+// Collectives between two host reads of the device wait's status word.
 //
 // This is the shipped failure detector now that the device wait is the shipped wait,
 // and it is what keeps "the kernel is bounded" from meaning "a dead peer costs one
 // bound per collective and nothing says so". The word it reads is sticky: the kernel
 // never clears it, and the host clears it only after reading a zero, so a failure on
-// any of the 31 calls in between is still there when this one looks.
-constexpr long long kStatusCheckEvery = 32;
+// any of the calls in between is still there when this one looks.
+//
+// It is an interval rather than a per-call read because the read is a blocking D2H
+// copy, and a blocking copy drains the default stream -- the host wait the device arm
+// was built to delete, bought back once every `every` calls. What it costs was
+// measured by running `..._STATUS_EVERY` at 0, 32 and 128, three interleaved rounds at
+// each of two widths, every figure read off the run's own decode line. At a concurrency
+// of one the step is 53.32 ms and 18.75 tokens/s at 32, 52.35 ms and 19.10 at 128, and
+// 52.05 ms and 19.21 with no read at all; at 16 rows, 80.25 ms and 199.4 tokens/s,
+// 79.38 and 201.6, and 78.80 and 203.0. Both widths put 128 within 0.6 ms of the arm
+// that never reads, and both price one read at about 0.3 ms of step time -- 0.29 ms at
+// 16 rows, 0.32 at one -- which is the difference over the three extra reads a step
+// that 32 makes.
+//
+// 128 is that interval and it is not a round number: a decode step is 129 collectives,
+// so one read in 128 is one read a step -- 1.008 of them against 4.03 at 32. What the
+// longer interval gives up is detection latency: 32 calls is a quarter of a step and
+// 128 is a step, so a peer lost at the start of one step is reported on the next rather
+// than inside the one that lost it. The bound is still a bound: the kernel gives up
+// after `poll_deadline_ms()`, the latch it writes is sticky, and the host reads it
+// within a step.
+//
+// A plane above the size ceiling falls through to HCCL and never reaches the counter
+// this indexes, so at >512 rows a step is fewer than 129 calls and the check is
+// correspondingly more often than once a step. That is the direction that costs
+// latency rather than correctness.
+constexpr long long kDefaultStatusCheckEvery = 128;
+
+// `POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY` sets the interval above, and it is a
+// diagnostic rather than a tuning knob: the numbers justifying 128 are in the comment
+// above rather than in a sweep somebody would re-run. What it prices is the *read*.
+// `0` never reads the word, which is wrong by construction because the kernel's spin
+// bound then stops being reported, and exists to price the whole check in one run.
+// The reader, `ascend_ipc_status_check_every()`, is declared in the header and defined
+// outside this anonymous namespace, so the device-free unit test can drive it.
 
 // `POCKET_ASCEND_IPC_ALLREDUCE_RSTREAM` moves this collective off the caller's
 // stream and onto a stream of its own when the caller passed none, which is what
@@ -763,6 +794,29 @@ IpcState& state_for(const std::string& id_path, int world, int rank, int device,
 
 }  // namespace
 
+// Read on every call rather than cached at first use, unlike the diagnostic switches
+// above and like `max_elements()`. `getenv` against a process-sized environment is
+// nanoseconds against the ~100 us a collective costs, so there is nothing to save, and
+// the uncached reading is what lets the device-free unit test drive every case in one
+// process -- a cached one would have answered whichever case came first and then kept
+// that answer for an environment it never looked at again.
+//
+// `strtoll` and not `atoi` here, unlike the switches above: 0 is a value this knob has
+// to be able to say, and it is the opposite of the default. A negative reading falls
+// back to the default rather than clamping to 0, because 0 means "never look", which
+// is the one answer that turns the shipped failure detector off. A value with no digits
+// in it at all falls back for the same reason -- `strtoll` answers 0 for `"yes"`, and
+// the typo should not be the one reading that disables the check. Trailing text after
+// the digits is read the lenient way `..._MAX_ELEMENTS` reads it: `"32x"` is 32.
+long long ascend_ipc_status_check_every() {
+    const char* value = std::getenv("POCKET_ASCEND_IPC_ALLREDUCE_STATUS_EVERY");
+    if (value == nullptr || *value == '\0') return kDefaultStatusCheckEvery;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end == value) return kDefaultStatusCheckEvery;
+    return parsed >= 0 ? parsed : kDefaultStatusCheckEvery;
+}
+
 bool ascend_ipc_allreduce_f16_applies(int world, int count) {
     // Default on, so an ordinary `pocketllm serve` gets it. See the history on
     // `enabled_unless_disabled` above and the header comment in ipc_allreduce.hpp
@@ -1002,11 +1056,11 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     // the kernel writes. This is the shipped failure detector, not a diagnostic one:
     // the kernel is bounded and this is what turns its bound into an error the caller
     // sees. Reading the latch drains the default stream, which is the one thing the
-    // device arm exists to stop doing, so it happens every `kStatusCheckEvery` calls
-    // rather than every call: one drain in 32 is a thirty-second of the cost of the
-    // drain per call it replaces, and the kernel never clears the latch itself, so a
-    // failure in the other 31 calls is still there when this one looks. See
-    // qwen_ipc_arrive_wait.cpp.
+    // device arm exists to stop doing, so it happens every
+    // `ascend_ipc_status_check_every()` calls rather than every call. A dead group is
+    // still reported within a step of the call that lost it, and the kernel never
+    // clears the latch itself, so a failure on any of the calls in between is still
+    // there when this one looks. See qwen_ipc_arrive_wait.cpp.
     //
     // The read is `memcpy_d2h`, which is a blocking copy and therefore ordered only
     // against the default stream. That is the stream this collective is on whenever
@@ -1021,7 +1075,8 @@ bool ascend_ipc_allreduce_f16_inplace(int world, int rank, int device,
     double status_check_ms = 0.0;
     if (devwait_enabled()) {
         const double t_check = timing ? now_ms() : 0.0;
-        if ((state.round + 1) % kStatusCheckEvery == 0) {
+        const long long every = ascend_ipc_status_check_every();
+        if (every > 0 && (state.round + 1) % every == 0) {
             uint32_t reported = 0;
             if (!memcpy_d2h(&reported, state.status, sizeof(reported))) {
                 throw std::runtime_error(
