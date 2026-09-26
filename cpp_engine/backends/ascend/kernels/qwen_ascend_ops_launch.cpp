@@ -35,6 +35,11 @@
 #include "qwen_ascend_ops.hpp"
 #include "qwen_gated_delta_geometry.hpp"
 
+// Tile size and block bounds, shared with the rotation's device kernel so the
+// largest `block` admitted here is the one that kernel sized its UB tiles for.
+// See the header: a drift is a copy that lands in the next tile, not a failure.
+#include "qwen_hadamard_geometry.hpp"
+
 // Grid width and tile size, shared with the device kernel so the divisor the
 // kernel partitions on and the block count launched here cannot drift apart.
 #include "qwen_hbm_probe_geometry.hpp"
@@ -62,6 +67,8 @@
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_partial_kernel.h"
 #include "aclrtlaunch_qwen_gqa_decode_attention_flashdec_reduce_kernel.h"
 #include "aclrtlaunch_qwen_hbm_read_probe_kernel.h"
+#include "aclrtlaunch_qwen_hadamard_forward_f16_kernel.h"
+#include "aclrtlaunch_qwen_hadamard_inverse_f16_kernel.h"
 #include "aclrtlaunch_qwen_ipc_arrive_wait_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_kernel.h"
 #include "aclrtlaunch_qwen_gqa_prefill_attention_vector_kernel.h"
@@ -72,6 +79,7 @@
 #include "aclrtlaunch_qwen_partial_rope_rows_kernel.h"
 #include "aclrtlaunch_qwen_cube_gemm_probe_kernel.h"
 #include "aclrtlaunch_qwen_cube_transpose_probe_kernel.h"
+#include "aclrtlaunch_qwen_vec_offset_probe_kernel.h"
 #include "aclrtlaunch_qwen_transpose_f16_kernel.h"
 #include "aclrtlaunch_qwen_gqa_attention_cube_kernel.h"
 #include "aclrtlaunch_qwen_gqa_attention_cube_partial_kernel.h"
@@ -1418,6 +1426,26 @@ bool qwen_cube_transpose_probe(const uint16_t* d_a, const uint16_t* d_b, uint16_
                static_cast<uint32_t>(k), transpose, 0) == kLaunchOk;
 }
 
+// Addressing oracle: one core computes dst[i] = src[i] + src[i + shift] over
+// `count` FP32 elements at a caller-chosen `shift`, so a caller can ask whether
+// the vector unit honours a UB source operand that is offset by less than a
+// 32-byte block. See the device kernel for what depends on the answer.
+//
+// `count` must be a multiple of 8, since both the copy it stages through UB and
+// the Add it issues count in whole blocks, and `shift` is at most one block --
+// the whole question is the offsets below that, and above it nothing here is in
+// doubt.
+bool qwen_vec_offset_probe(const float* d_source, float* d_dest, int count,
+                           int shift, void* stream) {
+    if (d_source == nullptr || d_dest == nullptr || count <= 0 ||
+        (count % 8) != 0 || shift <= 0 || shift > 8) {
+        return false;
+    }
+    return aclrtlaunch_qwen_vec_offset_probe_kernel(
+               1, resolve(stream), gm(d_source), gm(d_dest),
+               static_cast<uint32_t>(count), static_cast<uint32_t>(shift)) == kLaunchOk;
+}
+
 // fp16 transpose: d_dst[cols, rows] = transpose(d_src[rows, cols]).
 //
 // The whole grid is used rather than one core, because this is not an oracle but
@@ -1463,6 +1491,74 @@ bool qwen_transpose_f16_padded_ascend(const uint16_t* d_src, uint16_t* d_dst, in
                static_cast<uint32_t>(rows), static_cast<uint32_t>(cols),
                static_cast<uint32_t>(dst_pitch), static_cast<uint32_t>(src_pitch),
                static_cast<uint32_t>(src_rows)) == kLaunchOk;
+}
+
+namespace {
+
+// One body for both directions, which differ only in the kernel they launch and
+// the order of the signs and the butterflies. Listing the contract once is what
+// keeps a bound from being checked in one and forgotten in the other.
+//
+// The incoherence rotation the ternary checkpoint needs: `R = (1/sqrt(N)) H diag(s)`
+// applied independently to each `block` run of the last axis, `s` read from the
+// checkpoint's own sign vector. See the device kernel for the butterfly split and
+// the reason the three sub-block levels run on the scalar unit.
+//
+// `d_signs_fp32` covers the whole feature axis, not one run, and is indexed by the
+// run; it is FP32 in the checkpoint and is not narrowed, because a sign folded into
+// an fp16 rounding is no longer exactly +-1.
+//
+// `d_x_fp16` and `d_y_fp16` are the same shape and may be the same buffer. `scale`
+// is derived here rather than passed by the caller so the two directions cannot be
+// launched with different scales -- it is `1/sqrt(block)`, and the kernel multiplies
+// the *input* by it, which is what makes the result agree with the reference rather
+// than merely approximate it.
+//
+// The bounds are the kernel's own, from the shared geometry header: a power of two
+// in [kHadamardMinBlock, kHadamardMaxBlock] that divides the width. The lower bound
+// is the fp16 copy's block granularity, not a mathematical one -- a shorter run
+// would have DataCopy move a whole 32-byte block anyway, off the end of the row it
+// was given.
+bool qwen_hadamard_f16_common(const uint16_t* d_x_fp16, const float* d_signs_fp32,
+                              uint16_t* d_y_fp16, int rows, int width, int block,
+                              bool forward, void* stream) {
+    if (d_x_fp16 == nullptr || d_signs_fp32 == nullptr || d_y_fp16 == nullptr ||
+        rows <= 0 || width <= 0 || block <= 0 ||
+        static_cast<uint32_t>(block) < pocket::kHadamardMinBlock ||
+        static_cast<uint32_t>(block) > pocket::kHadamardMaxBlock ||
+        (width % block) != 0 || (block & (block - 1)) != 0) {
+        return false;
+    }
+    const float scale = 1.0f / std::sqrt(static_cast<float>(block));
+    const uint32_t work = static_cast<uint32_t>(rows) *
+                          (static_cast<uint32_t>(width) / static_cast<uint32_t>(block));
+    const uint32_t blocks = blocks_for(work);
+    if (forward) {
+        return aclrtlaunch_qwen_hadamard_forward_f16_kernel(
+                   blocks, resolve(stream), gm(d_x_fp16), gm(d_signs_fp32), gm(d_y_fp16),
+                   static_cast<uint32_t>(rows), static_cast<uint32_t>(width),
+                   static_cast<uint32_t>(block), scale) == kLaunchOk;
+    }
+    return aclrtlaunch_qwen_hadamard_inverse_f16_kernel(
+               blocks, resolve(stream), gm(d_x_fp16), gm(d_signs_fp32), gm(d_y_fp16),
+               static_cast<uint32_t>(rows), static_cast<uint32_t>(width),
+               static_cast<uint32_t>(block), scale) == kLaunchOk;
+}
+
+}  // namespace
+
+bool qwen_hadamard_forward_f16_ascend(const uint16_t* d_x_fp16, const float* d_signs_fp32,
+                                      uint16_t* d_y_fp16, int rows, int width, int block,
+                                      void* stream) {
+    return qwen_hadamard_f16_common(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block,
+                                    true, stream);
+}
+
+bool qwen_hadamard_inverse_f16_ascend(const uint16_t* d_x_fp16, const float* d_signs_fp32,
+                                      uint16_t* d_y_fp16, int rows, int width, int block,
+                                      void* stream) {
+    return qwen_hadamard_f16_common(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block,
+                                    false, stream);
 }
 
 }  // namespace pocket

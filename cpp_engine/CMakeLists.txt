@@ -303,6 +303,8 @@ else()
         backends/ascend/kernels/qwen_hbm_read_probe.cpp
         backends/ascend/kernels/qwen_ipc_arrive_wait.cpp
         backends/ascend/kernels/qwen_transpose_f16.cpp
+        backends/ascend/kernels/qwen_hadamard_f16.cpp
+        backends/ascend/kernels/qwen_vec_offset_probe.cpp
         backends/ascend/kernels/qwen_attention_cube_f16.cpp
     )
     # Optional escape hatch: reuse a previously built kernel archive instead of
@@ -878,6 +880,35 @@ set_target_properties(test_qwen_ascend_group_b PROPERTIES RUNTIME_OUTPUT_DIRECTO
 add_executable(test_qwen_ascend_norm_gamma tests/test_qwen_ascend_norm_gamma.cpp)
 target_link_libraries(test_qwen_ascend_norm_gamma PRIVATE pocket_cpp_core)
 set_target_properties(test_qwen_ascend_norm_gamma PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# One addressing question, asked of the hardware: does a vector instruction honour
+# a UB source operand offset by less than a 32-byte block? Nothing in the tree
+# answers it, and the incoherence rotation the ternary checkpoint needs is ten
+# butterfly passes three of whose levels are exactly that. It is a separate binary
+# because a misaligned operand is the kind of thing that faults rather than
+# miscomputes, and a fault here should not take the operator coverage with it.
+add_executable(test_qwen_ascend_vec_offset tests/test_qwen_ascend_vec_offset.cpp)
+target_link_libraries(test_qwen_ascend_vec_offset PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ascend_vec_offset PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The incoherence rotation the ternary checkpoint needs, against the definition of
+# the transform rather than against the CUDA kernel. The transform is a pairing
+# network with no multiplies and a power-of-two scale, so the integer and zero
+# cases are exact on both sides of the narrowing and are decided by equality, which
+# is what makes this worth running rather than a tolerance that would pass on a
+# wrong pairing. The random cases carry full mantissas and are judged by a bound.
+add_executable(test_qwen_ascend_hadamard tests/test_qwen_ascend_hadamard.cpp)
+target_link_libraries(test_qwen_ascend_hadamard PRIVATE pocket_cpp_core)
+set_target_properties(test_qwen_ascend_hadamard PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+# The rotation is on the per-token path of every projection that was quantized in
+# the rotated frame, so its cost is a layer-budget item. The kernel's header names
+# the scalar sub-block stage as its known weakness and leaves the measurement open;
+# this is that measurement, with a block sweep that separates the scalar stage from
+# the vector levels.
+add_executable(bench_qwen_ascend_hadamard tests/bench_qwen_ascend_hadamard.cpp)
+target_link_libraries(bench_qwen_ascend_hadamard PRIVATE pocket_cpp_core)
+set_target_properties(bench_qwen_ascend_hadamard PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 # Config parsing is device-agnostic, so this test links pocket_core and runs on a
 # host with no vendor SDK.
