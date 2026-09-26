@@ -1,0 +1,33 @@
+{
+  "entry": "xing4",
+  "checkpoint": "/mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf",
+  "argv": [
+    "serve",
+    "--backend",
+    "xing4",
+    "--model",
+    "/mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf",
+    "--max-model-len",
+    "4096"
+  ],
+  "env": {},
+  "prompt": "Reply with the single line: golden fixture.",
+  "sampling": {
+    "temperature": 0.0,
+    "max_tokens": 16
+  },
+  "expected": {
+    "prompt_tokens": 9,
+    "token_ids": [
+      35,
+      48972,
+      408,
+      39033,
+      2
+    ],
+    "text": "\ngolden fixture"
+  },
+  "commit": "832ca8c",
+  "taken_at": "2026-09-26",
+  "notes": "GGUF IQ4_NL only: the safetensors sibling on this box is an incomplete shard set"
+}

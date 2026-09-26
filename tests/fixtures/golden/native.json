@@ -1,0 +1,33 @@
+{
+  "entry": "native",
+  "checkpoint": "/mnt/data2/Qwen3.8-27B-FP8",
+  "argv": [
+    "--ckpt",
+    "/mnt/data2/Qwen3.8-27B-FP8",
+    "--binary",
+    "/mnt/data1/dsv4_inference/cpp_engine/build/pocketllm_engine",
+    "--devices",
+    "0,1,2,3",
+    "--max-context",
+    "4096",
+    "--max-batch-size",
+    "1",
+    "--prefill-token-budget",
+    "4096",
+    "--port",
+    "18292"
+  ],
+  "env": {},
+  "prompt": "Reply with the single line: golden fixture.",
+  "sampling": {
+    "temperature": 0.0,
+    "max_tokens": 16
+  },
+  "expected": {
+    "prompt_tokens": 21,
+    "text": "golden fixture."
+  },
+  "commit": "832ca8c",
+  "taken_at": "2026-09-26",
+  "notes": "the pocketllm_engine binary: four ranks, one process each, one card each, driven over HTTP because that is the only way it is reached"
+}
