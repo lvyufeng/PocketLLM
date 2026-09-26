@@ -98,6 +98,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Xing4.0-29B-A4B design and measurements](https://lvyufeng.github.io/PocketLLM/architecture/xing4_0_29b_a4b_design/)
 - [Ternary-Bonsai-2-27B dense GEMM](https://lvyufeng.github.io/PocketLLM/architecture/ternary_bonsai_2_dense_gemm/)
 - [Ternary-Bonsai-2-27B served runtime](https://lvyufeng.github.io/PocketLLM/architecture/bonsai_2_27b_design/)
+- [GLM-5.3-Flash checkpoint audit](https://lvyufeng.github.io/PocketLLM/architecture/glm_5_3_flash_audit/)
 - [vLLM and SGLang architecture analysis](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_architecture_analysis/)
 - [vLLM and SGLang comparison (pre-Phase-1)](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_comparison/)
 - [Ascend 910A performance roadmap](https://lvyufeng.github.io/PocketLLM/architecture/ascend_performance_roadmap/)

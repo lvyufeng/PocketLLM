@@ -184,6 +184,7 @@ nav:
       - Xing4.0-29B-A4B design and measurements: architecture/xing4_0_29b_a4b_design.md
       - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
       - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
+      - GLM-5.3-Flash checkpoint audit: architecture/glm_5_3_flash_audit.md
       - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
       - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
       - Ascend 910A performance roadmap: architecture/ascend_performance_roadmap.md
