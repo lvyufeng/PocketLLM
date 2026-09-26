@@ -238,6 +238,16 @@ per head, and folding the head axis into the GEMM's `M` dimension took the 32K d
 to 0.516 ms per layer. Prefill takes the expanded form and decode the absorbed one; the gap is 3.2x at
 2048 tokens and 20x at 32768.
 
+Xing4.0's fourth task has landed too, and it is [measured on the same
+card](../performance/xing4_0_hyper_connection_sm75.md): the matrix hyper-connection is ported as the
+audit read it — four residual streams, a 4 + 4 + 16 coefficient split, a 20-iteration Sinkhorn, and a
+residual that is *rebuilt* from `post` and `comb` rather than accumulated — and its forward pass is
+held to the released code's own line for line. The finding is a dispatch count rather than an
+arithmetic one: the block is 2.5% of a token's weight bytes and 300 kernel launches per call, 120 of
+them the Sinkhorn's 20 iterations of (sum, add, divide) on each axis, which is 30.6 ms of GPU per
+decode token for 0.09 ms of work. That is the second largest decode item in the stage after the MoE and
+the most fixable, and it is recorded with the three ways out rather than fixed here.
+
 A stage that dies at its gate is a result, and it goes in this document rather than the issue tree being
 quietly pruned. That is the same convention the old-hardware roadmap follows: it records what was
 measured and closed — the FP4 cross-layer prefetch, the score-split hybrid, the resident expert cache —
