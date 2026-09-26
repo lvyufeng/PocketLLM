@@ -5,8 +5,19 @@
 // a decode token to do 0.09 ms of arithmetic, which stage 4 measured at 30.6 ms
 // of GPU and 183 ms of wall a token.  Nothing here is new arithmetic: it is the
 // same norm, the same 24-wide gate, the same 20-iteration Sinkhorn and the same
-// rebuild, arranged so that all of it happens once, in registers, with the two
-// block-wide reductions being the only synchronizations in the kernel.
+// rebuild, arranged so that all of it happens once, with the gate's warp
+// reduction and the two block-wide ones around the Sinkhorn being the only
+// synchronizations in the kernel.
+//
+// Cost.  Measured on the 2080 Ti, back to back inside a CUDA graph so that no
+// host submission is counted: ~62 us a call at the released shape on one row and
+// ~79 us on 64, of which the Sinkhorn is ~24 us (its comment says why) and the
+// width-proportional part -- the norm over 14336 and the 24-wide gate -- is the
+// remaining ~27 us at 14336 against 5 us at 64.  A call is therefore mostly
+// latency: one block of eight warps has little to overlap, and the two loops
+// that read the 672 KiB projection are ~7 GB/s rather than the card's 616.
+// Splitting the row across blocks would fix that and cost a second launch, which
+// at 80 calls a token is the wrong trade while the step is launch-bound.
 //
 // Shape.  `hidden` is [rows, hc, hidden] and its four streams are flattened to
 // `wide = hc * hidden` for the norm and the gate, because the checkpoint's own
@@ -96,6 +107,7 @@ __global__ void xing4_hyper_connection_kernel(
         const scalar_t* f0 = fn + static_cast<int64_t>(out0) * wide;
         const scalar_t* f1 = fn + static_cast<int64_t>(out1) * wide;
         const scalar_t* f2 = fn + static_cast<int64_t>(out2) * wide;
+        #pragma unroll 8
         for (int k = lane; k < wide; k += kWarpSize) {
             // The reference runs this projection in the model dtype and casts to
             // fp32 only for the gates, so the normalized value is rounded to
@@ -133,38 +145,44 @@ __global__ void xing4_hyper_connection_kernel(
             const int idx = hc + s;
             shared[gate_post + s] = 2.0f / (1.0f + expf(-(shared[idx] * scale[1] + base[idx])));
         }
-        float comb[kMaxHc][kMaxHc];
-        float row_max[kMaxHc];
-        for (int d = 0; d < hc; ++d) row_max[d] = -INFINITY;
+        // The iterate lives in shared memory rather than in a local `comb[8][8]`.
+        // Every index below is a runtime `d`/`s`, so a register array would be
+        // placed in local memory and its ~1300 accesses would be dynamic round
+        // trips.  This one thread is also the kernel's serial section: at the
+        // released `iters=20` and `hc=4` it is ~24 us of the kernel's ~62 us, at
+        // ~60 cycles a division, because each iteration's 32 divisions are a
+        // dependent chain of row-pass then column-pass.  Parallelizing it across
+        // `hc` threads would take that to ~6 us; it is left alone because the
+        // decode step it sits in is bound by 5829 launches, not by this kernel.
         for (int d = 0; d < hc; ++d) {
             for (int s = 0; s < hc; ++s) {
                 const int idx = 2 * hc + d * hc + s;
                 // The clamp is on the logits, before the exponential: +-30 is far
                 // outside fp32's ability to represent exp, so it is a guard.
-                const float logit = fminf(fmaxf(shared[idx] * scale[2] + base[idx], clamp_min), clamp_max);
-                comb[d][s] = logit;
-                row_max[d] = fmaxf(row_max[d], logit);
+                shared[gate_comb + d * hc + s] =
+                    fminf(fmaxf(shared[idx] * scale[2] + base[idx], clamp_min), clamp_max);
             }
-        }
-        for (int d = 0; d < hc; ++d) {
-            for (int s = 0; s < hc; ++s) comb[d][s] = expf(comb[d][s] - row_max[d]);
+            // The row max is over the clamped logits, and it is taken in place so
+            // that no array is indexed by `d`.
+            float row_max = -INFINITY;
+            for (int s = 0; s < hc; ++s) row_max = fmaxf(row_max, shared[gate_comb + d * hc + s]);
+            for (int s = 0; s < hc; ++s) {
+                shared[gate_comb + d * hc + s] = expf(shared[gate_comb + d * hc + s] - row_max);
+            }
         }
         // Rows then columns, `iters` times, with `eps` added to each denominator.
         // The order is the reference's and the iteration count is a config value.
         for (int step = 0; step < iters; ++step) {
             for (int d = 0; d < hc; ++d) {
                 float sum = eps;
-                for (int s = 0; s < hc; ++s) sum += comb[d][s];
-                for (int s = 0; s < hc; ++s) comb[d][s] /= sum;
+                for (int s = 0; s < hc; ++s) sum += shared[gate_comb + d * hc + s];
+                for (int s = 0; s < hc; ++s) shared[gate_comb + d * hc + s] /= sum;
             }
             for (int s = 0; s < hc; ++s) {
                 float sum = eps;
-                for (int d = 0; d < hc; ++d) sum += comb[d][s];
-                for (int d = 0; d < hc; ++d) comb[d][s] /= sum;
+                for (int d = 0; d < hc; ++d) sum += shared[gate_comb + d * hc + s];
+                for (int d = 0; d < hc; ++d) shared[gate_comb + d * hc + s] /= sum;
             }
-        }
-        for (int d = 0; d < hc; ++d) {
-            for (int s = 0; s < hc; ++s) shared[gate_comb + d * hc + s] = comb[d][s];
         }
     }
     __syncthreads();
