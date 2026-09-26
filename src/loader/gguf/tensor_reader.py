@@ -12,6 +12,7 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from src.loader.gguf import iq4_nl
 from src.loader.gguf.quant_types import GGUF_TERNARY_TYPE_NAMES
 from src.loader.gguf.reader import GGUFFile, GGUFReader, GGUFTensorInfo
 
@@ -115,6 +116,11 @@ _QUANT_BLOCK_META = {
     "q5_k": (256, 176),
     "q6_k": (256, 210),
     "iq4_xs": (256, 136),
+    # A 32-weight block, not 256, which is why every reader below takes its block
+    # size from this table instead of assuming QK_K.  IQ4_NL is upstream type 20
+    # and this checkpoint's 243 MoE/dense tensors; it is *loader-only*, so it is
+    # absent from `GGUF_DENSE_TYPE_IDS` and no kernel switch sees it.
+    "iq4_nl": (iq4_nl.QK_IQ4_NL, iq4_nl.IQ4_NL_BLOCK_BYTES),
     "ptq1_0": (128, 28),
     "pq2_0": (128, 34),
 }
@@ -614,7 +620,11 @@ class GGUFTensorDataReader:
         return torch.from_numpy(blocks).to(device="cpu")
 
     def _read_quantized_matrix(self, tensor: GGUFTensorInfo, offset: int, in_dim: int, out_dim: int, type_name: str) -> torch.Tensor:
-        blocks_per_row = math.ceil(in_dim / 256)
+        # The block size comes from the format, not from QK_K: nine of the eleven
+        # types here are 256-wide, but `iq4_nl` is 32- and the ternary packs are
+        # 128-wide, so a hard-coded 256 reads the wrong bytes rather than failing.
+        block_elems, _block_bytes = _quant_block_meta(type_name)
+        blocks_per_row = math.ceil(in_dim / block_elems)
         if type_name == "q2_k":
             values = self._read_q2_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "q3_k":
@@ -635,9 +645,11 @@ class GGUFTensorDataReader:
             values = self._read_q6_k_rows(offset, out_dim, blocks_per_row)
         elif type_name == "iq4_xs":
             values = self._read_iq4_xs_rows(offset, out_dim, blocks_per_row)
+        elif type_name == "iq4_nl":
+            values = self._read_iq4_nl_rows(offset, out_dim, blocks_per_row)
         else:
             raise NotImplementedError(type_name)
-        return torch.from_numpy(values.reshape(out_dim, blocks_per_row * 256)[:, :in_dim].copy())
+        return torch.from_numpy(values.reshape(out_dim, blocks_per_row * block_elems)[:, :in_dim].copy())
 
     def _read_q2_k_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
         global _GGUF_READER_PROFILE_COUNT
@@ -979,26 +991,48 @@ class GGUFTensorDataReader:
         scales_h = blocks[:, :, 2:4].view("<u2").reshape(rows, blocks_per_row)
         scales_l = blocks[:, :, 4:8]
         qs = blocks[:, :, 8:136]
-        kvalues = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
         out = np.empty((rows, blocks_per_row, 256), dtype=np.float32)
         for group in range(8):
             scale = ((scales_l[:, :, group // 2] >> (4 if group & 1 else 0)) & 0x0F).astype(np.int16)
             scale |= (((scales_h >> (2 * group)) & 0x03).astype(np.int16) << 4)
             scale = (scale - 32).astype(np.float32)
-            q = qs[:, :, group * 16:(group + 1) * 16]
-            lo = kvalues[q & 0x0F]
-            hi = kvalues[q >> 4]
-            values = np.empty((rows, blocks_per_row, 32), dtype=np.float32)
-            # ggml iq4_xs packs each 16-byte group as 16 low nibbles then 16 high
-            # nibbles (block layout), not interleaved.
-            values[:, :, 0:16] = lo
-            values[:, :, 16:32] = hi
+            # IQ4_XS shares IQ4_NL's codebook and its nibble order, so the split
+            # into 32 values per group is the shared decoder and not a copy of it.
+            values = iq4_nl.decode_indices(qs[:, :, group * 16:(group + 1) * 16])
             out[:, :, group * 32:(group + 1) * 32] = d[:, :, None] * scale[:, :, None] * values
         if profile:
             t_done = time.perf_counter()
             _GGUF_READER_PROFILE_COUNT += 1
             print(
                 f"gguf_reader_profile type=iq4_xs rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
+                f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
+                flush=True,
+            )
+        return out
+
+    def _read_iq4_nl_rows(self, offset: int, rows: int, blocks_per_row: int) -> np.ndarray:
+        """Reference-decode IQ4_NL rows to float32.
+
+        The block is 18 bytes -- an fp16 scale and 16 packed nibbles -- for 32
+        weights, so the byte count is ``rows * blocks_per_row * 18`` and not the
+        ``* 136`` an IQ4_XS-shaped reader would use.  There is no per-group scale
+        to reconstruct here: the fp16 is the only scale.
+        """
+        global _GGUF_READER_PROFILE_COUNT
+        profile = _GGUF_READER_PROFILE and _GGUF_READER_PROFILE_COUNT < _GGUF_READER_PROFILE_LIMIT
+        t0 = time.perf_counter() if profile else 0.0
+        block_bytes = iq4_nl.IQ4_NL_BLOCK_BYTES
+        nbytes = rows * blocks_per_row * block_bytes
+        data = self._read_at(offset, nbytes)
+        if profile:
+            t_read = time.perf_counter()
+        blocks = np.frombuffer(data, dtype=np.uint8).reshape(rows, blocks_per_row, block_bytes)
+        out = iq4_nl.dequantize_blocks(blocks)
+        if profile:
+            t_done = time.perf_counter()
+            _GGUF_READER_PROFILE_COUNT += 1
+            print(
+                f"gguf_reader_profile type=iq4_nl rows={rows} blocks_per_row={blocks_per_row} bytes={nbytes} "
                 f"read={t_read - t0:.6f}s decode={t_done - t_read:.6f}s total={t_done - t0:.6f}s",
                 flush=True,
             )

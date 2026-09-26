@@ -37,6 +37,19 @@ GGUF_TERNARY_FILE_TYPE_IDS = {
 
 GGUF_TERNARY_TYPE_NAMES = frozenset(GGUF_TERNARY_FILE_TYPE_IDS)
 
+# Formats the loader can both address and dequantize but which have no raw-block
+# kernel yet, so they are absent from `GGUF_DENSE_TYPE_IDS` above for the same
+# reason the ternary packs are: a name in that map is a claim that a kernel
+# switches on its id, and a 32-weight IQ4_NL block handed to a 256-wide GEMM is
+# the failure the claim would produce.  The distinction from the ternary pair is
+# the loader's behaviour, not the file's: `read_tensor` decodes these honestly
+# (upstream `ggml` assigns IQ4_NL type 20, so its block geometry is public and
+# its 16-entry codebook is in the vendored header), while it refuses a ternary
+# tensor by name.  Xing4.0-29B-A4B's released GGUF is 243 tensors of IQ4_NL.
+GGUF_LOADER_TYPE_NAMES = frozenset({"iq4_nl"})
+
 #: Every GGUF type whose blocks the loader can address by offset, whether or not
 #: anything downstream can consume them.
-GGUF_ADDRESSABLE_TYPE_NAMES = frozenset(GGUF_DENSE_TYPE_IDS) | GGUF_TERNARY_TYPE_NAMES
+GGUF_ADDRESSABLE_TYPE_NAMES = (
+    frozenset(GGUF_DENSE_TYPE_IDS) | GGUF_TERNARY_TYPE_NAMES | GGUF_LOADER_TYPE_NAMES
+)
