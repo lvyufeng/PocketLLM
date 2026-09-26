@@ -1401,6 +1401,18 @@ void FusedGateUpSwiGLU::forward(
 #ifdef POCKET_BACKEND_ASCEND
     // Use fused gate_up projection when available (reduces MatMul calls from 2 to 1).
     if (layer.gate_up.weight.data != nullptr) {
+        // The fusion concatenates two weights but only one activation, so the
+        // fused linear has to inherit the frame the operands read it in. A fused
+        // weight that kept the default `false` on a folded checkpoint -- where
+        // both halves are written against the rotated activation -- produces
+        // fluent nonsense rather than an error, and no kernel can tell. It is a
+        // host-side property of two structs, so it is checked here, once per
+        // layer per step, and refused rather than trusted.
+        if (layer.gate_up.input_rotated != layer.gate.input_rotated) {
+            throw std::runtime_error(
+                "Qwen fused gate/up linear carries the wrong input frame: the "
+                "fusion must inherit the operands' `input_rotated`");
+        }
         const int gate_rows = static_cast<int>(layer.gate.logical_shape[0]);
         const int total_rows = gate_rows * 2;
         QwenDeviceTensor& fused_output = runtime.workspace_half(

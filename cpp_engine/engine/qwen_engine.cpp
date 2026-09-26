@@ -285,6 +285,24 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
         first.logical_shape[1] != second.logical_shape[1]) {
         return fused;
     }
+    // The input frame is part of the concatenation, not a property of either
+    // half. Both operands read the *same* activation, and the fused linear gets
+    // one input, so a fused pair that kept the default `false` would send that
+    // activation unrotated into weights written against the rotated frame -- the
+    // silent failure this mechanism produces rather than an error. `kind` and
+    // `logical_shape` are copied down for the same reason; this flag is the one
+    // that was missed, and on a folded checkpoint it is set: `gate_proj` and
+    // `up_proj` are folded, so both arrive rotated and the fused linear must
+    // rotate too.
+    //
+    // The two can also disagree, which no single input can satisfy -- one half
+    // would need the rotation and the other would need the raw activation. That
+    // is refused rather than resolved, because each operand's own answer is
+    // still available: the caller falls back to two separate projections, which
+    // is what one of the two asked for.
+    if (first.input_rotated != second.input_rotated) {
+        return fused;
+    }
     // Block-128 FP8 scale rows track output-row blocks and therefore concatenate
     // with the weight rows. Other compressed formats have different layouts and
     // are rejected above until a fused consumer for them is validated.
@@ -298,6 +316,7 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     }
 
     fused.kind = first.kind;
+    fused.input_rotated = first.input_rotated;
     fused.logical_shape = {first.logical_shape[0] + second.logical_shape[0],
                            first.logical_shape[1]};
     const uint64_t first_rows = first.weight.shape[0];
