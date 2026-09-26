@@ -66,6 +66,27 @@ class HyperConnectionWeights:
     hc_scale: torch.Tensor  # [3], one scalar per gate
 
     @classmethod
+    def from_gguf(cls, loader, gguf_prefix: str, params: Xing4_0Params, *, dtype: torch.dtype = torch.float32):
+        """`gguf_prefix` is `blk.N.hc_attn` or `blk.N.hc_ffn`.
+
+        The two sources name these three tensors differently and that is the whole
+        difference between this and `from_hf`: the checkpoint writes
+        `attn_hc.hc_fn` where the GGUF writes `hc_attn_fn.weight`.  The shapes are
+        the same, because GGUF's fastest-varying-first order already reverses
+        `[14336, 24]` into the `[24, 14336]` a `F.linear` wants.
+        """
+        mix = (2 + params.hc_mult) * params.hc_mult
+        wide = params.hc_mult * params.hidden_size
+        fn = loader.read_dense(f"{gguf_prefix}_fn.weight", dtype=dtype)
+        if tuple(fn.shape) != (mix, wide):
+            raise ValueError(f"{gguf_prefix}_fn.weight is {tuple(fn.shape)}, expected {(mix, wide)}")
+        return cls(
+            hc_fn=fn,
+            hc_base=loader.read_dense(f"{gguf_prefix}_base.weight", dtype=torch.float32),
+            hc_scale=loader.read_dense(f"{gguf_prefix}_scale.weight", dtype=torch.float32),
+        )
+
+    @classmethod
     def from_hf(cls, tensors: dict[str, torch.Tensor], params: Xing4_0Params, prefix: str) -> "HyperConnectionWeights":
         """`prefix` is `attn_hc` or `ffn_hc` -- the release names them per sublayer."""
         mix = (2 + params.hc_mult) * params.hc_mult

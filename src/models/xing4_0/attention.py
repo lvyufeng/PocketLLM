@@ -92,6 +92,58 @@ class MLAAttentionWeights:
     v_b: torch.Tensor  # [n_heads, v_head_dim, kv_lora]
     o_proj: torch.Tensor  # [hidden, n_heads * v_head_dim]
 
+    #: GGUF name -> this dataclass's field.  The released file already ships the
+    #: absorbed split (`attn_k_b`, `attn_v_b`), so unlike `from_hf` there is no
+    #: `kv_b_proj` to cut up: these are the same seven weights under the names the
+    #: llama.cpp port uses.
+    GGUF_NAMES = {
+        "attn_q_a.weight": "q_a_proj",
+        "attn_q_a_norm.weight": "q_a_norm",
+        "attn_q_b.weight": "q_b_proj",
+        "attn_kv_a_mqa.weight": "kv_a_proj",
+        "attn_kv_a_norm.weight": "kv_a_norm",
+        "attn_k_b.weight": "k_b",
+        "attn_v_b.weight": "v_b",
+        "attn_output.weight": "o_proj",
+    }
+
+    @classmethod
+    def from_gguf(
+        cls, loader, block_prefix: str, params: Xing4_0Params, *, dtype: torch.dtype = torch.float32
+    ) -> "MLAAttentionWeights":
+        """Read one layer out of the released GGUF, at its stored widths.
+
+        `block_prefix` is `blk.N.`.  Every tensor here is bf16 in the file and
+        dense, so this is a cast and not a decode: the quantizer left the whole
+        attention path at bf16, which is why the audit's byte table puts 2.117 GiB
+        of a decode token's traffic here against the routed experts' 0.877 GiB.
+
+        The two 3-D weights arrive with the head axis last in the header
+        (`[128, 512, 32]`) and the reader reverses that, so what comes back is
+        already `(heads, kv_lora, qk_nope)` -- the orientation `from_hf` has to
+        build by transposing the middle two axes of `kv_b_proj`.
+        """
+        values = {
+            field: loader.read_dense(f"{block_prefix}{name}", dtype=dtype)
+            for name, field in cls.GGUF_NAMES.items()
+        }
+        heads, nope, v_head = params.n_heads, params.qk_nope_head_dim, params.v_head_dim
+        kv_lora = params.kv_lora_rank
+        expected = {
+            "q_a_proj": (params.q_lora_rank, params.hidden_size),
+            "q_a_norm": (params.q_lora_rank,),
+            "q_b_proj": (heads * params.qk_head_dim, params.q_lora_rank),
+            "kv_a_proj": (kv_lora + params.qk_rope_head_dim, params.hidden_size),
+            "kv_a_norm": (kv_lora,),
+            "k_b": (heads, kv_lora, nope),
+            "v_b": (heads, v_head, kv_lora),
+            "o_proj": (params.hidden_size, heads * v_head),
+        }
+        for field, shape in expected.items():
+            if tuple(values[field].shape) != shape:
+                raise ValueError(f"{block_prefix}{field} is {tuple(values[field].shape)}, expected {shape}")
+        return cls(**values)
+
     @classmethod
     def from_hf(cls, tensors: dict[str, torch.Tensor], params: Xing4_0Params) -> "MLAAttentionWeights":
         """Build from the released BF16 checkpoint's own tensor names.
