@@ -264,7 +264,18 @@ def plan_routes(indices: torch.Tensor, weights: torch.Tensor, n_experts: int) ->
     """Build the plan for a `[tokens, top_k]` route table."""
     _, top_k = indices.shape
     flat_expert = indices.reshape(-1)
-    counts = torch.bincount(flat_expert, minlength=n_experts)
+    # The histogram, without `torch.bincount`.  `minlength` already fixes the
+    # length at `n_experts`, but `bincount` still sizes its output from the
+    # data's own maximum, which it reads back to the host -- a device-to-host
+    # copy and a stream drain, once per MoE block, so 38 times a decode step
+    # measured at 76 copies and 78 synchronisations (it is two of each a call).
+    # It is also why a decode step could not be captured into a CUDA graph at
+    # all.  The scatter-add is the same histogram over a known-length buffer, is
+    # bit-identical to `torch.bincount(flat_expert, minlength=n_experts)` -- the
+    # assertion in `test_the_plan_is_a_csr_over_the_route_table` is against that
+    # call -- and the host read is 0.
+    counts = torch.zeros(n_experts, dtype=torch.int64, device=flat_expert.device)
+    counts.scatter_add_(0, flat_expert, torch.ones_like(flat_expert))
     seg_starts = torch.zeros(n_experts + 1, dtype=torch.int32, device=indices.device)
     torch.cumsum(counts, dim=0, out=seg_starts[1:])
     order = torch.argsort(flat_expert, stable=True)

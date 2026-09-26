@@ -73,6 +73,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Serving concurrency and throughput](https://lvyufeng.github.io/PocketLLM/performance/serving_throughput_scaling/)
 - [Xing4.0-29B-A4B MLA attention on sm_75](https://lvyufeng.github.io/PocketLLM/performance/xing4_0_attention_sm75/)
 - [Xing4.0-29B-A4B hyper-connection on sm_75](https://lvyufeng.github.io/PocketLLM/performance/xing4_0_hyper_connection_sm75/)
+- [Xing4.0-29B-A4B decode launch gap](https://lvyufeng.github.io/PocketLLM/performance/xing4_0_decode_launch_gap/)
 
 ## Architecture
 

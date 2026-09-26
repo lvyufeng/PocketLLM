@@ -285,6 +285,60 @@ def test_the_gather_reads_the_token_that_owns_the_route() -> None:
         assert torch.all(gathered[route] == float(plan.token_of_route[route]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a card is needed to synchronise")
+def test_the_plan_never_reads_back_from_the_card() -> None:
+    """`plan_routes` is built without a device-to-host read, and that is the point.
+
+    `torch.bincount` sizes its output from the data's own maximum, so it reads it
+    back to the host.  `plan_routes` runs once per MoE block -- 38 times a decode
+    step -- and the call measured **two device-to-host copies and two stream
+    drains each**, i.e. 76 and 78 in a step.  It is also a CUDA graph's flat
+    refusal: a decode step could not be captured at all while it was there.
+
+    Sync debug mode is the detector, and the control below is what makes it
+    trustworthy -- a guard that cannot fail on the thing it guards against is a
+    comment.  `bincount` still is caught here, so this test fails on a
+    reintroduced read rather than passing because the detector went quiet.
+    """
+    import warnings
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    indices, weights, experts = _plan_fixture()
+    indices = indices.to(device)
+    weights = weights.to(device)
+    plan_routes(indices, weights, experts)
+    torch.cuda.synchronize()
+
+    flat = indices.reshape(-1)
+    counts = torch.zeros(experts, dtype=torch.int64, device=device)
+    with warnings.catch_warnings():
+        # The mode is a prototype and says so, once, on every set.
+        warnings.filterwarnings("ignore", message=".*prototype feature.*")
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            # The control, first: the detector has to still fire.
+            with pytest.raises(RuntimeError, match="synchronizing CUDA operation"):
+                torch.bincount(flat, minlength=experts)
+
+            plan_routes(indices, weights, experts)
+            counts.scatter_add_(0, flat, torch.ones_like(flat))
+        except RuntimeError as error:  # pragma: no cover - the failure path
+            if "synchronizing CUDA operation" in str(error):
+                raise AssertionError(
+                    "plan_routes read a value back from the card; the histogram's length "
+                    "is `n_experts` and needs no host read"
+                ) from error
+            raise
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+
+    # And the replacement is the same histogram, so the guard is not bought with
+    # a different answer.
+    seg = plan_routes(indices, weights, experts).seg_starts
+    assert torch.equal(seg[1:] - seg[:-1], torch.bincount(flat, minlength=experts))
+
+
 # --------------------------------------------------------------------------- #
 # The routed experts: the kernel against a dense evaluation of the same weights
 # --------------------------------------------------------------------------- #
