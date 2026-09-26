@@ -547,6 +547,17 @@ torch::Tensor gguf_quant_embedding_forward_cuda(
     int64_t type_id,
     const torch::Tensor& signed_grid);
 
+std::vector<torch::Tensor> xing4_hyper_connection_forward_cuda(
+    const torch::Tensor& hidden,
+    const torch::Tensor& fn,
+    const torch::Tensor& base,
+    const torch::Tensor& scale,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double eps,
+    double clamp_min,
+    double clamp_max);
+
 torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
@@ -652,12 +663,20 @@ int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
     if (type_id == 6) return 98;    // iq3_xxs
     if (type_id == 7) return 136;   // iq4_xs
     if (type_id == 8) return 210;   // q6_k
+    if (type_id == 20) return 144;  // iq4_nl, eight native 18-byte blocks
     if (type_id == 143) return 28;  // ptq1_0, the fork-private ternary block
     TORCH_CHECK(false, "unsupported GGUF quant type_id: ", type_id);
 }
 
 // Weights per block.  Everything here is a 256-group except the ternary pack, whose
 // group is half that -- so a caller's "blocks cover row_elems" test cannot assume 256.
+//
+// iq4_nl is a 256-group by a different route: its native block is 32 weights, and
+// the loader folds eight of them into the 144-byte row element the kernels walk.
+// The number of weights is the same as the other ten, which is what keeps this
+// one comparison sufficient -- but the block *bytes* above are not derivable
+// from it, and a native iq4_nl row (18 bytes per 32 weights) fails the size check
+// rather than being silently accepted.
 int64_t gguf_quant_block_elems_for_type(int64_t type_id) {
     return type_id == 143 ? 128 : 256;
 }
@@ -665,7 +684,7 @@ int64_t gguf_quant_block_elems_for_type(int64_t type_id) {
 bool gguf_quant_type_supported(int64_t type_id) {
     return type_id == 0 || type_id == 1 || type_id == 2 || type_id == 3 ||
            type_id == 4 || type_id == 5 || type_id == 6 || type_id == 7 ||
-           type_id == 8 || type_id == 143;
+           type_id == 8 || type_id == 20 || type_id == 143;
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
@@ -685,6 +704,8 @@ void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const cha
         TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
         TORCH_CHECK(grid.numel() >= (512 * 128 * 8 + 256 * 128 * 8), name, " must contain packed iq2_xs and iq3_xxs signed grids");
     }
+    // iq4_nl has no signed grid: its values come from a 16-entry codebook that the
+    // kernel holds in registers, so an empty grid tensor is the correct argument.
 }
 
 }  // namespace
@@ -2294,6 +2315,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
     m.def("qwen4_exp_grouped_rms_norm", &qwen4_exp_grouped_rms_norm, "Qwen4-Exp grouped RMSNorm with centered gain (CUDA)");
     m.def("qwen4_exp_inject", &qwen4_exp_inject, "Qwen4-Exp hyper-connection stream injection (CUDA)");
+    m.def("xing4_hyper_connection_forward", &xing4_hyper_connection_forward_cuda,
+          "Xing4.0-29B-A4B's matrix hyper-connection in one kernel: the flattened unweighted "
+          "norm, the 24-wide gate, the 20-iteration Sinkhorn and the collapsed stream, "
+          "one block a row",
+          pybind11::arg("hidden"), pybind11::arg("fn"), pybind11::arg("base"),
+          pybind11::arg("scale"), pybind11::arg("hc_mult"), pybind11::arg("sinkhorn_iters"),
+          pybind11::arg("eps"), pybind11::arg("clamp_min"), pybind11::arg("clamp_max"));
     m.def("qwen4_exp_hc_silu", &qwen4_exp_hc_silu, "Qwen4-Exp hyper-connection scaled SiLU (CUDA)");
     m.def("qwen4_exp_hc_inject_gate", &qwen4_exp_hc_inject_gate, "Qwen4-Exp hyper-connection injection gate (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");

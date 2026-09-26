@@ -21,11 +21,17 @@ vendored llama.cpp header rather than transcribed, so there is one statement of
 it in this repository: ``kvalues_iq4nl`` in
 ``src/csrc/llama_mmq/ggml-common.h``.
 
-Note what this module is *not* allowed to imply: it decodes blocks, and decoding
-blocks is not the same as having a kernel that consumes them.  ``IQ4_NL`` is
-deliberately absent from ``GGUF_DENSE_TYPE_IDS``, the raw-block runtime's
-dispatch table, so a checkpoint whose tensors are ``IQ4_NL`` raises rather than
-reaching a kernel that would read 32-weight blocks as a 256-weight format.
+Decoding blocks and running them are different things, and for one stage they
+were separated here on purpose: ``IQ4_NL`` was absent from ``GGUF_DENSE_TYPE_IDS``
+-- the raw-block runtime's dispatch table -- so a checkpoint whose tensors were
+``IQ4_NL`` raised rather than reaching a kernel that would read 32-weight blocks
+as a 256-weight format.  It is in that table now (``#393``), because
+``src/csrc/cuda_kernel_impl.cu`` has a ``iq4nl_block_dot_256`` that walks eight
+native blocks where the other ten formats unpack one 256-weight header.  What
+made that a small kernel rather than a second kernel family is
+:func:`fold_to_runtime_span` below: the loader folds eight native blocks into a
+144-byte row element so every GEMM above sees the uniform 256-wide geometry the
+runtime already had.
 """
 
 from __future__ import annotations
@@ -120,6 +126,39 @@ def decode_indices(qs: np.ndarray) -> np.ndarray:
 def blocks_per_row(row_elems: int) -> int:
     """Blocks in a row of ``row_elems`` weights, rounding up."""
     return (int(row_elems) + QK_IQ4_NL - 1) // QK_IQ4_NL
+
+
+def fold_to_runtime_span(blocks, row_elems: int):
+    """Regroup native 18-byte blocks into the runtime's 256-weight row element.
+
+    ``blocks`` arrives as ``(..., row_elems // 32, 18)`` -- the file's own
+    geometry, which every decoder in this module is written against.  The
+    raw-block kernels want ``(..., row_elems // 256, 144)``, eight native blocks
+    end to end, because that is what their block walk assumes of all eleven
+    formats.  Both shapes hold the same bytes in the same order, so this
+    rearranges nothing; it is a view for a contiguous input and a copy for a
+    strided one.  It works on numpy and torch arrays alike and is used on both --
+    the decoders here take numpy, the loader hands it a torch tensor.
+
+    ``row_elems`` must be a multiple of 256: a row that is not would leave a
+    partial runtime block, and the kernels index the next output row by
+    ``blocks_per_row * block_bytes`` rather than by an element cursor, so a
+    partial one would silently shift every row after it.  Both of Xing4.0's
+    expert widths (3584 and 1024) are multiples, and the check is here rather
+    than in a caller because the failure it prevents is a wrong answer.
+    """
+    span = QK_IQ4_NL * 8
+    if int(row_elems) % span:
+        raise ValueError(
+            f"IQ4_NL row of {row_elems} weights is not a multiple of the runtime's "
+            f"{span}-weight span, so its raw blocks cannot be regrouped"
+        )
+    if blocks.shape[-2] != blocks_per_row(row_elems):
+        raise ValueError(
+            f"IQ4_NL block grid {(blocks.shape[-1], blocks.shape[-2])} does not match "
+            f"a {row_elems}-weight row at {QK_IQ4_NL} weights per block"
+        )
+    return blocks.reshape(*blocks.shape[:-2], int(row_elems) // span, span // QK_IQ4_NL * IQ4_NL_BLOCK_BYTES)
 
 
 def _f16_to_f32(data: np.ndarray) -> np.ndarray:

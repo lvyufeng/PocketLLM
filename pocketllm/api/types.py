@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from .errors import ConfigurationError
 
 
-_BACKENDS = {"auto", "torch", "cpp", "v41", "mimo"}
+_BACKENDS = {"auto", "torch", "cpp", "v41", "mimo", "xing4"}
 _FORMATS = {"auto", "safetensors", "gguf"}
 
 

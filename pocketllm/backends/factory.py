@@ -18,11 +18,13 @@ from .cpp_backend import CppBackend, gguf_is_servable
 from .mimo_backend import MimoBackend
 from .torch_backend import TorchBackend
 from .v41_backend import V41Backend
+from .xing4_backend import Xing4Backend
 
 
 _QWEN35_TYPES = {"qwen3_5", "qwen3_5_text"}
 _V41_TYPES = {"deepseek_v41", "deepseek_v41_text"}
 _MIMO_TYPES = {"mimo_v2", "mimo_v2_text"}
+_XING4_TYPES = {"xing4_0", "xing4_0_text"}
 
 
 def _config_path(path: str, explicit: str | None = None) -> Path:
@@ -116,6 +118,82 @@ def _is_mimo_config(config: dict[str, Any]) -> bool:
 def _looks_like_mimo(path: str, config_path: str | None = None) -> bool:
     config = _read_config(path, config_path)
     return config is not None and _is_mimo_config(config)
+
+
+def _is_xing4_config(config: dict[str, Any]) -> bool:
+    """Whether a config describes Xing4.0-29B-A4B.
+
+    The released checkpoint is not nested and its ``model_type`` is the name the
+    GGUF's own ``general.architecture`` carries, so the two artifacts the release
+    ships are recognized by the same string.
+    """
+
+    def is_xing4(value: Any) -> bool:
+        return str(value or "").lower() in _XING4_TYPES
+
+    if is_xing4(config.get("model_type")):
+        return True
+    architectures = config.get("architectures", ())
+    if isinstance(architectures, (list, tuple)):
+        if any("xing4" in str(item).lower() for item in architectures):
+            return True
+    nested = config.get("text_config")
+    return isinstance(nested, dict) and _is_xing4_config(nested)
+
+
+def _xing4_gguf_architecture(path: str) -> str:
+    """``general.architecture`` out of a GGUF, or the empty string.
+
+    Read rather than assumed: the file the launcher points at may be any GGUF, so
+    this is what separates "a Xing4 export" from "a file ending in .gguf".  A
+    header that cannot be parsed returns nothing and the caller falls through to
+    the next adapter -- the native reader reports the precise error when it is the
+    one that ends up with the file.
+    """
+    try:
+        candidate = Path(path)
+        if candidate.is_dir():
+            found = sorted(candidate.glob("*.gguf"))
+            if len(found) != 1:
+                return ""
+            candidate = found[0]
+        if not candidate.is_file() or candidate.suffix.lower() != ".gguf":
+            return ""
+        from src.loader.gguf.bundle import read_gguf_bundle
+
+        metadata = read_gguf_bundle(candidate).metadata
+        return str(metadata.get("general.architecture") or "")
+    except Exception:
+        return ""
+
+
+def _looks_like_xing4(path: str, config_path: str | None = None) -> bool:
+    config = _read_config(path, config_path)
+    if config is not None:
+        return _is_xing4_config(config)
+    return _xing4_gguf_architecture(path) == "xing4_0"
+
+
+def _xing4_model_supported(args: EngineArgs) -> bool:
+    """Whether the requested checkpoint is one the Xing4 adapter can read.
+
+    Either artifact qualifies: the GPTQ export's ``config.json`` says
+    ``xing4_0``, and the GGUF's header says the same in
+    ``general.architecture``.
+    """
+    if str(args.model_format).lower() == "safetensors":
+        return False
+    return _looks_like_xing4(args.checkpoint_dir, args.config_path)
+
+
+def _reject_unsupported_xing4_checkpoint(args: EngineArgs) -> None:
+    """Fail fast for a checkpoint the Xing4 adapter provably cannot serve."""
+    if not _looks_like_xing4(args.checkpoint_dir, args.config_path):
+        raise UnsupportedFeatureError(
+            "backend='xing4' serves Xing4.0-29B-A4B checkpoints only: a directory whose "
+            "config.json says model_type=xing4_0, or a .gguf whose general.architecture is"
+            " xing4_0"
+        )
 
 
 def _checkpoint_has_gguf(path: str) -> bool:
@@ -239,6 +317,8 @@ def select_backend(args: EngineArgs) -> str:
             _reject_unsupported_v41_checkpoint(args)
         elif args.backend == "mimo":
             _reject_unsupported_mimo_checkpoint(args)
+        elif args.backend == "xing4":
+            _reject_unsupported_xing4_checkpoint(args)
         return args.backend
     # The architecture-specific adapters before the native one, and the native one before the
     # generic torch runtime: each reads a checkpoint the others cannot, and the order is the
@@ -247,6 +327,8 @@ def select_backend(args: EngineArgs) -> str:
         return "v41"
     if _mimo_model_supported(args):
         return "mimo"
+    if _xing4_model_supported(args):
+        return "xing4"
     if CppBackend.native_available() and _cpp_model_supported(args):
         return "cpp"
     return "torch"
@@ -292,6 +374,12 @@ def create_backend(args: EngineArgs, **injected: Any):
                 torch_rendezvous=True,
             )
         return construct(args)
+    if selected == "xing4":
+        return Xing4Backend(
+            args,
+            loader=injected.get("loader"),
+            tokenizer=injected.get("tokenizer"),
+        )
     if selected == "mimo":
         def construct(resolved: EngineArgs) -> MimoBackend:
             return MimoBackend(

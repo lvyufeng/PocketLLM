@@ -215,6 +215,7 @@ if TORCH_AVAILABLE:
                 "src/csrc/qwen4_exp_gated_delta.cu",
                 "src/csrc/qwen4_exp_qsa.cu",
                 "src/csrc/qwen4_exp_hyper_connection.cu",
+                "src/csrc/xing4_hyper_connection.cu",
             ],
             libraries=["cublas"],
             extra_compile_args={

@@ -36,12 +36,12 @@ from pocketllm.api import (
     SamplingParams,
 )
 from pocketllm.backends import factory
+from pocketllm.backends.base import hold_back
 from pocketllm.backends.mimo_backend import (
     DEFAULT_EXPERT_ROWS,
     DEFAULT_PREFILL_CHUNK,
     DEFAULT_RESIDENT_ROWS,
     MimoBackend,
-    _hold_back,
     _Options,
 )
 from src.models.mimo_v2.generate import Generation, generate, sample_token
@@ -447,12 +447,12 @@ def test_a_stop_string_ends_the_answer_where_it_starts_and_is_never_sent():
 
 def test_a_tail_that_is_still_half_a_stop_string_is_held_back():
     """A stream cannot take a character back, so a partial marker waits for the token that ends it."""
-    assert _hold_back("alpha BE", ["BETA"]) == "alpha "
-    assert _hold_back("alpha BETA", ["BETA"]) == "alpha BETA"  # whole: the caller cuts it
-    assert _hold_back("alpha B", ["BETA"]) == "alpha "
-    assert _hold_back("alpha", ["BETA"]) == "alpha"
-    assert _hold_back("alphabet", ["BETA"]) == "alphabet"
-    assert _hold_back("", ["BETA"]) == ""
+    assert hold_back("alpha BE", ["BETA"]) == "alpha "
+    assert hold_back("alpha BETA", ["BETA"]) == "alpha BETA"  # whole: the caller cuts it
+    assert hold_back("alpha B", ["BETA"]) == "alpha "
+    assert hold_back("alpha", ["BETA"]) == "alpha"
+    assert hold_back("alphabet", ["BETA"]) == "alphabet"
+    assert hold_back("", ["BETA"]) == ""
 
     tokenizer = FakeTokenizer(pieces={11: "alpha", 12: "BE", 13: "TA", 14: "!"})
     adapter = backend(model=ScriptedModel(scripted=(11, 12, 13, 14)), tokenizer=tokenizer)

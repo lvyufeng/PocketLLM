@@ -77,14 +77,20 @@ class DecoderLayer:
         *,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cpu",
+        use_kernel: bool = False,
+        residual_dtype: torch.dtype | None = None,
     ):
         self.params = params
         self.weights = weights
         self.mlp = mlp
         self.dtype = dtype
+        # The four residual streams are carried at their own width, which is
+        # `dtype` unless a caller says otherwise.  See `forward` for why this
+        # checkpoint needs the wider one.
+        self.residual_dtype = dtype if residual_dtype is None else residual_dtype
         self.device = device
-        self.attn_hc = HyperConnection(params, weights.attn_hc, dtype=dtype)
-        self.ffn_hc = HyperConnection(params, weights.ffn_hc, dtype=dtype)
+        self.attn_hc = HyperConnection(params, weights.attn_hc, dtype=dtype, use_kernel=use_kernel)
+        self.ffn_hc = HyperConnection(params, weights.ffn_hc, dtype=dtype, use_kernel=use_kernel)
         self.attention = MLAAttention(params, weights.attention, dtype=dtype, device=device)
 
     @classmethod
@@ -111,16 +117,26 @@ class DecoderLayer:
     ) -> torch.Tensor:
         """`hidden` is `(*batch, tokens, hc, hidden)`; returns the same shape."""
         p = self.params
+        # The sublayers work in `dtype` -- the width the GEMMs and the attention
+        # were built for -- and the residual streams are carried in
+        # `residual_dtype`.  The two are the same on a model whose activations fit
+        # in fp16 and they are not on this one: a routed expert's SwiGLU output
+        # passes 1e5, which fp16 saturates at 65504 and calls inf, and the inf
+        # lands in the residual where every later layer reads it.  What makes the
+        # split safe is that a sublayer only ever *sees* the collapsed stream,
+        # and that stream goes through `rms_norm` first -- so the sublayer's own
+        # arithmetic is on O(1) numbers however large the residual has grown.
+        residual = self.residual_dtype
         post, comb, collapsed = self.attn_hc.forward(hidden)
         collapsed = rms_norm(collapsed, self.weights.input_layernorm, p.rms_norm_eps)
         attend = self.attention.forward_absorbed if absorbed else self.attention.forward_expanded
-        attn_out = attend(collapsed, positions, cache=cache, start_pos=start_pos)
-        hidden = post.unsqueeze(-1) * attn_out.unsqueeze(-2) + torch.matmul(comb, hidden)
+        attn_out = attend(collapsed.to(self.dtype), positions, cache=cache, start_pos=start_pos)
+        hidden = post.unsqueeze(-1) * attn_out.to(residual).unsqueeze(-2) + torch.matmul(comb, hidden)
 
         post, comb, collapsed = self.ffn_hc.forward(hidden)
         collapsed = rms_norm(collapsed, self.weights.post_attention_layernorm, p.rms_norm_eps)
-        mlp_out = self.mlp(collapsed)
-        return post.unsqueeze(-1) * mlp_out.unsqueeze(-2) + torch.matmul(comb, hidden)
+        mlp_out = self.mlp(collapsed.to(self.dtype))
+        return post.unsqueeze(-1) * mlp_out.to(residual).unsqueeze(-2) + torch.matmul(comb, hidden)
 
     def collapse(self, hidden: torch.Tensor) -> torch.Tensor:
         """`hidden_states.mean(dim=2)` -- what the head does before the final norm."""

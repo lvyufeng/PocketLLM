@@ -66,6 +66,27 @@ class HyperConnectionWeights:
     hc_scale: torch.Tensor  # [3], one scalar per gate
 
     @classmethod
+    def from_gguf(cls, loader, gguf_prefix: str, params: Xing4_0Params, *, dtype: torch.dtype = torch.float32):
+        """`gguf_prefix` is `blk.N.hc_attn` or `blk.N.hc_ffn`.
+
+        The two sources name these three tensors differently and that is the whole
+        difference between this and `from_hf`: the checkpoint writes
+        `attn_hc.hc_fn` where the GGUF writes `hc_attn_fn.weight`.  The shapes are
+        the same, because GGUF's fastest-varying-first order already reverses
+        `[14336, 24]` into the `[24, 14336]` a `F.linear` wants.
+        """
+        mix = (2 + params.hc_mult) * params.hc_mult
+        wide = params.hc_mult * params.hidden_size
+        fn = loader.read_dense(f"{gguf_prefix}_fn.weight", dtype=dtype)
+        if tuple(fn.shape) != (mix, wide):
+            raise ValueError(f"{gguf_prefix}_fn.weight is {tuple(fn.shape)}, expected {(mix, wide)}")
+        return cls(
+            hc_fn=fn,
+            hc_base=loader.read_dense(f"{gguf_prefix}_base.weight", dtype=torch.float32),
+            hc_scale=loader.read_dense(f"{gguf_prefix}_scale.weight", dtype=torch.float32),
+        )
+
+    @classmethod
     def from_hf(cls, tensors: dict[str, torch.Tensor], params: Xing4_0Params, prefix: str) -> "HyperConnectionWeights":
         """`prefix` is `attn_hc` or `ffn_hc` -- the release names them per sublayer."""
         mix = (2 + params.hc_mult) * params.hc_mult
@@ -78,6 +99,22 @@ class HyperConnectionWeights:
             hc_base=tensors[f"{prefix}.hc_base"],
             hc_scale=tensors[f"{prefix}.hc_scale"],
         )
+
+
+def _load_hyper_connection_kernel():
+    """The built extension, or `None` when it has no such op.
+
+    `None` rather than raising: this is one kernel of many in a tree that also
+    builds for Ascend, and a forward pass that falls back to the eager arithmetic
+    is correct, just slower.  The op's absence is the only thing being tolerated
+    here -- an op that exists and fails still raises.
+    """
+    from src.kernels.cuda_loader import load_cuda_kernel
+
+    module = load_cuda_kernel()
+    if module is None or not hasattr(module, "xing4_hyper_connection_forward"):
+        return None
+    return module
 
 
 def sinkhorn(comb: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
@@ -98,7 +135,14 @@ def sinkhorn(comb: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
 class HyperConnection:
     """One `hc_*` block.  Stateless apart from the weights it is handed."""
 
-    def __init__(self, params: Xing4_0Params, weights: HyperConnectionWeights, *, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        params: Xing4_0Params,
+        weights: HyperConnectionWeights,
+        *,
+        dtype: torch.dtype = torch.float32,
+        use_kernel: bool = False,
+    ):
         self.params = params
         self.weights = weights
         self.dtype = dtype
@@ -110,6 +154,30 @@ class HyperConnection:
         self.iters = int(params.hc_sinkhorn_iters)
         self.clamp_min = float(params.hc_clamp_min)
         self.clamp_max = float(params.hc_clamp_max)
+        # The fused kernel is the same arithmetic in one dispatch instead of 300;
+        # `src/csrc/xing4_hyper_connection.cu` carries the measurement.  It is
+        # still opt-in because it is a second implementation of a forward pass,
+        # and the eager one is the definition: `tests/test_xing4_0_hyper_connection.py`
+        # pins this against it, and the GGUF model turns it on for a loaded
+        # checkpoint.
+        self.cuda = _load_hyper_connection_kernel() if use_kernel else None
+        self._kernel_fn: torch.Tensor | None = None
+
+    def _kernel_args(self, dtype: torch.dtype, device: torch.device):
+        """`hc_fn` cast to the activation's dtype and device once, not once a call.
+
+        The released GGUF keeps this projection in bf16 and the trunk runs fp16,
+        so the cast is real work on a 672 KiB tensor -- 24000 of them a decode
+        token is a second copy of the eager path's problem, from the other end.
+        """
+        if self._kernel_fn is None or self._kernel_fn.dtype != dtype or self._kernel_fn.device != device:
+            self._kernel_fn = self.weights.hc_fn.to(device=device, dtype=dtype).contiguous()
+        w = self.weights
+        return (
+            self._kernel_fn,
+            w.hc_base.to(device=device, dtype=torch.float32).contiguous(),
+            w.hc_scale.to(device=device, dtype=torch.float32).contiguous(),
+        )
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(..., hc, hidden)` -> `(post, comb, collapsed)`.
@@ -120,6 +188,30 @@ class HyperConnection:
         """
         hc = self.hc
         original_dtype = hidden_streams.dtype
+        if self.cuda is not None:
+            fn, base, scale = self._kernel_args(original_dtype, hidden_streams.device)
+            # The kernel is one block a row and takes rows; the block's own state
+            # is `(*batch, tokens, hc, hidden)`, and the eager path below works on
+            # that shape unchanged.  Flattening the leading axes is the same
+            # arithmetic, and the reshape back is a view.
+            lead = hidden_streams.shape[:-2]
+            rows = hidden_streams.reshape(-1, hc, hidden_streams.shape[-1])
+            post, comb, collapsed = self.cuda.xing4_hyper_connection_forward(
+                rows.contiguous(),
+                fn,
+                base,
+                scale,
+                hc,
+                self.iters,
+                self.eps,
+                self.clamp_min,
+                self.clamp_max,
+            )
+            return (
+                post.reshape(*lead, hc),
+                comb.reshape(*lead, hc, hc),
+                collapsed.reshape(*lead, collapsed.shape[-1]),
+            )
         # The reference writes `flatten(start_dim=2)` because its state is
         # `[batch, seq, hc, hidden]`; flattening the last two dims is the same
         # thing without requiring the batch and sequence axes to be separate.

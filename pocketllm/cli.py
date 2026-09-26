@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     serve_parser = subparsers.add_parser("serve", help="start the OpenAI-compatible server")
     serve_parser.add_argument("--model", required=True, help="checkpoint directory or model path")
-    serve_parser.add_argument("--backend", choices=["auto", "torch", "cpp", "v41", "mimo"], default="auto")
+    serve_parser.add_argument("--backend", choices=["auto", "torch", "cpp", "v41", "mimo", "xing4"], default="auto")
     serve_parser.add_argument("--tokenizer-path")
     serve_parser.add_argument("--config-path")
     serve_parser.add_argument("--model-format", choices=["auto", "safetensors", "gguf"], default="auto")

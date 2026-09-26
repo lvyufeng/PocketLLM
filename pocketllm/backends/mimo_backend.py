@@ -71,7 +71,7 @@ from pocketllm.api import (
     Usage,
 )
 
-from .base import BackendBase, byte_size, settled_text
+from .base import BackendBase, TokenStreamer, byte_size, settled_text
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the KV cache is sized at when ``--max-model-len`` is not given.
@@ -860,7 +860,7 @@ class MimoBackend(BackendBase):
             try:
                 prompt_ids = self._tokenize(request)
                 budget = self._budget(prompt_ids, request)
-                streamer = _Streamer(
+                streamer = TokenStreamer(
                     request_id=request.request_id,
                     stops=tuple(request.sampling_params.stop or ()),
                     events=events,
@@ -994,102 +994,6 @@ class MimoBackend(BackendBase):
                 # A peer that already left is not this rank's problem, and close() must not raise.
                 pass
         super().close()
-
-
-class _Streamer:
-    """The streaming half of a request: what has been sent, and what may be sent next.
-
-    Held in an object rather than in a closure because two of these fields (`sent` and the id list)
-    are written from the token callback and read from it again, and a closure that assigns to a name
-    it also reads is a local variable with an unbound first read.
-
-    The text is decoded from the run's tokens every token rather than incrementally, because a
-    byte-level tokenizer cannot decode a token in isolation: what it has is a byte stream, and one
-    token's bytes may end in the middle of a character. The whole decode is the only thing that
-    knows; ``settled_text`` is what keeps the half-character from being sent.
-
-    A stop string is *recorded* here and not raised. The loop it interrupts is a four-rank lockstep,
-    and only rank 0 has a stop string to find, so leaving on the spot would leave three peers inside
-    a layer's all-reduce. ``reached`` is handed to the per-step sync instead, which is a collective:
-    every rank then leaves at the same token boundary, one step after the marker was found. What the
-    client sees is the same text either way -- the cut has already been emitted by then.
-    """
-
-    def __init__(self, *, request_id: str, stops: Sequence[str], events: Any, decode: Any) -> None:
-        self.request_id = request_id
-        self.stops = tuple(stops)
-        self.events = events
-        self.decode = decode
-        self.ids: list[int] = []
-        self.text = ""
-        self.sent = ""
-        self.token = 0
-        self.hit = False
-
-    def reached(self) -> bool:
-        """Whether a stop string has been found, which is a local fact and only rank 0's."""
-        return self.hit
-
-    def accept(self, token: int) -> None:
-        """One token from the loop: send everything that is now settled, or end on a stop string."""
-        if self.hit:
-            return
-        self.ids.append(int(token))
-        self.token = int(token)
-        self.text = settled_text(self.decode(self.ids))
-        cut = self._cut(self.text)
-        if cut >= 0:
-            self._emit(self.text[:cut], token=self.token)
-            self.hit = True
-            return
-        self._emit(_hold_back(self.text, self.stops), token=self.token)
-
-    def flush(self, tokens: Sequence[int]) -> None:
-        """The answer is over: send the tail unless it is the start of a stop string.
-
-        Nothing was sent for it until now precisely because it could still have turned out to be a
-        marker. A stop string that never completed is text the model really wrote and goes out; one
-        that did complete was already cut at its first character.
-        """
-        text = settled_text(self.decode(list(tokens)))
-        cut = self._cut(text)
-        self._emit(text[:cut] if cut >= 0 else text)
-
-    def _cut(self, text: str) -> int:
-        return min((text.find(stop) for stop in self.stops if stop in text), default=-1)
-
-    def _emit(self, target: str, *, token: int | None = None) -> None:
-        """Send what `target` adds to what has already gone out.
-
-        The id travels with the text because the server's own counters and its inter-token
-        latency are keyed off an event that carries one: a stream of text-only events is a
-        response a client renders and a metrics scrape reads as zero tokens and no TTFT.
-        """
-        if len(target) > len(self.sent):
-            self.events.put(
-                TokenEvent(
-                    request_id=self.request_id,
-                    token_id=token,
-                    text=target[len(self.sent) :],
-                )
-            )
-            self.sent = target
-
-
-def _hold_back(text: str, stops: Sequence[str]) -> str:
-    """``text`` without a tail that is a *partial* match of a stop string.
-
-    A stream cannot take a character back, so a tail that could still turn out to be the start of a
-    marker waits for the token that decides it. A whole stop string at the end is not held: the
-    caller has already cut the answer at it, and holding one here would delay text that is not
-    going to be sent again.
-    """
-    keep = 0
-    for stop in stops:
-        for size in range(1, min(len(stop) - 1, len(text)) + 1):
-            if text.endswith(stop[:size]):
-                keep = max(keep, size)
-    return text[: len(text) - keep] if keep else text
 
 
 __all__ = [
