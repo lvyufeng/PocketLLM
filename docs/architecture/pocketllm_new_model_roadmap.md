@@ -228,11 +228,20 @@ operation for operation by the two published implementations of it, which is wha
 here. It also re-reads this document's Stage 2 table against the artifacts and produces the per-token
 byte table that the stage's final task is measured against.
 
+Xing4.0's third task has landed and is [measured on sm_75](../performance/xing4_0_attention_sm75.md):
+the MLA attention is ported in both the expanded form the checkpoint's own code uses and the absorbed
+form its released GGUF is shaped for, the two agree with the reference and with each other, and the
+cost measurement found the thing worth knowing. The expected geometry held — 2.117 GiB of attention
+weights per decode token against the MoE's 0.877 GiB, so the attention is not the bottleneck at the
+contexts this card holds — but the way the absorbed score is naturally written re-reads the cache once
+per head, and folding the head axis into the GEMM's `M` dimension took the 32K decode step from 2.991
+to 0.516 ms per layer. Prefill takes the expanded form and decode the absorbed one; the gap is 3.2x at
+2048 tokens and 20x at 32768.
+
 A stage that dies at its gate is a result, and it goes in this document rather than the issue tree being
 quietly pruned. That is the same convention the old-hardware roadmap follows: it records what was
 measured and closed — the FP4 cross-layer prefetch, the score-split hybrid, the resident expert cache —
 and not only what shipped.
-
 ## Evidence
 
 Everything in this document is read from the artifacts rather than from documentation: the GGUF
