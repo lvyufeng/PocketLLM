@@ -138,6 +138,7 @@ def generate(
     chunk: int = DEFAULT_PREFILL_CHUNK,
     cache: Any = None,
     prefix_cache: Any = None,
+    decode_step: Any = None,
     on_token: Callable[[int, torch.Tensor], None] | None = None,
     on_step: Callable[[], bool] | None = None,
 ) -> Generation:
@@ -158,6 +159,20 @@ def generate(
     prompt.  It is consulted once, before anything is forwarded, and what it hands
     back is the state a cold prefill of the same tokens leaves -- see
     :mod:`src.models.xing4_0.prefix_cache`.
+
+    `decode_step` is how a decode step is taken, or `None` for the eager forward.  It is a caller's object
+    rather than something this function builds, because a :class:`~src.models.xing4_0.graphs.DecodeGraphs`
+    holds its cache's own addresses: a server records a rung once and every later request replays it,
+    which only works if the holder outlives the request.  Anything with a
+    `step(token, cache, position) -> logits` will do, and `generate` tells it how far this run goes
+    through an optional `reserve(upto)` so that the recording cost lands in one step rather than in
+    whichever step first crosses a bucket boundary.
+
+    **The prefill is eager whatever `decode_step` is.**  A chunk is a different shape and a different mask
+    and it is not what a graph is for; what the graphs change is one line of the loop below, and with
+    it the *submission* of the step and not its arithmetic.  See
+    :mod:`src.models.xing4_0.graphs` for the captured step and :mod:`src.models.xing4_0.decode_pos`
+    for the position that makes it replayable at more than one place.
     """
     ids = [int(token) for token in prompt_ids]
     if not ids:
@@ -167,8 +182,20 @@ def generate(
         raise ValueError(f"a budget of {budget} tokens is not a generation")
     if chunk <= 0:
         raise ValueError(f"a chunk of {chunk} tokens is not a chunk")
+    if decode_step is not None and cache is None:
+        raise ValueError(
+            "a captured decode step replays against the buffers it was recorded from, so a caller "
+            "with graphs has to pass that cache rather than have one built here"
+        )
     if cache is None:
         cache = model.make_cache(len(ids) + budget + 8, batch=1)
+    if decode_step is not None:
+        # One past the last position any step of this run writes, so every rung it will need is
+        # recorded at the first step. A hint, and optional: a rung nobody reserved is still recorded
+        # when a step first needs it, one boundary at a time.
+        reserve = getattr(decode_step, "reserve", None)
+        if reserve is not None:
+            reserve(len(ids) + budget)
 
     generator = None
     if temperature > 1e-5:
@@ -200,6 +227,13 @@ def generate(
     first = time.perf_counter()
 
     eos = _eos_set(eos_token_id)
+    if decode_step is None:
+        def forward_one(token: int, position: int) -> torch.Tensor:
+            return model.forward([token], cache=cache, start_pos=position)
+    else:
+        def forward_one(token: int, position: int) -> torch.Tensor:
+            return decode_step.step(token, cache, position)
+
     tokens: list[int] = []
     stopped = "length"
     first_step = 0.0
@@ -223,7 +257,7 @@ def generate(
         # cache holding exactly `len(ids)`, which is what makes this arithmetic
         # rather than a counter to keep.
         step_started = time.perf_counter()
-        step = model.forward([token], cache=cache, start_pos=len(ids) + index)
+        step = forward_one(token, len(ids) + index)
         if index == 0:
             first_step = time.perf_counter() - step_started
         logits = step[-1]

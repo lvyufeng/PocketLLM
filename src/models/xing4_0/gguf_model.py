@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from src.models.xing4_0.attention import MLAAttentionWeights
 from src.models.xing4_0.block import DecoderLayer, DecoderLayerWeights, rms_norm
 from src.models.xing4_0.config import Xing4_0Params
+from src.models.xing4_0.decode_pos import Pos
 from src.models.xing4_0.hyper_connection import HyperConnectionWeights
 from src.models.xing4_0.mlp import GroupedExpertStack, MoEWeights, RoutedMoE, SwiGLUMLP
 
@@ -287,14 +288,25 @@ class Xing4_0GGUFModel:
         input_ids: torch.Tensor,
         *,
         cache=None,
-        start_pos: int = 0,
+        start_pos: "int | Pos" = 0,
         absorbed: bool = True,
     ) -> torch.Tensor:
-        """`[tokens]` -> `[tokens, vocab]` fp32 logits."""
+        """`[tokens]` -> `[tokens, vocab]` fp32 logits.
+
+        `start_pos` is an `int` for every eager caller and a `Pos` for a decode step a graph replays.
+        The one place the two differ here is the rotary table's row: a Python `int` is a value a
+        capture freezes, so on the device path the table is built as `arange(seq) + pos` — the same
+        numbers, from an index tensor the graph reads.  See :mod:`src.models.xing4_0.decode_pos`.
+        """
+        pos = Pos.of(start_pos)
         hidden = self.embed(input_ids)
-        positions = torch.arange(
-            int(start_pos), int(start_pos) + hidden.shape[1], device=self.device, dtype=torch.float32
-        ).unsqueeze(0)
+        seq = hidden.shape[1]
+        if pos.on_device:
+            positions = (torch.arange(seq, device=self.device, dtype=torch.float32) + pos.row()).unsqueeze(0)
+        else:
+            positions = torch.arange(
+                pos.host, pos.host + seq, device=self.device, dtype=torch.float32
+            ).unsqueeze(0)
         for index, block in enumerate(self.blocks):
             hidden = block.forward(
                 hidden,
@@ -303,7 +315,7 @@ class Xing4_0GGUFModel:
                 # per layer -- a 512 latent and its 64-wide rope key -- so a list
                 # is 40 x 576 a token and not a single tensor of that width.
                 cache=None if cache is None else cache[index],
-                start_pos=start_pos,
+                start_pos=pos,
                 absorbed=absorbed,
             )
         collapsed = block_collapse(hidden)
