@@ -90,6 +90,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 - [Roadmap for old hardware](https://lvyufeng.github.io/PocketLLM/architecture/pocketllm_roadmap_old_hardware/)
 - [New model roadmap](https://lvyufeng.github.io/PocketLLM/architecture/pocketllm_new_model_roadmap/)
 - [Ternary-Bonsai-2-27B reference gate](https://lvyufeng.github.io/PocketLLM/architecture/ternary_bonsai_2_reference_gate/)
+- [Xing4.0-29B-A4B checkpoint audit](https://lvyufeng.github.io/PocketLLM/architecture/xing4_0_29b_a4b_audit/)
 - [Ternary-Bonsai-2-27B dense GEMM](https://lvyufeng.github.io/PocketLLM/architecture/ternary_bonsai_2_dense_gemm/)
 - [Ternary-Bonsai-2-27B served runtime](https://lvyufeng.github.io/PocketLLM/architecture/bonsai_2_27b_design/)
 - [vLLM and SGLang architecture analysis](https://lvyufeng.github.io/PocketLLM/architecture/vllm_sglang_architecture_analysis/)

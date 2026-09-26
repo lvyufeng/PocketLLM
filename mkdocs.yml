@@ -176,6 +176,7 @@ nav:
       - Roadmap for old hardware: architecture/pocketllm_roadmap_old_hardware.md
       - New model roadmap: architecture/pocketllm_new_model_roadmap.md
       - Ternary-Bonsai-2-27B reference gate: architecture/ternary_bonsai_2_reference_gate.md
+      - Xing4.0-29B-A4B checkpoint audit: architecture/xing4_0_29b_a4b_audit.md
       - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
       - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
       - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
