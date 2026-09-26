@@ -47,7 +47,7 @@ Four of those models are served end to end over the OpenAI-compatible API:
   block** mixed by a matrix hyper-connection — released as an official `IQ4_NL` GGUF that fits a 22 GiB
   card whole, so **all 64 experts of all 38 MoE blocks stay resident** and there is no host bank and no
   tensor parallel group. `pocketllm serve --backend xing4` answers chat with SSE streaming, cancel and
-  `/metrics`: **78.69 tok/s of prefill** at a 4,096-token prompt and **6.52 tok/s of decode**, flat in
+  `/metrics`: **75.22 tok/s of prefill** at a 4,096-token prompt and **6.72 tok/s of decode**, flat in
   context to 32,768 tokens. The run found two defects the unit tests could not — the four residuals
   were carried at fp16 while the checkpoint's activations reach 1e5, and a shared cache was never reset
   between requests — and both are fixed and guarded. Decode is now launch-bound rather than
@@ -183,7 +183,7 @@ the checkpoint fits on one**.
 | [MiMo-V2.6-Flash](models/mimo-v2.6-flash.md) | Safetensors FP8 E4M3 dense + MXFP4 experts | `pocketllm serve --backend mimo`, 48 layers on the cards, experts out of a 149.81 GiB host bank, TP4 | 104.04 tok/s prefill at a 262,144-token prompt, 5.56 tok/s decode at that depth, 6.40 tok/s at a short context and 8.53 with experts resident |
 | [Qwen3.8-27B-FP8](models/qwen3.8-27b-fp8.md) | Safetensors FP8 E4M3 | C++/CUDA TP4, GPU-resident FP8 | 864.54 tok/s prefill, 43.22 tok/s decode on a 512-token prompt |
 | [Ternary-Bonsai-2-27B](models/ternary-bonsai-2-27b.md) | GGUF `PTQ1_0` (GGML type 143), 1.75 bits a weight, 5.53 GiB | `pocketllm serve`, native C++/CUDA, **one card**, no flag needed | **636.0 tok/s prefill** at a 4,096-token prompt and 25.9 tok/s decode, against the same card's upstream reference of 642.5 and 30.7 |
-| [Xing4.0-29B-A4B](models/xing4.0-29b-a4b.md) | GGUF `IQ4_NL` (GGML type 20), 4.5 bits a weight, 17.94 GiB resident | `pocketllm serve --backend xing4`, **one card**, all 64 experts of every layer resident | **78.69 tok/s prefill** at a 4,096-token prompt and 6.52 tok/s decode, 84.39 tok/s prefill at 512 tokens; decode is host-launch-bound, not bandwidth-bound |
+| [Xing4.0-29B-A4B](models/xing4.0-29b-a4b.md) | GGUF `IQ4_NL` (GGML type 20), 4.5 bits a weight, 17.94 GiB resident | `pocketllm serve --backend xing4`, **one card**, all 64 experts of every layer resident | **75.22 tok/s prefill** at a 4,096-token prompt and 6.72 tok/s decode, 79.15 tok/s prefill at 512 tokens; decode is host-launch-bound, not bandwidth-bound |
 | [DeepSeek-V4-Flash](models/deepseek-v4.md) | Safetensors FP4/FP8; GGUF Q2/IQ2/IQ1 | PyTorch heterogeneous, C++/CUDA, GGUF TP4 | C++ FP4: ~401 tok/s prefill at 32K–64K; ~3.7 tok/s decode |
 | [MiniMax-M2.7](models/minimax-m2.7.md) | GGUF `UD-IQ1_M` | Raw-block CUDA, GGUF TP4 | 256-token prefill ~104.9–107 tok/s; 43-layer decode benchmark 10.32 tok/s |
 | [GLM-5.2](models/glm-5.2.md) | GGUF `UD-Q2_K_XL` | Raw-block CUDA, GGUF TP4 | ~0.79 tok/s prefill; ~0.66 tok/s decode |

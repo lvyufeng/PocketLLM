@@ -184,6 +184,18 @@ def generate(
         # *prompt* leaves, and by the time the answer is finished the cache holds
         # the answer's rows too.
         prefix_cache.store(ids, snapshot(cache, len(ids)))
+    # The prompt's work is asynchronous and this seam is a host clock, so without a drain the two
+    # fields below are not the two things they are named after: the last prefill chunk is still in
+    # flight when `prefill` is read, and it lands inside the *first* `sample_token` instead -- so
+    # `prefill_seconds` under-reports by that chunk's device time and `decode_seconds` over-reports
+    # by exactly as much. Measured, not reasoned about: a 512-token prompt prefilled in one 512-wide
+    # chunk reports 3.2 s of decode over a loop whose own steps are 138 ms each and which therefore
+    # took 1.0 s, and the missing 2.1 s is that chunk; the same prompt in four 128-wide chunks
+    # reports the same loop as 1.5 s, because the chunk left in flight is a quarter the size. It is
+    # a rate bug and not a latency one -- a client waits for the same wall either way, and `ttft`
+    # below has always included the drain -- but every decode rate this repository has published for
+    # this model was read off the wrong side of it.
+    _drain(model)
     prefill = time.perf_counter() - started
     first = time.perf_counter()
 
@@ -290,3 +302,18 @@ def _eos_set(eos_token_id: Sequence[int] | int | None) -> set[int]:
     if isinstance(eos_token_id, int):
         return {int(eos_token_id)}
     return {int(token) for token in eos_token_id}
+
+
+def _drain(model: Any) -> None:
+    """Wait for the device, when the model is on one, so that a host clock can be a device fact.
+
+    Guarded rather than assumed because `generate` is driven by a fake model on the host in
+    `tests/test_xing4_0_serving.py`, and because a caller may hand it a CPU model: on either of
+    those this is correctly a no-op.
+    """
+    device = getattr(model, "device", None)
+    if device is None:
+        return
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)

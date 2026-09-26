@@ -34,7 +34,7 @@ from pocketllm.backends.xing4_backend import (
     _Options,
     resolve_paths,
 )
-from src.models.xing4_0.generate import Generation, generate, sample_token
+from src.models.xing4_0.generate import Generation, _drain, generate, sample_token
 from src.models.xing4_0.prefix_cache import LatentPrefixCache, restore, snapshot
 
 # ---------------------------------------------------------------------------- stand-ins
@@ -254,6 +254,59 @@ def test_a_chunked_prompt_is_forwarded_in_chunks_and_masked_at_the_seam() -> Non
     cache = model.make_cache(32)
     generate(model, list(range(1, 11)), max_new_tokens=1, eos_token_id=99, cache=cache, chunk=4)
     assert model.forwards[:3] == [([1, 2, 3, 4], 0), ([5, 6, 7, 8], 4), ([9, 10], 8)]
+
+
+def test_the_prompt_and_the_decode_are_split_by_a_device_drain() -> None:
+    """The seam between the two clocks is a device fact, and it is exactly where it has to be.
+
+    `prefill_seconds` and `decode_seconds` are two host clocks around a boundary the device does
+    not have: a forward is asynchronous, so without a drain the last prefill chunk is still running
+    when the first clock is read and it lands inside the first `sample_token` instead -- charging
+    the prompt to the decode loop.  So the drain's position is the whole of this test, and a fake
+    `torch.cuda.synchronize` is how it is observed on a machine that has no card.
+
+    Two forwards of a four-token prompt at `chunk=2`, then the drain, then the two decode steps a
+    three-token budget takes.  A version that drained at the end of the loop, or per step, or not
+    at all, produces a different log.
+    """
+    model = ScriptedModel(scripted=(11, 12, 13, 14))
+    model.device = torch.device("cuda:3")
+    events: list[str] = []
+    inner = model.forward
+
+    def recording_forward(*args, **kwargs):
+        events.append("forward")
+        return inner(*args, **kwargs)
+
+    model.forward = recording_forward
+    drained: list[object] = []
+    original = torch.cuda.synchronize
+
+    def fake_synchronize(device=None):
+        events.append("drain")
+        drained.append(device)
+
+    torch.cuda.synchronize = fake_synchronize
+    try:
+        result = generate(
+            model, [1, 2, 3, 4], max_new_tokens=3, eos_token_id=99,
+            cache=model.make_cache(64), chunk=2,
+        )
+    finally:
+        torch.cuda.synchronize = original
+    assert events == ["forward", "forward", "drain", "forward", "forward"]
+    # The device it was told to wait for is the model's own, and not one read off a default.
+    assert drained == [torch.device("cuda:3")]
+    # And the drain is charged to the prompt, which is what `ttft` has always meant.
+    assert result.prefill_seconds > 0 and result.ttft_seconds == result.prefill_seconds
+
+
+def test_the_drain_is_a_no_op_off_the_device() -> None:
+    """`generate` is driven by a host stand-in in this file, and may be driven by a CPU model."""
+    plain = ScriptedModel()
+    assert not hasattr(plain, "device")
+    _drain(plain)  # a model that names no device at all
+    _drain(SimpleNamespace(device="cpu"))  # a device, and not one there is anything to wait for
 
 
 def test_the_loop_resumes_from_the_store_and_forwards_only_the_remainder() -> None:

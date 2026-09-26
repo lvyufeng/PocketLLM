@@ -31,6 +31,19 @@ The first generated token is produced by the prompt forward and therefore belong
 
 Do not report a combined tokens/s number as a replacement for these two fields. Combined throughput is useful only as an additional end-to-end figure.
 
+**The seam between the two is a device fact, not a host clock.** A forward is asynchronous: the host
+returns from the prompt's forward with its kernels still in flight, so a clock read at that moment
+does not measure the prefill. Without a synchronisation there, the prompt's remaining work drains
+inside the *first* decode step instead — `prefill_seconds` under-reports by the last chunk's device
+time and `decode_seconds` over-reports by exactly as much. The size of that error is not a constant:
+it follows the width of the last prefill chunk and the depth of the context, so it distorts the two
+rates against each other and distorts a decode-versus-context trend most of all.
+
+So a timed path has to drain at the seam. `src/models/xing4_0/generate.py`'s `_drain` is that, and
+what it removes is measured in
+[Xing4.0-29B-A4B: the prefill/decode seam](../performance/xing4_0_rate_clock_split.md). The same seam
+is in `src/models/mimo_v2/generate.py`, where it has not been re-measured.
+
 This is one of two conventions in this repository. For client-observed serving
 numbers — TTFT, TPOT, ITL, E2EL, throughput and goodput, defined the way vLLM
 defines them — see [Serving latency metrics](latency_metrics.md). The two answer

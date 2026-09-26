@@ -72,11 +72,17 @@ so a decode token reads 2.12 GiB of attention weights against the routed experts
 | `hc_*`, router, norms, embedding | 0.086 | 2.3% |
 | **Total** | **3.761** | |
 
-On a 2080 Ti's 616 GB/s that is a 6.56 ms floor, or 152 tok/s. **The measured decode rate is 5.7
-tok/s, and the reason is not the bytes.** A step submits 11,536 kernel launches, each costing about
+On a 2080 Ti's 616 GB/s that is a 6.56 ms floor, or 152 tok/s. **The measured decode rate is 6.7 tok/s,
+and the reason is not the bytes.** A step submits 11,536 kernel launches, each costing about
 15 µs of host time, so 178 ms of host submission against 46.5 ms of device work: the GPU is idle
 three-quarters of a decode step and the card's bandwidth is barely touched. That is the honest state
 of this runtime and it is where its remaining work is — see **Known limitations**.
+
+Every rate below is from the corrected instrument: the seam between the prompt and the decode loop is
+drained, so what the two clocks report is what the two phases cost. That correction moved decode from
+6.50 to 6.75 tok/s at a 512-token context and from 6.07 to 6.76 at 32,768, and it is what makes the
+trend flat rather than falling — see
+[the record](../performance/xing4_0_rate_clock_split.md).
 
 ### One token's path
 
@@ -176,25 +182,30 @@ of the activations and a prompt made of noise routes to experts a served request
 
 | Prompt | Prefill | Decode, all steps | Decode, steady | First step |
 | ---: | ---: | ---: | ---: | ---: |
-| 512 | 84.39 tok/s (6.07 s) | 6.50 tok/s | 6.51 tok/s | 158 ms |
-| 4,096 | 78.69 tok/s (52.1 s) | 6.52 tok/s | 6.50 tok/s | 143 ms |
-| 16,384 | 68.54 tok/s (239 s) | 6.45 tok/s | 6.43 tok/s | 141 ms |
-| 32,768 | 63.84 tok/s (513 s) | 6.07 tok/s | 6.06 tok/s | 152 ms |
+| 512 — the process's first request | 77.84 tok/s (6.58 s) | 6.69 tok/s | 6.72 tok/s | 171 ms |
+| 512 | 79.15 tok/s (6.47 s) | 6.75 tok/s | 6.75 tok/s | 146 ms |
+| 4,096 | 75.22 tok/s (54.5 s) | 6.72 tok/s | 6.72 tok/s | 150 ms |
+| 16,384 | 68.30 tok/s (239.9 s) | 6.74 tok/s | 6.74 tok/s | 146 ms |
+| 32,768 | 64.36 tok/s (509.2 s) | 6.76 tok/s | 6.76 tok/s | 145 ms |
 
 Every row is at a 128-token prefill chunk, which is what the card's room at a 32,768-token context
-affords — the chunk is a memory decision and not a tuning one, see **Hardware and memory**.
+affords — the chunk is a memory decision and not a tuning one, see **Hardware and memory**. The
+512-token row is measured twice on purpose: the first request of a process is not the same
+measurement as a warm one, and the difference is 0.9% of the rate and 25 ms of its first step.
 
 Three things to read with the table:
 
-- **Decode is flat in context** — 6.50 → 6.07 tok/s from a 512- to a 32,768-token context, a 7% fall
-  across 64× the depth. The absorbed cache means a decode step reads 576 values a layer a token
-  regardless of how much context is behind it, so growing the context barely changes what a step
-  touches.
-- **Prefill falls 24% from 512 to 32,768 tokens**, which is the quadratic attention term appearing
+- **Decode is flat in context** — 6.75 → 6.76 tok/s from a 512- to a 32,768-token context, which is a
+  0.6% spread across 64× the depth. The absorbed cache means a decode step reads 576 values a layer a
+  token regardless of how much context is behind it, so growing the context barely changes what a step
+  touches. A previous version of this table read 6.50 down to 6.07 — a 7% *fall* — and that trend was
+  an artefact of the prefill/decode seam rather than of the model; see
+  [the record](../performance/xing4_0_rate_clock_split.md).
+- **Prefill falls 19% from 512 to 32,768 tokens**, which is the quadratic attention term appearing
   against a linear MoE term: the MoE kernels are 75% of prefill at short prompts and the attention
   takes a growing share of a long one.
 - **The first decode step is reported separately because a cold one is not a steady one.** In a warm
-  process it is 141–158 ms, indistinguishable from the rest. In a *fresh* process, where the allocator
+  process it is 145–150 ms, indistinguishable from the rest. In a *fresh* process, where the allocator
   has never held a request-sized working set, it is 0.6 s after a 4,096-token prefill and 3.0 s after
   a prefill with a 1024-wide chunk — a one-off allocation, paid once, and large enough to pull a
   32-token answer's average measurably below its steady rate. Both figures are real; a report that
@@ -213,15 +224,21 @@ Same 512-token prompt, `--max-model-len 8192`, chunk 128, 32 decode steps:
 
 | | Prefill | Decode | Steady |
 | --- | ---: | ---: | ---: |
-| One process, one card | 86.28 tok/s | 6.48 tok/s | 6.50 tok/s |
-| Two processes, cards 0 and 1 — the first | 84.79 tok/s | 6.52 tok/s | 6.52 tok/s |
-| Two processes, cards 0 and 1 — the second | 85.89 tok/s | 6.53 tok/s | 6.53 tok/s |
+| One process, one card | 83.94 tok/s | 7.10 tok/s | 7.10 tok/s |
+| Two processes, cards 0 and 1 — the first | 82.81 tok/s | 7.27 tok/s | 7.27 tok/s |
+| Two processes, cards 0 and 1 — the second | 84.29 tok/s | 7.09 tok/s | 7.09 tok/s |
 
-Both concurrent runs hold the single-run rate to within 2%, so the aggregate is 2× at no cost to
-either: neither the card nor the host submission path is shared. A 4×2080 Ti box therefore serves this
-checkpoint as four independent servers, and the number of interest is the one the header asks about —
-**17.94 GiB of 22 GiB resident, 3.4 GiB left over, so about 85% of each card is the model and the rest
-is context.**
+Both concurrent runs hold the single-run rate to within 3%, and the fastest decode in the table belongs
+to a concurrent process, so there is no concurrency cost being rounded away: neither the card nor the
+host submission path is shared. A 4×2080 Ti box therefore serves this checkpoint as four independent
+servers, and the number of interest is the one the header asks about — **17.94 GiB of 22 GiB resident,
+3.4 GiB left over, so about 85% of each card is the model and the rest is context.**
+
+Each process above was measured twice on the same prompt and the row is its warm request; the cold
+first one was 81.75 tok/s and 7.03 tok/s alone, 79.33/7.19 and 80.82/7.05 concurrent, with a 158–170 ms
+first decode step against 135–139 warm — the same one-off allocation the table above reports. These
+rows were re-measured alongside the corrected table and moved the way that correction predicts; see
+[the record](../performance/xing4_0_rate_clock_split.md#the-two-card-table).
 
 ### Against the Qwen3.8-27B paths at comparable size
 
@@ -232,8 +249,8 @@ repository with.
 | | Xing4.0-29B-A4B, 1 card, IQ4_NL | Ternary-Bonsai-2-27B, 1 card, 1.75 bit | Qwen3.8-27B-FP8, 4 cards, TP4 |
 | --- | ---: | ---: | ---: |
 | Weights | 17.94 GiB resident | 5.53 GiB | 6.86 GiB a rank |
-| Prefill, 4,096 tokens | **78.7 tok/s** | 636.0 tok/s | 1,729 tok/s |
-| Decode, 4,096-token context | **6.52 tok/s** | 25.9 tok/s | 43.8 tok/s |
+| Prefill, 4,096 tokens | **75.2 tok/s** | 636.0 tok/s | 1,729 tok/s |
+| Decode, 4,096-token context | **6.72 tok/s** | 25.9 tok/s | 43.8 tok/s |
 | Architecture | MLA + 64-expert MoE, 4 streams | hybrid GQA, dense FFN | full GQA, dense FFN |
 | Runtime | PyTorch eager + raw-block kernels | C++ engine | C++ engine |
 
@@ -267,7 +284,7 @@ questions — what the runtime will promise, and what the card can just barely d
 
 ## Known limitations
 
-- **Decode runs at 6.5 tok/s against a 152 tok/s byte floor, and the gap is host submission.** A
+- **Decode runs at 6.7 tok/s against a 152 tok/s byte floor, and the gap is host submission.** A
   decode step is 11,536 kernel launches; at about 15 µs each that is 178 ms of host time against
   46.5 ms of device work, so the GPU is idle three-quarters of the step and the card's 616 GB/s is
   barely used. Nothing about the checkpoint explains it — the bytes a token reads are 3.76 GiB, which
@@ -285,7 +302,7 @@ questions — what the runtime will promise, and what the card can just barely d
   and a per-layer collective would add to the host cost that decode is bound by instead of subtracting
   from it. What a second card is for here is **aggregate throughput and context**, and both were
   measured. Two server processes, one a card, prefill the same 512-token prompt concurrently at
-  **84.79 and 85.89 tok/s against 86.28 alone** and decode at **6.52 and 6.53 tok/s against 6.48
+  **82.81 and 84.29 tok/s against 83.94 alone** and decode at **7.27 and 7.09 tok/s against 7.10
   alone** — 2× the throughput at no cost to either, because neither the card nor the host path is
   shared. Running one process a card is therefore the supported multi-card shape for this checkpoint,
   and the TP2 question — whether sharding the MoE and the MLA path would raise a *single* stream's
