@@ -161,6 +161,7 @@ nav:
       - Serving concurrency and throughput: performance/serving_throughput_scaling.md
       - Xing4.0-29B-A4B MLA attention on sm_75: performance/xing4_0_attention_sm75.md
       - Xing4.0-29B-A4B hyper-connection on sm_75: performance/xing4_0_hyper_connection_sm75.md
+      - Xing4.0-29B-A4B decode launch gap: performance/xing4_0_decode_launch_gap.md
   - Architecture:
       - Overview: architecture/index.md
       - MiMo-V2.6-Flash design and measurements: architecture/mimo_v2_6_flash_design.md

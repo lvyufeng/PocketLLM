@@ -315,6 +315,29 @@ Two things follow, and both are left for a later stage rather than half-done her
 - **Fewer, larger kernels is the other**, and the fused hyper-connection kernel is the evidence for
   what it is worth: 2.17× and 5,800 launches gone at once.
 
+**Both were then measured, and this section's premise was wrong about where the host time goes.**
+[Xing4.0-29B-A4B: the decode step's launch count, and what a graph buys](../performance/xing4_0_decode_launch_gap.md)
+profiles the step by name and prices the ceiling. The step hands the host **22,155 ATen dispatches**,
+of which **10,508 are metadata-only** (`view`, `reshape`, `as_strided` and their kin, 24 ms of host
+time for nothing) and a further **4,349 are fp16↔fp32 casts** (21 ms); those submit **5,346
+`cudaLaunchKernel` calls for 5,577 kernels that take 46 ms of device time**. A whole-step CUDA graph at
+a frozen position then takes the step to **38.0 ms at bit-identical logits**, with the card at 100% of
+the step and zero host submissions. Three corrections to what is above:
+
+- **The hostile site is one, not three.** It is `torch.bincount` in `plan_routes`, which sizes its
+  output from the data's maximum and so reads it back — **76 device-to-host copies and 78 stream
+  drains a step**. Removed there; its own cost was 3.6 ms of the step, so it was never the bottleneck,
+  but it is what refused the capture.
+- **A `.item()` is not among them.** `generate.sample_token` reads the logits row back, and that is at
+  the end of the step rather than inside it, so a graphed step excludes it by construction.
+- **`torch.compile` is not a substitute.** It refuses cudagraphs on the step's mutated inputs and
+  cannot trace the two pybind MoE ops, so it lands at 1.15× against the hand graph's 4.2× or better.
+
+The fused-kernel lever is unchanged and is the *second* one: once the graph removes the submission
+cost the step is device-bound at 38 ms, which is the number the fusions have to be priced against.
+This section's own 11,536 launches does not reconcile with the profile above's 5,346 submissions and
+5,577 kernels — different instruments, and the newer pair is the one that can be reproduced.
+
 **A conditional number, honestly.** `generate` reports `first_step_seconds` as well as
 `step_seconds`, because the first decode step after a prefill is not a steady-state step. In a warm
 process it is 141–158 ms and indistinguishable from the rest. In a *fresh* process, where the
