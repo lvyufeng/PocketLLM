@@ -7062,6 +7062,78 @@ __device__ __forceinline__ float iq4xs_block_dot_256(
     return local;
 }
 
+// A 256-element span of IQ4_NL is eight consecutive 18-byte blocks, 144 bytes.
+// The runtime's other nine formats all have a 256-weight block with an internal
+// scale table; IQ4_NL's scale is per 32, so this walks the eight sub-blocks
+// instead of unpacking one header.  `block_bytes` stays 144 for every row, and
+// the loader folds eight native blocks into it, so the four GEMM kernels above
+// need no IQ4_NL case of their own.
+//
+// The nibble order is the one `src/loader/gguf/iq4_nl.py` decodes: low nibble of
+// qs[j] is weight j, high nibble is weight j + 16.  It is IQ4_XS's packing, not
+// an alternating one, and getting it wrong is a permutation that still produces
+// plausible numbers.
+__device__ __forceinline__ float iq4nl_block_dot_256(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane) {
+    const int byte_idx = lane & 15;
+    const int hi_half = lane >> 4;
+    float local = 0.0f;
+    #pragma unroll
+    for (int sub = 0; sub < 8; ++sub) {
+        const uint8_t* b = block + sub * 18;
+        const float d = gguf_block_scale_f16(b);
+        const uint8_t q = b[2 + byte_idx];
+        const int nib = hi_half ? (q >> 4) : (q & 0x0F);
+        local += x_shared[sub * 32 + lane] * d * static_cast<float>(kIQ4NLValues[nib]);
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local += __shfl_down_sync(0xffffffff, local, offset);
+    }
+    return local;
+}
+
+__device__ __forceinline__ void iq4nl_block_dot_256_rows4(
+    const float* __restrict__ x_shared,
+    const uint8_t* __restrict__ block,
+    int lane,
+    int valid_rows,
+    float* __restrict__ acc) {
+    const int byte_idx = lane & 15;
+    const int hi_half = lane >> 4;
+    float local0 = 0.0f;
+    float local1 = 0.0f;
+    float local2 = 0.0f;
+    float local3 = 0.0f;
+    #pragma unroll
+    for (int sub = 0; sub < 8; ++sub) {
+        const uint8_t* b = block + sub * 18;
+        const float d = gguf_block_scale_f16(b);
+        const uint8_t q = b[2 + byte_idx];
+        const float v = d * static_cast<float>(kIQ4NLValues[hi_half ? (q >> 4) : (q & 0x0F)]);
+        const int k = sub * 32 + lane;
+        local0 += x_shared[k] * v;
+        if (valid_rows > 1) local1 += x_shared[256 + k] * v;
+        if (valid_rows > 2) local2 += x_shared[512 + k] * v;
+        if (valid_rows > 3) local3 += x_shared[768 + k] * v;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local0 += __shfl_down_sync(0xffffffff, local0, offset);
+        if (valid_rows > 1) local1 += __shfl_down_sync(0xffffffff, local1, offset);
+        if (valid_rows > 2) local2 += __shfl_down_sync(0xffffffff, local2, offset);
+        if (valid_rows > 3) local3 += __shfl_down_sync(0xffffffff, local3, offset);
+    }
+    if (lane == 0) {
+        acc[0] += local0;
+        if (valid_rows > 1) acc[1] += local1;
+        if (valid_rows > 2) acc[2] += local2;
+        if (valid_rows > 3) acc[3] += local3;
+    }
+}
+
 __device__ __forceinline__ float gguf_quant_block_dot_256(
     const float* __restrict__ x_shared,
     const uint8_t* __restrict__ block,
@@ -7115,6 +7187,9 @@ __device__ __forceinline__ float gguf_quant_block_dot_256(
         if (lane == 0) acc += blk;
     } else if (type_id == 8) {
         const float blk = q6k_block_dot_256(x_shared, block, lane);
+        if (lane == 0) acc += blk;
+    } else if (type_id == 20) {
+        const float blk = iq4nl_block_dot_256(x_shared, block, lane);
         if (lane == 0) acc += blk;
     } else {
         const uint8_t* scales = block;
@@ -7212,6 +7287,8 @@ __device__ __forceinline__ void gguf_quant_block_dot_256_rows4(
             float blk = gguf_quant_block_dot_256(x_shared + 768, block, signed_grid, type_id, lane);
             if (lane == 0) acc[3] += blk;
         }
+    } else if (type_id == 20) {
+        iq4nl_block_dot_256_rows4(x_shared, block, lane, valid_rows, acc);
     } else {
         const uint8_t* scales = block;
         const uint8_t* qs = block + 16;

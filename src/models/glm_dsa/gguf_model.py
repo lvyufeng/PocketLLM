@@ -141,6 +141,7 @@ class GLMDSAGGUFModelLoader:
         ``row_count`` is given, only that output-row slice is read (TP sharding
         of vocab/lm_head).
         """
+        from src.loader.gguf.iq4_nl import fold_to_runtime_span
         from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
         from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
 
@@ -152,6 +153,8 @@ class GLMDSAGGUFModelLoader:
             blocks, type_name, row_elems = reader.read_quantized_matrix_block_rows(
                 tensor.name, int(row_start), int(row_count)
             )
+        if type_name == "iq4_nl":
+            blocks = fold_to_runtime_span(blocks, row_elems)
         try:
             type_id = GGUF_DENSE_TYPE_IDS[type_name]
         except KeyError as exc:

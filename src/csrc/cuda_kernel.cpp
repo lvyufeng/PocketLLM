@@ -652,12 +652,20 @@ int64_t gguf_quant_block_bytes_for_type(int64_t type_id) {
     if (type_id == 6) return 98;    // iq3_xxs
     if (type_id == 7) return 136;   // iq4_xs
     if (type_id == 8) return 210;   // q6_k
+    if (type_id == 20) return 144;  // iq4_nl, eight native 18-byte blocks
     if (type_id == 143) return 28;  // ptq1_0, the fork-private ternary block
     TORCH_CHECK(false, "unsupported GGUF quant type_id: ", type_id);
 }
 
 // Weights per block.  Everything here is a 256-group except the ternary pack, whose
 // group is half that -- so a caller's "blocks cover row_elems" test cannot assume 256.
+//
+// iq4_nl is a 256-group by a different route: its native block is 32 weights, and
+// the loader folds eight of them into the 144-byte row element the kernels walk.
+// The number of weights is the same as the other ten, which is what keeps this
+// one comparison sufficient -- but the block *bytes* above are not derivable
+// from it, and a native iq4_nl row (18 bytes per 32 weights) fails the size check
+// rather than being silently accepted.
 int64_t gguf_quant_block_elems_for_type(int64_t type_id) {
     return type_id == 143 ? 128 : 256;
 }
@@ -665,7 +673,7 @@ int64_t gguf_quant_block_elems_for_type(int64_t type_id) {
 bool gguf_quant_type_supported(int64_t type_id) {
     return type_id == 0 || type_id == 1 || type_id == 2 || type_id == 3 ||
            type_id == 4 || type_id == 5 || type_id == 6 || type_id == 7 ||
-           type_id == 8 || type_id == 143;
+           type_id == 8 || type_id == 20 || type_id == 143;
 }
 
 void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const char* name) {
@@ -685,6 +693,8 @@ void check_gguf_quant_grid(const torch::Tensor& grid, int64_t type_id, const cha
         TORCH_CHECK(grid.is_contiguous(), name, " must be contiguous");
         TORCH_CHECK(grid.numel() >= (512 * 128 * 8 + 256 * 128 * 8), name, " must contain packed iq2_xs and iq3_xxs signed grids");
     }
+    // iq4_nl has no signed grid: its values come from a 16-entry codebook that the
+    // kernel holds in registers, so an empty grid tensor is the correct argument.
 }
 
 }  // namespace

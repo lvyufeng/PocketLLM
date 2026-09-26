@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from src.loader.gguf.bundle import GGUFBundle, GGUFTensorRef, read_gguf_bundle
+from src.loader.gguf.iq4_nl import fold_to_runtime_span
 from src.loader.gguf.quant_types import GGUF_DENSE_TYPE_IDS
 from src.loader.gguf.quantized_tensor import QuantizedGGUFTensor
 from src.loader.gguf.tensor_reader import GGUFTensorDataReader
@@ -87,6 +88,8 @@ class GGUFQuantizedTensorLoader:
     ) -> QuantizedGGUFTensor:
         if type_name != expected_type:
             raise RuntimeError(f"{name} reader type mismatch: expected={expected_type} got={type_name}")
+        if type_name == "iq4_nl":
+            blocks = fold_to_runtime_span(blocks, row_elems)
         try:
             type_id = GGUF_DENSE_TYPE_IDS[type_name]
         except KeyError as exc:

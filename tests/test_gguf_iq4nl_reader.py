@@ -8,8 +8,10 @@ llama.cpp header, and the nibble order is the block layout rather than an
 alternating one.  The row-width half is the regression this task exists for --
 ``IQ4_NL`` blocks are 32 weights where every other format in the loader is 256,
 so a reader that assumes ``QK_K`` reads the wrong bytes instead of failing.
-The dispatch half pins the one thing that must *not* change: the loader decodes
-the format, and no kernel claims it.
+The runtime half is what #393 changed: the type *is* a kernel claim now, so the
+loader regroups the native blocks into the 256-weight row element the kernels
+are written against, and the empty loader-only category says the loader decodes
+nothing that nothing runs.
 
 The checkpoint half is the acceptance criterion: the released GGUF's own
 ``IQ4_NL`` tensors are compared against the same tensor names in the
@@ -275,38 +277,78 @@ def test_a_decode_of_one_block_is_the_format_s_own_arithmetic() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The type is loader-only, and that is stated in the tables rather than a comment
+# The type is a kernel claim now, and the tables say so
 # --------------------------------------------------------------------------- #
 
 
-def test_iq4_nl_is_not_a_claim_that_a_kernel_exists() -> None:
-    """``GGUF_DENSE_TYPE_IDS`` is the raw-block runtime's dispatch table."""
-    assert GGUF_LOADER_TYPE_NAMES == frozenset({"iq4_nl"})
-    assert "iq4_nl" not in GGUF_DENSE_TYPE_IDS
-    assert "iq4_nl" not in GGUF_DENSE_TYPE_NAMES.values()
+def test_iq4_nl_is_a_claim_that_a_kernel_exists() -> None:
+    """``GGUF_DENSE_TYPE_IDS`` is the raw-block runtime's dispatch table.
+
+    ``iq4_nl`` was the loader-only category's only member when #390 introduced
+    it.  #393 gave it ``iq4nl_block_dot_256``, so it is in the dispatch table and
+    that category is empty -- a state this asserts rather than leaves to a
+    comment, because the set is what says "the loader decodes this and nothing
+    runs it".
+    """
+    assert GGUF_DENSE_TYPE_IDS["iq4_nl"] == 20
+    assert GGUF_DENSE_TYPE_NAMES[20] == "iq4_nl"
+    assert GGUF_LOADER_TYPE_NAMES == frozenset()
     assert "iq4_nl" in GGUF_ADDRESSABLE_TYPE_NAMES
     assert set(GGUF_DENSE_TYPE_IDS) <= GGUF_ADDRESSABLE_TYPE_NAMES
 
 
-def test_the_runtime_refuses_it_by_name(tmp_path: Path) -> None:
-    """Asking for a raw-block tensor of a kernel-less type raises, and says why.
+def test_the_loader_regroups_the_blocks_for_the_runtime(tmp_path: Path) -> None:
+    """The 32-weight blocks come back as the runtime's 256-weight row element.
 
-    This is the refusal-not-upcast rule applied to the opposite failure: a ternary
-    tensor must not be silently expanded to F16, and an IQ4_NL tensor must not be
-    silently handed to a GEMM that reads 32-weight blocks as a 256-weight format.
-    Both are refused at the same place -- the dispatch table -- so there is one
-    place to read.
+    Every kernel above this format indexes the next output row by
+    ``blocks_per_row * block_bytes``, so an IQ4_NL row left at its native
+    geometry would have each row's walk start at the wrong byte.  The loader
+    folds eight native blocks into a 144-byte element, and that is what the
+    shapes here pin: same bytes, ``(out_dim, 2, 144)`` rather than
+    ``(out_dim, 16, 18)`` for a 512-weight row.
     """
-    path = tmp_path / "iq4_nl-runtime.gguf"
+    rows, row_elems = 3, 512
+    path = tmp_path / "iq4_nl-fold.gguf"
     write_gguf(
         path,
         metadata={"general.architecture": "xing4_0", "xing4_0.block_count": 1},
-        tensors=[("blk.0.ffn_gate.weight", (64, 2), GGML_IQ4_NL)],
-        payloads={"blk.0.ffn_gate.weight": _marker_payload(2, 2)},
+        tensors=[("blk.0.ffn_gate.weight", (row_elems, rows), GGML_IQ4_NL)],
+        payloads={"blk.0.ffn_gate.weight": _marker_payload(row_elems // 32, rows)},
     )
     with GGUFQuantizedTensorLoader(str(path), device="cpu") as loader:
-        with pytest.raises(NotImplementedError, match="iq4_nl"):
-            loader.read_quant("blk.0.ffn_gate.weight", "iq4_nl")
+        quant = loader.read_quant("blk.0.ffn_gate.weight", "iq4_nl")
+    assert quant.type_id == 20
+    assert quant.row_elems == row_elems
+    assert tuple(quant.blocks.shape) == (rows, row_elems // 256, 144)
+    # The fold is a regrouping and not a permutation: decoding the folded tensor
+    # gives back the same weights in the same order.
+    folded = iq4_nl.dequantize_blocks(
+        quant.blocks.numpy().reshape(rows, -1, iq4_nl.IQ4_NL_BLOCK_BYTES)
+    ).reshape(rows, row_elems)
+    native = iq4_nl.dequantize_blocks(
+        np.frombuffer(_marker_payload(row_elems // 32, rows), dtype=np.uint8).reshape(
+            rows, row_elems // 32, iq4_nl.IQ4_NL_BLOCK_BYTES
+        )
+    ).reshape(rows, row_elems)
+    assert np.array_equal(folded, native)
+
+
+def test_a_row_that_is_not_a_whole_number_of_spans_raises() -> None:
+    """A 128-weight row is four native blocks and half a runtime element.
+
+    The kernels would take it and index the next row from the wrong place, so
+    the refusal has to happen where the geometry is known.  Both of Xing4.0's
+    expert widths are multiples of 256, which is why this is a guard rather than
+    a supported case.
+    """
+    with pytest.raises(ValueError, match="not a multiple"):
+        iq4_nl.fold_to_runtime_span(np.zeros((2, 4, 18), dtype=np.uint8), 128)
+
+
+def test_the_fold_rejects_a_block_grid_that_is_not_the_rows() -> None:
+    """A grid of the wrong width is caught here rather than inside a GEMM."""
+    with pytest.raises(ValueError, match="does not match"):
+        iq4_nl.fold_to_runtime_span(np.zeros((2, 9, 18), dtype=np.uint8), 512)
 
 
 def test_an_unknown_id_still_raises(tmp_path: Path) -> None:
