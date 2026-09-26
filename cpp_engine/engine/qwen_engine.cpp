@@ -3194,16 +3194,6 @@ struct QwenEngine::Impl {
     // read the wrong frame.
     const uint16_t* rotate_activation(const uint16_t* input, int rows, int columns,
                                       const char* site) {
-#ifdef POCKET_BACKEND_ASCEND
-        // The transform is a CUDA kernel. Branching here rather than dropping the
-        // call would leave the symbol referenced from this object, and the Ascend
-        // link has no definition of it -- which is the same reason the Qwen
-        // Ascend path is dense FP16 only. Nothing reaches this: the weight map
-        // refuses a ternary checkpoint on this backend.
-        (void)input; (void)rows; (void)columns; (void)site;
-        throw std::runtime_error(
-            "the incoherence rotation is not implemented on the Ascend backend");
-#else
         PhaseScope scope(this, std::string(rows == 1 ? "rot.d." : "rot.r.") + site);
         if (!rotation.active) {
             throw std::runtime_error(
@@ -3241,7 +3231,7 @@ struct QwenEngine::Impl {
         const std::vector<uint64_t> shape = {static_cast<uint64_t>(rows), width};
         QwenDeviceTensor& scratch =
             workspace_half(static_cast<size_t>(rows) * width, shape);
-        require_launch(qwen_hadamard_forward_f16_cuda(
+        require_launch(qwen_hadamard_forward_f16(
                            input, static_cast<const float*>(device_signs->data),
                            scratch.f16_data(), rows, columns, rotation.block_size),
                        "Qwen incoherence rotation");
@@ -3271,7 +3261,6 @@ struct QwenEngine::Impl {
         target->generation = rotation.generation;
         target->result = scratch.f16_data();
         return target->result;
-#endif
     }
 
     // The same transform, handed to the batched target head as a callback. The
@@ -3294,11 +3283,6 @@ struct QwenEngine::Impl {
     // them, so no thread can see another's output.
     void apply_embedding_inverse(uint16_t* rows, int row_count) {
         if (!embed_takes_inverse) return;
-#ifdef POCKET_BACKEND_ASCEND
-        (void)rows; (void)row_count;
-        throw std::runtime_error(
-            "the incoherence rotation is not implemented on the Ascend backend");
-#else
         PhaseScope scope(this, "embed.inv");
         const uint64_t width = config.hidden_size;
         const QwenDeviceTensor* device_signs = rotation.signs_for(width);
@@ -3307,12 +3291,11 @@ struct QwenEngine::Impl {
                 "the checkpoint stores its embedding in the rotated frame but "
                 "declares no sign vector for width " + std::to_string(width));
         }
-        require_launch(qwen_hadamard_inverse_f16_cuda(
+        require_launch(qwen_hadamard_inverse_f16(
                            rows, static_cast<const float*>(device_signs->data),
                            rows, row_count, static_cast<int>(width),
                            rotation.block_size),
                        "Qwen embedding inverse transform");
-#endif
     }
 
     bool sampling_enabled() const { return options.temperature > 1.0e-5f; }

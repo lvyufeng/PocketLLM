@@ -22,12 +22,15 @@ void Linear::forward(
             std::string("Qwen Ascend path is not implemented for ") +
             qwen_linear_kind_name(linear.kind));
     }
-    // The rotation is a CUDA kernel as well, and a folded weight read without it
-    // produces fluent nonsense rather than an error, so it fails here too.
+    // The rotation is what a folded weight requires: the stored matrix is in the
+    // checkpoint's rotated frame, and a projection that reads an unrotated
+    // activation against it produces fluent nonsense rather than an error. The
+    // engine owns the sign vectors and the workspace slot, and hands the same slot
+    // back to a second consumer of the same activation -- one layer feeds five
+    // projections from one normalized hidden state, and on Ascend the transform is
+    // a device pass of its own.
     if (linear.input_rotated) {
-        throw std::runtime_error(
-            "Qwen Ascend path is not implemented for a folded (rotated-frame) "
-            "weight");
+        input = runtime.rotate_activation(input, rows, columns, site);
     }
     // One activation row against the weight shard, with the activation's batch
     // dimension broadcast over that row so the Cube's M tile is full.

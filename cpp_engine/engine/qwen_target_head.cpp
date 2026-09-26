@@ -60,7 +60,12 @@ bool QwenTargetHeadAdapter::project_f16_to_f32(
     }
 #ifdef POCKET_BACKEND_ASCEND
     (void)stream;
-    // First-generation Ascend bring-up supports dense FP16 target heads only.
+    // Only the dense kind is implemented here. The rotation above is not what is
+    // missing -- a folded dense head reaches its frame on this backend -- it is
+    // the quantized projections themselves: the packed ternary matvec and the
+    // block FP8 path have CUDA kernels and no Ascend counterpart yet. Returning
+    // false is what turns that into an error at load rather than a head that
+    // reads 1.75-bit blocks as a dense matrix.
     return false;
 #else
     if (kind == QwenLinearKind::Ptq1_0) {

@@ -266,6 +266,27 @@ inline bool qwen_gqa_verify_attention_f16(const uint16_t* d_q_rows_fp16, const u
 #endif
 }
 
+// The activation side of the incoherence transform a ternary checkpoint folds its
+// weights with. On CUDA the two directions are one kernel each; on Ascend they are
+// the same transform built from offset-tensor butterflies and a scalar sub-block
+// stage, which is why the two are separate implementations rather than one shared
+// body. The contract the engine sees is identical, so it has one call site.
+inline bool qwen_hadamard_forward_f16(const uint16_t* d_x_fp16, const float* d_signs_fp32, uint16_t* d_y_fp16, int rows, int width, int block, void* stream = nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_hadamard_forward_f16_ascend(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block, stream);
+#else
+    return qwen_hadamard_forward_f16_cuda(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block, stream);
+#endif
+}
+
+inline bool qwen_hadamard_inverse_f16(const uint16_t* d_x_fp16, const float* d_signs_fp32, uint16_t* d_y_fp16, int rows, int width, int block, void* stream = nullptr) {
+#ifdef POCKET_BACKEND_ASCEND
+    return qwen_hadamard_inverse_f16_ascend(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block, stream);
+#else
+    return qwen_hadamard_inverse_f16_cuda(d_x_fp16, d_signs_fp32, d_y_fp16, rows, width, block, stream);
+#endif
+}
+
 inline bool qwen_linear_attn_gates_f16(const uint16_t* d_a_fp16, const uint16_t* d_b_fp16, const uint16_t* d_a_log_fp16, const uint16_t* d_dt_bias_fp16, uint16_t* d_g_fp16, uint16_t* d_beta_fp16, int rows, int heads, void* stream = nullptr) {
 #ifdef POCKET_BACKEND_ASCEND
     return qwen_linear_attn_gates_f16_ascend(d_a_fp16, d_b_fp16, d_a_log_fp16, d_dt_bias_fp16, d_g_fp16, d_beta_fp16, rows, heads, stream);
