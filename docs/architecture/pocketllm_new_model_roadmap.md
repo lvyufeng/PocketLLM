@@ -124,7 +124,7 @@ smallest card in the fleet gets an architecture with the shape of a frontier mod
 | | |
 | --- | --- |
 | Blocks | 40 (+1 NextN), hidden 3584, 32 query heads |
-| Attention | **MLA**: `q_lora_rank 768`, `kv_lora_rank 512`, `qk_nope 192`, `qk_rope 128`, `v_head_dim 128` |
+| Attention | **MLA**: `q_lora_rank 768`, `kv_lora_rank 512`, `qk_nope 128`, `qk_rope 64`, `v_head_dim 128` |
 | MoE | 64 experts, top-4, 1 shared, 2 leading dense blocks, `expert_ffn 1024` |
 | RoPE | **YaRN**, `original_context_length 4096` |
 | GGUF types | 243 × `IQ4_NL`, 327 BF16, 406 F32, 1 Q6_K |
@@ -145,6 +145,20 @@ the mapping is a mapping and not a copy. Two things are genuinely new:
 
 The stage is second because it is a genuinely new architecture family at a size that fits, and because
 it is the only one of the three where the *card* is not the interesting constraint.
+
+The gate ([#389](https://github.com/lvyufeng/PocketLLM/issues/389)) has run:
+[the audit](xing4_0_29b_a4b_audit.md) reads the hyper-connection out of the checkpoint's own remote code
+and out of the open llama.cpp port, and the two agree operation for operation, so the block is a port
+rather than a research project and the stage is a **go**. The same page is where the description a
+reimplementation is written from now lives, and it corrects this document's attention ranks — the only
+reading of its Stage 2 table that did not survive the artifacts, since 192 is `key_length_mla` and its
+halves are 128 and 64. Two of the audit's findings change the remaining tasks rather than annotating
+them: **`IQ4_NL` is smaller work than it looked** (`reader.GGML_TYPES` already carries its geometry, so
+what is missing is a codebook and a dispatch entry, and the format is upstream rather than
+fork-private), and **this GGUF leaves the whole attention path at BF16** — 2.117 GiB of the 3.761 GiB a
+decode step reads, against 0.877 GiB for the routed experts. On a bandwidth-bound decode step the MLA
+path, not the MoE, is where this checkpoint's time will go, which is the opposite of what MiMo-V2.6 and
+V4.1 both measured and is the first prediction the stage can be judged against.
 
 ## Stage 3 — GLM-5.3-Flash
 
@@ -207,6 +221,12 @@ Stage 1's gate has run: [the reference measures 30.7 tokens/s of decode and 665 
 card](ternary_bonsai_2_reference_gate.md), which is a pass on both the memory and the speed axis. That page also
 pins the block format, the Hadamard and the kernel question, so the tasks after it start from a measured artifact
 rather than from a model card.
+
+Stage 2's gate has run too, and it is also a pass: [the audit](xing4_0_29b_a4b_audit.md) writes the
+hyper-connection out as a forward pass a reimplementation can be built from and finds it agreed
+operation for operation by the two published implementations of it, which is what "it is a port" means
+here. It also re-reads this document's Stage 2 table against the artifacts and produces the per-token
+byte table that the stage's final task is measured against.
 
 A stage that dies at its gate is a result, and it goes in this document rather than the issue tree being
 quietly pruned. That is the same convention the old-hardware roadmap follows: it records what was
