@@ -7,6 +7,7 @@
 
 #include "qwen_gguf.hpp"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -233,6 +234,53 @@ const std::vector<int64_t>& QwenHadamardSpec::signs_for_width(uint64_t width) co
     throw std::runtime_error(
         "the checkpoint's hadamard block declares no sign vector for the width " +
         std::to_string(width) + "; it declares " + declared);
+}
+
+void qwen_hadamard_inverse_blockwise(float* data, uint64_t rows, uint64_t width,
+                                     uint64_t block, const int64_t* signs) {
+    if (data == nullptr || signs == nullptr) {
+        throw std::invalid_argument("null Hadamard transform buffer");
+    }
+    if (rows == 0 || width == 0 || block == 0 || (block & (block - 1)) != 0 ||
+        width % block != 0) {
+        throw std::invalid_argument(
+            "a Hadamard block must be a power of two that divides the width");
+    }
+    // The device kernel folds the scale into the pass that reads the tile and the
+    // signs into the write, and the two are elementwise and commute -- a sign is
+    // +-1 and so exact. Scaling the input is what the fork's own order does, and
+    // it is reproduced here rather than in the mathematically identical place so
+    // that the two implementations round alike at the deepest level.
+    const float scale = 1.0f / std::sqrt(static_cast<float>(block));
+    for (uint64_t row = 0; row < rows; ++row) {
+        float* line = data + row * width;
+        for (uint64_t base = 0; base < width; base += block) {
+            float* tile = line + base;
+            for (uint64_t i = 0; i < block; ++i) tile[i] *= scale;
+            // The same butterfly network the kernel runs: level `step` pairs `i`
+            // with `i + step` wherever `i`'s `step` bit is clear, which visits the
+            // strides 1, 2, 4, ... in order and lands on the natural (Hadamard)
+            // ordering, `H[i][j] = (-1)^popcount(i AND j)`. No bit reversal, so
+            // the kernel's scalar stage and this loop are the same permutation of
+            // the same additions.
+            for (uint64_t step = 1; step < block; step <<= 1) {
+                for (uint64_t i = 0; i < block; i += 2 * step) {
+                    for (uint64_t j = 0; j < step; ++j) {
+                        const float low = tile[i + j];
+                        const float high = tile[i + step + j];
+                        tile[i + j] = low + high;
+                        tile[i + step + j] = low - high;
+                    }
+                }
+            }
+            // The signs come after the butterflies here, which is what makes this
+            // the inverse: `(W R^-1) R`, with `R = (1/sqrt(N)) H diag(s)`.
+            const int64_t* sign = signs + base;
+            for (uint64_t i = 0; i < block; ++i) {
+                tile[i] *= static_cast<float>(sign[i]);
+            }
+        }
+    }
 }
 
 }  // namespace pocket

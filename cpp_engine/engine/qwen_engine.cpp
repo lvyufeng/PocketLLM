@@ -3146,20 +3146,24 @@ struct QwenEngine::Impl {
 
     // The embedding lookup, whichever way the table is stored.
     //
-    // A ternary checkpoint quantizes its embedding like everything else, and the
-    // table is then read where it lies: expanding it to fp16 at load costs 2.4 GiB
-    // on a card where the 27B of weights is 5.5, which is the difference between a
-    // model that fits beside its KV cache and one that does not. Both paths write
-    // zeros for a token this rank does not hold, because the caller sums the
-    // ranks' rows.
+    // A ternary checkpoint quantizes its embedding like everything else. Where the
+    // backend has a kernel for the blocks -- CUDA -- the table is read where it
+    // lies, because expanding it to fp16 at load costs 2.4 GiB on a card where the
+    // 27B of weights is 5.5, which is the difference between a model that fits
+    // beside its KV cache and one that does not. Where it has none -- Ascend -- the
+    // cost is unavoidable and is paid instead of the model not running at all; the
+    // table arrives here decoded, as fp16, and takes the dense gather below.
+    // Both paths write zeros for a token this rank does not hold, because the
+    // caller sums the ranks' rows.
     void embedding_lookup(const int* tokens, uint16_t* output, int rows,
                           const char* site) {
         const int hidden_size = static_cast<int>(config.hidden_size);
         const int vocab_start = static_cast<int>(weights_vocab_start());
         const int vocab_rows = static_cast<int>(embed.shape[0]);
 #ifdef POCKET_BACKEND_ASCEND
-        // The Ascend backend is dense FP16 only, and a weight map that refused a
-        // ternary checkpoint never gets here with one.
+        // This backend has no block reader, so a ternary embedding is decoded by
+        // the weight map before it gets here and `embed` is fp16 like any other
+        // table. See qwen_backend_reads_packed_ternary.
         require_launch(qwen_embedding_fp16_gather_f16(embed.f16_data(), tokens,
                                                       output, rows, hidden_size,
                                                       vocab_start, vocab_rows),

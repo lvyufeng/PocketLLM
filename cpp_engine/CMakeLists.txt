@@ -376,6 +376,19 @@ target_include_directories(pocket_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
+# The weight map has to know one thing about the backend it is being built for:
+# whether that backend's kernels read a PTQ1_0 weight where it lies, as 28-byte
+# blocks, or want it decoded into fp16 at load. That is a property of the backend
+# and not of a checkpoint, so it is fixed when the backend is chosen and cannot be
+# a runtime flag; see qwen_backend_reads_packed_ternary.
+#
+# This is the whole of what core/ is told about the backend, and it is a
+# preprocessor tag rather than a dependency: core/ still includes no vendor header
+# and still links no vendor library, so the checkpoint audit it exists for keeps
+# working on a host with no toolkit installed.
+if(POCKET_BACKEND STREQUAL "ascend")
+    target_compile_definitions(pocket_core PRIVATE POCKET_BACKEND_ASCEND=1)
+endif()
 
 # The selected backend's device runtime, on its own. One vendor implementation is
 # linked, chosen at configure time, so a call through this costs the same as

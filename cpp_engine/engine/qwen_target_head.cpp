@@ -62,10 +62,12 @@ bool QwenTargetHeadAdapter::project_f16_to_f32(
     (void)stream;
     // Only the dense kind is implemented here. The rotation above is not what is
     // missing -- a folded dense head reaches its frame on this backend -- it is
-    // the quantized projections themselves: the packed ternary matvec and the
-    // block FP8 path have CUDA kernels and no Ascend counterpart yet. Returning
-    // false is what turns that into an error at load rather than a head that
-    // reads 1.75-bit blocks as a dense matrix.
+    // the quantized projections themselves: the block FP8 path has a CUDA kernel
+    // and no Ascend counterpart yet. Returning false is what turns that into an
+    // error at load rather than a head that reads compressed blocks as a dense
+    // matrix. The ternary kind does not reach this point on this backend: the
+    // weight map decodes it to dense fp16 and reports it as DenseF16, which the
+    // branch above handles.
     return false;
 #else
     if (kind == QwenLinearKind::Ptq1_0) {

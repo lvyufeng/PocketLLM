@@ -98,4 +98,27 @@ private:
     bool gdn_v_grouped_ = false;
 };
 
+// The second of the two directions above, applied on the *host*:
+// `z |-> (1/sqrt(N)) . s * (H . z)`, blockwise along `width`, which `block` tiles
+// exactly. `data` is `rows * width` elements and is transformed in place.
+//
+// It is the counterpart of the device's `qwen_hadamard_inverse_f16`, and the
+// loader needs it for the one case the device cannot reach. A folded weight
+// expects its *input* rotated and the rotation is blockwise, so a rank whose shard
+// takes part of a rotation axis has no activation to rotate: a block's outputs
+// read the whole block, and part of that block lives on another rank. The loader
+// unfolds the weight instead -- this transform run over the checkpoint's own
+// matrix -- which it can do only where the weights are elements rather than a
+// sub-byte pack. See `qwen_materialize_host_tensor`.
+//
+// `signs` points at the sign vector of the *first* block of `data`. The block
+// declares one sign vector per folded width, so a caller unfolding one window of a
+// wider axis passes `spec.signs_for_width(w) + first_block * block`: the offset is
+// the caller's, because only the caller knows where its window starts.
+//
+// The accumulation is fp32, the width the device kernel uses. A ten-pass butterfly
+// in fp16 would lose exactly the low bits a 1.75-bit weight cannot afford.
+void qwen_hadamard_inverse_blockwise(float* data, uint64_t rows, uint64_t width,
+                                     uint64_t block, const int64_t* signs);
+
 }  // namespace pocket

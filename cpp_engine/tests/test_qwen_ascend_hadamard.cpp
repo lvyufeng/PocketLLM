@@ -279,6 +279,15 @@ int run(int device) {
         {"random, block 4096, largest legal", Input::kRandom, false, {1, 4096, 4096}},
         {"random, in place (x is y)", Input::kRandom, true, {2, 1024, 1024}},
         {"zeros, block 1024 over 5120", Input::kZeros, false, {2, 5120, 1024}},
+        // The two production widths the rows above do not reach. 5120 is one
+        // folded axis of this model; 6144 is the other -- the gated-DeltaNet
+        // value axis, which is `in_proj_z`, the `v` third of `in_proj_qkv` and
+        // `out_proj`'s input -- and 17408 is the MLP's inner axis, `down_proj`'s
+        // input. Both are whole numbers of runs (6 and 17), so the tail handling
+        // is not what these cases add; what they add is the two widths a real
+        // step actually rotates, and neither was covered before.
+        {"random, block 1024 over 6144", Input::kRandom, false, {2, 6144, 1024}},
+        {"random, block 1024 over 17408", Input::kRandom, false, {1, 17408, 1024}},
     };
 
     for (const Case& test : cases) {
