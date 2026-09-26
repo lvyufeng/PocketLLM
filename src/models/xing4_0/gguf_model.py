@@ -241,7 +241,11 @@ class Xing4_0GGUFModel:
         pull them apart, so a port that began with four streams of different
         values would diverge before the first block.
         """
-        ids = input_ids.reshape(-1).to(self.device)
+        # A list is accepted as well as a tensor: the generation loop builds
+        # one chunk at a time from a Python token list, and a caller that had
+        # to know the model's device to call it would be one more place for a
+        # `cuda:2` to drift from a `cuda:0`.
+        ids = torch.as_tensor(input_ids, device=self.device).reshape(-1)
         hidden = F.embedding(ids, self.embedding)
         return hidden.unsqueeze(0).unsqueeze(2).expand(1, -1, int(self.params.hc_mult), -1).contiguous()
 
