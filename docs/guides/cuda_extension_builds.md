@@ -108,20 +108,32 @@ QwenKernelOptions API (#108)", 2026-09-13), which added the sources *and* the te
 but did not touch `setup.py` — the compile entries and the binding registration were never added
 alongside them.
 
-## A missing op fails, and it does not skip
+## A missing op is asked for by name, and it skips
 
-`pytest.importorskip` and `load_cuda_kernel() -> None` guard the **extension loading**. They do
-not guard an individual op. A test that loads the extension successfully and then calls a
-binding that does not exist gets an `AttributeError`, which is a failure, not a skip: four tests
-in this tree are in that state — `tests/test_minimax_gqa_kernel.py::test_gqa_qk_gemv`,
-`::test_gqa_attn_v_gemv`, `::test_gqa_full_attention` (all three call `gqa_decode_qk_gemv` /
+`pytest.importorskip` and `load_cuda_kernel() -> None` guard the **extension loading**. They did not
+guard an individual op, so a test that loaded the extension and then called a binding that does not
+exist got an `AttributeError` — a *failure*, whose traceback points at the caller and reads like a
+broken test. Four tests were in exactly that state: `tests/test_minimax_gqa_kernel.py::test_gqa_qk_gemv`,
+`::test_gqa_attn_v_gemv`, `::test_gqa_full_attention` (all three calling `gqa_decode_qk_gemv` /
 `gqa_decode_attn_v_gemv`) and `tests/test_fused_decode_gqa_real.py::test_against_minimax_attention`.
-The current 3.11 extension exports 51 bindings and none of them is any of those three names.
+The 3.11 extension exports 51 bindings and none of them is any of those names.
 
-So **a failure in those four files is a missing source or a missing registration, not a missing
-GPU** — read the error before reading the hardware. Fixing them means either adding the file to
-`setup.py`'s source list and binding it, or deleting the test and the source together; leaving a
-test that cannot pass spends a future reader's time on the wrong question.
+`tests/cuda_bindings.py::extension(requires=(...))` closes that hole: a test names the bindings it is
+about and gets either the module or a skip that lists what the build does not export. Those four now
+skip, each naming its missing binding, and the skip is **self-clearing** — add the file to `setup.py`
+and register it, and the same tests run with no edit to them.
+
+So the rule for a reader is:
+
+- a **skip** naming a binding means the build does not have that kernel — a missing source or a
+  missing registration, not a missing GPU;
+- an **`AttributeError`** means somebody called a binding without asking for it first, which is the
+  mistake the helper exists to prevent.
+
+The kernel sources are still on disk and still unbuilt, and that is deliberate rather than forgotten:
+deleting them is a decision about work somebody wrote on purpose, and deleting only the tests would
+lose the record of what they were for. Wiring them up is the other end of the same choice, and it is
+now a one-line change on both sides.
 
 [loader]: https://github.com/lvyufeng/PocketLLM/blob/master/src/kernels/cuda_loader.py
 [setup]: https://github.com/lvyufeng/PocketLLM/blob/master/setup.py

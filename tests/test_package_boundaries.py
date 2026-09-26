@@ -28,7 +28,11 @@ LOADER_FORBIDDEN_IMPORT_PREFIXES = (
 )
 
 COMPONENTS_MOE_ALLOWED_MODEL_IMPORTS = {
+    # Exactly the specs `src/components/moe/registry.py::_init_specs` imports to build its
+    # `general.architecture` table. GLM-DSA was registered there and left out of this set, so the
+    # test failed on a registry that is doing the one thing it is allowed to do.
     "src.models.deepseek_v4.spec",
+    "src.models.glm_dsa.spec",
     "src.models.minimax_m2.spec",
 }
 
