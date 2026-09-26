@@ -58,6 +58,7 @@ import torch
 import torch.nn.functional as F
 
 from src.models.xing4_0.config import Xing4_0Params
+from src.models.xing4_0.decode_pos import Pos, write_row
 from src.models.xing4_0.rope import cos_sin, inv_freq, rotate_interleaved
 
 __all__ = ["MLAAttention", "MLAAttentionWeights", "KVLatentCache"]
@@ -204,15 +205,32 @@ class KVLatentCache:
         self.latent = torch.zeros((self.batch, self.capacity, self.width), device=device, dtype=dtype)
         self.length = 0
 
-    def append(self, rows: torch.Tensor, start_pos: int) -> None:
-        """Write one chunk at `start_pos`; rows are `(batch, seq, width)`."""
-        end = int(start_pos) + rows.shape[1]
+    def append(self, rows: torch.Tensor, pos: "int | torch.Tensor") -> None:
+        """Write one chunk at `pos`; rows are `(batch, seq, width)`.
+
+        Two spellings, and which one is used is not a style choice. A chunk's `pos` is a Python
+        `int`, its write is a slice, and it advances `length` — that is the prefill and it is never
+        captured. A decode step's `pos` is a 0-dim index tensor, its write is `index_copy_` (see
+        `decode_pos.write_row` for why the slice cannot be recorded), and **it does not advance
+        `length`**: reading the tensor back to compare it against the capacity would be a host read,
+        which is the one thing a capture forbids. On that path `length` is the caller's — a captured
+        decode loop knows its own position and sets it, and `graphs.DecodeGraphs` does.
+        """
+        if isinstance(pos, torch.Tensor):
+            write_row(self.latent, pos, rows)
+            return
+        end = int(pos) + rows.shape[1]
         if end > self.capacity:
             raise ValueError(f"cache holds {self.capacity} tokens, asked for {end}")
-        self.latent[:, start_pos:end] = rows
+        self.latent[:, int(pos) : end] = rows
         self.length = max(self.length, end)
 
     def view(self, length: int | None = None) -> torch.Tensor:
+        """The first `length` rows, or — with no argument — everything written so far.
+
+        A captured decode step must pass an explicit width: the bucket it was recorded at. See
+        `Pos.width` for why the cache's own length cannot be the default there.
+        """
         return self.latent[:, : length if length is not None else self.length]
 
     def reset(self) -> None:
@@ -284,13 +302,22 @@ class MLAAttention:
         positions: torch.Tensor,
         *,
         cache: KVLatentCache | None = None,
-        start_pos: int = 0,
+        start_pos: "int | Pos" = 0,
     ) -> torch.Tensor:
         """The checkpoint's own remote-code arithmetic, expanded per head.
 
         `hidden` is `(1, seq, hidden)`.  Returns `(1, seq, hidden)`.
+
+        Every caller of this is a parity check against the reference, and a parity check is eager
+        by construction — so a `Pos` that has reached the card is refused rather than half-served.
         """
         p = self.params
+        pos = Pos.of(start_pos)
+        if pos.on_device:
+            raise TypeError(
+                "the expanded form is the reference's arithmetic, not a decode path; it builds its "
+                "causal mask from a Python position and is never captured"
+            )
         b, seq, _ = hidden.shape
         nope, rope, heads = p.qk_nope_head_dim, p.qk_rope_head_dim, p.n_heads
         v_head = p.v_head_dim
@@ -300,18 +327,17 @@ class MLAAttention:
         q_rot = self.rope_queries(q_rot, positions)
 
         latent, rope_key = self._compressed_kv(hidden)
+        rope_key = self.rope_queries(rope_key.unsqueeze(2), positions).squeeze(2)
         if cache is not None:
-            rope_key = self.rope_queries(rope_key.unsqueeze(2), positions).squeeze(2)
-            cache.append(torch.cat((latent, rope_key), dim=-1), start_pos)
+            cache.append(torch.cat((latent, rope_key), dim=-1), pos.row())
             latent_full = cache.view()[:, :, : p.kv_lora_rank]
             rope_full = cache.view()[:, :, p.kv_lora_rank :]
             # The reference ropes the key once and broadcasts it across heads.
             k_rot = rope_full.unsqueeze(2).expand(-1, -1, heads, -1)
-            tokens, offset = latent_full.shape[1], 0
+            tokens = latent_full.shape[1]
         else:
-            rope_key = self.rope_queries(rope_key.unsqueeze(2), positions).squeeze(2)
             latent_full, k_rot = latent, rope_key.unsqueeze(2).expand(-1, -1, heads, -1)
-            tokens, offset = seq, 0
+            tokens = seq
 
         # k_nope: `k_b[h]` is (kv_lora, qk_nope), so it contracts the latent's
         # 512 down to this head's 128 without a transpose.
@@ -322,7 +348,7 @@ class MLAAttention:
         key = torch.cat((k_nope, k_rot), dim=-1).transpose(1, 2)
         value = v.transpose(1, 2)
 
-        out = _attend(query, key, value, self.scale, seq, tokens, start_pos, dtype=self.dtype)
+        out = _attend(query, key, value, self.scale, seq, tokens, pos.host, dtype=self.dtype)
         return F.linear(out, self.weights.o_proj)
 
     # -- the released file's form: absorbed ---------------------------------- #
@@ -333,13 +359,18 @@ class MLAAttention:
         positions: torch.Tensor,
         *,
         cache: KVLatentCache | None = None,
-        start_pos: int = 0,
+        start_pos: "int | Pos" = 0,
     ) -> torch.Tensor:
         """The same arithmetic, re-associated so the cache stays a latent.
 
         `hidden` is `(1, seq, hidden)`.  Returns `(1, seq, hidden)`.
+
+        `start_pos` is a `Pos` on the path a graph replays, and the three things it carries are used
+        here: the row the cache writes, the width the cache is read at, and the position the mask is
+        expressed against.  See :mod:`src.models.xing4_0.decode_pos`.
         """
         p = self.params
+        pos = Pos.of(start_pos)
         b, seq, _ = hidden.shape
         nope, rope, heads = p.qk_nope_head_dim, p.qk_rope_head_dim, p.n_heads
 
@@ -350,12 +381,16 @@ class MLAAttention:
         latent, rope_key = self._compressed_kv(hidden)
         rope_key = self.rope_queries(rope_key.unsqueeze(2), positions).squeeze(2)
         if cache is not None:
-            cache.append(torch.cat((latent, rope_key), dim=-1), start_pos)
-            stored = cache.view()
+            cache.append(torch.cat((latent, rope_key), dim=-1), pos.row())
+            stored = cache.view(pos.width)
             latent_full = stored[:, :, : p.kv_lora_rank]
             rope_full = stored[:, :, p.kv_lora_rank :]
         else:
             latent_full, rope_full = latent, rope_key
+        # `latent_full.shape[1]` and not `pos.width`: they are the same number by construction, and
+        # this one is the tensor's own, so the score, the mask and the value contraction cannot
+        # disagree about how wide the cache they are looking at is.
+        tokens = latent_full.shape[1]
 
         # W_kb^T applied to the query instead of W_kb applied to the key: the same
         # tensor as `forward_expanded` reads, contracted the other way.
@@ -379,7 +414,7 @@ class MLAAttention:
         scores = scores + (
             q_rot.transpose(1, 2).reshape(batch, heads_axis, rope) @ rope_t
         ).reshape(batch, heads, seq, latent_full.shape[1])
-        scores = _mask(scores * self.scale, seq, latent_full.shape[1], start_pos)
+        scores = _mask(scores * self.scale, seq, tokens, pos)
         # As `eager_attention_forward` does: an fp32 softmax, cast back before the
         # value contraction.  The contractions stay in the model dtype.
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(self.dtype)
@@ -395,11 +430,25 @@ class MLAAttention:
         return F.linear(out.to(self.dtype), self.weights.o_proj)
 
 
-def _mask(scores: torch.Tensor, seq: int, tokens: int, start_pos: int) -> torch.Tensor:
-    """Causal mask, expressed against absolute positions so a resume is one rule."""
+def _mask(scores: torch.Tensor, seq: int, tokens: int, pos: Pos) -> torch.Tensor:
+    """Causal mask, expressed against absolute positions so a resume is one rule.
+
+    `tokens` is the width the cache was *read* at, and on the bucketed and captured paths it is wider
+    than the rows the position has actually reached.  So both arms mask, and the decode arm's mask is
+    the reason a bucket is legal at all: `k_pos > pos` hides the rows past the position, and `pos` is
+    a 0-dim tensor there, which is a comparison a capture can hold.
+
+    On the host path at the cache's own length the decode mask hides nothing — every row from 0 to
+    `pos` is a row the step may see — and `masked_fill` with an all-false mask returns its input
+    bit for bit.  So the rule is applied unconditionally rather than branched on, which is what makes
+    a bucketed eager step and a captured one differ in their submission and in nothing else.
+    """
     if seq == 1:
-        return scores
-    q_pos = torch.arange(start_pos, start_pos + seq, device=scores.device).view(1, 1, seq, 1)
+        k_pos = torch.arange(tokens, device=scores.device).view(1, 1, 1, tokens)
+        return scores.masked_fill(k_pos > pos.row(), float("-inf"))
+    # The prefill: absolute positions on both sides, so a resumed prompt's offset is one rule rather
+    # than a second mask.  `pos.row()` is an `int` here — a chunk is never captured.
+    q_pos = (torch.arange(seq, device=scores.device) + pos.row()).view(1, 1, seq, 1)
     k_pos = torch.arange(0, tokens, device=scores.device).view(1, 1, 1, tokens)
     return scores.masked_fill(k_pos > q_pos, float("-inf"))
 

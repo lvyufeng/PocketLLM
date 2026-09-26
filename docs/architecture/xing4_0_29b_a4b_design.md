@@ -345,6 +345,16 @@ cost the step is device-bound at 38 ms, which is the number the fusions have to 
 This section's own 11,536 launches does not reconcile with the profile above's 5,346 submissions and
 5,577 kernels — different instruments, and the newer pair is the one that can be reproduced.
 
+**The loop was built, and the ceiling held.**
+[Xing4.0-29B-A4B: the decode step, captured a bucket at a time](../performance/xing4_0_decode_graph.md)
+makes the position reach the card as an index tensor in all four places it is read and freezes the
+attention's `N` by rounding the cache read up to a power-of-two bucket with the rows past the position
+masked. Measured in one process, interleaved: **38.6 ms a replayed step against an eager 148.1 —
+3.84×** — with the bucket itself at 1.00×. End to end the same bench gives **26.26 tok/s decode at a
+512-token context against 6.61**, and **20.68 against 6.90 at 32,768**, the same 33 greedy tokens in
+both arms at every length. So the device-bound 38 ms this section hands on is now a measured number and
+not a projection, and it is what §3's casts and §4's attention kernel are priced against.
+
 **A conditional number, honestly.** `generate` reports `first_step_seconds` as well as
 `step_seconds`, because the first decode step after a prefill is not a steady-state step. In a warm
 process it is 141–158 ms and indistinguishable from the rest. In a *fresh* process, where the
@@ -352,7 +362,9 @@ allocator has never held a request-sized working set, it is **571 ms after a 4,0
 128-wide chunk and 2,981 ms after the same prefill at a 1024-wide chunk**, against a steady 176 ms.
 The mechanism is an allocation, not a kernel, and the consequence is that a 24-step average taken on a
 cold process reads 4.02 tok/s where the same run's steady rate is 6.39 — which is exactly the mistake
-this record nearly published. Both readings are reported, and the bench prints both.
+this record nearly published. Both readings are reported, and the bench prints both. A graphed decode
+pays its recordings in the same field — 577–598 ms of first step, of which 0.6 s is one rung's four
+real forwards — which is the second reason that field is reported apart from the rate.
 
 ---
 

@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 from src.models.xing4_0.attention import MLAAttention, MLAAttentionWeights
 from src.models.xing4_0.config import Xing4_0Params
+from src.models.xing4_0.decode_pos import Pos
 from src.models.xing4_0.hyper_connection import HyperConnection, HyperConnectionWeights
 
 __all__ = ["DecoderLayer", "DecoderLayerWeights", "rms_norm"]
@@ -112,10 +113,16 @@ class DecoderLayer:
         positions: torch.Tensor,
         *,
         cache=None,
-        start_pos: int = 0,
+        start_pos: "int | Pos" = 0,
         absorbed: bool = False,
     ) -> torch.Tensor:
-        """`hidden` is `(*batch, tokens, hc, hidden)`; returns the same shape."""
+        """`hidden` is `(*batch, tokens, hc, hidden)`; returns the same shape.
+
+        `start_pos` is an `int` on the eager path and a `Pos` on the one a graph replays.  Nothing in
+        this method reads it — the two sublayers both hand it to the attention, which is the only
+        place in a block that a position means anything.  See
+        :mod:`src.models.xing4_0.decode_pos`.
+        """
         p = self.params
         # The sublayers work in `dtype` -- the width the GEMMs and the attention
         # were built for -- and the residual streams are carried in

@@ -10,11 +10,25 @@ Each length is measured in one process, serially, and the model is loaded once.
 The numbers a report wants are prefill tokens a second (the prompt's own pass)
 and decode tokens a second (the steps after it), stated at the context they were
 taken at -- a decode rate without its prompt length is not a comparable number.
+
+`--decode` picks how a step is taken, and the three arms exist to separate two
+changes that a report would otherwise have to state as one:
+
+    eager    the forward as it always ran
+    bucket   the same forward, reading the cache at the width a graph would
+    graph    a captured step at that width, replayed
+
+`bucket` against `eager` is what the *bucket* costs -- the attention reads at
+most twice the rows a step needs, and nothing else about the step moves.
+`graph` against `bucket` is what the *recording* buys, and nothing else.  The
+capture itself is a one-off and lands in `first step`, which is reported apart
+from the steady rate for exactly that reason.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -60,6 +74,13 @@ def main() -> int:
         default=0,
         help="prefill chunk; 0 derives it from the context the way the server does",
     )
+    ap.add_argument(
+        "--decode",
+        choices=("eager", "bucket", "graph"),
+        default="eager",
+        help="how a decode step is taken: the forward as it always ran, the same forward at a "
+        "bucket width, or that width captured and replayed",
+    )
     args = ap.parse_args()
 
     sys.path.insert(0, args.release)
@@ -93,6 +114,29 @@ def main() -> int:
     free = int(torch.cuda.mem_get_info(torch.device(args.device).index)[0])
     room = max(PREFILL_SCORE_BUDGET // 2, free - PREFILL_DEVICE_RESERVE)
     print(f"room above the cache {room / 2**20:.0f} MiB")
+
+    # The stepper, built once against the one cache every length below shares -- which is what makes
+    # a rung recorded for one length a replay for the next rather than a new capture. `bucket` is the
+    # holder's own eager path, wrapped in the two-method protocol `generate` takes a stepper through.
+    stepper = None
+    holder = None
+    if args.decode != "eager":
+        from src.models.xing4_0.graphs import DecodeGraphs
+
+        holder = DecodeGraphs(model, cache, device=args.device)
+        print(f"decode graphs: rungs {holder.ladder} over {holder.capacity} positions")
+        stepper = holder
+        if args.decode == "bucket":
+            class _BucketedEager:
+                """The holder's eager step, in the shape `generate` takes a stepper in."""
+
+                def reserve(self, upto: int) -> None:
+                    holder.reserve(upto)
+
+                def step(self, token: int, cache, position: int):
+                    return holder.step_eager(token, cache, position)
+
+            stepper = _BucketedEager()
     print()
 
     for length in (int(item) for item in args.lengths.split(",")):
@@ -112,23 +156,40 @@ def main() -> int:
             eos_token_id=tokenizer.eos_token_id,
             cache=cache,
             chunk=chunk,
+            decode_step=stepper,
         )
         prefill = result.prefill_seconds
         steps = max(1, len(result.tokens) - 1)
-        decode = result.decode_seconds / steps
+        # `decode_seconds` for one step, and not named `decode`: that is the stepper the loop above
+        # handed to `generate`, and a local of the same name would replace it for the next length.
+        per_token = result.decode_seconds / steps
         # The first step after a prefill is a one-off: the allocator settles a
         # request-sized working set, measured at 0.6 s after a narrow chunk and
         # 3.0 s after a wide one, against a steady ~0.18 s.  Both numbers are
         # reported, because a client pays the first one and a rate wants neither
         # hidden nor averaged into the other.
         steady = result.steady_step_seconds
+        # A digest of the answer, because the two arms of `--decode` are supposed to produce the
+        # same tokens and a rate table is where that would otherwise go unnoticed: a decode that is
+        # faster and wrong is not a result. Greedy, so the digest is reproducible.
+        digest = hashlib.sha256(",".join(str(t) for t in result.tokens).encode()).hexdigest()[:12]
         print(
             f"{length:6d} tokens:  prefill {length / prefill:8.2f} tok/s ({prefill * 1000:8.0f} ms)   "
-            f"decode {1 / decode:6.2f} tok/s ({decode * 1000:7.1f} ms/token)   "
+            f"decode {1 / per_token:6.2f} tok/s ({per_token * 1000:7.1f} ms/token)   "
             f"steady {1 / steady:6.2f} tok/s ({steady * 1000:6.1f} ms)   "
             f"first step {result.first_step_seconds * 1000:6.0f} ms   ttft {result.ttft_seconds * 1000:.0f} ms   "
-            f"chunk {chunk} (peak {_prefill_peak_bytes(chunk, int(model.params.n_heads), args.max_model_len) / 2**20:.0f} MiB)"
+            f"chunk {chunk} (peak {_prefill_peak_bytes(chunk, int(model.params.n_heads), args.max_model_len) / 2**20:.0f} MiB)   "
+            f"answer {digest}"
         )
+        if holder is not None:
+            rung = holder.bucket_for(length + 1)
+            print(
+                f"{'':13s}rung {rung} for {length + 1} positions "
+                f"({rung / (length + 1):.2f}x the rows)   "
+                f"captures so far {len(holder.recorded)} rungs, {holder.capture_seconds:.1f} s, "
+                f"pool {holder.pool_bytes / 2**20:.1f} MiB   "
+                f"replay {holder.replay_millis:.1f} ms/step host"
+            )
     return 0
 
 
