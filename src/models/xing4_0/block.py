@@ -77,14 +77,15 @@ class DecoderLayer:
         *,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cpu",
+        use_kernel: bool = False,
     ):
         self.params = params
         self.weights = weights
         self.mlp = mlp
         self.dtype = dtype
         self.device = device
-        self.attn_hc = HyperConnection(params, weights.attn_hc, dtype=dtype)
-        self.ffn_hc = HyperConnection(params, weights.ffn_hc, dtype=dtype)
+        self.attn_hc = HyperConnection(params, weights.attn_hc, dtype=dtype, use_kernel=use_kernel)
+        self.ffn_hc = HyperConnection(params, weights.ffn_hc, dtype=dtype, use_kernel=use_kernel)
         self.attention = MLAAttention(params, weights.attention, dtype=dtype, device=device)
 
     @classmethod

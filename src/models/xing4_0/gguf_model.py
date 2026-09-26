@@ -58,6 +58,7 @@ class Xing4_0GGUFModel:
         dtype: torch.dtype = torch.float16,
         block_count: int | None = None,
         config_path: str | Path | None = None,
+        use_kernel: bool = True,
     ):
         from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
 
@@ -67,6 +68,7 @@ class Xing4_0GGUFModel:
         self.loader = GGUFQuantizedTensorLoader(self.path, device=self.device)
         self.params = self._read_params(config_path)
         self.block_count = int(self.params.n_layers if block_count is None else block_count)
+        self.use_kernel = bool(use_kernel)
 
         self.embedding = self.loader.read_dense("token_embd.weight", dtype=dtype)
         self.output_norm = self.loader.read_dense("output_norm.weight", dtype=torch.float32)
@@ -88,7 +90,14 @@ class Xing4_0GGUFModel:
                 post_attention_layernorm=self.loader.read_dense(f"{prefix}ffn_norm.weight", dtype=torch.float32),
             )
             self.blocks.append(
-                DecoderLayer(self.params, weights, self._mlp(prefix, index, cuda_mod), dtype=dtype, device=self.device)
+                DecoderLayer(
+                    self.params,
+                    weights,
+                    self._mlp(prefix, index, cuda_mod),
+                    dtype=dtype,
+                    device=self.device,
+                    use_kernel=self.use_kernel,
+                )
             )
 
     # -- loading ------------------------------------------------------------- #

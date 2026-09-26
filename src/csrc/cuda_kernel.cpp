@@ -547,6 +547,17 @@ torch::Tensor gguf_quant_embedding_forward_cuda(
     int64_t type_id,
     const torch::Tensor& signed_grid);
 
+std::vector<torch::Tensor> xing4_hyper_connection_forward_cuda(
+    const torch::Tensor& hidden,
+    const torch::Tensor& fn,
+    const torch::Tensor& base,
+    const torch::Tensor& scale,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double eps,
+    double clamp_min,
+    double clamp_max);
+
 torch::Tensor gguf_moe_prefill_grouped_forward_cuda(
     const torch::Tensor& x,
     const torch::Tensor& route_tokens,
@@ -2304,6 +2315,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qwen4_exp_qsa_bf16_forward", &qwen4_exp_qsa_bf16_forward, "Qwen4-Exp indexed BF16 GQA attention (CUDA)");
     m.def("qwen4_exp_grouped_rms_norm", &qwen4_exp_grouped_rms_norm, "Qwen4-Exp grouped RMSNorm with centered gain (CUDA)");
     m.def("qwen4_exp_inject", &qwen4_exp_inject, "Qwen4-Exp hyper-connection stream injection (CUDA)");
+    m.def("xing4_hyper_connection_forward", &xing4_hyper_connection_forward_cuda,
+          "Xing4.0-29B-A4B's matrix hyper-connection in one kernel: the flattened unweighted "
+          "norm, the 24-wide gate, the 20-iteration Sinkhorn and the collapsed stream, "
+          "one block a row",
+          pybind11::arg("hidden"), pybind11::arg("fn"), pybind11::arg("base"),
+          pybind11::arg("scale"), pybind11::arg("hc_mult"), pybind11::arg("sinkhorn_iters"),
+          pybind11::arg("eps"), pybind11::arg("clamp_min"), pybind11::arg("clamp_max"));
     m.def("qwen4_exp_hc_silu", &qwen4_exp_hc_silu, "Qwen4-Exp hyper-connection scaled SiLU (CUDA)");
     m.def("qwen4_exp_hc_inject_gate", &qwen4_exp_hc_inject_gate, "Qwen4-Exp hyper-connection injection gate (CUDA)");
     m.def("moe_prefill_int8_grouped_gemm_forward", &moe_prefill_int8_grouped_gemm_forward, "prefill MoE grouped-GEMM int8 forward (CUDA)");

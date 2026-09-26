@@ -451,3 +451,114 @@ def test_the_norms_are_in_the_block_and_not_only_in_the_model() -> None:
     normalised = rms_norm(collapsed, layer.weights.input_layernorm, params.rms_norm_eps)
     assert torch.allclose(normalised.pow(2).mean(dim=-1), torch.ones(1, 2), atol=1e-5)
     assert tuple(normalised.shape) == (1, 2, params.hidden_size)
+
+
+# --------------------------------------------------------------------------- #
+# The kernel
+# --------------------------------------------------------------------------- #
+
+#: The fused kernel does its arithmetic in the activation's dtype -- it rounds
+#: the normalized activation before the gate's fma, like the reference's own
+#: `flat.to(original_dtype)`, and it accumulates the collapsed stream in fp32 and
+#: stores it back rounded.  Two different summation orders over 14336 products is
+#: a few ulp of the dtype, not a few ulp of fp32: what is asserted here is that
+#: the kernel is the *same forward pass*, at the precision the dtype has.
+_KERNEL_REL_TOL = {torch.float32: 1e-5, torch.float16: 4e-3, torch.bfloat16: 4e-2}
+
+
+def _kernel():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from src.models.xing4_0.hyper_connection import _load_hyper_connection_kernel
+
+    module = _load_hyper_connection_kernel()
+    if module is None:
+        pytest.skip("xing4_hyper_connection_forward is not built for this interpreter")
+    return module
+
+
+def _kernel_parity(dtype: torch.dtype, rows: int, scale: float = 0.5, seed: int = 11) -> None:
+    params = _params()
+    weights = _weights(params, seed=seed)
+    connection = HyperConnection(params, weights, dtype=dtype, use_kernel=True)
+    # `[batch, seq, hc, hidden]`: the eager port flattens from dim 2, so a state
+    # without the batch axis is a shape it is not written for.
+    hidden = torch.randn(1, rows, params.hc_mult, params.hidden_size, generator=torch.Generator().manual_seed(seed + 1)) * scale
+    hidden = hidden.to(dtype).cuda()
+
+    got = connection.forward(hidden)
+    expected = _reference_hyper_connection(params, weights, hidden.cpu())
+    for index, (a, b) in enumerate(zip(got, expected)):
+        a = a.float().cpu()
+        magnitude = b.abs().max().item()
+        worst = (a - b).abs().max().item()
+        assert worst <= _KERNEL_REL_TOL[dtype] * max(magnitude, 1e-3), (
+            f"rows={rows} {dtype} tensor {index}: {worst} on a magnitude of {magnitude}"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("rows", [1, 7, 64])
+def test_the_kernel_is_the_port(dtype: torch.dtype, rows: int) -> None:
+    """One block a row, and the same arithmetic the eager port does."""
+    _kernel()
+    _kernel_parity(dtype, rows)
+
+
+def test_the_kernel_takes_the_batch_axis_and_gives_it_back() -> None:
+    """`(*batch, tokens, hc, hidden)` in, the same leading shape out.
+
+    The block's own state carries a batch axis that the eager port flattens
+    implicitly; the kernel is one block a row and has to be told the rows, so the
+    reshape has to come back the way it went in or every shape below it is wrong.
+    """
+    _kernel()
+    params = _params()
+    connection = HyperConnection(params, _weights(params, seed=5), dtype=torch.float32, use_kernel=True)
+    hidden = torch.randn(2, 3, params.hc_mult, params.hidden_size).cuda()
+    post, comb, collapsed = connection.forward(hidden)
+    assert tuple(post.shape) == (2, 3, params.hc_mult)
+    assert tuple(comb.shape) == (2, 3, params.hc_mult, params.hc_mult)
+    assert tuple(collapsed.shape) == (2, 3, params.hidden_size)
+
+
+def test_the_kernel_agrees_with_the_eager_path_on_a_real_activation() -> None:
+    """Rows of a real released `attn_hc`, at the released 3584-wide state.
+
+    The synthetic cases above are noise, which makes the unweighted norm's output
+    direction uniform on the sphere.  A real activation has a heavy tail, and the
+    one place that could matter is whether the Sinkhorn iterate saturates -- so
+    this runs the released weights at the released width, where it can.
+    """
+    _kernel()
+    params = _real_params()
+    tensors = _real_tensors()
+    weights = HyperConnectionWeights.from_hf(tensors, params, "attn_hc")
+    generator = torch.Generator().manual_seed(7)
+    hidden = torch.randn(1, 9, params.hc_mult, params.hidden_size, generator=generator) * 4.0
+    hidden[:, :, 0] *= 40.0
+
+    kernel = HyperConnection(params, weights, dtype=torch.float32, use_kernel=True)
+    eager = HyperConnection(params, weights, dtype=torch.float32)
+    got, expected = kernel.forward(hidden.cuda()), eager.forward(hidden.cpu())
+    for index, (a, b) in enumerate(zip(got, expected)):
+        worst = (a.float().cpu() - b).abs().max().item()
+        assert worst <= 1e-3 * max(b.abs().max().item(), 1.0), f"tensor {index} differs by {worst}"
+
+
+def test_the_kernel_survives_a_row_that_the_eager_path_never_sees() -> None:
+    """`hc_mult = 1`: no mixing, and the kernel's own bounds are what allow it.
+
+    The kernel is sized for eight streams and asserts the bound rather than
+    trusting the caller, so a width it was not written for is the case that would
+    read past an array.  One stream is the smallest that still has a Sinkhorn.
+    """
+    _kernel()
+    params = _params(hc_mult=1)
+    weights = _weights(params, seed=9)
+    connection = HyperConnection(params, weights, dtype=torch.float32, use_kernel=True)
+    hidden = torch.randn(1, 5, 1, params.hidden_size).cuda()
+    got = connection.forward(hidden)
+    expected = _reference_hyper_connection(params, weights, hidden.cpu())
+    _tree_close(got[0].float().cpu(), expected[0], 1.0, atol=1e-5)
+    _tree_close(got[1].float().cpu(), expected[1], 1.0, atol=1e-5)
