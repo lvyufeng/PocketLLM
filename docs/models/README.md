@@ -31,6 +31,7 @@ This table is the runtime status and nothing else, so a row stays scannable.
 | [Ternary-Bonsai-2-27B](ternary-bonsai-2-27b.md) | Same text architecture | GGUF `PTQ1_0`, 1.75 bits a weight | C++/CUDA, **one card**, no flag | Text + server | [Design](../architecture/bonsai_2_27b_design.md) |
 | [DeepSeek-V4.1-Flash](deepseek-v4.1-flash.md) | Encoder-decoder, CSA2 shared-KV, MoE | Safetensors FP8 + FP4 | `--backend v41`, host PyTorch, TP4 | Text + server | [Design](../architecture/deepseek_v4_1_flash_design.md) |
 | [MiMo-V2.6-Flash](mimo-v2.6-flash.md) | 9 global + 39 sliding-window, MoE | Safetensors FP8 + MXFP4 | `--backend mimo`, host expert bank, TP4 | Text + server | [Design](../architecture/mimo_v2_6_flash_design.md) |
+| [Xing4.0-29B-A4B](xing4.0-29b-a4b.md) | MLA + matrix hyper-connection, 64-expert MoE | GGUF `IQ4_NL` | `--backend xing4`, **one card**, experts resident | Text + server | [Design](../architecture/xing4_0_29b_a4b_design.md) |
 
 The **Design doc** column points at the engineering record for that model: what its runtime does and why, the measurements behind each design choice, and the probes those numbers come from. It lives under `docs/architecture/`, not next to the guides, because it is written for changing the runtime rather than for running it.
 

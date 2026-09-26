@@ -116,6 +116,7 @@ nav:
       - DeepSeek-V4.1-Flash: models/deepseek-v4.1-flash.md
       - MiMo-V2.6-Flash: models/mimo-v2.6-flash.md
       - Ternary-Bonsai-2-27B: models/ternary-bonsai-2-27b.md
+      - Xing4.0-29B-A4B: models/xing4.0-29b-a4b.md
   - Guides:
       - Overview: guides/index.md
       - Benchmarking and reporting: guides/benchmarking.md
@@ -179,6 +180,7 @@ nav:
       - New model roadmap: architecture/pocketllm_new_model_roadmap.md
       - Ternary-Bonsai-2-27B reference gate: architecture/ternary_bonsai_2_reference_gate.md
       - Xing4.0-29B-A4B checkpoint audit: architecture/xing4_0_29b_a4b_audit.md
+      - Xing4.0-29B-A4B design and measurements: architecture/xing4_0_29b_a4b_design.md
       - Ternary-Bonsai-2-27B dense GEMM: architecture/ternary_bonsai_2_dense_gemm.md
       - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
       - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md

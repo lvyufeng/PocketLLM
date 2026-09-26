@@ -58,6 +58,7 @@ class Generation:
     stopped: str = "length"
     prefill_seconds: float = 0.0
     decode_seconds: float = 0.0
+    first_step_seconds: float = 0.0
     ttft_seconds: float = 0.0
     prompt_tokens: int = 0
     cached_tokens: int = 0
@@ -66,6 +67,21 @@ class Generation:
     def step_seconds(self) -> float:
         """One decode step's share of the loop, which is what a per-token rate means."""
         return self.decode_seconds / max(1, len(self.tokens) - 1)
+
+    @property
+    def steady_step_seconds(self) -> float:
+        """The same, with the first step excluded.
+
+        The first step after a prefill is not a steady-state step: it is where
+        the allocator settles a request-sized working set, measured on one card
+        at 0.6 s after a narrow prefill chunk and 3.0 s after a wide one against
+        a steady 0.18 s.  It is a real cost and a client pays it, which is why
+        `step_seconds` still counts it -- but a per-token *rate* wants the
+        steady figure, and a report that gave only one of the two would be
+        wrong about either the request or the engine.
+        """
+        remaining = max(1, len(self.tokens) - 2)
+        return (self.decode_seconds - self.first_step_seconds) / remaining
 
 
 def sample_token(
@@ -174,6 +190,7 @@ def generate(
     eos = _eos_set(eos_token_id)
     tokens: list[int] = []
     stopped = "length"
+    first_step = 0.0
     for index in range(budget):
         if on_step is not None and on_step():
             stopped = "cancel"
@@ -193,7 +210,10 @@ def generate(
         # prompt and the tokens already emitted.  A chunked prefill leaves the
         # cache holding exactly `len(ids)`, which is what makes this arithmetic
         # rather than a counter to keep.
+        step_started = time.perf_counter()
         step = model.forward([token], cache=cache, start_pos=len(ids) + index)
+        if index == 0:
+            first_step = time.perf_counter() - step_started
         logits = step[-1]
 
     decode = time.perf_counter() - first
@@ -202,6 +222,7 @@ def generate(
         stopped=stopped,
         prefill_seconds=prefill,
         decode_seconds=decode,
+        first_step_seconds=first_step,
         ttft_seconds=prefill,
         prompt_tokens=len(ids),
         cached_tokens=cached_len,

@@ -114,12 +114,20 @@ def main() -> int:
             chunk=chunk,
         )
         prefill = result.prefill_seconds
-        decode = result.decode_seconds / max(1, len(result.tokens) - 1)
+        steps = max(1, len(result.tokens) - 1)
+        decode = result.decode_seconds / steps
+        # The first step after a prefill is a one-off: the allocator settles a
+        # request-sized working set, measured at 0.6 s after a narrow chunk and
+        # 3.0 s after a wide one, against a steady ~0.18 s.  Both numbers are
+        # reported, because a client pays the first one and a rate wants neither
+        # hidden nor averaged into the other.
+        steady = result.steady_step_seconds
         print(
             f"{length:6d} tokens:  prefill {length / prefill:8.2f} tok/s ({prefill * 1000:8.0f} ms)   "
             f"decode {1 / decode:6.2f} tok/s ({decode * 1000:7.1f} ms/token)   "
-            f"ttft {result.ttft_seconds * 1000:.0f} ms   chunk {chunk} "
-            f"(peak {_prefill_peak_bytes(chunk, int(model.params.n_heads), args.max_model_len) / 2**20:.0f} MiB)"
+            f"steady {1 / steady:6.2f} tok/s ({steady * 1000:6.1f} ms)   "
+            f"first step {result.first_step_seconds * 1000:6.0f} ms   ttft {result.ttft_seconds * 1000:.0f} ms   "
+            f"chunk {chunk} (peak {_prefill_peak_bytes(chunk, int(model.params.n_heads), args.max_model_len) / 2**20:.0f} MiB)"
         )
     return 0
 
