@@ -36,8 +36,9 @@ Three things decide how this runtime is built.
 resident footprint is expert weights, read once at load and indexed by expert thereafter. Every other
 MoE in this repository streams its active experts from a host bank or a disk because its checkpoint is
 far larger than a card; this one would pay a PCIe round trip for weights that are already where they
-are needed. It is also why there is no tensor-parallel path: `ep_size = 1`, nothing spills, and a
-second card buys context rather than rate — see **Known limitations**.
+are needed. It is also why there is no tensor-parallel path: `ep_size = 1` and nothing spills. What a
+second card is for here is **throughput and context**, and running one process a card doubles both at
+no cost to either — see **Performance**.
 
 **Four residual streams, and the sublayer never sees them.** The state is
 `[tokens, 4, 3584]`; the block projects all four flattened together into 24 coefficients
@@ -54,7 +55,7 @@ four streams from compounding rather than behaving like one. None of that is a r
 accumulate — `pre`, `post` and `comb` are recomputed from the current state at every sublayer — and
 none of it is cheap in the naive form either: 20 Sinkhorn rounds × 2 gates × 40 blocks is 1,600
 dependent small-matrix steps a token. PocketLLM runs the whole thing in one kernel, one block a row,
-which is where decode's 2.45× came from
+which is where decode's **2.17×** came from
 ([the design record](../architecture/xing4_0_29b_a4b_design.md#3-the-hyper-connection-in-one-kernel)).
 
 **The attention is the largest single read of a decode token, and it is not quantized.** The
@@ -128,7 +129,7 @@ prefix store is on by default.
 | `--backend-option prefill_chunk=N` | derived | Tokens a prefill forward takes. Derived from the card's free memory and the context; naming one is for reproducing a measurement, not for tuning. |
 | `--backend-option prefix_cache_bytes=N` | 2 GiB | The store's host-side budget. |
 | `--backend-option tokenizer=DIR` | — | The tokenizer directory, same as `--tokenizer-path`. |
-| `--backend-option use_kernel=false` | `true` | Runs the hyper-connection in PyTorch instead of the fused kernel. **2.45× slower at decode**; it exists so the two can be compared. |
+| `--backend-option use_kernel=false` | `true` | Runs the hyper-connection in PyTorch instead of the fused kernel. **2.17× slower at decode**; it exists so the two can be compared. |
 | `--tensor-parallel-size` | 1 | Not implemented for this checkpoint; a value above 1 is refused rather than silently ignored. |
 
 ### Without a server
@@ -271,7 +272,7 @@ questions — what the runtime will promise, and what the card can just barely d
   46.5 ms of device work, so the GPU is idle three-quarters of the step and the card's 616 GB/s is
   barely used. Nothing about the checkpoint explains it — the bytes a token reads are 3.76 GiB, which
   the card could deliver in 6.6 ms. The levers are CUDA graphs and fewer, larger kernels, and the
-  fused hyper-connection kernel already showed what the second one is worth (2.45×, and it removed
+  fused hyper-connection kernel already showed what the second one is worth (2.17×, and it removed
   5,800 of those launches at once). This number varies ±15% run to run because it is a host-side
   measurement; the mechanism does not.
 - **Requests serialize.** `capabilities.supports_batch` is False and the adapter refuses a second
