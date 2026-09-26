@@ -67,19 +67,49 @@ process on the host, not the number the model was trained at.
 """
 
 DEFAULT_PREFILL_CHUNK = 2048
-"""Tokens one prefill forward takes when the context leaves room for that many.
+"""Tokens one prefill forward takes when the room leaves space for that many.
 
 The loop's own default and the widest this adapter will pick.  It is not always
-usable: the absorbed MLA materialises a `heads x chunk x tokens` fp32 score
-matrix, so a chunk costs ``4 * 32 * chunk * context`` bytes of the card and the
-checkpoint leaves 3.4 GiB of it.  2048 is 537 MiB at a 2048-token prompt and
-4.3 GiB at a 16384-token one, which is the measurement that produced
-:func:`_chunk_for` -- a first long prompt under a `--max-model-len 32768` launch
-would otherwise OOM inside the attention, several minutes into a request.
+usable, because the absorbed MLA materialises a `heads x chunk x tokens` score
+path, so a chunk costs a multiple of its own width of the card -- see
+:func:`_chunk_for` for the measurement.
 """
 
-#: Bytes the prefill's score matrix may take.  Half of what is free with this
-#: checkpoint resident, leaving room for the MoE's own buffers and the allocator.
+#: The narrowest prefill chunk this loop will run.  Below it a request makes no
+#: progress worth the launch, and the score path stops shrinking faster than the
+#: context grows, so the floor is also where a context ceiling comes from: the
+#: workspace and the KV cache want the same few GiB of the card.
+MIN_PREFILL_CHUNK = 128
+
+#: Bytes one element of the prefill's score path costs at its peak, measured.
+#: **Not 4.**  The score matrix is fp16 (2 bytes), the fp32 softmax the reference
+#: asks for is a second copy of the whole thing (4) and the fp16 probabilities it
+#: is cast back into are a third (2); all three are live at once, and the peak of
+#: the three is what the card has to have.  A chunk-wide measurement at a fixed
+#: 8192-token context gives 281.5, 552.4, 1095.2 and 2183.3 MiB for chunks of
+#: 128, 256, 512 and 1024, against this constant's 256.0, 512.0, 1024.0 and
+#: 2048.0 -- so the remainder is the two terms below and not a fourth copy.
+SCORE_BYTES_PER_ELEMENT = 8
+
+#: What a prefill holds besides the scores, per chunk token: the fp32 residual
+#: streams (`[1, chunk, 4, 3584]` is 56 KiB a chunk token on its own, and the
+#: hyper-connection rebuilds several of them) and the grouped MoE's per-route
+#: buffers.  Measured as the same probe's remainder divided by the chunk.
+PREFILL_WORKSPACE_BYTES_PER_CHUNK = 126 << 10
+
+#: The part of that remainder that does not scale with the chunk.
+PREFILL_WORKSPACE_FLOOR_BYTES = 11 << 20
+
+#: What to leave free on the card for everything nobody accounted for: the
+#: allocator's own fragmentation, the sampler's host-side copy of a 131072-wide
+#: logits row, and whatever else the box already has resident.  The default
+#: context needs about 300 MiB of it in practice; this is the reserve that makes
+#: the derivation conservative rather than tight.
+PREFILL_DEVICE_RESERVE = 768 << 20
+
+#: The room a chunk is planned against when nobody measured the device -- a
+#: caller with no card in hand, or a test.  Half of what is free with this
+#: checkpoint resident.
 PREFILL_SCORE_BUDGET = 1 << 30
 
 #: ``backend_options`` keys a launch always carries that this adapter has no use for, on the same
@@ -93,18 +123,41 @@ _KNOWN_OPTIONS = frozenset(
 )
 
 
-def _chunk_for(context: int, heads: int) -> int:
-    """A prefill chunk whose score matrix fits `PREFILL_SCORE_BUDGET`.
+def _prefill_peak_bytes(chunk: int, heads: int, context: int) -> int:
+    """What one prefill chunk of `chunk` tokens costs the card at its peak.
 
-    ``score_bytes = 4 * heads * chunk * context``, rounded down to a multiple of
-    128 so the chunk boundary is a round number of tiles, and floored at 128
-    because a chunk narrower than that is a request that cannot make progress.
+    Two terms, both measured rather than assumed: the score path, which is
+    ``SCORE_BYTES_PER_ELEMENT * heads * chunk * context``, and the per-chunk
+    working set, which is linear in the chunk with a small constant under it.
+    """
+    return (
+        SCORE_BYTES_PER_ELEMENT * int(heads) * int(chunk) * int(context)
+        + PREFILL_WORKSPACE_BYTES_PER_CHUNK * int(chunk)
+        + PREFILL_WORKSPACE_FLOOR_BYTES
+    )
+
+
+def _chunk_for(context: int, heads: int, room_bytes: int | None = None) -> int:
+    """The widest prefill chunk whose peak fits `room_bytes` of the card.
+
+    The inverse of :func:`_prefill_peak_bytes`, rounded down to a multiple of 128
+    so the chunk boundary is a round number of tiles and floored at 128 because a
+    chunk narrower than that is a request that cannot make progress.
+
+    The arithmetic is why this is derived rather than defaulted.  With 3.40 GiB
+    free and a 32768-position cache taking 1.41 GiB of it, a 2048-token chunk's
+    score path is 2.0 GiB **per chunk** at a 32768-token context and the launch
+    dies inside the softmax several minutes into its first long prompt -- which is
+    the failure this function exists to prevent and which an earlier version of
+    it, budgeting 4 bytes an element instead of 8, did not actually prevent.
     """
     if context <= 0 or heads <= 0:
         return DEFAULT_PREFILL_CHUNK
-    room = PREFILL_SCORE_BUDGET // (4 * int(heads) * int(context))
-    chunk = min(DEFAULT_PREFILL_CHUNK, max(128, int(room)))
-    return max(128, chunk // 128 * 128)
+    room = PREFILL_SCORE_BUDGET if room_bytes is None else max(0, int(room_bytes))
+    per_chunk = SCORE_BYTES_PER_ELEMENT * int(heads) * int(context) + PREFILL_WORKSPACE_BYTES_PER_CHUNK
+    affordable = (room - PREFILL_WORKSPACE_FLOOR_BYTES) // per_chunk
+    chunk = min(DEFAULT_PREFILL_CHUNK, max(MIN_PREFILL_CHUNK, int(affordable)))
+    return max(MIN_PREFILL_CHUNK, chunk // MIN_PREFILL_CHUNK * MIN_PREFILL_CHUNK)
 
 
 @dataclass(slots=True)
@@ -299,14 +352,33 @@ class Xing4Backend(BackendBase):
         # One cache for the life of the process, sized to the context the launcher asked for and
         # reset per request. It is 1.51 GiB at the default and allocating it per request would both
         # fragment the card and pay the zeroing every time.
+        self._heads = int(getattr(getattr(self._model, "params", None), "n_heads", 0))
         self._cache = self._model.make_cache(self._max_seq_len, batch=1)
         if self._options.prefill_chunk is None:
-            # Derived rather than defaulted: the score matrix's size is a function
-            # of the context the launcher asked for, so the chunk that fits is too.
-            self._heads = int(getattr(getattr(self._model, "params", None), "n_heads", 0))
-            self._options.prefill_chunk = _chunk_for(self._max_seq_len, self._heads)
-        else:
-            self._heads = int(getattr(getattr(self._model, "params", None), "n_heads", 0))
+            # Derived rather than defaulted, and derived from *this* card: the score
+            # path's size is a function of the context the launcher asked for, and
+            # what is left to spend on it is a function of the card. A constant
+            # budget is what made the default launch unable to prefill its own
+            # default context -- see `_chunk_for`.
+            room = self._prefill_room()
+            floor_peak = _prefill_peak_bytes(MIN_PREFILL_CHUNK, self._heads, self._max_seq_len)
+            if floor_peak > room:
+                # Refused here rather than left to the allocator twenty minutes
+                # into the first long prompt: at this context even the narrowest
+                # chunk does not fit, and the KV cache and the score workspace are
+                # competing for the same few GiB.
+                raise ConfigurationError(
+                    f"--max-model-len {self._max_seq_len} leaves {room / 2**20:.0f} MiB above the "
+                    f"{self._cache_bytes() / 2**20:.0f} MiB cache, and the narrowest prefill chunk "
+                    f"({MIN_PREFILL_CHUNK} tokens) needs {floor_peak / 2**20:.0f} MiB of it at that "
+                    f"context; lower --max-model-len, or raise it on a card with more room"
+                )
+            self._options.prefill_chunk = _chunk_for(self._max_seq_len, self._heads, room)
+            self._say(
+                f"prefill chunk {self._options.prefill_chunk} "
+                f"(peak {_prefill_peak_bytes(self._options.prefill_chunk, self._heads, self._max_seq_len) / 2**20:.0f} MiB "
+                f"of {room / 2**20:.0f} MiB free above the cache)"
+            )
         if self._tokenizer is None:
             self._tokenizer = self._open_tokenizer()
         self._build_details()
@@ -314,6 +386,28 @@ class Xing4Backend(BackendBase):
             f"resident {self._model.nbytes / 2**30:.2f} GiB, "
             f"cache {self._cache_bytes() / 2**30:.2f} GiB over {self._max_seq_len} positions"
         )
+
+    def _prefill_room(self) -> int:
+        """Bytes the prefill may spend above what is already allocated.
+
+        The card's own free memory, minus a reserve, read *after* the model and
+        the cache are on it -- so what is left is exactly the working room.  A
+        device that cannot be queried (a test, a launcher that names no card)
+        falls back to the constant, which is a smaller number and therefore the
+        conservative direction.
+        """
+        device = self._device
+        try:
+            # Imported here rather than at module scope: this adapter is
+            # importable without a CUDA torch, which is what lets the factory and
+            # the tests touch it on a box that has no card.
+            import torch
+
+            index = torch.device(device).index
+            free = int(torch.cuda.mem_get_info(index)[0])
+        except (ImportError, AttributeError, RuntimeError, ValueError, TypeError):
+            return PREFILL_SCORE_BUDGET
+        return max(PREFILL_SCORE_BUDGET // 2, free - PREFILL_DEVICE_RESERVE)
 
     def _ensure_prefix_cache(self) -> None:
         if self._prefix_cache is not None or self._options.prefix_cache_bytes <= 0:
@@ -338,9 +432,9 @@ class Xing4Backend(BackendBase):
             "experts": "64 routed top-4 plus one shared, every expert resident on the card",
             "prefill": (
                 f"one forward a {self._options.prefill_chunk}-token chunk, "
-                f"sized so its "
-                f"{4 * self._heads * self._options.prefill_chunk * self._max_seq_len / 2**20:.0f} MiB "
-                f"score matrix fits out of the {PREFILL_SCORE_BUDGET / 2**20:.0f} MiB budget"
+                f"sized so its peak "
+                f"{_prefill_peak_bytes(self._options.prefill_chunk, self._heads, self._max_seq_len) / 2**20:.0f} MiB "
+                f"fits the room left above the cache"
             ),
             "context": (
                 f"{self._max_seq_len} positions, absorbed cache {self._cache_bytes() / 2**30:.2f} GiB"
@@ -673,5 +767,10 @@ __all__ = [
     "DEFAULT_MAX_SEQ_LEN",
     "DEFAULT_PREFILL_CHUNK",
     "PREFILL_SCORE_BUDGET",
+    "SCORE_BYTES_PER_ELEMENT",
+    "PREFILL_DEVICE_RESERVE",
+    "MIN_PREFILL_CHUNK",
+    "_chunk_for",
+    "_prefill_peak_bytes",
     "resolve_paths",
 ]

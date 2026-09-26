@@ -432,14 +432,81 @@ def test_the_adapter_reports_what_it_holds_between_requests() -> None:
 
 
 def test_the_chunk_is_derived_from_the_context_the_launcher_asked_for() -> None:
-    """A long context gets a narrow chunk, because the score matrix is `chunk x tokens`."""
-    from pocketllm.backends.xing4_backend import _chunk_for
+    """A long context gets a narrow chunk, because the score path is `chunk x tokens`."""
+    from pocketllm.backends.xing4_backend import _chunk_for, _prefill_peak_bytes
 
-    assert _chunk_for(2048, 32) == DEFAULT_PREFILL_CHUNK
-    assert _chunk_for(4096, 32) == DEFAULT_PREFILL_CHUNK
-    assert _chunk_for(32768, 32) == 256
-    assert _chunk_for(262144, 32) == 128, "floored, because a narrower chunk makes no progress"
+    room = 1 << 30
+    assert _chunk_for(2048, 32, room) == 1536
+    assert _chunk_for(8192, 32, room) == 384
+    assert _chunk_for(32768, 32, room) == 128
+    assert _chunk_for(262144, 32, room) == 128, "floored, because a narrower chunk makes no progress"
     assert _chunk_for(0, 32) == DEFAULT_PREFILL_CHUNK
+    # The room the adapter actually computes on a 2080 Ti with this checkpoint
+    # resident: 3.40 GiB free minus the reserve.
+    from pocketllm.backends.xing4_backend import PREFILL_DEVICE_RESERVE
+
+    device_room = int(3.40 * 2**30) - PREFILL_DEVICE_RESERVE
+    assert _chunk_for(2048, 32, device_room) == DEFAULT_PREFILL_CHUNK
+    assert _chunk_for(32768, 32, device_room) == 256
+    # Whatever room it was given, what it picked fits in it -- which is the
+    # property an earlier version of this function failed: it budgeted four bytes
+    # a score element where the peak is eight, so it answered 256 at a
+    # 32768-token context and a 1 GiB room, and 256 does not fit 1 GiB there.
+    for context in (2048, 8192, 32768):
+        for given in (1 << 29, 1 << 30, 3 << 30):
+            picked = _chunk_for(context, 32, given)
+            assert _prefill_peak_bytes(picked, 32, context) <= given or picked == 128, (
+                f"chunk {picked} at {context} tokens needs "
+                f"{_prefill_peak_bytes(picked, 32, context) / 2**20:.0f} MiB of a {given / 2**20:.0f} MiB room"
+            )
+
+
+def test_a_context_whose_narrowest_chunk_does_not_fit_is_refused() -> None:
+    """Refused at load, not left to the allocator inside the first long prompt.
+
+    The KV cache and the prefill's score path want the same few GiB, so past a
+    context that depends on the card there is no chunk the loop can run at all.
+    The adapter knows the card's free memory, so it can say so in a line rather
+    than OOM twenty minutes into a request -- which is what a `--max-model-len`
+    beyond the hardware used to do.
+    """
+
+    class Pinned(Xing4Backend):
+        """A backend whose room is fixed, because the test is not on the card."""
+
+        def _prefill_room(self) -> int:
+            return 256 << 20
+
+    model = ScriptedModel()
+    args = EngineArgs(
+        model="a-xing4-checkpoint",
+        backend="xing4",
+        max_model_len=32768,
+        backend_options={"gguf": "/nowhere/xing4_0-29b-IQ4_NL.gguf"},
+    )
+    instance = Pinned(args, loader=lambda _path, _options: model, tokenizer=FakeTokenizer())
+    with pytest.raises(ConfigurationError, match="max-model-len 32768"):
+        instance.prepare()
+    # And the same context on a card with room is not refused, so the check is
+    # about the room and not about the number.
+    roomy = Xing4Backend(args, loader=lambda _path, _options: model, tokenizer=FakeTokenizer())
+    roomy.prepare()
+    assert "peak" in roomy.capabilities.details["prefill"]
+
+
+def test_the_prefill_peak_is_the_two_measured_terms() -> None:
+    """The formula against the probe, so a change to either constant is visible.
+
+    Measured on one 2080 Ti at an 8192-token context: 281.5, 552.4, 1095.2 and
+    2183.3 MiB for chunks of 128, 256, 512 and 1024.  Within a few percent, which
+    is what a budget needs.
+    """
+    from pocketllm.backends.xing4_backend import _prefill_peak_bytes
+
+    measured = {128: 281.5, 256: 552.4, 512: 1095.2, 1024: 2183.3}
+    for chunk, mib in measured.items():
+        got = _prefill_peak_bytes(chunk, 32, 8192) / 2**20
+        assert abs(got - mib) / mib < 0.05, f"chunk {chunk}: predicted {got:.1f} MiB, measured {mib} MiB"
 
 
 def test_a_named_chunk_is_not_second_guessed() -> None:

@@ -24,6 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 from src.models.xing4_0.gguf_model import Xing4_0GGUFModel
+from pocketllm.backends.xing4_backend import (
+    PREFILL_DEVICE_RESERVE,
+    PREFILL_SCORE_BUDGET,
+    _chunk_for,
+    _prefill_peak_bytes,
+)
 
 DEFAULT_GGUF = "/mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf"
 DEFAULT_RELEASE = "/mnt/data2/Xing4.0-29B-A4B"
@@ -48,7 +54,12 @@ def main() -> int:
     ap.add_argument("--decode-steps", type=int, default=32)
     ap.add_argument("--max-model-len", type=int, default=32768)
     ap.add_argument("--no-kernel", action="store_true")
-    ap.add_argument("--chunk", type=int, default=2048)
+    ap.add_argument(
+        "--chunk",
+        type=int,
+        default=0,
+        help="prefill chunk; 0 derives it from the context the way the server does",
+    )
     args = ap.parse_args()
 
     sys.path.insert(0, args.release)
@@ -73,13 +84,24 @@ def main() -> int:
         f"{free / 2**30:.2f} GiB free of {total / 2**30:.2f} GiB"
     )
 
-    cache = model.make_cache(args.max_model_len, batch=1)
+    cache = model.make_cache(args.max_model_len + args.decode_steps + 8, batch=1)
     print(f"cache {sum(int(l.latent.numel()) * l.latent.element_size() for l in cache) / 2**30:.2f} GiB "
           f"over {args.max_model_len} positions")
+    # The room the *adapter* would compute, which is the device's own free memory
+    # after the model and the cache are on it minus its reserve.  Read here rather
+    # than taken from the adapter because this script holds the device directly.
+    free = int(torch.cuda.mem_get_info(torch.device(args.device).index)[0])
+    room = max(PREFILL_SCORE_BUDGET // 2, free - PREFILL_DEVICE_RESERVE)
+    print(f"room above the cache {room / 2**20:.0f} MiB")
     print()
 
     for length in (int(item) for item in args.lengths.split(",")):
         ids = build_prompt(tokenizer, length)
+        # The chunk the *server* would pick for this context and this card, not
+        # one the caller likes: the score path is 8 bytes an element and at 32K a
+        # 2048-wide chunk is 2.0 GiB of a card that has 2.6 GiB spare.  Measured
+        # at any other width this row is a rate for a configuration nobody runs.
+        chunk = args.chunk or _chunk_for(args.max_model_len, int(model.params.n_heads), room)
         # One full run per length, so the rates below are of a settled card and a
         # warm allocator rather than of the first call in the process.
         result = generate(
@@ -89,14 +111,15 @@ def main() -> int:
             temperature=0.0,
             eos_token_id=tokenizer.eos_token_id,
             cache=cache,
-            chunk=args.chunk,
+            chunk=chunk,
         )
         prefill = result.prefill_seconds
         decode = result.decode_seconds / max(1, len(result.tokens) - 1)
         print(
             f"{length:6d} tokens:  prefill {length / prefill:8.2f} tok/s ({prefill * 1000:8.0f} ms)   "
             f"decode {1 / decode:6.2f} tok/s ({decode * 1000:7.1f} ms/token)   "
-            f"ttft {result.ttft_seconds * 1000:.0f} ms"
+            f"ttft {result.ttft_seconds * 1000:.0f} ms   chunk {chunk} "
+            f"(peak {_prefill_peak_bytes(chunk, int(model.params.n_heads), args.max_model_len) / 2**20:.0f} MiB)"
         )
     return 0
 
