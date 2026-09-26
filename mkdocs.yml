@@ -188,6 +188,7 @@ nav:
       - Ternary-Bonsai-2-27B served runtime: architecture/bonsai_2_27b_design.md
       - GLM-5.3-Flash checkpoint audit: architecture/glm_5_3_flash_audit.md
       - vLLM and SGLang architecture analysis: architecture/vllm_sglang_architecture_analysis.md
+      - Multi-backend and multi-model (vLLM 0.30, SGLang 0.5.20): architecture/multi_backend_multi_model_2026_09.md
       - vLLM and SGLang comparison (pre-Phase-1): architecture/vllm_sglang_comparison.md
       - Ascend 910A performance roadmap: architecture/ascend_performance_roadmap.md
   - Migration:
