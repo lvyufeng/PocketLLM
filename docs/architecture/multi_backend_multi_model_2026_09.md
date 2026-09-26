@@ -53,8 +53,13 @@ hardware. In practice, each hardware backend benefits from its own model impleme
 newest frontier models have moved to `vllm/models/<model>/{common,nvidia,amd,xpu,cpu}/` with a
 platform-dispatching `__init__.py`. The generic-model camp is splitting its own position into "generic
 for the tail, per-vendor for the head". That is, in effect, a statement that PocketLLM's core bet is
-defensible; what PocketLLM lacks is not the bet but the **seams** — a plugin/registry boundary at the
-kernel level, and a single runtime contract at the model level.
+defensible; what PocketLLM lacks is not the bet but the **seams**.
+
+**§8 is the decision this page records, and it splits the two axes.** Model computation stays
+per-model — that is the part both competitors are moving back toward. The request lifecycle and the
+scheduler become one implementation over the narrow `InferenceEngine` contract that already exists in
+`cpp_engine/include/inference_engine.hpp`, driving every runtime, C++ or Python. The short version is:
+**N architecture families over one lifecycle**, not one runtime for twenty checkpoints.
 
 ---
 
@@ -413,6 +418,10 @@ The order is by (value × confidence) ÷ risk, and every item is scoped so it ca
 `docs/guides/benchmarking.md` requires: one configuration per process, arms interleaved, a null arm
 where the difference is small.
 
+**Tiers 1 and 2 are the implementation of the decision in §8** (scheduler unification, stages R1 and R2
+of the refactor project); Tier 3 is the per-model and per-backend work that follows it. Read §8 first if
+the split between "one lifecycle" and "per-model implementations" is the question.
+
 ### Tier 1 — make what exists reachable
 
 1. **Default `pocketllm serve --backend cpp` to the batch path.** Expose `enable_batching` as a CLI
@@ -487,7 +496,179 @@ where the difference is small.
 
 ---
 
-## 8. What this page does not establish
+## 8. Decision: model implementations stay separate; the request lifecycle and scheduler become one
+
+This section is the decision this page exists to record. It is stated as a boundary rather than a
+direction, because the failure mode on both sides is real: a generic data plane costs the per-model
+kernels that are this engine's measured advantage (§5), and five per-model serving stacks cost five
+copies of the same correctness risk (§4.2).
+
+**The decision has two halves, and they point the same way.**
+
+- **Model computation stays per-model.** Attention, KV layout, quantization format, expert placement,
+  the forward's op sequence and its tuning knobs are written per checkpoint family and are not to be
+  abstracted into a generic layer set. This is §5, and the evidence for it now includes vLLM's own
+  position (#42770) and TensorRT-LLM's measured +64.5% from model-specific work.
+- **The request lifecycle and the scheduler become one.** A prompt is admitted, chunked, KV-accounted,
+  sampled per row, cancelled, streamed and reported to the client by **one** implementation, and that
+  implementation drives every runtime — C++ or Python — through the same interface.
+
+### 8.1 The interface already exists, and its design intent is already written down
+
+`cpp_engine/include/inference_engine.hpp:200` is the contract, and it argues for itself:
+
+> This is deliberately the smallest set that `BatchScheduler` actually calls, **not a general model
+> API**: slot lifecycle, paged-KV accounting for admission, the two batched forward entry points, and a
+> capability declaration. Everything model-specific — weight layout, attention kind, speculative
+> decoding, prefix reuse, TP worker protocol — **stays on the concrete engine, where it can keep its own
+> types**.
+>
+> Every method here is called once per scheduler iteration, never per token and never per layer, so
+> dispatching them virtually cannot show up against a batched forward pass. Layer-level components are
+> concrete types for the opposite reason.
+
+That is the boundary this decision asks for, already implemented, with the cost question already
+answered: five virtual calls per scheduler iteration is not a hot path. `Capabilities`
+(`inference_engine.hpp:9`) is the other half and records a mistake the project has already made and
+fixed:
+
+> What an engine can actually do, declared rather than inferred. The scheduler used to read
+> `kv_total_blocks() == 0` as "this engine uses a contiguous arena", which happens to be true for the
+> one engine that existed but is an inference from an accounting field, not a statement of capability.
+
+So the scheduler is already **one implementation over a narrow contract with explicit capability
+declarations**, and it already drives two engines with very different internals. What is missing is not
+the design. What is missing is that it drives only the *native* path.
+
+### 8.2 What actually blocks it
+
+**(a) The Python runtimes do not implement the contract.** They are separate processes with separate
+stacks, and each of the three has its own documented reason:
+
+| Runtime | What the record says stands in front of the scheduler |
+|---|---|
+| v41 | "What it still has none of is **batching, continuous batching** and an MTP layer" ([design record](deepseek_v4_1_flash_design.md)) |
+| MiMo | "Batching, a scheduler — **Not implemented — one request at a time**" ([design record](mimo_v2_6_flash_design.md)) |
+| Xing4 | "`supports_batch` is **False** — the trunk's forward flattens its input to one token axis, so two sequences given to it together would **attend to each other**" ([design record](xing4_0_29b_a4b_design.md)) |
+
+Xing4's is the structural one: its forward has a token axis but no independent value-batch axis. All
+three need per-row sampling and a prefill entry that accepts a budget and can resume.
+
+**(b) The Python control plane has no scheduler — it has a lock.** `pocketllm/backends/base.py:75`:
+
+> The lock is intentionally at the backend boundary. Current native engines own one mutable KV-cache
+> transaction, so concurrent calls must **serialize until a request-aware cache scheduler is
+> implemented**.
+
+The result is that **the same checkpoint is served by two stacks with different semantics**: the native
+binary owns `BatchScheduler`, while `pocketllm serve --backend cpp` drives the engine token by token
+from Python under a lock. They disagree about `supports_batch`, about `prompt_tokens_details.cached_tokens`,
+and about TTFT — for the same model, on the same host, on the same port number.
+
+### 8.3 The migration ladder already exists, and needs no big-bang
+
+`Capabilities` makes the migration incremental: `continuous_batching = false` with `max_slots = 1` *is*
+"this engine can only run one at a time", and the scheduler already knows how to drive such an engine.
+The precedent is `PersistentEngineAdapter` (`engine/persistent_engine_adapter.cpp:55`):
+
+```cpp
+c.continuous_batching = max_slots_ > 1 && engine_->batched_decode_enabled();
+```
+
+with the comment that `Capabilities` should not have, because both directions of error were already
+observed:
+
+> a hardcoded false silently discarded `--max-batch-size`, and a hardcoded true would advertise
+> concurrency the engine does not deliver.
+
+**So step one is not "make v41/mimo/xing4 batchable". Step one is "register them under the one
+scheduler, declaring honestly that they are width 1".** Each runtime's width then improves on its own
+schedule, and the scheduler does not change for it.
+
+### 8.4 Where the scheduler lives: the C++ library, driven from either host — recommended
+
+Three reasons, in order:
+
+1. **It is the only real scheduler in the tree.** Waiting queue, block-budget admission, chunked
+   prefill, one request per choice, and a measured 4.68× at 8 concurrent requests against vLLM's 3.82×.
+2. **It is already exposed to Python.** `cpp_engine/python/bindings.cpp:591` binds it as
+   `QwenBatchScheduler` with `submit_request` / `poll_result`, and `pocketllm/backends/cpp_backend.py:800`
+   is already its client. The path is open; it is bound to `QwenEngine*` and needs to be bound to
+   `InferenceEngine*` instead.
+3. **Moving it to Python would rewrite the `Capabilities` lessons and add a layer to the C++ decode
+   path** — and that path is the entire reason the C++ engine exists.
+
+The resulting shape: **the scheduler is a library with two hosts** (the Python control plane and the
+native binary) rather than two schedulers. The Python runtimes become out-of-process workers on the
+same control channel the C++ TP ranks already use (`core/cmd_channel.cpp` is a unix-domain socket and
+carries no language-specific assumptions). Whether a model's forward is C++ or Python becomes invisible
+to the scheduler.
+
+One consequence has to be taken with it: **the C++ HTTP front end** (`engine/openai_server.cpp`, 2,117
+lines, with its own tokenizer, prefix cache, cancellation, SSE and metrics) cannot stay a second
+implementation. The fix is not to delete the native binary — its latency path is the product — but to
+make the front end a library too, so the native binary is a **host of the same implementation** rather
+than a copy of it. In the same commit the two capability declarations (`pocket::Capabilities` and
+`pocketllm.api.types.BackendCapabilities`) become one, because they are the same fact in two languages.
+
+### 8.5 The boundary
+
+| One implementation | Written per model, deliberately |
+|---|---|
+| `BatchScheduler`: admission, chunking, fairness, per-choice requests | attention implementation (MLA / DSA / GDN / SWA / hyper-connection) |
+| `InferenceEngine`: slot lifecycle, KV accounting, the two batched forwards, capabilities | KV layout and its kernels |
+| the worker control protocol (five IPC mechanisms today) | quantization format and its kernels |
+| HTTP / OpenAI / SSE / cancellation / metrics | expert placement decisions |
+| the prefix-cache **interface** and its metric names | prefix-cache implementations (they are geometry-specific) |
+| adapter: one, plus a per-runtime spec | the forward's op sequence and tuning knobs |
+| test harness and served-path acceptance | the single-request latency path |
+
+The per-model side of that table is exactly what §5 defends. The left column is what the audit in §4.2
+found duplicated — five lifecycles, three schedulers, four HTTP servers, five IPCs, `_decode` byte-identical
+between two adapters.
+
+### 8.6 Where this reaches its limit
+
+This is **not** a claim that 20 checkpoints become one runtime. vLLM's own layout is the honest
+precedent: frontier models under `vllm/models/<model>/{nvidia,amd,xpu,cpu}/` with per-vendor
+implementations, the registry for the tail. The shape to plan for is **N architecture families over
+one lifecycle**, with a small number of bespoke runtimes that genuinely do not fit. A family boundary
+is real here and is already measurable: `attention.py` is 0.85-similar between `qwen4_exp` and
+`xing4_0`, and the checkpoint roadmap itself is ordered by reuse — Bonsai reuses the Qwen3.8-27B runtime
+field for field, and GLM-5.3-Flash is last because it joins two half-built paths.
+
+### 8.7 Sequence
+
+The order matters and the first item is not negotiable.
+
+1. **Repair the acceptance surface first.** `tests/test_cpp_backend_batching.py` is not a pytest test —
+   it inserts a path, takes `sys.argv`, and prints `SKIP` and returns, so **under pytest it is a silent
+   false pass**. CI runs no tests, and the suite's baseline is 9 failures + 5 errors with a
+   collection-time failure. Unifying the lifecycle while regressions are invisible means trading the
+   only working acceptance mechanism for an abstraction with no evidence behind it. Fix the test, add
+   one served-path golden fixture per entry point, and record the baseline as a *set*, because a falling
+   count hides a new failure.
+2. **Make the existing scheduler reachable** (§6.1): `enable_batching` becomes a CLI flag and defaults
+   on for the cpp backend, `--max-batch-size` implies it, and the DeepSeek clamp either defaults on or
+   fails loudly. No runtime changes.
+3. **One capability declaration**, consumed by `pocketllm/backends/factory.py`, replacing four
+   `_reject_unsupported_*` bodies and three `_IGNORED_OPTIONS` sets.
+4. **Bind the scheduler to `InferenceEngine*`** instead of `QwenEngine*`; the Python server drives it.
+5. **Register the Python runtimes under it, width 1.** v41, then mimo, then xing4 (cheapest first: it is
+   single-card, no TP, experts resident).
+6. **Collapse the adapters** to one plus a per-runtime spec, and unify the prefix-cache interface behind
+   the four implementations.
+7. **Raise each runtime's width** as its own per-model work: xing4's value-batch axis, then per-row
+   sampling and resumable prefill for mimo and v41.
+8. **Merge the two HTTP front ends**, and extend `check_layering` to `engine/` — the last one matters
+   because steps 4–7 move engine code, and `engine/` is the one directory the layering check does not
+   cover today.
+
+Items 1–3 are scheduled as Stage R1, 4–6 as R2, and 7–8 as R3 in the refactor project.
+
+---
+
+## 9. What this page does not establish
 
 - No number measured on vLLM 0.30.0 or SGLang 0.5.20 is reproduced here; this machine cannot run
   either on these cards (SGLang has no sm_75 AOT artifacts and retired its CUDA 12 lane; vLLM 0.30
@@ -536,6 +717,9 @@ provider docs; TensorRT-LLM DeepSeek-V4 blog.
 
 ## Related
 
+- [Refactor project: one request lifecycle, one scheduler](https://github.com/users/lvyufeng/projects/7) —
+  §8's decision as a tracked issue tree, tracked from
+  [#432](https://github.com/lvyufeng/PocketLLM/issues/432)
 - [PocketLLM vs vLLM vs SGLang](vllm_sglang_architecture_analysis.md) — the earlier comparison, against
   the local 0.21.0 fork
 - [cpp_engine multi-backend refactor plan](cpp_engine_multi_backend_plan.md) — the layering plan item 6
