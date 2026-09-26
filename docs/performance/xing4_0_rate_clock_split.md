@@ -17,7 +17,7 @@ and the corrected trend is flat.
 | Hardware | 1 x RTX 2080 Ti (sm_75), `--device cuda:2` |
 | Checkpoint | `/mnt/data2/Xing4.0-29B-A4B-GGUF/xing4_0-29b-IQ4_NL.gguf` (18.72 GiB) + the release directory's tokenizer and `config.json` |
 | Context | 512, 512, 4,096, 16,384, 32,768 tokens — real prose, `--max-model-len 32768`, chunk 128, greedy, one request, 32 generated tokens |
-| Commit | `fix/xing4-0-prefill-decode-clock`, the tree of PR #429 |
+| Commit | `fix/xing4-0-prefill-decode-clock`, the tree of PR #430 |
 | Question | how much of `decode_seconds` was the prompt, and where in a request it is |
 | Run | 2026-09-26, `scripts/bench_xing4_0_e2e.py --device cuda:2 --lengths 512,512,4096,16384,32768 --decode-steps 32 --max-model-len 32768` |
 
