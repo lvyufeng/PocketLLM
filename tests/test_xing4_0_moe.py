@@ -482,6 +482,65 @@ def test_the_shared_expert_is_added_after_the_routed_ones() -> None:
     assert torch.abs(moe(x) - moe.stack.run(x, indices, route_weights)).max() > 1e-3
 
 
+class _LoudStack:
+    """A routed half whose sum is past fp16's ceiling, which the real one's is.
+
+    The grouped kernel computes and returns fp32 -- `gate`, `up` and the
+    `atomicAdd` scatter are all `float` -- so a routed expert whose SwiGLU
+    activation is quadratic in a loud expert's weights arrives here already past
+    65504 and it is the narrowing *after* the kernel that would spoil it.
+    """
+
+    def __init__(self, value: float):
+        self.value = value
+
+    def run(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return torch.full((x.size(0), x.size(-1)), self.value, dtype=torch.float32, device=x.device)
+
+
+def test_the_moe_does_not_narrow_its_own_sum() -> None:
+    """The shared expert is added in fp32 and the result leaves in `out_dtype`.
+
+    `routed + shared` is where the two halves meet, and doing it in the model's
+    own narrow dtype is what turns a 1e5 activation into the inf the rest of the
+    trunk then reads.  The shared expert's `silu(gate) * up` is the second place
+    the same value appears, so its own down projection is built wide too.
+    """
+    params = _params()
+    generator = torch.Generator().manual_seed(3)
+    hidden, experts = 8, 2
+    loud = 9.0e4
+    zeros = lambda: torch.zeros(hidden, hidden)  # noqa: E731
+    weights = MoEWeights(
+        router_weight=torch.randn(experts, hidden, generator=generator),
+        router_bias=torch.zeros(experts),
+        w1=None,
+        w3=None,
+        w2=None,
+        shared_gate=_linear(zeros()),
+        shared_up=_linear(zeros()),
+        shared_down=_linear(zeros()),
+    )
+    small = replace(
+        params,
+        hidden_size=hidden,
+        moe_intermediate_size=hidden,
+        n_routed_experts=experts,
+        n_experts_per_tok=min(params.n_experts_per_tok, experts),
+    )
+    x = torch.randn(4, hidden, generator=generator)
+
+    wide = RoutedMoE(small, weights, _LoudStack(loud), dtype=torch.float16, out_dtype=torch.float32)
+    out = wide(x)
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert out.abs().min() == loud  # the zero shared expert leaves it exactly
+
+    # And the same call at the narrow width saturates, which is the bug.
+    narrow = RoutedMoE(small, weights, _LoudStack(loud), dtype=torch.float16)
+    assert not torch.isfinite(narrow(x)).all()
+
+
 def _linear(weight: torch.Tensor):
     def linear(x: torch.Tensor) -> torch.Tensor:
         return F.linear(x, weight)

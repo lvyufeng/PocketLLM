@@ -87,7 +87,9 @@ class MoEWeights:
     GGUF_SHARED = (("ffn_gate_shexp.weight", "shared_gate"), ("ffn_up_shexp.weight", "shared_up"), ("ffn_down_shexp.weight", "shared_down"))
 
     @classmethod
-    def from_gguf(cls, loader, prefix: str, device: str = "cuda") -> "MoEWeights":
+    def from_gguf(
+        cls, loader, prefix: str, device: str = "cuda", *, out_dtype: torch.dtype = torch.float32
+    ) -> "MoEWeights":
         """Build one block's MoE weights, resident, from the released GGUF.
 
         The routed trio arrives as the file's own stacked-expert tensors and is
@@ -101,6 +103,12 @@ class MoEWeights:
         back is already `[experts, hidden]`.  Reading it with a transpose as well
         would give a matrix that multiplies, is wrong, and passes every shape
         check that does not know which axis is which.
+
+        `out_dtype` is the width the shared expert's GEMMs emit at, and it
+        defaults to fp32 rather than to the fp16 the rest of the file runs at:
+        the shared expert is a real expert on the same weights and its
+        `silu(gate) * up` reaches values fp16 saturates.  Narrowing it here would
+        put an inf into the sum the routed experts are added to.
         """
         from src.components.gguf.quantized_ops import QuantizedGGUFLinear
 
@@ -121,7 +129,9 @@ class MoEWeights:
         for suffix, key in cls.GGUF_ROUTED:
             values[key] = _folded(suffix)
         for suffix, key in cls.GGUF_SHARED:
-            values[key] = QuantizedGGUFLinear(loader.read_quant(f"{prefix}{suffix}", "iq4_nl"))
+            values[key] = QuantizedGGUFLinear(
+                loader.read_quant(f"{prefix}{suffix}", "iq4_nl"), out_dtype=out_dtype
+            )
 
         return cls(
             router_weight=loader.read_dense(f"{prefix}ffn_gate_inp.weight").float(),
@@ -375,11 +385,17 @@ class RoutedMoE:
         *,
         dtype: torch.dtype = torch.float32,
         swiglu_limit: float = 0.0,
+        out_dtype: torch.dtype | None = None,
     ):
         self.params = params
         self.weights = weights
         self.stack = stack
         self.dtype = dtype
+        # What this block hands back.  `dtype` unless the caller names something
+        # wider, which the model does: the routed sum is fp32 out of the kernel
+        # and narrowing it to fp16 here is what turned a 1e5 activation into the
+        # inf the whole trunk then carried.
+        self.out_dtype = dtype if out_dtype is None else out_dtype
         self.top_k = int(params.n_experts_per_tok)
         self.scaling = float(params.routed_scaling_factor)
         self.norm_topk_prob = bool(params.norm_topk_prob)
@@ -387,12 +403,15 @@ class RoutedMoE:
             raise NotImplementedError(
                 f"Xing4.0's router scores with sigmoid; {params.scoring_func!r} is not implemented"
             )
+        # The shared expert's activation product is the same magnitude as a routed
+        # expert's, so it is handed to its down projection in fp32 and never in
+        # the model's own narrow dtype.
         self.shared = SwiGLUMLP(
             weights.shared_gate,
             weights.shared_up,
             weights.shared_down,
             swiglu_limit=swiglu_limit,
-            out_dtype=dtype,
+            out_dtype=torch.float32,
         )
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -417,4 +436,4 @@ class RoutedMoE:
         xf = x.reshape(-1, shape[-1])
         indices, weights = self.route(xf)
         routed = self.stack.run(xf, indices, weights)
-        return (routed + self.shared(xf).float()).reshape(*shape[:-1], routed.size(-1)).to(self.dtype)
+        return (routed + self.shared(xf)).reshape(*shape[:-1], routed.size(-1)).to(self.out_dtype)

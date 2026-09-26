@@ -363,20 +363,28 @@ def _real_params() -> Xing4_0Params:
     return Xing4_0Params.from_config(json.loads(CONFIG.read_text(encoding="utf-8")))
 
 
-def _layer(params: Xing4_0Params, weights: HyperConnectionWeights, mlp=None) -> DecoderLayer:
+def _layer(
+    params: Xing4_0Params,
+    weights: HyperConnectionWeights,
+    mlp=None,
+    *,
+    dtype: torch.dtype = torch.float32,
+    residual_dtype: torch.dtype | None = None,
+) -> DecoderLayer:
     """A layer whose FFN is known, so only the plumbing is measured."""
     from src.models.xing4_0.attention import MLAAttentionWeights
 
     if mlp is None:
         mlp = lambda x: x  # noqa: E731
 
-    shape = lambda *dims: torch.zeros(*dims)  # noqa: E731
+    shape = lambda *dims: torch.zeros(*dims, dtype=dtype)  # noqa: E731
+    ones = lambda *dims: torch.ones(*dims, dtype=dtype)  # noqa: E731
     attention = MLAAttentionWeights(
         q_a_proj=shape(params.q_lora_rank, params.hidden_size),
-        q_a_norm=torch.ones(params.q_lora_rank),
+        q_a_norm=ones(params.q_lora_rank),
         q_b_proj=shape(params.n_heads * params.qk_head_dim, params.q_lora_rank),
         kv_a_proj=shape(params.kv_lora_rank + params.qk_rope_head_dim, params.hidden_size),
-        kv_a_norm=torch.ones(params.kv_lora_rank),
+        kv_a_norm=ones(params.kv_lora_rank),
         k_b=shape(params.n_heads, params.kv_lora_rank, params.qk_nope_head_dim),
         v_b=shape(params.n_heads, params.v_head_dim, params.kv_lora_rank),
         o_proj=shape(params.hidden_size, params.n_heads * params.v_head_dim),
@@ -391,7 +399,8 @@ def _layer(params: Xing4_0Params, weights: HyperConnectionWeights, mlp=None) -> 
             post_attention_layernorm=torch.ones(params.hidden_size),
         ),
         mlp=mlp,
-        dtype=torch.float32,
+        dtype=dtype,
+        residual_dtype=residual_dtype,
     )
 
 
@@ -431,6 +440,51 @@ def test_the_residual_is_rebuilt_and_not_accumulated() -> None:
     # And it is not a residual add: `hidden + sublayer_out` is a different tensor,
     # which is the failure this test exists to catch.
     assert not torch.allclose(out, mid + mlp_out.unsqueeze(-2), atol=1e-4)
+
+
+def test_the_residual_stream_is_wider_than_the_sublayer() -> None:
+    """This checkpoint's activations leave fp16, so its streams are not carried there.
+
+    A routed expert's `silu(gate) * up` is quadratic in its input and reaches
+    ~1e5 on the released weights; fp16 saturates at 65504 and calls the overflow
+    inf, and an inf in the residual is a NaN logits row by the end of the trunk.
+    The block's answer is to keep the sublayers at the narrow width -- what they
+    are handed has just been through an RMS norm, so their arithmetic never sees
+    the magnitude -- and to carry the four streams where the number fits.
+
+    Both halves are asserted, because either one alone is a different bug: the
+    sublayer must be handed the narrow dtype, and its output must reach the
+    residual whole.  The narrow-residual layer below is the same block without
+    the fix, and it is inf.
+    """
+    params = _params()
+    weights = _weights(params, seed=21)
+    loud = 9.0e4
+    seen: list[torch.dtype] = []
+
+    def sublayer(x: torch.Tensor) -> torch.Tensor:
+        # The reference's own shape for this: the arithmetic runs wide inside the
+        # sublayer and the result is what crosses back.  `full_like` in fp16 would
+        # be inf before the block ever saw it, which is the other half of the bug.
+        seen.append(x.dtype)
+        return torch.full(x.shape, loud, dtype=torch.float32, device=x.device)
+
+    torch.manual_seed(22)
+    hidden = torch.randn(1, 2, params.hc_mult, params.hidden_size) * 0.5
+    positions = torch.arange(2)
+
+    wide = _layer(params, weights, mlp=sublayer, dtype=torch.float16, residual_dtype=torch.float32)
+    out = wide.forward(hidden, positions)
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert seen[0] == torch.float16, "the FFN was handed something other than the model's dtype"
+    # It is the activation that crosses, not a clipped or dropped one: `post` is
+    # at most 2, so the residual is the same order of magnitude as the sublayer's
+    # output rather than a normalised version of it.
+    assert out.abs().max() > loud / 2
+
+    narrow = _layer(params, weights, mlp=sublayer, dtype=torch.float16, residual_dtype=torch.float16)
+    assert not torch.isfinite(narrow.forward(hidden, positions)).all()
 
 
 def test_the_norms_are_in_the_block_and_not_only_in_the_model() -> None:

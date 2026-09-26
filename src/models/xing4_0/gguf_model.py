@@ -59,12 +59,19 @@ class Xing4_0GGUFModel:
         block_count: int | None = None,
         config_path: str | Path | None = None,
         use_kernel: bool = True,
+        residual_dtype: torch.dtype = torch.float32,
     ):
         from src.loader.gguf.quantized_loader import GGUFQuantizedTensorLoader
 
         self.path = str(gguf_path)
         self.device = torch.device(device)
         self.dtype = dtype
+        # `dtype` is what the sublayers compute in and `residual_dtype` is what
+        # the four streams are carried in.  They are separate because they have
+        # to be: this checkpoint's activations pass fp16's 65504 -- see
+        # `DecoderLayer.forward` -- while its GEMMs and its attention are built
+        # for the narrow width and would gain nothing from the wide one.
+        self.residual_dtype = residual_dtype
         self.loader = GGUFQuantizedTensorLoader(self.path, device=self.device)
         self.params = self._read_params(config_path)
         self.block_count = int(self.params.n_layers if block_count is None else block_count)
@@ -97,6 +104,7 @@ class Xing4_0GGUFModel:
                     dtype=dtype,
                     device=self.device,
                     use_kernel=self.use_kernel,
+                    residual_dtype=self.residual_dtype,
                 )
             )
 
@@ -211,17 +219,34 @@ class Xing4_0GGUFModel:
         FFN and every block after them has the 64-expert one.  The dense blocks
         are still IQ4_NL -- the quantizer applies to the whole model -- so they
         are raw blocks behind `QuantizedGGUFLinear` and not fp16 weights.
+
+        Both branches are built with fp32 outputs.  An expert's
+        `silu(gate) * up` is the one quantity in the block that is quadratic in
+        the input and it is the one that leaves fp16's range, so the activation
+        product and everything it is then contracted with stay wide; the caller
+        that needs a narrow tensor is the block, and it makes that choice once.
         """
         from src.components.gguf.quantized_ops import QuantizedGGUFLinear
 
         if index < int(self.params.first_k_dense_replace):
             return SwiGLUMLP(
-                QuantizedGGUFLinear(self.loader.read_quant(f"{prefix}ffn_gate.weight", "iq4_nl")),
-                QuantizedGGUFLinear(self.loader.read_quant(f"{prefix}ffn_up.weight", "iq4_nl")),
-                QuantizedGGUFLinear(self.loader.read_quant(f"{prefix}ffn_down.weight", "iq4_nl")),
-                out_dtype=self.dtype,
+                QuantizedGGUFLinear(
+                    self.loader.read_quant(f"{prefix}ffn_gate.weight", "iq4_nl"),
+                    out_dtype=torch.float32,
+                ),
+                QuantizedGGUFLinear(
+                    self.loader.read_quant(f"{prefix}ffn_up.weight", "iq4_nl"),
+                    out_dtype=torch.float32,
+                ),
+                QuantizedGGUFLinear(
+                    self.loader.read_quant(f"{prefix}ffn_down.weight", "iq4_nl"),
+                    out_dtype=torch.float32,
+                ),
+                out_dtype=torch.float32,
             )
-        weights = MoEWeights.from_gguf(self.loader, prefix, device=str(self.device))
+        weights = MoEWeights.from_gguf(
+            self.loader, prefix, device=str(self.device), out_dtype=torch.float32
+        )
         stack = GroupedExpertStack(
             self.params,
             weights,
@@ -229,7 +254,9 @@ class Xing4_0GGUFModel:
             in_dim=int(self.params.hidden_size),
             inter_dim=int(self.params.moe_intermediate_size),
         )
-        return RoutedMoE(self.params, weights, stack, dtype=self.dtype)
+        return RoutedMoE(
+            self.params, weights, stack, dtype=self.dtype, out_dtype=self.residual_dtype
+        )
 
     # -- running ------------------------------------------------------------- #
 
@@ -247,7 +274,13 @@ class Xing4_0GGUFModel:
         # `cuda:2` to drift from a `cuda:0`.
         ids = torch.as_tensor(input_ids, device=self.device).reshape(-1)
         hidden = F.embedding(ids, self.embedding)
-        return hidden.unsqueeze(0).unsqueeze(2).expand(1, -1, int(self.params.hc_mult), -1).contiguous()
+        return (
+            hidden.unsqueeze(0)
+            .unsqueeze(2)
+            .expand(1, -1, int(self.params.hc_mult), -1)
+            .to(self.residual_dtype)
+            .contiguous()
+        )
 
     def forward(
         self,
