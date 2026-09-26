@@ -49,7 +49,7 @@ which is the number the whole design follows from.
 | `hc_*`, router, norms, embedding | 0.086 | 2.3% |
 | **Total** | **3.761** | |
 
-At 616 GB/s that is 6.56 ms, or 152 tok/s. **The measured rate is 6.5 tok/s**, and the reason is not
+At 616 GB/s that is 6.56 ms, or 152 tok/s. **The measured rate is 6.7 tok/s**, and the reason is not
 in this table — it is in §6.
 
 ---
@@ -304,8 +304,15 @@ decode step: wall 128.3 ms   device 46.5 ms   11536 launches/step
 **11,536 launches at ~15 µs of host time each is 173 ms, and the device work is 46.5 ms.** Measured
 directly, host submission is 178–187 ms a step against a 176 ms step, so the GPU is idle about
 three-quarters of every decode step and the card's 616 GB/s is barely touched. That is the whole
-explanation for 6.5 tok/s against a 152 tok/s byte floor, and it is why the entry in **Known
+explanation for 6.7 tok/s against a 152 tok/s byte floor, and it is why the entry in **Known
 limitations** on the guide is about launch count and not about bandwidth.
+
+*Corrected later:* the 6.5 this section first carried was measured across the prefill/decode seam,
+which is a host clock around a boundary the device does not have — the prompt's last chunk drained
+inside the first decode step and was charged to it. The measured size of that error, and the corrected
+table, are in
+[the record](../performance/xing4_0_rate_clock_split.md). Nothing in this section moves: the launch
+count, the host time and the device time are all the step's own.
 
 Two things follow, and both are left for a later stage rather than half-done here:
 
@@ -442,8 +449,11 @@ checkpoint's own renderings does.
 **Tensor parallelism.** Refused rather than unimplemented: `--tensor-parallel-size 2` raises.
 `ep_size = 1`, nothing spills, and a per-layer collective would add to the host submission that
 already bounds decode (§6) rather than subtract from it. The measurement that stands in for it is two
-*processes*, one a card, on the same prompt: **84.79 and 85.89 tok/s prefill against 86.28 alone, and
-6.52 and 6.53 tok/s decode against 6.48 alone** — 2× aggregate at no cost to either. Running one
+*processes*, one a card, on the same prompt: **82.81 and 84.29 tok/s prefill against 83.94 alone, and
+7.27 and 7.09 tok/s decode against 7.10 alone** — 2× aggregate at no cost to either. (Both columns
+were re-measured after §6's *Corrected later* note; the same seam was in them, and
+[the record](../performance/xing4_0_rate_clock_split.md#the-two-card-table) carries the before and
+after.) Running one
 server a card is the supported multi-card shape here. Whether TP2 would raise a *single* stream's rate
 is left open, and would have to be priced against the added collective.
 
