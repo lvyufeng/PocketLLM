@@ -1,0 +1,11 @@
+# The suite's known failures, by node id. Regenerate with
+#   python scripts/check_test_baseline.py --update
+#
+# One entry a line, `<nodeid> <failed|error>`, sorted. This file is a *set*, not a count:
+# the check in scripts/check_test_baseline.py reports a node id that is new and a node id
+# that is no longer failing separately, because three tests fixed and one broken is a net
+# improvement in a count and a regression in the tree.
+#
+# A test added to this file is a test that runs on this host and fails. Anything skipped for
+# want of a GPU, a checkpoint or a built extension is not here and must not be.
+tests/test_package_boundaries.py::test_runtime_stays_model_and_checkpoint_format_agnostic failed
