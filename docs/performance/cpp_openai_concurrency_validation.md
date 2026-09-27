@@ -273,6 +273,36 @@ other, which is the fair-scheduling signature the serialized queue does not have
 smoke measurement at one concurrency level, not a ladder; the ladder with the true multi-row decode
 behind it is the native-server table above.
 
+### One scheduler, read from the inside
+
+Every measurement above compares *responses*. That is not enough to establish that the Python
+server's requests are multiplexed rather than merely queued: a server that serializes under a lock
+and a server that runs one `BatchScheduler` return the same tokens, the same usage counts and the
+same finish reasons. The difference is only visible from inside the process, so it is read from the
+server's own exposition.
+
+`CppBackend.metrics()` republishes the live `BatchScheduler::Stats` under the names the native host
+uses, so `pocketllm_requests_running` here is `pocket_requests_running` there — the same gauge, from
+the same struct, in both hosts of one library.
+`scripts/bench_cpp_scheduler_metrics.py` samples it while a group is in flight and reports the peak.
+
+`pocketllm serve --backend cpp`, Bonsai 2 27B GGUF, TP1, four distinct prompts, 48 greedy tokens,
+one server process per arm:
+
+| Arm | Peak `requests_running` | Peak `requests_waiting` | Aggregate tok/s | Per-request latency |
+|---|---:|---:|---:|---|
+| default (batch) | **4** | 3 | 55.27 | 3.02 – 3.36 s |
+| `--no-enable-batching` | 0 (series absent) | 0 (series absent) | 25.79 | 1.75 – 7.20 s |
+
+Both arms returned 186 completion tokens. The batch arm is 2.14x the aggregate rate, and its four
+latencies lie within 340 ms of each other while the serialized arm's span 5.45 s — a queue that
+drains in submission order, which is what the gauge is reporting.
+
+The serialized arm's `0` is not a measurement: that path has no scheduler, so the series is absent
+from the exposition and the sampler's peak over nothing is zero. That is the reason the field is
+not published as `0` — an absent series cannot be mistaken for a reading, and a zero would say "the
+scheduler is here and idle" about a process that does not have one.
+
 ### Single-request long-context A/B
 
 Same two servers, one request at a time, no concurrency, 128 generated tokens,

@@ -248,3 +248,98 @@ def test_the_batch_decision_reaches_every_rank() -> None:
         tokenizer=FakeTokenizer(),
     )
     assert worker._configured_max_batch_size() == 1
+
+
+# --------------------------------------------------------------------------------------------------
+# what the scheduler reports about itself
+# --------------------------------------------------------------------------------------------------
+
+
+class FakeStats:
+    """The fields `BatchScheduler::Stats` carries, and no more."""
+
+    def __init__(self, **values: int) -> None:
+        self.waiting_requests = values.get("waiting_requests", 0)
+        self.running_requests = values.get("running_requests", 0)
+        self.completed_requests = values.get("completed_requests", 0)
+        self.cancelled_requests = values.get("cancelled_requests", 0)
+        self.free_slots = values.get("free_slots", 0)
+        self.reserved_blocks = values.get("reserved_blocks", 0)
+        self.total_blocks = values.get("total_blocks", 0)
+        self.free_blocks = values.get("free_blocks", 0)
+        self.cache_pinned_blocks = values.get("cache_pinned_blocks", 0)
+
+
+class FakeSchedulerWithStats(FakeScheduler):
+    def __init__(self, engine: object, width: int, *, stats=None, paged_kv: bool = False) -> None:
+        super().__init__(engine, width)
+        self._stats = stats or FakeStats()
+        self._paged_kv = paged_kv
+
+    def get_stats(self) -> FakeStats:
+        return self._stats
+
+    def engine_caps(self) -> Any:
+        class _Caps:
+            paged_kv = self._paged_kv
+
+        return _Caps()
+
+
+class FakeNativeWithStats(FakeNativeWithScheduler):
+    """A build whose scheduler can be asked what it is doing."""
+
+    def __init__(self, **scheduler_kwargs: Any) -> None:
+        self.QwenBatchScheduler = lambda engine, width: FakeSchedulerWithStats(
+            engine, width, **scheduler_kwargs
+        )
+
+
+def test_the_python_server_publishes_the_schedulers_own_gauges() -> None:
+    """`/metrics` is where "one scheduler, several requests" is observable, and it is the same
+    reading on both hosts: the Python server prefixes what it exports, so the native host's
+    `pocket_requests_running` is this server's `pocketllm_requests_running` and the suffixes match.
+    A gauge named anything else would make the two hosts' numbers incomparable without a table."""
+    backend = make_backend(
+        native=FakeNativeWithStats(stats=FakeStats(running_requests=2, waiting_requests=1,
+                                                   free_slots=6))
+    )
+
+    published = backend.metrics()
+
+    assert published["requests_running"] == 2.0
+    assert published["requests_waiting"] == 1.0
+    assert published["slots_free"] == 6.0
+
+
+def test_the_serialized_path_publishes_no_scheduler_gauges() -> None:
+    """There is no scheduler on that path, so publishing zeros would say "the scheduler exists and
+    is idle" about a process that does not have one -- which is worse than an absent series, because
+    an absent series cannot be mistaken for a measurement."""
+    assert make_backend(enable_batching=False).metrics() == {}
+
+
+def test_the_block_gauges_appear_only_on_an_engine_that_pages() -> None:
+    """An unpaged engine's block counts are zeros that a scraper reads as a pool of no blocks
+    rather than as no pool, and `pocket_kv_blocks` is a family a paged deployment reads."""
+    unpaged = make_backend(native=FakeNativeWithStats(stats=FakeStats(total_blocks=64)))
+    paged = make_backend(
+        native=FakeNativeWithStats(stats=FakeStats(total_blocks=64, free_blocks=41), paged_kv=True)
+    )
+
+    assert not [name for name in unpaged.metrics() if name.startswith("kv_blocks")]
+    assert paged.metrics()['kv_blocks{state="total"}'] == 64.0
+    assert paged.metrics()['kv_blocks{state="free"}'] == 41.0
+
+
+def test_a_scheduler_that_cannot_report_does_not_fail_the_scrape() -> None:
+    """A metrics scrape must not fail a request path or a scrape itself. An engine that cannot
+    report is an engine whose series are absent, which a scraper reads as no data."""
+    class _Broken(FakeScheduler):
+        def get_stats(self) -> Any:
+            raise RuntimeError("no stats")
+
+    class _Native(FakeNativeWithScheduler):
+        QwenBatchScheduler = _Broken
+
+    assert make_backend(native=_Native()).metrics() == {}

@@ -382,7 +382,26 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("global_cache_budget_bytes", &QwenPrefixCacheStats::global_cache_budget_bytes)
         .def("as_dict", &prefix_stats_dict);
 
-    py::class_<QwenEngine>(module, "QwenEngine")
+    // The engine interface, registered as a base so the scheduler can be handed any
+    // implementation rather than the one concrete type that happened to exist first.
+    // No constructor: this is the interface a runtime implements, not something Python
+    // instantiates. What it buys is that `QwenBatchScheduler(engine, width)` accepts any
+    // registered `InferenceEngine`, which is the whole point of the abstraction -- a new
+    // engine reaches the scheduler through the same call, with no second scheduler and no
+    // binding change.
+    py::class_<InferenceEngine>(module, "InferenceEngine")
+        .def("caps", &InferenceEngine::caps,
+             "What this engine declares it can do.")
+        .def_property_readonly("max_context", &InferenceEngine::max_context)
+        .def_property_readonly("device", &InferenceEngine::device,
+             "Device this engine bound, or -1 for a host-only engine.")
+        .def_property_readonly("kv_paged", &InferenceEngine::kv_paged)
+        .def_property_readonly("kv_free_blocks", &InferenceEngine::kv_free_blocks)
+        .def_property_readonly("kv_total_blocks", &InferenceEngine::kv_total_blocks)
+        .def_property_readonly("kv_cache_pinned_blocks",
+                               &InferenceEngine::kv_cache_pinned_blocks);
+
+    py::class_<QwenEngine, InferenceEngine>(module, "QwenEngine")
         .def(py::init<const std::string&, const QwenEngineOptions&, int, int>(),
              py::arg("checkpoint_dir"), py::arg("options"),
              py::arg("layer_count") = 0, py::arg("max_context") = 8192,
@@ -593,10 +612,19 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readwrite("completed_requests", &BatchScheduler::Stats::completed_requests)
         .def_readwrite("cancelled_requests", &BatchScheduler::Stats::cancelled_requests)
         .def_readwrite("free_slots", &BatchScheduler::Stats::free_slots)
+        // The paged-KV half of the same struct. Exposed so a Python host can publish the
+        // scheduler's admission state under the metric names the native host already uses, which
+        // is the comparison the two hosts are held to: same library, so the same numbers.
+        .def_readwrite("reserved_blocks", &BatchScheduler::Stats::reserved_blocks)
+        .def_readwrite("total_blocks", &BatchScheduler::Stats::total_blocks)
+        .def_readwrite("free_blocks", &BatchScheduler::Stats::free_blocks)
         .def_readwrite("cache_pinned_blocks", &BatchScheduler::Stats::cache_pinned_blocks);
 
     py::class_<BatchScheduler>(module, "QwenBatchScheduler")
-        .def(py::init<QwenEngine*, int>(),
+        // `InferenceEngine*`, not `QwenEngine*`: the scheduler is one library with as many hosts
+        // as there are engines, so which runtime drives it is the argument's business and not the
+        // binding's. The native binary already constructs it through this same pointer.
+        .def(py::init<InferenceEngine*, int>(),
              py::arg("engine"), py::arg("max_batch_size"))
         .def("submit_request",
              [](BatchScheduler& scheduler,

@@ -196,6 +196,32 @@ The unified server provides:
 
 `/ready` returns HTTP 503 while model loading is incomplete. `/metrics` uses dependency-free Prometheus text exposition and can later be wrapped by a richer exporter.
 
+### The scheduler gauges
+
+On the `cpp` backend with batching on, `/metrics` additionally carries the live `BatchScheduler`'s
+own admission state:
+
+| Series | Meaning |
+| --- | --- |
+| `pocketllm_requests_running` | Requests the scheduler is currently holding a slot for. |
+| `pocketllm_requests_waiting` | Requests admitted but not yet running. |
+| `pocketllm_slots_free` | Slots the running set is not using. |
+| `pocketllm_kv_blocks{state=...}` | `total` / `free` / `reserved` / `cache_pinned`, on an engine that pages only. |
+
+These are the same numbers, from the same `BatchScheduler::Stats`, that the native
+`pocketllm_engine` server publishes — its `pocket_requests_running` is this server's
+`pocketllm_requests_running`, with the same suffix and the same meaning, so the two hosts are
+compared by substituting the prefix rather than by a translation table.
+
+`requests_running` is the one to watch. Two concurrent clients reaching a server that serializes
+them under a lock and two reaching a scheduler produce identical tokens and identical responses; the
+only place they differ is this gauge, which is why it is the reading the concurrency acceptance
+measurements take. `scripts/bench_cpp_scheduler_metrics.py` samples it while a group of requests is
+in flight and reports the peak.
+
+On the serialized path there is no scheduler, so none of these series is exported — not as zero.
+An absent series cannot be mistaken for a measurement; a zero would read as "the scheduler is idle".
+
 That list is the whole HTTP surface. **`/v1/embeddings` is deliberately unsupported** — PocketLLM
 serves the checkpoint's text-generation path, and nothing in either plane computes a pooled
 embedding, so there is no head to return, no `/v1/moderations`, `/v1/audio`, or `/v1/images` either.
