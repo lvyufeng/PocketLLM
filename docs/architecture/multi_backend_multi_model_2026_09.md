@@ -198,8 +198,10 @@ The duplication is measurable at file granularity:
 - `mimo_backend.py` (1,006 lines) vs `xing4_backend.py` (776): a method-level diff finds ~288 lines of
   same-named methods at ≥0.5 similarity, and **`_decode` is byte-identical** (`difflib` ratio 1.00,
   verified). `stream` is a ~65-line clone differing in a thread name.
-- `_publish_cache_metrics` exists three times (v41, mimo, xing4) with the same nine keys.
-- The three `run_worker` scripts in `factory.py` (lines 571, 620, 675) are the same program three times.
+- `_publish_cache_metrics` exists three times (v41, mimo, xing4) with the same nine keys. *Now one
+  body in `BackendBase` — see §8.3.*
+- The three `run_worker` scripts in `factory.py` (lines 571, 620, 675) are the same program three
+  times. *Now one program plus a `WorkerSpec` registry — see §8.3.*
 - `_IGNORED_OPTIONS` is written out three times.
 - OpenAI request parsing/validation exists twice, in two languages: `pocketllm/protocol/` (575 lines)
   and `cpp_engine/core/openai_request_fields.cpp` + `openai_stop_strings.cpp` + `json_constraint.cpp`
@@ -627,6 +629,25 @@ the GIL is very often the one dropping the scheduler, because `~BatchScheduler` 
 rather than shutting down, which is a failure a native-only host could not have produced. The
 constructor asks now, on the thread that already calls `caps` and `allocate_batch_slots`, and hands
 the loop thread the answer.
+
+**One program for every worker rank.** The three `run_worker` scripts in §4.2 are gone. They were
+generated as source text, one per runtime, and differed in three things: the import line, the
+`backend=` string, and whether the checkpoint had loaded by the time the adapter was constructed.
+That is a registry entry — `pocketllm/backends/worker.py`'s `WORKERS`, keyed by the same name
+`select_backend` resolves — and the program is one constant `-c` string that reads which runtime it
+is from the environment, which is the only channel the supervisor has to a child anyway.
+
+The gain is not the ~135 lines. It is that the child is now a real module instead of a string: a
+worker that fails to start is the hardest thing in this tree to debug — the parent sees a child exit
+and a rendezvous that never completes, and the exception that would explain it is inside a `-c`
+script nobody can open. `WorkerSpec` also states the one difference that is easy to get wrong in
+both directions: `ready_at_construction` is True only for the native adapter, whose engine loads in
+its constructor, and False for the Python runtimes, which load *inside* `run_worker`. Announcing
+early would tell the parent a rank is up while it is still inside a collective.
+
+The same pass deleted the three copies of `_publish_cache_metrics` — the same nine Prometheus keys
+in three adapters. A series a scrape sees only when one runtime happens to be serving is worse than
+one it sees always, and nine names typed three times is how they stop agreeing.
 
 ### 8.4 Where the scheduler lives: the C++ library, driven from either host — recommended
 

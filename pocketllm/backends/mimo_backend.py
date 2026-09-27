@@ -287,10 +287,6 @@ class MimoBackend(SchedulerHost, BackendBase):
         self._model: Any = None
         self._cache: Any = None
         self._prefix_cache: Any = None
-        # What `prefix_cache.stats()` last said, in the exporter's spelling. Rebound whole at the end
-        # of every request, because the HTTP thread reads it while a request may be mid-prefill and a
-        # `stats()` walk concurrent with a `store` is a `dictionary changed size`.
-        self._cache_metrics: dict[str, float] = {}
         self._ep: Any = None
         self._device: Any = None
         self._world = 1
@@ -583,30 +579,6 @@ class MimoBackend(SchedulerHost, BackendBase):
             # same `Stats` struct and same names as the `cpp` backend publishes -- which is what
             # makes the two readable as one scheduler rather than as two servers that agree.
             **self.scheduler_metrics(),
-        }
-
-    def _publish_cache_metrics(self) -> None:
-        """Hand the store's counters to the exporter, in the names ``/metrics`` reads.
-
-        The store owns these numbers and no request owns a share of them -- hits and misses are
-        cumulative over the process -- so they travel as whole values rather than as per-request
-        deltas the HTTP layer would have to accumulate. The ``_total`` suffix is Prometheus's
-        convention for a counter and is the whole of the type dispatch at the other end: a name
-        without it is a gauge. ``budget_bytes`` is here rather than only in ``capabilities`` because
-        it is what makes ``bytes`` readable as a fraction, which is the one number that says whether
-        the store is the right size for the traffic.
-        """
-        cache = self._prefix_cache
-        if cache is None:
-            return
-        stats = cache.stats()
-        self._cache_metrics = {
-            "prefix_cache_hits_total": stats["hits"],
-            "prefix_cache_misses_total": stats["misses"],
-            "prefix_cache_reused_tokens_total": stats["reused_tokens"],
-            "prefix_cache_entries": stats["entries"],
-            "prefix_cache_bytes": stats["bytes"],
-            "prefix_cache_budget_bytes": stats["budget_bytes"],
         }
 
     # -------------------------------------------------------------------- requests

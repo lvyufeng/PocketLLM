@@ -84,6 +84,14 @@ class BackendBase:
         self._state_lock = threading.RLock()
         self._cancelled: set[str] = set()
         self._active_requests: set[str] = set()
+        #: What :meth:`_publish_cache_metrics` last read, in the exporter's spelling, and what
+        #: :meth:`metrics` merges into its answer. Rebound whole rather than mutated: the HTTP thread
+        #: reads it while a request may be mid-prefill, and a `stats()` walk running concurrently with
+        #: a store is a `dictionary changed size`. A scrape therefore reads one request's worth of
+        #: state or the request before it, never a half-updated dict. Empty until a runtime with a
+        #: prefix store publishes one, and a runtime without a store never does -- which
+        #: :meth:`metrics` reads as "no backend-owned series".
+        self._cache_metrics: dict[str, float] = {}
 
     @property
     def capabilities(self) -> BackendCapabilities:
@@ -146,6 +154,32 @@ class BackendBase:
     def _check_cancelled(self, request_id: str) -> None:
         if self._is_cancelled(request_id):
             raise RequestCancelledError(f"request {request_id} was cancelled")
+
+    def _publish_cache_metrics(self) -> None:
+        """Hand the prefix store's counters to the exporter, in the names ``/metrics`` reads.
+
+        The store owns these numbers and no request owns a share of them -- hits and misses are
+        cumulative over the process -- so they travel as whole values rather than as per-request
+        deltas the HTTP layer would have to accumulate, which is what :meth:`metrics` is for.
+
+        The names are fixed here rather than per adapter. They were three copies of the same nine
+        keys, and a series that a scrape sees only when one runtime happens to be serving is worse
+        than one it sees always: a dashboard cannot compare two adapters whose metric names were
+        typed three times. A runtime with no prefix store publishes nothing, which
+        :meth:`metrics` reads as "no backend-owned series" rather than as zero.
+        """
+        cache = getattr(self, "_prefix_cache", None)
+        if cache is None:
+            return
+        stats = cache.stats()
+        self._cache_metrics = {
+            "prefix_cache_hits_total": float(stats["hits"]),
+            "prefix_cache_misses_total": float(stats["misses"]),
+            "prefix_cache_reused_tokens_total": float(stats["reused_tokens"]),
+            "prefix_cache_entries": float(stats["entries"]),
+            "prefix_cache_bytes": float(stats["bytes"]),
+            "prefix_cache_budget_bytes": float(stats["budget_bytes"]),
+        }
 
     def close(self) -> None:
         with self._state_lock:

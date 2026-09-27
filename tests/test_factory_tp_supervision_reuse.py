@@ -86,11 +86,17 @@ def test_tp2_supervision_keeps_full_world_and_spawns_rank_one(supervised):
     assert "POCKETLLM_NCCL_ID_PATH" not in os.environ
 
 
-def test_worker_script_uses_supervisor_assigned_actual_rank():
-    script = factory._worker_script()
+def test_every_supervised_child_is_told_which_runtime_it_is(supervised):
+    """The child program is the same one for all three, so the name has to travel separately.
 
-    assert 'actual_rank = int(os.environ.get("TP_RANK", "0"))' in script
-    assert "actual_rank = supervisor_rank + 1" not in script
+    It comes from what ``select_backend`` resolved and not from ``args.backend``, which is what
+    the operator typed and may have been ``auto`` -- a child that resolved ``auto`` for itself
+    would pick a runtime by looking at a checkpoint it has not been told the path of yet.
+    """
+    factory.create_backend(_args(backend="auto"))
+
+    env = supervised.instances[0].config.env
+    assert env["POCKETLLM_WORKER_BACKEND"] == "cpp"
 
 
 def test_second_backend_still_spawns_workers(supervised):

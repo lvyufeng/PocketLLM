@@ -321,10 +321,6 @@ class V41Backend(SchedulerHost, BackendBase):
         self._details: dict[str, Any] = {}
         self._bell: Bell | None = None
         self._prefix_cache: Any = None
-        # What `prefix_cache.stats()` last said, in the exporter's spelling. Rebound whole at the end
-        # of every request rather than mutated, so a scrape reads one request's worth of state or the
-        # request before it and never a half-updated dict -- see `cache_metrics`.
-        self._cache_metrics: dict[str, float] = {}
         # The one scheduler, when this runtime is driven by it. Built here rather than on the first
         # request because `/capabilities` has to answer whether requests go through it, and a report
         # that said no and then routed them through one is the same class of lie as a flag accepted
@@ -1101,32 +1097,6 @@ class V41Backend(SchedulerHost, BackendBase):
             marks,
             cached_tokens=generation.cached_tokens,
         )
-
-    def _publish_cache_metrics(self) -> None:
-        """Hand the store's counters to the exporter, in the names ``/metrics`` reads.
-
-        The store owns these numbers and no request owns a share of them -- hits and misses are
-        cumulative over the process -- so they travel as whole values rather than as per-request
-        deltas the HTTP layer would have to accumulate. ``_cache_metrics`` is what ``metrics()``
-        returns, and the server sets them at scrape time; that is the only writer, so there is
-        nothing to double-count.
-
-        The ``_total`` suffix is Prometheus's convention for a counter and is the whole of the type
-        dispatch at the other end -- a name without it is a gauge. ``budget_bytes`` is here rather
-        than only in ``capabilities`` because it is what makes ``bytes`` readable as a fraction.
-        """
-        cache = self._prefix_cache
-        if cache is None:
-            return
-        stats = cache.stats()
-        self._cache_metrics = {
-            "prefix_cache_hits_total": stats["hits"],
-            "prefix_cache_misses_total": stats["misses"],
-            "prefix_cache_reused_tokens_total": stats["reused_tokens"],
-            "prefix_cache_entries": stats["entries"],
-            "prefix_cache_bytes": stats["bytes"],
-            "prefix_cache_budget_bytes": stats["budget_bytes"],
-        }
 
     def metrics(self) -> dict[str, float]:
         """The backend-owned metric values this rank's exporter has to publish.

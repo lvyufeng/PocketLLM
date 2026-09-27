@@ -233,7 +233,7 @@ def test_the_batch_decision_reaches_every_rank() -> None:
     args = EngineArgs(model="model", backend="cpp", tensor_parallel_size=4, enable_batching=False)
 
     assert factory._worker_arg_overrides(args)["enable_batching"] is False
-    env = factory._worker_env(args)
+    env = factory._worker_env(args, "cpp")
     assert json.loads(env["POCKETLLM_WORKER_ARGS"])["enable_batching"] is False
 
     # And the worker that rebuilds from those overrides lands on the same width rank 0 did.
