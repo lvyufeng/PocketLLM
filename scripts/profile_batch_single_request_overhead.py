@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """Attribute batch-mode single-request overhead to a specific layer.
 
-The batch path is ~10% slower than the serial path for one request.  Wall time
-alone cannot say whether that sits in the Python submit/poll plumbing or inside
-the scheduler loop, so print both clocks for the same runs:
+Wall time alone cannot say whether the batch path's cost for one request sits
+in the Python submit/poll plumbing or inside the scheduler loop, so print both
+clocks for the same runs:
 
   * Python wall  - generate() entry to return, everything included.
   * scheduler    - submit_time to completion_time, measured in C++.
 
-A gap between them is plumbing (thread handoff, poll wakeup, result copy).  A
+A gap between them is plumbing (thread handoff, poll wakeup, result copy). A
 scheduler time that already exceeds the serial baseline puts the cost in the
 loop, i.e. in the per-step work around batch_decode_step.
+
+**Prefix caching is disabled in both arms.** It is on by default and the two
+arms do not use it the same way: the serialized session resumes a repeated
+prompt out of its per-slot cache and the scheduler's `batch_prefill` does not
+look at the cache at all, so a shared prompt makes the batch arm look as though
+it paid a prefill the other arm never ran. That asymmetry produced this script's
+original "~10% slower" reading, and the same one produced a later "batch is
+faster at one request". Neither is the scheduler's cost. With caching off both
+arms run the same work, and what is left is the width's own. The cost of the
+width *with* caching left on, which is the deployment a served client sees, is
+measured in docs/performance/cpp_openai_concurrency_validation.md.
 """
 
 import argparse
@@ -30,6 +41,10 @@ def run(checkpoint, *, enable_batching, max_batch_size, tp, max_model_len,
         backend="cpp",
         tensor_parallel_size=tp,
         max_model_len=max_model_len,
+        # Off in both arms, for the reason in the module docstring: a shared prompt would be resumed
+        # by the serialized session and re-forwarded by the scheduler, and the difference would be
+        # read as the scheduler's cost.
+        enable_prefix_caching=False,
         backend_options={
             "enable_batching": enable_batching,
             "max_batch_size": max_batch_size if enable_batching else 1,

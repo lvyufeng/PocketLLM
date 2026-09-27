@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from src.loader.gguf.bundle import GGUFBundle
+from pathlib import Path
+
+from src.loader.gguf.bundle import GGUFBundle, read_gguf_bundle
+from src.loader.gguf.prewarm import prewarm_bundle as _prewarm_shards
 from src.components.moe.spec import MoEModelSpec
 
 
@@ -45,3 +48,34 @@ def detect_spec(bundle: GGUFBundle, override: str = "auto") -> MoEModelSpec:
     if not isinstance(arch, str) or not arch:
         raise ValueError("GGUF metadata does not contain general.architecture; pass --architecture explicitly")
     return get_spec(arch)
+
+
+# ---------------------------------------------------------------------------------------------
+# The checkpoint-format seam
+# ---------------------------------------------------------------------------------------------
+#
+# Reading a checkpoint is *format* knowledge, not architecture knowledge, so it cannot live on a
+# spec: `detect_spec` needs the bundle before it knows which spec to ask, and a second format would
+# have to hand every spec a second reading path. It lives here instead, because this module is the
+# one thing above `src.loader` that the generation driver is allowed to import --
+# `src/runtime/generation.py` must stay both model- and format-agnostic, which is what
+# `tests/test_package_boundaries.py::test_runtime_stays_model_and_checkpoint_format_agnostic`
+# asserts.
+#
+# The effect is that `src/runtime/` names no container format at all. Adding one is a branch here,
+# and the generation loop below it does not change.
+
+
+def load_bundle(path: str | Path) -> GGUFBundle:
+    """Read a checkpoint into the bundle the spec layer works on."""
+    return read_gguf_bundle(path)
+
+
+def prewarm_shards(bundle: GGUFBundle) -> dict[str, float]:
+    """Pull a bundle's shard files into the OS page cache.
+
+    Exposed here for the same reason as :func:`load_bundle`; the pass itself is
+    :mod:`src.loader.gguf.prewarm`'s.
+    """
+    return _prewarm_shards(bundle)
+

@@ -861,3 +861,101 @@ def test_cpp_backend_rejects_unexposed_sampling_controls() -> None:
 
     with pytest.raises(UnsupportedFeatureError, match="greedy"):
         backend.generate([request])
+
+
+# --------------------------------------------------------------------------------------------------
+# What the batch path hands the client
+# --------------------------------------------------------------------------------------------------
+
+
+class ScriptedScheduler:
+    """A scheduler that returns one canned native result, so the answer shape is the subject."""
+
+    def __init__(self, result) -> None:
+        self.result = result
+
+    def submit_request(self, prompt_ids, sampling, callback, on_token=None) -> int:
+        return 1
+
+    def poll_result(self, request_id, timeout_ms):
+        return self.result
+
+
+class ScriptedNativeModule:
+    class QwenBatchSamplingParams:
+        pass
+
+
+def batched_backend_with(result) -> CppBackend:
+    backend, _ = make_backend()
+    backend._native = ScriptedNativeModule()
+    backend._scheduler = ScriptedScheduler(result)
+    backend._batching_enabled = True
+    return backend
+
+
+class ScriptedNativeResult:
+    def __init__(self, *, tokens, finish_reason, constraint_completed=False) -> None:
+        self.error = ""
+        self.generated_tokens = list(tokens)
+        self.finish_reason = finish_reason
+        self.constraint_completed = constraint_completed
+        self.prompt_tokens = 2
+        self.completion_tokens = len(tokens)
+        self.total_seconds = 0.1
+        self.ttft_seconds = 0.05
+
+
+def test_a_stop_token_is_not_part_of_the_answer() -> None:
+    """The engine returns the stop token; the client must not see it.
+
+    The engine keeps it because its KV cache has to agree with what it reports, and every consumer is
+    responsible for dropping it: `openai_server.cpp::strip_stop_token` does it before detokenizing,
+    and the scheduler's streaming path never emits it. The non-streaming result was the one place it
+    leaked through, so one request answered through `pocketllm serve` came back with a visible
+    `<|im_end|>` on the end and the same request through the native binary did not. The `cpp`
+    served-path fixture is what found it -- it is recorded from the serial path and compares ids.
+    """
+    backend = batched_backend_with(
+        ScriptedNativeResult(tokens=[271, 93884, 12149, 248046], finish_reason="stop")
+    )
+    try:
+        result = backend.generate(
+            [GenerationRequest(prompt_tokens=[1, 2], request_id="req-stop")]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.token_ids == [271, 93884, 12149]
+    assert "<|im_end|>" not in result.text
+    assert result.finish_reason == "stop"
+    # Usage still counts the stop step, which is the convention the serial path uses as well, so the
+    # two paths stay comparable rather than the batch one reporting one token fewer.
+    assert result.usage.completion_tokens == 4
+
+
+def test_a_terminal_constraint_token_is_part_of_the_answer() -> None:
+    """"stop" also describes a structured-output close token, which is output and must be kept."""
+    backend = batched_backend_with(
+        ScriptedNativeResult(tokens=[1, 2, 3], finish_reason="stop", constraint_completed=True)
+    )
+    try:
+        result = backend.generate(
+            [GenerationRequest(prompt_tokens=[1, 2], request_id="req-constraint")]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.token_ids == [1, 2, 3]
+
+
+def test_a_length_capped_answer_keeps_its_last_token() -> None:
+    backend = batched_backend_with(ScriptedNativeResult(tokens=[1, 2, 3], finish_reason="length"))
+    try:
+        result = backend.generate(
+            [GenerationRequest(prompt_tokens=[1, 2], request_id="req-length")]
+        )[0]
+    finally:
+        backend.close()
+
+    assert result.token_ids == [1, 2, 3]

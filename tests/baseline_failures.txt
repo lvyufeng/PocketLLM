@@ -8,4 +8,7 @@
 #
 # A test added to this file is a test that runs on this host and fails. Anything skipped for
 # want of a GPU, a checkpoint or a built extension is not here and must not be.
-tests/test_package_boundaries.py::test_runtime_stays_model_and_checkpoint_format_agnostic failed
+#
+# The set is empty: every test this host collects and runs passes. The suite still
+# skips the ones needing a checkpoint, a card or an extension this build has not got,
+# and a skip is not a pass.

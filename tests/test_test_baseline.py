@@ -148,9 +148,43 @@ def test_the_recorded_baseline_parses_and_is_sorted() -> None:
 
     It is asserted as sorted because an unsorted file makes a one-line change look like a rewrite,
     and the diff is the entire point of recording a set.
-    """
-    entries = checker.parse_baseline(checker.BASELINE_PATH.read_text(encoding="utf-8"))
 
-    assert entries, "the baseline is empty, so nothing that used to fail is being tracked"
+    The empty set is a legal state -- it is the state this host is in -- so the guard cannot be
+    "there is at least one entry". What has to hold instead is that nothing was silently dropped:
+    every non-comment, non-blank line of the file is a parsed entry. A parser that stopped
+    understanding the format returns `{}` for a file full of entries, which is the regression the
+    count-based assertion used to catch and this one still does.
+    """
+    text = checker.BASELINE_PATH.read_text(encoding="utf-8")
+    entries = checker.parse_baseline(text)
+
+    recorded = [
+        line.split("#", 1)[0].strip()
+        for line in text.splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+    assert [f"{nodeid} {outcome}" for nodeid, outcome in sorted(entries.items())] == recorded
     assert list(entries) == sorted(entries)
     assert all(outcome in checker.FAILING_OUTCOMES for outcome in entries.values())
+
+
+def test_a_missing_baseline_is_refused_and_an_empty_one_is_not(tmp_path, monkeypatch) -> None:
+    """The two states are different, and reading them as one made the check unusable.
+
+    An empty file is the state this host is in -- its own header says so -- and the check has
+    nothing to report there. A missing file cannot be told apart from a file that lost its entries,
+    and treating it as empty would report every known failure as new, burying the one fact worth
+    reading under a wall of node ids.
+    """
+    observed = tmp_path / "observed.json"
+    observed.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(checker, "BASELINE_PATH", tmp_path / "gone" / "baseline_failures.txt")
+    with pytest.raises(SystemExit) as refused:
+        checker.main(["--observed", str(observed)])
+    assert "missing" in str(refused.value)
+
+    empty = tmp_path / "baseline_failures.txt"
+    empty.write_text("# The set is empty: every test this host collects and runs passes.\n", "utf-8")
+    monkeypatch.setattr(checker, "BASELINE_PATH", empty)
+    assert checker.main(["--observed", str(observed)]) == 0

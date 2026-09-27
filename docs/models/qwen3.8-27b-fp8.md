@@ -69,8 +69,8 @@ scheduler admission.
 | `--kv-cache-dtype` | `auto` (FP16) | FP16 is the default and the precision baseline. `fp8` halves KV data per rank but is not the faster configuration at any measured length. |
 | `--prefill-chunk-tokens` | engine default | Tokens a prefill chunk takes. Chunked prefill is what makes the 262,140-token boundary reachable inside 22 GiB a rank. |
 | `--max-model-len` | engine default | The context the engine reserves. It has to cover the prompt plus the generated positions. |
-| `--enable-prefix-caching` | on | Exact cross-request prefix reuse, including restores from a device-resident snapshot. `--no-enable-prefix-caching` turns it off. |
-| `--backend-option enable_batching=true` | off | Admits concurrent requests through the native scheduler. The width comes from `--backend-option max_batch_size` (8 when batching is on). |
+| `--enable-prefix-caching` | on | Exact cross-request prefix reuse, including restores from a device-resident snapshot. `--no-enable-prefix-caching` turns it off. **The serialized session's only — the batch scheduler's prefill path does not consult it.** See Known limitations. |
+| `--enable-batching` / `--max-batch-size` | on / 8 | The batch scheduler. A width above 1 asks for it on its own, `--no-enable-batching` selects the serialized session and cannot be combined with a width above 1. The width is what the KV arena is sized from, so it is a memory decision as well. |
 | `--speculative-method` | off | `mtp` for the native one-layer predictor, `dspark` or `dflash2` for an external drafter — the latter two need `--backend-option dspark_checkpoint=PATH` / `dflash2_checkpoint=PATH`, and the three are mutually exclusive. |
 | `--speculative-tokens` | 1 | Drafts per speculative step. |
 | `--attention-window` / `--attention-sink-tokens` | `0` (exact) | Sink-plus-sliding-window attention. **Changes full-attention semantics**; not part of the exact-parity claim, and FP8 cache is rejected for it. |
@@ -223,6 +223,14 @@ Every case below was checked token-for-token against its plain serial run, on al
   0.124× of FP16 once the cache is dequantized once.
 - **Decode Context Parallelism is not implemented and is not planned for four GPUs.** It would need
   at least eight ranks to keep the TP4 weight shard while halving the per-device context.
+- **The batch scheduler does not reuse the prefix cache.** The prefix reuse described under
+  [Reuse a prefix across requests](#reuse-a-prefix-across-requests) is the serialized session's; the
+  scheduler's prefill path never consults it, so a repeated prompt is re-forwarded in full and the
+  width's rows each pay their own prefill. Since the batch path is now the default, a client that had
+  the reuse has to keep it by turning batching off (`--no-enable-batching`) or accept the cost. Six
+  consecutive submissions of one 16-token prompt were measured at a full 344 ms of prefill each, and
+  the A/B is in
+  [the concurrency acceptance page](../performance/cpp_openai_concurrency_validation.md#what-the-width-costs-a-lone-request).
 
 ## Where the detail is
 

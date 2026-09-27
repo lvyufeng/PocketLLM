@@ -53,7 +53,26 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--kv-cache-dtype", default="auto")
     serve_parser.add_argument("--prefill-chunk-tokens", type=int, default=0)
     serve_parser.add_argument("--enable-prefix-caching", action=argparse.BooleanOptionalAction, default=True)
-    serve_parser.add_argument("--max-batch-size", type=int, default=1)
+    serve_parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "rows the batch scheduler may run at once. Above 1 this asks for the batch path on a "
+            "backend that has one; a backend without a scheduler refuses it rather than accepting "
+            "a width it cannot honour"
+        ),
+    )
+    serve_parser.add_argument(
+        "--enable-batching",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "serve through the batch scheduler (default: on for backends that own one). "
+            "--no-enable-batching forces the serialized session, and cannot be combined with a "
+            "--max-batch-size above 1"
+        ),
+    )
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=8000)
     # "auto" asks the native model registry which engine the checkpoint wants.
@@ -124,6 +143,7 @@ def _args(namespace: argparse.Namespace) -> EngineArgs:
         prefill_chunk_tokens=namespace.prefill_chunk_tokens,
         enable_prefix_caching=namespace.enable_prefix_caching,
         max_batch_size=namespace.max_batch_size,
+        enable_batching=namespace.enable_batching,
         attention_window=namespace.attention_window,
         attention_sink_tokens=namespace.attention_sink_tokens,
         speculative_method=namespace.speculative_method,

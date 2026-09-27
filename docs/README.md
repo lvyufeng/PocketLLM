@@ -201,7 +201,7 @@ guarantee.
 | [Model guides](models/README.md) | The support matrix and one page per checkpoint |
 | [Performance](performance/index.md) | Run records and bottleneck analyses for capabilities that are live today |
 | [Architecture](architecture/index.md) | Engine design, refactor plans, roadmaps, and the vLLM/SGLang comparisons |
-| [Migration](migration/dsv4-to-pocket-rename.md) | Breaking-change notes — currently the `dsv4` → `pocket` rename |
+| [Migration](migration/index.md) | Breaking-change notes — the `dsv4` → `pocket` rename, and batching now being on by default for the `cpp` backend |
 | [Reports](reports/dsv4_2080ti_report.pdf) | Rendered long-form reports |
 | [Archive: Phase 2 and Phase 3](archive/phase2-phase3/index.md) | Completed records, kept for their measurement context and superseded numbers |
 

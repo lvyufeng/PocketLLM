@@ -516,6 +516,12 @@ def _environment(values: Mapping[str, str]) -> Iterator[None]:
 # engine.  Ranks must agree on all of them; see the comment at the worker_env
 # construction site.  Fields that are per-rank (tensor_parallel_rank, device) or
 # already forwarded explicitly are deliberately absent.
+#
+# `enable_batching` belongs here even though only rank 0 ever runs a scheduler: a
+# worker rank still builds the engine, and the batch decision is what the engine
+# sizes its KV cache from, so a rank that resolved the default instead of the
+# operator's `--no-enable-batching` would allocate a different number of slots
+# than rank 0 under the same process group.
 _WORKER_SHARED_ARGS = (
     "prefill_chunk_tokens",
     "enable_prefix_caching",
@@ -524,6 +530,7 @@ _WORKER_SHARED_ARGS = (
     "speculative_method",
     "speculative_tokens",
     "max_batch_size",
+    "enable_batching",
     "model_format",
     "dtype",
 )

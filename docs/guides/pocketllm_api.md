@@ -86,7 +86,10 @@ async with AsyncLLM(EngineArgs(model="/path/to/checkpoint")) as llm:
         print(event.text, end="", flush=True)
 ```
 
-`AsyncLLM` currently provides non-blocking application integration around the backend contract. It does not claim device-level continuous batching. Backend schedulers will add that capability independently. The async chat methods reuse the same executor-backed lifecycle and `TokenEvent` contract as the sync facade; they do not add a scheduler.
+`AsyncLLM` currently provides non-blocking application integration around the backend contract. Its
+own concurrency is the executor's `max_workers`, which defaults to 1, so it adds no batching of its
+own; the batch path belongs to the backend under it and is a separate decision. The async chat
+methods reuse the same executor-backed lifecycle and `TokenEvent` contract as the sync facade.
 
 ## CLI and server
 
@@ -137,8 +140,48 @@ inside the rendezvous window, because a V4.1 backend handed back unloaded would 
 The Python C++ Qwen adapter does not yet expose a native worker entry point, so
 `backend="cpp"` must use the legacy `pocketllm_engine` launcher or opt out with
 `--no-tensor-parallel-supervisor`. Existing `torchrun` and manual rank launchers remain compatible
-through that opt-out. This process supervisor is not a scheduler and does not provide continuous
-batching or request-local native state.
+through that opt-out. This process supervisor is not a scheduler: it starts ranks and reaps them, and
+what runs inside those ranks is the backend's own business. Whether a served backend batches is
+decided separately and per backend — see [Batching on the `cpp` backend](#batching-on-the-cpp-backend)
+— so `--tensor-parallel-size 4` says nothing about the width a request sees.
+
+### Batching on the `cpp` backend
+
+This backend owns a continuous-batching scheduler, and it is the default path. The two flags are the
+same decision seen twice, so the contradiction between them is refused rather than resolved:
+
+| Command | Effect |
+| --- | --- |
+| `--backend cpp` | The batch scheduler, 8 slots. |
+| `--backend cpp --max-batch-size 4` | The batch scheduler, 4 slots. A width above 1 asks for the scheduler on its own. |
+| `--backend cpp --no-enable-batching` | The serialized session: one request at a time, no scheduler. |
+| `--backend cpp --no-enable-batching --max-batch-size 4` | `ConfigurationError`. A width is a request for a scheduler and the opt-out refuses it; picking one of the two here would leave the other flag accepted and ignored. |
+| `--backend-option enable_batching=false` | The serialized session. The backend option is the spelling the `scripts/` benchmarks use and it wins over the flag. |
+
+**The default width is 8, not 1.** A width of 1 is not a batch, so a default of 1 would make the
+default path serial — which is exactly what it used to be. The number is not cosmetic: the engine
+sizes its KV cache from it at construction, so a width that does not reach the engine is a width the
+server refuses at the first concurrent request. Which of the two paths the backend resolved, and at
+what width, is what `capabilities.details` reports through the Python API — `details["scheduler"]`
+and `details["max_batch_size"]` — and the scheduler's own view of it is
+[`engine_caps()`](#scheduler-backed-async-requests). Neither is on the HTTP surface today: `/health`
+reports the backend and its model, not its capabilities.
+
+**A width above 1 costs a lone request some latency.** The scheduler runs the width's rows whether or
+not that many requests are present, so a single request pays for the width it was given: with the
+prompt cache held fixed, ~17% more wall than the serialized session at width 2 and ~18% at width 8,
+of which about ten points is decode. More than that, the scheduler's prefill path does not consult
+the prefix cache, so a prompt the serialized session would have resumed for nothing is re-forwarded
+in full — which is the larger of the two costs for a client that repeats its prompt, and the reason
+`--max-batch-size 2` (or `--no-enable-batching`) is the setting for a deployment that serves one
+caller at a time. What the width buys is concurrency: on the real CLI, two concurrent requests
+reached 30.6 aggregate tok/s through the default path against 25.6 through the serialized one. Both
+figures and the method behind them are in
+[the concurrency acceptance page](../performance/cpp_openai_concurrency_validation.md#what-the-width-costs-a-lone-request).
+
+Once the batch path is selected, the per-request sampling options the OpenAI surface accepts
+(`top_p`, `top_k`, `min_p`, `stop`, `n`, `logprobs`) are honoured; the serialized session refuses
+them, because there is no per-request sampling in it to honour them with.
 
 The unified server provides:
 

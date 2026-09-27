@@ -4,6 +4,21 @@ Measured on commit `c8c3b15`, 4× RTX 2080 Ti (22 GB), TP4, checkpoint
 `/mnt/data2/Qwen3.8-27B-FP8`, 16-token prompts, 32 new tokens, 1 warmup + 5 runs
 per measurement. Driver: `scripts/run_phase35_benchmarks.sh`.
 
+> **Superseded in two places, kept for the measurement context.** The `1.002×` single-request row
+> below is *not* the batch path's cost, and reading it as "batching is free for a lone request" is
+> wrong in both directions. The serial and batch arms were not paying for the same work: the serial
+> arm resumed its prompt out of the prefix cache and the batch arm re-forwarded it, so about 340 ms
+> of the batch arm's wall in the tables that follow is a prefill the other arm never ran — which is
+> also why an even later run measured the batch arm as *faster* at one request. With the prompt
+> cache held fixed, the batch path costs a lone request ~17% wall at both width 2 and width 8, and
+> the batch scheduler does not consult the prefix cache at all. Both are measured in
+> [the concurrency acceptance page](../../performance/cpp_openai_concurrency_validation.md#what-the-width-costs-a-lone-request).
+> Separately, the concurrent rows are pre-`POCKETLLM_CPP_BATCHED_DECODE`: `batch_decode_step` was a
+> serial per-row loop at this commit, which is why throughput is flat at ~1.46 req/s and why the
+> real batched forward — the missing prerequisite the page names — later reached 4.68x at eight
+> concurrent. The measurement bugs it records, and the ~10% second-engine-in-a-process penalty that
+> invalidated its first comparison, still stand.
+
 ## Verdict
 
 | Target | Result | |
