@@ -136,7 +136,56 @@ prefix store is on by default.
 | `--backend-option prefix_cache_bytes=N` | 2 GiB | The store's host-side budget. |
 | `--backend-option tokenizer=DIR` | — | The tokenizer directory, same as `--tokenizer-path`. |
 | `--backend-option use_kernel=false` | `true` | Runs the hyper-connection in PyTorch instead of the fused kernel. **2.17× slower at decode**; it exists so the two can be compared. |
+| `--enable-batching` | off | Serves requests through the shared `BatchScheduler` instead of this adapter's own serialized session. See below. |
 | `--tensor-parallel-size` | 1 | Not implemented for this checkpoint; a value above 1 is refused rather than silently ignored. |
+
+### Through the shared scheduler
+
+`--enable-batching` routes requests through the same `BatchScheduler` the `cpp` backend drives. It is
+off by default, and the reason is a dependency rather than a doubt: the scheduler is the C++ library,
+so this route needs `pocketllm_cpp` built, and this runtime otherwise serves without it.
+
+It is not a claim of concurrency. The runtime declares `max_slots = 1` and
+`continuous_batching = False`, and the scheduler takes the smaller of the requested width and the
+declaration — so what joins the shared lifecycle is this runtime as it is, one request at a time,
+with admission, cancellation, per-request timings and the `/metrics` gauges coming from the one
+library instead of from a second implementation of them. The bridge's own account is in
+`pocketllm/backends/runtime_engine.py`; what it costs and what it buys is below.
+
+Measured on one RTX 2080 Ti, `cuda:0` through `scripts/bench_runtime_scheduler_path.py`: the released
+`xing4_0-29b-IQ4_NL.gguf`, `--max-model-len 8192`, 32 greedy tokens, one warmup request and four
+measured ones per arm, **one arm per process** (a second engine in the same process runs about 10%
+slower than the first, which would be the order the arms were built in rather than the thing being
+compared). Two process pairs in each order, because a difference this size is exactly the size of a
+first-run artifact:
+
+| Arm | Process pair | Wall, median of 4 | Prefill | Decode |
+| --- | --- | ---: | ---: | ---: |
+| serialized session | A-B-A-B | 4.631 s | 0.247 s | 4.492 s |
+| `--enable-batching` | A-B-A-B | 4.383 s | 0.251 s | 4.231 s |
+| serialized session | B-A-B-A | 4.783 s | 0.251 s | 4.684 s |
+| `--enable-batching` | B-A-B-A | 4.460 s | 0.253 s | 4.432 s |
+
+**Every one of the four runs in both arms returned the same 32 token ids**, which is the claim that
+matters: a runtime that joins the scheduler and answers something else has been replaced, not routed.
+The scheduler path is at the faster end by about 5% in both orders, and this page does not claim it
+as a speedup — a host-bound decode loop at ~11,500 launches a step has a spread that size, and the
+mechanism for it has not been established.
+
+The first measurement of this pair — no warmup, one request an arm, the serial arm first — read the
+scheduler path as **27% faster** (4.94 s against 6.48 s), which it is not. The first request through
+a freshly loaded checkpoint pays the kernel-module load and the allocator growth, and it landed
+entirely on whichever arm ran first. That is why the table above has a warmup round, four measured
+runs and a spread instead of two numbers, and why the two arms are run in both orders.
+
+**The routed path is visible from outside the process.** `scripts/bench_cpp_scheduler_metrics.py`
+serves this backend and samples `/metrics` while two clients are in flight. With `--enable-batching`
+the exposition carries `pocketllm_requests_running` and `pocketllm_requests_waiting` — the same
+`BatchScheduler::Stats` fields the `cpp` host publishes as `pocket_…`, at this runtime's declared
+width of one — and the peak over the group is **1 running and 1 waiting**: the scheduler is holding
+the second request rather than the second request never having arrived. Without the flag the series
+is **absent**, not zero, because there is no scheduler in that process to ask. A peak of zero would
+be the ambiguous reading; an absent series is not.
 
 ### Without a server
 
@@ -167,7 +216,8 @@ python scripts/bench_xing4_0_hyper_connection.py --device cuda:2 --steps 8
 | Cross-request prefix reuse | Supported, on by default |
 | Sampling (`temperature`, `top_k`, `top_p`) | Supported; greedy by default |
 | Memory-fitted context, up to the card's ceiling | Supported; measured at about 40,960 tokens |
-| Concurrent requests | **Not implemented** — requests serialize, one at a time |
+| Concurrent requests | **Not implemented** — requests serialize, one at a time, through the adapter's own session and through the shared scheduler alike |
+| The shared `BatchScheduler` (`--enable-batching`) | Supported at the width this runtime declares, which is 1. Same lifecycle and same gauges as the `cpp` backend, same answers as the serialized path |
 | Tensor parallelism | **Not implemented** — the checkpoint fits one card whole |
 | The NextN/MTP block (`blk.40`, 0.93 GiB) | **Not executed** — it is not loaded and there is no speculative path for it |
 | LoRA, adapters, logprobs, tool calling | **Not implemented** |

@@ -667,6 +667,31 @@ def test_the_batched_path_answers_what_the_serial_path_answers(native_module) ->
     batched.close()
 
 
+def test_the_scheduler_gauges_are_published_only_where_a_scheduler_is(native_module) -> None:
+    """The reading that separates a scheduler from a lock, and it has to be absent on the lock.
+
+    Both paths answer the same tokens, so this series is the only in-process evidence that a
+    request went through the scheduler rather than through a queue. The serialized path exports
+    none of it -- not as zero, which would read as "the scheduler is here and idle" about a process
+    that has none.
+    """
+    serial = backend()
+    batched = batched_backend()
+    try:
+        assert "requests_running" not in serial.metrics()
+        assert "requests_waiting" not in serial.metrics()
+
+        gauges = batched.metrics()
+        # Idle rather than absent: this runtime has a scheduler and nothing in it.
+        assert gauges["requests_running"] == 0.0
+        assert gauges["requests_waiting"] == 0.0
+        assert gauges["slots_free"] == 1.0
+        # No block pool on this runtime, so the pool gauges are not published at all.
+        assert not [key for key in gauges if key.startswith("kv_blocks")]
+    finally:
+        batched.close()
+
+
 def test_the_scheduler_reads_the_runtime_s_own_declaration(native_module) -> None:
     """The width the engine was built with and the width it declares are different things.
 

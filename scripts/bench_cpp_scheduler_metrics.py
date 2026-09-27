@@ -114,6 +114,10 @@ class _Sampler(threading.Thread):
         self.url = f"http://127.0.0.1:{port}/metrics"
         self.interval = interval
         self.samples: list[dict[str, float]] = []
+        #: Gauges seen at least once. The peak alone cannot tell "the scheduler is here and was
+        #: never busy" from "there is no scheduler to ask" -- both read as zero -- and those are
+        #: the two arms this script exists to separate.
+        self.seen: set[str] = set()
         # Not `self._stop`: `threading.Thread` has a private `_stop` of its own that `join()` calls
         # on the way to reaping the thread, so an attribute of that name shadows a method and
         # `join()` dies with "'Event' object is not callable".
@@ -122,7 +126,9 @@ class _Sampler(threading.Thread):
     def run(self) -> None:
         while not self._done.is_set():
             try:
-                self.samples.append(scrape(self.url))
+                sample = scrape(self.url)
+                self.seen.update(sample)
+                self.samples.append(sample)
             except Exception:
                 pass
             self._done.wait(self.interval)
@@ -142,6 +148,19 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--checkpoint", default=CKPT)
     parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument(
+        "--backend",
+        default="cpp",
+        help="the runtime to serve; a Python runtime joins the same scheduler behind "
+        "--enable-batching and reports the same gauges at its own width",
+    )
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument(
+        "--backend-option",
+        action="append",
+        default=[],
+        help="name=value, repeatable; passed through to the server as --backend-option",
+    )
     parser.add_argument("--no-enable-batching", action="store_true")
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
@@ -149,14 +168,18 @@ def main() -> int:
     arm = "serial" if args.no_enable_batching else "batch"
     command = [
         sys.executable, "-m", "pocketllm", "serve",
-        "--backend", "cpp",
+        "--backend", args.backend,
         "--model", args.checkpoint,
         "--tensor-parallel-size", str(args.tp),
-        "--max-model-len", "4096",
+        "--max-model-len", str(args.max_model_len),
         "--port", str(args.port),
     ]
+    for option in args.backend_option:
+        command += ["--backend-option", option]
     if args.no_enable_batching:
         command.append("--no-enable-batching")
+    else:
+        command.append("--enable-batching")
 
     print(f"=== arm: {arm} ===", flush=True)
     started = time.perf_counter()
@@ -211,11 +234,29 @@ def main() -> int:
               f"= {total_tokens / max(group_seconds, 1e-9):.2f} tok/s")
         print(f"per-request latency              min {latencies[0]:.2f}s  "
               f"max {latencies[-1]:.2f}s")
-        # The verdict the two arms are read against: a serialized server cannot report more than
-        # one running request, however many clients are connected to it.
-        verdict = "one scheduler" if peak_running > 1 else "serialized (or never overlapped)"
-        print(f"verdict: {verdict} — peak running {peak_running:.0f} of "
-              f"{args.concurrent} concurrent clients")
+        # The verdict the two arms are read against. A serialized server cannot report more than
+        # one running request, however many clients are connected to it -- but a *width-1* runtime
+        # under the scheduler cannot either, and it is not the same thing: the scheduler says so by
+        # holding the other client, which a lock has no way to report. So the series' presence is
+        # read before its peak, and one running with one waiting is the scheduler at width 1 rather
+        # than the scheduler absent.
+        if not sampler.seen:
+            verdict = (
+                "no scheduler published these gauges — this backend serializes its requests "
+                "without one"
+            )
+        elif peak_running > 1:
+            verdict = (
+                f"one scheduler, {peak_running:.0f} requests running at once of "
+                f"{args.concurrent} concurrent clients"
+            )
+        else:
+            verdict = (
+                f"one scheduler at the runtime's declared width — peak running "
+                f"{peak_running:.0f}, peak waiting {peak_waiting:.0f} of {args.concurrent} "
+                "concurrent clients"
+            )
+        print(f"verdict: {verdict}")
 
         if args.json_out:
             Path(args.json_out).write_text(

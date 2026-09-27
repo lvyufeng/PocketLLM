@@ -24,16 +24,16 @@ longest prefix it shares with one already served and forwards only the rest. See
 :mod:`src.models.xing4_0.prefix_cache` for what is stored and why the whole
 latent a layer is enough.
 
-**Requests serialize.** The trunk's forward flattens its input to one token axis
-(``gguf_model.embed`` reshapes to ``[-1]`` and expands a single batch axis), so two
-sequences handed to it together would attend to each other. Serving them one at a time
-is the honest answer and the lock at the backend boundary is where
-:class:`~pocketllm.backends.base.BackendBase` says it belongs.
-
-Which path enforces that is what ``capabilities.supports_batch`` reports, and it is
-the same answer either way: serialized by the lock on the legacy path, or serialized by
-the shared scheduler, on which this runtime declares ``max_slots = 1`` and
-``continuous_batching = False``.
+**Requests serialize, and now they can serialize under the shared scheduler.** The trunk's
+forward flattens its input to one token axis (``gguf_model.embed`` reshapes to
+``[-1]`` and expands a single batch axis), so two sequences handed to it together
+would attend to each other, and serving them one at a time is the honest answer.
+``--enable-batching`` routes that one-at-a-time serving through the same
+``BatchScheduler`` the ``cpp`` backend drives, at the width this runtime declares
+(``max_slots = 1``, ``continuous_batching = False``); without it, serialization is the
+lock at the backend boundary, where :class:`~pocketllm.backends.base.BackendBase` says
+it belongs. ``capabilities.supports_batch`` reports which of the two is live, and it is
+the same answer either way.
 
 Stage 5 of [#388](https://github.com/lvyufeng/PocketLLM/issues/388).
 """
@@ -62,6 +62,7 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer, byte_size
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .runtime_engine import RuntimeSpec, make_runtime_engine, scheduler_gauges
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the cache is sized at when ``--max-model-len`` is not given.
@@ -390,8 +391,6 @@ class Xing4Backend(BackendBase):
             )
             return
         try:
-            from .runtime_engine import RuntimeSpec, make_runtime_engine
-
             engine = make_runtime_engine(self._runtime_spec(), self._native)
             # The width is the scheduler's to clamp: this runtime declares one slot, so a command
             # line naming eight is answered with one rather than refused. Refusing would make the
@@ -404,8 +403,6 @@ class Xing4Backend(BackendBase):
             self._scheduler = None
 
     def _runtime_spec(self) -> Any:
-        from .runtime_engine import RuntimeSpec
-
         return RuntimeSpec(
             name=self.name,
             start=self._start_runtime,
@@ -680,6 +677,11 @@ class Xing4Backend(BackendBase):
             "xing4_kv_cache_bytes": float(self._cache_bytes()),
             "xing4_context_positions": float(self._max_seq_len),
             **self._cache_metrics,
+            # The scheduler's own admission state, when this runtime is driven by one. Same
+            # series, same `Stats` struct and same names as the `cpp` backend publishes -- which is
+            # what makes the two readable as one scheduler rather than as two servers that happen
+            # to agree.
+            **scheduler_gauges(self._scheduler),
         }
 
     def _publish_cache_metrics(self) -> None:

@@ -596,6 +596,21 @@ observed:
 scheduler, declaring honestly that they are width 1".** Each runtime's width then improves on its own
 schedule, and the scheduler does not change for it.
 
+**Step one, walked for one runtime.** `xing4` registers under the one scheduler behind
+`--enable-batching`, and what it took is the shape the other two will take. The scheduler
+takes an `InferenceEngine*`, so a Python runtime needs to *be* one; `pocketllm/backends/runtime_engine.py`
+is that, plus the one thing the three runtimes have in common that the scheduler cannot see: they
+generate by running to the end, and the scheduler drives one token per call. `RuntimeRun` reconciles
+the two by running the runtime's own loop on a thread and meeting it at the `on_token`/`on_step`
+callbacks the loop already had for cancellation — so the block in 8.2 (a) is answered without
+touching a model implementation, and 8.2 (b) is answered for this runtime because the lock it names is
+no longer what serializes the requests.
+
+The claim is deliberately weak and that is the point: one request at a time, `continuous_batching =
+False`, the same 32 token ids as the serialized path, and about the same wall time. What changed is
+*whose* lifecycle it is. Raising the width is a change to the declaration, and the scheduler does not
+change for it. The measured pair is in the [checkpoint's own guide](../models/xing4.0-29b-a4b.md).
+
 ### 8.4 Where the scheduler lives: the C++ library, driven from either host — recommended
 
 Three reasons, in order:

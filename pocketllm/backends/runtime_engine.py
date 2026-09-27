@@ -426,10 +426,50 @@ def make_runtime_engine(spec: RuntimeSpec, native: Any):
     return engine_class(native)(spec)
 
 
+def scheduler_gauges(scheduler: Any) -> dict[str, float]:
+    """The live scheduler's admission state, under the names the native host uses.
+
+    `requests_running` is the one that matters and the only one that can separate a scheduler from
+    a lock: two concurrent clients reaching either one produce identical tokens and identical
+    responses, and the difference is visible only from inside the process. The same `Stats` struct,
+    the same field, read here and published under the same suffix the native server uses -- so the
+    two hosts are compared by substituting `pocketllm_` for `pocket_` rather than through a
+    translation table.
+
+    Nothing is published on a serialized path -- not zeros. There is no scheduler there, and a zero
+    would read as "the scheduler is here and idle" about a process that does not have one.
+    """
+    if scheduler is None:
+        return {}
+    try:
+        stats = scheduler.get_stats()
+        caps = scheduler.engine_caps()
+    except Exception:
+        # A scrape is not worth failing a process's metrics over: a scheduler that cannot answer is
+        # a scheduler whose gauges are absent, which is the same reading as a serialized path.
+        return {}
+    published = {
+        "requests_running": float(stats.running_requests),
+        "requests_waiting": float(stats.waiting_requests),
+        "slots_free": float(stats.free_slots),
+    }
+    if bool(getattr(caps, "paged_kv", False)):
+        published.update(
+            {
+                'kv_blocks{state="total"}': float(stats.total_blocks),
+                'kv_blocks{state="free"}': float(stats.free_blocks),
+                'kv_blocks{state="reserved"}': float(stats.reserved_blocks),
+                'kv_blocks{state="cache_pinned"}': float(stats.cache_pinned_blocks),
+            }
+        )
+    return published
+
+
 __all__ = [
     "DEFAULT_STEP_TIMEOUT",
     "RuntimeRun",
     "RuntimeSpec",
     "engine_class",
     "make_runtime_engine",
+    "scheduler_gauges",
 ]
