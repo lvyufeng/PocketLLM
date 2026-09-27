@@ -193,6 +193,10 @@ Five request-lifecycle implementations, three schedulers (`BatchScheduler` in C+
 `CmdChannel` unix socket, the per-worker `work_bell` doorbell, `broadcast_object_list`, and the
 Python sidecar pipepair for chat templating).
 
+Rows 1, 3, 4 and 5 now reach the one `BatchScheduler` behind `--enable-batching`, each declaring
+itself width 1; row 1's queue is the fallback the other three do not have, because it predates the
+scheduler rather than sharing it. *See §8.3.*
+
 The duplication is measurable at file granularity:
 
 - `mimo_backend.py` (1,006 lines) vs `xing4_backend.py` (776): a method-level diff finds ~288 lines of
@@ -598,8 +602,8 @@ observed:
 scheduler, declaring honestly that they are width 1".** Each runtime's width then improves on its own
 schedule, and the scheduler does not change for it.
 
-**Step one, walked for all three runtimes.** `xing4`, `v41` and `mimo` each register under the one
-scheduler behind `--enable-batching`. The scheduler takes an `InferenceEngine*`, so a Python runtime
+**Step one, walked for all four runtimes.** `xing4`, `v41`, `mimo` and `torch` each register under
+the one scheduler behind `--enable-batching`. The scheduler takes an `InferenceEngine*`, so a Python runtime
 needs to *be* one; `pocketllm/backends/runtime_engine.py` is that, plus the one thing the three
 runtimes have in common that the scheduler cannot see: they generate by running to the end, and the
 scheduler drives one token per call. `RuntimeRun` reconciles the two by running the runtime's own
@@ -629,6 +633,24 @@ the GIL is very often the one dropping the scheduler, because `~BatchScheduler` 
 rather than shutting down, which is a failure a native-only host could not have produced. The
 constructor asks now, on the thread that already calls `caps` and `allocate_batch_slots`, and hands
 the loop thread the answer.
+
+**The torch plane is the last lifecycle, and it is the one with a second answer format.**
+`--backend torch` is what serves every checkpoint the four specific adapters do not claim, so it is
+where a new model lands first and where a second implementation of admission, cancellation and
+timings would have been copied to next. It registers like the others -- `SchedulerHost`, width 1 by
+declaration -- but it cannot share the *answer*: its serial path returns the parsed assistant
+message, with reasoning split out and tool-call markup removed, and no token ids at all. That is a
+fact about that checkpoint's runtime rather than about serving, so its result step routes the
+scheduler's tokens back through the legacy path's own formatter, and the two routes agree by
+construction rather than by inspection. The boundary §5 defends, drawn one level down: the lifecycle
+is shared, the answer is the model's.
+
+It also had a check worth recording the absence of. An earlier revision compared the tokens it fed
+the scheduler against the runtime's own `done.completion_tokens` and refused on disagreement --
+unreachable, because `submit_stream` yields `main_t1[~prompt_mask]` per step while `done` slices the
+same array trimmed at EOS, so the two are one number. A comparison that cannot fail is not a check;
+the durable half of the claim, that every token the runtime streams is one the scheduler counted,
+is asserted directly instead.
 
 **One program for every worker rank.** The three `run_worker` scripts in §4.2 are gone. They were
 generated as source text, one per runtime, and differed in three things: the import line, the
