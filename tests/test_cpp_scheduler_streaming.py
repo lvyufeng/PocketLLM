@@ -71,15 +71,29 @@ def sampling_params(native_module, max_new_tokens):
     return sampling
 
 
-def test_capabilities_type_is_read_only(native_module):
+def test_capabilities_are_declared_from_either_language(native_module):
+    """The declaration has two directions, and the second one is a Python engine stating its own.
+
+    It used to be read-only, which is the right shape for a fact only a C++ engine can state and
+    the wrong one for a scheduler that accepts a Python engine: the engine *is* the declaration,
+    and a Python runtime that cannot write these has to have its capability described somewhere
+    outside itself. What has not changed is who reads it -- `engine_caps()` hands back a copy, so
+    nothing a caller does to this object reaches the engine either way.
+    """
     caps = native_module.Capabilities()
     assert caps.max_slots == 1
     assert caps.continuous_batching is False
     assert caps.fixed_top_p == 1.0
     assert "Capabilities" in repr(caps)
-    # The engine declares these; Python must not be able to forge them.
-    with pytest.raises(AttributeError):
-        caps.max_slots = 99
+
+    caps.max_slots = 4
+    caps.continuous_batching = True
+    caps.fixed_seed = 7
+    caps.fixed_top_p = 0.5
+    assert caps.max_slots == 4
+    assert caps.continuous_batching is True
+    assert caps.fixed_seed == 7
+    assert caps.fixed_top_p == 0.5
 
 
 def test_submit_request_accepts_token_callback(native_module):

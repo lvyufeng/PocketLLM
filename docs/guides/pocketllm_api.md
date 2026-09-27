@@ -213,6 +213,13 @@ These are the same numbers, from the same `BatchScheduler::Stats`, that the nati
 `pocketllm_requests_running`, with the same suffix and the same meaning, so the two hosts are
 compared by substituting the prefix rather than by a translation table.
 
+A Python runtime driven by the same scheduler publishes the same series, which is the point of
+driving it from there: `xing4` with `--enable-batching` reports `pocketllm_requests_running` out of
+the one `BatchScheduler` library, under the same names, without a second implementation of it. What
+differs is the width the runtime declares — `xing4` declares one slot, so that gauge reads 1 rather
+than the running set a wide engine has, and `pocketllm_slots_free` is 0 or 1. A runtime is charged
+for the width it declares, and a declaration of one is not a claim of concurrency.
+
 `requests_running` is the one to watch. Two concurrent clients reaching a server that serializes
 them under a lock and two reaching a scheduler produce identical tokens and identical responses; the
 only place they differ is this gauge, which is why it is the reading the concurrency acceptance

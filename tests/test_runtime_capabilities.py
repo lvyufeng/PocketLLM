@@ -63,9 +63,14 @@ def test_the_wire_type_is_constructed_in_one_module() -> None:
 
 
 def test_the_ignored_options_have_one_definition() -> None:
-    """Three adapters used to carry a frozenset literal with the same four keys. Accepting an
-    option and ignoring it is a deliberate list, and there is one of them -- so the scan is for a
-    second *literal*, not for a second mention: importing the shared set is the fix, not the bug."""
+    """Three adapters used to carry a frozenset literal with the same keys. Accepting an option and
+    ignoring it is a deliberate list, and there is one of them -- so the scan is for a second
+    *literal*, not for a second mention: importing the shared set is the fix, not the bug.
+
+    The pinned set is the second half of that. A key added here is a key every *model* options
+    parser stops refusing, so it is the one place a launch option can become universally accepted
+    by accident. The four the CLI and the supervisor fill in, plus the two `SchedulerHost` reads,
+    are the whole list; nothing else belongs."""
     keys = sorted(IGNORED_OPTIONS)
     literal = re.compile(r"frozenset\(\s*\{[^}]*\}\)", re.S)
     offenders = []
@@ -77,7 +82,17 @@ def test_the_ignored_options_have_one_definition() -> None:
                 offenders.append(path.relative_to(REPO_ROOT).as_posix())
 
     assert not offenders, f"an adapter writes the ignored-options set out again: {offenders}"
-    assert set(keys) == {"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"}
+    assert set(keys) == {
+        # Filled in by the CLI on every serve command, and by the supervisor for a sharded one.
+        "engine_kind",
+        "routed_experts_device",
+        "pd_mode",
+        "nccl_id_path",
+        # Not ignored: `SchedulerHost` reads both. They are in this set so a launch can name them
+        # without the model option parser refusing them, which is the same treatment as the four.
+        "enable_batching",
+        "scheduler_timeout_ms",
+    }
 
 
 def test_the_rejection_and_the_routing_predicate_are_the_same_call() -> None:
