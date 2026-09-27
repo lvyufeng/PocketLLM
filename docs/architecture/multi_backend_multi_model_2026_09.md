@@ -86,9 +86,12 @@ scheduler become one implementation over the narrow `InferenceEngine` contract t
 ### 3.1 What PocketLLM has that the others do not
 
 The `core/` / `engine/` / `backends/` split is enforced, not aspirational: `check_layering` in
-`cpp_engine/CMakeLists.txt` fails the build if `include/` or `core/` pulls in a vendor SDK header, and
-the invariant holds empirically — **zero `<<<` launch sites in `engine/`, `core/` and `include/`**, all
-371 of them under `backends/cuda/kernels/` (22 files). The op contract is coarse-grained and
+`cpp_engine/CMakeLists.txt` fails the build if `include/`, `core/`, `engine/` or `backends/api/`
+pulls in a vendor SDK header — and for `engine/` it applies a second test, failing on a vendor
+runtime *entry point* too, because an include check alone would miss a stray `cudaMalloc` that
+compiles only because some other header pulled the SDK in transitively. The invariant holds
+empirically — **zero `<<<` launch sites in `engine/`, `core/` and `include/`**, all 371 of them under
+`backends/cuda/kernels/` (22 files). The op contract is coarse-grained and
 vendor-neutral by construction
 (`void* stream` on all but two of 93 declarations in `cuda_ops.hpp`). That is a cleaner kernel seam
 than either competitor has: no vendor in the vLLM or SGLang trees gets that guarantee, which is why
@@ -113,14 +116,18 @@ problem is that the abstraction's *coverage* stops well short of "a second backe
 | Engines buildable | 2 (`QwenEngine`, `PersistentEngineAdapter`) + 2 drafters | 1 (`QwenEngine`) | `deepseek_v4_engine.cpp`, `dspark_engine.cpp`, `qwen_dspark.cpp`, `qwen_dflash2.cpp` excluded |
 | Tenants of those engines | the whole model set | Qwen FP16 only, and only in the C++ engine | the Python plane (`--backend v41/mimo/xing4/torch`) has **no** NPU path at all |
 | Collective | stock NCCL (`ncclAllReduce`) | hand-written IPC all-reduce + device-side arrival wait | the CUDA side has no equivalent optimization |
-| Layering check | `core/` and `include/` enforced | same | `engine/` is **not** covered — Phase 1 of the plan is still open |
+| Layering check | all four guarded directories enforced, `engine/` with a symbol test too | same | — |
 
-The last row is the one with leverage. `engine/deepseek_v4_engine.cpp` names CUDA kernels directly in
-~120 places, which is why `engine/backend_unimplemented_ascend.cpp` (317 lines of throwing stubs) has
-to exist at all: a CUDA symbol referenced from any object in the link must resolve even when its branch
-is unreachable. Every model added to `engine/` without going through `backends/api/device_runtime.hpp`
-makes the second backend more expensive, and the plan already identified this — extending
-`check_layering` to `engine/` is the mechanical version.
+The layering row used to be the one with leverage, and it is now the one row with no gap: the check
+covers all four guarded directories and applies the symbol test to `engine/` (added with the
+vendor-neutral device runtime, #138), so a model cannot reach the device from `engine/` without
+going through `backends/api/device_runtime.hpp` — the build says so. What remains is the second row.
+`engine/deepseek_v4_engine.cpp` names CUDA kernels directly in ~120 places, which is why
+`engine/backend_unimplemented_ascend.cpp` (317 lines of throwing stubs) has to exist at all: a CUDA
+symbol referenced from any object in the link must resolve even when its branch is unreachable. Those
+stubs shrinking to what is genuinely model-specific is Ascend-side work — implementing the
+`cuda_ops.hpp` contract for the four excluded translation units — and it cannot be done or verified
+from a host with no `/dev/davinci*` and no CANN.
 
 ### 3.3 What the competitors' plugin seams cost, and what they buy
 
@@ -465,10 +472,13 @@ the split between "one lifecycle" and "per-model implementations" is the questio
    latent store the same interface and metrics names, and delete `runtime/prefix_snapshot.py` or
    port its one consumer. Note that a radix tree is *not* the goal — vLLM itself uses a chained block
    hash, and SGLang's tree is a response to multi-tenant routing that a single-user box does not have.
-6. **Extend `check_layering` to `engine/`.** This is Phase 1 of the existing multi-backend plan, and
-   it is the only item that makes the *next* model cheaper on both backends instead of just on CUDA.
-   The four CUDA-only TUs are the work; the verification is the existing CUDA regression suite plus
-   the Ascend parity targets.
+6. **The four CUDA-only translation units.** `check_layering` already covers `engine/` (see §3.2);
+   what is open is that `deepseek_v4_engine.cpp`, `dspark_engine.cpp`, `qwen_dspark.cpp` and
+   `qwen_dflash2.cpp` are excluded from the Ascend target outright, which is why
+   `backend_unimplemented_ascend.cpp` is 317 lines of throwing stubs. This is the only item that makes
+   the *next* model cheaper on both backends instead of just on CUDA, and it is Ascend-side work: the
+   verification is the existing CUDA regression suite plus the Ascend parity targets, and neither can
+   be run from a host with no `/dev/davinci*`.
 
 ### Tier 3 — close the headline gaps
 
@@ -746,9 +756,8 @@ The order matters and the first item is not negotiable.
    the four implementations.
 7. **Raise each runtime's width** as its own per-model work: xing4's value-batch axis, then per-row
    sampling and resumable prefill for mimo and v41.
-8. **Merge the two HTTP front ends**, and extend `check_layering` to `engine/` — the last one matters
-   because steps 4–7 move engine code, and `engine/` is the one directory the layering check does not
-   cover today.
+8. **Merge the two HTTP front ends.** The layering check is no longer a companion item here:
+   `check_layering` covers `engine/` already, so steps 4–7 cannot move engine code past it.
 
 Items 1–3 are scheduled as Stage R1, 4–6 as R2, and 7–8 as R3 in the refactor project.
 
