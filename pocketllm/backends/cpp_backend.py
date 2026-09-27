@@ -36,6 +36,11 @@ from .base import BackendBase, settled_text
 
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
 
+#: Rows the batch scheduler runs when the batch path is on and nobody named a width. Eight is what
+#: `enable_batching` has meant since it existed, and the engine sizes its KV cache for this many
+#: slots at construction, so it is the number to look at when a checkpoint stops fitting.
+DEFAULT_BATCH_SLOTS = 8
+
 
 def _preload_torch_runtime() -> None:
     """Let torch bind its own NCCL before the native module loads one.
@@ -263,15 +268,13 @@ class CppBackend(BackendBase):
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
         self._eos_ids, self._eos_source = self._resolve_eos_ids()
 
-        # Phase 3.4: Optional batch scheduler.  Only rank 0 drives scheduling:
-        # the scheduler runs a background thread that issues collectives, and on
-        # a worker rank that would race run_worker_loop() and deadlock NCCL.
+        # Phase 3.4: the batch scheduler, on by default and only on rank 0.  Only rank 0 drives
+        # scheduling: the scheduler runs a background thread that issues collectives, and on a worker
+        # rank that would race run_worker_loop() and deadlock NCCL.  A worker rank therefore reports
+        # no scheduling of its own, and the width reaches it through the shared worker options.
         self._scheduler = None
         self._batching_enabled = False
-        if (
-            self.args.backend_options.get("enable_batching", False)
-            and self.args.tensor_parallel_rank == 0
-        ):
+        if self._batching_requested() and self.args.tensor_parallel_rank == 0:
             self._batching_enabled = self._init_batch_scheduler()
 
         self._ready = True
@@ -327,26 +330,99 @@ class CppBackend(BackendBase):
     def _configured_max_batch_size(self) -> int:
         """Batch width for this backend, shared by the engine and the scheduler.
 
-        The engine sizes its KV cache from this at construction, so the scheduler
-        must not ask for more slots later.  Batching off means a single slot,
-        which keeps the serial path's memory footprint unchanged.
+        The engine sizes its KV cache from this at construction, so the scheduler must not ask for
+        more slots later.  Batching off means a single slot, which keeps the serial path's memory
+        footprint unchanged.
+
+        Three sources, the first one set winning:
+
+        1. `backend_options["max_batch_size"]`, the programmatic spelling. It wins over the flag,
+           because every benchmark in `scripts/` sets it and none of them passes a CLI flag --
+           reading the flag first would silently reset those to its default of 1.
+        2. `--max-batch-size`, which is how an operator asks for a width.
+        3. `DEFAULT_BATCH_SLOTS`. A width of 1 is not a batch, so leaving the unspecified width at 1
+           would make `--enable-batching` on its own do nothing.
         """
-        if not self.args.backend_options.get("enable_batching", False):
+        if not self._batching_requested():
             return 1
+        raw = self._requested_batch_width()
+        if raw is None:
+            return DEFAULT_BATCH_SLOTS
         try:
-            requested = int(self.args.backend_options.get("max_batch_size", 8))
+            requested = int(raw)
         except (TypeError, ValueError):
-            return 1
-        return requested if requested >= 1 else 1
+            raise ConfigurationError(
+                f"max_batch_size={raw!r} is not an integer; it is a row count"
+            ) from None
+        if requested < 1:
+            raise ConfigurationError(
+                f"max_batch_size={requested} is not a width; use 1 for the serialized session or "
+                f"--no-enable-batching, which says the same thing"
+            )
+        return requested
+
+    def _batching_requested(self) -> bool:
+        """Whether the operator, or the caller, asked for the batch scheduler.
+
+        The CLI flag is the operator's spelling and the backend option is the programmatic one; the
+        flag wins when it is set, because it is the one a person typed. Neither being set means this
+        backend's own default, which is **on**: the batch path is the only one that can honour a
+        width above 1, and the only one that accepts a sampling policy at all -- `_check_sampling`
+        refuses `top_k`, `top_p`, `min_p`, `n`, `logprobs` and `stop` on the serial path, so
+        defaulting to serial would silently refuse options `pocketllm serve` advertises.
+        """
+        explicit = self.args.backend_options.get("enable_batching")
+        if explicit is None:
+            explicit = self.args.enable_batching
+        return True if explicit is None else bool(explicit)
+
+    def _batching_source(self) -> str:
+        """Which of the three places the batch decision came from, for a message about it."""
+        if self.args.backend_options.get("enable_batching") is not None:
+            return "from --backend-option enable_batching"
+        if self.args.enable_batching is not None:
+            return "from --enable-batching" if self.args.enable_batching else "from --no-enable-batching"
+        return "from this backend's default"
+
+    def _batching_was_asked_for(self) -> bool:
+        """Whether a *person or caller* asked, as opposed to this backend assuming it.
+
+        The difference decides whether a build without a scheduler is worth a warning. An explicit
+        request that cannot be honoured is the case a warning is for. The assumption is not: it is a
+        claim about the build, `capabilities.details['scheduler']` answers it on every construction,
+        and a warning on the default path would be one line of noise per process for a fact the
+        capability report already carries -- the same declaration R2 exists to make uniform.
+        """
+        if self.args.backend_options.get("enable_batching"):
+            return True
+        if self.args.enable_batching:
+            return True
+        # A width can be refused for being unreadable, but this decides whether to *warn* about it, so
+        # it must not be the thing that raises: a build with no scheduler and a nonsense width would
+        # otherwise report the ValueError in place of the ConfigurationError that names the width.
+        try:
+            return int(self._requested_batch_width() or 1) > 1
+        except (TypeError, ValueError):
+            return True
+
+    def _requested_batch_width(self) -> Any:
+        """The width as asked for, or `None` when neither source named one."""
+        if "max_batch_size" in self.args.backend_options:
+            return self.args.backend_options["max_batch_size"]
+        if self.args.max_batch_size != 1:
+            return self.args.max_batch_size
+        return None
 
     def _init_batch_scheduler(self) -> bool:
         """Initialize the batch scheduler if available."""
         if not hasattr(self._native, "QwenBatchScheduler"):
-            import warnings
-            warnings.warn(
-                "enable_batching=True but native module does not expose QwenBatchScheduler; "
-                "falling back to serial execution"
-            )
+            if self._batching_was_asked_for():
+                import warnings
+                warnings.warn(
+                    f"the batch path was asked for ({self._batching_source()}) but this native module "
+                    f"does not expose QwenBatchScheduler; falling back to serial execution, which "
+                    f"serves one request at a time"
+                )
             return False
 
         max_batch_size = self._configured_max_batch_size()

@@ -70,6 +70,14 @@ class EngineArgs:
     speculative_method: str | None = None
     speculative_tokens: int = 1
     max_batch_size: int = 1
+    #: Whether to run the batch scheduler instead of the serialized session.
+    #:
+    #: ``None`` is "the backend's default" rather than "off": a backend that owns a scheduler
+    #: chooses the batch path, and one that does not ignores the flag. It is deliberately not
+    #: ``False`` by default, because ``False`` and "nobody asked" have to be distinguishable --
+    #: ``--no-enable-batching`` next to a batch width is an operator contradicting themselves, and a
+    #: default of ``False`` would make that indistinguishable from the ordinary case.
+    enable_batching: bool | None = None
     backend_options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -100,6 +108,15 @@ class EngineArgs:
             raise ConfigurationError("speculative_tokens must be >= 1")
         if self.max_batch_size < 1:
             raise ConfigurationError("max_batch_size must be >= 1")
+        if self.enable_batching is False and self.max_batch_size > 1:
+            # Both fields are the operator's, and they disagree: a width is a request for a scheduler
+            # that runs that many rows, and refusing the scheduler is a request for the serialized
+            # session, which runs one. Picking one of the two here would leave the other flag
+            # accepted and ignored.
+            raise ConfigurationError(
+                f"max_batch_size={self.max_batch_size} asks for a batch width and enable_batching is "
+                f"False; a serialized session runs one request at a time. Drop one of the two"
+            )
 
     @property
     def checkpoint_dir(self) -> str:
