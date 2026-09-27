@@ -112,7 +112,7 @@ def test_tokenizer_owned_template_takes_precedence():
         metadata={"messages": messages, "thinking_mode": "chat"},
     )
 
-    assert backend._prompt_ids(request) == [91, 92]
+    assert backend._tokenize(request) == [91, 92]
     assert tokenizer.encoded == []
     assert tokenizer.template_calls[0][0] == messages
     assert tokenizer.template_calls[0][1]["add_generation_prompt"] is True
