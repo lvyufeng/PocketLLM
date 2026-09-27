@@ -454,7 +454,7 @@ add_custom_target(check_layering
     COMMAND ${CMAKE_COMMAND}
         -DPOCKET_ENGINE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckLayering.cmake
-    COMMENT "Checking that core/ and include/ pull in no vendor SDK headers"
+    COMMENT "Checking that core/, engine/, include/ and backends/api/ name no vendor SDK"
 )
 
 add_executable(pocketllm_engine engine/main.cpp)
