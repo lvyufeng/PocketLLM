@@ -24,8 +24,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from src.loader.gguf.bundle import read_gguf_bundle
-
 
 def setup_dist() -> tuple[int, int, int, torch.device]:
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -180,13 +178,14 @@ def run_gguf_generation(
 
     Returns ``(generated_token_ids, stats)`` on rank 0, ``None`` on other
     ranks. The architecture is resolved from ``general.architecture`` unless
-    overridden, so the same entrypoint serves every registered model.
+    overridden, so the same entrypoint serves every registered model. Reading
+    the checkpoint is the registry's, so this module names no container format.
     """
-    from src.components.moe.registry import detect_spec
+    from src.components.moe import registry
 
     world, rank, local_rank, device = setup_dist()
-    bundle = read_gguf_bundle(gguf_path)
-    spec = detect_spec(bundle, architecture)
+    bundle = registry.load_bundle(gguf_path)
+    spec = registry.detect_spec(bundle, architecture)
     if not hasattr(spec, "build_token_runtime"):
         raise ValueError(
             f"architecture {spec.architecture!r} does not support GGUF raw-block token generation"
@@ -220,10 +219,8 @@ def run_gguf_generation(
         # 236 GB at HDD bandwidth takes many minutes, so setup_dist raises the
         # process-group timeout to keep the idle ranks from tripping it here.
         if rank == 0:
-            from src.loader.gguf.prewarm import prewarm_bundle
-
             t0 = time.perf_counter()
-            elapsed = prewarm_bundle(bundle)
+            elapsed = registry.prewarm_shards(bundle)
             total_bytes = sum(os.path.getsize(p) for p in bundle.paths)
             print(
                 f"gguf_prewarm_done shards={len(elapsed)} "
