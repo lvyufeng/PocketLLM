@@ -84,6 +84,17 @@ def render_baseline(entries: dict[str, str]) -> str:
         "# A test added to this file is a test that runs on this host and fails. Anything skipped for\n"
         "# want of a GPU, a checkpoint or a built extension is not here and must not be.\n"
     )
+    if not entries:
+        # An empty file under a header that says "the suite's known failures" is ambiguous: it
+        # reads either as "every test passes" or as "nobody has recorded anything", and the two
+        # call for opposite responses. The line says which one it is, and it is written by the same
+        # function that writes the entries, so it cannot go stale independently of them.
+        header += (
+            "#\n"
+            "# The set is empty: every test this host collects and runs passes. The suite still\n"
+            "# skips the ones needing a checkpoint, a card or an extension this build has not got,\n"
+            "# and a skip is not a pass.\n"
+        )
     body = "".join(f"{nodeid} {entries[nodeid]}\n" for nodeid in sorted(entries))
     return header + body
 

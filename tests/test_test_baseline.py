@@ -148,9 +148,21 @@ def test_the_recorded_baseline_parses_and_is_sorted() -> None:
 
     It is asserted as sorted because an unsorted file makes a one-line change look like a rewrite,
     and the diff is the entire point of recording a set.
-    """
-    entries = checker.parse_baseline(checker.BASELINE_PATH.read_text(encoding="utf-8"))
 
-    assert entries, "the baseline is empty, so nothing that used to fail is being tracked"
+    The empty set is a legal state -- it is the state this host is in -- so the guard cannot be
+    "there is at least one entry". What has to hold instead is that nothing was silently dropped:
+    every non-comment, non-blank line of the file is a parsed entry. A parser that stopped
+    understanding the format returns `{}` for a file full of entries, which is the regression the
+    count-based assertion used to catch and this one still does.
+    """
+    text = checker.BASELINE_PATH.read_text(encoding="utf-8")
+    entries = checker.parse_baseline(text)
+
+    recorded = [
+        line.split("#", 1)[0].strip()
+        for line in text.splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+    assert [f"{nodeid} {outcome}" for nodeid, outcome in sorted(entries.items())] == recorded
     assert list(entries) == sorted(entries)
     assert all(outcome in checker.FAILING_OUTCOMES for outcome in entries.values())
