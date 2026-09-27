@@ -107,11 +107,27 @@ decoded text on one of them. One field is not the same on the two: `usage.cached
 prefix store reports to the serial path and the scheduler has no channel for. The token ids, the
 text and the finish reason are.
 
-**Not measured end to end on this host.** A V4.1 serve needs the released checkpoint and the cards it
-was sized for, so no A/B against the serialized path has been run and this page claims no throughput
-figure for the route. What is asserted is the weaker and more important claim: a request through the
-scheduler returns the same token ids, text and finish reason as the serialized path, and says
-`continuous_batching = False` about itself.
+**Measured on the four-card host.** Two concurrent clients, 16 tokens each, against the released
+checkpoint on 4 x RTX 2080 Ti at `--max-model-len 4096`, the resident expert bank attached
+(`DEEPSEEK_V41_RESIDENT_EXPERTS=1`), one process per arm:
+
+| Arm | Aggregate | First client | Second client | `requests_running` peak |
+|---|---|---|---|---|
+| `--enable-batching` | **2.19 tok/s** (32 tokens in 14.62 s) | 6.97 s | 14.61 s | 1, with 1 waiting |
+| `--no-enable-batching` | 1.88 tok/s (32 tokens in 16.98 s) | 7.97 s | 16.97 s | not published |
+
+The scheduler route is 1.17x the serialized one and both clients finish sooner, which is what a
+width-1 scheduler should do and not what concurrency would: the first request is admitted at once and
+the second waits for the slot, where the serialized path admits both and makes each wait on the
+other's lock. The gauges are the evidence that it was the scheduler -- peak `requests_running` 1 and
+`requests_waiting` 1 out of two clients, against no series at all on the other arm.
+
+`scripts/bench_cpp_scheduler_metrics.py --backend v41 --tp 4` is the harness. It needs
+`--startup-timeout` well above the supervisor's 300 s default: a first run that has to *fill* the
+457.8 GiB bank takes about seven minutes, and the supervisor's timeout fires while the fill is still
+running and reports the ranks as missing. Filling it once with a long-budget run leaves
+`/dev/shm/pocketllm_v41_experts/bank.ready` behind, and every run after that attaches in
+milliseconds.
 
 `DEEPSEEK_V41_RESIDENT_EXPERTS=1` is the environment-variable form of the pinned host bank and is what
 the command above uses. `DEEPSEEK_V41_INDEXER_ROW_SPLIT=1` is the one knob that reaches the attention's
