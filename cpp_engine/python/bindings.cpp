@@ -64,6 +64,138 @@ private:
     std::shared_ptr<py::function> fn_;
 };
 
+// Run one Python-implemented engine method, from whatever thread calls it.
+//
+// Both halves are load-bearing.
+//
+// **The GIL.** `BatchScheduler` runs its loop on its own `std::thread`, which Python knows nothing
+// about, and `batch_prefill` / `batch_decode_step` are called from there. A Python body therefore has
+// to take the GIL itself. (The constructor's calls -- `caps()` and `allocate_batch_slots()` -- are
+// made from whichever thread built the scheduler, i.e. the GIL-holding one; `gil_scoped_acquire` is
+// recursive through `PyGILState_Ensure`, so the same wrapper serves both.)
+//
+// **The conversion.** `py::error_already_set` is destroyed with the GIL held and its `what()` reads
+// live Python state, but the scheduler catches `std::exception` on its own thread with the GIL
+// released -- so letting one through would unwind this acquire-before-anything-reads-the-message and
+// turn a Python traceback into a crash. It is caught here, rendered to a string while the GIL is
+// still held, and rethrown as a plain `std::runtime_error`, which is what the scheduler's own error
+// path expects and what it reports to the waiting request.
+template <typename Fn>
+auto call_python_engine(const char* what, Fn&& fn) -> decltype(fn()) {
+    py::gil_scoped_acquire acquire;
+    try {
+        return fn();
+    } catch (const py::error_already_set& error) {
+        throw std::runtime_error(std::string("python engine ") + what + " failed: " + error.what());
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("python engine ") + what + " failed: " + error.what());
+    }
+}
+
+// The trampoline that lets a Python class be the engine behind the C++ scheduler.
+//
+// This is what makes the scheduler one scheduler rather than one per language: `BatchScheduler` is
+// constructed from an `InferenceEngine*` and does not know or care which side of the binding the
+// implementation lives on. `QwenEngine` does *not* derive from this class, so the native path pays
+// nothing for it -- these overrides only exist on objects Python created.
+class PyInferenceEngine : public InferenceEngine {
+public:
+    using InferenceEngine::InferenceEngine;
+
+    Capabilities caps() const override {
+        return call_python_engine("caps", [this] {
+            PYBIND11_OVERRIDE_PURE(Capabilities, InferenceEngine, caps);
+        });
+    }
+
+    int max_context() const override {
+        return call_python_engine("max_context", [this] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, max_context);
+        });
+    }
+
+    int device() const override {
+        return call_python_engine("device", [this] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, device);
+        });
+    }
+
+    void allocate_batch_slots(int max_batch_size) override {
+        call_python_engine("allocate_batch_slots", [this, max_batch_size] {
+            PYBIND11_OVERRIDE_PURE(void, InferenceEngine, allocate_batch_slots, max_batch_size);
+        });
+    }
+
+    int allocate_slot(uint64_t request_id) override {
+        return call_python_engine("allocate_slot", [this, request_id] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, allocate_slot, request_id);
+        });
+    }
+
+    void free_slot(uint64_t request_id) override {
+        call_python_engine("free_slot", [this, request_id] {
+            PYBIND11_OVERRIDE_PURE(void, InferenceEngine, free_slot, request_id);
+        });
+    }
+
+    bool kv_paged() const override {
+        return call_python_engine("kv_paged", [this] {
+            PYBIND11_OVERRIDE_PURE(bool, InferenceEngine, kv_paged);
+        });
+    }
+
+    int kv_free_blocks() const override {
+        return call_python_engine("kv_free_blocks", [this] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, kv_free_blocks);
+        });
+    }
+
+    int kv_total_blocks() const override {
+        return call_python_engine("kv_total_blocks", [this] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, kv_total_blocks);
+        });
+    }
+
+    int kv_cache_pinned_blocks() const override {
+        return call_python_engine("kv_cache_pinned_blocks", [this] {
+            PYBIND11_OVERRIDE(int, InferenceEngine, kv_cache_pinned_blocks);
+        });
+    }
+
+    int kv_evict_cache_blocks(int count) override {
+        return call_python_engine("kv_evict_cache_blocks", [this, count] {
+            PYBIND11_OVERRIDE(int, InferenceEngine, kv_evict_cache_blocks, count);
+        });
+    }
+
+    int kv_blocks_for_tokens(int tokens) const override {
+        return call_python_engine("kv_blocks_for_tokens", [this, tokens] {
+            PYBIND11_OVERRIDE_PURE(int, InferenceEngine, kv_blocks_for_tokens, tokens);
+        });
+    }
+
+    BatchPrefillResult batch_prefill(const std::vector<BatchedRequest*>& requests,
+                                     int token_budget) override {
+        return call_python_engine("batch_prefill", [this, &requests, token_budget] {
+            PYBIND11_OVERRIDE_PURE(BatchPrefillResult, InferenceEngine, batch_prefill, requests,
+                                   token_budget);
+        });
+    }
+
+    BatchDecodeResult batch_decode_step(
+        const std::vector<BatchedRequest*>& requests) override {
+        return call_python_engine("batch_decode_step", [this, &requests] {
+            PYBIND11_OVERRIDE_PURE(BatchDecodeResult, InferenceEngine, batch_decode_step, requests);
+        });
+    }
+
+    void warmup_tp() override {
+        call_python_engine("warmup_tp", [this] {
+            PYBIND11_OVERRIDE(void, InferenceEngine, warmup_tp);
+        });
+    }
+};
+
 py::dict forward_result_dict(const ForwardResult& result) {
     py::dict out;
     out["token"] = result.token;
@@ -230,6 +362,52 @@ std::vector<int> persistent_batch_verify(PersistentEngine& engine,
     return engine.batch_verify_step(tokens, position, params);
 }
 
+// A vector member that reads as a copy and writes as a whole value.
+//
+// `def_readwrite` on a `std::vector` member is the obvious thing and it does not work: the stl caster
+// builds a fresh Python list from the vector on every read and drops the reference, so
+// `result.results.append(row)` appends to a temporary and the C++ vector stays empty. Nothing raises
+// at the offending line -- the empty result only surfaces later, as the scheduler complaining that
+// `batch_prefill` returned no rows, which names the field but not the reason.
+//
+// A tuple is a copy in a way that cannot be mistaken for a mutable view: the same append raises
+// `AttributeError` where it was written. Assignment still works, and is how these are meant to be
+// set -- build the list in Python, assign it once.
+template <typename C, typename T>
+void read_only_vector(py::class_<C>& cls, const char* name, std::vector<T> C::*member) {
+    cls.def_property(
+        name,
+        [member](const C& self) {
+            const std::vector<T>& values = self.*member;
+            py::tuple out(values.size());
+            for (size_t i = 0; i < values.size(); ++i) {
+                out[i] = py::cast(values[i]);
+            }
+            return out;
+        },
+        [member](C& self, const std::vector<T>& value) { self.*member = value; },
+        "Read-only view; assign a sequence to replace it.");
+}
+
+// A member of a registered class type exposed by reference rather than by value.
+//
+// The same copy-on-read applies to a nested object: `req.last_result.top_token = 7` reads
+// `last_result` into a temporary, sets the field on the temporary, and discards it. Returning a
+// reference to the member makes the nested write land, and spares the engine a copy of the sampling
+// parameters on every row of every iteration.
+//
+// The reference is `reference_internal`, so the returned object keeps the parent alive. The parent
+// itself is scheduler-owned and freed with the request, so a Python engine must not hold one past
+// the call that handed it over.
+template <typename C, typename T>
+void by_reference(py::class_<C>& cls, const char* name, T C::*member) {
+    cls.def_property(
+        name,
+        [member](C& self) -> T& { return self.*member; },
+        [member](C& self, const T& value) { self.*member = value; },
+        py::return_value_policy::reference_internal);
+}
+
 }  // namespace
 
 PYBIND11_MODULE(pocketllm_cpp, module) {
@@ -389,17 +567,47 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
     // registered `InferenceEngine`, which is the whole point of the abstraction -- a new
     // engine reaches the scheduler through the same call, with no second scheduler and no
     // binding change.
-    py::class_<InferenceEngine>(module, "InferenceEngine")
+    //
+    // `PyInferenceEngine` is the trampoline, and its presence is what makes "any engine"
+    // include a Python one: a Python subclass of this appears to `BatchScheduler` as an
+    // `InferenceEngine*`, and the two batched forwards it does not implement are forwarded
+    // back into Python. The native engines do not derive from the trampoline, so nothing
+    // on their path changes.
+    py::class_<InferenceEngine, PyInferenceEngine>(module, "InferenceEngine")
+        // A default constructor, and it exists only so a Python subclass can be built: pybind11
+        // requires one on the trampoline before `class MyEngine(InferenceEngine)` is even legal.
+        // The C++ interface is not constructible and this does not make it so -- every pure virtual
+        // it declares raises `NotImplementedError` until a subclass supplies it, so instantiating
+        // this directly produces an engine that fails on its first call rather than a working one.
+        .def(py::init<>())
         .def("caps", &InferenceEngine::caps,
              "What this engine declares it can do.")
-        .def_property_readonly("max_context", &InferenceEngine::max_context)
-        .def_property_readonly("device", &InferenceEngine::device,
+        .def("max_context", &InferenceEngine::max_context)
+        .def("device", &InferenceEngine::device,
              "Device this engine bound, or -1 for a host-only engine.")
-        .def_property_readonly("kv_paged", &InferenceEngine::kv_paged)
-        .def_property_readonly("kv_free_blocks", &InferenceEngine::kv_free_blocks)
-        .def_property_readonly("kv_total_blocks", &InferenceEngine::kv_total_blocks)
-        .def_property_readonly("kv_cache_pinned_blocks",
-                               &InferenceEngine::kv_cache_pinned_blocks);
+        .def("kv_paged", &InferenceEngine::kv_paged)
+        .def("kv_free_blocks", &InferenceEngine::kv_free_blocks)
+        .def("kv_total_blocks", &InferenceEngine::kv_total_blocks)
+        .def("kv_cache_pinned_blocks", &InferenceEngine::kv_cache_pinned_blocks)
+        .def("kv_blocks_for_tokens", &InferenceEngine::kv_blocks_for_tokens,
+             py::arg("tokens"))
+        .def("allocate_batch_slots", &InferenceEngine::allocate_batch_slots,
+             py::arg("max_batch_size"))
+        .def("allocate_slot", &InferenceEngine::allocate_slot, py::arg("request_id"))
+        .def("free_slot", &InferenceEngine::free_slot, py::arg("request_id"))
+        .def("batch_prefill", &InferenceEngine::batch_prefill,
+             py::arg("requests"), py::arg("token_budget"),
+             R"doc(Advance each request's prompt by at most `token_budget` tokens; 0 runs every
+             prompt to completion.
+
+             Called from the scheduler's own thread, so a Python override runs with the GIL
+             acquired by the binding rather than by the caller. It must leave `seq_len` on each
+             request at the number of prompt tokens now consumed, and return one result row and
+             one `incomplete` flag per request.
+             )doc")
+        .def("batch_decode_step", &InferenceEngine::batch_decode_step,
+             py::arg("requests"),
+             "Advance every request by one or more output tokens.");
 
     py::class_<QwenEngine, InferenceEngine>(module, "QwenEngine")
         .def(py::init<const std::string&, const QwenEngineOptions&, int, int>(),
@@ -543,21 +751,26 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
     // Capabilities struct for engine introspection
     py::class_<Capabilities>(module, "Capabilities")
         .def(py::init<>())
-        .def_readonly("paged_kv", &Capabilities::paged_kv)
-        .def_readonly("continuous_batching", &Capabilities::continuous_batching)
-        .def_readonly("chunked_prefill", &Capabilities::chunked_prefill)
-        .def_readonly("max_slots", &Capabilities::max_slots)
-        .def_readonly("per_request_sampling", &Capabilities::per_request_sampling)
-        .def_readonly("per_request_top_k", &Capabilities::per_request_top_k)
-        .def_readonly("fixed_temperature", &Capabilities::fixed_temperature)
-        .def_readonly("fixed_top_p", &Capabilities::fixed_top_p)
-        .def_readonly("fixed_top_k", &Capabilities::fixed_top_k)
-        .def_readonly("fixed_seed", &Capabilities::fixed_seed)
-        // Declared in the struct and reachable from Python as well, so the two declarations can be
-        // compared rather than one of them being copied by hand: the Python adapter reported both
-        // of these as False whatever the engine said.
-        .def_readonly("structured_outputs", &Capabilities::structured_outputs)
-        .def_readonly("logprobs", &Capabilities::logprobs)
+        // Readable and writable, because this type has two directions now: the engine side of the
+        // binding reads what a C++ engine declared, and a Python engine has to be able to *state*
+        // its own declaration. Read-only fields would make the second impossible and would push a
+        // Python runtime back to having its capability described somewhere outside the engine.
+        //
+        // `structured_outputs` and `logprobs` are here for the same reason as the rest rather than
+        // because a Python runtime declares them today: the set is one list, and a field that is
+        // readable only would be the one thing a Python engine could not say about itself.
+        .def_readwrite("paged_kv", &Capabilities::paged_kv)
+        .def_readwrite("continuous_batching", &Capabilities::continuous_batching)
+        .def_readwrite("chunked_prefill", &Capabilities::chunked_prefill)
+        .def_readwrite("max_slots", &Capabilities::max_slots)
+        .def_readwrite("per_request_sampling", &Capabilities::per_request_sampling)
+        .def_readwrite("per_request_top_k", &Capabilities::per_request_top_k)
+        .def_readwrite("fixed_temperature", &Capabilities::fixed_temperature)
+        .def_readwrite("fixed_top_p", &Capabilities::fixed_top_p)
+        .def_readwrite("fixed_top_k", &Capabilities::fixed_top_k)
+        .def_readwrite("fixed_seed", &Capabilities::fixed_seed)
+        .def_readwrite("structured_outputs", &Capabilities::structured_outputs)
+        .def_readwrite("logprobs", &Capabilities::logprobs)
         .def("__repr__", [](const Capabilities& c) {
             return "<Capabilities max_slots=" + std::to_string(c.max_slots) +
                    " continuous_batching=" + (c.continuous_batching ? "True" : "False") +
@@ -566,6 +779,77 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
                    " structured_outputs=" + (c.structured_outputs ? "True" : "False") +
                    " logprobs=" + (c.logprobs ? "True" : "False") + ">";
         });
+
+    // The per-request state a batched forward is given and the rows it returns.
+    //
+    // Bound as mutable value types because a Python engine both *reads* the request the scheduler
+    // built (the prompt, how far it has got, the sampling parameters) and *writes* back into it --
+    // `seq_len` is how `batch_prefill` reports how much of the prompt it consumed, and `finished`
+    // is how it reports that the first predicted token is a stop token.
+    py::class_<BatchedRequest> request_class(module, "BatchedRequest");
+    request_class.def(py::init<>())
+        .def_readwrite("request_id", &BatchedRequest::request_id)
+        .def_readwrite("prompt_tokens", &BatchedRequest::prompt_tokens)
+        // How many prompt tokens have been consumed. `batch_prefill` is expected to leave this at
+        // the new total; a chunked engine advances it by its budget, one that runs the prompt to
+        // completion sets it to `prompt_tokens.size()`.
+        .def_readwrite("seq_len", &BatchedRequest::seq_len)
+        .def_readwrite("slot_id", &BatchedRequest::slot_id)
+        .def_readwrite("cached_prefix_len", &BatchedRequest::cached_prefix_len)
+        .def_readwrite("finished", &BatchedRequest::finished)
+        .def_readwrite("last_token", &BatchedRequest::last_token)
+        .def_readwrite("generated_tokens", &BatchedRequest::generated_tokens);
+    // Read through a reference, so reading the sampling parameters does not copy them per row and
+    // the result of the last forward is writable in place. See `by_reference`.
+    by_reference(request_class, "sampling", &BatchedRequest::sampling);
+    by_reference(request_class, "last_result", &BatchedRequest::last_result);
+
+    py::class_<BatchPrefillResult> prefill_class(module, "BatchPrefillResult");
+    prefill_class.def(py::init<>())
+        // One row per request, parallel to `incomplete`.
+        //
+        // Assigned, not appended to: they read back as tuples because a list here would be a copy
+        // that looks mutable. See `read_only_vector`.
+        .def_readwrite("total_tokens", &BatchPrefillResult::total_tokens)
+        .def_readwrite("seconds", &BatchPrefillResult::seconds);
+    read_only_vector(prefill_class, "results", &BatchPrefillResult::results);
+    // True where the prompt is not yet fully consumed, in which case this row's `results`
+    // entry holds the last chunk's interior logits and is not a prediction for the prompt's
+    // final token -- the scheduler skips those rows and does not sample them.
+    read_only_vector(prefill_class, "incomplete", &BatchPrefillResult::incomplete);
+
+    // The ranking an engine reports for one generated position.
+    //
+    // Registered because `BatchDecodeResult.logprobs` is a vector of these: without a type here the
+    // member could be neither filled nor read from Python, and a vector that raises on access is a
+    // worse answer than one that is not exposed at all. Its two vectors are assigned rather than
+    // appended to, for the same reason as the result rows above.
+    py::class_<TokenLogprob>(module, "TokenLogprob")
+        .def(py::init<>())
+        .def_readwrite("present", &TokenLogprob::present,
+                       "False when the engine produced no ranking for this position.")
+        .def_readwrite("logprob", &TokenLogprob::logprob)
+        .def_readwrite("top_tokens", &TokenLogprob::top_tokens)
+        .def_readwrite("top_logprobs", &TokenLogprob::top_logprobs);
+
+    py::class_<BatchDecodeResult> decode_class(module, "BatchDecodeResult");
+    decode_class.def(py::init<>())
+        .def_readwrite("seconds", &BatchDecodeResult::seconds);
+    read_only_vector(decode_class, "next_tokens", &BatchDecodeResult::next_tokens);
+    read_only_vector(decode_class, "finished", &BatchDecodeResult::finished);
+    // Parallel to `next_tokens`, and not recoverable from `finished`: it is the difference
+    // between stopping on a stop token and stopping on `max_new_tokens`, which is what
+    // `finish_reason` reports.
+    read_only_vector(decode_class, "hit_stop_token", &BatchDecodeResult::hit_stop_token);
+    // The optional speculative row metadata. All of it may be left empty, which is what a
+    // plain one-token-per-row engine does and what the scheduler then assumes.
+    read_only_vector(decode_class, "emitted_tokens", &BatchDecodeResult::emitted_tokens);
+    read_only_vector(decode_class, "position_advances", &BatchDecodeResult::position_advances);
+    read_only_vector(decode_class, "proposed_drafts", &BatchDecodeResult::proposed_drafts);
+    read_only_vector(decode_class, "accepted_drafts", &BatchDecodeResult::accepted_drafts);
+    read_only_vector(decode_class, "used_speculative", &BatchDecodeResult::used_speculative);
+    read_only_vector(decode_class, "rolled_back", &BatchDecodeResult::rolled_back);
+    read_only_vector(decode_class, "logprobs", &BatchDecodeResult::logprobs);
 
     // BatchScheduler bindings (Phase 3.4)
     py::class_<BatchSamplingParams>(module, "QwenBatchSamplingParams")
