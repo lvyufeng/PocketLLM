@@ -96,11 +96,25 @@ scheduler's step boundary to all four, and
 `tests/test_mimo_serving.py` asserts the payload a scheduler-driven request broadcasts is the one the
 request produces, key for key.
 
-**Not measured end to end on this host.** The checkpoint is served here, but the A/B against the
-serialized path has not been run, so this page does not claim a throughput or latency figure for the
-route. What is asserted is the weaker and more important claim: a request through the scheduler
-returns the same token ids, text and finish reason as the serialized path, and says
-`continuous_batching = False` about itself.
+**Measured on the four-card host.** Two concurrent clients, 16 tokens each, against the released
+checkpoint on 4 x RTX 2080 Ti at `--max-model-len 8192`, `prefill_chunk=2048`, `chunk_rows=16`,
+`resident_rows=16`, one process per arm:
+
+| Arm | Aggregate | First client | Second client | `requests_running` peak |
+|---|---|---|---|---|
+| `--enable-batching` | 2.83 tok/s (32 tokens in 11.31 s) | 5.50 s | 11.31 s | 1, with 1 waiting |
+| `--no-enable-batching` | 2.84 tok/s (32 tokens in 11.28 s) | 5.47 s | 11.27 s | not published |
+
+That is the claim this route makes, and it is deliberately the weak one: identical to within a third
+of a percent, with the difference being *whose* lifecycle it is rather than how fast it runs. The
+gauges are the evidence — peak `requests_running` 1 and `requests_waiting` 1 out of two clients on
+the scheduler arm, and no series at all on the other. Raising the width is what would move these
+numbers, and that is R3 of [#432](https://github.com/lvyufeng/PocketLLM/issues/432).
+
+`scripts/bench_cpp_scheduler_metrics.py --backend mimo --tp 4` is the harness. It needs the bank to
+exist before the ranks start: a cold host has every rank take the fill path at once and the fill
+aborts partway (see [#456](https://github.com/lvyufeng/PocketLLM/issues/456)), which costs the
+thirteen minutes. Fill it once from a single process and the ranks attach in milliseconds.
 
 ### Without a server
 
