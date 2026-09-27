@@ -1427,3 +1427,156 @@ def test_the_streaming_producer_and_the_consumer_are_different_threads(tmp_path,
     _drain(backend, request)
 
     assert seen == ["pocketllm-v41-stream"]
+
+
+# ---------------------------------------------------------------------- the shared scheduler
+
+
+@pytest.fixture
+def scheduler_module():
+    """The real `pocketllm_cpp`, or a skip.
+
+    The routing below is a claim about *that* scheduler: a fake of it would show that this adapter
+    calls something, not that the something accepts a Python engine and drives it a token at a
+    time. The natives' own contract is covered in `tests/test_python_engine_binding.py`.
+    """
+    return pytest.importorskip("pocketllm_cpp")
+
+
+class _RefusingScheduler:
+    """A scheduler whose admission says no, which is what a full queue answers with."""
+
+    def submit_request(self, *_args, **_kwargs) -> int:
+        return 0
+
+
+def _schedule(monkeypatch, module):
+    """Make `load_native_module` answer with `module`, so nothing is built or imported for real."""
+    import pocketllm.backends.cpp_backend as cpp_backend
+
+    monkeypatch.setattr(cpp_backend, "load_native_module", lambda: module)
+
+
+def test_the_scheduler_options_are_accepted_rather_than_refused(tmp_path):
+    """`enable_batching` and its timeout are the adapter's, and the model options are not asked.
+
+    They have to be accepted by a parser whose stated rule is that every unknown key is refused --
+    so this is the pair being let through on purpose, not an option that happens to parse.
+    """
+    backend, _ = _build(
+        _checkpoint(tmp_path),
+        backend_options={"enable_batching": True, "scheduler_timeout_ms": 1000},
+    )
+
+    assert backend._poll_timeout_ms == 1000
+
+    with pytest.raises(ConfigurationError, match="does not recognise backend option"):
+        _build(_checkpoint(tmp_path), backend_options={"scheduler_timeout_ms_typo": 1})
+
+
+def test_asking_for_the_scheduler_without_the_built_module_serves_anyway(tmp_path, monkeypatch):
+    """A warning and the serialized path, not a refusal: this runtime does not need the module."""
+    import pocketllm.backends.cpp_backend as cpp_backend
+
+    def missing():
+        raise ImportError("no pocketllm_cpp in this build")
+
+    monkeypatch.setattr(cpp_backend, "load_native_module", missing)
+    with pytest.warns(UserWarning, match="needs the native pocketllm_cpp module"):
+        backend, _ = _build(_checkpoint(tmp_path), enable_batching=True)
+
+    assert backend._batching() is False
+    assert backend.capabilities.supports_batch is False
+
+
+def test_a_runtime_without_the_scheduler_declares_the_serialized_path(tmp_path):
+    backend, _ = _build(_checkpoint(tmp_path))
+
+    assert backend.capabilities.supports_batch is False
+    assert backend.capabilities.details["scheduler"].startswith("one mutable KV state")
+    assert backend.metrics() == {}
+
+
+def test_the_capabilities_name_the_scheduler_when_one_is_driving(tmp_path, loop, scheduler_module, monkeypatch):
+    _schedule(monkeypatch, scheduler_module)
+    loop(tokens=[11, 12])
+    backend, _ = _build(_checkpoint(tmp_path), enable_batching=True, max_model_len=64)
+
+    capabilities = backend.capabilities
+
+    assert capabilities.supports_batch is True
+    assert capabilities.details["scheduler"].startswith("BatchScheduler")
+    assert capabilities.details["max_batch_size"] == 1
+
+
+def test_a_request_through_the_scheduler_answers_what_the_serial_path_answers(
+    tmp_path, loop, scheduler_module, monkeypatch
+):
+    """The claim the routing has to earn: the same request, the same tokens, on both paths."""
+    _schedule(monkeypatch, scheduler_module)
+    loop(tokens=[11, 12, 1])
+    serial, _ = _build(_checkpoint(tmp_path), max_model_len=64)
+    batched, _ = _build(_checkpoint(tmp_path), enable_batching=True, max_model_len=64)
+    assert batched._batching() is True
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4, 5], sampling_params=SamplingParams(max_tokens=3)
+    )
+
+    expected = serial.generate([request])[0]
+    answer = batched.generate(
+        [GenerationRequest(
+            request_id="r2", prompt_tokens=[4, 5], sampling_params=SamplingParams(max_tokens=3)
+        )]
+    )[0]
+
+    assert answer.token_ids == expected.token_ids
+    assert answer.text == expected.text
+    assert answer.finish_reason == expected.finish_reason
+    assert (answer.usage.prompt_tokens, answer.usage.completion_tokens) == (
+        expected.usage.prompt_tokens,
+        expected.usage.completion_tokens,
+    )
+
+
+def test_the_scheduler_gauges_are_published_only_where_a_scheduler_is(
+    tmp_path, loop, scheduler_module, monkeypatch
+):
+    _schedule(monkeypatch, scheduler_module)
+    loop(tokens=[11])
+    backend, _ = _build(_checkpoint(tmp_path), enable_batching=True, max_model_len=64)
+
+    # Nothing has been loaded, so `metrics()` has no model counters to add -- but the scheduler's
+    # own admission state is in the answer, which is the reading that separates a scheduler from a
+    # lock. Its absence on the serialized path is asserted above.
+    gauges = backend.metrics()
+    assert "requests_running" in gauges
+
+
+def test_the_budget_the_scheduler_admits_with_is_the_one_the_payload_carries(tmp_path):
+    """Two derivations of it would be a request whose budget the engine and the scheduler disagreed
+    about, and the disagreement would show up as a token count."""
+    backend, _ = _build(_checkpoint(tmp_path), max_model_len=64)
+    request = GenerationRequest(
+        request_id="r1", prompt_tokens=[4, 5], sampling_params=SamplingParams(max_tokens=None)
+    )
+
+    payload = backend._payload(request, [4, 5])
+
+    assert payload["max_new_tokens"] == backend._budget([4, 5], request) == 62
+
+
+def test_a_request_the_scheduler_refuses_names_the_request(tmp_path, loop, scheduler_module, monkeypatch):
+    _schedule(monkeypatch, scheduler_module)
+    loop(tokens=[11])
+    # Built *without* the flag, so this process has one scheduler and it is the stand-in below: a
+    # pybind11 method is not assignable, and replacing the whole object is the way to make
+    # `submit_request` answer zero. The real scheduler's own contract is the previous test's.
+    backend, _ = _build(_checkpoint(tmp_path), max_model_len=64)
+    backend._native = scheduler_module
+    backend._scheduler = _RefusingScheduler()
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="refused request r1"):
+        backend.generate([request])
+
+    assert backend.active_request_count() == 0

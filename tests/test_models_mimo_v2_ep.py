@@ -392,3 +392,19 @@ def test_a_single_rank_joins_nothing():
     from src.models.mimo_v2.ep import make_all_gather
 
     assert make_all_gather(1) is None
+
+
+def test_a_single_process_group_keeps_the_card_the_caller_named(monkeypatch):
+    """The `device` argument means the same thing at world one as at world four.
+
+    Outside a group there is no rank to offset a card by, so the value is carried rather than
+    adjusted -- but it has to be *carried*. Dropping it here is what built the device model with
+    `torch.device(None)`, which is a TypeError rather than a default, and it went unnoticed because
+    every measurement of this runtime is four-rank.
+    """
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+
+    assert EpGroup.from_env().device is None
+    assert EpGroup.from_env(device="cuda:2").device == torch.device("cuda:2")

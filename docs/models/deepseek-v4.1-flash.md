@@ -77,6 +77,41 @@ as `usage.prompt_tokens_details.cached_tokens`.
 | `expert_buffers` | 2 | Expert arenas the pipeline keeps in flight. |
 | `resident_engram` | `false` | Copy the two Engram tables into RAM instead of gathering from the shards. 189.13 GiB and roughly 750 s of reading, once. |
 | `expert_device` / `expert_world` | resolved per run | Where the routed experts execute, in the loader's convention: at TP>1 this resolves to the cards (`cuda:0` plus the rank) and `expert_world` to the world size; a single-process run keeps the experts where the dense tree is unless told otherwise. |
+| `--enable-batching` | off | Serves requests through the shared `BatchScheduler` instead of this adapter's own serialized session. See below. |
+| `scheduler_timeout_ms` | 600000 | How long a submitted request waits for its result before failing. A backstop against a wedged request, not a deadline. |
+
+### Through the shared scheduler
+
+`--enable-batching` routes requests through the same `BatchScheduler` the `cpp` backend drives. Off by
+default because the scheduler is the C++ library, and this runtime otherwise serves without it.
+
+It is not a claim of concurrency. The runtime declares `max_slots = 1` and
+`continuous_batching = False` — one mutable KV state, unchanged — and the scheduler takes the smaller
+of the requested width and the declaration, so a `--max-batch-size` above 1 is answered with one
+rather than refused. What changes is *whose* request lifecycle it is: admission, slot accounting,
+cancellation and the `/metrics` gauges come from the one library the `cpp` backend uses instead of
+from a second implementation of them.
+
+Two seams are worth naming, because both are places a second path could quietly stop agreeing with
+the first.
+
+`_start_runtime` builds its payload with the serial path's own `_payload`, from the request the
+scheduler's row came from rather than from a re-derivation of the fields the scheduler carries. The
+scheduler's copy has no `thinking_mode`, and the mode decides how a finished generation is split into
+`reasoning_content` and an answer, so a route that rebuilt the request from the transport would
+answer differently from the route that did not.
+
+`_result` is still this checkpoint's, through an override of `_batched_result`, so the finished
+generation is parsed by the checkpoint's own encoder on both routes rather than being returned as the
+decoded text on one of them. One field is not the same on the two: `usage.cached_tokens`, which the
+prefix store reports to the serial path and the scheduler has no channel for. The token ids, the
+text and the finish reason are.
+
+**Not measured end to end on this host.** A V4.1 serve needs the released checkpoint and the cards it
+was sized for, so no A/B against the serialized path has been run and this page claims no throughput
+figure for the route. What is asserted is the weaker and more important claim: a request through the
+scheduler returns the same token ids, text and finish reason as the serialized path, and says
+`continuous_batching = False` about itself.
 
 `DEEPSEEK_V41_RESIDENT_EXPERTS=1` is the environment-variable form of the pinned host bank and is what
 the command above uses. `DEEPSEEK_V41_INDEXER_ROW_SPLIT=1` is the one knob that reaches the attention's
@@ -114,7 +149,8 @@ python scripts/audit_dsv41_headers.py --checkpoint-dir /path/to/DeepSeek-V4.1-Fl
 | Engram lookup (189.13 GiB of tables) | Read on demand, from the shards or from RAM — there is no GPU consumer of the rows |
 | Vision tower and aligner (263 tensors) | **Not implemented** — audited and never loaded; the text path carries no image mask |
 | MTP / DSpark (3 draft layers, 7.39 GiB) | Present in the checkpoint, not executed |
-| Batching, continuous batching, chunked prefill | **Not implemented** — one request at a time |
+| Batching, continuous batching, chunked prefill | **Not implemented** — one request at a time, through this adapter's own session and through the shared `BatchScheduler` alike |
+| The shared `BatchScheduler` (`--enable-batching`) | Supported at the width this runtime declares, which is 1. Same lifecycle and same gauges as the `cpp` backend, same answers as the serialized path |
 | Numeric parity with the released reference | **Unclaimed** — the reference stack needs `torch>=2.10.0` and `tilelang==0.1.8`, neither available here |
 
 ## Performance

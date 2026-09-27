@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
+
+from pocketllm.api import ConfigurationError, GenerationResult, TimingMetrics, Usage
 
 #: How long the scheduler's side waits for a runtime to hand back a token before failing the
 #: request. It is a backstop against a wedged runtime, not a deadline: a 64K prefill on one of
@@ -47,6 +50,14 @@ DEFAULT_STEP_TIMEOUT = 900.0
 
 #: Put on the token queue when the run is over. An `int` cannot be confused with it.
 _DONE = object()
+
+#: How long a run thread waits for the adapter to publish which of its requests a row is for.
+#:
+#: The publish happens microseconds after `submit_request` returns, on the thread that made the
+#: call, so anything but an immediate answer means the adapter is not publishing at all -- a
+#: programming error rather than a slow path. Short for that reason: it bounds a mistake rather
+#: than a wait.
+DEFAULT_ROW_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True)
@@ -61,8 +72,8 @@ class RuntimeSpec:
 
     #: Used in error messages and thread names, so a wedged run says which runtime wedged.
     name: str
-    #: Runs one whole generation. Called with `request_id`, `prompt_ids`, `sampling`, `on_token`
-    #: and `on_step` as keyword arguments; returns when the run is over. It must call
+    #: Runs one whole generation. Called with `request_id`, `prompt_ids`, `sampling`, `context`,
+    #: `on_token` and `on_step` as keyword arguments; returns when the run is over. It must call
     #: `on_token(token)` for every generated token -- the first one included -- and `on_step()`
     #: before every decode step, stopping when it returns true.
     #:
@@ -70,10 +81,12 @@ class RuntimeSpec:
     #: `mimo` pass `(token, logits)` to `on_token` and the callers in their adapters unwrap it;
     #: adapting that is the spec's job, and doing it here would mean the bridge knew about models.
     #:
-    #: `request_id` is the scheduler's id for the row, and it is here because an adapter's own
-    #: cancellation is keyed on it: a client that disconnects calls `backend.cancel(request_id)`,
-    #: and a runtime driven by the scheduler has to fold that into the same step boundary the
-    #: scheduler's own cancel arrives at.
+    #: `request_id` is the scheduler's id for the row. `context` is the adapter's *own* request
+    #: object for it, which the adapter publishes when it submits and which carries what the
+    #: scheduler has no field for -- `thinking_mode` is the one today, and it decides how a
+    #: finished generation is split. It is the request's own id, not the scheduler's, that a
+    #: client's disconnect arrives under, so cancellation is keyed on `context.request_id`. A spec
+    #: that does not ask for it (`wants_request`) is called with `context=None`.
     start: Callable[..., None]
     #: Tokens that end a sequence. A callable rather than a set because a runtime that has not
     #: loaded its checkpoint cannot answer yet.
@@ -97,6 +110,13 @@ class RuntimeSpec:
     per_request_sampling: bool = True
     per_request_top_k: bool = True
     step_timeout: float = DEFAULT_STEP_TIMEOUT
+    #: Whether `start` wants the adapter's own request object as `context`.
+    #:
+    #: False by default because resolving it is not free: it is a publish-and-wait between two
+    #: threads, and a runtime that renders entirely from `sampling` should not pay for it. True for
+    #: a runtime that needs something the scheduler has no field for -- `thinking_mode` -- or that
+    #: has to key its own cancellation on the id its client knows the request by.
+    wants_request: bool = False
 
 
 class RuntimeRun:
@@ -229,6 +249,50 @@ def engine_class(native: Any) -> type:
             self._slots: dict[int, int] = {}
             self._free_slots: list[int] = list(range(spec.max_slots))[::-1]
             self._runs: dict[int, RuntimeRun] = {}
+            # The adapter's own request for each row it has submitted, and the condition a run
+            # thread waits on when it gets to a row before the adapter has published it. See
+            # `row_request`.
+            self._rows: dict[int, Any] = {}
+            self._rows_changed = threading.Condition(threading.Lock())
+
+        # -- the adapter's own request, per row ----------------------------------------------
+
+        def publish_row(self, request_id: int, request: Any) -> None:
+            """Record which of the adapter's requests a scheduler row is for.
+
+            Called on the submitting thread the moment the row's id is known, which is the earliest
+            it can be: the scheduler assigns it inside `submit_request`.
+            """
+            with self._rows_changed:
+                self._rows[int(request_id)] = request
+                self._rows_changed.notify_all()
+
+        def forget_row(self, request_id: int) -> None:
+            with self._rows_changed:
+                self._rows.pop(int(request_id), None)
+
+        def row_request(self, request_id: int, timeout: float = DEFAULT_ROW_TIMEOUT) -> Any:
+            """The adapter's request for a row, waiting briefly if it has not been published yet.
+
+            The wait is the whole reason this lives on the engine rather than in the adapter. A
+            scheduler is free to admit a row the instant `submit_request` returns, which can be
+            before the submitting thread next gets the GIL -- so a run thread that read the mapping
+            without waiting would sometimes find nothing there, and a runtime that renders from it
+            would render the default for that request and the requested value for the next.
+
+            The wait releases the GIL, which is what makes it make progress rather than deadlock:
+            the thread being waited for has to acquire the GIL to publish. It is bounded, and a
+            timeout returns `None` -- an adapter that has nothing to say about a row is a normal
+            case, not an error.
+            """
+            deadline = time.monotonic() + timeout
+            with self._rows_changed:
+                while int(request_id) not in self._rows:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    self._rows_changed.wait(remaining)
+                return self._rows[int(request_id)]
 
         # -- declaration ---------------------------------------------------------------------
 
@@ -389,15 +453,26 @@ def engine_class(native: Any) -> type:
             runtime samples its own tokens: the scheduler's copy is what the request asked for and
             the runtime is what decides what it gets, so a runtime that cannot honour a parameter
             has to say so in its declaration instead of being corrected in flight.
+
+            `context` crosses too -- the adapter's own request object for this row, which the
+            scheduler has no field for and the adapter still needs. It is resolved here, on the run
+            thread, rather than in the adapter, so that the resolution can wait: the row's id exists
+            only once `submit_request` returns, and the adapter publishes the mapping immediately
+            after, on a thread the scheduler may have run ahead of.
             """
             sampling = request.sampling
             prompt_ids = [int(token) for token in request.prompt_tokens]
             request_id = int(request.request_id)
 
+            context = None
+            if self.spec.wants_request:
+                context = self.row_request(request_id)
+
             return lambda *, on_token, on_step: self.spec.start(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling=sampling,
+                context=context,
                 on_token=on_token,
                 on_step=on_step,
             )
@@ -424,6 +499,274 @@ def engine_class(native: Any) -> type:
 def make_runtime_engine(spec: RuntimeSpec, native: Any):
     """An engine the scheduler can be constructed from, for `spec`."""
     return engine_class(native)(spec)
+
+
+#: How long an adapter waits for its own submitted request to come back out of the scheduler.
+#: Generous for the same reason `DEFAULT_STEP_TIMEOUT` is: a 64K prefill on one of these models takes
+#: minutes, and this is a backstop against a wedged request rather than a deadline.
+DEFAULT_POLL_TIMEOUT_MS = 600_000
+
+
+def cancel_key(context: Any, request_id: int) -> str:
+    """The id a client's `cancel` for this row arrives under.
+
+    The bridge publishes the adapter's own request as `context`, and the request's id is what the
+    HTTP layer knows that request by; the scheduler's row id is not something a client ever sees.
+    Falling back to the row id keeps a runtime whose context was never published cancellable at
+    all, rather than silently uncancellable.
+    """
+    return str(getattr(context, "request_id", None) or request_id)
+
+
+def device_index(device: Any) -> int:
+    """The card index a device names, or -1 for a host device.
+
+    Accepts what a launcher option carries (``"cpu"``, ``"cuda"``, ``"cuda:2"``) and what torch
+    reports (``torch.device`` and ``torch.device("cpu")``), because an adapter that reads one and
+    not the other is a runtime that binds the wrong card on the one path nobody exercised.
+    """
+    if device is None:
+        return -1
+    text = str(device)
+    if text.startswith("cpu"):
+        return -1
+    index = getattr(device, "index", None)
+    if index is not None:
+        return int(index)
+    _, _, suffix = text.partition(":")
+    try:
+        return int(suffix)
+    except ValueError:
+        return 0
+
+
+class SchedulerHost:
+    """The serving half of a Python runtime adapter: join the scheduler, submit to it, publish it.
+
+    A runtime adapter is two things stacked. One is about the model -- which entry point generates,
+    which tokens end a sequence, which card the weights are on -- and that cannot be shared because
+    it is different for every checkpoint. The other is about serving: where the scheduler comes from,
+    what it is told when it is not available, how a request is submitted and how its result is read
+    back. That half is the same for every Python runtime, and it lives here so that there is one
+    answer to "was `--enable-batching` asked for" rather than three.
+
+    Keeping it here rather than in each adapter is not tidiness. The failure this avoids is specific:
+    three adapters that each build their own scheduler from a slightly different reading of
+    `enable_batching` are three answers to the question `--enable-batching` asks, and only one of
+    them is the backend's.
+
+    A subclass provides `_runtime_spec` and the pieces that method reaches for, and calls
+    `_init_batch_scheduler()` at the end of its `__init__`. Everything else it inherits: `self.args`,
+    `self.name`, `self._tokenize`, `self._budget`, `self._begin_request`, `self._clear_request` and
+    `self._decode` all come from the backend base class.
+    """
+
+    #: The scheduler, when this runtime is driven by one, and the native module it came from. Both
+    #: are also set by `_init_batch_scheduler`; declared here so an adapter that never calls it has
+    #: the attribute rather than an `AttributeError` on the first `/capabilities`.
+    _scheduler: Any = None
+    _engine: Any = None
+    _native: Any = None
+    _poll_timeout_ms: int = DEFAULT_POLL_TIMEOUT_MS
+
+    # -- construction ----------------------------------------------------------------------------
+
+    def _batching_requested(self) -> bool:
+        """Whether this runtime was asked to join the shared scheduler.
+
+        Two spellings, and the backend option wins because it is the programmatic one -- the same
+        precedence `cpp` uses. Unlike `cpp`, neither being set means *off*: there the batch path is
+        the only one that can honour a width above one, and here it is a queue.
+        """
+        explicit = self.args.backend_options.get("enable_batching")
+        if explicit is None:
+            explicit = getattr(self.args, "enable_batching", None)
+        return False if explicit is None else bool(explicit)
+
+    def _init_batch_scheduler(self) -> None:
+        """Join the shared `BatchScheduler`, when the operator asked for it and it is available.
+
+        Off by default for these runtimes. The scheduler it joins is the same library the `cpp`
+        backend drives, and at a declared width of one it is a queue rather than a batcher -- which
+        is what these adapters already do under their own request lock. Asking for it is therefore
+        asking for *the same code path as `cpp`*, not for concurrency, and it stays opt-in until
+        that path has been measured rather than merely works.
+
+        Three ways it does not happen, all of them reported rather than silent: no native module
+        (these runtimes do not need one to serve), no scheduler binding in the native module, or
+        nothing asks for it. `capabilities.details["scheduler"]` says which path is live.
+        """
+        self._poll_timeout_ms = self._configured_timeout()
+        if not self._batching_requested():
+            return
+        try:
+            from .cpp_backend import load_native_module
+
+            self._native = load_native_module()
+        except Exception as exc:
+            self._warn_scheduler(
+                f"--enable-batching needs the native pocketllm_cpp module for its scheduler "
+                f"({exc})"
+            )
+            return
+        if not hasattr(self._native, "QwenBatchScheduler"):
+            self._warn_scheduler(
+                "--enable-batching was asked for but this native module does not expose "
+                "QwenBatchScheduler"
+            )
+            return
+        try:
+            engine = make_runtime_engine(self._runtime_spec(), self._native)
+            # Held because the row-to-request mapping lives on the engine, and this is the only
+            # object that knows which of its requests a row is for.
+            self._engine = engine
+            # The width is the scheduler's to clamp: these runtimes declare one slot, so a command
+            # line naming eight is answered with one rather than refused. Refusing would make the
+            # width a property of the launch script instead of of the runtime.
+            self._scheduler = self._native.QwenBatchScheduler(
+                engine, max(1, int(self.args.max_batch_size or 1))
+            )
+        except Exception as exc:
+            self._scheduler = None
+            self._warn_scheduler(f"could not build the batch scheduler: {exc}")
+
+    @staticmethod
+    def _warn_scheduler(reason: str) -> None:
+        import warnings
+
+        warnings.warn(f"{reason}; serving this runtime serialized, one request at a time")
+
+    def _configured_timeout(self) -> int:
+        """How long this adapter waits for one of its own requests to come back out of the queue.
+
+        Generous by default for the reason `DEFAULT_STEP_TIMEOUT` is: a 64K prefill on one of these
+        models takes minutes, and a timeout that fired on a slow but working request would turn it
+        into a failure. The option is here rather than on `RuntimeSpec` because it bounds *this*
+        side's wait, not the runtime's step.
+        """
+        raw = self.args.backend_options.get("scheduler_timeout_ms", DEFAULT_POLL_TIMEOUT_MS)
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            raise ConfigurationError(
+                f"backend option 'scheduler_timeout_ms' is a number of milliseconds and {raw!r} "
+                "is not one"
+            ) from None
+
+    def _runtime_spec(self) -> RuntimeSpec:
+        """What the bridge needs to know about this model. The one method a subclass must write."""
+        raise NotImplementedError
+
+    # -- the scheduler-facing half of a request --------------------------------------------------
+
+    def scheduler_metrics(self) -> dict[str, float]:
+        """The live scheduler's admission state, or nothing when there is no scheduler."""
+        return scheduler_gauges(self._scheduler)
+
+    def _batching(self) -> bool:
+        return self._scheduler is not None
+
+    def _generate_batched(self, requests: Sequence[Any]) -> list[Any]:
+        """The same generation, submitted to the shared `BatchScheduler`.
+
+        Submission and polling are the whole of this adapter's part: which request runs when, how
+        slots are handed out, when a request is cancelled and what the timings are is the
+        scheduler's, exactly as it is for the `cpp` backend. That is the point of routing these
+        runtimes through it -- one request lifecycle for both languages rather than two that agree
+        by inspection.
+        """
+        scheduler = self._scheduler
+        submitted: list[tuple[int, Any, list[int]]] = []
+        for request in requests:
+            self._begin_request(request.request_id)
+            try:
+                prompt_ids = self._tokenize(request)
+                budget = self._budget(prompt_ids, request)
+                sampling = self._batch_sampling(request, budget)
+                native_id = scheduler.submit_request(prompt_ids, sampling, None)
+                if native_id > 0:
+                    # Which of this adapter's requests the row is for, published on the engine so
+                    # the run thread can wait for it -- see `RuntimeEngine.row_request`. Without
+                    # it a runtime that renders part of its answer from the request (v41's thinking
+                    # mode) would render the default whenever the scheduler admitted the row before
+                    # this thread got the GIL back.
+                    self._engine.publish_row(int(native_id), request)
+            except Exception:
+                self._clear_request(request.request_id)
+                raise
+            if native_id <= 0:
+                self._clear_request(request.request_id)
+                raise RuntimeError(f"the scheduler refused request {request.request_id}")
+            submitted.append((native_id, request, prompt_ids))
+
+        outputs: list[Any] = []
+        errors: list[str] = []
+        for native_id, request, prompt_ids in submitted:
+            try:
+                result = scheduler.poll_result(native_id, self._poll_timeout_ms)
+                if result is None:
+                    raise TimeoutError(
+                        f"request {request.request_id} did not finish within "
+                        f"{self._poll_timeout_ms} ms"
+                    )
+                error = str(getattr(result, "error", "") or "")
+                if error:
+                    # Poll the rest of the batch before raising. The scheduler fails every row of
+                    # a wave it could not run, and abandoning their results here would leave that
+                    # many completed entries in it.
+                    errors.append(error)
+                    continue
+                outputs.append(self._batched_result(request, result))
+            finally:
+                self._engine.forget_row(int(native_id))
+                self._clear_request(request.request_id)
+
+        if errors:
+            raise RuntimeError("; ".join(dict.fromkeys(errors)))
+        return outputs
+
+    def _batch_sampling(self, request: Any, budget: int) -> Any:
+        """One request's sampling parameters, in the scheduler's vocabulary.
+
+        `stop` strings are deliberately not translated: the serial path applies them by holding
+        text back as it streams, and a token-level stop is a different thing that these runtimes
+        have no way to derive from a string. Leaving them out means both paths stop on the same
+        tokens -- the checkpoint's -- instead of one of them stopping somewhere the other cannot.
+        """
+        params = request.sampling_params
+        sampling = self._native.QwenBatchSamplingParams()
+        sampling.max_new_tokens = int(budget)
+        sampling.temperature = float(params.temperature or 0.0)
+        sampling.top_p = float(params.top_p if params.top_p is not None else 1.0)
+        sampling.top_k = int(params.top_k) if params.top_k else 0
+        sampling.seed = int(params.seed or 0)
+        sampling.ignore_eos = bool(params.extra.get("ignore_eos", False))
+        return sampling
+
+    def _batched_result(self, request: Any, result: Any) -> Any:
+        """A scheduler result as this backend's own.
+
+        The token list is the scheduler's, unstripped: these runtimes' serial paths keep the stop
+        token in `token_ids` -- their loops append before they check -- and the two paths have to
+        return the same answer, not the same answer with one token removed to look tidier.
+        """
+        token_ids = list(result.generated_tokens)
+        return GenerationResult(
+            request_id=request.request_id,
+            token_ids=token_ids,
+            text=self._decode(token_ids),
+            finish_reason=result.finish_reason,
+            usage=Usage(
+                prompt_tokens=int(result.prompt_tokens),
+                completion_tokens=int(result.completion_tokens),
+            ),
+            timings=TimingMetrics(
+                prefill_seconds=max(0.0, float(result.prefill_seconds)),
+                decode_seconds=max(0.0, float(result.decode_seconds)),
+                total_seconds=float(result.total_seconds),
+                ttft_seconds=max(0.0, float(result.ttft_seconds)),
+            ),
+        )
 
 
 def scheduler_gauges(scheduler: Any) -> dict[str, float]:
@@ -466,9 +809,14 @@ def scheduler_gauges(scheduler: Any) -> dict[str, float]:
 
 
 __all__ = [
+    "DEFAULT_POLL_TIMEOUT_MS",
+    "DEFAULT_ROW_TIMEOUT",
     "DEFAULT_STEP_TIMEOUT",
     "RuntimeRun",
     "RuntimeSpec",
+    "SchedulerHost",
+    "cancel_key",
+    "device_index",
     "engine_class",
     "make_runtime_engine",
     "scheduler_gauges",

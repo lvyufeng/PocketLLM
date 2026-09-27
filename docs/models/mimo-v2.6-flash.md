@@ -71,6 +71,36 @@ tail: cross-request prefix caching is on by default.
 | `deal` | `sorted` | Which deal divides the experts. `sorted` balances a decode step's drawing; `id` gives each rank a fixed 64 experts a layer and is what a prefill chunk needs. A served run keeps both arenas and dispatches on the row count of the call. |
 | `prefix_cache_bytes` | `4g` | Host memory a rank's prefix store may hold, as an integer or a `k`/`m`/`g` suffix. `0` is what `--no-enable-prefix-caching` folds it to. |
 | `prefix_cache_head_tokens` | 1024 | The fixed-length anchor a cold prefill also stores, which is what serves a *different* conversation that shares the same rendered header. `0` stores the prompt's end alone. |
+| `--enable-batching` | off | Serves requests through the shared `BatchScheduler` instead of this adapter's own serialized session. See below. |
+| `scheduler_timeout_ms` | 600000 | How long a submitted request waits for its result before failing. A backstop against a wedged request, not a deadline — a 64K prefill takes minutes. |
+
+### Through the shared scheduler
+
+`--enable-batching` routes requests through the same `BatchScheduler` the `cpp` backend drives. Off by
+default because the scheduler is the C++ library, and this runtime otherwise serves without it.
+
+It is not a claim of concurrency. The runtime declares `max_slots = 1` and
+`continuous_batching = False`, and the scheduler takes the smaller of the requested width and the
+declaration — so what joins the shared lifecycle is this runtime as it is, one request at a time,
+with admission, cancellation, per-request timings and the `/metrics` gauges coming from the one
+library instead of from a second implementation of them. Raising the width is R3 of
+[#432](https://github.com/lvyufeng/PocketLLM/issues/432) and changes the declaration, not the
+scheduler.
+
+What the route *is* measured on here is the thing that can differ silently: the adapter's per-step
+agreement between ranks. Every routed layer closes with an `all_reduce`, so a rank 0 that entered a
+generation the workers were not told about would not be idle — it would be at a different collective.
+`_start_runtime` therefore goes through the same `_loop` the serial path uses, including the same
+`_dispatch` that hands the payload to the peers and the same `_step_sync` that carries the
+scheduler's step boundary to all four, and
+`tests/test_mimo_serving.py` asserts the payload a scheduler-driven request broadcasts is the one the
+request produces, key for key.
+
+**Not measured end to end on this host.** The checkpoint is served here, but the A/B against the
+serialized path has not been run, so this page does not claim a throughput or latency figure for the
+route. What is asserted is the weaker and more important claim: a request through the scheduler
+returns the same token ids, text and finish reason as the serialized path, and says
+`continuous_batching = False` about itself.
 
 ### Without a server
 
@@ -100,7 +130,8 @@ torchrun --nproc_per_node=4 tests/bench_mimo_v2_prefill.py \
 | Sampling (`temperature`, `top_k`, `top_p`, `seed`) | Supported; greedy unless a temperature is given, which is the checkpoint's own default |
 | Repetition penalty, logit bias, grammar | **Not implemented** |
 | Cross-request prefix caching | Supported, on by default; `usage.prompt_tokens_details.cached_tokens` reports the reuse |
-| Batching, a scheduler | **Not implemented** — one request at a time |
+| Batching, a scheduler | **Not implemented** — one request at a time, through this adapter's own session and through the shared `BatchScheduler` alike |
+| The shared `BatchScheduler` (`--enable-batching`) | Supported at the width this runtime declares, which is 1. Same lifecycle and same gauges as the `cpp` backend, same answers as the serialized path |
 | MTP (3 layers) and the DFlash drafter | Present in the checkpoint, not executed |
 | Vision tower, audio encoders | Out of scope |
 

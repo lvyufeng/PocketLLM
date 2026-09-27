@@ -73,6 +73,7 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer, byte_size, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .runtime_engine import RuntimeSpec, SchedulerHost, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the KV cache is sized at when ``--max-model-len`` is not given.
@@ -257,7 +258,7 @@ class _Options:
         )
 
 
-class MimoBackend(BackendBase):
+class MimoBackend(SchedulerHost, BackendBase):
     """One MiMo-V2.6-Flash checkpoint, one process a rank, one request at a time."""
 
     name = "mimo"
@@ -297,6 +298,13 @@ class MimoBackend(BackendBase):
         self._request_lock = threading.RLock()
         self._distributed = False
         self._details: dict[str, Any] = {}
+        # The one scheduler, when this runtime is driven by it. Built here rather than on the first
+        # request because `/capabilities` has to answer whether requests go through it, and a report
+        # that said no and then routed them through one is the same class of lie as a flag accepted
+        # and ignored. Off unless `enable_batching` asked for it -- see `SchedulerHost`.
+        self._scheduler: Any = None
+        self._native: Any = None
+        self._init_batch_scheduler()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -520,8 +528,23 @@ class MimoBackend(BackendBase):
         # resumed -- answered for this configuration.
         return declared_capabilities(
             self.name,
-            details=dict(self._details),
+            details={
+                **self._details,
+                # After `_details`, because that one is built when the model is and says what the
+                # serialized path does. This one is read live, before anything is loaded.
+                "scheduler": (
+                    "BatchScheduler (width 1, continuous batching off)"
+                    if self._batching()
+                    else "one mutable KV cache, serialized at the backend boundary"
+                ),
+                "max_batch_size": 1,
+            },
             reads_prefix_cache=self._prefix_cache is not None,
+            # Two different claims, and the honest one depends on the path: a runtime driven by
+            # the scheduler *is* submitting to a batch scheduler, on which this one declares a
+            # single slot; the serialized path serves one request at a time by its own lock.
+            # Either way the answer to "may this be called concurrently" is what the field reports.
+            supports_batch=self._batching(),
         )
 
     def metrics(self) -> dict[str, float]:
@@ -537,7 +560,10 @@ class MimoBackend(BackendBase):
         """
         experts = getattr(self._model, "experts", None)
         if experts is None:
-            return {}
+            # Nothing loaded, so there are no model counters to add. The scheduler's gauges are not
+            # the model's, though, and a scrape during loading is exactly when an operator wants to
+            # know whether this process has a scheduler at all -- so they are published either way.
+            return dict(self.scheduler_metrics())
         # Two arenas when there are two, and the counts are reported separately because they
         # answer different questions: a step's share is a property of the deal over the drawing
         # and a chunk's is a share of the expert set. The step module of a `sorted` run holds no
@@ -553,6 +579,10 @@ class MimoBackend(BackendBase):
             "mimo_kv_cache_bytes": float(self._cache.memory_bytes) if self._cache else 0.0,
             "mimo_world": float(self._world),
             **self._cache_metrics,
+            # The scheduler's own admission state, when this runtime is driven by one. Same series,
+            # same `Stats` struct and same names as the `cpp` backend publishes -- which is what
+            # makes the two readable as one scheduler rather than as two servers that agree.
+            **self.scheduler_metrics(),
         }
 
     def _publish_cache_metrics(self) -> None:
@@ -686,6 +716,68 @@ class MimoBackend(BackendBase):
             return bool(int(flag.item()))
 
         return agreed
+
+    # ------------------------------------------------------------------ the shared scheduler
+
+    def _runtime_spec(self) -> RuntimeSpec:
+        return RuntimeSpec(
+            name=self.name,
+            start=self._start_runtime,
+            eos_tokens=self._eos_tokens,
+            max_context=self._max_seq_len,
+            wants_request=True,
+            device=self._runtime_device,
+        )
+
+    def _runtime_device(self) -> int:
+        """The card this rank drives, read the way the model's own card is chosen.
+
+        `_init_distributed` is what picks it, and it runs on this thread inside `_ensure_loaded` --
+        the same call that builds the model and the cache -- so by the time a forward is about to
+        happen this answers. Before that it falls back to the launcher's option, and the bridge's
+        bind is a no-op rather than a wrong card: the ep group binds its own rank's card itself,
+        which is also why nothing here has to.
+        """
+        if self._device is not None:
+            return device_index(self._device)
+        return device_index(self._options.device)
+
+    def _start_runtime(
+        self,
+        *,
+        request_id: int,
+        prompt_ids: Sequence[int],
+        sampling: Any,
+        context: Any,
+        on_token: Callable[[int], None],
+        on_step: Callable[[], bool],
+    ) -> None:
+        """One generation, driven a step at a time by the scheduler.
+
+        This is `_loop` with two of its arguments supplied differently, and it is `_loop` on purpose
+        rather than a second call to `generate`: every routed layer closes with an `all_reduce`, so
+        a rank 0 that ran a request the workers were not told about would not be idle, it would be
+        at a different collective. Going through the same method is what keeps the payload, the
+        broadcast and the per-step agreement in one place instead of two that agree by inspection.
+
+        The budget is the scheduler's, which derived it from this request with the same rule the
+        serial path uses. Everything else -- the sampler, the seed, the prompt -- is read off
+        `context`, which *is* the request this row was submitted for, so the two routes render the
+        same thing by construction.
+
+        And the step boundary is the scheduler's. `_step_sync` is what tells rank 0's park to the
+        other ranks, so they take that step together or none of them does, and a client that
+        disconnected -- which arrives on the HTTP thread under the request's own id, not the
+        scheduler's -- reaches the loop at the same seam.
+        """
+        self._loop(
+            list(prompt_ids),
+            int(sampling.max_new_tokens),
+            context,
+            on_token=on_token,
+            marks={"started": time.perf_counter()},
+            stop=on_step,
+        )
 
     def _generate_one(self, request: GenerationRequest) -> GenerationResult:
         self._begin_request(request.request_id)
@@ -828,6 +920,8 @@ class MimoBackend(BackendBase):
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         self._ensure_loaded()
+        if self._batching():
+            return self._generate_batched(requests)
         return [self._generate_one(request) for request in requests]
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
@@ -979,6 +1073,12 @@ class MimoBackend(BackendBase):
             except Exception:
                 # A peer that already left is not this rank's problem, and close() must not raise.
                 pass
+        # Before the base class tears the rank down: the scheduler's thread runs this runtime's
+        # generation, and a step in flight is a collective the other ranks are already inside.
+        scheduler = self._scheduler
+        self._scheduler = None
+        if scheduler is not None:
+            scheduler.stop()
         super().close()
 
 

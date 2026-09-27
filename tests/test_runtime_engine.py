@@ -40,11 +40,24 @@ class FakeLoop:
         self.prompt_ids: list[int] = []
         self.request_id: int | None = None
         self.sampling = None
+        #: The adapter's own request for the row, resolved by the bridge. `None` for a spec that did
+        #: not ask for it.
+        self.context: object = "not called"
 
-    def __call__(self, *, request_id=None, prompt_ids=(), sampling=None, on_token=None, on_step=None):
+    def __call__(
+        self,
+        *,
+        request_id=None,
+        prompt_ids=(),
+        sampling=None,
+        context=None,
+        on_token=None,
+        on_step=None,
+    ):
         self.request_id = request_id
         self.prompt_ids = list(prompt_ids)
         self.sampling = sampling
+        self.context = context
         if self.fail:
             raise RuntimeError(self.fail)
         for index in range(self.budget):
@@ -350,3 +363,83 @@ def test_freeing_a_slot_cancels_the_run_it_was_holding():
     assert not run._thread.is_alive()
     # And the slot is handed back, which is what a later request needs.
     assert engine.allocate_slot(8) == 0
+
+
+# -- the adapter's own request, which the scheduler has no field for ------------------------------
+
+
+def test_a_spec_that_does_not_ask_for_the_request_is_called_with_none():
+    """The default, because resolving it is a wait between two threads and is not free."""
+    loop = FakeLoop(4, first=100)
+    engine = _engine(loop)
+    engine.publish_row(1, "the request")
+    request = FakeRequest(1, [1, 2], FakeSampling(max_new_tokens=4))
+    engine.batch_prefill([request], 0)
+    engine.batch_decode_step([request])
+    engine.free_slot(1)
+
+    assert loop.context is None
+
+
+def test_a_published_row_reaches_the_runtime_as_its_own_request():
+    loop = FakeLoop(4, first=100)
+    engine = _engine(loop, wants_request=True)
+    engine.publish_row(7, "the request")
+    request = FakeRequest(7, [1, 2], FakeSampling(max_new_tokens=4))
+
+    engine.batch_prefill([request], 0)
+
+    assert loop.context == "the request"
+    engine.batch_decode_step([request])
+    engine.free_slot(7)
+
+
+def test_a_row_that_is_published_after_the_run_starts_still_reaches_it():
+    """The race the wait exists for.
+
+    A scheduler may admit a row the instant `submit_request` returns, which can be before the
+    submitting thread gets the GIL back to publish what the row is for. A run thread that read the
+    mapping without waiting would find nothing there, and a runtime that renders part of its answer
+    from the request would render the default for that request and the requested value for the next
+    one -- the kind of wrong that looks like a model.
+    """
+    loop = FakeLoop(4, first=100)
+    engine = _engine(loop, wants_request=True)
+    request = FakeRequest(7, [1, 2], FakeSampling(max_new_tokens=4))
+
+    publisher = threading.Timer(0.05, engine.publish_row, args=(7, "late"))
+    publisher.start()
+    try:
+        engine.batch_prefill([request], 0)
+    finally:
+        publisher.join()
+
+    assert loop.context == "late"
+    engine.batch_decode_step([request])
+    engine.free_slot(7)
+
+
+def test_a_row_that_is_never_published_is_none_rather_than_a_hang():
+    """Bounded, because an adapter that does not publish is a mistake and not a slow path."""
+    loop = FakeLoop(4, first=100)
+    engine = _engine(loop, wants_request=True)
+    request = FakeRequest(7, [1, 2], FakeSampling(max_new_tokens=4))
+
+    started = time.monotonic()
+    engine.batch_prefill([request], 0)
+
+    assert loop.context is None
+    assert time.monotonic() - started < 30.0
+    engine.batch_decode_step([request])
+    engine.free_slot(7)
+
+
+def test_forgetting_a_row_takes_it_out_of_the_mapping():
+    loop = FakeLoop(4, first=100)
+    engine = _engine(loop)
+    engine.publish_row(7, "the request")
+    assert engine.row_request(7, timeout=0.01) == "the request"
+
+    engine.forget_row(7)
+
+    assert engine.row_request(7, timeout=0.01) is None

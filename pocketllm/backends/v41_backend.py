@@ -62,6 +62,7 @@ from pocketllm.api import (
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
 from .base import BackendBase, byte_size, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
+from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 
 DEFAULT_MAX_SEQ_LEN = 8192
@@ -275,7 +276,7 @@ def _options_from(args: Any) -> _Options:
     return options
 
 
-class V41Backend(BackendBase):
+class V41Backend(SchedulerHost, BackendBase):
     """Serve one DeepSeek-V4.1-Flash checkpoint, one request at a time.
 
     ``loader`` and ``front`` are injection points for tests: a unit test supplies a callable that
@@ -294,7 +295,7 @@ class V41Backend(BackendBase):
         tokenizer: Any = None,
     ) -> None:
         super().__init__()
-        self._args = args
+        self.args = args
         self._options = _options_from(args)
         self._backend = str(getattr(args, "backend", "v41")).lower()
         self._checkpoint = str(args.checkpoint_dir)
@@ -324,6 +325,13 @@ class V41Backend(BackendBase):
         # of every request rather than mutated, so a scrape reads one request's worth of state or the
         # request before it and never a half-updated dict -- see `cache_metrics`.
         self._cache_metrics: dict[str, float] = {}
+        # The one scheduler, when this runtime is driven by it. Built here rather than on the first
+        # request because `/capabilities` has to answer whether requests go through it, and a report
+        # that said no and then routed them through one is the same class of lie as a flag accepted
+        # and ignored. Off unless `enable_batching` asked for it -- see `SchedulerHost`.
+        self._scheduler: Any = None
+        self._native: Any = None
+        self._init_batch_scheduler()
 
     # ------------------------------------------------------------------ construction
 
@@ -638,13 +646,140 @@ class V41Backend(BackendBase):
         return declared_capabilities(
             self.name,
             details={
+                "execution": "src/models/deepseek_v4_1 PyTorch runtime",
+                "scheduler": (
+                    "BatchScheduler (width 1, continuous batching off)"
+                    if self._batching()
+                    else "one mutable KV state, serialized at the backend boundary"
+                ),
+                "max_batch_size": 1,
+                "cancellation": "per-step collective; not inside the prompt's forward",
                 "prompt_format": "the checkpoint's own encoding/encoding.py, loaded by path",
                 **self._details,
             },
             reads_prefix_cache=self._options.prefix_cache_bytes > 0,
+            # Two different claims, and the honest one depends on the path: a runtime driven by
+            # the scheduler *is* submitting to a batch scheduler, on which this one declares a
+            # single slot; the serialized path serves one request at a time by its own lock.
+            # Either way the answer to "may this be called concurrently" is what the field reports.
+            supports_batch=self._batching(),
         )
 
     # ------------------------------------------------------------------ requests
+
+    # ------------------------------------------------------------------ the shared scheduler
+
+    def _runtime_spec(self) -> RuntimeSpec:
+        """What the bridge needs to know about this checkpoint.
+
+        `device` is a callable because the tree's card is a property of the launch rather than of
+        the object, and because the run thread binds it *before* it calls this adapter's generation
+        entry point -- that is, before `_ensure_loaded` has run. `_tree_device` answers from the
+        options and the rank, which are known at construction; reading the card off a loaded buffer
+        instead would answer `-1` on the first request and the right card on every one after it.
+        """
+        return RuntimeSpec(
+            name=self.name,
+            start=self._start_runtime,
+            eos_tokens=self._eos_tokens,
+            max_context=self._max_seq_len,
+            wants_request=True,
+            device=self._runtime_device,
+        )
+
+    def _runtime_device(self) -> int:
+        return device_index(self._tree_device())
+
+    def _eos_tokens(self) -> set[int]:
+        """The id this runtime's own loop stops on, which is the one the scheduler checks here.
+
+        Deliberately the same call `_run_payload` passes as `eos_token_id`: two readings of "the
+        end of a sequence" on the two paths would be two different answers, and the one that
+        disagreed would run to its budget.
+        """
+        token = self._eos_token_id()
+        return set() if token is None else {int(token)}
+
+    def _start_runtime(
+        self,
+        *,
+        request_id: int,
+        prompt_ids: Sequence[int],
+        sampling: Any,
+        context: Any,
+        on_token: Callable[[int], None],
+        on_step: Callable[[], bool],
+    ) -> None:
+        """One generation, driven a step at a time by the scheduler.
+
+        Almost the call `_generate_one` makes, and deliberately so. `_run` still broadcasts the
+        payload to this rank's peers -- a rank 0 that entered a generation the workers were not told
+        about would not be idle, it would be at a different collective -- `_step_hook` is still the
+        per-token hook, `_run_payload` is still what drives the model, and the payload is the serial
+        path's own builder. The bridge is additive: no model code is involved.
+
+        Two things differ, and both are the scheduler's doing rather than the checkpoint's.
+
+        The payload is built from `context` rather than from a `GenerationRequest` the caller
+        supplied, because there is no caller here -- the scheduler is one. `context` *is* the
+        request this row was submitted for, so the two routes render the same prompt, the same
+        sampler and the same thinking mode by construction rather than by agreement.
+
+        And the step boundary is the scheduler's: `on_step` is where the run parks until the next
+        token is asked for, called at the end of the per-token hook -- the last point before the
+        loop takes another forward. Either cancellation unwinds there, the scheduler retiring the
+        row and a client that disconnected under `backend.cancel` alike, which is the same seam the
+        streaming path already uses.
+        """
+        self._ensure_loaded()
+        # The serial path's own payload builder, so the two routes cannot disagree about what they
+        # sent: the budget, the sampler, the seed and the thinking mode all come from the request
+        # this row was submitted for rather than from a second derivation of them.
+        payload = self._payload(context, prompt_ids)
+        self._validate_length(prompt_ids, payload)
+
+        # The client's own id for this request, which is what `backend.cancel` is called with. The
+        # scheduler's row id is not something a client ever sees, so keying the check on it would
+        # mean a disconnect was never noticed.
+        cancelled_at = cancel_key(context, request_id)
+
+        def emit(token: int, _logits: Any) -> None:
+            on_token(int(token))
+            # The step boundary is the scheduler's: this is where the run parks until the next
+            # token is asked for, and where either cancellation unwinds.
+            if on_step() or self._is_cancelled(cancelled_at):
+                raise _AbortGeneration("cancel")
+
+        # `request=None`: the per-step hook reads stop *strings* off it, and this route applies
+        # none -- `SchedulerHost._batch_sampling` records why. The engine's own stop check is
+        # token-level and is what ends the row.
+        with self._request_lock:
+            self._run(payload, None, on_token=emit)
+
+    def _batched_result(
+        self, request: GenerationRequest, result: Any
+    ) -> GenerationResult:
+        """A scheduler result as this backend's own, through this runtime's own result builder.
+
+        Overridden rather than inherited because this checkpoint's answer is not the decoded text:
+        `_result` splits a finished generation into reasoning, answer and tool calls, and the
+        inherited builder would return the same tokens with that reading dropped -- a client would
+        see the reasoning arrive as prose on this route and as `reasoning_content` on the other.
+
+        One field is not the same on the two routes: `usage.cached_tokens`, which the prefix store
+        reports to the serial path and which the scheduler has no way to carry back. The token ids,
+        the text and the finish reason are the same, which is what the two routes are compared on.
+        """
+        prompt_ids = self._tokenize(request)
+        return self._result(
+            request.request_id,
+            self._payload(request, prompt_ids),
+            list(result.generated_tokens),
+            self._decode(list(result.generated_tokens)),
+            "length" if str(result.finish_reason) == "length" else "eos",
+            float(result.decode_seconds) or None,
+            None,
+        )
 
     def _tokenize(self, request: GenerationRequest) -> list[int]:
         if request.prompt_tokens is not None:
@@ -690,16 +825,28 @@ class V41Backend(BackendBase):
         # the tokenizer add a second one.
         return [int(token) for token in tokenizer(text, add_special_tokens=False)["input_ids"]]
 
+    def _budget(self, prompt_ids: Sequence[int], request: GenerationRequest) -> int:
+        """How many tokens this request may generate, from the request and these caches.
+
+        An absent budget is resolved here and not at parse time, because the number of positions a
+        request may fill is a property of these caches: everything the prompt leaves of
+        `_max_seq_len`. The answer then ends at EOS or when the caches are full.
+
+        This is the only place the number is derived. `_payload` reads it for the serial path and
+        `SchedulerHost._generate_batched` reads it for the scheduler's own length check, and two
+        derivations of it would be a request whose budget the engine and the scheduler disagreed
+        about.
+        """
+        params = request.sampling_params
+        return int(params.token_budget(self._max_seq_len - len(prompt_ids)))
+
     def _payload(self, request: GenerationRequest, prompt_ids: Sequence[int]) -> dict[str, Any]:
         params = request.sampling_params
         return {
             "op": "generate",
             "request_id": request.request_id,
             "prompt_ids": [int(token) for token in prompt_ids],
-            # An absent budget is resolved here and not at parse time, because the number of
-            # positions a request may fill is a property of these caches: everything the prompt
-            # leaves of `_max_seq_len`. The answer then ends at EOS or when the caches are full.
-            "max_new_tokens": params.token_budget(self._max_seq_len - len(prompt_ids)),
+            "max_new_tokens": self._budget(prompt_ids, request),
             "temperature": float(params.temperature),
             "top_k": None if params.top_k is None else int(params.top_k),
             "seed": None if params.seed is None else int(params.seed),
@@ -726,6 +873,8 @@ class V41Backend(BackendBase):
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         self._ensure_loaded()
+        if self._batching():
+            return self._generate_batched(requests)
         return [self._generate_one(request) for request in requests]
 
     def _generate_one(self, request: GenerationRequest) -> GenerationResult:
@@ -993,7 +1142,10 @@ class V41Backend(BackendBase):
         """
         if self._rank:
             return {}
-        return dict(self._cache_metrics)
+        # The scheduler's own admission state, when this runtime is driven by one. Same series,
+        # same `Stats` struct and same names as the `cpp` backend publishes -- which is what makes
+        # the two readable as one scheduler rather than as two servers that happen to agree.
+        return {**self._cache_metrics, **self.scheduler_metrics()}
 
     @staticmethod
     def _release_graphs(driver: Any) -> None:
@@ -1311,6 +1463,13 @@ class V41Backend(BackendBase):
         # as the end of the group, and it has to be handed the shutdown it was sent first.
         if self._bell is not None:
             self._bell.close()
+        # Before the rest of the teardown, and after the shutdown above: the scheduler's thread
+        # runs this runtime's generation, so it has to be joined while the model it drives is still
+        # resident -- and a worker parked on its bell has to have been sent the shutdown first.
+        scheduler = self._scheduler
+        self._scheduler = None
+        if scheduler is not None:
+            scheduler.stop()
         super().close()
 
 

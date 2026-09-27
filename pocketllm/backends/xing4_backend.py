@@ -44,7 +44,6 @@ import os
 import queue
 import threading
 import time
-import warnings
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,7 +61,7 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer, byte_size
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .runtime_engine import RuntimeSpec, make_runtime_engine, scheduler_gauges
+from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the cache is sized at when ``--max-model-len`` is not given.
@@ -119,9 +118,6 @@ PREFILL_DEVICE_RESERVE = 768 << 20
 #: checkpoint resident.
 PREFILL_SCORE_BUDGET = 1 << 30
 
-#: ``backend_options`` keys this adapter reads, on top of the always-carried ones it accepts and
-#: ignores (``capabilities.IGNORED_OPTIONS``). Every *other* unknown key is a refusal, because an
-#: option that silently does nothing is how a run ends up measured on the wrong lever.
 _KNOWN_OPTIONS = frozenset(
     {"device", "gguf", "prefill_chunk", "prefix_cache_bytes", "tokenizer", "use_kernel"}
 )
@@ -204,21 +200,6 @@ class _Options:
             tokenizer=values.pop("tokenizer", None),
             use_kernel=bool(values.pop("use_kernel", True)),
         )
-
-
-def _device_index(device: str) -> int:
-    """The device index a scheduler thread has to bind, or -1 for a host-only runtime.
-
-    The scheduler runs every forward from its own thread and the current device is per-thread, so
-    an engine that reports the index it bound is what stops a runtime on the third card from
-    allocating on the first. `torch.cuda.current_device()` reads the same `cudaGetDevice` the
-    binding's own `device_set` writes, so binding it in C++ binds it for the Python side too.
-    """
-    text = str(device or "cuda").strip().lower()
-    if text.startswith("cpu"):
-        return -1
-    _, _, suffix = text.partition(":")
-    return int(suffix) if suffix.isdigit() else 0
 
 
 def resolve_paths(model: str, options: _Options, tokenizer_path: str | None) -> tuple[str, str]:
@@ -304,7 +285,7 @@ def _is_xing4_release(directory: Path) -> bool:
     return str(config.get("model_type", "")).lower() == "xing4_0" 
 
 
-class Xing4Backend(BackendBase):
+class Xing4Backend(SchedulerHost, BackendBase):
     """One Xing4.0-29B-A4B checkpoint on one card, one request at a time."""
 
     name = "xing4"
@@ -347,67 +328,13 @@ class Xing4Backend(BackendBase):
         )
         self._init_batch_scheduler()
 
-    def _batching_requested(self) -> bool:
-        """Whether this runtime was asked to join the shared scheduler.
-
-        Two spellings, and the backend option wins because it is the programmatic one -- the same
-        precedence `cpp` uses. Unlike `cpp`, neither being set means *off*: there the batch path is
-        the only one that can honour a width above one, and here it is a queue.
-        """
-        explicit = self.args.backend_options.get("enable_batching")
-        if explicit is None:
-            explicit = getattr(self.args, "enable_batching", None)
-        return False if explicit is None else bool(explicit)
-
-    def _init_batch_scheduler(self) -> None:
-        """Join the shared `BatchScheduler`, when the operator asked for it and it is available.
-
-        Off by default for this runtime. The scheduler it joins is the same library the `cpp`
-        backend drives, and at this runtime's declared width of one it is a queue rather than a
-        batcher -- which is what this adapter already does under its own request lock. Asking for
-        it is therefore asking for *the same code path as `cpp`*, not for concurrency, and the
-        default flips when that path has been measured rather than when it merely works.
-
-        Three ways it does not happen, all of them reported rather than silent: no native module
-        (this runtime does not need one to serve), no scheduler binding in the native module, or
-        nothing asks for it. `capabilities.details["scheduler"]` says which path is live.
-        """
-        if not self._batching_requested():
-            return
-        try:
-            from .cpp_backend import load_native_module
-
-            self._native = load_native_module()
-        except Exception as exc:
-            warnings.warn(
-                f"--enable-batching needs the native pocketllm_cpp module for its scheduler "
-                f"({exc}); serving this runtime serialized, one request at a time"
-            )
-            return
-        if not hasattr(self._native, "QwenBatchScheduler"):
-            warnings.warn(
-                "--enable-batching was asked for but this native module does not expose "
-                "QwenBatchScheduler; serving this runtime serialized, one request at a time"
-            )
-            return
-        try:
-            engine = make_runtime_engine(self._runtime_spec(), self._native)
-            # The width is the scheduler's to clamp: this runtime declares one slot, so a command
-            # line naming eight is answered with one rather than refused. Refusing would make the
-            # width a property of the launch script instead of of the runtime.
-            self._scheduler = self._native.QwenBatchScheduler(
-                engine, max(1, int(self.args.max_batch_size or 1))
-            )
-        except Exception as exc:
-            warnings.warn(f"could not build the batch scheduler: {exc}; serving serialized")
-            self._scheduler = None
-
     def _runtime_spec(self) -> Any:
         return RuntimeSpec(
             name=self.name,
             start=self._start_runtime,
             eos_tokens=self._eos_tokens,
             max_context=self._max_seq_len,
+            wants_request=True,
             # A callable because the model is not loaded yet: this spec is built with the backend,
             # and the card the weights ended up on is only known once they are.
             device=self._runtime_device,
@@ -424,12 +351,12 @@ class Xing4Backend(BackendBase):
         if device is None:
             # A host stand-in, or a checkpoint whose model names no device. Fall back to what the
             # launcher asked for, which for a CPU run is a device index of -1.
-            return _device_index(self._device)
+            return device_index(self._device)
         text = str(device)
         if text.startswith("cpu"):
             return -1
         index = getattr(device, "index", None)
-        return int(index) if index is not None else _device_index(text)
+        return int(index) if index is not None else device_index(text)
 
     def _start_runtime(
         self,
@@ -437,6 +364,7 @@ class Xing4Backend(BackendBase):
         request_id: int,
         prompt_ids: Sequence[int],
         sampling: Any,
+        context: Any,
         on_token: Callable[[int], None],
         on_step: Callable[[], bool],
     ) -> None:
@@ -468,7 +396,10 @@ class Xing4Backend(BackendBase):
                 cache=self._cache,
                 prefix_cache=self._prefix_cache,
                 on_token=lambda token, _logits: on_token(token),
-                on_step=lambda: self._is_cancelled(str(request_id)) or on_step(),
+                # Two cancellations meet at the same seam: the runtime's own, which is called with
+                # the id the client's request carries, and the scheduler's, which arrives as
+                # `on_step` returning true.
+                on_step=lambda: self._is_cancelled(cancel_key(context, request_id)) or on_step(),
             )
         finally:
             self._publish_cache_metrics()
@@ -646,7 +577,7 @@ class Xing4Backend(BackendBase):
                 **self._details,
                 "scheduler": (
                     "BatchScheduler (width 1, continuous batching off)"
-                    if self._scheduler is not None
+                    if self._batching()
                     else "serialized session"
                 ),
                 "max_batch_size": 1,
@@ -657,7 +588,7 @@ class Xing4Backend(BackendBase):
             # scheduler *is* submitting to a batch scheduler, on which this one declares one slot;
             # the serialized path serves one request at a time by its own lock. Either way the
             # answer to "may this be called concurrently" is what the field reports.
-            supports_batch=self._scheduler is not None,
+            supports_batch=self._batching(),
         )
 
     def metrics(self) -> dict[str, float]:
@@ -671,7 +602,9 @@ class Xing4Backend(BackendBase):
         store itself, because the HTTP thread is not under the request lock.
         """
         if self._model is None:
-            return {}
+            # No model counters yet -- but the scheduler's gauges are not the model's, and a scrape
+            # during loading is when an operator most wants to know this process has one.
+            return dict(self.scheduler_metrics())
         return {
             "xing4_resident_bytes": float(self._model.nbytes),
             "xing4_kv_cache_bytes": float(self._cache_bytes()),
@@ -681,7 +614,7 @@ class Xing4Backend(BackendBase):
             # series, same `Stats` struct and same names as the `cpp` backend publishes -- which is
             # what makes the two readable as one scheduler rather than as two servers that happen
             # to agree.
-            **scheduler_gauges(self._scheduler),
+            **self.scheduler_metrics(),
         }
 
     def _publish_cache_metrics(self) -> None:
@@ -849,7 +782,7 @@ class Xing4Backend(BackendBase):
 
     def generate(self, requests: Sequence[GenerationRequest]) -> list[GenerationResult]:
         self._ensure_loaded()
-        if self._scheduler is not None:
+        if self._batching():
             return self._generate_batched(requests)
         results = []
         for request in requests:
@@ -866,102 +799,6 @@ class Xing4Backend(BackendBase):
             finally:
                 self._clear_request(request.request_id)
         return results
-
-    def _generate_batched(
-        self, requests: Sequence[GenerationRequest]
-    ) -> list[GenerationResult]:
-        """The same generation, submitted to the shared `BatchScheduler`.
-
-        Submission and polling are the whole of this adapter's part: which request runs when, how
-        slots are handed out, when a request is cancelled and what the timings are is the
-        scheduler's, exactly as it is for the `cpp` backend. That is the point of routing this
-        runtime through it -- one request lifecycle for both languages rather than two that agree
-        by inspection.
-        """
-        scheduler = self._scheduler
-        submitted: list[tuple[int, GenerationRequest, list[int]]] = []
-        for request in requests:
-            self._begin_request(request.request_id)
-            try:
-                prompt_ids = self._tokenize(request)
-                budget = self._budget(prompt_ids, request)
-                sampling = self._batch_sampling(request, budget)
-                native_id = scheduler.submit_request(prompt_ids, sampling, None)
-            except Exception:
-                self._clear_request(request.request_id)
-                raise
-            if native_id <= 0:
-                self._clear_request(request.request_id)
-                raise RuntimeError(f"the scheduler refused request {request.request_id}")
-            submitted.append((native_id, request, prompt_ids))
-
-        outputs: list[GenerationResult] = []
-        errors: list[str] = []
-        for native_id, request, prompt_ids in submitted:
-            try:
-                result = scheduler.poll_result(native_id, self._poll_timeout_ms)
-                if result is None:
-                    raise TimeoutError(
-                        f"request {request.request_id} did not finish within "
-                        f"{self._poll_timeout_ms} ms"
-                    )
-                error = str(getattr(result, "error", "") or "")
-                if error:
-                    # Poll the rest of the batch before raising. The scheduler fails every row of
-                    # a wave it could not run, and abandoning their results here would leave that
-                    # many completed entries in it.
-                    errors.append(error)
-                    continue
-                outputs.append(self._batched_result(request, result))
-            finally:
-                self._clear_request(request.request_id)
-
-        if errors:
-            raise RuntimeError("; ".join(dict.fromkeys(errors)))
-        return outputs
-
-    def _batch_sampling(self, request: GenerationRequest, budget: int) -> Any:
-        """One request's sampling parameters, in the scheduler's vocabulary.
-
-        `stop` strings are deliberately not translated: the serial path applies them by holding
-        text back as it streams, and a token-level stop is a different thing that this runtime has
-        no way to derive from a string. Leaving them out means both paths stop on the same tokens
-        -- the checkpoint's -- instead of one of them stopping somewhere the other cannot.
-        """
-        params = request.sampling_params
-        sampling = self._native.QwenBatchSamplingParams()
-        sampling.max_new_tokens = int(budget)
-        sampling.temperature = float(params.temperature or 0.0)
-        sampling.top_p = float(params.top_p if params.top_p is not None else 1.0)
-        sampling.top_k = int(params.top_k) if params.top_k else 0
-        sampling.seed = int(params.seed or 0)
-        sampling.ignore_eos = bool(params.extra.get("ignore_eos", False))
-        return sampling
-
-    def _batched_result(self, request: GenerationRequest, result: Any) -> GenerationResult:
-        """A scheduler result as this backend's own.
-
-        The token list is the scheduler's, unstripped: this runtime's serial path keeps the stop
-        token in `token_ids` -- its loop appends before it checks -- and the two paths have to
-        return the same answer, not the same answer with one token removed to look tidier.
-        """
-        token_ids = list(result.generated_tokens)
-        return GenerationResult(
-            request_id=request.request_id,
-            token_ids=token_ids,
-            text=self._decode(token_ids),
-            finish_reason=result.finish_reason,
-            usage=Usage(
-                prompt_tokens=int(result.prompt_tokens),
-                completion_tokens=int(result.completion_tokens),
-            ),
-            timings=TimingMetrics(
-                prefill_seconds=max(0.0, float(result.prefill_seconds)),
-                decode_seconds=max(0.0, float(result.decode_seconds)),
-                total_seconds=float(result.total_seconds),
-                ttft_seconds=max(0.0, float(result.ttft_seconds)),
-            ),
-        )
 
     def stream(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         """Yield one event a token, off a worker thread, with the stop strings held back.

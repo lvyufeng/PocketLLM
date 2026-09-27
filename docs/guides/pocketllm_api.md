@@ -214,11 +214,16 @@ These are the same numbers, from the same `BatchScheduler::Stats`, that the nati
 compared by substituting the prefix rather than by a translation table.
 
 A Python runtime driven by the same scheduler publishes the same series, which is the point of
-driving it from there: `xing4` with `--enable-batching` reports `pocketllm_requests_running` out of
-the one `BatchScheduler` library, under the same names, without a second implementation of it. What
-differs is the width the runtime declares — `xing4` declares one slot, so that gauge reads 1 rather
-than the running set a wide engine has, and `pocketllm_slots_free` is 0 or 1. A runtime is charged
-for the width it declares, and a declaration of one is not a claim of concurrency.
+driving it from there: `xing4`, `v41` and `mimo` with `--enable-batching` report
+`pocketllm_requests_running` out of the one `BatchScheduler` library, under the same names, without a
+second implementation of it. What differs is the width the runtime declares — each declares one slot,
+so that gauge reads 1 rather than the running set a wide engine has, and `pocketllm_slots_free` is 0
+or 1. A runtime is charged for the width it declares, and a declaration of one is not a claim of
+concurrency.
+
+The gauges are published whether or not the model is loaded. They are the *scheduler's* numbers and
+not the model's, and a scrape during a long load is exactly when an operator wants to know whether
+the process has a scheduler in it at all — which is the question the series answers.
 
 `requests_running` is the one to watch. Two concurrent clients reaching a server that serializes
 them under a lock and two reaching a scheduler produce identical tokens and identical responses; the

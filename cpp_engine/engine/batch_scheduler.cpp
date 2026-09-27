@@ -44,6 +44,13 @@ BatchScheduler::BatchScheduler(InferenceEngine* engine, int max_batch_size)
     // Allocate batch slots in the engine
     engine_->allocate_batch_slots(max_batch_size_);
 
+    // Asked here, on the constructing thread, and not by the loop below.  A
+    // host-only engine answers -1 quickly, but a Python one has to take the GIL
+    // to be asked at all, and a loop that is waiting for the GIL is a loop that
+    // cannot be joined from a thread that holds it -- which is every thread
+    // that drops a scheduler instead of stopping it first.
+    engine_device_ = engine_->device();
+
     // Start scheduler thread
     schedule_thread_ = std::thread(&BatchScheduler::schedule_loop, this);
 }
@@ -204,8 +211,11 @@ void BatchScheduler::schedule_loop() {
     // The current device is per-thread, and the engine bound it on the thread
     // that constructed it.  This loop runs every forward pass from its own
     // thread, so it has to bind the same device before touching device memory.
-    // A host-only engine reports -1 and needs no device context.
-    const int engine_device = engine_->device();
+    // A host-only engine reports -1 and needs no device context.  The index was
+    // read by the constructor -- see `engine_device_` -- because asking the
+    // engine here would be a call into Python, and this thread must stay
+    // joinable by a thread holding the GIL.
+    const int engine_device = engine_device_;
     if (engine_device >= 0 && !device_set(engine_device)) {
         std::cerr << "BatchScheduler: failed to select device "
                   << engine_device
