@@ -223,8 +223,9 @@ public:
     const Tokenizer& tokenizer() const;
     const ForwardSmokeOptions& options() const;
 
-    // TP rank > 0 entry point. Blocks on a small NCCL int32 broadcast channel
-    // driven by rank 0; runs the requested op until SHUTDOWN.
+    // TP rank > 0 entry point. Blocks on the CmdChannel unix socket -- see
+    // cmd_channel.hpp for why it is a socket and not a collective -- reading one
+    // int32 header at a time from rank 0, and runs the op until SHUTDOWN.
     void run_worker_loop();
 
     // Trigger NCCL communicator init on all ranks. Must be called by every

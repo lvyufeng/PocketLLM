@@ -439,8 +439,9 @@ public:
     // Check if batched API is supported (depends on build config)
     bool supports_batching() const;
 
-    // TP rank > 0 entry point. Blocks on a small NCCL int32 broadcast channel
-    // driven by rank 0; runs the requested op until SHUTDOWN.
+    // TP rank > 0 entry point. Blocks on the CmdChannel unix socket -- see
+    // cmd_channel.hpp for why it is a socket and not a collective -- reading one
+    // int32 header at a time from rank 0, and runs the op until SHUTDOWN.
     void run_worker_loop() override;
 
     // InferenceEngine's name for worker_command_shutdown(), so a caller holding

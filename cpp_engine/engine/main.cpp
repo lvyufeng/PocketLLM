@@ -492,7 +492,7 @@ int main(int argc, char** argv) {
             std::cout << "server_max_context=" << engine->max_context() << "\n";
             engine->warmup_tp();
             if (args.tp_rank > 0) {
-                // Worker rank: park on the NCCL command channel until rank 0
+                // Worker rank: park on the CmdChannel unix socket until rank 0
                 // sends SHUTDOWN.
                 engine->run_worker_loop();
                 return 0;
