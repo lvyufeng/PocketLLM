@@ -534,11 +534,18 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def_readonly("fixed_top_p", &Capabilities::fixed_top_p)
         .def_readonly("fixed_top_k", &Capabilities::fixed_top_k)
         .def_readonly("fixed_seed", &Capabilities::fixed_seed)
+        // Declared in the struct and reachable from Python as well, so the two declarations can be
+        // compared rather than one of them being copied by hand: the Python adapter reported both
+        // of these as False whatever the engine said.
+        .def_readonly("structured_outputs", &Capabilities::structured_outputs)
+        .def_readonly("logprobs", &Capabilities::logprobs)
         .def("__repr__", [](const Capabilities& c) {
             return "<Capabilities max_slots=" + std::to_string(c.max_slots) +
                    " continuous_batching=" + (c.continuous_batching ? "True" : "False") +
                    " chunked_prefill=" + (c.chunked_prefill ? "True" : "False") +
-                   " paged_kv=" + (c.paged_kv ? "True" : "False") + ">";
+                   " paged_kv=" + (c.paged_kv ? "True" : "False") +
+                   " structured_outputs=" + (c.structured_outputs ? "True" : "False") +
+                   " logprobs=" + (c.logprobs ? "True" : "False") + ">";
         });
 
     // BatchScheduler bindings (Phase 3.4)

@@ -61,6 +61,7 @@ from pocketllm.api import (
 
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
 from .base import BackendBase, byte_size, settled_text
+from .capabilities import IGNORED_OPTIONS, declared_capabilities
 
 
 DEFAULT_MAX_SEQ_LEN = 8192
@@ -100,16 +101,6 @@ The head anchor is for a *different* conversation with the same rendered header 
 message, tools JSON and effort prefix -- which the end anchor cannot serve because the two prompts
 diverge before it. It costs the cold prefill one chunk boundary, since a position's ring can only be
 observed at a forward boundary, and it is paid on a miss only: a resumed prefill skips it.
-"""
-
-_IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
-"""``backend_options`` keys a launch always carries that this backend has no use for.
-
-The CLI fills in ``engine_kind``, ``routed_experts_device`` and ``pd_mode`` on every serve command,
-and the supervisor adds ``nccl_id_path`` for a sharded one, so all four arrive whether or not the
-selected adapter reads them. Accepting them means a V4.1 launch is the same command line as a native
-one. Every other unknown key is a refusal, because a tuning option that silently does nothing is how
-a run ends up measured on the wrong lever.
 """
 
 _KNOWN_OPTIONS = frozenset({
@@ -240,7 +231,7 @@ class _Options:
 
 def _options_from(args: Any) -> _Options:
     raw = dict(getattr(args, "backend_options", None) or {})
-    unknown = sorted(set(raw) - _KNOWN_OPTIONS - _IGNORED_OPTIONS)
+    unknown = sorted(set(raw) - _KNOWN_OPTIONS - IGNORED_OPTIONS)
     if unknown:
         raise ConfigurationError(
             f"backend='v41' does not recognise backend option(s) {unknown}; "
@@ -641,23 +632,16 @@ class V41Backend(BackendBase):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
-            name=self.name,
-            models=("deepseek_v4_1", "deepseek_v41"),
-            model_formats=("safetensors",),
-            devices=("cpu", "cuda"),
-            supports_batch=False,
-            supports_streaming=True,
-            supports_cancellation=True,
-            supports_logprobs=False,
-            supports_prefix_caching=self._options.prefix_cache_bytes > 0,
+        # The gate is the budget, and a zero budget is how `--no-enable-prefix-caching` is
+        # spelled here: three options fold into it, and a positive budget is the one state in
+        # which this runtime resumes a prefix rather than forwarding it again.
+        return declared_capabilities(
+            self.name,
             details={
-                "execution": "src/models/deepseek_v4_1 PyTorch runtime",
-                "scheduler": "one mutable KV state, serialized at the backend boundary",
-                "cancellation": "per-step collective; not inside the prompt's forward",
                 "prompt_format": "the checkpoint's own encoding/encoding.py, loaded by path",
                 **self._details,
             },
+            reads_prefix_cache=self._options.prefix_cache_bytes > 0,
         )
 
     # ------------------------------------------------------------------ requests

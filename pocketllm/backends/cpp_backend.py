@@ -32,6 +32,7 @@ from pocketllm.api import (
 from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 
 from .base import BackendBase, settled_text
+from .capabilities import declared_capabilities
 
 
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
@@ -461,36 +462,88 @@ class CppBackend(BackendBase):
         except Exception:
             return ("qwen3_5",)
 
+    def _engine_capabilities(self) -> Any | None:
+        """What the engine itself declares, when there is an engine to ask.
+
+        This is the seam the two declarations meet at. `pocket::Capabilities` is the C++ engine's
+        own statement of what it can do -- written because reading `kv_total_blocks() == 0` as "this
+        engine has a contiguous arena" was an inference from an accounting field rather than a
+        declaration -- and until now the Python adapter re-derived the overlapping half of it by
+        hand instead of asking. The scheduler is the only object that exposes it across the binding,
+        so a build without one, or a fake without the method, leaves this `None` and the adapter
+        falls back to what it resolved at construction.
+        """
+        scheduler = self._scheduler
+        getter = getattr(scheduler, "engine_caps", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
     @property
     def capabilities(self) -> BackendCapabilities:
         # The Ascend build rejects the external drafters, so report only what the
         # linked backend actually implements instead of the CUDA superset.
         native_backend = str(getattr(self._native, "backend", "") or "").lower()
         speculative: tuple[str, ...] = ("mtp",) if native_backend == "ascend" else ("mtp", "dspark", "dflash2")
-        return BackendCapabilities(
-            name="cpp",
+        engine = self._engine_capabilities()
+        # Every field the two declarations share is reported from the engine's, so there is one
+        # answer rather than two that happen to agree.
+        batch_width = (
+            int(engine.max_slots) if engine is not None else self._configured_max_batch_size()
+        )
+        return declared_capabilities(
+            "cpp",
             models=self._registered_architectures(),
-            model_formats=("safetensors", "gguf"),
             devices=(native_backend,) if native_backend else ("cuda", "ascend"),
-            supports_batch=self._batching_enabled,  # Phase 3.4: dynamic based on scheduler
-            supports_streaming=True,
-            supports_cancellation=True,
-            supports_embeddings=False,
-            supports_logprobs=False,
-            supports_structured_outputs=False,
-            supports_prefix_caching=True,
+            # Whether this instance really holds more than one request is whether it built a
+            # scheduler, not whether the runtime could -- that is the declaration's `supports_batch`.
+            # The engine's `continuous_batching` is the same fact from the engine's side, and it is
+            # published next to this under `engine_declares` rather than consulted here: the two
+            # disagreeing would mean a scheduler built around an engine that cannot run it, which is
+            # worth being able to see rather than silently resolving to one of the two.
+            supports_batch=self._batching_enabled,
             supports_speculative_decoding=speculative,
+            # The serialized session resumes a repeated prompt from its per-slot cache. The batch
+            # scheduler does not: it prefills through `QwenEngine::batch_prefill`, which never
+            # enters the prefix lookup in `QwenEngine::prefill`. Reporting `True` on both paths
+            # would be the field answering "does the cache exist" on one and "will it be used" on
+            # the other, which is the drift this declaration exists to remove.
+            reads_prefix_cache=bool(self.args.enable_prefix_caching) and not self._batching_enabled,
             details={
-                "execution": "native C++",
                 "scheduler": "batch scheduler" if self._batching_enabled else "serialized compatibility session",
                 "device_backend": native_backend or "unknown",
-                "cancellation": "safe boundary only",
                 "eos_token_ids": sorted(self._eos_ids),
                 "eos_source": self._eos_source or "none",
-                "max_batch_size": self._configured_max_batch_size() if self._batching_enabled else 1,
-                "kv_paged": bool(self.args.backend_options.get("kv_paged", False)),
+                "max_batch_size": batch_width if self._batching_enabled else 1,
+                "kv_paged": (
+                    bool(engine.paged_kv) if engine is not None
+                    else bool(self.args.backend_options.get("kv_paged", False))
+                ),
+                # What the engine declares that this adapter does not yet surface as a capability.
+                # Publishing them rather than hiding them is the point of the field: each one is a
+                # path Python would have to deliver end to end before the capability could be
+                # reported, and the adapter reporting `False` over an engine saying `True` is a gap
+                # to close deliberately rather than a value to copy over.
+                "engine_declares": self._engine_declaration(engine),
             },
         )
+
+    @staticmethod
+    def _engine_declaration(engine: Any | None) -> dict[str, Any]:
+        """The engine's own answer for the facts this adapter does not yet report as capabilities."""
+        if engine is None:
+            return {}
+        return {
+            "continuous_batching": bool(engine.continuous_batching),
+            "chunked_prefill": bool(engine.chunked_prefill),
+            "per_request_sampling": bool(engine.per_request_sampling),
+            "per_request_top_k": bool(engine.per_request_top_k),
+            "structured_outputs": bool(getattr(engine, "structured_outputs", False)),
+            "logprobs": bool(getattr(engine, "logprobs", False)),
+        }
 
     def _load_tokenizer(self) -> Any | None:
         tokenizer_path = self.args.tokenizer_path or self.args.checkpoint_dir

@@ -72,6 +72,7 @@ from pocketllm.api import (
 )
 
 from .base import BackendBase, TokenStreamer, byte_size, settled_text
+from .capabilities import IGNORED_OPTIONS, declared_capabilities
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the KV cache is sized at when ``--max-model-len`` is not given.
@@ -168,16 +169,6 @@ _KNOWN_OPTIONS = frozenset({
     "slots",
 })
 
-_IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
-"""``backend_options`` keys a launch always carries that this backend has no use for.
-
-The CLI fills in ``engine_kind``, ``routed_experts_device`` and ``pd_mode`` on every serve command
-and the supervisor adds ``nccl_id_path`` for a sharded one, so all four arrive whether or not the
-selected adapter reads them; accepting them is what makes a MiMo launch the same command line as a
-native one. Every *other* unknown key is a refusal, because a tuning option that silently does
-nothing is how a run ends up measured on the wrong lever.
-"""
-
 
 def _flag(value: Any, name: str) -> bool:
     if isinstance(value, bool):
@@ -215,7 +206,7 @@ class _Options:
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
         values = dict(getattr(args, "backend_options", None) or {})
-        for name in _IGNORED_OPTIONS:
+        for name in IGNORED_OPTIONS:
             values.pop(name, None)
         unknown = sorted(set(values) - _KNOWN_OPTIONS)
         if unknown:
@@ -522,20 +513,15 @@ class MimoBackend(BackendBase):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
-            name=self.name,
-            models=("mimo_v2", "mimo_v2_6"),
-            model_formats=("safetensors",),
-            devices=("cuda",),
-            supports_batch=False,
-            supports_streaming=True,
-            supports_cancellation=True,
-            supports_logprobs=False,
-            # The store's existence rather than the option that would build one: a budget the
-            # launcher set on a cache that cannot be snapshotted is a run with no store, and a
-            # capability that reported it anyway is how a deployment sizes a budget it never gets.
-            supports_prefix_caching=self._prefix_cache is not None,
+        # The store's existence rather than the option that would build one: a budget the launcher
+        # set on a cache that cannot be snapshotted is a run with no store, and a capability that
+        # reported it anyway is how a deployment sizes a budget it never gets. That is the gate,
+        # and it is the same question the declaration asks -- whether a repeated prefix is
+        # resumed -- answered for this configuration.
+        return declared_capabilities(
+            self.name,
             details=dict(self._details),
+            reads_prefix_cache=self._prefix_cache is not None,
         )
 
     def metrics(self) -> dict[str, float]:

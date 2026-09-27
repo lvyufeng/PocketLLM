@@ -28,6 +28,7 @@ from pocketllm.api import (
 from pocketllm.protocol import encode_chat_prompt, render_fallback_prompt
 
 from .base import BackendBase
+from .capabilities import declared_capabilities
 
 
 #: What the legacy runtime generates when a request carries no budget of its own
@@ -67,25 +68,10 @@ class TorchBackend(BackendBase):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
-            name="torch",
-            model_formats=("safetensors", "gguf"),
-            devices=("cuda", "cpu"),
-            supports_batch=False,
-            supports_streaming=True,
-            # Cancellation is observed between streamed events and at request
-            # boundaries. It never interrupts a running device kernel.
-            supports_cancellation=True,
-            supports_embeddings=False,
-            supports_logprobs=True,
-            supports_structured_outputs=False,
-            supports_prefix_caching=True,
-            details={
-                "execution": "existing src/ runtime",
-                "scheduler": "legacy serving queue",
-                "cancellation": "safe boundary only",
-            },
-        )
+        # The one runtime whose capability is fully static: it reads every checkpoint the others
+        # do not claim, it holds one request at a time, and its cancellation is observed between
+        # streamed events and at request boundaries rather than inside a running device kernel.
+        return declared_capabilities("torch")
 
     @property
     def runtime(self) -> Mapping[str, Any] | None:

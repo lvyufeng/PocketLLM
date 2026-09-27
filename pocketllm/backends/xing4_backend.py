@@ -56,6 +56,7 @@ from pocketllm.api import (
 )
 
 from .base import BackendBase, TokenStreamer, byte_size
+from .capabilities import IGNORED_OPTIONS, declared_capabilities
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the cache is sized at when ``--max-model-len`` is not given.
@@ -112,12 +113,9 @@ PREFILL_DEVICE_RESERVE = 768 << 20
 #: checkpoint resident.
 PREFILL_SCORE_BUDGET = 1 << 30
 
-#: ``backend_options`` keys a launch always carries that this adapter has no use for, on the same
-#: terms as the other Python adapters': accepting them is what makes a Xing4 launch the same command
-#: line as a native one. Every *other* unknown key is a refusal, because an option that silently
-#: does nothing is how a run ends up measured on the wrong lever.
-_IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
-
+#: ``backend_options`` keys this adapter reads, on top of the always-carried ones it accepts and
+#: ignores (``capabilities.IGNORED_OPTIONS``). Every *other* unknown key is a refusal, because an
+#: option that silently does nothing is how a run ends up measured on the wrong lever.
 _KNOWN_OPTIONS = frozenset(
     {"device", "gguf", "prefill_chunk", "prefix_cache_bytes", "tokenizer", "use_kernel"}
 )
@@ -174,7 +172,7 @@ class _Options:
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
         values = dict(getattr(args, "backend_options", None) or {})
-        for name in _IGNORED_OPTIONS:
+        for name in IGNORED_OPTIONS:
             values.pop(name, None)
         unknown = sorted(set(values) - _KNOWN_OPTIONS)
         if unknown:
@@ -482,19 +480,13 @@ class Xing4Backend(BackendBase):
 
     @property
     def capabilities(self) -> BackendCapabilities:
-        return BackendCapabilities(
-            name=self.name,
-            models=("xing4_0",),
-            model_formats=("gguf",),
-            devices=("cuda",),
-            supports_batch=False,
-            supports_streaming=True,
-            supports_cancellation=True,
-            supports_logprobs=False,
-            # The store's existence rather than the option that would build one: a budget the
-            # launcher set on a cache that cannot be snapshotted is a run with no store.
-            supports_prefix_caching=self._prefix_cache is not None,
+        # The store's existence rather than the option that would build one, for the reason
+        # `MimoBackend.capabilities` gives: that is what "a repeated prefix is resumed" means for
+        # this configuration.
+        return declared_capabilities(
+            self.name,
             details=dict(self._details),
+            reads_prefix_cache=self._prefix_cache is not None,
         )
 
     def metrics(self) -> dict[str, float]:
