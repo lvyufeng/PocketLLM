@@ -172,6 +172,30 @@ def _checkpoint_eos_ids(checkpoint_dir: str) -> tuple[tuple[int, ...], str]:
     return (), ""
 
 
+def _strip_terminal_stop_token(result: Any) -> list[int]:
+    """The answer without the stop token the engine returns as part of its sequence.
+
+    A stop token is the last token of a sequence and the engine counts and returns it, because its KV
+    cache has to agree with what it reports. It is not part of the answer. `openai_server.cpp` drops it
+    before detokenizing -- and before counting `completion_tokens` for the client -- in
+    `strip_stop_token`; the batch scheduler's own streaming path does the same by never emitting it.
+    The non-streaming result is the one place it leaked through, so a request answered through
+    `pocketllm serve` came back with a visible `<|im_end|>` on the end that the same request through
+    the native binary did not have. Caught by the `cpp` served-path fixture, which is recorded from
+    the serial path and compares token ids.
+
+    A structured-output terminal token is also reported as "stop" -- it closes the JSON -- so it is
+    preserved. `constraint_completed` is what says which of the two this is, and it is read with
+    `getattr` because a result object from a build older than that field should not raise here.
+    """
+    tokens = list(result.generated_tokens)
+    if not tokens or result.finish_reason != "stop":
+        return tokens
+    if bool(getattr(result, "constraint_completed", False)):
+        return tokens
+    return tokens[:-1]
+
+
 def _native_device_index(value: str | int | None) -> int:
     """Normalize a public device selector for the native single-rank option."""
     if value is None:
@@ -869,7 +893,7 @@ class CppBackend(BackendBase):
                 continue
 
             # Convert native result to GenerationResult
-            token_ids = result.generated_tokens
+            token_ids = _strip_terminal_stop_token(result)
             text = self._decode(token_ids)
 
             outputs.append(
