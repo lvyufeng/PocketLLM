@@ -908,8 +908,15 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         // `InferenceEngine*`, not `QwenEngine*`: the scheduler is one library with as many hosts
         // as there are engines, so which runtime drives it is the argument's business and not the
         // binding's. The native binary already constructs it through this same pointer.
+        // `keep_alive`: the scheduler holds a bare `InferenceEngine*` for the life of the object,
+        // and for a Python engine that pointer *is* the Python object. Without this, an engine
+        // passed as an expression rather than bound to a name -- `QwenBatchScheduler(Engine(), 1)`
+        // -- is collected as soon as the constructor returns, and the scheduler then reads freed
+        // memory. The symptom is not a traceback: `engine_caps()` returns whatever the freed
+        // object's fields happen to hold, and the crash lands later, in whichever call touches the
+        // engine next.
         .def(py::init<InferenceEngine*, int>(),
-             py::arg("engine"), py::arg("max_batch_size"))
+             py::arg("engine"), py::arg("max_batch_size"), py::keep_alive<1, 2>())
         .def("submit_request",
              [](BatchScheduler& scheduler,
                 const std::vector<int>& prompt_tokens,

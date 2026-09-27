@@ -13,6 +13,7 @@ belong: the parity tests in `tests/test_xing4_0_moe.py` and
 
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -598,6 +599,111 @@ def test_the_options_a_native_launch_always_carries_are_accepted() -> None:
     options = _Options.from_args(args)
     assert options.prefill_chunk is None, "unnamed means derived at load, from the context"
     assert options.prefix_cache_bytes > 0
+
+
+# ------------------------------------------------------------------- the shared scheduler
+
+
+@pytest.fixture(scope="module")
+def native_module():
+    """The C++ extension, which is what carries the scheduler binding."""
+    try:
+        return importlib.import_module("pocketllm_cpp")
+    except ImportError as exc:
+        pytest.skip(f"native pocketllm_cpp module is not built: {exc}")
+
+
+def batched_backend(**options) -> Xing4Backend:
+    """This runtime serving through the scheduler `cpp` uses.
+
+    `device: cpu` because the model is the file's stand-in and there is no card in the path: the
+    runtime then binds nothing, and what is under test is the route rather than a kernel. The rest
+    of the wiring is the real one -- a real `BatchScheduler` driving the real adapter, with the
+    bridge in between.
+    """
+    args = EngineArgs(
+        model="a-xing4-checkpoint",
+        backend="xing4",
+        max_model_len=64,
+        backend_options={
+            "gguf": "/nowhere/xing4_0-29b-IQ4_NL.gguf",
+            "device": "cpu",
+            "enable_batching": True,
+            **options,
+        },
+    )
+    instance = Xing4Backend(
+        args, loader=lambda _path, _options: ScriptedModel(), tokenizer=FakeTokenizer()
+    )
+    instance.prepare()
+    return instance
+
+
+def test_the_batched_path_answers_what_the_serial_path_answers(native_module) -> None:
+    """Turning the scheduler on changes the route, not the answer.
+
+    The two arms are the same scripted model and the same request, so the only thing that can
+    differ is which code path ran. That is the claim a migration like this has to earn: the same
+    tokens, the same finish reason, and a `usage` a client can still read.
+    """
+    serial = backend()
+    batched = batched_backend()
+    assert serial.capabilities.supports_batch is False
+    assert batched.capabilities.supports_batch is True
+    assert "BatchScheduler" in batched.capabilities.details["scheduler"]
+    assert "serialized" in serial.capabilities.details["scheduler"]
+
+    one = serial.generate([request(request_id="r1")])[0]
+    two = batched.generate([request(request_id="r1")])[0]
+
+    assert two.token_ids == one.token_ids == [11, 12, 13, 14]
+    assert two.text == one.text
+    assert two.finish_reason == one.finish_reason
+    assert two.usage.prompt_tokens == one.usage.prompt_tokens
+    assert two.usage.completion_tokens == one.usage.completion_tokens
+    # The split the scheduler keeps for its own gauges reaches the client too, rather than being
+    # zeroed on the way through a result type this runtime did not build.
+    assert two.timings.total_seconds > 0
+    batched.close()
+
+
+def test_the_scheduler_reads_the_runtime_s_own_declaration(native_module) -> None:
+    """The width the engine was built with and the width it declares are different things.
+
+    A launch script that names eight rows gets one, and it gets one because the runtime said so --
+    not because a constant somewhere kept them apart.
+    """
+    batched = batched_backend()
+    try:
+        caps = batched._scheduler.engine_caps()
+        assert caps.max_slots == 1
+        assert caps.continuous_batching is False
+        assert caps.chunked_prefill is False
+        assert caps.paged_kv is False
+    finally:
+        batched.close()
+
+
+def test_a_second_request_after_a_failure_still_serves(native_module) -> None:
+    """The scheduler is a long-lived object, so one request's failure must not wedge it.
+
+    The failure here is the runtime's own: `_eos_tokens` raises for a checkpoint that names no
+    end-of-turn token, and it is reached inside the run rather than before submission.
+    """
+    batched = batched_backend()
+    tokenizer = FakeTokenizer(eos_token_id=None)
+    batched._tokenizer = tokenizer
+    batched._model.params = SimpleNamespace(n_heads=32)
+    try:
+        with pytest.raises(Exception):
+            batched.generate([request(request_id="bad")])
+
+        # And the next one, with the checkpoint's own end-of-turn token back, is answered.
+        tokenizer.eos_token_id = 2
+        result = batched.generate([request(request_id="good")])[0]
+        assert result.token_ids == [11, 12, 13, 14]
+    finally:
+        batched.close()
 
 
 # ---------------------------------------------------------------------------- selection
