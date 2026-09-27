@@ -352,11 +352,11 @@ class Xing4Backend(SchedulerHost, BackendBase):
             # A host stand-in, or a checkpoint whose model names no device. Fall back to what the
             # launcher asked for, which for a CPU run is a device index of -1.
             return device_index(self._device)
-        text = str(device)
-        if text.startswith("cpu"):
-            return -1
-        index = getattr(device, "index", None)
-        return int(index) if index is not None else device_index(text)
+        # One reading, not two. This was a local copy of it -- `str(device)`, then the attribute,
+        # then the suffix -- and the copy had the bug the shared one had: a model whose `.device`
+        # is a *string* would hand `int()` the builtin `str.index` and raise. `device_index` reads
+        # every shape a device arrives in, and this is one of them.
+        return device_index(device)
 
     def _start_runtime(
         self,

@@ -521,18 +521,33 @@ def cancel_key(context: Any, request_id: int) -> str:
 def device_index(device: Any) -> int:
     """The card index a device names, or -1 for a host device.
 
-    Accepts what a launcher option carries (``"cpu"``, ``"cuda"``, ``"cuda:2"``) and what torch
-    reports (``torch.device`` and ``torch.device("cpu")``), because an adapter that reads one and
-    not the other is a runtime that binds the wrong card on the one path nobody exercised.
+    Accepts what a launcher option carries (``"cpu"``, ``"cuda"``, ``"cuda:2"``), an already-typed
+    card index, and what torch reports (``torch.device`` and ``torch.device("cpu")``), because an
+    adapter that reads one and not the other is a runtime that binds the wrong card on the one path
+    nobody exercised.
+
+    A `str` is read as a `str`. `getattr(x, "index")` used to be asked first, and `"cuda:3".index`
+    is `str.index` -- a builtin method -- so `int()` of it raised on every string device, and an
+    `int` device fell through to the suffix parse and answered **0**: a rank asked for card 3 bound
+    card 0. Both were live on the v41 and torch routes, which pass a string and an int
+    respectively; the branch below is keyed on the type rather than on attribute presence so that
+    neither can happen again.
     """
     if device is None:
         return -1
-    text = str(device)
+    if isinstance(device, bool):  # a bool is an int, and never a card
+        raise TypeError(f"{device!r} is not a device")
+    if isinstance(device, int):
+        return int(device)
+    if isinstance(device, str):
+        text = device
+    else:
+        index = getattr(device, "index", None)
+        if isinstance(index, int):
+            return int(index)
+        text = str(device)
     if text.startswith("cpu"):
         return -1
-    index = getattr(device, "index", None)
-    if index is not None:
-        return int(index)
     _, _, suffix = text.partition(":")
     try:
         return int(suffix)

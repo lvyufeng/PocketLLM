@@ -17,7 +17,7 @@ import time
 
 import pytest
 
-from pocketllm.backends.runtime_engine import RuntimeRun, RuntimeSpec, engine_class
+from pocketllm.backends.runtime_engine import RuntimeRun, RuntimeSpec, device_index, engine_class
 
 
 class FakeLoop:
@@ -73,6 +73,46 @@ class FakeLoop:
                 self.stopped = "eos"
                 return
         self.stopped = "length"
+
+
+# -----------------------------------------------------------------------------------
+# which card a runtime binds, which is the one mistake that costs a whole run
+# -----------------------------------------------------------------------------------
+
+
+def test_the_card_a_runtime_names_is_the_card_it_gets():
+    """Every shape a launch hands this over in, because two of them were read wrong.
+
+    `device_index` is what decides which GPU a run thread binds before it drives the model, and
+    both of its live callers hand it something that used to be misread: the v41 route passes
+    `"cuda:{rank}"` and the torch route passes an `int`. A `str` went through `getattr(x, "index")`
+    and `"cuda:3".index` is `str.index`, a builtin method, so `int()` of it raised and the run died
+    before its first forward; an `int` fell through to the suffix parse and answered **0**, so a
+    rank that asked for card 3 bound card 0 -- silently, in the direction that does not raise.
+
+    Tested without torch: what is under test is the reading, and a test that imports torch to check
+    it would skip on exactly the hosts where the string route is the one that runs.
+    """
+    assert device_index(None) == -1
+    assert device_index(-1) == -1
+    assert device_index(0) == 0
+    assert device_index(2) == 2
+    assert device_index(3) == 3
+    assert device_index("cpu") == -1
+    assert device_index("cuda") == 0
+    assert device_index("cuda:0") == 0
+    assert device_index("cuda:3") == 3
+    with pytest.raises(TypeError):
+        device_index(True)
+
+
+def test_a_torch_device_is_read_the_same_way():
+    """`torch.device` carries the index as an attribute rather than in its text, which is why the
+    attribute branch exists at all."""
+    torch = pytest.importorskip("torch")
+    assert device_index(torch.device("cpu")) == -1
+    assert device_index(torch.device("cuda")) == 0
+    assert device_index(torch.device("cuda", 3)) == 3
 
 
 def test_a_run_hands_over_one_token_per_step():
