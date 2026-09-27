@@ -185,15 +185,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("pytest_args", nargs="*", help="extra arguments passed through to pytest")
     args = parser.parse_args(argv)
 
-    baseline = (
-        parse_baseline(BASELINE_PATH.read_text(encoding="utf-8"))
-        if BASELINE_PATH.exists()
-        else {}
-    )
-    if not baseline and not args.update:
-        # An empty baseline is the state a fresh checkout would be in if the file were lost, and it
-        # would report every known failure as new. That is a loud enough failure to be worth its own
-        # message rather than a wall of node ids.
+    present = BASELINE_PATH.exists()
+    baseline = parse_baseline(BASELINE_PATH.read_text(encoding="utf-8")) if present else {}
+    if not present and not args.update:
+        # A *missing* file cannot be told apart from a file that lost its entries, and a checkout
+        # without one would report every known failure as new -- a wall of node ids in place of the
+        # one fact that matters. An *empty* file is the opposite: it is the state this host is in,
+        # it says so in its own header, and the check has nothing to report because there is
+        # nothing failing. Reading the two as one made the tool refuse to run in the state the tree
+        # was deliberately left in.
         raise SystemExit(f"{BASELINE_PATH} is missing; run with --update to record it")
     observed = (
         dict(json.loads(args.observed.read_text(encoding="utf-8")))
