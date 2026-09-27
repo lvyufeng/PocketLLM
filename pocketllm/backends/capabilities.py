@@ -214,14 +214,28 @@ def refused(reason: str) -> Identification:
     return Identification(Verdict.REFUSED, reason)
 
 
-#: The ``backend_options`` keys every launch carries and no adapter has a use for.
+#: The ``backend_options`` keys every launch carries and no *model* options parser has a use for.
 #:
 #: The CLI fills in ``engine_kind``, ``routed_experts_device`` and ``pd_mode`` on every serve
 #: command and the supervisor adds ``nccl_id_path`` for a sharded one, so all four arrive whether or
 #: not the selected adapter reads them. Accepting them is what makes one launch command line work
 #: for every backend. Every *other* unknown key is a refusal, because a tuning option that silently
 #: does nothing is how a run ends up measured on the wrong lever.
-IGNORED_OPTIONS = frozenset({"engine_kind", "routed_experts_device", "pd_mode", "nccl_id_path"})
+#:
+#: ``enable_batching`` and ``scheduler_timeout_ms`` are carried for the same reason and are *not*
+#: ignored: `SchedulerHost` reads both, and they decide whether this runtime joins the shared
+#: scheduler and how long it waits on it. They are here so a launch can name them without the model
+#: option parser refusing them as unknown, which is the treatment every other key still gets.
+IGNORED_OPTIONS = frozenset(
+    {
+        "engine_kind",
+        "routed_experts_device",
+        "pd_mode",
+        "nccl_id_path",
+        "enable_batching",
+        "scheduler_timeout_ms",
+    }
+)
 
 
 @dataclass(frozen=True)
