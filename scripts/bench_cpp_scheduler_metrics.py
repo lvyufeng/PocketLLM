@@ -114,18 +114,21 @@ class _Sampler(threading.Thread):
         self.url = f"http://127.0.0.1:{port}/metrics"
         self.interval = interval
         self.samples: list[dict[str, float]] = []
-        self._stop = threading.Event()
+        # Not `self._stop`: `threading.Thread` has a private `_stop` of its own that `join()` calls
+        # on the way to reaping the thread, so an attribute of that name shadows a method and
+        # `join()` dies with "'Event' object is not callable".
+        self._done = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._done.is_set():
             try:
                 self.samples.append(scrape(self.url))
             except Exception:
                 pass
-            self._stop.wait(self.interval)
+            self._done.wait(self.interval)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._done.set()
         self.join(timeout=5.0)
 
     def peak(self, name: str) -> float:
