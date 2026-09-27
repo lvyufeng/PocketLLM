@@ -137,6 +137,11 @@ directory and is never removed by PocketLLM.
 The built-in supervisor currently works with the Torch backend by reusing its existing NCCL/Gloo
 worker loop, and with the V4.1 adapter, which builds its own ranks the same way — rank 0 loads
 inside the rendezvous window, because a V4.1 backend handed back unloaded would find the group gone.
+A rank it starts runs **one program**, `pocketllm/backends/worker.py`, whichever runtime it is
+serving: what tells it which one is `POCKETLLM_WORKER_BACKEND`, set from the `WORKERS` registry, and
+the two things that still differ per runtime are the adapter to import and whether the checkpoint is
+already loaded when the adapter is constructed. Adding a runtime therefore means adding a
+`WorkerSpec` entry rather than writing a second worker script.
 The Python C++ Qwen adapter does not yet expose a native worker entry point, so
 `backend="cpp"` must use the legacy `pocketllm_engine` launcher or opt out with
 `--no-tensor-parallel-supervisor`. Existing `torchrun` and manual rank launchers remain compatible

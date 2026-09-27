@@ -312,7 +312,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
         self._model: Any = None
         self._cache: Any = None
         self._prefix_cache: Any = None
-        self._cache_metrics: dict[str, float] = {}
         self._device = self._options.device or str(getattr(args, "device", "") or "cuda")
         self._heads = 0
         self._request_lock = threading.RLock()
@@ -615,20 +614,6 @@ class Xing4Backend(SchedulerHost, BackendBase):
             # what makes the two readable as one scheduler rather than as two servers that happen
             # to agree.
             **self.scheduler_metrics(),
-        }
-
-    def _publish_cache_metrics(self) -> None:
-        cache = self._prefix_cache
-        if cache is None:
-            return
-        stats = cache.stats()
-        self._cache_metrics = {
-            "prefix_cache_hits_total": float(stats["hits"]),
-            "prefix_cache_misses_total": float(stats["misses"]),
-            "prefix_cache_reused_tokens_total": float(stats["reused_tokens"]),
-            "prefix_cache_entries": float(stats["entries"]),
-            "prefix_cache_bytes": float(stats["bytes"]),
-            "prefix_cache_budget_bytes": float(stats["budget_bytes"]),
         }
 
     # -------------------------------------------------------------------- requests

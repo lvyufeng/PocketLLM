@@ -16,7 +16,7 @@ import os
 import pytest
 
 from pocketllm.api import EngineArgs
-from pocketllm.backends import factory
+from pocketllm.backends import factory, worker
 from pocketllm.backends.base import BackendBase
 
 
@@ -103,10 +103,11 @@ def test_rank_zero_is_supervised_with_a_v41_worker_command(supervised):
     config = supervised.instances[0].config
     assert config.world_size == 4
     assert config.child_ranks == (1, 2, 3)
-    # The children run the V4.1 worker, not the native one: the two build different
-    # adapters and a mismatch is a group that never forms.
-    assert config.command[2] == factory._v41_worker_script()
-    assert "V41Backend" in config.command[2]
+    # The children run the one worker program; which runtime that is travels in the
+    # environment, because the program is the same for all of them. A child told the
+    # native runtime would build a different adapter under the same process group.
+    assert config.command[2] == worker.program()
+    assert config.env["POCKETLLM_WORKER_BACKEND"] == "v41"
 
 
 def test_rank_zero_loads_inside_the_rendezvous_it_was_given(supervised):
@@ -151,22 +152,25 @@ def test_single_rank_v41_is_not_supervised(supervised):
     assert backend.prepared == 0
 
 
-def test_v41_worker_script_rebuilds_the_same_engine():
-    script = factory._v41_worker_script()
+def test_the_v41_worker_entry_names_the_v41_adapter():
+    """The registry entry is what the child imports, so a wrong one is a wrong model.
 
-    # Rank comes from the supervisor's assignment, matching the native worker.
-    assert 'actual_rank = int(os.environ.get("TP_RANK", "0"))' in script
-    assert 'backend="v41"' in script
-    # Readiness is announced from the worker loop, after the group is joined and the
-    # checkpoint is loaded -- not from a bare print at import time.
-    assert "run_worker(" in script
-    assert "on_ready=lambda: print(f\"POCKETLLM_RANK_READY rank={actual_rank}\"" in script
+    Readiness is not asserted here: it is a property of the *program* and is the same for
+    every runtime, and it is pinned in ``tests/test_worker_program.py`` where the program
+    itself is under test.
+    """
+    spec = worker.WORKERS["v41"]
+
+    assert spec.entry_point.endswith(":V41Backend")
+    # The adapter joins the group and loads inside run_worker, so it cannot announce itself
+    # at construction.
+    assert spec.ready_at_construction is False
 
 
 def test_v41_worker_env_carries_the_paths_rank_zero_resolved(tmp_path):
     """A rank that resolves its own tokenizer or config loads a different model."""
     args = _args(config_path=str(tmp_path / "config.json"), tokenizer_path=str(tmp_path / "tok"))
-    env = factory._worker_env(args)
+    env = factory._worker_env(args, "v41")
 
     assert env["POCKETLLM_CONFIG_PATH"] == str(tmp_path / "config.json")
     assert env["POCKETLLM_TOKENIZER_PATH"] == str(tmp_path / "tok")
@@ -176,7 +180,7 @@ def test_v41_worker_env_carries_the_paths_rank_zero_resolved(tmp_path):
 
 
 def test_v41_worker_env_blanks_a_path_rank_zero_never_set():
-    env = factory._worker_env(_args())
+    env = factory._worker_env(_args(), "v41")
 
     assert env["POCKETLLM_CONFIG_PATH"] == ""
     assert env["POCKETLLM_TOKENIZER_PATH"] == ""

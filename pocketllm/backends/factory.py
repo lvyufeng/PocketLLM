@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -20,6 +19,7 @@ from .cpp_backend import CppBackend
 from .mimo_backend import MimoBackend
 from .torch_backend import TorchBackend
 from .v41_backend import V41Backend
+from .worker import WORKERS, program
 from .xing4_backend import Xing4Backend
 
 
@@ -120,7 +120,7 @@ def create_backend(args: EngineArgs, **injected: Any):
 
             return _supervise_rank_zero(
                 args,
-                worker_script=_v41_worker_script(),
+                worker="v41",
                 build=build,
                 torch_rendezvous=True,
             )
@@ -150,7 +150,7 @@ def create_backend(args: EngineArgs, **injected: Any):
 
             return _supervise_rank_zero(
                 args,
-                worker_script=_mimo_worker_script(),
+                worker="mimo",
                 build=build,
                 torch_rendezvous=True,
             )
@@ -165,7 +165,7 @@ def create_backend(args: EngineArgs, **injected: Any):
             )
 
         if _needs_supervision(args, injected):
-            return _supervise_rank_zero(args, worker_script=_worker_script(), build=build)
+            return _supervise_rank_zero(args, worker="cpp", build=build)
         return build(args)
     raise BackendUnavailableError(f"unsupported backend {selected!r}")
 
@@ -189,7 +189,7 @@ def _needs_supervision(args: EngineArgs, injected: Mapping[str, Any]) -> bool:
 def _supervise_rank_zero(
     args: EngineArgs,
     *,
-    worker_script: str,
+    worker: str,
     build: Callable[[EngineArgs], Any],
     torch_rendezvous: bool = False,
 ) -> Any:
@@ -203,7 +203,13 @@ def _supervise_rank_zero(
     environment into the next ``create_backend`` call is what makes a second engine
     conclude it is already supervised, skip spawning, and then block forever in a
     rendezvous waiting for ranks nobody started.
+
+    ``worker`` is a key of :data:`~pocketllm.backends.worker.WORKERS`, and it is the whole of
+    what a child is told about which runtime it is: the same program runs for all of them and
+    the name arrives in the environment, which is the channel the children have anyway.
     """
+    if worker not in WORKERS:
+        raise BackendUnavailableError(f"no worker program for backend {worker!r}")
     from ..supervisor import TensorParallelConfig, TensorParallelSupervisor
 
     supervisor = TensorParallelSupervisor(
@@ -211,10 +217,10 @@ def _supervise_rank_zero(
             # Rank 0 remains in the parent process, while the supervisor owns the remaining
             # actual TP ranks.  Keep the full world size in child environments so NCCL sees
             # the same group as rank 0, including the TP2 case with one child.
-            command=(sys.executable, "-c", worker_script),
+            command=(sys.executable, "-c", program()),
             world_size=args.tensor_parallel_size,
             child_ranks=tuple(range(1, args.tensor_parallel_size)),
-            env=_worker_env(args),
+            env=_worker_env(args, worker),
         )
     )
     supervisor.start()
@@ -292,15 +298,21 @@ def _worker_arg_overrides(args: EngineArgs) -> dict[str, Any]:
     return {name: getattr(args, name) for name in _WORKER_SHARED_ARGS}
 
 
-def _worker_env(args: EngineArgs) -> dict[str, str]:
+def _worker_env(args: EngineArgs, worker: str) -> dict[str, str]:
     """The environment a worker rank needs to rebuild rank 0's engine.
 
-    The two trailing path variables are read by the V4.1 worker only: its adapter
-    resolves the tokenizer and the config by path, and a rank that resolved a
-    different one would load a different model under the same process group.  The
-    native worker ignores them because its adapter reads neither.
+    Every rank is handed the same variables, whichever runtime it is serving.  The two trailing
+    path variables are read by the runtimes that resolve a tokenizer or a config by path -- a rank
+    that resolved a different one would load a different model under the same process group --
+    and ignored by the ones that read neither.  Selecting them per runtime here would be a second
+    place that has to know which runtime reads what, and the first is
+    :data:`~pocketllm.backends.worker.WORKERS`.
+
+    ``POCKETLLM_WORKER_BACKEND`` is what tells the one child program which runtime it is; it comes
+    from the registry key rather than from ``args.backend``, which may have been ``auto``.
     """
     return {
+        "POCKETLLM_WORKER_BACKEND": worker,
         "POCKETLLM_CHECKPOINT": args.checkpoint_dir,
         "POCKETLLM_TP_SIZE": str(args.tensor_parallel_size),
         "POCKETLLM_MAX_MODEL_LEN": str(args.max_model_len or 8192),
@@ -318,161 +330,4 @@ def _restore_env(name: str, previous: str | None) -> None:
         os.environ.pop(name, None)
     else:
         os.environ[name] = previous
-
-
-def _worker_script() -> str:
-    """Generate Python code for worker processes (actual TP ranks 1, 2, ...).
-
-    Rank 0 stays in the parent process. The supervisor assigns each child its
-    actual TP rank, so the worker environment already matches the NCCL group.
-    """
-    return """
-import os
-import json
-from pocketllm import EngineArgs
-from pocketllm.backends.cpp_backend import CppBackend
-
-# Get the actual rank assigned by the supervisor. Rank 0 belongs to the
-# parent process; child TP ranks start at 1.
-actual_rank = int(os.environ.get("TP_RANK", "0"))
-
-tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
-checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
-nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
-max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
-kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
-backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
-# Fields rank 0 resolved; a default here would desynchronize the collectives.
-shared_args = json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}"))
-
-# Add NCCL ID to backend options
-backend_options["nccl_id_path"] = nccl_id_path
-
-# Create EngineArgs for this worker rank
-args = EngineArgs(
-    model=checkpoint,
-    backend="cpp",
-    tensor_parallel_size=tp_size,
-    tensor_parallel_rank=actual_rank,
-    max_model_len=max_model_len,
-    kv_cache_dtype=kv_cache_dtype,
-    backend_options=backend_options,
-    **shared_args,
-)
-
-# Create backend and enter worker loop
-backend = CppBackend(args)
-print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
-backend.run_worker(on_ready=None)
-"""
-
-
-def _mimo_worker_script() -> str:
-    """Generate Python code for a MiMo worker rank (actual TP ranks 1, 2, ...).
-
-    Rank 0 stays in the parent process.  Like the V4.1 worker, this one joins the process group
-    and attaches the expert bank inside ``run_worker`` rather than at construction, so readiness is
-    announced from there -- the bank attach ends in a barrier rank 0 is already waiting at, and
-    "constructed" is not a state worth announcing.
-    """
-    return """
-import os
-import json
-from pocketllm import EngineArgs
-from pocketllm.backends.mimo_backend import MimoBackend
-
-# Get the actual rank assigned by the supervisor. Rank 0 belongs to the
-# parent process; child TP ranks start at 1.
-actual_rank = int(os.environ.get("TP_RANK", "0"))
-
-tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
-checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
-nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
-max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
-kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
-backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
-# Fields rank 0 resolved; a default here would desynchronize the collectives.
-shared_args = json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}"))
-tokenizer_path = os.environ.get("POCKETLLM_TOKENIZER_PATH") or None
-
-# Add NCCL ID to backend options
-backend_options["nccl_id_path"] = nccl_id_path
-
-# Create EngineArgs for this worker rank
-args = EngineArgs(
-    model=checkpoint,
-    backend="mimo",
-    tensor_parallel_size=tp_size,
-    tensor_parallel_rank=actual_rank,
-    max_model_len=max_model_len,
-    kv_cache_dtype=kv_cache_dtype,
-    backend_options=backend_options,
-    tokenizer_path=tokenizer_path,
-    **shared_args,
-)
-
-# Construct and enter the worker loop.  The group is joined, the bank attached and the tree
-# built inside run_worker, so readiness is announced from there.
-backend = MimoBackend(args)
-backend.run_worker(
-    on_ready=lambda: print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
-)
-"""
-
-
-def _v41_worker_script() -> str:
-    """Generate Python code for a V4.1 worker rank (actual TP ranks 1, 2, ...).
-
-    Rank 0 stays in the parent process.  Unlike the native worker, this one does not
-    print its readiness marker before entering the loop: ``run_worker`` joins the
-    process group first and loads the checkpoint second, and the load ends in a
-    barrier rank 0 is already waiting at, so "constructed" is not a state worth
-    announcing.  The marker is emitted from ``on_ready``, which runs once the rank
-    has actually loaded and can serve.
-    """
-    return """
-import os
-import json
-from pocketllm import EngineArgs
-from pocketllm.backends.v41_backend import V41Backend
-
-# Get the actual rank assigned by the supervisor. Rank 0 belongs to the
-# parent process; child TP ranks start at 1.
-actual_rank = int(os.environ.get("TP_RANK", "0"))
-
-tp_size = int(os.environ["POCKETLLM_TP_SIZE"])
-checkpoint = os.environ["POCKETLLM_CHECKPOINT"]
-nccl_id_path = os.environ["POCKETLLM_NCCL_ID_PATH"]
-max_model_len = int(os.environ.get("POCKETLLM_MAX_MODEL_LEN", "8192"))
-kv_cache_dtype = os.environ.get("POCKETLLM_KV_CACHE_DTYPE", "auto")
-backend_options = json.loads(os.environ.get("POCKETLLM_BACKEND_OPTIONS", "{}"))
-# Fields rank 0 resolved; a default here would desynchronize the collectives.
-shared_args = json.loads(os.environ.get("POCKETLLM_WORKER_ARGS", "{}"))
-config_path = os.environ.get("POCKETLLM_CONFIG_PATH") or None
-tokenizer_path = os.environ.get("POCKETLLM_TOKENIZER_PATH") or None
-
-# Add NCCL ID to backend options
-backend_options["nccl_id_path"] = nccl_id_path
-
-# Create EngineArgs for this worker rank
-args = EngineArgs(
-    model=checkpoint,
-    backend="v41",
-    tensor_parallel_size=tp_size,
-    tensor_parallel_rank=actual_rank,
-    max_model_len=max_model_len,
-    kv_cache_dtype=kv_cache_dtype,
-    backend_options=backend_options,
-    config_path=config_path,
-    tokenizer_path=tokenizer_path,
-    **shared_args,
-)
-
-# Construct and enter the worker loop.  The group is joined and the checkpoint
-# loaded inside run_worker, so readiness is announced from there.
-backend = V41Backend(args)
-backend.run_worker(
-    on_ready=lambda: print(f"POCKETLLM_RANK_READY rank={actual_rank}", flush=True)
-)
-"""
 
