@@ -127,9 +127,14 @@ exactly 32 completion tokens with `finish_reason=length`.
 | vLLM `max_num_seqs=1` | 0.887 | 36.09 | pass |
 
 Batch mode was **0.833x** of the serial wall time on PocketLLM (17% faster) and
-**1.046x** on vLLM (5% slower). On PocketLLM the batch arm also reuses the prompt
-prefix across the slots it allocates, so part of that 17% is cache reuse rather than
-scheduling; treat it as a smoke bound, not a permanent gain.
+**1.046x** on vLLM (5% slower). The PocketLLM row is a smoke bound in the other direction from what
+this page first said about it: a lone request through the batch path is now measured *slower*, not
+faster, and the reason originally offered here (that the batch arm reuses the prompt prefix across
+the slots it allocates) is contradicted by the scheduler's own prefill path, which does not consult
+the prefix cache at all — see [What the width costs a lone request](#what-the-width-costs-a-lone-request).
+So this row is unexplained rather than explained: it is a native-server measurement with a warmup
+round whose two arms are not known to have paid for the same work, and it should not be read as a
+claim that batching makes a lone request faster.
 
 #### Concurrent non-streaming requests
 
@@ -211,6 +216,62 @@ were run on PocketLLM only.
 The reduced harness smoke additionally passed the same cases with a four-layer
 model, confirming the test's lifecycle and cleanup behavior independently of the
 full-depth timing run.
+
+### What the width costs a lone request
+
+The batch path is the `cpp` backend's default, and the scheduler runs its width's rows whether or not
+that many requests are present, so a lone request pays for the width it was given. That cost was
+misread twice before it was measured properly — once as ~10% and once, in the native-server table
+above, as a 17% *gain* — because the serial and batch arms were not paying for the same work. The
+serialized session resumes a repeated prompt from its per-slot cache; the scheduler does not.
+
+Measured on `/mnt/data2/Qwen3.8-27B-FP8`, TP4, four RTX 2080 Ti, through the Python adapter
+(`EngineArgs(backend="cpp")`), a 16-token prompt, 32 greedy tokens, five runs per arm, one arm per
+process. Prefix caching is left at its default, on. *Cold* means every measured run used a prompt the
+process had never forwarded; *repeated* means one prompt, served once to warm the cache and then
+measured. Wall seconds, mean of five:
+
+| Arm | Cold wall | Repeated-prompt wall | Prefill (cold) | Decode |
+|---|---:|---:|---:|---:|
+| serialized session | 1.0435 | 0.7032 | a cache resume | 22.0 ms/step |
+| batch, width 2 | 1.2180 | 1.1010 | 344.72 ms | 24.11 ms/step |
+| batch, width 8 | 1.2300 | 1.1108 | 380.69 ms | 26.51 ms/step |
+
+The serialized session's split is not reported from that path (its native `generate()` runs its own
+loop and gives no first-token boundary), so its decode figure is its own repeated-prompt wall divided
+by 32 — with the resume costing nothing, that wall is all decode.
+
+| Comparison | Cold, like for like | Repeated prompt, as a served client sees it |
+|---|---:|---:|
+| width 2 / serial | **1.167x** | 1.566x |
+| width 8 / serial | **1.179x** | 1.580x |
+
+The cold column is the width's own cost: ~17-18% wall, of which about ten points is decode
+(24.11 against 22.0 ms/step at width 2). The repeated-prompt column is much larger because of the
+second finding, which is the more important one:
+
+**The batch scheduler does not consult the prefix cache.** Six consecutive submissions of the
+identical 16-token prompt, through one scheduler, each reported `prefill_seconds` of 343.10, 344.74,
+344.58, 343.80, 344.37 and 343.72 ms — a full prefill every time, with no reuse of the five that came
+before it. A 32-token prompt that extends that one by 16 tokens cost 371.03 ms, i.e. all 32 tokens,
+not the 16 it did not already have. The mechanism is where the call lands:
+`BatchScheduler::run_prefill_batch` issues `QwenEngine::batch_prefill`
+(`cpp_engine/engine/batch_scheduler.cpp:375`, `cpp_engine/engine/qwen_engine.cpp:5442`), and the live
+resume, the device-resident snapshot restore and the paged global cache are all in
+`QwenEngine::prefill` (`cpp_engine/engine/qwen_engine.cpp:5888`), which that path does not enter. The
+global cache would also need `--backend-option kv_paged=true`, since `global_prefix_enabled()`
+requires a block pool, and paging is off by default. So turning the batch path on by default takes
+prefix reuse away from a client that had it, and the deployment most affected is the one the Qwen
+guide recommends — a long-lived single-concurrency stream extending its own prefix.
+
+The width is still worth having. On the real CLI (`pocketllm serve --backend cpp`, Bonsai 2 27B
+GGUF, TP1, two distinct prompts, 32 tokens each, greedy), two concurrent requests took 2.094 s and
+returned 64 tokens through the default arm — **30.57 aggregate tok/s** — against 2.497 s and
+**25.63** through `--no-enable-batching`: 1.19x the aggregate rate, with an overlap factor of 1.98
+(a serialized pair would read 1.00). Both requests in the batch arm finished within 39 ms of each
+other, which is the fair-scheduling signature the serialized queue does not have. That A/B is a
+smoke measurement at one concurrency level, not a ladder; the ladder with the true multi-row decode
+behind it is the native-server table above.
 
 ### Single-request long-context A/B
 
