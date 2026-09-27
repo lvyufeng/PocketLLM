@@ -14,324 +14,75 @@ from typing import Any, Iterator
 
 from pocketllm.api import BackendUnavailableError, EngineArgs, UnsupportedFeatureError
 
-from .cpp_backend import CppBackend, gguf_is_servable
+from . import capabilities
+from .capabilities import runtime_capabilities
+from .cpp_backend import CppBackend
 from .mimo_backend import MimoBackend
 from .torch_backend import TorchBackend
 from .v41_backend import V41Backend
 from .xing4_backend import Xing4Backend
 
 
-_QWEN35_TYPES = {"qwen3_5", "qwen3_5_text"}
-_V41_TYPES = {"deepseek_v41", "deepseek_v41_text"}
-_MIMO_TYPES = {"mimo_v2", "mimo_v2_text"}
-_XING4_TYPES = {"xing4_0", "xing4_0_text"}
+# ---------------------------------------------------------------------------------------------
+# Selection
+# ---------------------------------------------------------------------------------------------
 
 
-def _config_path(path: str, explicit: str | None = None) -> Path:
-    candidate = Path(explicit) if explicit else Path(path) / "config.json"
-    if candidate.is_dir():
-        candidate = candidate / "config.json"
-    return candidate
+def _refuse_a_capability_the_runtime_lacks(name: str, args: EngineArgs) -> None:
+    """Refuse a request for something the runtime does not declare, before anything loads.
 
+    The one instance so far, and it is the one that motivated the declaration: the CLI accepts
+    ``--max-batch-size`` and ``--enable-batching`` on every backend, and on a runtime with no
+    scheduler they used to be read by nothing. A width is a request for concurrency; a runtime that
+    declares ``supports_batch=False`` cannot deliver it, and the refusal costs a process start
+    rather than a model load.
 
-def _read_config(path: str, explicit: str | None = None) -> dict[str, Any] | None:
-    try:
-        config = _config_path(path, explicit)
-        if not config.is_file():
-            return None
-        with config.open(encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _is_qwen35_config(config: dict[str, Any]) -> bool:
-    def is_qwen35(value: Any) -> bool:
-        return str(value or "").lower() in _QWEN35_TYPES
-
-    if is_qwen35(config.get("model_type")):
-        return True
-    architectures = config.get("architectures", ())
-    if isinstance(architectures, (list, tuple)):
-        if any("qwen3_5" in str(item).lower() for item in architectures):
-            return True
-    nested = config.get("text_config")
-    return isinstance(nested, dict) and _is_qwen35_config(nested)
-
-
-def _looks_like_qwen35(path: str, config_path: str | None = None) -> bool:
-    config = _read_config(path, config_path)
-    return config is not None and _is_qwen35_config(config)
-
-
-def _is_v41_config(config: dict[str, Any]) -> bool:
-    """Whether a config describes DeepSeek-V4.1-Flash.
-
-    The released checkpoint nests its text stack, so ``model_type`` is
-    ``deepseek_v41`` at the root and ``deepseek_v41_text`` inside
-    ``text_config`` -- the same shape ``_is_qwen35_config`` walks, and for the
-    same reason: a wrapper config is still the architecture.
+    The width and the flag are checked separately because they are two different asks: a width
+    above 1 is a request for rows, and ``--enable-batching`` on its own is a request for the batch
+    *path* even at width 1. Only the second is why the flag exists rather than the width alone.
     """
-
-    def is_v41(value: Any) -> bool:
-        return str(value or "").lower() in _V41_TYPES
-
-    if is_v41(config.get("model_type")):
-        return True
-    architectures = config.get("architectures", ())
-    if isinstance(architectures, (list, tuple)):
-        if any("deepseekv41" in str(item).lower() for item in architectures):
-            return True
-    nested = config.get("text_config")
-    return isinstance(nested, dict) and _is_v41_config(nested)
-
-
-def _looks_like_v41(path: str, config_path: str | None = None) -> bool:
-    config = _read_config(path, config_path)
-    return config is not None and _is_v41_config(config)
-
-
-def _is_mimo_config(config: dict[str, Any]) -> bool:
-    """Whether a config describes MiMo-V2.6-Flash.
-
-    Unlike V4.1's, this checkpoint's text stack is not nested: ``model_type`` and
-    ``architectures`` are at the root and describe the language model, with the vision and audio
-    towers under their own keys. The nested walk is here anyway because a wrapper config is still
-    the architecture, and a MiMo release under someone else's multimodal wrapper should not stop
-    being a MiMo release.
-    """
-
-    def is_mimo(value: Any) -> bool:
-        return str(value or "").lower() in _MIMO_TYPES
-
-    if is_mimo(config.get("model_type")):
-        return True
-    architectures = config.get("architectures", ())
-    if isinstance(architectures, (list, tuple)):
-        if any("mimov2" in str(item).lower() for item in architectures):
-            return True
-    nested = config.get("text_encoder_config") or config.get("text_config")
-    return isinstance(nested, dict) and _is_mimo_config(nested)
-
-
-def _looks_like_mimo(path: str, config_path: str | None = None) -> bool:
-    config = _read_config(path, config_path)
-    return config is not None and _is_mimo_config(config)
-
-
-def _is_xing4_config(config: dict[str, Any]) -> bool:
-    """Whether a config describes Xing4.0-29B-A4B.
-
-    The released checkpoint is not nested and its ``model_type`` is the name the
-    GGUF's own ``general.architecture`` carries, so the two artifacts the release
-    ships are recognized by the same string.
-    """
-
-    def is_xing4(value: Any) -> bool:
-        return str(value or "").lower() in _XING4_TYPES
-
-    if is_xing4(config.get("model_type")):
-        return True
-    architectures = config.get("architectures", ())
-    if isinstance(architectures, (list, tuple)):
-        if any("xing4" in str(item).lower() for item in architectures):
-            return True
-    nested = config.get("text_config")
-    return isinstance(nested, dict) and _is_xing4_config(nested)
-
-
-def _xing4_gguf_architecture(path: str) -> str:
-    """``general.architecture`` out of a GGUF, or the empty string.
-
-    Read rather than assumed: the file the launcher points at may be any GGUF, so
-    this is what separates "a Xing4 export" from "a file ending in .gguf".  A
-    header that cannot be parsed returns nothing and the caller falls through to
-    the next adapter -- the native reader reports the precise error when it is the
-    one that ends up with the file.
-    """
-    try:
-        candidate = Path(path)
-        if candidate.is_dir():
-            found = sorted(candidate.glob("*.gguf"))
-            if len(found) != 1:
-                return ""
-            candidate = found[0]
-        if not candidate.is_file() or candidate.suffix.lower() != ".gguf":
-            return ""
-        from src.loader.gguf.bundle import read_gguf_bundle
-
-        metadata = read_gguf_bundle(candidate).metadata
-        return str(metadata.get("general.architecture") or "")
-    except Exception:
-        return ""
-
-
-def _looks_like_xing4(path: str, config_path: str | None = None) -> bool:
-    config = _read_config(path, config_path)
-    if config is not None:
-        return _is_xing4_config(config)
-    return _xing4_gguf_architecture(path) == "xing4_0"
-
-
-def _xing4_model_supported(args: EngineArgs) -> bool:
-    """Whether the requested checkpoint is one the Xing4 adapter can read.
-
-    Either artifact qualifies: the GPTQ export's ``config.json`` says
-    ``xing4_0``, and the GGUF's header says the same in
-    ``general.architecture``.
-    """
-    if str(args.model_format).lower() == "safetensors":
-        return False
-    return _looks_like_xing4(args.checkpoint_dir, args.config_path)
-
-
-def _reject_unsupported_xing4_checkpoint(args: EngineArgs) -> None:
-    """Fail fast for a checkpoint the Xing4 adapter provably cannot serve."""
-    if not _looks_like_xing4(args.checkpoint_dir, args.config_path):
-        raise UnsupportedFeatureError(
-            "backend='xing4' serves Xing4.0-29B-A4B checkpoints only: a directory whose "
-            "config.json says model_type=xing4_0, or a .gguf whose general.architecture is"
-            " xing4_0"
-        )
-
-
-def _checkpoint_has_gguf(path: str) -> bool:
-    """Return whether the requested checkpoint is visibly a GGUF model."""
-    try:
-        candidate = Path(path)
-        if candidate.is_file():
-            return candidate.suffix.lower() == ".gguf"
-        if not candidate.is_dir():
-            return False
-        return any(candidate.glob("*.gguf"))
-    except OSError:
-        return False
-
-
-def _cpp_model_supported(args: EngineArgs) -> bool:
-    if _requested_gguf(args):
-        return gguf_is_servable(args.checkpoint_dir)
-    return _looks_like_qwen35(args.checkpoint_dir, args.config_path)
-
-
-def _requested_gguf(args: EngineArgs) -> bool:
-    """Whether the caller is pointing at a GGUF, by declaration or by shape."""
-    return args.model_format == "gguf" or (
-        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
+    if runtime_capabilities(name).supports_batch:
+        return
+    asked: list[str] = []
+    if args.max_batch_size > 1:
+        asked.append(f"--max-batch-size {args.max_batch_size}")
+    if args.enable_batching:
+        asked.append("--enable-batching")
+    if not asked:
+        return
+    raise UnsupportedFeatureError(
+        f"backend={name!r} declares supports_batch=False: it runs one request at a time, so "
+        f"{' and '.join(asked)} asks for concurrency it cannot deliver. Drop "
+        f"{'that' if len(asked) == 1 else 'those'}, or use backend='cpp', which owns the batch "
+        f"scheduler"
     )
 
 
-def _reject_unsupported_cpp_checkpoint(args: EngineArgs) -> None:
-    """Fail fast for checkpoints the native adapter provably cannot serve.
-
-    A missing or unreadable path is left alone so injected engines and unusual
-    layouts still reach the native loader, which reports the precise error.
-    """
-    if _requested_gguf(args):
-        # The native reader opens one GGUF file and the registry routes it to the
-        # Qwen3.5 engine, so a GGUF is servable when both of those hold: one
-        # file, and `general.architecture` a name that engine claims. Anything
-        # else -- shards, a directory of two models, another architecture -- is
-        # refused here rather than at the loader, because the reason is about the
-        # checkpoint format and the refusal is what tells the caller which
-        # backend to ask for instead.
-        if not gguf_is_servable(args.checkpoint_dir):
-            raise UnsupportedFeatureError(
-                "the native C++ adapter serves the Qwen3.5 GGUF export, as a "
-                "single .gguf file declaring general.architecture=qwen35; "
-                "other GGUF checkpoints must use backend='torch'"
-            )
-        return
-    config = _read_config(args.checkpoint_dir, args.config_path)
-    if config is not None and not _is_qwen35_config(config):
-        raise UnsupportedFeatureError(
-            "the native C++ adapter supports Qwen3.5 checkpoints only"
-        )
-
-
-def _v41_model_supported(args: EngineArgs) -> bool:
-    """Whether the requested checkpoint is one the V4.1 adapter can read."""
-    if args.model_format == "gguf":
-        return False
-    if args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir):
-        return False
-    return _looks_like_v41(args.checkpoint_dir, args.config_path)
-
-
-def _reject_unsupported_v41_checkpoint(args: EngineArgs) -> None:
-    """Fail fast for checkpoints the V4.1 adapter provably cannot serve.
-
-    A missing or unreadable path is left alone: the adapter reports the
-    unreadable checkpoint itself, and with the encoder it needs named.
-    """
-    if args.model_format == "gguf" or (
-        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
-    ):
-        raise UnsupportedFeatureError(
-            "backend='v41' reads the checkpoint's safetensors shards only; "
-            "a GGUF checkpoint must use backend='torch'"
-        )
-    config = _read_config(args.checkpoint_dir, args.config_path)
-    if config is not None and not _is_v41_config(config):
-        raise UnsupportedFeatureError(
-            "backend='v41' serves DeepSeek-V4.1-Flash checkpoints only"
-        )
-
-
-def _mimo_model_supported(args: EngineArgs) -> bool:
-    """Whether the requested checkpoint is one the MiMo adapter can read."""
-    if args.model_format == "gguf":
-        return False
-    if args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir):
-        return False
-    return _looks_like_mimo(args.checkpoint_dir, args.config_path)
-
-
-def _reject_unsupported_mimo_checkpoint(args: EngineArgs) -> None:
-    """Fail fast for checkpoints the MiMo adapter provably cannot serve.
-
-    A missing or unreadable path is left alone: the adapter reports the
-    unreadable checkpoint itself.
-    """
-    if args.model_format == "gguf" or (
-        args.model_format == "auto" and _checkpoint_has_gguf(args.checkpoint_dir)
-    ):
-        raise UnsupportedFeatureError(
-            "backend='mimo' reads the checkpoint's safetensors shards only; "
-            "a GGUF checkpoint must use backend='torch'"
-        )
-    config = _read_config(args.checkpoint_dir, args.config_path)
-    if config is not None and not _is_mimo_config(config):
-        raise UnsupportedFeatureError(
-            "backend='mimo' serves MiMo-V2.6-Flash checkpoints only"
-        )
-
-
 def select_backend(args: EngineArgs) -> str:
-    """Select a backend without silently changing an explicit user choice."""
+    """Select a backend without silently changing an explicit user choice.
+
+    Both questions -- which checkpoint is this, and can this runtime serve it -- are answered from
+    ``capabilities.RUNTIMES``. The two halves used to be four predicate functions plus four
+    ``_reject_unsupported_*`` bodies, which is two chances per adapter to disagree about which
+    checkpoints are its.
+    """
     if args.backend != "auto":
-        if args.backend == "cpp":
-            _reject_unsupported_cpp_checkpoint(args)
-        elif args.backend == "v41":
-            _reject_unsupported_v41_checkpoint(args)
-        elif args.backend == "mimo":
-            _reject_unsupported_mimo_checkpoint(args)
-        elif args.backend == "xing4":
-            _reject_unsupported_xing4_checkpoint(args)
+        refusal = capabilities.refusal(args.backend, args)
+        if refusal:
+            raise UnsupportedFeatureError(refusal)
+        _refuse_a_capability_the_runtime_lacks(args.backend, args)
         return args.backend
-    # The architecture-specific adapters before the native one, and the native one before the
-    # generic torch runtime: each reads a checkpoint the others cannot, and the order is the
-    # specificity of the reader.
-    if _v41_model_supported(args):
-        return "v41"
-    if _mimo_model_supported(args):
-        return "mimo"
-    if _xing4_model_supported(args):
-        return "xing4"
-    if CppBackend.native_available() and _cpp_model_supported(args):
-        return "cpp"
-    return "torch"
+    # `auto` asks a different question than the explicit path does: not "is this provably not
+    # yours" but "does this checkpoint identify you", so a checkpoint presenting no evidence falls
+    # through to the generic runtime rather than being routed on the strength of a backend being
+    # importable.
+    for name in capabilities.AUTO_ORDER:
+        if name == "cpp" and not CppBackend.native_available():
+            continue
+        if capabilities.identify(name, args).routes_here:
+            _refuse_a_capability_the_runtime_lacks(name, args)
+            return name
+    raise AssertionError("capabilities.AUTO_ORDER has no fallback")
 
 
 def create_backend(args: EngineArgs, **injected: Any):
