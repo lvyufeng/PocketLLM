@@ -179,12 +179,23 @@ There is no `conftest.py` and no pytest configuration; modules import from the r
 python -m pytest tests/ -q
 ```
 
-- `tests/test_gguf_q2_precision.py` fails at **collection**: it still imports `src.gguf.reader`,
-  which moved to `src/loader/gguf/reader.py`. A bare `python -m pytest tests/` aborts on it, so add
-  `--continue-on-collection-errors` to run the rest. Porting or deleting that module is the better
-  fix.
-- Modules that need a GPU, a real checkpoint, or a built `pocketllm_cpp` skip themselves via
-  `pytest.importorskip`. A skip is not a pass.
+`tests/README.md` is the suite's own documentation: what pytest collects and what it does not, the
+skip policy, the golden fixtures, and what CI does and does not run. Read it before changing how the
+suite is invoked.
+
+- **The suite is not green on `master`, and the known failures are recorded as a set of node ids** in
+  `tests/baseline_failures.txt`. Diff a run against it with
+  `python scripts/check_test_baseline.py` (`--update` to re-record). It is a set and not a count on
+  purpose: three tests fixed and one broken is a net improvement in a count and a regression in the
+  tree.
+- Modules that need a GPU, a real checkpoint, or a built extension **skip** themselves — and a skip
+  is not a pass. `tests/cuda_bindings.py::extension(requires=...)` is how a test asks for the op it
+  is about, so a binding this build does not export reads as a skip naming it rather than as an
+  `AttributeError` that looks like a broken test.
+- The **golden fixtures** in `tests/fixtures/golden/` are the only end-to-end claims: one real
+  request through one real entry point per backend, compared against recorded token ids. Record one
+  with `scripts/record_golden_fixture.py`.
 - **CI runs no tests.** `.github/workflows/publish-pypi.yml` builds and uploads a release, and
   `.github/workflows/pages.yml` builds the documentation site with `mkdocs build --strict`. No
-  workflow runs the pytest suite.
+  workflow runs the pytest suite, so the baseline check is a manual step and a gate only where
+  somebody runs it.

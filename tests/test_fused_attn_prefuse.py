@@ -3,19 +3,43 @@
 Compares fused_q_rmsnorm_rope_inplace + fused_kv_rope_actquant_inplace against
 the eager PyTorch reference (apply_rotary_emb + RMSNorm + blockfp8_act_quant).
 
-Run inside the deepseek conda env, e.g.:
-  CUDA_VISIBLE_DEVICES=0 conda run -n deepseek PYTHONPATH=$PWD/inference python tests/test_fused_attn_prefuse.py
+The kernels are loaded through a fixture rather than by `main()`, which is what makes this a
+test: the four functions below take `ext` and `device` as arguments, and a bare `main()` cannot
+supply them, so pytest used to report four *errors* -- "fixture 'ext' not found" -- for four
+functions that had never been given the chance to run. `ext` skips when the extension was not
+built with these kernels, and `device` skips when no card is visible, so the module reports a
+skip rather than an error on a host that cannot run it.
+
+Run directly, either way:
+
+  CUDA_VISIBLE_DEVICES=0 python -m pytest tests/test_fused_attn_prefuse.py -q
 """
 
 import math
 import os
 import sys
 import torch
+import pytest
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 from src.kernels.cuda_loader import load_cuda_kernel  # noqa: E402
 from src.kernels.ops import act_quant  # noqa: E402
 from src.models.deepseek_v4.runtime import apply_rotary_emb, precompute_freqs_cis, RMSNorm  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def device():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    return torch.device("cuda:0")
+
+
+@pytest.fixture(scope="module")
+def ext():
+    extension = load_cuda_kernel()
+    if not hasattr(extension, "fused_q_rmsnorm_rope_inplace"):
+        pytest.skip("extension was not rebuilt with fused attn prefuse kernels")
+    return extension
 
 
 def make_freqs(seqlen: int, rd: int, device):
@@ -158,6 +182,11 @@ def test_o_inv(ext, device, seed=0):
 
 
 def main():
+    """Retained for a one-off run outside pytest; the four tests are the instrument now.
+
+    It is not the entry point the suite uses -- `main()` cannot be collected, which is exactly how
+    these four kernels spent their life as collection errors.
+    """
     if not torch.cuda.is_available():
         print("CUDA not available; skipping.")
         return

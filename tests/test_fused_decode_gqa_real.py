@@ -1,9 +1,22 @@
 """
 Test fused decode GQA attention against real MiniMaxAttention forward pass.
+
+**The kernel this test is about is not compiled into this tree.** `src/csrc/fused_decode_gqa_attention.cu`
+defines `fused_decode_gqa_attention_cuda` and nothing binds it -- see
+`docs/guides/cuda_extension_builds.md`, which records the commit that added the source and this test
+without the build entry, so `cuda_mod.fused_decode_gqa_attention(...)` resolves on no tree. The test
+therefore skips, naming the missing binding, instead of failing with an `AttributeError` whose
+traceback points at the caller rather than at the build.
+
+The comparison itself is worth keeping: it is against the exact op sequence `MiniMaxAttention.__call__`
+runs, including the `repeat_interleave` a Turing card needs because `enable_gqa` is sm_80 and up. Wire
+the source into `setup.py` and this becomes a real test with no edit here.
 """
 import torch
 import torch.nn.functional as F
-from src.kernels.cuda_loader import load_cuda_kernel
+
+from tests.cuda_bindings import extension
+
 
 def test_against_minimax_attention():
     """Compare fused kernel against the exact ops MiniMaxAttention.__call__ does."""
@@ -49,7 +62,10 @@ def test_against_minimax_attention():
     )  # [B, Hq, 1, D]
 
     # Fused kernel
-    cuda_mod = load_cuda_kernel()
+    cuda_mod = extension(
+        requires=("fused_decode_gqa_attention",),
+        why="the source is on disk but not in setup.py's list; see docs/guides/cuda_extension_builds.md",
+    )
     out = cuda_mod.fused_decode_gqa_attention(q, k_new, v_new, cache_k, cache_v, start_pos, sm_scale)
 
     # Compare
