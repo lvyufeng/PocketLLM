@@ -283,6 +283,16 @@ private:
     std::atomic<bool> running_{true};
     std::thread schedule_thread_;
 
+    // The engine's device index, read once in the constructor rather than from
+    // the loop thread.  `engine_->device()` is a virtual call the loop cannot
+    // make safely: with a Python engine it crosses the language boundary and
+    // needs the GIL, and the thread that can hold a scheduler's GIL is the one
+    // about to join it -- `~QwenBatchScheduler` runs with the GIL held, so a
+    // loop still waiting for it makes the destructor a deadlock.  The
+    // constructor already calls into the engine on the constructing thread
+    // (`caps`, `allocate_batch_slots`), and that is where this belongs.
+    int engine_device_{-1};
+
     // Statistics
     std::atomic<int> total_completed_{0};
     std::atomic<int> total_cancelled_{0};

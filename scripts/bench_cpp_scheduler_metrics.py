@@ -162,6 +162,15 @@ def main() -> int:
         help="name=value, repeatable; passed through to the server as --backend-option",
     )
     parser.add_argument("--no-enable-batching", action="store_true")
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=900.0,
+        help="seconds to allow for readiness, given to the server's TP supervisor as well as "
+        "used here; a runtime that fills a resident expert bank on startup needs far more "
+        "than the supervisor's 300 s default, and the supervisor's is the one that fires "
+        "first -- it reports the ranks as missing while the fill is still running",
+    )
     parser.add_argument("--json-out", default="")
     args = parser.parse_args()
 
@@ -173,6 +182,7 @@ def main() -> int:
         "--tensor-parallel-size", str(args.tp),
         "--max-model-len", str(args.max_model_len),
         "--port", str(args.port),
+        "--tensor-parallel-startup-timeout", str(args.startup_timeout),
     ]
     for option in args.backend_option:
         command += ["--backend-option", option]
@@ -185,7 +195,7 @@ def main() -> int:
     started = time.perf_counter()
     process = subprocess.Popen(command, start_new_session=True)
     try:
-        wait_ready(args.port, process, time.perf_counter() + 900.0)
+        wait_ready(args.port, process, time.perf_counter() + args.startup_timeout)
         print(f"ready after {time.perf_counter() - started:.1f}s", flush=True)
 
         # One request first, so the model's lazy one-time work lands outside the measured group.

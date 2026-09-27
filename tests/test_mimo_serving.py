@@ -611,3 +611,103 @@ def test_a_worker_runs_the_payload_rank_zero_sent_key_for_key(group, monkeypatch
     assert seen["top_k"] == payload["top_k"]
     assert seen["top_p"] == payload["top_p"]
     assert seen["seed"] == payload["seed"]
+
+
+# ------------------------------------------------------------------- the shared scheduler
+
+
+@pytest.fixture
+def scheduler_module():
+    """The real `pocketllm_cpp`, or a skip: a fake would show that this adapter calls *something*."""
+    return pytest.importorskip("pocketllm_cpp")
+
+
+def _schedule(monkeypatch, module):
+    import pocketllm.backends.cpp_backend as cpp_backend
+
+    monkeypatch.setattr(cpp_backend, "load_native_module", lambda: module)
+
+
+def test_the_scheduler_options_are_accepted_rather_than_refused():
+    """The parser refuses every key it does not know, so letting these two through is deliberate."""
+    adapter = backend(enable_batching=True, scheduler_timeout_ms=1500)
+
+    assert adapter._poll_timeout_ms == 1500
+
+    with pytest.raises(ConfigurationError, match="has no option"):
+        backend(scheduler_timeout_ms_typo=1)
+
+
+def test_asking_for_the_scheduler_without_the_built_module_serves_anyway(monkeypatch):
+    import pocketllm.backends.cpp_backend as cpp_backend
+
+    def missing():
+        raise ImportError("no pocketllm_cpp in this build")
+
+    monkeypatch.setattr(cpp_backend, "load_native_module", missing)
+    with pytest.warns(UserWarning, match="needs the native pocketllm_cpp module"):
+        adapter = backend(enable_batching=True)
+
+    assert adapter._batching() is False
+    assert adapter.capabilities.supports_batch is False
+    assert adapter.capabilities.details["scheduler"].startswith("one mutable KV cache")
+
+
+def test_a_runtime_without_the_scheduler_declares_the_serialized_path():
+    adapter = backend()
+
+    assert adapter.capabilities.supports_batch is False
+    assert adapter.capabilities.details["max_batch_size"] == 1
+    assert adapter.metrics() == {}
+
+
+def test_a_request_through_the_scheduler_answers_what_the_serial_path_answers(
+    scheduler_module, monkeypatch
+):
+    """The claim the routing has to earn: the same request, the same tokens, on both paths."""
+    _schedule(monkeypatch, scheduler_module)
+    serial = backend()
+    batched = backend(enable_batching=True)
+    assert batched._batching() is True
+
+    expected = serial.generate([request(max_tokens=3)])[0]
+    answer = batched.generate([request(max_tokens=3)])[0]
+
+    assert answer.token_ids == expected.token_ids
+    assert answer.text == expected.text
+    assert answer.finish_reason == expected.finish_reason
+    assert (answer.usage.prompt_tokens, answer.usage.completion_tokens) == (
+        expected.usage.prompt_tokens,
+        expected.usage.completion_tokens,
+    )
+
+
+def test_the_scheduler_gauges_are_published_only_where_a_scheduler_is(scheduler_module, monkeypatch):
+    _schedule(monkeypatch, scheduler_module)
+    adapter = backend(enable_batching=True)
+
+    assert "requests_running" in adapter.metrics()
+    assert adapter.capabilities.supports_batch is True
+    assert adapter.capabilities.details["scheduler"].startswith("BatchScheduler")
+
+
+def test_the_rank_zero_broadcast_carries_the_request_the_row_came_from(
+    group, scheduler_module, monkeypatch
+):
+    """The four ranks have to agree, so the payload has to be built from the same object.
+
+    The scheduler carries the prompt and the sampler and no `GenerationRequest`, so a runtime that
+    rebuilt the payload from those alone could differ from the workers -- which, with an all_reduce
+    closing every routed layer, is not a wrong answer but a hang. `_start_runtime` goes through
+    `_loop`, which is the serial path's own dispatch, so this asserts the payload the workers are
+    handed is the one the request produces.
+    """
+    _schedule(monkeypatch, scheduler_module)
+    adapter = as_four_ranks(backend(enable_batching=True), 0)
+    assert adapter._batching() is True
+
+    adapter.generate([request(prompt_ids=(5, 6), max_tokens=2)])
+
+    assert [payload["op"] for payload in group] == ["generate"]
+    assert group[0]["prompt_ids"] == [5, 6]
+    assert group[0]["max_new_tokens"] == 2

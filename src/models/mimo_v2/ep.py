@@ -381,7 +381,12 @@ class EpGroup:
         rank = int(os.environ.get("RANK", "0"))
         local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
         if world <= 1:
-            return cls()
+            # The caller's card comes through even outside a group. There is no rank to offset it
+            # by, so it is left exactly as named -- but it has to be carried, or the field the
+            # parameter is documented to set is dropped here and the model is built with
+            # `torch.device(None)`, which is a TypeError rather than a default. Every measurement
+            # of this runtime is four-rank, which is why nothing had hit it.
+            return cls(device=device)
         import torch.distributed as dist
 
         if not torch.cuda.is_available():

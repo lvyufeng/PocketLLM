@@ -596,20 +596,37 @@ observed:
 scheduler, declaring honestly that they are width 1".** Each runtime's width then improves on its own
 schedule, and the scheduler does not change for it.
 
-**Step one, walked for one runtime.** `xing4` registers under the one scheduler behind
-`--enable-batching`, and what it took is the shape the other two will take. The scheduler
-takes an `InferenceEngine*`, so a Python runtime needs to *be* one; `pocketllm/backends/runtime_engine.py`
-is that, plus the one thing the three runtimes have in common that the scheduler cannot see: they
-generate by running to the end, and the scheduler drives one token per call. `RuntimeRun` reconciles
-the two by running the runtime's own loop on a thread and meeting it at the `on_token`/`on_step`
-callbacks the loop already had for cancellation — so the block in 8.2 (a) is answered without
-touching a model implementation, and 8.2 (b) is answered for this runtime because the lock it names is
-no longer what serializes the requests.
+**Step one, walked for all three runtimes.** `xing4`, `v41` and `mimo` each register under the one
+scheduler behind `--enable-batching`. The scheduler takes an `InferenceEngine*`, so a Python runtime
+needs to *be* one; `pocketllm/backends/runtime_engine.py` is that, plus the one thing the three
+runtimes have in common that the scheduler cannot see: they generate by running to the end, and the
+scheduler drives one token per call. `RuntimeRun` reconciles the two by running the runtime's own
+loop on a thread and meeting it at the `on_token`/`on_step` callbacks the loop already had for
+cancellation — so the block in 8.2 (a) is answered without touching a model implementation, and 8.2
+(b) is answered for these runtimes because the lock it names is no longer what serializes their
+requests.
+
+What the three then share is the *serving* half — where the scheduler comes from, what the runtime
+declares, how a row is submitted and how its result is read back — and that lives in one place,
+`SchedulerHost`, rather than in three adapters that agree by inspection. What each keeps is the half
+that is about its own checkpoint: the entry point, the tokens that end a turn, the card, and how a
+finished generation is read.
 
 The claim is deliberately weak and that is the point: one request at a time, `continuous_batching =
-False`, the same 32 token ids as the serialized path, and about the same wall time. What changed is
-*whose* lifecycle it is. Raising the width is a change to the declaration, and the scheduler does not
-change for it. The measured pair is in the [checkpoint's own guide](../models/xing4.0-29b-a4b.md).
+False`, the same tokens as the serialized path, and about the same wall time. What changed is *whose*
+lifecycle it is. Raising the width is a change to the declaration, and the scheduler does not change
+for it. The measured pair for `xing4` is in
+[the checkpoint's own guide](../models/xing4.0-29b-a4b.md); the other two are asserted, not measured,
+and their guides say so.
+
+**One thing the Python host taught the scheduler.** `BatchScheduler::schedule_loop` used to ask the
+engine for its device as its first act, on its own thread. For a native engine that is a virtual
+call; for a Python one it crosses the language boundary and needs the GIL — and the thread that holds
+the GIL is very often the one dropping the scheduler, because `~BatchScheduler` runs `stop()`, and
+`stop()` joins. A scheduler created and destroyed in the same instant deadlocked the interpreter
+rather than shutting down, which is a failure a native-only host could not have produced. The
+constructor asks now, on the thread that already calls `caps` and `allocate_batch_slots`, and hands
+the loop thread the answer.
 
 ### 8.4 Where the scheduler lives: the C++ library, driven from either host — recommended
 

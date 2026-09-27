@@ -238,7 +238,7 @@ def test_the_bridge_carries_a_runtime_through_the_real_scheduler(native_module):
 
     emitted: list[int] = []
 
-    def generate(*, request_id, prompt_ids, sampling, on_token, on_step):
+    def generate(*, request_id, prompt_ids, sampling, context, on_token, on_step):
         """A runtime of the shape the real ones have: a gate and a token per step."""
         emitted.append((request_id, list(prompt_ids)))
         for token in range(100, 100 + int(sampling.max_new_tokens)):
@@ -282,3 +282,64 @@ def test_the_bridge_carries_a_runtime_through_the_real_scheduler(native_module):
     assert [tokens for _, tokens in emitted] == [[10, 20, 30]]
     assert emitted[0][0] == result.request_id
 
+
+
+def test_the_engine_is_asked_for_its_device_before_the_loop_thread_starts(native_module):
+    """A scheduler has to be stoppable without the GIL, and asking the engine is what stops it.
+
+    `BatchScheduler::schedule_loop` runs on its own thread and asks the engine for its device before
+    anything else. Against a Python engine that question crosses the language boundary and needs the
+    GIL -- and the thread that holds the GIL is very often the one that is about to drop the
+    scheduler, because `~BatchScheduler` runs `stop()` and `stop()` joins. A scheduler created and
+    dropped in the same breath therefore deadlocked the process: not a slow shutdown, a wedged one,
+    which is how this was found.
+
+    So the constructor asks, on the constructing thread, and hands the loop thread the answer. That
+    is asserted by thread identity rather than by stopwatch: a test that simply dropped a scheduler
+    would hang rather than fail, and a hang is not a failing test.
+    """
+    asked: list[int] = []
+
+    class Engine(native_module.InferenceEngine):
+        def caps(self):
+            caps = native_module.Capabilities()
+            caps.max_slots = 1
+            caps.continuous_batching = False
+            return caps
+
+        def max_context(self) -> int:
+            return 1024
+
+        def device(self) -> int:
+            asked.append(threading.get_ident())
+            return -1
+
+        def allocate_batch_slots(self, max_batch_size: int) -> None:
+            return None
+
+        def allocate_slot(self, request_id: int) -> int:
+            return 0
+
+        def free_slot(self, request_id: int) -> None:
+            return None
+
+    here = threading.get_ident()
+    scheduler = native_module.QwenBatchScheduler(Engine(), 1)
+    try:
+        assert asked == [here]
+    finally:
+        scheduler.stop()
+
+
+def test_a_scheduler_that_is_dropped_rather_than_stopped_lets_the_process_go(native_module):
+    """The shape the deadlock took, run for real.
+
+    The assertion is the one above -- this is here because the failure mode is a hang and a hang in
+    a test suite is indistinguishable from a slow machine. It is bounded by the interpreter's own
+    teardown: the `del` runs `~QwenBatchScheduler`, which joins the loop thread, so a regression
+    here wedges the suite rather than failing it. That is worse than a failure and better than
+    silence.
+    """
+    scheduler = native_module.QwenBatchScheduler(_toy_engine(native_module), 1)
+
+    del scheduler
