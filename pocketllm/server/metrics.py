@@ -129,6 +129,10 @@ class Metrics:
         self._lock = threading.Lock()
         self._counters: defaultdict[str, float] = defaultdict(float)
         self._gauges: defaultdict[str, float] = defaultdict(float)
+        # Family name -> { "{state=\"free\"}": value }. Kept apart from `_gauges` because the
+        # `# TYPE` line belongs to the family and has to be written once for all its series, which
+        # a flat name->value map cannot express.
+        self._labeled_gauges: dict[str, dict[str, float]] = {}
         self._histograms: dict[str, _Histogram] = {
             name: _Histogram(bounds) for name, (bounds, _) in HISTOGRAMS.items()
         }
@@ -148,8 +152,20 @@ class Metrics:
             self._counters[name] = float(value)
 
     def set(self, name: str, value: float) -> None:
+        """Set one gauge.
+
+        ``name`` may carry a label selector written the way it renders -- ``kv_blocks{state="free"}``
+        -- which is how a backend republishes a family the native host exports with labels. The
+        spelling is the Prometheus one rather than a `(name, labels)` pair because the exporter
+        prefixes the *family* and hands the rest through untouched, so a name that already renders
+        correctly cannot be misassembled here.
+        """
+        family, _, selector = str(name).partition("{")
         with self._lock:
-            self._gauges[name] = float(value)
+            if selector:
+                self._labeled_gauges.setdefault(family, {})["{" + selector] = float(value)
+            else:
+                self._gauges[name] = float(value)
 
     def add(self, name: str, value: float) -> None:
         """Add to a gauge while preserving counter monotonicity."""
@@ -182,6 +198,7 @@ class Metrics:
         with self._lock:
             counters = dict(self._counters)
             gauges = dict(self._gauges)
+            labeled = {family: dict(series) for family, series in self._labeled_gauges.items()}
             histograms = {
                 name: (list(item.increments), item.sum_seconds, item.count)
                 for name, item in self._histograms.items()
@@ -196,6 +213,10 @@ class Metrics:
         for name, value in sorted(gauges.items()):
             lines.append(f"# TYPE {self.prefix}_{name} gauge")
             lines.append(f"{self.prefix}_{name} {value:.17g}")
+        for family, series in sorted(labeled.items()):
+            lines.append(f"# TYPE {self.prefix}_{family} gauge")
+            for selector, value in sorted(series.items()):
+                lines.append(f"{self.prefix}_{family}{selector} {value:.17g}")
         for name in sorted(histograms):
             bounds, help_text = HISTOGRAMS[name]
             increments, total, count = histograms[name]

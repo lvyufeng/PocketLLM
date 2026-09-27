@@ -652,3 +652,39 @@ def test_a_decode_with_nothing_to_settle_is_returned_unchanged():
     assert settled_text("") == ""
     assert settled_text("answer") == "answer"
     assert settled_text("line\n") == "line\n"
+
+
+def test_a_labeled_gauge_carries_one_type_line_for_the_whole_family():
+    """A family the native host exports with labels -- `pocket_kv_blocks{state="free"}`, and so on
+    -- has to arrive here as the same series with the same selector, because the comparison being
+    made is between the two servers' numbers and a name that only nearly matches is not compared.
+
+    The `# TYPE` line belongs to the family, not to a series: writing one per selector is what a
+    naive flat name -> value map produces, and it is why the labeled gauges are stored apart.
+    """
+    metrics = Metrics()
+    metrics.set('kv_blocks{state="total"}', 64)
+    metrics.set('kv_blocks{state="free"}', 41)
+    metrics.set("requests_running", 2)
+    text = metrics.render()
+
+    assert text.count("# TYPE pocketllm_kv_blocks gauge\n") == 1
+    assert 'pocketllm_kv_blocks{state="free"} 41\n' in text
+    assert 'pocketllm_kv_blocks{state="total"} 64\n' in text
+    # The unlabeled gauge is untouched by the labeled path.
+    assert _metric_value(text, "requests_running") == 2.0
+
+
+def test_the_exporter_prefixes_the_family_not_the_selector():
+    """`set` takes a name that already renders, so the exporter cannot misassemble a label. What it
+    still owns is the family prefix, and that is the one substitution the two hosts differ by."""
+    metrics = Metrics()
+    metrics.set('kv_blocks{state="free"}', 7)
+    line = next(
+        item for item in metrics.render().splitlines()
+        if item.startswith("pocketllm_kv_blocks{")
+    )
+
+    assert line.split(" ")[0] == 'pocketllm_kv_blocks{state="free"}'
+    # The native host's spelling of the same series, for the substitution to be visible.
+    assert line == 'pocketllm_kv_blocks{state="free"} 7'

@@ -751,6 +751,51 @@ class CppBackend(BackendBase):
         details.update({"model": self.args.checkpoint_dir})
         return HealthStatus(status.status, status.backend, status.ready, status.message, details)
 
+    def metrics(self) -> dict[str, float]:
+        """The scheduler's own admission state, named as the native host names it.
+
+        Both hosts of `BatchScheduler` are the same library with the same stats struct, and the
+        server prefixes what it publishes, so the two agree when the *suffix* does: the native
+        host's `pocket_requests_running` is this server's `pocketllm_requests_running`, and the
+        comparison is a prefix substitution rather than a translation table. That is the same
+        reason the histogram bucket bounds here are transcribed from vLLM's rather than chosen.
+
+        `requests_running` is the series that matters most: it is how an operator reads that a
+        `serve --backend cpp` deployment has one scheduler holding several requests at once rather
+        than a lock serializing them, which is a claim about the process that no per-request log
+        can make.
+
+        Empty on the serialized path. That path has no scheduler, so it has no running set, and
+        publishing zeros would say "the scheduler exists and is idle" about a process that does
+        not have one.
+        """
+        scheduler = self._scheduler
+        if not self._batching_enabled or scheduler is None:
+            return {}
+        try:
+            stats = scheduler.get_stats()
+        except Exception:
+            # A metrics scrape must not fail a request path or a scrape itself: an engine that
+            # cannot report is an engine whose series are absent, which a scraper reads as no data.
+            return {}
+        published = {
+            "requests_running": float(stats.running_requests),
+            "requests_waiting": float(stats.waiting_requests),
+            "slots_free": float(stats.free_slots),
+        }
+        # The paged block gauges, and only when the engine actually pages: an unpaged engine
+        # reports zeros that a scraper would read as a pool of no blocks rather than no pool.
+        if bool(getattr(scheduler.engine_caps(), "paged_kv", False)):
+            published.update(
+                {
+                    'kv_blocks{state="total"}': float(stats.total_blocks),
+                    'kv_blocks{state="free"}': float(stats.free_blocks),
+                    'kv_blocks{state="reserved"}': float(stats.reserved_blocks),
+                    'kv_blocks{state="cache_pinned"}': float(stats.cache_pinned_blocks),
+                }
+            )
+        return published
+
     def _context_tokens(self) -> int:
         """The positions this engine's caches hold, exactly as the native engine was built.
 
