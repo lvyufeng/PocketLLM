@@ -634,7 +634,7 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         .def("run_worker_loop", [](QwenEngine& engine) {
             py::gil_scoped_release release;
             engine.run_worker_loop();
-        }, "TP rank > 0 entry point: blocks on NCCL command channel until shutdown")
+        }, "TP rank > 0 entry point: blocks on the CmdChannel unix socket until shutdown")
         .def("worker_command_prefill", [](QwenEngine& engine, const std::vector<int>& token_ids,
                                           int32_t slot_id) {
             py::gil_scoped_release release;
