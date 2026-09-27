@@ -89,9 +89,9 @@ file declaring general.architecture=qwen35; other GGUF checkpoints must use back
 | --- | ---: | --- |
 | `--max-model-len` | 8192 | Positions the caches hold. **The KV arena is sized from this at start**, so it is a memory decision as much as a context one: 64 KiB a token. |
 | `--kv-cache-dtype` | `auto` → `fp16` | `fp8` halves the KV and is what the checkpoint's own 262,144 fits with. It changes the arithmetic, so it is not free. |
-| `--enable-prefix-caching` | on | Resumes a prompt that repeats the one just served instead of forwarding it again. |
+| `--enable-prefix-caching` | on | Resumes a prompt that repeats the one just served instead of forwarding it again. The serialized session's only — the batch scheduler's prefill path does not consult it. |
 | `--prefill-chunk-tokens` | 8192 | Tokens one prefill call takes at once. |
-| `--backend-option enable_batching=true` | off | Turns on the shared batch scheduler; `--backend-option max_batch_size=4` sizes it. **Off by default: it buys aggregate throughput and costs per-request latency — see Known limitations.** |
+| `--enable-batching` / `--max-batch-size` | on / 8 | The batch scheduler. A width above 1 asks for it on its own; `--no-enable-batching` selects the serialized session and cannot be combined with a width above 1. **On by default, at width 8: the width buys aggregate throughput and costs per-request latency — see Known limitations.** |
 | `--backend-option kv_paged=true` | off | Paged KV blocks instead of one contiguous arena. Memory-neutral on its own, and measured to give up the prefix resume — see Known limitations. |
 | `--tensor-parallel-size` | 1 | The engine supports TP4, which is how the FP8 sibling is served, but **TP > 1 was not measured for this artifact**. |
 
@@ -210,11 +210,20 @@ does not grow with how many prompts the server has answered.
   and reproducible on every prompt tried and the mechanism is not yet identified; it is tracked as
   [#406](https://github.com/lvyufeng/PocketLLM/issues/406). Note that the chat template adds tokens,
   so the count that matters is the one the server reports, not the length of the text you sent.
-- **Concurrency is off by default.** With `--backend-option enable_batching=true --backend-option
-  max_batch_size=4` the aggregate decode rate rises 1.78× at a short prompt and 1.14× at a 2,044-token
-  one, while per-request latency grows with the batch — at 2,044 tokens the batched group's median is
-  41.1 s where the serial queue's median is 35.7 s, so four callers wait longer in total than they
-  would have queued. Turn it on for aggregate throughput, not for latency.
+- **The default path batches, and the width costs a lone request some latency.** With
+  `--backend-option enable_batching=true --backend-option max_batch_size=4` the aggregate decode
+  rate rises 1.78× at a short prompt and 1.14× at a 2,044-token one, while per-request latency grows
+  with the batch — at 2,044 tokens the batched group's median is 41.1 s where the serial queue's
+  median is 35.7 s, so four callers wait longer in total than they would have queued. The scheduler
+  runs the width's rows whether or not that many requests are present, which is the same effect seen
+  from the other side: one request alone through `slots=2` pays more than it would through the
+  serialized session, and through `slots=8` more still. The scheduler also does not consult the
+  prefix cache, so a prompt the serialized session would have resumed is re-forwarded in full — the
+  larger of the two costs for a caller that repeats its prompt. Turn the width down
+  (`--max-batch-size 2`) or off (`--no-enable-batching`) for single-caller latency, and up for
+  aggregate throughput. The per-request cost of the width, measured with the prompt cache held
+  fixed, is in
+  [the concurrency acceptance page](../performance/cpp_openai_concurrency_validation.md).
 - **An earlier build of this branch reported that a greedy answer could depend on the batch.** Four
   identical requests produced two distinct texts, and a prompt choosing between `"5:00:00"` and
   `"0:15:00"` gave one row each. That measurement came from a build whose greedy runs did not stop at

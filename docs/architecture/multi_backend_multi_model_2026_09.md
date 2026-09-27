@@ -294,6 +294,17 @@ concrete fixes, in order of value: expose `enable_batching` as a flag and defaul
 backend; make `--max-batch-size` imply batching; and make the DeepSeek default width match the
 documented batch width, or make the clamp an explicit error instead of a silent one.
 
+**Landed.** The first two are in: `--enable-batching` / `--no-enable-batching` exists, the cpp
+backend defaults to the batch path at width 8, a `--max-batch-size` above 1 implies it, and a width
+above 1 next to `--no-enable-batching` is a `ConfigurationError` rather than a resolution. The
+default width is 8 and not 1 deliberately — a width of 1 is not a batch — which means the cost the
+paragraph above describes now lands on the default path instead of on an opt-in; it is measured with
+the prompt cache held fixed in
+[cpp_openai_concurrency_validation.md](../performance/cpp_openai_concurrency_validation.md). The
+third is still open, and it is narrower than it reads: the V4.1 adapter already raises
+`UnsupportedFeatureError` for a width it cannot honour, so what remains is deciding the prefill-only
+shape rather than removing a silent clamp.
+
 ### 6.2 No captured decode step in the C++ engine
 
 This is the largest single measured headroom in the repository. The evidence is entirely local:
