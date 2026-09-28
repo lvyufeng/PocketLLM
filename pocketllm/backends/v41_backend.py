@@ -4,7 +4,7 @@ A V4.1 checkpoint needs its own adapter rather than a flag on :mod:`torch_backen
 are different architectures and different runtimes: this one serves the released multimodal wrapper
 -- a 40-layer, 5120-hidden text stack with 384 routed experts, two Engram layers and 32 index heads
 -- out of ``src/models/deepseek_v4_1/``, while ``torch_backend`` loads the 0731 model through
-``src/server/openai.py``. Nothing in that runtime can read this checkpoint.
+``src/models/deepseek_v4/serving.py``. Nothing in that runtime can read this checkpoint.
 
 What this adapter adds over ``src/cli/generate_v41.py`` is a process that outlives one prompt: the
 checkpoint is read once at startup, the tree is built once, and requests then arrive as

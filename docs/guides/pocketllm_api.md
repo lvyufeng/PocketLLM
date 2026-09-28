@@ -606,10 +606,13 @@ the routed experts in host memory, one process a rank under `--tensor-parallel-s
 
 ## Request normalization
 
-`pocketllm.protocol` holds the request normalization shared by the unified server and the legacy
-`src.server.openai` server: OpenAI content-block flattening, tool attachment and `tool_choice`
-instructions, `reasoning`/`reasoning_effort` handling, tool-call shaping, and stop-string truncation.
-There is one implementation, and it imports neither Torch nor the native module.
+`pocketllm.protocol` holds the request normalization the server runs: OpenAI content-block
+flattening, tool attachment and `tool_choice` instructions, `reasoning`/`reasoning_effort` handling,
+tool-call shaping, and stop-string truncation. There is one implementation, and it imports neither
+Torch nor the native module. It used to be shared with a second, model-owned server
+(`src.server.openai`, since retired with the rest of the duplicate front ends — see
+[#447](https://github.com/lvyufeng/PocketLLM/issues/447)); the module that server's runtime half
+became is `src/models/deepseek_v4/serving.py`.
 
 `/v1/chat/completions` puts the normalized messages, thinking mode, reasoning effort, and tool
 metadata in `GenerationRequest.metadata`. The shared prompt boundary first asks the selected

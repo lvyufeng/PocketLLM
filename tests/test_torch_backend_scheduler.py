@@ -85,7 +85,7 @@ class ScriptedServingEngine:
         Computed here rather than in the adapter so the two arms are compared against a mapping
         this test produced, not against one the code under test happened to hand both of them.
         """
-        from src.server.openai import _format_completion_result
+        from src.models.deepseek_v4.serving import _format_completion_result
 
         prompt_ids = payload["_prompt_ids"]
         return _format_completion_result(

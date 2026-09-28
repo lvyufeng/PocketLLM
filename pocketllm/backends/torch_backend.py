@@ -33,7 +33,7 @@ from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key
 
 
 #: What the legacy runtime generates when a request carries no budget of its own
-#: (``src/server/openai.py`` reads ``payload.get("max_tokens") or 512``).  This adapter has to name
+#: (``src/models/deepseek_v4/serving.py`` reads ``payload.get("max_tokens") or 512``).  This adapter has to name
 #: the number rather than leave the field absent, because the same field is what the legacy
 #: serving queue's admission check counts against its token budget; a missing one would be read
 #: there as zero and the request would be admitted on a promise the runtime does not keep.
@@ -155,7 +155,7 @@ class TorchBackend(SchedulerHost, BackendBase):
         if self._runtime_loader is not None:
             loader = self._runtime_loader
         else:
-            from src.server.openai import _init_runtime
+            from src.models.deepseek_v4.serving import _init_runtime
 
             loader = _init_runtime
         self._runtime = loader(self._runtime_namespace())
@@ -168,7 +168,7 @@ class TorchBackend(SchedulerHost, BackendBase):
         runtime = self._load_runtime()
         if self._serving_engine is None:
             from src.server.engine import DeepSeekServingEngine
-            from src.server.openai import _broadcast_payload, _run_payload, _run_payload_stream
+            from src.models.deepseek_v4.serving import _broadcast_payload, _run_payload, _run_payload_stream
 
             self._serving_engine = DeepSeekServingEngine(
                 runtime,
@@ -432,7 +432,7 @@ class TorchBackend(SchedulerHost, BackendBase):
         and the tokens the first forward did not produce), so the derived rates are close and not
         identical. The tokens, the text, the reasoning, the tool calls and the finish reason are.
         """
-        from src.server.openai import _format_completion_result
+        from src.models.deepseek_v4.serving import _format_completion_result
 
         token_ids = [int(token) for token in result.generated_tokens]
         payload = self._payload(request, stream=False)
@@ -558,7 +558,7 @@ class TorchBackend(SchedulerHost, BackendBase):
         if on_ready is not None:
             on_ready()
         # Delegate to the existing Gloo/NCCL broadcast worker protocol.
-        from src.server.openai import _worker_loop
+        from src.models.deepseek_v4.serving import _worker_loop
 
         _worker_loop(runtime)
 

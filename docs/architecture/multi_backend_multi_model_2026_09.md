@@ -204,6 +204,15 @@ Rows 1, 3, 4 and 5 now reach the one `BatchScheduler` behind `--enable-batching`
 itself width 1; row 1's queue is the fallback the other three do not have, because it predates the
 scheduler rather than sharing it. *See §8.3.*
 
+**Rows 6 and 7 have since been deleted.** The table is a snapshot of `8162937` and is left as one,
+but the two entries that carried their own front end are gone
+([#447](https://github.com/lvyufeng/PocketLLM/issues/447)): the C++ `--serve` server, and the
+`torchrun -m src.server.openai` launcher whose runtime half moved to
+`src/models/deepseek_v4/serving.py`. That is what removes the C++ HTTP server and the sidecar
+pipepair from the counts above, and what makes the shipped `cpp` backend a *client* of the engine
+rather than a second server in front of it. Rows 1–5 are now the whole list, and they are one
+command with one front end.
+
 The duplication is measurable at file granularity:
 
 - `mimo_backend.py` (1,006 lines) vs `xing4_backend.py` (776): a method-level diff finds ~288 lines of

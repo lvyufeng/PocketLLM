@@ -10,7 +10,7 @@ The native server emits no per-token timing on the wire, and its stream cannot
 be used to delimit the phases: `handle_stream` writes the role chunk *before*
 `sched.submit_request`, so the client sees a first event within milliseconds of
 the request regardless of prompt length. `deepseek_timings` is a field of the
-*Python* server (`src/server/openai.py`) and never appears on this path.
+*Python* server (`src/models/deepseek_v4/serving.py`) and never appears on this path.
 (Equally, `handle_nonstream` passes a null token callback, so the engine has no
 first-token instant there either and its TTFT equals its full duration —
 measured, not assumed: 8.8588 s against 8.8587 s.)
