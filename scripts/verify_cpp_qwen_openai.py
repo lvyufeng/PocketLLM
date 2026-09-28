@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Verify the native Qwen C++ OpenAI-compatible server with real weights.
+"""Verify the OpenAI surface of the Qwen C++ path with real weights.
 
-This is an opt-in integration check rather than a unit test. It starts one native
+This is an opt-in integration check rather than a unit test. It starts one
 process per tensor-parallel rank, exercises the HTTP surface, and tears the group
 down on every exit path.
+
+``--launch`` chooses the front end under test. ``native`` starts the
+``pocketllm_engine --serve`` binary directly, one process a rank. ``pocketllm``
+starts a single ``pocketllm serve --backend cpp``, which supervises its own
+ranks. Both are the same engine and the same scheduler underneath, so the checks
+below are the same checks; running both is how the entry point that replaces the
+binary is held to the surface the binary was held to.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 
@@ -84,7 +92,13 @@ def parse_devices(value: str) -> list[str]:
     return devices
 
 
-def wait_for_health(base_url: str, processes: list[subprocess.Popen[bytes]], timeout: float) -> None:
+def wait_for_health(base_url: str, processes: list[subprocess.Popen[bytes]], timeout: float) -> str:
+    """Wait for a served endpoint, and return the status word its /health carried.
+
+    The two front ends spell readiness differently -- the binary answers
+    ``"ok"`` and ``pocketllm serve`` answers ``"ready"`` -- and both are
+    readiness, so both are accepted and the caller gets told which one it saw.
+    """
     deadline = time.monotonic() + timeout
     last_error = "no response"
     while time.monotonic() < deadline:
@@ -93,9 +107,13 @@ def wait_for_health(base_url: str, processes: list[subprocess.Popen[bytes]], tim
             raise RuntimeError(f"a TP rank exited before readiness: {exited}")
         try:
             result = http_request(base_url, "/health", timeout=2.0)
-            if result.status == 200 and result.json().get("status") == "ok":
-                return
-            last_error = f"HTTP {result.status}: {result.text}"
+            if result.status == 200:
+                status = result.json().get("status")
+                if status in {"ok", "ready"}:
+                    return str(status)
+                last_error = f"HTTP {result.status}: {result.text}"
+            else:
+                last_error = f"HTTP {result.status}: {result.text}"
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             last_error = str(exc)
         time.sleep(2.0)
@@ -125,6 +143,132 @@ def read_logs(log_dir: pathlib.Path) -> str:
     for path in sorted(log_dir.glob("rank*.log")):
         chunks.append(f"--- {path.name}\n{path.read_text(encoding='utf-8', errors='replace')}")
     return "\n".join(chunks)
+
+
+def launch_native(
+    args: argparse.Namespace,
+    checkpoint: pathlib.Path,
+    python_bin: pathlib.Path,
+    sidecar: pathlib.Path,
+    devices: list[str],
+    log_dir: pathlib.Path,
+    rendezvous: pathlib.Path,
+) -> list[subprocess.Popen[bytes]]:
+    """One ``pocketllm_engine --serve`` process per rank, each pinned to its card."""
+    binary = pathlib.Path(args.binary).resolve()
+    require(binary.exists(), f"native binary does not exist: {binary}")
+    sidecar = sidecar.resolve()
+    require(sidecar.exists(), f"sidecar script does not exist: {sidecar}")
+
+    common = [
+        str(binary),
+        "--serve",
+        "--ckpt",
+        str(checkpoint),
+        "--tp-world",
+        str(len(devices)),
+        "--nccl-id-path",
+        str(rendezvous),
+        "--smoke-layers",
+        str(args.layers),
+        "--max-context",
+        str(args.max_context),
+        "--max-batch-size",
+        str(args.max_batch_size),
+        "--prefill-token-budget",
+        str(args.prefill_token_budget),
+        "--request-timeout-seconds",
+        str(args.request_timeout_seconds),
+        "--python",
+        str(python_bin),
+        "--sidecar",
+        str(sidecar),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--kv-block-size",
+        str(args.kv_block_size),
+    ]
+    if args.prefill_chunk_tokens > 0:
+        common.extend(["--prefill-chunk-tokens", str(args.prefill_chunk_tokens)])
+    if args.kv_paged:
+        common.append("--kv-paged")
+
+    processes: list[subprocess.Popen[bytes]] = []
+    for rank, visible_device in enumerate(devices):
+        log = (log_dir / f"rank{rank}.log").open("wb")
+        environment = os.environ.copy()
+        environment["CUDA_VISIBLE_DEVICES"] = visible_device
+        process = subprocess.Popen(
+            common + ["--tp-rank", str(rank), "--device", "0"],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=environment,
+        )
+        processes.append(process)
+        log.close()
+    return processes
+
+
+def launch_pocketllm(
+    args: argparse.Namespace,
+    checkpoint: pathlib.Path,
+    devices: list[str],
+    log_dir: pathlib.Path,
+) -> list[subprocess.Popen[bytes]]:
+    """One ``pocketllm serve --backend cpp`` process, which spawns its own ranks.
+
+    The supervisor hands every rank the same visible device list and the adapter
+    applies the rank offset itself, so this narrowing is the whole of the
+    placement: rank r takes the rth card of ``--devices``. That is why there is
+    one process here rather than one per rank and no ``--device`` anywhere.
+
+    The binary's own tuning flags that have no ``pocketllm serve`` spelling are
+    translated to backend options where a counterpart exists and dropped where
+    none does -- ``--smoke-layers`` is a native debug flag, and the prefill
+    budget is derived from ``--prefill-chunk-tokens`` by the scheduler.
+    """
+    python_bin = pathlib.Path(args.pocketllm_python).resolve()
+    require(python_bin.exists(), f"Python executable does not exist: {python_bin}")
+
+    command = [
+        str(python_bin),
+        "-m",
+        "pocketllm",
+        "serve",
+        "--backend",
+        "cpp",
+        "--model",
+        str(checkpoint),
+        "--tensor-parallel-size",
+        str(len(devices)),
+        "--tensor-parallel-startup-timeout",
+        str(args.startup_timeout),
+        "--max-batch-size",
+        str(args.max_batch_size),
+        "--max-model-len",
+        str(args.max_context),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(args.port),
+        "--backend-option",
+        f"kv_block_size={args.kv_block_size}",
+        "--backend-option",
+        f"kv_paged={'true' if args.kv_paged else 'false'}",
+    ]
+    if args.prefill_chunk_tokens > 0:
+        command.extend(["--prefill-chunk-tokens", str(args.prefill_chunk_tokens)])
+
+    log = (log_dir / "rank0.log").open("wb")
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    process = subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, env=environment
+    )
+    log.close()
+    return [process]
 
 
 def validate_nonstream(result: HttpResult, expected_model: str) -> dict[str, Any]:
@@ -214,10 +358,19 @@ REFUSED_CHAT_FIELDS: tuple[tuple[str, Any], ...] = (
     ("frequency_penalty", 1.5),
     ("presence_penalty", -1.0),
     ("logit_bias", {"100": -100}),
+    ("parallel_tool_calls", False),
+)
+
+# Tool selection, which the two front ends disagree about by design. The binary forwards the tool
+# definitions to the chat template and applies no policy of its own, so anything but "auto" named a
+# choice it could not carry out and was refused. The unified front end applies the policy the field
+# names -- "none" drops the definitions, "required" and a named function become an instruction in
+# the prompt -- which is the field being served rather than dropped, so on that launch these are
+# accepted and the tool-call checks below are what hold the behaviour.
+TOOL_CHOICE_REFUSED_ON_NATIVE: tuple[tuple[str, Any], ...] = (
     ("tool_choice", "required"),
     ("tool_choice", "none"),
     ("tool_choice", {"type": "function", "function": {"name": "get_weather"}}),
-    ("parallel_tool_calls", False),
 )
 
 # The same fields at the value that names what the server already does. These
@@ -264,7 +417,51 @@ def refusal_error(result: HttpResult, label: str) -> dict[str, Any]:
     return error
 
 
-def validate_request_field_refusals(base_url: str, model_name: str, timeout: float) -> None:
+# Checks `pocketllm serve --backend cpp` does not serve yet, and why. Each one names a field the
+# native front end answered and the unified one refuses by name instead, which is the honest half of
+# the port: a request that will not be honoured is not answered as if it had not been made.
+#
+# The set is deliberately a set rather than a skip list. A check here that starts passing fails the
+# run below, so the entry has to be deleted in the commit that ports it rather than left to rot --
+# the same discipline `tests/baseline_failures.txt` uses for the pytest suite. Emptying this mapping
+# is what U1d-2 is, and the native front end is deleted only after it is empty.
+PENDING_ON_POCKETLLM: dict[str, str] = {
+    "n choices": (
+        "several choices are several scheduler requests, and the fan-out is the host's dispatch "
+        "rather than this adapter's: one implementation for every runtime. Ported in U1d-2"
+    ),
+    "logprobs": (
+        "the engine produces the per-token ranking and `SchedulerGenerationResult.logprobs` is "
+        "not bound to Python yet, so there is nowhere for the probabilities to arrive. Ported "
+        "in U1d-2"
+    ),
+}
+
+
+def run_check(name: str, check: Callable[[], None], *, launch: str) -> None:
+    """Runs one named check, holding a not-yet-ported one to the recorded reason.
+
+    A pending check that passes is a failure: it means the field is served now and the entry above
+    is stale, which is the entry that would otherwise stay behind and quietly excuse a regression.
+    """
+    reason = PENDING_ON_POCKETLLM.get(name) if launch == "pocketllm" else None
+    if reason is None:
+        check()
+        return
+    try:
+        check()
+    except Exception as exc:  # noqa: BLE001 - the check's own assertion is the expected outcome
+        print(f"[PENDING] {name} is not served via pocketllm yet: {reason} (check said: {exc})")
+        return
+    raise AssertionError(
+        f"{name} passes via pocketllm now, so the PENDING_ON_POCKETLLM entry is stale: "
+        f"delete it, and delete the front end it was excusing"
+    )
+
+
+def validate_request_field_refusals(
+    base_url: str, model_name: str, timeout: float, *, launch: str
+) -> None:
     """Checks the request-field contract on both OpenAI endpoints."""
     messages = [{"role": "user", "content": "This request is inspected, not generated."}]
     base = {"messages": messages, "max_tokens": 1}
@@ -277,6 +474,25 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
         require(
             error.get("param") == field,
             f"{field} refusal named {error.get('param')!r} instead of {field!r}",
+        )
+
+    # The tool-selection policy: refused where nothing carries it out, answered where the policy
+    # reaches the prompt.
+    for field, value in TOOL_CHOICE_REFUSED_ON_NATIVE:
+        result = http_request(
+            base_url, "/v1/chat/completions", {**base, field: value}, timeout=timeout
+        )
+        if launch == "native":
+            error = refusal_error(result, f"chat {field}={value!r}")
+            require(
+                error.get("param") == field,
+                f"{field} refusal named {error.get('param')!r} instead of {field!r}",
+            )
+            continue
+        require(
+            result.status == 200,
+            f"chat {field}={value!r} is applied by this launch, but it answered "
+            f"HTTP {result.status}: {result.text}",
         )
 
     for field, value in ACCEPTED_CHAT_DEFAULTS:
@@ -317,6 +533,17 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
     # answered with a stream that looks the same as one that asked for none. On
     # /v1/completions 0 is a real request for the sampled token's probability, so
     # only chat has an inert spelling of the field here.
+    #
+    # Which reason is the right one depends on what this launch does with the same
+    # request *without* streaming: a runtime that ranks tokens refuses the streamed
+    # spelling for being streamed, and one that ranks nothing refuses both for being
+    # a request it cannot answer at all.
+    ranks_unstreamed = (
+        http_request(
+            base_url, "/v1/chat/completions", {**base, "logprobs": True}, timeout=timeout
+        ).status
+        == 200
+    )
     for path, payload in (
         ("/v1/chat/completions", {**base, "logprobs": True}),
         ("/v1/chat/completions", {**base, "logprobs": True, "top_logprobs": 3}),
@@ -336,7 +563,7 @@ def validate_request_field_refusals(base_url: str, model_name: str, timeout: flo
             f"streaming logprobs refusal named {error.get('param')!r}",
         )
         require(
-            "stream" in error.get("message", ""),
+            not ranks_unstreamed or "stream" in error.get("message", ""),
             f"streaming logprobs refusal does not mention streaming: {error.get('message')!r}",
         )
 
@@ -1336,18 +1563,22 @@ def validate_langchain_tool_call(base_url: str, model_name: str, timeout: float)
 
 def run(args: argparse.Namespace) -> int:
     checkpoint = pathlib.Path(args.ckpt).resolve()
-    binary = pathlib.Path(args.binary).resolve()
-    sidecar = pathlib.Path(args.sidecar).resolve()
     python_bin = pathlib.Path(args.python).resolve()
     devices = parse_devices(args.devices)
-    tp_world = len(devices)
 
-    for path, label in (
-        (checkpoint, "checkpoint"),
-        (binary, "native binary"),
-        (sidecar, "sidecar script"),
-        (python_bin, "Python executable"),
-    ):
+    # Only the launch that needs a path is asked for it: a `pocketllm` run does
+    # not have a binary or a sidecar to find, and requiring them would report a
+    # missing file where nothing was going to look for one.
+    required = [(checkpoint, "checkpoint")]
+    if args.launch == "native":
+        required.extend(
+            (
+                (pathlib.Path(args.binary).resolve(), "native binary"),
+                (pathlib.Path(args.sidecar).resolve(), "sidecar script"),
+                (python_bin, "Python executable"),
+            )
+        )
+    for path, label in required:
         require(path.exists(), f"{label} does not exist: {path}")
     require((checkpoint / "config.json").exists(), "checkpoint has no config.json")
     require((checkpoint / "tokenizer.json").exists(), "checkpoint has no tokenizer.json")
@@ -1365,58 +1596,26 @@ def run(args: argparse.Namespace) -> int:
     processes: list[subprocess.Popen[bytes]] = []
     base_url = f"http://127.0.0.1:{args.port}"
     try:
-        common = [
-            str(binary),
-            "--serve",
-            "--ckpt",
-            str(checkpoint),
-            "--tp-world",
-            str(tp_world),
-            "--nccl-id-path",
-            str(rendezvous),
-            "--smoke-layers",
-            str(args.layers),
-            "--max-context",
-            str(args.max_context),
-            "--max-batch-size",
-            str(args.max_batch_size),
-            "--prefill-token-budget",
-            str(args.prefill_token_budget),
-            "--request-timeout-seconds",
-            str(args.request_timeout_seconds),
-            "--python",
-            str(python_bin),
-            "--sidecar",
-            str(sidecar),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(args.port),
-            "--kv-block-size",
-            str(args.kv_block_size),
-        ]
-        if args.prefill_chunk_tokens > 0:
-            common.extend(["--prefill-chunk-tokens", str(args.prefill_chunk_tokens)])
-        if args.kv_paged:
-            common.append("--kv-paged")
-
-        for rank, visible_device in enumerate(devices):
-            log = (log_dir / f"rank{rank}.log").open("wb")
-            environment = os.environ.copy()
-            environment["CUDA_VISIBLE_DEVICES"] = visible_device
-            process = subprocess.Popen(
-                common + ["--tp-rank", str(rank), "--device", "0"],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=environment,
+        if args.launch == "native":
+            processes = launch_native(
+                args,
+                checkpoint,
+                python_bin,
+                pathlib.Path(args.sidecar),
+                devices,
+                log_dir,
+                rendezvous,
             )
-            processes.append(process)
-            log.close()
+        else:
+            processes = launch_pocketllm(args, checkpoint, devices, log_dir)
 
         wait_for_health(base_url, processes, args.startup_timeout)
 
         health = http_request(base_url, "/health", timeout=5.0)
-        require(health.status == 200 and health.json().get("status") == "ok", "health check failed")
+        require(
+            health.status == 200 and health.json().get("status") in {"ok", "ready"},
+            "health check failed",
+        )
 
         models = http_request(base_url, "/v1/models", timeout=5.0)
         require(models.status == 200, f"models endpoint failed: {models.text}")
@@ -1424,7 +1623,12 @@ def run(args: argparse.Namespace) -> int:
         model_data = model_body.get("data")
         require(isinstance(model_data, list) and model_data, "models endpoint has no data")
         model_name = model_data[0].get("id")
-        require(model_name == "qwen3_5", f"unexpected served model: {model_name!r}")
+        require(isinstance(model_name, str) and model_name, f"no served model id: {model_name!r}")
+        # The binary is constructed with the registry's name for the checkpoint;
+        # `pocketllm serve` reports the checkpoint it was pointed at unless told
+        # otherwise, so only the binary's id is a fixed string.
+        if args.launch == "native":
+            require(model_name == "qwen3_5", f"unexpected served model: {model_name!r}")
 
         nonstream = http_request(
             base_url,
@@ -1442,13 +1646,27 @@ def run(args: argparse.Namespace) -> int:
         )
         validate_stream(stream, model_name)
 
-        validate_request_field_refusals(base_url, model_name, timeout=10.0)
+        validate_request_field_refusals(
+            base_url, model_name, timeout=10.0, launch=args.launch
+        )
 
         validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
-        validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+        run_check(
+            "n choices",
+            lambda: validate_n_choices(
+                base_url, model_name, timeout=args.request_timeout_seconds + 30
+            ),
+            launch=args.launch,
+        )
 
-        validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
+        run_check(
+            "logprobs",
+            lambda: validate_logprobs(
+                base_url, model_name, timeout=args.request_timeout_seconds + 30
+            ),
+            launch=args.launch,
+        )
 
         validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
@@ -1493,26 +1711,32 @@ def run(args: argparse.Namespace) -> int:
         require(len(concurrent_results) == 2, "concurrent request count mismatch")
 
         logs = read_logs(log_dir)
-        expected_width = min(args.max_batch_size, 2)
-        require(
-            f"[server] batch width {expected_width}" in logs,
-            "rank-0 log did not report the requested scheduler width",
-        )
-        require(
-            f"prefill budget {args.prefill_token_budget}" in logs,
-            "rank-0 log did not report the configured prefill budget",
-        )
+        # These two lines are the binary's own report of what it was
+        # constructed with; `pocketllm serve` takes the same width through the
+        # flag it already asserts by accepting, and derives the prefill budget
+        # from --prefill-chunk-tokens rather than logging it, so there is no
+        # counterpart line to read back.
+        if args.launch == "native":
+            expected_width = min(args.max_batch_size, 2)
+            require(
+                f"[server] batch width {expected_width}" in logs,
+                "rank-0 log did not report the requested scheduler width",
+            )
+            require(
+                f"prefill budget {args.prefill_token_budget}" in logs,
+                "rank-0 log did not report the configured prefill budget",
+            )
         clients = ", ".join(
             f"{client}={status}" for client, status in sorted(TOOL_CLIENT_RESULTS.items())
         )
         print(
-            f"[PASS] native Qwen OpenAI serving: tp={tp_world} model={model_name} "
-            f"log_dir={log_dir} concurrent_requests={len(concurrent_results)} "
-            f"tool_clients=[{clients}]"
+            f"[PASS] Qwen OpenAI serving via {args.launch}: tp={len(devices)} "
+            f"model={model_name} log_dir={log_dir} "
+            f"concurrent_requests={len(concurrent_results)} tool_clients=[{clients}]"
         )
         return 0
     except Exception:
-        print("[FAIL] native Qwen OpenAI serving", file=sys.stderr)
+        print(f"[FAIL] Qwen OpenAI serving via {args.launch}", file=sys.stderr)
         print(read_logs(log_dir), file=sys.stderr)
         raise
     finally:
@@ -1528,8 +1752,23 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True, help="Qwen Safetensors checkpoint directory")
+    parser.add_argument(
+        "--launch",
+        choices=["native", "pocketllm"],
+        default="native",
+        help=(
+            "which front end to test: the pocketllm_engine --serve binary "
+            "(one process a rank), or `pocketllm serve --backend cpp` (one "
+            "process, supervising its own ranks)"
+        ),
+    )
     parser.add_argument("--binary", default="build/cpp_engine/pocketllm_engine")
     parser.add_argument("--python", default=sys.executable, help="Python with transformers installed")
+    parser.add_argument(
+        "--pocketllm-python",
+        default=sys.executable,
+        help="interpreter to run `pocketllm serve` with, for --launch pocketllm",
+    )
     parser.add_argument("--sidecar", default="src/server/cpp_sidecar.py")
     parser.add_argument("--devices", default="0,1,2,3", help="Comma-separated CUDA device IDs")
     parser.add_argument("--port", type=int, default=18080)
