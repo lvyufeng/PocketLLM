@@ -589,6 +589,7 @@ The native bridge is optional and does not affect CPU-only imports. You can buil
 ### Via pip install
 
 ```bash
+export NCCL_ROOT=/path/to/nccl          # see "NCCL is not optional for TP" below
 POCKETLLM_BUILD_CPP=1 pip install --no-build-isolation .
 ```
 
@@ -596,16 +597,47 @@ The `--no-build-isolation` flag ensures the active environment's Torch is the on
 Torch extension build. Without `POCKETLLM_BUILD_CPP=1`, the install skips the native module and
 produces only the Torch runtime.
 
-The native module installs top-level (`import pocketllm_cpp`), so no manual copy is needed.
+The native module installs top-level (`import pocketllm_cpp`), so no manual copy is needed. The
+install forwards `NCCL_ROOT`, `NCCL_INCLUDE_DIR` and `NCCL_LIBRARY` from the environment when they
+are set; it does not search for NCCL of its own.
 
 ### Manual CMake build
 
 ```bash
+export NCCL_ROOT=/path/to/nccl
 cmake -S cpp_engine -B cpp_engine/build-python \
   -DPOCKET_BACKEND=cuda \
   -DPOCKET_BUILD_PYTHON=ON \
+  -DPython3_ROOT_DIR="$(python -c 'import sys; print(sys.prefix)')" \
+  -DPython3_FIND_STRATEGY=LOCATION \
+  -DNCCL_ROOT="$NCCL_ROOT" \
+  -DPOCKET_REQUIRE_NCCL=ON \
   -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')"
 cmake --build cpp_engine/build-python --target pocketllm_cpp -j
+cp cpp_engine/build-python/python/pocketllm_cpp*.so "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+```
+
+`-DPython3_ROOT_DIR` is what makes CMake build against the interpreter that will import the module;
+without it a conda environment's Python is easy to lose to whichever one is first on the search path,
+and the mismatch shows up as a missing `Development.Module` at configure time.
+
+#### NCCL is not optional for TP
+
+NCCL is optional to the *build* and required by every `--tensor-parallel-size` above 1, and the
+first failure is late: the module imports, loads a checkpoint, and then `warmup_tp()` raises
+`Qwen TP requires an NCCL-enabled build`. NCCL from a conda `nvidia-nccl-cu12` wheel lives under
+`$CONDA_PREFIX/lib/python3.*/site-packages/nvidia/nccl`, which is not on CMake's search path, so a
+build that does not name it comes out TP-incapable with no warning at configure time.
+`-DPOCKET_REQUIRE_NCCL=ON` turns that into a configure failure; leave it off on a machine that will
+only ever run one card, which is a real configuration (the single-card GGUF paths have no
+collective at all).
+
+The pip path has no equivalent switch: it forwards `NCCL_ROOT` and leaves the decision to CMake's
+own discovery, so a `pip install` build has no configure-time guard at all. The check that catches
+it after the fact is `ldd` on the installed module — no `libnccl` line means no TP:
+
+```bash
+ldd "$(python -c 'import pocketllm_cpp; print(pocketllm_cpp.__file__)')" | grep nccl
 ```
 
 Add `cpp_engine/build-python/python` to `PYTHONPATH` for a build-tree smoke test:
