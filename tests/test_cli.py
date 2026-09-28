@@ -233,13 +233,68 @@ def test_supervised_parent_passes_lifecycle_options(monkeypatch) -> None:
     assert captured["rendezvous_dir"] == "/tmp/rv"
 
 
-def test_supervised_parent_rejects_explicit_device(monkeypatch) -> None:
+def test_supervised_parent_forwards_the_platform_and_the_card_list(monkeypatch) -> None:
+    """Both halves of the split reach the children, and the parent no longer refuses either.
+
+    `--device` used to be refused outright under automatic supervision, and the refusal was the
+    reason a sharded launch had to narrow `CUDA_VISIBLE_DEVICES` per rank and pass `--device 0`
+    beside it. U3 split the name: a platform has nothing to conflict with supervision, and
+    `--device-ids 2,3` is well defined under it -- rank *r* takes the r-th -- so the pair is now one
+    flag on the parent's command line and there is nothing left for the parent to refuse.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeSupervisor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "TensorParallelSupervisor", FakeSupervisor)
+    monkeypatch.setattr(cli, "create_backend", lambda args: pytest.fail("backend was constructed"))
     monkeypatch.setattr(cli, "select_backend", lambda args: "torch")
-    with pytest.raises(Exception, match="--device"):
-        cli.main([
-            "serve", "--model", "checkpoint", "--backend", "torch",
-            "--tensor-parallel-size", "2", "--device", "cuda:0",
-        ])
+
+    assert cli.main([
+        "serve", "--model", "checkpoint", "--backend", "torch",
+        "--tensor-parallel-size", "2", "--device", "cuda", "--device-ids", "2,3",
+    ]) == 0
+    command = captured["command"]
+    assert command[command.index("--device") + 1] == "cuda"
+    assert command[command.index("--device-ids") + 1] == "2,3"
+
+
+def test_a_card_under_device_is_refused_by_name_with_the_flag_that_answers_it(capsys) -> None:
+    """The migration, in the one place an operator meets it.
+
+    `--device cuda:2` is not a typo -- it is the value this flag took until U3 -- so `invalid
+    choice` would be true and useless. The refusal names `--device-ids`, which is the whole of what
+    an affected script has to change. Read off stderr rather than off the exception, because
+    argparse reports a parse error by exiting with a status and printing the sentence.
+    """
+    for value, hint in (("cuda:2", "--device-ids 2"), ("0", "--device-ids 0")):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["serve", "--model", "checkpoint", "--device", value])
+        assert hint in capsys.readouterr().err
+
+
+def test_device_ids_are_one_card_per_rank_in_rank_order() -> None:
+    """The parser's value is a comma-separated list, and the args carry it as the same list.
+
+    `--device-ids 2,3` is the pair a launcher used to write twice -- `CUDA_VISIBLE_DEVICES=$rank`
+    once per rank, `--device 0` beside it -- and rank *r* taking the r-th entry is what makes one
+    spelling enough. A list shorter than the world leaves the last ranks none, which is refused
+    where the world is known rather than where the card is looked up.
+    """
+    args = _args(_parse("--tensor-parallel-size", "2", "--device-ids", "2,3"))
+    assert args.device_ids == (2, 3)
+    assert _args(_parse("--device-ids", "2")).device_ids == (2,)
+    assert _args(_parse()).device_ids == ()
+
+    with pytest.raises(Exception, match="one per rank"):
+        _args(_parse("--tensor-parallel-size", "4", "--device-ids", "2,3"))
+    with pytest.raises(Exception, match="cannot hold two ranks"):
+        _args(_parse("--tensor-parallel-size", "2", "--device-ids", "2,2"))
 
 
 def test_supervised_parent_spawns_the_cpp_backend_too(monkeypatch) -> None:

@@ -33,10 +33,11 @@ that is tens of milliseconds of device work, that is not measurable.
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -553,6 +554,67 @@ def device_index(device: Any) -> int:
         return int(suffix)
     except ValueError:
         return 0
+
+
+#: The variables a launcher narrows the visible card set with, per platform. Read together rather
+#: than by the selected runtime's vendor, because who chose the vendor is not settled when a rank
+#: works out its card, and a launcher that sets one of them means the same thing on either.
+_VISIBLE_DEVICES = ("CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES")
+
+
+def visible_card_count(env: Mapping[str, str] | None = None) -> int | None:
+    """How many cards this process can see, when the launcher narrowed the list; ``None`` otherwise.
+
+    ``None`` and ``0`` are different answers and are kept apart: a variable nobody set means the
+    whole host, and a variable set to the empty string means no card at all -- which is how the
+    suite runs a CPU-only test on a card-bearing host. Collapsing them would make "narrowed to one"
+    and "narrowed to none" the same input to :func:`card_for_rank`.
+    """
+    source = os.environ if env is None else env
+    for variable in _VISIBLE_DEVICES:
+        value = source.get(variable)
+        if value is not None:
+            return len([item for item in value.split(",") if item.strip()])
+    return None
+
+
+def card_for_rank(
+    device_ids: Sequence[int] = (),
+    *,
+    rank: int = 0,
+    world: int = 1,
+    visible: int | None = None,
+) -> int:
+    """Which card this rank runs on, as an index into the set the process can see.
+
+    Two answers, and the difference between them is what ``--device-ids`` bought. **Named**: the
+    list is the world's cards in rank order, so this rank's is ``device_ids[rank]`` -- one flag
+    names every rank's card, and the launcher's ``CUDA_VISIBLE_DEVICES=$rank`` beside ``--device 0``
+    has nothing left to do. **Unnamed**: the rule every runtime already had, kept because a launcher
+    that still narrows visibility per rank is still correct -- a single process takes card 0, a
+    sharded one takes its rank, and a visibility narrowed to one card *is* index 0 of what this
+    process can see.
+
+    The indices are into the visible set and not physical, which is what makes the second spelling
+    reachable: ``--device-ids 0`` beside a per-rank ``CUDA_VISIBLE_DEVICES`` means what ``--device 0``
+    means today, and ``--device-ids 2,3`` on an unnarrowed host names cards 2 and 3. A launcher that
+    does both gets the intersection, which is the only reading that keeps the narrowed case working.
+    """
+    if device_ids:
+        if rank >= len(device_ids):
+            # Also refused in `EngineArgs.__post_init__` against the world, which is the check that
+            # can be made before anything loads; this one is the same statement for a caller that
+            # reached here with a rank the args never saw (an EP group's, say).
+            raise ConfigurationError(
+                f"device_ids names {len(device_ids)} card(s), so rank {rank} has none; "
+                "name one per rank, in rank order"
+            )
+        return int(device_ids[rank])
+    if world <= 1:
+        return 0
+    if visible is not None and visible <= 1:
+        return 0
+    return rank
 
 
 class SchedulerHost:

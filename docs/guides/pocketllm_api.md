@@ -147,9 +147,10 @@ the two things that still differ per runtime are the adapter to import and wheth
 already loaded when the adapter is constructed. Adding a runtime therefore means adding a
 `WorkerSpec` entry rather than writing a second worker script.
 `--no-tensor-parallel-supervisor` remains supported for `torchrun` and hand-written rank launchers,
-and is the opt-out for a rank layout this supervisor does not produce (a per-rank
-`CUDA_VISIBLE_DEVICES`, for instance, which the `cpp` adapter detects and honours rather than
-double-counting). This process supervisor is not a scheduler: it starts ranks and reaps them, and
+and is the opt-out for a rank layout this supervisor does not produce. A per-rank
+`CUDA_VISIBLE_DEVICES` is a layout it does produce — and is still honoured — but it is no longer the
+way to name cards: `--device-ids 2,3` names every rank's card once, and the offset the `cpp` adapter
+used to apply on top of a narrowed list is not applied on top of an explicit list. This process supervisor is not a scheduler: it starts ranks and reaps them, and
 what runs inside those ranks is the backend's own business. Whether a served backend batches is
 decided separately and per backend — see [Batching on the `cpp` backend](#batching-on-the-cpp-backend)
 — so `--tensor-parallel-size 4` says nothing about the width a request sees.
@@ -216,14 +217,23 @@ long form of one that has.
 | Named one option twice, once by an older spelling | `ConfigurationError`. `chunk_rows`/`expert_rows` and `expert_deal`/`deal` are each one option under two names, and which of the two was meant is not knowable from the values. |
 
 A concept more than one runtime reads is declared once
-(`pocketllm/backends/shared_options.py`): `device`, `prefill_chunk`, `prefix_cache_bytes`,
+(`pocketllm/backends/shared_options.py`): `prefill_chunk`, `prefix_cache_bytes`,
 `prefix_cache_head_tokens` and `expert_deal`. Each runtime references that declaration and states
 only what it answers for itself — its own default, its own way of resolving an unset value — so the
 flag means one thing wherever it is read, and `--help` prints the answers side by side
-(`when unset: 4g on v41 and mimo; 2g on xing4`). Two declarations are spelled by a host flag instead
+(`when unset: 4g on v41 and mimo; 2g on xing4`). One declaration is spelled by a host flag instead
 of a generated one: `prefill_chunk` is `--prefill-chunk-tokens`, which the native engine reads by
-that name, and `device` has no flag until the `--device`/`--device-ids` split (issue #447's U3) —
-the card is reachable as `--backend-option device=cuda:1`, as it is today.
+that name.
+
+`device` used to be declared here too, and it is not an option any more. One name did two jobs — the
+platform on the top level, a card on each of the three runtimes, read three different ways — so it
+split: **`--device auto|cuda|ascend|cpu`** is the platform and **`--device-ids 2,3`** is the cards,
+both on the host beside `--tensor-parallel-size`, because a card list that means the same thing on
+every runtime is a fact about the launch. Rank *r* takes the r-th entry, which is the pair
+`CUDA_VISIBLE_DEVICES=$rank` + `--device 0` written once for the whole world; unset keeps that pair
+working. The old spelling — `--device cuda:2`, `--device 0`, `--backend-option device=...` — is
+refused by name, with `--device-ids` in the message. See
+[the migration note](../migration/device-splits-into-platform-and-cards.md).
 
 The keys the CLI fills in on every launch — `engine_kind`, `routed_experts_device`, `pd_mode`, and
 `nccl_id_path` for a sharded one — are accepted by every runtime and read by none of the model

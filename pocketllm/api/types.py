@@ -16,6 +16,12 @@ from .errors import ConfigurationError
 
 _BACKENDS = {"auto", "torch", "cpp", "v41", "mimo", "xing4"}
 _FORMATS = {"auto", "safetensors", "gguf"}
+#: The platforms ``--device`` accepts. Upstream's sets are wider -- vLLM has ``auto|cuda|cpu|tpu|
+#: xpu`` and SGLang ``cuda|xpu|hpu|npu|cpu|musa`` -- and narrower for us only in that we have no
+#: build for the four we omit: a value this build cannot serve is refused rather than retuned, which
+#: is the same reason upstream keeps a ``cpu`` in a list of accelerators. ``cpu`` is here because
+#: this repository really runs that way: the suite's scripted models, and a `torch` deployment.
+_DEVICES = ("auto", "cuda", "ascend", "cpu")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -33,6 +39,65 @@ def _env_int(name: str, default: int) -> int:
 def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     return default if value is None or value == "" else float(value)
+
+
+def _names_a_card(value: Any) -> bool:
+    """Whether a device value is a card rather than a platform, which is the pre-U3 spelling.
+
+    ``0``, ``cuda:2`` and ``npu:1`` are each one card; ``cuda`` and ``ascend`` are platforms. The
+    distinction is made here rather than inside an error message so that the message can say which
+    of the two a caller typed -- a number is the part a reader recognises, and it is the reason this
+    field stopped accepting it.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    text = str(value).strip().lower()
+    return ":" in text or text.isdigit()
+
+
+def device_hint(value: Any) -> str:
+    """The sentence a refusal of the old ``--device`` spelling ends with, or the empty string.
+
+    One function because two places refuse that spelling -- the parser, so an operator reads it
+    before anything loads, and :meth:`EngineArgs.__post_init__`, so a caller building the args by
+    hand reads it too -- and the value they were handed is the only thing that differs between them.
+    """
+    if not _names_a_card(value):
+        return ""
+    card = str(value).split(":")[-1].strip()
+    return f"; {value!r} names a card, which is `--device-ids {card}`"
+
+
+def _coerce_device_ids(value: Any) -> tuple[int, ...]:
+    """``--device-ids`` as a tuple of card indices, from a list, a tuple or ``"2,3"``.
+
+    A string is split on commas because that is what a command line carries and what the worker
+    environment is written from, and a sequence is read as one because that is what a caller
+    building :class:`EngineArgs` by hand has. Both land on the same tuple so that comparing two
+    launches -- a parent against the rank it spawned -- is a comparison of values and not of
+    spellings. A duplicate is refused: two ranks on one card is a collective that never completes.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items: list[Any] = [item for item in value.split(",") if item.strip()]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        items = list(value)
+    else:
+        raise ConfigurationError(f"device_ids must be a list of card indices or 'L,M', got {value!r}")
+    cards: list[int] = []
+    for item in items:
+        if isinstance(item, bool) or not isinstance(item, (int, str)) or not str(item).strip().isdigit():
+            raise ConfigurationError(f"device_ids must be non-negative card indices, got {item!r}")
+        cards.append(int(item))
+    duplicates = sorted({card for card in cards if cards.count(card) > 1})
+    if duplicates:
+        raise ConfigurationError(
+            f"device_ids names card {duplicates[0]} twice; one card cannot hold two ranks"
+        )
+    return tuple(cards)
 
 
 def _coerce_stop(value: Any) -> tuple[str, ...]:
@@ -59,7 +124,20 @@ class EngineArgs:
     model_format: str = "auto"
     tensor_parallel_size: int = 1
     tensor_parallel_rank: int = 0
-    device: str | int | None = None
+    #: Which platform this process runs on: ``auto``, ``cuda``, ``ascend`` or ``cpu``. It is the
+    #: *vendor*,
+    #: and it used to be the card -- one name doing both jobs, which is what U3 of #447 split. A
+    #: value that names a card is refused in :meth:`__post_init__` with :attr:`device_ids` in the
+    #: message, because this field cannot answer it: ``auto`` asks the build, and an explicit value
+    #: this build cannot serve is an error rather than a retune.
+    device: str = "auto"
+    #: The cards the ranks run on, in rank order: rank *r* takes ``device_ids[r]``. Indices into the
+    #: set this process can see, so ``--device-ids 0`` beside a per-rank ``CUDA_VISIBLE_DEVICES``
+    #: means what ``--device 0`` means today, and ``--device-ids 2,3`` is that pair written once for
+    #: the whole world. Empty is the rule every runtime already had -- a single process takes card 0
+    #: and a sharded one takes its rank -- which is why unset stays the default rather than becoming
+    #: an error: a launcher that narrows visibility per rank is still correct.
+    device_ids: tuple[int, ...] = ()
     max_model_len: int | None = None
     dtype: str | None = None
     kv_cache_dtype: str = "auto"
@@ -104,6 +182,28 @@ class EngineArgs:
             raise ConfigurationError("tensor_parallel_size must be >= 1")
         if not 0 <= self.tensor_parallel_rank < self.tensor_parallel_size:
             raise ConfigurationError("tensor_parallel_rank must be in [0, tensor_parallel_size)")
+        if self.device not in _DEVICES:
+            # U3 split one name in two, and this is where the old one is refused. `--device 0` and
+            # `--device cuda:2` named a card; a card is `--device-ids` now, and the message says so
+            # rather than leaving the caller to find the flag. Anything else is a plain typo.
+            raise ConfigurationError(
+                f"device must be one of {', '.join(_DEVICES)}, got {self.device!r}"
+                f"{device_hint(self.device)}"
+            )
+        if self.device_ids and self.device == "cpu":
+            # A card list and a host-only platform are two answers to one question, and the pair has
+            # none: `cpu:0` is not a device. Refused here rather than at the binding, because this is
+            # where both halves are still the caller's words.
+            raise ConfigurationError("device_ids names cards, and device=cpu names none")
+        self.device_ids = _coerce_device_ids(self.device_ids)
+        if self.device_ids and len(self.device_ids) < self.tensor_parallel_size:
+            # Caught here rather than at the card lookup, because this is the same statement the
+            # lookup makes and it can be made once, before a runtime has loaded anything: every rank
+            # of the world needs a card, and a list shorter than the world leaves the last ones none.
+            raise ConfigurationError(
+                f"device_ids names {len(self.device_ids)} card(s) for a world of "
+                f"{self.tensor_parallel_size}; name one per rank, in rank order"
+            )
         if self.max_model_len is not None and self.max_model_len < 1:
             raise ConfigurationError("max_model_len must be positive")
         if self.prefill_chunk_tokens < 0:
@@ -158,7 +258,8 @@ class EngineArgs:
             "model_format": os.getenv("CKPT_FORMAT", "auto"),
             "tensor_parallel_size": _env_int("TENSOR_PARALLEL_SIZE", _env_int("TP_WORLD", 1)),
             "tensor_parallel_rank": _env_int("TENSOR_PARALLEL_RANK", _env_int("TP_RANK", 0)),
-            "device": os.getenv("DEVICE") or None,
+            "device": os.getenv("DEVICE") or "auto",
+            "device_ids": os.getenv("POCKETLLM_DEVICE_IDS") or (),
             "max_model_len": (
                 _env_int("MAX_MODEL_LEN", _env_int("DEEPSEEK_MAX_MODEL_LEN", 0)) or None
             ),

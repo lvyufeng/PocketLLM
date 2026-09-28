@@ -399,8 +399,8 @@ def test_native_options_normalize_cli_device_and_auto_kv_dtype() -> None:
             "checkpoint",
             "--backend",
             "cpp",
-            "--device",
-            "cuda:2",
+            "--device-ids",
+            "2",
             "--max-model-len",
             "4096",
         ]

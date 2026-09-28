@@ -285,6 +285,19 @@ def canonical_names(declarations: Iterable[BackendOption]) -> dict[str, str]:
     return {spelling: option.name for option in declarations for spelling in option.names}
 
 
+#: Keys a runtime used to declare and does not any more, and where the concept went. One entry, and
+#: it earns its place: the alternative to saying it is a caller reading a list of the keys that
+#: remain and concluding that `device` was dropped, when what happened is that it moved up to the
+#: host and split in two. `--backend-option` is where such a move is felt, because a key with no
+#: declaration is refused here and a flag with no reader is refused a layer above.
+MOVED: dict[str, str] = {
+    "device": (
+        "`device` is the host's now and it is two concepts: `--device` is the platform "
+        "(auto|cuda|ascend|cpu) and `--device-ids 2,3` is the cards, in rank order"
+    ),
+}
+
+
 def decode_args(
     declarations: Iterable[BackendOption],
     args: Any,
@@ -352,9 +365,14 @@ def decode_options(
     spellings = canonical_names(declarations)
     unknown = sorted(set(supplied) - set(spellings))
     if unknown:
+        # The list of what it does know is the answer to a typo. A key that *moved* is a different
+        # question, and it is the one this surface's own splits create, so the two get two sentences:
+        # a reader told only the list would be told the concept no longer exists, and it does.
+        moved = MOVED.get(unknown[0])
         raise ConfigurationError(
             f"backend={runtime!r} has no option {unknown[0]!r}; it knows "
             f"{', '.join(sorted(option.name for option in declarations))}"
+            + (f". {moved}" if moved else "")
         )
     resolved = dict(resolved or {})
     undeclared = sorted(set(resolved) - {option.name for option in declarations})

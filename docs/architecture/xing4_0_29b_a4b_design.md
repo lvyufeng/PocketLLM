@@ -398,7 +398,7 @@ tokenize the prompt with the wrong vocabulary.
 ```
 $ python -m pocketllm serve --backend xing4 \
     --model .../xing4_0-29b-IQ4_NL.gguf --tokenizer-path .../Xing4.0-29B-A4B \
-    --served-model-name xing4 --device cuda:2 --max-model-len 8192 --port 8123
+    --served-model-name xing4 --device-ids 2 --max-model-len 8192 --port 8123
 
 $ curl -s localhost:8123/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model":"xing4","temperature":0,"max_tokens":48,
@@ -500,7 +500,7 @@ Every number above is a measurement on one x86_64 box with 4×RTX 2080 Ti, on th
 | The context ceiling | allocate the cache, then run a 128-token chunk at `ctx - 128` |
 | The decode step's launch count and per-kernel device time | `torch.profiler` over 10 steps at a 4096-token context |
 | The residual-width defect | a per-block magnitude walk on the one-token `[2]` prompt, plus an fp64 dequantized replay of `blk.27`'s MoE |
-| The served request, streaming, cancel, metrics | `pocketllm serve --backend xing4 --device cuda:2 --max-model-len 8192 --port 8123` and `curl` |
+| The served request, streaming, cancel, metrics | `pocketllm serve --backend xing4 --device-ids 2 --max-model-len 8192 --port 8123` and `curl` |
 | Two cards as two processes | the same bench on `cuda:0` alone and then on `cuda:0` and `cuda:1` together |
 
 The tests are `tests/test_xing4_0_hyper_connection.py`, `tests/test_xing4_0_moe.py`,

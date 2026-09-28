@@ -225,7 +225,7 @@ python scripts/bench_xing4_0_hyper_connection.py --device cuda:2 --steps 8
 
 ## Performance
 
-One RTX 2080 Ti 22 GiB, `--device cuda:2`, the released `xing4_0-29b-IQ4_NL.gguf`, one request at a
+One RTX 2080 Ti 22 GiB, card 2 (`--device-ids 2`), the released `xing4_0-29b-IQ4_NL.gguf`, one request at a
 time, `--max-model-len 32768`, greedy, **32 generated tokens**. The prompts are a real repository
 document cut to an exact token count — not synthetic ids, because the router's draws are a function
 of the activations and a prompt made of noise routes to experts a served request never picks.

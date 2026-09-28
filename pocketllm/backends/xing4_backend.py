@@ -62,8 +62,15 @@ from pocketllm.api import (
 from .base import BackendBase, TokenStreamer
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
-from .shared_options import DEVICE, PREFILL_CHUNK, PREFIX_CACHE_BYTES
-from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
+from .shared_options import PREFILL_CHUNK, PREFIX_CACHE_BYTES
+from .runtime_engine import (
+    RuntimeSpec,
+    SchedulerHost,
+    cancel_key,
+    card_for_rank,
+    device_index,
+    visible_card_count,
+)
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the cache is sized at when ``--max-model-len`` is not given.
@@ -132,7 +139,6 @@ DEFAULT_PREFIX_CACHE_BYTES = 2 << 30
 #: picks it from the context and the card's free memory at load, so the declaration carries ``None``
 #: and the adapter resolves it -- and says so in ``--help`` via the ``resolution`` sentence.
 OPTIONS: tuple[BackendOption, ...] = (
-    DEVICE,
     BackendOption(
         "gguf",
         Kind.STRING,
@@ -208,7 +214,6 @@ class _Options:
     the declarations to: the two cannot say different things about a default.
     """
 
-    device: str | None = None
     gguf: str | None = None
     prefill_chunk: int | None = None
     prefix_cache_bytes: int = DEFAULT_PREFIX_CACHE_BYTES
@@ -336,7 +341,30 @@ class Xing4Backend(SchedulerHost, BackendBase):
         self._model: Any = None
         self._cache: Any = None
         self._prefix_cache: Any = None
-        self._device = self._options.device or str(getattr(args, "device", "") or "cuda")
+        #: The cards the launch named, in rank order; empty when it named none.
+        self._device_ids = tuple(getattr(args, "device_ids", ()) or ())
+        # The platform, and then the card. Before U3 this was one expression over two names for the
+        # same thing -- the option this runtime declared, and the top level's own flag, either of
+        # which a launcher might have used. `auto` resolves to `cuda` here rather than to whatever
+        # the box has, because this runtime is a CUDA one: `cpu` is how a caller asks for no card at
+        # all, which is what the suite's scripted model runs as, and it is the launch's word rather
+        # than a fallback this adapter picked.
+        self._device = str(getattr(args, "device", "") or "auto")
+        if self._device == "auto":
+            self._device = "cuda"
+        if self._device_ids:
+            # This runtime owns one process, so this process's card is the list's first entry; the
+            # rank is read from the arguments all the same, so a served-from-one-process launch
+            # names its card the same way a sharded one does.
+            self._device = "%s:%d" % (
+                self._device,
+                card_for_rank(
+                    self._device_ids,
+                    rank=int(getattr(args, "tensor_parallel_rank", 0) or 0),
+                    world=int(getattr(args, "tensor_parallel_size", 1) or 1),
+                    visible=visible_card_count(),
+                ),
+            )
         self._heads = 0
         self._request_lock = threading.RLock()
         self._details: dict[str, Any] = {}

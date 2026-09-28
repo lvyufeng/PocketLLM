@@ -425,19 +425,25 @@ def test_the_backend_option_wins_over_the_cli_flag_for_the_prefill_chunk(tmp_pat
     assert backend._prefill_chunk is None
 
 
-def test_an_expert_device_option_offsets_by_rank_only_when_one_process_drives_a_card(tmp_path):
-    backend, _ = _build(_checkpoint(tmp_path), backend_options={"device": "cuda:2"})
+def test_the_expert_arena_starts_where_the_card_list_starts(tmp_path):
+    """The loader adds the rank to the split's first card, so what it can be told is the list's base.
+
+    `--device-ids 2,3` on a world of two therefore reaches the loader as 2 and lands rank 1's
+    experts on card 3, which is the card the launch named for it. A list the runtime cannot reach
+    is refused rather than handed over: the loader has one number and cannot honour a gap.
+    """
+    backend, _ = _build(_checkpoint(tmp_path), device_ids=(2,))
     assert backend._resolve_expert_device() == "cuda:2"
 
     backend, _ = _build(_checkpoint(tmp_path))
     assert backend._resolve_expert_device() is None
 
-    # A sharded run wants where the split starts, not this rank's card: the loader adds the rank.
-    backend, _ = _build(
-        _checkpoint(tmp_path), tensor_parallel_size=4, backend_options={"device": "cuda:2"}
-    )
-    backend._world, backend._rank = 4, 2
+    # Sharded: the base is the list's first entry and the loader names every card from it.
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4, device_ids=(0, 1, 2, 3))
     assert backend._resolve_expert_device() == "cuda:0"
+
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=4, device_ids=(2, 3, 4, 5))
+    assert backend._resolve_expert_device() == "cuda:2"
 
     backend, _ = _build(
         _checkpoint(tmp_path), tensor_parallel_size=4, backend_options={"expert_device": "cuda:1"}
@@ -445,13 +451,15 @@ def test_an_expert_device_option_offsets_by_rank_only_when_one_process_drives_a_
     assert backend._resolve_expert_device() == "cuda:1"
 
 
-def test_a_rank_whose_card_the_loader_arithmetic_cannot_name_is_refused(tmp_path):
-    """The loader adds the rank to the split's first card, so a rank must not sit below it."""
-    backend, _ = _build(
-        _checkpoint(tmp_path), tensor_parallel_size=4, backend_options={"device": "cuda:1"}
-    )
-    backend._world, backend._rank = 1, 3
-    with pytest.raises(ConfigurationError, match="one node"):
+def test_a_card_list_the_loader_arithmetic_cannot_walk_is_refused(tmp_path):
+    """A gap is not a base the loader can be given, and the first entry is the wrong answer.
+
+    Handing it `2` for `2,4` would put rank 1's experts on card 3 -- a card the launch did not name
+    -- so the refusal is the only answer that is not silently wrong. A caller who really means a
+    base names it outright.
+    """
+    backend, _ = _build(_checkpoint(tmp_path), tensor_parallel_size=2, device_ids=(2, 4))
+    with pytest.raises(ConfigurationError, match="contiguous"):
         backend._resolve_expert_device()
 
 
@@ -464,9 +472,14 @@ def test_a_sharded_tree_lands_on_the_rank_own_card(tmp_path):
     backend._world, backend._rank, backend._local_rank = 4, 2, 2
     assert backend._tree_device() == "cuda:2"
 
-    # An explicit device still wins, sharded or not.
-    backend, _ = _build(_checkpoint(tmp_path), backend_options={"device": "cuda:3"})
-    backend._world, backend._rank, backend._local_rank = 4, 2, 2
+    # A card list answers it outright, per rank -- here rank 2 of four, on the card it named.
+    backend, _ = _build(
+        _checkpoint(tmp_path), tensor_parallel_size=4, tensor_parallel_rank=2, device_ids=(2, 3, 4, 5)
+    )
+    assert backend._tree_device() == "cuda:4"
+
+    # And a single process that named a card gets it, where the default would have kept the tree host.
+    backend, _ = _build(_checkpoint(tmp_path), device_ids=(3,))
     assert backend._tree_device() == "cuda:3"
 
 

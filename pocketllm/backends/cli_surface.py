@@ -16,15 +16,15 @@ both declare is *one* declaration (:mod:`pocketllm.backends.shared_options`), an
 flag the selected runtime does not read is refused rather than ignored -- see
 :func:`unread_options` and its caller in :func:`pocketllm.backends.factory.select_backend`.
 
-**Two declarations are answered by a flag that already exists**, and they are the only two:
+**One declaration is answered by a flag that already exists**, and it is the only one:
+``prefill_chunk`` is spelled ``--prefill-chunk-tokens``, the native engine's name for the same
+quantity, which predates the declarations and is read by paths that have no options of their own.
 
-* ``prefill_chunk`` is spelled ``--prefill-chunk-tokens``, the native engine's name for the same
-  quantity, which predates the declarations and is read by paths that have no options of their own.
-* ``device`` has no flag at all, because ``--device`` already exists and means the *vendor* on one
-  path and the card on another; splitting it into ``--device auto|cuda|ascend`` plus
-  ``--device-ids`` is the whole of U3, and a generated ``--device`` in the meantime would be a
-  second meaning for a name that has one. The card stays reachable as ``--backend-option
-  device=cuda:1``, as it is today.
+``device`` used to be the second entry on that list and is not on it any more. U3 split it -- the
+platform is ``--device``, the cards are ``--device-ids`` -- and left both on the host, next to
+``--tensor-parallel-size``, because a card list that means the same thing on every runtime is a fact
+about the launch rather than a lever a runtime tunes. See
+:mod:`pocketllm.backends.shared_options` for why the declaration went away instead of being renamed.
 
 **A flag nobody named is absent**, not set to a sentinel: every action here is registered with
 ``argparse.SUPPRESS``, so the mapping this module fills holds exactly the options the launch named.
@@ -68,9 +68,12 @@ HOST_FLAGS: dict[str, str] = {
     "prefill_chunk": "prefill_chunk_tokens",
 }
 
-#: The declarations that deliberately have no flag yet. See the module docstring: ``device``'s name
-#: is taken by a host flag that means two things, and replacing it is U3.
-NO_FLAG: frozenset[str] = frozenset({"device"})
+#: The declarations that deliberately have no flag. Empty, and that is the state U3 left it in: the
+#: one entry was ``device``, whose name was taken by a host flag meaning two things, and splitting
+#: that name removed the declaration rather than giving it a flag. Kept as a set because the
+#: question it answers -- "is there anything a launch can name that is not on this command line?" --
+#: is one a reader should be able to ask and get ``no`` from.
+NO_FLAG: frozenset[str] = frozenset()
 
 _HOST_ONLY = frozenset({*HOST_FLAGS, *NO_FLAG})
 
