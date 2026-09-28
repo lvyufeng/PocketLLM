@@ -245,7 +245,7 @@ tensor cut in segments rather than as one range.
 
 | | Result |
 | --- | ---: |
-| Load, all 64 layers on 4 cards | **~122 s** — 497 dense FP16 linears, 12.53 GiB resident |
+| Load, all 64 layers on 4 cards | **~23 s** — 497 dense FP16 linears, 12.53 GiB resident |
 | Decode, one row | 23.6 tok/s — from a 16-token run, so indicative rather than a rate |
 | Decode, 16 rows batched | **173.6 tok/s** — 92.2 ms a step |
 | Card memory, one row | 19.60 GiB of 32 |
@@ -253,25 +253,28 @@ tensor cut in segments rather than as one range.
 The load is host work, not disk or device transfer. Both checkpoints put the same 12.53 GiB of FP16
 weights on each rank — that is what a TP4 shard of 27B parameters is — and the dense sibling loads it
 in **35.5 s** because it reads FP16 off disk and copies it across. Here the engine reads 5.95 GB
-instead, decodes 402 ternary tensors to FP16 on the host, and then pushes the same 12.53 GiB. Four
-runs of the whole runner, two per binary on the same command line, read 244.82 / 244.21 s for the
-first engine and 123.76 / 124.37 s for the second; the single-row pair reads 246.03 s and 120.10 s.
-The 244.6 s this page used to record was the decode at its old cost, and **the decode is no longer
-what the load spends**:
+instead, decodes 402 ternary tensors to FP16 on the host, and then pushes the same 12.53 GiB — and it
+now does the whole thing in less time than the sibling does with a copy, because the Hadamard unfold
+stopped being the load. Three arms on the same command line, two runs each and interleaved, put the
+previously shipped binary at 123.79 / 122.99 s (`model_load_seconds`, rank 0), the same code with the
+unfold restricted to the blocks a shard reads at 63.08 / 62.93 s, and that plus the row fan-out at
+22.70 / 24.87 s: **5.1× in all**, on bit-identical weights, with the design page carrying the arms,
+the worker sweep and how the bit-exactness is established.
 
-| What the ~122 s goes to | |
+| What the ~23 s goes to | |
 | --- | ---: |
-| Hadamard weight unfold, 128 tensors | **101.0 s** |
 | PTQ1_0 decode outside the unfold | 11.5 s |
 | Host resize of the 12.53 GiB destination | 4.4 s |
 | Device upload, checkpoint read and the rest | 4.6 s |
+| Hadamard weight unfold, 128 tensors, 16 workers | **~2.7 s** |
 
 The decode fell because a trit is −1, 0 or 1 and a block's scale is one fp16, so a block's 128
 weights take one of exactly three values: the narrowing runs three times a block into a three-entry
-table and each weight costs a lookup. It is now **2.9 ns a weight**, 20.3 s in all, of which 8.8 s
-sits inside the unfold above. What is left is the unfold — the 128 row-parallel folded matrices whose
-rotation axis a TP4 shard does not divide into whole blocks, transformed one row at a time in fp32 —
-which this change does not touch and which the design page describes.
+table and each weight costs a lookup. It is now **2.9 ns a weight**, 20.3 s in all. The unfold is no
+longer the largest term either, and the first three rows above are the previous record's numbers
+rather than new ones: the change does not touch those regions, and the non-unfold load measures the
+same 21.5 s it did before, so they are left where they were measured. What is left is the decode and
+the destination resize, which the design page names as the next two things.
 
 ### The batching gate
 
@@ -290,10 +293,10 @@ worst_logit_abs=0.0076313
 ## Known limitations
 
 - **The Ascend path expands this checkpoint to FP16.** 12.53 GiB resident instead of 5.53, and a
-  122 s load instead of the dense sibling's 35.5 s. It is the only way to run `PTQ1_0` there:
-  there is no packed-ternary kernel for the backend. The remaining gap is no longer the expansion:
-  101 s of the 122 is the Hadamard weight unfold, which the TP4 layout forces regardless of how the
-  weights are stored.
+  ~23 s load. It is the only way to run `PTQ1_0` there: there is no packed-ternary kernel for the
+  backend. The expansion is now cheaper than the dense sibling's FP16 load (35.5 s), so the trade is
+  paid off; what remains of the load is the PTQ1_0 decode and the destination resize rather than the
+  Hadamard unfold, which is down to ~2.7 s from the 101 s it was.
 - **A prompt whose token count is not a multiple of 64 pays a one-off penalty of up to 12 seconds.**
   The engine's last partial tile is processed by something slow: a 4,096-token prompt prefills in
   6.44 s and a 4,097-token one in 18.11 s, same content. The cost tracks the *unused* slots in that
