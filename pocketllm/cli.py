@@ -204,17 +204,24 @@ def main(argv: list[str] | None = None) -> int:
                 "--device cannot be used with automatic TP supervision; "
                 "use --no-tensor-parallel-supervisor for manual rank control"
             )
-        selected = select_backend(engine_args)
-        if selected == "cpp":
-            raise UnsupportedFeatureError(
-                "Python C++ Qwen adapter does not support automatic TP supervision; "
-                "use --no-tensor-parallel-supervisor and launch ranks through the "
-                "native binary instead"
-            )
-        # Every other adapter here is a Python one and takes its rank from the
-        # rendezvous the supervisor publishes, so it needs no special case: the V4.1
-        # adapter in particular joins the group and loads inside the child, which is
-        # what the readiness marker below the spawn is waiting for.
+        # Every adapter is dispatched by the same rule from here down, because every adapter takes
+        # its rank from the rendezvous the supervisor publishes. The V4.1 adapter in particular
+        # joins the group and loads inside the child, which is what the readiness marker below the
+        # spawn is waiting for.
+        #
+        # `cpp` used to be refused at this point, on the grounds that it exposed no worker entry
+        # point. It does: `CppBackend.run_worker` calls the engine's own `run_worker_loop`,
+        # `warmup_tp` forces the NCCL communicator up inside construction, `POCKETLLM_NCCL_ID_PATH`
+        # is read from the environment the supervisor sets, and the rank's card comes from
+        # `_native_rank_device`, which applies the rank offset precisely because the supervisor
+        # hands every rank the same visible device list. The refusal's remaining advice was to
+        # launch the ranks through the native binary instead -- the front end this refactor exists
+        # to delete.
+        #
+        # This resolves the backend and refuses an unroutable checkpoint here, in the parent, before
+        # any rank is started; a run whose ranks would each fail the same way is worse than one that
+        # fails once.
+        select_backend(engine_args)
         supervisor = TensorParallelSupervisor(
             command=[sys.executable, "-m", "pocketllm", *_supervised_command(argv or sys.argv[1:])],
             world_size=world,
