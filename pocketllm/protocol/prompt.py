@@ -101,6 +101,7 @@ def _encode_with_template(
     thinking_mode: str,
     reasoning_effort: Any,
     tools: Any,
+    add_generation_prompt: bool,
 ) -> list[int] | None:
     # Hugging Face exposes ``apply_chat_template`` on many tokenizers even
     # when the checkpoint has no actual template.  Check the metadata first so
@@ -114,7 +115,7 @@ def _encode_with_template(
 
     kwargs: dict[str, Any] = {
         "tokenize": True,
-        "add_generation_prompt": True,
+        "add_generation_prompt": add_generation_prompt,
         "enable_thinking": thinking_mode == "thinking",
         "reasoning_effort": _template_reasoning_effort(reasoning_effort),
     }
@@ -190,6 +191,7 @@ def encode_chat_prompt(
     thinking_mode: str = "chat",
     reasoning_effort: Any = None,
     tools: Any = None,
+    add_generation_prompt: bool = True,
     deepseek_fallback: bool = False,
 ) -> list[int] | None:
     """Encode normalized chat messages using the best available model format.
@@ -199,6 +201,13 @@ def encode_chat_prompt(
     enabled by the DeepSeek adapter; generic callers otherwise receive
     ``None`` and may use their own fallback.  ``None`` means the tokenizer
     cannot encode this chat request.
+
+    ``add_generation_prompt`` is passed to the checkpoint's template, where it
+    decides whether the prompt ends with the assistant header the model answers
+    into.  It has no counterpart in the legacy DeepSeek encoder, which builds its
+    own framing and always opens the assistant turn -- so a caller that turns it
+    off and lands on that path gets the framing it always got, rather than a
+    prompt neither encoder would produce.
     """
     if not isinstance(messages, Sequence) or isinstance(messages, (str, bytes)):
         raise ValueError("messages must be a non-empty sequence")
@@ -211,6 +220,7 @@ def encode_chat_prompt(
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
         tools=tools,
+        add_generation_prompt=add_generation_prompt,
     )
     if encoded is not None:
         return encoded

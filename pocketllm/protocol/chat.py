@@ -19,6 +19,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 _REASONING_EFFORTS = {None, "minimal", "low", "medium", "high", "max"}
+#: The two values ``thinking_mode`` takes. Named because the mode is a *choice* rather than an
+#: effort, so a value outside this set is a request error rather than something to map onto a
+#: default the way an unknown effort is.
+_THINKING_MODES = {"chat", "thinking"}
 _TOOL_ATTACH_ROLES = {"system", "developer"}
 _INSTRUCTION_ROLES = {"user", "developer", "system"}
 
@@ -118,16 +122,30 @@ def prepare_messages(body: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def thinking_config(body: Mapping[str, Any]) -> tuple[str, str | None]:
-    """Resolve ``reasoning``/``reasoning_effort`` into a thinking mode and effort."""
+    """Resolve the mode and the effort a chat request asks for.
+
+    ``thinking_mode`` is this project's own spelling and the one the native front end read, so it is
+    taken as the mode rather than inferred from anything else: a request that names it has said
+    which of the two it wants. ``reasoning`` and ``reasoning_effort`` are OpenAI's pair, and either
+    of them being present is what *implies* thinking -- there is nothing else for an effort to
+    control, so a request carrying one without naming a mode asked for thinking. A request naming
+    both gets the named mode and the effort, which is contradictory input and worth answering
+    literally rather than guessing which half the caller meant.
+    """
+    named = body.get("thinking_mode")
+    if named is not None and str(named).strip().lower() not in _THINKING_MODES:
+        raise ValueError('thinking_mode must be "chat" or "thinking"')
     reasoning = body.get("reasoning")
     effort = body.get("reasoning_effort")
     if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
         effort = reasoning.get("effort")
-    if reasoning is None and effort is None:
-        return "chat", None
+    if named is not None:
+        mode = str(named).strip().lower()
+    else:
+        mode = "thinking" if (reasoning is not None or effort is not None) else "chat"
     if effort not in _REASONING_EFFORTS:
         effort = None
-    return "thinking", effort
+    return mode, effort
 
 
 def normalize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
@@ -203,6 +221,15 @@ class ChatRequest:
     prompt: str | None = None
     thinking_mode: str = "chat"
     reasoning_effort: str | None = None
+    #: Whether the prompt ends with the assistant header the model answers into.
+    #:
+    #: True is what a chat request wants and what every OpenAI client sends by leaving it out:
+    #: the template closes the conversation and opens the assistant's turn. False encodes the
+    #: conversation as it stands, with nothing after the last message -- which is how a caller
+    #: continues an assistant turn or checks what the template does. It is the native front end's
+    #: field and was never plumbed through here, so a request setting it was answered as if it had
+    #: asked for the assistant header.
+    add_generation_prompt: bool = True
     tools: Any = None
     tool_choice: Any = None
     response_format: Any = None
@@ -232,6 +259,7 @@ class ChatRequest:
             messages=messages,
             thinking_mode=mode,
             reasoning_effort=effort,
+            add_generation_prompt=bool(body.get("add_generation_prompt", True)),
             tools=body.get("tools"),
             tool_choice=body.get("tool_choice"),
             response_format=body.get("response_format"),
@@ -249,6 +277,12 @@ class ChatRequest:
             "stream_options": dict(self.stream_options),
             "response_format": self.response_format,
         }
+        # The default is what every backend already does, so it is written only when a request
+        # overrides it -- the same way ``reasoning_effort`` and ``tools`` below are. A completion
+        # never carries it at all: its prompt is literal text with no template to add an assistant
+        # header to, so the key would be one every reader had to know to ignore.
+        if self.add_generation_prompt is not True:
+            data["add_generation_prompt"] = self.add_generation_prompt
         if self.messages:
             data["messages"] = [dict(message) for message in self.messages]
         if self.reasoning_effort is not None:

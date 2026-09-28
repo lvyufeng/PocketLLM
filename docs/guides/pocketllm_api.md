@@ -189,9 +189,9 @@ reached 30.6 aggregate tok/s through the default path against 25.6 through the s
 figures and the method behind them are in
 [the concurrency acceptance page](../performance/cpp_openai_concurrency_validation.md#what-the-width-costs-a-lone-request).
 
-Once the batch path is selected, the per-request sampling options the OpenAI surface accepts
-(`top_p`, `top_k`, `min_p`, `stop`, `n`, `logprobs`) are honoured; the serialized session refuses
-them, because there is no per-request sampling in it to honour them with.
+Once the batch path is selected, the sampling options the OpenAI surface accepts are honoured subject
+to the engine's own limits: see [Request fields](#request-fields) for which values the engine under
+this adapter can apply per request, and what happens to the ones it cannot.
 
 ### Backend options
 
@@ -303,6 +303,17 @@ A request field is accepted only when the server acts on it. Every documented Op
 therefore falls into one of three groups, and a field in the second group has to be removed rather
 than trusted.
 
+**Which runtime acts on what.** Whether a field's *value* has a shape this server can read is one
+policy for every runtime and is checked before dispatch. Whether a runtime's answer applies the field
+at all depends on the runtime, and each declares its own answer through `BackendBase.audit_request`
+(the `cpp` backend is the adapter that declares one today; a runtime that has declared nothing
+refuses nothing and is subject to the shape checks alone). `--backend cpp` serves `stop`,
+`thinking_mode` and `add_generation_prompt`, and refuses **`n` above 1** and **any request for log
+probabilities** — rows marked *(not on `cpp` yet)* — by name in `param`, because the choice fan-out
+and the per-token ranking are not ported to it yet. Both are being ported before the native binary
+that also serves them is deleted; the refusals are what a caller sees in the meantime, and they are
+refusals rather than dropped fields so that a request for four choices cannot come back as one.
+
 ### Implemented
 
 | Field | Endpoints | Behaviour |
@@ -312,13 +323,14 @@ than trusted.
 | `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. A body carrying neither — or carrying `null` for either, which clients do send — asks for no cap: the answer runs until EOS or the context limit, resolved against the engine's own context the way vLLM (`max_model_len - input_length`) and SGLang resolve an absent cap. A backend that sizes its own caches — v41 — refuses a request whose prompt and budget together do not fit them, as a 400 before any work starts. |
 | `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
-| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
+| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). *(not on `cpp` yet)* |
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
 | `tools` | chat | Tool definitions reach the chat template, and a call the model writes back is reported in the assistant message's `tool_calls` rather than left in the text; see [Tool calls](#tool-calls). |
+| `tool_choice` | chat | `"none"` drops the definitions, `"required"` and a named function become an instruction in the prompt; see [Tool calls](#tool-calls). |
 | `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
-| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. |
-| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. |
-| `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. |
+| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. *(not on `cpp` yet)* |
+| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. *(not on `cpp` yet)* |
+| `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. `thinking_mode` is `"chat"` or `"thinking"` and decides whether an answer is split at `</think>` into `content` and `reasoning_content`; `add_generation_prompt` (default `true`) decides whether the rendered prompt ends with the assistant header the model answers into, and `false` encodes the conversation as it stands — how a caller continues an assistant turn or inspects what the template does. |
 
 #### Stop sequences
 
@@ -332,15 +344,19 @@ completion, the sequence itself is not part of the answer, and `finish_reason` i
 
 Three details are worth knowing before relying on the field:
 
-- **A partial sequence is withheld while streaming.** If the text so far ends in a run of characters
-  that is the beginning of a stop sequence, those bytes are held rather than sent, because the next
-  token may complete the sequence and text already written to the socket cannot be taken back. Once
-  generation ends the same bytes can no longer complete anything, so they are flushed as part of the
-  answer. Nothing is withheld when the trailing characters cannot begin a sequence, which is the
-  usual case — the hold is bounded by the longest sequence, not by the length of the text.
-- **On chat, `stop` applies to the answer and not to `reasoning_content`.** The reasoning block is a
-  separate field that ends on a token id, and a sequence that appeared inside it would otherwise
-  truncate the answer that follows.
+- **A partial sequence is withheld while streaming.** If the answer so far ends in a run of
+  characters that is the beginning of a stop sequence, those bytes are held rather than sent,
+  because the next token may complete the sequence and text already written to the socket cannot be
+  taken back. Once generation ends the same bytes can no longer complete anything, so they are
+  flushed as part of the answer. Nothing is withheld when the trailing characters cannot begin a
+  sequence, which is the usual case — the hold is bounded by the longest sequence, not by the length
+  of the text.
+- **On chat, `stop` applies to the answer and not to `reasoning_content`.** The split between the
+  two is read out of the text at `</think>`, and the search for a sequence starts after that marker.
+  The block is a separate field whose text is not the completion, and the difference shows on the
+  values clients actually send: `"\n\n"` is a common stop sequence and a reasoning block is full of
+  blank lines, so matching the whole decode would end the answer before the model had written any
+  of it — which a client reads as an empty answer rather than a truncated one.
 - **`usage.completion_tokens` counts the tokens the engine generated**, which can exceed the number
   of tokens in the returned text when a sequence truncated it. The engine is not stopped early: the
   scheduler ends a request on token ids, and a client sequence is not one, so the request runs to its
@@ -470,9 +486,13 @@ Five things are worth knowing before relying on the field:
   you want `tool_calls`. The *reasoning* split is a different matter and does happen on a stream: a
   thinking-mode answer sends everything before `</think>` as `reasoning_content` deltas, so a client
   watches the reasoning instead of waiting for the answer.
-- **The selection policy is not applied.** `tool_choice` other than `"auto"` and
-  `parallel_tool_calls: false` are 400s, listed below: the model still decides whether to call
-  anything and how many calls to make.
+- **The selection policy is applied.** `tool_choice: "auto"` is the default; `"none"` drops the
+  definitions before the template is rendered, and `"required"` or a named function becomes an
+  instruction in the prompt naming what must be called. The policy reaches the model rather than
+  constraining the sampler, which is what SGLang does with the same field, so a client that asks for
+  a call still reads the answer's `tool_calls` to find out whether one was made. A `tool_choice`
+  naming a function that is not among `tools` is a 400. `parallel_tool_calls: false` is a 400: the
+  model decides how many calls it makes and nothing here limits the count.
 
 ### Refused with HTTP 400
 
@@ -495,16 +515,27 @@ are shape checks on the endpoint that defines the value, not refusals of the fea
 | `best_of` | completions | not 1 | One candidate is generated per request; there is no second candidate to compare it against. |
 | `suffix` | completions | non-empty | The completion is returned on its own, with no suffix appended. |
 | `echo` | completions | `true` | `text` holds only the generated continuation, never the prompt. |
-| `tool_choice` | chat | anything but `"auto"` | Tool definitions reach the chat template, but the model is not constrained to call a tool, skip them, or call one function, so the policy has no effect. |
+| `tool_choice` | chat | a function choice naming a tool that is not in `tools` | A request error rather than a named-field refusal: the policy is applied to the prompt, so a name the prompt cannot be given is a request the server cannot render. |
 | `parallel_tool_calls` | chat | `false` | The number of tool calls the model emits is not limited. |
 | `stream_options.include_usage` | both | `true` on a streaming request | A stream is delta chunks followed by `[DONE]`, and none of them carries `usage`. A non-streaming response already reports usage, so the option is satisfied there and accepted. |
 
-The refusal uses the OpenAI error shape with `type` set to `invalid_request_error` and `param` set
-to the offending field, so a client can act on it without parsing the prose:
+The refusal uses the OpenAI error shape with `type` set to `invalid_request_error`, `param` set to
+the offending field, and `code` to `unsupported_feature`, so a client can act on it without parsing
+the prose:
 
 ```json
-{"error":{"message":"\"stop\" = 5 is not supported by this server: a stop sequence is a string, or a list of strings, and this value is neither. Send \"stop\" as a string or an array of strings.","type":"invalid_request_error","param":"stop","code":null}}
+{"error":{"message":"\"stop\" = 5 is not supported by this server: a stop sequence is a string, or a list of strings, and this value is neither. Send \"stop\" as a string or an array of strings.","type":"invalid_request_error","param":"stop","code":"unsupported_feature"}}
 ```
+
+The check runs before dispatch, so a request this server will not serve is refused whole rather than
+streamed halfway and abandoned. Which fields are refused at which values is
+`pocketllm/protocol/contract.py`, and the adapter's own answer is
+`BackendBase.audit_request`: the *shape* of a field is the same on every runtime and is checked
+host-side, while whether a runtime's answer applies a field at all depends on the runtime and is
+declared by it. A runtime that has not declared anything refuses nothing, which is why the sections
+above describe the socket rather than a policy — the `cpp` backend is the adapter that declares one
+today, and it refuses `n` above 1 and any request for log probabilities by name until both are
+ported to it.
 
 ### Accepted and inert
 
