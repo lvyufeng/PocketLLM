@@ -56,7 +56,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from pocketllm.api import (
@@ -73,7 +73,14 @@ from pocketllm.api import (
 
 from .base import BackendBase, TokenStreamer, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_options
+from .shared_options import (
+    DEVICE,
+    EXPERT_DEAL,
+    PREFILL_CHUNK,
+    PREFIX_CACHE_BYTES,
+    PREFIX_CACHE_HEAD_TOKENS,
+)
 from .runtime_engine import RuntimeSpec, SchedulerHost, device_index
 
 DEFAULT_MAX_SEQ_LEN = 32768
@@ -157,9 +164,12 @@ before it. It costs the cold prefill one chunk boundary, since a position can on
 forward boundary, and it is paid on a miss only: a resumed prefill skips it.
 """
 
-#: Every option this runtime reads, declared once. ``chunk_rows`` and ``deal`` are each known by a
-#: second name -- this adapter answered to ``expert_rows`` and ``expert_deal`` before it was
-#: ``MimoBackend``, and a launch script that still says one of those keeps working.
+#: Every option this runtime reads, declared once. The five concepts this shares with another
+#: runtime -- the card, the prefill width, the two prefix-store numbers and the deal -- are taken
+#: from :mod:`pocketllm.backends.shared_options` and differ from the shared shape only in what this
+#: runtime answers, which is the one argument passed to :func:`dataclasses.replace`. ``chunk_rows``
+#: keeps its second name: the adapter answered to ``expert_rows`` before it was ``MimoBackend``, and
+#: a launch script that still says it keeps working.
 OPTIONS: tuple[BackendOption, ...] = (
     BackendOption(
         "chunk_rows",
@@ -167,52 +177,33 @@ OPTIONS: tuple[BackendOption, ...] = (
         DEFAULT_EXPERT_ROWS,
         "experts one expert-kernel call stages, which is the arena's width in bands; `null` leaves "
         "this a decode model, feeding a prompt one token at a time",
+        group=Group.EXPERT,
         aliases=("expert_rows",),
         minimum=0,
     ),
-    BackendOption(
-        "deal",
-        Kind.STRING,
-        "sorted",
-        "which deal divides the experts: `sorted` balances them across ranks, `id` leaves them in "
-        "checkpoint order; `null` takes the process's POCKETLLM_MIMO_EXPERT_DEAL",
-        aliases=("expert_deal",),
-        choices=("id", "sorted"),
+    replace(
+        EXPERT_DEAL,
+        default="sorted",
+        # This runtime's own resolution: unset is not "no deal", it is the process's environment.
+        help=EXPERT_DEAL.help + "; `null` takes the process's POCKETLLM_MIMO_EXPERT_DEAL",
     ),
-    BackendOption(
-        "device", Kind.STRING, None, "the card this rank runs on; the rank's own when unset"
-    ),
+    DEVICE,
     BackendOption(
         "pin",
         Kind.FLAG,
         True,
         "page-lock the staging buffers, which is what makes the copies asynchronous",
+        group=Group.EXPERT,
     ),
-    BackendOption(
-        "prefill_chunk",
-        Kind.INTEGER,
-        DEFAULT_PREFILL_CHUNK,
-        "tokens one prefill call takes, which is the width the prompt's rate was measured at",
-        minimum=1,
-    ),
-    BackendOption(
-        "prefix_cache_bytes",
-        Kind.BYTES,
-        DEFAULT_PREFIX_CACHE_BYTES,
-        "host memory a rank's prefix store may hold",
-    ),
-    BackendOption(
-        "prefix_cache_head_tokens",
-        Kind.INTEGER,
-        DEFAULT_PREFIX_CACHE_HEAD_TOKENS,
-        "the fixed-length anchor a prefill also stores, or 0 for the prompt's end alone",
-        minimum=0,
-    ),
+    replace(PREFILL_CHUNK, default=DEFAULT_PREFILL_CHUNK),
+    replace(PREFIX_CACHE_BYTES, default=DEFAULT_PREFIX_CACHE_BYTES),
+    PREFIX_CACHE_HEAD_TOKENS,
     BackendOption(
         "resident_rows",
         Kind.INTEGER,
         DEFAULT_RESIDENT_ROWS,
         "experts of each routed layer the card keeps instead of staging a token",
+        group=Group.EXPERT,
         minimum=0,
     ),
     BackendOption(
@@ -220,6 +211,7 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.INTEGER,
         DEFAULT_EXPERT_SLOTS,
         "expert arena slots: one call in flight while the next one's copy lands",
+        group=Group.EXPERT,
         minimum=1,
     ),
 )
@@ -230,15 +222,18 @@ class _Options:
     """The launcher's levers, resolved once at construction.
 
     Every one of these changes what the run does, which is why an unknown key is refused rather
-    than ignored: ``chunk_rows`` is the arena a card pays for, ``deal`` is which deal the experts
-    are divided by, ``prefill_chunk`` is the width a prompt goes through at, ``slots`` is how
+    than ignored: ``chunk_rows`` is the arena a card pays for, ``expert_deal`` is which deal the
+    experts are divided by, ``prefill_chunk`` is the width a prompt goes through at, ``slots`` is how
     many calls the pipeline keeps in flight, ``resident_rows`` is how many of a routed layer's
     experts the card keeps instead of copying a token, and the two ``prefix_cache_*`` keys are the
     store's budget and the length of the head anchor.
+
+    The field names are the declarations' canonical names, which is why the deal is ``expert_deal``
+    here and was ``deal``: the flag's own name is the one the two runtimes that read it agree on.
     """
 
     chunk_rows: int | None = DEFAULT_EXPERT_ROWS
-    deal: str | None = "sorted"
+    expert_deal: str | None = "sorted"
     device: str | None = None
     pin: bool = True
     prefill_chunk: int = DEFAULT_PREFILL_CHUNK
@@ -254,6 +249,12 @@ class _Options:
             getattr(args, "backend_options", None),
             runtime="mimo",
             ignored=IGNORED_OPTIONS,
+            resolved={
+                # ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk``, a flag
+                # above the runtimes because every runtime has a prefill. A launch that names both
+                # gets the backend option, the way every other pair on this surface resolves.
+                "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
+            },
         )
         budget = values["prefix_cache_bytes"]
         head = values["prefix_cache_head_tokens"]
@@ -267,7 +268,7 @@ class _Options:
             head = 0
         return cls(
             chunk_rows=values["chunk_rows"],
-            deal=values["deal"],
+            expert_deal=values["expert_deal"],
             device=values["device"],
             pin=values["pin"],
             prefill_chunk=values["prefill_chunk"],
@@ -391,7 +392,7 @@ class MimoBackend(SchedulerHost, BackendBase):
             expert_source=self._bank,
             ep=self._ep,
             slots=options.slots,
-            deal=options.deal,
+            deal=options.expert_deal,
             chunk_rows=options.chunk_rows,
             pin=options.pin,
             resident_rows=options.resident_rows,

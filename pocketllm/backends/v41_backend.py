@@ -43,7 +43,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
@@ -62,7 +62,14 @@ from pocketllm.api import (
 from ..work_bell import Bell, BellRinger, WorkerBell, bell_path
 from .base import BackendBase, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
-from .options import BackendOption, Kind, decode_options
+from .options import BackendOption, Group, Kind, decode_options
+from .shared_options import (
+    DEVICE,
+    EXPERT_DEAL,
+    PREFILL_CHUNK,
+    PREFIX_CACHE_BYTES,
+    PREFIX_CACHE_HEAD_TOKENS,
+)
 from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
 
 
@@ -106,25 +113,24 @@ observed at a forward boundary, and it is paid on a miss only: a resumed prefill
 """
 
 #: Every option this runtime reads, declared once. The order is the dataclass's, so the two read
-#: as one list; `tests/test_declared_options.py` holds them to each other.
+#: as one list; `tests/test_declared_options.py` holds them to each other. The five entries that
+#: come from `shared_options` are the concepts another runtime also reads -- one declaration each,
+#: with `replace` where this runtime answers differently.
 OPTIONS: tuple[BackendOption, ...] = (
-    BackendOption(
-        "device",
-        Kind.STRING,
-        None,
-        "the card this rank's tree runs on; the rank's own card when unset",
-    ),
+    DEVICE,
     BackendOption(
         "expert_device",
         Kind.STRING,
         None,
         "the card the expert arena lives on; the host when unset",
+        group=Group.DEVICE,
     ),
     BackendOption(
         "expert_world",
         Kind.INTEGER,
         None,
         "how many cards the arena is spread over; the network's own width when unset",
+        group=Group.EXPERT,
         minimum=1,
     ),
     BackendOption(
@@ -132,6 +138,7 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.INTEGER,
         None,
         "experts the loader may keep cached a rank; the loader's own default when unset",
+        group=Group.EXPERT,
     ),
     BackendOption(
         "expert_hot_rows",
@@ -139,6 +146,7 @@ OPTIONS: tuple[BackendOption, ...] = (
         0,
         "experts of each routed layer this card keeps resident, refilled once a layer; needs "
         "`expert_device`, since there is no arena to keep anything in otherwise",
+        group=Group.EXPERT,
         minimum=0,
     ),
     BackendOption(
@@ -146,6 +154,7 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.INTEGER,
         DEFAULT_EXPERT_POOL_ROWS,
         "arena rows a card pools for the experts a step draws",
+        group=Group.EXPERT,
         minimum=0,
     ),
     BackendOption(
@@ -153,6 +162,7 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.INTEGER,
         DEFAULT_EXPERT_BUFFERS,
         "arena buffers a rank keeps in flight",
+        group=Group.EXPERT,
         minimum=0,
     ),
     BackendOption(
@@ -160,65 +170,49 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.FLAG,
         True,
         "one batched expert GEMM a layer rather than one call an expert",
+        group=Group.EXPERT,
     ),
-    BackendOption(
-        "expert_deal",
-        Kind.STRING,
-        None,
-        "which deal divides the experts: `sorted` balances them across ranks, `id` leaves them in "
-        "checkpoint order; the loader's own when unset",
-        choices=("sorted", "id"),
-    ),
+    replace(EXPERT_DEAL, resolution="the loader's own deal"),
     BackendOption(
         "resident_engram",
         Kind.FLAG,
         False,
         "copy both Engram tables into RAM at load instead of gathering from the shards",
+        group=Group.EXPERT,
     ),
     BackendOption(
         "resident_experts",
         Kind.FLAG,
         None,
         "attach the resident expert bank; `DEEPSEEK_V41_RESIDENT_EXPERTS` answers for it when unset",
+        group=Group.EXPERT,
     ),
-    BackendOption(
-        "prefill_chunk",
-        Kind.INTEGER,
-        None,
-        "tokens one prefill forward takes at once; `--prefill-chunk-tokens` when unset, and the "
-        "loader's own width when neither names one",
-        minimum=1,
+    replace(
+        PREFILL_CHUNK,
+        resolution="`--prefill-chunk-tokens`, then the loader's own width",
     ),
-    BackendOption(
-        "prefix_cache_bytes",
-        Kind.BYTES,
-        DEFAULT_PREFIX_CACHE_BYTES,
-        "host memory a rank's prefix store may hold",
-    ),
-    BackendOption(
-        "prefix_cache_head_tokens",
-        Kind.INTEGER,
-        DEFAULT_PREFIX_CACHE_HEAD_TOKENS,
-        "the fixed-length anchor a prefill also stores, or 0 for the prompt's end alone",
-        minimum=0,
-    ),
+    replace(PREFIX_CACHE_BYTES, default=DEFAULT_PREFIX_CACHE_BYTES),
+    PREFIX_CACHE_HEAD_TOKENS,
     BackendOption(
         "decode_graphs",
         Kind.FLAG,
         False,
         "capture the decode block into a CUDA graph",
+        group=Group.DECODE,
     ),
     BackendOption(
         "cancel_collective",
         Kind.FLAG,
         True,
         "check the cancel flag with a per-step collective, which is how a rank learns in time",
+        group=Group.DECODE,
     ),
     BackendOption(
         "threads",
         Kind.INTEGER,
         None,
         "torch's intra-op thread count for this rank's host paths",
+        group=Group.EXECUTION,
         minimum=1,
     ),
     BackendOption(
@@ -226,12 +220,14 @@ OPTIONS: tuple[BackendOption, ...] = (
         Kind.FLAG,
         True,
         "drop special tokens when decoding an answer for a client",
+        group=Group.EXECUTION,
     ),
     BackendOption(
         "progress",
         Kind.FLAG,
         True,
         "print the load and per-request progress lines to stderr",
+        group=Group.EXECUTION,
     ),
 )
 
@@ -340,13 +336,22 @@ class _Options:
 
     @classmethod
     def from_args(cls, args: Any) -> "_Options":
-        """The options one launch resolves to, decoded from ``OPTIONS``."""
+        """The options one launch resolves to, decoded from ``OPTIONS``.
+
+        ``--prefill-chunk-tokens`` is the host's spelling of ``prefill_chunk`` -- a flag above the
+        runtimes, because every runtime has a prefill -- so it is handed in as a resolved value
+        rather than read here. A caller that reaches for both gets the backend option, which is the
+        rule the whole surface follows: the more specific spelling wins.
+        """
         options = cls(
             **decode_options(
                 OPTIONS,
                 getattr(args, "backend_options", None),
                 runtime="v41",
                 ignored=IGNORED_OPTIONS,
+                resolved={
+                    "prefill_chunk": getattr(args, "prefill_chunk_tokens", 0) or None,
+                },
             )
         )
         if not bool(getattr(args, "enable_prefix_caching", True)):
@@ -385,11 +390,7 @@ class V41Backend(SchedulerHost, BackendBase):
         self._config_path = getattr(args, "config_path", None)
         self._tokenizer_path = getattr(args, "tokenizer_path", None) or self._checkpoint
         self._max_seq_len = getattr(args, "max_model_len", None) or DEFAULT_MAX_SEQ_LEN
-        self._prefill_chunk = (
-            self._options.prefill_chunk
-            if self._options.prefill_chunk is not None
-            else (getattr(args, "prefill_chunk_tokens", 0) or None)
-        )
+        self._prefill_chunk = self._options.prefill_chunk
         self._world = int(getattr(args, "tensor_parallel_size", 1) or 1)
         self._rank = int(getattr(args, "tensor_parallel_rank", 0) or 0)
         self._local_rank = self._rank

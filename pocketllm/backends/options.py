@@ -86,6 +86,28 @@ class Kind(str, Enum):
     BYTES = "bytes"
 
 
+class Group(str, Enum):
+    """Which part of a run an option belongs to, for ``--help``.
+
+    vLLM registers every flag inside ``parser.add_argument_group(title="CacheConfig")`` and SGLang
+    groups by the file a field is declared in; neither puts the group in the flag's *name*. This is
+    the same thing: the section a generated flag is listed under, and the answer to "*whose* lever
+    is this" -- which is the one question a runtime prefix would otherwise be answering badly.
+
+    A closed set rather than a free string, because two spellings of one section is a section split
+    in half, and that is not a mistake a test can see in a help page nobody diffs.
+    """
+
+    DEVICE = "Device"
+    EXPERT = "Expert arena"
+    PREFILL = "Prefill"
+    PREFIX_CACHE = "Prefix cache"
+    DECODE = "Decode"
+    KERNELS = "Kernels"
+    EXECUTION = "Execution"
+    MODEL = "Model and tokenizer"
+
+
 @dataclass(frozen=True)
 class BackendOption:
     """One ``backend_options`` key, as the runtime that reads it declares it.
@@ -104,6 +126,18 @@ class BackendOption:
     kind: Kind
     default: Any
     help: str
+    #: The ``--help`` section this option is listed under. See :class:`Group`.
+    group: Group = Group.EXECUTION
+    #: How this runtime gets a value when nothing names one, for the options whose answer is not a
+    #: constant -- a measurement, the card's free memory, another flag of the launch's. Only
+    #: meaningful while ``default`` is ``None``, and there so that ``--help`` can say what an unset
+    #: option becomes instead of printing ``None``, which is not a value anybody can type.
+    resolution: str | None = None
+    #: The runtimes that read this option, for a declaration in
+    #: :mod:`pocketllm.backends.shared_options`. Empty for a runtime-private option, whose reader is
+    #: the module it is declared in. It is what lets a test ask whether a shared concept's readers
+    #: agree, and what U2b-2 asks when a launch names an option the selected runtime does not read.
+    readers: tuple[str, ...] = ()
     #: Older spellings of the same key, still accepted. A launch script that uses one keeps working.
     #: Naming both the canonical key and an alias is refused rather than silently resolved by order.
     aliases: tuple[str, ...] = ()
@@ -173,13 +207,29 @@ class BackendOption:
         """The default as ``--help`` shows it.
 
         A byte budget is rendered the way a launch writes it -- ``4g`` rather than ``4294967296`` --
-        because the option takes the suffix and the number is the part nobody reads.
+        because the option takes the suffix and the number is the part nobody reads. An option whose
+        runtime resolves it says so instead of printing ``None``, which is not a value anybody can
+        type: the sentence is what a reader needs, and the code is not.
         """
+        if self.resolution and self.default is None:
+            return f"unset (resolved: {self.resolution})"
         if self.kind is Kind.BYTES and isinstance(self.default, int) and self.default > 0:
             for suffix, factor in sorted(_UNITS.items(), key=lambda item: -item[1]):
                 if self.default % factor == 0:
                     return f"{self.default // factor}{suffix}"
         return repr(self.default)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group, Group):
+            raise ConfigurationError(
+                f"backend option {self.name!r} names the --help group {self.group!r}; groups are "
+                f"{', '.join(member.value for member in Group)}"
+            )
+        if self.resolution is not None and self.default is not None:
+            raise ConfigurationError(
+                f"backend option {self.name!r} declares both the default {self.default!r} and a "
+                f"resolution ({self.resolution!r}); a value the runtime computes is not a default"
+            )
 
 
 def lower_bound(minimum: float) -> str:
@@ -241,8 +291,22 @@ def decode_options(
     *,
     runtime: str,
     ignored: Iterable[str] = (),
+    resolved: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``values`` decoded against ``declarations``, with the defaults filled in.
+
+    Three sources decide an option's value, and they are ordered because a launch can name more
+    than one of them:
+
+    1. ``values`` -- the ``--backend-option KEY=VALUE`` spellings this call is handed.
+    2. ``resolved`` -- what the *host* already decided: a flag of the command line's own, which is
+       the concept by a second name. The flag lives above the runtimes, so it is passed in rather
+       than read here, and this is where a runtime says which of its options that flag answers.
+    3. the declaration's ``default``.
+
+    The order is the same rule the whole surface follows -- the more specific spelling wins -- and
+    it is why ``--backend-option`` is an escape hatch rather than a second opinion: naming an option
+    there beats naming its flag, exactly as it did before the flags existed.
 
     The returned mapping covers every declared option, so a caller can hand it straight to its
     ``_Options`` dataclass and read the result the way it reads any other instance. The refusals
@@ -268,18 +332,32 @@ def decode_options(
             f"backend={runtime!r} has no option {unknown[0]!r}; it knows "
             f"{', '.join(sorted(option.name for option in declarations))}"
         )
-    resolved: dict[str, tuple[str, Any]] = {}
+    resolved = dict(resolved or {})
+    undeclared = sorted(set(resolved) - {option.name for option in declarations})
+    if undeclared:
+        # Not a launch's mistake, so not the launch's message: the host resolved a concept this
+        # runtime does not read, and silently dropping it would make the host's answer a no-op.
+        raise ConfigurationError(
+            f"backend={runtime!r} was handed a resolved value for {undeclared[0]!r}, which it does "
+            "not declare; the host and the runtime disagree about what this option is"
+        )
+    resolved_set: dict[str, tuple[str, Any]] = {}
     for spelling, value in supplied.items():
         canonical = spellings[spelling]
-        if canonical in resolved:
+        if canonical in resolved_set:
             raise ConfigurationError(
                 f"backend={runtime!r} was given {canonical!r} twice, as "
-                f"{resolved[canonical][0]!r} and {spelling!r}; they are the same option and only "
+                f"{resolved_set[canonical][0]!r} and {spelling!r}; they are the same option and only "
                 "one can win"
             )
-        resolved[canonical] = (spelling, value)
+        resolved_set[canonical] = (spelling, value)
     decoded: dict[str, Any] = {}
     for option in declarations:
-        spelling, value = resolved.get(option.name, (option.name, option.default))
-        decoded[option.name] = option.decode(value)
+        if option.name in resolved_set:
+            source = resolved_set[option.name][1]
+        elif option.name in resolved and resolved[option.name] is not None:
+            source = resolved[option.name]
+        else:
+            source = option.default
+        decoded[option.name] = option.decode(source)
     return decoded

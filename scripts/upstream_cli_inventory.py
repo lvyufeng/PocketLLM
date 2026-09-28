@@ -36,6 +36,8 @@ import pathlib
 import re
 import subprocess
 import sys
+from dataclasses import fields
+from typing import Any
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -105,30 +107,96 @@ def our_flags() -> tuple[dict[str, list[str]], str]:
     which is what :mod:`pocketllm.backends.options` decodes and what has no CLI spelling yet. Both
     are printed, because the second is the list the design has to place somewhere.
     """
-    # This half reads *this* package, so the repository root has to be importable. The suite is
-    # run from the root and no conftest puts it on the path; a script under `scripts/` is not.
+    groups: dict[str, list[str]] = {"serve (top level)": _our_top_level()}
+    for name, module in _our_modules().items():
+        # The flag each option *would* have, not the key it takes today: `--backend-option` is the
+        # only spelling that exists until the declarations reach the parser, and the collision check
+        # is about the names they are going to take.
+        groups[f"--backend-option, backend={name}"] = sorted(
+            cli_name(option.name) for option in module.OPTIONS
+        )
+    return groups, commit_of(REPO)
+
+
+def our_repeats() -> list[tuple[str, list[str], str]]:
+    """``(flag, runtimes that declare it, what stands behind it)`` for every repeated flag.
+
+    A name two runtimes both declare is the shape a duplicated flag comes from, but after the merge
+    it is also what a shared concept *is* -- SGLang's ``page_size`` is declared once and read by
+    several backends. So the interesting half is not that a name repeats; it is whether one
+    declaration stands behind it, whether the answers it leaves to a runtime are the only thing that
+    differs, and whether anything else does. This is the machine-checkable form of the design
+    document's collision table.
+    """
     if str(REPO) not in sys.path:
         sys.path.insert(0, str(REPO))
-    from pocketllm.backends import capabilities, mimo_backend, v41_backend, xing4_backend
+    from pocketllm.backends import shared_options
+    from pocketllm.backends.options import BackendOption
+
+    declared: dict[str, list[tuple[str, BackendOption]]] = collections.defaultdict(list)
+    for name, module in _our_modules().items():
+        for option in module.OPTIONS:
+            declared[option.name].append((name, option))
+
+    shared = {option.name: option for option in shared_options.SHARED}
+    found: list[tuple[str, list[str], str]] = []
+    for key, readers in sorted(declared.items()):
+        if len(readers) < 2:
+            continue
+        reference = shared.get(key) or readers[0][1]
+        drifted = sorted(
+            field.name
+            for field in fields(BackendOption)
+            if field.name not in _STATED_PER_RUNTIME
+            and any(getattr(o, field.name) != getattr(reference, field.name) for _, o in readers)
+        )
+        answered = sorted(
+            field.name
+            for field in fields(BackendOption)
+            if field.name in _STATED_PER_RUNTIME
+            and any(getattr(o, field.name) != getattr(reference, field.name) for _, o in readers)
+        )
+        if drifted:
+            # Two flags wearing one name -- the collision this whole exercise is about, and the one
+            # case a reader has to look at rather than count.
+            where = f"{len(readers)} declarations disagreeing on {', '.join(drifted)}"
+        elif answered:
+            where = f"one declaration (`{key}`), with {' and '.join(answered)} answered per runtime"
+        else:
+            where = f"one declaration (`{key}`), read as declared"
+        found.append((cli_name(key), [name for name, _ in readers], where))
+    return found
+
+
+def _our_top_level() -> list[str]:
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
     from pocketllm.cli import build_parser
+
     serve = build_parser()._subparsers._group_actions[0].choices["serve"]
-    top = sorted({
+    return sorted({
         option
         for action in serve._actions
         for option in action.option_strings
         if option.startswith("--")
     })
-    groups: dict[str, list[str]] = {"serve (top level)": top}
-    for name in capabilities.AUTO_ORDER:
-        module = {"v41": v41_backend, "mimo": mimo_backend, "xing4": xing4_backend}.get(name)
-        if module is not None:
-            # The flag each option *would* have, not the key it takes today: `--backend-option`
-            # is the only spelling that exists until the declarations reach the parser, and the
-            # collision check is about the names they are going to take.
-            groups[f"--backend-option, backend={name}"] = sorted(
-                cli_name(option.name) for option in module.OPTIONS
-            )
-    return groups, commit_of(REPO)
+
+
+def _our_modules() -> dict[str, Any]:
+    """The adapters that declare options, in the order the factory would pick them."""
+    if str(REPO) not in sys.path:
+        sys.path.insert(0, str(REPO))
+    from pocketllm.backends import capabilities, mimo_backend, v41_backend, xing4_backend
+
+    known = {"v41": v41_backend, "mimo": mimo_backend, "xing4": xing4_backend}
+    return {name: known[name] for name in capabilities.AUTO_ORDER if name in known}
+
+
+#: The fields of a shared declaration a runtime answers for itself: its own default, its own
+#: resolution, and its own sentence appended to the shared one. Everything else -- the name, the
+#: alias, the kind, the group, the accepted values, the bounds -- is the shape the flag has wherever
+#: it is read. ``tests/test_declared_options.py`` holds the tree to the same set.
+_STATED_PER_RUNTIME = frozenset({"default", "resolution", "help"})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -175,7 +243,11 @@ def report(name: str, groups: dict[str, list[str]], revision: str) -> None:
         print(f"| `{group}` | {len(flags)} |")
     print()
     shared = {flag: where for flag, where in every.items() if len(where) > 1}
-    print(f"Declared in more than one group: {shared if shared else 'none'}")
+    print(
+        "Declared in more than one group: "
+        f"{shared if shared else 'none'} "
+        "(upstream, a flag in two groups is one a client cannot place)"
+    )
     print()
     repeat = [
         (flag, where) for flag, where in every.items()
@@ -221,6 +293,11 @@ def main(argv: list[str] | None = None) -> int:
         groups, revision = our_flags()
         stacks["PocketLLM"] = groups
         report("PocketLLM", groups, revision)
+        print("A name more than one runtime declares, and what stands behind it:")
+        print()
+        for flag, readers, standing in our_repeats():
+            print(f"- `{flag}` -- {standing}; declared by {', '.join(readers)}")
+        print()
 
     if args.overlap and len(stacks) > 1:
         names = list(stacks)

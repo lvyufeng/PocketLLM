@@ -204,7 +204,15 @@ that can disagree:
 | --- | --- |
 | Named a key the runtime does not declare | `ConfigurationError` naming the key and listing the ones it does. A tuning option that silently does nothing is how a run ends up measured on the wrong lever. |
 | Gave a value the declared type cannot read | `ConfigurationError` naming the key: `prefill_chunk` is a whole number, `prefix_cache_bytes` takes a `k`/`m`/`g` suffix, `pin` is a flag and reads `true`/`yes`/`on` and their negatives as well as a JSON boolean. |
-| Named one option twice, once by an older spelling | `ConfigurationError`. `chunk_rows`/`expert_rows` and `deal`/`expert_deal` are each one option under two names, and which of the two was meant is not knowable from the values. |
+| Named one option twice, once by an older spelling | `ConfigurationError`. `chunk_rows`/`expert_rows` and `expert_deal`/`deal` are each one option under two names, and which of the two was meant is not knowable from the values. |
+
+A concept more than one runtime reads is declared once
+(`pocketllm/backends/shared_options.py`): `device`, `prefill_chunk`, `prefix_cache_bytes`,
+`prefix_cache_head_tokens` and `expert_deal`. Each runtime references that declaration and states
+only what it answers for itself — its own default, its own way of resolving an unset value — so the
+flag means one thing wherever it is read. The top-level `--prefill-chunk-tokens` is the same concept
+by its CLI spelling and resolves into the shared key on every runtime, which is why a launch names
+one flag wherever the prefill happens.
 
 The keys the CLI fills in on every launch — `engine_kind`, `routed_experts_device`, `pd_mode`, and
 `nccl_id_path` for a sharded one — are accepted by every runtime and read by none of the model
@@ -628,9 +636,11 @@ the routed experts in host memory, one process a rank under `--tensor-parallel-s
 - **`max_model_len` is the KV cache.** A MiMo deployment sizes one cache at startup (32768
   positions by default) and every request is clamped to what is left of it; a prompt that fills it
   is refused before any work starts, with the number and the flag to raise. Its
-  `--backend-option`s are `prefill_chunk` (tokens a prefill call, default 2048), `chunk_rows`
-  (experts a grouped expert call, which trades arena bytes for call count), `slots`, `deal` and
-  `pin`, and an unknown option is a `ConfigurationError` rather than a silent default.
+  `--backend-option`s are `prefill_chunk` (tokens a prefill call, default 2048 — the top-level
+  `--prefill-chunk-tokens` resolves into the same key), `chunk_rows` (experts a grouped expert call,
+  which trades arena bytes for call count), `slots`, `expert_deal` (`deal` is the older spelling of
+  the same key) and `pin`, and an unknown option is a `ConfigurationError` rather than a silent
+  default.
 
 ## Request normalization
 

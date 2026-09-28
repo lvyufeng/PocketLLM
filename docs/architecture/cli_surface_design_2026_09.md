@@ -40,7 +40,8 @@ python scripts/upstream_cli_inventory.py --vllm /tmp/vllm_ref --sglang /tmp/sgla
 | PocketLLM | 71 | 63 | **4** |
 
 Ours are `--device` (top level and all three runtimes), `--prefill-chunk` (v41, mimo, xing4),
-`--prefix-cache-bytes` (v41, mimo, xing4) and `--prefix-cache-head-tokens` (v41, mimo).
+`--prefix-cache-bytes` (v41, mimo, xing4) and `--prefix-cache-head-tokens` (v41, mimo). This is the
+state at `fa6b46b`, the commit the document was written from; U2b-1 (§7) is what merges the four.
 
 That is not a coincidence about their flags or our flags. It is what a command line is: a name on a
 command line has one meaning, and a name with two meanings is a name the operator has to resolve by
@@ -183,10 +184,10 @@ Every flag we have, against its counterpart. `—` means no upstream flag does t
 
 | Today | After | How the difference is carried |
 | --- | --- | --- |
-| `--prefill-chunk-tokens`, `prefill_chunk` ×3 | `--prefill-chunk-tokens` | `unset` = resolve: v41 → `--prefill-chunk-tokens` → the loader; mimo → 2048; xing4 → `_chunk_for(context, heads, free_bytes)` |
+| `--prefill-chunk-tokens`, `prefill_chunk` ×3 | `--prefill-chunk-tokens` | the flag reaches all three; `unset` = the runtime's own fallback: v41 → the loader's width, mimo → 2048, xing4 → `_chunk_for(context, heads, free_bytes)` |
 | `--prefix-cache-bytes` ×3 | `--prefix-cache-bytes` | `unset` = the runtime's own constant (4g / 4g / 2g) |
 | `--prefix-cache-head-tokens` ×2 | `--prefix-cache-head-tokens` | 1024 in both; keep one declaration referenced by both runtimes |
-| `--expert-deal` (v41, default `None`), `deal` (mimo, default `"sorted"`) | `--expert-deal`, choices `id\|sorted` | `unset` = resolve: v41 → the loader's own; mimo → `POCKETLLM_MIMO_EXPERT_DEAL`, then `"sorted"` |
+| `--expert-deal` (v41, default `None`), `deal` (mimo, default `"sorted"`) | `--expert-deal`, choices `sorted\|id` | `unset` = resolve: v41 → the loader's own; mimo → `POCKETLLM_MIMO_EXPERT_DEAL`, then `"sorted"` |
 | `--device` (top level) + `device` ×3 | `--device` + `--device-ids` | see below |
 
 ### `--device` splits into two flags
@@ -272,10 +273,22 @@ already been populated by the parse.
 
 The three steps are unchanged in order; this document fixes their contents.
 
-**U2b-1 — structure, no behaviour change.** `BackendOption` gains `group`; the five rows of §5's
-collision table become one declaration each, referenced by every runtime that reads it;
-`decode_options` accepts the resolved mapping as well as the raw `backend_options` dict. `--help`
-still lists `--backend-option`; the flag set is identical.
+**U2b-1 — structure, one fix.** `BackendOption` gains `group`, `resolution` and `readers`; the five
+rows of §5's collision table become one declaration each in `pocketllm/backends/shared_options.py`,
+referenced by every runtime that reads it and differing only in what that runtime answers;
+`decode_options` takes the resolved mapping as well as the raw `backend_options` dict. `--help`
+still lists `--backend-option` and the flag set is identical.
+
+One behaviour does change, and it is a fix the structure exposed rather than a decision: MiMo's
+adapter read no `--prefill-chunk-tokens` at all, so a MiMo launch that named it prefillled at the
+runtime's own 2048 regardless — which is the silent no-op the merge exists to end. The flag now
+reaches all three runtimes, and each runtime's *unset* answer is the one it always had. The aliases
+widen by one name for the same reason: `--expert-deal`'s reader list makes v41 accept `deal=` too,
+which is what one declaration read by two runtimes means.
+
+`tests/test_declared_options.py` holds the tree to this: the shared list is exactly the set of names
+more than one runtime declares, `readers` matches the tree, and every reader agrees with the shared
+shape on everything except the three fields a runtime answers for itself.
 
 **U2b-2 — generate the CLI.** The parser is built from the declarations, `add_argument_group` per
 `group`, `--backend-option` becomes the alias and escape hatch of §6.6, and a post-parse check
