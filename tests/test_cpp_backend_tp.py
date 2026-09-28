@@ -208,20 +208,26 @@ def test_tp_ranks_claim_distinct_devices() -> None:
             backend.close()
 
 
-def test_explicit_device_overrides_rank_offset() -> None:
+def test_an_explicit_card_list_overrides_the_rank_offset() -> None:
+    """`--device-ids` is the rank rule made explicit, and rank *r* takes the r-th entry.
+
+    It is the same quantity the default already computes -- this is the default's rule given a
+    name -- so the two cannot disagree: a launch that names cards 4,5,6,7 puts rank 2 on card 6,
+    where the rank rule alone puts it on card 2.
+    """
     args = EngineArgs(
         model="model",
         backend="cpp",
         tensor_parallel_size=4,
         tensor_parallel_rank=2,
-        device="cuda:7",
+        device_ids=(4, 5, 6, 7),
         backend_options={"nccl_id_path": "/tmp/pocketllm-test-nccl"},
     )
     native = TpFakeNative()
     backend = CppBackend(args, native_module=native, tokenizer=SimpleTokenizer())
     try:
         assert native.qwen_options is not None
-        assert native.qwen_options.device == 7
+        assert native.qwen_options.device == 6
     finally:
         backend.close()
 

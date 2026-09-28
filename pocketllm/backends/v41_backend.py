@@ -64,13 +64,19 @@ from .base import BackendBase, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
-    DEVICE,
     EXPERT_DEAL,
     PREFILL_CHUNK,
     PREFIX_CACHE_BYTES,
     PREFIX_CACHE_HEAD_TOKENS,
 )
-from .runtime_engine import RuntimeSpec, SchedulerHost, cancel_key, device_index
+from .runtime_engine import (
+    RuntimeSpec,
+    SchedulerHost,
+    cancel_key,
+    card_for_rank,
+    device_index,
+    visible_card_count,
+)
 
 
 DEFAULT_MAX_SEQ_LEN = 8192
@@ -113,11 +119,11 @@ observed at a forward boundary, and it is paid on a miss only: a resumed prefill
 """
 
 #: Every option this runtime reads, declared once. The order is the dataclass's, so the two read
-#: as one list; `tests/test_declared_options.py` holds them to each other. The five entries that
+#: as one list; `tests/test_declared_options.py` holds them to each other. The four entries that
 #: come from `shared_options` are the concepts another runtime also reads -- one declaration each,
-#: with `replace` where this runtime answers differently.
+#: with `replace` where this runtime answers differently. `device` used to be a fifth and is not an
+#: option any more: U3 moved the platform and the card out to `EngineArgs`, see `shared_options`.
 OPTIONS: tuple[BackendOption, ...] = (
-    DEVICE,
     BackendOption(
         "expert_device",
         Kind.STRING,
@@ -314,7 +320,6 @@ class _Marks:
 class _Options:
     """The ``backend_options`` this adapter reads, resolved once at construction."""
 
-    device: str | None = None
     expert_device: str | None = None
     expert_world: int | None = None
     expert_cache: int | None = None
@@ -379,7 +384,19 @@ class V41Backend(SchedulerHost, BackendBase):
         self._prefill_chunk = self._options.prefill_chunk
         self._world = int(getattr(args, "tensor_parallel_size", 1) or 1)
         self._rank = int(getattr(args, "tensor_parallel_rank", 0) or 0)
-        self._local_rank = self._rank
+        #: The cards this launch named, in rank order -- empty when it named none, which is the
+        #: launcher's older spelling and stays correct. U3 moved the card here from `backend_options`,
+        #: where it was read three ways; this is the one reading.
+        self._device_ids = tuple(getattr(args, "device_ids", ()) or ())
+        # This rank's card. `--device-ids` answers it outright, so it is resolved here rather than at
+        # the group: the tree, the expert arena's base and the NCCL binding all read this one field,
+        # and resolving it once is what keeps them from disagreeing. A launch that named no ids
+        # keeps the older rule and takes `LOCAL_RANK` when the group exists -- `_init_distributed`
+        # does that half, because outside a group there is no `LOCAL_RANK` to take.
+        self._local_rank = card_for_rank(
+            self._device_ids, rank=self._rank, world=self._world,
+            visible=visible_card_count(),
+        )
         self._validate_args(args)
 
         self._front = front
@@ -441,47 +458,45 @@ class V41Backend(SchedulerHost, BackendBase):
         """Which card this rank drives its routed experts from, in the loader's own convention.
 
         ``loader.on_device`` reads ``--expert-device`` as where the split *starts* and adds the rank,
-        so a sharded run wants ``cuda:0`` and lets the rank arithmetic name the card. A single-process
-        run keeps the launcher's other rule: the experts land where the tree does, and
-        ``expert_world`` is how a caller says that one process should drive several cards.
+        so what the loader can be told is the *base* of a contiguous run: ``--device-ids 2,3`` gives
+        it 2, and its own arithmetic reaches card 3 on rank 1. A list that skips a card is therefore
+        refused here -- the loader has one number and cannot honour a gap, and handing it the first
+        id anyway would place rank 1's experts on rank 0's card, which is a wrong answer rather than
+        a slow one.
+
+        With no ids the older rules stand: a sharded run starts at 0 and lets the rank arithmetic
+        name every card, and a single process has no rank to offset, so its experts land where the
+        tree does. ``expert_world`` is how a caller says one process should drive several cards.
         """
         if self._options.expert_device is not None:
             return self._options.expert_device
+        if self._device_ids:
+            base = int(self._device_ids[0])
+            if list(self._device_ids) != [base + step for step in range(len(self._device_ids))]:
+                raise ConfigurationError(
+                    f"expert placement reads --device-ids as a run of adjacent cards and got "
+                    f"{list(self._device_ids)}; name a contiguous list, or name the base outright "
+                    "with --backend-option expert_device=cuda:N"
+                )
+            return f"cuda:{base}"
         if self._world > 1:
             return "cuda:0"
-        if self._options.device is None:
-            return None
-        device = str(self._options.device)
-        index = device.split(":")[1] if ":" in device else "0"
-        try:
-            base = int(index) - self._rank
-        except ValueError as exc:
-            raise ConfigurationError(
-                f"backend option 'device' must name a card, got {device!r}"
-            ) from exc
-        if base < 0:
-            raise ConfigurationError(
-                f"rank {self._rank} drives card {index}, so the loader's rank-offset card "
-                "arithmetic cannot name its own card: this backend runs one node"
-            )
-        return f"cuda:{base}"
+        return None
 
     def _tree_device(self) -> str | None:
         """Where this rank's copy of the dense tree lives.
 
         The tree follows the process group. ``tp.py`` collects each layer's attention and FFN output
         with NCCL all-reduces, and NCCL has no CPU backend, so a sharded tree left on the host dies
-        at the first layer with "No backend type associated with device type cpu". The launcher's
-        ``setup_distributed`` puts every rank's tree on ``cuda:{local_rank}`` for exactly this
-        reason, and the backend runs one node, so ``local_rank`` is ``rank`` -- naming the card here
-        is the same placement.
+        at the first layer with "No backend type associated with device type cpu". ``_local_rank``
+        is that placement -- ``--device-ids``'s answer when the launch named the cards, and
+        ``LOCAL_RANK`` when it left them to torchrun.
 
         A single process has no group and no collective to satisfy, so it keeps the host tree unless
-        ``device`` asks for a card; that is the shape the single-card measurements were taken in.
+        ``--device-ids`` asks for a card; that is the shape the single-card measurements were taken
+        in.
         """
-        if self._options.device is not None:
-            return str(self._options.device)
-        if self._world > 1:
+        if self._device_ids or self._world > 1:
             return f"cuda:{self._local_rank}"
         return None
 
@@ -511,11 +526,14 @@ class V41Backend(SchedulerHost, BackendBase):
 
         # This rank's card, resolved before the group exists because the group is bound to it: NCCL
         # guesses the device from the global rank otherwise, and a guess that happens to be right on
-        # one node is not the same thing as a placement the tree is known to sit on.
-        try:
-            self._local_rank = int(os.environ.get("LOCAL_RANK", str(self._rank)))
-        except ValueError:
-            self._local_rank = self._rank
+        # one node is not the same thing as a placement the tree is known to sit on. An explicit
+        # `--device-ids` was resolved at construction and is kept -- the launcher named the cards,
+        # so `LOCAL_RANK` is torchrun's numbering and not this launch's.
+        if not self._device_ids:
+            try:
+                self._local_rank = int(os.environ.get("LOCAL_RANK", str(self._rank)))
+            except ValueError:
+                self._local_rank = self._rank
         if not dist.is_initialized():
             if not os.environ.get("MASTER_ADDR") or not os.environ.get("MASTER_PORT"):
                 raise ConfigurationError(

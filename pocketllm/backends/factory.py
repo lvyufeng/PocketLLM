@@ -327,6 +327,11 @@ _WORKER_SHARED_ARGS = (
     "enable_batching",
     "model_format",
     "dtype",
+    # The launch's placement, which every rank has to agree on: a worker that defaulted the card
+    # list would put its own weights on a card rank 0 did not name, and the collective would find
+    # out at the first all-reduce rather than at startup.
+    "device",
+    "device_ids",
 )
 
 

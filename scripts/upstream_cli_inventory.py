@@ -167,19 +167,19 @@ def our_repeats() -> list[tuple[str, list[str], str]]:
 def our_host_only() -> list[tuple[str, str]]:
     """``(flag, why)`` for every declaration that did not become a flag.
 
-    Two of them, and they are the two the design document calls out: the native engine's own
-    ``--prefill-chunk-tokens``, which is the declaration's CLI under another spelling, and
-    ``--device``, whose name is taken by a flag that means the vendor on one path and the card on
-    another -- U3 splits it, and until then a generated one would be a second meaning for a name
-    that has one.
+    One of them: the native engine's own ``--prefill-chunk-tokens``, which is the declaration's CLI
+    under another spelling. The list had two entries between U2b-2 and U3 -- ``--device`` was the
+    other, its name taken by a flag that meant the vendor on one path and the card on another -- and
+    the split took the *declaration* away rather than giving it a flag, so this prints one line
+    where the design document of that commit printed two.
     """
     import pocketllm.backends.cli_surface as surface
 
     found: list[tuple[str, str]] = []
     for name, attribute in surface.HOST_FLAGS.items():
         found.append((cli_name(name), f"spelled `--{attribute.replace('_', '-')}` by the host"))
-    for name in sorted(surface.NO_FLAG):
-        found.append((cli_name(name), "the host's `--device` is U3's to split"))
+    for name in sorted(surface.NO_FLAG):  # empty since U3; a name here is a gap to explain
+        found.append((cli_name(name), "the host spells this one, under a name of its own"))
     return found
 
 

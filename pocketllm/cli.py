@@ -7,11 +7,32 @@ import json
 import os
 import sys
 
-from .api import ConfigurationError, EngineArgs, UnsupportedFeatureError
+from .api import ConfigurationError, EngineArgs, UnsupportedFeatureError, device_hint
 from .backends.cli_surface import add_declared_options, resolved_options
 from .backends.factory import create_backend, select_backend
 from .server.openai import serve
 from .supervisor import TensorParallelSupervisor
+
+
+#: The platforms ``--device`` accepts, which is ``EngineArgs``'s set: ``auto`` asks the build, and
+#: an explicit value this build cannot serve is refused rather than retuned. Spelled here as well
+#: because the parser has to render the set in ``--help`` and refuse a bad one before anything is
+#: constructed -- and it is the *choices* that make the refusal reachable at all.
+DEVICE_PLATFORMS = ("auto", "cuda", "ascend", "cpu")
+
+
+def _device_platform(value: str) -> str:
+    """``--device``'s type: the platform, or a refusal naming the flag that answers a card.
+
+    ``choices`` alone would print ``invalid choice: 'cuda:2'``, which is true and unhelpful -- the
+    whole of U3's migration is that the value is well formed and belongs to a different flag, and a
+    message that does not say so is a message an operator answers by reading the source.
+    """
+    if value not in DEVICE_PLATFORMS:
+        raise argparse.ArgumentTypeError(
+            f"must be one of {', '.join(DEVICE_PLATFORMS)}, got {value!r}{device_hint(value)}"
+        )
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +69,26 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--tensor-parallel-master-addr")
     serve_parser.add_argument("--tensor-parallel-master-port", type=int)
     serve_parser.add_argument("--tensor-parallel-rendezvous-dir")
-    serve_parser.add_argument("--device")
+    serve_parser.add_argument(
+        "--device",
+        default="auto",
+        type=_device_platform,
+        choices=DEVICE_PLATFORMS,
+        help=(
+            "platform this process runs on: auto, cuda, ascend or cpu; `auto` asks the build "
+            "(default: auto). A card is not a platform -- `--device cuda:2` is refused by name, "
+            "because `--device-ids` answers it"
+        ),
+    )
+    serve_parser.add_argument(
+        "--device-ids",
+        default=None,
+        metavar="L",
+        help=(
+            "cards the ranks run on, comma-separated and in rank order, so rank r takes the r-th; "
+            "default is each rank's own card, which is what a per-rank CUDA_VISIBLE_DEVICES did"
+        ),
+    )
     serve_parser.add_argument("--max-model-len", type=int)
     serve_parser.add_argument("--dtype")
     serve_parser.add_argument("--kv-cache-dtype", default="auto")
@@ -144,6 +184,7 @@ def _args(namespace: argparse.Namespace) -> EngineArgs:
         tensor_parallel_size=namespace.tensor_parallel_size,
         tensor_parallel_rank=namespace.tensor_parallel_rank,
         device=namespace.device,
+        device_ids=namespace.device_ids,
         max_model_len=namespace.max_model_len,
         dtype=namespace.dtype,
         kv_cache_dtype=namespace.kv_cache_dtype,
@@ -211,11 +252,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Supervised parent: spawn ranks and monitor.
     if world > 1 and rank == 0 and supervised:
-        if args.device is not None:
-            raise ConfigurationError(
-                "--device cannot be used with automatic TP supervision; "
-                "use --no-tensor-parallel-supervisor for manual rank control"
-            )
+        # `--device` used to be refused here, and the refusal outlived its reason when U3 split the
+        # name in two. A *platform* has nothing to conflict with automatic supervision, and
+        # `--device-ids 2,3` is well defined under it -- rank r takes the r-th -- so both are
+        # forwarded to every child and the parent only has to say which runtime it is starting.
         # Every adapter is dispatched by the same rule from here down, because every adapter takes
         # its rank from the rendezvous the supervisor publishes. The V4.1 adapter in particular
         # joins the group and loads inside the child, which is what the readiness marker below the

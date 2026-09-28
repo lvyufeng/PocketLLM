@@ -13,7 +13,6 @@ section and the sentence describing it -- and a runtime that reads it takes it a
 where it differs, in one word:
 
 ```python
-DEVICE                                          # read as declared
 replace(PREFILL_CHUNK, resolution="the loader's own width")     # same flag; this runtime computes it
 replace(EXPERT_DEAL, default="sorted")                          # same flag; this runtime's own default
 ```
@@ -35,25 +34,17 @@ from __future__ import annotations
 
 from .options import BackendOption, Group, Kind
 
-#: Where this rank runs, and which card it is.
+#: ``device`` used to be here, and U3 took it out rather than splitting it in place.
 #:
-#: Shared by all three runtimes and read as declared -- unset means the runtime works it out from the
-#: rank, which is what each of them already did.
-#:
-#: U3 splits this option in two: ``--device auto|cuda|ascend`` for the vendor and ``--device-ids``
-#: for the cards, which is vLLM's ``--device``/``--device-ids`` and SGLang's
-#: ``--device``/``--base-gpu-id``. One name doing both jobs is why our top level refuses ``--device``
-#: under automatic TP supervision while v41 reads its own as a base card. Until then this is the
-#: card, as it is today on every runtime that reads it.
-DEVICE = BackendOption(
-    "device",
-    Kind.STRING,
-    None,
-    "the card this rank runs on",
-    group=Group.DEVICE,
-    resolution="the rank's own card",
-    readers=("v41", "mimo", "xing4"),
-)
+#: It was declared shared because three runtimes each read a *card* under it, and each read it
+#: differently: v41 as the card its dense tree sits on and again as the *base* card the loader's
+#: rank offset is applied to, mimo as the card it drives, xing4 as a fallback. Splitting it left two
+#: concepts with one meaning each -- ``--device`` is the platform, ``--device-ids`` is the list of
+#: cards -- and a declaration is what a *runtime's own* lever gets. A flag whose meaning is the same
+#: on every runtime, including the native one that has no options list at all, is a fact about the
+#: launch rather than about the runtime, so both live in :class:`pocketllm.api.EngineArgs` beside
+#: ``tensor_parallel_size``, which is the same kind of thing. Nothing reads a card out of
+#: ``backend_options`` any more: ``--backend-option device=...`` is refused as an undeclared key.
 
 #: How wide one prefill forward is.
 #:
@@ -125,7 +116,6 @@ EXPERT_DEAL = BackendOption(
 
 #: Every shared declaration, in the order a reader should meet them.
 SHARED: tuple[BackendOption, ...] = (
-    DEVICE,
     PREFILL_CHUNK,
     PREFIX_CACHE_BYTES,
     PREFIX_CACHE_HEAD_TOKENS,

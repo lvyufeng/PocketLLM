@@ -616,18 +616,20 @@ def native_module():
 def batched_backend(**options) -> Xing4Backend:
     """This runtime serving through the scheduler `cpp` uses.
 
-    `device: cpu` because the model is the file's stand-in and there is no card in the path: the
-    runtime then binds nothing, and what is under test is the route rather than a kernel. The rest
-    of the wiring is the real one -- a real `BatchScheduler` driving the real adapter, with the
-    bridge in between.
+    `--device cpu` because the model is the file's stand-in and there is no card in the path: the
+    runtime then binds nothing, and what is under test is the route rather than a kernel. It is a
+    platform and not a card, which since U3 is the field it belongs in -- a card would be
+    `device_ids`, and naming one here would ask the stand-in to be placed on it. The rest of the
+    wiring is the real one -- a real `BatchScheduler` driving the real adapter, with the bridge in
+    between.
     """
     args = EngineArgs(
         model="a-xing4-checkpoint",
         backend="xing4",
+        device="cpu",
         max_model_len=64,
         backend_options={
             "gguf": "/nowhere/xing4_0-29b-IQ4_NL.gguf",
-            "device": "cpu",
             "enable_batching": True,
             **options,
         },

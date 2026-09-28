@@ -34,6 +34,7 @@ from pocketllm.protocol.templating import build_templater, detect_architecture
 
 from .base import BackendBase, settled_text
 from .capabilities import declared_capabilities
+from .runtime_engine import card_for_rank, visible_card_count
 
 
 _NATIVE_MODULE_NAMES = ("pocketllm_cpp", "_pocketllm_cpp", "cpp_engine")
@@ -215,31 +216,6 @@ def _strip_terminal_stop_token(result: Any) -> list[int]:
     if bool(getattr(result, "constraint_completed", False)):
         return tokens
     return tokens[:-1]
-
-
-def _native_device_index(value: str | int | None) -> int:
-    """Normalize a public device selector for the native single-rank option."""
-    if value is None:
-        return 0
-    if isinstance(value, bool):
-        raise ConfigurationError("C++ backend device must be a non-negative device index")
-    if isinstance(value, int):
-        index = value
-    else:
-        text = str(value).strip().lower()
-        for prefix in ("cuda:", "ascend:", "npu:"):
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-                break
-        try:
-            index = int(text)
-        except ValueError as exc:
-            raise ConfigurationError(
-                "C++ backend device must be an integer or cuda:/ascend:/npu: index"
-            ) from exc
-    if index < 0:
-        raise ConfigurationError("C++ backend device must be a non-negative device index")
-    return index
 
 
 class CppBackend(BackendBase):
@@ -666,7 +642,7 @@ class CppBackend(BackendBase):
         options = options_cls()
         options.tp_world = self.args.tensor_parallel_size
         options.tp_rank = self.args.tensor_parallel_rank
-        options.device = _native_device_index(self.args.device)
+        options.device = self._native_rank_device()
         options.skip_fp4_host_prepare = False
         options.nccl_id_path = str(self.args.backend_options.get("nccl_id_path", ""))
 
@@ -741,25 +717,25 @@ class CppBackend(BackendBase):
         return engine
 
     def _native_rank_device(self) -> int:
-        """Resolve this rank's device index.
+        """Resolve this rank's card index, which the native engine takes as one integer.
 
-        An explicit --device wins.  Otherwise a TP rank claims device
-        ``tensor_parallel_rank``, since the supervisor gives every rank the same
-        visible device list; leaving the default 0 would stack the whole world
-        onto one GPU.  When the launcher already narrowed CUDA_VISIBLE_DEVICES to
-        one device per rank, that device is renumbered to 0 for this process, so
-        the rank offset must not be applied on top of it.
+        `--device-ids` answers it outright -- rank *r* takes the r-th entry -- and that is exactly
+        what the launcher's ``CUDA_VISIBLE_DEVICES=$rank`` beside ``--device 0`` used to say, one
+        rank and one process at a time. The pair is still honoured, because it still works: with no
+        ids a TP rank claims card ``tensor_parallel_rank`` -- the supervisor gives every rank the
+        same visible device list, so leaving the default 0 would stack the whole world onto one GPU
+        -- and a launcher that narrowed ``CUDA_VISIBLE_DEVICES`` to one device per rank has already
+        renumbered that device to 0, which is why the offset is not applied on top of it.
+
+        Both halves live in `card_for_rank` because two other adapters ask the same question, and
+        "which card is mine" answered twice is how the two answers come to differ.
         """
-        if self.args.device is not None:
-            return _native_device_index(self.args.device)
-        if self.args.tensor_parallel_size <= 1:
-            return 0
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-        if visible is not None:
-            entries = [item for item in visible.split(",") if item.strip()]
-            if len(entries) <= 1:
-                return 0
-        return self.args.tensor_parallel_rank
+        return card_for_rank(
+            self.args.device_ids,
+            rank=self.args.tensor_parallel_rank,
+            world=self.args.tensor_parallel_size,
+            visible=visible_card_count(),
+        )
 
     def health(self) -> HealthStatus:
         status = super().health()

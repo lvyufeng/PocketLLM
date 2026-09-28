@@ -110,6 +110,7 @@ by `scripts/gen_llms_txt.py`; edit the nav, not this file, and re-run the script
 ## Migration
 
 - [Overview](https://lvyufeng.github.io/PocketLLM/migration/)
+- [--device splits into a platform and a card list](https://lvyufeng.github.io/PocketLLM/migration/device-splits-into-platform-and-cards/)
 - [Batching is on by default for the cpp backend](https://lvyufeng.github.io/PocketLLM/migration/batching-default-on/)
 - [The dsv4 to pocket rename](https://lvyufeng.github.io/PocketLLM/migration/dsv4-to-pocket-rename/)
 

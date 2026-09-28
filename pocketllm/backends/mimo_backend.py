@@ -75,13 +75,18 @@ from .base import BackendBase, TokenStreamer, settled_text
 from .capabilities import IGNORED_OPTIONS, declared_capabilities
 from .options import BackendOption, Group, Kind, decode_args
 from .shared_options import (
-    DEVICE,
     EXPERT_DEAL,
     PREFILL_CHUNK,
     PREFIX_CACHE_BYTES,
     PREFIX_CACHE_HEAD_TOKENS,
 )
-from .runtime_engine import RuntimeSpec, SchedulerHost, device_index
+from .runtime_engine import (
+    RuntimeSpec,
+    SchedulerHost,
+    card_for_rank,
+    device_index,
+    visible_card_count,
+)
 
 DEFAULT_MAX_SEQ_LEN = 32768
 """Positions the KV cache is sized at when ``--max-model-len`` is not given.
@@ -187,7 +192,6 @@ OPTIONS: tuple[BackendOption, ...] = (
         # This runtime's own resolution: unset is not "no deal", it is the process's environment.
         help=EXPERT_DEAL.help + "; `null` takes the process's POCKETLLM_MIMO_EXPERT_DEAL",
     ),
-    DEVICE,
     BackendOption(
         "pin",
         Kind.FLAG,
@@ -234,7 +238,6 @@ class _Options:
 
     chunk_rows: int | None = DEFAULT_EXPERT_ROWS
     expert_deal: str | None = "sorted"
-    device: str | None = None
     pin: bool = True
     prefill_chunk: int = DEFAULT_PREFILL_CHUNK
     prefix_cache_bytes: int = DEFAULT_PREFIX_CACHE_BYTES
@@ -258,7 +261,6 @@ class _Options:
         return cls(
             chunk_rows=values["chunk_rows"],
             expert_deal=values["expert_deal"],
-            device=values["device"],
             pin=values["pin"],
             prefill_chunk=values["prefill_chunk"],
             prefix_cache_bytes=budget,
@@ -283,6 +285,10 @@ class MimoBackend(SchedulerHost, BackendBase):
         super().__init__()
         self.args = args
         self._options = _Options.from_args(args)
+        #: The cards the launch named, in rank order; empty when it named none. U3 moved the card
+        #: here from `backend_options`, where this runtime read it as its own device and the top
+        #: level read the same name as a different one.
+        self._device_ids = tuple(getattr(args, "device_ids", ()) or ())
         self._checkpoint_dir = str(getattr(args, "model", "") or "")
         self._tokenizer_path = str(getattr(args, "tokenizer_path", "") or "")
         self._max_seq_len = int(getattr(args, "max_model_len", 0) or 0) or DEFAULT_MAX_SEQ_LEN
@@ -333,10 +339,32 @@ class MimoBackend(SchedulerHost, BackendBase):
             return
         from src.models.mimo_v2.ep import EpGroup
 
-        self._ep = EpGroup.from_env(device=self._options.device)
+        # Which card this rank drives. `--device-ids` is the launch's answer and `torchrun`'s
+        # `LOCAL_RANK` is the fallback, and the group is asked before either is used: a world of one
+        # has no rank to offset and takes the named card as it stands, and a group of more asks for
+        # it through the same `device` field the model then reads. Unnamed and unsharded stays `None`,
+        # which is what `EpGroup` reads as the current device.
+        device = self._card()
+        self._ep = EpGroup.from_env(device=device)
         self._world, self._rank = self._ep.world, self._ep.rank
         self._device = self._ep.device
         self._distributed = True
+
+    def _card(self) -> int | None:
+        """The card this launch named for this rank, or ``None`` when it named none.
+
+        The world the ids are indexed by comes from the arguments and not from the group, because
+        this runs *before* the group exists -- the group is the thing being told which card to bind.
+        They agree wherever both are set, and the argument is the one that exists in both cases.
+        """
+        if not self._device_ids:
+            return None
+        return card_for_rank(
+            self._device_ids,
+            rank=int(getattr(self.args, "tensor_parallel_rank", 0) or 0),
+            world=int(getattr(self.args, "tensor_parallel_size", 1) or 1),
+            visible=visible_card_count(),
+        )
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -722,7 +750,8 @@ class MimoBackend(SchedulerHost, BackendBase):
         """
         if self._device is not None:
             return device_index(self._device)
-        return device_index(self._options.device)
+        card = self._card()
+        return card if card is not None else -1
 
     def _start_runtime(
         self,

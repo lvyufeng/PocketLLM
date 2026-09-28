@@ -16,6 +16,7 @@ them against any checkout.
 | SGLang | `f4de6ab` (2026-09-28) | 526 flags in 12 namespace classes |
 | PocketLLM | `fa6b46b` (2026-09-28) | 37 `serve` flags + 34 per-runtime options = 63 distinct names |
 | PocketLLM | after U2b-2 (§7) | 57 flags in 8 `--help` sections, `--help`-derived rather than counted by hand |
+| PocketLLM | after U3 (§7) | 58, with `device` a host flag rather than a declaration |
 
 Both upstream checkouts are at their tip as of the date on this document — no release tag in
 between, so neither column is a description of an old version. The first PocketLLM row is the state
@@ -44,9 +45,10 @@ python scripts/upstream_cli_inventory.py --vllm /tmp/vllm_ref --sglang /tmp/sgla
 
 Ours are `--device` (top level and all three runtimes), `--prefill-chunk` (v41, mimo, xing4),
 `--prefix-cache-bytes` (v41, mimo, xing4) and `--prefix-cache-head-tokens` (v41, mimo). This is the
-state at `fa6b46b`, the commit the document was written from; U2b-1 and U2b-2 (§7) are what merge the
-four and put the result on the command line, and the tool reads 57 flags with no repeat at that
-commit.
+state at `fa6b46b`, the commit the document was written from; U2b-1 and U2b-2 (§7) merge the four
+and put the result on the command line, and U3 takes the first of them off the runtimes altogether --
+`device` is a host flag now, so it is a repeat no longer. The tool reads 57 flags with no repeat at
+U2b-2, and 58 at U3.
 
 That is not a coincidence about their flags or our flags. It is what a command line is: a name on a
 command line has one meaning, and a name with two meanings is a name the operator has to resolve by
@@ -212,12 +214,19 @@ Upstream separates them, and both do it the same way:
 For us: **`--device auto|cuda|ascend`** (the answer comes from `pocketllm_cpp.backend` or platform
 detection, and an explicit value this build cannot serve is a hard error — vLLM's
 `validate_flashinfer_moe_ep_model` is the precedent for refusing rather than retuning), and
-**`--device-ids 2,3`** for the cards, comma-separated physical ids, defaulting to the rank.
+**`--device-ids 2,3`** for the cards, comma-separated and in rank order, defaulting to the rank.
 `CppBackend._native_rank_device` already derives the rank's card; this is that rule given a name.
 
 It also removes the refusal rather than restating it: `--device` (a vendor) has no reason to
 conflict with automatic supervision, and `--device-ids 2,3` is well defined under it — rank *r*
 takes `device_ids[r]`.
+
+As landed (§7), three details of the above are not what the sketch said, and each is recorded where
+it is decided: `cpu` is in the platform set, because a host-only run is one this repository makes
+and upstream keeps a `cpu` for the same reason; *where* the flag lives is the host rather than a
+declaration, because the card list means one thing on all four adapters including the one that
+cannot declare; and the ids are indices into the set the process can see rather than physical,
+which is what keeps the `CUDA_VISIBLE_DEVICES` form working.
 
 ### Ours only, and why that is not a defect
 
@@ -337,14 +346,37 @@ generated flag collides with one the host declares, a section exists for every g
 names, the mapping holds exactly what the launch named, and the refusal names the flag and its
 reader.
 
-**U3 — `--device` splits.** `--device auto|cuda|ascend` and `--device-ids L`, with the adapters
-reading the card from the ids rather than from `--device`; the 39 `scripts/` files that mention
-`--device` or `CUDA_VISIBLE_DEVICES` (115 lines between them) lose the `CUDA_VISIBLE_DEVICES=$rank`
-plus `--device 0` pair wherever it is the rank pattern, because the rank's card is now the default.
-The old spelling is refused by name with the new one in the message, and the change gets a
-`docs/migration/` note. This is the only step with a migration, which is why it is the last one.
-`cli_surface.NO_FLAG` is the one line that changes: `device` joins the generated set, and the two
-adapters that read a base card take the ids instead.
+**U3 — `--device` splits.** As landed:
+
+* **`--device auto|cuda|ascend|cpu` is the platform, `--device-ids 2,3` is the cards**, and rank *r*
+  takes the r-th entry. `cpu` is not in the sketch above and is in the set, because upstream keeps
+  one in a list of accelerators for the same reason we do: a value the build cannot serve is refused
+  rather than retuned, and a host-only run is one this repository really makes. The card list is
+  indices into the set the process can see, which is what keeps `CUDA_VISIBLE_DEVICES=$rank` +
+  `--device-ids 0` meaning what the old pair meant.
+* **Both are host flags, and the `device` declaration is gone rather than renamed.** This is the one
+  place the plan above was wrong, and the reason is the split's own result: after it, the card list
+  means the same thing on all four runtime adapters *including* `cpp`, which has no `OPTIONS` list
+  and so cannot declare anything. A flag every runtime reads is a fact about the launch, like
+  `--tensor-parallel-size`, and it lives beside it in `EngineArgs`. The refusal in U2b-2 is what
+  settles it: a flag exempt from "the selected runtime does not read this" is not in that system.
+  The reading moved to `runtime_engine.card_for_rank`, so the four adapters ask one question once.
+* **The 39-file migration above is wrong, and the tool that counted it was counting names.**
+  Reviewed against `scripts/` at `f739286`: of the 40 files mentioning `--device`, `CUDA_VISIBLE_DEVICES`
+  or `ASCEND_RT_VISIBLE_DEVICES`, all but two are passing `--device` to something *else* — the native
+  binary's own smoke/bench front end (`$BIN … --tp-rank $rank --device 0`), which U3 does not touch
+  and U1e does not delete (it deletes that binary's *serving* front end), or a bench script's own
+  argparse parser taking a torch device string (`--device cuda:2` to `torch.device`). **No script in
+  the repository passes `--device` to `python -m pocketllm serve`**, which is the only command line
+  U3 changes, so the in-repo migration is zero files. What is left is the honest half of the claim:
+  the change is breaking for anybody's *own* launcher, and it gets a note.
+* **The old spelling is refused by name, with the new flag in the message**, in the parser and again
+  in `EngineArgs.__post_init__` — one function, `api.device_hint`, because two places refuse the same
+  well-formed value and neither can rely on the other having run. `--backend-option device=…` is
+  refused too, as an undeclared key, which is what removing the declaration means.
+* **The refusal under automatic supervision is gone with it**, rather than restated: a platform has
+  nothing to conflict with supervision, and a card list is well defined under it.
+* `cli_surface.NO_FLAG` is the one line that changes, and it is now empty.
 
 ## Verification
 
@@ -353,5 +385,5 @@ at the top. It reads both upstream projects as text — no import, no dependency
 against a future commit without installing anything, which is the property that makes the numbers
 in this document checkable rather than asserted. Since U2b-2 its PocketLLM half reads the parser the
 CLI builds rather than the declarations, so the flags it reports are the ones an operator can type,
-and it lists the repeated names, what stands behind each, and the two declarations that have no flag
-of their own.
+and it lists the repeated names, what stands behind each, and the declarations that have no flag of
+their own -- one before U3 (`prefill_chunk`), none after it.
