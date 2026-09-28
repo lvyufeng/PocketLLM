@@ -38,6 +38,7 @@ from pocketllm.protocol import (
     render_fallback_prompt,
 )
 from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit as audit_body
+from pocketllm.protocol.contract import structured_output_spec
 from pocketllm.protocol.logprobs import complete as ranking_complete
 from pocketllm.protocol.logprobs import render as render_logprobs
 from pocketllm.protocol.templating import build_templater, detect_architecture
@@ -480,6 +481,12 @@ class CppBackend(BackendBase):
         self._tokenizer = tokenizer if tokenizer is not None else self._load_tokenizer()
         self._eos_ids, self._eos_source = self._resolve_eos_ids()
         self._answer_reader_cache: Any = _READER_UNSET
+        # The vocabulary constrained decoding masks over, built on the first request that asks for
+        # a schema. `_READER_UNSET` rather than `None` because "no request has needed it yet" and
+        # "it could not be read" are different answers -- the first is not a failure and must not
+        # be reported as one.
+        self._constraint_tokenizer_cache: Any = _READER_UNSET
+        self._constraint_tokenizer_error: str = ""
 
         # Phase 3.4: the batch scheduler, on by default and only on rank 0.  Only rank 0 drives
         # scheduling: the scheduler runs a background thread that issues collectives, and on a worker
@@ -706,6 +713,7 @@ class CppBackend(BackendBase):
         batch_width = (
             int(engine.max_slots) if engine is not None else self._configured_max_batch_size()
         )
+        served = self._served_fields()
         return declared_capabilities(
             "cpp",
             models=self._registered_architectures(),
@@ -717,6 +725,17 @@ class CppBackend(BackendBase):
             # disagreeing would mean a scheduler built around an engine that cannot run it, which is
             # worth being able to see rather than silently resolving to one of the two.
             supports_batch=self._batching_enabled,
+            # From the table `audit_request` refuses from, rather than stated a second time here. A
+            # capability a client reads off a model list and a field that same client is refused are
+            # one answer, and this is the second one that would come to differ from it: whether this
+            # instance serves constrained decoding is its scheduler's answer and its engine's, and
+            # neither is a fact about the runtime.
+            #
+            # `logprobs` is deliberately not here, and it is the one field where the two really are
+            # separate questions: the ranking comes off the scheduler's result rather than out of
+            # the sampler, so the path that gates it is the scheduler alone and its published
+            # capability is left where that decision put it.
+            supports_structured_outputs=served.structured_outputs,
             supports_speculative_decoding=speculative,
             # The serialized session resumes a repeated prompt from its per-slot cache. The batch
             # scheduler does not: it prefills through `QwenEngine::batch_prefill`, which never
@@ -734,18 +753,30 @@ class CppBackend(BackendBase):
                     bool(engine.paged_kv) if engine is not None
                     else bool(self.args.backend_options.get("kv_paged", False))
                 ),
-                # What the engine declares that this adapter does not yet surface as a capability.
-                # Publishing them rather than hiding them is the point of the field: each one is a
-                # path Python would have to deliver end to end before the capability could be
-                # reported, and the adapter reporting `False` over an engine saying `True` is a gap
-                # to close deliberately rather than a value to copy over.
+                # What the engine declares that this adapter does not surface as a capability.
+                # Publishing it rather than hiding it is the point of the field: an entry is a path
+                # Python would have to deliver end to end before the capability could be reported,
+                # and the adapter reporting `False` over an engine saying `True` is a gap to close
+                # deliberately rather than a value to copy over. `structured_outputs` was on this
+                # list and is not any more; `logprobs` stays for the reason given above.
                 "engine_declares": self._engine_declaration(engine),
             },
         )
 
     @staticmethod
     def _engine_declaration(engine: Any | None) -> dict[str, Any]:
-        """The engine's own answer for the facts this adapter does not yet report as capabilities."""
+        """The engine's own answer for the facts this adapter does not report as capabilities.
+
+        Which engine can vary sampling per request, and whether it chunks a long prompt, are engine
+        facts with no counterpart in the published capability set -- there is no
+        ``supports_per_request_sampling`` for a client to read, and there should not be one, because
+        what a client acts on is the refusal it gets for a value the engine will not apply. So they
+        are published here, beside the adapter's own answers, as the evidence for those refusals.
+
+        ``logprobs`` is here for a third reason: it is an engine fact whose *published* counterpart
+        is gated on something else -- the scheduler, not the sampler -- so the two are worth being
+        able to compare rather than collapsing into one answer.
+        """
         if engine is None:
             return {}
         return {
@@ -753,7 +784,6 @@ class CppBackend(BackendBase):
             "chunked_prefill": bool(engine.chunked_prefill),
             "per_request_sampling": bool(engine.per_request_sampling),
             "per_request_top_k": bool(engine.per_request_top_k),
-            "structured_outputs": bool(getattr(engine, "structured_outputs", False)),
             "logprobs": bool(getattr(engine, "logprobs", False)),
         }
 
@@ -1067,12 +1097,116 @@ class CppBackend(BackendBase):
         the reason the native front end refused them: a streamed chunk carries the text of its token
         with no ranking beside it, and one ranking per chunk would have to come off the same result
         object the stream is draining.
+
+        ``structured_outputs`` is the same question as ``logprobs`` -- asked of the engine rather
+        than of this file -- and it is asked in two parts. The constraint travels on the scheduler
+        request, so the scheduler path is necessary; and the mask is applied by the engine's per-row
+        device sampler, so the engine's own declaration is necessary too. That second part is not a
+        formality: under tensor parallelism the sampler is engine-wide, and an engine that applies
+        one temperature to every row applies no per-row mask either. Answering a schema there would
+        return unconstrained text with a 200.
         """
         return ServedFields(
             choices=True,
             stop=True,
             logprobs=self._batching_enabled and self._scheduler is not None,
+            structured_outputs=self._constraints_available(),
         )
+
+    def _constraints_available(self) -> bool:
+        """Whether a request naming a schema can actually be held to it on this path.
+
+        See :meth:`_served_fields`. The engine's half is read off the scheduler rather than off
+        ``caps()`` on the engine, because it is the scheduler that will apply the mask and the two
+        answers cannot be allowed to differ.
+
+        A scheduler with no binding to ask is read as ``False`` rather than raising, for the reason
+        :meth:`_engine_capabilities` swallows the same absence: a capability report and a field audit
+        are not the places to propagate "this extension is older than the caller". The direction is
+        the safe one -- a runtime that has not said it applies a field is refused by name, which is
+        where every other undeclared capability points.
+        """
+        if not (self._batching_enabled and self._scheduler is not None):
+            return False
+        getter = getattr(self._scheduler, "engine_caps", None)
+        if not callable(getter):
+            return False
+        try:
+            caps = getter()
+        except Exception:
+            return False
+        return bool(getattr(caps, "structured_outputs", False))
+
+    def _constraint_tokenizer(self) -> Any | None:
+        """The engine's own vocabulary, read once, for building constrained-decode masks.
+
+        Read through the native ``Tokenizer`` rather than reused from ``self._tokenizer``, and that
+        is the whole reason this is not free. A constraint is a mask computed over the vocabulary
+        *piece by piece*, and a piece is what the tokenizer emits rather than what the vocabulary
+        file stores: a byte-level BPE vocabulary spells a space ``Ġ``, so a mask built from the raw
+        entries would refuse every token that continues a word and the constrained answer would come
+        back empty. The pieces have to be the ones the engine samples from, which is a fact about
+        the C++ tokenizer and not about the Python one this file already holds for prompt encoding.
+
+        Built on first use and kept, because the vocabulary is megabytes and a decode step never
+        touches it: a run that asks for no schema should not pay for the runs that do.
+
+        An explicit ``tokenizer_path`` is deliberately not honoured here, though `_load_tokenizer`
+        prefers one. The two are different jobs: prompt encoding may use whichever tokenizer the
+        caller named, and a mask has to be indexed the way the *engine* indexes, so the vocabulary
+        comes from the checkpoint the engine was built on and from nowhere else.
+        """
+        if self._constraint_tokenizer_cache is _READER_UNSET:
+            tokenizer = None
+            path = self.args.checkpoint_dir
+            if path and self._native is not None:
+                # A directory may hold a GGUF rather than a `tokenizer.json`, and the C++ reader
+                # takes the container's own path: the file it holds is the one the engine opened.
+                path = gguf_checkpoint_file(path) or path
+                try:
+                    tokenizer = self._native.Tokenizer(path)
+                except Exception as exc:
+                    self._constraint_tokenizer_error = f"{type(exc).__name__}: {exc}"
+            elif not path:
+                self._constraint_tokenizer_error = "no checkpoint_dir"
+            self._constraint_tokenizer_cache = tokenizer
+        return self._constraint_tokenizer_cache
+
+    def _structured_output(self, params: SamplingParams) -> Any | None:
+        """The token constraint this request's ``response_format`` asks for, or ``None``.
+
+        ``None`` covers two of the four things this can be, and they are the common ones: an absent
+        field, and ``{"type": "text"}`` -- which is what an OpenAI client sends by default. Neither
+        is a request to hold the answer to anything, and handing the scheduler a constraint for them
+        would generate JSON for a caller who asked for prose. An absent field is also not a malformed
+        one, so it does not go through the reading below at all.
+
+        The reading of the field is :func:`structured_output_spec`, which is also what the host
+        audited the body with, so a schema that passed the audit is the schema built here. Nothing
+        about the schema is re-decided: whether the validator supports it is the validator's answer,
+        raised from the C++ factory rather than guessed at from Python, because a keyword the
+        validator does not implement is a schema silently half-applied and that is a wrong answer
+        rather than a slow one.
+        """
+        if params.response_format is None:
+            return None
+        spec = structured_output_spec(params.response_format)
+        if isinstance(spec, FieldRefusal):
+            # Unreachable through the front end, which audits before it dispatches, and reachable
+            # through the library surface, which builds `SamplingParams` by hand. Both have to be
+            # answered the same way rather than one of them getting a TypeError later.
+            raise UnsupportedFeatureError(spec.message)
+        if not spec.constrains:
+            return None
+        tokenizer = self._constraint_tokenizer()
+        if tokenizer is None:
+            raise ConfigurationError(
+                "structured outputs need the checkpoint's vocabulary to constrain against, and it "
+                f"could not be read ({self._constraint_tokenizer_error or 'no native tokenizer'})"
+            )
+        if spec.kind == "json_object":
+            return self._native.make_json_object_constraint(tokenizer)
+        return self._native.make_json_schema_constraint(tokenizer, json.dumps(spec.schema))
 
     def audit_request(
         self, body: Mapping[str, Any], *, endpoint: str = CHAT
@@ -1465,8 +1599,17 @@ class CppBackend(BackendBase):
                 if bool(request.sampling_params.extra.get("ignore_eos", False)):
                     sampling.ignore_eos = True
 
-                # Submit to scheduler
-                native_req_id = self._scheduler.submit_request(prompt_ids, sampling, None)
+                # Submit to scheduler. The constraint is built here rather than up with the other
+                # sampling parameters because of what it is: the scheduler owns it for the
+                # request's whole life, and `sampling` does not carry it -- the field there is a
+                # borrow of the pointer this call hands over.
+                native_req_id = self._scheduler.submit_request(
+                    prompt_ids,
+                    sampling,
+                    None,
+                    None,
+                    self._structured_output(request.sampling_params),
+                )
                 if native_req_id > 0:
                     native_request_ids.append(native_req_id)
                     request_map[native_req_id] = request
@@ -1749,6 +1892,7 @@ class CppBackend(BackendBase):
         self._engine = None
         self._tokenizer = None
         self._answer_reader_cache = _READER_UNSET
+        self._constraint_tokenizer_cache = _READER_UNSET
         self._native = None
         self._ready = False
         close = getattr(engine, "close", None)

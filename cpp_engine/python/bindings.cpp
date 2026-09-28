@@ -13,6 +13,9 @@
 #include "device_runtime.hpp"
 #include "model_registry.hpp"
 #include "qwen_layer_components.hpp"
+#include "json_lite.hpp"
+#include "token_constraint.hpp"
+#include "tokenizer.hpp"
 
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
@@ -870,6 +873,72 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
         // the kernels only keep the candidates when a caller asked for them.
         .def_readwrite("logprobs_n", &BatchSamplingParams::logprobs_n);
 
+    // The vocabulary, and the constrained-decode object built from it.
+    //
+    // Structured outputs are a sampling-time feature of the engine rather than a front-end one: the
+    // constraint is applied immediately before the sampler draws, and `SchedulerRequest` owns it for
+    // the request's lifetime -- the request itself only borrows a pointer, which is why the field is
+    // not exposed for writing here. What Python could not do was *build* one, and the reason it has
+    // to come across the binding rather than be rebuilt on the other side from the same checkpoint
+    // file is `decode_piece`: a byte-level BPE vocabulary spells a space `Ġ`, so a mask built from
+    // the raw vocabulary entries would refuse every token that continues a word and the constrained
+    // answer would come back empty. The pieces have to be the ones the engine samples, and this is
+    // the one place they are produced.
+    py::class_<TokenConstraint, std::shared_ptr<TokenConstraint>>(module, "TokenConstraint")
+        // The two questions the sampler asks it, so a caller can ask the same ones. `fill_mask` is
+        // deliberately not among them: it writes a `bool` per vocabulary entry into a caller-owned
+        // buffer, and the only thing a Python caller could do with that is reimplement the sampler.
+        // What is useful is what the answer *is* -- whether this token may be taken, and whether the
+        // constraint is satisfied -- which is what the two below report.
+        .def("accept_token", &TokenConstraint::accept_token, py::arg("token_id"),
+             "Commit a token and advance the constraint. False, with the state unchanged, when the "
+             "token is one the constraint cannot take.")
+        .def("is_complete", &TokenConstraint::is_complete,
+             "Whether the top-level value has closed and satisfies the schema.")
+        .def("reset", &TokenConstraint::reset, "Return to the initial state.");
+
+    py::class_<Tokenizer, std::shared_ptr<Tokenizer>>(module, "Tokenizer")
+        .def(py::init<const std::string&>(), py::arg("checkpoint"),
+             R"doc(Read a checkpoint's vocabulary.
+
+             Args:
+                 checkpoint: A checkpoint directory -- `tokenizer.json` beside the weights -- or a
+                     `.gguf` file, whose header carries the same facts. Which one it is comes from
+                     the path, so a caller does not choose.
+             )doc")
+        .def_property_readonly("vocab_size", &Tokenizer::vocab_size)
+        .def("token_id", &Tokenizer::token_id, py::arg("token"),
+             "The id of a vocabulary entry as it is spelled in the file, or -1 when there is none.")
+        .def("decode_piece", &Tokenizer::decode_piece, py::arg("token_id"),
+             R"doc(The text a token contributes to the output, which is not the same string as its
+             vocabulary entry: a byte-level BPE vocabulary spells a space `Ġ`, and this is what a
+             constrained decode has to match against.)doc");
+
+    module.def(
+        "make_json_object_constraint",
+        [](const Tokenizer& tokenizer) {
+            return std::shared_ptr<TokenConstraint>(make_json_object_constraint(tokenizer));
+        },
+        py::arg("tokenizer"),
+        R"doc(A constraint accepting any JSON object, over `tokenizer`'s vocabulary.)doc");
+
+    module.def(
+        "make_json_schema_constraint",
+        [](const Tokenizer& tokenizer, const std::string& schema_json) {
+            return std::shared_ptr<TokenConstraint>(
+                make_json_schema_constraint(tokenizer, parse_json(schema_json)));
+        },
+        py::arg("tokenizer"), py::arg("schema_json"),
+        R"doc(A constraint holding the answer to a JSON Schema, over `tokenizer`'s vocabulary.
+
+        Args:
+            tokenizer: The vocabulary the constraint masks over.
+            schema_json: The object schema, as JSON text. A schema keyword the validator does not
+                implement raises rather than being ignored, which is the behaviour the native front
+                end had: a schema silently half-applied is an answer that looks constrained and is
+                not.
+        )doc");
+
     py::class_<SchedulerGenerationResult> result_class(module, "SchedulerGenerationResult");
     result_class.def(py::init<>())
         .def_readwrite("request_id", &SchedulerGenerationResult::request_id)
@@ -934,7 +1003,8 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
                 const std::vector<int>& prompt_tokens,
                 const BatchSamplingParams& sampling,
                 py::object callback,
-                py::object on_token) -> uint64_t {
+                py::object on_token,
+                std::shared_ptr<TokenConstraint> constraint) -> uint64_t {
 
                  std::function<void(const SchedulerGenerationResult&)> cpp_callback;
                  if (!callback.is_none()) {
@@ -955,15 +1025,21 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
                  // Moved, not copied: copying a std::function that owns a
                  // py::function touches the Python refcount, and the GIL is
                  // released below. Moving is a pointer swap, so it is safe.
+                 //
+                 // The constraint is moved for a second reason: the scheduler keeps it for the
+                 // request's lifetime, and a caller that let go of its own reference the moment
+                 // this returned would be relying on that. Moving says who owns it.
                  py::gil_scoped_release release;
                  return scheduler.submit_request(prompt_tokens, sampling,
                                                 std::move(cpp_callback),
-                                                std::move(cpp_token_callback));
+                                                std::move(cpp_token_callback),
+                                                std::move(constraint));
              },
              py::arg("prompt_tokens"),
              py::arg("sampling"),
              py::arg("callback") = py::none(),
              py::arg("on_token") = py::none(),
+             py::arg("constraint") = py::none(),
              R"doc(Submit a generation request.
 
              Args:
@@ -971,6 +1047,11 @@ PYBIND11_MODULE(pocketllm_cpp, module) {
                  sampling: Sampling parameters (temperature, top_p, etc.)
                  callback: Optional completion callback (called from scheduler thread)
                  on_token: Optional per-token callback (called from scheduler thread)
+                 constraint: Optional `TokenConstraint` this request's tokens must satisfy, built by
+                     `make_json_object_constraint` or `make_json_schema_constraint`. The scheduler
+                     owns it for the request's whole life, so the caller does not have to hold a
+                     reference. One constraint per request: the object carries the state of the
+                     answer so far, and two requests sharing one would accept each other's tokens.
 
              Returns:
                  request_id (> 0 on success, 0 on failure)

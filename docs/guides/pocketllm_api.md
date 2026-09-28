@@ -308,9 +308,9 @@ policy for every runtime and is checked before dispatch. Whether a runtime's ans
 at all depends on the runtime, and each declares its own answer through `BackendBase.audit_request`
 (the `cpp` backend is the adapter that declares one today; a runtime that has declared nothing
 refuses nothing and is subject to the shape checks alone). `--backend cpp` serves `stop`, `n`,
-`logprobs`, `thinking_mode` and `add_generation_prompt`.
+`logprobs`, `response_format`, `thinking_mode` and `add_generation_prompt`.
 
-Two of those are served by code that is not in any adapter, and saying so is the point of the
+Three of those are served by code that is not in any adapter, and saying so is the point of the
 division:
 
 - **`n` is the host's dispatch.** A request for `n` choices is `n` requests to the runtime, built by
@@ -322,6 +322,14 @@ division:
 - **`logprobs` is the scheduler's.** The ranking comes off the scheduler's result, so a build whose
   scheduler was not created (`batching=false` selects the serialized compatibility session) refuses
   the field by name rather than answering with an empty array.
+- **`response_format` is the engine's sampler**, and it is the one field the host cannot even build
+  the input for. A token constraint is a mask over the vocabulary *piece by piece*, and a piece is
+  what the tokenizer emits rather than what the vocabulary file stores — a byte-level BPE vocabulary
+  spells a space `Ġ`, so a mask assembled anywhere else would refuse every token that continues a
+  word. The vocabulary therefore comes from the engine, the constraint is built over it, and the mask
+  is applied by the per-row device sampler; an engine that samples at engine-wide values applies none,
+  which is why the capability is the engine's declaration rather than the adapter's and why
+  `batching=false` and tensor-parallel configurations refuse the field by name.
 
 ### Implemented
 

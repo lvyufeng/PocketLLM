@@ -164,6 +164,16 @@ def make_backend(engine: FakeEngine | None = None) -> tuple[CppBackend, FakeEngi
     return backend, fake_engine
 
 
+def scripted_caps(*, structured_outputs: bool = True) -> object:
+    """The engine's own declaration, as a scheduler double reports it through `engine_caps`.
+
+    One helper rather than one per double because it is one fact: the capability is the engine's, the
+    scheduler is only the thing the adapter can reach it through, and a double that disagreed with
+    the others about it would be a double whose structured-output tests were about something else.
+    """
+    return SimpleNamespace(structured_outputs=structured_outputs)
+
+
 def test_cpp_chat_prompt_uses_tokenizer_owned_template() -> None:
     tokenizer = TemplateTokenizer()
     backend, _ = make_backend()
@@ -253,13 +263,16 @@ def test_batched_native_error_is_raised_and_clears_request() -> None:
             self.next_id = 16
             self.polled = []
 
-        def submit_request(self, prompt_ids, sampling, callback):
+        def submit_request(self, prompt_ids, sampling, callback, on_token=None, constraint=None):
             self.next_id += 1
             return self.next_id
 
         def poll_result(self, request_id, timeout_ms):
             self.polled.append(request_id)
             return NativeResult()
+
+        def engine_caps(self):
+            return scripted_caps()
 
     backend, _ = make_backend()
     backend._native = NativeModule()
@@ -825,12 +838,15 @@ def test_a_batched_request_without_a_budget_asks_for_all_the_prompt_leaves() -> 
         ttft_seconds = 0.05
 
     class Scheduler:
-        def submit_request(self, prompt_ids, sampling, callback):
+        def submit_request(self, prompt_ids, sampling, callback, on_token=None, constraint=None):
             submitted.append(sampling)
             return 1
 
         def poll_result(self, request_id, timeout_ms):
             return NativeResult()
+
+        def engine_caps(self):
+            return scripted_caps()
 
     backend, _ = make_backend()
     backend._native = NativeModule()
@@ -878,14 +894,28 @@ def test_cpp_backend_rejects_unexposed_sampling_controls() -> None:
 
 
 class ScriptedScheduler:
-    """A scheduler that returns one canned native result, so the answer shape is the subject."""
+    """A scheduler that returns one canned native result, so the answer shape is the subject.
 
-    def __init__(self, result) -> None:
+    It mirrors the binding's `submit_request` argument for argument, constraint included, because a
+    double that took fewer would accept a call the real one refuses -- and one of the arguments is
+    the object under test. `engine_caps` is the engine's declaration as the scheduler reports it,
+    which is where the structured-output capability is read from.
+    """
+
+    def __init__(self, result, *, structured_outputs: bool = True) -> None:
         self.result = result
         self.submitted: list[object] = []
+        self.constraints: list[object | None] = []
+        self.structured_outputs = structured_outputs
 
-    def submit_request(self, prompt_ids, sampling, callback, on_token=None) -> int:
+    def engine_caps(self) -> object:
+        return scripted_caps(structured_outputs=self.structured_outputs)
+
+    def submit_request(
+        self, prompt_ids, sampling, callback, on_token=None, constraint=None
+    ) -> int:
         self.submitted.append(sampling)
+        self.constraints.append(constraint)
         return 1
 
     def poll_result(self, request_id, timeout_ms):
@@ -893,14 +923,46 @@ class ScriptedScheduler:
 
 
 class ScriptedNativeModule:
+    """The native module as far as the batch path reaches: sampling params, and the constraint.
+
+    `Tokenizer` and the two factories are recorded rather than implemented, because what the adapter
+    is responsible for is *which* factory a `response_format` selects, over *whose* vocabulary. What
+    the factory then builds is the C++ validator's business and is tested there.
+    """
+
     class QwenBatchSamplingParams:
         pass
 
+    def __init__(self) -> None:
+        self.tokenizer_paths: list[str] = []
+        self.object_calls: list[object] = []
+        self.schema_calls: list[tuple[object, str]] = []
 
-def batched_backend_with(result) -> CppBackend:
+    class _Constraint:
+        def __init__(self, kind: str, schema: str = "") -> None:
+            self.kind = kind
+            self.schema = schema
+
+        def __repr__(self) -> str:
+            return f"<constraint {self.kind}>"
+
+    def Tokenizer(self, checkpoint: str):  # noqa: N802 - the binding's name
+        self.tokenizer_paths.append(checkpoint)
+        return f"tokenizer:{checkpoint}"
+
+    def make_json_object_constraint(self, tokenizer):  # noqa: N802 - the binding's name
+        self.object_calls.append(tokenizer)
+        return ScriptedNativeModule._Constraint("object")
+
+    def make_json_schema_constraint(self, tokenizer, schema_json):  # noqa: N802 - the binding's name
+        self.schema_calls.append((tokenizer, schema_json))
+        return ScriptedNativeModule._Constraint("schema", schema_json)
+
+
+def batched_backend_with(result, *, structured_outputs: bool = True) -> CppBackend:
     backend, _ = make_backend()
     backend._native = ScriptedNativeModule()
-    backend._scheduler = ScriptedScheduler(result)
+    backend._scheduler = ScriptedScheduler(result, structured_outputs=structured_outputs)
     backend._batching_enabled = True
     return backend
 
@@ -1052,6 +1114,11 @@ def _engine_sampling(**fields):
         fixed_top_p=1.0,
         fixed_top_k=20,
         fixed_seed=0,
+        # Whether the sampler applies a per-row token mask travels with the same declaration and for
+        # the same reason: it is the device sampler that applies one, so an engine that samples
+        # engine-wide applies no mask either. A double that said otherwise would let a test pass on
+        # a request the real engine answers with unconstrained text.
+        structured_outputs=True,
     )
     declared.update(fields)
     return lambda: SimpleNamespace(**declared)
@@ -1789,3 +1856,244 @@ def test_a_stream_does_not_end_on_a_sequence_inside_the_reasoning_block() -> Non
     assert "".join(event.text for event in events) == "the answer "
     assert [event.metadata.get("reasoning_content") for event in events][0] == "USER: thinking"
     backend.close()
+
+
+# --------------------------------------------------------------------------------------------------
+# Structured outputs: the token constraint the native front end built and this one did not
+# --------------------------------------------------------------------------------------------------
+
+
+def _structured_backend(checkpoint: str, *, structured_outputs: bool = True):
+    """A batch-path backend whose engine declares what it can do about a schema.
+
+    The vocabulary is a real directory here rather than a stub, because *which* path the native
+    `Tokenizer` is handed is one of the two things this adapter decides: a directory holding a GGUF
+    is not a directory holding `tokenizer.json`, and the C++ reader takes whichever one the engine
+    itself would have opened.
+    """
+    backend = CppBackend(
+        EngineArgs(model=checkpoint, backend="cpp"),
+        engine=FakeEngine(),
+        tokenizer=FakeTokenizer(),
+    )
+    backend._native = ScriptedNativeModule()
+    backend._scheduler = ScriptedScheduler(
+        ScriptedNativeResult(tokens=[1, 2, 3], finish_reason="stop"),
+        structured_outputs=structured_outputs,
+    )
+    backend._batching_enabled = True
+    return backend
+
+
+def _constrained(backend, response_format, *, request_id: str = "req-schema"):
+    return backend.generate(
+        [
+            GenerationRequest(
+                prompt_tokens=[1, 2],
+                request_id=request_id,
+                sampling_params=SamplingParams(max_tokens=4, response_format=response_format),
+            )
+        ]
+    )
+
+
+CONSTRAINED_SCHEMA = {
+    "type": "object",
+    "properties": {"city": {"type": "string"}},
+    "required": ["city"],
+}
+
+
+def test_a_schema_selects_the_schema_factory_over_the_checkpoints_own_vocabulary(tmp_path) -> None:
+    """The field reaches the scheduler as a token constraint, which is the only way it is applied.
+
+    Both halves matter and neither is guessable from the other: the *schema* factory is what holds
+    the answer to the schema where the json-object factory would accept any JSON, and the vocabulary
+    has to be the checkpoint's own because the mask is indexed by the engine's token ids. A run that
+    picked the wrong factory would answer a valid JSON object the client cannot use, and one that
+    masked over a different vocabulary would refuse the tokens it meant to allow.
+    """
+    backend = _structured_backend(str(tmp_path))
+    native, scheduler = backend._native, backend._scheduler
+    try:
+        _constrained(
+            backend,
+            {"type": "json_schema", "json_schema": {"name": "City", "schema": CONSTRAINED_SCHEMA}},
+        )
+    finally:
+        backend.close()
+
+    assert native.tokenizer_paths == [str(tmp_path)]
+    assert [call[0] for call in native.schema_calls] == [f"tokenizer:{tmp_path}"]
+    assert json.loads(native.schema_calls[0][1]) == CONSTRAINED_SCHEMA
+    assert native.object_calls == []
+    (constraint,) = scheduler.constraints
+    assert constraint.kind == "schema"
+
+
+def test_a_json_object_response_format_needs_no_schema_and_gets_its_own_factory(tmp_path) -> None:
+    """`{"type": "json_object"}` is a shape the client asked for, not a schema it supplied.
+
+    The engine derives the grammar for "any object" itself, so the adapter's whole part is picking
+    the factory -- and picking the schema one here would leave the request waiting for a schema that
+    was never sent.
+    """
+    backend = _structured_backend(str(tmp_path))
+    native, scheduler = backend._native, backend._scheduler
+    try:
+        _constrained(backend, {"type": "json_object"})
+    finally:
+        backend.close()
+
+    assert native.schema_calls == []
+    assert native.object_calls == [f"tokenizer:{tmp_path}"]
+    assert scheduler.constraints[0].kind == "object"
+
+
+def test_text_is_the_shape_that_asks_for_nothing(tmp_path) -> None:
+    """`{"type": "text"}` is what an OpenAI client sends by default.
+
+    Constraining it would generate JSON for a caller who asked for prose, and refusing it would
+    break every client that spells the default out -- which is most of them.
+    """
+    backend = _structured_backend(str(tmp_path))
+    native, scheduler = backend._native, backend._scheduler
+    try:
+        _constrained(backend, {"type": "text"})
+    finally:
+        backend.close()
+
+    assert scheduler.constraints == [None]
+    assert native.tokenizer_paths == []
+
+
+def test_a_request_that_names_no_response_format_builds_no_constraint(tmp_path) -> None:
+    """The common case, and the one the vocabulary load must not be paid for."""
+    backend = _structured_backend(str(tmp_path))
+    native, scheduler = backend._native, backend._scheduler
+    try:
+        backend.generate(
+            [GenerationRequest(prompt_tokens=[1, 2], request_id="req-plain",
+                               sampling_params=SamplingParams(max_tokens=4))]
+        )
+    finally:
+        backend.close()
+
+    assert scheduler.constraints == [None]
+    assert native.tokenizer_paths == []
+
+
+def test_the_vocabulary_is_read_once_however_many_requests_ask_for_a_schema(tmp_path) -> None:
+    """Megabytes, and a decode step never touches them: read on first use and kept.
+
+    The cost of getting this wrong is not correctness, which is why it is worth a test of its own:
+    it is a per-request read of a vocabulary file that never changes.
+    """
+    backend = _structured_backend(str(tmp_path))
+    native = backend._native
+    try:
+        _constrained(backend, {"type": "json_object"}, request_id="req-1")
+        _constrained(backend, {"type": "json_object"}, request_id="req-2")
+    finally:
+        backend.close()
+
+    assert native.tokenizer_paths == [str(tmp_path)]
+    assert len(native.object_calls) == 2
+    # Both requests get their own: a constraint carries the state of the answer so far, and two
+    # requests sharing one would accept each other's tokens.
+    assert native.object_calls[0] is native.object_calls[1]
+
+
+def test_a_directory_holding_a_gguf_is_read_through_the_file_it_holds(tmp_path, monkeypatch) -> None:
+    """The container decides where the vocabulary lives, and only one of them is a directory read.
+
+    The released ternary artifact is a bare GGUF, so `Tokenizer(<dir>)` would fail looking for a
+    `tokenizer.json` that does not exist -- while the engine, opening the same path, reads the
+    header happily. Naming the file the engine would open is what keeps the two agreeing.
+    """
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    bundle = ckpt / "model.gguf"
+    bundle.write_bytes(b"GGUF")
+    monkeypatch.setattr("pocketllm.backends.cpp_backend.gguf_checkpoint_file", lambda path: str(bundle))
+
+    backend = _structured_backend(str(ckpt))
+    native = backend._native
+    try:
+        _constrained(backend, {"type": "json_object"})
+    finally:
+        backend.close()
+
+    assert native.tokenizer_paths == [str(bundle)]
+
+
+def test_an_engine_that_applies_no_mask_refuses_the_field_rather_than_ignoring_it(tmp_path) -> None:
+    """The constraint lives in the per-row device sampler, so engine-wide sampling has no mask.
+
+    Under tensor parallelism every rank has to enter the same sampler collectives, so an engine that
+    samples engine-wide applies no per-row mask -- and answering a schema there would return
+    unconstrained text with a 200, which is the silent drop this contract exists to prevent.
+    """
+    backend = _structured_backend(str(tmp_path), structured_outputs=False)
+    scheduler = backend._scheduler
+    try:
+        with pytest.raises(UnsupportedFeatureError, match="constrained decoding"):
+            _constrained(backend, {"type": "json_object"})
+    finally:
+        backend.close()
+
+    assert scheduler.constraints == []
+
+
+def test_the_serial_path_refuses_a_schema_because_nothing_carries_a_constraint(tmp_path) -> None:
+    """`batching=false` selects the serialized session, which has no scheduler and no mask.
+
+    The same rule as `logprobs`, and refused for the same reason: the field would be answered by
+    text that does not apply it.
+    """
+    backend = _structured_backend(str(tmp_path))
+    backend._scheduler = None
+    backend._batching_enabled = False
+    try:
+        with pytest.raises(UnsupportedFeatureError, match="constrained decoding"):
+            _constrained(backend, {"type": "json_object"})
+    finally:
+        backend.close()
+
+
+def test_a_response_format_that_is_not_one_is_refused_by_shape(tmp_path) -> None:
+    """Well formed JSON, and not one of the three shapes -- so the refusal names the field.
+
+    A client sending `{"type": "json_schema"}` without the schema has made a mistake the engine
+    cannot act on, and the answer has to be the one that says which key is missing rather than a
+    generation that runs unconstrained.
+    """
+    backend = _structured_backend(str(tmp_path))
+    scheduler = backend._scheduler
+    try:
+        with pytest.raises(UnsupportedFeatureError, match="json_schema.schema"):
+            _constrained(backend, {"type": "json_schema", "json_schema": {"name": "City"}})
+        with pytest.raises(UnsupportedFeatureError, match="must be 'text'"):
+            _constrained(backend, {"type": "csv"})
+    finally:
+        backend.close()
+
+    assert scheduler.constraints == []
+
+
+def test_the_host_refuses_a_schema_before_the_backend_ever_sees_it(tmp_path) -> None:
+    """The two halves of the audit, in the order the server runs them: shape, then capability.
+
+    A malformed value is refused by the *shape* pass, which knows nothing about the runtime, so the
+    same refusal is what every runtime answers. That separation is what stops a runtime from being
+    blamed for a client's typo.
+    """
+    from pocketllm.protocol.contract import audit_shape
+
+    refusal = audit_shape({"response_format": {"type": "json_schema", "json_schema": {}}})
+    assert refusal is not None
+    assert refusal.field == "response_format"
+    assert "response_format" in refusal.message
+
+    assert audit_shape({"response_format": {"type": "text"}}) is None
+    assert audit_shape({}) is None

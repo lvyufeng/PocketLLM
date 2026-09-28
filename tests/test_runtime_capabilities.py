@@ -339,14 +339,21 @@ def test_a_contradiction_in_the_arguments_is_still_a_configuration_error() -> No
 class _FakeEngineCaps:
     """A stand-in for the binding's ``Capabilities``: the fields the adapter reads, and no more."""
 
-    def __init__(self, *, max_slots: int, paged_kv: bool = False, logprobs: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        max_slots: int,
+        paged_kv: bool = False,
+        logprobs: bool = False,
+        structured_outputs: bool = True,
+    ) -> None:
         self.max_slots = max_slots
         self.continuous_batching = max_slots > 1
         self.chunked_prefill = True
         self.paged_kv = paged_kv
         self.per_request_sampling = True
         self.per_request_top_k = True
-        self.structured_outputs = True
+        self.structured_outputs = structured_outputs
         self.logprobs = logprobs
 
 
@@ -391,16 +398,55 @@ def test_the_width_comes_from_the_engine_when_the_engine_can_be_asked() -> None:
     assert backend.capabilities.details["engine_declares"]["continuous_batching"] is True
 
 
-def test_the_engine_s_answer_is_published_even_where_the_adapter_does_not_report_it() -> None:
-    """The engine declares structured outputs and logprobs available here; the adapter reports
-    neither as a capability, because neither is delivered end to end through this path yet. The gap
-    is published rather than hidden -- that is what makes it a decision instead of a drift."""
+def test_constrained_decoding_is_reported_from_where_it_is_refused() -> None:
+    """The field a client is refused and the capability it reads are one answer, not two.
+
+    Whether this instance holds an answer to a schema is per *instance* and in two parts: a scheduler
+    to carry the constraint and an engine that applies the mask. A runtime-level declaration could
+    only ever be a claim about the best case, so the capability comes from the serving table -- and
+    the engine's half stops being published as a gap, because it is no longer one.
+    """
+    backend = _cpp_backend_with_engine_caps()
+
+    assert backend.capabilities.supports_structured_outputs is True
+    assert "structured_outputs" not in backend.capabilities.details["engine_declares"]
+
+
+def test_an_engine_that_applies_no_mask_reports_no_structured_outputs() -> None:
+    """The engine's own word, and it is the one that counts: the mask is applied by the per-row
+    sampler, so an engine sampling at engine-wide values cannot hold an answer to a schema however
+    willing the adapter is to build the constraint."""
+    backend = _cpp_backend_with_engine_caps(structured_outputs=False)
+
+    assert backend.capabilities.supports_structured_outputs is False
+
+
+def test_logprobs_is_gated_on_the_scheduler_and_the_engines_word_is_published_beside_it() -> None:
+    """The one field whose two questions really are separate, held here so the difference is a
+    decision rather than an oversight.
+
+    The ranking comes off the scheduler's result rather than out of the sampler, so what gates the
+    *field* is the scheduler -- where `response_format` additionally needs the engine's own answer,
+    because a constraint is applied by the sampler. The engine's word about ranking is published
+    under `engine_declares` to be compared with, rather than copied over the serving gate.
+    """
     backend = _cpp_backend_with_engine_caps(logprobs=True)
 
+    assert backend._served_fields().logprobs is True
+    assert backend.capabilities.details["engine_declares"]["logprobs"] is True
+
+
+def test_a_build_with_no_scheduler_reports_neither_carried_field() -> None:
+    """No scheduler, nothing to carry a ranking or a constraint -- whatever the engine could do.
+
+    This is `batching=false`, the serialized compatibility session, and the two fields are the ones
+    whose answer is the instance's rather than the runtime's.
+    """
+    backend = _cpp_backend(enable_batching=False)
+
+    assert backend._batching_enabled is False
     assert backend.capabilities.supports_logprobs is False
     assert backend.capabilities.supports_structured_outputs is False
-    assert backend.capabilities.details["engine_declares"]["logprobs"] is True
-    assert backend.capabilities.details["engine_declares"]["structured_outputs"] is True
 
 
 def test_paging_is_read_from_the_engine_rather_than_from_the_option() -> None:

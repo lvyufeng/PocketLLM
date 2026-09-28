@@ -49,9 +49,11 @@ __all__ = [
     "MAX_LOGPROB_ALTERNATIVES",
     "FieldRefusal",
     "ServedFields",
+    "StructuredOutput",
     "audit",
     "audit_shape",
     "is_stop_shape",
+    "structured_output_spec",
 ]
 
 
@@ -231,6 +233,86 @@ def is_stop_shape(value: Any) -> bool:
     if not isinstance(value, (list, tuple)):
         return False
     return all(isinstance(item, str) for item in value)
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredOutput:
+    """What ``response_format`` asked for, reduced to what a constrained decode is built from.
+
+    Three shapes are accepted and two of them mean work. ``{"type": "text"}`` is the shape that asks
+    for nothing, and it is the value an OpenAI client sends by default, so it is read as a kind
+    rather than refused for having no constraint behind it. ``{"type": "json_object"}`` accepts any
+    JSON object. ``{"type": "json_schema"}`` carries the object schema to hold the answer to, and
+    that schema is the only thing here an engine cannot derive for itself.
+    """
+
+    #: ``"text"``, ``"json_object"`` or ``"json_schema"``.
+    kind: str
+    #: The object schema under ``json_schema.schema``, present only for :attr:`kind` ``json_schema``.
+    schema: Mapping[str, Any] | None = None
+
+    @property
+    def constrains(self) -> bool:
+        """Whether this asks the engine to hold the answer to anything.
+
+        The distinction the adapter branches on: a ``text`` request is generated on whatever path the
+        runtime would have used anyway, and only the other two need a token constraint. Keeping it
+        a property of the spec rather than a ``kind != "text"`` at every call site is what stops the
+        two from disagreeing when a fourth kind is added.
+        """
+        return self.kind != "text"
+
+
+def structured_output_spec(response_format: Any) -> StructuredOutput | FieldRefusal:
+    """``response_format`` as :class:`StructuredOutput`, or the refusal saying why it is not one.
+
+    The native front end's ``parse_response_format``, minus the two halves that are not about the
+    value: whether the running engine can constrain at all is the capability half
+    (:attr:`ServedFields.structured_outputs`), and whether the schema is one the engine's validator
+    supports is only knowable where the validator is. What stays here is the reading of the field,
+    which is the same on every runtime and is what both the host's audit and the ``cpp`` adapter need
+    -- read once, so a schema the audit passed is the schema the adapter builds from.
+    """
+    if not isinstance(response_format, Mapping):
+        return FieldRefusal.build(
+            "response_format", response_format,
+            "response_format is an object with a type, and this value is not an object.",
+            'Send {"type": "text"}, {"type": "json_object"}, or a json_schema response_format.',
+        )
+
+    kind = response_format.get("type")
+    if not isinstance(kind, str):
+        return FieldRefusal.build(
+            "response_format", response_format,
+            "response_format needs a string type, and this value has none.",
+            'Send {"type": "text"}, {"type": "json_object"}, or a json_schema response_format.',
+        )
+    if kind == "text":
+        return StructuredOutput(kind="text")
+    if kind == "json_object":
+        return StructuredOutput(kind="json_object")
+    if kind != "json_schema":
+        return FieldRefusal.build(
+            "response_format", response_format,
+            f"response_format type must be 'text', 'json_object' or 'json_schema', not {kind!r}.",
+            'Send {"type": "text"}, {"type": "json_object"}, or a json_schema response_format.',
+        )
+
+    json_schema = response_format.get("json_schema")
+    if not isinstance(json_schema, Mapping):
+        return FieldRefusal.build(
+            "response_format", response_format,
+            "a json_schema response_format needs a json_schema object carrying the schema.",
+            'Send {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}.',
+        )
+    schema = json_schema.get("schema")
+    if not isinstance(schema, Mapping):
+        return FieldRefusal.build(
+            "response_format", json_schema,
+            "a json_schema response_format needs an object schema under json_schema.schema.",
+            'Send {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}.',
+        )
+    return StructuredOutput(kind="json_schema", schema=schema)
 
 
 def audit(  # noqa: C901 - one field per block, in the order the refusal table documents
@@ -451,13 +533,16 @@ def audit(  # noqa: C901 - one field per block, in the order the refusal table d
                 'Remove "logit_bias".',
             )
 
-    # Structured outputs. ``{"type": "text"}`` is the shape that asks for nothing, so it is the one
-    # value accepted without the engine behind it.
-    if not serves.structured_outputs:
-        value = body.get("response_format")
-        if not _absent(value) and not (
-            isinstance(value, Mapping) and str(value.get("type") or "") == "text"
-        ):
+    # Structured outputs. The value is read the same way on every runtime, so the shape is checked
+    # here and only the capability is checked below -- a runtime with no constrained decoding still
+    # needs to be told that `{"type": "json_object"}` is a shape it can never accept, rather than
+    # being handed one the host thought was fine.
+    value = body.get("response_format")
+    if not _absent(value):
+        spec = structured_output_spec(value)
+        if isinstance(spec, FieldRefusal):
+            return spec
+        if spec.constrains and not serves.structured_outputs:
             return FieldRefusal.build(
                 "response_format", value,
                 "this runtime applies no constrained decoding, so the answer is unconstrained text.",
