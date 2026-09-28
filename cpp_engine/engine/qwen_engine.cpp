@@ -285,6 +285,24 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
         first.logical_shape[1] != second.logical_shape[1]) {
         return fused;
     }
+    // The input frame is part of the concatenation, not a property of either
+    // half. Both operands read the *same* activation, and the fused linear gets
+    // one input, so a fused pair that kept the default `false` would send that
+    // activation unrotated into weights written against the rotated frame -- the
+    // silent failure this mechanism produces rather than an error. `kind` and
+    // `logical_shape` are copied down for the same reason; this flag is the one
+    // that was missed, and on a folded checkpoint it is set: `gate_proj` and
+    // `up_proj` are folded, so both arrive rotated and the fused linear must
+    // rotate too.
+    //
+    // The two can also disagree, which no single input can satisfy -- one half
+    // would need the rotation and the other would need the raw activation. That
+    // is refused rather than resolved, because each operand's own answer is
+    // still available: the caller falls back to two separate projections, which
+    // is what one of the two asked for.
+    if (first.input_rotated != second.input_rotated) {
+        return fused;
+    }
     // Block-128 FP8 scale rows track output-row blocks and therefore concatenate
     // with the weight rows. Other compressed formats have different layouts and
     // are rejected above until a fused consumer for them is validated.
@@ -298,6 +316,7 @@ DeviceLinear fuse_linear_rows(const DeviceLinear& first,
     }
 
     fused.kind = first.kind;
+    fused.input_rotated = first.input_rotated;
     fused.logical_shape = {first.logical_shape[0] + second.logical_shape[0],
                            first.logical_shape[1]};
     const uint64_t first_rows = first.weight.shape[0];
@@ -3127,20 +3146,24 @@ struct QwenEngine::Impl {
 
     // The embedding lookup, whichever way the table is stored.
     //
-    // A ternary checkpoint quantizes its embedding like everything else, and the
-    // table is then read where it lies: expanding it to fp16 at load costs 2.4 GiB
-    // on a card where the 27B of weights is 5.5, which is the difference between a
-    // model that fits beside its KV cache and one that does not. Both paths write
-    // zeros for a token this rank does not hold, because the caller sums the
-    // ranks' rows.
+    // A ternary checkpoint quantizes its embedding like everything else. Where the
+    // backend has a kernel for the blocks -- CUDA -- the table is read where it
+    // lies, because expanding it to fp16 at load costs 2.4 GiB on a card where the
+    // 27B of weights is 5.5, which is the difference between a model that fits
+    // beside its KV cache and one that does not. Where it has none -- Ascend -- the
+    // cost is unavoidable and is paid instead of the model not running at all; the
+    // table arrives here decoded, as fp16, and takes the dense gather below.
+    // Both paths write zeros for a token this rank does not hold, because the
+    // caller sums the ranks' rows.
     void embedding_lookup(const int* tokens, uint16_t* output, int rows,
                           const char* site) {
         const int hidden_size = static_cast<int>(config.hidden_size);
         const int vocab_start = static_cast<int>(weights_vocab_start());
         const int vocab_rows = static_cast<int>(embed.shape[0]);
 #ifdef POCKET_BACKEND_ASCEND
-        // The Ascend backend is dense FP16 only, and a weight map that refused a
-        // ternary checkpoint never gets here with one.
+        // This backend has no block reader, so a ternary embedding is decoded by
+        // the weight map before it gets here and `embed` is fp16 like any other
+        // table. See qwen_backend_reads_packed_ternary.
         require_launch(qwen_embedding_fp16_gather_f16(embed.f16_data(), tokens,
                                                       output, rows, hidden_size,
                                                       vocab_start, vocab_rows),
@@ -3194,16 +3217,6 @@ struct QwenEngine::Impl {
     // read the wrong frame.
     const uint16_t* rotate_activation(const uint16_t* input, int rows, int columns,
                                       const char* site) {
-#ifdef POCKET_BACKEND_ASCEND
-        // The transform is a CUDA kernel. Branching here rather than dropping the
-        // call would leave the symbol referenced from this object, and the Ascend
-        // link has no definition of it -- which is the same reason the Qwen
-        // Ascend path is dense FP16 only. Nothing reaches this: the weight map
-        // refuses a ternary checkpoint on this backend.
-        (void)input; (void)rows; (void)columns; (void)site;
-        throw std::runtime_error(
-            "the incoherence rotation is not implemented on the Ascend backend");
-#else
         PhaseScope scope(this, std::string(rows == 1 ? "rot.d." : "rot.r.") + site);
         if (!rotation.active) {
             throw std::runtime_error(
@@ -3241,7 +3254,7 @@ struct QwenEngine::Impl {
         const std::vector<uint64_t> shape = {static_cast<uint64_t>(rows), width};
         QwenDeviceTensor& scratch =
             workspace_half(static_cast<size_t>(rows) * width, shape);
-        require_launch(qwen_hadamard_forward_f16_cuda(
+        require_launch(qwen_hadamard_forward_f16(
                            input, static_cast<const float*>(device_signs->data),
                            scratch.f16_data(), rows, columns, rotation.block_size),
                        "Qwen incoherence rotation");
@@ -3271,7 +3284,6 @@ struct QwenEngine::Impl {
         target->generation = rotation.generation;
         target->result = scratch.f16_data();
         return target->result;
-#endif
     }
 
     // The same transform, handed to the batched target head as a callback. The
@@ -3294,11 +3306,6 @@ struct QwenEngine::Impl {
     // them, so no thread can see another's output.
     void apply_embedding_inverse(uint16_t* rows, int row_count) {
         if (!embed_takes_inverse) return;
-#ifdef POCKET_BACKEND_ASCEND
-        (void)rows; (void)row_count;
-        throw std::runtime_error(
-            "the incoherence rotation is not implemented on the Ascend backend");
-#else
         PhaseScope scope(this, "embed.inv");
         const uint64_t width = config.hidden_size;
         const QwenDeviceTensor* device_signs = rotation.signs_for(width);
@@ -3307,12 +3314,11 @@ struct QwenEngine::Impl {
                 "the checkpoint stores its embedding in the rotated frame but "
                 "declares no sign vector for width " + std::to_string(width));
         }
-        require_launch(qwen_hadamard_inverse_f16_cuda(
+        require_launch(qwen_hadamard_inverse_f16(
                            rows, static_cast<const float*>(device_signs->data),
                            rows, row_count, static_cast<int>(width),
                            rotation.block_size),
                        "Qwen embedding inverse transform");
-#endif
     }
 
     bool sampling_enabled() const { return options.temperature > 1.0e-5f; }

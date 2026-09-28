@@ -282,6 +282,82 @@ at the end, so a repeat of the immediately preceding prompt resumes and a repeat
 does not, whatever `--enable-prefix-caching` or the arena size says. In the served table above the
 resumed request is the one at 0.023 s.
 
+## The Ascend port
+
+Four first-generation 910A cards run the same file through the same engine and the same weight map.
+The container, the transform and the tokenizer are backend-independent — the weight map decides what
+a tensor *is* before any backend sees it — so the port is three decisions and one bug.
+
+**The format is unpacked at load rather than at use.** No Ascend kernel reads a sub-byte weight, and
+the primitives one would need are missing rather than unwritten: the gather and pad-copy families are
+stubs on this silicon, there is no UB-to-L1 copy path, and the unary set has no floor, truncation or
+rounding, which is what a trit index would have to be computed with. So `qwen_materialize_host_tensor`
+decodes `PTQ1_0` to FP16 while the tensor is still in host memory and the device receives the decoded
+bytes. One predicate decides which of the two happens — `qwen_backend_reads_packed_ternary()` — and
+both the shape arithmetic (`ternary_storage_shape`) and the materializer read it, so a rank cannot
+compute its byte offsets for one layout and upload the other. The cost is 16 bits a weight where the
+checkpoint holds 1.75.
+
+**Three tensors are no longer a shard of a folded matrix.** A column-parallel weight whose shard stops
+inside a 1024-element rotation block cannot rotate its own activation: it holds a slice of the rotated
+axis, and the block it would need is on another rank. The loader resolves this the other way — it
+applies the inverse transform to the weight once, at load, and the site becomes an ordinary dense
+multiply. At TP4 this is `out_proj`, `o_proj` and `down_proj`, and it is why the ternary model's
+`down_proj` is a plain FP16 `[5120, 4352]` per rank rather than a slice of a folded `[5120, 17408]`.
+The decision lives in `qwen_rotation_needs_weight_unfold`, and both the weight map (which sets
+`QwenLinearRef::input_rotated`) and the materializer (which does the unfolding) call it with the same
+numbers, so the two cannot disagree about which frame a given weight is in.
+
+**The fold flag has to survive a weight fusion, and it did not.** `fuse_linear_rows` concatenates two
+projections along their output rows so one GEMM produces both — `gate_proj` with `up_proj` for the MLP
+(`fuse_ab_projection`, on by default), and `in_proj_a` with `in_proj_b` for the Gated DeltaNet. It
+copies `kind` and `logical_shape` onto the fused linear, because `Linear::forward` dispatches on both.
+It did not copy `input_rotated`, which `Linear::forward` also dispatches on — so the fused `gate_up`
+arrived at the GEMM with the **default `false`** and skipped the rotation, feeding an unrotated
+activation into a weight written against the rotated frame.
+
+Nothing could catch it downstream: both halves of the concatenation are individually consistent, the
+shapes are right, the kernel is right, and the output is a plausible-looking tensor. On a dense
+checkpoint the flag is `false` on both operands and the fusion is correct by accident, which is why
+the whole CUDA record above was unaffected; the defect needs a folded checkpoint *and* a fusion, and
+this is the first checkpoint that is both. It presented as fluent nonsense — the model answered `The
+capital of France is` with a repeating two-token cycle — and nothing else.
+
+The fix propagates the flag (`fused.input_rotated = first.input_rotated`), refuses the fusion when
+the two operands disagree, which no single input can satisfy, and checks the invariant where it is
+consumed, in `FusedGateUpSwiGLU::forward`. That last check is a host-side comparison of two structs
+and costs one branch per layer per step; it exists because the failure mode is silent, and because
+the class of bug — a hand-written field copy that misses a field the dispatch reads — is one a future
+fusion can repeat.
+
+**TP4, because TP8 is not available.** The model has 4 KV heads and 8 does not divide them, so a
+rank's share would be a partial head. The layout is the one the FP8 sibling uses: column-parallel
+`qkv`/`gate`/`up`/`z`, row-parallel `out_proj`/`o_proj`/`down_proj`, and the packed `[q | k | v]`
+tensor cut in segments rather than as one range so no rank receives part of a head it cannot use.
+
+### What the port measures
+
+`scripts/run_qwen_ascend_tp4.sh`, four 910A cards, the released `PTQ1_0` file, greedy:
+
+| | Result |
+| --- | ---: |
+| Load, 64 layers × 4 ranks | **244.6 s** — 12.53 GiB of FP16 weights a rank |
+| Decode, one row | 23.6 tok/s, 15 tokens |
+| Decode, 16 rows batched | **173.6 tok/s**, 92.2 ms a step |
+| Card memory, one row | 19.60 GiB of 32 |
+
+The load is host decode, not transfer. The dense sibling checkpoint puts the same 12.53 GiB a rank on
+the card in 35.5 s, because it reads FP16 off disk; here the engine reads 5.95 GB, decodes 402 ternary
+tensors on the host, and pushes the same 12.53 GiB. The **7×** is the expansion.
+
+The batched figure is gated, not just measured: the harness compares the batched path against a
+synchronous single-row reference at three interleaved steps and checks both tokens and logits.
+
+```bash
+QWEN_BATCH_ROWS=16 QWEN_BATCH_VERIFY=3 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+# verify_mismatches=0 verify_compared=48 batch_repeat_mismatches=0 seed_mismatches=0
+```
+
 ## Correctness and what is not claimed
 
 The generated text is the evidence that the container, the transform and the kernels compose: the
@@ -292,8 +368,9 @@ and on `tests/`.
 
 Not claimed here: any quality or accuracy figure for the checkpoint (those belong to the authors'
 evaluations), speculative decoding (MTP, DSpark and DFlash2 exist in this engine for the FP8
-checkpoint and none was run against the ternary artifact), and TP > 1 (the engine supports TP4, which
-is how the FP8 sibling is served, but no multi-card run was made for this one).
+checkpoint and none was run against the ternary artifact), and TP > 1 **on CUDA**. The engine's TP4 is
+what the FP8 sibling is served with, and the Ascend port above runs the ternary artifact at TP4, but
+no multi-card CUDA run was made for it.
 
 The alignment penalty is measured but not diagnosed. It is called out here so that the next person to
 serve this checkpoint — or any checkpoint on this engine — does not measure a 4,097-token prompt and

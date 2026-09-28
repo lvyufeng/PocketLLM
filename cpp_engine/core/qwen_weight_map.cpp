@@ -47,12 +47,109 @@ void require_tp(int world, int rank) {
 
 // 128 three-valued weights in 28 bytes: 24 bytes of packed trits, two more for
 // the top of the range, and the fp16 block scale last.
+constexpr uint64_t kTernaryBlockWeights = 128;
+constexpr uint64_t kTernaryBlockBytes = 28;
+
 uint64_t ternary_row_bytes(uint64_t weights, const std::string& name) {
-    if (weights == 0 || weights % 128 != 0) {
+    if (weights == 0 || weights % kTernaryBlockWeights != 0) {
         throw std::runtime_error(
             "a ternary row is not a whole number of 128-weight blocks: " + name);
     }
-    return weights / 128 * 28;
+    return weights / kTernaryBlockWeights * kTernaryBlockBytes;
+}
+
+// IEEE binary16 -> float, by hand for the same reason qwen_float_to_fp16_bits is:
+// both backends compile this translation unit and neither has a half type the
+// other does.
+float fp16_bits_to_float(uint16_t bits) {
+    const uint32_t sign = static_cast<uint32_t>(bits & 0x8000u) << 16;
+    const uint32_t exponent = (bits >> 10) & 0x1fu;
+    const uint32_t mantissa = bits & 0x3ffu;
+    uint32_t out = 0;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            out = sign;
+        } else {
+            // Subnormal: shift the leading one up out of the mantissa and pay for
+            // it in the exponent, which is what fp16's fixed 2^-14 floor costs.
+            uint32_t normalized = mantissa;
+            uint32_t shift = 0;
+            while ((normalized & 0x400u) == 0) {
+                normalized <<= 1;
+                ++shift;
+            }
+            out = sign | ((113u - shift) << 23) | ((normalized & 0x3ffu) << 13);
+        }
+    } else if (exponent == 31) {
+        out = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        out = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    float value = 0.0f;
+    std::memcpy(&value, &out, sizeof(value));
+    return value;
+}
+
+// The CUDA backend's `ptq1_0_trit_at` (backends/cuda/kernels/qwen_ternary_ops.cu),
+// reproduced here for the backends that have no kernel to run it in.
+//
+// Five trits share a byte, most significant first, so the sixth through the
+// twentieth weight of a block come from the same bytes as the first five with the
+// byte multiplied by a power of three. The multiplication wraps in uint8_t, and
+// that wrap is part of the format rather than an accident of it: the stored value
+// is a rounded-up division by 243, and only reading it back modulo 256 recovers
+// the trit. The 24 bytes of `qs` are read in stages of 16 and 8 bytes, not 32 --
+// the packing was defined for a 32-byte stage that a 28-byte block never fills --
+// and the last eight weights live in `qh`, interleaved by parity.
+int ptq1_0_trit_at(const uint8_t* block, uint64_t index) {
+    static const uint8_t kPow3[5] = {1, 3, 9, 27, 81};
+    uint8_t byte = 0;
+    uint8_t shift = 1;
+    if (index < 80) {
+        byte = block[index % 16];
+        shift = kPow3[index / 16];
+    } else if (index < 120) {
+        const uint64_t within = index - 80;
+        byte = block[16 + within % 8];
+        shift = kPow3[within / 8];
+    } else {
+        const uint64_t within = index - 120;
+        byte = block[24 + within % 2];
+        shift = kPow3[within / 2];
+    }
+    const uint8_t q = static_cast<uint8_t>(byte * shift);
+    return static_cast<int>((q * 3) >> 8) - 1;
+}
+
+// A run of packed weights into fp16, for the backends that keep a ternary weight
+// decoded rather than read it in place. See qwen_backend_reads_packed_ternary.
+//
+// `elements` counts weights and the run has to start on a block boundary. Both
+// hold for every caller in this file: a row is a whole number of blocks, and a
+// row's pitch is therefore a whole number of blocks too, so a run that spans rows
+// is the same byte sequence as one long row would be and the flat index below
+// needs no row arithmetic.
+void decode_ptq1_0(const uint8_t* src, uint8_t* dst, uint64_t elements,
+                   const std::string& name) {
+    if (elements % kTernaryBlockWeights != 0) {
+        throw std::runtime_error(
+            "a ternary run is not a whole number of 128-weight blocks: " + name);
+    }
+    uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
+    for (uint64_t base = 0; base < elements; base += kTernaryBlockWeights) {
+        const uint8_t* block = src + base / kTernaryBlockWeights * kTernaryBlockBytes;
+        // The block scale is the last two bytes: `ggml_half d`, the block's amax.
+        uint16_t scale_bits = 0;
+        std::memcpy(&scale_bits, block + 26, sizeof(scale_bits));
+        const float scale = fp16_bits_to_float(scale_bits);
+        for (uint64_t index = 0; index < kTernaryBlockWeights; ++index) {
+            // A trit is -1, 0 or 1 and the scale is a finite fp16, so this product
+            // is exact in fp16 and lands on the same bits the block reader's
+            // kernels produce -- this is a decode, not an approximation of one.
+            halves[base + index] =
+                qwen_float_to_fp16_bits(static_cast<float>(ptq1_0_trit_at(block, index)) * scale);
+        }
+    }
 }
 
 // A ternary pack is not an element array, so a descriptor's storage shape is not
@@ -63,9 +160,15 @@ uint64_t ternary_row_bytes(uint64_t weights, const std::string& name) {
 // The rewrite happens after the sharding arithmetic rather than before it,
 // because a shard is a range of *weights*: splitting the block count instead
 // would round a rank's share of a 128-weight block.
+//
+// A backend that decodes the pack keeps the descriptor logical throughout: its
+// device tensor is the weight matrix, not a byte array, so the last axis counts
+// weights the way every other tensor's does and the shard arithmetic above is
+// already the whole answer. Only the storage row pitch stays packed, and that is
+// a property of the source rather than of the descriptor.
 void ternary_storage_shape(const QwenSourceTensor& info,
                            std::vector<uint64_t>* local_shape) {
-    if (!info.ternary_blocks) return;
+    if (!info.ternary_blocks || !qwen_backend_reads_packed_ternary()) return;
     if (local_shape->size() != 2) {
         throw std::runtime_error("a ternary weight must be a matrix: " + info.name);
     }
@@ -93,6 +196,51 @@ void shard_range(uint64_t total, int world, int rank, uint64_t* start, uint64_t*
     }
     *size = total / static_cast<uint64_t>(world);
     *start = *size * static_cast<uint64_t>(rank);
+}
+
+// Whether a folded weight's incoherence rotation has to be undone *in the weight*
+// rather than applied to the activation that meets it.
+//
+// The rotation is blockwise along the tensor's last axis, so a rank that holds
+// whole blocks rotates its own share of the activation and the blockwise rule is
+// the whole story -- which is the cheap path, and the one both backends share. A
+// rank whose column shard stops inside a block cannot take it: a rotated output
+// reads its entire block, and part of that block is on another rank, so the
+// entries it would need are not here to rotate. There is no activation-side fix.
+//
+// The way out is to rotate the stored matrix instead, where the whole block is
+// still in reach, and to leave the activation alone: `W = M . R` along the last
+// axis, which the site then multiplies as an ordinary dense weight.
+// `qwen_hadamard_inverse_blockwise` is that transform and
+// `qwen_materialize_host_tensor` is where it is applied, on a tensor the loader
+// has already decoded back into elements.
+//
+// It costs one load-time pass over one tensor per folded matrix whose last axis
+// is sharded, and only where the world does not divide that axis into whole
+// blocks -- at world 4, `ssm_out` and `o_proj` (1536 columns) and `ffn_down`
+// (4352). At world 1 none of them qualifies and the activation-side rotation is
+// used everywhere.
+//
+// `shard_dim`, `shard_start` and `shard_size` describe the weight's own shard, so
+// the map -- deciding whether the site still rotates its input -- and the
+// materializer -- deciding whether it has to unfold -- ask one question of one
+// set of numbers, which is what keeps the two from disagreeing.
+bool qwen_rotation_needs_weight_unfold(const QwenHadamardSpec& spec,
+                                       const std::string& name, int shard_dim,
+                                       uint64_t shard_start, uint64_t shard_size) {
+    if (!spec.folds(name)) return false;
+    // Only a backend that decodes the pack can take this. One that reads the
+    // weight in place has no kernel that would accept an unfolded matrix, and
+    // clearing its rotation flag without one would leave the pack read in a frame
+    // the activation is no longer in -- fluent nonsense rather than an error. So
+    // such a backend keeps the rotation and keeps failing loudly at the block
+    // check, which is where it is today.
+    if (qwen_backend_reads_packed_ternary()) return false;
+    // The rotation axis is the last one. A shard of any other dimension, and a
+    // tensor no dimension is sharded along at all, leave the axis whole.
+    if (shard_dim != 1) return false;
+    const uint64_t block = static_cast<uint64_t>(spec.block_size());
+    return shard_start % block != 0 || shard_size % block != 0;
 }
 
 void validate_model_tp(const QwenConfig& config, int world) {
@@ -209,6 +357,24 @@ SafeDType qwen_device_dtype(SafeDType storage_dtype) {
     // A backend with native BF16 must not reuse this without re-deriving it; see
     // CLAUDE.md for why the Ascend product name cannot be used to make that call.
     return storage_dtype == SafeDType::BF16 ? SafeDType::F16 : storage_dtype;
+}
+
+bool qwen_backend_reads_packed_ternary() {
+#ifdef POCKET_BACKEND_ASCEND
+    // No kernel on this backend reads a sub-byte weight, and the primitives that
+    // would be needed to write one are missing rather than merely unwritten: the
+    // gather family and the pad-copy family are stubs on this silicon, there is no
+    // UB-to-L1 copy path, and the unary set has no floor, truncation or rounding,
+    // which is what a trit index would have to be computed with. So the pack is
+    // decoded once, on the host, into the fp16 matrix the dense kernels already
+    // take. The cost is 16 bits a weight where the checkpoint holds 1.75, and it
+    // is paid at load: the alternative is not a slower model but no model.
+    return false;
+#else
+    // The CUDA backend reads the blocks where they lie, which is what keeps a 27B
+    // ternary checkpoint at 5.5 GiB resident instead of 54.
+    return true;
+#endif
 }
 
 uint16_t qwen_float_to_fp16_bits(float value) {
@@ -387,8 +553,17 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
 
     auto copy_bytes = [&](const uint8_t* src, uint8_t* dst, uint64_t elements) {
         if (info.ternary_blocks) {
-            const uint64_t bytes = ternary_row_bytes(elements, ref.name);
-            std::memcpy(dst, src, static_cast<size_t>(bytes));
+            // `elements` counts weights, and the destination is either the packed
+            // bytes themselves or one fp16 per weight, depending on whether this
+            // backend has a kernel that reads a block. The conversion is done here
+            // and only here, which is what makes it a load-time cost rather than a
+            // per-token one.
+            if (qwen_backend_reads_packed_ternary()) {
+                std::memcpy(dst, src, static_cast<size_t>(
+                                         ternary_row_bytes(elements, ref.name)));
+            } else {
+                decode_ptq1_0(src, dst, elements, ref.name);
+            }
         } else if (ref.dtype == SafeDType::BF16) {
             if (ref.device_dtype != SafeDType::F16) {
                 throw std::runtime_error("Qwen BF16 tensor has non-FP16 device dtype: " + ref.name);
@@ -488,6 +663,70 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
         copy_rows(ref.shard_start, rows, destination, local_row_bytes);
         return out;
     }
+    if (const QwenHadamardSpec* const spec = source.hadamard();
+        spec != nullptr && shard_dim == 1 && ref.full_shape.size() == 2 &&
+        qwen_rotation_needs_weight_unfold(*spec, ref.name, shard_dim,
+                                          ref.shard_start, ref.shard_size)) {
+        // A folded weight whose rotation axis is sharded across a block boundary
+        // is unfolded here, on the checkpoint's own matrix, rather than on the
+        // activation at run time: the whole block is still in this container even
+        // though it is no longer in this rank, so the rotation can be undone
+        // where every entry is reachable and the site becomes an ordinary dense
+        // multiply. The rank keeps its own columns of the result, which is what
+        // `shard_start` indexes -- the transform is blockwise and the shard is a
+        // slice of the transformed row, so the slice boundary needs no block
+        // alignment even though the transform inside it does.
+        //
+        // See `qwen_rotation_needs_weight_unfold` for why this is the only way,
+        // and `qwen_hadamard_inverse_blockwise` for the transform. It is a
+        // load-time cost, paid once, on one tensor per folded matrix whose last
+        // axis the TP world does not divide into whole blocks.
+        const uint64_t rows = ref.full_shape[0];
+        const uint64_t cols = ref.full_shape[1];
+        const uint64_t local_cols = ref.local_shape[1];
+        if (ref.shard_start + ref.shard_size > cols || local_cols != ref.shard_size) {
+            throw std::runtime_error("Qwen folded dim-1 shard shape mismatch: " + ref.name);
+        }
+        if (ref.device_dtype != SafeDType::F16 && ref.device_dtype != SafeDType::F32) {
+            throw std::runtime_error(
+                "Qwen rotation can only be unfolded for a decoded element tensor: " +
+                ref.name);
+        }
+        const std::vector<int64_t>& signs = spec->signs_for_width(cols);
+        const uint64_t block = static_cast<uint64_t>(spec->block_size());
+        // One decoded row, then the same row in fp32. The butterfly accumulates
+        // in fp32 for the reason the device kernel does: ten passes of rounding
+        // in fp16 would cost exactly the low bits a 1.75-bit weight cannot
+        // afford, and the narrowing happens once, after the last pass.
+        std::vector<uint8_t> scratch(
+            static_cast<size_t>(logical_row_numel * device_item_size));
+        std::vector<float> line(static_cast<size_t>(logical_row_numel));
+        for (uint64_t row = 0; row < rows; ++row) {
+            copy_bytes(source_row(row), scratch.data(), logical_row_numel);
+            if (ref.device_dtype == SafeDType::F16) {
+                const uint16_t* halves =
+                    reinterpret_cast<const uint16_t*>(scratch.data());
+                for (uint64_t i = 0; i < logical_row_numel; ++i) {
+                    line[i] = fp16_bits_to_float(halves[i]);
+                }
+            } else {
+                std::memcpy(line.data(), scratch.data(),
+                            static_cast<size_t>(logical_row_numel * sizeof(float)));
+            }
+            qwen_hadamard_inverse_blockwise(line.data(), 1, cols, block, signs.data());
+            uint8_t* dst = destination + row * local_row_bytes;
+            if (ref.device_dtype == SafeDType::F16) {
+                uint16_t* halves = reinterpret_cast<uint16_t*>(dst);
+                for (uint64_t i = 0; i < local_cols; ++i) {
+                    halves[i] = qwen_float_to_fp16_bits(line[ref.shard_start + i]);
+                }
+            } else {
+                std::memcpy(dst, line.data() + ref.shard_start,
+                            static_cast<size_t>(local_cols * sizeof(float)));
+            }
+        }
+        return out;
+    }
     if (shard_dim == 1 && ref.full_shape.size() == 2 && info.ternary_blocks) {
         // A packed column axis is not an element array: the columns are runs of
         // 128-weight blocks, 28 bytes each, so the shard is a run of *blocks* and
@@ -497,21 +736,36 @@ QwenHostTensor qwen_materialize_host_tensor(const QwenCheckpointSource& source,
         // this branch exists rather than the generic one below, whose column
         // arithmetic counts elements.
         //
-        // `local_shape[1]` is the packed width, where `shard_size` is in weights:
-        // the descriptor carries both, deliberately (see ternary_storage_shape).
+        // `shard_start` and `shard_size` count weights either way, and the
+        // destination's columns are weights or bytes depending on whether the
+        // backend keeps the pack; the row pitch below is the one place that
+        // difference shows.
         const uint64_t rows = ref.full_shape[0];
         const uint64_t source_cols = ref.full_shape[1];
         const uint64_t local_cols = ref.local_shape[1];
+        const uint64_t source_row_bytes = ternary_row_bytes(source_cols, ref.name);
+        // A shard has to start on a block boundary: one that started inside a block
+        // would take half of that block's scale with it, and the two ranks would
+        // decode the same 28 bytes differently. `shard_start` is a weight index, so
+        // this is the check, and the byte offset is the block count times 28.
+        if (ref.shard_start % kTernaryBlockWeights != 0) {
+            throw std::runtime_error(
+                "a ternary shard starts inside a 128-weight block: " + ref.name);
+        }
+        const uint64_t first_byte =
+            ref.shard_start / kTernaryBlockWeights * kTernaryBlockBytes;
+        const uint64_t local_row_bytes = local_cols * device_item_size;
+        const uint64_t expected_local_cols =
+            qwen_backend_reads_packed_ternary()
+                ? ternary_row_bytes(ref.shard_size, ref.name)
+                : ref.shard_size;
         if (ref.shard_start + ref.shard_size > source_cols ||
-            local_cols != ternary_row_bytes(ref.shard_size, ref.name)) {
+            local_cols != expected_local_cols) {
             throw std::runtime_error("Qwen dim-1 packed shard shape mismatch: " + ref.name);
         }
-        const uint64_t source_row_bytes = ternary_row_bytes(source_cols, ref.name);
-        const uint64_t first_byte = ref.shard_start / 128 * (source_row_bytes / (source_cols / 128));
         for (uint64_t row = 0; row < rows; ++row) {
-            std::memcpy(destination + row * local_cols,
-                        source_row(row) + first_byte,
-                        static_cast<size_t>(local_cols));
+            copy_bytes(source_row(row) + first_byte,
+                       destination + row * local_row_bytes, ref.shard_size);
         }
         return out;
     }
@@ -615,11 +869,18 @@ QwenTensorRef make_ref(const QwenSourceTensor& info, SafeDType device_dtype,
     ref.shard_dim = shard_dim;
     ref.shard_start = start;
     ref.shard_size = size;
-    ref.nbytes = safe_tensor_numel(local_shape) * safe_dtype_size(info.dtype);
+    ref.nbytes = info.ternary_blocks && !qwen_backend_reads_packed_ternary()
+                     ? storage_nbytes(info.dtype, true, local_shape, info.name)
+                     : safe_tensor_numel(local_shape) * safe_dtype_size(info.dtype);
     ref.device_nbytes = safe_tensor_numel(local_shape) * safe_dtype_size(device_dtype);
     // A block-packed tensor's local shape already counts bytes on its last axis,
     // so `nbytes` above is right for it; the whole-tensor count is the one that
     // has to be derived from the logical shape.
+    //
+    // Decoded, it is the other way round: the local shape counts weights again, so
+    // the per-shard count is the one that has to be derived from the packing. The
+    // whole-tensor count above needs no such care -- it is derived from the full
+    // shape either way.
     ref.full_nbytes = storage_nbytes(info.dtype, info.ternary_blocks, info.shape,
                                      info.name);
     ref.ternary_blocks = info.ternary_blocks;
@@ -891,7 +1152,14 @@ QwenTensorRef QwenWeightMap::require_tensor(const std::string& name, SafeDType d
         throw std::runtime_error("unexpected shape for " + name + " expected=" + shape_string(shape) +
                                  " actual=" + shape_string(info.shape));
     }
-    const SafeDType device_dtype = source_.device_dtype(info.dtype);
+    // The storage dtype stays what the checkpoint holds -- a ternary tensor is
+    // declared U8 because that is what it is on disk -- while the device dtype is
+    // the backend's answer, and for a backend with no block reader that answer is
+    // the decoded matrix. See qwen_backend_reads_packed_ternary.
+    const SafeDType device_dtype =
+        info.ternary_blocks && !qwen_backend_reads_packed_ternary()
+            ? SafeDType::F16
+            : source_.device_dtype(info.dtype);
 
     std::vector<uint64_t> local_shape = shape;
     uint64_t start = 0;
@@ -963,8 +1231,9 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
     // same axis. By the time the activation reaches this matrix the axis is in
     // the order the recurrence and the matrix both use, so there is no
     // activation-side reorder left to declare.
-    if (const QwenHadamardSpec* spec = source_.hadamard()) {
-        result.input_rotated = spec->folds(name);
+    const QwenHadamardSpec* const rotation = source_.hadamard();
+    if (rotation != nullptr) {
+        result.input_rotated = rotation->folds(name);
     }
     result.rule = rule;
     result.shard_dim = shard_dim;
@@ -990,6 +1259,22 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
             shard_range(shape.at(static_cast<size_t>(shard_dim)), tp_world_,
                         tp_rank_, &start, &size);
             result.logical_local_shape[static_cast<size_t>(shard_dim)] = size;
+        }
+    }
+    // A shard of the rotation axis that stops inside a block cannot rotate its
+    // own activation, so the weight carries the rotation instead and this site
+    // becomes an ordinary dense multiply. The materializer takes the same
+    // decision from the same numbers -- see
+    // `qwen_rotation_needs_weight_unfold` -- so the two cannot disagree about
+    // which frame this weight is in.
+    if (rotation != nullptr && result.input_rotated &&
+        rule == QwenShardRule::RowParallel && shard_dim == 1) {
+        uint64_t rotation_start = 0;
+        uint64_t rotation_size = 0;
+        shard_range(shape[1], tp_world_, tp_rank_, &rotation_start, &rotation_size);
+        if (qwen_rotation_needs_weight_unfold(*rotation, name, shard_dim,
+                                              rotation_start, rotation_size)) {
+            result.input_rotated = false;
         }
     }
     const uint64_t local_n = result.logical_local_shape.at(0);
@@ -1098,7 +1383,14 @@ QwenLinearRef QwenWeightMap::require_linear(const std::string& name,
             throw std::runtime_error(
                 "ternary Qwen linear unexpectedly has a separate scale: " + name);
         }
-        result.kind = QwenLinearKind::Ptq1_0;
+        // The kind is the checkpoint's, except on a backend that has no kernel for
+        // the pack -- there the decoded weight is an ordinary dense fp16 matrix and
+        // every consumer downstream has to be told so, because that is the only
+        // implementation it will find. `require_tensor` makes the same decision for
+        // the device dtype, off the same predicate.
+        result.kind = qwen_backend_reads_packed_ternary()
+                          ? QwenLinearKind::Ptq1_0
+                          : QwenLinearKind::DenseF16;
         result.weight = require_tensor(name, SafeDType::U8, shape, rule, shard_dim);
         return result;
     }

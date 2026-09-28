@@ -70,9 +70,23 @@ bool file_exists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-const char* const kGgufPath =
-    "/mnt/data2/Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
-const char* const kSiblingDir = "/mnt/data2/Qwen3.8-27B-FP8";
+// Neither checkpoint is in the repository, so both paths are defaults an
+// environment variable can move: `QWEN_TERNARY_GGUF` for the file this test
+// reads, `QWEN38_FP8_DIR` for the FP8 sibling its last stage compares it
+// against. Without a checkpoint the stages that need one skip, which is exactly
+// why the overrides exist -- a skip on a host that has the file is a check that
+// silently did not run.
+std::string env_or_default(const char* name, const char* fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::string(value)
+                                                : std::string(fallback);
+}
+
+const std::string kGgufPath = env_or_default(
+    "QWEN_TERNARY_GGUF",
+    "/mnt/data2/Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+const std::string kSiblingDir =
+    env_or_default("QWEN38_FP8_DIR", "/mnt/data2/Qwen3.8-27B-FP8");
 
 // -- the name mapping, which needs no checkpoint --------------------------- //
 
@@ -355,39 +369,69 @@ void check_checkpoint() {
               << " fp8_block128=" << kinds.fp8_block128
               << " fp8_channel=" << kinds.fp8_channel
               << " nvfp4=" << kinds.nvfp4_group16 << "\n";
+    // Whether a ternary linear stays the block it was stored as or is decoded to
+    // dense fp16 on the way in is the backend's decision, not the checkpoint's,
+    // and this is the audit that has to hold under either answer. See
+    // qwen_backend_reads_packed_ternary: a backend whose kernels cannot read a
+    // 28-byte block decodes it at load and every consumer downstream then sees an
+    // ordinary weight matrix, kinds included.
+    const bool packed = pocket::qwen_backend_reads_packed_ternary();
+    std::cout << "[INFO] backend reads packed ternary=" << (packed ? "yes" : "no")
+              << "\n";
     // 288 in the 48 linear-attention layers (qkv, z, out, gate, up, down), 112 in
     // the 16 full-attention ones (q, k, v, o, gate, up, down), and the head.
-    check_eq(kinds.ptq1_0, uint64_t{401}, "401 ternary linears");
+    const uint64_t ternary_linears = 401;
     // The two per-head projections that scale the decay are bf16 in this file:
     // 48 layers x 2. They read the same rotated activation as the ternary ones
     // and are the only dense linears in the model.
-    check_eq(kinds.dense_f16, uint64_t{96}, "96 dense linears");
+    const uint64_t dense_linears = 96;
+    check_eq(kinds.ptq1_0, packed ? ternary_linears : uint64_t{0},
+             packed ? "401 ternary linears" : "no ternary linears when decoded");
+    check_eq(kinds.dense_f16, packed ? dense_linears : dense_linears + ternary_linears,
+             packed ? "96 dense linears" : "497 dense linears when decoded");
     check_eq(kinds.fp8_block128, uint64_t{0}, "no FP8 linears");
     check_eq(kinds.nvfp4_group16, uint64_t{0}, "no NVFP4 linears");
 
     // The storage shape of a ternary weight is the block geometry, and the
     // logical shape is the weight's. Both are needed and they differ; a kernel
-    // reads the second and indexes the first.
+    // reads the second and indexes the first. A backend that decodes loses the
+    // distinction on the local shape -- its rows are weights again -- so the
+    // block geometry is asserted only where a kernel indexes it.
+    const uint64_t down_rows = 5120;
+    const uint64_t down_cols = 17408;
+    const uint64_t down_block_bytes = down_rows * (down_cols / 128 * 28);
     const pocket::QwenLinearRef& down = map.layers()[0].mlp.down_proj;
-    check(down.kind == pocket::QwenLinearKind::Ptq1_0, "ffn_down is ternary");
-    check_eq(down.logical_local_shape[0], uint64_t{5120}, "ffn_down rows");
-    check_eq(down.logical_local_shape[1], uint64_t{17408}, "ffn_down columns");
-    check_eq(down.weight.local_shape[1], uint64_t{17408 / 128 * 28},
-             "ffn_down storage row is 28 bytes per 128 weights");
-    check_eq(down.weight.nbytes, uint64_t{5120} * (17408 / 128 * 28),
-             "ffn_down block bytes");
-    // The whole tensor's bytes come from the logical shape through the packing,
-    // not from the logical shape multiplied out: 5120 x 17408 elements would be
-    // 85 MiB, and the file holds 18.6.
-    check_eq(down.weight.full_nbytes, uint64_t{5120} * (17408 / 128 * 28),
+    check(down.kind == (packed ? pocket::QwenLinearKind::Ptq1_0
+                               : pocket::QwenLinearKind::DenseF16),
+          packed ? "ffn_down is ternary" : "ffn_down is decoded to dense fp16");
+    check_eq(down.logical_local_shape[0], down_rows, "ffn_down rows");
+    check_eq(down.logical_local_shape[1], down_cols, "ffn_down columns");
+    check_eq(down.weight.local_shape[1],
+             packed ? down_cols / 128 * 28 : down_cols,
+             "ffn_down local columns");
+    // `nbytes` is the checkpoint's bytes and `device_nbytes` is the backend's;
+    // the decode is what makes the two differ, and on a backend that reads the
+    // blocks it is the same packing either way through the logical shape.
+    check_eq(down.weight.nbytes, down_block_bytes, "ffn_down block bytes");
+    check_eq(down.weight.full_nbytes, down_block_bytes,
              "ffn_down full block bytes");
-    check(down.weight.device_dtype == pocket::SafeDType::U8,
-          "ternary blocks are uploaded as bytes");
+    check_eq(down.weight.device_nbytes,
+             packed ? down_block_bytes : down_rows * down_cols * 2,
+             packed ? "ffn_down device bytes are the blocks"
+                    : "ffn_down device bytes are one fp16 per weight");
+    check(down.weight.device_dtype ==
+              (packed ? pocket::SafeDType::U8 : pocket::SafeDType::F16),
+          packed ? "ternary blocks are uploaded as bytes"
+                 : "a decoded ternary weight is uploaded as fp16");
+    // The source property the two backends share, so that the byte count below
+    // is the checkpoint's rather than a restatement of the backend's policy.
+    check(down.weight.ternary_blocks, "ffn_down is a packed source tensor");
 
     // The embedding is the one declared tensor that takes the inverse, and it is
     // a table rather than a linear, so the map reads it as a tensor of blocks.
-    check_eq(map.embed_tokens().local_shape[1], uint64_t{5120 / 128 * 28},
-             "the embedding is stored as blocks too");
+    check_eq(map.embed_tokens().local_shape[1],
+             packed ? uint64_t{5120 / 128 * 28} : uint64_t{5120},
+             "the embedding's local columns");
     const uint64_t ternary_files_bytes = [&]() {
         uint64_t total = 0;
         for (const auto& layer : map.layers()) {
@@ -396,13 +440,13 @@ void check_checkpoint() {
                   &layer.linear_attention.in_proj_z,
                   &layer.linear_attention.out_proj, &layer.mlp.gate_proj,
                   &layer.mlp.up_proj, &layer.mlp.down_proj}) {
-                if (linear->kind == pocket::QwenLinearKind::Ptq1_0) {
+                if (linear->weight.ternary_blocks) {
                     total += linear->weight.nbytes;
                 }
             }
             // The full-attention layers add four attention linears; gate, up and
             // down are already counted above for every layer.
-            if (layer.full_attention.q_proj.kind == pocket::QwenLinearKind::Ptq1_0) {
+            if (layer.full_attention.q_proj.weight.ternary_blocks) {
                 total += layer.full_attention.q_proj.weight.nbytes +
                          layer.full_attention.k_proj.weight.nbytes +
                          layer.full_attention.v_proj.weight.nbytes +
@@ -426,7 +470,7 @@ void check_checkpoint() {
     check_norm_fold(source);
     check_row_order(source);
 
-    if (!file_exists(std::string(kSiblingDir) + "/model.safetensors.index.json")) {
+    if (!file_exists(kSiblingDir + "/model.safetensors.index.json")) {
         std::cout << "[SKIP] the FP8 sibling is not on disk; the two-source "
                      "comparison did not run\n";
         return;

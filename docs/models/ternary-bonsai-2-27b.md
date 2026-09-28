@@ -122,7 +122,8 @@ python -m pytest tests/test_ptq1_0_layout.py -q
 | Sampling (`temperature`, `top_k`, `top_p`) | Supported by the engine; the adapter exposes greedy generation only |
 | MTP, DSpark, DFlash2 speculative decoding | **Not validated on this checkpoint** |
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` (type 142, 2.13 bits) | Declared in the loader, **no kernel** — it is refused, not upcast |
-| TP > 1 | Unmeasured for this artifact |
+| TP > 1 on CUDA | Unmeasured for this artifact |
+| TP4 on the Ascend 910A | Supported, validated — see [On the Ascend 910A](#on-the-ascend-910a) |
 | Vision | The chat template renders images; nothing reads them |
 
 ## Performance
@@ -200,8 +201,80 @@ prompt. It settles at **8,952 MiB** and stays there: eight cold 4,096-token prom
 produced 7,078 → 8,952 MiB, flat after the first. That is the workspace, it is one per thread, and it
 does not grow with how many prompts the server has answered.
 
+## On the Ascend 910A
+
+The same checkpoint runs on four first-generation 910A cards (32 GiB HBM each, CANN 9.0.0), through
+the same engine and the same weight map. The container, the transform and the tokenizer are
+backend-independent, so what changes is the arithmetic: the Ascend backend is **dense FP16 only**,
+and there is no ternary kernel for it.
+
+### The weights are expanded, and that is the whole cost
+
+`PTQ1_0` is decoded to FP16 while the tensor is still on the host, so the card holds 27B parameters
+at two bytes each rather than 1.75 bits: **12.53 GiB resident**, against the 5.53 GiB the file
+occupies. On a 910A that is affordable — the card has 32 GiB where the 2080 Ti has 22 — and it is
+the only option, because there is no kernel that could consume the blocks in place. The decoder is
+the same one the CUDA path uses; it just runs unconditionally instead of being skipped when the
+backend declares it reads packed ternary.
+
+Three further consequences follow from FP16-only and are worth stating because each one is a
+difference from the CUDA path rather than a property of the model:
+
+- **The embedding table is materialized.** The CUDA path reads `token_embd`'s ternary blocks
+  directly. With no packed kernel, the table is decoded like everything else.
+- **`token_embd`'s inverse transform is folded into the table** rather than applied per lookup, for
+  the same reason.
+- **The fold is applied to the weight, not the activation, where the two cannot both happen.** A
+  column-parallel shard that stops inside a 1024-element block has no way to rotate its own
+  activation, so the loader unfolds the weight once at load and the site becomes an ordinary dense
+  multiply. At TP4 every row-parallel folded matrix — `out_proj`, `o_proj`, `down_proj` — takes
+  this path. The decision is made in one place
+  (`qwen_rotation_needs_weight_unfold`) and both the weight map and the materializer read it, so the
+  two cannot disagree about which frame a weight is in.
+
+### Four cards, not one
+
+TP4 is how this runs, and TP8 is not available: the model has 4 KV heads and 8 does not divide them,
+so a TP8 shard would be a partial head. The layout is the one the FP8 sibling uses — column-parallel
+`qkv`/`gate`/`up`/`z`, row-parallel `out_proj`/`o_proj`/`down_proj`, and the packed `[q | k | v]`
+tensor cut in segments rather than as one range.
+
+### What it measures
+
+`scripts/run_qwen_ascend_tp4.sh` on four 910A cards, the released `PTQ1_0` file, greedy:
+
+| | Result |
+| --- | ---: |
+| Load, all 64 layers on 4 cards | **244.6 s** — 497 dense FP16 linears, 12.53 GiB resident |
+| Decode, one row | 23.6 tok/s — from a 16-token run, so indicative rather than a rate |
+| Decode, 16 rows batched | **173.6 tok/s** — 92.2 ms a step |
+| Card memory, one row | 19.60 GiB of 32 |
+
+The 244.6 s is host decode, not disk or device transfer. Both checkpoints put the same 12.53 GiB of
+FP16 weights on each rank — that is what a TP4 shard of 27B parameters is — and the dense sibling
+loads it in **35.5 s** because it reads FP16 off disk and copies it across. Here the engine reads
+5.95 GB instead, decodes 402 ternary tensors to FP16 on the host, and then pushes the same 12.53
+GiB. The **7×** is the price of the expansion, and it is paid once.
+
+### The batching gate
+
+The harness checks the batched path against a synchronous single-row reference at three steps,
+interleaved across sixteen rows, and compares both the tokens and the logits:
+
+```bash
+QWEN_BATCH_ROWS=16 QWEN_BATCH_VERIFY=3 scripts/run_qwen_ascend_tp4.sh "The capital of France is" 8
+```
+
+```text
+verify_mismatches=0 verify_compared=48 batch_repeat_mismatches=0 seed_mismatches=0
+worst_logit_abs=0.0076313
+```
+
 ## Known limitations
 
+- **The Ascend path expands this checkpoint to FP16.** 12.53 GiB resident instead of 5.53, and a
+  244.6 s load instead of the dense sibling's 35.5 s. It is the only way to run `PTQ1_0` there:
+  there is no packed-ternary kernel for the backend.
 - **A prompt whose token count is not a multiple of 64 pays a one-off penalty of up to 12 seconds.**
   The engine's last partial tile is processed by something slow: a 4,096-token prompt prefills in
   6.44 s and a 4,097-token one in 18.11 s, same content. The cost tracks the *unused* slots in that

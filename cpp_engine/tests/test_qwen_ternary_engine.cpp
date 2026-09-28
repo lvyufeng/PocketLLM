@@ -53,8 +53,18 @@ bool file_exists(const std::string& path) {
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-const char* const kGgufPath =
-    "/mnt/data2/Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf";
+// The released checkpoint's own default location, overridable because the tree
+// is mirrored onto the Ascend host under a different root. Same variable name as
+// `test_qwen_gguf_weights` uses, so one export points both tests at one file.
+std::string env_or_default(const char* name, const char* fallback) {
+    const char* const value = std::getenv(name);
+    return (value != nullptr && *value != '\0') ? std::string(value) : std::string(fallback);
+}
+
+std::string gguf_path() {
+    return env_or_default("QWEN_TERNARY_GGUF",
+                          "/mnt/data2/Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf");
+}
 
 // "The capital of France is" -- the tokenizer's own ids, five tokens.
 const int kPrompt[] = {760, 6511, 314, 9338, 369};
@@ -89,13 +99,13 @@ std::string detokenize(const std::vector<std::string>& table,
 }  // namespace
 
 int main() {
-    if (!file_exists(kGgufPath)) {
+    if (!file_exists(gguf_path())) {
         std::cout << "[SKIP] test_qwen_ternary_engine needs the released checkpoint at "
-                  << kGgufPath << "\n";
+                  << gguf_path() << "\n";
         return 0;
     }
 
-    pocket::GGUFFile file(kGgufPath);
+    pocket::GGUFFile file(gguf_path());
     const std::vector<std::string> table =
         file.metadata_string_array("tokenizer.ggml.tokens").value_or(
             std::vector<std::string>());
@@ -110,7 +120,7 @@ int main() {
     options.mtp = false;
 
     const int max_context = 2048;
-    pocket::QwenEngine engine(kGgufPath, options, 0, max_context);
+    pocket::QwenEngine engine(gguf_path(), options, 0, max_context);
 
     // The transform is a fact about the file, and if the metadata did not reach
     // the runtime then nothing below means anything: the engine would take a

@@ -2,6 +2,7 @@
 #include "cuda_ops.hpp"
 #include "device_runtime.hpp"
 #include "deepseek_v4_engine.hpp"
+#include "gguf_reader.hpp"
 #include "model_config.hpp"
 #include "model_registry.hpp"
 #include "openai_server.hpp"
@@ -12,6 +13,7 @@
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
+#include "weight_source.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -436,6 +438,31 @@ void print_safe_tensor(const pocket::SafeTensorInfo& info, const std::string& sh
     std::cout << "] begin=" << info.data_begin << " abs=" << info.absolute_begin << " bytes=" << info.nbytes << " shard=" << shard << '\n';
 }
 
+// The GGUF spelling of the same line. `begin` is the tensor's offset inside the
+// data section and `abs` its offset in the file, which is what the safetensors
+// printer means by the same two fields -- a container difference, not a
+// different question.
+void print_gguf_tensor(const pocket::GGUFTensorInfo& info) {
+    std::cout << info.name << " dtype=" << pocket::dtype_name(info.dtype)
+              << " ggml_type=" << info.ggml_type
+              << " shape=[";
+    for (size_t i = 0; i < info.shape.size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << info.shape[i];
+    }
+    std::cout << "] begin=" << info.offset << " abs=" << info.absolute_offset
+              << " bytes=" << info.nbytes << " shard=-\n";
+}
+
+// The checkpoint's configuration, from whichever container the path names. The
+// engine's own reader, repeated here because the header does not carry it: a
+// GGUF states the model's hyperparameters in its own header, an HF export in
+// config.json, and the two agree because they describe the same architecture.
+pocket::QwenConfig qwen_config_of(const std::string& ckpt) {
+    return pocket::is_gguf_path(ckpt) ? pocket::QwenConfig::from_gguf(ckpt)
+                                      : pocket::QwenConfig::from_hf_config(ckpt);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -525,24 +552,47 @@ int main(int argc, char** argv) {
         if (!args.ckpt.empty()) {
             const bool qwen_checkpoint =
                 pocket::detect_architecture(args.ckpt) == "qwen3_5";
-            pocket::SafeTensorsIndex index(args.ckpt);
+            // The extension is the whole of the container choice -- a .gguf is
+            // one file with its own header, an HF export is a directory behind
+            // an index -- and nothing below may assume the safetensors shape.
+            // Reading the index unconditionally is what made a GGUF fail to
+            // open at all, before the engine that reads it was ever reached.
+            const bool gguf_checkpoint = pocket::is_gguf_path(args.ckpt);
             std::cout << "pocketllm_engine opened " << args.ckpt << "\n";
-            std::cout << "format=safetensors tensors=" << index.tensor_count()
-                      << " shards=" << index.shard_count()
-                      << " total_size=" << index.total_size()
-                      << " backend=" << pocket::device_backend_name() << " device_runtime=" << (pocket::device_runtime_available() ? "yes" : "no") << "\n";
+            if (gguf_checkpoint) {
+                pocket::GGUFFile file(args.ckpt);
+                std::cout << "format=gguf tensors=" << file.tensor_count()
+                          << " shards=1 total_size=" << file.file_size()
+                          << " backend=" << pocket::device_backend_name()
+                          << " device_runtime="
+                          << (pocket::device_runtime_available() ? "yes" : "no") << "\n";
+            } else {
+                pocket::SafeTensorsIndex index(args.ckpt);
+                std::cout << "format=safetensors tensors=" << index.tensor_count()
+                          << " shards=" << index.shard_count()
+                          << " total_size=" << index.total_size()
+                          << " backend=" << pocket::device_backend_name() << " device_runtime=" << (pocket::device_runtime_available() ? "yes" : "no") << "\n";
+            }
             if (args.dump_config) {
                 if (qwen_checkpoint) {
-                    const pocket::QwenConfig qwen_config = pocket::QwenConfig::from_hf_config(args.ckpt);
-                    std::cout << qwen_config.to_string();
+                    std::cout << qwen_config_of(args.ckpt).to_string();
+                } else if (gguf_checkpoint) {
+                    std::cout << pocket::ModelConfig::from_gguf(
+                                     pocket::GGUFFile(args.ckpt)).to_string();
                 } else {
                     std::cout << pocket::ModelConfig::from_hf_config(args.ckpt).to_string();
                 }
             }
             if (args.qwen_audit) {
                 if (!qwen_checkpoint) throw std::runtime_error("--qwen-audit requires a Qwen checkpoint");
-                const pocket::QwenConfig qwen_config = pocket::QwenConfig::from_hf_config(args.ckpt);
-                const pocket::QwenWeightMap map(index, qwen_config, args.tp_world, args.tp_rank);
+                // Through the source rather than an index, so a GGUF audits as
+                // readily as an HF export: the shape table and the sharding
+                // rules are statements about the architecture, not about the
+                // container carrying it.
+                const std::unique_ptr<pocket::QwenCheckpointSource> source =
+                    pocket::open_qwen_checkpoint(args.ckpt);
+                const pocket::QwenWeightMap map(
+                    *source, qwen_config_of(args.ckpt), args.tp_world, args.tp_rank);
                 const pocket::QwenLinearKindCounts kinds = map.checkpoint_linear_kind_counts();
                 const pocket::QwenCoverage cover = map.coverage();
                 const double gib = 1024.0 * 1024.0 * 1024.0;
@@ -592,9 +642,9 @@ int main(int argc, char** argv) {
                           << mlp.gate_proj.logical_local_shape.at(0)
                           << " down_proj_k=" << mlp.down_proj.logical_local_shape.at(1)
                           << " linear_attention_layers="
-                          << qwen_config.linear_attention_layers()
+                          << map.config().linear_attention_layers()
                           << " full_attention_layers="
-                          << qwen_config.full_attention_layers()
+                          << map.config().full_attention_layers()
                           << " mtp=" << (map.mtp().found ? 1 : 0)
                           << "\n";
                 if (args.qwen_audit_strict) {
@@ -606,12 +656,21 @@ int main(int argc, char** argv) {
                 }
             }
             if (!args.inspect_tensor.empty()) {
-                const std::string* shard_name = index.shard_for_tensor(args.inspect_tensor);
-                if (shard_name == nullptr) throw std::runtime_error("tensor not found: " + args.inspect_tensor);
-                pocket::SafeTensorsShard shard(index.shard_path(*shard_name));
-                const auto* info = shard.find_tensor(args.inspect_tensor);
-                if (info == nullptr) throw std::runtime_error("tensor missing in shard header: " + args.inspect_tensor);
-                print_safe_tensor(*info, *shard_name);
+                if (gguf_checkpoint) {
+                    pocket::GGUFFile file(args.ckpt);
+                    const pocket::GGUFTensorInfo* info =
+                        file.find_tensor(args.inspect_tensor);
+                    if (info == nullptr) throw std::runtime_error("tensor not found: " + args.inspect_tensor);
+                    print_gguf_tensor(*info);
+                } else {
+                    pocket::SafeTensorsIndex index(args.ckpt);
+                    const std::string* shard_name = index.shard_for_tensor(args.inspect_tensor);
+                    if (shard_name == nullptr) throw std::runtime_error("tensor not found: " + args.inspect_tensor);
+                    pocket::SafeTensorsShard shard(index.shard_path(*shard_name));
+                    const auto* info = shard.find_tensor(args.inspect_tensor);
+                    if (info == nullptr) throw std::runtime_error("tensor missing in shard header: " + args.inspect_tensor);
+                    print_safe_tensor(*info, *shard_name);
+                }
             }
             if (args.smoke_forward) {
                 if (qwen_checkpoint) {

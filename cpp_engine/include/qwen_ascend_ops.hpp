@@ -148,6 +148,25 @@ bool qwen_gqa_decode_attention_flashdec_f16_ascend(const uint16_t* d_q_fp16, con
 // single-core Cube entry instead.
 bool qwen_gqa_decode_attention_cube_split_f16_ascend(const uint16_t* d_q_fp16, const uint16_t* d_k_cache_fp16, const uint16_t* d_v_cache_fp16, uint16_t* d_out_fp16, int q_heads, int kv_heads, int head_dim, int context_len, int max_context, int partitions, void* stream);
 
+// The incoherence rotation the ternary checkpoint's folded weights are quantized
+// in: `R = (1/sqrt(N)) H diag(s)` applied independently to each `block` run of the
+// last axis, `d_signs_fp32` being the checkpoint's own sign vector over the whole
+// feature axis (FP32 there, and kept FP32 here -- a sign folded through an fp16
+// rounding is no longer exactly +-1).
+//
+// The forward direction is what meets a folded weight: signs, then the butterflies,
+// with the `1/sqrt(block)` scale on the input. The inverse is the same transform
+// with the passes reversed, for the embedding table, which is stored in the rotated
+// frame. `d_x_fp16` and `d_y_fp16` are the same shape and may be the same buffer.
+//
+// `block` must be a power of two between kHadamardMinBlock and kHadamardMaxBlock
+// that divides `width`; the bounds are shared with the kernel through
+// `qwen_hadamard_geometry.hpp`, and the lower one is the fp16 copy's block
+// granularity rather than a mathematical limit.
+bool qwen_hadamard_forward_f16_ascend(const uint16_t* d_x_fp16, const float* d_signs_fp32, uint16_t* d_y_fp16, int rows, int width, int block, void* stream);
+
+bool qwen_hadamard_inverse_f16_ascend(const uint16_t* d_x_fp16, const float* d_signs_fp32, uint16_t* d_y_fp16, int rows, int width, int block, void* stream);
+
 bool qwen_hbm_read_probe_ascend(const uint16_t* d_source, uint16_t* d_sink, int tile_count, void* stream);
 
 // Device-side arrival wait for the hand-written cross-process all-reduce: block on

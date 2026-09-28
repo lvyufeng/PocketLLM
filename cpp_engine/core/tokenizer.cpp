@@ -2,6 +2,7 @@
 
 #include "gguf_reader.hpp"
 #include "json_lite.hpp"
+#include "weight_source.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -174,8 +175,18 @@ std::vector<int64_t> metadata_int_array_as_i64(const GGUFFile& gguf, const std::
 
 }  // namespace
 
-Tokenizer::Tokenizer(const std::string& ckpt_dir) {
-    JsonValue root_value = parse_json(read_file(ckpt_dir + "/tokenizer.json"));
+Tokenizer::Tokenizer(const std::string& ckpt) {
+    // The container decides where the vocabulary lives: a GGUF carries it in
+    // the file header, an HF export in tokenizer.json beside the weights. The
+    // extension is the whole of the choice, and without this branch a .gguf
+    // path fails with "failed to open <ckpt>/tokenizer.json" -- a message about
+    // a file it should never have looked for.
+    if (is_gguf_path(ckpt)) {
+        const GGUFFile gguf(ckpt);
+        *this = from_gguf(gguf);
+        return;
+    }
+    JsonValue root_value = parse_json(read_file(ckpt + "/tokenizer.json"));
     const JsonObject& root = root_value.object();
     const JsonObject& model = object_get(root, "model")->object();
     const JsonObject& vocab = object_get(model, "vocab")->object();

@@ -456,12 +456,33 @@ bool qwen_is_visual_tensor(const std::string& name);
 
 // Qwen checkpoint tensors retain their source dtype for validation. Storage
 // dtype is what the checkpoint holds; device dtype is what the backend keeps
-// resident. This is the CUDA/SM75 policy: Turing has no native BF16 arithmetic,
-// so every BF16 tensor -- whether it comes from the official BF16 checkpoint or
-// from the BF16 scale metadata of an FP8 checkpoint -- is converted to IEEE FP16
-// at the upload boundary, while FP8 and NVFP4 codes stay compressed. A native
-// BF16 backend must supply its own policy here rather than inherit this one.
+// resident. Both supported backends land on the same policy here, for unrelated
+// reasons: neither has native BF16, so every BF16 tensor -- whether it comes
+// from the official BF16 checkpoint or from the BF16 scale metadata of an FP8
+// checkpoint -- is converted to IEEE FP16 at the upload boundary, while FP8 and
+// NVFP4 codes stay compressed. A backend with native BF16 must supply its own
+// policy here rather than inherit this one. The ternary pack is a separate
+// question with its own answer; see qwen_backend_reads_packed_ternary.
 SafeDType qwen_device_dtype(SafeDType storage_dtype);
+
+// Whether this backend's kernels read a PTQ1_0 weight where it lies, as 28-byte
+// blocks, or whether the device tensor is the decoded weights.
+//
+// The CUDA backend has the block reader (qwen_ternary_ops.cu), so its device
+// tensors stay U8 and a 27B checkpoint costs 5.5 GiB resident. The Ascend
+// backend has no sub-byte weight kernel, so a ternary weight is decoded once at
+// materialization and uploaded as FP16: the decode is exact -- a trit is -1, 0
+// or 1 and the block scale is a finite fp16 -- so the resulting tensor is the
+// same matrix the block reader would produce, at 16 bits a weight instead of
+// 1.75. That is four times the memory and the decode is not free, and it is what
+// lets the model run through the dense FP16 kernels both backends already have
+// rather than through a sub-byte GEMV this backend does not.
+//
+// This is a property of the backend, not of a checkpoint, so it is a compiled
+// constant rather than a flag: a server cannot be told at runtime to read blocks
+// it has no kernel for.
+bool qwen_backend_reads_packed_ternary();
+
 uint16_t qwen_bf16_to_fp16_bits(uint16_t bits);
 // Round-to-nearest-even FP32 -> FP16, for the norms a GGUF stores in fp32 where
 // the kernels want fp16 gamma.
