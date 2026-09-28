@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -25,6 +25,7 @@ from pocketllm.api import (
     TokenEvent,
     UnsupportedFeatureError,
 )
+from pocketllm.choices import expanded, folded_usage, streamed
 from pocketllm.protocol import build_chat_request, build_completion_request
 from pocketllm.protocol.contract import CHAT, COMPLETIONS, FieldRefusal, audit_shape
 
@@ -57,7 +58,7 @@ def _field_refusal_error(refusal: FieldRefusal) -> dict[str, Any]:
     }
 
 
-def _result_response(result: GenerationResult, model: str, request_id: str) -> dict[str, Any]:
+def _chat_choice(index: int, result: GenerationResult) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": result.text}
     reasoning = result.metadata.get("reasoning_content")
     if reasoning:
@@ -66,39 +67,58 @@ def _result_response(result: GenerationResult, model: str, request_id: str) -> d
     if tool_calls:
         message["tool_calls"] = tool_calls
     choice = {
-        "index": 0,
+        "index": index,
         "message": message,
         "finish_reason": result.finish_reason,
     }
     if result.logprobs is not None:
         choice["logprobs"] = result.logprobs
+    return choice
+
+
+def _completion_choice(index: int, result: GenerationResult) -> dict[str, Any]:
     return {
-        "id": request_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [choice],
-        "usage": result.usage.as_dict(),
+        "text": result.text,
+        "index": index,
+        # Always present on this endpoint, and null when none was asked for, which is the shape
+        # OpenAI's own completions response has: a client reading the key unconditionally is not
+        # making a mistake. Chat instead omits it, because its spec says so.
+        "logprobs": result.logprobs,
+        "finish_reason": result.finish_reason,
     }
 
 
-def _completion_response(result: GenerationResult, model: str, request_id: str) -> dict[str, Any]:
+def _result_response(
+    results: Sequence[GenerationResult],
+    model: str,
+    request_id: str,
+    *,
+    completion: bool = False,
+) -> dict[str, Any]:
+    """One response for a request, from the one or more runs that answered it.
+
+    A request for ``n`` choices is ``n`` runs, so this takes them all and writes them out in index
+    order. The count is whatever the dispatch produced rather than the ``n`` that was asked for:
+    where a runtime answers fewer, the response says so by having fewer choices, which is the one
+    way a client can notice -- an error would lose the choices that did succeed.
+
+    ``usage`` is the group's, not a choice's. See :func:`pocketllm.choices.folded_usage` for why the
+    prompt is counted once and the completion as the sum.
+    """
+    build = _completion_choice if completion else _chat_choice
     return {
         "id": request_id,
-        "object": "text_completion",
+        "object": "text_completion" if completion else "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "text": result.text,
-            "index": 0,
-            "logprobs": result.logprobs,
-            "finish_reason": result.finish_reason,
-        }],
-        "usage": result.usage.as_dict(),
+        "choices": [build(index, result) for index, result in enumerate(results)],
+        "usage": folded_usage(results).as_dict(),
     }
 
 
-def _event_json(event: TokenEvent, model: str, *, completion: bool = False) -> dict[str, Any]:
+def _event_json(
+    event: TokenEvent, model: str, *, completion: bool = False
+) -> dict[str, Any]:
     if completion:
         # Text completions use their own chunk schema; a chat delta here would
         # break OpenAI-compatible clients that read `choices[].text`.
@@ -108,7 +128,7 @@ def _event_json(event: TokenEvent, model: str, *, completion: bool = False) -> d
             "created": int(time.time()),
             "model": model,
             "choices": [{
-                "index": 0,
+                "index": event.choice_index,
                 "text": event.text,
                 "logprobs": None,
                 "finish_reason": event.finish_reason,
@@ -133,7 +153,9 @@ def _event_json(event: TokenEvent, model: str, *, completion: bool = False) -> d
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": event.finish_reason}],
+        "choices": [
+            {"index": event.choice_index, "delta": delta, "finish_reason": event.finish_reason}
+        ],
     }
     if event.usage is not None:
         item["usage"] = event.usage.as_dict()
@@ -211,6 +233,19 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(data)
+
+    def _write_event(
+        self, event: TokenEvent, model: str, *, completion: bool = False
+    ) -> None:
+        """One server-sent event, flushed.
+
+        Written and flushed per event rather than buffered, because a stream a client cannot read
+        until it ends is not a stream: the point of the transport is that the first token arrives
+        when the model produced it.
+        """
+        payload = _event_json(event, model, completion=completion)
+        self.wfile.write(b"data: " + _json_bytes(payload) + b"\n\n")
+        self.wfile.flush()
 
     def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -301,11 +336,15 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             if bool(body.get("stream", False)):
                 self._stream(request, started=started, completion=completion)
                 return
-            result = server.backend.generate([request])[0]
-            server.metrics.inc("generation_tokens_total", result.usage.completion_tokens)
-            server.metrics.inc("prompt_tokens_total", result.usage.prompt_tokens)
-            response = (_completion_response if completion else _result_response)(
-                result, server.model, request.request_id
+            # A request for `n` choices is `n` requests to the runtime, run here rather than in an
+            # adapter: it is the same fan-out whatever is underneath, and the response is what needs
+            # to know about it. See `pocketllm.choices`.
+            results = server.backend.generate(expanded(request))
+            for result in results:
+                server.metrics.inc("generation_tokens_total", result.usage.completion_tokens)
+            server.metrics.inc("prompt_tokens_total", folded_usage(results).prompt_tokens)
+            response = _result_response(
+                results, server.model, request.request_id, completion=completion
             )
             self._send_json(200, response)
         except Exception as exc:
@@ -324,20 +363,43 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        if not completion:
-            role = TokenEvent(request.request_id, metadata={"role": "assistant"})
-            self.wfile.write(b"data: " + _json_bytes(_event_json(role, server.model)) + b"\n\n")
-            self.wfile.flush()
         prompt_counted = False
-        # Latency sampling. The role delta written above is not a token, so TTFT
-        # is latched on the first event that actually carries one -- the same
-        # signal the generation-token counter already keys off.
+        # Latency sampling. A role delta is not a token, so TTFT is latched on the
+        # first event that actually carries one -- the same signal the
+        # generation-token counter already keys off.
         tokens_seen = 0
         first_token_at: float | None = None
         last_token_at = 0.0
         inter_token_total = 0.0
+        #: Which choices have been opened with their role delta. A set rather than a boolean, because
+        #: a request for several choices is several streams in one response and each of them opens
+        #: the way a single-choice stream does.
+        greeted: set[int] = set()
+        if not completion:
+            # Choice 0's opener goes out before generation starts, which is what this server has
+            # always done and is worth keeping: a client sees the assistant turn begin as soon as the
+            # response headers are on the wire, rather than at the first token, which on a long
+            # prefill is seconds later. The choices after it open at their own first event, because
+            # they do not begin until the one before them has finished.
+            greeted.add(0)
+            self._write_event(
+                TokenEvent(request.request_id, metadata={"role": "assistant"}), server.model
+            )
         try:
-            for event in server.backend.stream(request):
+            for event in streamed(server.backend, request):
+                # A chat stream opens each choice with its role: a client accumulating per `index`
+                # sees an assistant delta arrive before that choice's first content, and does not
+                # have to infer from a content-only delta that a new choice started.
+                if not completion and event.choice_index not in greeted:
+                    greeted.add(event.choice_index)
+                    self._write_event(
+                        TokenEvent(
+                            request.request_id,
+                            choice_index=event.choice_index,
+                            metadata={"role": "assistant"},
+                        ),
+                        server.model,
+                    )
                 if event.token_id is not None:
                     server.metrics.inc("generation_tokens_total")
                     now = time.perf_counter()
@@ -351,11 +413,12 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     last_token_at = now
                     tokens_seen += 1
                 if event.usage is not None and not prompt_counted:
+                    # Once for the request, not once per choice: the prompt was sent once and the
+                    # engine prefilled it `n` times, which is the engine's cost to pay and not the
+                    # client's to be billed for. `folded_usage` is the same rule on the response.
                     server.metrics.inc("prompt_tokens_total", event.usage.prompt_tokens)
                     prompt_counted = True
-                payload = _event_json(event, server.model, completion=completion)
-                self.wfile.write(b"data: " + _json_bytes(payload) + b"\n\n")
-                self.wfile.flush()
+                self._write_event(event, server.model, completion=completion)
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):

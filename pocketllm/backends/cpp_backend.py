@@ -30,6 +30,7 @@ from pocketllm.api import (
     Usage,
     UnsupportedFeatureError,
 )
+from pocketllm.choices import SEED_MASK
 from pocketllm.protocol import (
     apply_stop_to_text,
     encode_chat_prompt,
@@ -37,6 +38,8 @@ from pocketllm.protocol import (
     render_fallback_prompt,
 )
 from pocketllm.protocol.contract import CHAT, FieldRefusal, ServedFields, audit as audit_body
+from pocketllm.protocol.logprobs import complete as ranking_complete
+from pocketllm.protocol.logprobs import render as render_logprobs
 from pocketllm.protocol.templating import build_templater, detect_architecture
 
 from .base import BackendBase, hold_back, settled_text
@@ -225,6 +228,25 @@ def _strip_terminal_stop_token(result: Any) -> list[int]:
     return tokens[:-1]
 
 
+def _ranking_width(params: SamplingParams) -> int:
+    """How wide a ranking this request asks the engine to produce, 0 for none.
+
+    The two endpoints spell the field differently and this is where the two spellings meet. Chat
+    takes a boolean and puts the count of ranked alternatives in ``top_logprobs``;
+    ``/v1/completions`` takes one count in ``logprobs`` where even 0 asks for the sampled token's own
+    probability. Either way a request that asked for a ranking wants at least the sampled token, so
+    the width is never 0 once it has asked -- which is exactly what the native front end's
+    ``LogprobsSpec.width = max(alternatives, 1)`` says.
+
+    The alternatives *rendered* is a separate number, and smaller: the engines rank a whole batch at
+    the widest width any row in the step asked for, so an entry can carry more candidates than this
+    request wants. :func:`pocketllm.protocol.logprobs.render` narrows it.
+    """
+    if not params.logprobs:
+        return 0
+    return max(int(params.top_logprobs or 0), 1)
+
+
 #: The sampling values the adapter constructs the engine with. They are the engine's effective
 #: values on any path where it cannot be asked -- see :func:`_engine_sampling_refusal`.
 _ENGINE_SAMPLING_DEFAULTS = {
@@ -395,6 +417,24 @@ def _engine_sampling_refusal(body: Mapping[str, Any], sampling: "_EngineSampling
         and int(float(seed)) != sampling.fixed_seed
     ):
         return mismatch("seed", seed, float(sampling.fixed_seed))
+
+    # Several choices are several requests, run one level up by the host's dispatch, so the count
+    # itself is never this adapter's to refuse. What is left to refuse is a request those runs
+    # cannot answer: they differ only in the seed they are given, and an engine that samples at
+    # engine-wide values reads no seed it was handed. Every run would then draw from the same
+    # distribution at the same seed and the client would receive one text presented as `n`
+    # independent samples, with nothing in the response to tell it what happened. Under greedy
+    # decoding the same text `n` times is the answer that was asked for, so this refuses only the
+    # stochastic case -- the same line the native front end drew.
+    n = named("n")
+    if n is not None and int(n) > 1 and stochastic and not sampling.per_request_sampling:
+        return FieldRefusal.build(
+            "n", n,
+            f"this engine samples at an engine-wide temperature of "
+            f"{sampling.fixed_temperature:g} and a seed it cannot vary per request, so all "
+            f"{int(n)} choices would be the same text presented as independent samples.",
+            'Remove "n", or run an engine configuration that samples per request.',
+        )
     return None
 
 
@@ -1004,23 +1044,35 @@ class CppBackend(BackendBase):
 
         The capability half of the audit, and it lives beside the adapter rather than in the
         runtime table because it is not one fact about the runtime: ``stop`` is served by code in
-        this file, and ``choices`` is not served by this file at all.
+        this file, and ``choices`` is served by no adapter at all.
 
-        These are the fields the native front end answered, and each ``False`` is a field that front
-        end refused by name rather than dropping: the engine's sampler has no repetition, presence
-        or min-p term, its token constraint is not reachable across the binding, and its per-token
-        ranking is not bound to Python. ``stop`` moves from ``False`` to ``True`` here, because this
-        adapter can match a sequence against the decoded text as the native server did.
+        The ``False`` entries are the fields the native front end refused by name rather than
+        dropping: the engine's sampler has no repetition, presence or min-p term, its token
+        constraint is not reachable across the binding, and it has no ``logit_bias``. Each of those
+        is a field a caller set that would not have changed the answer, which is why the answer is a
+        refusal and not a 200.
 
-        ``choices`` stays ``False`` although the native front end served ``n`` by running one
-        scheduler request per choice. The fan-out needs the response to carry more than one choice
-        and ``EngineBackend.generate`` returns exactly one :class:`GenerationResult` per
-        :class:`GenerationRequest`, so there is nowhere for a second choice to go -- it belongs in
-        the host's dispatch, beside the request building, where it is one implementation for every
-        runtime rather than one per adapter. Until it is there, ``n`` greater than 1 is refused by
-        name: answering four choices with one is the response this module exists to prevent.
+        ``choices`` is ``True`` although nothing in this file generates a second choice. A request
+        for ``n`` choices is ``n`` requests one level up, in the host's dispatch
+        (:func:`pocketllm.choices.expanded`), and this adapter's part of serving the field is to
+        answer each of them; declaring it ``False`` here would refuse the field on every runtime,
+        which is the opposite of where the fan-out lives. What this file must not do is answer ``n``
+        choices with one, and it cannot: it is handed one request per choice.
+
+        ``logprobs`` is asked of the scheduler rather than stated, because it is one: the per-token
+        ranking is produced by the scheduler's per-row sampler and arrives on the scheduler's result
+        object. A build whose scheduler was not created -- ``batching=false`` selects the serialized
+        compatibility session -- has no ranking anywhere in the call, so the field is refused by
+        name there rather than answered with an empty array. Streaming logprobs stay ``False`` for
+        the reason the native front end refused them: a streamed chunk carries the text of its token
+        with no ranking beside it, and one ranking per chunk would have to come off the same result
+        object the stream is draining.
         """
-        return ServedFields(choices=False, stop=True)
+        return ServedFields(
+            choices=True,
+            stop=True,
+            logprobs=self._batching_enabled and self._scheduler is not None,
+        )
 
     def audit_request(
         self, body: Mapping[str, Any], *, endpoint: str = CHAT
@@ -1223,7 +1275,7 @@ class CppBackend(BackendBase):
 
     def _answer_from_tokens(
         self, request: GenerationRequest, token_ids: Sequence[int], finish_reason: str
-    ) -> tuple[str, str, dict[str, Any]]:
+    ) -> tuple[str, str, dict[str, Any], tuple[int, int]]:
         """A finished run read back, with the client's stop sequences applied first.
 
         A stop sequence ends the *answer*, and on a chat request the reasoning block is not part of
@@ -1241,14 +1293,30 @@ class CppBackend(BackendBase):
         The token ids are not cut. They are what ``usage`` counts and what the engine really
         executed -- the scheduler has no way to see a text-level sequence, so the run goes to its
         budget either way -- which is the same pair the native server reported.
+
+        The fourth element is where the returned text sits in the decoded token stream, in UTF-8
+        bytes. It is what lines a per-token ranking up against the text it is reported beside; see
+        :func:`pocketllm.protocol.logprobs.render`.
+
+        The start is found by subtraction rather than by asking the reader, because the answer is a
+        **suffix** of the text the reader was handed: both cuts remove from an end -- the reasoning
+        split from the front, the stop sequence and the parser from the back -- and neither removes
+        from the middle, which is the invariant :meth:`_cut_answer` already relies on when it
+        reattaches the block it split off. So the answer is the last ``len(text)`` bytes of that
+        text, and a trailing marker the parser dropped of its own accord falls outside the span by
+        the same arithmetic that puts a stop cut outside it.
         """
         stops = tuple(request.sampling_params.stop)
         decoded = self._decode(list(token_ids))
+        cut = decoded
         if stops:
-            decoded, stopped = self._cut_answer(decoded, stops, request)
+            cut, stopped = self._cut_answer(decoded, stops, request)
             if stopped:
                 finish_reason = "stop"
-        return self._read_answer(request, decoded, finish_reason)
+        text, finish_reason, metadata = self._read_answer(request, cut, finish_reason)
+        text_bytes = len(text.encode("utf-8"))
+        start = len(cut.encode("utf-8")) - text_bytes
+        return text, finish_reason, metadata, (start, start + text_bytes)
 
     def _cut_answer(
         self, decoded: str, stops: Sequence[str], request: GenerationRequest
@@ -1319,7 +1387,11 @@ class CppBackend(BackendBase):
                 # `completion_tokens` counts the EOS step the engine executed, so
                 # usage stays comparable with the streamed path.
                 completion_tokens = len(token_ids) + (1 if hit_eos else 0)
-                text, finish_reason, metadata = self._answer_from_tokens(
+                # The ranking is not read here: this path has no scheduler to ask for one, which is
+                # what `_served_fields` reports and `_check_sampling` has already refused a request
+                # for logprobs by. The span is returned all the same -- one reader for both paths is
+                # what keeps the two from disagreeing about where an answer starts.
+                text, finish_reason, metadata, _span = self._answer_from_tokens(
                     request, token_ids, "stop" if hit_eos else "length"
                 )
                 outputs.append(
@@ -1367,6 +1439,24 @@ class CppBackend(BackendBase):
                 sampling.temperature = request.sampling_params.temperature or 0.0
                 sampling.top_p = request.sampling_params.top_p or 1.0
                 sampling.top_k = request.sampling_params.top_k or 20
+                # Whether to rank each position at all is a property of the *step* rather than of a
+                # row -- the ranking kernels take one width for the whole batch, and under TP every
+                # rank has to enter the same collectives at the same width -- so a batch containing
+                # one request that asked for a ranking is ranked for all of them and each row is
+                # narrowed back to what it asked for when the result is rendered.
+                sampling.logprobs_n = _ranking_width(request.sampling_params)
+                # A seed the caller named has to reach the sampler, and until now it did not: the
+                # field was never assigned, so every batched request ran at the engine's default
+                # seed and a client that pinned one was answered as if it had not. That is invisible
+                # on a request that asked for one choice and fatal to one that asked for several --
+                # the choices of an `n`-choice request differ only in the seed they are given, so
+                # dropping it turns the fan-out into the same answer written out `n` times.
+                #
+                # The engine's seed is unsigned and the mask is how a negative Python int names one,
+                # which is the same reinterpretation the native front end made when it assigned a
+                # double into a `uint64_t`.
+                if request.sampling_params.seed is not None:
+                    sampling.seed = int(request.sampling_params.seed) & SEED_MASK
                 # The batch scheduler runs the model to max_new_tokens unless
                 # told otherwise. EOS truncation is the default for serving, but
                 # a benchmark (or any caller that wants the full budget) opts in
@@ -1415,7 +1505,7 @@ class CppBackend(BackendBase):
 
             # Convert native result to GenerationResult
             token_ids = _strip_terminal_stop_token(result)
-            text, finish_reason, metadata = self._answer_from_tokens(
+            text, finish_reason, metadata, span = self._answer_from_tokens(
                 request, token_ids, result.finish_reason
             )
 
@@ -1430,6 +1520,7 @@ class CppBackend(BackendBase):
                         total_seconds=result.total_seconds,
                         ttft_seconds=result.ttft_seconds,
                     ),
+                    logprobs=self._ranking(request, result, token_ids, span),
                     metadata=metadata,
                 )
             )
@@ -1441,6 +1532,46 @@ class CppBackend(BackendBase):
             raise RuntimeError(f"native C++ generation failed: {joined}")
 
         return outputs
+
+    def _ranking(
+        self,
+        request: GenerationRequest,
+        result: Any,
+        token_ids: Sequence[int],
+        span: tuple[int, int],
+    ) -> dict[str, Any] | None:
+        """The OpenAI ``logprobs`` object for one finished choice, or ``None`` if none was asked.
+
+        The engine reports one ranking per generated position, and the vector is parallel to
+        ``result.generated_tokens`` -- the tokens *before* the terminal stop token is stripped, which
+        is the vector the ranking is indexed against -- while ``token_ids`` is that vector with the
+        token the answer does not contain removed. Walking the stripped ids against the unstripped
+        ranking is what the native front end did as well, and it is safe for the same reason: the
+        stripped vector is a prefix of the other, so index ``i`` is the same position in both.
+
+        A position the engine left unranked fails the request instead of coming back as an array
+        shorter than the text. A caller reading a probability per token has no way to notice that the
+        two drifted apart, and speculative decoding is exactly where it happens: the engine describes
+        the first token a row emitted and no others, so a row that emitted several leaves the rest
+        without an entry.
+        """
+        if not request.sampling_params.logprobs:
+            return None
+        rankings = list(getattr(result, "logprobs", ()) or ())
+        generated = list(getattr(result, "generated_tokens", ()) or ())
+        if not ranking_complete(rankings, len(generated)):
+            raise RuntimeError(
+                "the engine returned no log probabilities for a position it was asked to rank, so "
+                f"the ranking for request {request.request_id} describes fewer tokens than its text"
+            )
+        return render_logprobs(
+            token_ids,
+            rankings,
+            decode=self._decode,
+            text_start=span[0],
+            text_end=span[1],
+            alternatives=int(request.sampling_params.top_logprobs or 0),
+        )
 
     def _stream_native(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         self._check_sampling(request.sampling_params)

@@ -18,6 +18,7 @@ from pocketllm.api import (
     TokenEvent,
 )
 from pocketllm.backends.factory import create_backend
+from pocketllm.choices import expanded, streamed
 from pocketllm.protocol import build_chat_request
 
 
@@ -65,6 +66,23 @@ class LLM:
                 requests.append(GenerationRequest(prompt_tokens=[int(token) for token in prompt], sampling_params=params))
         return requests
 
+    @staticmethod
+    def _dispatch(requests: Sequence[GenerationRequest]) -> list[GenerationRequest]:
+        """Every runtime request a caller's request is made of.
+
+        ``n`` choices are ``n`` generations, and a generation is what this library hands the
+        backend. The fan-out itself is :func:`pocketllm.choices.expanded`, one implementation shared
+        with the HTTP server so the two entry points cannot disagree about how many generations an
+        ``n = 3`` request is; this is where it is applied on the library path. Each result carries
+        its own ``request_id`` -- the choice's, in the ``req-1#2`` shape :mod:`pocketllm.choices`
+        documents -- because a caller holding several has to be able to tell them apart, and the
+        ``cancel`` this facade forwards accepts either that id or the one the caller supplied.
+        """
+        dispatched: list[GenerationRequest] = []
+        for request in requests:
+            dispatched.extend(expanded(request))
+        return dispatched
+
     def generate(
         self,
         prompts: str | Sequence[str | Sequence[int]],
@@ -75,7 +93,7 @@ class LLM:
         if isinstance(prompts, str):
             prompts = [prompts]
         params = sampling_params or SamplingParams()
-        return self._backend.generate(self._requests(prompts, params))
+        return self._backend.generate(self._dispatch(self._requests(prompts, params)))
 
     def generate_stream(
         self,
@@ -86,7 +104,7 @@ class LLM:
             raise RuntimeError("LLM is closed")
         params = sampling_params or SamplingParams()
         request = self._requests([prompt], params)[0]
-        return self._backend.stream(request)
+        return streamed(self._backend, request)
 
     @staticmethod
     def _chat_body(
@@ -162,7 +180,7 @@ class LLM:
             response_format=response_format,
             request_id=request_id,
         )
-        return self._backend.generate([request])
+        return self._backend.generate(self._dispatch([request]))
 
     def chat_stream(
         self,
@@ -189,7 +207,7 @@ class LLM:
             response_format=response_format,
             request_id=request_id,
         )
-        return self._backend.stream(request)
+        return streamed(self._backend, request)
 
     def cancel(self, request_id: str) -> bool:
         return self._backend.cancel(request_id)

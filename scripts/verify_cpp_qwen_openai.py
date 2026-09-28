@@ -31,7 +31,6 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable
 from typing import Any
 
 
@@ -417,46 +416,12 @@ def refusal_error(result: HttpResult, label: str) -> dict[str, Any]:
     return error
 
 
-# Checks `pocketllm serve --backend cpp` does not serve yet, and why. Each one names a field the
-# native front end answered and the unified one refuses by name instead, which is the honest half of
-# the port: a request that will not be honoured is not answered as if it had not been made.
-#
-# The set is deliberately a set rather than a skip list. A check here that starts passing fails the
-# run below, so the entry has to be deleted in the commit that ports it rather than left to rot --
-# the same discipline `tests/baseline_failures.txt` uses for the pytest suite. Emptying this mapping
-# is what U1d-2 is, and the native front end is deleted only after it is empty.
-PENDING_ON_POCKETLLM: dict[str, str] = {
-    "n choices": (
-        "several choices are several scheduler requests, and the fan-out is the host's dispatch "
-        "rather than this adapter's: one implementation for every runtime. Ported in U1d-2"
-    ),
-    "logprobs": (
-        "the engine produces the per-token ranking and `SchedulerGenerationResult.logprobs` is "
-        "not bound to Python yet, so there is nowhere for the probabilities to arrive. Ported "
-        "in U1d-2"
-    ),
-}
-
-
-def run_check(name: str, check: Callable[[], None], *, launch: str) -> None:
-    """Runs one named check, holding a not-yet-ported one to the recorded reason.
-
-    A pending check that passes is a failure: it means the field is served now and the entry above
-    is stale, which is the entry that would otherwise stay behind and quietly excuse a regression.
-    """
-    reason = PENDING_ON_POCKETLLM.get(name) if launch == "pocketllm" else None
-    if reason is None:
-        check()
-        return
-    try:
-        check()
-    except Exception as exc:  # noqa: BLE001 - the check's own assertion is the expected outcome
-        print(f"[PENDING] {name} is not served via pocketllm yet: {reason} (check said: {exc})")
-        return
-    raise AssertionError(
-        f"{name} passes via pocketllm now, so the PENDING_ON_POCKETLLM entry is stale: "
-        f"delete it, and delete the front end it was excusing"
-    )
+# `n` and `logprobs` were the last two checks the unified front end did not pass, held here as a
+# mapping from check name to the reason it was still refused. Both are ported now, so the mapping is
+# gone and the checks run the same way as every other one: a check that cannot pass has to fail the
+# run rather than be recorded as expected, or the entry that excuses it outlives the gap it named.
+# The native front end is deleted next, and the two launches are compared field by field until then
+# by `validate_request_field_refusals`.
 
 
 def validate_request_field_refusals(
@@ -1652,21 +1617,9 @@ def run(args: argparse.Namespace) -> int:
 
         validate_stop_sequences(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
-        run_check(
-            "n choices",
-            lambda: validate_n_choices(
-                base_url, model_name, timeout=args.request_timeout_seconds + 30
-            ),
-            launch=args.launch,
-        )
+        validate_n_choices(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
-        run_check(
-            "logprobs",
-            lambda: validate_logprobs(
-                base_url, model_name, timeout=args.request_timeout_seconds + 30
-            ),
-            launch=args.launch,
-        )
+        validate_logprobs(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 
         validate_tool_calls(base_url, model_name, timeout=args.request_timeout_seconds + 30)
 

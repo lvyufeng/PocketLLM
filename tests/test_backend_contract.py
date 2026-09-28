@@ -368,6 +368,100 @@ def test_reasoning_and_tool_calls_are_forwarded_in_responses():
         server.server_close()
 
 
+def test_a_request_for_several_choices_is_a_request_per_choice():
+    """`n` is served by running the request again, one level above the runtime.
+
+    The backend is handed three requests and echoes three results, so the response has three choices
+    -- and the ids it saw say which choice each was, which is also how a cancellation reaches them.
+    The usage is the group's: the prompt counted once, the completion summed.
+    """
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        body = _post(
+            base,
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "n": 3, "max_tokens": 4},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [choice["index"] for choice in body["choices"]] == [0, 1, 2]
+    assert [choice["message"]["content"] for choice in body["choices"]] == ["ok", "ok", "ok"]
+    assert body["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+
+    ids = [request.request_id for request in backend.seen]
+    assert len(ids) == 3
+    bases = {request_id.split("#")[0] for request_id in ids}
+    assert len(bases) == 1
+    assert sorted(request_id.split("#")[1] for request_id in ids) == ["0", "1", "2"]
+    # Every choice asks for one, which is the shape an adapter's single-result contract needs.
+    assert {request.sampling_params.n for request in backend.seen} == {1}
+
+
+def test_a_completions_request_for_several_choices_is_a_request_per_choice():
+    """The same fan-out on the other endpoint, whose response shape is its own."""
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        body = _post(base, "/v1/completions", {"prompt": "hi", "n": 2, "max_tokens": 4})
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [choice["index"] for choice in body["choices"]] == [0, 1]
+    assert [choice["text"] for choice in body["choices"]] == ["ok", "ok"]
+    # Always present on this endpoint, null when none was asked for.
+    assert [choice["logprobs"] for choice in body["choices"]] == [None, None]
+    assert body["usage"]["completion_tokens"] == 2
+
+
+def test_a_streamed_multi_choice_response_names_the_choice_of_every_chunk():
+    """A client accumulating per index has to be able to put each chunk where it belongs.
+
+    The choices arrive one after the other rather than interleaved -- the runtime is streamed one
+    request at a time -- and that is invisible to a client because an OpenAI stream is keyed by the
+    index each chunk carries. Each choice opens with its own role delta, the way a single-choice
+    stream opens with one.
+    """
+    backend = ContractBackend()
+    server, base = _server(backend=backend)
+    try:
+        raw = _post_raw(
+            base,
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hi"}], "n": 2, "stream": True},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    lines = [
+        line[len("data: "):] for line in raw.splitlines() if line.startswith("data: ")
+    ]
+    assert lines[-1] == "[DONE]"
+    # Once for the response, not once per choice: the terminator ends the stream, and a client that
+    # stopped reading at the first one would lose every choice after it.
+    assert lines.count("[DONE]") == 1
+    chunks = [json.loads(line) for line in lines if line != "[DONE]"]
+
+    texts: dict[int, str] = {}
+    roles: dict[int, int] = {}
+    for chunk in chunks:
+        (choice,) = chunk["choices"]
+        index = choice["index"]
+        delta = choice["delta"]
+        if delta.get("role"):
+            roles[index] = roles.get(index, 0) + 1
+        texts[index] = texts.get(index, "") + delta.get("content", "")
+
+    assert texts == {0: "ok", 1: "ok"}
+    assert roles == {0: 1, 1: 1}
+    # The id on every chunk is the request the client made, not the per-choice id the fan-out used.
+    assert {chunk.get("id") for chunk in chunks} == {chunks[0]["id"]}
+
+
 def test_cancelling_unknown_request_returns_404():
     server, base = _server()
     try:

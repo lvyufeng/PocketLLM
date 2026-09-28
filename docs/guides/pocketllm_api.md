@@ -307,12 +307,21 @@ than trusted.
 policy for every runtime and is checked before dispatch. Whether a runtime's answer applies the field
 at all depends on the runtime, and each declares its own answer through `BackendBase.audit_request`
 (the `cpp` backend is the adapter that declares one today; a runtime that has declared nothing
-refuses nothing and is subject to the shape checks alone). `--backend cpp` serves `stop`,
-`thinking_mode` and `add_generation_prompt`, and refuses **`n` above 1** and **any request for log
-probabilities** — rows marked *(not on `cpp` yet)* — by name in `param`, because the choice fan-out
-and the per-token ranking are not ported to it yet. Both are being ported before the native binary
-that also serves them is deleted; the refusals are what a caller sees in the meantime, and they are
-refusals rather than dropped fields so that a request for four choices cannot come back as one.
+refuses nothing and is subject to the shape checks alone). `--backend cpp` serves `stop`, `n`,
+`logprobs`, `thinking_mode` and `add_generation_prompt`.
+
+Two of those are served by code that is not in any adapter, and saying so is the point of the
+division:
+
+- **`n` is the host's dispatch.** A request for `n` choices is `n` requests to the runtime, built by
+  `pocketllm/choices.py` and run by whichever entry point received the request — the HTTP server or
+  `LLM.chat`. One implementation for every runtime, which is why it is not in an adapter. The one
+  `n` still refused is a stochastic request against an engine that samples at engine-wide values: the
+  choices differ only in the seed they are handed, and that engine reads no seed it was given, so all
+  `n` would be one text presented as independent samples.
+- **`logprobs` is the scheduler's.** The ranking comes off the scheduler's result, so a build whose
+  scheduler was not created (`batching=false` selects the serialized compatibility session) refuses
+  the field by name rather than answering with an empty array.
 
 ### Implemented
 
@@ -323,13 +332,13 @@ refusals rather than dropped fields so that a request for four choices cannot co
 | `max_tokens`, `max_completion_tokens` | both | The generation budget. `max_completion_tokens` wins when a request carries both, which is OpenAI's rule for the deprecated/current pair. A body carrying neither — or carrying `null` for either, which clients do send — asks for no cap: the answer runs until EOS or the context limit, resolved against the engine's own context the way vLLM (`max_model_len - input_length`) and SGLang resolve an absent cap. A backend that sizes its own caches — v41 — refuses a request whose prompt and budget together do not fit them, as a 400 before any work starts. |
 | `temperature`, `top_p`, `top_k`, `seed` | both | Applied when the engine declares per-request sampling and top-k; otherwise a value that differs from the engine's effective one is a 400 from the sampling check rather than a silent substitution. |
 | `stream` | both | Selects SSE deltas terminated by `[DONE]`. |
-| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). *(not on `cpp` yet)* |
+| `n` | both | The number of choices. Served by running the request `n` times, so the response holds one entry per choice with `index` running 0..n-1; see [Choices](#choices). |
 | `response_format` | chat | Applied when the engine declares structured outputs; `text`, `json_object` and `json_schema` are supported there, and the request is refused when it is not. |
 | `tools` | chat | Tool definitions reach the chat template, and a call the model writes back is reported in the assistant message's `tool_calls` rather than left in the text; see [Tool calls](#tool-calls). |
 | `tool_choice` | chat | `"none"` drops the definitions, `"required"` and a named function become an instruction in the prompt; see [Tool calls](#tool-calls). |
 | `stop` | both | Matched against the decoded text as it is produced, so the completion ends at the first occurrence of any sequence and the sequence itself is not part of the answer. The field is a string or a list of strings; a value of another shape is a 400. |
-| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. *(not on `cpp` yet)* |
-| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. *(not on `cpp` yet)* |
+| `logprobs` | both | The sampled token's own log probability, and — on chat, up to `top_logprobs` of — the alternatives ranked at the same position; see [Log probabilities](#log-probabilities). A boolean on chat, a count on completions. |
+| `top_logprobs` | chat | How many alternatives to rank per position alongside the sampled token. `0` reports the sampled token's probability and no alternatives. |
 | `thinking_mode`, `reasoning_effort`, `add_generation_prompt`, `drop_thinking`, `request_id` | chat | PocketLLM extensions, not OpenAI fields. `thinking_mode` is `"chat"` or `"thinking"` and decides whether an answer is split at `</think>` into `content` and `reasoning_content`; `add_generation_prompt` (default `true`) decides whether the rendered prompt ends with the assistant header the model answers into, and `false` encodes the conversation as it stands — how a caller continues an assistant turn or inspects what the template does. |
 
 #### Stop sequences
@@ -365,14 +374,21 @@ Three details are worth knowing before relying on the field:
 #### Choices
 
 `n` is the number of completions one request asks for, and the server serves it by running the
-request `n` times: each choice is its own scheduler request, with its own seed derived from the
+request `n` times: each choice is its own runtime request, with its own seed derived from the
 request's `seed` and — when `response_format` asks for one — its own grammar. The response carries
-one entry per choice with `index` running 0..`n`-1, and a streaming response **interleaves** the
-choices rather than sending one after another, so a client watching four choices sees all four
-advance together. `usage` is counted the way OpenAI counts it: `prompt_tokens` once for the request,
-`completion_tokens` the sum over the choices.
+one entry per choice with `index` running 0..`n`-1. `usage` is counted the way OpenAI counts it:
+`prompt_tokens` once for the request, `completion_tokens` the sum over the choices.
 
-Three consequences are worth knowing:
+On a streamed response the choices arrive **one after another**, not interleaved, and each chunk
+names the choice it belongs to in `index`. Interleaving would need the runtime to be driving several
+requests at once, and a stream here is serialized against the engine's one mutable KV session — so
+the choices are streamed in index order and the client reassembles them by index, which is what an
+OpenAI stream is for. Each choice opens with its own `role: "assistant"` delta, the same way a
+single-choice stream does. The practical consequence is latency rather than correctness: choice 2 of
+3 does not begin until choice 1 has finished, so a client that wants all of them early is better off
+sending `n` separate requests.
+
+Four consequences are worth knowing:
 
 - **Under greedy decoding every choice is the same text.** With `temperature` at 0 the seed is not
   read, so `n=3` returns the greedy answer three times. That is what a greedy request for three
@@ -433,16 +449,21 @@ Four things are worth knowing before relying on the field:
   the answer, and the array is cut with it — a position the caller never received is not reported.
   `usage.completion_tokens` still counts the tokens the engine generated, so it can exceed the number
   of entries in `content`.
-- **On chat the array sits beside `message`, not inside it.** The sidecar splits the token stream
-  into `content`, `reasoning_content` and `tool_calls`, so a client that wants a probability per
-  field has to do that split itself — the ranking describes the stream the model produced.
+- **On chat it covers the answer and not the reasoning block.** A thinking model decodes its
+  reasoning first, and `message.content` is what follows it, so the array starts where the content
+  starts: a client indexing into `content` and a client indexing into `logprobs.content` are looking
+  at the same position. The reasoning block's own probabilities are therefore not reported, even
+  though they were generated.
 - **Streaming is not supported**, because a chunk carries the text of its token with no ranking
   beside it. `{"stream":true,"logprobs":...}` is a 400 rather than a stream that looks the same as
   one whose request asked for no ranking at all.
-- **The engine has to declare it.** `logprobs` is refused when the capability is off, which is the
-  case for speculative decoding (its verify step ranks no tokens) and for the Ascend backend. The
-  limit on alternatives is this server's — 20 per position, above OpenAI's documented range — and a
-  request past it is a 400 naming the ceiling.
+- **The engine has to declare it, and the runtime has to be able to ask.** `logprobs` is refused
+  when the capability is off, which is the case for speculative decoding (its verify step ranks no
+  tokens, so a row that emitted several has no ranking for the rest) and for the Ascend backend. On
+  `--backend cpp` the ranking comes off the batch scheduler, so a build running the serialized
+  compatibility session (`batching=false`) refuses the field by name rather than answering with an
+  empty array. The limit on alternatives is this server's — 20 per position, above OpenAI's
+  documented range — and a request past it is a 400 naming the ceiling.
 
 #### Tool calls
 
@@ -534,8 +555,7 @@ streamed halfway and abandoned. Which fields are refused at which values is
 host-side, while whether a runtime's answer applies a field at all depends on the runtime and is
 declared by it. A runtime that has not declared anything refuses nothing, which is why the sections
 above describe the socket rather than a policy — the `cpp` backend is the adapter that declares one
-today, and it refuses `n` above 1 and any request for log probabilities by name until both are
-ported to it.
+today.
 
 ### Accepted and inert
 
